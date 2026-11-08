@@ -40,5 +40,8 @@ pub use mutation::{
     Mutator, Proposal, REJECT_BIRTH_NO_CHARGE, RejectionReason, TopologyChange,
     UNIFORM_OTHER_CATALOG_MEMBER, perturb, reflect_log_scale,
 };
-pub use quota::{GenomeQuota, ParameterBuffer, allocate_parameters, logical_bytes};
+pub use quota::{
+    ALLOCATED_GENOME_BYTES, GenomeQuota, LOGICAL_GENOME_BYTES, ParameterBuffer,
+    allocate_parameters, logical_bytes,
+};
 pub use transition::{Transition, map_parameters};

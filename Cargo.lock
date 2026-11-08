@@ -737,6 +737,8 @@ version = "0.0.1"
 dependencies = [
  "flife-core",
  "flife-field",
+ "flife-genome",
+ "flife-neural",
 ]
 
 [[package]]

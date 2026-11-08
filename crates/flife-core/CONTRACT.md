@@ -7,6 +7,8 @@ FL-005 (`flife-f6x`) adds the global energy ledger (§4.4, §8.2, §21.4, INV-03
 adds the host-independent elementary functions of the reference numerical profile (A.1, C.11). FL-010
 (`flife-rf8`) adds `fnp-philox-semantic-v1`, the semantically addressed random source every model draw comes from
 (§16.2, A.3 item 3, INV-11), with the `exp`, `ln` and turn-angle sine and cosine its distributions need.
+FL-011 (`flife-t24`) adds the `birthing` stream and the `attempt` lane kind for reproduction (A.3 item 10), and
+`EnergyBudget::retain` for the share a parent keeps (§7.4).
 
 **Inputs.** Configuration TOML (Appendix A's schema). Every key is required and unknown keys are refused, so there
 are no hidden defaults.
@@ -28,7 +30,7 @@ are no hidden defaults.
   - `Transfer`: uptake, emission, child endowment and recycling, each with a named loss flow.
   - `Holdings`, and `TickLedger` with its `TickClosure`.
   - The run's `EnergyLedger` with its `LedgerReport`, and `ResidualBudget`.
-  - The per-organism `EnergyBudget`, with `Payment`.
+  - The per-organism `EnergyBudget`, with `Payment`, `pay` and (FL-011) `retain`.
   - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.
 - Numerics (FL-006, FL-007, FL-010): `exp_neg`, `expm1_neg`, `tanh`, `sigmoid`, `log2`, `ln`, `exp` and
   `sin_cos_turns`.
@@ -86,8 +88,9 @@ are no hidden defaults.
   - An address is `(stream, entity, ordinal, lane, draw)`. Its block is the first four outputs of NumPy's
     `Philox(key=[world_seed, stream code], counter=[entity, ordinal, lane, draw])` through FrankenNumPy's
     NumPy-exact `PhiloxRng`, which is Philox4x64-10 of `counter + 1`.
-  - Stream codes are frozen eight-byte ASCII tags: `founders`, `mutation`, `srcchems`, `srcpaths`, `srcplace`.
-  - A lane packs `candidate << 56 | kind << 48 | index` with frozen kind codes 1–9, and a neuron index
+  - Stream codes are frozen eight-byte ASCII tags: `founders`, `mutation`, `srcchems`, `srcpaths`, `srcplace`
+    and (FL-011) `birthing`.
+  - A lane packs `candidate << 56 | kind << 48 | index` with frozen kind codes 1–10, and a neuron index
     `layer << 32 | output << 16 | input`. A value out of range is refused (`Overflow`), never wrapped.
   - Distinct addresses never share a block, because the counter map is injective and Philox is a bijection for
     a fixed key.
@@ -126,6 +129,7 @@ Every issue is reported, not just the first.
 - A residual outside the per-tick or the cumulative allowance.
 - A tick that is out of order, does not open where the last one closed, or was checked against another budget.
 - A credit to an exhausted budget.
+- Retaining more than a budget holds, or retaining from an exhausted budget.
 
 **Not refused here (by design).**
 - The worst admitted allocation exceeding the logical quota. It is reported in `worst_case_fits_logical_quota`,
@@ -156,6 +160,10 @@ Every issue is reported, not just the first.
     `motion_response` and `sensing_scale`, which completes them.
   - In `flife-field`: the seeded draws of FL-004's `seeded-unit-vectors` and `seeded-smooth-torus-v1`, which
     completes those too.
+- FL-011, in `flife-engine`: `no-emission-no-charge`, the `post-motion` emission position, `next-tick` emission
+  visibility and `next-tick` newborn activation. `reject-birth-no-charge` now also cites the birth transaction's
+  test. `pause-before-commit` stays `Specified` under FL-013, which owns pausing the tick. FL-011 supplies the
+  `CapacityShortfall` it pauses on.
 - The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
   stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
@@ -179,6 +187,8 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
   - C.1's accounting, checked exactly.
   - Round-down and the INV-05 bound, checked against exact `i128` arithmetic on dyadic values.
   - The cumulative gate tripping at a computed tick, and every reported normalization checked exactly.
+  - `retain` keeps exactly what it is asked to and pays the difference, over 2,000 random cases and C.5's 10 to 6.
+    Keeping zero exhausts the budget. It refuses an exhausted budget and invalid amounts.
 - `tests/numerics.rs`:
   - 24 pinned bit patterns, each within 1 ulp of its correctly rounded value.
   - Agreement with the platform `libm` over a log-spaced and dense sweep, within bounds that hold on any
@@ -192,11 +202,11 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
   - Turn angles: nine pinned pairs, exact quarter turns, agreement with `std` and `sin² + cos² = 1` over 4,096
     turns, and the domain.
 - `tests/rng.rs`:
-  - Philox blocks equal NumPy 2.5.4's at zero, all-ones and carrying counters, and at five semantic addresses.
-    Every expected word comes from NumPy itself, through an oracle script that imports neither FrankenLife nor
+  - Philox blocks equal NumPy 2.5.4's at zero, all-ones and carrying counters, and at seven semantic addresses.
+    FL-011 adds two pins on the `birthing` stream. Every expected word comes from NumPy itself, through an oracle script that imports neither FrankenLife nor
     FrankenNumPy.
   - Frozen stream codes and injective lane packing, with out-of-range refusals.
-  - Blocks are the same in forward, reverse and four-worker order. No two of 480 addresses share a block, and
+  - Blocks are the same in forward, reverse and four-worker order. No two of 576 addresses share a block, and
     another seed moves all of them.
   - Exact uniform and choice conventions.
   - Box–Muller pairs, pinned and within 4 ulp of correctly rounded, with the exact quarter turn.

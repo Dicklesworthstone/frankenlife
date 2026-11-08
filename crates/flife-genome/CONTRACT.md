@@ -114,7 +114,9 @@ Births and deaths are FL-011 and FL-012. Packed per-topology arenas are FL-026.
 - A default topology that is not a member, or is above the cap. Another catalog, inheritance map or depth-change
   map (`UnknownAlgorithm`).
 - A member above the parameter cap, or a quota that cannot cover a genome (`BudgetExhausted`, with what was
-  required and what was available). Quotas out of order.
+  required and what was available). Quotas out of order. The budget is named by `LOGICAL_GENOME_BYTES` or
+  `ALLOCATED_GENOME_BYTES`, so the birth transaction can tell a fixed logical shortfall (a pause) from a host
+  allocation limit (an error).
 - An unrepresentable or host-refused buffer (`AllocationFailed`).
 - A parameter or trait outside its bound, a nonfinite value, or a sensing scale out of range. Nonpositive or
   nonfinite bounds.
@@ -211,6 +213,7 @@ F32 canonical weights and `independent-dense-mlp-v1` controllers, with traits fo
 - Genomes are separate heap buffers. Packed immutable slabs by topology, generation-tagged handles and device
   sharding are FL-026. A store with an identity map, epoch-aware reclamation and checkpointed genome identity
   belongs to the tick and the store (FL-013, FL-014).
-- Research-mode pause and exhibition-mode birth rejection on quota pressure (§7.5) are policies of the birth
-  transaction, FL-011. This crate reports the refusal.
+- Pausing on quota pressure (§7.5) belongs to the birth transaction. FL-011's `flife_engine::resolve_births`
+  turns a logical refusal into a `CapacityShortfall` and rolls back; FL-013 pauses the tick on it. Exhibition-mode
+  birth rejection has no registered name yet. This crate reports the refusal.
 - A backend-compatible materialization of each transition (C.16) is FL-025 and FL-030.

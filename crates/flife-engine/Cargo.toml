@@ -1,6 +1,6 @@
 [package]
 name = "flife-engine"
-description = "FrankenLife organism-phase reference operators: per-packet bounded chemistry, toxicity, maintenance costs and affordable motion"
+description = "FrankenLife organism-phase reference operators: per-packet bounded chemistry, toxicity, maintenance costs, affordable motion, paid emission and the birth transaction"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 flife-core = { path = "../flife-core" }
 flife-field = { path = "../flife-field" }
+flife-genome = { path = "../flife-genome" }
+flife-neural = { path = "../flife-neural" }
 
 [lints]
 workspace = true

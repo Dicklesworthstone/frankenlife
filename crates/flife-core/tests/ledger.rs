@@ -418,3 +418,40 @@ fn exhausted_budgets_pay_nothing_and_absorb_nothing() {
     assert!(exact_spend.is_exhausted());
     assert_eq!(exact_spend.remaining(), 0.0);
 }
+
+#[test]
+fn budgets_retain_exactly_the_share_a_parent_keeps() {
+    // FL-011: a parent keeps its split share bit for bit, whatever the
+    // rounding of what it paid out.
+    let mut next = splitmix(0x0f11_0011);
+    for _ in 0..2_000 {
+        let available = dyadic(&mut next, -2, 6);
+        let kept = dyadic(&mut next, -8, 6).min(available);
+        let mut budget = EnergyBudget::new(available).expect("budget");
+        let payment = budget.retain(kept).expect("retain");
+        assert_eq!(budget.remaining().to_bits(), kept.to_bits());
+        assert!(!budget.is_exhausted());
+        assert!(payment.is_full());
+        assert_eq!(payment.paid, available - kept);
+    }
+    // C.5: a parent with 10 keeps 6.
+    let mut parent = EnergyBudget::new(10.0).expect("budget");
+    assert_eq!(parent.retain(6.0).expect("retain").paid, 4.0);
+    assert_eq!(parent.remaining(), 6.0);
+    // Keeping everything pays nothing; keeping nothing exhausts.
+    assert_eq!(parent.retain(6.0).expect("retain").paid, 0.0);
+    assert_eq!(parent.retain(0.0).expect("retain").paid, 6.0);
+    assert!(parent.is_exhausted());
+    assert!(matches!(
+        parent.retain(0.0),
+        Err(CoreError::StateConflict { .. })
+    ));
+    let mut budget = EnergyBudget::new(1.0).expect("budget");
+    for kept in [1.0_f64.next_up(), -0.5, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            budget.retain(kept),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+        assert_eq!(budget.remaining(), 1.0, "a refused retain changes nothing");
+    }
+}

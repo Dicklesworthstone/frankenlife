@@ -613,7 +613,8 @@ The repository holds:
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
-  numerics), `crates/flife-field` (FL-003–FL-005 and the FL-007 pyramid), `crates/flife-engine` (FL-006),
+  numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
+  (FL-006, FL-011),
   `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009, FL-010), each with its
   `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
 
@@ -655,8 +656,19 @@ knots), and `log-linear-v1` scale blending, all in lerp form so a uniform field 
 before toxicity is paid, so toxicity is clipped to `E + G` and the ledger records the paid amount (C.2).
 Maintenance comes from canonical model work only. Motion integrates drag with `expm1_neg` (C.11), clamps speed
 and acceleration radially as computed in F64, and scales the whole velocity when it is unaffordable, exhausting
-the organism (C.12). Every organism spends through a `flife_core::EnergyBudget` in §8.2 order. Trait mutation is
-FL-010; emission and reproduction are FL-011.
+the organism (C.12). Every organism spends through a `flife_core::EnergyBudget` in §8.2 order.
+
+FL-011 adds `emission` and `reproduction` to `flife-engine`, and `flife_field::deposit`.
+- Emission pays `f E` from the post-motion budget, in full, and stages `ρ f E` at the post-motion position. A
+  closed gate, a zero direction or a dead organism pays nothing. `apply_deposits` runs after `apply_grants` and
+  rounds every cell down, so the field never gains more than was paid. It depends on identities, not push order.
+- Reproduction draws one Bernoulli attempt per eligible parent and tick on the `birthing` stream. The split is
+  `R = E − c_b` rounded down, the child gets `β R`, and the parent keeps `R − β R` rounded down. Minimums are
+  checked on those committed values.
+- `resolve_births` stages births in ascending parent identity. Each one reserves a population slot, then the
+  logical genome quota, before any genome work, and issues identities only on acceptance. A shortfall or error
+  rolls the whole stage back. `Births::settle` re-checks each parent's budget and records one `child-endowment`
+  transfer per birth. Pausing the tick on a `CapacityShortfall` is FL-013's.
 
 `flife-neural` (FL-007) is the sensor/action ABI. `observe` encodes a blended pyramid sample and the organism's
 own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y gradients saturated with
@@ -696,7 +708,7 @@ item 4's order:
 - invalid or effective no-op candidates are rejected, never reinterpreted;
 - when every candidate is rejected, every buffer has been abandoned and the quota is unchanged.
 
-No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
+No death, organism store or simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 
 ---
 

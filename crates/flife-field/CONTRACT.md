@@ -19,6 +19,8 @@
 - FL-010 (`flife-rf8`) supplies FL-004's seeded draws from `fnp-philox-semantic-v1` (A.3 items 7 and 8, §16.2):
   chemical directions, initial source centers and per-segment travel directions, each named by the source's
   stable identity.
+- FL-011 (`flife-t24`) covers the reduction of paid emission deposits into the next field (§5.5, §8.1 phase 9,
+  INV-03, INV-05, C.4). The emission settlement that stages them is `flife_engine::emission`.
 
 **Inputs.**
 - A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world`, `[field_initialization]`, `[sources]`).
@@ -31,6 +33,8 @@
   most once per tick.
 - For sensing: the observation snapshot's `FieldState`, the pyramid level count, and a position and sensing scale
   per query.
+- For deposits (FL-011): each emitter's identity, post-motion position, payment `w`, offer `ρ w` and chemical
+  direction, and the next field after that tick's uptake debits.
 
 **Outputs.**
 - `FieldState`: one planar `[plane, y, x]` buffer of `33 G_x G_y` real `f32` values. Plane 0 holds energy;
@@ -61,6 +65,9 @@
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
   `CellDebit` per demanded cell, each organism's total `U_i` in input order, and an `UptakeSummary`.
   `apply_grants` debits the field.
+- `deposit` (FL-011): reusable `Deposits` (`push`, `clear`, `len`, `is_applied`) and `apply_deposits`, which adds
+  them to the field and returns a `DepositSummary` (organisms, cells, paid, offered and applied).
+  `DepositSummary::record` books the reduction as one `emission` transfer in a `TickLedger`.
 
 **Invariants — representation (FL-003).**
 - Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy
@@ -171,6 +178,22 @@
 - Every value depends only on the seed and the source's identity (and segment ordinal), never on the order
   sources are made or advanced.
 
+**Invariants — emission deposits (FL-011).**
+- An offer spreads over the emitter's `grid-cic-v1` footprint at its post-motion position, one packet per cell.
+  Every cell but the largest-weight one (lowest index on a tie) gets `ρ w w_c` rounded to nearest, and that cell
+  gets the remainder rounded down. So the packets never sum to more than the offer, exactly, and none is negative.
+- Energy and every moment component share each cell's packet: `(q_c, q_c a)`.
+- Packets are sorted by (cell, organism identity) and each cell sums them in that order, rounding down. The new
+  cell energy is the largest F32 value at or below `e_c + S_c`, so a deposit never creates energy. What the F32
+  cell cannot hold is dissipated, like an uptake request below half a quantum.
+- The moment gains `(δ_c/S_c) Σ q a`, where `δ_c` is what the cell received, rounded once per component. The
+  composition shrinks with the energy it accompanies, which keeps the cone (INV-02).
+- One reduction is one ledger transfer: debit `Σ w`, credit `min(Σ δ_c, Σ w)`, the rest to `emission-loss`.
+- The result depends only on organism identities, never on push order or storage slot.
+- Deposits are applied after the tick's uptake debits, and `apply_grants` refuses a field that has changed
+  since its snapshot, so the order cannot be inverted. Nothing writes the observation snapshot, so a deposit is
+  first sensed and absorbable on the next tick.
+
 **Refusal cases.**
 - Representation: a zero cell count, or a nonfinite or nonpositive world or cell side; byte counts past
   `u64::MAX` or `isize::MAX`; a buffer above its limit; any layout mismatch, including one of equal length; a
@@ -191,6 +214,10 @@
   - A field on another grid.
   - A scale outside `[s_0, s_0 2^L]`, a nonfinite position or a nonfinite density.
   - Another filter or blend name.
+- Deposits (FL-011): a negative or nonfinite payment or offer; an offer above its payment; a direction outside
+  the unit ball; a nonfinite position; staging on another grid, or after the deposits were applied (until
+  `clear`); applying twice, to another grid, with one organism staged twice, or to a field missing a moment
+  plane. Nothing is written on a refusal.
 - Invariants: the first cell that violates INV-01 or INV-02.
 
 **Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
@@ -248,6 +275,10 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   - A moved source keeping its chemistry.
 - The pyramid's tests live in `flife-neural`'s `tests/sensing.rs`, next to the sensor encoding they feed: a slow
   direct oracle at every level, C.10's uniform field, knots and edges, translations, and refusals.
+- The deposit reduction's tests live in `flife-engine`'s `tests/emission_births.rs` (FL-011), next to the
+  emission that stages it. They cover C.4 exactly; shared bilinear weights for energy and moment; push-order
+  independence, including an adversarial F32 boundary; ledger closure; no energy created at efficiency 1; and
+  every refusal.
 
 **Known gaps.**
 - The tick that carries `SeededPath` and updates source centers each tick, and its checkpoint of anchor and
@@ -265,7 +296,8 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
 - `UptakeSummary::contended_cells` counts every cell whose demand exceeds its energy, including empty cells
   that receive demand.
 - Per-packet chemistry, toxicity and affordable motion are in `flife-engine` (FL-006). Clearing tiny reservoirs
-  and death are FL-012. Device arrangements, device alignment and sharding belong to the Metal backend.
+  and death are FL-012. Recycling a dead organism's energy reuses `Deposits` as a separate reduction booked under
+  `Transfer::Recycling` (FL-012). Device arrangements, device alignment and sharding belong to the Metal backend.
   Whole-run memory admission is FL-043.
 - The pyramid is rebuilt in full every tick in F64 (two thirds of the F32 base field's bytes). An F32 or Metal
   pyramid is a separate numerical profile. Its contract, with the sensor encoding, is

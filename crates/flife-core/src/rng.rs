@@ -50,7 +50,8 @@ pub enum Stream {
     /// organism, ordinal zero.
     Founders,
     /// Mutation proposals (§7.3, A.3 item 4): entity is the parent
-    /// organism, ordinal the event tick.
+    /// organism, ordinal the attempt tick (the input tick of the advance
+    /// that attempts the birth).
     Mutation,
     /// Source chemical directions (A.3 item 7): entity is the source,
     /// ordinal zero.
@@ -61,16 +62,20 @@ pub enum Stream {
     /// Initial source centers (A.3 item 7): entity is the source, ordinal
     /// zero.
     SourcePlacement,
+    /// Reproduction attempts and child offsets (§7.4, A.3 item 10): entity
+    /// is the parent organism, ordinal the attempt tick.
+    Birth,
 }
 
 impl Stream {
     /// Every stream, in code order of declaration.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Founders,
         Self::Mutation,
         Self::SourceChemistry,
         Self::SourcePath,
         Self::SourcePlacement,
+        Self::Birth,
     ];
 
     /// The tag whose bytes are the code.
@@ -82,6 +87,7 @@ impl Stream {
             Self::SourceChemistry => b"srcchems",
             Self::SourcePath => b"srcpaths",
             Self::SourcePlacement => b"srcplace",
+            Self::Birth => b"birthing",
         }
     }
 
@@ -112,8 +118,11 @@ pub enum LaneKind {
     /// A direction: a Box–Muller pair of a source's chemistry, or a travel
     /// angle.
     Direction,
-    /// A position on the torus.
+    /// A position: a point on the torus, or a child's offset from its
+    /// parent.
     Position,
+    /// A Bernoulli attempt, such as a parent's reproduction attempt.
+    Attempt,
 }
 
 impl LaneKind {
@@ -130,6 +139,7 @@ impl LaneKind {
             Self::SensingScale => 7,
             Self::Direction => 8,
             Self::Position => 9,
+            Self::Attempt => 10,
         }
     }
 }

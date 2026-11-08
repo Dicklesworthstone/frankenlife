@@ -17,6 +17,16 @@ use crate::genome::Genome;
 /// Bytes per canonical F32 parameter.
 pub const F32_BYTES: u64 = 4;
 
+/// The budget a [`CoreError::BudgetExhausted`] names when the fixed logical
+/// genome quota refuses a genome. Under `pause-before-commit` this is a
+/// capacity shortfall that pauses the tick (§7.5).
+pub const LOGICAL_GENOME_BYTES: &str = "logical genome bytes";
+
+/// The budget a [`CoreError::BudgetExhausted`] names when the allocated
+/// (physical) genome quota refuses a buffer. That is a physical condition
+/// that pauses, retries or fails the run; it never selects births (§7.5).
+pub const ALLOCATED_GENOME_BYTES: &str = "allocated genome bytes";
+
 /// The logical bytes one genome of `topology` is charged.
 ///
 /// # Errors
@@ -155,13 +165,13 @@ impl GenomeQuota {
         }
         let logical = logical_bytes(topology)?;
         self.check(
-            "logical genome bytes",
+            LOGICAL_GENOME_BYTES,
             logical,
             self.logical,
             self.maximum_logical,
         )?;
         self.check(
-            "allocated genome bytes",
+            ALLOCATED_GENOME_BYTES,
             logical,
             self.allocated,
             self.maximum_allocated,
@@ -174,7 +184,7 @@ impl GenomeQuota {
         // The host may reserve more than requested; the allocated quota
         // counts what it actually reserved.
         self.check(
-            "allocated genome bytes",
+            ALLOCATED_GENOME_BYTES,
             allocated,
             self.allocated,
             self.maximum_allocated,

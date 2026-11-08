@@ -232,6 +232,9 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     ),
     entry("zero", Role::InitialVelocity, "A.3 item 1", "FL-015"),
     entry("uniform", Role::InitialPositions, "A.3 item 1", "FL-015"),
+    // FL-011's birth stage reports a fixed logical quota shortfall with
+    // everything rolled back (`flife_engine::CapacityShortfall`); pausing
+    // the whole candidate tick before commit is the ordered tick's.
     entry(
         "pause-before-commit",
         Role::CapacityPolicy,
@@ -509,8 +512,10 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-010",
         )
     },
-    // Rejection, abandonment and the record are FL-010's; preserving the
-    // parent's energy and cooldown is the birth transaction's (FL-011).
+    // Rejection, abandonment and the record are FL-010's. The birth
+    // transaction (FL-011) keeps the parent's energy and cooldown and issues
+    // no identity for a rejected birth
+    // (`flife-engine::tests/emission_births.rs::rejected_births_charge_nothing_and_take_no_identity`).
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-genome::tests/mutation.rs::c16_exhausted_no_op_candidates_reject_the_birth_without_charge",
@@ -522,15 +527,40 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-010",
         )
     },
-    entry(
-        "no-emission-no-charge",
-        Role::ZeroDirection,
-        "§5.5",
-        "FL-011",
-    ),
-    entry("post-motion", Role::EmissionPosition, "§5.5", "FL-011"),
-    entry("next-tick", Role::EmissionVisibility, "§5.5", "FL-011"),
-    entry("next-tick", Role::NewbornActivation, "§6.6, §7.4", "FL-011"),
+    // FL-007 decodes a closed gate or a zero direction as no proposal;
+    // FL-011 charges nothing for it (`flife_engine::emission`).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/emission_births.rs::no_emission_no_charge_for_closed_gates_zero_directions_and_the_dead",
+        },
+        ..entry(
+            "no-emission-no-charge",
+            Role::ZeroDirection,
+            "§5.5",
+            "FL-011",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/emission_births.rs::emission_spends_the_decoded_fraction_of_the_post_motion_budget",
+        },
+        ..entry("post-motion", Role::EmissionPosition, "§5.5", "FL-011")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/emission_births.rs::deposits_are_first_sensed_and_absorbed_on_the_next_tick",
+        },
+        ..entry("next-tick", Role::EmissionVisibility, "§5.5", "FL-011")
+    },
+    // The birth transaction stamps newborns with birth tick `n + 1`, an
+    // invalid held output and zero history; the ordered tick (FL-013) first
+    // advances them from that committed state.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/emission_births.rs::newborns_start_inert_and_join_on_the_next_tick",
+        },
+        ..entry("next-tick", Role::NewbornActivation, "§6.6, §7.4", "FL-011")
+    },
     entry("genetic-affinity", Role::CorpseDirection, "§7.6", "FL-012"),
     entry(
         "stop-and-preserve",

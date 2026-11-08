@@ -30,12 +30,17 @@
 //! - [`seeding`]: the seeded draws of `seeded-unit-vectors`, initial source
 //!   centers and `seeded-smooth-torus-v1` travel directions, from
 //!   `fnp-philox-semantic-v1` by stable source identity (FL-010).
+//! - [`deposit`]: phase 9's reduction of paid deposits into the next
+//!   field: identity-ordered, rounded down per cell so that no deposit
+//!   creates energy, with the composition carried by the energy each cell
+//!   actually received (FL-011).
 //!
 //! The energy ledger itself is `flife_core::ledger`. The sensor encoding
 //! and action decoding are in `flife-neural`.
 
 #![forbid(unsafe_code)]
 
+pub mod deposit;
 pub mod exchange;
 pub mod footprint;
 pub mod grid;
@@ -50,6 +55,7 @@ pub mod step;
 pub mod transport;
 pub mod uptake;
 
+pub use deposit::{DepositSummary, Deposits, apply_deposits};
 pub use exchange::{ExchangeStencil, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};

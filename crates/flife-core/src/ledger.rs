@@ -967,6 +967,41 @@ impl EnergyBudget {
         self.pay(amount)?;
         Ok(true)
     }
+
+    /// Keep exactly `kept` and pay out the rest, as a parent does when it
+    /// endows a child (§7.4). The balance becomes `kept` bit for bit; the
+    /// returned payment is `remaining − kept` rounded to nearest, which is
+    /// telemetry: the ledger is told what moved by the transaction that
+    /// computed `kept`. Keeping zero exhausts the budget.
+    ///
+    /// # Errors
+    /// - [`CoreError::NumericalInvalid`] unless `kept` is finite,
+    ///   nonnegative and at most the balance.
+    /// - [`CoreError::StateConflict`] when the budget is exhausted.
+    pub fn retain(&mut self, kept: f64) -> Result<Payment, CoreError> {
+        let kept = energy("retained energy", kept)?;
+        if self.exhausted {
+            return Err(CoreError::StateConflict {
+                operation: "retain energy",
+                detail: "the budget is exhausted; a dead organism cannot reproduce".into(),
+            });
+        }
+        if kept > self.remaining {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "retained energy",
+                detail: format!("{kept} exceeds the balance {}", self.remaining),
+            });
+        }
+        let paid = self.remaining - kept;
+        self.remaining = kept;
+        if kept == 0.0 && paid > 0.0 {
+            self.exhausted = true;
+        }
+        Ok(Payment {
+            requested: paid,
+            paid,
+        })
+    }
 }
 
 /// `value` as a finite nonnegative energy, with `-0.0` folded to `0.0`.

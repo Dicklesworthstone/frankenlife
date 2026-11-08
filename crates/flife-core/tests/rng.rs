@@ -172,6 +172,28 @@ fn semantic_blocks_match_numpy() {
                 0x5da8_e339_f71b_9be6,
             ],
         ),
+        (
+            // FL-011: parent 7's reproduction attempt at tick 1234.
+            rng,
+            address(Stream::Birth, 7, 1234, lane(0, LaneKind::Attempt, 0), 0),
+            [
+                0x3f4f_7194_32ff_9508,
+                0x92b2_47a0_96ff_7764,
+                0x8399_704a_ba04_8e1f,
+                0xfe29_b71d_8efe_9aae,
+            ],
+        ),
+        (
+            // FL-011: the same attempt's child offset.
+            rng,
+            address(Stream::Birth, 7, 1234, lane(0, LaneKind::Position, 0), 0),
+            [
+                0xa073_9383_ebe0_9bdd,
+                0x6ed2_9dff_bff5_db7e,
+                0x7893_1cf5_f13c_805f,
+                0x9e5c_6c9c_ba17_2d0b,
+            ],
+        ),
     ];
     for (rng, at, expected) in cases {
         assert_eq!(rng.block(at), expected, "{at:?}");
@@ -179,6 +201,8 @@ fn semantic_blocks_match_numpy() {
     // The oracle packed these lanes independently.
     assert_eq!(weight.get(), 0x0302_0001_0005_0011);
     assert_eq!(founder.get(), 0x0002_0000_0003_0065);
+    assert_eq!(lane(0, LaneKind::Attempt, 0).get(), 0x000a_0000_0000_0000);
+    assert_eq!(lane(0, LaneKind::Position, 0).get(), 0x0009_0000_0000_0000);
 }
 
 #[test]
@@ -192,6 +216,7 @@ fn stream_codes_are_frozen_tags() {
             0x7372_6363_6865_6d73, // srcchems
             0x7372_6370_6174_6873, // srcpaths
             0x7372_6370_6c61_6365, // srcplace
+            0x6269_7274_6869_6e67, // birthing
         ]
     );
     for stream in Stream::ALL {
@@ -211,6 +236,7 @@ fn lanes_pack_injectively_and_refuse_overflow() {
         LaneKind::SensingScale,
         LaneKind::Direction,
         LaneKind::Position,
+        LaneKind::Attempt,
     ];
     let codes: HashSet<u64> = kinds.iter().map(|kind| kind.code()).collect();
     assert_eq!(codes.len(), kinds.len());

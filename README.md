@@ -51,7 +51,7 @@ history and its animation are three views of the same committed state.
 | Does the stack compose? | **Not yet shown.** The plan's source audit found the siblings pinning different revisions of Asupersync, FrankenTorch and FrankenNumPy (§12.8), and the native presenter FrankenManim uses does not yet deliver pointer or keyboard events (§13.1). Gate G0 settles both before anything broad is built |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
-| Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They have not yet been converted to beads |
+| Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 58 beads with the plan's 141 dependency edges in `.beads/` for `br` |
 
 ---
 
@@ -350,6 +350,7 @@ AGENTS.md                                             the operating contract for
 README.md                                             this file
 LICENSE                                               MIT with the OpenAI/Anthropic rider
 rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint settings for the workspace to come
+.beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
 ```
 
 Code, small independent fixtures, presets, benchmark definitions and compact gallery manifests will live here.

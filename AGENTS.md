@@ -568,9 +568,11 @@ If `am` fails, retry once after a few seconds, then continue without it.
 
 ## Beads (`br`) - Issue Tracking
 
-The plan's backlog (FL-001 … FL-058, §23) has not yet been converted to beads. When it is, keep each FL
-identifier in its bead title and its dependency edges in step with the plan, and preserve identifiers when the
-plan is revised (plan §23.1).
+`.beads/issues.jsonl` mirrors the plan's backlog: 58 beads (prefix `flife`, one per FL-001 … FL-058) and the
+plan's 141 dependency edges, acyclic. Each title starts with its FL identifier and its `external_ref` holds it;
+labels give the lane (`foundation`, `heredity`, `studio`, `accel`, `persistence`, `scale`, `later`) and the
+earliest milestone that needs it (`m0` … `m6`). Keep titles, acceptance text and edges in step with the plan,
+and preserve identifiers when the plan is revised (plan §23.1). FL-001 is `flife-nw7`.
 
 ```bash
 br ready --json
@@ -606,7 +608,8 @@ Before committing code: `ubs $(git diff --name-only --cached)`. Fix true positiv
 The repository holds:
 - the comprehensive plan (v0.2, §1–§28, Appendices A–E);
 - this file, the README and the license;
-- the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`).
+- the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
+- the work graph in `.beads/` (58 beads, prefix `flife`).
 
 There is no Cargo workspace, no crate and no `franken-stack.lock` yet. The first work item is FL-001. Nothing is
 implemented: every capability is a proposed design or a Target until its gate records a pass.

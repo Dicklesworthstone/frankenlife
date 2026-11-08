@@ -1,0 +1,113 @@
+# Rust build output
+/target/
+target/
+**/*.rs.bk
+*.pdb
+
+# Keep Cargo.lock tracked: flife and flife-studio are binaries, and every run manifest names its build (plan B.1).
+
+# Remote build helper target trees
+.rch-target/
+.rch-target-*/
+.rch-results/
+
+# Profiling, coverage, benchmark scratch
+*.profraw
+*.profdata
+/coverage/
+lcov.info
+/criterion/
+/bench-output/
+perf.data
+perf.data.old
+flamegraph*.svg
+*.trace/
+*.gputrace/
+
+# Wasm build output
+/pkg/
+/crates/*/pkg/
+*.wasm
+
+# Golden-artifact sidecars: review the diff and re-bless, never commit the candidate output
+*.actual
+*.snap.new
+
+# === FrankenLife specific ===
+
+# Run output. Worlds, checkpoints, chunk stores, run catalogs and command journals are produced by `flife`
+# and live in artifact storage, not in git (plan §16, §18.5).
+/runs/
+/worlds/
+/checkpoints/
+/chunks/
+/out/
+/exports/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+
+# Rendered media. Videos, frame dumps, GIFs and audio stay on disk; the gallery is committed as compact
+# manifests that carry run ID, seed or checkpoint, model version and display mapping (plan §2.4, §13.8).
+/media/
+/recordings/
+/frames/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.gif
+*.y4m
+*.wav
+
+# Reference screenshots of Neural-Kimchi-4B are third-party design evidence, read locally and cited by name.
+/reference_images/
+IMG_*.jpeg
+IMG_*.jpg
+IMG_*.png
+
+# Beads: the JSONL is truth; the database, locks and local history are not
+.beads/*.lock
+.beads/.*.lock
+.beads/.br_history/
+.beads/.br_recovery/
+.beads/last-touched
+.beads/*.fsqlite-migration-state
+
+# Agent and tool state
+.ee/
+.ntm/
+.rch/
+.bv/
+.doctor/
+.agent-mail-project-id
+.agent-mail.yaml
+.claude/settings.local.json
+.playwright-mcp/
+
+# Python analysis tooling (never a production dependency, plan §3.4)
+.venv/
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# Environment
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary and crash output
+*.tmp
+*.bak
+*.log
+nohup.out
+rustc-ice-*.txt

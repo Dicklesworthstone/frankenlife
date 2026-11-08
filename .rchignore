@@ -1,0 +1,24 @@
+# rch copies the working tree to build workers and does not read .gitignore.
+# Run output, media and third-party reference images stay off the workers; keep in step with .gitignore.
+runs/
+worlds/
+checkpoints/
+chunks/
+out/
+exports/
+media/
+recordings/
+frames/
+reference_images/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.gif
+*.y4m
+*.wav
+IMG_*.jpeg
+IMG_*.jpg
+IMG_*.png
+.env
+.env.*

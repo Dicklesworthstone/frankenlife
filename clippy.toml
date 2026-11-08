@@ -1,0 +1,4 @@
+# Tests may unwrap, expect and panic; production library code may not (AGENTS.md, Toolchain, Unsafe Code And Lints).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

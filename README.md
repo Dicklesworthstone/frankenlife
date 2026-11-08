@@ -1,0 +1,402 @@
+# FrankenLife
+
+<div align="center">
+
+[![Status](https://img.shields.io/badge/status-design%20plan%20%C2%B7%20no%20code%20yet-orange)](#honest-status)
+[![Runtime](https://img.shields.io/badge/runtime-asupersync-6f42c1)](#the-stack)
+[![Core](https://img.shields.io/badge/core-Rust%202024%20%C2%B7%20forbid%28unsafe%29-b7410e)](#architecture)
+[![Animation](https://img.shields.io/badge/animation-FrankenManim-1f6feb)](#the-stack)
+[![Plan](https://img.shields.io/badge/plan-58%20work%20items%20%C2%B7%2011%20gates-2ea44f)](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md)
+[![License](https://img.shields.io/badge/license-MIT%20%2B%20AI%20rider-yellow)](LICENSE)
+
+</div>
+
+**FrankenLife is a real-time artificial-life laboratory in memory-safe Rust. Hundreds of thousands of organisms,
+each carrying its own heritable neural network and chemistry, feed, signal, move, split and die through one shared
+energy field. You can watch, pause, inspect, perturb, branch and record them while they evolve.**
+
+The intended look is a dark microscope: luminous particles, filaments, hollow boundaries, dense colonies, vortices
+and shifting ecological fronts. None of those shapes is painted. They have to come out of an ecology with finite
+energy, genuine inheritance and an energy ledger that balances on every tick. The live world, its scientific
+history and its animation are three views of the same committed state.
+
+- **Every organism has its own weights.** Organisms with the same topology share a kernel and a memory layout,
+  never a parameter.
+- **Organisms interact only through the field.** There are no pairwise attraction tables, collision forces or
+  global reward functions in the baseline.
+- **Signals cannot counterfeit food.** A field cell holds spendable energy `e` and a 32-component signed chemical
+  signature `m` with `‖m‖₂ ≤ e`. Opposite signals can cancel each other's chemistry without destroying or
+  creating energy.
+- **Nothing is trained by gradient.** Weights start random and change only through inherited mutation.
+- **FrankenManim is the animation system.** It owns the camera, overlays, timeline and export. The world enters
+  the scene as a few bulk primitives, not as 400,000 scene objects.
+
+> **Inspiration, not a port.** The visual and mechanical target comes from screenshots of Fraser Price's
+> Neural-Kimchi-4B and its description: about 400,000 particles, each with a distinct untrained, randomly mutated
+> network of roughly 10,000 parameters, interacting only through a 1,000 × 1,000 × 32 field. The screenshots do
+> not give the equations. FrankenLife is therefore an original, explicit rule set (**FieldEcologyV1**) built from
+> the described primitives. It is not affiliated with that project and claims no numerical parity with it.
+
+---
+
+## Honest status
+
+**The design is written down and has been through an independent mathematical, systems and integration audit
+(plan v0.2). There is no code yet.**
+
+| Question | Answer |
+|---|---|
+| Is there a design? | **Yes.** [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md`](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md) (about 2,400 lines, §1–§28 plus Appendices A–E) covers the equations, the tick, data layout, accelerator design, the runtime protocol, rendering, checkpoints, 15 invariants, 11 gates, a complete starter configuration and 17 hand-computable fixtures. Its statements are labelled **Observed**, **Derived**, **Target** or **Hypothesis**; anything unlabelled is a proposed design |
+| Is there code? | **No.** The repository holds the plan, this README, the agent contract and toolchain settings. The first code is FL-001: compile one pinned Franken dependency closure and pass small capability probes |
+| Does the stack compose? | **Not yet shown.** The plan's source audit found the siblings pinning different revisions of Asupersync, FrankenTorch and FrankenNumPy (§12.8), and the native presenter FrankenManim uses does not yet deliver pointer or keyboard events (§13.1). Gate G0 settles both before anything broad is built |
+| Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
+| Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
+| Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They have not yet been converted to beads |
+
+---
+
+## TL;DR
+
+**The problem.** Artificial-life imagery is easy to make beautiful and hard to make honest. A shared-weight
+network, an unaccounted energy source, a cull that keeps the screen attractive, or a renderer benchmarked with
+inference switched off can each produce a gorgeous video of nothing evolving. Rigorous artificial-life systems,
+meanwhile, tend to be small, offline and hard to look inside.
+
+**What already exists.** Neural cellular automata learn one shared local rule. Lenia, Flow-Lenia and Particle
+Lenia show what continuous local rules, mass conservation and interactive exploration can do. ScriptBots-style
+simulators give agents direct interactions and pluggable brains. Neural-Kimchi-4B shows the target look at the
+target scale.
+
+**What FrankenLife composes.**
+- an independent heritable neural controller for every organism;
+- field-only interaction under an explicit energy ledger;
+- a deterministic, checkpointable tick that survives cancellation and crashes;
+- live, inspectable, recordable animation of that same committed state;
+
+all at a scale (about four billion independent parameters) where memory bandwidth, not arithmetic, is the limit.
+
+---
+
+## The four claims
+
+The plan keeps four claims apart and never lets one stand in for another (Executive design, §15, §21):
+
+| Claim | Meaning | What establishes it |
+|---|---|---|
+| **Rules** | The simulation obeys its own rules | Invariants INV-01–INV-15 and the energy ledger, checked on every committed tick |
+| **Implementation** | The code reproduces those rules | Independent hand-computed fixtures, a separate scalar oracle, CPU/Metal parity tests |
+| **Visual** | The images have the intended character | Human review against the references, with raw diagnostic views beside the aesthetic ones (G5) |
+| **Ecological** | Populations show measurable evolutionary phenomena | Ablations, seed ensembles and held-out seeds, with failed and extinct runs kept (G9) |
+
+A beautiful image establishes only the third. A speed measured on named hardware is a separate kind of result
+and is evidence for none of the four.
+
+---
+
+## How the world works
+
+**FieldEcologyV1**, the first model (plan §4–§8):
+
+- **World.** A two-dimensional periodic torus. Organisms have continuous positions; the field is a regular grid
+  (1024 × 1024 at target scale).
+- **Field.** Each cell holds energy `e ≥ 0` and a 32-component signed moment `m` with `‖m‖₂ ≤ e`; composition is
+  `z = m / e`. Diffusion applies the same positive five-point stencil to `e` and to every component of `m`. That
+  preserves the cone `‖m‖ ≤ e` and conserves energy before declared decay (Appendix D).
+- **Sources.** Seeded Gaussian patches drift across the torus on smooth paths. Each injects a fixed total power
+  with a fixed chemical direction, per simulation-second and never per display frame.
+- **Sensing.** Each organism reads energy, 32 composition values and their x and y gradients at a heritable
+  sensing scale through a density pyramid, plus its own energy, age, velocity and recent energy change: 104
+  inputs.
+- **Brain.** The default network is `104 → 64 → 32 → 36` (9,988 parameters), `tanh` hidden layers and a linear
+  output layer. A topology catalog lets offspring move between networks of 1,164 and 29,316 parameters.
+- **Decisions.** The 36 outputs are a reproduction hazard, a child energy share, an emission gate, a 32-dimensional
+  emission direction and an emission spending rate. There is no motor output: motion comes from chemistry.
+- **Uptake.** Organisms request energy from the cells under them, and a contended cell grants proportionally in a
+  two-pass demand/grant step. No cell is overdrawn, and thread order cannot decide who eats.
+- **Chemistry.** Each granted packet is evaluated separately. A heritable affinity direction `a` decides whether
+  that packet feeds or poisons: `η = η_max · tanh(k · a·z − b)`. Toxicity is clipped to the energy the organism
+  actually has.
+- **Motion.** Heritable responses to energy and composition gradients produce an acceleration. Drag is integrated
+  analytically. Movement costs energy in proportion to speed squared and is scaled down when unaffordable.
+- **Emission.** An organism can spend energy to deposit chemical material at efficiency `ρ ≤ 1`. Deposits become
+  visible on the next tick, so a closed self-feeding loop cannot amplify energy.
+- **Reproduction.** A split creates a mutated child holding a share of the parent's energy minus a birth cost. The
+  identity, genome, slot and energy transfer commit together, or nothing happens.
+- **Death.** Zero energy after any stage is death, checked after every stage. Part of the residue returns to the
+  field.
+
+**The ledger.** With `𝓔 = Σ organism energy + Σ cell energy`, every committed tick satisfies
+`𝓔ₙ₊₁ − 𝓔ₙ = injection − removal − dissipation + numerical residual`. Emission, absorption and child transfer are
+internal moves. No correction may silently add energy to make the equation balance.
+
+### One tick
+
+| Phase | Action |
+|---:|---|
+| 1 | Admit commands at their recorded tick boundary |
+| 2 | Transport the field and inject sources, producing one immutable observation field |
+| 3 | Build the sensing pyramid and spatial bins |
+| 4 | Sense and evaluate due controllers, all from the same epoch |
+| 5 | Resolve uptake demand into cell grants |
+| 6 | Settle useful gain, toxicity and maintenance |
+| 7 | Propose affordable motion, then emission, then reproduction |
+| 8 | Resolve capacity, construct births and collect deaths, transactionally and in stable-identity order |
+| 9 | Reduce deposits and recycling into the next field, first sensed on the next tick |
+| 10 | Validate the invariants and publish state, event cursor and accounting together |
+
+Cancellation before phase 10 discards the candidate tick; the last committed world stays authoritative.
+
+---
+
+## Why the scale is hard
+
+**Derived.** 400,000 organisms × 9,988 parameters ≈ 4.0 billion independent parameters: 7.45 GiB of F16 weights,
+or 14.90 GiB in F32, before any other state. No two organisms share weights, so there is almost no weight reuse,
+and every full neural sweep has to stream the whole bank from memory:
+
+| Full-population sweeps/s | Multiply-accumulates/s | F16 weight stream | F32 weight stream |
+|---:|---:|---:|---:|
+| 15 | 60 billion | 120 GB/s | 240 GB/s |
+| 30 | 120 billion | 240 GB/s | 480 GB/s |
+| 60 | 240 billion | 480 GB/s | 960 GB/s |
+| 128 | 512 billion | 1.024 TB/s | 2.048 TB/s |
+
+These are arithmetic, not benchmarks. A headline GPU FLOP/s figure cannot justify a real-time claim for this
+workload; only sustained bandwidth with the real independent-weight layout can.
+
+Energy does not scale by copying numbers either. The starter profile's eight sources supply 640 energy units per
+simulation-second, enough to sustain at most about 74,800 default organisms even with perfect uptake. 400,000 of
+them need about 3,423 units per second for mandatory costs alone. Each operating profile therefore declares its
+own environment (§19.5).
+
+### Operating profiles
+
+**Target.** These are workload definitions, not measured capabilities.
+
+| Profile | Population | Field | Canonical weights | Neural schedule | Purpose |
+|---|---:|---|---|---|---|
+| Reference | 4,096 | 128² × 33 | F32 | Every tick | Independent correctness and a small live world |
+| Interactive | 25,000 | 256² × 33 | F32, or a separately named F16 | Every tick | First polished live viewer |
+| Desktop ecology | 100,000 | 512² × 33 | F16 | Every tick; an every-fourth-tick profile available | Everyday exploration |
+| Target full | 400,000 | 1024² × 33 | F16, mean near 10k parameters | Every tick | The screenshot scale |
+| Target multi-rate | 400,000 | 1024² × 33 | F16, mean near 10k parameters | Every fourth tick | A separately named, bandwidth-conscious ecology |
+
+The full-scale gate (G7) asks for at least 30 achieved full-evaluation ticks per second and 30 fps at 1080p on a
+named machine, for at least ten minutes, with at least 380,000 live organisms averaging 9,000–11,000 parameters.
+The screenshots' 65–82 steps/s comes next; 128 steps/s is a stretch target.
+
+**Honest clocks.** The HUD reports achieved scientific steps per second and the simulation-time/wall-time ratio
+separately from display fps. At 30 steps/s with `Δt = 1/128`, the world advances 0.234 simulated seconds per wall
+second. The engine never skips ticks, enlarges `Δt` or lowers neural cadence under load while keeping the same
+model name.
+
+---
+
+## Three modes, one engine
+
+| Mode | Purpose | What it does |
+|---|---|---|
+| **Studio** | Watch, inspect, intervene, discover | Responsive camera, honest clocks, an organism inspector, intervention brushes, presets and recordings |
+| **Laboratory** | Reproduce and compare | Headless runs, seed ensembles, controlled branches, metrics and checkpoints |
+| **Cinema** | Explanatory or artistic output | FrankenManim camera tracks, captions, diagrams and precisely timed export, with recorded provenance |
+
+Cinema never invents simulation events, and Studio never runs its own physics in a frame callback.
+
+The intended Studio flow: launch a validated preset and see the world at once. Zoom from the whole ecosystem to a
+single organism without changing the simulation. Click an organism to see its energy, ancestry, chemistry, network
+architecture, current inputs and decoded actions. Pause, erase part of a colony, resume, and compare the result
+with a control branch from the exact pre-intervention checkpoint. Record the sequence with the same camera moves.
+
+---
+
+## The stack
+
+| Component | Role in FrankenLife |
+|---|---|
+| [Asupersync](https://github.com/Dicklesworthstone/asupersync) | Owns the session, cancellation, bounded queues, control channels, checkpoint and export workers, and deterministic Lab tests. No detached tasks; 400,000 organisms never become 400,000 tasks |
+| [FrankenTorch](https://github.com/Dicklesworthstone/frankentorch) | Typed tensor storage, CPU reference inference, independent-network population execution and the Metal compute gateway |
+| [FrankenNumPy](https://github.com/Dicklesworthstone/franken_numpy) | Truly typed host arrays, layout, deterministic Philox RNG and reference numerics |
+| [FrankenManim](https://github.com/Dicklesworthstone/franken_manim) | Scene composition, cameras, bulk particle and field primitives, overlays, timeline and export |
+| [FrankenSQLite](https://github.com/Dicklesworthstone/frankensqlite) | Run catalog, command journal, checkpoint index, lineage summaries; never per-particle rows |
+| [FrankenPandas](https://github.com/Dicklesworthstone/frankenpandas), [FrankenNetworkX](https://github.com/Dicklesworthstone/franken_networkx) | Optional offline analysis of sampled summaries and lineage graphs |
+| [FrankenSim](https://github.com/Dicklesworthstone/frankensim), [FrankenThreeD](https://github.com/Dicklesworthstone/franken_threed) | Optional later physical extensions and volumetric presentation |
+
+The first four are foundational. Some of the required work belongs upstream and is planned as deliverables there
+(§22.4): population inference kernels, batched command submission and resource leases in FrankenTorch; bulk
+`ParticleCloud` and `FieldTexture` primitives, a resident resource bridge and a native input bridge in
+FrankenManim; borrowed typed-array kernels in FrankenNumPy.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A["Studio and CLI"] --> B["Asupersync runtime"]
+    A --> C["FrankenManim adapter"]
+    B --> D["Simulation engine"]
+    B --> E["Checkpoints and analysis"]
+    C --> F["Read only render epochs"]
+    D --> F
+    D --> G["Core ports and model contracts"]
+    H["CPU and Metal backends"] --> G
+    A --> H
+    H --> I["FrankenTorch and FrankenNumPy"]
+    D --> J["Field and genome rules"]
+    J --> G
+```
+
+The composition root injects a backend through the core ports. The engine never depends on a concrete backend,
+and the renderer reads immutable epochs; it does not own the engine.
+
+The proposed workspace (§18.1). A crate is created only when a milestone needs it:
+
+| Crate | Responsibility |
+|---|---|
+| `flife-core` | IDs, units, schemas, errors, epochs, model descriptors, kernel-port contracts |
+| `flife-field` | Field semantics, exchange and transport reference operators, layout contracts |
+| `flife-genome` | Chemistry and controller genomes, mutation, topology catalog, ancestry |
+| `flife-neural` | Sensor/action ABI, scalar oracle, FrankenTorch population adapter |
+| `flife-engine` | The tick state machine, budgets and lifecycle transactions |
+| `flife-backend-cpu`, `flife-backend-metal` | Qualified phase execution; device owner, kernels and resource leases |
+| `flife-runtime` | Asupersync session ownership, commands, supervision, queue policies |
+| `flife-render`, `flife-manim` | Compact render projections and colour semantics; the bulk FrankenManim adapter |
+| `flife-store` | Chunk format, checkpoint transactions, run and lineage catalog |
+| `flife-analysis`, `flife-experiments` | Metrics and controlled comparisons; seed ensembles, sweeps, branches |
+| `flife-cli`, `flife-studio` | The `flife` command line and the interactive application |
+
+Every FrankenLife crate uses `#![forbid(unsafe_code)]`. The dependency graph is not unsafe-free (CPU SIMD and Metal
+FFI sit in reviewed upstream boundary crates), and the project does not claim it is (§3.3).
+
+---
+
+## Milestones and gates
+
+| Milestone | Deliverable | Gates |
+|---|---|---|
+| **M0** Compatible foundation | One native program runs an Asupersync session, a typed array operation, an independent-network batch and a FrankenManim frame | G0 |
+| **M1** First living world | A 4,096-organism field ecology with independent genomes, the energy ledger, reproduction, mutation and death, viewed live in FrankenManim | G1, G2 |
+| **M2** Usable laboratory | A polished 25k profile, inspector, interventions, checkpoint/resume, branches and basic recording | G3, G5, G6 |
+| **M3** Qualified acceleration | CPU/Metal parity, persistent buffers, fused population inference, variable topology and births | G4 |
+| **M4** Screenshot-scale world | 400k independent networks near 10k parameters on a 1024² field, rendered interactively with honest clocks | G7, G8 |
+| **M5** Scientific and visual release | A seed gallery, ablations, experiment reports, reliable Cinema export, extension examples | G9, G10 |
+| **M6** Additional model families | Recurrent controllers, multi-carrier chemistry or physical boundaries, each with a demonstrated need | Per extension |
+
+The gates: **G0** stack compiles at one lockset and its probes pass · **G1** hand fixtures and arithmetic ·
+**G2** a first world that lives, renders and pauses · **G3** checkpoint replay and crash/retry recovery ·
+**G4** CPU/Metal parity · **G5** visual review · **G6** 30 fps with p95 input latency ≤ 100 ms ·
+**G7** the 400k scale interval · **G8** eight-hour endurance · **G9** research claims · **G10** export alignment.
+
+The first useful slice is a complete cycle. Source energy enters the field; organisms sense it; independent
+networks decide; chemistry causes gain, loss and motion; paid emission changes the field; reproduction produces a
+mutated child; death releases resources; and the result appears live through FrankenManim. A small authentic
+ecology comes before any broad infrastructure.
+
+---
+
+## Planned command surface
+
+**Proposed.** No binary exists yet (§14.6).
+
+```bash
+flife validate <config>     # range-check a config; report real memory and the worst admitted allocation
+flife capabilities          # what this machine and build can actually run, with explicit refusals
+flife run <config>          # a headless run
+flife step | inspect        # advance one tick; a bounded snapshot of one organism at an exact tick
+flife checkpoint | resume   # durable, verified world state and exact resumption
+flife branch                # control and intervention branches from one checkpoint
+flife sweep | analyze       # seed ensembles, parameter sweeps, ablations and their metrics
+flife render | export       # simulation-time frames and video through FrankenManim
+flife-studio <preset>       # the interactive microscope
+```
+
+Machine output is versioned JSON or NDJSON with stable identifiers and typed errors. Missing accelerator capability,
+budget exhaustion, schema mismatch, incompatible checkpoints, numerical invalidity and cancellation are distinct
+error classes. A missing GPU yields a smaller CPU route when selected, or an explicit refusal; it never silently
+substitutes a different neural model.
+
+---
+
+## Pins
+
+| Item | Pin |
+|---|---|
+| Rust toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition |
+| Asupersync | **Open.** The siblings currently pin different releases and revisions. FL-001 selects one version with one package id across the closure and records it |
+| FrankenTorch, FrankenNumPy, FrankenManim | **Open.** Research revisions are in plan §27.2; the qualified lockset goes into `franken-stack.lock` with the probes that passed it |
+| `rust-block` override | Reviewed revision `b39ae859…`, carried or requalified at this workspace root, because Cargo ignores a dependency's own `[patch]` (§12.8) |
+
+---
+
+## What FrankenLife is not
+
+- Not a reproduction or port of Neural-Kimchi-4B, and not a claim of numerical parity with it.
+- Not a decorative particle animation: no shapes are painted in, there is no hidden culling to keep the display
+  attractive, and extinct worlds are not silently reseeded.
+- Not a shared-policy, distilled or low-rank shortcut presented as independent networks.
+- Not trained by gradient in the baseline, and not scored by any aesthetic fitness function inside the world.
+- Not a three-dimensional ecology, a distributed single world or a full-scale browser application in the initial
+  release. A browser timeline player for recorded runs comes first.
+- Not a claim about "life". "Species", "colony" and "cooperation" are analysis labels with explicit operational
+  criteria.
+
+---
+
+## Repository layout
+
+```text
+COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md   the design specification and implementation plan
+AGENTS.md                                             the operating contract for coding agents
+README.md                                             this file
+LICENSE                                               MIT with the OpenAI/Anthropic rider
+rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint settings for the workspace to come
+```
+
+Code, small independent fixtures, presets, benchmark definitions and compact gallery manifests will live here.
+Large recordings and run histories belong in artifact storage, not in git (§18.5).
+
+---
+
+## Reading paths
+
+- **What and why:** this README, then plan §1–§3 and §26.
+- **The model:** §4–§8, then Appendix D (why the field invariant holds) and Appendix C (the fixtures).
+- **Performance:** §9–§11 and §19.
+- **Runtime, rendering and Studio:** §12–§14.
+- **Science:** §15, §21.6 and §24.
+- **Implementing:** [`AGENTS.md`](AGENTS.md), §18, §21–§23, then Appendix A (the starter configuration).
+
+---
+
+## FAQ
+
+**Why not share weights across organisms and batch them like a normal network?** Because then they would not be
+independent organisms. A common weight matrix turns hundreds of thousands of evolving brains into one policy.
+FrankenLife batches by topology so that each organism keeps its own weights, mutations and ancestry, and pays the
+bandwidth cost that implies.
+
+**Why a separate energy plane next to the 32 chemical channels?** With signed channels alone, two opposite signals
+cancel. If those channels were also the food, mixing would destroy or create energy. A nonnegative energy amount
+plus a bounded signed signature lets chemistry cancel while energy is conserved.
+
+**Will a random start produce the screenshots?** Not necessarily. A random start may go extinct. Presets come in
+three declared kinds: random research starts, viability-calibrated starts and saved evolved populations. A curated
+seed bank is never presented as the unconditional result of arbitrary random initialization.
+
+**Does a beautiful video show that something is evolving?** No. That is the visual claim only. Ecological claims
+need ablations: frozen or shuffled controllers, emission switched off, fixed topology, altered sources, multiple
+seeds, and the failed runs kept.
+
+**Will it run in a browser?** Not at full scale. Four billion parameters exceed conventional 32-bit WebAssembly
+memory even in F16. A browser player for recorded native runs is planned first.
+
+**Why Rust and a custom runtime?** The tick has to be cancellable without half-applied energy transfers, resumable
+from checkpoints with off-phase controller state intact, and testable under adversarial schedules. Structured
+concurrency with region-owned tasks and a deterministic Lab runtime make those properties testable, and
+`forbid(unsafe_code)` keeps FrankenLife's own crates memory-safe.
+
+---
+
+## License
+
+MIT with the OpenAI/Anthropic rider. See [LICENSE](LICENSE).

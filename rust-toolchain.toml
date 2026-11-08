@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned date so every worker and local build resolves the same nightly, matching the FrankenSuite siblings
+# (Asupersync, FrankenTorch, FrankenNumPy, FrankenManim). Bump deliberately, together with the qualified
+# dependency closure in franken-stack.lock (plan §12.8, §18.5): reference-arithmetic replay assumes one compiler.
+channel = "nightly-2026-08-31"
+components = ["rustfmt", "clippy", "rust-src"]

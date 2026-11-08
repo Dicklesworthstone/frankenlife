@@ -29,8 +29,20 @@ FL-012 (`flife-3zm`) adds death, recycling, live storage and stable identity (pl
 - `costs`: the mandatory cost split by ledger flow (`maintenance`, `sensor-cost`, `controller-cost`), with a
   declared order for a partial payment.
 
-The ordered tick that calls them is FL-013. The crate computes settlements, proposals and staged births, and stores
-the committed organisms; the tick decides when each runs. It does not own the field.
+FL-013 (`flife-x3o`) adds `world`, the ordered candidate tick and epoch publication (plan §7.5, §7.6, §8.1–§8.4,
+§9.4, §9.5, INV-01–INV-08, A.3 item 1, Appendix C.7, C.8):
+- `World::found`: a world at tick zero from a validated configuration, with its founders (`uniform` positions,
+  `zero` velocity) and seeded sources;
+- `World::advance`: phases 2–10 of §8.1 against the committed state, giving a checked `Candidate`, or a pause
+  under `pause-before-commit`;
+- `Candidate::publish`: the population's whole-tick commit (`Population::commit_tick`), then the field, ledger,
+  quota, identities, source paths, tick, epoch and event cursor together. Dropping or cancelling a candidate
+  discards it;
+- `stop-and-preserve`: a numerical fault stops the run with the committed state kept.
+
+It runs on the scalar CPU reference (`cpu-reference`) in the `qualified-reference` determinism class. The other
+modules compute settlements, proposals and staged births and store the committed organisms; `world` decides when
+each runs and owns the field.
 
 **Inputs.**
 - A `ValidatedConfig` (`[chemistry]`, `[costs]`, the timestep), or the constants directly.
@@ -47,6 +59,9 @@ the committed organisms; the tick decides when each runs. It does not own the fi
 - FL-012: `world.tiny_energy_policy` and its threshold, `[death]`, `population.maximum_count`; each organism's
   budget after each stage; its resulting position and genetic affinity at death; an explicit removal's residual
   and `Disposition`; founders and staged births as `Entrant`s (an `Organism` row and its sealed `Genome`).
+- FL-013: a whole validated configuration; the `Arrangement`; a `NumericalProfile` (the ledger's
+  `ResidualBudget` and the field's `ConeTolerance`). `NumericalProfile::reference_f32` is §21.4's initial F32 gate:
+  `1e-5` per tick and cumulatively, and `1e-5` of a cell's energy for the cone, each above the smallest normal F32.
 
 **Outputs.**
 - `Chemistry::efficiency`: `η(z) = η_max tanh(k a·z − b)`.
@@ -81,7 +96,22 @@ the committed organisms; the tick decides when each runs. It does not own the fi
 - `Population`: `admit`, `update`, `commit` (the `Collected` deaths, each with its last row and genome, for the
   caller to retire), `get`, `iter` and `ids` in identity order, `slot` and `slots`, `genome`, `latest` and
   `digest`, a SHA-256 of the canonical state in identity order without slots (`frankenlife.population-state.v1`).
-  `HeldOutput` hides an invalid output entirely.
+  `HeldOutput` hides an invalid output entirely. `check_tick` and `commit_tick` (FL-013) check and commit a whole
+  tick: survivors, deaths with their genome charges returned to the quota, and births.
+- `World` (FL-013): the committed `tick`, `epoch` (a `ResourceEpoch`, zero at founding and one more per
+  publication), event cursor `events`, `field`, `population`, source `paths`, `identities`, `quota`, `ledger`,
+  `fault`, and `digest`, a SHA-256 of the scientific state (`frankenlife.world-state.v1`: tick, every field value,
+  the population digest, the identity sequences, the quota, the path ordinals and the ledger holdings; slots,
+  epoch and cursor excluded). `advance` returns an `Advance` (`Ready(Candidate)` or `Paused(CapacityShortfall)`),
+  and `step` advances and publishes.
+- `Candidate`: `report`, `field` (the next field), `base` (the committed tick and epoch), `cancel` and `publish`.
+- `TickReport`: the input and published ticks, the epoch, the event range (deaths, then births, each in identity
+  order), live count, evaluations, emitters, viable attempts, `BirthEvent`s (child, parent, genome, mutation
+  record), rejected births, deaths, the uptake summary, phase 2's `FieldStepReport`, the next field's
+  `FieldSummary`, the tick's `TickClosure` and the run's `LedgerReport`. `NumericalFault` holds the input tick and
+  error of the advance that stopped the run.
+- `founder_position`: words 0 and 1 of `(founders, organism, 0, lane (0, position, 0), 0)` as half-open uniforms
+  scaled to the world.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -171,6 +201,48 @@ the committed organisms; the tick decides when each runs. It does not own the fi
 - Maintenance is one payment of the bill's total. A partial payment covers basal, then sensor, then controller,
   and the attribution rounds down, so the recorded flows never exceed the payment.
 
+**Invariants — the ordered tick (FL-013).**
+- Phases run in §8.1 order, once each per tick. Phase 1 admits no commands yet. Phase 2 transports the committed
+  field into the spare buffer and applies each source at its mid-tick center, `(n + ½)Δt` on the segment that
+  contains tick `n`. That buffer is the tick's one observation field: every organism senses it, demands from it
+  and reads its packets' compositions from it before anything debits it. The ledger records `source-power` as
+  the declared `Σ P Δt` and `decay` as transport's removal.
+- Every organism is observed every tick. Its controller is evaluated when `(n + 1) mod K` equals its phase or when
+  its held output is invalid (a newborn's or founder's first advance), stored with evaluation tick `n + 1`, and
+  charged as controller cost. A forced evaluation does not shift the phase. Every tick decodes the held raw output
+  for that tick and decides against that tick's budget. Age and eligibility use the input tick `n`.
+- Per organism, in identity order: chemistry, maintenance, motion, emission, then the reproduction proposal at
+  attempt tick `n`, with exhaustion rechecked after each. Organisms without a viable attempt then run the split
+  (unchanged) and tiny-reservoir stages. The live-population quota counts them, if alive, plus every parent with a
+  viable attempt. The births are staged as one transaction, the parents keep exactly their split shares and take
+  the new deadline, and the parents' last two stages follow. A paused birth stage pauses the whole tick.
+- Fates follow in identity order. A survivor commits its position, velocity, energy, held output, deadline and
+  `(E_next − E_previous)/Δt`. A death is collected exhausted at its resulting position at tick `n + 1`, and its
+  residual (zero) is settled under the death policy. Newborns join at `n + 1` and are first advanced from it.
+- Phase 9 debits the grants first, then reduces the emission deposits (`emission`), then recycling (`recycling`),
+  all into the next field, so new deposits are first sensed next tick.
+- Phase 10 checks the next field (INV-01, INV-02 at the profile's cone tolerance), closes the tick against holdings
+  measured from the next field and the survivors and newborns in identity order (INV-03 per tick), commits the
+  closure to a copy of the run's ledger (INV-03 cumulative), and checks the population's whole commit (INV-01,
+  INV-06, INV-07). The next tick opens at exactly those holdings, so energy that moved without a flow is refused.
+- A candidate reads only committed state and writes only the spare field buffer, reusable scratch and its own
+  copies of the ledger, quota, identities and paths. Until publication the committed world is authoritative and
+  unchanged. Cancelling, dropping, pausing or failing leaves every committed byte as it was. A retry prepares the
+  same candidate, report for report. A candidate borrows the world mutably, so it is the only writer and its base
+  cannot move (§9.5).
+- Publication commits the population first (check-then-apply, with the dying genomes' charges returned to the
+  candidate's quota). Then it swaps the field buffers and replaces the ledger, quota, identities and paths, and
+  advances the tick, epoch and event cursor. None of that can fail. A published tick's state, events and accounting
+  appear together (INV-10's precondition). Every live organism has exactly one genome charge.
+- `stop-and-preserve`: a `NumericalInvalid` while preparing records a `NumericalFault` with the input tick and
+  stops the run. Every later advance is refused, and the committed state is the last published epoch, bit for bit.
+- Organisms interact only through the field (INV-08). Each stage reads the shared observation field and the
+  organism's own state, and writes only its own budget, its grants and its deposits. The only population-wide
+  coupling is the declared capacity policy. Storage slots never decide an order.
+- Founders (A.3 item 1): identities, genomes and lineages `0, 1, …`, uniform positions on the torus, zero velocity
+  and history, the initial energy, birth tick zero, cooldown deadline `⌈cooldown/Δt⌉`, invalid held outputs and
+  stable phases. The ledger's initial holdings include their endowment.
+
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
@@ -194,6 +266,12 @@ the committed organisms; the tick decides when each runs. It does not own the fi
   a recycled affinity outside the unit ball; every commit and admission refusal above; a population above its
   capacity (`BudgetExhausted`); a host-refused column (`AllocationFailed`); a nonfinite held output; and a negative
   or nonfinite maintenance term.
+- FL-013: a backend, determinism class, fault policy, capacity policy, initial positions or velocity, chemical
+  directions or source path other than the ones implemented (`UnknownAlgorithm`); automatic reseeding
+  (`MissingCapability`); a whole-tick commit whose survivors are out of identity order, repeated, not alive, also
+  dying, changing a lifelong field or failing INV-01, that leaves a live organism unaccounted for, or whose quota
+  does not hold the dying genomes' charges (`StateConflict`, `NumericalInvalid`); every phase's own refusal; and any
+  advance once the run has stopped (`StateConflict`). Nothing committed changes on any of them.
 
 **Determinism.** Pure functions of their inputs. Sums run in channel or packet order and the packet sums are
 compensated. The only elementary functions are `flife_core::numerics` (`exp_neg`, `expm1_neg`, `tanh`) and the
@@ -202,7 +280,10 @@ its final organisms and field. FL-011's randomness is `fnp-philox-semantic-v1` o
 addressed by parent identity and attempt tick, plus the mutation stream. Staging order is ascending parent
 identity, so the births do not depend on request order, worker or storage slot. FL-012 draws nothing. The
 population's index is a `BTreeMap` and its free list a `BTreeSet`, so every order it exposes is identity order or
-a deterministic function of the commit history.
+a deterministic function of the commit history. FL-013 visits organisms in identity order and runs every reduction
+in one fixed order (`qualified-reference`): demand order for grants, identity order for deposits, holdings and
+births. Packets are grouped by demand in cell order. It draws only on the founders', sources', birth and mutation
+streams. The small ecology pins its world digest, checked on Linux x86_64.
 
 **Independent tests.** `tests/organism_phase.rs`:
 - C.2 exactly: absorbed 3, `T_req = 5`, `T = 2`, dissipation 5 closing at `ε = 0`; recording `T_req` cannot close.
@@ -277,26 +358,68 @@ a deterministic function of the commit history.
     reused slot keeping its held output, a free list that never reuses slots, a digest without the cooldown
     deadline, maintenance covering sensor first, and controller cost booked as basal.
 
+- `tests/world.rs` (FL-013, 10 tests). Every world is Appendix A with a few values changed, so that a 32 × 32
+  world breeds within a few hundred ticks. The oracles recount the published state from the state itself:
+  - G1's small headless ecology: 48 founders over 384 ticks, with 41 births, 57 deaths (chemistry and
+    maintenance), about 12,000 emissions, perturbed children and dead descendants. Every tick checks INV-01–INV-07
+    independently: one epoch per tick, contiguous events, field and organism holdings measured bit for bit, the
+    cumulative residual within the gate, each survivor's change equal to its recorded rate, every child's
+    endowment equal to the recorded transfer, one genome charge per organism, the dead never returning, and an
+    organism that died before motion collected where it stood. Motion paid is recounted from the survivors'
+    velocities. At about `1e-7` per tick it is far below the transport residual, so closure alone cannot see it.
+    The world digest is pinned.
+  - C.7: compact and free-list worlds publish the same epochs, reports, rows and digests for 288 ticks.
+  - C.8: a candidate cancelled, dropped or retried leaves the prior epoch authoritative, and its retry publishes
+    exactly the reference run's state.
+  - Controller cadence at `K = 4` against an independent due-tick oracle, with every newborn forced on its first
+    advance and its phase unchanged.
+  - Population and genome-quota shortfalls pause the tick with every committed byte unchanged.
+  - A numerical fault stops the run, preserves the committed state and refuses every later advance.
+  - Founders follow A.3 item 1 (identities, quadrant coverage, a pinned founder position, the cooldown deadline).
+  - INV-08: an organism out of the field's reach evolves bit for bit as if alone.
+  - `Population::check_tick` refusals: a forgotten, repeated, reordered, surviving-and-dying, starved or renamed
+    organism, and a quota short of the dying genomes' bytes or count, each checked on its own.
+  - Twenty-two planted bugs were each caught by at least one of these tests: regular evaluation keyed to the input
+    tick, newborns not forced, packet scratch leaking between organisms, every demand at one position, identities
+    or the quota advanced in place, the field, epoch or event cursor not committed, deposits before the grants'
+    debits, parents keeping their whole budget, a cooldown not reset, the energy change rate not recorded, source
+    paths a tick late, founder positions on another lane, faults not stopping the run, a pause becoming an error,
+    motion cost unrecorded, a tick forgetting an organism, dying genomes keeping their charges, survivors' state not
+    written, and the quota's count not checked.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
-`pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`.
+`pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`; FL-013 at
+`cpu-reference`, `qualified-reference`, `stop-and-preserve`, `pause-before-commit`, `uniform` positions and `zero`
+velocity, first-order splitting at the configured fixed timestep.
 
 **Known gaps.**
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
-- The ordered tick (FL-013) has to do several things with these pieces:
-  - string the stages together per organism and record each flow;
-  - reduce emission deposits before recycling, both after the uptake debits;
-  - commit survivors' new state (including `(E_next − E_previous)/Δt`), births and deaths with publication;
-  - pause the whole candidate on a `CapacityShortfall`;
-  - stop the run and preserve the candidate on a numerical fault (`stop-and-preserve`, now owned by FL-013).
-
-  The exhibition-mode stable-ID birth rejection policy has no registered name yet.
+- The ordered tick admits no commands: phase 1 is FL-014's command admission, with the session owner and
+  durability. The exhibition-mode stable-ID birth rejection policy has no registered name yet.
+- `stop-and-preserve` keeps the committed state and the fault's description, which names the quantity and,
+  where the operator knows it, the organism. It does not yet retain the faulted candidate's buffers for
+  inspection, and there is no exhibition containment mode.
+- Steady state reuses the field buffers, the pyramid, transport and controller scratch, and the per-organism,
+  demand, grant, packet, deposit, survivor and death buffers. Each tick still allocates its boxed candidate, the
+  birth requests, the staged births and the report's event lists, which scale with births and deaths, not with the
+  population. Admitting scratch capacity during preflight is FL-014 and later.
+- The live-population quota counts every parent with a viable attempt as live. Its kept share is at least
+  `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
+- Resource epochs here are the committed world's: there are no leases, observers or render projections yet
+  (FL-017), and the reference has no device fences. A candidate is exclusive by borrowing, not by a lease.
+- One thread. `execution.cpu_workers` is not read, and parallel phases must keep these reduction orders.
+- First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
+  scheme identity (§8.4).
+- INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.
+- Checkpointing the world (INV-14) is FL-016. The digest covers the scientific state but is not a checkpoint.
 - Explicit removal needs a command to carry it, and the erase brush is a later command item. FL-012 supplies only
   the settlement. Environmental hazards are not part of `field-ecology-v1`.
 - `Population` stores each genome as its own heap value. Packed slabs, generation-tagged handles,
-  epoch-aware reclamation after readers finish, and checkpointing the store are FL-013, FL-016 and FL-026.
-  The caller retires a collected genome's quota charge at once; readers holding its shared parameters keep them.
+  epoch-aware reclamation after readers finish, and checkpointing the store are FL-016 and FL-026. The ordered
+  tick returns a dead genome's quota charge in the publishing commit; readers holding its shared parameters keep
+  them.
 - Field reservoirs are not cleared by the tiny-energy policy: A.1's "clears its moment consistently" has no
   organism moment to act on in this model, and F32 subnormal cells are a numerical-profile matter (the field
   contract's cone-tolerance gap).

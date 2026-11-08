@@ -46,8 +46,8 @@ pub const LANE_INDEX_BITS: u32 = 48;
 /// frozen in v1: the eight ASCII bytes of its tag, big-endian.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Stream {
-    /// Founders' genomes (A.3 items 1 and 2): entity is the founder
-    /// organism, ordinal zero.
+    /// Founders' genomes and initial positions (A.3 items 1 and 2): entity
+    /// is the founder organism, ordinal zero.
     Founders,
     /// Mutation proposals (§7.3, A.3 item 4): entity is the parent
     /// organism, ordinal the attempt tick (the input tick of the advance

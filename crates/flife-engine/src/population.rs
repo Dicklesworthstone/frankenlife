@@ -29,6 +29,10 @@
 //! - each birth is a new identity, in ascending order, with its own genome;
 //! - the result fits the capacity.
 //!
+//! [`Population::commit_tick`] commits a whole ordered tick (FL-013): every
+//! live organism either survives, with its new state, or dies, and the
+//! dying genomes' quota charges are returned in the same transaction.
+//!
 //! A refused commit leaves the population exactly as it was. Columns are
 //! reserved to capacity up front, so applying a checked commit cannot fail
 //! or allocate. Every write is checked as well: a stored organism has
@@ -43,7 +47,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
-use flife_genome::{Genome, MutationRecord};
+use flife_genome::{Genome, GenomeQuota, MutationRecord};
 use flife_neural::ACTION_WIDTH;
 
 use crate::lifecycle::Death;
@@ -287,6 +291,24 @@ pub struct Population {
     latest: Option<OrganismId>,
 }
 
+/// Every birth in `births` is at `tick`.
+fn check_birth_ticks(tick: Tick, births: &[Entrant]) -> Result<(), CoreError> {
+    for entrant in births {
+        if entrant.organism.birth_tick != tick {
+            return Err(CoreError::StateConflict {
+                operation: "commit births",
+                detail: format!(
+                    "{} is born at tick {}, not {}",
+                    entrant.organism.id,
+                    entrant.organism.birth_tick.get(),
+                    tick.get()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn reserve<T>(capacity: usize) -> Result<Vec<T>, CoreError> {
     let mut column = Vec::new();
     column
@@ -487,6 +509,167 @@ impl Population {
         deaths: &[Death],
         births: &mut Vec<Entrant>,
     ) -> Result<Vec<Collected>, CoreError> {
+        let dying = self.check_deaths(tick, deaths)?;
+        check_birth_ticks(tick, births)?;
+        self.check_entrants(births, self.len() - dying.len())?;
+
+        let collected = self.remove(dying);
+        for entrant in births.drain(..) {
+            self.insert(entrant);
+        }
+        Ok(collected)
+    }
+
+    /// Check a whole tick's commit (§8.1 phase 10) without changing
+    /// anything: every live organism either survives, with its new state in
+    /// `survivors`, or dies in `deaths`; the births are as for
+    /// [`Population::commit`]; and `quota` holds the charges of the dying
+    /// organisms' genomes.
+    ///
+    /// # Errors
+    /// As [`Population::commit_tick`].
+    pub fn check_tick(
+        &self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &[Entrant],
+        quota: &GenomeQuota,
+    ) -> Result<(), CoreError> {
+        self.check_whole_tick(tick, survivors, deaths, births, quota)
+            .map(|_| ())
+    }
+
+    /// Commit one whole tick together: the survivors' new state, then the
+    /// deaths, whose genome charges `quota` takes back, then the births
+    /// (INV-01, INV-06, INV-07). On success `births` is drained.
+    ///
+    /// # Errors
+    /// - [`CoreError::StateConflict`] for survivors that are not in strictly
+    ///   ascending identity order, not alive, also dying, or changing a
+    ///   field fixed for life, and for a live organism that neither survives
+    ///   nor dies; for a quota that does not hold the dying genomes'
+    ///   charges; and as [`Population::commit`] for the deaths and births.
+    /// - [`CoreError::NumericalInvalid`] for a survivor or newborn that fails
+    ///   INV-01, naming it.
+    /// - [`CoreError::BudgetExhausted`] when the result would exceed the
+    ///   capacity.
+    ///
+    /// Nothing changes on error, neither here nor in `quota`, and `births`
+    /// keeps every genome.
+    pub fn commit_tick(
+        &mut self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &mut Vec<Entrant>,
+        quota: &mut GenomeQuota,
+    ) -> Result<(), CoreError> {
+        let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
+        for organism in survivors {
+            if let Some(&slot) = self.index.get(&organism.id) {
+                self.write(slot, organism);
+            }
+        }
+        for collected in self.remove(dying) {
+            // Checked above: the quota holds every one of these charges.
+            quota.retire(collected.genome)?;
+        }
+        for entrant in births.drain(..) {
+            self.insert(entrant);
+        }
+        Ok(())
+    }
+
+    fn check_whole_tick(
+        &self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &[Entrant],
+        quota: &GenomeQuota,
+    ) -> Result<BTreeMap<OrganismId, Death>, CoreError> {
+        let dying = self.check_deaths(tick, deaths)?;
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "commit tick",
+            detail,
+        };
+        let mut previous: Option<OrganismId> = None;
+        for organism in survivors {
+            if previous.is_some_and(|previous| organism.id <= previous) {
+                return Err(conflict(format!(
+                    "{} is not after the survivor before it; survivors are given once, in ascending identity order",
+                    organism.id
+                )));
+            }
+            previous = Some(organism.id);
+            if dying.contains_key(&organism.id) {
+                return Err(conflict(format!("{} both survives and dies", organism.id)));
+            }
+            let Some(&slot) = self.index.get(&organism.id) else {
+                return Err(conflict(format!("{} is not alive", organism.id)));
+            };
+            if self.read(slot).lineage_key() != organism.lineage_key() {
+                return Err(conflict(format!(
+                    "{} cannot change its genome, ancestry, birth tick or phase",
+                    organism.id
+                )));
+            }
+            organism.check()?;
+        }
+        if survivors.len() + dying.len() != self.len() {
+            return Err(conflict(format!(
+                "{} survivors and {} deaths do not account for {} live organisms",
+                survivors.len(),
+                dying.len(),
+                self.len()
+            )));
+        }
+        check_birth_ticks(tick, births)?;
+        self.check_entrants(births, survivors.len())?;
+        let (mut logical, mut allocated) = (0_u64, 0_u64);
+        for id in dying.keys() {
+            let genome = self
+                .index
+                .get(id)
+                .and_then(|&slot| self.genomes.get(slot))
+                .and_then(Option::as_ref)
+                .ok_or_else(|| conflict(format!("{id} has no genome")))?;
+            logical = logical
+                .checked_add(genome.logical_bytes())
+                .ok_or(CoreError::Overflow {
+                    quantity: "retired logical genome bytes",
+                })?;
+            allocated =
+                allocated
+                    .checked_add(genome.allocated_bytes())
+                    .ok_or(CoreError::Overflow {
+                        quantity: "retired allocated genome bytes",
+                    })?;
+        }
+        let count = u64::try_from(dying.len()).unwrap_or(u64::MAX);
+        if logical > quota.logical_bytes()
+            || allocated > quota.allocated_bytes()
+            || count > quota.live()
+        {
+            return Err(conflict(format!(
+                "the quota holds {} logical and {} allocated bytes for {} genomes, \
+                 less than the {logical}, {allocated} and {count} the deaths return",
+                quota.logical_bytes(),
+                quota.allocated_bytes(),
+                quota.live()
+            )));
+        }
+        Ok(dying)
+    }
+
+    /// Check `deaths` against the live organisms: each at `tick`, alive,
+    /// once, and naming the stored genome, lineage and generation.
+    fn check_deaths(
+        &self,
+        tick: Tick,
+        deaths: &[Death],
+    ) -> Result<BTreeMap<OrganismId, Death>, CoreError> {
         let mut dying = BTreeMap::new();
         for &death in deaths {
             let conflict = |detail: String| CoreError::StateConflict {
@@ -527,26 +710,7 @@ impl Population {
                 return Err(conflict(format!("{} dies twice in one commit", death.id)));
             }
         }
-        for entrant in births.iter() {
-            if entrant.organism.birth_tick != tick {
-                return Err(CoreError::StateConflict {
-                    operation: "commit births",
-                    detail: format!(
-                        "{} is born at tick {}, not {}",
-                        entrant.organism.id,
-                        entrant.organism.birth_tick.get(),
-                        tick.get()
-                    ),
-                });
-            }
-        }
-        self.check_entrants(births, self.len() - dying.len())?;
-
-        let collected = self.remove(dying);
-        for entrant in births.drain(..) {
-            self.insert(entrant);
-        }
-        Ok(collected)
+        Ok(dying)
     }
 
     /// The canonical scientific state, in identity order, without slots.

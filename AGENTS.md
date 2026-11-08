@@ -614,7 +614,7 @@ The repository holds:
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
-  (FL-006, FL-011, FL-012),
+  (FL-006, FL-011–FL-013),
   `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009, FL-010), each with its
   `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
 
@@ -651,7 +651,7 @@ refuse to apply twice or to a changed field. FL-007 adds the sensor pyramid: `po
 anchored to the torus origin, bilinear sampling with analytic physical derivatives (right-hand interval at
 knots), and `log-linear-v1` scale blending, all in lerp form so a uniform field is exact at every scale.
 
-`flife-engine` (FL-006) holds the organism-phase operators that the ordered tick (FL-013) will call. Chemistry is
+`flife-engine` (FL-006) holds the organism-phase operators that the ordered tick (FL-013) calls. Chemistry is
 `bounded-affinity-v1`, evaluated on each granted cell packet and never on the mixture (C.9). The gain is credited
 before toxicity is paid, so toxicity is clipped to `E + G` and the ledger records the paid amount (C.2).
 Maintenance comes from canonical model work only. Motion integrates drag with `expm1_neg` (C.11), clamps speed
@@ -668,7 +668,7 @@ FL-011 adds `emission` and `reproduction` to `flife-engine`, and `flife_field::d
 - `resolve_births` stages births in ascending parent identity. Each one reserves a population slot, then the
   logical genome quota, before any genome work, and issues identities only on acceptance. A shortfall or error
   rolls the whole stage back. `Births::settle` re-checks each parent's budget and records one `child-endowment`
-  transfer per birth. Pausing the tick on a `CapacityShortfall` is FL-013's.
+  transfer per birth. FL-013 pauses the whole tick on a `CapacityShortfall`.
 
 FL-012 adds `lifecycle` and `population` to `flife-engine`.
 - `Vitality` rechecks exhaustion after every §8.2 stage, in order, and keeps the first stage that exhausted the
@@ -682,6 +682,21 @@ FL-012 adds `lifecycle` and `population` to `flife-engine`.
   and hands the entrants back on refusal. Never key anything scientific by slot; iterate with `ids` or `iter`.
 - `MaintenanceCosts::bill` splits the mandatory cost into `maintenance`, `sensor-cost` and `controller-cost`. A
   partial payment covers them in that order.
+
+FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publication.
+- `World::found` builds tick zero from a validated configuration: founders with `uniform` positions and `zero`
+  velocity, seeded sources and an opened ledger. `advance` runs §8.1 phases 2–10 against the committed state and
+  returns a checked `Candidate` (or `Paused` under `pause-before-commit`). `Candidate::publish` commits the
+  population's whole tick (`Population::commit_tick`) first, then swaps the field and replaces the ledger, quota,
+  identities and paths, and advances tick, epoch and event cursor, none of which can fail. Dropping a candidate
+  changes nothing.
+- Only the spare field buffer, reusable scratch and the candidate's own copies are written before publication.
+  Never mutate committed state in `prepare`. A numerical fault stops the run (`stop-and-preserve`) and every later
+  advance is refused.
+- Order is identity order everywhere. Controllers are evaluated when `(n + 1) mod K` matches their phase or the
+  held output is invalid. Deposits and recycling are reduced after the grants, into the next field.
+- `World::digest` (`frankenlife.world-state.v1`) hashes the scientific state without slots, epoch or cursor. The
+  small ecology in `tests/world.rs` pins it: moving that pin means the science changed, so say why.
 
 `flife-neural` (FL-007) is the sensor/action ABI. `observe` encodes a blended pyramid sample and the organism's
 own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y gradients saturated with

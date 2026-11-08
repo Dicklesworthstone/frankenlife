@@ -1,5 +1,6 @@
-//! FrankenLife organism-phase reference operators and lifecycle (FL-006,
-//! FL-011, FL-012; plan §5.3–§5.6, §7.4–§7.7, §8.1, §8.2, §9.1).
+//! FrankenLife organism-phase reference operators, lifecycle and the
+//! ordered tick (FL-006, FL-011–FL-013; plan §5.3–§5.6, §7.4–§7.7, §8.1–§8.4,
+//! §9.1–§9.5).
 //!
 //! - [`chemistry`]: `bounded-affinity-v1` efficiency evaluated on each
 //!   granted cell packet, useful gain, toxicity clipped to what the organism
@@ -19,13 +20,17 @@
 //!   with their cause, and `genetic-affinity` recycling (FL-012).
 //! - [`population`]: live organisms as a structure of arrays behind a
 //!   stable-identity index, in a compacting or a free-list arrangement, with
-//!   transactional commits of deaths and births (FL-012).
+//!   transactional commits of deaths and births (FL-012), and the whole
+//!   tick's commit (FL-013).
+//! - [`world`]: the ordered candidate tick (§8.1 phases 2–10) against the
+//!   committed world and its atomic epoch publication, with
+//!   `pause-before-commit` and `stop-and-preserve` (FL-013).
 //!
 //! Each organism spends through a `flife_core::EnergyBudget` in the order of
 //! §8.2: it absorbs its gain, pays toxicity and maintenance, then pays for
 //! motion, then emission, then reproduction. Once its budget is exhausted it
-//! pays nothing more and absorbs nothing more, and it dies. The ordered tick
-//! that strings these together is FL-013.
+//! pays nothing more and absorbs nothing more, and it dies. [`world`] strings
+//! these together in identity order.
 
 #![forbid(unsafe_code)]
 
@@ -36,6 +41,7 @@ pub mod lifecycle;
 pub mod motion;
 pub mod population;
 pub mod reproduction;
+pub mod world;
 
 pub use chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, settle_efficiencies,
@@ -55,4 +61,9 @@ pub use reproduction::{
     CapacityShortfall, Identities, NEXT_TICK_ACTIVATION, Newborn, ParentState, PopulationQuota,
     RejectedBirth, Reproduction, ReproductionProposal, ReproductionRules, Split, Unviable,
     Viability, resolve_births,
+};
+pub use world::{
+    Advance, BirthEvent, CPU_REFERENCE, Candidate, NumericalFault, NumericalProfile,
+    PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE, Stepped, TickReport,
+    UNIFORM_POSITIONS, WORLD_DIGEST_SCHEMA, World, ZERO_VELOCITY, founder_position,
 };

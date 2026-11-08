@@ -40,7 +40,8 @@
 - `FieldState`: one planar `[plane, y, x]` buffer of `33 G_x G_y` real `f32` values. Plane 0 holds energy;
   plane `k + 1` holds moment channel `k`. Every plane is a cell amount in `ecological-energy`; divide by
   `cell_area` for a density. `energy_total` gives the field's holdings for the ledger.
-- `FieldLayout`, `FieldView`, `relayout`, and `FieldPair` (current/next; `commit` swaps without reallocating).
+- `FieldLayout`, `FieldView`, `relayout`, and `FieldPair` (current/next; `commit` swaps without reallocating;
+  `next` reads the candidate buffer, which FL-013's `Candidate::field` exposes before publication).
 - `FieldFootprint`, `InitialEnergy` and `FieldSummary`.
 - `DeclaredLayout::canonical_text` and its SHA-256.
 - `TransportPlan`: requested and per-substep `r_x`, `r_y`, the substep count, the center coefficient and
@@ -281,8 +282,8 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   every refusal.
 
 **Known gaps.**
-- The tick that carries `SeededPath` and updates source centers each tick, and its checkpoint of anchor and
-  ordinal, are FL-013 and FL-037.
+- FL-013's tick carries each `SeededPath` and moves a source's center to its mid-tick position every tick.
+  Checkpointing the anchor and ordinal is FL-016 and FL-037.
 - Cone tolerance. The values belong to an undeclared numerical profile. One finding: far from sources,
   diffusion leaves subnormal F32 energies (about 1e-40) with no relative precision. A cone tolerance therefore
   needs an absolute floor at F32's subnormal scale, and the 128-tick test uses `f32::MIN_POSITIVE`. Metal

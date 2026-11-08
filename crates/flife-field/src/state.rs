@@ -434,6 +434,14 @@ impl FieldPair {
         &mut self.current
     }
 
+    /// The candidate buffer, as the last step left it. Before a commit it is
+    /// the candidate; after one it is the previous committed field, to be
+    /// overwritten by the next step.
+    #[must_use]
+    pub const fn next(&self) -> &FieldState {
+        &self.next
+    }
+
     /// Read the committed field while writing the candidate.
     #[must_use]
     pub const fn stage(&mut self) -> (&FieldState, &mut FieldState) {

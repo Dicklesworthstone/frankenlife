@@ -235,17 +235,34 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-012",
         )
     },
-    entry("zero", Role::InitialVelocity, "A.3 item 1", "FL-015"),
-    entry("uniform", Role::InitialPositions, "A.3 item 1", "FL-015"),
+    // The ordered tick founds its world (FL-013), so it implements the
+    // initial population; FL-015 builds the small-world preset on it.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/world.rs::founders_follow_appendix_a3_item_1",
+        },
+        ..entry("zero", Role::InitialVelocity, "A.3 item 1", "FL-013")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/world.rs::founders_follow_appendix_a3_item_1",
+        },
+        ..entry("uniform", Role::InitialPositions, "A.3 item 1", "FL-013")
+    },
     // FL-011's birth stage reports a fixed logical quota shortfall with
-    // everything rolled back (`flife_engine::CapacityShortfall`); pausing
-    // the whole candidate tick before commit is the ordered tick's.
-    entry(
-        "pause-before-commit",
-        Role::CapacityPolicy,
-        "§7.5",
-        "FL-013",
-    ),
+    // everything rolled back (`flife_engine::CapacityShortfall`); the
+    // ordered tick pauses on it before commit (FL-013).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/world.rs::a_population_shortfall_pauses_the_tick_and_changes_nothing",
+        },
+        ..entry(
+            "pause-before-commit",
+            Role::CapacityPolicy,
+            "§7.5",
+            "FL-013",
+        )
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-field::tests/field_layout.rs::appendix_a_initial_field_is_uniform_with_zero_moments",
@@ -573,17 +590,31 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         ..entry("genetic-affinity", Role::CorpseDirection, "§7.6", "FL-012")
     },
     // FL-012 refuses a numerical fault by identity and never collects it as
-    // a death, leaving the committed population unchanged
-    // (`flife_engine::Population`). Stopping the run and preserving the
-    // offending candidate is the ordered tick's.
-    entry(
-        "stop-and-preserve",
-        Role::NumericalFaultPolicy,
-        "§7.6",
-        "FL-013",
-    ),
-    entry("cpu-reference", Role::Backend, "§10.1, §18.1", "FL-013"),
-    entry("qualified-reference", Role::Determinism, "§16.1", "FL-013"),
+    // a death (`flife_engine::Population`); the ordered tick stops the run
+    // with the committed state preserved (FL-013).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/world.rs::a_numerical_fault_stops_the_run_and_preserves_the_committed_state",
+        },
+        ..entry(
+            "stop-and-preserve",
+            Role::NumericalFaultPolicy,
+            "§7.6",
+            "FL-013",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/world.rs::a_small_headless_ecology_lives_breeds_mutates_emits_and_dies",
+        },
+        ..entry("cpu-reference", Role::Backend, "§10.1, §18.1", "FL-013")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/world.rs::c7_compact_and_free_list_worlds_publish_the_same_epochs",
+        },
+        ..entry("qualified-reference", Role::Determinism, "§16.1", "FL-013")
+    },
     entry("specified", Role::MathMode, "§10.3, A.1", "FL-008"),
     entry(
         "write-ahead-before-apply",

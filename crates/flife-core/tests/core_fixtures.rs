@@ -33,6 +33,11 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         "flife-field::tests/uptake_ledger.rs",
         include_str!("../../flife-field/tests/uptake_ledger.rs"),
     ),
+    ("flife-core::tests/numerics.rs", include_str!("numerics.rs")),
+    (
+        "flife-engine::tests/organism_phase.rs",
+        include_str!("../../flife-engine/tests/organism_phase.rs"),
+    ),
 ];
 
 #[expect(

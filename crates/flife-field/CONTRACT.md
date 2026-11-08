@@ -39,7 +39,8 @@
   normalized and applied energy), and `unit_direction`.
 - `PathSegment`: position, velocity, mid-tick fraction and the next segment.
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
-- `numerics::exp_neg`: a host-independent `exp(−x)`.
+- `numerics`: the host-independent `exp_neg`, `expm1_neg`, `tanh` and `sigmoid`, re-exported from
+  `flife-core::numerics`.
 - `ExchangeStencil`: an organism's footprint cells and weights, and its local density `Σ w_c e_c / (h_x h_y)`.
   `saturating_request` gives `d = Δt U_max r/(K + r)`.
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
@@ -92,8 +93,9 @@
   The next segment starts at the wrapped endpoint with direction `b`, which keeps position and velocity
   continuous at a join. The mid-tick fraction is `(2k + 1)/(2K)`, computed from integer ticks.
 - `exp_neg` uses only IEEE-754 `+ × ÷` in a fixed order with no FMA, so every conforming host computes the
-  same bits. The tests pin them, and they agree on macOS arm64 and Linux x86_64. Measured accuracy is 0 ulp at
-  the Appendix A decay factor, 1 ulp at 0.1 and 36 ulp at the kernel cutoff.
+  same bits. The tests pin them, and they agree on macOS arm64 and Linux x86_64. It reduces Cody–Waite style to
+  `n ln 2 + r` and is within 1 ulp of the correctly rounded value over `[1e-9, 745]` (measured), and exact at
+  the Appendix A decay factor and the kernel cutoff. The implementation lives in `flife-core::numerics`.
 - `advance_field` writes only the candidate buffer and reports `ε = (E' − E) − (I − D_decay)`. On error the
   candidate must be discarded; the committed field is untouched.
 
@@ -203,6 +205,6 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
   reconciliation, so a different one would be a different numerical profile.
 - `UptakeSummary::contended_cells` counts every cell whose demand exceeds its energy, including empty cells
   that receive demand.
-- Per-packet chemistry, toxicity and affordable motion are FL-006. Clearing tiny reservoirs and death are
-  FL-012. Device arrangements, device alignment and sharding belong to the Metal backend. Sensing and the
+- Per-packet chemistry, toxicity and affordable motion are in `flife-engine` (FL-006). Clearing tiny reservoirs
+  and death are FL-012. Device arrangements, device alignment and sharding belong to the Metal backend. Sensing and the
   pyramid are FL-007, and whole-run memory admission is FL-043.

@@ -612,8 +612,8 @@ The repository holds:
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
-- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger) and `crates/flife-field`
-  (FL-003–FL-005), each with its `CONTRACT.md`.
+- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006 numerics),
+  `crates/flife-field` (FL-003–FL-005) and `crates/flife-engine` (FL-006), each with its `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -639,11 +639,20 @@ also covers periodic wrapping, the configured initial field and the INV-01/INV-0
 of the tick: the `positive-five-point-v1` stencil with CFL subcycling (never clamping), exponential decay
 charged to dissipation, and normalized truncated minimum-image Gaussian deposits of exactly `P Δt` per
 source. `advance_field` writes only the candidate buffer and reports `I`, `D` and `ε`. Model arithmetic avoids
-platform `libm`: `numerics::exp_neg` gives identical bits on every IEEE-754 host. Seeded source draws await
+platform `libm`: `flife_core::numerics` (`exp_neg`, `expm1_neg`, `tanh`, `sigmoid`) gives identical bits on every
+IEEE-754 host, within 1–2 ulp of correctly rounded. Seeded source draws await
 FL-010. FL-005 adds uptake: the `grid-cic-v1` footprint, A.1's saturating request, and two-pass demand/grant
 resolution that grants whole F32 quanta of each cell (`cell-quantum-largest-remainder-v1`), so grants never
 exceed a cell and the field loses exactly what organisms receive. Grants depend on identities, not slots, and
 refuse to apply twice or to a changed field. Sensing is FL-007.
+
+`flife-engine` (FL-006) holds the organism-phase operators that the ordered tick (FL-013) will call. Chemistry is
+`bounded-affinity-v1`, evaluated on each granted cell packet and never on the mixture (C.9). The gain is credited
+before toxicity is paid, so toxicity is clipped to `E + G` and the ledger records the paid amount (C.2).
+Maintenance comes from canonical model work only. Motion integrates drag with `expm1_neg` (C.11), clamps speed
+and acceleration radially as computed in F64, and scales the whole velocity when it is unaffordable, exhausting
+the organism (C.12). Every organism spends through a `flife_core::EnergyBudget` in §8.2 order. Trait mutation is
+FL-010; emission and reproduction are FL-011.
 
 No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

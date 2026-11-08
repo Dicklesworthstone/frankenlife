@@ -3,7 +3,8 @@
 **Purpose.** FL-002 (`flife-jb0`): the shared vocabulary every FrankenLife crate builds on (plan §18.1, §18.3). That
 covers identities, integer clocks, units, failure classes, the named-algorithm registry, the
 `frankenlife.config.v1` configuration with its A.2 validator, canonical serialization, and the model descriptor.
-FL-005 (`flife-f6x`) adds the global energy ledger (§4.4, §8.2, §21.4, INV-03 and INV-05).
+FL-005 (`flife-f6x`) adds the global energy ledger (§4.4, §8.2, §21.4, INV-03 and INV-05). FL-006 (`flife-h6c`)
+adds the host-independent elementary functions of the reference numerical profile (A.1, C.11).
 
 **Inputs.** Configuration TOML (Appendix A's schema). Every key is required and unknown keys are refused, so there
 are no hidden defaults.
@@ -27,6 +28,7 @@ are no hidden defaults.
   - The run's `EnergyLedger` with its `LedgerReport`, and `ResidualBudget`.
   - The per-organism `EnergyBudget`, with `Payment`.
   - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.
+- Numerics (FL-006): `exp_neg`, `expm1_neg`, `tanh` and `sigmoid`.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -58,6 +60,15 @@ are no hidden defaults.
     `Σ paid ≤ available + Σ credited`.
   - A payment reports the requested and paid amounts separately.
   - A budget that a payment empties stays exhausted. Later payments get nothing and credits are refused.
+- Numerics (A.1).
+  - Only IEEE-754 `+ − × ÷`, exact rounding to an integer and exact power-of-two scaling, in a fixed order with
+    no fused multiply-add. Every conforming host computes the same bits; tests pin them.
+  - `exp_neg` reduces Cody–Waite style to `n ln 2 + r`. `expm1_neg` uses `1 − exp_neg` where `e^(−x) ≤ 1/2` and a
+    series with exact halving and the doubling identity below that, so it does not cancel near zero.
+  - Measured against correctly rounded values (Python `Decimal`) over 1,296 arguments from `1e-9` to `745`:
+    `exp_neg` within 1 ulp; `expm1_neg`, `tanh` and `sigmoid` within 2 ulp.
+  - `sigmoid` takes the sign-stable branch: a large negative logit decays to zero instead of dividing by
+    infinity.
 
 **Refusal cases (A.2).**
 - Nonfinite numbers and negative costs.
@@ -97,6 +108,9 @@ Every issue is reported, not just the first.
   - FL-004: `positive-five-point-v1`, `subcycle`, `fixed-total-power`,
     `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`.
   - FL-005: `grid-cic-v1`.
+- Implemented in `flife-engine` (FL-006): `bounded-affinity-v1` and `per-granted-cell-packet`. The heritable
+  traits `affinity_direction` and `motion_response` have their representation, bound and use there, but stay
+  `Specified` under FL-010 until they mutate as A.3 item 4 specifies.
 - The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
   stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
@@ -115,9 +129,16 @@ Every issue is reported, not just the first.
 **Determinism.** Pure functions of their inputs. No hash-map iteration and no floating clocks. The canonical forms
 and both digests are pinned by tests. Ledger sums run in a fixed order.
 
-**Independent tests.** `tests/ledger.rs`:
-- C.1's accounting, checked exactly.
-- Round-down and the INV-05 bound, checked against exact `i128` arithmetic on dyadic values.
-- The cumulative gate tripping at a computed tick, and every reported normalization checked exactly.
+**Independent tests.**
+- `tests/ledger.rs`:
+  - C.1's accounting, checked exactly.
+  - Round-down and the INV-05 bound, checked against exact `i128` arithmetic on dyadic values.
+  - The cumulative gate tripping at a computed tick, and every reported normalization checked exactly.
+- `tests/numerics.rs`:
+  - 24 pinned bit patterns, each within 1 ulp of its correctly rounded value.
+  - Agreement with the platform `libm` over a log-spaced and dense sweep, within bounds that hold on any
+    conforming host.
+  - Domains, saturation, odd symmetry, `σ(x) + σ(−x) = 1`, and monotonicity.
+  - C.11: the drag coefficient, the F32 cancellation, and `sigmoid(8)` against `sigmoid(tanh(8))`.
 
 **Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`.

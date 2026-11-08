@@ -731,6 +731,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flife-engine"
+version = "0.0.1"
+dependencies = [
+ "flife-core",
+ "flife-field",
+]
+
+[[package]]
 name = "flife-field"
 version = "0.0.1"
 dependencies = [

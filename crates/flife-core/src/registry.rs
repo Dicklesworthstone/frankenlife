@@ -289,23 +289,32 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "A.3 item 8",
         "FL-004",
     ),
-    entry(
-        "bounded-affinity-v1",
-        Role::ChemistryFamily,
-        "§5.3",
-        "FL-006",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/organism_phase.rs::c9_chemistry_is_evaluated_per_packet_not_on_the_mixture",
+        },
+        ..entry(
+            "bounded-affinity-v1",
+            Role::ChemistryFamily,
+            "§5.3",
+            "FL-006",
+        )
+    },
+    // FL-006 implements these traits' representation, norm bound and use
+    // (`flife_engine::Affinity`, `flife_engine::MotionResponse`). A
+    // heritable trait is complete only when it also mutates as A.3 item 4
+    // specifies, which is FL-010's.
     entry(
         "affinity_direction",
         Role::HeritableTrait,
         "§5.3, A.3 item 4",
-        "FL-006",
+        "FL-010",
     ),
     entry(
         "motion_response",
         Role::HeritableTrait,
         "§5.4, A.3 item 4",
-        "FL-006",
+        "FL-010",
     ),
     entry(
         "sensing_scale",
@@ -313,12 +322,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "§6.1, A.3 item 4",
         "FL-007",
     ),
-    entry(
-        "per-granted-cell-packet",
-        Role::ChemistryEvaluation,
-        "§5.3",
-        "FL-006",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/organism_phase.rs::organisms_settle_contended_uptake_and_close_the_ledger_every_tick",
+        },
+        ..entry(
+            "per-granted-cell-packet",
+            Role::ChemistryEvaluation,
+            "§5.3",
+            "FL-006",
+        )
+    },
     entry(
         "energy-moment-gradient-104-v1",
         Role::SensorSchema,

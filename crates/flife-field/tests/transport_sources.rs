@@ -363,19 +363,22 @@ fn host_independent_exp_matches_std() {
         let ours = exp_neg(x).expect("finite");
         let reference = (-x).exp();
         let relative = (ours - reference).abs() / reference;
-        // 2^(k+2) ulps, k = ⌈log2(16x)⌉ halvings.
-        assert!(relative <= 1.0e-12, "x = {x}: {ours} vs {reference}");
+        // Within 1 ulp of the correctly rounded value; `std` within 1 more.
+        assert!(
+            relative <= 4.0 * f64::EPSILON,
+            "x = {x}: {ours} vs {reference}"
+        );
         x *= 1.9;
     }
     // Cross-host guard: the bits every IEEE-754 host computes, pinned on
-    // macOS arm64 and checked again on Linux x86_64. Against the correctly
-    // rounded value (Python `Decimal`, 60 digits): Appendix A's decay factor
-    // is exact, x = 0.1 is 1 ulp off, and the kernel cutoff x = 8 is 36 ulp
-    // off after its 7 squarings.
+    // macOS arm64 and checked again on Linux x86_64. All three are the
+    // correctly rounded values (Python `Decimal`, 60 digits): Appendix A's
+    // decay factor, x = 0.1, and the kernel cutoff x = 8. The full table is
+    // in `flife-core/tests/numerics.rs`.
     for (x, bits) in [
         (0.01 / 128.0, 0x3fef_ff5c_2a99_2df2_u64),
-        (0.1, 0x3fec_f46d_99d5_2b3b),
-        (8.0, 0x3f35_fc21_0410_27d1),
+        (0.1, 0x3fec_f46d_99d5_2b3a),
+        (8.0, 0x3f35_fc21_0410_27ad),
     ] {
         assert_eq!(exp_neg(x).map(f64::to_bits), Some(bits), "exp_neg({x:?})");
     }

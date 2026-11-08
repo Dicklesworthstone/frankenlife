@@ -16,6 +16,8 @@
 //!   arithmetic.
 //! - [`ledger`]: the global energy ledger (INV-03), its residual budget,
 //!   and per-organism energy budgets that never spend twice (INV-05).
+//! - [`numerics`]: host-independent `exp(−x)`, `1 − exp(−x)`, `tanh` and
+//!   `sigmoid` for the reference numerical profile.
 
 #![forbid(unsafe_code)]
 
@@ -27,6 +29,7 @@ pub mod error;
 pub mod ids;
 pub mod ledger;
 pub mod model;
+pub mod numerics;
 pub mod registry;
 pub mod schema;
 pub mod units;

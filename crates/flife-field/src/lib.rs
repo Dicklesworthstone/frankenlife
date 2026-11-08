@@ -17,8 +17,8 @@
 //!   torus path (FL-004).
 //! - [`step`]: phase 2 of the tick, transport and then sources, with its
 //!   ledger terms (FL-004).
-//! - [`numerics`]: a host-independent `exp(−x)` for decay factors and
-//!   kernel weights.
+//! - [`numerics`]: the host-independent elementary functions of
+//!   `flife_core::numerics`, used for decay factors and kernel weights.
 //! - [`exchange`]: the `grid-cic-v1` exchange footprint and A.1's
 //!   saturating request (FL-005).
 //! - [`uptake`]: two-pass demand/grant resolution with exact

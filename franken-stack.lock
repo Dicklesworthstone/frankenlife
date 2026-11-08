@@ -44,3 +44,11 @@ manim_frame	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; 320x180 cert
 metal	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; Apple M5 Ultra unified=true simd=32; 2x+1 over 256 f32 exact
 native_input	gap	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; gap tracked by flife-jdf; PresentationState = visible,occluded,closed
 native_window	gap	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; gap tracked by flife-jdf; real window, 30 polls, states occludedx1,visiblex29, typed input events 0
+closure	qualified	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); 295 packages; single-copy set 15; asupersync@a5d23e8d,franken_manim@ac39e721,franken_markdown@c1754278,franken_networkx@9d710b1c,franken_numpy@6492ff31,frankenpandas@da85cf65,frankenscipy@ae52b654,frankentorch@c611501c,rust-block@b39ae859
+runtime	qualified	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); lab order [0, 5, 4, 3, 2, 1] replayed identically; production spawn joined; ft-runtime Budget type unifies
+rng	qualified	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); PCG64DXSM(42) words 0xab1c50338e63481d,0x01bdf91d548d1872,0xa872905d0418d0a1,0x5f0a84270b80eabc; random() bits 0x3fe5638a0671cc69; advance(1000) 0x6cea836221a14f5f; SeedSequence and spawn key match NumPy 2.5.4
+array	qualified	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); C strides [16896, 132, 4] F strides [4, 512, 65536] nbytes 2162688; broadcast matches NumPy 2.5.4
+tensor	qualified	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); matmul [58.0, 64.0, 139.0, 154.0]
+manim_frame	qualified	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); certified PNG sha256 820b5378a59f5755be4cdfd60deed853c70e009df7949d16741cfa904b0bb7e5 (8472 B), byte-identical to the macOS arm64 render; empty-scene control 7ae54c1993fc525986b08cd354c1de4c5173edd04cf75372a899a840578fd8a9
+metal	unavailable	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); unavailable: no Metal device on this host
+native_input	gap	linux-7.0.0-x86_64/AMD-EPYC-Genoa	2026-11-08 (rch hz2, tree of commit 410f8f5); gap tracked by flife-jdf; PresentationState = visible,occluded,closed

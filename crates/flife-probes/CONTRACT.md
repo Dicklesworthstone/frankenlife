@@ -28,8 +28,9 @@ capability missing upstream is `gap` with its bead; a wrong answer or an error i
 **Refusal cases.** A missing output directory or unknown argument is a usage error. A no-clobber render collision
 is `failed`, never overwritten.
 
-**Determinism.** Every probe is seeded with 42. The lab, RNG, array and tensor checks are bit-exact. The Manim digest
-is certified-mode output, so it should match across the certified matrix. Only the macOS digest has been observed.
+**Determinism.** Every probe is seeded with 42. The lab, RNG, array and tensor checks are bit-exact. The certified
+Manim frame (`820b5378…`) and its empty control (`7ae54c19…`) were byte-identical on macOS arm64 (Apple M5 Ultra)
+and Linux x86_64 (AMD EPYC Genoa); see `franken-stack.lock` `[probes]`.
 
 **Validity domain.** The commits in `franken-stack.lock` and the toolchain in `rust-toolchain.toml`. The Metal and
 window probes need macOS with a GPU and, for the window, a window server and the main thread.

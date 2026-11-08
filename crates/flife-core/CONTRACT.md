@@ -57,8 +57,9 @@ Every issue is reported, not just the first.
 - Topology-catalog membership beyond depth and parameter cap (FL-009).
 
 **Registry status.** `field-ecology-v1` and the `stable-identity` phase policy are implemented here with fixtures.
-The `periodic` boundary, the `f32` field dtype and the `zero` field composition are implemented in `flife-field`
-(FL-003). Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no
+`flife-field` implements the `periodic` boundary, the `f32` field dtype and the `zero` field composition
+(FL-003). It also implements `positive-five-point-v1`, `subcycle`, `fixed-total-power`,
+`normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source` (FL-004). Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no
 known-answer vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it. An `Implemented`
 entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited function exists.
 

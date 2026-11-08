@@ -25,6 +25,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         "flife-field::tests/field_layout.rs",
         include_str!("../../flife-field/tests/field_layout.rs"),
     ),
+    (
+        "flife-field::tests/transport_sources.rs",
+        include_str!("../../flife-field/tests/transport_sources.rs"),
+    ),
 ];
 
 #[expect(

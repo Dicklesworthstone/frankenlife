@@ -198,13 +198,23 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("f32", Role::FieldDtype, "§4.2, §10.3", "FL-003")
     },
-    entry(
-        "positive-five-point-v1",
-        Role::TransportScheme,
-        "§4.5",
-        "FL-004",
-    ),
-    entry("subcycle", Role::StabilityPolicy, "§4.5, §8.4", "FL-004"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/transport_sources.rs::rectangular_stencil_matches_an_independent_oracle_and_conserves",
+        },
+        ..entry(
+            "positive-five-point-v1",
+            Role::TransportScheme,
+            "§4.5",
+            "FL-004",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/transport_sources.rs::cfl_bound_subcycles_instead_of_going_negative",
+        },
+        ..entry("subcycle", Role::StabilityPolicy, "§4.5, §8.4", "FL-004")
+    },
     entry("grid-cic-v1", Role::ExchangeKernel, "§4.3, §5.1", "FL-005"),
     entry(
         "dissipate-and-record",
@@ -226,30 +236,45 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("zero", Role::FieldComposition, "§4.2", "FL-003")
     },
-    entry(
-        "fixed-total-power",
-        Role::SourceNormalization,
-        "§4.3, A.3 item 9",
-        "FL-004",
-    ),
-    entry(
-        "normalized-truncated-minimum-image-gaussian-v1",
-        Role::SourceKernel,
-        "A.3 item 9",
-        "FL-004",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/transport_sources.rs::source_totals_do_not_depend_on_resolution_or_position",
+        },
+        ..entry(
+            "fixed-total-power",
+            Role::SourceNormalization,
+            "§4.3, A.3 item 9",
+            "FL-004",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/transport_sources.rs::small_supports_deposit_exact_totals",
+        },
+        ..entry(
+            "normalized-truncated-minimum-image-gaussian-v1",
+            Role::SourceKernel,
+            "A.3 item 9",
+            "FL-004",
+        )
+    },
     entry(
         "seeded-unit-vectors",
         Role::SourceChemistry,
         "A.3 item 7",
         "FL-004",
     ),
-    entry(
-        "fixed-per-source",
-        Role::SourceChemistryPolicy,
-        "A.3 item 7",
-        "FL-004",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/transport_sources.rs::chemical_directions_stay_inside_the_unit_ball",
+        },
+        ..entry(
+            "fixed-per-source",
+            Role::SourceChemistryPolicy,
+            "A.3 item 7",
+            "FL-004",
+        )
+    },
     entry(
         "seeded-smooth-torus-v1",
         Role::SourcePath,

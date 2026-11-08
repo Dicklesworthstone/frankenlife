@@ -10,9 +10,17 @@
 //!   ping-pong pair.
 //! - [`footprint`]: checked byte counts and per-buffer limits.
 //! - [`invariants`]: INV-01 and INV-02 on a committed field.
+//! - [`transport`]: `positive-five-point-v1` with `subcycle` stability and
+//!   exponential decay (FL-004).
+//! - [`sources`]: the normalized truncated minimum-image Gaussian,
+//!   fixed-total-power deposits, fixed chemical directions and the smooth
+//!   torus path (FL-004).
+//! - [`step`]: phase 2 of the tick, transport and then sources, with its
+//!   ledger terms (FL-004).
+//! - [`numerics`]: a host-independent `exp(−x)` for decay factors and
+//!   kernel weights.
 //!
-//! Source injection and transport are FL-004; uptake and the ledger are
-//! FL-005; sensing and the pyramid are FL-007.
+//! Uptake and the ledger are FL-005; sensing and the pyramid are FL-007.
 
 #![forbid(unsafe_code)]
 
@@ -20,10 +28,17 @@ pub mod footprint;
 pub mod grid;
 pub mod invariants;
 pub mod layout;
+pub mod numerics;
+pub mod sources;
 pub mod state;
+pub mod step;
+pub mod transport;
 
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
+pub use sources::{DepositReport, PathSegment, Source, SourceKernel, SourceSupport};
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
+pub use step::{FieldStepReport, advance_field};
+pub use transport::{TransportPlan, TransportReport, TransportScratch};

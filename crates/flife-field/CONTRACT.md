@@ -1,81 +1,135 @@
 # flife-field — contract
 
-**Purpose.** FL-003 (`flife-82g`) covers the field representation of plan §4.2, §9.3 and §19.3. The field is 33
-typed F32 planes (energy plus 32 chemical moments) on a periodic grid. It comes with a semantic layout descriptor
-that FrankenNumPy supplies and checks, per-buffer limits (INV-15), the configured initial field, and the INV-01
-and INV-02 checks for a committed field.
+**Purpose.**
+- FL-003 (`flife-82g`) covers the field representation of plan §4.2, §9.3 and §19.3. The field is 33 typed F32
+  planes (energy plus 32 chemical moments) on a periodic grid. It comes with a semantic layout descriptor that
+  FrankenNumPy supplies and checks, per-buffer limits (INV-15), the configured initial field, and the INV-01 and
+  INV-02 checks.
+- FL-004 (`flife-03d`) covers phase 2 of the tick (§4.5, §8.1, §11.5, A.3 items 7–9). That is
+  `positive-five-point-v1` transport with `subcycle` stability, exponential decay, and `fixed-total-power`
+  deposits through the `normalized-truncated-minimum-image-gaussian-v1` kernel with `fixed-per-source`
+  chemistry. It also covers the analytic `seeded-smooth-torus-v1` path integrator.
 
 **Inputs.**
-- A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world` and `[field_initialization]`).
+- A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world`, `[field_initialization]`, `[sources]`).
 - `BufferLimits`: the largest single buffer a backend can allocate.
 - A `DeclaredLayout` read from a checkpoint or interchange record.
 - A `ConeTolerance` taken from the declared numerical profile.
+- `Source`s for this tick: identity, sampled center, chemical direction and power. Segment directions for
+  `PathSegment`. Seeded values come from FL-010; this crate draws no random numbers.
 
 **Outputs.**
 - `FieldState`: one planar `[plane, y, x]` buffer of `33 G_x G_y` real `f32` values. Plane 0 holds energy;
   plane `k + 1` holds moment channel `k`. Every plane is a cell amount in `ecological-energy`; divide by
   `cell_area` for a density.
-- `FieldLayout`: arrangement, shape, byte strides, dtype, base alignment, ownership, unit, measure and grid.
-- `FieldView`: a borrowed buffer checked against its declared layout.
-- `relayout`: a copy into another arrangement that moves each value to its semantic index.
-- `FieldPair`: the current committed state plus the next candidate; `commit` swaps them without reallocating.
-- `FieldFootprint`: checked byte counts.
-- `InitialEnergy`: the stored per-cell value and the exact injected total, for the ledger.
-- `FieldSummary`: energy total, maximum cone residual and empty-cell count.
+- `FieldLayout`, `FieldView`, `relayout`, and `FieldPair` (current/next; `commit` swaps without reallocating).
+- `FieldFootprint`, `InitialEnergy` and `FieldSummary`.
 - `DeclaredLayout::canonical_text` and its SHA-256.
+- `TransportPlan`: requested and per-substep `r_x`, `r_y`, the substep count, the center coefficient and
+  `exp(−λΔt)`.
+- `transport` with its `TransportReport`: energy before, transported and after; decay removal; transport
+  residual.
+- `SourceKernel`, `SourceSupport` (reused across ticks), `deposit` with its `DepositReport` (declared,
+  normalized and applied energy), and `unit_direction`.
+- `PathSegment`: position, velocity, mid-tick fraction and the next segment.
+- `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
+- `numerics::exp_neg`: a host-independent `exp(−x)`.
 
-**Invariants.**
-- Storage is `Vec<f32>`. It is never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy
+**Invariants — representation (FL-003).**
+- Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy
   `ArrayStorage::F32` moves the buffer without copying it, and `F64` storage is refused.
 - Strides come from `fnp_ndarray::contiguous_strides` and are cross-checked against independent `u64`
   arithmetic. Every `(plane, x, y)` has exactly one byte offset, and those offsets cover the buffer exactly.
 - A reader states the layout it needs. Arrangement, grid, world size (and therefore cell size and energy
   density), shape, strides and length must all agree. Equal byte lengths never make two layouts compatible.
-- A declared layout is admitted before any allocation (Appendix B.2). It must name this schema and dtype `f32`
+- A declared layout is admitted before allocation (Appendix B.2). It must name this schema and dtype `f32`
   with 4-byte items. Its axis names must match the arrangement, and it must have 33 planes, an
   `ecological-energy` `cell-integrated` unit and 4-byte alignment. FrankenNumPy checks that the view stays
   inside the declared bytes and does not overlap itself. The strides must be the canonical contiguous ones, and
   the byte length must be exact.
-- Every count is checked. A state is admitted against `BufferLimits` and against `isize::MAX` bytes before it
-  is allocated. The allocation itself uses `try_reserve_exact`, so a refusal is reported as an error instead of
+- Every count is checked. Buffers are admitted against `BufferLimits` and `isize::MAX` before they are
+  allocated. The allocation itself uses `try_reserve_exact`, so a refusal is reported as an error instead of
   aborting the process.
 - Periodic boundary. A cell index wraps by `rem_euclid`. A coordinate wraps into `[0, L)`, and a coordinate
   within rounding below zero maps to `0.0`, never to `L`. The minimum image lies in `[-L/2, L/2)`, and its
   correction is exact (Sterbenz).
 - INV-01: every energy is finite and nonnegative (`-0.0` counts as zero), and every moment is finite.
-  INV-02: `max(0, ||m||₂ − e) ≤ absolute + relative · e`. The checks run in F64 over the exact F32 values,
-  summing squares in channel order and energy in cell-index order.
-- Initial field. `energy_per_cell` is rounded once to F32 and the composition is `zero` (no moment). The stored
-  value is reported. `injected_total` equals the cell-order F64 sum of the stored field whenever the grid has at
-  most 2^29 cells.
+  INV-02: `max(0, ||m||₂ − e) ≤ absolute + relative · e`, checked in F64 over the exact F32 values.
+- Initial field. `energy_per_cell` is rounded once to F32 and the composition is `zero`. The stored value is
+  reported, and `injected_total` is exact for grids of at most 2^29 cells.
+
+**Invariants — phase 2 (FL-004).**
+- The same five-point operator is applied to every plane:
+  `u' = ((c·u + r_x·(u_w + u_e)) + r_y·(u_s + u_n))` in F64 from exact F32 inputs, rounded once to F32. Its
+  coefficients are nonnegative and its rows and columns sum to one. It therefore keeps energy nonnegative,
+  conserves the periodic total up to one F32 rounding per cell, and preserves the cone up to rounding.
+- Subcycling uses the fewest equal substeps whose computed center coefficient `1 − 2r_x − 2r_y` is
+  nonnegative. The test is on the coefficient actually used, not on an estimate. The bound for rectangular
+  cells is `r_x + r_y ≤ 1/2`. Diffusion is never clamped, and a tick needing more than `MAX_SUBSTEPS` (1024)
+  substeps is refused. One subcycled tick equals the same number of single-substep ticks bit for bit.
+- Decay is `f32(f64(u) × exp(−λΔt))` on every plane. The removed energy `Σ (e − e')` is reported and charged to
+  dissipation, and `λ = 0` changes nothing.
+- A source deposits `q_c = P Δt · k_c / Σ k` with `k_c = exp(−|d_c|²/2σ²)` at cell centers within `cutoff × σ`,
+  where `d_c` is the minimum-image displacement. Both sums run in cell-index order, and every cell appears once,
+  even when the support wraps around the whole grid. An empty support is refused. The F64 total is `P Δt`
+  whatever the resolution or position. Storing into F32 rounds each cell once; the applied energy is reported,
+  and it is exact for dyadic fixtures.
+- A deposit adds `(q, q a)` with `||a||₂ ≤ 1` checked in F64. `unit_direction` shrinks by one ulp until that
+  holds exactly, because Appendix D's cone argument needs `≤ 1`, not `≈ 1`. Under `fixed-per-source`, moving a
+  source never changes its direction.
+- `PathSegment` integrates `s(u) = vT[a u + (b − a)(u³ − u⁴/2)]` analytically, so the speed is at most `v`.
+  The next segment starts at the wrapped endpoint with direction `b`, which keeps position and velocity
+  continuous at a join. The mid-tick fraction is `(2k + 1)/(2K)`, computed from integer ticks.
+- `exp_neg` uses only IEEE-754 `+ × ÷` in a fixed order with no FMA, so every conforming host computes the
+  same bits. The tests pin them, and they agree on macOS arm64 and Linux x86_64. Measured accuracy is 0 ulp at
+  the Appendix A decay factor, 1 ulp at 0.1 and 36 ulp at the kernel cutoff.
+- `advance_field` writes only the candidate buffer and reports `ε = (E' − E) − (I − D_decay)`. On error the
+  candidate must be discarded; the committed field is untouched.
 
 **Refusal cases.**
-- A zero cell count, or a nonfinite or nonpositive world or cell side.
-- Byte counts past `u64::MAX` or `isize::MAX`.
-- A buffer above its limit.
-- Any layout mismatch, including one of equal length.
-- A slice whose length disagrees with its declared layout.
-- Each inconsistent declaration listed under Invariants.
-- Non-F32 storage.
-- An unimplemented boundary, dtype, channel count or composition.
-- An initial energy beyond F32.
-- The first cell that violates INV-01 or INV-02, named by its coordinates.
+- Representation: a zero cell count, or a nonfinite or nonpositive world or cell side; byte counts past
+  `u64::MAX` or `isize::MAX`; a buffer above its limit; any layout mismatch, including one of equal length; a
+  slice whose length disagrees with its layout; each inconsistent declaration; non-F32 storage.
+- Unimplemented names: a boundary, dtype, channel count, composition, transport scheme, stability policy,
+  kernel, normalization or chemistry policy this crate does not implement.
+- Values: an initial energy beyond F32; a negative or nonfinite diffusion, decay or power; more than 1024
+  substeps; a nonpositive kernel width or cutoff; an empty support; a direction with `||a|| > 1`; a non-unit
+  path direction, an unwrapped anchor or a zero-tick segment.
+- Invariants: the first cell that violates INV-01 or INV-02.
 
-**Determinism.** Pure functions of their inputs, with fixed iteration orders. No hash-map iteration, and no
-parallel reduction here.
+**Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
+reduction, no platform `libm` in model arithmetic, and no random draws.
 
-**Validity domain.** `field-ecology-v1` with the `periodic` boundary, the `f32` field dtype and the `zero`
-composition, all implemented here. Layout schema `frankenlife.field-layout.v1`, host buffers only.
+**Validity domain.**
+- Implemented here: `field-ecology-v1` with `periodic`, `f32`, `zero`, `positive-five-point-v1`, `subcycle`,
+  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`.
+- Deterministic parts only: `seeded-unit-vectors` (normalization) and `seeded-smooth-torus-v1` (integration).
+- Host buffers in layout schema `frankenlife.field-layout.v1`.
 
-**Independent tests** (`tests/field_layout.rs`). Expected strides are NumPy's
-`np.zeros(shape, np.float32).strides`. The pinned digest is `shasum -a 256` of the literal canonical text. Byte
-counts are §19.3's table: 4 MiB, 128 MiB, 132 MiB and 264 MiB at 1024², measured on the real allocation as well
-as computed.
+**Independent tests.**
+- `tests/field_layout.rs`: NumPy strides, a `shasum` digest, and the §19.3 byte counts measured on the real
+  allocation.
+- `tests/transport_sources.rs`:
+  - C.6, both exact (dyadic `r`) and within half an ulp of the rational 1/5.
+  - A separately written `rem_euclid` oracle on a random rectangular field.
+  - Subcycling minimality across a sweep of diffusion values.
+  - Decay accounting that is exact.
+  - C.17 exact totals for 1, 2 and 4 support cells (the last across the periodic corner), and resolution and
+    position independence at 64², 128² and 256².
+  - Path continuity and the speed bound.
+  - `exp_neg` against `std` and against correctly rounded references.
+  - One simulated second (128 ticks) of the Appendix A field with 8 sources. The ledger closes, with a
+    cumulative residual of 1.7e-5, which is 2.7e-8 of the transfers; §21.4 proposes 1e-5.
 
 **Known gaps.**
-- Device arrangements such as channel-blocked tiles, device alignment, and sharding by maximum buffer length are
-  the Metal backend's work. Their layouts will need their own descriptors and benchmarks (§9.3, §9.2).
-- Transport and source injection are FL-004. Uptake and the reduction rule of the ledger are FL-005. Sensing and
-  the pyramid are FL-007.
-- Whole-run peak-memory admission is FL-043.
-- The cone tolerance values belong to a numerical profile that is not yet declared.
+- Seeded source centers, chemical directions and path directions need FL-010's Philox semantic addressing.
+  Uniform-by-angle path directions also need a host-independent `sin`/`cos`. Until then those two registry
+  entries stay `Specified`.
+- Cone tolerance. The values belong to an undeclared numerical profile. One finding: far from sources,
+  diffusion leaves subnormal F32 energies (about 1e-40) with no relative precision. A cone tolerance therefore
+  needs an absolute floor at F32's subnormal scale, and the 128-tick test uses `f32::MIN_POSITIVE`. Metal
+  commonly flushes subnormals to zero, so CPU–Metal parity (FL-031) must declare its subnormal policy.
+- The reference stencil computes in F64. A production F32 kernel is a separate numerical profile with its own
+  tolerances (§21.4).
+- Device arrangements, device alignment and sharding belong to the Metal backend. Uptake and the ledger's
+  reduction rule are FL-005, sensing and the pyramid FL-007, whole-run memory admission FL-043.

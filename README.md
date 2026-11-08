@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Status](https://img.shields.io/badge/status-design%20plan%20%C2%B7%20no%20code%20yet-orange)](#honest-status)
+[![Status](https://img.shields.io/badge/status-stack%20probes%20only%20%C2%B7%20no%20simulation%20yet-orange)](#honest-status)
 [![Runtime](https://img.shields.io/badge/runtime-asupersync-6f42c1)](#the-stack)
 [![Core](https://img.shields.io/badge/core-Rust%202024%20%C2%B7%20forbid%28unsafe%29-b7410e)](#architecture)
 [![Animation](https://img.shields.io/badge/animation-FrankenManim-1f6feb)](#the-stack)
@@ -42,13 +42,14 @@ history and its animation are three views of the same committed state.
 ## Honest status
 
 **The design is written down and has been through an independent mathematical, systems and integration audit
-(plan v0.2). There is no code yet.**
+(plan v0.2). The only code is the FL-001 probe crate that qualifies the dependency stack; there is no simulation
+code yet.**
 
 | Question | Answer |
 |---|---|
 | Is there a design? | **Yes.** [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md`](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md) (about 2,400 lines, §1–§28 plus Appendices A–E) covers the equations, the tick, data layout, accelerator design, the runtime protocol, rendering, checkpoints, 15 invariants, 11 gates, a complete starter configuration and 17 hand-computable fixtures. Its statements are labelled **Observed**, **Derived**, **Target** or **Hypothesis**; anything unlabelled is a proposed design |
-| Is there code? | **No.** The repository holds the plan, this README, the agent contract and toolchain settings. The first code is FL-001: compile one pinned Franken dependency closure and pass small capability probes |
-| Does the stack compose? | **Not yet shown.** The plan's source audit found the siblings pinning different revisions of Asupersync, FrankenTorch and FrankenNumPy (§12.8), and the native presenter FrankenManim uses does not yet deliver pointer or keyboard events (§13.1). Gate G0 settles both before anything broad is built |
+| Is there code? | **Only the stack probes.** `crates/flife-probes` (FL-001) compiles one pinned Franken dependency closure and checks it with capability probes. No part of the world, model or Studio is implemented |
+| Does the stack compose? | **Yes, on macOS (FL-001), except for input.** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter still delivers no pointer or keyboard events (§13.1); a real window probe records that, and FL-018 owns the fix. Linux hosts have not been qualified |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
 | Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 58 beads with the plan's 141 dependency edges in `.beads/` for `br` |
@@ -322,9 +323,9 @@ substitutes a different neural model.
 | Item | Pin |
 |---|---|
 | Rust toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition |
-| Asupersync | **Open.** The siblings currently pin different releases and revisions. FL-001 selects one version with one package id across the closure and records it |
-| FrankenTorch, FrankenNumPy, FrankenManim | **Open.** Research revisions are in plan §27.2; the qualified lockset goes into `franken-stack.lock` with the probes that passed it |
-| `rust-block` override | Reviewed revision `b39ae859…`, carried or requalified at this workspace root, because Cargo ignores a dependency's own `[patch]` (§12.8) |
+| Asupersync | v0.6.2 (`a5d23e8d`), one package id across the closure; the root `[patch.crates-io]` maps FrankenTorch's crates.io edge onto the same commit |
+| FrankenManim, FrankenTorch, FrankenNumPy | `ac39e721`, `c611501c`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
+| `rust-block` override | Reviewed revision `b39ae859…`, carried at this workspace root because Cargo ignores a dependency's own `[patch]` (§12.8) |
 
 ---
 
@@ -349,7 +350,10 @@ COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md   the design specification a
 AGENTS.md                                             the operating contract for coding agents
 README.md                                             this file
 LICENSE                                               MIT with the OpenAI/Anthropic rider
-rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint settings for the workspace to come
+rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint settings
+Cargo.toml, Cargo.lock                                the workspace, its pins and its root patches
+franken-stack.lock                                    the qualified dependency closure and its probe results
+crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
 .beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
 ```
 

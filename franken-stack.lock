@@ -1,0 +1,46 @@
+# franken-stack.lock — FrankenLife's qualified dependency closure
+# (FL-001 / flife-nw7, plan §12.8 and §18.5).
+#
+# Every FrankenSuite repository that Cargo.lock resolves is pinned here, with
+# the root patches FrankenLife carries and the capability probes that
+# qualified the combination. crates/flife-probes enforces the pins: its
+# closure probe fails if Cargo.lock resolves a suite repository at any other
+# commit, at two commits, or holds a second copy of a single-copy package
+# (asupersync, ft-kernel-metal, fnp-random-core, block and the rest).
+#
+# Moving a pin is deliberate. Change it here and in Cargo.toml in one commit,
+# re-run `flife-probe` on every qualified host, and replace that host's
+# [probes] rows with the new results, recording the old ones in the commit
+# message. Line format: section-tagged, tab-separated.
+
+[toolchain]
+rustc	nightly-2026-08-31
+edition	2024
+
+[repos]
+# repo	commit	role	notes
+asupersync	a5d23e8dd2c8d776bd02e2da8e38e6296600e84c	direct	the v0.6.2 release tag (crates.io 0.6.2); the sole async runtime; also the [patches] target, so FrankenTorch's crates.io edge resolves to this same package
+franken_manim	ac39e721ec0297156f5f3e0f1b33916e6232e5cb	direct	fmn umbrella (scene, DotCloud, certified CPU render); this commit moves Manim onto asupersync 0.6.2, frankentorch c611501c and franken_numpy 6492ff31
+frankentorch	c611501c0280ed09a796c517e071ff78ecb61c5a	direct	ft-api, ft-core, ft-runtime (asupersync-integration) and ft-kernel-metal (compute gateway and native presenter); the only GPU gateway
+franken_numpy	6492ff310c45ad72abf27e4394f68b9059770193	direct	fnp-random-core (PCG64DXSM, SeedSequence), fnp-ndarray, fnp-dtype
+frankenscipy	ae52b65454841cd4976f6fbac907be0539508d9b	transitive	via fmn, at franken_manim's SUITE.lock pin
+franken_markdown	c1754278a74810729825ea38f18a07a648b974b2	transitive	via fmn, at franken_manim's SUITE.lock pin
+franken_networkx	9d710b1c33e99412c94de7fa4de2f7ce4954110f	transitive	via fmn, at franken_manim's SUITE.lock pin
+frankenpandas	da85cf65df48965e027b2f5aa21b7d0ce6a7e29c	transitive	via fmn, at franken_manim's SUITE.lock pin
+
+[patches]
+# repo	commit	target	notes
+rust-block	b39ae859d1ee8e8cb5eef6a516471f1578d26b96	crates-io block	reviewed block 0.1.6 fork for metal 0.33: models the external Objective-C class symbol by raw address instead of an uninhabited extern static; same commit as franken_manim's SUITE.lock [patches] row
+# The asupersync patch (crates-io asupersync -> asupersync@a5d23e8d) is the [repos] row above.
+
+[probes]
+# probe	verdict	host	evidence
+closure	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; 295 packages; single-copy set 15; asupersync@a5d23e8d,franken_manim@ac39e721,franken_markdown@c1754278,franken_networkx@9d710b1c,franken_numpy@6492ff31,frankenpandas@da85cf65,frankenscipy@ae52b654,frankentorch@c611501c,rust-block@b39ae859
+runtime	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; lab order [0, 5, 4, 3, 2, 1] replayed identically; production spawn joined; ft-runtime Budget type unifies
+rng	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; PCG64DXSM(42) words 0xab1c50338e63481d,0x01bdf91d548d1872,0xa872905d0418d0a1,0x5f0a84270b80eabc; random() bits 0x3fe5638a0671cc69; advance(1000) 0x6cea836221a14f5f; SeedSequence and spawn key match NumPy 2.5.4
+array	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; (128,128,33) f32 C strides [16896, 132, 4] F strides [4, 512, 65536] nbytes 2162688; broadcast matches NumPy 2.5.4
+tensor	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; matmul [58.0, 64.0, 139.0, 154.0]
+manim_frame	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; 320x180 certified PNG sha256 820b5378a59f5755be4cdfd60deed853c70e009df7949d16741cfa904b0bb7e5 (8472 B), re-render identical; empty-scene control 7ae54c1993fc525986b08cd354c1de4c5173edd04cf75372a899a840578fd8a9
+metal	qualified	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; Apple M5 Ultra unified=true simd=32; 2x+1 over 256 f32 exact
+native_input	gap	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; gap tracked by flife-jdf; PresentationState = visible,occluded,closed
+native_window	gap	macos-27.0.1-arm64/Apple-M5-Ultra	2026-11-08; gap tracked by flife-jdf; real window, 30 polls, states occludedx1,visiblex29, typed input events 0

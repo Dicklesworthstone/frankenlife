@@ -153,7 +153,8 @@ After publishing `main`, fast-forward both local and remote `master` to the same
   - the source register S1–S22 with pinned research revisions (§27);
   - the starter configuration, artifact schemas, known-answer fixtures C.1–C.17 and the field-invariant proof
     (Appendices A–D).
-- `franken-stack.lock` (created by FL-001) records the qualified dependency closure and the probes that passed it.
+- `franken-stack.lock` records the qualified dependency closure and the probes that passed it. The closure probe in
+  `crates/flife-probes` (FL-001) fails the build's tests when `Cargo.lock` drifts from it.
 - Each substantial crate has a `CONTRACT.md` (plan §18.4) once another crate depends on it.
 
 When this file and the plan disagree on a technical rule, the plan wins; flag the discrepancy. When the plan and
@@ -264,9 +265,9 @@ The plan's labels apply to code comments, docs, commit messages and reports:
 | Item | Pin |
 |---|---|
 | Toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition; one Cargo workspace |
-| Async runtime | Asupersync, the sole runtime, with one package id per closure. **Open:** the siblings currently disagree (plan §12.8); FL-001 selects and records the version |
-| Sibling revisions | Research pins in plan §27.2; the qualified set goes into `franken-stack.lock` |
-| Root overrides | The reviewed `rust-block` override `b39ae859d1ee8e8cb5eef6a516471f1578d26b96` is carried or requalified at this workspace root, because Cargo ignores a dependency's own `[patch]` (plan §12.8) |
+| Async runtime | Asupersync v0.6.2 (`a5d23e8d`), the sole runtime, with one package id per closure. FrankenManim takes it from git and FrankenTorch from crates.io, so the root `[patch.crates-io]` maps the crates.io edge onto the same commit (plan §12.8) |
+| Sibling revisions | `franken_manim` `ac39e721`, `frankentorch` `c611501c`, `franken_numpy` `6492ff31`, plus FrankenManim's transitive pins; the full qualified set is in `franken-stack.lock` |
+| Root overrides | `[patch.crates-io]` in `Cargo.toml`: asupersync → `a5d23e8d`, and the reviewed `rust-block` `b39ae859d1ee8e8cb5eef6a516471f1578d26b96`. Both live at this root because Cargo ignores a dependency's own `[patch]` (plan §12.8) |
 
 Moving a pin is a deliberate event: requalify the capability probes and keep the old results.
 
@@ -609,10 +610,17 @@ The repository holds:
 - the comprehensive plan (v0.2, §1–§28, Appendices A–E);
 - this file, the README and the license;
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
-- the work graph in `.beads/` (58 beads, prefix `flife`).
+- the work graph in `.beads/` (58 beads, prefix `flife`);
+- the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
+- one crate, `crates/flife-probes` (FL-001), with its `CONTRACT.md`.
 
-There is no Cargo workspace, no crate and no `franken-stack.lock` yet. The first work item is FL-001. Nothing is
-implemented: every capability is a proposed design or a Target until its gate records a pass.
+`flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
+lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
+native-input gap. Run them with `cargo run -p flife-probes --bin flife-probe -- --window`, which prints NDJSON and
+opens a window. `cargo test` runs every probe except the window probe. Native typed input is a recorded gap,
+tracked by FL-018 (`flife-jdf`).
+
+No simulation code exists. Every world capability is a proposed design or a Target until its gate records a pass.
 
 ---
 

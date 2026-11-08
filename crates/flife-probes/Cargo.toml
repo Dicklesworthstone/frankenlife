@@ -1,0 +1,26 @@
+[package]
+name = "flife-probes"
+description = "FL-001 capability probes: qualify FrankenLife's pinned FrankenSuite dependency closure (runtime, RNG, array, tensor, Manim frame, Metal, native input)."
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "flife-probe"
+path = "src/main.rs"
+
+[dependencies]
+asupersync.workspace = true
+fmn.workspace = true
+fnp-dtype.workspace = true
+fnp-ndarray.workspace = true
+fnp-random-core.workspace = true
+ft-api.workspace = true
+ft-core.workspace = true
+ft-kernel-metal.workspace = true
+ft-runtime.workspace = true
+
+[lints]
+workspace = true

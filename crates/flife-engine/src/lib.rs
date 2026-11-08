@@ -1,5 +1,5 @@
-//! FrankenLife organism-phase reference operators (FL-006, FL-011; plan
-//! §5.3–§5.6, §7.4, §7.5, §8.1, §8.2).
+//! FrankenLife organism-phase reference operators and lifecycle (FL-006,
+//! FL-011, FL-012; plan §5.3–§5.6, §7.4–§7.7, §8.1, §8.2, §9.1).
 //!
 //! - [`chemistry`]: `bounded-affinity-v1` efficiency evaluated on each
 //!   granted cell packet, useful gain, toxicity clipped to what the organism
@@ -14,27 +14,42 @@
 //! - [`reproduction`]: phase 7's cooldown, Bernoulli attempt and viability
 //!   on the post-emission budget, and phase 8's birth transaction, with
 //!   early fixed logical quotas and all-or-nothing rollback (FL-011).
+//! - [`lifecycle`]: exhaustion rechecked after every budget stage,
+//!   `dissipate-and-record` tiny-reservoir clearing, deaths collected once
+//!   with their cause, and `genetic-affinity` recycling (FL-012).
+//! - [`population`]: live organisms as a structure of arrays behind a
+//!   stable-identity index, in a compacting or a free-list arrangement, with
+//!   transactional commits of deaths and births (FL-012).
 //!
 //! Each organism spends through a `flife_core::EnergyBudget` in the order of
 //! §8.2: it absorbs its gain, pays toxicity and maintenance, then pays for
 //! motion, then emission, then reproduction. Once its budget is exhausted it
-//! pays nothing more and absorbs nothing more. Death, recycling and the
-//! ordered tick are FL-012 and FL-013.
+//! pays nothing more and absorbs nothing more, and it dies. The ordered tick
+//! that strings these together is FL-013.
 
 #![forbid(unsafe_code)]
 
 pub mod chemistry;
 pub mod costs;
 pub mod emission;
+pub mod lifecycle;
 pub mod motion;
+pub mod population;
 pub mod reproduction;
 
 pub use chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, settle_efficiencies,
 };
-pub use costs::MaintenanceCosts;
+pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
+pub use lifecycle::{
+    BudgetStage, DISSIPATE_AND_RECORD, Death, DeathCause, DeathSettlement, Disposition, Fate,
+    GENETIC_AFFINITY, Recycling, TinyEnergyPolicy, Vitality,
+};
 pub use motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
+pub use population::{
+    Arrangement, Collected, Entrant, HeldOutput, Organism, POPULATION_DIGEST_SCHEMA, Population,
+};
 pub use reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity,
     CapacityShortfall, Identities, NEXT_TICK_ACTIVATION, Newborn, ParentState, PopulationQuota,

@@ -221,15 +221,20 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("grid-cic-v1", Role::ExchangeKernel, "§4.3, §5.1", "FL-005")
     },
-    // Clearing a tiny reservoir is the last budget stage before an
-    // exhausted organism dies (§8.2), so the lifecycle item owns it. The
-    // ledger's `tiny-reservoir` dissipation flow is ready for it.
-    entry(
-        "dissipate-and-record",
-        Role::TinyEnergyPolicy,
-        "§4.4, §8.2, A.1",
-        "FL-012",
-    ),
+    // Clearing a tiny reservoir is the last budget stage (§8.2): a
+    // reservoir strictly below the threshold is paid in full, recorded as
+    // the `tiny-reservoir` flow, and the organism dies of it.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/lifecycle.rs::tiny_reservoirs_below_the_threshold_are_dissipated_and_recorded",
+        },
+        ..entry(
+            "dissipate-and-record",
+            Role::TinyEnergyPolicy,
+            "§4.4, §8.2, A.1",
+            "FL-012",
+        )
+    },
     entry("zero", Role::InitialVelocity, "A.3 item 1", "FL-015"),
     entry("uniform", Role::InitialPositions, "A.3 item 1", "FL-015"),
     // FL-011's birth stage reports a fixed logical quota shortfall with
@@ -561,12 +566,21 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("next-tick", Role::NewbornActivation, "§6.6, §7.4", "FL-011")
     },
-    entry("genetic-affinity", Role::CorpseDirection, "§7.6", "FL-012"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/lifecycle.rs::recycling_returns_the_configured_fraction_with_the_genetic_affinity",
+        },
+        ..entry("genetic-affinity", Role::CorpseDirection, "§7.6", "FL-012")
+    },
+    // FL-012 refuses a numerical fault by identity and never collects it as
+    // a death, leaving the committed population unchanged
+    // (`flife_engine::Population`). Stopping the run and preserving the
+    // offending candidate is the ordered tick's.
     entry(
         "stop-and-preserve",
         Role::NumericalFaultPolicy,
         "§7.6",
-        "FL-012",
+        "FL-013",
     ),
     entry("cpu-reference", Role::Backend, "§10.1, §18.1", "FL-013"),
     entry("qualified-reference", Role::Determinism, "§16.1", "FL-013"),

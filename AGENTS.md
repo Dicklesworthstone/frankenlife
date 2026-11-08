@@ -614,7 +614,7 @@ The repository holds:
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
-  (FL-006, FL-011),
+  (FL-006, FL-011, FL-012),
   `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009, FL-010), each with its
   `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
 
@@ -670,6 +670,19 @@ FL-011 adds `emission` and `reproduction` to `flife-engine`, and `flife_field::d
   rolls the whole stage back. `Births::settle` re-checks each parent's budget and records one `child-endowment`
   transfer per birth. Pausing the tick on a `CapacityShortfall` is FL-013's.
 
+FL-012 adds `lifecycle` and `population` to `flife-engine`.
+- `Vitality` rechecks exhaustion after every §8.2 stage, in order, and keeps the first stage that exhausted the
+  organism. Nothing after it pays or acts. A survivor's fate needs the tiny-reservoir stage
+  (`dissipate-and-record`: strictly below the threshold, paid and recorded as `tiny-reservoir`).
+- `Death` is collected once, at the resulting position. An explicit removal's residual is removed, dissipated or
+  recycled (`genetic-affinity`: the configured fraction at the death position, carrying the organism's affinity,
+  through a separate `Deposits` reduction under `Transfer::Recycling`).
+- `Population` stores organisms as columns behind a `BTreeMap` identity index, as `Compact` or `FreeList`. It admits
+  identities once, in increasing order (INV-07). `commit` checks every death and birth before changing anything
+  and hands the entrants back on refusal. Never key anything scientific by slot; iterate with `ids` or `iter`.
+- `MaintenanceCosts::bill` splits the mandatory cost into `maintenance`, `sensor-cost` and `controller-cost`. A
+  partial payment covers them in that order.
+
 `flife-neural` (FL-007) is the sensor/action ABI. `observe` encodes a blended pyramid sample and the organism's
 own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y gradients saturated with
 `tanh(L ∂)`, five intrinsic inputs), with fixed local normalizers only, and returns the unsaturated gradients for
@@ -708,7 +721,7 @@ item 4's order:
 - invalid or effective no-op candidates are rejected, never reinterpreted;
 - when every candidate is rejected, every buffer has been abandoned and the quota is unchanged.
 
-No death, organism store or simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
+No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 
 ---
 

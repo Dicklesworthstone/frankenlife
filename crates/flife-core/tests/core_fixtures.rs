@@ -63,6 +63,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         "flife-engine::tests/emission_births.rs",
         include_str!("../../flife-engine/tests/emission_births.rs"),
     ),
+    (
+        "flife-engine::tests/lifecycle.rs",
+        include_str!("../../flife-engine/tests/lifecycle.rs"),
+    ),
 ];
 
 #[expect(

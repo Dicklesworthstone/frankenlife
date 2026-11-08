@@ -19,8 +19,18 @@ and 8, §8.2, INV-05, INV-06, A.3 item 10, Appendix C.4, C.5):
   child from `flife_genome::Mutator`, identities issued in stable parent order, a uniform-by-area child offset,
   and all-or-nothing rollback (`next-tick` newborn activation).
 
-The ordered tick that calls them is FL-013. This crate computes settlements, proposals and staged births; it does
-not own organisms or the field.
+FL-012 (`flife-3zm`) adds death, recycling, live storage and stable identity (plan §4.4, §7.6, §7.7, §8.2,
+§9.1, INV-01, INV-06, INV-07, A.1, Appendix C.7, C.12):
+- `lifecycle`: exhaustion rechecked after every §8.2 budget stage, `dissipate-and-record` tiny-reservoir clearing
+  as the last stage, deaths collected once with their cause at the resulting position, and `genetic-affinity`
+  recycling through `flife_field::Deposits` under `Transfer::Recycling`;
+- `population`: the live organisms as a structure of arrays behind an ordered stable-identity index, in a
+  `Compact` or a `FreeList` slot arrangement, with transactional commits of one tick's deaths and births;
+- `costs`: the mandatory cost split by ledger flow (`maintenance`, `sensor-cost`, `controller-cost`), with a
+  declared order for a partial payment.
+
+The ordered tick that calls them is FL-013. The crate computes settlements, proposals and staged births, and stores
+the committed organisms; the tick decides when each runs. It does not own the field.
 
 **Inputs.**
 - A `ValidatedConfig` (`[chemistry]`, `[costs]`, the timestep), or the constants directly.
@@ -34,6 +44,9 @@ not own organisms or the field.
   interval; one tick's `flife_neural::DecodedActions`; the world's `SemanticRng`; each parent's
   `ParentState` (identity, lineage, generation, post-motion position, cooldown deadline), post-emission budget and
   genome; the run's `GenomeQuota`, `Identities` and `Mutator`.
+- FL-012: `world.tiny_energy_policy` and its threshold, `[death]`, `population.maximum_count`; each organism's
+  budget after each stage; its resulting position and genetic affinity at death; an explicit removal's residual
+  and `Disposition`; founders and staged births as `Entrant`s (an `Organism` row and its sealed `Genome`).
 
 **Outputs.**
 - `Chemistry::efficiency`: `η(z) = η_max tanh(k a·z − b)`.
@@ -41,7 +54,10 @@ not own organisms or the field.
   toxicity `Payment` holding `T_req` and the paid `T`. `net() = G − T` and `dissipated() = U − G + T`.
   `record` enters an uptake transfer of `U` crediting `G` (its loss charged to `uptake-inefficiency`) and the
   paid toxicity.
-- `MaintenanceCosts::mandatory`: `Δt (c_basal + c_sensor s / s_unit) + c_neural P × evaluated`.
+- `MaintenanceCosts::mandatory`: `Δt (c_basal + c_sensor s / s_unit) + c_neural P × evaluated`, the total of
+  `MaintenanceCosts::bill` (FL-012). A `MaintenanceBill` holds the basal, sensor and controller terms.
+  `MaintenanceBill::settle` pays the total once and attributes it to them, and `MaintenanceSettlement::record`
+  books them as `maintenance`, `sensor-cost` and `controller-cost`.
 - `Motion`: `decay = e^(−γΔt)`, `force_coefficient = (1 − e^(−γΔt))/γ` (or `Δt` at `γ = 0`), `acceleration`,
   `propose`, `settle` (a `MotionSettlement` with the proposal, the applied velocity, the cost `Payment` and
   whether it was scaled) and `displace`.
@@ -57,6 +73,15 @@ not own organisms or the field.
   transfer per birth. `Births::abandon` returns every staged charge. A `CapacityShortfall` names the quota
   (`PopulationSlots` or `LogicalGenomeBytes`), the first parent it could not cover, the required and available
   amounts, every proposed parent in stable order, and how many births were covered.
+- `Vitality` (FL-012): per organism, the first `BudgetStage` that exhausted it, and its `Fate` (`Survives` or
+  `Dies(stage)`) once the tiny-reservoir stage has been checked.
+- `TinyEnergyPolicy::clear`: the cleared energy, for the `tiny-reservoir` flow.
+- `Death` (identity, genome, lineage, generation, tick, resulting position, `DeathCause`, residual), and
+  `Recycling::settle`'s `DeathSettlement` (removed, dissipated, recycled and offered; `record` books the first two).
+- `Population`: `admit`, `update`, `commit` (the `Collected` deaths, each with its last row and genome, for the
+  caller to retire), `get`, `iter` and `ids` in identity order, `slot` and `slots`, `genome`, `latest` and
+  `digest`, a SHA-256 of the canonical state in identity order without slots (`frankenlife.population-state.v1`).
+  `HeldOutput` hides an invalid output entirely.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -116,6 +141,36 @@ not own organisms or the field.
   the parent's lineage at the next generation. Both deadlines become `n + 1 + ⌈cooldown/Δt⌉`, and nothing else
   changes a deadline.
 
+**Invariants — death and stable identity (FL-012).**
+- `Vitality` checks every stage once, in §8.2 order (chemistry, maintenance, motion, emission, split, tiny
+  reservoir). The first stage that finds the budget exhausted is where the organism died, and nothing after it
+  pays or acts. Payments already made keep their effect. A survivor's fate needs the tiny-reservoir stage, so no
+  organism is published before it (INV-01).
+- `dissipate-and-record` clears a reservoir strictly below the threshold: the whole remainder is paid and
+  recorded as `tiny-reservoir`, and the organism dies of it.
+- The split never exhausts a parent: its kept share has a positive minimum, and rules without one are refused.
+- Natural death here is exhaustion and leaves no residual, so it recycles nothing. An explicit removal's residual
+  goes to `command-removal` (`Remove`), `unrecycled-death` (`Dissipate`) or the field (`Recycle`). Recycling
+  offers `f R` at the death position with the organism's own affinity as its chemistry, through a separate deposit
+  reduction booked as `recycling`. The field never receives more than the offer, and the rest is
+  `unrecycled-death`.
+- A death is committed once. A commit refuses a death of an organism that is not alive, a second death in one
+  commit, a death at another tick, and a death whose genome, lineage or generation is not the stored organism's.
+- Identities are admitted once, in strictly increasing order, so a dead identity is never resurrected (INV-07). A
+  reused slot gets every column rewritten. A newborn's held output is invalid and unreadable, so no stale
+  controller state reaches it.
+- A commit checks every death and birth before changing anything, and applies deaths and then births in identity
+  order. Each birth brings the genome its row names (INV-06). A refused commit or admission changes nothing and
+  hands the entrants back, so their quota charges can be returned. Columns are reserved to capacity, so a checked
+  commit neither fails nor allocates.
+- `update` changes only position, velocity, energy, energy-change rate, held output and cooldown deadline. A
+  stored organism always has finite state and strictly positive energy, and a fault is refused by identity, never
+  stored or collected as a death.
+- The two arrangements give the same rows, iteration order and digest after every commit. Only `slot` and
+  `slots` differ (C.7).
+- Maintenance is one payment of the bill's total. A partial payment covers basal, then sensor, then controller,
+  and the attribution rounds down, so the recorded flows never exceed the payment.
+
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
@@ -133,13 +188,21 @@ not own organisms or the field.
   `(0, 1)`; two requests from one parent, or requests of different ticks (`StateConflict`); an exhausted identity
   sequence or a generation past `u32::MAX` (`Overflow`); a population quota with more live organisms than its
   maximum; and settling against a missing, dead or changed parent budget (`StateConflict`, nothing recorded).
+- FL-012: a stage checked out of order or twice, or a survivor's fate before the tiny-reservoir stage
+  (`StateConflict`); a negative or nonfinite tiny threshold, a recycle fraction outside `[0, 1]`, a nonfinite
+  death position, or a negative or nonfinite residual; an exhaustion death claiming a residual (`StateConflict`);
+  a recycled affinity outside the unit ball; every commit and admission refusal above; a population above its
+  capacity (`BudgetExhausted`); a host-refused column (`AllocationFailed`); a nonfinite held output; and a negative
+  or nonfinite maintenance term.
 
 **Determinism.** Pure functions of their inputs. Sums run in channel or packet order and the packet sums are
 compensated. The only elementary functions are `flife_core::numerics` (`exp_neg`, `expm1_neg`, `tanh`) and the
 correctly rounded `sqrt`, so every IEEE-754 host computes the same bits. The integrated fixture pins a digest of
 its final organisms and field. FL-011's randomness is `fnp-philox-semantic-v1` on the frozen `birthing` stream,
 addressed by parent identity and attempt tick, plus the mutation stream. Staging order is ascending parent
-identity, so the births do not depend on request order, worker or storage slot.
+identity, so the births do not depend on request order, worker or storage slot. FL-012 draws nothing. The
+population's index is a `BTreeMap` and its free list a `BTreeSet`, so every order it exposes is identity order or
+a deterministic function of the commit history.
 
 **Independent tests.** `tests/organism_phase.rs`:
 - C.2 exactly: absorbed 3, `T_req = 5`, `T = 2`, dissipation 5 closing at `ε = 0`; recording `T_req` cannot close.
@@ -186,21 +249,56 @@ identity, so the births do not depend on request order, worker or storage slot.
     rollback on shortfall, rejected births consuming identities, a nearest-rounded parent share, and paying
     before staging.
 
+- `tests/lifecycle.rs` (FL-012, 14 tests):
+  - C.12 in both arrangements. Motion spends the last unit and the organism still moves. It dies at motion, then
+    neither emits nor splits, and is collected at its resulting position with nothing to recycle. The ledger closes
+    exactly with one dissipated unit, and the genome charge comes back. Resumed with field energy, the dead identity
+    demands nothing and absorbs nothing, and readmission, update and a second death are all refused.
+  - Exhaustion at chemistry, maintenance, motion, emission and the tiny reservoir, each against an exact ledger.
+    Every later stage pays nothing, and what was paid keeps its effect. A survivor runs every stage.
+  - Stage order and single checks; tiny clearing strictly below the threshold, including its `next_down`; recycling
+    with the genetic affinity in every channel, removal to `O`, dissipation, a zero fraction and the refusals.
+  - Single deaths, with refusals for duplicates, other ticks, never-born identities and mismatched genome,
+    lineage or generation. A refused commit returns the births.
+  - INV-07 readmission refusals, and capacity, order, tick, genome and INV-01 refusals, with nothing changed.
+  - Stale held outputs never reach a newborn in a reused slot; compacted survivors keep their own state.
+  - C.7: 48 ticks of random deaths, births and updates in both arrangements, with the same digest and rows after
+    every tick and different slot layouts.
+  - Numerical faults refused by identity, and updates that keep lifelong fields fixed. The digest sees each
+    changing field.
+  - Births and deaths committed together with FL-011's birth transaction. The parent keeps its share and deadline
+    and the ledger closes. Both arrangements agree.
+  - The maintenance bill against `mandatory` bit for bit at Appendix A, with partial payments covering basal
+    first, exactly.
+  - Sixteen planted bugs were each caught by at least one of these tests: keeping the last exhausting stage,
+    allowing a repeated stage, a fate without the tiny stage, clearing at the threshold, recycling the whole
+    residual, removal booked as dissipation, updates changing lineage fields, deaths not checked against the stored
+    identity, duplicate deaths collapsing, readmitting the latest identity, compaction not moving the index, a
+    reused slot keeping its held output, a free list that never reuses slots, a digest without the cooldown
+    deadline, maintenance covering sensor first, and controller cost booked as basal.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
-`pause-before-commit` at the birth stage.
+`pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`.
 
 **Known gaps.**
-- Maintenance is recorded as one `maintenance` flow. Splitting it into the ledger's `controller-cost` and
-  `sensor-cost` flows, and the order in which a partial payment covers them, is FL-012's with
-  `dissipate-and-record`.
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
-- Death collection, recycling deposits and tiny-reservoir clearing are FL-012. Recycling reuses
-  `flife_field::Deposits` as a separate reduction under `Transfer::Recycling`. Slot storage, compaction and
-  INV-07 are FL-012 as well. FL-011 reserves logical slots only.
-- Pausing the whole candidate tick on a `CapacityShortfall`, ordering deaths and births within phase 8, and
-  committing newborns and kept budgets with publication are FL-013. So is the exhibition-mode stable-ID birth
-  rejection policy, which no registered name selects yet.
+- The ordered tick (FL-013) has to do several things with these pieces:
+  - string the stages together per organism and record each flow;
+  - reduce emission deposits before recycling, both after the uptake debits;
+  - commit survivors' new state (including `(E_next − E_previous)/Δt`), births and deaths with publication;
+  - pause the whole candidate on a `CapacityShortfall`;
+  - stop the run and preserve the candidate on a numerical fault (`stop-and-preserve`, now owned by FL-013).
+
+  The exhibition-mode stable-ID birth rejection policy has no registered name yet.
+- Explicit removal needs a command to carry it, and the erase brush is a later command item. FL-012 supplies only
+  the settlement. Environmental hazards are not part of `field-ecology-v1`.
+- `Population` stores each genome as its own heap value. Packed slabs, generation-tagged handles,
+  epoch-aware reclamation after readers finish, and checkpointing the store are FL-013, FL-016 and FL-026.
+  The caller retires a collected genome's quota charge at once; readers holding its shared parameters keep them.
+- Field reservoirs are not cleared by the tiny-energy policy: A.1's "clears its moment consistently" has no
+  organism moment to act on in this model, and F32 subnormal cells are a numerical-profile matter (the field
+  contract's cone-tolerance gap).
 - Sensor gradients come from FL-007.
 - A Metal implementation is FL-032; its parity with this reference is a separate numerical profile.

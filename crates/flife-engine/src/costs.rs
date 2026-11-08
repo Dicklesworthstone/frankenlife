@@ -6,8 +6,22 @@
 //! ran this tick (including a newborn's forced evaluation). Costs come from
 //! canonical model work, never from wall-clock time, cache behavior, kernel
 //! padding or the backend, so every backend charges the same amount.
+//!
+//! A [`MaintenanceBill`] keeps the three terms apart, one per ledger flow:
+//! basal `Δt c_basal` (`maintenance`), sensor `Δt c_sensor (s / s_unit)`
+//! (`sensor-cost`) and controller `c_neural P` (`controller-cost`). The
+//! total is `(basal + sensor) + controller` in that order. For a
+//! power-of-two `Δt`, as in Appendix A, scaling by `Δt` is exact, so this is
+//! bit for bit `Δt [c_basal + c_sensor (s / s_unit)] + c_neural P`.
+//!
+//! Maintenance is one payment of the total, paid up to what the organism
+//! holds (§8.2). A partial payment covers the terms in the declared order
+//! basal, then sensor, then controller. The attribution rounds down, so the
+//! recorded flows never exceed the payment. Unpaid maintenance is never
+//! recorded as dissipation.
 
-use flife_core::{CoreError, TimeStep, ValidatedConfig};
+use flife_core::ledger::{EnergyBudget, Payment, TickLedger, sub_down};
+use flife_core::{CoreError, Flow, TimeStep, ValidatedConfig};
 
 /// The cost coefficients of `[costs]` that maintenance uses.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,7 +108,8 @@ impl MaintenanceCosts {
 
     /// The mandatory cost of one tick for an organism with sensing scale
     /// `sensing_scale` (world-length) and a controller of `parameters`
-    /// weights and biases, evaluated this tick or not.
+    /// weights and biases, evaluated this tick or not: the
+    /// [`MaintenanceBill::total`] of [`MaintenanceCosts::bill`].
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a nonpositive or nonfinite
@@ -106,18 +121,119 @@ impl MaintenanceCosts {
         parameters: u32,
         evaluated: bool,
     ) -> Result<f64, CoreError> {
+        Ok(self
+            .bill(step, sensing_scale, parameters, evaluated)?
+            .total())
+    }
+
+    /// The mandatory cost of one tick, by ledger flow.
+    ///
+    /// # Errors
+    /// As [`MaintenanceCosts::mandatory`].
+    pub fn bill(
+        &self,
+        step: TimeStep,
+        sensing_scale: f64,
+        parameters: u32,
+        evaluated: bool,
+    ) -> Result<MaintenanceBill, CoreError> {
         if !sensing_scale.is_finite() || sensing_scale <= 0.0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "sensing scale",
                 detail: format!("{sensing_scale} is not a positive length"),
             });
         }
-        let per_second = self.basal + self.sensor * (sensing_scale / self.sensor_unit_scale);
-        let neural = if evaluated {
-            self.neural * f64::from(parameters)
-        } else {
-            0.0
-        };
-        Ok(step.seconds_per_tick() * per_second + neural)
+        let seconds = step.seconds_per_tick();
+        Ok(MaintenanceBill {
+            basal: seconds * self.basal,
+            sensor: seconds * (self.sensor * (sensing_scale / self.sensor_unit_scale)),
+            controller: if evaluated {
+                self.neural * f64::from(parameters)
+            } else {
+                0.0
+            },
+        })
+    }
+}
+
+/// One tick's mandatory cost, by ledger flow.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaintenanceBill {
+    /// `Δt c_basal`: the `maintenance` flow.
+    pub basal: f64,
+    /// `Δt c_sensor (s / s_unit)`: the `sensor-cost` flow.
+    pub sensor: f64,
+    /// `c_neural P` when the controller ran, else zero: the `controller-cost`
+    /// flow.
+    pub controller: f64,
+}
+
+impl MaintenanceBill {
+    /// `(basal + sensor) + controller`.
+    #[must_use]
+    pub fn total(&self) -> f64 {
+        (self.basal + self.sensor) + self.controller
+    }
+
+    /// Pay the total from `budget`, up to what it holds, and attribute the
+    /// payment to basal, then sensor, then controller.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a negative or nonfinite term.
+    pub fn settle(&self, budget: &mut EnergyBudget) -> Result<MaintenanceSettlement, CoreError> {
+        for (quantity, value) in [
+            ("basal maintenance", self.basal),
+            ("sensor cost", self.sensor),
+            ("controller cost", self.controller),
+        ] {
+            if !(value.is_finite() && value >= 0.0) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity,
+                    detail: format!("{value} is not a finite nonnegative energy"),
+                });
+            }
+        }
+        let cost = budget.pay(self.total())?;
+        let basal = cost.paid.min(self.basal);
+        let rest = sub_down(cost.paid, basal);
+        let sensor = rest.min(self.sensor);
+        let controller = sub_down(rest, sensor);
+        Ok(MaintenanceSettlement {
+            cost,
+            paid: Self {
+                basal,
+                sensor,
+                controller,
+            },
+        })
+    }
+}
+
+/// One organism's maintenance payment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaintenanceSettlement {
+    /// The total, requested and paid.
+    pub cost: Payment,
+    /// What was paid toward each term.
+    pub paid: MaintenanceBill,
+}
+
+impl MaintenanceSettlement {
+    /// Record the paid terms as `maintenance`, `sensor-cost` and
+    /// `controller-cost`.
+    ///
+    /// # Errors
+    /// As [`TickLedger::record`].
+    pub fn record(&self, ledger: &mut TickLedger) -> Result<(), CoreError> {
+        for (flow, amount) in [
+            (Flow::Maintenance, self.paid.basal),
+            (Flow::SensorCost, self.paid.sensor),
+            (Flow::ControllerCost, self.paid.controller),
+        ] {
+            if amount > 0.0 {
+                ledger.record(flow, amount)?;
+            }
+        }
+        Ok(())
     }
 }

@@ -297,7 +297,7 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   that receive demand.
 - Per-packet chemistry, toxicity and affordable motion are in `flife-engine` (FL-006). Clearing tiny reservoirs
   and death are FL-012. Recycling a dead organism's energy reuses `Deposits` as a separate reduction booked under
-  `Transfer::Recycling` (FL-012). Device arrangements, device alignment and sharding belong to the Metal backend.
+  `Transfer::Recycling` (FL-012, `flife_engine::Recycling`). Device arrangements, device alignment and sharding belong to the Metal backend.
   Whole-run memory admission is FL-043.
 - The pyramid is rebuilt in full every tick in F64 (two thirds of the F32 base field's bytes). An F32 or Metal
   pyramid is a separate numerical profile. Its contract, with the sensor encoding, is

@@ -164,8 +164,10 @@ Every issue is reported, not just the first.
   visibility and `next-tick` newborn activation. `reject-birth-no-charge` now also cites the birth transaction's
   test. `pause-before-commit` stays `Specified` under FL-013, which owns pausing the tick. FL-011 supplies the
   `CapacityShortfall` it pauses on.
-- The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
-  stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
+- FL-012, in `flife-engine`: the tiny-energy policy `dissipate-and-record`, the last budget stage (§8.2), recorded
+  as the ledger's `tiny-reservoir` flow, and the `genetic-affinity` corpse direction. `stop-and-preserve` stays
+  `Specified` and moves to FL-013, which owns stopping the run. FL-012 supplies the refusal of a numerical fault
+  by identity.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
   vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it.
 - An `Implemented` entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited

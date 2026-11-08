@@ -1,0 +1,15 @@
+[package]
+name = "flife-genome"
+description = "FrankenLife immutable genomes, the dense topology catalog, logical genome quotas and topology transition maps"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flife-core = { path = "../flife-core" }
+flife-neural = { path = "../flife-neural" }
+
+[lints]
+workspace = true

@@ -748,6 +748,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flife-genome"
+version = "0.0.1"
+dependencies = [
+ "flife-core",
+ "flife-neural",
+]
+
+[[package]]
 name = "flife-neural"
 version = "0.0.1"
 dependencies = [

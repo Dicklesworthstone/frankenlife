@@ -118,8 +118,11 @@ Every issue is reported, not just the first.
   `fixed-local-scales-v1` in `flife-neural`. The heritable `sensing_scale` is sampled at any admitted scale
   there, and stays `Specified` under FL-010 for the same reason.
 - FL-008, in `flife-neural`: `independent-dense-mlp-v1`, the `tanh` hidden activation, the `linear` output
-  activation and `f32` accumulation. The `f32` weight dtype stays `Specified` under FL-009, which owns the
-  canonical genotype.
+  activation and `f32` accumulation.
+- FL-009, in `flife-genome`: the `f32` weight dtype of the canonical genotype, `dense-104-36-catalog-v1`,
+  `overlap-plus-zero-output-v1` and `prefix-and-identity-bridge-v1`. The founders' initializer
+  `fan-in-scaled-symmetric-v1` stays `Specified` under FL-010: its arithmetic is implemented, but it is
+  complete only with FL-010's semantic Philox addressing.
 - The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
   stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer

@@ -394,9 +394,12 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("linear", Role::OutputActivation, "§6.3", "FL-008")
     },
-    // The reference evaluator reads F32 weights; the canonical genotype that
-    // stores them, its rounding and its checkpoint identity are FL-009's.
-    entry("f32", Role::WeightDtype, "§10.3", "FL-009"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/genomes.rs::genomes_are_sealed_once_and_shared_read_only",
+        },
+        ..entry("f32", Role::WeightDtype, "§10.3", "FL-009")
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-neural::tests/controller.rs::accumulation_is_f32_bias_first_in_ascending_input_order",
@@ -414,30 +417,50 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-002",
         )
     },
+    // FL-009 implements the deterministic map from raw words to founders'
+    // parameters (`flife_genome::init`, evidence
+    // `founders_draw_each_weight_from_its_own_address`). A founder from a
+    // seed also needs FL-010's Philox semantic addressing, so the entry is
+    // complete with FL-010, as FL-004's seeded entries are.
     entry(
         "fan-in-scaled-symmetric-v1",
         Role::Initializer,
         "§7.2, A.3 item 2",
-        "FL-009",
+        "FL-010",
     ),
-    entry(
-        "dense-104-36-catalog-v1",
-        Role::TopologyCatalog,
-        "§6.4",
-        "FL-009",
-    ),
-    entry(
-        "overlap-plus-zero-output-v1",
-        Role::InheritanceMap,
-        "A.3 item 5",
-        "FL-009",
-    ),
-    entry(
-        "prefix-and-identity-bridge-v1",
-        Role::DepthChangeMap,
-        "A.3 item 6",
-        "FL-009",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/genomes.rs::catalog_is_section_6_4_in_order_under_the_parameter_cap",
+        },
+        ..entry(
+            "dense-104-36-catalog-v1",
+            Role::TopologyCatalog,
+            "§6.4",
+            "FL-009",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/genomes.rs::equal_depth_widening_preserves_the_parent_function",
+        },
+        ..entry(
+            "overlap-plus-zero-output-v1",
+            Role::InheritanceMap,
+            "A.3 item 5",
+            "FL-009",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/genomes.rs::deepening_inserts_an_identity_bridge",
+        },
+        ..entry(
+            "prefix-and-identity-bridge-v1",
+            Role::DepthChangeMap,
+            "A.3 item 6",
+            "FL-009",
+        )
+    },
     entry(
         "uniform-other-catalog-member",
         Role::TargetSelection,

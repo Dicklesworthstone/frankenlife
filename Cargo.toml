@@ -7,6 +7,7 @@ members = [
     "crates/flife-core",
     "crates/flife-engine",
     "crates/flife-field",
+    "crates/flife-genome",
     "crates/flife-neural",
     "crates/flife-probes",
 ]

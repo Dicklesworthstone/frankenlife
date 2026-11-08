@@ -613,8 +613,8 @@ The repository holds:
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
-  numerics), `crates/flife-field` (FL-003–FL-005 and the FL-007 pyramid), `crates/flife-engine` (FL-006) and
-  `crates/flife-neural` (FL-007, FL-008), each with its `CONTRACT.md`.
+  numerics), `crates/flife-field` (FL-003–FL-005 and the FL-007 pyramid), `crates/flife-engine` (FL-006),
+  `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009), each with its `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -668,6 +668,17 @@ ascending input order with no fused multiply-add, `tanh` evaluated in F64 and ro
 layer, over each organism's own parameters in `weight[out][in]`, `bias[out]` layer order. Its tests take their
 expected values from hand-set networks and a separate F64 oracle with a rigorous error bound, never from the
 evaluator itself (§21.1). Population inference (FL-025, FL-030) must match it within declared tolerances.
+
+`flife-genome` (FL-009) holds immutable genomes. `TopologyCatalog` is `dense-104-36-catalog-v1`, exactly §6.4's
+five rows in order. A member above `maximum_parameters` stays listed but is never admitted. `GenomeQuota`
+charges every live genome `P × 4` logical bytes, which deduplication never lowers, and also tracks allocated
+bytes. Both are checked before `try_reserve_exact`, and a refusal changes nothing. `Genome::seal` validates a
+filled `ParameterBuffer` once; a genome is never `Clone`, and readers share its parameters read-only. Traits
+are F64 and checked with the engine's norm bounds. `map_parameters` implements `overlap-plus-zero-output-v1`
+(widening preserves the function exactly) and `prefix-and-identity-bridge-v1`, writing every child value and
+asking the caller for one word per added incoming weight in ascending address order. Zeroing an added neuron's
+outgoing weights takes precedence over the identity bridge. FL-010 supplies those words (semantic Philox) and
+mutation.
 
 No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

@@ -178,6 +178,13 @@ impl FieldState {
         self.plane(ENERGY_PLANE).unwrap_or(&[])
     }
 
+    /// `Σ e_c` in F64, summed in cell-index order: the field's holdings for
+    /// the energy ledger.
+    #[must_use]
+    pub fn energy_total(&self) -> f64 {
+        crate::transport::sum(self.energy())
+    }
+
     /// The energy plane, writable.
     #[must_use]
     pub fn energy_mut(&mut self) -> &mut [f32] {

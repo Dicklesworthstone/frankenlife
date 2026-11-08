@@ -3,6 +3,7 @@
 **Purpose.** FL-002 (`flife-jb0`): the shared vocabulary every FrankenLife crate builds on (plan §18.1, §18.3). That
 covers identities, integer clocks, units, failure classes, the named-algorithm registry, the
 `frankenlife.config.v1` configuration with its A.2 validator, canonical serialization, and the model descriptor.
+FL-005 (`flife-f6x`) adds the global energy ledger (§4.4, §8.2, §21.4, INV-03 and INV-05).
 
 **Inputs.** Configuration TOML (Appendix A's schema). Every key is required and unknown keys are refused, so there
 are no hidden defaults.
@@ -19,6 +20,13 @@ are no hidden defaults.
   `SourceId`, `Generation`) and `IdSequence`.
 - `Tick`, `TickSpan`, `TimeStep`, `age_seconds` and `stable_phase`.
 - `CoreError` and the `REGISTRY`.
+- The ledger (FL-005):
+  - `Flow`: 15 named kinds, each in one `FlowClass`.
+  - `Transfer`: uptake, emission, child endowment and recycling, each with a named loss flow.
+  - `Holdings`, and `TickLedger` with its `TickClosure`.
+  - The run's `EnergyLedger` with its `LedgerReport`, and `ResidualBudget`.
+  - The per-organism `EnergyBudget`, with `Payment`.
+  - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -31,6 +39,25 @@ are no hidden defaults.
   Floats use shortest round-trip form with `-0.0` written as `0.0`.
 - Every named algorithm resolves to exactly one registry entry for its key. An unknown name, or a known name under
   the wrong key, is refused.
+- Ledger (INV-03).
+  - A tick closes with `ε = (𝓔_close − 𝓔_open) − (I − O − D)`, measured from holdings and never inferred from
+    flows.
+  - `|ε|` must be at most `absolute + per_tick × (𝓔_open + turnover)`.
+  - The cumulative `|Σε|` must be at most `absolute + cumulative × (𝓔_initial + Σ turnover)`.
+  - A breach is an error in every build profile. Every closure records the budget it was checked against.
+  - A transfer debits one holding, credits another, and charges the difference to its named loss. It can never
+    credit more than it debits.
+  - The run ledger refuses a tick that is out of order, or that does not open exactly where the previous tick
+    closed. Energy that changes between ticks without a flow is therefore caught.
+  - The report gives `|Σε|` against `𝓔_initial + turnover`, which is the gated measure. It also gives `|Σε|`
+    against initial energy alone and against current energy alone, the largest single-tick residual, and the
+    drift slope (§21.4).
+  - Sums are Neumaier-compensated and run in a fixed order.
+- Budgets (INV-05, §8.2).
+  - The balance is rounded down after every credit and payment, so in exact arithmetic
+    `Σ paid ≤ available + Σ credited`.
+  - A payment reports the requested and paid amounts separately.
+  - A budget that a payment empties stays exhausted. Later payments get nothing and credits are refused.
 
 **Refusal cases (A.2).**
 - Nonfinite numbers and negative costs.
@@ -50,24 +77,47 @@ are no hidden defaults.
 
 Every issue is reported, not just the first.
 
+**Refusal cases (ledger).**
+- A negative or nonfinite holding, flow, transfer, budget or payment.
+- A transfer that credits more than it debits.
+- A residual outside the per-tick or the cumulative allowance.
+- A tick that is out of order, does not open where the last one closed, or was checked against another budget.
+- A credit to an exhausted budget.
+
 **Not refused here (by design).**
 - The worst admitted allocation exceeding the logical quota. It is reported in `worst_case_fits_logical_quota`,
   and §7.5 admission enforces it at run time.
 - Host capability checks and backend/renderer combinations. Only one backend and one renderer are registered today.
 - Topology-catalog membership beyond depth and parameter cap (FL-009).
 
-**Registry status.** `field-ecology-v1` and the `stable-identity` phase policy are implemented here with fixtures.
-`flife-field` implements the `periodic` boundary, the `f32` field dtype and the `zero` field composition
-(FL-003). It also implements `positive-five-point-v1`, `subcycle`, `fixed-total-power`,
-`normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source` (FL-004). Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no
-known-answer vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it. An `Implemented`
-entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited function exists.
+**Registry status.**
+- Implemented here with fixtures: `field-ecology-v1` and the `stable-identity` phase policy.
+- Implemented in `flife-field`:
+  - FL-003: the `periodic` boundary, the `f32` field dtype and the `zero` field composition.
+  - FL-004: `positive-five-point-v1`, `subcycle`, `fixed-total-power`,
+    `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`.
+  - FL-005: `grid-cic-v1`.
+- The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
+  stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
+- Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
+  vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it.
+- An `Implemented` entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited
+  function exists.
 
-**Error classes.** `LayoutMismatch` covers a buffer whose declared layout is impossible or is not the one its
-reader requires; such a buffer is refused, never reinterpreted. `AllocationFailed` covers a host that refuses
-an allocation every checked limit admitted.
+**Error classes.**
+- `LayoutMismatch` covers a buffer whose declared layout is impossible or is not the one its reader requires.
+  Such a buffer is refused, never reinterpreted.
+- `AllocationFailed` covers a host that refuses an allocation every checked limit admitted.
+- `StateConflict` covers work prepared against one state and then offered to another state, or offered twice.
+  Examples are uptake grants applied to a changed field, a ledger tick that does not continue the last one, and
+  a credit to an exhausted budget. Nothing is changed.
 
 **Determinism.** Pure functions of their inputs. No hash-map iteration and no floating clocks. The canonical forms
-and both digests are pinned by tests.
+and both digests are pinned by tests. Ledger sums run in a fixed order.
+
+**Independent tests.** `tests/ledger.rs`:
+- C.1's accounting, checked exactly.
+- Round-down and the INV-05 bound, checked against exact `i128` arithmetic on dyadic values.
+- The cumulative gate tripping at a computed tick, and every reported normalization checked exactly.
 
 **Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`.

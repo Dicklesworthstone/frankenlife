@@ -9,6 +9,10 @@
   `positive-five-point-v1` transport with `subcycle` stability, exponential decay, and `fixed-total-power`
   deposits through the `normalized-truncated-minimum-image-gaussian-v1` kernel with `fixed-per-source`
   chemistry. It also covers the analytic `seeded-smooth-torus-v1` path integrator.
+- FL-005 (`flife-f6x`) covers local uptake (§5.1, §5.2, §11.3, A.1, Appendix C.1, INV-04). That is the
+  `grid-cic-v1` exchange footprint, A.1's saturating request, two-pass demand/grant resolution with
+  `cell-quantum-largest-remainder-v1` reconciliation, and the proportional field debit. The energy ledger it
+  feeds is `flife_core::ledger`.
 
 **Inputs.**
 - A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world`, `[field_initialization]`, `[sources]`).
@@ -17,11 +21,13 @@
 - A `ConeTolerance` taken from the declared numerical profile.
 - `Source`s for this tick: identity, sampled center, chemical direction and power. Segment directions for
   `PathSegment`. Seeded values come from FL-010; this crate draws no random numbers.
+- `Demand`s for this tick: organism identity, position and requested amount `d_i`. Each organism demands at
+  most once per tick.
 
 **Outputs.**
 - `FieldState`: one planar `[plane, y, x]` buffer of `33 G_x G_y` real `f32` values. Plane 0 holds energy;
   plane `k + 1` holds moment channel `k`. Every plane is a cell amount in `ecological-energy`; divide by
-  `cell_area` for a density.
+  `cell_area` for a density. `energy_total` gives the field's holdings for the ledger.
 - `FieldLayout`, `FieldView`, `relayout`, and `FieldPair` (current/next; `commit` swaps without reallocating).
 - `FieldFootprint`, `InitialEnergy` and `FieldSummary`.
 - `DeclaredLayout::canonical_text` and its SHA-256.
@@ -34,6 +40,11 @@
 - `PathSegment`: position, velocity, mid-tick fraction and the next segment.
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
 - `numerics::exp_neg`: a host-independent `exp(−x)`.
+- `ExchangeStencil`: an organism's footprint cells and weights, and its local density `Σ w_c e_c / (h_x h_y)`.
+  `saturating_request` gives `d = Δt U_max r/(K + r)`.
+- `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
+  `CellDebit` per demanded cell, each organism's total `U_i` in input order, and an `UptakeSummary`.
+  `apply_grants` debits the field.
 
 **Invariants — representation (FL-003).**
 - Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy
@@ -86,6 +97,37 @@
 - `advance_field` writes only the candidate buffer and reports `ε = (E' − E) − (I − D_decay)`. On error the
   candidate must be discarded; the committed field is untouched.
 
+**Invariants — uptake (FL-005).**
+- Consumption is local. The `grid-cic-v1` footprint at `x` uses the continuous index `(x/h_x − ½, y/h_y − ½)`.
+  Its floor selects the lower-left cell, and its fractional part gives the four bilinear weights, wrapped
+  periodically. A cell named twice on a grid one cell wide is combined into one entry, and zero weights are
+  dropped. Every footprint cell lies within one cell spacing of `x`, so a long-range sensor never becomes
+  long-range feeding.
+- The protocol has two passes over one immutable snapshot. First, each packet `q_ic = d_i w_ic` is formed, and
+  the packets are sorted by (cell, organism identity). Second, each cell sums `A_c` in that order and grants
+  with `α_c = min(1, e_c/A_c)`.
+- Reconciliation follows `cell-quantum-largest-remainder-v1`.
+  - A cell's F32 energy is `n_c` quanta of `Q_c`, its F32 unit in the last place. Grants are whole quanta.
+  - A contended cell grants all `n_c` quanta. An uncontended cell grants `round(A_c/Q_c)` quanta, ties to
+    even.
+  - Each packet first gets the floor of `α_c q_ic/Q_c` quanta. The leftover quanta go to the largest
+    remainders, with ties going to the lower identity.
+- Consequences of the reconciliation:
+  - Every grant is nonnegative and within one quantum of its ideal value.
+  - A cell's grants sum to exactly its debit, and the debit never exceeds its energy (INV-04).
+  - The new cell energy `(n_c − K_c) Q_c` is exact in F32, so the field loses exactly what is granted. Uptake
+    adds no residual to the ledger.
+- An uncontended request below half a quantum is granted nothing. Granting it would create energy the F32 cell
+  cannot give up.
+- Each organism's `U_i` is the round-down sum of its at most four exact packets. It therefore never exceeds what
+  its cells lost.
+- Grants depend on identities only. Permuting the demands permutes the totals and leaves every value and the
+  debited field identical bit for bit.
+- The debit scales the moment by `e'_c/e_c` in F64, rounded once to F32, and writes exactly zero when the cell
+  is drained. This removes composition in proportion and preserves the cone up to rounding.
+- Grants record each cell's pre-debit energy. Applying them twice, to another grid, or to a field whose
+  demanded cell has changed is refused before anything is written.
+
 **Refusal cases.**
 - Representation: a zero cell count, or a nonfinite or nonpositive world or cell side; byte counts past
   `u64::MAX` or `isize::MAX`; a buffer above its limit; any layout mismatch, including one of equal length; a
@@ -95,6 +137,12 @@
 - Values: an initial energy beyond F32; a negative or nonfinite diffusion, decay or power; more than 1024
   substeps; a nonpositive kernel width or cutoff; an empty support; a direction with `||a|| > 1`; a non-unit
   path direction, an unwrapped anchor or a zero-tick segment.
+- Uptake:
+  - A negative or nonfinite demand, or a nonfinite position.
+  - An organism that demands twice.
+  - A nonfinite or negative cell energy.
+  - A request law with negative capacity, nonpositive half-saturation or negative density.
+  - Grants applied twice, to another grid, or to a changed field.
 - Invariants: the first cell that violates INV-01 or INV-02.
 
 **Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
@@ -102,7 +150,7 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
 
 **Validity domain.**
 - Implemented here: `field-ecology-v1` with `periodic`, `f32`, `zero`, `positive-five-point-v1`, `subcycle`,
-  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`.
+  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1`, `fixed-per-source` and `grid-cic-v1`.
 - Deterministic parts only: `seeded-unit-vectors` (normalization) and `seeded-smooth-torus-v1` (integration).
 - Host buffers in layout schema `frankenlife.field-layout.v1`.
 
@@ -120,6 +168,24 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
   - `exp_neg` against `std` and against correctly rounded references.
   - One simulated second (128 ticks) of the Appendix A field with 8 sources. The ledger closes, with a
     cumulative residual of 1.7e-5, which is 2.7e-8 of the transfers; §21.4 proposes 1e-5.
+- `tests/uptake_ledger.rs`. Grants are whole quanta, so the oracles are integers.
+  - C.1 exactly: grants 4 and 6, the moment removed, 6.5 dissipated, `ε = 0`.
+  - The uncontended remainder and its moment.
+  - The two leftover quanta of `2^23/3` going to the two lowest identities under all six input orders.
+  - Rounding once per cell after aggregation, including ties to even.
+  - A million requests on one cell (§21.5).
+  - A 64² field with 100,000 organisms, half in a hotspot, with conservation checked in every cell.
+  - Footprint weights, wrapping, combination and locality.
+  - A.1's request law.
+  - Stale and duplicate application refused.
+  - A fault-injection lane taken from rust_scriptbots. Credit without debit, debit without credit, double
+    credit, an unrecorded loss, a gain above the grant, overspend repaired by clamping, double apply, a stale
+    field, a duplicate demand, recording requested rather than paid maintenance, and an unrecorded change
+    between ticks: each must fail through the check meant to catch it.
+  - One simulated second of the Appendix A world with 4,096 static organisms taking up energy and paying
+    maintenance, committed through the ledger every tick. The cumulative residual is 1.9e-5, which is 2.1e-9 of
+    initial energy plus turnover (§21.4 proposes 1e-5). The largest single-tick residual is 7.8e-7. The drift is
+    +1.3e-7 energy per tick and comes from phase 2's F32 rounding; uptake contributes none.
 
 **Known gaps.**
 - Seeded source centers, chemical directions and path directions need FL-010's Philox semantic addressing.
@@ -129,7 +195,14 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
   diffusion leaves subnormal F32 energies (about 1e-40) with no relative precision. A cone tolerance therefore
   needs an absolute floor at F32's subnormal scale, and the 128-tick test uses `f32::MIN_POSITIVE`. Metal
   commonly flushes subnormals to zero, so CPU–Metal parity (FL-031) must declare its subnormal policy.
+- Phase 2's residual drifts slowly upward (+1.3e-7 per tick at Appendix A scale). That is far inside budget, but
+  the endurance gate (G8) should track the slope.
 - The reference stencil computes in F64. A production F32 kernel is a separate numerical profile with its own
   tolerances (§21.4).
-- Device arrangements, device alignment and sharding belong to the Metal backend. Uptake and the ledger's
-  reduction rule are FL-005, sensing and the pyramid FL-007, whole-run memory admission FL-043.
+- `cell-quantum-largest-remainder-v1` is this crate's reconciliation. The configuration schema does not name a
+  reconciliation, so a different one would be a different numerical profile.
+- `UptakeSummary::contended_cells` counts every cell whose demand exceeds its energy, including empty cells
+  that receive demand.
+- Per-packet chemistry, toxicity and affordable motion are FL-006. Clearing tiny reservoirs and death are
+  FL-012. Device arrangements, device alignment and sharding belong to the Metal backend. Sensing and the
+  pyramid are FL-007, and whole-run memory admission is FL-043.

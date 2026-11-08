@@ -19,11 +19,18 @@
 //!   ledger terms (FL-004).
 //! - [`numerics`]: a host-independent `exp(−x)` for decay factors and
 //!   kernel weights.
+//! - [`exchange`]: the `grid-cic-v1` exchange footprint and A.1's
+//!   saturating request (FL-005).
+//! - [`uptake`]: two-pass demand/grant resolution with exact
+//!   `cell-quantum-largest-remainder-v1` reconciliation, and the
+//!   proportional field debit (FL-005).
 //!
-//! Uptake and the ledger are FL-005; sensing and the pyramid are FL-007.
+//! The energy ledger itself is `flife_core::ledger`. Sensing and the
+//! pyramid are FL-007.
 
 #![forbid(unsafe_code)]
 
+pub mod exchange;
 pub mod footprint;
 pub mod grid;
 pub mod invariants;
@@ -33,7 +40,9 @@ pub mod sources;
 pub mod state;
 pub mod step;
 pub mod transport;
+pub mod uptake;
 
+pub use exchange::{ExchangeStencil, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldSummary};
@@ -42,3 +51,6 @@ pub use sources::{DepositReport, PathSegment, Source, SourceKernel, SourceSuppor
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
 pub use step::{FieldStepReport, advance_field};
 pub use transport::{TransportPlan, TransportReport, TransportScratch};
+pub use uptake::{
+    CellDebit, Demand, GrantPacket, Grants, UptakeSummary, apply_grants, resolve_uptake,
+};

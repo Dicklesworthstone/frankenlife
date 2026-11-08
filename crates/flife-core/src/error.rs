@@ -2,9 +2,9 @@
 //!
 //! An API that can fail says how. Missing capability, budget exhaustion,
 //! schema mismatch, an incompatible checkpoint, queue closure, numerical
-//! invalidity, cancellation, integer overflow, a buffer layout mismatch and a
-//! refused allocation are separate variants, so a caller can never mistake
-//! one for another.
+//! invalidity, cancellation, integer overflow, a buffer layout mismatch, a
+//! refused allocation and a state conflict are separate variants, so a
+//! caller can never mistake one for another.
 
 use std::fmt;
 
@@ -103,6 +103,15 @@ pub enum CoreError {
         /// The bytes requested.
         bytes: u64,
     },
+    /// Work prepared against one state was offered to a different state, or
+    /// offered twice: for example uptake grants applied to a field that has
+    /// changed since they were resolved. Nothing is changed.
+    StateConflict {
+        /// The operation that was refused.
+        operation: &'static str,
+        /// The conflict that was found.
+        detail: String,
+    },
 }
 
 impl fmt::Display for CoreError {
@@ -139,6 +148,9 @@ impl fmt::Display for CoreError {
             }
             Self::AllocationFailed { buffer, bytes } => {
                 write!(f, "host refused a {bytes}-byte {buffer} allocation")
+            }
+            Self::StateConflict { operation, detail } => {
+                write!(f, "{operation} refused: {detail}")
             }
             Self::InvalidConfig(issues) => {
                 write!(f, "invalid configuration ({} issues)", issues.len())?;

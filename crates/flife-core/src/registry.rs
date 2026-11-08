@@ -215,12 +215,20 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("subcycle", Role::StabilityPolicy, "§4.5, §8.4", "FL-004")
     },
-    entry("grid-cic-v1", Role::ExchangeKernel, "§4.3, §5.1", "FL-005"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/uptake_ledger.rs::exchange_footprints_are_bilinear_local_and_periodic",
+        },
+        ..entry("grid-cic-v1", Role::ExchangeKernel, "§4.3, §5.1", "FL-005")
+    },
+    // Clearing a tiny reservoir is the last budget stage before an
+    // exhausted organism dies (§8.2), so the lifecycle item owns it. The
+    // ledger's `tiny-reservoir` dissipation flow is ready for it.
     entry(
         "dissipate-and-record",
         Role::TinyEnergyPolicy,
-        "§4.4, A.1",
-        "FL-005",
+        "§4.4, §8.2, A.1",
+        "FL-012",
     ),
     entry("zero", Role::InitialVelocity, "A.3 item 1", "FL-015"),
     entry("uniform", Role::InitialPositions, "A.3 item 1", "FL-015"),

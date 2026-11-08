@@ -8,12 +8,14 @@
 //! - [`error`]: distinct failure classes.
 //! - [`registry`]: every named algorithm, policy and dtype a configuration
 //!   may use, with its contract, owner and status.
-//! - [`config`], [`schema`], [`validate`], [`canonical`]: the
+//! - [`config`], [`schema`], [`validate`](mod@validate), [`canonical`]: the
 //!   `frankenlife.config.v1` configuration, its table of units and bounds,
 //!   the A.2 validator and the canonical serialization with its hash.
 //! - [`descriptor`]: the model descriptor and its identity hash.
 //! - [`model`]: fixed facts of `field-ecology-v1` and checked capacity
 //!   arithmetic.
+//! - [`ledger`]: the global energy ledger (INV-03), its residual budget,
+//!   and per-organism energy budgets that never spend twice (INV-05).
 
 #![forbid(unsafe_code)]
 
@@ -23,6 +25,7 @@ pub mod config;
 pub mod descriptor;
 pub mod error;
 pub mod ids;
+pub mod ledger;
 pub mod model;
 pub mod registry;
 pub mod schema;
@@ -34,4 +37,8 @@ pub use clock::{Tick, TickSpan, TimeStep};
 pub use config::RunConfig;
 pub use descriptor::ModelDescriptor;
 pub use error::{ConfigIssue, CoreError};
+pub use ledger::{
+    EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, LedgerReport, Payment, ResidualBudget,
+    TickClosure, TickLedger, Transfer,
+};
 pub use validate::{ValidatedConfig, ValidationReport, validate};

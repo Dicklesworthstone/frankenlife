@@ -612,8 +612,8 @@ The repository holds:
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
-- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002) and `crates/flife-field` (FL-003, FL-004), each
-  with its `CONTRACT.md`.
+- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger) and `crates/flife-field`
+  (FL-003–FL-005), each with its `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -626,7 +626,10 @@ conversion, units, `CoreError`, the named-algorithm registry, and `frankenlife.c
 comes with its A.2 validator, its canonical TOML and configuration hash, and the model descriptor and its hash.
 The tests parse Appendix A's TOML straight out of the plan. Editing Appendix A or the schema table therefore
 moves the pinned hashes deliberately or fails the tests. A new named algorithm must be added to
-`registry::REGISTRY` with its plan section and owning FL item.
+`registry::REGISTRY` with its plan section and owning FL item. `ledger` (FL-005) is the global energy ledger.
+A tick opens and closes against measured holdings and is checked against a declared `ResidualBudget`; a breach
+is an error in every build profile. The run ledger refuses a tick that does not open where the last one closed.
+An `EnergyBudget` never pays out more than it holds (INV-05).
 
 `flife-field` holds the field: one planar `[plane, y, x]` buffer of real `f32` values per state (energy plus 32
 moments), held as a current/next pair. Its layout descriptor gets its strides from FrankenNumPy. Readers name
@@ -637,7 +640,10 @@ of the tick: the `positive-five-point-v1` stencil with CFL subcycling (never cla
 charged to dissipation, and normalized truncated minimum-image Gaussian deposits of exactly `P Δt` per
 source. `advance_field` writes only the candidate buffer and reports `I`, `D` and `ε`. Model arithmetic avoids
 platform `libm`: `numerics::exp_neg` gives identical bits on every IEEE-754 host. Seeded source draws await
-FL-010. Uptake and sensing are FL-005 and FL-007.
+FL-010. FL-005 adds uptake: the `grid-cic-v1` footprint, A.1's saturating request, and two-pass demand/grant
+resolution that grants whole F32 quanta of each cell (`cell-quantum-largest-remainder-v1`), so grants never
+exceed a cell and the field loses exactly what organisms receive. Grants depend on identities, not slots, and
+refuse to apply twice or to a changed field. Sensing is FL-007.
 
 No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

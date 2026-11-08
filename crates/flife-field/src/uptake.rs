@@ -1,0 +1,497 @@
+//! Simultaneous uptake without overspending (plan §5.2, §11.3, INV-04,
+//! Appendix C.1).
+//!
+//! Uptake is a two-pass demand-and-grant protocol over one immutable field
+//! snapshot.
+//!
+//! 1. Organism `i` requests `d_i ≥ 0`. The request is spread over its
+//!    exchange footprint as packets `q_ic = d_i w_ic`.
+//! 2. Packets are sorted by (cell, organism identity). Each cell sums its
+//!    demand `A_c` in that order and grants `u_ic = α_c q_ic`, where
+//!    `α_c = min(1, e_c/A_c)` and `α_c = 0` when `A_c = 0`.
+//!
+//! Finite precision needs a defined reconciliation. This module implements
+//! `cell-quantum-largest-remainder-v1`:
+//! - A cell's F32 energy is a whole number `n_c` of quanta `Q_c`, where
+//!   `Q_c` is its F32 unit in the last place, a power of two. Grants are
+//!   whole quanta.
+//! - A contended cell (`A_c > e_c`) grants exactly `n_c` quanta and is
+//!   drained.
+//! - An uncontended cell grants `round(A_c/Q_c)` quanta, with ties to even
+//!   and never more than `n_c`.
+//! - The quanta are apportioned by largest remainder. Each packet first gets
+//!   the floor of its ideal share `α_c q_ic / Q_c`. Leftover quanta go to
+//!   the largest fractional parts, with ties going to the lower identity.
+//!
+//! Therefore:
+//! - Each grant is nonnegative and within one quantum of its ideal value.
+//! - A cell's grants sum to exactly its debit, and the debit never exceeds
+//!   its energy (INV-04).
+//! - The new cell energy `(n_c − K_c) Q_c` is exactly representable in F32.
+//!   The field loses exactly what organisms are granted, so uptake adds no
+//!   residual to the ledger.
+//! - The result depends on organism identities, never on storage slots or
+//!   input order.
+//!
+//! An uncontended request below half a quantum is granted nothing. The F32
+//! field cannot represent that change, and granting it anyway would create
+//! energy.
+//!
+//! Applying grants debits each cell's energy and scales its moment by
+//! `e'_c/e_c`, which removes the same proportion of composition. Grants
+//! carry the pre-debit cell energies. Applying them to a field that no
+//! longer holds those values, or applying them twice, is refused before
+//! anything is written.
+
+use flife_core::CoreError;
+use flife_core::ids::OrganismId;
+use flife_core::ledger::{CompensatedSum, add_down};
+use flife_core::model::MOMENT_CHANNELS;
+
+use crate::exchange::ExchangeStencil;
+use crate::grid::FieldGrid;
+use crate::state::FieldState;
+
+/// The finite-precision reconciliation this module implements.
+pub const CELL_QUANTUM_LARGEST_REMAINDER_V1: &str = "cell-quantum-largest-remainder-v1";
+
+/// One organism's uptake request for this tick.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Demand {
+    /// The requesting organism. Each organism may demand once per tick.
+    pub organism: OrganismId,
+    /// Its position. The exchange footprint is taken here.
+    pub position: [f64; 2],
+    /// `d_i`, the total energy requested this tick.
+    pub amount: f64,
+}
+
+/// One organism's grant from one cell.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GrantPacket {
+    /// The cell.
+    pub cell: usize,
+    /// The organism.
+    pub organism: OrganismId,
+    /// The index of the organism's [`Demand`] in the resolved slice.
+    pub demand: usize,
+    /// `q_ic = d_i w_ic`.
+    pub requested: f64,
+    /// `u_ic`: whole quanta of the cell, exact in F64.
+    pub granted: f64,
+}
+
+/// One cell's debit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellDebit {
+    /// The cell.
+    pub cell: usize,
+    /// Its energy when the grants were resolved.
+    pub energy_before: f32,
+    /// Its energy after the debit: exactly `energy_before − granted`.
+    pub energy_after: f32,
+    /// `A_c`, the cell's total demand.
+    pub demanded: f64,
+    /// `Σ_i u_ic`, exact.
+    pub granted: f64,
+    /// Whether `A_c > e_c`.
+    pub contended: bool,
+}
+
+/// Totals for one resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct UptakeSummary {
+    /// `Σ_c A_c`.
+    pub requested: f64,
+    /// `Σ_c Σ_i u_ic`.
+    pub granted: f64,
+    /// Cells with demand.
+    pub cells: usize,
+    /// Cells whose demand exceeded their energy.
+    pub contended_cells: usize,
+    /// Cells left with no energy.
+    pub drained_cells: usize,
+    /// The most packets competing for one cell.
+    pub largest_cell_packets: usize,
+}
+
+/// The grants of one resolution, reusable from tick to tick so that
+/// steady-state ticks do not allocate (§9.4).
+#[derive(Debug, Clone, Default)]
+pub struct Grants {
+    grid: Option<FieldGrid>,
+    packets: Vec<GrantPacket>,
+    debits: Vec<CellDebit>,
+    totals: Vec<f64>,
+    summary: UptakeSummary,
+    applied: bool,
+    identities: Vec<(OrganismId, usize)>,
+    shares: Vec<Share>,
+    rank: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Share {
+    quanta: u64,
+    remainder: f64,
+}
+
+impl Grants {
+    /// Empty grants.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every packet, sorted by (cell, organism).
+    #[must_use]
+    pub fn packets(&self) -> &[GrantPacket] {
+        &self.packets
+    }
+
+    /// Every cell with demand, in ascending cell order.
+    #[must_use]
+    pub fn debits(&self) -> &[CellDebit] {
+        &self.debits
+    }
+
+    /// `U_i = Σ_c u_ic` for each demand, in the order the demands were
+    /// given. Each total is summed in cell order and rounded down, so it
+    /// never exceeds the energy its cells lost.
+    #[must_use]
+    pub fn totals(&self) -> &[f64] {
+        &self.totals
+    }
+
+    /// The resolution's totals.
+    #[must_use]
+    pub const fn summary(&self) -> UptakeSummary {
+        self.summary
+    }
+
+    /// Whether these grants have been applied.
+    #[must_use]
+    pub const fn is_applied(&self) -> bool {
+        self.applied
+    }
+
+    fn reset(&mut self) {
+        self.grid = None;
+        self.packets.clear();
+        self.debits.clear();
+        self.totals.clear();
+        self.summary = UptakeSummary::default();
+        self.applied = false;
+        self.identities.clear();
+    }
+}
+
+/// Resolve `demands` against the immutable `field` snapshot into `grants`.
+/// The field is not changed; [`apply_grants`] debits it.
+///
+/// # Errors
+/// - [`CoreError::StateConflict`] when an organism demands twice.
+/// - [`CoreError::NumericalInvalid`] for a negative or nonfinite amount, a
+///   nonfinite position, or an invalid cell energy.
+///
+/// On error `grants` is left empty.
+pub fn resolve_uptake(
+    field: &FieldState,
+    demands: &[Demand],
+    grants: &mut Grants,
+) -> Result<UptakeSummary, CoreError> {
+    grants.reset();
+    let result = resolve_into(field, demands, grants);
+    if result.is_err() {
+        grants.reset();
+    }
+    result
+}
+
+fn resolve_into(
+    field: &FieldState,
+    demands: &[Demand],
+    grants: &mut Grants,
+) -> Result<UptakeSummary, CoreError> {
+    let grid = *field.grid();
+    grants.identities.extend(
+        demands
+            .iter()
+            .enumerate()
+            .map(|(index, demand)| (demand.organism, index)),
+    );
+    grants.identities.sort_unstable();
+    if let Some(pair) = grants
+        .identities
+        .windows(2)
+        .find(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(CoreError::StateConflict {
+            operation: "uptake demand",
+            detail: format!(
+                "organism {} demands twice (entries {} and {}); an organism cannot be granted the same tick twice",
+                pair[0].0.get(),
+                pair[0].1,
+                pair[1].1
+            ),
+        });
+    }
+    for (index, demand) in demands.iter().enumerate() {
+        if !demand.amount.is_finite() || demand.amount < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "uptake demand",
+                detail: format!(
+                    "organism {} requests {}",
+                    demand.organism.get(),
+                    demand.amount
+                ),
+            });
+        }
+        let stencil = ExchangeStencil::at(&grid, demand.position)?;
+        for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+            let requested = demand.amount * weight;
+            if requested > 0.0 {
+                grants.packets.push(GrantPacket {
+                    cell,
+                    organism: demand.organism,
+                    demand: index,
+                    requested,
+                    granted: 0.0,
+                });
+            }
+        }
+    }
+    grants
+        .packets
+        .sort_unstable_by_key(|packet| (packet.cell, packet.organism));
+
+    let energy = field.energy();
+    let mut summary = UptakeSummary::default();
+    let (mut requested, mut granted) = (CompensatedSum::ZERO, CompensatedSum::ZERO);
+    let mut start = 0;
+    while let Some(first) = grants.packets.get(start) {
+        let cell = first.cell;
+        let length = grants.packets[start..]
+            .iter()
+            .position(|packet| packet.cell != cell)
+            .unwrap_or(grants.packets.len() - start);
+        let value = energy
+            .get(cell)
+            .copied()
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "field",
+                detail: format!("exchange cell {cell} is not in this field"),
+            })?;
+        let debit = resolve_cell(
+            &mut grants.packets[start..start + length],
+            cell,
+            value,
+            &mut grants.shares,
+            &mut grants.rank,
+        )?;
+        requested.add(debit.demanded);
+        granted.add(debit.granted);
+        summary.cells += 1;
+        summary.contended_cells += usize::from(debit.contended);
+        summary.drained_cells += usize::from(debit.granted > 0.0 && debit.energy_after == 0.0);
+        summary.largest_cell_packets = summary.largest_cell_packets.max(length);
+        grants.debits.push(debit);
+        start += length;
+    }
+    summary.requested = requested.value();
+    summary.granted = granted.value();
+
+    grants.totals.resize(demands.len(), 0.0);
+    for packet in &grants.packets {
+        let total = &mut grants.totals[packet.demand];
+        *total = add_down(*total, packet.granted);
+    }
+    grants.summary = summary;
+    grants.grid = Some(grid);
+    Ok(summary)
+}
+
+/// Resolve one cell's packets, which are in identity order.
+fn resolve_cell(
+    packets: &mut [GrantPacket],
+    cell: usize,
+    energy: f32,
+    shares: &mut Vec<Share>,
+    rank: &mut Vec<usize>,
+) -> Result<CellDebit, CoreError> {
+    if !energy.is_finite() || energy < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "field energy",
+            detail: format!("cell {cell} holds {energy}"),
+        });
+    }
+    let mut demand = CompensatedSum::ZERO;
+    for packet in packets.iter() {
+        demand.add(packet.requested);
+    }
+    let demanded = demand.value();
+    let contended = demanded > f64::from(energy);
+    let (quantum, quanta) = quanta_of(energy);
+    if quanta == 0 {
+        return Ok(CellDebit {
+            cell,
+            energy_before: energy,
+            energy_after: energy,
+            demanded,
+            granted: 0.0,
+            contended,
+        });
+    }
+    // `quanta < 2^24`, so these conversions are exact.
+    let whole = quanta as f64;
+    let (target, scale) = if contended {
+        (quanta, whole / demanded)
+    } else {
+        // Uncontended: `A_c ≤ e_c`, so the rounded quotient is at most
+        // `n_c`; `min` guards the edge.
+        let ideal = (demanded / quantum).round_ties_even().min(whole);
+        (ideal as u64, 1.0 / quantum)
+    };
+
+    shares.clear();
+    let mut floors = 0_u64;
+    for packet in packets.iter() {
+        let ideal = packet.requested * scale;
+        let floor = ideal.floor();
+        // `ideal ≤ n_c (1 + rounding) < 2^25`.
+        let share = floor as u64;
+        floors += share;
+        shares.push(Share {
+            quanta: share,
+            remainder: ideal - floor,
+        });
+    }
+    rank.clear();
+    rank.extend(0..packets.len());
+    if floors < target {
+        // Largest remainder first; ties to the lower identity.
+        rank.sort_unstable_by(|&a, &b| {
+            shares[b]
+                .remainder
+                .total_cmp(&shares[a].remainder)
+                .then(a.cmp(&b))
+        });
+        let mut deficit = target - floors;
+        while deficit > 0 {
+            for &index in rank.iter() {
+                if deficit == 0 {
+                    break;
+                }
+                shares[index].quanta += 1;
+                deficit -= 1;
+            }
+        }
+    } else if floors > target {
+        // Smallest remainder first; ties to the higher identity.
+        rank.sort_unstable_by(|&a, &b| {
+            shares[a]
+                .remainder
+                .total_cmp(&shares[b].remainder)
+                .then(b.cmp(&a))
+        });
+        let mut surplus = floors - target;
+        while surplus > 0 {
+            for &index in rank.iter() {
+                if surplus == 0 {
+                    break;
+                }
+                if shares[index].quanta > 0 {
+                    shares[index].quanta -= 1;
+                    surplus -= 1;
+                }
+            }
+        }
+    }
+    for (packet, share) in packets.iter_mut().zip(shares.iter()) {
+        packet.granted = share.quanta as f64 * quantum;
+    }
+    // `(n_c − K_c) Q_c` is an integer below 2^24 times a power of two at
+    // least 2^-149, so it is exact in F32.
+    let energy_after = ((quanta - target) as f64 * quantum) as f32;
+    Ok(CellDebit {
+        cell,
+        energy_before: energy,
+        energy_after,
+        demanded,
+        granted: target as f64 * quantum,
+        contended,
+    })
+}
+
+/// A nonnegative F32 energy as `(Q, n)` with `energy = n Q` exactly: `Q` is
+/// its unit in the last place and `n < 2^24`.
+fn quanta_of(energy: f32) -> (f64, u64) {
+    let bits = energy.to_bits();
+    let exponent = (bits >> 23) & 0xff;
+    let fraction = u64::from(bits & 0x7f_ffff);
+    let quanta = if exponent == 0 {
+        fraction
+    } else {
+        fraction | 0x80_0000
+    };
+    // `Q = 2^(max(exponent, 1) − 150)`: biased F64 exponent
+    // `max(exponent, 1) + 873`.
+    let quantum = f64::from_bits(u64::from(exponent.max(1) + 873) << 52);
+    (quantum, quanta)
+}
+
+/// Debit `field` by `grants`: each cell's energy becomes its debit's
+/// `energy_after`, and its moment is scaled by `e'_c/e_c` (exactly zero when
+/// the cell is drained). Returns the energy debited.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] when the grants were already applied, were
+/// resolved for another grid, or any debited cell no longer holds the
+/// energy they were resolved against. Nothing is written.
+pub fn apply_grants(field: &mut FieldState, grants: &mut Grants) -> Result<f64, CoreError> {
+    let conflict = |detail: String| CoreError::StateConflict {
+        operation: "uptake grants",
+        detail,
+    };
+    if grants.applied {
+        return Err(conflict("these grants were already applied".into()));
+    }
+    if grants.grid != Some(*field.grid()) {
+        return Err(conflict(
+            "these grants were resolved for another grid".into(),
+        ));
+    }
+    let energy = field.energy();
+    for debit in &grants.debits {
+        let current = energy.get(debit.cell).copied();
+        if current.map(f32::to_bits) != Some(debit.energy_before.to_bits()) {
+            return Err(conflict(format!(
+                "cell {} holds {current:?}, but the grants were resolved against {}",
+                debit.cell, debit.energy_before
+            )));
+        }
+    }
+    if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
+        return Err(conflict("a moment plane is missing".into()));
+    }
+    let energy = field.energy_mut();
+    for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
+        energy[debit.cell] = debit.energy_after;
+    }
+    for channel in 0..MOMENT_CHANNELS {
+        let plane = field
+            .moment_mut(channel)
+            .ok_or_else(|| conflict(format!("moment plane {channel} is missing")))?;
+        for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
+            let moment = &mut plane[debit.cell];
+            *moment = if debit.energy_after == 0.0 {
+                0.0
+            } else {
+                let ratio = f64::from(debit.energy_after) / f64::from(debit.energy_before);
+                (f64::from(*moment) * ratio) as f32
+            };
+        }
+    }
+    grants.applied = true;
+    Ok(grants.summary.granted)
+}

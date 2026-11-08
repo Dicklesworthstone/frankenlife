@@ -7,9 +7,13 @@
 - Decoding of the 36 raw outputs of a linear final layer into a reproduction attempt probability, a child energy
   fraction and an emission proposal.
 
-The pyramid itself, its storage and its sampling are `flife_field::pyramid`; this crate encodes and decodes. The
-scalar reference controller and the FrankenTorch population adapter are FL-008. Applying decoded actions
-(emission, reproduction) is FL-011.
+FL-008 (`flife-6fh`) covers the scalar reference controller between the two (plan §6.2, §6.5, §10.1, §10.3, C.11,
+C.16): `independent-dense-mlp-v1` with `tanh` hidden layers, a `linear` output layer and `f32` accumulation in a
+declared order. It is the known-answer oracle that accelerated routes are compared against.
+
+The pyramid itself, its storage and its sampling are `flife_field::pyramid`; this crate encodes, evaluates and
+decodes. The FrankenTorch population adapter is FL-025 and the Metal kernels are FL-030. Genomes, their storage and
+initialization are FL-009. Applying decoded actions (emission, reproduction) is FL-011.
 
 **Inputs.**
 - A `flife_field::RawSample`: the blended raw densities `R`, `M_0..M_31` and their physical derivatives along x
@@ -19,6 +23,8 @@ scalar reference controller and the FrankenTorch population adapter are FL-008. 
 - `SensorScales` (`[sensors]`): `R_scale`, `L_gradient`, `R_floor`, `E_scale`, the age, velocity and
   energy-change scales, and the admitted sensing-scale range.
 - 36 raw controller outputs, the `TimeStep`, and `ActionDecoding` (`[reproduction]`, `[emission]`).
+- For the controller: a `DenseTopology` (`[controller]`, or hidden widths directly), one organism's own F32
+  parameters in the declared layout, and `maximum_absolute_parameter`.
 
 **Outputs.**
 - `observe` returns an `Observation`:
@@ -37,6 +43,10 @@ scalar reference controller and the FrankenTorch population adapter are FL-008. 
     when the gate is open and the direction is valid.
 - Index constants for every ABI slot (`VALUES`, `X_DERIVATIVES`, …, `EMISSION_SPEND`), with `SENSOR_WIDTH = 104`
   and `ACTION_WIDTH = 36`.
+- `DenseTopology`: hidden widths, `parameter_count` (`P`, weights plus biases, the figure maintenance charges), and
+  each layer's `LayerShape`, which maps `weight[out][in]` and `bias[out]` to packed offsets.
+- `ReferenceController::evaluate` returns the 36 raw F32 outputs of the linear final layer, and `widen` gives the
+  exact F64 values `decode` reads. `ControllerScratch` is reusable activation storage.
 
 **Invariants.**
 - Normalization comes after blending. The pyramid stores raw densities only. A coarse composition is a ratio of
@@ -55,6 +65,20 @@ scalar reference controller and the FrankenTorch population adapter are FL-008. 
   threshold, emits nothing. The decoder returns fractions, never amounts. A held output is decoded again each tick
   against that tick's budget.
 - Decoding happens before any state changes (§6.3).
+- Controller arithmetic, the reference F32 profile:
+  - each F64 input is rounded once to F32;
+  - neuron `o` accumulates `((b_o + w_o,0 x_0) + w_o,1 x_1) + …` in F32: the bias first, then the inputs in
+    ascending index, every product and sum rounded, no fused multiply-add;
+  - a hidden activation is `flife_core::numerics::tanh` of the F32 pre-activation, in F64, rounded once to F32;
+  - the output layer is linear, so its `z` is the raw output.
+- Parameter layout: layers in evaluation order, each `weight[out][in]` row-major and then `bias[out]` (torch's
+  `parameters_to_vector` order). A neuron is named by layer and index, not by packed offset (A.3 item 5).
+- Every parameter is finite and within `±maximum_absolute_parameter`, checked when the controller is built. ABI
+  inputs are saturated or regularized ratios of magnitude about one, so every affine calculation stays far from
+  F32 overflow; an input large enough to overflow anyway is refused.
+- Independent weights (§6.5, INV-13). A controller is a view over one organism's own parameters; organisms of a
+  topology share only its shape. Scratch carries nothing from one evaluation to the next, whatever topology used
+  it before.
 
 **Refusal cases.**
 - A negative or nonfinite sensed density, a negative or nonfinite internal energy or age, or any nonfinite input
@@ -67,10 +91,15 @@ scalar reference controller and the FrankenTorch population adapter are FL-008. 
   zero threshold.
 - A configuration naming another sensor schema, normalization, pyramid filter, scale blend or zero-direction
   policy (`UnknownAlgorithm`).
+- Controller: no hidden layer or more than two, a zero width, a parameter count past `usize` (`Overflow`), a
+  parameter slice of the wrong length (`LayoutMismatch`), a nonfinite or out-of-bound parameter, a nonpositive or
+  nonfinite bound, an input that is not finite in F32, and a pre-activation that overflows. Overflow is refused,
+  never saturated. Another controller family, activation, weight dtype or accumulation dtype is `UnknownAlgorithm`.
 
 **Determinism.** Pure functions of their inputs, in fixed channel order. The only elementary functions are
 `flife_core::numerics` (`tanh`, `sigmoid`, `expm1_neg`, `log2`) and the correctly rounded `sqrt`, so every
 IEEE-754 host computes the same bits. The pyramid's coarse levels are F64 and each is a fixed-order 2×2 average.
+The controller uses F32 `+` and `×` in the declared order; Rust never contracts them into a fused multiply-add.
 
 **Independent tests.** `tests/sensing.rs`:
 - C.10: a uniform field on a 32² grid with four levels gives one identical observation at eight scales (blended
@@ -96,14 +125,49 @@ IEEE-754 host computes the same bits. The pyramid's coarse levels are F64 and ea
   sub-threshold directions emitting nothing with the gate open, and overflow refused.
 - Decoding constants checked one by one.
 
+`tests/controller.rs`. The expected values do not come from the evaluator. The hand-set networks have dyadic
+weights, so every pre-activation is exact. Their `tanh` values were computed to 60 digits and rounded directly to
+F32, and each lies at least 0.10 F32 ulp from a rounding midpoint.
+- C.11: zero weights with nonzero hidden biases, on a real observation, pass the output biases through bit for bit.
+  Within Appendix A's `|p| ≤ 4` that is `σ(4) = 0.98201379`, against `tanh(4) ≈ 0.99932930` for a `tanh` head. The
+  literal logit 8 is outside that bound, so it runs under a declared fixture bound of 8 and decodes to
+  `0.99966465`. A logit of 8 is still reachable within the bound: a hidden unit saturated at exactly 1, through
+  weight 4, plus bias 4.
+- A hand-set `104 → 2 → 36` network: all 36 outputs pinned bit for bit.
+- C.16: `tanh(1) = 0x3f42f7d6` (`≈ 0.76159416`) through one hidden layer, and `tanh(tanh(1)) = 0x3f245b18`
+  (`≈ 0.64201499`) through an identity bridge.
+- The accumulation order: with `b = 2^-22` and products `±4`, the declared order gives `0` for `(4, −4)` and
+  `2^-22` for `(−4, 4)`. Products first, descending order and F64 accumulation each give a different answer.
+  Inputs are rounded to F32 once.
+- The layout of `104 → 3 → 2 → 36` by hand (431 parameters), with edits at named indices reaching exactly the
+  outputs they name, including through the middle layer.
+- An input-major F64 oracle with `std`'s `tanh` over four topologies and 96 evaluations, under a rigorous running
+  error bound (`γ_n Σ|w x|` per dot product, plus propagated and rounding error). The largest observed error is
+  5.3e-7, or 0.5% of its bound.
+- INV-13: two genomes of one topology answer differently, and a shared scratch alternating between narrow, wide
+  and default topologies gives the same bits as fresh scratch.
+- §6.4's parameter counts (1,164; 4,548; 9,988; 18,628; 29,316) and Appendix A's default layer offsets.
+- Refusals, including the first F32 value above the bound and a finite input that overflows its pre-activation.
+- A regression pin: the digest of 64 evaluations of a seeded default network. The same constant is checked on
+  macOS arm64 and on Linux x86_64.
+
 **Validity domain.** `energy-moment-gradient-104-v1` with `fixed-local-scales-v1`, `positive-box-v1`,
-`log-linear-v1` and `no-emission-no-charge`, for the 32-channel field of `field-ecology-v1`.
+`log-linear-v1` and `no-emission-no-charge`, for the 32-channel field of `field-ecology-v1`. The controller covers
+`independent-dense-mlp-v1` with one or two hidden layers, `tanh`, `linear` and `f32` accumulation over F32
+weights: the reference F32 profile of §10.3.
 
 **Known gaps.**
 - Mutation of the heritable sensing scale (A.3 item 4) is FL-010's, so that registry entry stays `Specified`
   under FL-010. This crate samples at any admitted scale.
-- The controller that produces the 36 outputs from the 104 inputs is FL-008. Charging for emission, reproduction
-  attempts and their budget order are FL-011.
+- Charging for emission, reproduction attempts and their budget order are FL-011.
+- The reference controller is scalar and single-threaded: 9,856 multiply-adds per default evaluation, written for
+  a declared order rather than for speed. Population inference is FL-025 (FrankenTorch CPU) and FL-030 (Metal),
+  each a separate numerical profile compared against this one under declared tolerances. Metal contracts
+  multiply-adds by default, so bitwise parity is not expected there.
+- Genome storage, the `f32` weight-dtype entry (canonical rounding and checkpoint identity), the
+  `fan-in-scaled-symmetric-v1` initializer and the topology catalog are FL-009. The tests draw A.3 item 2's
+  distribution from a local generator, not from FL-010's Philox addressing.
+- Held raw outputs and the evaluation cadence (§6.6) belong to the ordered tick, FL-013.
 - The reference pyramid is F64 and rebuilt in full each tick. A Metal pyramid (FL-032) and an F32 pyramid are
   separate numerical profiles with their own tolerances.
 - Bilinear interpolation is `C^0`. A gradient-following organism sees a jump in its derivative at each knot. That

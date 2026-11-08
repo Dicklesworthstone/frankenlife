@@ -614,7 +614,7 @@ The repository holds:
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005 and the FL-007 pyramid), `crates/flife-engine` (FL-006) and
-  `crates/flife-neural` (FL-007), each with its `CONTRACT.md`.
+  `crates/flife-neural` (FL-007, FL-008), each with its `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -662,7 +662,12 @@ own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y g
 `tanh(L ∂)`, five intrinsic inputs), with fixed local normalizers only, and returns the unsaturated gradients for
 motion. Normalization comes after blending, never inside the pyramid. `decode` turns 36 linear outputs into
 `λ`, `p = 1 − e^(−λΔt)`, `β`, the emission gate and an optional unit-direction emission proposal; sigmoid is
-applied exactly once and every rate goes through `expm1_neg` (C.11). The controller itself is FL-008.
+applied exactly once and every rate goes through `expm1_neg` (C.11). Between them, `ReferenceController` (FL-008)
+is the scalar known-answer oracle for `independent-dense-mlp-v1`: F32 inputs, F32 accumulation bias-first in
+ascending input order with no fused multiply-add, `tanh` evaluated in F64 and rounded once, and a linear output
+layer, over each organism's own parameters in `weight[out][in]`, `bias[out]` layer order. Its tests take their
+expected values from hand-set networks and a separate F64 oracle with a rigorous error bound, never from the
+evaluator itself (§21.1). Population inference (FL-025, FL-030) must match it within declared tolerances.
 
 No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

@@ -371,16 +371,38 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("log-linear-v1", Role::PyramidBlend, "§6.1", "FL-007")
     },
-    entry(
-        "independent-dense-mlp-v1",
-        Role::ControllerFamily,
-        "§6.2, §6.5",
-        "FL-008",
-    ),
-    entry("tanh", Role::HiddenActivation, "§6.2", "FL-008"),
-    entry("linear", Role::OutputActivation, "§6.3", "FL-008"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/controller.rs::hand_set_network_matches_independent_known_answers",
+        },
+        ..entry(
+            "independent-dense-mlp-v1",
+            Role::ControllerFamily,
+            "§6.2, §6.5",
+            "FL-008",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/controller.rs::c16_a_tanh_layer_is_not_an_identity",
+        },
+        ..entry("tanh", Role::HiddenActivation, "§6.2", "FL-008")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/controller.rs::c11_zero_weights_pass_output_biases_through_a_linear_layer",
+        },
+        ..entry("linear", Role::OutputActivation, "§6.3", "FL-008")
+    },
+    // The reference evaluator reads F32 weights; the canonical genotype that
+    // stores them, its rounding and its checkpoint identity are FL-009's.
     entry("f32", Role::WeightDtype, "§10.3", "FL-009"),
-    entry("f32", Role::AccumulationDtype, "§10.3", "FL-008"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/controller.rs::accumulation_is_f32_bias_first_in_ascending_input_order",
+        },
+        ..entry("f32", Role::AccumulationDtype, "§10.3", "FL-008")
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-core::tests/core_fixtures.rs::stable_phase_is_identity_mod_interval",

@@ -117,6 +117,9 @@ Every issue is reported, not just the first.
 - FL-007: `positive-box-v1` and `log-linear-v1` in `flife-field`; `energy-moment-gradient-104-v1` and
   `fixed-local-scales-v1` in `flife-neural`. The heritable `sensing_scale` is sampled at any admitted scale
   there, and stays `Specified` under FL-010 for the same reason.
+- FL-008, in `flife-neural`: `independent-dense-mlp-v1`, the `tanh` hidden activation, the `linear` output
+  activation and `f32` accumulation. The `f32` weight dtype stays `Specified` under FL-009, which owns the
+  canonical genotype.
 - The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
   stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer

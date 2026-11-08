@@ -42,6 +42,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         "flife-neural::tests/sensing.rs",
         include_str!("../../flife-neural/tests/sensing.rs"),
     ),
+    (
+        "flife-neural::tests/controller.rs",
+        include_str!("../../flife-neural/tests/controller.rs"),
+    ),
 ];
 
 #[expect(

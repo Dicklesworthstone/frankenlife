@@ -1,0 +1,16 @@
+[package]
+name = "flife-field"
+description = "FrankenLife field representation: typed F32 energy-and-moment planes on a periodic grid, a FrankenNumPy-checked layout descriptor, buffer limits and field invariants"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flife-core = { path = "../flife-core" }
+fnp-dtype.workspace = true
+fnp-ndarray.workspace = true
+
+[lints]
+workspace = true

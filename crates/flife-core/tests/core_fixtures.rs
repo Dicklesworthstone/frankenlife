@@ -18,6 +18,15 @@ use flife_core::{
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
 const THIS_FILE: &str = include_str!("core_fixtures.rs");
 
+/// The test files a registry `test:<crate>::<path>::<fn>` citation may name.
+const EVIDENCE_FILES: &[(&str, &str)] = &[
+    ("flife-core::tests/core_fixtures.rs", THIS_FILE),
+    (
+        "flife-field::tests/field_layout.rs",
+        include_str!("../../flife-field/tests/field_layout.rs"),
+    ),
+];
+
 #[expect(
     clippy::expect_used,
     reason = "test helper: a failure here is a test failure"
@@ -587,9 +596,13 @@ fn registry_names_are_unique_per_role_and_cite_their_owners() {
             && entry.owner[3..].chars().all(|c| c.is_ascii_digit());
         assert!(owner_ok, "{} has owner {}", entry.name, entry.owner);
         if let Status::Implemented { evidence } = entry.status {
-            let function = evidence.rsplit("::").next().unwrap();
+            let cited = evidence.strip_prefix("test:").unwrap();
+            let (file, function) = cited.rsplit_once("::").unwrap();
+            let source = EVIDENCE_FILES
+                .iter()
+                .find_map(|&(name, source)| (name == file).then_some(source));
             assert!(
-                THIS_FILE.contains(&format!("fn {function}()")),
+                source.is_some_and(|source| source.contains(&format!("fn {function}()"))),
                 "{} cites missing evidence {evidence}",
                 entry.name
             );

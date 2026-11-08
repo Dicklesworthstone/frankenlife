@@ -186,8 +186,18 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("field-ecology-v1", Role::Model, "§4, Appendix A", "FL-002")
     },
-    entry("periodic", Role::Boundary, "§4.1", "FL-003"),
-    entry("f32", Role::FieldDtype, "§4.2, §10.3", "FL-003"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/field_layout.rs::minimum_image_is_half_open_and_adds_no_rounding",
+        },
+        ..entry("periodic", Role::Boundary, "§4.1", "FL-003")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/field_layout.rs::actual_f32_allocation_at_1024_squared",
+        },
+        ..entry("f32", Role::FieldDtype, "§4.2, §10.3", "FL-003")
+    },
     entry(
         "positive-five-point-v1",
         Role::TransportScheme,
@@ -210,7 +220,12 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "§7.5",
         "FL-013",
     ),
-    entry("zero", Role::FieldComposition, "§4.2", "FL-003"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/field_layout.rs::appendix_a_initial_field_is_uniform_with_zero_moments",
+        },
+        ..entry("zero", Role::FieldComposition, "§4.2", "FL-003")
+    },
     entry(
         "fixed-total-power",
         Role::SourceNormalization,

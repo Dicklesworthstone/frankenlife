@@ -2,8 +2,9 @@
 //!
 //! An API that can fail says how. Missing capability, budget exhaustion,
 //! schema mismatch, an incompatible checkpoint, queue closure, numerical
-//! invalidity, cancellation and integer overflow are separate variants, so a
-//! caller can never mistake one for another.
+//! invalidity, cancellation, integer overflow, a buffer layout mismatch and a
+//! refused allocation are separate variants, so a caller can never mistake
+//! one for another.
 
 use std::fmt;
 
@@ -85,6 +86,23 @@ pub enum CoreError {
     },
     /// A configuration failed validation. Every issue found is listed.
     InvalidConfig(Vec<ConfigIssue>),
+    /// A buffer's declared layout is impossible, or differs from the layout
+    /// its reader requires (plan §9.3). The buffer is refused, never
+    /// reinterpreted from its length.
+    LayoutMismatch {
+        /// The buffer, for example `field`.
+        buffer: &'static str,
+        /// The first difference or impossibility found.
+        detail: String,
+    },
+    /// The host refused an allocation that every checked limit admitted. It
+    /// is reported instead of aborting the process (INV-15).
+    AllocationFailed {
+        /// The buffer being allocated.
+        buffer: &'static str,
+        /// The bytes requested.
+        bytes: u64,
+    },
 }
 
 impl fmt::Display for CoreError {
@@ -115,6 +133,12 @@ impl fmt::Display for CoreError {
             Self::Overflow { quantity } => write!(f, "{quantity} overflow refused"),
             Self::UnknownAlgorithm { role, name } => {
                 write!(f, "{role} names unknown or inadmissible algorithm `{name}`")
+            }
+            Self::LayoutMismatch { buffer, detail } => {
+                write!(f, "{buffer} layout refused: {detail}")
+            }
+            Self::AllocationFailed { buffer, bytes } => {
+                write!(f, "host refused a {bytes}-byte {buffer} allocation")
             }
             Self::InvalidConfig(issues) => {
                 write!(f, "invalid configuration ({} issues)", issues.len())?;

@@ -42,13 +42,13 @@ history and its animation are three views of the same committed state.
 ## Honest status
 
 **The design is written down and has been through an independent mathematical, systems and integration audit
-(plan v0.2). The code so far is foundations: the FL-001 stack probes and the FL-002 core contracts. There is no
-simulation code yet.**
+(plan v0.2). The code so far is foundations: the FL-001 stack probes, the FL-002 core contracts and the FL-003
+field buffers. Nothing advances a world yet.**
 
 | Question | Answer |
 |---|---|
 | Is there a design? | **Yes.** [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md`](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md) (about 2,400 lines, §1–§28 plus Appendices A–E) covers the equations, the tick, data layout, accelerator design, the runtime protocol, rendering, checkpoints, 15 invariants, 11 gates, a complete starter configuration and 17 hand-computable fixtures. Its statements are labelled **Observed**, **Derived**, **Target** or **Hypothesis**; anything unlabelled is a proposed design |
-| Is there code? | **Foundations only.** `crates/flife-probes` (FL-001) qualifies the pinned dependency closure. `crates/flife-core` (FL-002) defines identities, integer clocks, units, errors, the named-algorithm registry, the validated Appendix A configuration and its canonical hashes. No part of the world, model or Studio is implemented |
+| Is there code? | **Foundations only.** `crates/flife-probes` (FL-001) qualifies the pinned dependency closure. `crates/flife-core` (FL-002) defines identities, integer clocks, units, errors, the named-algorithm registry, the validated Appendix A configuration and its canonical hashes. `crates/flife-field` (FL-003) holds the field as 33 typed F32 planes on a periodic grid, with a FrankenNumPy-checked layout descriptor, checked buffer limits, the configured initial field and the INV-01/INV-02 checks. Nothing yet injects, transports, senses or consumes energy, and no organism, model step or Studio exists |
 | Does the stack compose? | **Yes (FL-001), except for input.** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter still delivers no pointer or keyboard events (§13.1); a real window probe records that, and FL-018 owns the fix. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
@@ -354,6 +354,7 @@ rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint set
 Cargo.toml, Cargo.lock                                the workspace, its pins and its root patches
 franken-stack.lock                                    the qualified dependency closure and its probe results
 crates/flife-core/                                    FL-002 IDs, clocks, units, errors, registry, config validation and hashes
+crates/flife-field/                                   FL-003 typed F32 field buffers, layout descriptor, limits, field invariants
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
 .beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
 ```

@@ -612,7 +612,8 @@ The repository holds:
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
-- `crates/flife-probes` (FL-001) and `crates/flife-core` (FL-002), each with its `CONTRACT.md`.
+- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002) and `crates/flife-field` (FL-003), each with its
+  `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -627,7 +628,14 @@ The tests parse Appendix A's TOML straight out of the plan. Editing Appendix A o
 moves the pinned hashes deliberately or fails the tests. A new named algorithm must be added to
 `registry::REGISTRY` with its plan section and owning FL item.
 
-No simulation code exists. Every world capability is a proposed design or a Target until its gate records a pass.
+`flife-field` holds the field: one planar `[plane, y, x]` buffer of real `f32` values per state (energy plus 32
+moments), held as a current/next pair. Its layout descriptor gets its strides from FrankenNumPy. Readers name
+the layout they need and refuse any other, even one with the same length. Declared layouts are admitted before
+allocation, buffers are checked against `BufferLimits` and `isize::MAX`, and allocation failure is an error. It
+also covers periodic wrapping, the configured initial field and the INV-01/INV-02 checks. Transport, sources,
+uptake and sensing are FL-004, FL-005 and FL-007.
+
+No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 
 ---
 

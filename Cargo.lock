@@ -731,6 +731,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flife-field"
+version = "0.0.1"
+dependencies = [
+ "flife-core",
+ "fnp-dtype",
+ "fnp-ndarray",
+]
+
+[[package]]
 name = "flife-probes"
 version = "0.0.1"
 dependencies = [

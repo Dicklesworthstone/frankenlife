@@ -57,8 +57,14 @@ Every issue is reported, not just the first.
 - Topology-catalog membership beyond depth and parameter cap (FL-009).
 
 **Registry status.** `field-ecology-v1` and the `stable-identity` phase policy are implemented here with fixtures.
-Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
-vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it.
+The `periodic` boundary, the `f32` field dtype and the `zero` field composition are implemented in `flife-field`
+(FL-003). Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no
+known-answer vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it. An `Implemented`
+entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited function exists.
+
+**Error classes.** `LayoutMismatch` covers a buffer whose declared layout is impossible or is not the one its
+reader requires; such a buffer is refused, never reinterpreted. `AllocationFailed` covers a host that refuses
+an allocation every checked limit admitted.
 
 **Determinism.** Pure functions of their inputs. No hash-map iteration and no floating clocks. The canonical forms
 and both digests are pinned by tests.

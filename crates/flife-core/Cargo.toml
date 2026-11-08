@@ -1,0 +1,16 @@
+[package]
+name = "flife-core"
+description = "FrankenLife core contracts: IDs, integer clocks, units, errors, the algorithm registry and the canonical model descriptor"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

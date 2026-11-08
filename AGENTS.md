@@ -612,13 +612,20 @@ The repository holds:
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
-- one crate, `crates/flife-probes` (FL-001), with its `CONTRACT.md`.
+- `crates/flife-probes` (FL-001) and `crates/flife-core` (FL-002), each with its `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
 native-input gap. Run them with `cargo run -p flife-probes --bin flife-probe -- --window`, which prints NDJSON and
 opens a window. `cargo test` runs every probe except the window probe. Native typed input is a recorded gap,
-tracked by FL-018 (`flife-jdf`).
+tracked by FL-018 (`flife-jdf`). The probes qualify on macOS arm64 and Linux x86_64.
+
+`flife-core` holds the shared contracts: stable IDs and epochs, integer ticks with exact seconds-to-ticks
+conversion, units, `CoreError`, the named-algorithm registry, and `frankenlife.config.v1`. That configuration
+comes with its A.2 validator, its canonical TOML and configuration hash, and the model descriptor and its hash.
+The tests parse Appendix A's TOML straight out of the plan. Editing Appendix A or the schema table therefore
+moves the pinned hashes deliberately or fails the tests. A new named algorithm must be added to
+`registry::REGISTRY` with its plan section and owning FL item.
 
 No simulation code exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

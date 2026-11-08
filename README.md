@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Status](https://img.shields.io/badge/status-stack%20probes%20only%20%C2%B7%20no%20simulation%20yet-orange)](#honest-status)
+[![Status](https://img.shields.io/badge/status-foundations%20only%20%C2%B7%20no%20simulation%20yet-orange)](#honest-status)
 [![Runtime](https://img.shields.io/badge/runtime-asupersync-6f42c1)](#the-stack)
 [![Core](https://img.shields.io/badge/core-Rust%202024%20%C2%B7%20forbid%28unsafe%29-b7410e)](#architecture)
 [![Animation](https://img.shields.io/badge/animation-FrankenManim-1f6feb)](#the-stack)
@@ -42,14 +42,14 @@ history and its animation are three views of the same committed state.
 ## Honest status
 
 **The design is written down and has been through an independent mathematical, systems and integration audit
-(plan v0.2). The only code is the FL-001 probe crate that qualifies the dependency stack; there is no simulation
-code yet.**
+(plan v0.2). The code so far is foundations: the FL-001 stack probes and the FL-002 core contracts. There is no
+simulation code yet.**
 
 | Question | Answer |
 |---|---|
 | Is there a design? | **Yes.** [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md`](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md) (about 2,400 lines, §1–§28 plus Appendices A–E) covers the equations, the tick, data layout, accelerator design, the runtime protocol, rendering, checkpoints, 15 invariants, 11 gates, a complete starter configuration and 17 hand-computable fixtures. Its statements are labelled **Observed**, **Derived**, **Target** or **Hypothesis**; anything unlabelled is a proposed design |
-| Is there code? | **Only the stack probes.** `crates/flife-probes` (FL-001) compiles one pinned Franken dependency closure and checks it with capability probes. No part of the world, model or Studio is implemented |
-| Does the stack compose? | **Yes, on macOS (FL-001), except for input.** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter still delivers no pointer or keyboard events (§13.1); a real window probe records that, and FL-018 owns the fix. Linux hosts have not been qualified |
+| Is there code? | **Foundations only.** `crates/flife-probes` (FL-001) qualifies the pinned dependency closure. `crates/flife-core` (FL-002) defines identities, integer clocks, units, errors, the named-algorithm registry, the validated Appendix A configuration and its canonical hashes. No part of the world, model or Studio is implemented |
+| Does the stack compose? | **Yes (FL-001), except for input.** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter still delivers no pointer or keyboard events (§13.1); a real window probe records that, and FL-018 owns the fix. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
 | Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 58 beads with the plan's 141 dependency edges in `.beads/` for `br` |
@@ -353,6 +353,7 @@ LICENSE                                               MIT with the OpenAI/Anthro
 rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint settings
 Cargo.toml, Cargo.lock                                the workspace, its pins and its root patches
 franken-stack.lock                                    the qualified dependency closure and its probe results
+crates/flife-core/                                    FL-002 IDs, clocks, units, errors, registry, config validation and hashes
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
 .beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
 ```

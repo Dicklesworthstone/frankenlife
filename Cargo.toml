@@ -1,8 +1,8 @@
 [workspace]
 resolver = "3"
-# Create only the crates each milestone needs (plan §18.1). FL-001 needs one:
-# the capability probes that qualify the dependency closure below.
-members = ["crates/flife-probes"]
+# Create only the crates each milestone needs (plan §18.1): FL-001's capability
+# probes, and FL-002's core contracts.
+members = ["crates/flife-core", "crates/flife-probes"]
 
 [workspace.package]
 version = "0.0.1"
@@ -27,6 +27,13 @@ ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworths
 ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a" }
 ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a" }
 ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a", features = ["asupersync-integration"] }
+
+# Third-party crates. serde and sha2 0.11 are already in the qualified closure;
+# toml is the one addition, confined to flife-core's config loader (Appendix A
+# is TOML, and the loader must refuse unknown keys).
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 
 # Root-only overrides. Cargo reads [patch] only at the consuming workspace
 # root and ignores a dependency's own patches (plan §12.8, S20), so each one

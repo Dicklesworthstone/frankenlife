@@ -13,6 +13,9 @@
   `grid-cic-v1` exchange footprint, A.1's saturating request, two-pass demand/grant resolution with
   `cell-quantum-largest-remainder-v1` reconciliation, and the proportional field debit. The energy ledger it
   feeds is `flife_core::ledger`.
+- FL-007 (`flife-bzl`) covers the sensor density pyramid (§6.1, §8.1 phase 3, C.10): `positive-box-v1` density
+  levels, bilinear sampling with analytic physical derivatives, and `log-linear-v1` scale blending. Encoding the
+  sample into controller inputs is `flife-neural`.
 
 **Inputs.**
 - A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world`, `[field_initialization]`, `[sources]`).
@@ -23,6 +26,8 @@
   `PathSegment`. Seeded values come from FL-010; this crate draws no random numbers.
 - `Demand`s for this tick: organism identity, position and requested amount `d_i`. Each organism demands at
   most once per tick.
+- For sensing: the observation snapshot's `FieldState`, the pyramid level count, and a position and sensing scale
+  per query.
 
 **Outputs.**
 - `FieldState`: one planar `[plane, y, x]` buffer of `33 G_x G_y` real `f32` values. Plane 0 holds energy;
@@ -39,8 +44,13 @@
   normalized and applied energy), and `unit_direction`.
 - `PathSegment`: position, velocity, mid-tick fraction and the next segment.
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
-- `numerics`: the host-independent `exp_neg`, `expm1_neg`, `tanh` and `sigmoid`, re-exported from
+- `numerics`: the host-independent `exp_neg`, `expm1_neg`, `tanh`, `sigmoid` and `log2`, re-exported from
   `flife-core::numerics`.
+- `SensorPyramid`: reusable coarse-level storage admitted against `BufferLimits`, with its `LevelGrid`s and level
+  scales `s_l = 2^l max(h_x, h_y)`. `build` returns a `PyramidView` that borrows both the storage and the field,
+  so a view cannot outlive, or disagree with, the snapshot it was built from. The view gives `density`, `blend`
+  (level and `t`), `sample_level` and `sample`; the last two return a `RawSample` of 33 raw densities with their
+  derivatives along x and y.
 - `ExchangeStencil`: an organism's footprint cells and weights, and its local density `Σ w_c e_c / (h_x h_y)`.
   `saturating_request` gives `d = Δt U_max r/(K + r)`.
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
@@ -130,6 +140,19 @@
 - Grants record each cell's pre-debit energy. Applying them twice, to another grid, or to a field whose
   demanded cell has changed is refused before anything is written.
 
+**Invariants — sensing pyramid (FL-007).**
+- Level 0 is the field's density, `e/(h_x h_y)` and `m/(h_x h_y)`, read in F64. Level `l + 1` is the fixed-order
+  2×2 average `¼((a + b) + (c + d))` of level `l`, for every plane. Densities are averaged, not energies, so a
+  uniform density stays uniform at every level. Every level stays anchored to the torus origin.
+- Sampling a level is bilinear in the continuous index `(x/h − ½, y/h − ½)` at that level's spacing, wrapped
+  periodically. At a knot (a stored cell center) the floor-selected interval to the right is used. The derivatives
+  are those of the same interpolant, divided by the level's physical spacing.
+- The interpolant and the blend are written in lerp form, `a + t(b − a)`. Equal corner values therefore give that
+  value, and a zero derivative, exactly, at every level and every blend.
+- `log-linear-v1`: a scale `s` between `s_l` and `s_(l+1)` blends the two levels' raw values and derivatives with
+  `t = log₂(s/s_0) − l`. A scale that is an exact power of two times `s_0` uses its own level alone.
+- The pyramid holds raw densities only. Normalization happens after blending, in `flife-neural`.
+
 **Refusal cases.**
 - Representation: a zero cell count, or a nonfinite or nonpositive world or cell side; byte counts past
   `u64::MAX` or `isize::MAX`; a buffer above its limit; any layout mismatch, including one of equal length; a
@@ -145,6 +168,11 @@
   - A nonfinite or negative cell energy.
   - A request law with negative capacity, nonpositive half-saturation or negative density.
   - Grants applied twice, to another grid, or to a changed field.
+- Sensing pyramid:
+  - 32 or more levels, a grid not divisible by `2^levels`, or a level above the buffer limit.
+  - A field on another grid.
+  - A scale outside `[s_0, s_0 2^L]`, a nonfinite position or a nonfinite density.
+  - Another filter or blend name.
 - Invariants: the first cell that violates INV-01 or INV-02.
 
 **Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
@@ -152,7 +180,8 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
 
 **Validity domain.**
 - Implemented here: `field-ecology-v1` with `periodic`, `f32`, `zero`, `positive-five-point-v1`, `subcycle`,
-  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1`, `fixed-per-source` and `grid-cic-v1`.
+  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1`, `fixed-per-source`, `grid-cic-v1`,
+  `positive-box-v1` and `log-linear-v1`.
 - Deterministic parts only: `seeded-unit-vectors` (normalization) and `seeded-smooth-torus-v1` (integration).
 - Host buffers in layout schema `frankenlife.field-layout.v1`.
 
@@ -188,6 +217,8 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
     maintenance, committed through the ledger every tick. The cumulative residual is 1.9e-5, which is 2.1e-9 of
     initial energy plus turnover (§21.4 proposes 1e-5). The largest single-tick residual is 7.8e-7. The drift is
     +1.3e-7 energy per tick and comes from phase 2's F32 rounding; uptake contributes none.
+- The pyramid's tests live in `flife-neural`'s `tests/sensing.rs`, next to the sensor encoding they feed: a slow
+  direct oracle at every level, C.10's uniform field, knots and edges, translations, and refusals.
 
 **Known gaps.**
 - Seeded source centers, chemical directions and path directions need FL-010's Philox semantic addressing.
@@ -206,5 +237,8 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
 - `UptakeSummary::contended_cells` counts every cell whose demand exceeds its energy, including empty cells
   that receive demand.
 - Per-packet chemistry, toxicity and affordable motion are in `flife-engine` (FL-006). Clearing tiny reservoirs
-  and death are FL-012. Device arrangements, device alignment and sharding belong to the Metal backend. Sensing and the
-  pyramid are FL-007, and whole-run memory admission is FL-043.
+  and death are FL-012. Device arrangements, device alignment and sharding belong to the Metal backend.
+  Whole-run memory admission is FL-043.
+- The pyramid is rebuilt in full every tick in F64 (two thirds of the F32 base field's bytes). An F32 or Metal
+  pyramid is a separate numerical profile. Its contract, with the sensor encoding, is
+  `crates/flife-neural/CONTRACT.md`.

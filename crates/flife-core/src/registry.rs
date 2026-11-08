@@ -316,11 +316,15 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "§5.4, A.3 item 4",
         "FL-010",
     ),
+    // FL-007 implements sensing at any admitted scale
+    // (`flife_neural::SensorScales::admits_scale`,
+    // `flife_field::PyramidView::sample`); the trait's mutation is FL-010's,
+    // as above.
     entry(
         "sensing_scale",
         Role::HeritableTrait,
         "§6.1, A.3 item 4",
-        "FL-007",
+        "FL-010",
     ),
     AlgorithmEntry {
         status: Status::Implemented {
@@ -333,20 +337,40 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-006",
         )
     },
-    entry(
-        "energy-moment-gradient-104-v1",
-        Role::SensorSchema,
-        "§6.1",
-        "FL-007",
-    ),
-    entry(
-        "fixed-local-scales-v1",
-        Role::SensorNormalization,
-        "§6.1, A.1",
-        "FL-007",
-    ),
-    entry("positive-box-v1", Role::PyramidFilter, "§6.1", "FL-007"),
-    entry("log-linear-v1", Role::PyramidBlend, "§6.1", "FL-007"),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/sensing.rs::observations_follow_the_abi_order_and_formulas",
+        },
+        ..entry(
+            "energy-moment-gradient-104-v1",
+            Role::SensorSchema,
+            "§6.1",
+            "FL-007",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/sensing.rs::observations_follow_the_abi_order_and_formulas",
+        },
+        ..entry(
+            "fixed-local-scales-v1",
+            Role::SensorNormalization,
+            "§6.1, A.1",
+            "FL-007",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/sensing.rs::pyramid_matches_a_slow_direct_oracle",
+        },
+        ..entry("positive-box-v1", Role::PyramidFilter, "§6.1", "FL-007")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/sensing.rs::knots_take_the_right_hand_interval_and_edges_are_interior",
+        },
+        ..entry("log-linear-v1", Role::PyramidBlend, "§6.1", "FL-007")
+    },
     entry(
         "independent-dense-mlp-v1",
         Role::ControllerFamily,

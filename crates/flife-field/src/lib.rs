@@ -24,9 +24,12 @@
 //! - [`uptake`]: two-pass demand/grant resolution with exact
 //!   `cell-quantum-largest-remainder-v1` reconciliation, and the
 //!   proportional field debit (FL-005).
+//! - [`pyramid`]: the `positive-box-v1` sensor density pyramid and its
+//!   `log-linear-v1` sampling at a sensing scale: raw densities and their
+//!   physical derivatives (FL-007).
 //!
-//! The energy ledger itself is `flife_core::ledger`. Sensing and the
-//! pyramid are FL-007.
+//! The energy ledger itself is `flife_core::ledger`. The sensor encoding
+//! and action decoding are in `flife-neural`.
 
 #![forbid(unsafe_code)]
 
@@ -36,6 +39,7 @@ pub mod grid;
 pub mod invariants;
 pub mod layout;
 pub mod numerics;
+pub mod pyramid;
 pub mod sources;
 pub mod state;
 pub mod step;
@@ -47,6 +51,7 @@ pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
+pub use pyramid::{LevelGrid, PyramidView, RawSample, SensorPyramid};
 pub use sources::{DepositReport, PathSegment, Source, SourceKernel, SourceSupport};
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
 pub use step::{FieldStepReport, advance_field};

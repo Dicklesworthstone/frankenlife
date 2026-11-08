@@ -612,8 +612,9 @@ The repository holds:
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
-- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006 numerics),
-  `crates/flife-field` (FL-003–FL-005) and `crates/flife-engine` (FL-006), each with its `CONTRACT.md`.
+- `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
+  numerics), `crates/flife-field` (FL-003–FL-005 and the FL-007 pyramid), `crates/flife-engine` (FL-006) and
+  `crates/flife-neural` (FL-007), each with its `CONTRACT.md`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -644,7 +645,9 @@ IEEE-754 host, within 1–2 ulp of correctly rounded. Seeded source draws await
 FL-010. FL-005 adds uptake: the `grid-cic-v1` footprint, A.1's saturating request, and two-pass demand/grant
 resolution that grants whole F32 quanta of each cell (`cell-quantum-largest-remainder-v1`), so grants never
 exceed a cell and the field loses exactly what organisms receive. Grants depend on identities, not slots, and
-refuse to apply twice or to a changed field. Sensing is FL-007.
+refuse to apply twice or to a changed field. FL-007 adds the sensor pyramid: `positive-box-v1` density levels
+anchored to the torus origin, bilinear sampling with analytic physical derivatives (right-hand interval at
+knots), and `log-linear-v1` scale blending, all in lerp form so a uniform field is exact at every scale.
 
 `flife-engine` (FL-006) holds the organism-phase operators that the ordered tick (FL-013) will call. Chemistry is
 `bounded-affinity-v1`, evaluated on each granted cell packet and never on the mixture (C.9). The gain is credited
@@ -653,6 +656,13 @@ Maintenance comes from canonical model work only. Motion integrates drag with `e
 and acceleration radially as computed in F64, and scales the whole velocity when it is unaffordable, exhausting
 the organism (C.12). Every organism spends through a `flife_core::EnergyBudget` in §8.2 order. Trait mutation is
 FL-010; emission and reproduction are FL-011.
+
+`flife-neural` (FL-007) is the sensor/action ABI. `observe` encodes a blended pyramid sample and the organism's
+own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y gradients saturated with
+`tanh(L ∂)`, five intrinsic inputs), with fixed local normalizers only, and returns the unsaturated gradients for
+motion. Normalization comes after blending, never inside the pyramid. `decode` turns 36 linear outputs into
+`λ`, `p = 1 − e^(−λΔt)`, `β`, the emission gate and an optional unit-direction emission proposal; sigmoid is
+applied exactly once and every rate goes through `expm1_neg` (C.11). The controller itself is FL-008.
 
 No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

@@ -28,7 +28,7 @@ are no hidden defaults.
   - The run's `EnergyLedger` with its `LedgerReport`, and `ResidualBudget`.
   - The per-organism `EnergyBudget`, with `Payment`.
   - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.
-- Numerics (FL-006): `exp_neg`, `expm1_neg`, `tanh` and `sigmoid`.
+- Numerics (FL-006, FL-007): `exp_neg`, `expm1_neg`, `tanh`, `sigmoid` and `log2`.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -69,6 +69,9 @@ are no hidden defaults.
     `exp_neg` within 1 ulp; `expm1_neg`, `tanh` and `sigmoid` within 2 ulp.
   - `sigmoid` takes the sign-stable branch: a large negative logit decays to zero instead of dividing by
     infinity.
+  - `log2` reads the exponent from the bits (scaling a subnormal by `2^54` first, exactly), reduces the mantissa
+    to `[√2/2, √2]` and sums the `atanh` series of `(m − 1)/(m + 1)`. It is exact at every power of two from
+    `2^-1074` to `2^1023` and measured within 2 ulp of the correctly rounded value elsewhere.
 
 **Refusal cases (A.2).**
 - Nonfinite numbers and negative costs.
@@ -111,6 +114,9 @@ Every issue is reported, not just the first.
 - Implemented in `flife-engine` (FL-006): `bounded-affinity-v1` and `per-granted-cell-packet`. The heritable
   traits `affinity_direction` and `motion_response` have their representation, bound and use there, but stay
   `Specified` under FL-010 until they mutate as A.3 item 4 specifies.
+- FL-007: `positive-box-v1` and `log-linear-v1` in `flife-field`; `energy-moment-gradient-104-v1` and
+  `fixed-local-scales-v1` in `flife-neural`. The heritable `sensing_scale` is sampled at any admitted scale
+  there, and stays `Specified` under FL-010 for the same reason.
 - The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
   stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
@@ -140,5 +146,7 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
     conforming host.
   - Domains, saturation, odd symmetry, `σ(x) + σ(−x) = 1`, and monotonicity.
   - C.11: the drag coefficient, the F32 cancellation, and `sigmoid(8)` against `sigmoid(tanh(8))`.
+  - `log2`: every power of two exact, seven pinned bit patterns, agreement with `std` over a sweep, and refusal
+    of nonpositive and nonfinite arguments.
 
 **Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`.

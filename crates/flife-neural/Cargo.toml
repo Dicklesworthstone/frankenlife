@@ -1,0 +1,15 @@
+[package]
+name = "flife-neural"
+description = "FrankenLife sensor/action ABI: the 104-input sensor encoding and the 36-output action decoding"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flife-core = { path = "../flife-core" }
+flife-field = { path = "../flife-field" }
+
+[lints]
+workspace = true

@@ -173,6 +173,53 @@ pub fn sigmoid(x: f64) -> Option<f64> {
     })
 }
 
+/// Terms after the first of `atanh(z)/z = Σ z^(2k)/(2k + 1)`. For
+/// `|z| ≤ (√2 − 1)/(√2 + 1) < 0.172` the first omitted term is below
+/// `0.172^26 / 27 < 1e-21`.
+const LOG_TERMS: u32 = 12;
+
+/// `2^54`, which brings a subnormal into the normal range exactly.
+const SUBNORMAL_SCALE: f64 = 18_014_398_509_481_984.0;
+
+/// `log₂(x)` for finite `x > 0`, computed identically on every IEEE-754
+/// host.
+///
+/// The exponent `n` and mantissa `m` come exactly from the bits, with `m`
+/// moved into `(√2/2, √2]`. Then `ln m = 2 atanh(z)` with
+/// `z = (m − 1)/(m + 1)`, where `m − 1` is exact by Sterbenz's lemma, and
+/// `log₂ x = n + ln m · log₂ e`. A power of two gives its exponent exactly,
+/// so a pyramid level boundary blends with weight exactly zero (§6.1).
+/// Returns `None` for a nonpositive or nonfinite argument.
+#[must_use]
+pub fn log2(x: f64) -> Option<f64> {
+    if !x.is_finite() || x <= 0.0 {
+        return None;
+    }
+    let (normal, adjust) = if x < f64::MIN_POSITIVE {
+        (x * SUBNORMAL_SCALE, -54)
+    } else {
+        (x, 0)
+    };
+    let bits = normal.to_bits();
+    let biased = i32::try_from((bits >> 52) & 0x7ff).unwrap_or(0);
+    let mut exponent = biased - 1023 + adjust;
+    let mut mantissa = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+    if mantissa > core::f64::consts::SQRT_2 {
+        mantissa *= 0.5;
+        exponent += 1;
+    }
+    let z = (mantissa - 1.0) / (mantissa + 1.0);
+    let z2 = z * z;
+    // Horner from the highest term: `P_k = 1/(2k + 1) + z² P_(k+1)`, and
+    // `atanh(z) = z + z · z² P_1`.
+    let mut series = 0.0_f64;
+    for k in (1..=LOG_TERMS).rev() {
+        series = 1.0 / f64::from(2 * k + 1) + z2 * series;
+    }
+    let natural = 2.0 * (z + z * (z2 * series));
+    Some(f64::from(exponent) + natural * core::f64::consts::LOG2_E)
+}
+
 /// `x = y 2^k` with `y ≤ 1/16`, halving exactly.
 fn reduce(x: f64) -> (f64, u32) {
     let mut y = x;

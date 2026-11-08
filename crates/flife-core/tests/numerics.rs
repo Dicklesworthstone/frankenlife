@@ -2,7 +2,7 @@
 //! distance from correctly rounded values, agreement with the platform
 //! `libm`, and the domain and symmetry each function promises.
 
-use flife_core::numerics::{exp_neg, expm1_neg, sigmoid, tanh};
+use flife_core::numerics::{exp_neg, expm1_neg, log2, sigmoid, tanh};
 
 /// A total order on finite `f64` in which adjacent values differ by one.
 fn ordinal(value: f64) -> i64 {
@@ -339,4 +339,47 @@ fn sigmoid_of_tanh_is_not_sigmoid() {
     let twice = tanh(8.0).and_then(sigmoid).unwrap_or(f64::NAN);
     assert!((once - 0.999_664_65).abs() < 5.0e-9, "{once}");
     assert!((twice - 0.731_058_53).abs() < 1.0e-8, "{twice}");
+}
+
+#[test]
+fn log2_is_exact_at_powers_of_two_and_close_elsewhere() {
+    // Pyramid levels sit at powers of two: the blend weight there must be
+    // exactly zero (§6.1), including across the subnormal range.
+    for exponent in -1074..=1023_i32 {
+        let x = if exponent >= -1022 {
+            f64::from_bits(u64::try_from(exponent + 1023).unwrap_or(0) << 52)
+        } else {
+            f64::from_bits(1_u64 << (exponent + 1074))
+        };
+        assert_eq!(log2(x), Some(f64::from(exponent)), "2^{exponent}");
+    }
+    // `(x, our bits, correctly rounded bits)` from Python `Decimal`.
+    for (x, ours, correct) in [
+        (3.0, 0x3ff9_5c01_a39f_bd69_u64, 0x3ff9_5c01_a39f_bd68_u64),
+        (1.5, 0x3fe2_b803_473f_7ad2, 0x3fe2_b803_473f_7ad1),
+        (1.42, 0x3fe0_3042_2cd1_0ffb, 0x3fe0_3042_2cd1_0ffb),
+        (10.0, 0x400a_934f_0979_a371, 0x400a_934f_0979_a371),
+        (1.0e-300, 0xc08f_24a0_9f1a_8b89, 0xc08f_24a0_9f1a_8b89),
+        (
+            1.0 + f64::EPSILON,
+            0x3cb7_1547_652b_82fe,
+            0x3cb7_1547_652b_82fd,
+        ),
+        (f64::MAX, 0x4090_0000_0000_0000, 0x4090_0000_0000_0000),
+    ] {
+        let value = log2(x).unwrap_or(f64::NAN);
+        assert_eq!(value.to_bits(), ours, "log2({x:e}) = {value:e}");
+        assert!(ulps(value, f64::from_bits(correct)) <= 1, "log2({x:e})");
+    }
+    // Measured: within 2 ulp of correctly rounded over 4,078 arguments from
+    // 1e-12 to 1e12. A conforming `log2` is within 1.
+    let mut x = 1.0e-12_f64;
+    while x < 1.0e12 {
+        let ours = log2(x).unwrap_or(f64::NAN);
+        assert!(ulps(ours, x.log2()) <= 3, "log2({x:e})");
+        x *= 1.0137;
+    }
+    for x in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(log2(x), None, "log2({x})");
+    }
 }

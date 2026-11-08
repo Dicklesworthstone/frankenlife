@@ -157,7 +157,7 @@ pub fn saturating_request(
 }
 
 /// The floor of a continuous index and its fractional part.
-fn split(continuous: f64) -> (i64, f64) {
+pub(crate) fn split(continuous: f64) -> (i64, f64) {
     let floor = continuous.floor();
     // `continuous` lies in `[−½, G − ½]` with `G < 2^32`, so the floor is
     // an exact small integer.

@@ -16,6 +16,9 @@
 - FL-007 (`flife-bzl`) covers the sensor density pyramid (§6.1, §8.1 phase 3, C.10): `positive-box-v1` density
   levels, bilinear sampling with analytic physical derivatives, and `log-linear-v1` scale blending. Encoding the
   sample into controller inputs is `flife-neural`.
+- FL-010 (`flife-rf8`) supplies FL-004's seeded draws from `fnp-philox-semantic-v1` (A.3 items 7 and 8, §16.2):
+  chemical directions, initial source centers and per-segment travel directions, each named by the source's
+  stable identity.
 
 **Inputs.**
 - A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world`, `[field_initialization]`, `[sources]`).
@@ -23,7 +26,7 @@
 - A `DeclaredLayout` read from a checkpoint or interchange record.
 - A `ConeTolerance` taken from the declared numerical profile.
 - `Source`s for this tick: identity, sampled center, chemical direction and power. Segment directions for
-  `PathSegment`. Seeded values come from FL-010; this crate draws no random numbers.
+  `PathSegment`. Seeded values come from a `SemanticRng` through `seeding` (FL-010); nothing else here draws.
 - `Demand`s for this tick: organism identity, position and requested amount `d_i`. Each organism demands at
   most once per tick.
 - For sensing: the observation snapshot's `FieldState`, the pyramid level count, and a position and sensing scale
@@ -43,6 +46,8 @@
 - `SourceKernel`, `SourceSupport` (reused across ticks), `deposit` with its `DepositReport` (declared,
   normalized and applied energy), and `unit_direction`.
 - `PathSegment`: position, velocity, mid-tick fraction and the next segment.
+- `seeding` (FL-010): `chemical_direction`, `initial_center`, `travel_direction`, `initial_source`, and
+  `SeededPath` (source, segment ordinal and current segment).
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
 - `numerics`: the host-independent `exp_neg`, `expm1_neg`, `tanh`, `sigmoid` and `log2`, re-exported from
   `flife-core::numerics`.
@@ -153,6 +158,19 @@
   `t = log₂(s/s_0) − l`. A scale that is an exact power of two times `s_0` uses its own level alone.
 - The pyramid holds raw densities only. Normalization happens after blending, in `flife-neural`.
 
+**Invariants — seeded sources (FL-010).**
+- Chemical direction of source `j`: 32 Box–Muller normals, pair `p` from words 0 and 1 of `(srcchems, j, 0,
+  lane (0, direction, p), 0)` giving components `2p` and `2p + 1`, normalized by `unit_direction` to
+  `||a|| ≤ 1` exactly. It is fixed for the run (`fixed-per-source`).
+- Initial center: `(W u₀, H u₁)` from the half-open uniforms of words 0 and 1 of `(srcplace, j, 0, lane (0,
+  position, 0), 0)`, wrapped onto the torus.
+- Travel direction `d_k`: `(cos 2πu, sin 2πu)` from the half-open uniform of word 0 of `(srcpaths, j, k, lane (0,
+  direction, 0), 0)`, uniform by angle through the host-independent `sin_cos_turns`.
+- Segment `k` of `SeededPath` blends `d_k` into `d_(k+1)`. Segment 0 starts at the initial center, and each later
+  segment at its predecessor's wrapped endpoint, so position and velocity are continuous at every join.
+- Every value depends only on the seed and the source's identity (and segment ordinal), never on the order
+  sources are made or advanced.
+
 **Refusal cases.**
 - Representation: a zero cell count, or a nonfinite or nonpositive world or cell side; byte counts past
   `u64::MAX` or `isize::MAX`; a buffer above its limit; any layout mismatch, including one of equal length; a
@@ -176,13 +194,13 @@
 - Invariants: the first cell that violates INV-01 or INV-02.
 
 **Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
-reduction, no platform `libm` in model arithmetic, and no random draws.
+reduction, and no platform `libm` in model arithmetic. Random words come only from semantic blocks in `seeding`.
 
 **Validity domain.**
 - Implemented here: `field-ecology-v1` with `periodic`, `f32`, `zero`, `positive-five-point-v1`, `subcycle`,
   `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1`, `fixed-per-source`, `grid-cic-v1`,
-  `positive-box-v1` and `log-linear-v1`.
-- Deterministic parts only: `seeded-unit-vectors` (normalization) and `seeded-smooth-torus-v1` (integration).
+  `positive-box-v1`, `log-linear-v1`, `seeded-unit-vectors` and `seeded-smooth-torus-v1` (the last two with
+  FL-010's draws).
 - Host buffers in layout schema `frankenlife.field-layout.v1`.
 
 **Independent tests.**
@@ -217,13 +235,23 @@ reduction, no platform `libm` in model arithmetic, and no random draws.
     maintenance, committed through the ledger every tick. The cumulative residual is 1.9e-5, which is 2.1e-9 of
     initial energy plus turnover (§21.4 proposes 1e-5). The largest single-tick residual is 7.8e-7. The drift is
     +1.3e-7 energy per tick and comes from phase 2's F32 rounding; uptake contributes none.
+- `tests/seeding.rs` (FL-010). Expected values come from an oracle using NumPy 2.5.4's `Philox` and Python
+  `Decimal`.
+  - Source 5's 32-channel direction within 8 ulp of correctly rounded.
+  - A travel direction within 2 ulp.
+  - An initial center exact.
+  - The same sources in forward, reverse and interleaved order, and another seed moving them.
+  - Isotropy, uniform centers and uniform angles over 4,096 sources.
+  - Twelve seeded path segments that start at the seeded center, run along their own `d_k` and `d_(k+1)`, stay
+    within the speed limit and join continuously.
+  - A path unaffected by another source's advances.
+  - A moved source keeping its chemistry.
 - The pyramid's tests live in `flife-neural`'s `tests/sensing.rs`, next to the sensor encoding they feed: a slow
   direct oracle at every level, C.10's uniform field, knots and edges, translations, and refusals.
 
 **Known gaps.**
-- Seeded source centers, chemical directions and path directions need FL-010's Philox semantic addressing.
-  Uniform-by-angle path directions also need a host-independent `sin`/`cos`. Until then those two registry
-  entries stay `Specified`.
+- The tick that carries `SeededPath` and updates source centers each tick, and its checkpoint of anchor and
+  ordinal, are FL-013 and FL-037.
 - Cone tolerance. The values belong to an undeclared numerical profile. One finding: far from sources,
   diffusion leaves subnormal F32 energies (about 1e-40) with no relative precision. A cone tolerance therefore
   needs an absolute floor at F32's subnormal scale, and the 128-tick test uses `f32::MIN_POSITIVE`. Metal

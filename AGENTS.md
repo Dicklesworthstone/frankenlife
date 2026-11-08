@@ -614,7 +614,8 @@ The repository holds:
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005 and the FL-007 pyramid), `crates/flife-engine` (FL-006),
-  `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009), each with its `CONTRACT.md`.
+  `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009, FL-010), each with its
+  `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -641,8 +642,8 @@ of the tick: the `positive-five-point-v1` stencil with CFL subcycling (never cla
 charged to dissipation, and normalized truncated minimum-image Gaussian deposits of exactly `P Δt` per
 source. `advance_field` writes only the candidate buffer and reports `I`, `D` and `ε`. Model arithmetic avoids
 platform `libm`: `flife_core::numerics` (`exp_neg`, `expm1_neg`, `tanh`, `sigmoid`) gives identical bits on every
-IEEE-754 host, within 1–2 ulp of correctly rounded. Seeded source draws await
-FL-010. FL-005 adds uptake: the `grid-cic-v1` footprint, A.1's saturating request, and two-pass demand/grant
+IEEE-754 host, within 1–2 ulp of correctly rounded. `flife_field::seeding` (FL-010) draws source chemistry,
+centers and travel directions by source identity. FL-005 adds uptake: the `grid-cic-v1` footprint, A.1's saturating request, and two-pass demand/grant
 resolution that grants whole F32 quanta of each cell (`cell-quantum-largest-remainder-v1`), so grants never
 exceed a cell and the field loses exactly what organisms receive. Grants depend on identities, not slots, and
 refuse to apply twice or to a changed field. FL-007 adds the sensor pyramid: `positive-box-v1` density levels
@@ -677,8 +678,23 @@ filled `ParameterBuffer` once; a genome is never `Clone`, and readers share its 
 are F64 and checked with the engine's norm bounds. `map_parameters` implements `overlap-plus-zero-output-v1`
 (widening preserves the function exactly) and `prefix-and-identity-bridge-v1`, writing every child value and
 asking the caller for one word per added incoming weight in ascending address order. Zeroing an added neuron's
-outgoing weights takes precedence over the identity bridge. FL-010 supplies those words (semantic Philox) and
-mutation.
+outgoing weights takes precedence over the identity bridge.
+
+FL-010 adds `flife_core::rng`, which implements `fnp-philox-semantic-v1`.
+- An address `(stream, entity, ordinal, lane, draw)` maps to the first four outputs of NumPy's
+  `Philox(key=[seed, stream tag], counter=[entity, ordinal, lane, draw])`, through FrankenNumPy's NumPy-exact
+  `PhiloxRng`.
+- Every model draw names its address. Never seed or order randomness by worker, slot, wall time or frame
+  (INV-11). Add a new stream or lane kind with a new frozen code, never by reusing one.
+- The conventions are fixed: half-open `k 2^-52`, open `(k + ½) 2^-52`, integer `choose`, and Box–Muller with
+  host-independent `ln`, `exp` and `sin_cos_turns`.
+
+`flife_genome::founder` draws founders by organism identity. `flife_genome::Mutator::propose` mutates in A.3
+item 4's order:
+- at most eight candidates per birth, addressed `(mutation, parent, tick, lane (candidate, kind, neuron), draw)`;
+- topology first, then parameters (replacement before perturbation, F64 rounded once to F32), then traits;
+- invalid or effective no-op candidates are rejected, never reinterpreted;
+- when every candidate is rejected, every buffer has been abandoned and the quota is unchanged.
 
 No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
 

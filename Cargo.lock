@@ -725,6 +725,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 name = "flife-core"
 version = "0.0.1"
 dependencies = [
+ "fnp-random",
  "serde",
  "sha2 0.11.1",
  "toml",
@@ -1022,6 +1023,17 @@ dependencies = [
 name = "fnp-ndarray"
 version = "0.5.0"
 source = "git+https://github.com/Dicklesworthstone/franken_numpy?rev=6492ff310c45ad72abf27e4394f68b9059770193#6492ff310c45ad72abf27e4394f68b9059770193"
+
+[[package]]
+name = "fnp-random"
+version = "0.5.0"
+source = "git+https://github.com/Dicklesworthstone/franken_numpy?rev=6492ff310c45ad72abf27e4394f68b9059770193#6492ff310c45ad72abf27e4394f68b9059770193"
+dependencies = [
+ "fnp-ndarray",
+ "fnp-random-core",
+ "getrandom 0.4.3",
+ "rayon",
+]
 
 [[package]]
 name = "fnp-random-core"

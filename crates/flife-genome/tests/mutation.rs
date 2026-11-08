@@ -1,0 +1,829 @@
+//! FL-010: founders and mutation proposals under `fnp-philox-semantic-v1`
+//! (plan §7.2, §7.3, §16.2, A.3 items 1–4, Appendix C.16, INV-11).
+//!
+//! Seed and order invariance, fixed versus heritable components, finite
+//! retries, and canonical rounding. The full-path fixtures take their
+//! expected bits from an oracle script that uses NumPy 2.5.4's `Philox`,
+//! Python `Decimal` at 80 digits and `numpy.float32` rounding, and imports
+//! no FrankenLife or FrankenNumPy code.
+
+use std::collections::BTreeMap;
+
+use flife_core::ids::{GenomeId, OrganismId};
+use flife_core::numerics::exp;
+use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream};
+use flife_core::{CoreError, Tick, ValidatedConfig};
+use flife_genome::{
+    BirthAttempt, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters, Mutator, Proposal,
+    RejectionReason, TopologyCatalog, TopologyId, TraitLimits, Traits, Transition, fan_in_weight,
+    founder, initial_scale, map_parameters, perturb, reflect_log_scale,
+};
+
+const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn appendix_a() -> ValidatedConfig {
+    let appendix = &PLAN[PLAN.find("## Appendix A").expect("Appendix A heading")..];
+    let start = appendix.find("```toml\n").expect("Appendix A TOML block") + "```toml\n".len();
+    let length = appendix[start..].find("```").expect("closing fence");
+    ValidatedConfig::from_toml(&appendix[start..start + length]).expect("Appendix A is valid")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn catalog() -> TopologyCatalog {
+    TopologyCatalog::from_config(&appendix_a()).expect("Appendix A catalog")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn limits() -> TraitLimits {
+    TraitLimits::from_config(&appendix_a()).expect("Appendix A limits")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn quota() -> GenomeQuota {
+    GenomeQuota::new(1 << 32, 1 << 32).expect("quotas in order")
+}
+
+/// Appendix A's rates with every operator off.
+fn quiet() -> MutationParameters {
+    MutationParameters {
+        topology_change_probability: 0.0,
+        weight_probability: 0.0,
+        weight_standard_deviation: 0.0,
+        replacement_probability: 0.0,
+        chemistry_standard_deviation: 0.0,
+        sensing_log_scale_standard_deviation: 0.0,
+        reject_effective_noop: false,
+        maximum_candidates: MAXIMUM_CANDIDATES,
+    }
+}
+
+const SEED: u64 = 42;
+
+fn attempt(parent: u64, tick: u64) -> BirthAttempt {
+    BirthAttempt {
+        parent: OrganismId::new(parent),
+        tick: Tick::new(tick),
+    }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn founder_of(
+    rng: &SemanticRng,
+    organism: u64,
+    catalog: &TopologyCatalog,
+    quota: &mut GenomeQuota,
+) -> Genome {
+    founder(
+        rng,
+        OrganismId::new(organism),
+        GenomeId::new(organism),
+        catalog,
+        quota,
+        &limits(),
+        initial_scale(&appendix_a()),
+    )
+    .expect("a founder")
+}
+
+/// A parent of the default member whose every parameter is `value`.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn uniform_parent(value: f32, catalog: &TopologyCatalog, quota: &mut GenomeQuota) -> Genome {
+    let rng = SemanticRng::new(SEED);
+    let traits = *founder_of(&rng, 99, catalog, &mut quota.clone()).traits();
+    let mut buffer = quota
+        .allocate(catalog, catalog.default_topology())
+        .expect("room for the parent");
+    buffer.values_mut().fill(value);
+    Genome::seal(
+        buffer,
+        GenomeId::new(1_000),
+        catalog,
+        traits,
+        None,
+        &limits(),
+    )
+    .expect("an in-bound parent")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn mutator(parameters: MutationParameters, catalog: &TopologyCatalog) -> Mutator<'_> {
+    Mutator::new(SemanticRng::new(SEED), parameters, catalog, limits()).expect("valid rates")
+}
+
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn child(
+    mutator: &Mutator<'_>,
+    parent: &Genome,
+    at: BirthAttempt,
+    quota: &mut GenomeQuota,
+) -> (Box<Genome>, flife_genome::MutationRecord) {
+    match mutator
+        .propose(parent, at, GenomeId::new(5_000), quota)
+        .expect("no capacity error")
+    {
+        Proposal::Child { genome, record } => (genome, record),
+        Proposal::Rejected { candidates } => panic!("birth rejected: {candidates:?}"),
+    }
+}
+
+/// Everything heritable, bit for bit.
+fn content(genome: &Genome) -> (TopologyId, Vec<u32>, Vec<u64>) {
+    let traits = genome.traits();
+    let mut values: Vec<u64> = traits.affinity().iter().map(|v| v.to_bits()).collect();
+    values.extend(traits.motion_response().iter().map(|v| v.to_bits()));
+    values.push(traits.sensing_scale().to_bits());
+    (
+        genome.topology(),
+        genome.parameters().iter().map(|v| v.to_bits()).collect(),
+        values,
+    )
+}
+
+fn squared(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .fold(0.0, |total, &value| total + value * value)
+}
+
+#[test]
+fn founders_are_functions_of_the_seed_and_their_identity() {
+    let catalog = catalog();
+    let rng = SemanticRng::new(SEED);
+    let (mut forward, mut backward) = (quota(), quota());
+    let ahead: BTreeMap<u64, _> = (1..=16)
+        .map(|organism| {
+            let genome = founder_of(&rng, organism, &catalog, &mut forward);
+            (organism, content(&genome))
+        })
+        .collect();
+    let behind: BTreeMap<u64, _> = (1..=16)
+        .rev()
+        .map(|organism| {
+            let genome = founder_of(&rng, organism, &catalog, &mut backward);
+            (organism, content(&genome))
+        })
+        .collect();
+    assert_eq!(ahead, behind);
+    assert_eq!(forward, backward);
+
+    // Organism 1's weight (layer 0, output 3, input 101) is
+    // `fan-in-scaled-symmetric-v1` of NumPy's word 0x7cf8385e9e0737d2 at
+    // fan-in 104, rounded by numpy.float32.
+    let one = founder_of(&rng, 1, &catalog, &mut quota());
+    let topology = catalog
+        .topology(catalog.default_topology())
+        .expect("default member");
+    let layers = topology.layers();
+    let offset = layers[0].weight(3, 101).expect("in range");
+    assert_eq!(one.parameters()[offset].to_bits(), 0xbb83_c278);
+    for layer in layers {
+        for output in 0..layer.outputs {
+            let bias = layer.bias(output).expect("in range");
+            assert_eq!(one.parameters()[bias].to_bits(), 0, "biases start at zero");
+        }
+    }
+
+    // Distinct organisms and another seed draw distinct founders.
+    let two = founder_of(&rng, 2, &catalog, &mut quota());
+    let other = founder_of(&SemanticRng::new(SEED + 1), 1, &catalog, &mut quota());
+    assert_ne!(content(&one).1, content(&two).1);
+    assert_ne!(content(&one).1, content(&other).1);
+    assert_ne!(content(&one).2, content(&two).2);
+
+    // Traits: unit affinity, a motion response on its norm sphere, the
+    // configured scale; isotropy to sampling error over 512 founders.
+    let limits = limits();
+    let motion_limit = limits.motion_response_norm();
+    let mut mean = [0.0_f64; 32];
+    let mut square = 0.0;
+    let count = 512;
+    for organism in 1..=count {
+        let genome = founder_of(&rng, organism, &catalog, &mut quota());
+        let traits = genome.traits();
+        let affinity = squared(traits.affinity());
+        assert!(
+            affinity <= 1.0 && affinity > 1.0 - 8.0 * f64::EPSILON,
+            "{affinity}"
+        );
+        let motion = squared(traits.motion_response());
+        assert!(motion <= motion_limit * motion_limit);
+        assert!(motion > motion_limit * motion_limit * (1.0 - 8.0 * f64::EPSILON));
+        assert_eq!(traits.sensing_scale(), initial_scale(&appendix_a()));
+        for (total, &value) in mean.iter_mut().zip(traits.affinity()) {
+            *total += value;
+        }
+        square += traits.affinity()[7] * traits.affinity()[7];
+    }
+    let n = count as f64;
+    // Each component has mean 0 and variance 1/32.
+    let standard_error = (1.0 / 32.0 / n).sqrt();
+    for total in mean {
+        assert!((total / n).abs() < 5.0 * standard_error, "{}", total / n);
+    }
+    assert!((square / n - 1.0 / 32.0).abs() < 0.01, "{}", square / n);
+}
+
+#[test]
+fn zero_rates_give_a_bit_identical_child() {
+    let catalog = catalog();
+    let mut quota = quota();
+    let parent = founder_of(&SemanticRng::new(SEED), 3, &catalog, &mut quota);
+    let mutator = mutator(quiet(), &catalog);
+    let (genome, record) = child(&mutator, &parent, attempt(3, 10), &mut quota);
+    assert_eq!(content(&genome), content(&parent));
+    assert_eq!(genome.parent(), Some(parent.id()));
+    assert!(
+        !genome
+            .shared_parameters()
+            .same_buffer(&parent.shared_parameters())
+    );
+    assert_eq!(
+        (
+            record.candidate,
+            record.topology,
+            record.replaced,
+            record.perturbed
+        ),
+        (0, None, 0, 0)
+    );
+    assert!(record.rejected.is_empty());
+}
+
+#[test]
+fn each_operator_changes_only_its_own_heritable_component() {
+    let catalog = catalog();
+    let mut quota = quota();
+    let parent = founder_of(&SemanticRng::new(SEED), 4, &catalog, &mut quota);
+    let (topology, parameters, traits) = content(&parent);
+    let count = parameters.len();
+    let at = attempt(4, 77);
+    let traits_of = |genome: &Genome| -> Traits { *genome.traits() };
+
+    // Weights and biases only.
+    let rates = MutationParameters {
+        weight_probability: 1.0,
+        weight_standard_deviation: 0.02,
+        ..quiet()
+    };
+    let (genome, record) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    assert_eq!(record.perturbed as usize, count);
+    let (t, p, r) = content(&genome);
+    assert_eq!((t, &r), (topology, &traits));
+    let changed = p.iter().zip(&parameters).filter(|(a, b)| a != b).count();
+    assert!(changed + 2 >= count, "{changed} of {count}");
+
+    // Replacement only: every parameter is the initializer of its own word 1.
+    let rates = MutationParameters {
+        replacement_probability: 1.0,
+        ..quiet()
+    };
+    let (genome, record) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    assert_eq!(record.replaced as usize, count);
+    assert_eq!(traits_of(&genome), traits_of(&parent));
+    let rng = SemanticRng::new(SEED);
+    let shape = catalog.topology(topology).expect("parent member").layers()[1];
+    for (kind, input, offset) in [
+        (LaneKind::Weight, 17, shape.weight(5, 17)),
+        (LaneKind::Bias, 0, shape.bias(5)),
+    ] {
+        let lane =
+            Lane::new(0, kind, Lane::neuron_index(1, 5, input).expect("neuron")).expect("lane");
+        let word = rng.block(Address {
+            stream: Stream::Mutation,
+            entity: 4,
+            ordinal: 77,
+            lane,
+            draw: 0,
+        })[1];
+        let expected = fan_in_weight(word, shape.inputs).expect("fan-in");
+        assert_eq!(genome.parameters()[offset.expect("in range")], expected);
+    }
+
+    // Affinity and motion response only.
+    let rates = MutationParameters {
+        chemistry_standard_deviation: 0.05,
+        ..quiet()
+    };
+    let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    let (t, p, _) = content(&genome);
+    assert_eq!((t, &p), (topology, &parameters));
+    let ours = traits_of(&genome);
+    let theirs = traits_of(&parent);
+    assert_ne!(ours.affinity(), theirs.affinity());
+    assert_ne!(ours.motion_response(), theirs.motion_response());
+    assert_eq!(ours.sensing_scale(), theirs.sensing_scale());
+    let affinity = squared(ours.affinity());
+    assert!(affinity <= 1.0 && affinity > 1.0 - 8.0 * f64::EPSILON);
+    let limit = limits().motion_response_norm();
+    assert!(squared(ours.motion_response()) <= limit * limit);
+
+    // Sensing scale only.
+    let rates = MutationParameters {
+        sensing_log_scale_standard_deviation: 0.02,
+        ..quiet()
+    };
+    let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    let ours = traits_of(&genome);
+    assert_eq!(content(&genome).1, parameters);
+    assert_eq!(ours.affinity(), theirs.affinity());
+    assert_eq!(ours.motion_response(), theirs.motion_response());
+    assert_ne!(ours.sensing_scale(), theirs.sensing_scale());
+    let [low, high] = limits().scale_range();
+    assert!((low..=high).contains(&ours.sensing_scale()));
+
+    // Topology only: the child is the declared map of the parent, with the
+    // map's words from its own lanes.
+    let rates = MutationParameters {
+        topology_change_probability: 1.0,
+        ..quiet()
+    };
+    let (genome, record) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    let change = record.topology.expect("a topology change");
+    assert_eq!((change.from, change.to), (topology, genome.topology()));
+    assert_ne!(change.to, topology);
+    assert_eq!(traits_of(&genome), traits_of(&parent));
+    let source = catalog.topology(change.from).expect("source");
+    let target = catalog.topology(change.to).expect("target");
+    assert_eq!(
+        Transition::between(source, target).expect("a supported change"),
+        change.transition
+    );
+    let mut expected = vec![f32::NAN; target.parameter_count()];
+    map_parameters(
+        source,
+        parent.parameters(),
+        target,
+        &mut expected,
+        |weight| {
+            let index =
+                Lane::neuron_index(weight.layer, weight.output, weight.input).expect("neuron");
+            rng.block(Address {
+                stream: Stream::Mutation,
+                entity: 4,
+                ordinal: 77,
+                lane: Lane::new(0, LaneKind::MapWeight, index).expect("lane"),
+                draw: 0,
+            })[0]
+        },
+    )
+    .expect("the map applies");
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(genome.parameters()), bits(&expected));
+}
+
+#[test]
+fn proposals_depend_only_on_parent_tick_and_candidate() {
+    let catalog = catalog();
+    let rng = SemanticRng::new(SEED);
+    let rates = MutationParameters::from_config(&appendix_a()).expect("Appendix A rates");
+    let rates = MutationParameters {
+        // Enough change per child to make any order effect visible.
+        weight_probability: 0.05,
+        topology_change_probability: 0.3,
+        ..rates
+    };
+    let mutator = mutator(rates, &catalog);
+    let parents: Vec<Genome> = (1..=12)
+        .map(|organism| founder_of(&rng, organism, &catalog, &mut quota()))
+        .collect();
+    let run = |order: &[usize]| -> BTreeMap<u64, _> {
+        let mut quota = quota();
+        order
+            .iter()
+            .map(|&index| {
+                let parent = &parents[index];
+                let organism = parent.id().get();
+                let (genome, record) = child(&mutator, parent, attempt(organism, 500), &mut quota);
+                (organism, (content(&genome), record))
+            })
+            .collect()
+    };
+    let forward: Vec<usize> = (0..parents.len()).collect();
+    let backward: Vec<usize> = forward.iter().rev().copied().collect();
+    let interleaved: Vec<usize> = forward
+        .iter()
+        .step_by(2)
+        .chain(forward.iter().skip(1).step_by(2))
+        .copied()
+        .collect();
+    let reference = run(&forward);
+    assert_eq!(run(&backward), reference);
+    assert_eq!(run(&interleaved), reference);
+
+    // Four workers, each with its own quota, as a scheduler might split them.
+    let mut parallel = BTreeMap::new();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                let (parents, mutator) = (&parents, &mutator);
+                scope.spawn(move || {
+                    let mut quota = quota();
+                    parents
+                        .iter()
+                        .skip(worker)
+                        .step_by(4)
+                        .map(|parent| {
+                            let organism = parent.id().get();
+                            let (genome, record) =
+                                child(mutator, parent, attempt(organism, 500), &mut quota);
+                            (organism, (content(&genome), record))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for worker in workers {
+            parallel.extend(worker.join().expect("worker finished"));
+        }
+    });
+    assert_eq!(parallel, reference);
+
+    // An operational retry of the same tick repeats its proposal; a later
+    // tick and another seed draw fresh ones.
+    let parent = &parents[0];
+    let organism = parent.id().get();
+    let mut quota = quota();
+    let first = content(&child(&mutator, parent, attempt(organism, 500), &mut quota).0);
+    let again = content(&child(&mutator, parent, attempt(organism, 500), &mut quota).0);
+    let later = content(&child(&mutator, parent, attempt(organism, 501), &mut quota).0);
+    assert_eq!(first, again);
+    assert_ne!(first, later);
+    let reseeded =
+        Mutator::new(SemanticRng::new(SEED + 1), rates, &catalog, limits()).expect("valid rates");
+    let other = content(&child(&reseeded, parent, attempt(organism, 500), &mut quota).0);
+    assert_ne!(first, other);
+}
+
+#[test]
+fn c16_exhausted_no_op_candidates_reject_the_birth_without_charge() {
+    let catalog = catalog();
+    let mut quota = quota();
+    // Every parameter is 0.5, whose F32 half-ulp is 2^-25. A perturbation of
+    // at most 1e-12 × 8.6 rounds back to the parent: every candidate is an
+    // effective no-op after canonical rounding.
+    let parent = uniform_parent(0.5, &catalog, &mut quota);
+    let before = quota.clone();
+    for maximum in [MAXIMUM_CANDIDATES, 3, 1] {
+        let rates = MutationParameters {
+            weight_probability: 1.0,
+            weight_standard_deviation: 1.0e-12,
+            reject_effective_noop: true,
+            maximum_candidates: maximum,
+            ..quiet()
+        };
+        let proposal = mutator(rates, &catalog)
+            .propose(&parent, attempt(1, 9), GenomeId::new(2), &mut quota)
+            .expect("no capacity error");
+        let Proposal::Rejected { candidates } = proposal else {
+            panic!("an effective no-op was accepted");
+        };
+        assert_eq!(candidates.len(), usize::from(maximum));
+        for (index, rejection) in candidates.iter().enumerate() {
+            assert_eq!(usize::from(rejection.candidate), index);
+            assert_eq!(rejection.reason, RejectionReason::EffectiveNoop);
+        }
+        // Nothing leaked: logical, allocated and live counts are unchanged.
+        assert_eq!(quota, before);
+    }
+
+    // Without the strict rule the same no-op is an exact clone.
+    let rates = MutationParameters {
+        weight_probability: 1.0,
+        weight_standard_deviation: 1.0e-12,
+        ..quiet()
+    };
+    let (genome, record) = child(
+        &mutator(rates, &catalog),
+        &parent,
+        attempt(1, 9),
+        &mut quota,
+    );
+    assert_eq!(content(&genome), content(&parent));
+    assert_eq!(record.perturbed as usize, genome.parameters().len());
+}
+
+#[test]
+fn invalid_candidates_are_rejected_never_reinterpreted() {
+    let catalog = catalog();
+    let mut quota = quota();
+    let bound = limits().maximum_absolute_parameter() as f32;
+    // At the bound, a unit perturbation of every parameter leaves it.
+    let parent = uniform_parent(bound, &catalog, &mut quota);
+    let before = quota.clone();
+    let rates = MutationParameters {
+        weight_probability: 1.0,
+        weight_standard_deviation: 1.0,
+        ..quiet()
+    };
+    let proposal = mutator(rates, &catalog)
+        .propose(&parent, attempt(2, 3), GenomeId::new(2), &mut quota)
+        .expect("no capacity error");
+    let Proposal::Rejected { candidates } = proposal else {
+        panic!("an out-of-bound child was accepted");
+    };
+    assert_eq!(candidates.len(), usize::from(MAXIMUM_CANDIDATES));
+    assert!(candidates.iter().all(|rejection| matches!(
+        rejection.reason,
+        RejectionReason::Invalid(CoreError::NumericalInvalid { .. })
+    )));
+    assert_eq!(quota, before);
+
+    // With one parameter at the bound and half of them perturbed, some
+    // candidates fail and a later one succeeds; the record keeps the
+    // failures in order.
+    let mut buffer = quota
+        .allocate(&catalog, catalog.default_topology())
+        .expect("room");
+    buffer.values_mut().fill(0.25);
+    buffer.values_mut()[0] = bound;
+    let traits = *parent.traits();
+    let edge = Genome::seal(buffer, GenomeId::new(3), &catalog, traits, None, &limits())
+        .expect("in bound");
+    let rates = MutationParameters {
+        weight_probability: 0.5,
+        weight_standard_deviation: 0.5,
+        ..quiet()
+    };
+    let mutator = mutator(rates, &catalog);
+    let (tick, record) = (0..64)
+        .find_map(|tick| {
+            let (_, record) = child(&mutator, &edge, attempt(3, tick), &mut quota.clone());
+            (record.candidate > 0).then_some((tick, record))
+        })
+        .expect("some attempt needs a retry");
+    assert_eq!(record.rejected.len(), usize::from(record.candidate));
+    for (index, rejection) in record.rejected.iter().enumerate() {
+        assert_eq!(usize::from(rejection.candidate), index);
+        assert!(matches!(rejection.reason, RejectionReason::Invalid(_)));
+    }
+    // The accepted candidate is in bound, and retrying the tick repeats it.
+    let (genome, again) = child(&mutator, &edge, attempt(3, tick), &mut quota);
+    assert_eq!(again, record);
+    assert!(genome.parameters().iter().all(|value| value.abs() <= bound));
+}
+
+#[test]
+fn canonical_rounding_fixtures() {
+    // F64 arithmetic, rounded once to F32 with ties to even.
+    let half_ulp = 2.0_f64.powi(-24);
+    assert_eq!(perturb(1.0, half_ulp / 2.0), 1.0);
+    assert_eq!(perturb(1.0, half_ulp), 1.0, "a tie rounds to even");
+    assert_eq!(perturb(1.0, 1.5 * half_ulp), 1.0 + f32::EPSILON);
+    assert_eq!(
+        perturb(1.0 + f32::EPSILON, half_ulp),
+        1.0 + 2.0 * f32::EPSILON
+    );
+    assert_eq!(perturb(0.0, 1.0e-12), 1.0e-12_f64 as f32);
+
+    // Full path at parent 7, tick 1234, candidate 0, weight (1, 5, 17) of
+    // the default member, against the independent oracle:
+    // - replacement: fan-in-scaled word 0x1c637997ef8ba9f2 at fan-in 64;
+    // - bias (1, 5) replacement: word 0x65b52417be69ee0a;
+    // - perturbation of 0.25 by 0.02 × N, with N the Box–Muller cosine of
+    //   words 0x91a09948ada727b2 and 0xc659cf0c5953de83 (0.1648969520382955).
+    let catalog = catalog();
+    let mut quota = quota();
+    let parent = uniform_parent(0.25, &catalog, &mut quota);
+    let shape = catalog
+        .topology(catalog.default_topology())
+        .expect("default member")
+        .layers()[1];
+    let weight = shape.weight(5, 17).expect("in range");
+    let bias = shape.bias(5).expect("in range");
+    let at = attempt(7, 1234);
+
+    let rates = MutationParameters {
+        replacement_probability: 1.0,
+        ..quiet()
+    };
+    let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    assert_eq!(genome.parameters()[weight].to_bits(), 0xbe2c_8834);
+    assert_eq!(genome.parameters()[bias].to_bits(), 0xbd36_28c2);
+
+    let rates = MutationParameters {
+        weight_probability: 1.0,
+        weight_standard_deviation: 0.02,
+        ..quiet()
+    };
+    let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    assert_eq!(genome.parameters()[weight].to_bits(), 0x3e81_b044);
+}
+
+#[test]
+fn topology_changes_choose_uniformly_among_the_other_admitted_members() {
+    let rates = MutationParameters {
+        topology_change_probability: 1.0,
+        ..quiet()
+    };
+    let attempts = 400_u64;
+    for (cap, members) in [(30_000, 5), (20_000, 4)] {
+        let config = appendix_a();
+        let catalog = TopologyCatalog::dense_104_36_v1(cap, &[64, 32]).expect("catalog");
+        assert_eq!(
+            config.config().architecture_mutation.maximum_parameters,
+            30_000
+        );
+        let mut quota = quota();
+        let parent = founder_of(&SemanticRng::new(SEED), 5, &catalog, &mut quota);
+        let mutator = mutator(rates, &catalog);
+        let mut counts = BTreeMap::new();
+        for tick in 0..attempts {
+            let (genome, record) = child(&mutator, &parent, attempt(5, tick), &mut quota.clone());
+            let change = record.topology.expect("probability one");
+            assert_ne!(change.to, parent.topology());
+            assert!(catalog.admits(change.to));
+            *counts.entry(genome.topology().index()).or_insert(0_u64) += 1;
+        }
+        let others = members - 1;
+        assert_eq!(counts.len(), others, "{counts:?}");
+        let p = 1.0 / others as f64;
+        let n = attempts as f64;
+        let sigma = (n * p * (1.0 - p)).sqrt();
+        for (&member, &count) in &counts {
+            assert!(
+                (count as f64 - n * p).abs() < 5.0 * sigma,
+                "member {member}: {count} of {attempts}"
+            );
+        }
+    }
+}
+
+#[test]
+fn perturbation_and_replacement_counts_follow_their_rates() {
+    // Appendix A's rates; counts over 200 children of one parent lie within
+    // five standard deviations of their binomial means, and the changes
+    // are 0.02 × N(0, 1) before rounding.
+    let catalog = catalog();
+    let rates = MutationParameters::from_config(&appendix_a()).expect("Appendix A rates");
+    let rates = MutationParameters {
+        topology_change_probability: 0.0,
+        ..rates
+    };
+    let mutator = mutator(rates, &catalog);
+    let mut quota = quota();
+    let parent = founder_of(&SemanticRng::new(SEED), 6, &catalog, &mut quota);
+    let size = parent.parameters().len() as f64;
+    let children = 200_u64;
+    let (mut perturbed, mut replaced) = (0_u64, 0_u64);
+    let (mut sum, mut squares, mut changes) = (0.0, 0.0, 0.0);
+    for tick in 0..children {
+        let (genome, record) = child(&mutator, &parent, attempt(6, tick), &mut quota.clone());
+        perturbed += u64::from(record.perturbed);
+        replaced += u64::from(record.replaced);
+        if record.replaced == 0 {
+            for (&ours, &theirs) in genome.parameters().iter().zip(parent.parameters()) {
+                if ours != theirs {
+                    let step = (f64::from(ours) - f64::from(theirs)) / 0.02;
+                    sum += step;
+                    squares += step * step;
+                    changes += 1.0;
+                }
+            }
+        }
+    }
+    let n = children as f64 * size;
+    for (count, p) in [(perturbed, 0.002 * (1.0 - 0.0001)), (replaced, 0.0001)] {
+        let mean = n * p;
+        let sigma = (n * p * (1.0 - p)).sqrt();
+        assert!(
+            (count as f64 - mean).abs() < 5.0 * sigma,
+            "{count} against {mean} ± {sigma}"
+        );
+    }
+    let mean = sum / changes;
+    let variance = squares / changes - mean * mean;
+    assert!(changes > 1_000.0);
+    assert!(mean.abs() < 5.0 / changes.sqrt(), "{mean}");
+    assert!(
+        (variance - 1.0).abs() < 5.0 * (2.0 / changes).sqrt(),
+        "{variance}"
+    );
+}
+
+#[test]
+fn sensing_scale_reflects_at_its_log_bounds() {
+    let range = [1.0, 16.0];
+    let reflect =
+        |scale: f64, delta: f64| reflect_log_scale(scale, delta, range).expect("reflects");
+    // Inside: `exp(ln s + δ)`.
+    assert!((reflect(2.0, 0.1) - 2.0 * 0.1_f64.exp()).abs() < 1.0e-15);
+    // Below the floor `ln 1 = 0`: `δ = −0.1` reflects to `+0.1`.
+    assert_eq!(reflect(1.0, -0.1), exp(0.1).expect("finite"));
+    // Above the ceiling: `ln 16 + 0.5` reflects to `ln 16 − 0.5`.
+    assert!((reflect(16.0, 0.5) - 16.0 * (-0.5_f64).exp()).abs() < 1.0e-14);
+    // Repeated reflection stays inside, and the bounds themselves hold.
+    for step in [-20.0, -5.5, -0.01, 0.0, 0.01, 3.3, 11.0, 20.0] {
+        for scale in [1.0, 1.5, 4.0, 16.0] {
+            let value = reflect(scale, step);
+            assert!((1.0..=16.0).contains(&value), "{scale} {step} -> {value}");
+        }
+    }
+    // A single admitted scale admits only itself.
+    assert_eq!(reflect_log_scale(3.0, 0.4, [3.0, 3.0]), Ok(3.0));
+    // A step that cannot be reflected inside is refused, not clamped.
+    for refused in [
+        reflect_log_scale(2.0, 1.0e6, range),
+        reflect_log_scale(2.0, f64::NAN, range),
+        reflect_log_scale(0.0, 0.1, range),
+    ] {
+        assert!(matches!(refused, Err(CoreError::NumericalInvalid { .. })));
+    }
+}
+
+#[test]
+fn rates_come_from_the_configuration_and_are_validated() {
+    let rates = MutationParameters::from_config(&appendix_a()).expect("Appendix A rates");
+    assert_eq!(
+        rates,
+        MutationParameters {
+            topology_change_probability: 0.01,
+            weight_probability: 0.002,
+            weight_standard_deviation: 0.02,
+            replacement_probability: 0.0001,
+            chemistry_standard_deviation: 0.01,
+            sensing_log_scale_standard_deviation: 0.02,
+            reject_effective_noop: true,
+            maximum_candidates: 8,
+        }
+    );
+    for invalid in [
+        MutationParameters {
+            maximum_candidates: 9,
+            ..rates
+        },
+        MutationParameters {
+            maximum_candidates: 0,
+            ..rates
+        },
+        MutationParameters {
+            weight_probability: 1.5,
+            ..rates
+        },
+        MutationParameters {
+            topology_change_probability: f64::NAN,
+            ..rates
+        },
+        MutationParameters {
+            weight_standard_deviation: -0.1,
+            ..rates
+        },
+        MutationParameters {
+            sensing_log_scale_standard_deviation: f64::INFINITY,
+            ..rates
+        },
+        // A strict rule with no operator able to change a genome (§7.3).
+        MutationParameters {
+            reject_effective_noop: true,
+            ..quiet()
+        },
+        // Perturbation with a zero deviation changes nothing either.
+        MutationParameters {
+            reject_effective_noop: true,
+            weight_probability: 1.0,
+            ..quiet()
+        },
+    ] {
+        assert!(
+            matches!(invalid.validate(), Err(CoreError::NumericalInvalid { .. })),
+            "{invalid:?}"
+        );
+        assert!(Mutator::new(SemanticRng::new(SEED), invalid, &catalog(), limits()).is_err());
+    }
+    // Architecture mutation switched off zeroes the topology probability.
+    let text = PLAN[PLAN.find("## Appendix A").unwrap_or(0)..]
+        .split("```toml\n")
+        .nth(1)
+        .and_then(|block| block.split("```").next())
+        .unwrap_or("")
+        .replacen("enabled = true\ncatalog", "enabled = false\ncatalog", 1);
+    let config = ValidatedConfig::from_toml(&text).expect("still valid");
+    assert!(!config.config().architecture_mutation.enabled);
+    let rates = MutationParameters::from_config(&config).expect("rates");
+    assert_eq!(rates.topology_change_probability, 0.0);
+}

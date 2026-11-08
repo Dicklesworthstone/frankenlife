@@ -266,12 +266,19 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-004",
         )
     },
-    entry(
-        "seeded-unit-vectors",
-        Role::SourceChemistry,
-        "A.3 item 7",
-        "FL-004",
-    ),
+    // FL-004 implemented the arithmetic; FL-010 supplies the semantic draws
+    // (`flife_field::seeding`).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/seeding.rs::seeded_directions_match_an_independent_oracle",
+        },
+        ..entry(
+            "seeded-unit-vectors",
+            Role::SourceChemistry,
+            "A.3 item 7",
+            "FL-004",
+        )
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-field::tests/transport_sources.rs::chemical_directions_stay_inside_the_unit_ball",
@@ -283,12 +290,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-004",
         )
     },
-    entry(
-        "seeded-smooth-torus-v1",
-        Role::SourcePath,
-        "A.3 item 8",
-        "FL-004",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/seeding.rs::seeded_paths_chain_their_own_directions_and_join_continuously",
+        },
+        ..entry(
+            "seeded-smooth-torus-v1",
+            Role::SourcePath,
+            "A.3 item 8",
+            "FL-004",
+        )
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-engine::tests/organism_phase.rs::c9_chemistry_is_evaluated_per_packet_not_on_the_mixture",
@@ -301,31 +313,42 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         )
     },
     // FL-006 implements these traits' representation, norm bound and use
-    // (`flife_engine::Affinity`, `flife_engine::MotionResponse`). A
-    // heritable trait is complete only when it also mutates as A.3 item 4
-    // specifies, which is FL-010's.
-    entry(
-        "affinity_direction",
-        Role::HeritableTrait,
-        "§5.3, A.3 item 4",
-        "FL-010",
-    ),
-    entry(
-        "motion_response",
-        Role::HeritableTrait,
-        "§5.4, A.3 item 4",
-        "FL-010",
-    ),
-    // FL-007 implements sensing at any admitted scale
-    // (`flife_neural::SensorScales::admits_scale`,
-    // `flife_field::PyramidView::sample`); the trait's mutation is FL-010's,
-    // as above.
-    entry(
-        "sensing_scale",
-        Role::HeritableTrait,
-        "§6.1, A.3 item 4",
-        "FL-010",
-    ),
+    // (`flife_engine::Affinity`, `flife_engine::MotionResponse`), FL-007
+    // sensing at any admitted scale, and FL-010 their founders' draws and
+    // mutation as A.3 item 4 specifies (`flife_genome::mutation`).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/mutation.rs::each_operator_changes_only_its_own_heritable_component",
+        },
+        ..entry(
+            "affinity_direction",
+            Role::HeritableTrait,
+            "§5.3, A.3 item 4",
+            "FL-010",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/mutation.rs::each_operator_changes_only_its_own_heritable_component",
+        },
+        ..entry(
+            "motion_response",
+            Role::HeritableTrait,
+            "§5.4, A.3 item 4",
+            "FL-010",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/mutation.rs::sensing_scale_reflects_at_its_log_bounds",
+        },
+        ..entry(
+            "sensing_scale",
+            Role::HeritableTrait,
+            "§6.1, A.3 item 4",
+            "FL-010",
+        )
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-engine::tests/organism_phase.rs::organisms_settle_contended_uptake_and_close_the_ledger_every_tick",
@@ -417,17 +440,20 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-002",
         )
     },
-    // FL-009 implements the deterministic map from raw words to founders'
-    // parameters (`flife_genome::init`, evidence
-    // `founders_draw_each_weight_from_its_own_address`). A founder from a
-    // seed also needs FL-010's Philox semantic addressing, so the entry is
-    // complete with FL-010, as FL-004's seeded entries are.
-    entry(
-        "fan-in-scaled-symmetric-v1",
-        Role::Initializer,
-        "§7.2, A.3 item 2",
-        "FL-010",
-    ),
+    // FL-009 implements the map from raw words to parameters
+    // (`flife_genome::init`); FL-010 the founders' semantic words
+    // (`flife_genome::founder`).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/mutation.rs::founders_are_functions_of_the_seed_and_their_identity",
+        },
+        ..entry(
+            "fan-in-scaled-symmetric-v1",
+            Role::Initializer,
+            "§7.2, A.3 item 2",
+            "FL-010",
+        )
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-genome::tests/genomes.rs::catalog_is_section_6_4_in_order_under_the_parameter_cap",
@@ -461,24 +487,41 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-009",
         )
     },
-    entry(
-        "uniform-other-catalog-member",
-        Role::TargetSelection,
-        "A.3 item 4",
-        "FL-010",
-    ),
-    entry(
-        "fnp-philox-semantic-v1",
-        Role::MutationRng,
-        "§16.2, A.3 item 3",
-        "FL-010",
-    ),
-    entry(
-        "reject-birth-no-charge",
-        Role::ExhaustedProposals,
-        "A.3 item 4, C.16",
-        "FL-010",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/mutation.rs::topology_changes_choose_uniformly_among_the_other_admitted_members",
+        },
+        ..entry(
+            "uniform-other-catalog-member",
+            Role::TargetSelection,
+            "A.3 item 4",
+            "FL-010",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-core::tests/rng.rs::semantic_blocks_match_numpy",
+        },
+        ..entry(
+            "fnp-philox-semantic-v1",
+            Role::MutationRng,
+            "§16.2, A.3 item 3",
+            "FL-010",
+        )
+    },
+    // Rejection, abandonment and the record are FL-010's; preserving the
+    // parent's energy and cooldown is the birth transaction's (FL-011).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-genome::tests/mutation.rs::c16_exhausted_no_op_candidates_reject_the_birth_without_charge",
+        },
+        ..entry(
+            "reject-birth-no-charge",
+            Role::ExhaustedProposals,
+            "A.3 item 4, C.16",
+            "FL-010",
+        )
+    },
     entry(
         "no-emission-no-charge",
         Role::ZeroDirection,

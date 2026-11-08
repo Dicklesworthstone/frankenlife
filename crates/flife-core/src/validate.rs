@@ -371,7 +371,8 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
     // A strict no-op rule with no mutation source can never produce a child (A.2).
     let mutation = &config.mutation;
     let architecture = &config.architecture_mutation;
-    let any_mutation = mutation.weight_probability > 0.0
+    let any_mutation = (mutation.weight_probability > 0.0
+        && mutation.weight_standard_deviation > 0.0)
         || mutation.replacement_probability > 0.0
         || mutation.chemistry_standard_deviation > 0.0
         || mutation.sensing_log_scale_standard_deviation > 0.0
@@ -380,6 +381,13 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
         issues.add(
             "mutation.reject_effective_noop",
             "every mutation source is zero, so every candidate is a no-op and every birth fails",
+        );
+    }
+    // Strict mutation tries at most eight candidates per attempted birth (§7.3).
+    if mutation.maximum_candidate_proposals_per_birth > 8 {
+        issues.add(
+            "mutation.maximum_candidate_proposals_per_birth",
+            "strict mutation tries at most eight candidate proposals per attempted birth (§7.3)",
         );
     }
 

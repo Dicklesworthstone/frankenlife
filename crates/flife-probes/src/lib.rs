@@ -803,6 +803,7 @@ pub const SINGLE_COPY_PACKAGES: &[&str] = &[
     "fmn-render",
     "fnp-dtype",
     "fnp-ndarray",
+    "fnp-random",
     "fnp-random-core",
     "frankentorch-api",
     "frankentorch-core",

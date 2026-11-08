@@ -4,7 +4,9 @@
 covers identities, integer clocks, units, failure classes, the named-algorithm registry, the
 `frankenlife.config.v1` configuration with its A.2 validator, canonical serialization, and the model descriptor.
 FL-005 (`flife-f6x`) adds the global energy ledger (§4.4, §8.2, §21.4, INV-03 and INV-05). FL-006 (`flife-h6c`)
-adds the host-independent elementary functions of the reference numerical profile (A.1, C.11).
+adds the host-independent elementary functions of the reference numerical profile (A.1, C.11). FL-010
+(`flife-rf8`) adds `fnp-philox-semantic-v1`, the semantically addressed random source every model draw comes from
+(§16.2, A.3 item 3, INV-11), with the `exp`, `ln` and turn-angle sine and cosine its distributions need.
 
 **Inputs.** Configuration TOML (Appendix A's schema). Every key is required and unknown keys are refused, so there
 are no hidden defaults.
@@ -28,7 +30,10 @@ are no hidden defaults.
   - The run's `EnergyLedger` with its `LedgerReport`, and `ResidualBudget`.
   - The per-organism `EnergyBudget`, with `Payment`.
   - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.
-- Numerics (FL-006, FL-007): `exp_neg`, `expm1_neg`, `tanh`, `sigmoid` and `log2`.
+- Numerics (FL-006, FL-007, FL-010): `exp_neg`, `expm1_neg`, `tanh`, `sigmoid`, `log2`, `ln`, `exp` and
+  `sin_cos_turns`.
+- Random addressing (FL-010): `SemanticRng`, `Address`, `Stream`, `Lane`, `LaneKind`, `Block`, and the draw
+  conventions `half_open_unit`, `open_unit`, `bernoulli`, `choose` and `box_muller`.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -72,6 +77,28 @@ are no hidden defaults.
   - `log2` reads the exponent from the bits (scaling a subnormal by `2^54` first, exactly), reduces the mantissa
     to `[√2/2, √2]` and sums the `atanh` series of `(m − 1)/(m + 1)`. It is exact at every power of two from
     `2^-1074` to `2^1023` and measured within 2 ulp of the correctly rounded value elsewhere.
+  - `ln` shares that reduction and adds `n ln 2` split Cody–Waite style. `exp` is `exp_neg(−x)` for `x ≤ 0` and
+    the same reduction otherwise. `sin_cos_turns(u)` returns `(sin 2πu, cos 2πu)` for `u ∈ [0, 1)`. Its quadrant
+    and its fold to `[0, π/4]` are exact, so quarter turns are exact; nested Taylor series do the rest. Measured
+    against correctly rounded values: `ln` within 2 ulp over 12,387 arguments, `exp` within 1 ulp over 3,292,
+    and the sine and cosine within 2 ulp over 4,096 turns each.
+- Random addressing (`fnp-philox-semantic-v1`, §16.2, INV-11).
+  - An address is `(stream, entity, ordinal, lane, draw)`. Its block is the first four outputs of NumPy's
+    `Philox(key=[world_seed, stream code], counter=[entity, ordinal, lane, draw])` through FrankenNumPy's
+    NumPy-exact `PhiloxRng`, which is Philox4x64-10 of `counter + 1`.
+  - Stream codes are frozen eight-byte ASCII tags: `founders`, `mutation`, `srcchems`, `srcpaths`, `srcplace`.
+  - A lane packs `candidate << 56 | kind << 48 | index` with frozen kind codes 1–9, and a neuron index
+    `layer << 32 | output << 16 | input`. A value out of range is refused (`Overflow`), never wrapped.
+  - Distinct addresses never share a block, because the counter map is injective and Philox is a bijection for
+    a fixed key.
+  - Nothing is stateful. A block depends on the seed and its address, never on worker, task order, storage slot,
+    wall time or frame.
+  - Draws:
+    - the half-open uniform `k 2^-52` and the open uniform `(k + ½) 2^-52` from a word's leading 52 bits `k`,
+      both exact;
+    - `choose` as `⌊k n / 2^52⌋` in integer arithmetic;
+    - Box–Muller `[ρ cos 2πu₂, ρ sin 2πu₂]` with `ρ = √(−2 ln u₁)`, an open `u₁` from the first word, a
+      half-open `u₂` from the second, and no cached spare.
 
 **Refusal cases (A.2).**
 - Nonfinite numbers and negative costs.
@@ -80,7 +107,9 @@ are no hidden defaults.
 - More than two hidden layers, or a default network above the parameter cap.
 - An unsupported dtype, or an unknown or misplaced algorithm.
 - No viable child fraction at the minimum attempt energy, or child-fraction bounds out of order.
-- Strict no-op rejection with every mutation source at zero.
+- Strict no-op rejection with every mutation source at zero, a perturbation with a zero deviation counting as
+  none (§7.3).
+- More than eight candidate proposals per attempted birth (§7.3).
 - A sensing scale below the finest pyramid level, or a grid not divisible by `2^levels`.
 - A source kernel that can miss every cell center.
 - A source segment that is not tick-aligned.
@@ -112,17 +141,21 @@ Every issue is reported, not just the first.
     `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`.
   - FL-005: `grid-cic-v1`.
 - Implemented in `flife-engine` (FL-006): `bounded-affinity-v1` and `per-granted-cell-packet`. The heritable
-  traits `affinity_direction` and `motion_response` have their representation, bound and use there, but stay
-  `Specified` under FL-010 until they mutate as A.3 item 4 specifies.
+  traits `affinity_direction` and `motion_response` have their representation, bound and use there.
 - FL-007: `positive-box-v1` and `log-linear-v1` in `flife-field`; `energy-moment-gradient-104-v1` and
   `fixed-local-scales-v1` in `flife-neural`. The heritable `sensing_scale` is sampled at any admitted scale
-  there, and stays `Specified` under FL-010 for the same reason.
+  there.
 - FL-008, in `flife-neural`: `independent-dense-mlp-v1`, the `tanh` hidden activation, the `linear` output
   activation and `f32` accumulation.
 - FL-009, in `flife-genome`: the `f32` weight dtype of the canonical genotype, `dense-104-36-catalog-v1`,
-  `overlap-plus-zero-output-v1` and `prefix-and-identity-bridge-v1`. The founders' initializer
-  `fan-in-scaled-symmetric-v1` stays `Specified` under FL-010: its arithmetic is implemented, but it is
-  complete only with FL-010's semantic Philox addressing.
+  `overlap-plus-zero-output-v1` and `prefix-and-identity-bridge-v1`.
+- FL-010:
+  - `fnp-philox-semantic-v1`, here.
+  - In `flife-genome`: `fan-in-scaled-symmetric-v1` with the founders' semantic words, `uniform-other-catalog-member`
+    and `reject-birth-no-charge`, plus the mutation of the heritable traits `affinity_direction`,
+    `motion_response` and `sensing_scale`, which completes them.
+  - In `flife-field`: the seeded draws of FL-004's `seeded-unit-vectors` and `seeded-smooth-torus-v1`, which
+    completes those too.
 - The tiny-energy policy `dissipate-and-record` belongs to FL-012. Clearing a tiny reservoir is the last budget
   stage before an exhausted organism dies (§8.2). The ledger's `tiny-reservoir` flow is ready for it.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
@@ -154,5 +187,20 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
   - C.11: the drag coefficient, the F32 cancellation, and `sigmoid(8)` against `sigmoid(tanh(8))`.
   - `log2`: every power of two exact, seven pinned bit patterns, agreement with `std` over a sweep, and refusal
     of nonpositive and nonfinite arguments.
+  - `ln` and `exp`: 19 pinned bit patterns with their correctly rounded values, agreement with `std`, exactness at
+    `ln 1` and `exp 0`, `exp(−x) = exp_neg(x)`, and their domains.
+  - Turn angles: nine pinned pairs, exact quarter turns, agreement with `std` and `sin² + cos² = 1` over 4,096
+    turns, and the domain.
+- `tests/rng.rs`:
+  - Philox blocks equal NumPy 2.5.4's at zero, all-ones and carrying counters, and at five semantic addresses.
+    Every expected word comes from NumPy itself, through an oracle script that imports neither FrankenLife nor
+    FrankenNumPy.
+  - Frozen stream codes and injective lane packing, with out-of-range refusals.
+  - Blocks are the same in forward, reverse and four-worker order. No two of 480 addresses share a block, and
+    another seed moves all of them.
+  - Exact uniform and choice conventions.
+  - Box–Muller pairs, pinned and within 4 ulp of correctly rounded, with the exact quarter turn.
+  - Moments over 200,000 normals.
+  - The family and seed read from Appendix A, and another family refused.
 
 **Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`.

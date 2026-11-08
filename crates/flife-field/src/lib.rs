@@ -27,6 +27,9 @@
 //! - [`pyramid`]: the `positive-box-v1` sensor density pyramid and its
 //!   `log-linear-v1` sampling at a sensing scale: raw densities and their
 //!   physical derivatives (FL-007).
+//! - [`seeding`]: the seeded draws of `seeded-unit-vectors`, initial source
+//!   centers and `seeded-smooth-torus-v1` travel directions, from
+//!   `fnp-philox-semantic-v1` by stable source identity (FL-010).
 //!
 //! The energy ledger itself is `flife_core::ledger`. The sensor encoding
 //! and action decoding are in `flife-neural`.
@@ -40,6 +43,7 @@ pub mod invariants;
 pub mod layout;
 pub mod numerics;
 pub mod pyramid;
+pub mod seeding;
 pub mod sources;
 pub mod state;
 pub mod step;
@@ -52,6 +56,10 @@ pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
 pub use pyramid::{LevelGrid, PyramidView, RawSample, SensorPyramid};
+pub use seeding::{
+    SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, chemical_direction, initial_center,
+    initial_source, travel_direction,
+};
 pub use sources::{DepositReport, PathSegment, Source, SourceKernel, SourceSupport};
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
 pub use step::{FieldStepReport, advance_field};

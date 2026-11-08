@@ -107,6 +107,24 @@ impl TraitLimits {
     pub const fn maximum_absolute_parameter(&self) -> f64 {
         self.maximum_absolute_parameter
     }
+
+    /// The bound on `||a||₂`.
+    #[must_use]
+    pub const fn affinity_norm(&self) -> f64 {
+        self.affinity_norm
+    }
+
+    /// The bound on `||χ||₂`.
+    #[must_use]
+    pub const fn motion_response_norm(&self) -> f64 {
+        self.motion_response_norm
+    }
+
+    /// The admitted sensing scales `[minimum, maximum]`, in world-length.
+    #[must_use]
+    pub const fn scale_range(&self) -> [f64; 2] {
+        [self.minimum_scale, self.maximum_scale]
+    }
 }
 
 /// The heritable traits other than the controller.
@@ -170,17 +188,60 @@ impl Traits {
     }
 }
 
-fn check_norm(quantity: &'static str, values: &[f64], limit: f64) -> Result<(), CoreError> {
-    let mut squared = 0.0;
-    for &value in values {
-        if !value.is_finite() {
-            return Err(CoreError::NumericalInvalid {
-                quantity,
-                detail: format!("component {value} is not finite"),
-            });
-        }
-        squared += value * value;
+/// `Σ vᵢ²` in index order. Every norm bound in this crate is checked with
+/// exactly this sum against `limit²`.
+pub(crate) fn squared_norm(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .fold(0.0, |total, &value| total + value * value)
+}
+
+/// Scale `values` onto the sphere of `radius`: `vᵢ / ||v||₂ · radius`. While
+/// rounding leaves [`squared_norm`] above `radius²`, every component is
+/// multiplied by `1 − 2^-53`, so the result always passes the bound it is
+/// checked against. One pass almost always suffices.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a zero, nonfinite or unrecoverable
+/// norm.
+pub(crate) fn rescale(
+    quantity: &'static str,
+    values: &mut [f64],
+    radius: f64,
+) -> Result<(), CoreError> {
+    let norm = squared_norm(values).sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity,
+            detail: format!("a vector of norm {norm:?} has no direction"),
+        });
     }
+    for value in values.iter_mut() {
+        *value = *value / norm * radius;
+    }
+    let shrink = 1.0 - f64::EPSILON / 2.0;
+    for _ in 0..64 {
+        if squared_norm(values) <= radius * radius {
+            return Ok(());
+        }
+        for value in values.iter_mut() {
+            *value *= shrink;
+        }
+    }
+    Err(CoreError::NumericalInvalid {
+        quantity,
+        detail: format!("could not bring the norm within {radius}"),
+    })
+}
+
+fn check_norm(quantity: &'static str, values: &[f64], limit: f64) -> Result<(), CoreError> {
+    if let Some(value) = values.iter().find(|value| !value.is_finite()) {
+        return Err(CoreError::NumericalInvalid {
+            quantity,
+            detail: format!("component {value} is not finite"),
+        });
+    }
+    let squared = squared_norm(values);
     if squared > limit * limit {
         return Err(CoreError::NumericalInvalid {
             quantity,

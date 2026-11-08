@@ -15,8 +15,9 @@
 //! so the ledger can record the residual instead of hiding it.
 //!
 //! Random draws are not made here. Seeded centers, chemical directions and
-//! path directions come from FL-010's semantic RNG addressing. This module
-//! defines the deterministic arithmetic those draws feed.
+//! path directions come from `fnp-philox-semantic-v1` in
+//! [`crate::seeding`] (FL-010). This module defines the deterministic
+//! arithmetic those draws feed.
 
 use flife_core::ids::SourceId;
 use flife_core::{CoreError, TickSpan, TimeStep, ValidatedConfig};
@@ -355,7 +356,7 @@ fn squared_norm(values: &[f64]) -> f64 {
 /// The unit chemical direction of `seeded-unit-vectors` from 32 independent
 /// standard-normal draws (A.3 item 7). It is `z / ||z||₂`, with the squares
 /// summed in channel order and divided by one correctly rounded `sqrt`. The
-/// draws themselves come from FL-010's semantic RNG addressing.
+/// draws themselves come from [`crate::seeding::chemical_direction`].
 ///
 /// Rounding can leave `||a||² = 1 + 2^-52`. The cone argument needs
 /// `||a|| ≤ 1` exactly (Appendix D), so while the channel-order sum of

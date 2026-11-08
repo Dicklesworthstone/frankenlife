@@ -8,14 +8,21 @@
 - the deterministic part of `fan-in-scaled-symmetric-v1`, from raw words to founders' parameters;
 - the transition maps `overlap-plus-zero-output-v1` and `prefix-and-identity-bridge-v1`.
 
-Random words, mutation and target selection are FL-010. Births and deaths are FL-011 and FL-012. Packed
-per-topology arenas are FL-026.
+FL-010 (`flife-rf8`) adds founders and mutation (plan §7.2, §7.3, §16.2, A.3 items 1–4, C.16, INV-11):
+- founders' genomes from `fnp-philox-semantic-v1`, by stable organism identity;
+- bounded mutation proposals: at most eight candidates per attempted birth, each with its own semantic lanes,
+  topology change first (`uniform-other-catalog-member`), then parameters, then traits;
+- `reject-birth-no-charge` when every candidate is invalid or an effective no-op.
+
+Births and deaths are FL-011 and FL-012. Packed per-topology arenas are FL-026.
 
 **Inputs.**
 - A `ValidatedConfig` (`[architecture_mutation]`, `[controller]`, `[chemistry]`, `[sensors]`, `[execution]`), or
   the constants directly.
-- Raw 64-bit words, one per `WeightAddress` (layer, receiving neuron, sending neuron), supplied by the caller.
+- Raw 64-bit words, one per `WeightAddress` (layer, receiving neuron, sending neuron), for `initialize` and
+  `map_parameters` called directly.
 - A parent's parameters and topology, for a transition.
+- A `SemanticRng` (FL-010), and a `BirthAttempt` (parent organism, event tick) for each proposal.
 
 **Outputs.**
 - `TopologyCatalog`: members in catalog order with stable `TopologyId`s, `find`, `admits`, the founders' default
@@ -28,6 +35,10 @@ per-topology arenas are FL-026.
   `ReferenceController`.
 - `initialize` fills founders' parameters. `fan_in_weight` gives one weight from a word.
 - `map_parameters` writes a child's parameters from a parent's and reports the `Transition` kind.
+- `founder` and `founder_traits` (FL-010): a founder's charged, sealed genome and its traits.
+- `MutationParameters` (from `[mutation]` and `[architecture_mutation]`) and `Mutator::propose`, which returns
+  either `Proposal::Child` with its `MutationRecord` or `Proposal::Rejected` with every candidate's
+  `RejectionReason`. Also `perturb` and `reflect_log_scale`.
 
 **Invariants.**
 - The catalog is exactly §6.4's five rows, in order: `104 → 8 → 36` (1,164 parameters), `104 → 32 → 36` (4,548),
@@ -64,6 +75,40 @@ per-topology arenas are FL-026.
   This reading of A.3 item 6 ("initialize missing first-layer neurons as above") is a decision of this crate.
 - A map writes every child value explicitly, and requests words only for added neurons' incoming weights from
   inherited inputs, in ascending address order.
+- Founders (FL-010).
+  - The default member.
+  - Weight `(layer, output, input)` from word 0 of `(founders, organism, 0, lane (0, weight, neuron), 0)`;
+    zero biases.
+  - An affinity normalized from 32 Box–Muller normals to the sphere of radius `min(1, affinity_norm_limit)`.
+  - A motion response normalized from 33 normals to radius `motion_response_norm_limit`.
+  - The configured initial sensing scale.
+  - Pair `j` of lane `(0, kind, j)` gives components `2j` and `2j + 1`.
+- Mutation (FL-010). Every word of candidate `c` is addressed `(mutation, parent organism, tick, lane (c, kind,
+  index), draw)`. An operational retry of a tick repeats its proposals, a later tick draws fresh ones, and no two
+  candidates share a word. Within a candidate, in A.3 item 4's order:
+  1. Topology. Word 0 of lane `(c, topology, 0)` decides against `probability_per_birth` (zero when architecture
+     mutation is disabled), and word 1 chooses uniformly among the other admitted members. The map's added
+     weights take lane `(c, map weight, neuron)`.
+  2. Parameters, named by their neuron in the child's topology. Draw 0 of lane `(c, weight or bias, neuron)`
+     works as follows:
+     - word 0 against `replacement_probability` replaces the value with the initializer of word 1, at the
+       layer's fan-in;
+     - otherwise word 2 against `weight_probability` perturbs it by `weight_standard_deviation` times the
+       Box–Muller cosine of draw 1.
+     The arithmetic is F64, rounded once to F32 with ties to even. Biases follow the same rule.
+  3. Traits.
+     - The affinity adds `chemistry_standard_deviation` normals and renormalizes.
+     - The motion response adds the same deviation and projects radially into its ball when outside it.
+     - The sensing scale adds `sensing_log_scale_standard_deviation` times a normal to its natural log, reflects
+       at the log bounds, and is kept within the range against the last bit of `exp`.
+     - An operator whose rate or deviation is zero changes nothing, bit for bit.
+  - A candidate with a nonfinite, out-of-bound or zero-norm value (any `NumericalInvalid`) is rejected, never
+    reinterpreted. Under `reject_effective_noop`, a candidate equal to its parent bit for bit is rejected too.
+  - Each rejected candidate's buffer is abandoned at once. A birth whose candidates are all rejected leaves the
+    quota exactly as it was.
+  - A quota or allocation refusal is returned as an error, not as a mutation outcome.
+  - Only the controller (topology, weights, biases), the affinity, the motion response and the sensing scale are
+    heritable. Every fixed coefficient lives in the configuration, not in the genome (§7.1).
 
 **Refusal cases.**
 - A default topology that is not a member, or is above the cap. Another catalog, inheritance map or depth-change
@@ -75,9 +120,14 @@ per-topology arenas are FL-026.
   nonfinite bounds.
 - Releasing a charge the quota does not hold (`StateConflict`).
 - A buffer of the wrong length, a zero fan-in, or a depth change other than one-to-two or two-to-one.
+- Mutation parameters with a probability outside `[0, 1]`, a negative or nonfinite deviation, a candidate count
+  outside `1..=8`, or a strict no-op rule with no operator able to change a genome. Another target selection or
+  exhausted-proposals policy (`UnknownAlgorithm`).
+- A log-scale step that cannot be reflected into range, or a nonpositive scale.
 
 **Determinism.** Pure functions of their inputs, in fixed (layer, output, input) order, using only IEEE-754
-arithmetic and the correctly rounded `sqrt`. No hash maps and no draws of its own.
+arithmetic, the correctly rounded `sqrt` and `flife_core::numerics`. No hash maps. Every draw is a semantic block,
+so results never depend on evaluation order, worker or quota state.
 
 **Independent tests.** `tests/genomes.rs`. Each directed transition is checked against an expectation the map does
 not compute:
@@ -107,15 +157,57 @@ not compute:
 A manual mutation check during FL-009 planted two map bugs: a bridge that also joins added neurons, and added
 neurons that keep their outgoing weights. These tests caught each of them.
 
+`tests/mutation.rs` (FL-010). The full-path fixtures take their expected bits from an oracle that uses NumPy
+2.5.4's `Philox`, Python `Decimal` and `numpy.float32`, and imports no FrankenLife or FrankenNumPy code.
+- Founders:
+  - the same content in forward and reverse order;
+  - a founder weight pinned to the oracle's `0xbb83c278`;
+  - zero biases, distinct organisms and seeds, and unit or limit norms;
+  - isotropic affinity moments over 512 founders.
+- Zero rates give a bit-identical child that records its parent in a new buffer.
+- Each operator alone changes only its own heritable component:
+  - perturbation changes every parameter;
+  - replacement equals the initializer of each parameter's own word 1;
+  - chemistry changes affinity and motion response within their norms;
+  - sensing changes only the scale, within range;
+  - a topology change equals the declared map with its own lanes.
+- The same children in forward, reverse, interleaved and four-worker order. A retry of a tick repeats its child,
+  and a later tick or another seed changes it.
+- C.16: a parent whose every perturbation rounds back to it in F32. Exactly 8, 3 or 1 candidates are tried, all
+  rejected as effective no-ops in order, and the quota is unchanged. Without the strict rule the same proposal is
+  an exact clone.
+- Out-of-bound candidates are rejected with `NumericalInvalid` and nothing is charged. A child accepted after
+  earlier rejections records them in order, and a retry repeats it.
+- Canonical rounding:
+  - ties to even;
+  - a replaced weight `0xbe2c8834`, a replaced bias `0xbd3628c2` and a perturbed weight `0x3e81b044`, all from the
+    oracle.
+- Topology targets are uniform among the other admitted members (400 attempts, five standard deviations), with a
+  capped member never chosen.
+- Perturbation and replacement counts over 200 children of Appendix A's rates lie within five standard
+  deviations of their binomial means, and the perturbations have unit variance in units of 0.02.
+- Log-scale reflection at both bounds, repeated reflection, a one-scale range, and refusals.
+- Rates read from Appendix A, every invalid rate refused, and architecture mutation switched off.
+
+Five planted mutation bugs were each caught by these tests:
+- the candidate index left out of parameter lanes;
+- Box–Muller from the wrong draw;
+- a no-op buffer not abandoned;
+- the sine component taken instead of the cosine;
+- the wrong stream.
+
 **Validity domain.** `dense-104-36-catalog-v1` with `overlap-plus-zero-output-v1`, `prefix-and-identity-bridge-v1`,
 F32 canonical weights and `independent-dense-mlp-v1` controllers, with traits for the 32-channel field of
 `field-ecology-v1`.
 
 **Known gaps.**
-- Founders' and added neurons' words come from the caller. FL-010's frozen Philox semantic addressing
-  (`fnp-philox-semantic-v1`) completes `fan-in-scaled-symmetric-v1`, which stays `Specified` under FL-010.
-- Mutation (weight perturbation and replacement, trait mutation, sensing-scale mutation), topology-change
-  selection (`uniform-other-catalog-member`) and the mutation record in provenance are FL-010.
+- The birth transaction is FL-011. It owns energy and cooldown preservation on a rejected birth, the identity of
+  the child, and storing the `MutationRecord` with the child's provenance.
+- Only F32 canonical genomes exist. C.16's F16 rounding case, and the strict-distinct profile's choice of a
+  representable neighbouring value, wait for an F16 weight dtype.
+- A strict globally unique benchmark's content-hash check at birth (§7.3) is not implemented. Parent-relative
+  nonidentity is.
+- `MAXIMUM_CANDIDATES` is §7.3's eight. Device paths must reuse the same addresses (FL-032).
 - Genomes are separate heap buffers. Packed immutable slabs by topology, generation-tagged handles and device
   sharding are FL-026. A store with an identity map, epoch-aware reclamation and checkpointed genome identity
   belongs to the tick and the store (FL-013, FL-014).

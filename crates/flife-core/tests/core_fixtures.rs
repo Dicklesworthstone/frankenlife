@@ -50,6 +50,15 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         "flife-genome::tests/genomes.rs",
         include_str!("../../flife-genome/tests/genomes.rs"),
     ),
+    ("flife-core::tests/rng.rs", include_str!("rng.rs")),
+    (
+        "flife-genome::tests/mutation.rs",
+        include_str!("../../flife-genome/tests/mutation.rs"),
+    ),
+    (
+        "flife-field::tests/seeding.rs",
+        include_str!("../../flife-field/tests/seeding.rs"),
+    ),
 ];
 
 #[expect(
@@ -383,10 +392,29 @@ fn birth_viability_and_strict_mutation_are_checked() {
         "mutation.reject_effective_noop",
         "every birth fails",
     );
+    // Perturbation with a zero deviation changes nothing either.
+    assert_refused(
+        |c: &mut RunConfig| {
+            silence(c);
+            c.mutation.weight_probability = 1.0;
+            c.mutation.weight_standard_deviation = 0.0;
+        },
+        "mutation.reject_effective_noop",
+        "every birth fails",
+    );
     // Positive control: without the strict no-op rule, clonal births are legal.
     let mut config = starter();
     silence(&mut config);
     config.mutation.reject_effective_noop = false;
+    assert!(validate(config).is_ok());
+    // Strict mutation tries at most eight candidates per attempted birth (§7.3).
+    assert_refused(
+        |c: &mut RunConfig| c.mutation.maximum_candidate_proposals_per_birth = 9,
+        "mutation.maximum_candidate_proposals_per_birth",
+        "at most eight",
+    );
+    let mut config = starter();
+    config.mutation.maximum_candidate_proposals_per_birth = 8;
     assert!(validate(config).is_ok());
 }
 

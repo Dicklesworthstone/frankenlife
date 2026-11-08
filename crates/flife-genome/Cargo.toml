@@ -1,6 +1,6 @@
 [package]
 name = "flife-genome"
-description = "FrankenLife immutable genomes, the dense topology catalog, logical genome quotas and topology transition maps"
+description = "FrankenLife immutable genomes, the dense topology catalog, logical genome quotas, topology transition maps, founders and bounded mutation"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true

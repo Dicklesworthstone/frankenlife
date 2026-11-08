@@ -2,7 +2,7 @@
 //! distance from correctly rounded values, agreement with the platform
 //! `libm`, and the domain and symmetry each function promises.
 
-use flife_core::numerics::{exp_neg, expm1_neg, log2, sigmoid, tanh};
+use flife_core::numerics::{exp, exp_neg, expm1_neg, ln, log2, sigmoid, sin_cos_turns, tanh};
 
 /// A total order on finite `f64` in which adjacent values differ by one.
 fn ordinal(value: f64) -> i64 {
@@ -381,5 +381,210 @@ fn log2_is_exact_at_powers_of_two_and_close_elsewhere() {
     }
     for x in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert_eq!(log2(x), None, "log2({x})");
+    }
+}
+
+/// `(x, our bits, correctly rounded bits)`; the correctly rounded values come
+/// from Python `Decimal` at 80 digits. Our bits are the cross-host guard.
+const LN_PINS: [(f64, u64, u64); 11] = [
+    (0.5, 0xbfe6_2e42_fefa_39ef, 0xbfe6_2e42_fefa_39ef),
+    // The smallest and largest open uniforms Box–Muller takes.
+    (
+        1.0 / 9_007_199_254_740_992.0,
+        0xc042_5e4f_7b27_37fa,
+        0xc042_5e4f_7b27_37fa,
+    ),
+    (
+        1.0 - 1.0 / 9_007_199_254_740_992.0,
+        0xbca0_0000_0000_0000,
+        0xbca0_0000_0000_0000,
+    ),
+    (1.0e-300, 0xc085_9634_47f8_7fb5, 0xc085_9634_47f8_7fb5),
+    (0.1, 0xc002_6bb1_bbb5_5515, 0xc002_6bb1_bbb5_5515),
+    (0.75, 0xbfd2_6962_1134_db92, 0xbfd2_6962_1134_db92),
+    (3.0, 0x3ff1_93ea_7aad_030b, 0x3ff1_93ea_7aad_030b),
+    (16.0, 0x4006_2e42_fefa_39ef, 0x4006_2e42_fefa_39ef),
+    (5.0e-324, 0xc087_4385_446d_71c3, 0xc087_4385_446d_71c3),
+    (
+        1.0 + f64::EPSILON,
+        0x3cb0_0000_0000_0000,
+        0x3caf_ffff_ffff_ffff,
+    ),
+    (
+        core::f64::consts::FRAC_1_SQRT_2,
+        0xbfd6_2e42_fefa_39ed,
+        0xbfd6_2e42_fefa_39ee,
+    ),
+];
+
+/// As [`LN_PINS`], for `exp`.
+const EXP_PINS: [(f64, u64, u64); 8] = [
+    (0.0625, 0x3ff1_082b_577d_34ee, 0x3ff1_082b_577d_34ed),
+    (0.5, 0x3ffa_6129_8e1e_069c, 0x3ffa_6129_8e1e_069c),
+    (1.0, 0x4005_bf0a_8b14_576a, 0x4005_bf0a_8b14_5769),
+    // `ln 16` rounded down, so `e^x` is just below 16.
+    (
+        2.772_588_722_239_781,
+        0x402f_ffff_ffff_ffff,
+        0x402f_ffff_ffff_ffff,
+    ),
+    (100.0, 0x48f3_494a_9b17_1bf5, 0x48f3_494a_9b17_1bf5),
+    (709.0, 0x7fdd_422d_2be5_dc9b, 0x7fdd_422d_2be5_dc9b),
+    (1.0e-10, 0x3ff0_0000_0006_df38, 0x3ff0_0000_0006_df38),
+    (
+        0.346_573_590_279_972_64,
+        0x3ff6_a09e_667f_3bcc,
+        0x3ff6_a09e_667f_3bcc,
+    ),
+];
+
+/// `(u, our sin 2πu, our cos 2πu, correctly rounded sin, correctly rounded
+/// cos)`.
+const TURN_PINS: [(f64, u64, u64, u64, u64); 9] = [
+    (
+        0.1,
+        0x3fe2_cf23_0475_5a5e,
+        0x3fe9_e377_9b97_f4a8,
+        0x3fe2_cf23_0475_5a5e,
+        0x3fe9_e377_9b97_f4a8,
+    ),
+    (
+        0.125,
+        0x3fe6_a09e_667f_3bcc,
+        0x3fe6_a09e_667f_3bcd,
+        0x3fe6_a09e_667f_3bcd,
+        0x3fe6_a09e_667f_3bcd,
+    ),
+    (
+        0.2,
+        0x3fee_6f0e_1344_5500,
+        0x3fd3_c6ef_372f_e94e,
+        0x3fee_6f0e_1344_5500,
+        0x3fd3_c6ef_372f_e94e,
+    ),
+    (
+        0.3,
+        0x3fee_6f0e_1344_5500,
+        0xbfd3_c6ef_372f_e94e,
+        0x3fee_6f0e_1344_5500,
+        0xbfd3_c6ef_372f_e94e,
+    ),
+    (
+        0.6,
+        0xbfe2_cf23_0475_5a5d,
+        0xbfe9_e377_9b97_f4a8,
+        0xbfe2_cf23_0475_5a5d,
+        0xbfe9_e377_9b97_f4a8,
+    ),
+    (
+        0.7,
+        0xbfee_6f0e_1344_54ff,
+        0xbfd3_c6ef_372f_e954,
+        0xbfee_6f0e_1344_54ff,
+        0xbfd3_c6ef_372f_e954,
+    ),
+    (
+        0.9,
+        0xbfe2_cf23_0475_5a5d,
+        0x3fe9_e377_9b97_f4a8,
+        0xbfe2_cf23_0475_5a5d,
+        0x3fe9_e377_9b97_f4a8,
+    ),
+    // The first and last half-open uniforms.
+    (
+        f64::EPSILON,
+        0x3cd9_21fb_5444_2d18,
+        0x3ff0_0000_0000_0000,
+        0x3cd9_21fb_5444_2d18,
+        0x3ff0_0000_0000_0000,
+    ),
+    (
+        1.0 - f64::EPSILON,
+        0xbcd9_21fb_5444_2d18,
+        0x3ff0_0000_0000_0000,
+        0xbcd9_21fb_5444_2d18,
+        0x3ff0_0000_0000_0000,
+    ),
+];
+
+#[test]
+fn ln_and_exp_are_within_two_ulp_of_correctly_rounded() {
+    for (x, ours, correct) in LN_PINS {
+        let value = ln(x).unwrap_or(f64::NAN);
+        assert_eq!(value.to_bits(), ours, "ln({x:e}) = {value:e}");
+        assert!(ulps(value, f64::from_bits(correct)) <= 2, "ln({x:e})");
+    }
+    for (x, ours, correct) in EXP_PINS {
+        let value = exp(x).unwrap_or(f64::NAN);
+        assert_eq!(value.to_bits(), ours, "exp({x:e}) = {value:e}");
+        assert!(ulps(value, f64::from_bits(correct)) <= 1, "exp({x:e})");
+    }
+    // Measured against correctly rounded values (scratch sweep, 12,387 `ln`
+    // and 3,292 `exp` arguments): `ln` ≤ 2 ulp, `exp` ≤ 1 ulp. A conforming
+    // `libm` is within 1, so these bounds hold on every host.
+    let mut x = 1.0e-300_f64;
+    while x < 1.0e300 {
+        assert!(ulps(ln(x).unwrap_or(f64::NAN), x.ln()) <= 3, "ln({x:e})");
+        x *= 1.37;
+    }
+    for t in sweep(709.0) {
+        for t in [t, -t] {
+            assert!(ulps(exp(t).unwrap_or(f64::NAN), t.exp()) <= 2, "exp({t:e})");
+        }
+    }
+    // Exact where the functions promise it.
+    assert_eq!(ln(1.0), Some(0.0));
+    assert_eq!(exp(0.0), Some(1.0));
+    for x in [1.0e-9, 0.01, 0.5, 3.0, 40.0, 745.0] {
+        assert_eq!(exp(-x), exp_neg(x), "exp(-{x}) is exp_neg({x})");
+    }
+    for x in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(ln(x), None, "ln({x})");
+    }
+    for x in [710.0, 1.0e300, f64::NAN, f64::INFINITY] {
+        assert_eq!(exp(x), None, "exp({x})");
+    }
+    assert_eq!(exp(f64::NEG_INFINITY), None);
+    // `log2` and `ln` share their reduction.
+    for x in [0.3, 7.0, 1.0e-200] {
+        let ratio = ln(x).unwrap_or(f64::NAN) / log2(x).unwrap_or(f64::NAN);
+        assert!((ratio - core::f64::consts::LN_2).abs() < 4.0e-16, "{x}");
+    }
+}
+
+#[test]
+fn turn_angles_are_within_two_ulp_and_exact_at_quarter_turns() {
+    for (u, our_sin, our_cos, sin, cos) in TURN_PINS {
+        let (s, c) = sin_cos_turns(u).unwrap_or((f64::NAN, f64::NAN));
+        assert_eq!(
+            (s.to_bits(), c.to_bits()),
+            (our_sin, our_cos),
+            "turns({u:e})"
+        );
+        assert!(ulps(s, f64::from_bits(sin)) <= 2, "sin 2π·{u:e}");
+        assert!(ulps(c, f64::from_bits(cos)) <= 2, "cos 2π·{u:e}");
+    }
+    // Quarter turns are exact; the sign of a zero follows the quadrant.
+    for (u, expected) in [
+        (0.0, (0.0, 1.0)),
+        (0.25, (1.0, 0.0)),
+        (0.5, (0.0, -1.0)),
+        (0.75, (-1.0, 0.0)),
+    ] {
+        assert_eq!(sin_cos_turns(u), Some(expected), "turns({u})");
+    }
+    // Measured: within 2 ulp of correctly rounded over 4,096 turns (scratch
+    // sweep). Against `libm` the angle `2πu` itself rounds, so compare
+    // absolutely; a unit vector stays a unit vector to rounding.
+    for k in 0..4096_u32 {
+        let u = (f64::from(k) + 0.37) / 4096.0;
+        let (s, c) = sin_cos_turns(u).unwrap_or((f64::NAN, f64::NAN));
+        let angle = core::f64::consts::TAU * u;
+        assert!((s - angle.sin()).abs() < 2.0e-15, "sin 2π·{u}");
+        assert!((c - angle.cos()).abs() < 2.0e-15, "cos 2π·{u}");
+        assert!((s * s + c * c - 1.0).abs() < 4.0 * f64::EPSILON, "{u}");
+    }
+    for u in [1.0, -1.0e-300, 2.0, f64::NAN, f64::INFINITY] {
+        assert_eq!(sin_cos_turns(u), None, "turns({u})");
     }
 }

@@ -1,4 +1,4 @@
-//! FrankenLife genomes (FL-009; plan §6.4, §6.5, §7.1, §7.2, §7.5, §9.2,
+//! FrankenLife genomes (FL-009, FL-010; plan §6.4, §6.5, §7.1, §7.2, §7.5, §9.2,
 //! A.2, A.3 items 2, 5 and 6, Appendix C.16).
 //!
 //! - [`catalog`]: `dense-104-36-catalog-v1`, the five dense topologies a
@@ -13,20 +13,32 @@
 //! - [`transition`]: `overlap-plus-zero-output-v1` and
 //!   `prefix-and-identity-bridge-v1`, which map a parent's parameters onto
 //!   another catalog member.
+//! - [`founder`](mod@founder) (FL-010): founders' genomes from `fnp-philox-semantic-v1`.
+//! - [`mutation`] (FL-010): bounded, semantically addressed mutation
+//!   proposals with `uniform-other-catalog-member` and
+//!   `reject-birth-no-charge`.
 //!
-//! Random words (FL-010's Philox semantic addressing), mutation (FL-010)
-//! and packed per-topology arenas (FL-026) are not here.
+//! Packed per-topology arenas (FL-026) are not here.
 
 #![forbid(unsafe_code)]
 
 pub mod catalog;
+mod draws;
+pub mod founder;
 pub mod genome;
 pub mod init;
+pub mod mutation;
 pub mod quota;
 pub mod transition;
 
 pub use catalog::{DENSE_104_36_CATALOG_V1, DENSE_104_36_MEMBERS, TopologyCatalog, TopologyId};
+pub use founder::{founder, founder_traits, initial_scale};
 pub use genome::{Genome, SharedParameters, TraitLimits, Traits, Unsealed};
 pub use init::{FAN_IN_SCALED_SYMMETRIC_V1, WeightAddress, fan_in_weight, initialize};
+pub use mutation::{
+    BirthAttempt, CandidateRejection, MAXIMUM_CANDIDATES, MutationParameters, MutationRecord,
+    Mutator, Proposal, REJECT_BIRTH_NO_CHARGE, RejectionReason, TopologyChange,
+    UNIFORM_OTHER_CATALOG_MEMBER, perturb, reflect_log_scale,
+};
 pub use quota::{GenomeQuota, ParameterBuffer, allocate_parameters, logical_bytes};
 pub use transition::{Transition, map_parameters};

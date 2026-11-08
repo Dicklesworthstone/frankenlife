@@ -8,18 +8,18 @@
 //! square root are correctly rounded) and rounded once to F32. Every bias
 //! is zero.
 //!
-//! The raw words come from the caller, addressed by [`WeightAddress`].
-//! Deriving them from FL-010's frozen Philox semantic addressing is FL-010's;
-//! this module is the deterministic map from words to parameters.
+//! The raw words come from the caller, addressed by [`WeightAddress`]; this
+//! module is the deterministic map from words to parameters. Founders take
+//! their words from `fnp-philox-semantic-v1` ([`crate::founder`](mod@crate::founder)), and
+//! mutation and transition maps from the mutation stream
+//! ([`crate::mutation`]).
 
 use flife_core::CoreError;
+use flife_core::rng::half_open_unit;
 use flife_neural::DenseTopology;
 
 /// The initializer this module implements.
 pub const FAN_IN_SCALED_SYMMETRIC_V1: &str = "fan-in-scaled-symmetric-v1";
-
-/// `2^-52`.
-const UNIT: f64 = 1.0 / 4_503_599_627_370_496.0;
 
 /// One weight's name: its layer and the neurons it joins. This is what a
 /// random address names, never a packed offset (A.3 item 5).
@@ -31,14 +31,6 @@ pub struct WeightAddress {
     pub output: usize,
     /// The sending neuron (or sensor input, for the first layer).
     pub input: usize,
-}
-
-/// The half-open uniform `k 2^-52` from a raw word's leading 52 bits, on
-/// `[0, 1)` (A.3 item 3).
-#[must_use]
-pub fn half_open_unit(word: u64) -> f64 {
-    // A 52-bit integer converts to F64 exactly.
-    (word >> 12) as f64 * UNIT
 }
 
 /// The fan-in-scaled weight a raw word gives a layer of fan-in `fan_in`.

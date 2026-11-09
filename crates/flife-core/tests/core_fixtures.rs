@@ -35,6 +35,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
     ),
     ("flife-core::tests/numerics.rs", include_str!("numerics.rs")),
     (
+        "flife-manim::tests/mapping.rs",
+        include_str!("../../flife-manim/tests/mapping.rs"),
+    ),
+    (
         "flife-engine::tests/organism_phase.rs",
         include_str!("../../flife-engine/tests/organism_phase.rs"),
     ),

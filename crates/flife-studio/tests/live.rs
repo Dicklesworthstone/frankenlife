@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_studio::{
-    ControllerChoice, End, Frame, KEY_ESCAPE, KEY_PERIOD, KEY_RIGHT, KEY_SPACE, Status, Studio,
-    StudioOptions,
+    ColorMapping, ControllerChoice, End, Frame, KEY_D, KEY_DIGITS, KEY_ESCAPE, KEY_F, KEY_PERIOD,
+    KEY_R, KEY_RIGHT, KEY_SPACE, Look, Particles, Status, Studio, StudioOptions, Style,
 };
 use fmn_render::metal::{LogicalPoint, Modifiers, PointerButton, SyntheticInput};
 
@@ -133,6 +133,7 @@ fn live() -> Result<Vec<String>, String> {
         // Metal where the host has it: the closing digest check then also
         // shows the GPU-evaluated world is the directly stepped one.
         controllers: ControllerChoice::Auto,
+        style: Style::default(),
     };
     let studio = Studio::open(&config, &options).map_err(|error| format!("opening: {error}"))?;
     let mut live = Live {
@@ -174,11 +175,11 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     let reserved = live.studio.view().cloud().reserved_bytes();
     live.check(
-        live.studio.view().scene_objects() == 2
+        live.studio.view().scene_objects() == 3
             && live.studio.view().cloud().capacity() == ceiling as usize,
         format!(
-            "two scene objects (the field and one cloud), the cloud reserved once for the \
-             {ceiling}-organism ceiling"
+            "three scene objects (the field, one cloud and its density layer), the cloud \
+             reserved once for the {ceiling}-organism ceiling"
         ),
     )?;
 
@@ -260,6 +261,95 @@ fn live() -> Result<Vec<String>, String> {
     live.check(
         true,
         format!("→ and . each step one tick, to {}", paused + 2),
+    )?;
+
+    // FL-019: style keys redraw the shown epoch in the new style while
+    // paused, through the live Metal presenter, and never reach the world.
+    let at = paused + 2;
+    let epochs = live.studio.tally().epochs;
+    let organisms = live.studio.view().cloud().draws().len();
+    let colours = |studio: &Studio| -> Vec<[u64; 3]> {
+        studio
+            .view()
+            .cloud()
+            .draws()
+            .iter()
+            .filter_map(|draw| match draw {
+                fmn_render::ThreeDDraw::TrueDot(dot) => {
+                    Some([dot.color.r, dot.color.g, dot.color.b].map(f64::to_bits))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let lineage = colours(&live.studio);
+    live.key(KEY_DIGITS[1], "2")?;
+    live.until("the energy colours on screen", |studio, frame, _| {
+        frame.restyled
+            && frame.outcome.is_some()
+            && studio.view().style().mapping == ColorMapping::Energy
+    })?;
+    let energy = colours(&live.studio);
+    live.check(
+        energy.len() == organisms && energy != lineage,
+        format!("2 recolours the {organisms} dots of tick {at} by energy"),
+    )?;
+    live.key(KEY_R, "r")?;
+    live.until("the raw look on screen", |studio, frame, _| {
+        frame.outcome.is_some() && studio.view().style().look == Look::Raw
+    })?;
+    live.check(
+        live.studio.view().cloud().halos().is_empty()
+            && live.studio.view().cloud().draws().len() == organisms,
+        "R draws the raw look: the dots without halos",
+    )?;
+    live.key(KEY_D, "d")?;
+    let frame = live.until("the density view on screen", |studio, frame, _| {
+        frame.outcome.is_some() && studio.view().style().particles == Particles::Density
+    })?;
+    let counted: u64 = live
+        .studio
+        .view()
+        .density()
+        .counts()
+        .iter()
+        .map(|&count| u64::from(count))
+        .sum();
+    live.check(
+        live.studio.view().cloud().draws().is_empty()
+            && counted == organisms as u64
+            && frame.outcome.is_some(),
+        format!(
+            "D draws density on the Metal route: {:?} bins counting all {organisms} organisms",
+            live.studio.view().density().bins()
+        ),
+    )?;
+    live.key(KEY_F, "f")?;
+    live.until("the field hidden", |studio, frame, _| {
+        frame.outcome.is_some() && !studio.view().style().field
+    })?;
+    for (code, text) in [
+        (KEY_DIGITS[0], "1"),
+        (KEY_R, "r"),
+        (KEY_D, "d"),
+        (KEY_F, "f"),
+    ] {
+        live.key(code, text)?;
+    }
+    let restored = live.until("the default style again", |studio, frame, _| {
+        frame.outcome.is_some() && studio.view().style() == Style::default()
+    })?;
+    live.check(
+        colours(&live.studio) == lineage
+            && live.studio.tally().epochs == epochs
+            && live.studio.tally().restyles >= 5
+            && shown_tick(&restored) == Some(at)
+            && !live.studio.controls().running(),
+        format!(
+            "1, R, D and F restore the lineage colours bit for bit; all {} restyles kept tick {at} \
+             on screen with no new epoch and no run",
+            live.studio.tally().restyles
+        ),
     )?;
 
     // A real resize refits the viewport and camera to the new content area.

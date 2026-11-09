@@ -11,7 +11,7 @@ use std::time::Instant;
 use flife_backend_metal::ControllerChoice;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::Stepped;
-use flife_manim::{WorldView, hex_rgb};
+use flife_manim::{Style, WorldView, hex_rgb};
 use flife_render::Publisher;
 use fmn_codec::CompressionLevel;
 use serde::Serialize;
@@ -43,6 +43,9 @@ pub struct RenderOptions {
     pub video: Option<PathBuf>,
     /// The video's frames per second.
     pub fps: u32,
+    /// How the frames are drawn: colour mapping, look, points or density,
+    /// and the field.
+    pub style: Style,
 }
 
 /// One `flife render` record.
@@ -80,6 +83,16 @@ pub enum RenderRecord {
         digest: String,
         /// The encoded video, if any.
         video: Option<String>,
+        /// The colour mapping the frames show.
+        mapping: &'static str,
+        /// What that colour means.
+        meaning: &'static str,
+        /// `glow` or `raw`.
+        look: &'static str,
+        /// `points` or `density`.
+        particles: &'static str,
+        /// Whether the field is drawn.
+        field: bool,
         /// What the controller backend did. Not scientific state.
         controllers: ControllerSummary,
         /// Wall seconds for the whole run.
@@ -116,6 +129,7 @@ pub fn render(
     let viewer = publisher.feed().viewer(1)?;
     let founding = viewer.latest()?;
     let mut view = WorldView::for_epoch(&founding, options.size, background)?;
+    view.set_style(options.style);
     drop(founding);
     let every = options.every.max(1);
     let mut frames = 0;
@@ -192,6 +206,11 @@ pub fn render(
         tick: world.tick().get(),
         digest: world.digest().to_hex(),
         video,
+        mapping: options.style.mapping.name(),
+        meaning: options.style.mapping.meaning(),
+        look: options.style.look.name(),
+        particles: options.style.particles.name(),
+        field: options.style.field,
         controllers: ControllerSummary::of(&world),
         wall_seconds: clock.elapsed().as_secs_f64(),
     });

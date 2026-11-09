@@ -14,7 +14,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use flife_cli::{ControllerChoice, ERROR_SCHEMA, RunOptions, Stop, Validation};
+use flife_cli::{
+    ColorMapping, ControllerChoice, ERROR_SCHEMA, Look, Particles, RunOptions, Stop, Style,
+    Validation,
+};
 use flife_core::ValidatedConfig;
 use serde::Serialize;
 
@@ -90,6 +93,21 @@ enum Command {
         /// The video's frames per second.
         #[arg(long, default_value_t = 30)]
         fps: u32,
+        /// What the organisms' colour means: `lineage`, `energy`,
+        /// `generation`, `motion` or `topology` (or a registered name such
+        /// as `founder-lineage-v1`). The default is the configuration's
+        /// `[presentation] color_mapping`.
+        #[arg(long)]
+        color: Option<ColorMapping>,
+        /// `glow` (the default) or `raw`: no halos and a linear grey field.
+        #[arg(long, default_value = "glow")]
+        look: Look,
+        /// Draw organism density per screen bin instead of dots.
+        #[arg(long)]
+        density: bool,
+        /// Leave the energy field out.
+        #[arg(long)]
+        no_field: bool,
     },
 }
 
@@ -121,6 +139,10 @@ fn main() -> ExitCode {
             render_threads,
             video,
             fps,
+            color,
+            look,
+            density,
+            no_field,
         } => render(
             &config,
             ticks,
@@ -131,6 +153,19 @@ fn main() -> ExitCode {
             render_threads,
             video,
             fps,
+            (
+                color,
+                Style {
+                    look,
+                    particles: if density {
+                        Particles::Density
+                    } else {
+                        Particles::Points
+                    },
+                    field: !no_field,
+                    ..Style::default()
+                },
+            ),
         ),
         Command::Run {
             config,
@@ -181,10 +216,15 @@ fn render(
     render_threads: NonZeroUsize,
     video: Option<PathBuf>,
     fps: u32,
+    (color, style): (Option<ColorMapping>, Style),
 ) -> ExitCode {
     let config = match load(config) {
         Ok(config) => config,
         Err(code) => return code,
+    };
+    let style = match color.map_or_else(|| ColorMapping::configured(&config), Ok) {
+        Ok(mapping) => Style { mapping, ..style },
+        Err(error) => return fail(error.kind(), error.to_string()),
     };
     let options = flife_cli::RenderOptions {
         ticks,
@@ -196,6 +236,7 @@ fn render(
         render_threads,
         video,
         fps,
+        style,
     };
     match flife_cli::render(&config, &options, print) {
         Ok(()) => ExitCode::SUCCESS,

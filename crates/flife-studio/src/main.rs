@@ -1,8 +1,9 @@
 //! `flife-studio`: the live world in a native window (FL-018; plan §13.6).
 //!
 //! Every line on standard output is one `frankenlife.studio.v1` record: an
-//! `open`, then a `status` per session status and a `frame` summary about
-//! once a second, then an `end` with the committed world's digest. An error
+//! `open`, then a `status` per session status, a `view` per style change
+//! and a `frame` summary about once a second, then an `end` with the
+//! committed world's digest. An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -18,7 +19,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use flife_backend_metal::ControllerChoice;
 use flife_core::ValidatedConfig;
-use flife_studio::{End, STUDIO_SCHEMA, Status, Studio, StudioOptions};
+use flife_studio::{
+    ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status, Studio, StudioOptions, Style,
+};
 use serde::Serialize;
 
 const ERROR_SCHEMA: &str = "frankenlife.error.v1";
@@ -51,10 +54,25 @@ struct Cli {
     cpu_workers: NonZeroUsize,
     /// Where due controllers are evaluated: `metal`, `cpu`, or `auto` (the
     /// default): Metal where this host has it and the world uses at most 8
-    /// CPU workers (with 16 it measured slower here, presentation sharing
-    /// the GPU). No result depends on it.
+    /// CPU workers (with 16 it measured no faster). No result depends on it.
     #[arg(long, default_value = "auto")]
     controllers: ControllerChoice,
+    /// What the organisms' colour means: `lineage`, `energy`, `generation`,
+    /// `motion` or `topology` (or a registered name such as
+    /// `founder-lineage-v1`). The default is the configuration's
+    /// `[presentation] color_mapping`. Keys 1 to 5 change it.
+    #[arg(long)]
+    color: Option<ColorMapping>,
+    /// `glow` (the default) or `raw`: no halos and a linear grey field. R
+    /// switches.
+    #[arg(long, default_value = "glow")]
+    look: Look,
+    /// Draw organism density per screen bin instead of dots. D switches.
+    #[arg(long)]
+    density: bool,
+    /// Hide the energy field. F switches.
+    #[arg(long)]
+    no_field: bool,
 }
 
 /// A worker count, or `auto`.
@@ -86,6 +104,20 @@ enum Record<'a> {
         frames_per_second: u32,
         cpu_workers: usize,
         controllers: &'a str,
+        mapping: &'static str,
+        meaning: &'static str,
+        look: &'static str,
+        particles: &'static str,
+        field: bool,
+    },
+    View {
+        schema: &'static str,
+        mapping: &'static str,
+        meaning: &'static str,
+        look: &'static str,
+        particles: &'static str,
+        field: bool,
+        shown_tick: Option<u64>,
     },
     Status {
         schema: &'static str,
@@ -139,6 +171,13 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(code) => return code,
     };
+    let mapping = match cli
+        .color
+        .map_or_else(|| ColorMapping::configured(&config), Ok)
+    {
+        Ok(mapping) => mapping,
+        Err(error) => return fail(error.kind(), error.to_string(), 2),
+    };
     let options = StudioOptions {
         size: cli
             .width
@@ -148,6 +187,16 @@ fn main() -> ExitCode {
         cpu_workers: Some(cli.cpu_workers),
         run_on_open: !cli.paused,
         controllers: cli.controllers,
+        style: Style {
+            mapping,
+            look: cli.look,
+            particles: if cli.density {
+                Particles::Density
+            } else {
+                Particles::Points
+            },
+            field: !cli.no_field,
+        },
         ..StudioOptions::default()
     };
     let clock = Instant::now();
@@ -167,6 +216,11 @@ fn main() -> ExitCode {
         frames_per_second: fps,
         cpu_workers: cli.cpu_workers.get(),
         controllers: studio.controllers(),
+        mapping: options.style.mapping.name(),
+        meaning: options.style.mapping.meaning(),
+        look: options.style.look.name(),
+        particles: options.style.particles.name(),
+        field: options.style.field,
     });
 
     let period = Duration::from_secs(1) / fps;
@@ -183,6 +237,18 @@ fn main() -> ExitCode {
         };
         for status in studio.take_statuses() {
             print(&status_record(&status));
+        }
+        if frame.restyled {
+            let style = studio.view().style();
+            print(&Record::View {
+                schema: STUDIO_SCHEMA,
+                mapping: style.mapping.name(),
+                meaning: style.mapping.meaning(),
+                look: style.look.name(),
+                particles: style.particles.name(),
+                field: style.field,
+                shown_tick: frame.shown.map(|shown| shown.tick.get()),
+            });
         }
         if summary.elapsed() >= Duration::from_secs(1) {
             summary = Instant::now();

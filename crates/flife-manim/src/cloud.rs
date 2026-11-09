@@ -9,15 +9,18 @@
 //! animation handle or draw call per organism, and a frame is one 3D job.
 //!
 //! Its draw buffer is reserved once, at the population ceiling, so lowering
-//! never allocates. Sizes and colours here are provisional: one dot radius,
-//! and a fixed categorical lineage palette. FL-019 owns the visual mappings.
+//! never allocates. A dot's colour is the style's [`ColorMapping`] of its
+//! row; the glow look adds a halo under every dot, the raw look none.
+//!
+//! [`ColorMapping`]: crate::ColorMapping
 
 use flife_core::CoreError;
 use flife_render::Epoch;
-use fmn_core::color::{LinearRgba, Srgb};
+use fmn_core::color::LinearRgba;
 use fmn_render::{ThreeDDraw, TrueDotDraw};
 
 use crate::Viewport;
+use crate::mapping::{Look, Particles, Style, mapped_color, traits};
 
 /// Dot radius in world units.
 pub const DOT_RADIUS: f64 = 0.35;
@@ -25,42 +28,6 @@ pub const DOT_RADIUS: f64 = 0.35;
 /// The smallest dot radius in drawable pixels: a world too large for its
 /// window still shows every organism.
 pub const DOT_RADIUS_MIN_PIXELS: f64 = 1.5;
-
-/// The provisional lineage palette (sRGB), indexed by [`lineage_slot`].
-pub const LINEAGE_PALETTE: [[u8; 3]; 12] = [
-    [0x4E, 0x79, 0xA7],
-    [0xF2, 0x8E, 0x2B],
-    [0xE1, 0x57, 0x59],
-    [0x76, 0xB7, 0xB2],
-    [0x59, 0xA1, 0x4F],
-    [0xED, 0xC9, 0x48],
-    [0xB0, 0x7A, 0xA1],
-    [0xFF, 0x9D, 0xA7],
-    [0x9C, 0x75, 0x5F],
-    [0xBA, 0xB0, 0xAC],
-    [0x86, 0xBC, 0xFF],
-    [0xC5, 0xE0, 0x6B],
-];
-
-/// The palette slot of a lineage: a fixed SplitMix64 mix of its identity,
-/// so neighbouring founder identities get unrelated colours and a lineage
-/// keeps its colour for the whole run.
-#[must_use]
-pub fn lineage_slot(lineage: u64) -> usize {
-    let mut z = lineage.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    let slots = LINEAGE_PALETTE.len() as u64;
-    usize::try_from(z % slots).unwrap_or(0)
-}
-
-/// The linear-light colour of a lineage.
-#[must_use]
-pub fn lineage_color(lineage: u64) -> LinearRgba {
-    let [r, g, b] = LINEAGE_PALETTE[lineage_slot(lineage)];
-    Srgb::from_rgb8(r, g, b).to_linear(1.0)
-}
 
 /// A halo's opacity: the soft glow around each organism.
 pub const HALO_ALPHA: f64 = 0.42;
@@ -129,8 +96,23 @@ impl ParticleCloud {
         Self::with_capacity(epoch.capacity())
     }
 
-    /// Lower `epoch` through `viewport`: one dot per row, in identity order,
-    /// centred on the row's scene point with the lineage colour. Nothing is
+    /// Lower `epoch` through `viewport` in the default style: lineage
+    /// colours with glow halos.
+    ///
+    /// # Errors
+    /// As [`ParticleCloud::update_styled`].
+    pub fn update(
+        &mut self,
+        epoch: &Epoch,
+        viewport: &Viewport,
+    ) -> Result<&[ThreeDDraw<'static>], CoreError> {
+        self.update_styled(epoch, viewport, &Style::default())
+    }
+
+    /// Lower `epoch` through `viewport` in `style`: one dot per row, in
+    /// identity order, centred on the row's scene point and coloured by the
+    /// style's mapping, with a halo under each for the glow look. The
+    /// density style draws no dots (the density layer does). Nothing is
     /// allocated.
     ///
     /// # Errors
@@ -138,10 +120,11 @@ impl ParticleCloud {
     ///   the cloud's capacity. The previous draws are kept.
     /// - [`CoreError::LayoutMismatch`] when the epoch's world is not the
     ///   viewport's. The previous draws are kept.
-    pub fn update(
+    pub fn update_styled(
         &mut self,
         epoch: &Epoch,
         viewport: &Viewport,
+        style: &Style,
     ) -> Result<&[ThreeDDraw<'static>], CoreError> {
         if epoch.len() > self.capacity {
             return Err(CoreError::BudgetExhausted {
@@ -164,25 +147,26 @@ impl ParticleCloud {
         self.radius = radius;
         self.draws.clear();
         self.halos.clear();
-        for ((position, &lineage), &energy) in epoch
-            .positions()
-            .iter()
-            .zip(epoch.lineages())
-            .zip(epoch.energies())
-        {
+        if style.particles == Particles::Density {
+            return Ok(&self.draws);
+        }
+        let speed = epoch.maximum_speed();
+        for (position, traits) in epoch.positions().iter().zip(traits(epoch)) {
             let world = [f64::from(position[0]), f64::from(position[1])];
             let center = viewport.scene_point(world);
-            let color = lineage_color(lineage);
+            let color = mapped_color(style.mapping, &traits, speed);
             self.draws
                 .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
-            self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
-                center,
-                radius * halo_factor(energy),
-                LinearRgba {
-                    a: HALO_ALPHA,
-                    ..color
-                },
-            )));
+            if style.look == Look::Glow {
+                self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                    center,
+                    radius * halo_factor(traits.energy),
+                    LinearRgba {
+                        a: HALO_ALPHA,
+                        ..color
+                    },
+                )));
+            }
         }
         Ok(&self.draws)
     }
@@ -206,7 +190,8 @@ impl ParticleCloud {
         }
     }
 
-    /// The current halos, one per dot and in the same order.
+    /// The current halos: for the glow look one per dot and in the same
+    /// order, for the raw look none.
     #[must_use]
     pub fn halos(&self) -> &[ThreeDDraw<'static>] {
         &self.halos

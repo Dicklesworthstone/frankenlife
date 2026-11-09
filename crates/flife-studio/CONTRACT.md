@@ -1,13 +1,14 @@
 # flife-studio contract
 
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
-(plan §13.1, §13.6). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
+(plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
+rendering (§13.4). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
 **Inputs.**
-- A `ValidatedConfig`. `[presentation]` gives the window size, the background and the frame rate.
-  `StudioOptions` can override the size and make the window fixed.
+- A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate and the colour
+  mapping. `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input. It comes from frankentorch `ft-kernel-metal` at rev `1c4febfb`, through FrankenManim
   `fmn-render` at rev `f401a947`.
@@ -27,7 +28,12 @@ adapter.
     | Space (not auto-repeat) | `Resume` or `Pause` |
     | → or `.` (auto-repeat steps again), while paused | `Step` |
     | Esc, or ⌘W | `Close` (once) |
+    | 1 to 5 | colour by lineage, energy, generation, motion or topology |
+    | R | switch the glow and raw looks |
+    | D | switch dots and density |
+    | F | show or hide the field |
 
+    The style keys ignore auto-repeat and ⌘, and produce no intent: they only change `Controls::style()`.
   - `drawable_size` is the content area in whole points. `hover` is the world point under the pointer.
 - `SessionThread`: the FL-014 session owner and one controller task on an Asupersync current-thread runtime, on its
   own thread.
@@ -42,20 +48,27 @@ adapter.
   1. drains typed input through `Controls` and offers the resulting intents;
   2. drains statuses;
   3. refits the `WorldView` when the content area changed;
-  4. leases the newest epoch if it is newer than the one shown, lowers it and drops the lease;
-  5. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
+  4. takes the controls' style if it changed;
+  5. leases the newest epoch if it is newer than the one shown, lowers it and drops the lease; after a style change
+     with no newer epoch, it lowers the shown epoch again, so a paused world restyles at once;
+  6. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
 
-  It returns a `Frame` (state, events, intents, refusals, statuses, refit, new epoch, shown `Prior`, hover,
-  outcome). `close()` closes the window and the session and returns the committed world (`StudioClosed`).
-- `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C]`: the binary. C is
+  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, new epoch, shown `Prior`,
+  hover, outcome). `close()` closes the window and the session and returns the committed world (`StudioClosed`).
+- `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
+  [--look glow|raw] [--density] [--no-field]`: the binary. M is `lineage`, `energy`, `generation`, `motion` or
+  `topology` (or a registered name such as `founder-lineage-v1`); the default is the configuration's
+  `[presentation] color_mapping`. C is
   `cpu`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8. The
   Studio's default W is one per core up to 16, so on a host with more than 8 cores the controllers run on the CPU
   reference by default. With 16 workers Metal
   measured slower in the Studio under FrankenManim `dfdc7d18` (72 against 119 ticks per second, one 12 s run each),
   with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
   1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
-  - `open`, naming the window, the CPU workers and the controller backend;
+  - `open`, naming the window, the CPU workers, the controller backend, and the style: `mapping`, its `meaning`,
+    `look`, `particles` and `field`;
   - one `status` per status;
+  - one `view` per style change, with the same style fields;
   - a `frame` summary about once a second;
   - `end`, with the committed tick, the world digest, and the controller evaluations the backend returned and
     deferred, and its failure if it failed.
@@ -97,15 +110,19 @@ presentation state, not scientific state.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
   - Following the session: a late end of run 1 does not stop run 2, and run 2 stopping on its own does.
   - A resume refused at the lane or by the session leaves the controls paused.
-- `tests/live.rs` (harness-free, 17 checks, `--features synthetic-input`): the real 4,096-organism reference preset
+- `tests/live.rs` (harness-free, 21 checks, `--features synthetic-input`): the real 4,096-organism reference preset
   in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
   and delivered through the presenter's typed bridge:
   - the first poll's real `Resized` (640 × 400 points), and a real `FocusGained` (made key by a real key-window
     change if another application holds the keyboard);
-  - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling;
+  - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling, in three scene
+    objects (the field, the cloud and the density layer);
   - Space runs, and live epochs reach the screen;
   - Space pauses at a reported boundary, which is what is shown, and no epoch arrives while paused;
   - → and `.` each step one tick;
+  - while paused: 2 recolours the shown dots by energy; R drops the halos; D draws density on the Metal route, its
+    bins counting every organism; 1, R, D and F restore the lineage colours bit for bit, and no restyle steps the
+    world or changes the shown tick;
   - a real resize to 800 × 450 refits the viewport (3.515625 px per world unit) without new draw storage, and the
     next frame is presented at the new drawable size;
   - real pointer motion hovers the right world point within a pixel, and a real scroll arrives;
@@ -133,8 +150,9 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   commands are FL-020's and FL-022's.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here. The
   synchronous present path is an integration starting point, not latency evidence.
-- The field layer and halos are a first legibility pass, not FL-019's mappings. The field is drawn from the epoch's
-  bounded `FieldTexture` at its texel resolution, so the picture is soft rather than detailed. Motion between ticks
+- There is no on-screen legend: the Metal 3D route has no text, and the presenter has no window-title setter. The
+  style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
+  at its texel resolution, so the picture is soft rather than detailed. Motion between ticks
   is not interpolated (FL-020).
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later
   work (FL-023, FL-038).

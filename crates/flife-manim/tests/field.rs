@@ -160,7 +160,7 @@ fn a_frame_draws_the_field_then_the_halos_then_the_dots() {
     let mut view = WorldView::for_epoch(&lease, [96, 96], [0, 0, 0]).expect("view");
     view.show(&lease).expect("show");
     assert!(view.field().draw().is_some());
-    assert_eq!(view.scene_objects(), 2);
+    assert_eq!(view.scene_objects(), 3);
     let rgba = view.render_rgba8(2).expect("an offline frame");
     assert_eq!(rgba.len(), 96 * 96 * 4);
     let (pixels, rest) = rgba.as_chunks::<4>();

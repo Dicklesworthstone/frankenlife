@@ -13,10 +13,11 @@
 
 use flife_core::CoreError;
 use flife_render::FieldTexture;
-use fmn_core::color::Srgb;
+use fmn_core::color::{LinearRgba, Srgb};
 use fmn_render::{SurfaceDraw, SurfaceMesh, SurfaceVertex, ThreeDDraw};
 
 use crate::Viewport;
+use crate::mapping::Look;
 
 /// The field palette, dark to bright, as sRGB stops evenly spaced in the
 /// mapped value.
@@ -41,6 +42,17 @@ pub fn display_value(value: f32, scale: f64) -> f64 {
         return 0.0;
     }
     (f64::from(value) / scale).sqrt().clamp(0.0, 1.0)
+}
+
+/// The raw display value of a density `value` against `scale`: linear,
+/// clamped to `[0, 1]`, so the grey's linear light is proportional to the
+/// density.
+#[must_use]
+pub fn raw_value(value: f32, scale: f64) -> f64 {
+    if scale.is_nan() || scale <= 0.0 || !value.is_finite() || value <= 0.0 {
+        return 0.0;
+    }
+    (f64::from(value) / scale).clamp(0.0, 1.0)
 }
 
 /// `t ∈ [0, 1]` through [`FIELD_PALETTE`], interpolated in sRGB bytes.
@@ -80,13 +92,23 @@ impl FieldLayer {
         }
     }
 
-    /// Map `field` through the palette into the layer's grid.
+    /// Map `field` through the palette into the layer's grid (the glow
+    /// look).
+    ///
+    /// # Errors
+    /// As [`FieldLayer::update_look`].
+    pub fn update(&mut self, field: &FieldTexture) -> Result<(), CoreError> {
+        self.update_look(field, Look::Glow)
+    }
+
+    /// Map `field` into the layer's grid: through the square-root palette
+    /// for the glow look, as linear grey ([`raw_value`]) for raw.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for a texture whose values do not fill
     /// its texels; [`CoreError::NumericalInvalid`] if FrankenManim refuses
     /// the grid. The previous grid is kept on error.
-    pub fn update(&mut self, field: &FieldTexture) -> Result<(), CoreError> {
+    pub fn update_look(&mut self, field: &FieldTexture, look: Look) -> Result<(), CoreError> {
         let [columns, rows] = field.texels().map(|n| n as usize);
         let values = field.values();
         if values.len() != columns * rows || values.is_empty() {
@@ -118,7 +140,21 @@ impl FieldLayer {
                     + f64::from(texel(left, row))
                     + f64::from(texel(column, row)))
                     / 4.0;
-                let [r, g, b] = palette(display_value(mean as f32, self.scale));
+                let color = match look {
+                    Look::Glow => {
+                        let [r, g, b] = palette(display_value(mean as f32, self.scale));
+                        Srgb::from_rgb8(r, g, b).to_linear(1.0)
+                    }
+                    Look::Raw => {
+                        let grey = raw_value(mean as f32, self.scale);
+                        LinearRgba {
+                            r: grey,
+                            g: grey,
+                            b: grey,
+                            a: 1.0,
+                        }
+                    }
+                };
                 let world = [
                     width * column as f64 / columns as f64,
                     height * row as f64 / rows as f64,
@@ -126,7 +162,7 @@ impl FieldLayer {
                 vertices.push(SurfaceVertex::colored(
                     self.viewport.scene_point(world),
                     [0.0, 0.0, 1.0],
-                    Srgb::from_rgb8(r, g, b).to_linear(1.0),
+                    color,
                 ));
             }
         }

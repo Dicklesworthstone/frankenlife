@@ -1,12 +1,13 @@
-//! The live world as a FrankenManim view: one viewport, one camera, one
-//! particle cloud.
+//! The live world as a FrankenManim view: one viewport, one camera, the
+//! field, one particle cloud and its density layer, drawn in one [`Style`].
 
 use flife_core::CoreError;
 use flife_render::{Epoch, Prior};
 use fmn_core::color::{LinearRgba, Srgb};
 use fmn_render::{ThreeDCamera, ThreeDDraw, ThreeDJob, Tiling};
 
-use crate::{FieldLayer, ParticleCloud, Viewport};
+use crate::mapping::{Look, Particles, Style};
+use crate::{DensityLayer, FieldLayer, ParticleCloud, Viewport};
 
 /// A `#rrggbb` colour, as `[presentation] background` spells it.
 #[must_use]
@@ -32,6 +33,8 @@ pub struct WorldView {
     camera: ThreeDCamera,
     field: FieldLayer,
     cloud: ParticleCloud,
+    density: DensityLayer,
+    style: Style,
     shown: Option<Prior>,
 }
 
@@ -55,8 +58,10 @@ impl WorldView {
             camera: viewport.camera(background)?,
             background,
             field: FieldLayer::new(&viewport),
+            density: DensityLayer::new(&viewport),
             viewport,
             cloud: ParticleCloud::with_capacity(capacity)?,
+            style: Style::default(),
             shown: None,
         })
     }
@@ -88,16 +93,36 @@ impl WorldView {
         self.viewport = viewport;
         self.camera = camera;
         self.cloud.refit(&self.viewport);
+        self.density.refit(&self.viewport);
         Ok(true)
     }
 
-    /// Lower `epoch` into the cloud and remember it as shown.
+    /// The style frames are drawn in.
+    #[must_use]
+    pub const fn style(&self) -> Style {
+        self.style
+    }
+
+    /// Draw from the next [`WorldView::show`] in `style`. Show an epoch
+    /// again to see the change at once.
+    pub const fn set_style(&mut self, style: Style) {
+        self.style = style;
+    }
+
+    /// Lower `epoch` in the current style and remember it as shown. The
+    /// field is mapped even while hidden, so its display scale keeps
+    /// following the world.
     ///
     /// # Errors
-    /// As [`ParticleCloud::update`]; what is shown is unchanged on error.
+    /// As [`ParticleCloud::update_styled`], [`DensityLayer::update`] and
+    /// [`FieldLayer::update_look`].
     pub fn show(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
-        self.cloud.update(epoch, &self.viewport)?;
-        self.field.update(epoch.field())?;
+        let style = self.style;
+        self.cloud.update_styled(epoch, &self.viewport, &style)?;
+        if style.particles == Particles::Density {
+            self.density.update(epoch, &style)?;
+        }
+        self.field.update_look(epoch.field(), style.look)?;
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),
@@ -105,28 +130,46 @@ impl WorldView {
         Ok(())
     }
 
-    /// The 3D job for the current frame.
+    /// The current frame's draws in painter order: the field, then the
+    /// density layer, or every halo and then every dot. Raw density is
+    /// opaque, so the field is left out under it.
     ///
     /// # Errors
-    /// [`CoreError::NumericalInvalid`] when FrankenManim refuses to compile
-    /// the draws.
-    pub fn job(&self) -> Result<ThreeDJob<'_>, CoreError> {
-        // Painter order: the field, every halo, then every dot.
+    /// [`CoreError::AllocationFailed`] when the list cannot be reserved.
+    pub fn draws(&self) -> Result<Vec<ThreeDDraw<'_>>, CoreError> {
+        let style = self.style;
+        let density = style.particles == Particles::Density;
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
         draws
-            .try_reserve_exact(1 + halos.len() + dots.len())
+            .try_reserve_exact(2 + halos.len() + dots.len())
             .map_err(|_| CoreError::AllocationFailed {
                 buffer: "world view frame draws",
                 bytes: u64::try_from(
-                    (1 + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
+                    (2 + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
                 )
                 .unwrap_or(u64::MAX),
             })?;
-        draws.extend(self.field.draw());
-        draws.extend_from_slice(halos);
-        draws.extend_from_slice(dots);
+        if style.field && !(density && style.look == Look::Raw) {
+            draws.extend(self.field.draw());
+        }
+        if density {
+            draws.extend(self.density.draw());
+        } else {
+            draws.extend_from_slice(halos);
+            draws.extend_from_slice(dots);
+        }
+        Ok(draws)
+    }
+
+    /// The 3D job for the current frame, over [`WorldView::draws`].
+    ///
+    /// # Errors
+    /// As [`WorldView::draws`]; [`CoreError::NumericalInvalid`] when
+    /// FrankenManim refuses to compile the draws.
+    pub fn job(&self) -> Result<ThreeDJob<'_>, CoreError> {
+        let draws = self.draws()?;
         ThreeDJob::new(self.camera.camera(), &draws, Tiling::default()).map_err(|error| {
             CoreError::NumericalInvalid {
                 quantity: "world view frame",
@@ -193,11 +236,17 @@ impl WorldView {
         &self.cloud
     }
 
-    /// Scene objects in the view: the field layer and the one particle
-    /// cloud, however many organisms it draws.
+    /// Scene objects in the view: the field layer, the one particle cloud
+    /// however many organisms it draws, and its density layer.
     #[must_use]
     pub const fn scene_objects(&self) -> usize {
-        2
+        3
+    }
+
+    /// The density layer.
+    #[must_use]
+    pub const fn density(&self) -> &DensityLayer {
+        &self.density
     }
 
     /// The field layer.

@@ -654,7 +654,38 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         )
     },
     entry("franken-manim", Role::PresentationEngine, "§13.1", "FL-018"),
-    entry("founder-lineage-v1", Role::ColorMapping, "§13.4", "FL-019"),
+    // FL-019's colour mappings: each a fixed function of one render-epoch
+    // row (flife-manim's `mapping` module).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::categorical_palettes_are_distinct_and_luminous",
+        },
+        ..entry("founder-lineage-v1", Role::ColorMapping, "§13.4", "FL-019")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::energy_maps_through_a_fixed_saturating_scale",
+        },
+        ..entry("energy-lightness-v1", Role::ColorMapping, "§13.4", "FL-019")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::generations_map_logarithmically_up_to_a_fixed_scale",
+        },
+        ..entry("generation-log-v1", Role::ColorMapping, "§13.4", "FL-019")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::motion_hue_is_the_heading_and_its_strength_the_speed",
+        },
+        ..entry("motion-heading-v1", Role::ColorMapping, "§13.4", "FL-019")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::categorical_palettes_are_distinct_and_luminous",
+        },
+        ..entry("topology-catalog-v1", Role::ColorMapping, "§13.4", "FL-019")
+    },
     entry(
         "committed-states-one-epoch-late",
         Role::Interpolation,

@@ -14,8 +14,17 @@
 //! | Space | run or pause |
 //! | → or `.` (held: repeats) | step one tick while paused |
 //! | Esc, or ⌘W | close |
+//!
+//! and, for the presentation owner alone (FL-019's [`Style`]):
+//!
+//! | Key | Style |
+//! |---|---|
+//! | 1 to 5 | colour by lineage, energy, generation, motion or topology |
+//! | R | glow or raw |
+//! | D | points or density |
+//! | F | field on or off |
 
-use flife_manim::Viewport;
+use flife_manim::{ColorMapping, Look, Particles, Style, Viewport};
 use fmn_render::metal::{ButtonSet, InputEvent, LogicalPoint, SurfaceMetrics};
 
 use crate::Status;
@@ -30,6 +39,14 @@ pub const KEY_PERIOD: u16 = 47;
 pub const KEY_ESCAPE: u16 = 53;
 /// `kVK_ANSI_W`.
 pub const KEY_W: u16 = 13;
+/// `kVK_ANSI_1` to `kVK_ANSI_5`, for [`ColorMapping::ALL`] in order.
+pub const KEY_DIGITS: [u16; 5] = [18, 19, 20, 21, 23];
+/// `kVK_ANSI_R`.
+pub const KEY_R: u16 = 15;
+/// `kVK_ANSI_D`.
+pub const KEY_D: u16 = 2;
+/// `kVK_ANSI_F`.
+pub const KEY_F: u16 = 3;
 
 /// What the presentation owner asks of the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +95,7 @@ pub struct Controls {
     buttons: ButtonSet,
     metrics: Option<SurfaceMetrics>,
     tally: InputTally,
+    style: Style,
 }
 
 impl Controls {
@@ -142,7 +160,11 @@ impl Controls {
                     KEY_RIGHT | KEY_PERIOD if !self.running => Some(Intent::Step),
                     KEY_ESCAPE => self.request_close(),
                     KEY_W if modifiers.command => self.request_close(),
-                    _ => None,
+                    _ if *repeat || modifiers.command => None,
+                    code => {
+                        self.restyle(code);
+                        None
+                    }
                 }
             }
             InputEvent::ModifiersChanged { .. } => {
@@ -170,6 +192,41 @@ impl Controls {
                 None
             }
         }
+    }
+
+    /// A style key's change, if `code` is one.
+    fn restyle(&mut self, code: u16) {
+        if let Some(slot) = KEY_DIGITS.iter().position(|&digit| digit == code) {
+            self.style.mapping = ColorMapping::ALL[slot];
+            return;
+        }
+        match code {
+            KEY_R => {
+                self.style.look = match self.style.look {
+                    Look::Glow => Look::Raw,
+                    Look::Raw => Look::Glow,
+                };
+            }
+            KEY_D => {
+                self.style.particles = match self.style.particles {
+                    Particles::Points => Particles::Density,
+                    Particles::Density => Particles::Points,
+                };
+            }
+            KEY_F => self.style.field = !self.style.field,
+            _ => {}
+        }
+    }
+
+    /// The style the presentation owner should draw in.
+    #[must_use]
+    pub const fn style(&self) -> Style {
+        self.style
+    }
+
+    /// Start from `style`, as the Studio opens.
+    pub const fn set_style(&mut self, style: Style) {
+        self.style = style;
     }
 
     fn request_close(&mut self) -> Option<Intent> {

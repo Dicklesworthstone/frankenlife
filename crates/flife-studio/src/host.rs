@@ -9,7 +9,9 @@
 //!    blocking, and drains what the session reports;
 //! 3. refits the viewport and camera when the content area changed;
 //! 4. leases the newest render epoch, if newer than the one shown, lowers
-//!    it into the particle cloud and returns the lease at once;
+//!    it into the particle cloud and returns the lease at once; after a
+//!    style key it lowers the newest epoch again in the new style, so the
+//!    change shows while paused too;
 //! 5. renders the cloud with FrankenManim's Metal 3D route straight into
 //!    the window's drawable, with no pixel readback.
 //!
@@ -20,7 +22,7 @@ use flife_backend_metal::ControllerChoice;
 use flife_core::ids::{RenderEpoch, SessionId};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
-use flife_manim::{WorldView, hex_rgb};
+use flife_manim::{Style, WorldView, hex_rgb};
 use flife_render::{Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
@@ -52,6 +54,8 @@ pub struct StudioOptions {
     pub run_on_open: bool,
     /// Where due controllers are evaluated. No result depends on it.
     pub controllers: ControllerChoice,
+    /// The style the window opens in; keys change it later.
+    pub style: Style,
 }
 
 impl Default for StudioOptions {
@@ -63,6 +67,7 @@ impl Default for StudioOptions {
             cpu_workers: None,
             run_on_open: false,
             controllers: ControllerChoice::Auto,
+            style: Style::default(),
         }
     }
 }
@@ -84,6 +89,8 @@ pub struct Frame {
     pub refitted: bool,
     /// Whether a newer epoch was lowered.
     pub new_epoch: bool,
+    /// Whether a style key changed the style this frame.
+    pub restyled: bool,
     /// The epoch on screen.
     pub shown: Option<Prior>,
     /// The world point under the pointer.
@@ -106,6 +113,8 @@ pub struct FrameTally {
     pub epochs: u64,
     /// Viewport refits.
     pub refits: u64,
+    /// Style changes.
+    pub restyles: u64,
     /// Intents accepted.
     pub intents: u64,
     /// Intents refused.
@@ -188,6 +197,7 @@ impl Studio {
         let viewer = feed.viewer(1)?;
         let founding = viewer.latest()?;
         let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
+        view.set_style(options.style);
         view.show(&founding)?;
         drop(founding);
         let session = SessionThread::spawn(owner, handle)?;
@@ -202,12 +212,14 @@ impl Studio {
         if options.run_on_open {
             session.send(Intent::Resume)?;
         }
+        let mut controls = Controls::new();
+        controls.set_style(options.style);
         Ok(Self {
             preview,
             session,
             viewer,
             view,
-            controls: Controls::new(),
+            controls,
             events,
             statuses: Vec::new(),
             tally: FrameTally::default(),
@@ -260,6 +272,13 @@ impl Studio {
         }
         let statuses = self.statuses.len() - before;
 
+        let style = self.controls.style();
+        let restyled = style != self.view.style();
+        if restyled {
+            self.view.set_style(style);
+            self.tally.restyles += 1;
+        }
+
         let refitted = match self.controls.drawable_size() {
             Some(size) => self.view.resize(size)?,
             None => false,
@@ -281,6 +300,10 @@ impl Studio {
         };
         if new_epoch {
             self.tally.epochs += 1;
+        } else if restyled {
+            // The same (or a newer) epoch again, lowered in the new style.
+            let lease = self.viewer.latest()?;
+            self.view.show(&lease)?;
         }
 
         let outcome = if state == PresentationState::Visible {
@@ -309,6 +332,7 @@ impl Studio {
             statuses,
             refitted,
             new_epoch,
+            restyled,
             shown: self.view.shown(),
             hover: self.controls.hover(self.view.viewport()),
             outcome,

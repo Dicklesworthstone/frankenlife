@@ -58,7 +58,9 @@ live world on screen: `flife-studio` shows the 4,096-organism preset in a native
 particle cloud. Its real pointer, key, scroll, focus and resize events run, pause and step the session, and a closed
 Studio's world is bit-identical to the same world stepped directly. FL-030's first part evaluates every due
 controller on the Mac's GPU in one fused Metal dispatch, bit for bit the CPU reference's, and `run`, `render` and the
-Studio use it by default (`--controllers auto`). Palettes, camera, zoom and selection come next.**
+Studio use it by default (`--controllers auto`). FL-019 adds five colour mappings (lineage, energy, generation,
+motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
+Camera, zoom and selection come next.**
 
 | Question | Answer |
 |---|---|
@@ -326,12 +328,26 @@ cargo run --release -p flife-cli -- validate presets/reference-small-world.toml
 cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128
 cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 2560 --every 4 \
     --width 1080 --height 1080 --out frames --video world.mp4
+cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 1200 --every 1200 \
+    --color energy --density --out frames-energy
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540
 ```
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
-and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary and the
-closing world digest). The organisms glow in their lineage colours over the energy field they feed on.
+and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
+record per style change and the closing world digest). The organisms glow over the energy field they feed on, in
+the configuration's colour mapping (`[presentation] color_mapping`, lineage in the preset). The style keys work
+while running or paused, and change only the picture:
+
+| Key | View |
+|---|---|
+| 1 to 5 | colour by lineage, energy (dark to bright), generation (logarithmic), motion (hue for heading, strength for speed) or topology (catalog member) |
+| R | the raw look: no halos, linear grey field |
+| D | density per screen bin instead of dots |
+| F | show or hide the field |
+
+`render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density` and `--no-field`.
+Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.
 
 `--controllers metal` evaluates the organisms' controllers on the Mac's GPU, and `cpu` keeps them on the CPU
 reference; `metal` refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and

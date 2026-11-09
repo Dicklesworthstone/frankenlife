@@ -28,7 +28,7 @@ const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_F
 
 /// The preset's declared changes from Appendix A, as TOML values:
 /// `(key, Appendix A's value, the preset's value)`.
-const DECLARED: [(&str, &str, &str); 7] = [
+const DECLARED: [(&str, &str, &str); 8] = [
     (
         "name",
         "\"reference-field-ecology\"",
@@ -43,6 +43,7 @@ const DECLARED: [(&str, &str, &str); 7] = [
         "3.0",
     ),
     ("reproduction.cooldown_seconds", "1.0", "0.5"),
+    ("chemistry.motion_response_norm_limit", "1.0", "256.0"),
     (
         "execution.command_durability",
         "\"write-ahead-before-apply\"",
@@ -52,7 +53,7 @@ const DECLARED: [(&str, &str, &str); 7] = [
 
 /// The smoke run's committed world after 1,024 ticks, identical on every
 /// qualified host.
-const SMOKE_DIGEST: &str = "e63b4b47d93d5a8c650ea3adbfb1e5e79dcc7fbc5cd8ffd46797403463edca90";
+const SMOKE_DIGEST: &str = "2ade32c2f3e74f6f54181019774181e2aa0857bd79bd6c5a6f774f85e46a8183";
 
 fn appendix_a() -> &'static str {
     let appendix = PLAN.find("## Appendix A").map_or("", |at| &PLAN[at..]);
@@ -357,56 +358,60 @@ fn the_smoke_run_shows_births_deaths_emissions_and_heritable_variation_in_raw_st
         *tally,
         Tally {
             ticks: 1024,
-            births: 359,
+            births: 507,
             rejected_births: 0,
-            deaths: 3753,
-            deaths_by_stage: BTreeMap::from([("chemistry", 165), ("maintenance", 3588)]),
-            emitter_ticks: 751_664,
-            emission_paid: 931.122_024_705_095,
-            emission_deposited: 837.958_172_663_772_4,
-            child_endowment: 780.878_021_831_785_6,
+            deaths: 3775,
+            deaths_by_stage: BTreeMap::from([
+                ("chemistry", 159),
+                ("maintenance", 3613),
+                ("motion", 3)
+            ]),
+            emitter_ticks: 747_053,
+            emission_paid: 1_008.661_307_687_298_5,
+            emission_deposited: 907.713_231_889_463_1,
+            child_endowment: 1_305.556_324_834_606_6,
             recycled: 0.0,
-            perturbed_parameters: 7130,
-            replaced_parameters: 361,
-            topology_changes: 1,
+            perturbed_parameters: 10_191,
+            replaced_parameters: 530,
+            topology_changes: 6,
             rejected_candidates: 0,
-            peak_live: 4097,
-            least_live: Some(470),
-            normalized_residual: Some(2.978_861_502_004_317e-9),
+            peak_live: 4096,
+            least_live: Some(478),
+            normalized_residual: Some(7.267_934_839_627_371e-10),
         }
     );
     assert_eq!(
         *survey,
         Survey {
             tick: 1024,
-            live: 702,
-            founders_alive: 344,
-            descendants_alive: 358,
-            max_generation: 4,
-            generations: BTreeMap::from([(0, 344), (1, 238), (2, 104), (3, 15), (4, 1)]),
-            lineages_alive: 344,
-            identities_issued: 4455,
-            distinct_genomes: 702,
-            distinct_parameter_sets: 702,
-            distinct_trait_vectors: 702,
-            topologies: BTreeMap::from([(0, 1), (2, 701)]),
+            live: 828,
+            founders_alive: 323,
+            descendants_alive: 505,
+            max_generation: 5,
+            generations: BTreeMap::from([(0, 323), (1, 277), (2, 160), (3, 53), (4, 12), (5, 3)]),
+            lineages_alive: 325,
+            identities_issued: 4603,
+            distinct_genomes: 828,
+            distinct_parameter_sets: 828,
+            distinct_trait_vectors: 828,
+            topologies: BTreeMap::from([(0, 4), (1, 3), (2, 818), (4, 3)]),
             heredity: Heredity {
-                pairs: 357,
-                pairs_differing: 357,
-                pairs_across_topologies: 1,
-                pair_parameters: 3_565_716,
-                pair_parameters_identical: 3_558_246,
-                most_parameter_differences: 36,
-                pair_trait_distance: Some(0.080_657_242_208_621_08),
-                founder_pairs: 343,
-                founder_parameters: 3_425_884,
-                founder_parameters_identical: 45_276,
-                founder_trait_distance: Some(1.992_437_971_030_074_1),
-                triples: 120,
-                parental_parameter_variants: 2541,
-                carried_parameter_variants: 2535,
-                triple_trait_distance_to_parent: Some(0.080_835_474_147_488_35),
-                triple_trait_distance_to_grandparent: Some(0.112_620_768_955_377_22),
+                pairs: 497,
+                pairs_differing: 497,
+                pairs_across_topologies: 6,
+                pair_parameters: 4_985_044,
+                pair_parameters_identical: 4_974_500,
+                most_parameter_differences: 69,
+                pair_trait_distance: Some(0.058_025_554_391_786_26),
+                founder_pairs: 322,
+                founder_parameters: 3_216_136,
+                founder_parameters_identical: 42_504,
+                founder_trait_distance: Some(1.985_464_526_404_333_4),
+                triples: 219,
+                parental_parameter_variants: 4596,
+                carried_parameter_variants: 4583,
+                triple_trait_distance_to_parent: Some(0.058_060_253_606_112_72),
+                triple_trait_distance_to_grandparent: Some(0.081_480_224_578_190_21),
             },
         }
     );
@@ -496,14 +501,24 @@ fn the_flife_binary_validates_runs_and_refuses_with_typed_errors() {
 /// the ceiling at the founders' count, the first viable birth has no slot
 /// (`pause-before-commit`), and nothing after the last published tick
 /// changes.
+///
+/// The construction needs the first viable birth before the first death. At
+/// Appendix A's motility gain (1.0) the first birth comes by tick 144 and
+/// the first death by tick 168. At the preset's gain a poisoning death comes
+/// first (by tick 160, the first birth by 176) and frees a slot, so this
+/// test keeps Appendix A's gain: its subject is the pause, not the ecology.
 #[test]
 fn a_capacity_pause_ends_the_run_with_its_stop_and_status_one() {
     let full = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("fl015-no-room.toml");
-    std::fs::write(
-        &full,
-        PRESET.replace("maximum_count = 16384\n", "maximum_count = 4096\n"),
-    )
-    .expect("write the configuration");
+    let configuration = PRESET
+        .replace("maximum_count = 16384\n", "maximum_count = 4096\n")
+        .replace(
+            "motion_response_norm_limit = 256.0\n",
+            "motion_response_norm_limit = 1.0\n",
+        );
+    assert!(configuration.contains("\nmaximum_count = 4096\n"));
+    assert!(configuration.contains("\nmotion_response_norm_limit = 1.0\n"));
+    std::fs::write(&full, configuration).expect("write the configuration");
     let (status, out, err) = flife(&[
         "run",
         full.to_str().expect("UTF-8"),

@@ -55,6 +55,10 @@ pub enum RenderRecord {
         tick: u64,
         /// Organisms alive.
         live: usize,
+        /// The live organisms' mean speed, world units per simulated second.
+        mean_speed: f64,
+        /// The fastest live organism's speed.
+        top_speed: f64,
         /// The PNG.
         path: String,
         /// Seconds rendering and encoding it took.
@@ -115,6 +119,7 @@ pub fn render(
             let started = Instant::now();
             view.show(&lease)?;
             let live = lease.len();
+            let (mean_speed, top_speed) = speeds(lease.velocities());
             drop(lease);
             let rgba = view.render_rgba8(options.render_threads.get())?;
             let path = options.out.join(format!("frame-{frames:06}.png"));
@@ -130,6 +135,8 @@ pub fn render(
                 frame: frames,
                 tick: world.tick().get(),
                 live,
+                mean_speed,
+                top_speed,
                 path: path.display().to_string(),
                 render_seconds: started.elapsed().as_secs_f64(),
             });
@@ -166,6 +173,22 @@ pub fn render(
         wall_seconds: clock.elapsed().as_secs_f64(),
     });
     Ok(())
+}
+
+/// The mean and largest of `velocities`' magnitudes; zeros when empty.
+fn speeds(velocities: &[[f32; 2]]) -> (f64, f64) {
+    let (sum, top) = velocities
+        .iter()
+        .fold((0.0, 0.0_f64), |(sum, top), [x, y]| {
+            let speed = f64::from(*x).hypot(f64::from(*y));
+            (sum + speed, top.max(speed))
+        });
+    let mean = if velocities.is_empty() {
+        0.0
+    } else {
+        sum / velocities.len() as f64
+    };
+    (mean, top)
 }
 
 /// Encode `frames/frame-%06d.png` into an H.264 MP4 with `ffmpeg`.

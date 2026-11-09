@@ -41,7 +41,8 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
   - organism identities issued, live counts by topology, and distinct genomes: whole contents, `(topology,
     parameters)` sets and trait vectors, each counted separately;
   - `Heredity`. Live parent–child pairs are compared bit for bit over parameters and by distance over the trait
-    vector (affinity, motion response, ln sensing scale), against consecutive live founders as the unrelated
+    vector (affinity over `affinity_norm_limit`, motion response over `motion_response_norm_limit`, and ln sensing
+    scale: dimensionless, so it compares across motility gains), against consecutive live founders as the unrelated
     baseline. Live grandparent–parent–child triples report how many of the parent's parameter variants the child
     carries, and the child's trait distance to its parent and to its grandparent.
 - Errors: one `frankenlife.error.v1` record on standard error. Its `kind` is `CoreError::kind`, or `io` for an
@@ -108,7 +109,7 @@ test.
 
 **Independent tests.** `tests/smoke.rs` (5 tests):
 - `the_preset_is_appendix_a_with_exactly_its_declared_changes`. It parses both TOML documents leaf by leaf, from
-  the plan's own Appendix A. It refuses any difference except the seven declared, and checks that the header
+  the plan's own Appendix A. It refuses any difference except the eight declared, and checks that the header
   declares each one.
 - `the_preset_validates_at_the_reference_scale_and_its_session_admits_it`. Appendix A as written validates, and
   its session refuses it as `MissingCapability`.
@@ -127,17 +128,21 @@ test.
   - The digest is pinned, and so are the whole tally and survey, every float included. The survey uses
     `flife_core::numerics::ln`, so it is identical on every host.
 
-  Observed at seed 42: 359 births and 3,753 deaths. Paid 931 energy and deposited 838. Kept 99.79% of
-  parameters, while founders share 1.3%. Trait distance 0.081 to the parent, 1.99 between founders. 120 triples
-  carried 99.76% of their parents' variants. Trait distance 0.081 to the parent and 0.113 to the grandparent, a
-  ratio near √2, as accumulated heritable perturbations predict.
+  Observed at seed 42: 507 births and 3,775 deaths (3,613 starved in maintenance, 159 poisoned in chemistry, 3
+  exhausted by motion). Paid 1,009 energy and deposited 908. Kept 99.79% of parameters, while founders share
+  1.3%. Trait distance 0.058 to the parent, 1.99 between founders. 219 triples carried 99.72% of their parents'
+  variants. Trait distance 0.058 to the parent and 0.081 to the grandparent, a ratio near √2, as accumulated
+  heritable perturbations predict. (Before the motility change, Appendix A's gain gave 359 births and 3,753
+  deaths, and 0.081 and 0.113.)
 - `the_flife_binary_validates_runs_and_refuses_with_typed_errors`. It runs the built `flife`:
   - `validate` prints the preset's hash;
   - `run --ticks 2 --every 1` prints start, progress, progress, end;
   - an unreadable file is `io` and an unknown key is `invalid-config`, each with exit status 2;
   - Appendix A validates, and `run` refuses it as `missing-capability` with no output.
 - `a_capacity_pause_ends_the_run_with_its_stop_and_status_one`. With the population ceiling at the founders' 4,096,
-  the first viable birth has no slot under `pause-before-commit`. The run ends `capacity-paused` before tick 1,024,
+  the first viable birth has no slot under `pause-before-commit`. This needs the first birth before the first
+  death, so the test keeps Appendix A's motility gain: at the preset's, a poisoning death comes first and frees a
+  slot. The run ends `capacity-paused` before tick 1,024,
   with no birth published, and `flife` exits with status 1.
 
 `tests/render.rs` (1 test): `rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it`. Six ticks

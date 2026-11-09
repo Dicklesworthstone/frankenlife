@@ -697,6 +697,12 @@ impl World {
         self.rules.motion.maximum_speed()
     }
 
+    /// The run's bounds on heritable traits and parameters.
+    #[must_use]
+    pub const fn trait_limits(&self) -> &TraitLimits {
+        &self.rules.limits
+    }
+
     /// The committed field.
     #[must_use]
     pub const fn field(&self) -> &FieldState {

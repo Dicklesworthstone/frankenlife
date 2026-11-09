@@ -328,7 +328,11 @@ fn live() -> Result<Vec<String>, String> {
         tally.capture_lost == before.capture_lost + 1
             && tally.focus_lost == before.focus_lost + 1
             && live.studio.controls().buttons().is_empty(),
-        "real focus loss with a button held loses the pointer capture and clears the drag",
+        format!(
+            "real focus loss with a button held loses the pointer capture and clears the drag \
+             (before {before:?}, after {tally:?}, buttons {:?})",
+            live.studio.controls().buttons()
+        ),
     )?;
     live.post(&SyntheticInput::Focus(true))?;
     live.until("focus regained", |studio, _, _| studio.controls().focused())?;

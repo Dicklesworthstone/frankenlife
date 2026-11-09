@@ -33,7 +33,9 @@ pub mod transition;
 
 pub use catalog::{DENSE_104_36_CATALOG_V1, DENSE_104_36_MEMBERS, TopologyCatalog, TopologyId};
 pub use founder::{founder, founder_traits, initial_scale};
-pub use genome::{Genome, SharedParameters, TraitLimits, Traits, Unsealed};
+pub use genome::{
+    AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, SharedParameters, TraitLimits, Traits, Unsealed,
+};
 pub use init::{FAN_IN_SCALED_SYMMETRIC_V1, WeightAddress, fan_in_weight, initialize};
 pub use mutation::{
     BirthAttempt, CandidateRejection, MAXIMUM_CANDIDATES, MutationParameters, MutationRecord,

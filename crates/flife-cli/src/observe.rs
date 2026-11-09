@@ -24,7 +24,7 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::Transfer;
 use flife_core::numerics;
 use flife_engine::{DeathCause, Population, TickReport, World};
-use flife_genome::Genome;
+use flife_genome::{AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits};
 use serde::Serialize;
 
 /// The published reports of a run, folded.
@@ -224,7 +224,7 @@ impl Survey {
             distinct_parameter_sets: parameter_sets.len(),
             distinct_trait_vectors: trait_vectors.len(),
             topologies,
-            heredity: heredity(population),
+            heredity: heredity(population, world.trait_limits()),
         }
     }
 }
@@ -250,7 +250,7 @@ impl Mean {
     }
 }
 
-fn heredity(population: &Population) -> Heredity {
+fn heredity(population: &Population, limits: &TraitLimits) -> Heredity {
     let mut heredity = Heredity::default();
     let mut pair_traits = Mean::default();
     let mut founder_traits = Mean::default();
@@ -269,7 +269,7 @@ fn heredity(population: &Population) -> Heredity {
                 heredity.founder_pairs += 1;
                 heredity.founder_parameters += compared;
                 heredity.founder_parameters_identical += identical;
-                founder_traits.add(trait_distance(previous, genome));
+                founder_traits.add(trait_distance(previous, genome, limits));
             }
             previous_founder = Some(genome);
             continue;
@@ -282,7 +282,7 @@ fn heredity(population: &Population) -> Heredity {
             continue;
         }
         let (compared, identical) = compare(parent, genome);
-        let distance = trait_distance(parent, genome);
+        let distance = trait_distance(parent, genome, limits);
         heredity.pairs += 1;
         heredity.pair_parameters += compared;
         heredity.pair_parameters_identical += identical;
@@ -299,7 +299,7 @@ fn heredity(population: &Population) -> Heredity {
             heredity.parental_parameter_variants += variants;
             heredity.carried_parameter_variants += carried;
             to_parent.add(distance);
-            to_grandparent.add(trait_distance(grandparent, genome));
+            to_grandparent.add(trait_distance(grandparent, genome, limits));
         }
     }
     heredity.pair_trait_distance = pair_traits.get();
@@ -356,12 +356,28 @@ fn trait_vector(genome: &Genome) -> impl Iterator<Item = f64> + '_ {
         ))
 }
 
-/// The Euclidean distance between two genomes' trait vectors, summed in
-/// vector order.
-fn trait_distance(a: &Genome, b: &Genome) -> f64 {
+/// The Euclidean distance between two genomes' trait vectors, each block in
+/// units of its norm budget: affinity over `affinity_norm_limit`, motion
+/// response over `motion_response_norm_limit`, and `ln(sensing scale)` as
+/// is. It is dimensionless, so it compares across configurations whatever
+/// their motility gain. Summed in vector order.
+fn trait_distance(a: &Genome, b: &Genome, limits: &TraitLimits) -> f64 {
+    let affinity = AFFINITY_TERMS;
+    let motion = affinity + MOTION_RESPONSE_TERMS;
     trait_vector(a)
         .zip(trait_vector(b))
-        .map(|(x, y)| (x - y) * (x - y))
+        .enumerate()
+        .map(|(index, (x, y))| {
+            let budget = if index < affinity {
+                limits.affinity_norm()
+            } else if index < motion {
+                limits.motion_response_norm()
+            } else {
+                1.0
+            };
+            let difference = (x - y) / budget;
+            difference * difference
+        })
         .sum::<f64>()
         .sqrt()
 }

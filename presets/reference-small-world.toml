@@ -17,6 +17,7 @@
 #   costs.basal_energy_per_second                      0.005  → 0.8
 #   reproduction.minimum_parent_energy_before_attempt  4.0    → 3.0
 #   reproduction.cooldown_seconds                      1.0    → 0.5
+#   chemistry.motion_response_norm_limit               1.0    → 256.0
 #   execution.command_durability                       write-ahead-before-apply → volatile-in-memory
 #
 # Why. Appendix A's founders start with 2.0 energy, below its 4.0 birth
@@ -29,15 +30,28 @@
 # - a founder that finds no source starves within about four seconds;
 # - the fed lineages then recover and grow.
 #
-# Observed when this preset was introduced, in release builds of `flife run`
-# over 8,192 ticks (64 simulated seconds) with seeds 42, 7, 99 and 1234:
+# Motion. The response coefficients χ have units of length² per second² and
+# share the norm budget `motion_response_norm_limit` (§5.4), so that budget is
+# the motility gain. Appendix A's 1.0 is far too small for its own field: the
+# sources vary over ~10 world units, so the normalized gradients organisms
+# feel are ~0.01 per unit, and at 1.0 the measured mean speed was 0.01 world
+# units per second (top 0.2), with the drag-limited ceiling at
+# maximum_acceleration / drag = 2. Nothing visibly moved. At 256 the mean is
+# ~0.6 and the fastest organisms reach the ceiling; foraging improves, so
+# the population recovers to ~4,600 instead of ~1,500.
+#
+# Observed with the motility change, in release builds of `flife run` over
+# 8,192 ticks (64 simulated seconds) with seeds 42, 7, 99 and 1234:
 # - unfed founders starved, and the population fell from 4,096 to a low of
-#   470–596 within the first 1,024 ticks;
-# - it recovered to 1,430–1,669, then ended at 857–1,142 live;
-# - there were 3,122–3,431 births and 6,088–6,587 deaths;
-# - 184–200 founder lineages survived, the deepest generation was 13–16, and
-#   four other catalog topologies arose by architecture mutation;
-# - no run paused on capacity, and every ledger closed within 6e-7.
+#   478–620 within the first 1,024 ticks;
+# - it recovered to a peak of 5,849–6,251, then ended at 4,427–5,309 live;
+# - there were 18,586–20,074 births and 18,255–18,861 deaths;
+# - 38–42 founder lineages survived, the deepest generation was 13–18, and
+#   all four other catalog topologies arose by architecture mutation;
+# - no run paused on capacity, and every ledger closed within a normalized
+#   4e-9.
+# (Before it, at Appendix A's gain, the population fell to 470–596, recovered
+# only to 1,430–1,669 and ended at 857–1,142, with 184–200 lineages left.)
 # Seed 42's first 1,024 ticks are pinned by the smoke test.
 #
 # The durability change is a capability, not tuning: write-ahead-before-apply
@@ -108,7 +122,7 @@ uptake_capacity_per_second = 6.0
 uptake_half_saturation_density = 0.1
 toxicity_sensitivity = 0.2
 chemistry_evaluation = "per-granted-cell-packet"
-motion_response_norm_limit = 1.0
+motion_response_norm_limit = 256.0
 maximum_acceleration = 4.0
 drag_per_second = 2.0
 maximum_speed = 4.0

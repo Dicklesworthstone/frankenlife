@@ -22,7 +22,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
 }
 
-#[expect(clippy::expect_used, clippy::unwrap_used, reason = "a measurement tool")]
+#[expect(clippy::expect_used, reason = "a measurement tool")]
 fn main() {
     let mut args = std::env::args().skip(1);
     let ticks: u64 = args.next().map_or(64, |t| t.parse().expect("ticks"));

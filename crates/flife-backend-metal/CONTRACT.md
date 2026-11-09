@@ -9,7 +9,10 @@ This crate is `forbid(unsafe_code)`; the Metal FFI is upstream.
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
   one batch (`ControllerJob`: genome identity, admitted controller, inputs). `ControllerChoice` (`cpu`, `metal`,
-  `auto`) is what the CLI and Studio select it with.
+  `auto`) is what the CLI and Studio select it with: `backend(cpu_workers)` gives `auto` Metal only on a host with
+  a device and at most `AUTO_METAL_MAX_WORKERS` = 8 workers, where it measured faster (whole ticks, 256 ticks, two
+  interleaved runs: 2 workers 27.5 → 16.3 ms, 4 workers 19.5 → 14.8 ms, 8 workers 15.8 → 14.3 ms). Test
+  `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling`.
 - The kernel alone: `Batch::push(topology, parameters, inputs)` for one organism's catalog topology, its parameters
   in the reference layout and its observation's 104 F64 inputs (topologies may mix in a batch); then
   `MetalControllers::open()`, `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.
@@ -67,7 +70,7 @@ compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `Lay
     1,101,004,800 patterns, zero and subnormals included, in about 3 s each. The fast path must fall back at least
     once and fewer than 1,000,000 times, so the fallback is exercised and the fast path carries the load.
   - Negative inputs (64 random windows of 65,536) and the saturated region equal the reference.
-- `tests/world.rs` (2 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
+- `tests/world.rs` (3 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
   evaluated every tick) runs 400 ticks with its controllers on Metal next to the reference world. The digests
   match at every tick, through the founder crash, 42 births and mutation. All 1,254,756 evaluations came from the
   device (none deferred, no tick redone on the reference). The planted negative flips one output bit of one

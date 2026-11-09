@@ -12,7 +12,8 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
 - `flife validate <config>`.
 - `flife run <config> --ticks N --every K --cpu-workers W --controllers C`, with N = 1,024, K = 128, W from the
   configuration and C = `auto` by default. C is `cpu` (the reference alone), `metal` (refused without a Metal device)
-  or `auto` (Metal where the host has it). `flife render` takes the same `--controllers`.
+  or `auto` (Metal where the host has it and W ≤ `AUTO_METAL_MAX_WORKERS` = 8, otherwise the reference). `flife
+  render` takes the same `--controllers`.
 - In the library, `run(config, RunOptions { ticks, every, cpu_workers, controllers }, emit)`. `emit` receives every
   record in order.
 
@@ -33,7 +34,9 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
   the video path if encoded, the controller summary, wall seconds). Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
-  route. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg`.
+  route. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
+  frame draws; the bytes are those of encoding them in order, and a failed encode or write fails the render with
+  its error. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg` after the last frame is written.
 - `Tally`:
   - published ticks;
   - births, rejected births, and deaths by the budget stage that exhausted them;
@@ -168,7 +171,11 @@ Twenty-two planted bugs were each caught by at least one of these tests or `flif
 - Only `validate`, `run` and `render`. Capabilities, step and inspect, checkpoint and resume, branch, sweep, analyze
   and export are later items (§14.6): FL-016, FL-021, FL-037, FL-039, FL-041 and FL-023.
 - `render` draws on FrankenManim's CPU reference 3D route, a tick per frame at most, at the epoch's texel resolution
-  for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio. The
+  for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio.
+  FrankenManim's Metal 3D route was measured on these frames (`examples/frame_routes.rs`, M5 Ultra, GPU shared
+  with other work): 189 ms per 1,280² frame against 48 ms on the CPU route with 36 threads, and 445 against 57 ms at
+  2,160²; about 70% of its time is the wait for the GPU. Its RGBA8 frame differs from the CPU's by one in 0.02% of
+  the bytes (332 of 1.6 M pixels at tick 64), so it would also change the written frames. The
   MP4 encoder is an external `ffmpeg` on `PATH`; without it `--video` is a typed `missing-capability` refusal after
   the frames are written.
 - The run sends no commands. Interventions from the command line come with FL-022's recorded commands.

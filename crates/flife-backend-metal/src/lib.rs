@@ -760,26 +760,39 @@ pub enum ControllerChoice {
     Cpu,
     /// The Metal backend; refused on a host without a Metal device.
     Metal,
-    /// Metal where this host has a Metal device, otherwise the CPU
+    /// Metal where this host has a Metal device and the world runs on at
+    /// most [`AUTO_METAL_MAX_WORKERS`] CPU workers, otherwise the CPU
     /// reference.
     #[default]
     Auto,
 }
 
+/// The most CPU workers at which [`ControllerChoice::Auto`] takes Metal.
+/// Measured on the preset (M5 Ultra, `flife run`, whole ticks): Metal is
+/// 2.2x faster on one worker, 1.7x on two, 1.3x on four and 1.1x on eight,
+/// and no faster on sixteen, where the serial phases bound the tick. In the
+/// Studio on sixteen it measured slower (72 against 119 ticks per second,
+/// one 12 s run each); the Studio's presentation uses the same GPU.
+pub const AUTO_METAL_MAX_WORKERS: usize = 8;
+
 impl ControllerChoice {
-    /// The backend this choice selects on this host, or `None` for the CPU
-    /// reference.
+    /// The backend this choice selects on this host for a world on
+    /// `cpu_workers` threads, or `None` for the CPU reference.
     ///
     /// # Errors
     /// For [`ControllerChoice::Metal`], [`MetalBackend::open`]'s errors. For
     /// [`ControllerChoice::Auto`], those other than a missing Metal device:
     /// a Mac whose kernel does not compile is a defect to report, not a
     /// reason to fall back quietly.
-    pub fn backend(self) -> Result<Option<Box<dyn ControllerBackend>>, CoreError> {
+    pub fn backend(
+        self,
+        cpu_workers: usize,
+    ) -> Result<Option<Box<dyn ControllerBackend>>, CoreError> {
         let boxed = |backend: MetalBackend| -> Box<dyn ControllerBackend> { Box::new(backend) };
         match self {
             Self::Cpu => Ok(None),
             Self::Metal => MetalBackend::open().map(boxed).map(Some),
+            Self::Auto if cpu_workers > AUTO_METAL_MAX_WORKERS => Ok(None),
             Self::Auto => match MetalBackend::open() {
                 Ok(backend) => Ok(Some(boxed(backend))),
                 Err(CoreError::MissingCapability { .. }) => Ok(None),

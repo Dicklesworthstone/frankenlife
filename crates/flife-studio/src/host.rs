@@ -175,7 +175,7 @@ impl Studio {
         if let Some(workers) = options.cpu_workers {
             world.set_cpu_workers(workers)?;
         }
-        world.set_controller_backend(options.controllers.backend()?);
+        world.set_controller_backend(options.controllers.backend(world.cpu_workers())?);
         let controllers = world
             .controller_report()
             .backend

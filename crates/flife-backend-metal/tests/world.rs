@@ -3,7 +3,7 @@
 //! controllers on the Metal backend is the reference world, digest for
 //! digest, at every tick through the founder crash, births and mutation.
 
-use flife_backend_metal::MetalBackend;
+use flife_backend_metal::{AUTO_METAL_MAX_WORKERS, ControllerChoice, MetalBackend};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob};
@@ -134,4 +134,39 @@ fn one_flipped_metal_output_bit_changes_the_world() {
     })));
     let (difference, ..) = race(&mut reference, &mut metal, 12);
     assert_eq!(difference, Some(9));
+}
+
+/// `auto` takes Metal up to `AUTO_METAL_MAX_WORKERS` CPU workers on a host
+/// with a device, and the CPU reference above that or without one; `cpu`
+/// never opens a device, and `metal` ignores the worker count.
+#[test]
+fn auto_takes_metal_only_up_to_its_worker_ceiling() {
+    let device = metal().is_some();
+    let described = |choice: ControllerChoice, workers: usize| {
+        choice
+            .backend(workers)
+            .map(|backend| backend.map(|backend| backend.describe()))
+    };
+    for workers in [1, 2, AUTO_METAL_MAX_WORKERS] {
+        let chosen = described(ControllerChoice::Auto, workers).expect("auto never refuses");
+        assert_eq!(chosen.is_some(), device, "auto at {workers} workers");
+        if let Some(name) = chosen {
+            assert!(name.starts_with("metal"), "{name}");
+        }
+    }
+    for workers in [AUTO_METAL_MAX_WORKERS + 1, 16, 64] {
+        assert!(
+            described(ControllerChoice::Auto, workers)
+                .expect("auto never refuses")
+                .is_none(),
+            "auto at {workers} workers is the reference"
+        );
+    }
+    assert!(described(ControllerChoice::Cpu, 1).expect("cpu").is_none());
+    let forced = described(ControllerChoice::Metal, 64);
+    if device {
+        assert!(forced.expect("metal on a device").is_some());
+    } else {
+        assert!(matches!(forced, Err(CoreError::MissingCapability { .. })));
+    }
 }

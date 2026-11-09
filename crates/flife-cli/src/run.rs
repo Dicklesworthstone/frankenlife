@@ -102,7 +102,7 @@ impl ControllerSummary {
 /// # Errors
 /// [`ControllerChoice::backend`]'s.
 pub fn install(world: &mut World, choice: ControllerChoice) -> Result<(), CoreError> {
-    world.set_controller_backend(choice.backend()?);
+    world.set_controller_backend(choice.backend(world.cpu_workers())?);
     Ok(())
 }
 

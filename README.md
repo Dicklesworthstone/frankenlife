@@ -333,8 +333,10 @@ The Studio opens running (`--paused` to start paused). Space runs or pauses, →
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary and the
 closing world digest). The organisms glow in their lineage colours over the energy field they feed on.
 
-`--controllers auto` (the default) evaluates the organisms' controllers on the Mac's GPU, and `cpu` keeps them on
-the CPU reference; `metal` refuses to run without a Metal device. Whatever the choice and the `--cpu-workers`
+`--controllers metal` evaluates the organisms' controllers on the Mac's GPU, and `cpu` keeps them on the CPU
+reference; `metal` refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and
+the world uses at most 8 CPU workers, where it measured faster (2.2× on one worker, 1.7× on two, 1.3× on four, 1.1×
+on eight). Whatever the choice and the `--cpu-workers`
 count, the world is the same bit for bit; the run's `start` record names the backend and `end` counts what it
 evaluated. Measured over 512 ticks of the preset on an M5 Ultra under other load (median of three interleaved
 runs, cv ≤ 2.5%), with all 4,096 founders alive:
@@ -346,7 +348,15 @@ runs, cv ≤ 2.5%), with all 4,096 founders alive:
 
 On one worker the controllers are about three quarters of a tick, and the GPU halves it. On 16 workers they are
 already spread thin, and the tick is bound by its serial phases (chemistry, uptake, deposits, invariant checks).
-There the GPU frees CPU cores but does not shorten the tick. The full surface, as planned:
+There the GPU frees CPU cores but does not shorten the tick, and in the Studio, whose presentation uses the same
+GPU, it measured slower (72 against 119 ticks per second), so `auto` stays on the CPU there.
+
+`flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
+frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,
+took 6.3 s instead of 12.8 s (median of four interleaved runs each; all eight runs wrote the same frames and world).
+FrankenManim's Metal 3D route was measured for these frames and not adopted: on this shared GPU it took 189 ms per
+1,280² frame against the CPU route's 48 ms, and it differs from the CPU frame by one in about 0.02% of the bytes
+(`cargo run --release -p flife-cli --example frame_routes`). The full surface, as planned:
 
 ```bash
 flife validate <config>     # range-check a config; report real memory and the worst admitted allocation

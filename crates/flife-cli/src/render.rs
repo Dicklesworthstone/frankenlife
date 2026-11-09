@@ -119,51 +119,66 @@ pub fn render(
     drop(founding);
     let every = options.every.max(1);
     let mut frames = 0;
-    for tick in 0..=options.ticks {
-        if tick % every == 0 {
-            publisher.offer(&world)?;
-            let lease = viewer.latest()?;
-            let started = Instant::now();
-            view.show(&lease)?;
-            let live = lease.len();
-            let (mean_speed, top_speed) = speeds(lease.velocities());
-            drop(lease);
-            let rgba = view.render_rgba8(options.render_threads.get())?;
-            let path = options.out.join(format!("frame-{frames:06}.png"));
-            let png = fmn_codec::png::encode_rgba8(
-                options.size[0],
-                options.size[1],
-                &rgba,
-                CompressionLevel::Fast,
-            );
-            std::fs::write(&path, png).map_err(|error| io("write a frame", &path, &error))?;
-            emit(&RenderRecord::Frame {
-                schema: RENDER_SCHEMA,
-                frame: frames,
-                tick: world.tick().get(),
-                live,
-                mean_speed,
-                top_speed,
-                path: path.display().to_string(),
-                render_seconds: started.elapsed().as_secs_f64(),
-            });
-            frames += 1;
-        }
-        if tick < options.ticks {
-            match world.step()? {
-                Stepped::Published(_) => {}
-                Stepped::Paused(shortfall) => {
-                    return Err(CoreError::StateConflict {
-                        operation: "render",
-                        detail: format!(
-                            "the world paused at tick {}: {shortfall:?}",
-                            world.tick().get()
-                        ),
-                    });
+    // PNG encoding is the largest part of a frame and independent of every
+    // other frame, so up to `ENCODERS` frames encode on their own threads
+    // while the world steps and the next frame renders. The bytes written
+    // are the same; only when they are written changes.
+    std::thread::scope(|scope| -> Result<(), CoreError> {
+        let mut encoding = std::collections::VecDeque::new();
+        for tick in 0..=options.ticks {
+            if tick % every == 0 {
+                publisher.offer(&world)?;
+                let lease = viewer.latest()?;
+                let started = Instant::now();
+                view.show(&lease)?;
+                let live = lease.len();
+                let (mean_speed, top_speed) = speeds(lease.velocities());
+                drop(lease);
+                let rgba = view.render_rgba8(options.render_threads.get())?;
+                let path = options.out.join(format!("frame-{frames:06}.png"));
+                if encoding.len() >= ENCODERS {
+                    finish(encoding.pop_front())?;
+                }
+                let [width, height] = options.size;
+                let target = path.clone();
+                encoding.push_back(scope.spawn(move || {
+                    let png =
+                        fmn_codec::png::encode_rgba8(width, height, &rgba, CompressionLevel::Fast);
+                    std::fs::write(&target, png)
+                        .map_err(|error| io("write a frame", &target, &error))
+                }));
+                emit(&RenderRecord::Frame {
+                    schema: RENDER_SCHEMA,
+                    frame: frames,
+                    tick: world.tick().get(),
+                    live,
+                    mean_speed,
+                    top_speed,
+                    path: path.display().to_string(),
+                    render_seconds: started.elapsed().as_secs_f64(),
+                });
+                frames += 1;
+            }
+            if tick < options.ticks {
+                match world.step()? {
+                    Stepped::Published(_) => {}
+                    Stepped::Paused(shortfall) => {
+                        return Err(CoreError::StateConflict {
+                            operation: "render",
+                            detail: format!(
+                                "the world paused at tick {}: {shortfall:?}",
+                                world.tick().get()
+                            ),
+                        });
+                    }
                 }
             }
         }
-    }
+        while let Some(handle) = encoding.pop_front() {
+            finish(Some(handle))?;
+        }
+        Ok(())
+    })?;
     let video = match &options.video {
         Some(video) => {
             encode(&options.out, video, options.fps)?;
@@ -181,6 +196,25 @@ pub fn render(
         wall_seconds: clock.elapsed().as_secs_f64(),
     });
     Ok(())
+}
+
+/// Frames encoding at once: enough to keep pace with rendering, and a
+/// bound on the frames held in memory.
+const ENCODERS: usize = 4;
+
+/// Wait for one frame's encoder and pass on its result.
+fn finish(
+    handle: Option<std::thread::ScopedJoinHandle<'_, Result<(), CoreError>>>,
+) -> Result<(), CoreError> {
+    match handle {
+        Some(handle) => handle.join().unwrap_or_else(|_| {
+            Err(CoreError::StateConflict {
+                operation: "encode a frame",
+                detail: "a frame encoder panicked".to_owned(),
+            })
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The mean and largest of `velocities`' magnitudes; zeros when empty.

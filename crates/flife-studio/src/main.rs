@@ -50,7 +50,9 @@ struct Cli {
     #[arg(long, default_value = "auto", value_parser = parse_workers)]
     cpu_workers: NonZeroUsize,
     /// Where due controllers are evaluated: `metal`, `cpu`, or `auto` (the
-    /// default) for Metal where this host has it. No result depends on it.
+    /// default): Metal where this host has it and the world uses at most 8
+    /// CPU workers (with 16 it measured slower here, presentation sharing
+    /// the GPU). No result depends on it.
     #[arg(long, default_value = "auto")]
     controllers: ControllerChoice,
 }

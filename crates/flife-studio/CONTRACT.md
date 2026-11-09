@@ -47,12 +47,17 @@ adapter.
 
   It returns a `Frame` (state, events, intents, refusals, statuses, refit, new epoch, shown `Prior`, hover,
   outcome). `close()` closes the window and the session and returns the committed world (`StudioClosed`).
-- `flife-studio <config> [--width W --height H] [--fixed]`: the binary. It paces frames to
-  `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
-  - `open`;
+- `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C]`: the binary. C is
+  `cpu`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8. The
+  Studio's default W is one per core up to 16, so on a host with more than 8 cores the controllers run on the CPU
+  reference by default. With 16 workers Metal
+  measured slower in the Studio (72 against 119 ticks per second, one 12 s run each), with presentation on the same
+  GPU. It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
+  - `open`, naming the window, the CPU workers and the controller backend;
   - one `status` per status;
   - a `frame` summary about once a second;
-  - `end`, with the committed tick and the world digest.
+  - `end`, with the committed tick, the world digest, and the controller evaluations the backend returned and
+    deferred, and its failure if it failed.
 
   Errors are `frankenlife.error.v1` on standard error. The exit code is 0 after a clean close, 2 when the
   configuration or window fails, and 1 after a later failure.

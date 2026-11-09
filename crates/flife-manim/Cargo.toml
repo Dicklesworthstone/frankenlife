@@ -1,0 +1,23 @@
+[package]
+name = "flife-manim"
+description = "FrankenLife's FrankenManim bulk world adapter: an exact toroidal viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from a render epoch into FrankenManim's 3D camera route"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Render epochs and FrankenManim (plan §18.1). fmn-render without features is
+# the camera, 3D job and CPU reference renderer; its Metal route belongs to
+# flife-studio.
+[dependencies]
+flife-core = { path = "../flife-core" }
+flife-render = { path = "../flife-render" }
+fmn-core.workspace = true
+fmn-render.workspace = true
+
+[dev-dependencies]
+flife-engine = { path = "../flife-engine" }
+
+[lints]
+workspace = true

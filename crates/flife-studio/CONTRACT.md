@@ -10,7 +10,7 @@ adapter.
   `StudioOptions` can override the size and make the window fixed.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input. It comes from frankentorch `ft-kernel-metal` at rev `1c4febfb`, through FrankenManim
-  `fmn-render` at rev `dfdc7d18`.
+  `fmn-render` at rev `f401a947`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and
@@ -51,8 +51,9 @@ adapter.
   `cpu`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8. The
   Studio's default W is one per core up to 16, so on a host with more than 8 cores the controllers run on the CPU
   reference by default. With 16 workers Metal
-  measured slower in the Studio (72 against 119 ticks per second, one 12 s run each), with presentation on the same
-  GPU. It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
+  measured slower in the Studio under FrankenManim `dfdc7d18` (72 against 119 ticks per second, one 12 s run each),
+  with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
+  1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
   - `open`, naming the window, the CPU workers and the controller backend;
   - one `status` per status;
   - a `frame` summary about once a second;

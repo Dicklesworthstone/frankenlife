@@ -348,8 +348,10 @@ runs, cv ≤ 2.5%), with all 4,096 founders alive:
 
 On one worker the controllers are about three quarters of a tick, and the GPU halves it. On 16 workers they are
 already spread thin, and the tick is bound by its serial phases (chemistry, uptake, deposits, invariant checks).
-There the GPU frees CPU cores but does not shorten the tick, and in the Studio, whose presentation uses the same
-GPU, it measured slower (72 against 119 ticks per second), so `auto` stays on the CPU there.
+There the GPU frees CPU cores but does not shorten the tick, so `auto` stays on the CPU there. The Studio, whose
+presentation uses the same GPU, measured slower with Metal under FrankenManim `dfdc7d18` (72 against 119 ticks per
+second). With `f401a947`'s lighter Metal frames it is level: 132 against 120 at 960×540 and 152 against 161 at
+1,920×1,080, four interleaved runs each.
 
 `flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
 frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,
@@ -357,11 +359,15 @@ took 6.3 s instead of 12.8 s (median of four interleaved runs each; all eight ru
 FrankenManim `dfdc7d18` then skips its polygon clipper for triangles wholly inside the view, most of the energy
 field's mesh, with the clipper's exact bytes. That halves the CPU frame (45 to 21.5 ms at 1,280² with 4,096 alive)
 and takes the same render to 3.95 s from 5.42 s, with the same PNG bytes. It also lifts the Studio from 14.8 to 19.6
-presented frames per second at 960×540, where the frame is still half preparation on the CPU and half waiting for the
-GPU.
-FrankenManim's Metal 3D route was measured for these frames and not adopted: on this shared GPU it took 189 ms per
-1,280² frame against the CPU route's 48 ms, and it differs from the CPU frame by one in about 0.02% of the bytes
-(`cargo run --release -p flife-cli --example frame_routes`). The full surface, as planned:
+presented frames per second at 960×540.
+FrankenManim `f401a947` gives its Metal 3D kernel per-tile triangle lists, so a pixel no longer walks every triangle
+of the field's full-screen mesh. The Metal frame went from 166 to 28 ms at 1,280² (median of four interleaved runs,
+the same CPU and Metal frame bytes as before in every run). The Studio, which draws through that route, now presents
+29.0 frames per second at 960×540 against its 30 fps pacing, up from 20.4, with about 10% fewer ticks per second
+(141 against 160), since it lowers and presents 42% more frames.
+For `flife render` the Metal route is measured and not adopted. It is now level with the CPU route (28 against 23 ms
+at 1,280², 32–34 against 30–41 ms at 2,160²), and its frame differs from the CPU frame by one in about 0.02% of the
+bytes, so it would change the written frames (`cargo run --release -p flife-cli --example frame_routes`). The full surface, as planned:
 
 ```bash
 flife validate <config>     # range-check a config; report real memory and the worst admitted allocation
@@ -388,7 +394,7 @@ substitutes a different neural model.
 |---|---|
 | Rust toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition |
 | Asupersync | v0.6.2 (`a5d23e8d`), one package id across the closure; the root `[patch.crates-io]` maps FrankenTorch's crates.io edge onto the same commit |
-| FrankenManim, FrankenTorch, FrankenNumPy | `dfdc7d18`, `1c4febfb`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
+| FrankenManim, FrankenTorch, FrankenNumPy | `f401a947`, `1c4febfb`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
 | `rust-block` override | Reviewed revision `b39ae859…`, carried at this workspace root because Cargo ignores a dependency's own `[patch]` (§12.8) |
 
 ---

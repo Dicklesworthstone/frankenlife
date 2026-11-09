@@ -771,8 +771,10 @@ pub enum ControllerChoice {
 /// Measured on the preset (M5 Ultra, `flife run`, whole ticks): Metal is
 /// 2.2x faster on one worker, 1.7x on two, 1.3x on four and 1.1x on eight,
 /// and no faster on sixteen, where the serial phases bound the tick. In the
-/// Studio on sixteen it measured slower (72 against 119 ticks per second,
-/// one 12 s run each); the Studio's presentation uses the same GPU.
+/// Studio on sixteen, whose presentation uses the same GPU, it measured
+/// slower under FrankenManim dfdc7d18 (72 against 119 ticks per second, one
+/// 12 s run each) and level under f401a947 (132 against 120 at 960x540, 152
+/// against 161 at 1920x1080, four interleaved 10 s runs each).
 pub const AUTO_METAL_MAX_WORKERS: usize = 8;
 
 impl ControllerChoice {

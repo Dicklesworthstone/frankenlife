@@ -36,15 +36,15 @@ publish = false
 # Asupersync v0.6.2 (crates.io 0.6.2), the same git source FrankenManim's
 # governed closure requires, so FrankenLife and Manim share one package id.
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "a5d23e8dd2c8d776bd02e2da8e38e6296600e84c", default-features = false }
-fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "dfdc7d18171e5f14021f56ecb4b9d41c77245acd" }
+fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
 # FrankenManim's camera, 3D job and Metal preview, for FL-018's world adapter
 # and Studio host. Already in the closure through fmn; named directly because
 # the umbrella does not re-export the renderer's Metal route.
-fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "dfdc7d18171e5f14021f56ecb4b9d41c77245acd" }
-fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "dfdc7d18171e5f14021f56ecb4b9d41c77245acd" }
+fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
+fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
 # Offline frames (`flife render`): Rgba16F to sRGB RGBA8, and PNG.
-fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "dfdc7d18171e5f14021f56ecb4b9d41c77245acd" }
-fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "dfdc7d18171e5f14021f56ecb4b9d41c77245acd" }
+fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
+fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
 fnp-dtype = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-ndarray = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-random-core = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }

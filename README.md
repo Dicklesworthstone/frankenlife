@@ -58,7 +58,9 @@ live world on screen: `flife-studio` shows the 4,096-organism preset in a native
 particle cloud. Its real pointer, key, scroll, focus and resize events run, pause and step the session, and a closed
 Studio's world is bit-identical to the same world stepped directly. FL-030's first part evaluates every due
 controller on the Mac's GPU in one fused Metal dispatch, bit for bit the CPU reference's, and `run`, `render` and the
-Studio use it by default (`--controllers auto`). FL-019 adds five colour mappings (lineage, energy, generation,
+Studio use it by default (`--controllers auto`). FL-028 puts every device buffer under one Metal owner: typed
+buffers, read and write leases that exclude each other, commands that hold what they bind until the GPU reports
+completion, and retirement that frees nothing still in use. FL-019 adds five colour mappings (lineage, energy, generation,
 motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
 FL-016 encodes a whole session, world and command book, as one sealed, chunked checkpoint (Appendix B.2). A
 world restored off phase, with newborns or after deaths publishes every later tick exactly as the uninterrupted

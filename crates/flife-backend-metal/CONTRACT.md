@@ -5,6 +5,11 @@ dispatch, bit-identical to `flife_neural::ReferenceController` (plan §10.2, §1
 FrankenTorch's generic compute gateway (`ft_kernel_metal::compute`), compiled in the gateway's IEEE-safe math mode.
 This crate is `forbid(unsafe_code)`; the Metal FFI is upstream.
 
+FL-028 (`flife-xbm`) adds the Metal owner, typed buffers and safe leases (plan §9.5, §10.3, §12.4), in `owner`. One
+`DeviceOwner` holds every device buffer the crate uses, with its state, epoch and users. Every command binds its
+buffers through it. Readers and writers hold typed leases, and a buffer in use is never freed. `MetalControllers`
+and `MetalBackend` now allocate, write, dispatch and read back only through their owner.
+
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
@@ -16,13 +21,30 @@ This crate is `forbid(unsafe_code)`; the Metal FFI is upstream.
 - The kernel alone: `Batch::push(topology, parameters, inputs)` for one organism's catalog topology, its parameters
   in the reference layout and its observation's 104 F64 inputs (topologies may mix in a batch); then
   `MetalControllers::open()`, `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.
+- FL-028, the owner: `DeviceOwner::open(Limits { bytes, leases_per_purpose })` (`Limits::UNBOUNDED` for the
+  controllers today). It is cheap to clone and usable from any thread. It provides:
+  - buffers: `zeroed::<T>(len)` and `upload(&[T])` for `T` = `f32` or `u32`, and `zeroed_owned`/`upload_owned`
+    for buffers retired when dropped;
+  - leases: `write(buffer)` and `read(buffer, Purpose)`, where a purpose is `Rendering`, `Checkpointing` or
+    `Readback`;
+  - commands: `submit(&pipeline, &[buffer.reads(), buffer.writes(), …], grid)`;
+  - `retire(buffer)`, `state`, `epoch`, `elements` and `usage`.
 
 **Outputs.** One entry per organism, in batch order: its 36 raw outputs, or `None` for a deferred organism. The
 caller evaluates a deferred organism on the reference controller.
 
+FL-028's outputs:
+- `Buffer<T>`, a typed handle that only names a buffer: its owner, slot and generation.
+- `ReadLease<T>`, which reads, gives the epoch it reads, and is released when dropped.
+- `WriteLease<T>`, which writes in place and is released when dropped.
+- `Receipt`, the epochs a completed command wrote.
+- `ResourceState`: `Available`, `Computing`, `Committed`, `Rendering`, `Checkpointing` or `Retiring` (§9.5).
+- `Usage`: buffers, bytes, retiring, read leases by purpose, write leases and running commands.
+
 **Residency.** `MetalBackend` keeps every buffer on the device across ticks. A genome's parameters are copied once
 and found again by genome identity. A hit is used only if the slot was copied from the same memory (pointer and
-length): genome parameters are immutable, so that identifies them even if a world were rewound. Each tick writes
+length): genome parameters are immutable, so that identifies them even if a world were rewound. Its five resident buffers are
+`Owned` by its `DeviceOwner`, and a rebuilt buffer retires the one it replaces. Each tick writes
 only the inputs and job words in place (`SharedBuffer::write_f32/write_u32`, FrankenTorch `1c4febfb`). When the
 parameter buffer fills, it is rebuilt at 1.5 times the current batch's need, which drops dead genomes. A job the
 kernel cannot shape, or whose inputs are not finite in F32, is deferred without dispatch.
@@ -54,8 +76,46 @@ kernel cannot shape, or whose inputs are not finite in F32, is deferred without 
   topology. It also refuses a topology outside the kernel's shape: one or two hidden layers, each at most 128 wide.
   The batch is unchanged on refusal.
 
+**Invariants — the owner (FL-028; §9.5).**
+- A buffer has any number of readers or one writer, never both:
+  - readers are read leases and the commands that read it;
+  - the writer is a write lease or the command that writes it;
+  - a buffer bound to one command twice, once written, is an alias and is refused (reading it twice is not).
+- The order of a submission:
+  1. Every binding is checked before any is marked, so a refused submission binds nothing.
+  2. The bindings are marked, and the table's lock is released while the gateway dispatches and waits.
+  3. Once the command buffer's status is known, the bindings are released.
+
+  So for the whole run, every other thread sees the bound buffers `Computing`, and is refused incompatible access.
+- Outcomes:
+  - a completed command makes each written buffer defined, at its next epoch;
+  - a command that failed after commit (the gateway's `CommandBuffer` error) makes each written buffer undefined,
+    at its next epoch, and reads of it are refused until it is rewritten;
+  - a command the gateway refused before encoding (a bad grid or threadgroup) changes no buffer.
+- Epochs and leases:
+  - an epoch counts writes: 0 for a zeroed buffer, 1 for an upload, and one more per completed write;
+  - a read lease's epoch cannot change while the lease is held;
+  - a released write lease commits what it wrote, at the next epoch.
+- Retirement:
+  - retiring refuses every new lease and binding at once;
+  - the buffer is freed, and its bytes returned, when its last lease or command releases it;
+  - a freed slot is reused under a new generation, so an old handle stays stale.
+- Handles: a handle of another owner, or a stale one, is refused before anything is touched.
+- Leases hold the owner's table alive, so a lease outlives every owner handle. A dropped lease is released, so a
+  consumer that exits or unwinds frees what it held.
+- Live bytes never exceed `Limits::bytes`, retiring buffers included, and each purpose holds at most
+  `leases_per_purpose` read leases.
+
 **Refusal cases.** No Metal device, which is always the case off macOS: `MissingCapability`. A kernel that does not
-compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `LayoutMismatch`.
+compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `LayoutMismatch`. FL-028's owner refuses:
+- a buffer of no elements: `LayoutMismatch`;
+- one beyond the byte limit: `BudgetExhausted` ("metal owner bytes");
+- one the device refuses: `AllocationFailed`;
+- a read lease beyond its purpose's limit: `BudgetExhausted` ("metal read leases");
+- `StateConflict` for: a stale or foreign handle; a retiring buffer; a writer beside a reader or another writer; a
+  reader beside a writer; a read of undefined contents; an alias; and an out-of-range host read or write.
+
+A refusal changes nothing.
 
 **Independent tests.**
 - `tests/arithmetic.rs` (5 tests):
@@ -84,6 +144,52 @@ compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `Lay
     - only the subnormal regime defers a finite result;
     - both errors and the deferral occur.
   - Refusals match the reference, and leave the batch unchanged.
+- `tests/owner.rs` (FL-028, 5 tests, about 3 s), on this host's device with small kernels of its own:
+  - `typed_buffers_hold_their_elements_within_the_owners_budget`:
+    - `f32` and `u32` buffers round-trip, with their element counts, states and epochs;
+    - a 64-byte budget refuses 40 bytes with 36 left, and a full owner refuses 4, each allocating nothing;
+    - retiring a buffer returns its bytes;
+    - no elements is refused, and so is a buffer above the device's largest, which allocates nothing.
+  - `a_buffer_has_many_readers_or_one_writer`:
+    - rendering and checkpointing leases share a buffer, refuse a writer, and let a command read it;
+    - a third rendering lease is refused at a limit of two, and admitted after one is dropped;
+    - a write lease refuses a second writer, a reader and a reading command;
+    - an out-of-range write is refused;
+    - releasing the writer advances the epoch, and a new reader sees its values.
+  - `a_command_binds_only_what_it_may_and_a_refused_one_changes_nothing`:
+    - a command's receipt and values, and one buffer read twice;
+    - three aliases and a foreign buffer refused, with nothing bound or changed;
+    - a threadgroup above the pipeline's maximum, refused by the gateway before encoding: the output keeps its
+      epoch, state and values, and is writable afterwards.
+  - `a_running_command_keeps_what_it_binds_from_every_other_thread`. One thread runs a 2^27-step xorshift kernel
+    (about half a second). The test thread waits until it sees the output `Computing`, and then:
+    - a running count of one;
+    - a readback of the output refused;
+    - host writes of both inputs refused;
+    - a second command writing the output refused;
+    - a rendering reader admitted beside the command;
+    - retiring an input deferred, the input then `Retiring`.
+
+    It then checks that the output was still `Computing` after all of that. When the command completes, the receipt
+    names epoch 1, the retired input is freed, and the output equals the CPU's xorshift.
+  - `retired_buffers_free_when_released_and_their_handles_stay_stale`:
+    - a retiring buffer refuses leases, writers and bindings, still counts its bytes, and still reads through the
+      lease it had;
+    - dropping that lease frees it;
+    - the slot comes back as generation 1, and every use of the old handle is refused;
+    - an `Owned` buffer retires on drop;
+    - another owner's handle is refused;
+    - a lease outlives its owner handle;
+    - a thread that panics holding a write lease releases it, committing its write at the next epoch.
+- The owner's unit test, `a_command_that_failed_after_commit_leaves_its_outputs_undefined`, covers the
+  post-commit failure. No device fault on this host fails a command after commit: GPU validation
+  (`MTL_SHADER_VALIDATION=1`) still returned success for an out-of-bounds store. So the test settles real
+  bindings with the gateway's own `CommandBuffer(Error)`. The written buffer becomes `Available` at epoch 2,
+  refuses leases and command reads, and is defined again after a host rewrite. The read buffer is unchanged, and
+  a refusal before encoding changes nothing.
+- `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's five buffers, with
+  no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
+  crate, every output still bit-identical.
 
 Planted mutants, each run in a scratch copy.
 - Caught:
@@ -123,7 +229,8 @@ dispatch over fresh buffers pays page mapping, and the upload is the per-call bu
 `evaluate` would lose to the CPU. The engine path must keep buffers resident; FrankenTorch `1c4febfb` adds the
 in-place `SharedBuffer::write_f32/write_u32` for that.
 
-**Validity domain.** Apple GPUs through the gateway's safe math mode; the dense-104-36-v1 catalog's shapes.
+**Validity domain.** Apple GPUs through the gateway's safe math mode; the dense-104-36-v1 catalog's shapes. The
+owner: `f32` and `u32` buffers, and the gateway's synchronous dispatch (one command buffer per submission).
 
 Whole ticks (`flife run`, preset, 512 ticks, median of three interleaved runs, cv ≤ 2.5%, same digest in all 12
 runs): one CPU worker 27.7 ms per tick with the reference and 12.5 ms with Metal (41.2 and 17.8 ms over the first
@@ -138,4 +245,15 @@ per-pass thread spawning (6%).
   is bound by those, so Metal does not shorten it there.
 - FL-030's closure also needs FL-026's packed genome arenas and FL-029's batched submission upstream, and its
   resident-bandwidth benchmark against §19.2's weight-stream bound.
+- FL-028 gaps:
+  - Submission is synchronous: the owner holds a command's bindings for exactly the gateway's dispatch-and-wait.
+    Several ordered kernels in one command buffer, retained across submissions with completion receipts, are
+    FL-029 upstream. The owner's bind/settle split is where an asynchronous completion will plug in.
+  - The post-commit failure path is tested with the gateway's error value, not a real device fault (see the tests).
+  - The controllers and backend open their owners `UNBOUNDED`. Declaring the backend's byte budget at preflight,
+    and admitting observers' and checkpoints' peaks against it, is FL-043. Render and checkpoint consumers of
+    device leases are FL-033 and FL-038; today's renderer reads the CPU world's epochs (FL-017).
+  - Only `f32` and `u32` elements. Textures, heaps and private-storage buffers are not owned yet.
+  - `ResourceState` reports the dominant use when several overlap, by precedence: retiring, computing,
+    checkpointing, rendering, committed, available. `usage` gives the lease counts.
 - No CUDA backend exists: FrankenTorch has no CUDA crate, and no host here has an NVIDIA GPU.

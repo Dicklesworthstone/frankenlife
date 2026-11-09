@@ -27,8 +27,15 @@ use std::collections::HashMap;
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH};
-use ft_kernel_metal::Error as MetalError;
-use ft_kernel_metal::compute::{Gateway, Grid, Pipeline, SharedBuffer};
+use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
+
+pub mod owner;
+
+use owner::metal;
+pub use owner::{
+    Binding, Buffer, DeviceOwner, Element, Limits, Owned, Purpose, ReadLease, Receipt,
+    ResourceState, Usage, WriteLease,
+};
 
 /// The kernel source.
 pub const CONTROLLER_MSL: &str = include_str!("controller.metal");
@@ -189,14 +196,14 @@ fn reserve<T>(
 }
 
 /// A batch on the device: its parameters, inputs and jobs, and room for its
-/// outputs.
+/// outputs. Its buffers are retired when it is dropped.
 pub struct Resident {
     organisms: usize,
-    parameters: SharedBuffer,
-    inputs: SharedBuffer,
-    jobs: SharedBuffer,
-    raw: SharedBuffer,
-    faults: SharedBuffer,
+    parameters: Owned<f32>,
+    inputs: Owned<f32>,
+    jobs: Owned<u32>,
+    raw: Owned<f32>,
+    faults: Owned<u32>,
 }
 
 impl std::fmt::Debug for Resident {
@@ -204,14 +211,15 @@ impl std::fmt::Debug for Resident {
         formatter
             .debug_struct("Resident")
             .field("organisms", &self.organisms)
-            .field("parameter_bytes", &self.parameters.len_bytes())
+            .field("parameters", &self.parameters.buffer())
             .finish_non_exhaustive()
     }
 }
 
-/// The compiled controller kernels on this host's Metal device.
+/// The compiled controller kernels on this host's Metal device, and the
+/// owner of every buffer they use (FL-028).
 pub struct MetalControllers {
-    gateway: Gateway,
+    owner: DeviceOwner,
     forward: Pipeline,
     activation: Pipeline,
     binary64: Pipeline,
@@ -222,20 +230,8 @@ impl std::fmt::Debug for MetalControllers {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("MetalControllers")
-            .field("device", &self.gateway.device_name())
+            .field("device", &self.owner.device_name())
             .finish_non_exhaustive()
-    }
-}
-
-fn metal(error: MetalError) -> CoreError {
-    match error {
-        MetalError::Unavailable => CoreError::MissingCapability {
-            capability: "a Metal device".to_owned(),
-        },
-        other => CoreError::StateConflict {
-            operation: "metal controller dispatch",
-            detail: other.to_string(),
-        },
     }
 }
 
@@ -246,29 +242,35 @@ impl MetalControllers {
     /// [`CoreError::MissingCapability`] without a Metal device (always, off
     /// macOS); [`CoreError::StateConflict`] if the kernels do not compile.
     pub fn open() -> Result<Self, CoreError> {
-        let gateway = Gateway::open().map_err(metal)?;
-        let library = gateway.library(CONTROLLER_MSL).map_err(metal)?;
+        let owner = DeviceOwner::open(Limits::UNBOUNDED)?;
+        let library = owner.library(CONTROLLER_MSL, MathMode::Safe)?;
         let pipeline = |name: &str| library.pipeline(name).map_err(metal);
         Ok(Self {
             forward: pipeline("controller_forward")?,
             activation: pipeline("activation_bits")?,
             binary64: pipeline("binary64_ops")?,
             binary32: pipeline("binary32_ops")?,
-            gateway,
+            owner,
         })
     }
 
     /// The device's name.
     #[must_use]
     pub fn device_name(&self) -> String {
-        self.gateway.device_name()
+        self.owner.device_name()
+    }
+
+    /// The owner of every buffer these kernels use.
+    #[must_use]
+    pub const fn owner(&self) -> &DeviceOwner {
+        &self.owner
     }
 
     /// Copy `batch` to the device, for [`Self::run`].
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for an empty batch;
-    /// [`CoreError::StateConflict`] if the device refuses a buffer.
+    /// [`CoreError::AllocationFailed`] if the device refuses a buffer.
     pub fn upload(&self, batch: &Batch) -> Result<Resident, CoreError> {
         let organisms = batch.len();
         if organisms == 0 {
@@ -279,17 +281,11 @@ impl MetalControllers {
         }
         Ok(Resident {
             organisms,
-            parameters: self.gateway.buffer_f32(&batch.parameters).map_err(metal)?,
-            inputs: self.gateway.buffer_f32(&batch.inputs).map_err(metal)?,
-            jobs: self.gateway.buffer_u32(&batch.jobs).map_err(metal)?,
-            raw: self
-                .gateway
-                .buffer_zeroed(organisms * ACTION_WIDTH * size_of::<f32>())
-                .map_err(metal)?,
-            faults: self
-                .gateway
-                .buffer_zeroed(organisms * size_of::<u32>())
-                .map_err(metal)?,
+            parameters: self.owner.upload_owned(&batch.parameters)?,
+            inputs: self.owner.upload_owned(&batch.inputs)?,
+            jobs: self.owner.upload_owned(&batch.jobs)?,
+            raw: self.owner.zeroed_owned(organisms * ACTION_WIDTH)?,
+            faults: self.owner.zeroed_owned(organisms)?,
         })
     }
 
@@ -309,23 +305,21 @@ impl MetalControllers {
         outputs.clear();
         let organisms = resident.organisms;
         reserve(outputs, organisms, "metal controller outputs")?;
-        self.gateway
-            .dispatch(
-                &self.forward,
-                &[
-                    &resident.parameters,
-                    &resident.inputs,
-                    &resident.jobs,
-                    &resident.raw,
-                    &resident.faults,
-                ],
-                Grid::linear(organisms, FORWARD_THREADS),
-            )
-            .map_err(metal)?;
+        self.owner.submit(
+            &self.forward,
+            &[
+                resident.parameters.buffer().reads(),
+                resident.inputs.buffer().reads(),
+                resident.jobs.buffer().reads(),
+                resident.raw.buffer().writes(),
+                resident.faults.buffer().writes(),
+            ],
+            Grid::linear(organisms, FORWARD_THREADS),
+        )?;
         let mut values = vec![0.0_f32; organisms * ACTION_WIDTH];
-        resident.raw.read_f32(&mut values).map_err(metal)?;
+        self.owner.read_back(resident.raw.buffer(), &mut values)?;
         let mut flags = vec![0_u32; organisms];
-        resident.faults.read_u32(&mut flags).map_err(metal)?;
+        self.owner.read_back(resident.faults.buffer(), &mut flags)?;
         for (row, &flag) in values.as_chunks::<ACTION_WIDTH>().0.iter().zip(&flags) {
             outputs.push((flag == 0).then_some(*row));
         }
@@ -374,28 +368,21 @@ impl MetalControllers {
                 detail: format!("{count} patterns from {base:#x} into {}", out.len()),
             });
         }
-        let start = self
-            .gateway
-            .buffer_u32(&[base, u32::from(software_only)])
-            .map_err(metal)?;
-        let results = self
-            .gateway
-            .buffer_zeroed(count * size_of::<u32>())
-            .map_err(metal)?;
-        let fallbacks = self
-            .gateway
-            .buffer_zeroed(size_of::<u32>())
-            .map_err(metal)?;
-        self.gateway
-            .dispatch(
-                &self.activation,
-                &[&start, &results, &fallbacks],
-                Grid::linear(count / 256, 256),
-            )
-            .map_err(metal)?;
-        results.read_u32(out).map_err(metal)?;
+        let start = self.owner.upload_owned(&[base, u32::from(software_only)])?;
+        let results = self.owner.zeroed_owned::<u32>(count)?;
+        let fallbacks = self.owner.zeroed_owned::<u32>(1)?;
+        self.owner.submit(
+            &self.activation,
+            &[
+                start.buffer().reads(),
+                results.buffer().writes(),
+                fallbacks.buffer().writes(),
+            ],
+            Grid::linear(count / 256, 256),
+        )?;
+        self.owner.read_back(results.buffer(), out)?;
         let mut fell = [0_u32];
-        fallbacks.read_u32(&mut fell).map_err(metal)?;
+        self.owner.read_back(fallbacks.buffer(), &mut fell)?;
         Ok(fell[0])
     }
 
@@ -422,20 +409,17 @@ impl MetalControllers {
             .iter()
             .flat_map(|pair| pair.iter().flat_map(|&v| [v as u32, (v >> 32) as u32]))
             .collect();
-        let operands = self.gateway.buffer_u32(&words).map_err(metal)?;
+        let operands = self.owner.upload_owned(&words)?;
         let results = self
-            .gateway
-            .buffer_zeroed(pairs.len() * BINARY64_RESULT_WORDS * size_of::<u32>())
-            .map_err(metal)?;
-        self.gateway
-            .dispatch(
-                &self.binary64,
-                &[&operands, &results],
-                Grid::linear(pairs.len() / 64, 64),
-            )
-            .map_err(metal)?;
+            .owner
+            .zeroed_owned::<u32>(pairs.len() * BINARY64_RESULT_WORDS)?;
+        self.owner.submit(
+            &self.binary64,
+            &[operands.buffer().reads(), results.buffer().writes()],
+            Grid::linear(pairs.len() / 64, 64),
+        )?;
         let mut flat = vec![0_u32; pairs.len() * BINARY64_RESULT_WORDS];
-        results.read_u32(&mut flat).map_err(metal)?;
+        self.owner.read_back(results.buffer(), &mut flat)?;
         out.clear();
         out.extend(flat.as_chunks::<BINARY64_RESULT_WORDS>().0.iter().copied());
         Ok(())
@@ -459,20 +443,15 @@ impl MetalControllers {
             });
         }
         let flat: Vec<f32> = pairs.iter().flatten().copied().collect();
-        let operands = self.gateway.buffer_f32(&flat).map_err(metal)?;
-        let results = self
-            .gateway
-            .buffer_zeroed(pairs.len() * 3 * size_of::<f32>())
-            .map_err(metal)?;
-        self.gateway
-            .dispatch(
-                &self.binary32,
-                &[&operands, &results],
-                Grid::linear(pairs.len() / 64, 64),
-            )
-            .map_err(metal)?;
+        let operands = self.owner.upload_owned(&flat)?;
+        let results = self.owner.zeroed_owned::<f32>(pairs.len() * 3)?;
+        self.owner.submit(
+            &self.binary32,
+            &[operands.buffer().reads(), results.buffer().writes()],
+            Grid::linear(pairs.len() / 64, 64),
+        )?;
         let mut values = vec![0.0_f32; pairs.len() * 3];
-        results.read_f32(&mut values).map_err(metal)?;
+        self.owner.read_back(results.buffer(), &mut values)?;
         out.clear();
         out.extend(values.as_chunks::<3>().0.iter().copied());
         Ok(())
@@ -496,16 +475,16 @@ struct Slot {
 pub struct MetalBackend {
     controllers: MetalControllers,
     slots: HashMap<GenomeId, Slot>,
-    parameters: Option<SharedBuffer>,
+    parameters: Option<Owned<f32>>,
     /// F32s the parameter buffer holds, and how many are in use.
     capacity: usize,
     used: usize,
     /// Per-organism buffers, sized for `organisms`.
     organisms: usize,
-    inputs: Option<SharedBuffer>,
-    jobs: Option<SharedBuffer>,
-    raw: Option<SharedBuffer>,
-    faults: Option<SharedBuffer>,
+    inputs: Option<Owned<f32>>,
+    jobs: Option<Owned<u32>>,
+    raw: Option<Owned<f32>>,
+    faults: Option<Owned<u32>>,
     /// Host staging, reused.
     staged_inputs: Vec<f32>,
     staged_jobs: Vec<u32>,
@@ -556,6 +535,12 @@ impl MetalBackend {
         self.slots.len()
     }
 
+    /// The owner of every buffer this backend holds.
+    #[must_use]
+    pub const fn owner(&self) -> &DeviceOwner {
+        self.controllers.owner()
+    }
+
     /// Make every dispatched job's parameters resident, rebuilding the
     /// buffer from this batch alone when they do not fit.
     fn place(&mut self, jobs: &[ControllerJob<'_>]) -> Result<(), CoreError> {
@@ -578,22 +563,20 @@ impl MetalBackend {
                 .map(|job| job.controller.parameters().len())
                 .sum();
             let capacity = needed.saturating_add(needed / 2).max(1 << 16);
-            self.parameters = Some(
-                self.controllers
-                    .gateway
-                    .buffer_zeroed(capacity * size_of::<f32>())
-                    .map_err(metal)?,
-            );
+            // Retire the old buffer first, so its bytes are free again.
+            self.parameters = None;
+            self.parameters = Some(self.controllers.owner.zeroed_owned::<f32>(capacity)?);
             self.capacity = capacity;
             self.used = 0;
             self.slots.clear();
         }
-        let Some(buffer) = self.parameters.as_mut() else {
+        let Some(buffer) = self.parameters.as_ref().map(Owned::buffer) else {
             return Err(CoreError::StateConflict {
                 operation: "metal controller residency",
                 detail: "no parameter buffer".to_owned(),
             });
         };
+        let mut lease = None;
         for &index in &self.dispatched {
             let Some(job) = jobs.get(index) else { continue };
             let parameters = job.controller.parameters();
@@ -605,7 +588,12 @@ impl MetalBackend {
             if hit {
                 continue;
             }
-            buffer.write_f32(self.used, parameters).map_err(metal)?;
+            if lease.is_none() {
+                lease = Some(self.controllers.owner.write(buffer)?);
+            }
+            if let Some(writer) = lease.as_mut() {
+                writer.write(self.used, parameters)?;
+            }
             self.slots.insert(
                 job.genome,
                 Slot {
@@ -625,12 +613,13 @@ impl MetalBackend {
             return Ok(());
         }
         let organisms = count.next_power_of_two().max(256);
-        let gateway = &self.controllers.gateway;
-        let zeroed = |bytes: usize| gateway.buffer_zeroed(bytes).map_err(metal);
-        self.inputs = Some(zeroed(organisms * SENSOR_WIDTH * size_of::<f32>())?);
-        self.jobs = Some(zeroed(organisms * JOB_WORDS * size_of::<u32>())?);
-        self.raw = Some(zeroed(organisms * ACTION_WIDTH * size_of::<f32>())?);
-        self.faults = Some(zeroed(organisms * size_of::<u32>())?);
+        // Retire the old buffers first, so their bytes are free again.
+        (self.inputs, self.jobs, self.raw, self.faults) = (None, None, None, None);
+        let owner = &self.controllers.owner;
+        self.inputs = Some(owner.zeroed_owned(organisms * SENSOR_WIDTH)?);
+        self.jobs = Some(owner.zeroed_owned(organisms * JOB_WORDS)?);
+        self.raw = Some(owner.zeroed_owned(organisms * ACTION_WIDTH)?);
+        self.faults = Some(owner.zeroed_owned(organisms)?);
         self.organisms = organisms;
         Ok(())
     }
@@ -703,33 +692,37 @@ impl ControllerBackend for MetalBackend {
                     .extend(job_entry.inputs.iter().map(|&value| value as f32));
             }
             let (Some(parameters), Some(inputs), Some(job_words), Some(raw), Some(faults)) = (
-                self.parameters.as_ref(),
-                self.inputs.as_mut(),
-                self.jobs.as_mut(),
-                self.raw.as_ref(),
-                self.faults.as_ref(),
+                self.parameters.as_ref().map(Owned::buffer),
+                self.inputs.as_ref().map(Owned::buffer),
+                self.jobs.as_ref().map(Owned::buffer),
+                self.raw.as_ref().map(Owned::buffer),
+                self.faults.as_ref().map(Owned::buffer),
             ) else {
                 return Err(CoreError::StateConflict {
                     operation: "metal controller residency",
                     detail: "buffers missing".to_owned(),
                 });
             };
-            inputs.write_f32(0, &self.staged_inputs).map_err(metal)?;
-            job_words.write_u32(0, &self.staged_jobs).map_err(metal)?;
-            self.controllers
-                .gateway
-                .dispatch(
-                    &self.controllers.forward,
-                    &[parameters, inputs, job_words, raw, faults],
-                    Grid::linear(count, FORWARD_THREADS),
-                )
-                .map_err(metal)?;
+            let owner = &self.controllers.owner;
+            owner.write(inputs)?.write(0, &self.staged_inputs)?;
+            owner.write(job_words)?.write(0, &self.staged_jobs)?;
+            owner.submit(
+                &self.controllers.forward,
+                &[
+                    parameters.reads(),
+                    inputs.reads(),
+                    job_words.reads(),
+                    raw.writes(),
+                    faults.writes(),
+                ],
+                Grid::linear(count, FORWARD_THREADS),
+            )?;
             self.values.clear();
             self.values.resize(count * ACTION_WIDTH, 0.0);
-            raw.read_f32(&mut self.values).map_err(metal)?;
+            owner.read_back(raw, &mut self.values)?;
             self.flags.clear();
             self.flags.resize(count, 0);
-            faults.read_u32(&mut self.flags).map_err(metal)?;
+            owner.read_back(faults, &mut self.flags)?;
         }
         let mut dispatched = self.dispatched.iter().zip(
             self.values

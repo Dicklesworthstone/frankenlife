@@ -2,6 +2,8 @@
 //! `[64, 32]` controllers, every organism evaluated every tick) run with its
 //! controllers on the Metal backend is the reference world, digest for
 //! digest, at every tick through the founder crash, births and mutation.
+//! FL-028: every buffer it uses is the owner's, and none is left leased,
+//! bound or retiring.
 
 use flife_backend_metal::{AUTO_METAL_MAX_WORKERS, ControllerChoice, MetalBackend};
 use flife_core::{CoreError, ValidatedConfig};
@@ -72,6 +74,7 @@ fn race(reference: &mut World, metal: &mut World, ticks: u64) -> (Option<u64>, u
 fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     let Some(backend) = metal() else { return };
     let description = backend.describe();
+    let owner = backend.owner().clone();
     let mut reference = found();
     let mut metal = found();
     metal.set_controller_backend(Some(Box::new(backend)));
@@ -86,6 +89,21 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     // The device, not the fallback, did the work.
     assert!(report.batched > 1_000_000, "{report:?}");
     assert!(births > 0, "newborn genomes must be uploaded mid-run");
+    // FL-028: after 400 ticks the owner holds exactly the backend's five
+    // resident buffers (parameters, inputs, jobs, outputs, fault flags),
+    // with no lease, command or retiring buffer left over.
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.buffers,
+            usage.retiring,
+            usage.read_leases,
+            usage.write_leases,
+            usage.running
+        ),
+        (5, 0, [0; 3], 0, 0),
+        "{usage:?}"
+    );
 }
 
 /// The planted negative: the same backend with one output bit of one

@@ -485,8 +485,8 @@ velocity, first-order splitting at the configured fixed timestep.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.
-- FL-016 encodes the world (INV-14) and restores it to the same trajectory. Writing it durably with an atomic
-  manifest is FL-035, and resuming a session from a file is FL-037. Genomes are stored whole, one copy per
+- FL-016 encodes the world (INV-14) and restores it to the same trajectory, and FL-035's `flife-store` publishes
+  it atomically and recovers the last valid one. Resuming a session from the store is FL-037. Genomes are stored whole, one copy per
   live genome: 1.4–3.6 MB for the 48-founder ecology and 161.3 MiB for the 4,096-organism preset, with no page
   sharing, deltas or compression. A restored store is compacted in identity order, so `Population::latest`
   names the highest live identity rather than a since-dead later one; new identities come from the restored

@@ -41,6 +41,9 @@ are no hidden defaults.
 - Checkpoints (FL-016): `checkpoint::{CheckpointWriter, CheckpointReader, Chunk, ChunkFamily, ByteWriter,
   ByteReader}` and the format constants. `LedgerState`, `EnergyLedger::state` and `EnergyLedger::restore` carry
   every bit of a ledger; `CompensatedSum::{from_parts, parts}` and `Sha256Digest::from_bytes` support them.
+  FL-035 adds `CheckpointManifest` and `ManifestEntry`, which verify a container's sealed prefix without its
+  payload, so `flife-store` can keep the prefix as a manifest and the chunks by digest. `CheckpointReader::parse`
+  is that check plus the chunk hashes and the payload's exact coverage.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -220,9 +223,11 @@ Every issue is reported, not just the first.
   a credit to an exhausted budget. Nothing is changed.
 - `IncompatibleCheckpoint` (FL-016) covers a checkpoint that fails any container or chunk check. The reason
   names the check. A damaged checkpoint and one of another format share this class.
+- `StorageFailed` (FL-035) covers a storage operation the host refuses: a full disk, a device or permission
+  failure, or a path in the way. It names the operation and the path.
 - `CoreError::kind` (FL-015) names each class for machine output (§14.6), such as `missing-capability` or
   `numerical-invalid`. Every name is stable, kebab-case and distinct. `flife-cli`'s error records carry it, and
-  `errors_name_their_class` pins all thirteen.
+  `errors_name_their_class` pins all fourteen.
 
 **Determinism.** Pure functions of their inputs. No hash-map iteration and no floating clocks. The canonical forms
 and both digests are pinned by tests. Ledger sums run in a fixed order.

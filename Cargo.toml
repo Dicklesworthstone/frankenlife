@@ -5,7 +5,7 @@ resolver = "3"
 # organism-phase operators, FL-007's sensor/action ABI, FL-009's genomes,
 # FL-014's session owner, FL-015's headless command line, FL-017's render
 # epochs, FL-018's FrankenManim world adapter and native Studio host, and
-# FL-030's fused Metal controller kernel.
+# FL-030's fused Metal controller kernel, and FL-035's checkpoint chunk store.
 members = [
     "crates/flife-backend-metal",
     "crates/flife-cli",
@@ -18,6 +18,7 @@ members = [
     "crates/flife-probes",
     "crates/flife-render",
     "crates/flife-runtime",
+    "crates/flife-store",
     "crates/flife-studio",
 ]
 

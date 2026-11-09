@@ -112,6 +112,17 @@ pub enum CoreError {
         /// The conflict that was found.
         detail: String,
     },
+    /// The host's storage refused an operation: a full disk, a device or
+    /// permission failure, or a path in the way (FL-035). Whatever was
+    /// published before stays published.
+    StorageFailed {
+        /// The operation, for example `write chunk`.
+        operation: &'static str,
+        /// The path it acted on.
+        path: String,
+        /// The host's error.
+        reason: String,
+    },
 }
 
 impl CoreError {
@@ -133,6 +144,7 @@ impl CoreError {
             Self::LayoutMismatch { .. } => "layout-mismatch",
             Self::AllocationFailed { .. } => "allocation-failed",
             Self::StateConflict { .. } => "state-conflict",
+            Self::StorageFailed { .. } => "storage-failed",
         }
     }
 }
@@ -175,6 +187,11 @@ impl fmt::Display for CoreError {
             Self::StateConflict { operation, detail } => {
                 write!(f, "{operation} refused: {detail}")
             }
+            Self::StorageFailed {
+                operation,
+                path,
+                reason,
+            } => write!(f, "{operation} failed at {path}: {reason}"),
             Self::InvalidConfig(issues) => {
                 write!(f, "invalid configuration ({} issues)", issues.len())?;
                 for issue in issues {

@@ -1,0 +1,18 @@
+[package]
+name = "flife-store"
+description = "FrankenLife checkpoint chunk store: content-addressed chunks, atomically published manifests, recovery to the last valid checkpoint after a crash, cancellation or corruption, and retention"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flife-core = { path = "../flife-core" }
+
+[dev-dependencies]
+flife-engine = { path = "../flife-engine" }
+flife-runtime = { path = "../flife-runtime" }
+
+[lints]
+workspace = true

@@ -861,6 +861,14 @@ fn errors_name_their_class() {
             },
             "state-conflict",
         ),
+        (
+            CoreError::StorageFailed {
+                operation: "write chunk",
+                path: "x".into(),
+                reason: "x".into(),
+            },
+            "storage-failed",
+        ),
     ];
     let mut kinds = std::collections::BTreeSet::new();
     for (error, kind) in &every {

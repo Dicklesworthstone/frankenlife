@@ -18,11 +18,12 @@
 //! read through [`ByteReader`], which checks every declared count against
 //! the bytes that remain before reserving storage and refuses unread bytes.
 //!
+//! [`CheckpointManifest::parse`] verifies the sealed prefix alone, so a chunk
+//! store can keep it as the checkpoint's manifest and the chunks by digest.
+//!
 //! Every chunk is stored raw ([`CODEC_RAW`]): its encoded and decoded sizes
 //! are equal and its hash is also its content identity, so no codec can
 //! change a genome's meaning.
-
-use std::collections::BTreeSet;
 
 use crate::canonical::Sha256Digest;
 use crate::error::CoreError;
@@ -288,30 +289,42 @@ impl CheckpointWriter {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Entry {
-    family: ChunkFamily,
-    version: u16,
-    items: u64,
-    start: usize,
-    end: usize,
+/// One chunk's manifest entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestEntry {
+    /// The chunk's family.
+    pub family: ChunkFamily,
+    /// Its schema version.
+    pub version: u16,
+    /// Its logical item count.
+    pub items: u64,
+    /// Where it starts in the payload.
+    pub offset: u64,
+    /// Its length in bytes (raw: encoded and decoded alike).
+    pub length: u64,
+    /// The SHA-256 of its bytes, which is also its content identity.
+    pub digest: Sha256Digest,
 }
 
-/// A parsed checkpoint whose structure and hashes were verified.
+/// A checkpoint's sealed prefix (header, manifest and seal), verified
+/// without its payload. A chunk store keeps this prefix as the
+/// checkpoint's manifest and the chunks by their digests (FL-035).
 #[derive(Debug, Clone)]
-pub struct CheckpointReader<'a> {
+pub struct CheckpointManifest<'a> {
     model: &'a str,
-    entries: Vec<Entry>,
-    payload: &'a [u8],
+    entries: Vec<ManifestEntry>,
+    sealed: usize,
 }
 
-impl<'a> CheckpointReader<'a> {
-    /// Verify `bytes` (see the [module documentation](self)) and require
-    /// every family in `required`.
+impl<'a> CheckpointManifest<'a> {
+    /// Verify the sealed prefix at the start of `bytes`, which may
+    /// continue with a payload or end at the seal. Checks everything
+    /// [`CheckpointReader::parse`] checks except the chunk hashes and how
+    /// the chunks cover a payload.
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] naming the first defect.
-    pub fn parse(bytes: &'a [u8], required: &[ChunkFamily]) -> Result<Self, CoreError> {
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, CoreError> {
         let mut header = ByteReader::new(bytes, "checkpoint header");
         if header.array::<8>()? != CHECKPOINT_MAGIC {
             return Err(refuse("not a FrankenLife checkpoint (magic)"));
@@ -345,18 +358,16 @@ impl<'a> CheckpointReader<'a> {
         if Sha256Digest::of(&bytes[..sealed]).as_bytes() != &seal {
             return Err(refuse("header or manifest hash mismatch"));
         }
-        let payload = &bytes[header.at..];
 
         let mut manifest = ByteReader::new(manifest_bytes, "checkpoint manifest");
         let count = manifest.u16()?;
-        let mut entries: Vec<Entry> = Vec::new();
+        let mut entries: Vec<ManifestEntry> = Vec::new();
         let mut expected = 0_u64;
-        let mut seen = BTreeSet::new();
         for _ in 0..count {
             let code = manifest.u8()?;
             let family = ChunkFamily::from_code(code)
                 .ok_or_else(|| refuse(format!("unknown chunk family {code}")))?;
-            if !seen.insert(family) {
+            if entries.iter().any(|entry| entry.family == family) {
                 return Err(refuse(format!("duplicate chunk {}", family.name())));
             }
             let codec = manifest.u8()?;
@@ -371,7 +382,7 @@ impl<'a> CheckpointReader<'a> {
             let offset = manifest.u64()?;
             let encoded = manifest.u64()?;
             let decoded = manifest.u64()?;
-            let digest = manifest.array::<32>()?;
+            let digest = Sha256Digest::from_bytes(manifest.array::<32>()?);
             let dependencies = manifest.u8()?;
             if dependencies > DEPENDENCIES_MAX {
                 return Err(refuse(format!(
@@ -407,44 +418,129 @@ impl<'a> CheckpointReader<'a> {
                     family.name()
                 )));
             }
-            let end = offset
-                .checked_add(encoded)
-                .filter(|end| *end <= u64::try_from(payload.len()).unwrap_or(u64::MAX))
-                .ok_or_else(|| {
-                    refuse(format!(
-                        "chunk {} runs past the payload's {} bytes",
-                        family.name(),
-                        payload.len()
-                    ))
-                })?;
-            let (start, end_index) = (
-                usize::try_from(offset).unwrap_or(usize::MAX),
-                usize::try_from(end).unwrap_or(usize::MAX),
-            );
-            if Sha256Digest::of(&payload[start..end_index]).as_bytes() != &digest {
-                return Err(refuse(format!("chunk {} hash mismatch", family.name())));
-            }
-            entries.push(Entry {
+            expected = offset.checked_add(encoded).ok_or_else(|| {
+                refuse(format!(
+                    "chunk {} declares {encoded} bytes at {offset}",
+                    family.name()
+                ))
+            })?;
+            entries.push(ManifestEntry {
                 family,
                 version,
                 items,
-                start,
-                end: end_index,
+                offset,
+                length: encoded,
+                digest,
             });
-            expected = end;
         }
         manifest.finish()?;
-        if expected != u64::try_from(payload.len()).unwrap_or(u64::MAX) {
+        Ok(Self {
+            model,
+            entries,
+            sealed: sealed + 32,
+        })
+    }
+
+    /// The model identifier.
+    #[must_use]
+    pub const fn model(&self) -> &'a str {
+        self.model
+    }
+
+    /// The chunks, in manifest (and payload) order.
+    #[must_use]
+    pub fn entries(&self) -> &[ManifestEntry] {
+        &self.entries
+    }
+
+    /// The length of the sealed prefix: header, manifest and seal.
+    #[must_use]
+    pub const fn sealed_length(&self) -> usize {
+        self.sealed
+    }
+
+    /// The payload length the chunks declare.
+    #[must_use]
+    pub fn payload_length(&self) -> u64 {
+        self.entries
+            .last()
+            .map_or(0, |entry| entry.offset.saturating_add(entry.length))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Entry {
+    family: ChunkFamily,
+    version: u16,
+    items: u64,
+    start: usize,
+    end: usize,
+}
+
+/// A parsed checkpoint whose structure and hashes were verified.
+#[derive(Debug, Clone)]
+pub struct CheckpointReader<'a> {
+    model: &'a str,
+    entries: Vec<Entry>,
+    payload: &'a [u8],
+}
+
+impl<'a> CheckpointReader<'a> {
+    /// Verify `bytes` (see the [module documentation](self)) and require
+    /// every family in `required`.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] naming the first defect.
+    pub fn parse(bytes: &'a [u8], required: &[ChunkFamily]) -> Result<Self, CoreError> {
+        let manifest = CheckpointManifest::parse(bytes)?;
+        let payload = &bytes[manifest.sealed..];
+        let available = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let mut entries = Vec::with_capacity(manifest.entries.len());
+        for entry in &manifest.entries {
+            let end = entry
+                .offset
+                .checked_add(entry.length)
+                .filter(|end| *end <= available)
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "chunk {} runs past the payload's {} bytes",
+                        entry.family.name(),
+                        payload.len()
+                    ))
+                })?;
+            let (start, end) = (
+                usize::try_from(entry.offset).unwrap_or(usize::MAX),
+                usize::try_from(end).unwrap_or(usize::MAX),
+            );
+            if Sha256Digest::of(&payload[start..end]) != entry.digest {
+                return Err(refuse(format!(
+                    "chunk {} hash mismatch",
+                    entry.family.name()
+                )));
+            }
+            entries.push(Entry {
+                family: entry.family,
+                version: entry.version,
+                items: entry.items,
+                start,
+                end,
+            });
+        }
+        let expected = manifest.payload_length();
+        if expected != available {
             return Err(refuse(format!(
                 "{} payload bytes, the chunks cover {expected}",
                 payload.len()
             )));
         }
-        if let Some(missing) = required.iter().find(|family| !seen.contains(*family)) {
+        if let Some(missing) = required
+            .iter()
+            .find(|family| !entries.iter().any(|entry| entry.family == **family))
+        {
             return Err(refuse(format!("missing chunk {}", missing.name())));
         }
         Ok(Self {
-            model,
+            model: manifest.model,
             entries,
             payload,
         })

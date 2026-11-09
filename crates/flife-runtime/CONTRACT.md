@@ -225,7 +225,8 @@ any Asupersync runtime; `InjectEnergy` as the only intervention.
   - crash and retry tests (C.14's interrupted energy brush).
 - Idempotency records are kept for the session's whole life. A bounded window belongs to the journal.
 - FL-016 encodes the schedule, sealed boundary and outcome stream with the world. C.14's checkpoint after B
-  across a crash needs the durable chunk store (FL-035), the journal (FL-036) and resume (FL-037). There is no
+  across a crash also needs the journal (FL-036) and resume (FL-037); FL-035's `flife-store` holds the
+  checkpoints. There is no
   checkpoint command or session resume yet: `checkpoint` and `restore` are library calls on a closed or
   quiescent world and book.
 - Brushes, regions, material, removal, seeded introduction, source edits and their native input mapping are FL-022.

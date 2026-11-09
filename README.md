@@ -62,8 +62,10 @@ Studio use it by default (`--controllers auto`). FL-019 adds five colour mapping
 motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
 FL-016 encodes a whole session, world and command book, as one sealed, chunked checkpoint (Appendix B.2). A
 world restored off phase, with newborns or after deaths publishes every later tick exactly as the uninterrupted
-one, pending commands apply once, and damaged checkpoints are refused by name. Durable writes and
-`flife checkpoint`/`resume` are FL-035 and FL-037.
+one, pending commands apply once, and damaged checkpoints are refused by name. FL-035's `flife-store` publishes
+checkpoints atomically, storing each distinct chunk once by its SHA-256. A process killed after any step of a
+publication, a cancellation, a refused write and damaged bytes all leave the last valid checkpoint recoverable,
+and retention keeps the newest valid ones. `flife checkpoint`/`resume` are FL-037.
 Camera, zoom and selection come next.**
 
 | Question | Answer |
@@ -289,7 +291,7 @@ The proposed workspace (§18.1). A crate is created only when a milestone needs 
 | `flife-backend-cpu`, `flife-backend-metal` | Qualified phase execution; device owner, kernels and resource leases |
 | `flife-runtime` | Asupersync session ownership, commands, supervision, queue policies |
 | `flife-render`, `flife-manim` | Compact render projections and colour semantics; the bulk FrankenManim adapter |
-| `flife-store` | Chunk format, checkpoint transactions, run and lineage catalog |
+| `flife-store` | Chunk store and atomic checkpoint manifests (FL-035); run and lineage catalog (FL-036) |
 | `flife-analysis`, `flife-experiments` | Metrics and controlled comparisons; seed ensembles, sweeps, branches |
 | `flife-cli`, `flife-studio` | The `flife` command line and the interactive application |
 

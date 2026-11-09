@@ -843,6 +843,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "flife-store"
+version = "0.0.1"
+dependencies = [
+ "flife-core",
+ "flife-engine",
+ "flife-runtime",
+]
+
+[[package]]
 name = "flife-studio"
 version = "0.0.1"
 dependencies = [

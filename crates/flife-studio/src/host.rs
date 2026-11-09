@@ -27,7 +27,7 @@ use fmn_render::metal::{
     SurfaceMetrics,
 };
 
-use crate::{Controls, Intent, SessionThread, Status};
+use crate::{Controls, SessionThread, Status};
 
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
@@ -122,7 +122,6 @@ pub struct Studio {
     controls: Controls,
     events: Vec<InputEvent>,
     statuses: Vec<Status>,
-    run: Option<u64>,
     tally: FrameTally,
     window_closed: bool,
 }
@@ -184,7 +183,6 @@ impl Studio {
             controls: Controls::new(),
             events,
             statuses: Vec::new(),
-            run: None,
             tally: FrameTally::default(),
             window_closed: false,
         })
@@ -209,10 +207,7 @@ impl Studio {
                     Ok(()) => intents += 1,
                     Err(_) => {
                         refused += 1;
-                        // A refused resume leaves the session paused.
-                        if intent == Intent::Resume {
-                            self.controls.set_running(false);
-                        }
+                        self.controls.refused(intent);
                     }
                 }
             }
@@ -225,21 +220,7 @@ impl Studio {
 
         let before = self.statuses.len();
         for status in self.session.statuses() {
-            match &status {
-                Status::Running { run, .. } => {
-                    self.run = Some(*run);
-                    self.controls.set_running(true);
-                }
-                Status::Ended { run, .. } if self.run == Some(*run) => {
-                    self.run = None;
-                    self.controls.set_running(false);
-                }
-                Status::Refused {
-                    intent: Intent::Resume,
-                    ..
-                } => self.controls.set_running(false),
-                _ => {}
-            }
+            self.controls.follow(&status);
             self.statuses.push(status);
         }
         let statuses = self.statuses.len() - before;

@@ -18,6 +18,8 @@
 use flife_manim::Viewport;
 use fmn_render::metal::{ButtonSet, InputEvent, LogicalPoint, SurfaceMetrics};
 
+use crate::Status;
+
 /// `kVK_Space`.
 pub const KEY_SPACE: u16 = 49;
 /// `kVK_RightArrow`.
@@ -69,6 +71,7 @@ pub struct InputTally {
 #[derive(Debug, Clone, Default)]
 pub struct Controls {
     running: bool,
+    run: Option<u64>,
     close: bool,
     focused: bool,
     pointer: Option<LogicalPoint>,
@@ -181,6 +184,42 @@ impl Controls {
     /// capacity shortfall, or a failed tick).
     pub fn set_running(&mut self, running: bool) {
         self.running = running;
+    }
+
+    /// Follow one status from the session, in the order it arrived. A run
+    /// that starts makes the controls run. Only the end of the current run
+    /// stops them: an older run's end can arrive after a newer run started.
+    /// A refused resume stops them too.
+    pub fn follow(&mut self, status: &Status) {
+        match status {
+            Status::Running { run, .. } => {
+                self.run = Some(*run);
+                self.running = true;
+            }
+            Status::Ended { run, .. } if self.run == Some(*run) => {
+                self.run = None;
+                self.running = false;
+            }
+            Status::Refused {
+                intent: Intent::Resume,
+                ..
+            } => self.running = false,
+            _ => {}
+        }
+    }
+
+    /// An intent the session never received, because its lane was full or
+    /// gone. A refused resume leaves the controls paused.
+    pub fn refused(&mut self, intent: Intent) {
+        if intent == Intent::Resume {
+            self.running = false;
+        }
+    }
+
+    /// The run the controls last saw start and not yet end.
+    #[must_use]
+    pub const fn run(&self) -> Option<u64> {
+        self.run
     }
 
     /// Whether the controls last asked the session to run.

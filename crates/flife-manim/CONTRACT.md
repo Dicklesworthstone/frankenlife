@@ -75,11 +75,12 @@ route.
   - Letterbox fit for wide, tall and exact aspects.
   - World and drawable round trips; the margin and the half-open far edges are not the world.
   - Retina-style logical points through the drawable ratio; empty and NaN logical sizes.
-  - Scene centring with y up, and the frame shape.
+  - Scene centring with y up, and the frame shape for exact, wide and tall drawables.
   - Degenerate extents and drawables are refused.
-  - *CPU render oracle:* FrankenManim's CPU `ThreeDJob::render` draws a dot at five world points of a letterboxed
-    160 × 90 drawable. The coverage-weighted centroid of each, decoded from the `Rgba16F` frame, is within 0.05 px
-    of `world_to_drawable`.
+  - *CPU render oracle:* FrankenManim's CPU `ThreeDJob::render` draws a dot at five world points of a 160 × 90 and
+    a 90 × 160 drawable, letterboxed each way. The coverage-weighted centroid of each, decoded from the `Rgba16F`
+    frame, is within 0.05 px of `world_to_drawable`. FrankenManim keeps a frame's height and fits its width to
+    the pixel aspect, so only the tall drawable tests the frame height through the render.
 - `tests/cloud.rs` (6 tests):
   - Every row of a real 24-tick epoch becomes one dot, in identity order, at its scene point with its lineage
     colour.

@@ -166,7 +166,10 @@ fn lineage_colours_are_fixed_and_spread_over_the_palette() {
     // Neighbouring identities are uncorrelated: about one pair in twelve
     // shares a colour, as for independent draws (4095 / 12 is about 341).
     let shared = slots.windows(2).filter(|pair| pair[0] == pair[1]).count();
-    assert!((250..=450).contains(&shared), "{shared} neighbouring pairs share a colour");
+    assert!(
+        (250..=450).contains(&shared),
+        "{shared} neighbouring pairs share a colour"
+    );
 
     assert_eq!(lineage_slot(7), lineage_slot(7));
     assert_eq!(lineage_color(7), lineage_color(7));

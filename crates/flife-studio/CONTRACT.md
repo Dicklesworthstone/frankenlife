@@ -18,7 +18,8 @@ adapter.
 
 **Outputs.**
 - `Controls`: a pure state machine from `InputEvent`s to `Intent`s and presentation state. It holds the pointer, the
-  held buttons, focus, the surface metrics and a tally by kind.
+  held buttons, focus, the surface metrics and a tally by kind. `follow(status)` tracks the session's current run,
+  and `refused(intent)` handles an intent the lane refused.
   - Keys go by virtual key code, so they do not depend on layout:
 
     | Key | Intent |
@@ -84,13 +85,17 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (5 tests): Space toggling and ignoring repeat; stepping only while paused, with repeat
-  stepping; Esc and ⌘W closing once; buttons through presses, motion and capture loss; focus, geometry rounding,
-  hover through a non-integral logical size, and the tally.
+- `tests/controls.rs` (7 tests):
+  - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
+  - Buttons through presses, motion and capture loss.
+  - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
+  - Following the session: a late end of run 1 does not stop run 2, and run 2 stopping on its own does.
+  - A resume refused at the lane or by the session leaves the controls paused.
 - `tests/live.rs` (harness-free, 17 checks, `--features synthetic-input`): the real 4,096-organism reference preset
   in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
   and delivered through the presenter's typed bridge:
-  - the first poll's real `Resized` (640 × 400 points) and `FocusGained`;
+  - the first poll's real `Resized` (640 × 400 points), and a real `FocusGained` (made key by a real key-window
+    change if another application holds the keyboard);
   - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling;
   - Space runs, and live epochs reach the screen;
   - Space pauses at a reported boundary, which is what is shown, and no epoch arrives while paused;

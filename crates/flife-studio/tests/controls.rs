@@ -171,3 +171,69 @@ fn focus_geometry_and_hover_follow_the_window() {
         (1, 1, 2, 1)
     );
 }
+
+#[test]
+fn only_the_current_runs_end_stops_the_controls() {
+    use flife_core::Tick;
+    use flife_studio::{End, Status};
+    let mut controls = Controls::new();
+    tap(&mut controls, KEY_SPACE);
+    controls.follow(&Status::Running {
+        run: 1,
+        from: Tick::ZERO,
+    });
+    assert_eq!(controls.run(), Some(1));
+    // Pause, then resume before run 1's end arrives.
+    tap(&mut controls, KEY_SPACE);
+    controls.follow(&Status::Paused { at: Tick::new(4) });
+    assert!(!controls.running());
+    tap(&mut controls, KEY_SPACE);
+    controls.follow(&Status::Running {
+        run: 2,
+        from: Tick::new(4),
+    });
+    let late = Status::Ended {
+        run: 1,
+        at: Tick::new(4),
+        why: End::Paused,
+    };
+    controls.follow(&late);
+    assert!(
+        controls.running(),
+        "a late end of run 1 must not stop run 2"
+    );
+    assert_eq!(controls.run(), Some(2));
+    // Run 2 stopping on its own stops the controls.
+    controls.follow(&Status::Ended {
+        run: 2,
+        at: Tick::new(9),
+        why: End::CapacityPaused {
+            detail: "population".into(),
+        },
+    });
+    assert!(!controls.running());
+    assert_eq!(controls.run(), None);
+    assert_eq!(tap(&mut controls, KEY_RIGHT), [Intent::Step]);
+}
+
+#[test]
+fn a_refused_resume_leaves_the_controls_paused() {
+    use flife_studio::Status;
+    let mut controls = Controls::new();
+    assert_eq!(tap(&mut controls, KEY_SPACE), [Intent::Resume]);
+    controls.refused(Intent::Resume);
+    assert!(!controls.running());
+    // A refused pause or step changes nothing.
+    controls.set_running(true);
+    controls.refused(Intent::Pause);
+    controls.refused(Intent::Step);
+    assert!(controls.running());
+    // The session refusing a resume stops them too.
+    controls.follow(&Status::Refused {
+        intent: Intent::Resume,
+        kind: "state-conflict",
+        detail: "the run stopped".into(),
+    });
+    assert!(!controls.running());
+    assert_eq!(tap(&mut controls, KEY_SPACE), [Intent::Resume]);
+}

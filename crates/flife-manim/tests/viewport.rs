@@ -76,7 +76,14 @@ fn scene_points_center_the_world_with_y_up_and_the_frame_is_the_whole_drawable()
     assert_eq!(viewport.scene_point([128.0, 64.0]), [64.0, -32.0, 0.0]);
     assert_eq!(viewport.scene_point([64.0, 32.0]), [0.0, 0.0, 0.0]);
     let scale = 400.0 / 128.0;
-    assert_eq!(viewport.frame_shape(), [400.0 / scale, 400.0 / scale]);
+    assert_eq!(viewport.frame_shape(), [400.0 / scale, 400.0 / scale]); // Wider than the world: the frame is wider than the world too.
+    let wide = fit([128.0, 128.0], [800, 450]);
+    assert_eq!(wide.frame_shape(), [800.0 / wide.scale(), 128.0]);
+    assert!(wide.frame_shape()[0] > 128.0);
+    // Taller than the world: the frame is taller.
+    let tall = fit([128.0, 128.0], [450, 800]);
+    assert_eq!(tall.frame_shape(), [128.0, 800.0 / tall.scale()]);
+    assert!(tall.frame_shape()[1] > 128.0);
 }
 
 #[test]
@@ -168,20 +175,23 @@ fn centroid(viewport: &Viewport, world: [f64; 2]) -> [f64; 2] {
 
 #[test]
 fn frankenmanim_draws_each_world_point_where_the_viewport_says() {
-    // A letterboxed, non-square drawable; points near every edge.
-    let viewport = fit([32.0, 32.0], [160, 90]);
-    for world in [
-        [4.0, 4.0],
-        [28.0, 8.0],
-        [16.0, 16.0],
-        [8.0, 29.0],
-        [30.5, 30.5],
-    ] {
-        let expected = viewport.world_to_drawable(world);
-        let drawn = centroid(&viewport, world);
-        assert!(
-            (drawn[0] - expected[0]).abs() < 0.05 && (drawn[1] - expected[1]).abs() < 0.05,
-            "world {world:?}: drawn at {drawn:?}, expected {expected:?}"
-        );
+    // Letterboxed both ways: wider than the world (margins left and right)
+    // and taller (margins above and below); points near every edge.
+    for drawable in [[160, 90], [90, 160]] {
+        let viewport = fit([32.0, 32.0], drawable);
+        for world in [
+            [4.0, 4.0],
+            [28.0, 8.0],
+            [16.0, 16.0],
+            [8.0, 29.0],
+            [30.5, 30.5],
+        ] {
+            let expected = viewport.world_to_drawable(world);
+            let drawn = centroid(&viewport, world);
+            assert!(
+                (drawn[0] - expected[0]).abs() < 0.05 && (drawn[1] - expected[1]).abs() < 0.05,
+                "{drawable:?}, world {world:?}: drawn at {drawn:?}, expected {expected:?}"
+            );
+        }
     }
 }

@@ -10,7 +10,7 @@ adapter.
   `StudioOptions` can override the size and make the window fixed.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input. It comes from frankentorch `ft-kernel-metal` at rev `1c4febfb`, through FrankenManim
-  `fmn-render` at rev `abd57cbf`.
+  `fmn-render` at rev `dfdc7d18`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and

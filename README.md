@@ -354,6 +354,11 @@ GPU, it measured slower (72 against 119 ticks per second), so `auto` stays on th
 `flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
 frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,
 took 6.3 s instead of 12.8 s (median of four interleaved runs each; all eight runs wrote the same frames and world).
+FrankenManim `dfdc7d18` then skips its polygon clipper for triangles wholly inside the view, most of the energy
+field's mesh, with the clipper's exact bytes. That halves the CPU frame (45 to 21.5 ms at 1,280² with 4,096 alive)
+and takes the same render to 3.95 s from 5.42 s, with the same PNG bytes. It also lifts the Studio from 14.8 to 19.6
+presented frames per second at 960×540, where the frame is still half preparation on the CPU and half waiting for the
+GPU.
 FrankenManim's Metal 3D route was measured for these frames and not adopted: on this shared GPU it took 189 ms per
 1,280² frame against the CPU route's 48 ms, and it differs from the CPU frame by one in about 0.02% of the bytes
 (`cargo run --release -p flife-cli --example frame_routes`). The full surface, as planned:
@@ -383,7 +388,7 @@ substitutes a different neural model.
 |---|---|
 | Rust toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition |
 | Asupersync | v0.6.2 (`a5d23e8d`), one package id across the closure; the root `[patch.crates-io]` maps FrankenTorch's crates.io edge onto the same commit |
-| FrankenManim, FrankenTorch, FrankenNumPy | `abd57cbf`, `1c4febfb`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
+| FrankenManim, FrankenTorch, FrankenNumPy | `dfdc7d18`, `1c4febfb`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
 | `rust-block` override | Reviewed revision `b39ae859…`, carried at this workspace root because Cargo ignores a dependency's own `[patch]` (§12.8) |
 
 ---

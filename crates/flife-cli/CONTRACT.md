@@ -174,7 +174,9 @@ Twenty-two planted bugs were each caught by at least one of these tests or `flif
   for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio.
   FrankenManim's Metal 3D route was measured on these frames (`examples/frame_routes.rs`, M5 Ultra, GPU shared
   with other work): 189 ms per 1,280² frame against 48 ms on the CPU route with 36 threads, and 445 against 57 ms at
-  2,160²; about 70% of its time is the wait for the GPU. Its RGBA8 frame differs from the CPU's by one in 0.02% of
+  2,160²; about 70% of its time is the wait for the GPU. With FrankenManim `dfdc7d18`'s unclipped-triangle path
+  both routes prepare faster (CPU 21.5 ms, Metal 163 ms at 1,280², same bytes on each), and the CPU route stays
+  ahead. Its RGBA8 frame differs from the CPU's by one in 0.02% of
   the bytes (332 of 1.6 M pixels at tick 64), so it would also change the written frames. The
   MP4 encoder is an external `ffmpeg` on `PATH`; without it `--video` is a typed `missing-capability` refusal after
   the frames are written.

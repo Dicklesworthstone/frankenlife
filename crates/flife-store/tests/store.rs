@@ -306,8 +306,11 @@ fn child_publishes_until_its_planned_crash() {
 
 /// Start a child that publishes `checkpoint` into `root` and kill it
 /// (`SIGKILL`) right after step `stop`. The step, or `None` if the
-/// publication has fewer steps.
+/// publication has fewer steps. The child's stderr goes to a file beside
+/// `root`, so a child that fails says why.
 fn crash_at(root: &Path, checkpoint: &Path, stop: usize, durability: Durability) -> Option<String> {
+    let stderr_path = root.with_extension("stderr");
+    let stderr = fs::File::create(&stderr_path).expect("creates the child's stderr file");
     let mut child = Command::new(std::env::current_exe().expect("this test binary"))
         .args([
             "--exact",
@@ -326,7 +329,7 @@ fn crash_at(root: &Path, checkpoint: &Path, stop: usize, durability: Durability)
             ),
         )
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("spawns");
     let stdout = child.stdout.take().expect("a pipe");
@@ -342,7 +345,11 @@ fn crash_at(root: &Path, checkpoint: &Path, stop: usize, durability: Durability)
             return None;
         }
     }
-    panic!("the child ended without a report: {:?}", child.wait());
+    let status = child.wait();
+    panic!(
+        "the child ended without a report: {status:?}; its stderr:\n{}",
+        fs::read_to_string(&stderr_path).unwrap_or_else(|error| format!("unreadable: {error}"))
+    );
 }
 
 /// §16.4: a publication killed after any step leaves the store with the
@@ -674,14 +681,19 @@ fn a_write_that_fails_part_way_leaves_the_last_valid_checkpoint() {
                     durability.name()
                 ),
             )
-            .stderr(Stdio::null())
             .output()
             .expect("runs");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let report = stdout
             .lines()
             .find_map(|line| line.find("FLIFE-").map(|at| &line[at..]))
-            .unwrap_or_else(|| panic!("no report: {stdout}"));
+            .unwrap_or_else(|| {
+                panic!(
+                    "no report ({}): {stdout}\nstderr:\n{}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
         assert!(
             report.starts_with("FLIFE-REFUSED 0 "),
             "{}: {report}",

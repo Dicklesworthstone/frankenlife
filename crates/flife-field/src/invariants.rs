@@ -48,6 +48,18 @@ impl ConeTolerance {
         Ok(Self { absolute, relative })
     }
 
+    /// The absolute part.
+    #[must_use]
+    pub const fn absolute(&self) -> f64 {
+        self.absolute
+    }
+
+    /// The part relative to the cell's energy.
+    #[must_use]
+    pub const fn relative(&self) -> f64 {
+        self.relative
+    }
+
     /// Whether `residual` is admissible in a cell holding `energy`.
     #[must_use]
     pub fn allows(&self, residual: f64, energy: f64) -> bool {

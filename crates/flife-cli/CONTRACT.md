@@ -178,7 +178,8 @@ Twenty-two planted bugs were each caught by at least one of these tests or `flif
 
 **Known gaps.**
 - Only `validate`, `run` and `render`. Capabilities, step and inspect, checkpoint and resume, branch, sweep, analyze
-  and export are later items (§14.6): FL-016, FL-021, FL-037, FL-039, FL-041 and FL-023.
+  and export are later items (§14.6): FL-021, FL-037, FL-039, FL-041 and FL-023. FL-016's checkpoint encoding
+  exists in `flife-runtime`; the `checkpoint` and `resume` commands are FL-037.
 - `render` draws on FrankenManim's CPU reference 3D route, a tick per frame at most, at the epoch's texel resolution
   for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio.
   FrankenManim's Metal 3D route was measured on these frames (`examples/frame_routes.rs`, M5 Ultra, GPU shared

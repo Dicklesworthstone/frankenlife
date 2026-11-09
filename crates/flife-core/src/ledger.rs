@@ -256,6 +256,19 @@ pub struct CompensatedSum {
 }
 
 impl CompensatedSum {
+    /// A sum restored from its running `sum` and `compensation`, as
+    /// [`CompensatedSum::parts`] gives them.
+    #[must_use]
+    pub const fn from_parts([sum, compensation]: [f64; 2]) -> Self {
+        Self { sum, compensation }
+    }
+
+    /// The running sum and its compensation.
+    #[must_use]
+    pub const fn parts(&self) -> [f64; 2] {
+        [self.sum, self.compensation]
+    }
+
     /// The empty sum.
     pub const ZERO: Self = Self {
         sum: 0.0,
@@ -613,6 +626,36 @@ impl TickClosure {
     }
 }
 
+/// Everything an [`EnergyLedger`] carries between ticks: its holdings,
+/// tick count and every running sum, bit for bit. Each tick's
+/// [`LedgerReport`] and INV-03 check read all of it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LedgerState {
+    /// The holdings the run started at.
+    pub initial: Holdings,
+    /// The last committed closing holdings.
+    pub last: Holdings,
+    /// The next tick the ledger accepts; `None` before the first.
+    pub next_tick: Option<Tick>,
+    /// Committed ticks.
+    pub ticks: u64,
+    /// Energy injected.
+    pub injected: CompensatedSum,
+    /// Energy removed.
+    pub removed: CompensatedSum,
+    /// Energy dissipated.
+    pub dissipated: CompensatedSum,
+    /// Energy turned over.
+    pub turnover: CompensatedSum,
+    /// The cumulative residual `Σ ε`.
+    pub residual: CompensatedSum,
+    /// The largest single-tick `|ε|`.
+    pub largest_tick_residual: f64,
+    /// The residual drift fit: count, mean x, mean y, co-moment and x
+    /// moment.
+    pub drift: [f64; 5],
+}
+
 /// The run ledger: every committed tick, in order, with no gaps between
 /// them.
 #[derive(Debug, Clone)]
@@ -656,6 +699,97 @@ impl EnergyLedger {
     #[must_use]
     pub const fn budget(&self) -> ResidualBudget {
         self.budget
+    }
+
+    /// Everything the ledger carries between ticks, for checkpoints.
+    #[must_use]
+    pub const fn state(&self) -> LedgerState {
+        LedgerState {
+            initial: self.initial,
+            last: self.last,
+            next_tick: self.next_tick,
+            ticks: self.ticks,
+            injected: self.injected,
+            removed: self.removed,
+            dissipated: self.dissipated,
+            turnover: self.turnover,
+            residual: self.residual,
+            largest_tick_residual: self.largest_tick_residual,
+            drift: [
+                self.drift.count,
+                self.drift.mean_x,
+                self.drift.mean_y,
+                self.drift.co_moment,
+                self.drift.x_moment,
+            ],
+        }
+    }
+
+    /// The ledger [`EnergyLedger::state`] gave `state`, checked against
+    /// `budget`.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] for a nonfinite value, a tick
+    /// count that disagrees with the next tick, or a cumulative residual
+    /// beyond the budget's allowance (INV-03).
+    pub fn restore(state: LedgerState, budget: ResidualBudget) -> Result<Self, CoreError> {
+        let sums = [
+            state.injected,
+            state.removed,
+            state.dissipated,
+            state.turnover,
+            state.residual,
+        ];
+        let finite = sums
+            .iter()
+            .flat_map(CompensatedSum::parts)
+            .chain(state.drift)
+            .chain([state.largest_tick_residual])
+            .all(f64::is_finite);
+        if !finite {
+            return Err(CoreError::IncompatibleCheckpoint {
+                reason: "ledger state holds a nonfinite value".into(),
+            });
+        }
+        if (state.ticks == 0) != state.next_tick.is_none() {
+            return Err(CoreError::IncompatibleCheckpoint {
+                reason: format!(
+                    "ledger counts {} ticks but its next tick is {:?}",
+                    state.ticks, state.next_tick
+                ),
+            });
+        }
+        let [count, mean_x, mean_y, co_moment, x_moment] = state.drift;
+        let ledger = Self {
+            budget,
+            initial: state.initial,
+            last: state.last,
+            next_tick: state.next_tick,
+            ticks: state.ticks,
+            injected: state.injected,
+            removed: state.removed,
+            dissipated: state.dissipated,
+            turnover: state.turnover,
+            residual: state.residual,
+            largest_tick_residual: state.largest_tick_residual,
+            drift: DriftFit {
+                count,
+                mean_x,
+                mean_y,
+                co_moment,
+                x_moment,
+            },
+        };
+        let report = ledger.report();
+        if report.residual.abs() > report.allowance {
+            return Err(CoreError::IncompatibleCheckpoint {
+                reason: format!(
+                    "ledger residual {:e} exceeds the allowance {:e} (INV-03)",
+                    report.residual, report.allowance
+                ),
+            });
+        }
+        Ok(ledger)
     }
 
     /// The holdings the next tick must open at.

@@ -186,6 +186,46 @@ impl SeededPath {
         })
     }
 
+    /// Segment `ordinal` of `source`'s path, from the wrapped `anchor`:
+    /// what [`SeededPath::start`] and `ordinal` calls of
+    /// [`SeededPath::next`] give when that segment starts at `anchor`. A
+    /// checkpoint stores only the ordinal and the anchor.
+    ///
+    /// # Errors
+    /// [`CoreError::Overflow`] at the last ordinal; otherwise as
+    /// [`PathSegment::new`] and the draws.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the segment's identity, anchor and the path's three constants"
+    )]
+    pub fn resume(
+        rng: &SemanticRng,
+        grid: &FieldGrid,
+        source: SourceId,
+        ordinal: u64,
+        anchor: [f64; 2],
+        speed: f64,
+        ticks: TickSpan,
+        step: TimeStep,
+    ) -> Result<Self, CoreError> {
+        let following = ordinal.checked_add(1).ok_or(CoreError::Overflow {
+            quantity: "source path segment",
+        })?;
+        Ok(Self {
+            source,
+            ordinal,
+            segment: PathSegment::new(
+                grid,
+                anchor,
+                travel_direction(rng, source, ordinal)?,
+                travel_direction(rng, source, following)?,
+                speed,
+                ticks,
+                step,
+            )?,
+        })
+    }
+
     /// The source.
     #[must_use]
     pub const fn source(&self) -> SourceId {

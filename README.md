@@ -60,6 +60,10 @@ Studio's world is bit-identical to the same world stepped directly. FL-030's fir
 controller on the Mac's GPU in one fused Metal dispatch, bit for bit the CPU reference's, and `run`, `render` and the
 Studio use it by default (`--controllers auto`). FL-019 adds five colour mappings (lineage, energy, generation,
 motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
+FL-016 encodes a whole session, world and command book, as one sealed, chunked checkpoint (Appendix B.2). A
+world restored off phase, with newborns or after deaths publishes every later tick exactly as the uninterrupted
+one, pending commands apply once, and damaged checkpoints are refused by name. Durable writes and
+`flife checkpoint`/`resume` are FL-035 and FL-037.
 Camera, zoom and selection come next.**
 
 | Question | Answer |

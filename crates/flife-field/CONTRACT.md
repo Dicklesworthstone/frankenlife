@@ -52,7 +52,8 @@
   normalized and applied energy), and `unit_direction`.
 - `PathSegment`: position, velocity, mid-tick fraction and the next segment.
 - `seeding` (FL-010): `chemical_direction`, `initial_center`, `travel_direction`, `initial_source`, and
-  `SeededPath` (source, segment ordinal and current segment).
+  `SeededPath` (source, segment ordinal and current segment). FL-016 adds `SeededPath::resume`, which rebuilds
+  a path from its source, ordinal and anchor, `PathSegment::anchor`, and `ConeTolerance::{absolute, relative}`.
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
 - `numerics`: the host-independent `exp_neg`, `expm1_neg`, `tanh`, `sigmoid` and `log2`, re-exported from
   `flife-core::numerics`.
@@ -283,7 +284,8 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
 
 **Known gaps.**
 - FL-013's tick carries each `SeededPath` and moves a source's center to its mid-tick position every tick.
-  Checkpointing the anchor and ordinal is FL-016 and FL-037.
+  FL-016 checkpoints each path's source, ordinal and anchor; the directions are counter-addressed draws, so
+  `SeededPath::resume` re-derives them. Resuming a session from a file is FL-037.
 - Cone tolerance. The values belong to an undeclared numerical profile. One finding: far from sources,
   diffusion leaves subnormal F32 energies (about 1e-40) with no relative precision. A cone tolerance therefore
   needs an absolute floor at F32's subnormal scale, and the 128-tick test uses `f32::MIN_POSITIVE`. Metal

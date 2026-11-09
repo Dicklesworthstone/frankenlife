@@ -11,6 +11,8 @@
 //!   idempotent admission by `(session, command id)`, the pending schedule
 //!   ordered by `(effective tick, admission order)`, sealed boundaries,
 //!   cancellation and the outcome stream.
+//! - [`checkpoint`]: a committed world and its complete command closure as
+//!   one verified checkpoint, and their exact restoration (FL-016).
 //! - [`session`]: the Asupersync owner task. It holds the committed world
 //!   and the book, serves a reserved control lane and a bounded scientific
 //!   lane, stays responsive while paused, advances one candidate at a time
@@ -24,10 +26,12 @@
 #![forbid(unsafe_code)]
 
 pub mod book;
+pub mod checkpoint;
 pub mod command;
 pub mod session;
 
-pub use book::CommandBook;
+pub use book::{COMMANDS_CHUNK_VERSION, CommandBook};
+pub use checkpoint::{Restored, SESSION_CHECKPOINT_CHUNKS, checkpoint, restore};
 pub use command::{
     Accepted, Admission, COMMAND_SCHEMA, CancelReason, Cancellation, Command, CommandStatus,
     Durability, Outcome, Rejection, Target, VOLATILE_IN_MEMORY,

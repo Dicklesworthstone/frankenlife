@@ -18,10 +18,13 @@
 //! - The outcome stream numbers terminal outcomes in the order they occur.
 //!   Its cursor is not the admission order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use flife_core::canonical::Sha256Digest;
-use flife_core::ids::{CommandId, SessionId};
+use flife_core::checkpoint::{
+    ByteReader, ByteWriter, CheckpointReader, CheckpointWriter, ChunkFamily,
+};
+use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick};
 use flife_engine::{Intervention, TickReport};
 use flife_field::FieldGrid;
@@ -420,5 +423,270 @@ impl CommandBook {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         self.closed
+    }
+}
+
+/// The command chunk's schema version.
+pub const COMMANDS_CHUNK_VERSION: u16 = 1;
+
+/// The longest command record or failure detail a checkpoint may carry.
+const RECORD_MAX_BYTES: usize = 64 * 1024;
+
+/// The most command records a checkpoint may carry.
+const RECORDS_MAX: usize = 1 << 24;
+
+fn refuse(reason: impl Into<String>) -> CoreError {
+    CoreError::IncompatibleCheckpoint {
+        reason: reason.into(),
+    }
+}
+
+impl CommandBook {
+    /// Add the book's command closure, [`ChunkFamily::Commands`], to
+    /// `writer`: every accepted command with its canonical record, its
+    /// acceptance and its status (pending, sealed or terminal with its
+    /// outcome), the outcome stream, the admission counter, the sealed
+    /// boundary and whether the book is closed. Pending future commands
+    /// are carried whole, not as a cursor.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] if `writer` lacks the
+    /// configuration chunk or already holds the commands.
+    pub fn write_checkpoint(&self, writer: &mut CheckpointWriter) -> Result<(), CoreError> {
+        let mut out = ByteWriter::new();
+        out.u64(self.session.get());
+        out.bytes(self.revision.as_bytes());
+        out.u64(u64::try_from(self.capacity).unwrap_or(u64::MAX));
+        out.u64(self.next_order);
+        out.option_u64(self.sealed.map(Tick::get));
+        out.u8(u8::from(self.closed));
+        out.u64(u64::try_from(self.records.len()).unwrap_or(u64::MAX));
+        for record in self.records.values() {
+            out.sized(&record.command.canonical_bytes());
+            out.u64(record.accepted.order);
+            out.u64(record.accepted.effective.get());
+            out.u8(u8::from(record.accepted.retargeted));
+            match record.accepted.durability {
+                Durability::Volatile => out.u8(0),
+            }
+            match &record.status {
+                CommandStatus::Pending => out.u8(0),
+                CommandStatus::Sealed => out.u8(1),
+                CommandStatus::Terminal(Outcome::Applied {
+                    tick,
+                    published,
+                    epoch,
+                    applied,
+                    cursor,
+                }) => {
+                    out.u8(2);
+                    out.u64(tick.get());
+                    out.u64(published.get());
+                    out.u64(epoch.get());
+                    out.f64(*applied);
+                    out.u64(*cursor);
+                }
+                CommandStatus::Terminal(Outcome::Cancelled {
+                    boundary,
+                    reason,
+                    cursor,
+                }) => {
+                    out.u8(3);
+                    out.u64(boundary.get());
+                    out.u8(match reason {
+                        CancelReason::Requested => 0,
+                        CancelReason::SessionClosed => 1,
+                    });
+                    out.u64(*cursor);
+                }
+                CommandStatus::Terminal(Outcome::Failed { detail, cursor }) => {
+                    out.u8(4);
+                    out.sized(detail.as_bytes());
+                    out.u64(*cursor);
+                }
+            }
+        }
+        out.u64(self.outcome_cursor());
+        for id in &self.outcomes {
+            out.u64(id.get());
+        }
+        writer.chunk(
+            ChunkFamily::Commands,
+            COMMANDS_CHUNK_VERSION,
+            u64::try_from(self.records.len()).unwrap_or(u64::MAX),
+            out.into_bytes(),
+            &[ChunkFamily::Configuration],
+        )
+    }
+
+    /// The book `reader`'s command closure holds, for a world committed at
+    /// `committed` running configuration `revision`.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] for a closure that is not one
+    /// this book could have reached: another revision; a record whose
+    /// identity, content hash, admission order or status disagrees; a
+    /// pending command due before `committed`; a sealed boundary other than
+    /// `committed`; or an outcome stream that is not exactly the terminal
+    /// commands in cursor order.
+    pub fn read_checkpoint(
+        reader: &CheckpointReader<'_>,
+        committed: Tick,
+        revision: Sha256Digest,
+    ) -> Result<Self, CoreError> {
+        let chunk = reader.versioned(ChunkFamily::Commands, COMMANDS_CHUNK_VERSION)?;
+        let mut input = ByteReader::new(chunk.bytes, "commands chunk");
+        let session = SessionId::new(input.u64()?);
+        let recorded = Sha256Digest::from_bytes(input.array()?);
+        if recorded != revision {
+            return Err(refuse(format!(
+                "the commands were accepted under configuration {}, the world runs {}",
+                recorded.to_hex(),
+                revision.to_hex()
+            )));
+        }
+        let capacity = usize::try_from(input.u64()?).unwrap_or(usize::MAX);
+        let next_order = input.u64()?;
+        let sealed = input.option_u64()?.map(Tick::new);
+        if sealed.is_some_and(|sealed| sealed != committed) {
+            return Err(refuse(format!(
+                "boundary {sealed:?} is sealed in a world at tick {}",
+                committed.get()
+            )));
+        }
+        let closed = input.flag()?;
+        let count = input.count(RECORDS_MAX, 8)?;
+        let mut book = Self {
+            session,
+            revision,
+            capacity,
+            records: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            sealed,
+            next_order,
+            outcomes: Vec::new(),
+            closed,
+        };
+        let mut orders = BTreeSet::new();
+        for _ in 0..count {
+            let bytes = input.sized(RECORD_MAX_BYTES)?;
+            let command = Command::from_canonical_bytes(bytes)?;
+            let accepted = Accepted {
+                order: input.u64()?,
+                effective: Tick::new(input.u64()?),
+                retargeted: input.flag()?,
+                durability: match input.u8()? {
+                    0 => Durability::Volatile,
+                    other => return Err(refuse(format!("unknown durability {other}"))),
+                },
+            };
+            if command.session != session
+                || accepted.order >= next_order
+                || !orders.insert(accepted.order)
+            {
+                return Err(refuse(format!(
+                    "{} is not a command this session admitted in order {}",
+                    command.id, accepted.order
+                )));
+            }
+            let status = match input.u8()? {
+                0 => CommandStatus::Pending,
+                1 => CommandStatus::Sealed,
+                2 => CommandStatus::Terminal(Outcome::Applied {
+                    tick: Tick::new(input.u64()?),
+                    published: Tick::new(input.u64()?),
+                    epoch: ResourceEpoch::new(input.u64()?),
+                    applied: input.f64()?,
+                    cursor: input.u64()?,
+                }),
+                3 => CommandStatus::Terminal(Outcome::Cancelled {
+                    boundary: Tick::new(input.u64()?),
+                    reason: match input.u8()? {
+                        0 => CancelReason::Requested,
+                        1 => CancelReason::SessionClosed,
+                        other => {
+                            return Err(refuse(format!("unknown cancellation reason {other}")));
+                        }
+                    },
+                    cursor: input.u64()?,
+                }),
+                4 => CommandStatus::Terminal(Outcome::Failed {
+                    detail: std::str::from_utf8(input.sized(RECORD_MAX_BYTES)?)
+                        .map_err(|_| refuse("a failure detail is not UTF-8"))?
+                        .to_owned(),
+                    cursor: input.u64()?,
+                }),
+                other => return Err(refuse(format!("unknown command status {other}"))),
+            };
+            match status {
+                CommandStatus::Pending if accepted.effective < committed => {
+                    return Err(refuse(format!(
+                        "{} is pending for tick {}, before the committed tick {}",
+                        command.id,
+                        accepted.effective.get(),
+                        committed.get()
+                    )));
+                }
+                CommandStatus::Sealed if Some(accepted.effective) != sealed => {
+                    return Err(refuse(format!(
+                        "{} is sealed for tick {}, but {sealed:?} is sealed",
+                        command.id,
+                        accepted.effective.get()
+                    )));
+                }
+                CommandStatus::Pending | CommandStatus::Sealed => {
+                    book.pending
+                        .insert((accepted.effective, accepted.order), command.id);
+                }
+                CommandStatus::Terminal(_) => {}
+            }
+            let id = command.id;
+            let previous = book.records.insert(
+                id,
+                Record {
+                    content: command.content_hash(),
+                    command,
+                    accepted,
+                    status,
+                },
+            );
+            if previous.is_some() {
+                return Err(refuse(format!("{id} is recorded twice")));
+            }
+        }
+        let outcomes = input.count(RECORDS_MAX, 8)?;
+        for cursor in 0..outcomes {
+            let id = CommandId::new(input.u64()?);
+            let matches = book.records.get(&id).is_some_and(|record| {
+                matches!(&record.status, CommandStatus::Terminal(outcome)
+                    if outcome.cursor() == u64::try_from(cursor).unwrap_or(u64::MAX))
+            });
+            if !matches {
+                return Err(refuse(format!(
+                    "outcome {cursor} names {id}, which did not end there"
+                )));
+            }
+            book.outcomes.push(id);
+        }
+        input.finish()?;
+        if chunk.items != u64::try_from(book.records.len()).unwrap_or(u64::MAX) {
+            return Err(refuse(format!(
+                "the manifest counts {} command records, the chunk holds {}",
+                chunk.items,
+                book.records.len()
+            )));
+        }
+        let terminal = book
+            .records
+            .values()
+            .filter(|record| matches!(record.status, CommandStatus::Terminal(_)))
+            .count();
+        if terminal != book.outcomes.len() {
+            return Err(refuse(format!(
+                "{terminal} commands ended but the outcome stream holds {}",
+                book.outcomes.len()
+            )));
+        }
+        Ok(book)
     }
 }

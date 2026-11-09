@@ -29,6 +29,12 @@ impl Sha256Digest {
         Self(digest)
     }
 
+    /// A digest read back from its raw bytes, as a checkpoint stores it.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// The raw digest.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {

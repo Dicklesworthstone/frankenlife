@@ -11,6 +11,8 @@
 //! - [`config`], [`schema`], [`validate`](mod@validate), [`canonical`]: the
 //!   `frankenlife.config.v1` configuration, its table of units and bounds,
 //!   the A.2 validator and the canonical serialization with its hash.
+//! - [`checkpoint`]: the versioned, hashed checkpoint container and its
+//!   bounded byte codecs (FL-016).
 //! - [`descriptor`]: the model descriptor and its identity hash.
 //! - [`model`]: fixed facts of `field-ecology-v1` and checked capacity
 //!   arithmetic.
@@ -25,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod checkpoint;
 pub mod clock;
 pub mod config;
 pub mod descriptor;
@@ -45,7 +48,7 @@ pub use config::RunConfig;
 pub use descriptor::ModelDescriptor;
 pub use error::{ConfigIssue, CoreError};
 pub use ledger::{
-    EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, LedgerReport, Payment, ResidualBudget,
-    TickClosure, TickLedger, Transfer,
+    CompensatedSum, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, LedgerReport,
+    LedgerState, Payment, ResidualBudget, TickClosure, TickLedger, Transfer,
 };
 pub use validate::{ValidatedConfig, ValidationReport, validate};

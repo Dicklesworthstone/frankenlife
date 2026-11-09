@@ -8,6 +8,7 @@
 //! before application, or failed.
 
 use flife_core::canonical::Sha256Digest;
+use flife_core::checkpoint::ByteReader;
 use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick};
 use flife_engine::Intervention;
@@ -89,6 +90,56 @@ impl Command {
             }
         }
         bytes
+    }
+
+    /// The command whose [`Command::canonical_bytes`] are `bytes`.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] for bytes that are not exactly
+    /// one canonical command record.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, CoreError> {
+        let refuse = |reason: &str| CoreError::IncompatibleCheckpoint {
+            reason: format!("command record: {reason}"),
+        };
+        let mut input = ByteReader::new(bytes, "command record");
+        if input.bytes(COMMAND_SCHEMA.len())? != COMMAND_SCHEMA.as_bytes() || input.u8()? != 0 {
+            return Err(refuse("not a frankenlife.command.v1 record"));
+        }
+        let session = SessionId::new(input.u64()?);
+        let id = CommandId::new(input.u64()?);
+        let target = match input.u8()? {
+            1 => Target::At {
+                tick: Tick::new(input.u64()?),
+                retarget: input.flag()?,
+            },
+            2 => Target::NextAdmissible,
+            _ => return Err(refuse("unknown target")),
+        };
+        let expected_revision = if input.flag()? {
+            Some(Sha256Digest::from_bytes(input.array()?))
+        } else {
+            None
+        };
+        let kind = b"inject-energy";
+        if input.bytes(kind.len())? != kind || input.u8()? != 0 {
+            return Err(refuse("unknown payload"));
+        }
+        let intervention = Intervention::InjectEnergy {
+            cell: [input.u32()?, input.u32()?],
+            amount: input.f64()?,
+        };
+        input.finish()?;
+        let command = Self {
+            session,
+            id,
+            target,
+            expected_revision,
+            intervention,
+        };
+        if command.canonical_bytes() != bytes {
+            return Err(refuse("not in canonical form"));
+        }
+        Ok(command)
     }
 
     /// The SHA-256 of [`Command::canonical_bytes`]. A retry with the same

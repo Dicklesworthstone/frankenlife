@@ -44,6 +44,9 @@ FL-014 (`flife-fp2`) adds `intervention` and `World::advance_with`: phase 1's se
 interventions, applied with phase 2's external sources and recorded in the ledger. The session owner that admits
 and seals them is `flife-runtime`.
 
+FL-016 (`flife-gh0`) writes and restores the whole world as ten checkpoint chunks (plan §16.1, §16.3, INV-14,
+Appendix B.2, C.13).
+
 It runs on the scalar CPU reference (`cpu-reference`) in the `qualified-reference` determinism class. The other
 modules compute settlements, proposals and staged births and store the committed organisms; `world` decides when
 each runs and owns the field.
@@ -260,6 +263,42 @@ each runs and owns the field.
 - The interventions are checked before anything is prepared. A refused one changes nothing and does not stop the
   run. A non-finite cell after an admitted injection is a numerical fault like any other.
 
+**Invariants — checkpoints (FL-016; §16.3, INV-14, B.2).**
+- `World::write_checkpoint` writes the ten world chunks of `WORLD_CHECKPOINT_CHUNKS` at version 1, each declaring
+  what it is decoded against:
+  - configuration: the canonical TOML, its hash, the slot arrangement and the numerical profile's five values;
+  - random (on configuration): the algorithm and seed;
+  - topology (on configuration): the catalog's name and every member's widths and parameter count;
+  - environment (on configuration): the tick, the resource epoch, and each seeded path's source, ordinal and
+    anchor;
+  - lifecycle (on configuration): the next organism, lineage and genome identities, the event count and the
+    quota's logical, allocated and live counts;
+  - field (on configuration): the shape and every plane's F32 values;
+  - genomes (on topology): every live genome in identity order, with its topology, parent, traits and
+    parameters;
+  - particles (on genomes): identity, genome, parent, lineage, generation, position, velocity and energy;
+  - held (on particles): each organism's held outputs with the tick they were evaluated at, its phase, cooldown
+    deadline, birth tick and energy change rate;
+  - ledger (on field and particles): every bit of `LedgerState`.
+- No generator state is saved because there is none: every random word is addressed by seed, stream and
+  counter (FL-010), so the seed and the tick determine every later draw. `SeededPath::resume` rebuilds a seeded
+  path from its source, ordinal and anchor.
+- `World::read_checkpoint` builds the world only from the chunks and checks each against what it determines.
+  The configuration must validate to the recorded hash, and the model, profile, algorithm, seed and catalog must
+  match. Paths come in source order, and the field has the configured shape and finite values. Each genome is
+  re-sealed through a fresh quota, which must end equal to the recorded one. Each organism must name its own
+  genome, have the phase its identity determines and a birth tick no later than the tick, and lie inside the
+  torus. Every manifest item count must match its chunk. The identity allocators must be past every live
+  identity. The ledger's last holdings must equal the measured field and organism holdings bit for bit, and its
+  next tick must be the world's tick.
+- Off-phase state survives (C.13): an organism between evaluations keeps its held outputs and their evaluation
+  tick, so a world restored mid-interval evaluates on each organism's own phase, and a newborn's forced first
+  evaluation stays due.
+- A faulted world is refused (`StateConflict`). `stop-and-preserve`'s fault is a diagnosis, not a state to
+  resume.
+- Scratch buffers and the controller backend are not state. A restored world evaluates on the reference path
+  until its owner calls `set_controller_backend`, and no result depends on the backend.
+
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
@@ -403,6 +442,7 @@ streams. The small ecology pins its world digest, checked on Linux x86_64.
     paths a tick late, founder positions on another lane, faults not stopping the run, a pause becoming an error,
     motion cost unrecorded, a tick forgetting an organism, dying genomes keeping their charges, survivors' state not
     written, and the quota's count not checked.
+- FL-016's world chunks are tested through the session, in `flife-runtime`'s `tests/checkpoint.rs`.
 
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
@@ -445,11 +485,16 @@ velocity, first-order splitting at the configured fixed timestep.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.
-- Checkpointing the world (INV-14) is FL-016. The digest covers the scientific state but is not a checkpoint.
+- FL-016 encodes the world (INV-14) and restores it to the same trajectory. Writing it durably with an atomic
+  manifest is FL-035, and resuming a session from a file is FL-037. Genomes are stored whole, one copy per
+  live genome: 1.4–3.6 MB for the 48-founder ecology and 161.3 MiB for the 4,096-organism preset, with no page
+  sharing, deltas or compression. A restored store is compacted in identity order, so `Population::latest`
+  names the highest live identity rather than a since-dead later one; new identities come from the restored
+  allocators either way. The checkpoint carries no toolchain or source fingerprint (B.1's run manifest).
 - Explicit removal needs a command to carry it, and the erase brush is a later command item. FL-012 supplies only
   the settlement. Environmental hazards are not part of `field-ecology-v1`.
-- `Population` stores each genome as its own heap value. Packed slabs, generation-tagged handles,
-  epoch-aware reclamation after readers finish, and checkpointing the store are FL-016 and FL-026. The ordered
+- `Population` stores each genome as its own heap value. Packed slabs, generation-tagged handles and
+  epoch-aware reclamation after readers finish are FL-026. FL-016 checkpoints the store's contents. The ordered
   tick returns a dead genome's quota charge in the publishing commit; readers holding its shared parameters keep
   them.
 - Field reservoirs are not cleared by the tiny-energy policy: A.1's "clears its moment consistently" has no

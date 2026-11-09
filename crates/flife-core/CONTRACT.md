@@ -8,7 +8,9 @@ adds the host-independent elementary functions of the reference numerical profil
 (`flife-rf8`) adds `fnp-philox-semantic-v1`, the semantically addressed random source every model draw comes from
 (§16.2, A.3 item 3, INV-11), with the `exp`, `ln` and turn-angle sine and cosine its distributions need.
 FL-011 (`flife-t24`) adds the `birthing` stream and the `attempt` lane kind for reproduction (A.3 item 10), and
-`EnergyBudget::retain` for the share a parent keeps (§7.4).
+`EnergyBudget::retain` for the share a parent keeps (§7.4). FL-016 (`flife-gh0`) adds Appendix B.2's checkpoint
+container: a sealed header and manifest over typed, versioned, hashed chunks, and the bounded little-endian
+codec the chunks are written in (§16.3, INV-14).
 
 **Inputs.** Configuration TOML (Appendix A's schema). Every key is required and unknown keys are refused, so there
 are no hidden defaults.
@@ -36,6 +38,9 @@ are no hidden defaults.
   `sin_cos_turns`.
 - Random addressing (FL-010): `SemanticRng`, `Address`, `Stream`, `Lane`, `LaneKind`, `Block`, and the draw
   conventions `half_open_unit`, `open_unit`, `bernoulli`, `choose` and `box_muller`.
+- Checkpoints (FL-016): `checkpoint::{CheckpointWriter, CheckpointReader, Chunk, ChunkFamily, ByteWriter,
+  ByteReader}` and the format constants. `LedgerState`, `EnergyLedger::state` and `EnergyLedger::restore` carry
+  every bit of a ledger; `CompensatedSum::{from_parts, parts}` and `Sha256Digest::from_bytes` support them.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -102,6 +107,25 @@ are no hidden defaults.
     - `choose` as `⌊k n / 2^52⌋` in integer arithmetic;
     - Box–Muller `[ρ cos 2πu₂, ρ sin 2πu₂]` with `ρ = √(−2 ln u₁)`, an open `u₁` from the first word, a
       half-open `u₂` from the second, and no cached spare.
+
+**Invariants — the checkpoint container (FL-016, B.2).**
+- Layout, little-endian: magic `FLIFECKP`, format 1, hash algorithm 1 (SHA-256), the model identifier (UTF-8, at
+  most 256 bytes), the manifest's length (at most 64 KiB), the manifest, a SHA-256 seal over every byte before it,
+  then the payload.
+- The manifest lists each chunk once: its family (one of the eleven `ChunkFamily` codes), codec (0, raw), version,
+  item count, payload offset, encoded and decoded lengths, the SHA-256 of its bytes, and at most 16 families it
+  depends on. Chunks are contiguous and in manifest order, and every dependency is an earlier chunk, so the
+  manifest order is a valid decoding order.
+- The writer refuses a family written twice, a dependency not yet written and more than 16 dependencies.
+- The reader checks everything before any chunk is decoded, in this order: magic, format, hash algorithm, model
+  identifier, manifest bound and seal; then each entry's family, uniqueness, codec, dependencies, lengths,
+  contiguity, bounds and hash; then that the chunks cover the payload exactly and that every family the caller
+  requires is present. A chunk is handed out only at the version its decoder asks for.
+- `ByteReader::count` checks a declared count against its cap and against the bytes left before anything is
+  allocated, and `finish` refuses unread bytes. Floats travel as their bit patterns.
+- `EnergyLedger::restore` takes only finite state whose next tick is present exactly when a tick has been
+  checked, and whose cumulative residual is inside the budget's INV-03 allowance. The restored ledger checks
+  later ticks as the original would.
 
 **Refusal cases (A.2).**
 - Nonfinite numbers and negative costs.
@@ -194,6 +218,8 @@ Every issue is reported, not just the first.
 - `StateConflict` covers work prepared against one state and then offered to another state, or offered twice.
   Examples are uptake grants applied to a changed field, a ledger tick that does not continue the last one, and
   a credit to an exhausted budget. Nothing is changed.
+- `IncompatibleCheckpoint` (FL-016) covers a checkpoint that fails any container or chunk check. The reason
+  names the check. A damaged checkpoint and one of another format share this class.
 - `CoreError::kind` (FL-015) names each class for machine output (§14.6), such as `missing-capability` or
   `numerical-invalid`. Every name is stable, kebab-case and distinct. `flife-cli`'s error records carry it, and
   `errors_name_their_class` pins all thirteen.
@@ -231,5 +257,14 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
   - Box–Muller pairs, pinned and within 4 ulp of correctly rounded, with the exact quarter turn.
   - Moments over 200,000 normals.
   - The family and seed read from Appendix A, and another family refused.
+- `tests/checkpoint.rs` (FL-016):
+  - A written container parses back to the same chunks, versions and item counts. Another version, an absent
+    family and a missing required family are refused.
+  - The writer's three refusals, and an over-long model identifier.
+  - Thirteen container defects, each refused by its own check: seven in the header, the seal or a chunk's bytes,
+    and six manifest defects re-sealed so that only the defect can be the reason. A trailing byte and every
+    truncation are refused too.
+  - Counts bounded by their cap and by the bytes left, a flag byte of 2, and unread bytes.
 
-**Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`.
+**Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`. FL-016:
+checkpoint format 1 with SHA-256 and raw chunks.

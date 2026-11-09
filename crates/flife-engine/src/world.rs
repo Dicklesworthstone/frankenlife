@@ -105,6 +105,10 @@ use crate::reproduction::{
     resolve_births,
 };
 
+mod checkpoint;
+
+pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION};
+
 /// The backend this module implements: the scalar CPU reference.
 pub const CPU_REFERENCE: &str = "cpu-reference";
 
@@ -513,6 +517,7 @@ struct Working {
 /// A committed world and the operators that advance it.
 #[derive(Debug)]
 pub struct World {
+    config: ValidatedConfig,
     rules: Rules,
     tick: Tick,
     epoch: ResourceEpoch,
@@ -607,16 +612,10 @@ impl World {
         }
         population.admit(&mut entrants)?;
 
-        let mut sources = Vec::new();
+        let sources = initial_sources(config, &rules)?;
         let mut paths = Vec::new();
         for index in 0..model.sources.count {
             let id = SourceId::new(index);
-            sources.push(initial_source(
-                &rules.rng,
-                &rules.grid,
-                id,
-                model.sources.power_per_source,
-            )?);
             paths.push(SeededPath::start(
                 &rules.rng,
                 &rules.grid,
@@ -629,23 +628,9 @@ impl World {
 
         let holdings = Holdings::new(field.current().energy_total(), organism_total(&population))?;
         let ledger = EnergyLedger::new(holdings, profile.residual);
-        let scratch = Scratch {
-            field: FieldWork::new(&rules.grid, &limits, workers(model.execution.cpu_workers)?)?,
-            pyramid: SensorPyramid::from_config(config, &limits)?,
-            rows: Vec::new(),
-            lanes: lanes(model.execution.cpu_workers)?,
-            sampled: Vec::with_capacity(sources.len()),
-            working: Vec::new(),
-            demands: Vec::new(),
-            grants: Grants::new(),
-            order: Vec::new(),
-            packets: Vec::new(),
-            emissions: Deposits::new(),
-            recycling: Deposits::new(),
-            survivors: Vec::new(),
-            deaths: Vec::new(),
-        };
+        let scratch = Scratch::new(config, &rules, sources.len())?;
         Ok(Self {
+            config: config.clone(),
             rules,
             tick: Tick::new(0),
             epoch: ResourceEpoch::new(0),
@@ -667,6 +652,18 @@ impl World {
     #[must_use]
     pub const fn tick(&self) -> Tick {
         self.tick
+    }
+
+    /// The validated configuration the world was founded from.
+    #[must_use]
+    pub const fn config(&self) -> &ValidatedConfig {
+        &self.config
+    }
+
+    /// The numerical profile the world is checked against.
+    #[must_use]
+    pub const fn profile(&self) -> NumericalProfile {
+        self.rules.profile
     }
 
     /// The committed resource epoch: zero at founding, one more at every
@@ -1305,6 +1302,46 @@ fn path_at(mut path: SeededPath, tick: Tick, rules: &Rules) -> Result<SeededPath
 
 /// `Σ E` over the live organisms in identity order, compensated: the
 /// organisms' holdings.
+/// The configuration's sources at their seeded centers: fixed for the run.
+fn initial_sources(config: &ValidatedConfig, rules: &Rules) -> Result<Vec<Source>, CoreError> {
+    let model = config.config();
+    (0..model.sources.count)
+        .map(|index| {
+            initial_source(
+                &rules.rng,
+                &rules.grid,
+                SourceId::new(index),
+                model.sources.power_per_source,
+            )
+        })
+        .collect()
+}
+
+impl Scratch {
+    /// Empty scratch for `sources` sources at the configuration's worker
+    /// count.
+    fn new(config: &ValidatedConfig, rules: &Rules, sources: usize) -> Result<Self, CoreError> {
+        let limits = BufferLimits::host();
+        let workers_configured = config.config().execution.cpu_workers;
+        Ok(Self {
+            field: FieldWork::new(&rules.grid, &limits, workers(workers_configured)?)?,
+            pyramid: SensorPyramid::from_config(config, &limits)?,
+            rows: Vec::new(),
+            lanes: lanes(workers_configured)?,
+            sampled: Vec::with_capacity(sources),
+            working: Vec::new(),
+            demands: Vec::new(),
+            grants: Grants::new(),
+            order: Vec::new(),
+            packets: Vec::new(),
+            emissions: Deposits::new(),
+            recycling: Deposits::new(),
+            survivors: Vec::new(),
+            deaths: Vec::new(),
+        })
+    }
+}
+
 fn organism_total(population: &Population) -> f64 {
     let mut total = CompensatedSum::ZERO;
     for organism in population.iter() {

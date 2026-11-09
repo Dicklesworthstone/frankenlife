@@ -518,6 +518,12 @@ pub struct PathSegment {
 const UNIT_TOLERANCE: f64 = 1.0e-12;
 
 impl PathSegment {
+    /// The wrapped point the segment starts from.
+    #[must_use]
+    pub const fn anchor(&self) -> [f64; 2] {
+        self.anchor
+    }
+
     /// A segment from the wrapped `anchor`, blending unit direction `start`
     /// into `end`, at `speed` world-length per simulation-second over
     /// `ticks` ticks of `step`.

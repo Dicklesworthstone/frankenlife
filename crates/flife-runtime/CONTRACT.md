@@ -5,7 +5,8 @@
 only commit authority. Clients submit simulation-changing commands and control requests through a
 `SessionHandle`. Admission gives every accepted command one admission order and one exact effective tick, and every
 accepted command ends in exactly one terminal outcome. The control loop stays responsive at a committed boundary
-while paused. Cancellation races publication at a declared boundary, and exactly one side wins.
+while paused. Cancellation races publication at a declared boundary, and exactly one side wins. FL-016
+(`flife-gh0`) checkpoints a session, the world and its command book, in one container (§16.3, C.14, B.2).
 
 **Inputs.**
 - A `World` founded from a validated configuration, the same configuration, and a `SessionId`.
@@ -42,6 +43,9 @@ while paused. Cancellation races publication at a declared boundary, and exactly
   through the lanes. `open_with` now returns a `Result`, because it allocates the render slots.
 - In `flife-engine`, FL-014 adds `World::advance_with` and `World::step_with`, plus each `TickReport`'s applied
   interventions: tick, position, intervention and applied energy.
+- Checkpoints (FL-016): `checkpoint`, `restore` and `Restored`, `SESSION_CHECKPOINT_CHUNKS`,
+  `CommandBook::{write_checkpoint, read_checkpoint}` with `COMMANDS_CHUNK_VERSION`, and
+  `Command::from_canonical_bytes`.
 
 **Invariants — admission and the schedule (§12.3).**
 - A command's identity is `(session, command id)`, and its content is the SHA-256 of its canonical record
@@ -105,6 +109,21 @@ while paused. Cancellation races publication at a declared boundary, and exactly
   wall time only, never a tick, a command, an admission decision or a birth. A render failure is recorded in the
   counters and never stops the run.
 - At close the owner offers the final boundary once more and marks the feed closed. The last epoch stays readable.
+
+**Invariants — checkpoints (FL-016; §16.3, C.14, B.2).**
+- `checkpoint(world, book)` writes the world's ten chunks and the commands chunk into one container
+  (`SESSION_CHECKPOINT_CHUNKS`). It refuses a book whose revision is not the world's configuration hash.
+- The commands chunk holds the session, the revision, the capacity, the next admission order, the sealed
+  boundary, whether admission is closed, every record (its canonical command, admission order, effective tick,
+  retargeting, durability and status with its outcome) and the outcome stream in cursor order.
+- `restore(bytes, profile)` requires all eleven chunks. The book must carry the world's revision, and a sealed
+  boundary must be the world's committed tick. Every order must be below the next order and unique, a pending
+  command must be effective at or after the committed tick, and a sealed one at the sealed boundary. No
+  identity repeats, every outcome is terminal with its cursor at its index, and the terminal records are
+  exactly the outcome stream. `Command::from_canonical_bytes` accepts only the canonical encoding.
+- A restored session continues as the uninterrupted one: pending commands apply once at their effective ticks, a
+  retry of an admitted command returns its first outcome, reuse with other content is still refused, and a
+  sealed boundary stays sealed.
 
 **Refusal cases.**
 - `SessionConfig::from_config`:
@@ -172,6 +191,29 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
 - Twenty-nine planted bugs were each caught by at least one of these tests (listed in the FL-014 commit). FL-017's
   twenty-five, three of them in the session's feed, are listed in its commit.
 
+- `tests/checkpoint.rs` (FL-016):
+  - A 48-founder ecology with a four-tick controller cadence, checkpointed at founding, off phase (tick 5), with
+    newborns (tick 33), after deaths (tick 218) and late (tick 401), continues to tick 480 with every published
+    report identical to the uninterrupted run's. Each restore has the same digest, tick, epoch, events, ledger
+    report, paths and genomes (compared directly, since the digest leaves genome contents out), and encodes to
+    the same bytes again.
+  - Pending commands: one for tick 40 admitted before one for tick 10, and a cancelled one, checkpointed at
+    tick 12. The restored session applies each once at its tick and reaches the reference world. A retry returns
+    the first outcome, and conflicting reuse is refused.
+  - A sealed boundary stays sealed across a checkpoint.
+  - The 4,096-organism preset at tick 64: 161.3 MiB, written in about 0.16 s and verified and restored in about
+    0.15 s on an Apple-silicon Mac; ticks 65–96 are identical.
+  - Damage, on a 2.1 MB checkpoint: every truncation and a flipped bit at every header, manifest and seal byte
+    and at every 97th payload byte (44,936 cases) are refused. So are a trailing byte and 12 re-sealed edits,
+    each refused by its own check: the particle count, the ledger's last holdings one ulp off, the quota's live
+    count, the seed, a configuration byte, a parameter set to `f32::MAX`, a held phase, a pending command marked
+    sealed, the sealed boundary, an outcome's identity, a manifest item count and a missing commands chunk.
+    Another numerical profile is refused.
+  - A checkpoint binds the world to its configuration and slot arrangement, and refuses a book from another
+    configuration.
+  - 20 planted mutants in the encoders, decoders, container and path resumption, each caught by these tests or
+    `flife-core`'s.
+
 **Validity domain.** `volatile-in-memory` durability; `cpu-reference` and `qualified-reference`; one owner task on
 any Asupersync runtime; `InjectEnergy` as the only intervention.
 
@@ -182,12 +224,15 @@ any Asupersync runtime; `InjectEnergy` as the only intervention.
   - reconciliation of an uncertain append by command identity and journal watermark;
   - crash and retry tests (C.14's interrupted energy brush).
 - Idempotency records are kept for the session's whole life. A bounded window belongs to the journal.
-- Checkpoints of the schedule, sealed boundary and outcome stream (C.14's checkpoint after B) are FL-016 and FL-037.
+- FL-016 encodes the schedule, sealed boundary and outcome stream with the world. C.14's checkpoint after B
+  across a crash needs the durable chunk store (FL-035), the journal (FL-036) and resume (FL-037). There is no
+  checkpoint command or session resume yet: `checkpoint` and `restore` are library calls on a closed or
+  quiescent world and book.
 - Brushes, regions, material, removal, seeded introduction, source edits and their native input mapping are FL-022.
   FL-014's single-cell `InjectEnergy` is the canonical payload they will extend.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
-- Checkpoint commands and branching (FL-016, FL-039) are not commands yet. Render epochs are not commands: viewers
+- Checkpoint commands and branching (FL-037, FL-039) are not commands yet. Render epochs are not commands: viewers
   read the feed directly (FL-017).
 - The render projection runs on the owner task, O(live + texels) per published boundary.
 - Lab tests cover protocol outcomes and publication invariants under seeded interleavings, not every possible

@@ -98,7 +98,7 @@ impl FieldWork {
     ) -> Result<Self, CoreError> {
         let mut work = Self {
             grid: *grid,
-            limits: limits.clone(),
+            limits: *limits,
             transport: Vec::new(),
             supports: Vec::new(),
         };

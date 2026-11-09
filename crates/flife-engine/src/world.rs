@@ -78,10 +78,10 @@ use flife_core::{
 };
 use flife_field::{
     BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldGrid, FieldPair,
-    FieldState, FieldStepReport, FieldSummary, GrantPacket, Grants, PyramidView,
+    FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants, PyramidView,
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorPyramid, Source, SourceKernel,
-    SourceSupport, TransportPlan, TransportScratch, UptakeSummary, advance_field, apply_deposits,
-    apply_grants, initial_source, resolve_uptake, saturating_request,
+    TransportPlan, UptakeSummary, advance_field_on, apply_deposits, apply_grants, initial_source,
+    resolve_uptake, saturating_request,
 };
 use flife_genome::{
     Genome, GenomeQuota, MutationParameters, MutationRecord, Mutator, TopologyCatalog, TraitLimits,
@@ -421,8 +421,8 @@ impl Rules {
 /// candidate's publication reads.
 #[derive(Debug)]
 struct Scratch {
-    transport: TransportScratch,
-    support: SourceSupport,
+    /// Transport scratch per worker and a support per source.
+    field: FieldWork,
     pyramid: SensorPyramid,
     /// The committed rows, in identity order, that phases 3 and 4 read.
     rows: Vec<Organism>,
@@ -598,8 +598,7 @@ impl World {
         let holdings = Holdings::new(field.current().energy_total(), organism_total(&population))?;
         let ledger = EnergyLedger::new(holdings, profile.residual);
         let scratch = Scratch {
-            transport: TransportScratch::new(&rules.grid, &limits)?,
-            support: SourceSupport::new(),
+            field: FieldWork::new(&rules.grid, &limits, workers(model.execution.cpu_workers)?)?,
             pyramid: SensorPyramid::from_config(config, &limits)?,
             rows: Vec::new(),
             lanes: lanes(model.execution.cpu_workers)?,
@@ -644,21 +643,24 @@ impl World {
         self.epoch
     }
 
-    /// How many threads phases 3 and 4 use: `[execution] cpu_workers`
-    /// unless [`World::set_cpu_workers`] changed it.
+    /// How many threads the field step and phases 3 and 4 use: `[execution]
+    /// cpu_workers` unless [`World::set_cpu_workers`] changed it.
     #[must_use]
     pub fn cpu_workers(&self) -> usize {
         self.scratch.lanes.len()
     }
 
-    /// Use `workers` threads for phases 3 and 4 from the next tick. No result
-    /// depends on the count: each organism's decision reads only committed
-    /// state, and the decisions are gathered in identity order.
+    /// Use `workers` threads for the field step and phases 3 and 4 from the
+    /// next tick. No result depends on the count: field planes are
+    /// transported and deposited independently, each organism's decision
+    /// reads only committed state, and decisions are gathered in identity
+    /// order.
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] if the lanes cannot be reserved; the
     /// count is then unchanged.
     pub fn set_cpu_workers(&mut self, workers: NonZeroUsize) -> Result<(), CoreError> {
+        self.scratch.field.set_workers(workers)?;
         let lanes = &mut self.scratch.lanes;
         let workers = workers.get();
         if workers > lanes.len() {
@@ -879,8 +881,7 @@ impl World {
             ..
         } = self;
         let Scratch {
-            transport,
-            support,
+            field: field_work,
             pyramid,
             rows,
             lanes,
@@ -925,15 +926,8 @@ impl World {
             let u = segment.mid_tick(from.get() - start)?;
             sampled.push(source.moved_to(segment.position(&rules.grid, u)?)?);
         }
-        let field_step = advance_field(
-            field,
-            &rules.plan,
-            &rules.kernel,
-            sampled,
-            step,
-            transport,
-            support,
-        )?;
+        let field_step =
+            advance_field_on(field, &rules.plan, &rules.kernel, sampled, step, field_work)?;
         tick_ledger.record(Flow::SourcePower, field_step.injected_declared)?;
         tick_ledger.record(Flow::Decay, field_step.transport.decay_removed)?;
         let mut applied = Vec::new();
@@ -1247,6 +1241,17 @@ fn organism_total(population: &Population) -> f64 {
         total.add(organism.energy);
     }
     total.value()
+}
+
+/// `[execution] cpu_workers` as a thread count.
+fn workers(workers: u32) -> Result<NonZeroUsize, CoreError> {
+    usize::try_from(workers)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "execution.cpu_workers",
+            detail: "not a positive thread count".to_owned(),
+        })
 }
 
 /// `workers` empty decision lanes.

@@ -1,0 +1,252 @@
+//! `flife-studio`: the live world in a native window (FL-018; plan §13.6).
+//!
+//! Every line on standard output is one `frankenlife.studio.v1` record: an
+//! `open`, then a `status` per session status and a `frame` summary about
+//! once a second, then an `end` with the committed world's digest. An error
+//! is one `frankenlife.error.v1` record on standard error. Exit status: 0
+//! after a clean close, 2 for an unreadable or invalid configuration or a
+//! window that cannot open, 1 for any later failure.
+
+#![forbid(unsafe_code)]
+
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::{Duration, Instant};
+
+use clap::Parser;
+use flife_core::ValidatedConfig;
+use flife_studio::{End, STUDIO_SCHEMA, Status, Studio, StudioOptions};
+use serde::Serialize;
+
+const ERROR_SCHEMA: &str = "frankenlife.error.v1";
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "flife-studio",
+    version,
+    about = "FrankenLife's Studio: the live world in a native window"
+)]
+struct Cli {
+    /// The configuration or preset, as TOML.
+    config: PathBuf,
+    /// Content width in points; `[presentation] width` by default.
+    #[arg(long, requires = "height")]
+    width: Option<u32>,
+    /// Content height in points; `[presentation] height` by default.
+    #[arg(long, requires = "width")]
+    height: Option<u32>,
+    /// Keep the window at its opening size.
+    #[arg(long)]
+    fixed: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case", tag = "record")]
+enum Record<'a> {
+    Open {
+        schema: &'static str,
+        name: &'a str,
+        config_hash: String,
+        world: [f64; 2],
+        capacity: usize,
+        window: [u32; 2],
+        frames_per_second: u32,
+    },
+    Status {
+        schema: &'static str,
+        status: &'static str,
+        run: Option<u64>,
+        tick: Option<u64>,
+        why: Option<&'static str>,
+        detail: Option<String>,
+    },
+    Frame {
+        schema: &'static str,
+        frames: u64,
+        presented: u64,
+        occluded: u64,
+        epochs: u64,
+        shown_tick: Option<u64>,
+        hover: Option<[f64; 2]>,
+        input_dropped: u64,
+    },
+    End {
+        schema: &'static str,
+        tick: u64,
+        digest: String,
+        frames: u64,
+        presented: u64,
+        epochs: u64,
+        refits: u64,
+        intents: u64,
+        refused: u64,
+        keys: u64,
+        pointer_moves: u64,
+        resizes: u64,
+        input_dropped: u64,
+        wall_seconds: f64,
+    },
+}
+
+#[derive(Serialize)]
+struct ErrorRecord<'a> {
+    schema: &'static str,
+    kind: &'a str,
+    detail: String,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let config = match load(&cli.config) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let options = StudioOptions {
+        size: cli.width.zip(cli.height).map(|(width, height)| [width, height]),
+        resizable: !cli.fixed,
+        ..StudioOptions::default()
+    };
+    let clock = Instant::now();
+    let mut studio = match Studio::open(&config, &options) {
+        Ok(studio) => studio,
+        Err(error) => return fail(error.kind(), error.to_string(), 2),
+    };
+    let model = config.config();
+    let fps = model.presentation.frames_per_second.max(1);
+    print(&Record::Open {
+        schema: STUDIO_SCHEMA,
+        name: &model.name,
+        config_hash: config.config_hash().to_hex(),
+        world: studio.view().viewport().extent(),
+        capacity: studio.view().cloud().capacity(),
+        window: studio.view().viewport().drawable(),
+        frames_per_second: fps,
+    });
+
+    let period = Duration::from_secs(1) / fps;
+    let mut summary = Instant::now();
+    while !studio.should_close() {
+        let started = Instant::now();
+        let frame = match studio.frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                let code = fail(error.kind(), error.to_string(), 1);
+                let _ = studio.close();
+                return code;
+            }
+        };
+        for status in studio.take_statuses() {
+            print(&status_record(&status));
+        }
+        if summary.elapsed() >= Duration::from_secs(1) {
+            summary = Instant::now();
+            let tally = studio.tally();
+            print(&Record::Frame {
+                schema: STUDIO_SCHEMA,
+                frames: tally.frames,
+                presented: tally.presented,
+                occluded: tally.occluded,
+                epochs: tally.epochs,
+                shown_tick: frame.shown.map(|shown| shown.tick.get()),
+                hover: frame.hover,
+                input_dropped: studio.input_dropped(),
+            });
+        }
+        if let Some(rest) = period.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+
+    match studio.close() {
+        Ok(closed) => {
+            print(&Record::End {
+                schema: STUDIO_SCHEMA,
+                tick: closed.session.boundary.tick.get(),
+                digest: closed.session.world.digest().to_hex(),
+                frames: closed.frames.frames,
+                presented: closed.frames.presented,
+                epochs: closed.frames.epochs,
+                refits: closed.frames.refits,
+                intents: closed.frames.intents,
+                refused: closed.frames.refused,
+                keys: closed.input.keys,
+                pointer_moves: closed.input.pointer_moves,
+                resizes: closed.input.resizes,
+                input_dropped: closed.input_dropped,
+                wall_seconds: clock.elapsed().as_secs_f64(),
+            });
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error.kind(), error.to_string(), 1),
+    }
+}
+
+fn status_record(status: &Status) -> Record<'static> {
+    let record = |status, run, tick, why, detail| Record::Status {
+        schema: STUDIO_SCHEMA,
+        status,
+        run,
+        tick,
+        why,
+        detail,
+    };
+    match status {
+        Status::Running { run, from } => record("running", Some(*run), Some(from.get()), None, None),
+        Status::Paused { at } => record("paused", None, Some(at.get()), None, None),
+        Status::Ended { run, at, why } => {
+            let (why, detail) = end(why);
+            record("ended", Some(*run), Some(at.get()), Some(why), detail)
+        }
+        Status::Stepped { tick } => record("stepped", None, Some(tick.get()), None, None),
+        Status::StepHeld { at, why } => {
+            let (why, detail) = end(why);
+            record("step-held", None, Some(at.get()), Some(why), detail)
+        }
+        Status::Refused { kind, detail, .. } => {
+            record("refused", None, None, Some(kind), Some(detail.clone()))
+        }
+        Status::Closed { at } => record("closed", None, Some(at.get()), None, None),
+    }
+}
+
+fn end(why: &End) -> (&'static str, Option<String>) {
+    match why {
+        End::Paused => ("paused", None),
+        End::Reached => ("reached", None),
+        End::CapacityPaused { detail } => ("capacity-paused", Some(detail.clone())),
+        End::Failed { kind, detail } => (kind, Some(detail.clone())),
+        End::Closed => ("closed", None),
+    }
+}
+
+fn load(path: &PathBuf) -> Result<ValidatedConfig, ExitCode> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| fail("io", format!("{}: {error}", path.display()), 2))?;
+    ValidatedConfig::from_toml(&text).map_err(|error| fail(error.kind(), error.to_string(), 2))
+}
+
+fn print(record: &impl Serialize) {
+    match serde_json::to_string(record) {
+        Ok(line) => {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        }
+        Err(error) => {
+            fail("serialization", error.to_string(), 1);
+        }
+    }
+}
+
+fn fail(kind: &str, detail: String, code: u8) -> ExitCode {
+    let record = ErrorRecord {
+        schema: ERROR_SCHEMA,
+        kind,
+        detail,
+    };
+    if let Ok(line) = serde_json::to_string(&record) {
+        let _ = writeln!(std::io::stderr().lock(), "{line}");
+    }
+    ExitCode::from(code)
+}

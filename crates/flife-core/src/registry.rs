@@ -622,6 +622,20 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "§12.3",
         "FL-036",
     ),
+    // §12.3's labelled best-effort mode: the session owner holds acceptance
+    // in memory and acknowledges it as volatile, lost if the process ends
+    // (FL-014). The write-ahead journal above is FL-036's.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-runtime::tests/session.rs::the_session_admits_volatile_in_memory_and_refuses_write_ahead_until_the_journal",
+        },
+        ..entry(
+            "volatile-in-memory",
+            Role::CommandDurability,
+            "§12.3",
+            "FL-014",
+        )
+    },
     entry(
         "drop-observer-or-pause-unchanged-world",
         Role::ObserverPressure,

@@ -40,6 +40,10 @@ FL-013 (`flife-x3o`) adds `world`, the ordered candidate tick and epoch publicat
   discards it;
 - `stop-and-preserve`: a numerical fault stops the run with the committed state kept.
 
+FL-014 (`flife-fp2`) adds `intervention` and `World::advance_with`: phase 1's sealed, admission-ordered
+interventions, applied with phase 2's external sources and recorded in the ledger. The session owner that admits
+and seals them is `flife-runtime`.
+
 It runs on the scalar CPU reference (`cpu-reference`) in the `qualified-reference` determinism class. The other
 modules compute settlements, proposals and staged births and store the committed organisms; `world` decides when
 each runs and owns the field.
@@ -112,6 +116,9 @@ each runs and owns the field.
   error of the advance that stopped the run.
 - `founder_position`: words 0 and 1 of `(founders, organism, 0, lane (0, position, 0), 0)` as half-open uniforms
   scaled to the world.
+- FL-014: `Intervention` (`InjectEnergy { cell, amount }`) with `check` and `declared_energy`;
+  `World::advance_with` and `World::step_with`; and each `TickReport`'s `interventions`, the
+  `AppliedIntervention`s (input tick, sealed position, intervention, applied energy) in sealed order.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -242,6 +249,16 @@ each runs and owns the field.
 - Founders (A.3 item 1): identities, genomes and lineages `0, 1, …`, uniform positions on the torus, zero velocity
   and history, the initial energy, birth tick zero, cooldown deadline `⌈cooldown/Δt⌉`, invalid held outputs and
   stable phases. The ledger's initial holdings include their endowment.
+
+**Invariants — interventions (FL-014).**
+- The interventions effective at tick `n` apply in the candidate from `n` to `n + 1`. They go into the observation
+  buffer after transport and the sources, in their sealed order, so every organism senses them during tick `n`.
+  `World::advance` is `advance_with` an empty set.
+- `InjectEnergy` raises one cell's energy and leaves its moments unchanged, so `||m||₂ ≤ e` still holds. The cell
+  is rounded down to the largest `f32` not above `e + amount`. The ledger records the change actually made as
+  `command-injection`: never more than declared, and within one `f32` ulp of the cell.
+- The interventions are checked before anything is prepared. A refused one changes nothing and does not stop the
+  run. A non-finite cell after an admitted injection is a numerical fault like any other.
 
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
@@ -396,15 +413,16 @@ velocity, first-order splitting at the configured fixed timestep.
 **Known gaps.**
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
-- The ordered tick admits no commands: phase 1 is FL-014's command admission, with the session owner and
-  durability. The exhibition-mode stable-ID birth rejection policy has no registered name yet.
+- Phase 1 applies only what `flife-runtime` (FL-014) seals: single-cell `InjectEnergy`. Brushes, regions,
+  material, removal, seeded introduction and source edits are FL-022, and durable admission is FL-036. The
+  exhibition-mode stable-ID birth rejection policy has no registered name yet.
 - `stop-and-preserve` keeps the committed state and the fault's description, which names the quantity and,
   where the operator knows it, the organism. It does not yet retain the faulted candidate's buffers for
   inspection, and there is no exhibition containment mode.
 - Steady state reuses the field buffers, the pyramid, transport and controller scratch, and the per-organism,
   demand, grant, packet, deposit, survivor and death buffers. Each tick still allocates its boxed candidate, the
   birth requests, the staged births and the report's event lists, which scale with births and deaths, not with the
-  population. Admitting scratch capacity during preflight is FL-014 and later.
+  population. Admitting scratch capacity during preflight comes later, with the CPU worker budget (§12.5).
 - The live-population quota counts every parent with a viable attempt as live. Its kept share is at least
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet

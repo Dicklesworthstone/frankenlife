@@ -172,6 +172,9 @@ Every issue is reported, not just the first.
   the capacity policy `pause-before-commit` (the whole tick pauses), the fault policy `stop-and-preserve` (the run
   stops on the committed state), and the founders' `uniform` initial positions and `zero` initial velocity, moved
   from FL-015. Founder positions draw words 0 and 1 of `(founders, organism, 0, lane (0, position, 0), 0)`.
+- FL-014, in `flife-runtime`: the command durability `volatile-in-memory`, §12.3's labelled best-effort mode.
+  Acceptance is held by the session owner and lost if the process ends. Appendix A's `write-ahead-before-apply`
+  stays `Specified` under FL-036, and a session refuses it until the journal exists.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
   vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it.
 - An `Implemented` entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited

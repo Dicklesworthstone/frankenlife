@@ -25,6 +25,9 @@
 //! - [`world`]: the ordered candidate tick (§8.1 phases 2–10) against the
 //!   committed world and its atomic epoch publication, with
 //!   `pause-before-commit` and `stop-and-preserve` (FL-013).
+//! - [`intervention`]: the canonical scientific interventions a session
+//!   seals at a tick boundary, applied with phase 2's external sources and
+//!   recorded in the ledger (FL-014).
 //!
 //! Each organism spends through a `flife_core::EnergyBudget` in the order of
 //! §8.2: it absorbs its gain, pays toxicity and maintenance, then pays for
@@ -37,6 +40,7 @@
 pub mod chemistry;
 pub mod costs;
 pub mod emission;
+pub mod intervention;
 pub mod lifecycle;
 pub mod motion;
 pub mod population;
@@ -48,6 +52,7 @@ pub use chemistry::{
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
+pub use intervention::{AppliedIntervention, Intervention};
 pub use lifecycle::{
     BudgetStage, DISSIPATE_AND_RECORD, Death, DeathCause, DeathSettlement, Disposition, Fate,
     GENETIC_AFFINITY, Recycling, TinyEnergyPolicy, Vitality,

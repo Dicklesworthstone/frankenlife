@@ -614,9 +614,9 @@ The repository holds:
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
-  (FL-006, FL-011–FL-013),
-  `crates/flife-neural` (FL-007, FL-008) and `crates/flife-genome` (FL-009, FL-010), each with its
-  `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
+  (FL-006, FL-011–FL-014),
+  `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010) and `crates/flife-runtime`
+  (FL-014), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -697,6 +697,22 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
   held output is invalid. Deposits and recycling are reduced after the grants, into the next field.
 - `World::digest` (`frankenlife.world-state.v1`) hashes the scientific state without slots, epoch or cursor. The
   small ecology in `tests/world.rs` pins it: moving that pin means the science changed, so say why.
+
+`flife-runtime` (FL-014) is the Asupersync world-session owner. One owner task holds the `World` and its
+`CommandBook` and is the only commit authority.
+- Clients use a `SessionHandle` over a reserved control lane and a bounded scientific lane. Admission never waits
+  for a tick.
+- `CommandBook` is a deterministic state machine:
+  - idempotency by `(session, command id)` and the canonical content hash;
+  - exact effective ticks, with late targets refused unless they permit retargeting;
+  - a schedule ordered by `(effective tick, admission order)` and sealed boundaries;
+  - an outcome stream distinct from admission order.
+- The owner seals a boundary's commands, prepares with `World::advance_with`, then yields and drains control before
+  publishing. A cancellation that arrives there discards the candidate and rebuilds it. Never publish a candidate
+  that holds a cancelled command, and never add a second commit path around the owner.
+- Durability is `volatile-in-memory` only. `write-ahead-before-apply` is refused until FL-036's journal exists.
+- Session tests run the owner and clients as Lab tasks. Assert outcomes against a directly stepped world, and sweep
+  seeds or yields until every side of a race is exercised.
 
 `flife-neural` (FL-007) is the sensor/action ABI. `observe` encodes a blended pyramid sample and the organism's
 own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y gradients saturated with

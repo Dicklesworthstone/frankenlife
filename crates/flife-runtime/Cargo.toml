@@ -1,0 +1,17 @@
+[package]
+name = "flife-runtime"
+description = "FrankenLife Asupersync world-session owner: command admission with idempotent command IDs, exact effective ticks, sealed boundaries, cancellation before publication and a responsive paused control loop"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+asupersync.workspace = true
+flife-core = { path = "../flife-core" }
+flife-engine = { path = "../flife-engine" }
+flife-field = { path = "../flife-field" }
+
+[lints]
+workspace = true

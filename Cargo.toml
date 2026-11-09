@@ -2,7 +2,8 @@
 resolver = "3"
 # Create only the crates each milestone needs (plan §18.1): FL-001's capability
 # probes, FL-002's core contracts, FL-003–FL-005's field, FL-006's
-# organism-phase operators, FL-007's sensor/action ABI, and FL-009's genomes.
+# organism-phase operators, FL-007's sensor/action ABI, FL-009's genomes, and
+# FL-014's session owner.
 members = [
     "crates/flife-core",
     "crates/flife-engine",
@@ -10,6 +11,7 @@ members = [
     "crates/flife-genome",
     "crates/flife-neural",
     "crates/flife-probes",
+    "crates/flife-runtime",
 ]
 
 [workspace.package]

@@ -94,6 +94,7 @@ use flife_neural::{
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
+use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
@@ -209,6 +210,9 @@ pub struct TickReport {
     pub closure: TickClosure,
     /// The run's ledger after the tick.
     pub ledger: LedgerReport,
+    /// The interventions applied at this tick's boundary, in their sealed
+    /// order (FL-014).
+    pub interventions: Vec<AppliedIntervention>,
 }
 
 /// The outcome of [`World::advance`].
@@ -722,6 +726,22 @@ impl World {
     /// [`CoreError::NumericalInvalid`] stops the run under
     /// `stop-and-preserve`.
     pub fn advance(&mut self) -> Result<Advance<'_>, CoreError> {
+        self.advance_with(&[])
+    }
+
+    /// Prepare the candidate for the next tick with `interventions`, the
+    /// sealed, admission-ordered set effective at the committed tick's
+    /// boundary (FL-014). They apply in order with phase 2's external
+    /// sources (see [`intervention`]).
+    ///
+    /// # Errors
+    /// As [`World::advance`]. An intervention that fails
+    /// [`Intervention::check`] is refused before anything is prepared and
+    /// does not stop the run.
+    pub fn advance_with(
+        &mut self,
+        interventions: &[Intervention],
+    ) -> Result<Advance<'_>, CoreError> {
         if let Some(fault) = &self.fault {
             return Err(CoreError::StateConflict {
                 operation: "advance world",
@@ -732,7 +752,11 @@ impl World {
                 ),
             });
         }
-        match self.prepare() {
+        let grid = self.field.current().grid();
+        for intervention in interventions {
+            intervention.check(grid)?;
+        }
+        match self.prepare(interventions) {
             Ok(Prepared::Ready(staged)) => Ok(Advance::Ready(Candidate {
                 world: self,
                 staged,
@@ -755,7 +779,16 @@ impl World {
     /// # Errors
     /// As [`World::advance`] and [`Candidate::publish`].
     pub fn step(&mut self) -> Result<Stepped, CoreError> {
-        match self.advance()? {
+        self.step_with(&[])
+    }
+
+    /// Advance with `interventions` and publish one tick, or report the
+    /// pause.
+    ///
+    /// # Errors
+    /// As [`World::advance_with`] and [`Candidate::publish`].
+    pub fn step_with(&mut self, interventions: &[Intervention]) -> Result<Stepped, CoreError> {
+        match self.advance_with(interventions)? {
             Advance::Ready(candidate) => Ok(Stepped::Published(Box::new(candidate.publish()?))),
             Advance::Paused(shortfall) => Ok(Stepped::Paused(shortfall)),
         }
@@ -765,7 +798,7 @@ impl World {
         clippy::too_many_lines,
         reason = "the ten ordered phases of §8.1 read top to bottom; each stage is its own function"
     )]
-    fn prepare(&mut self) -> Result<Prepared, CoreError> {
+    fn prepare(&mut self, interventions: &[Intervention]) -> Result<Prepared, CoreError> {
         let Self {
             rules,
             tick,
@@ -807,8 +840,10 @@ impl World {
         emissions.clear();
         recycling.clear();
 
-        // Phase 1: no commands yet (FL-014 admits them here).
-        // Phase 2: transport, then the sources sampled at mid-tick.
+        // Phase 1 sealed `interventions` at this boundary; they apply below,
+        // with phase 2's external sources.
+        // Phase 2: transport, then the sources sampled at mid-tick, then the
+        // interventions in their sealed order.
         let opening = Holdings::new(field.current().energy_total(), organism_total(population))?;
         let mut tick_ledger = ledger.open(from, opening)?;
         let mut next_paths = paths.clone();
@@ -836,6 +871,11 @@ impl World {
         )?;
         tick_ledger.record(Flow::SourcePower, field_step.injected_declared)?;
         tick_ledger.record(Flow::Decay, field_step.transport.decay_removed)?;
+        let mut applied = Vec::new();
+        {
+            let (_, next) = field.stage();
+            intervention::apply(from, interventions, next, &mut tick_ledger, &mut applied)?;
+        }
         let (_, observed) = field.stage();
         let observed: &FieldState = observed;
 
@@ -1091,6 +1131,7 @@ impl World {
             field: field_summary,
             closure,
             ledger: cumulative,
+            interventions: applied,
         };
         Ok(Prepared::Ready(Box::new(Staged {
             tick: to,

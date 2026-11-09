@@ -77,8 +77,8 @@ use flife_core::{
     Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
-    BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldGrid, FieldPair,
-    FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants, PyramidView,
+    Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldGrid, FieldPair,
+    FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorPyramid, Source, SourceKernel,
     TransportPlan, UptakeSummary, advance_field_on, apply_deposits, apply_grants, initial_source,
     resolve_uptake, saturating_request,
@@ -436,7 +436,8 @@ struct Scratch {
     working: Vec<Working>,
     demands: Vec<Demand>,
     grants: Grants,
-    order: Vec<usize>,
+    /// Each organism's grant packets, grouped by demand in cell order.
+    by_demand: Bins,
     packets: Vec<ChemicalPacket>,
     emissions: Deposits,
     recycling: Deposits,
@@ -948,7 +949,7 @@ impl World {
             working,
             demands,
             grants,
-            order,
+            by_demand,
             packets,
             emissions,
             recycling,
@@ -1055,22 +1056,25 @@ impl World {
             });
         }
         let uptake = resolve_uptake(observed, demands, grants)?;
-        by_demand(grants.packets(), order);
+        // The packets are in (cell, identity) order, so grouping them by
+        // demand keeps each organism's in cell order.
+        let granted = grants.packets();
+        by_demand.group(demands.len(), granted.len(), |at| {
+            granted.get(at).map_or(usize::MAX, |packet| packet.demand)
+        })?;
 
         // Phases 6 and 7: each organism's ordered budget stages.
-        let mut cursor = 0;
         for (index, organism) in working.iter_mut().enumerate() {
             packets.clear();
-            while let Some(packet) = order
-                .get(cursor)
-                .and_then(|&packet| grants.packets().get(packet))
-                .filter(|packet| packet.demand == index)
+            for packet in by_demand
+                .bucket(index)
+                .iter()
+                .filter_map(|&at| granted.get(at as usize))
             {
                 packets.push(ChemicalPacket {
                     granted: packet.granted,
                     composition: composition(observed, packet.cell)?,
                 });
-                cursor += 1;
             }
             let genome = genome_of(population, organism.committed.id)?;
             let parameters = parameter_count(&rules.catalog, genome)?;
@@ -1323,6 +1327,13 @@ impl Scratch {
     fn new(config: &ValidatedConfig, rules: &Rules, sources: usize) -> Result<Self, CoreError> {
         let limits = BufferLimits::host();
         let workers_configured = config.config().execution.cpu_workers;
+        // Contribution scratch for the largest live population (§9.4): every
+        // organism demands, emits and dies at most once per tick, and each
+        // touches at most four cells.
+        let organisms = rules.maximum_population;
+        let packets = organisms.checked_mul(4).ok_or(CoreError::Overflow {
+            quantity: "organism packets",
+        })?;
         Ok(Self {
             field: FieldWork::new(&rules.grid, &limits, workers(workers_configured)?)?,
             pyramid: SensorPyramid::from_config(config, &limits)?,
@@ -1331,11 +1342,11 @@ impl Scratch {
             sampled: Vec::with_capacity(sources),
             working: Vec::new(),
             demands: Vec::new(),
-            grants: Grants::new(),
-            order: Vec::new(),
+            grants: Grants::with_capacity(&rules.grid, organisms, &limits)?,
+            by_demand: Bins::with_capacity("organism packets", organisms, packets, &limits)?,
             packets: Vec::new(),
-            emissions: Deposits::new(),
-            recycling: Deposits::new(),
+            emissions: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
+            recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             survivors: Vec::new(),
             deaths: Vec::new(),
         })
@@ -1724,18 +1735,6 @@ fn parameter_count(catalog: &TopologyCatalog, genome: &Genome) -> Result<u32, Co
 }
 
 /// Packet indices grouped by demand, each group in cell order.
-fn by_demand(packets: &[GrantPacket], order: &mut Vec<usize>) {
-    order.clear();
-    order.extend(0..packets.len());
-    order.sort_unstable_by_key(|&index| {
-        packets
-            .get(index)
-            .map_or((usize::MAX, usize::MAX), |packet| {
-                (packet.demand, packet.cell)
-            })
-    });
-}
-
 fn find(working: &[Working], id: OrganismId) -> Option<&Working> {
     working
         .binary_search_by_key(&id, |organism| organism.committed.id)

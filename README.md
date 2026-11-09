@@ -62,7 +62,9 @@ Studio use it by default (`--controllers auto`). FL-028 puts every device buffer
 buffers, read and write leases that exclude each other, commands that hold what they bind until the GPU reports
 completion, and retirement that frees nothing still in use. FL-029 lets the owner submit several ordered kernels as
 one command: one command buffer, checked and held as a unit, whose receipt gives the epochs written, the kernels run
-and the GPU time. FL-019 adds five colour mappings (lineage, energy, generation,
+and the GPU time. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
+comparison sort: linear however organisms crowd, with scratch declared from the population maximum, in the same
+cell-then-identity order, so the world is bit-identical. FL-019 adds five colour mappings (lineage, energy, generation,
 motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
 FL-016 encodes a whole session, world and command book, as one sealed, chunked checkpoint (Appendix B.2). A
 world restored off phase, with newborns or after deaths publishes every later tick exactly as the uninterrupted
@@ -463,7 +465,7 @@ rust-toolchain.toml, .rustfmt.toml, clippy.toml       toolchain pin and lint set
 Cargo.toml, Cargo.lock                                the workspace, its pins and its root patches
 franken-stack.lock                                    the qualified dependency closure and its probe results
 crates/flife-core/                                    FL-002 IDs, clocks, units, errors, registry, config validation and hashes
-crates/flife-field/                                   FL-003–FL-005, FL-007, FL-011 F32 field buffers and layout, transport, decay, sources, uptake, sensor pyramid, emission deposits
+crates/flife-field/                                   FL-003–FL-005, FL-007, FL-011, FL-027 F32 field buffers and layout, transport, decay, sources, uptake, sensor pyramid, emission deposits, bounded cell bins
 crates/flife-engine/                                  FL-006 per-packet chemistry, toxicity, maintenance, affordable motion; FL-011 emission and the birth transaction; FL-012 death, recycling, live organism store; FL-013 the ordered candidate tick and epoch publication
 crates/flife-runtime/                                 FL-014 Asupersync session owner, command admission, sealed boundaries and cancellation
 crates/flife-render/                                  FL-017 immutable compact render epochs, bounded slots, per-viewer leases, identity matching

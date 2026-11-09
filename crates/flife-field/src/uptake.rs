@@ -6,7 +6,9 @@
 //!
 //! 1. Organism `i` requests `d_i ≥ 0`. The request is spread over its
 //!    exchange footprint as packets `q_ic = d_i w_ic`.
-//! 2. Packets are sorted by (cell, organism identity). Each cell sums its
+//! 2. Packets are grouped by cell, in organism identity order within each
+//!    cell, by [`Bins`]' counting sort (FL-027): `O(cells + packets)` and
+//!    bounded scratch, however the organisms cluster. Each cell sums its
 //!    demand `A_c` in that order and grants `u_ic = α_c q_ic`, where
 //!    `α_c = min(1, e_c/A_c)` and `α_c = 0` when `A_c = 0`.
 //!
@@ -48,9 +50,15 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, add_down};
 use flife_core::model::MOMENT_CHANNELS;
 
+use crate::bins::Bins;
 use crate::exchange::ExchangeStencil;
+use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
 use crate::state::FieldState;
+
+/// The most packets one organism's request becomes: its exchange footprint
+/// has at most four cells.
+const PACKETS_PER_DEMAND: u64 = 4;
 
 /// The finite-precision reconciliation this module implements.
 pub const CELL_QUANTUM_LARGEST_REMAINDER_V1: &str = "cell-quantum-largest-remainder-v1";
@@ -117,7 +125,7 @@ pub struct UptakeSummary {
 
 /// The grants of one resolution, reusable from tick to tick so that
 /// steady-state ticks do not allocate (§9.4).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Grants {
     grid: Option<FieldGrid>,
     packets: Vec<GrantPacket>,
@@ -125,9 +133,20 @@ pub struct Grants {
     totals: Vec<f64>,
     summary: UptakeSummary,
     applied: bool,
+    /// The most demands one resolution admits.
+    organisms: usize,
     identities: Vec<(OrganismId, usize)>,
+    /// Packets in organism identity order, before grouping by cell.
+    staged: Vec<GrantPacket>,
+    bins: Bins,
     shares: Vec<Share>,
     rank: Vec<usize>,
+}
+
+impl Default for Grants {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,10 +156,98 @@ struct Share {
 }
 
 impl Grants {
-    /// Empty grants.
+    /// Empty grants with no declared capacity: their scratch grows on demand
+    /// within the `u32` index range.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            grid: None,
+            packets: Vec::new(),
+            debits: Vec::new(),
+            totals: Vec::new(),
+            summary: UptakeSummary::default(),
+            applied: false,
+            organisms: usize::try_from(u32::MAX).unwrap_or(usize::MAX) / 4,
+            identities: Vec::new(),
+            staged: Vec::new(),
+            bins: Bins::new(UPTAKE_PACKETS),
+            shares: Vec::new(),
+            rank: Vec::new(),
+        }
+    }
+
+    /// Empty grants declared for at most `organisms` demands a resolution on
+    /// `grid` (§9.4). Their scratch is admitted against `limits` and
+    /// allocated now, so a resolution within the declaration never
+    /// allocates, and one beyond it is refused.
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] when a scratch buffer exceeds
+    /// `limits` or the `u32` index range; [`CoreError::Overflow`] if a byte
+    /// count overflows.
+    pub fn with_capacity(
+        grid: &FieldGrid,
+        organisms: u64,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
+        let overflow = || CoreError::Overflow {
+            quantity: UPTAKE_PACKETS,
+        };
+        let packets = organisms
+            .checked_mul(PACKETS_PER_DEMAND)
+            .ok_or_else(overflow)?;
+        let packet_bytes = packets
+            .checked_mul(std::mem::size_of::<GrantPacket>() as u64)
+            .ok_or_else(overflow)?;
+        limits.admit(UPTAKE_PACKETS, packet_bytes)?;
+        let bins = Bins::with_capacity(UPTAKE_PACKETS, grid.cell_count(), packets, limits)?;
+        let organisms = usize::try_from(organisms).map_err(|_| overflow())?;
+        let packets = usize::try_from(packets).map_err(|_| overflow())?;
+        let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+        Ok(Self {
+            packets: Vec::with_capacity(packets),
+            debits: Vec::with_capacity(packets.min(cells)),
+            totals: Vec::with_capacity(organisms),
+            organisms,
+            identities: Vec::with_capacity(organisms),
+            staged: Vec::with_capacity(packets),
+            bins,
+            // One cell may hold every packet: the hotspot.
+            shares: Vec::with_capacity(packets),
+            rank: Vec::with_capacity(packets),
+            ..Self::new()
+        })
+    }
+
+    /// The most demands one resolution admits.
+    #[must_use]
+    pub const fn organisms(&self) -> usize {
+        self.organisms
+    }
+
+    /// The cell bins of the last resolution: every packet's index in
+    /// [`Grants::packets`] order, grouped by cell (FL-027).
+    #[must_use]
+    pub const fn bins(&self) -> &Bins {
+        &self.bins
+    }
+
+    /// The allocated capacity of every scratch buffer, in entries: equal
+    /// before and after a resolution within the declaration.
+    #[must_use]
+    pub fn allocated(&self) -> [usize; 9] {
+        let (offsets, order) = self.bins.allocated();
+        [
+            self.packets.capacity(),
+            self.staged.capacity(),
+            self.debits.capacity(),
+            self.totals.capacity(),
+            self.identities.capacity(),
+            offsets,
+            order,
+            self.shares.capacity(),
+            self.rank.capacity(),
+        ]
     }
 
     /// Every packet, sorted by (cell, organism).
@@ -183,16 +290,39 @@ impl Grants {
         self.summary = UptakeSummary::default();
         self.applied = false;
         self.identities.clear();
+        self.staged.clear();
+        self.bins.clear();
     }
+}
+
+/// The name grants' scratch refusals carry.
+const UPTAKE_PACKETS: &str = "uptake packets";
+
+/// Check one demand and take its exchange footprint.
+fn footprint(grid: &FieldGrid, demand: &Demand) -> Result<ExchangeStencil, CoreError> {
+    if !demand.amount.is_finite() || demand.amount < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "uptake demand",
+            detail: format!(
+                "organism {} requests {}",
+                demand.organism.get(),
+                demand.amount
+            ),
+        });
+    }
+    ExchangeStencil::at(grid, demand.position)
 }
 
 /// Resolve `demands` against the immutable `field` snapshot into `grants`.
 /// The field is not changed; [`apply_grants`] debits it.
 ///
 /// # Errors
+/// - [`CoreError::BudgetExhausted`] for more demands than `grants` were
+///   declared for ([`Grants::with_capacity`]), before anything is staged.
 /// - [`CoreError::StateConflict`] when an organism demands twice.
 /// - [`CoreError::NumericalInvalid`] for a negative or nonfinite amount, a
-///   nonfinite position, or an invalid cell energy.
+///   nonfinite position, or an invalid cell energy. Of several invalid
+///   demands, the first in `demands` is reported.
 ///
 /// On error `grants` is left empty.
 pub fn resolve_uptake(
@@ -214,6 +344,13 @@ fn resolve_into(
     grants: &mut Grants,
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
+    if demands.len() > grants.organisms {
+        return Err(CoreError::BudgetExhausted {
+            budget: UPTAKE_PACKETS,
+            required: u64::try_from(demands.len()).unwrap_or(u64::MAX),
+            available: u64::try_from(grants.organisms).unwrap_or(u64::MAX),
+        });
+    }
     grants.identities.extend(
         demands
             .iter()
@@ -236,22 +373,27 @@ fn resolve_into(
             ),
         });
     }
-    for (index, demand) in demands.iter().enumerate() {
-        if !demand.amount.is_finite() || demand.amount < 0.0 {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "uptake demand",
-                detail: format!(
-                    "organism {} requests {}",
-                    demand.organism.get(),
-                    demand.amount
-                ),
-            });
-        }
-        let stencil = ExchangeStencil::at(&grid, demand.position)?;
+    // Stage packets in identity order. An organism's footprint names each
+    // cell at most once, so grouping them by cell gives (cell, identity)
+    // order.
+    for &(_, index) in &grants.identities {
+        let Some(demand) = demands.get(index) else {
+            continue;
+        };
+        let stencil = match footprint(&grid, demand) {
+            Ok(stencil) => stencil,
+            // Report the first invalid demand in the order given.
+            Err(error) => {
+                return Err(demands
+                    .iter()
+                    .find_map(|demand| footprint(&grid, demand).err())
+                    .unwrap_or(error));
+            }
+        };
         for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
             let requested = demand.amount * weight;
             if requested > 0.0 {
-                grants.packets.push(GrantPacket {
+                grants.staged.push(GrantPacket {
                     cell,
                     organism: demand.organism,
                     demand: index,
@@ -261,20 +403,31 @@ fn resolve_into(
             }
         }
     }
-    grants
-        .packets
-        .sort_unstable_by_key(|packet| (packet.cell, packet.organism));
+    let Grants {
+        staged,
+        bins,
+        packets,
+        debits,
+        shares,
+        rank,
+        ..
+    } = grants;
+    let cells = usize::try_from(grid.cell_count()).map_err(|_| CoreError::Overflow {
+        quantity: UPTAKE_PACKETS,
+    })?;
+    bins.group(cells, staged.len(), |at| {
+        staged.get(at).map_or(usize::MAX, |packet| packet.cell)
+    })?;
+    packets.extend(
+        bins.order()
+            .iter()
+            .filter_map(|&at| staged.get(at as usize).copied()),
+    );
 
     let energy = field.energy();
     let mut summary = UptakeSummary::default();
     let (mut requested, mut granted) = (CompensatedSum::ZERO, CompensatedSum::ZERO);
-    let mut start = 0;
-    while let Some(first) = grants.packets.get(start) {
-        let cell = first.cell;
-        let length = grants.packets[start..]
-            .iter()
-            .position(|packet| packet.cell != cell)
-            .unwrap_or(grants.packets.len() - start);
+    for (cell, range) in bins.occupied() {
         let value = energy
             .get(cell)
             .copied()
@@ -282,21 +435,18 @@ fn resolve_into(
                 buffer: "field",
                 detail: format!("exchange cell {cell} is not in this field"),
             })?;
-        let debit = resolve_cell(
-            &mut grants.packets[start..start + length],
-            cell,
-            value,
-            &mut grants.shares,
-            &mut grants.rank,
-        )?;
+        let length = range.len();
+        let Some(group) = packets.get_mut(range) else {
+            continue;
+        };
+        let debit = resolve_cell(group, cell, value, shares, rank)?;
         requested.add(debit.demanded);
         granted.add(debit.granted);
         summary.cells += 1;
         summary.contended_cells += usize::from(debit.contended);
         summary.drained_cells += usize::from(debit.granted > 0.0 && debit.energy_after == 0.0);
         summary.largest_cell_packets = summary.largest_cell_packets.max(length);
-        grants.debits.push(debit);
-        start += length;
+        debits.push(debit);
     }
     summary.requested = requested.value();
     summary.granted = granted.value();

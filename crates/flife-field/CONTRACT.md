@@ -21,10 +21,19 @@
   stable identity.
 - FL-011 (`flife-t24`) covers the reduction of paid emission deposits into the next field (§5.5, §8.1 phase 9,
   INV-03, INV-05, C.4). The emission settlement that stages them is `flife_engine::emission`.
+- FL-027 (`flife-9y8`) covers bounded bins for contribution reductions (§9.4, §11.2, §11.3). `Bins` is a stable
+  counting sort into compressed sparse rows. Uptake and deposits group their packets by cell through it, and
+  `flife-engine` groups each organism's grant packets through it. The work is `O(cells + packets)` however the
+  organisms cluster, the scratch is declared and admitted once, and the order is the deterministic route's:
+  ascending cell, then organism identity.
 
 **Inputs.**
 - A `FieldGrid` (cells and world size), or a `ValidatedConfig` (`world`, `[field_initialization]`, `[sources]`).
 - `BufferLimits`: the largest single buffer a backend can allocate.
+- FL-027's declared scratch: `Bins::with_capacity(name, buckets, items, &limits)`, and
+  `Grants::with_capacity` / `Deposits::with_capacity(&grid, organisms, &limits)` for at most `organisms`
+  demands or deposits per reduction. `Grants::new` and `Deposits::new` declare nothing and grow on demand within
+  the `u32` index range.
 - A `DeclaredLayout` read from a checkpoint or interchange record.
 - A `ConeTolerance` taken from the declared numerical profile.
 - `Source`s for this tick: identity, sampled center, chemical direction and power. Segment directions for
@@ -70,6 +79,10 @@
 - `deposit` (FL-011): reusable `Deposits` (`push`, `clear`, `len`, `is_applied`) and `apply_deposits`, which adds
   them to the field and returns a `DepositSummary` (organisms, cells, paid, offered and applied).
   `DepositSummary::record` books the reduction as one `emission` transfer in a `TickLedger`.
+- `bins` (FL-027): `Bins::group(buckets, items, bucket_of)`, then `order` (item indices, bucket by bucket),
+  `range` and `bucket` (one bucket), `occupied` (nonempty buckets, ascending), `largest` (the hotspot) and
+  `allocated`. `Grants::bins` and `Deposits::bins` expose the last reduction's bins, and their `allocated` gives
+  every scratch buffer's capacity.
 
 **Invariants — representation (FL-003).**
 - Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy
@@ -129,9 +142,10 @@
   periodically. A cell named twice on a grid one cell wide is combined into one entry, and zero weights are
   dropped. Every footprint cell lies within one cell spacing of `x`, so a long-range sensor never becomes
   long-range feeding.
-- The protocol has two passes over one immutable snapshot. First, each packet `q_ic = d_i w_ic` is formed, and
-  the packets are sorted by (cell, organism identity). Second, each cell sums `A_c` in that order and grants
-  with `α_c = min(1, e_c/A_c)`.
+- The protocol has two passes over one immutable snapshot. First, each packet `q_ic = d_i w_ic` is formed, in
+  organism identity order, and the packets are grouped by cell by `Bins` (FL-027). That is the order a sort by
+  (cell, organism identity) gives, since a footprint names each cell at most once. Second, each cell sums `A_c`
+  in that order and grants with `α_c = min(1, e_c/A_c)`.
 - Reconciliation follows `cell-quantum-largest-remainder-v1`.
   - A cell's F32 energy is `n_c` quanta of `Q_c`, its F32 unit in the last place. Grants are whole quanta.
   - A contended cell grants all `n_c` quanta. An uncontended cell grants `round(A_c/Q_c)` quanta, ties to
@@ -185,7 +199,8 @@
   Every cell but the largest-weight one (lowest index on a tie) gets `ρ w w_c` rounded to nearest, and that cell
   gets the remainder rounded down. So the packets never sum to more than the offer, exactly, and none is negative.
 - Energy and every moment component share each cell's packet: `(q_c, q_c a)`.
-- Packets are sorted by (cell, organism identity) and each cell sums them in that order, rounding down. The new
+- Packets are grouped by cell by `Bins`, in organism identity order within each cell (FL-027), and each cell
+  sums them in that order, rounding down. The new
   cell energy is the largest F32 value at or below `e_c + S_c`, so a deposit never creates energy. What the F32
   cell cannot hold is dissipated, like an uptake request below half a quantum.
 - The moment gains `(δ_c/S_c) Σ q a`, where `δ_c` is what the cell received, rounded once per component. The
@@ -195,6 +210,23 @@
 - Deposits are applied after the tick's uptake debits, and `apply_grants` refuses a field that has changed
   since its snapshot, so the order cannot be inverted. Nothing writes the observation snapshot, so a deposit is
   first sensed and absorbable on the next tick.
+
+**Invariants — bins (FL-027; §9.4, §11.2, §11.3).**
+- `Bins::group` is a stable counting sort: count each bucket's items, take the exclusive prefix sum, and scatter
+  the item indices in the order given. Within a bucket, items keep that order. Buckets come in ascending order,
+  and `offsets[b]..offsets[b + 1]` is bucket `b`.
+- The work is two passes over the items and one over the buckets, with no comparisons. One cell holding every
+  packet costs what a spread population does. `largest` reports the hotspot.
+- Capacity is declared when the bins are created (§9.4). The index buffers are admitted against `BufferLimits`
+  and allocated once. A grouping with more buckets or items than declared is refused, and so is an item whose
+  bucket is out of range. Either refusal leaves the bins empty. Indices are `u32`, the width a device buffer
+  holds.
+- Grants and deposits declared for `N` organisms admit `4N` packets. Grants also preallocate their per-cell
+  largest-remainder scratch for `4N`, since one cell may hold every packet. A reduction within the declaration
+  never allocates (`allocated` is unchanged). Demands beyond it are refused before anything is staged, and so is
+  a deposit pushed beyond it. `flife-engine` declares them from `population.maximum_count`.
+- Of several invalid demands, the first in the order given is reported, although packets are staged in identity
+  order.
 
 **Refusal cases.**
 - Representation: a zero cell count, or a nonfinite or nonpositive world or cell side; byte counts past
@@ -220,6 +252,10 @@
   the unit ball; a nonfinite position; staging on another grid, or after the deposits were applied (until
   `clear`); applying twice, to another grid, with one organism staged twice, or to a field missing a moment
   plane. Nothing is written on a refusal.
+- Bins and declared scratch (FL-027): bins, grants or deposits whose index buffers exceed `BufferLimits` or the
+  `u32` index range (`BudgetExhausted`); a grouping with more buckets or items than declared
+  (`BudgetExhausted`), or an item outside its buckets (`LayoutMismatch`); more demands, or more deposits staged,
+  than declared (`BudgetExhausted`, named `uptake packets` or `deposit packets`).
 - Invariants: the first cell that violates INV-01 or INV-02.
 
 **Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
@@ -275,6 +311,36 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
     within the speed limit and join continuously.
   - A path unaffected by another source's advances.
   - A moved source keeping its chemistry.
+- `tests/bins.rs` (FL-027, 6 tests). The oracles do not use `Bins`: a stable sort of item indices by bucket, and
+  a sort of every footprint packet by (cell, organism), the rule before FL-027.
+  - `bins_are_a_stable_sort_by_bucket_whatever_the_clustering`: 50,000 items spread over 1,000 buckets, all in
+    one bucket, a third in the last, none, and one bucket. Each matches the oracle, with its bucket counts,
+    occupied buckets and hotspot size, and nothing is allocated.
+  - `bins_refuse_what_they_did_not_declare_and_are_left_empty`: too many buckets or items, a bucket out of range,
+    a declaration above `BufferLimits` (20 bytes against 16) or past `u32`.
+  - `uptake_is_the_sorted_reduction_in_any_demand_order_and_any_clustering`: 6,000 demands on 32×24 cells. A
+    quarter are in one cell, a quarter crowd 3×3 cells, every 17th asks for nothing, and identities are scattered.
+    The packets equal the oracle's. Three shuffles of the demands give the same summary, debits, packets and
+    totals, bit for bit, and nothing is allocated.
+  - `a_hotspot_of_every_organism_drains_its_cell_exactly_and_ties_go_to_lower_identities`: 20,000 equal demands
+    in one cell, given in descending identity order. The cell is drained exactly, the shares differ by one
+    quantum with the extra quanta at the lowest identities, and the hotspot allocates nothing.
+  - `uptake_beyond_its_declaration_is_refused_before_anything_is_staged`: 40 demands against 39, with nothing
+    staged or allocated, then 39 admitted. Of two invalid demands, the earlier one is reported, although the
+    later one has the lower identity.
+  - `deposits_reduce_the_same_in_any_staging_order_and_any_clustering`: 5,000 deposits staged in three orders give
+    bit-identical fields (energy and all 32 moment planes) and summaries, with nothing allocated. A third deposit
+    against a declaration of two is refused.
+- FL-027's planted mutants, each run against both crates' suites in a scratch copy: 12 planted, 11 caught.
+  - Caught: a bucket scattered in reverse; bucket starts not restored; the item limit unchecked; the hotspot size
+    unreported; uptake packets staged in demand order; uptake's or deposits' declaration unchecked; the
+    identity-first invalid demand reported; hotspot scratch not preallocated; deposit packets sequenced in
+    staging order; each organism given its neighbour's packets (caught by `flife-engine`'s pinned world digests).
+  - Survived, judged equivalent: an organism's packets taken in reverse cell order. Chemistry sums at most four
+    packets with compensated sums, which round the same in either order, and the pinned world digest did not
+    change.
+- Whole worlds: the preset (4,096 founders, 512 ticks, 80 births) gives the same digest before and after FL-027,
+  on 3 and 16 CPU workers and with Metal controllers.
 - The pyramid's tests live in `flife-neural`'s `tests/sensing.rs`, next to the sensor encoding they feed: a slow
   direct oracle at every level, C.10's uniform field, knots and edges, translations, and refusals.
 - The deposit reduction's tests live in `flife-engine`'s `tests/emission_births.rs` (FL-011), next to the
@@ -302,6 +368,10 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   and death are FL-012. Recycling a dead organism's energy reuses `Deposits` as a separate reduction booked under
   `Transfer::Recycling` (FL-012, `flife_engine::Recycling`). Device arrangements, device alignment and sharding belong to the Metal backend.
   Whole-run memory admission is FL-043.
+- FL-027 is the CPU reference. A device route (FL-031) can mirror it with a device prefix sum and scatter. Each
+  cell's sum stays sequential in identity order there too, which keeps it bit-identical: a hotspot cell's sum
+  is serial over its packets. A fixed parallel reduction tree would change the rounding, so it would be a
+  separate numerical profile (§11.3, §11.4).
 - The pyramid is rebuilt in full every tick in F64 (two thirds of the F32 base field's bytes). An F32 or Metal
   pyramid is a separate numerical profile. Its contract, with the sensor encoding, is
   `crates/flife-neural/CONTRACT.md`.

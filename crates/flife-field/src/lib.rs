@@ -40,6 +40,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bins;
 pub mod deposit;
 pub mod exchange;
 pub mod footprint;
@@ -55,6 +56,7 @@ pub mod step;
 pub mod transport;
 pub mod uptake;
 
+pub use bins::Bins;
 pub use deposit::{DepositSummary, Deposits, apply_deposits};
 pub use exchange::{ExchangeStencil, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};

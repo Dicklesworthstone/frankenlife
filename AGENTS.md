@@ -620,7 +620,7 @@ The repository holds:
 - the work graph in `.beads/` (58 beads, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
-  numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
+  numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid, FL-011 deposits and FL-027 bins), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
   (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039), and

@@ -462,7 +462,12 @@ velocity, first-order splitting at the configured fixed timestep.
 - Steady state reuses the field buffers, the pyramid, transport and controller scratch, and the per-organism,
   demand, grant, packet, deposit, survivor and death buffers. Each tick still allocates its boxed candidate, the
   birth requests, the staged births and the report's event lists, which scale with births and deaths, not with the
-  population. Admitting scratch capacity during preflight comes later, with the CPU worker budget (§12.5).
+  population. FL-027 declares the contribution scratch when the world is built, from `population.maximum_count`,
+  and admits it against `BufferLimits`: the grants, both deposit reductions, and `Bins` grouping each organism's
+  grant packets. The tick groups packets by cell and by organism with `flife_field::Bins` counting sorts instead
+  of comparison sorts, in the same order, so the world is bit-identical. A reduction within the declaration
+  allocates nothing, a hotspot included. Admitting the rest of the scratch, with the CPU worker budget, comes
+  later (§12.5, FL-043).
 - The live-population quota counts every parent with a viable attempt as live. Its kept share is at least
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet

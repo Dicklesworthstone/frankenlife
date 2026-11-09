@@ -12,7 +12,9 @@
 //! largest weight is at least a quarter.
 //!
 //! The reduction:
-//! - Packets are sorted by (cell, organism identity). Each cell sums its
+//! - Packets are grouped by cell, in organism identity order within each
+//!   cell, by [`Bins`]' counting sort (FL-027): `O(cells + packets)` and
+//!   bounded scratch, however the organisms cluster. Each cell sums its
 //!   packets in that order, rounding every partial sum down, so its total
 //!   `S_c` never exceeds the exact sum.
 //! - The cell's new energy `e'_c` is the largest F32 value at or below
@@ -44,9 +46,18 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, TickLedger, Transfer, add_down, sub_down};
 use flife_core::model::MOMENT_CHANNELS;
 
+use crate::bins::Bins;
 use crate::exchange::ExchangeStencil;
+use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
 use crate::state::{CHANNELS, FieldState};
+
+/// The name deposits' scratch refusals carry.
+const DEPOSIT_PACKETS: &str = "deposit packets";
+
+/// The most packets one deposit becomes: its footprint has at most four
+/// cells.
+const PACKETS_PER_DEPOSIT: u64 = 4;
 
 /// One organism's staged deposit.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -55,6 +66,9 @@ struct Entry {
     paid: f64,
     offered: f64,
     direction: [f64; CHANNELS],
+    /// Its packets: `packets[first..first + count]`.
+    first: usize,
+    count: usize,
 }
 
 /// One cell's share of an entry.
@@ -110,21 +124,88 @@ impl DepositSummary {
 
 /// Deposits staged during one tick, reusable from tick to tick so that
 /// steady-state ticks do not allocate (§9.4).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Deposits {
     grid: Option<FieldGrid>,
     entries: Vec<Entry>,
     packets: Vec<Packet>,
     cells: Vec<CellDeposit>,
-    identities: Vec<OrganismId>,
+    /// Each entry's organism and index, sorted by organism.
+    identities: Vec<(OrganismId, usize)>,
+    /// Packet indices in organism identity order, before grouping by cell.
+    sequence: Vec<u32>,
+    bins: Bins,
+    /// The most deposits one reduction admits.
+    organisms: usize,
     applied: bool,
 }
 
+impl Default for Deposits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Deposits {
-    /// No deposits.
+    /// No deposits, with no declared capacity: their scratch grows on demand
+    /// within the `u32` index range.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            grid: None,
+            entries: Vec::new(),
+            packets: Vec::new(),
+            cells: Vec::new(),
+            identities: Vec::new(),
+            sequence: Vec::new(),
+            bins: Bins::new(DEPOSIT_PACKETS),
+            organisms: usize::try_from(u32::MAX).unwrap_or(usize::MAX) / 4,
+            applied: false,
+        }
+    }
+
+    /// No deposits, declared for at most `organisms` deposits a reduction on
+    /// `grid` (§9.4). Their scratch is admitted against `limits` and
+    /// allocated now, so staging and reducing within the declaration never
+    /// allocates, and staging beyond it is refused.
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] when a scratch buffer exceeds
+    /// `limits` or the `u32` index range; [`CoreError::Overflow`] if a byte
+    /// count overflows.
+    pub fn with_capacity(
+        grid: &FieldGrid,
+        organisms: u64,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
+        let overflow = || CoreError::Overflow {
+            quantity: DEPOSIT_PACKETS,
+        };
+        let packets = organisms
+            .checked_mul(PACKETS_PER_DEPOSIT)
+            .ok_or_else(overflow)?;
+        let entry_bytes = organisms
+            .checked_mul(std::mem::size_of::<Entry>() as u64)
+            .ok_or_else(overflow)?;
+        let cell_bytes = packets
+            .checked_mul(std::mem::size_of::<CellDeposit>() as u64)
+            .ok_or_else(overflow)?;
+        limits.admit(DEPOSIT_PACKETS, entry_bytes)?;
+        limits.admit(DEPOSIT_PACKETS, cell_bytes)?;
+        let bins = Bins::with_capacity(DEPOSIT_PACKETS, grid.cell_count(), packets, limits)?;
+        let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+        let organisms = usize::try_from(organisms).map_err(|_| overflow())?;
+        let packets = usize::try_from(packets).map_err(|_| overflow())?;
+        Ok(Self {
+            entries: Vec::with_capacity(organisms),
+            packets: Vec::with_capacity(packets),
+            cells: Vec::with_capacity(packets.min(cells)),
+            identities: Vec::with_capacity(organisms),
+            sequence: Vec::with_capacity(packets),
+            bins,
+            organisms,
+            ..Self::new()
+        })
     }
 
     /// Forget every staged deposit, keeping the buffers.
@@ -134,7 +215,38 @@ impl Deposits {
         self.packets.clear();
         self.cells.clear();
         self.identities.clear();
+        self.sequence.clear();
+        self.bins.clear();
         self.applied = false;
+    }
+
+    /// The most deposits one reduction admits.
+    #[must_use]
+    pub const fn organisms(&self) -> usize {
+        self.organisms
+    }
+
+    /// The cell bins of the last reduction: positions in the reduction's
+    /// identity-ordered packet sequence, grouped by cell (FL-027).
+    #[must_use]
+    pub const fn bins(&self) -> &Bins {
+        &self.bins
+    }
+
+    /// The allocated capacity of every scratch buffer, in entries: equal
+    /// before and after staging and reducing within the declaration.
+    #[must_use]
+    pub fn allocated(&self) -> [usize; 7] {
+        let (offsets, order) = self.bins.allocated();
+        [
+            self.entries.capacity(),
+            self.packets.capacity(),
+            self.cells.capacity(),
+            self.identities.capacity(),
+            self.sequence.capacity(),
+            offsets,
+            order,
+        ]
     }
 
     /// Staged deposits.
@@ -162,6 +274,8 @@ impl Deposits {
     /// # Errors
     /// - [`CoreError::StateConflict`] when the deposits were already
     ///   applied, or were staged for another grid.
+    /// - [`CoreError::BudgetExhausted`] for more deposits than these were
+    ///   declared for ([`Deposits::with_capacity`]).
     /// - [`CoreError::NumericalInvalid`] for a nonfinite or negative amount,
     ///   an offer above the payment, a nonfinite direction or one outside
     ///   the unit ball (squares summed in channel order), or a nonfinite
@@ -187,6 +301,13 @@ impl Deposits {
             return Err(CoreError::StateConflict {
                 operation: "stage deposit",
                 detail: "these deposits were staged for another grid".into(),
+            });
+        }
+        if self.entries.len() >= self.organisms {
+            return Err(CoreError::BudgetExhausted {
+                budget: DEPOSIT_PACKETS,
+                required: u64::try_from(self.entries.len() + 1).unwrap_or(u64::MAX),
+                available: u64::try_from(self.organisms).unwrap_or(u64::MAX),
             });
         }
         for (quantity, value) in [("deposit payment", paid), ("deposit offer", offered)] {
@@ -216,12 +337,7 @@ impl Deposits {
         let entry = self.entries.len();
         let shares = split(&stencil, offered);
         self.grid = Some(*grid);
-        self.entries.push(Entry {
-            organism,
-            paid: paid + 0.0,
-            offered: offered + 0.0,
-            direction: *direction,
-        });
+        let first = self.packets.len();
         for (&cell, &amount) in stencil.cells().iter().zip(&shares) {
             if amount > 0.0 {
                 self.packets.push(Packet {
@@ -232,6 +348,14 @@ impl Deposits {
                 });
             }
         }
+        self.entries.push(Entry {
+            organism,
+            paid: paid + 0.0,
+            offered: offered + 0.0,
+            direction: *direction,
+            first,
+            count: self.packets.len() - first,
+        });
         Ok(())
     }
 }
@@ -300,18 +424,22 @@ pub fn apply_deposits(
         ));
     }
     deposits.identities.clear();
-    deposits
-        .identities
-        .extend(deposits.entries.iter().map(|entry| entry.organism));
+    deposits.identities.extend(
+        deposits
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.organism, index)),
+    );
     deposits.identities.sort_unstable();
     if let Some(pair) = deposits
         .identities
         .windows(2)
-        .find(|pair| pair[0] == pair[1])
+        .find(|pair| pair[0].0 == pair[1].0)
     {
         return Err(conflict(format!(
             "{} staged two deposits in one reduction",
-            pair[0]
+            pair[0].0
         )));
     }
     if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
@@ -331,19 +459,44 @@ pub fn apply_deposits(
     summary.paid = paid.value();
     summary.offered = offered.value();
 
-    deposits
-        .packets
-        .sort_unstable_by_key(|packet| (packet.cell, packet.organism));
-    deposits.cells.clear();
+    // Packets in identity order. An organism's footprint names each cell at
+    // most once, so grouping them by cell gives (cell, identity) order.
+    let Deposits {
+        entries,
+        packets,
+        cells,
+        identities,
+        sequence,
+        bins,
+        ..
+    } = deposits;
+    sequence.clear();
+    for &(_, index) in identities.iter() {
+        if let Some(entry) = entries.get(index) {
+            // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
+            sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
+        }
+    }
+    let buckets = usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
+        quantity: DEPOSIT_PACKETS,
+    })?;
+    bins.group(buckets, sequence.len(), |at| {
+        sequence
+            .get(at)
+            .and_then(|&packet| packets.get(packet as usize))
+            .map_or(usize::MAX, |packet| packet.cell)
+    })?;
+    cells.clear();
     let energy = field.energy();
     let mut applied = CompensatedSum::ZERO;
-    for group in deposits
-        .packets
-        .chunk_by(|left, right| left.cell == right.cell)
-    {
-        let Some(&Packet { cell, .. }) = group.first() else {
-            continue;
-        };
+    for (cell, range) in bins.occupied() {
+        let group = bins
+            .order()
+            .get(range)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|&at| sequence.get(at as usize))
+            .filter_map(|&packet| packets.get(packet as usize));
         let before = energy
             .get(cell)
             .copied()
@@ -355,8 +508,7 @@ pub fn apply_deposits(
         let mut moment = [0.0; CHANNELS];
         for packet in group {
             total = add_down(total, packet.amount);
-            let direction = deposits
-                .entries
+            let direction = entries
                 .get(packet.entry)
                 .map_or(&[0.0; CHANNELS], |entry| &entry.direction);
             for (slot, &component) in moment.iter_mut().zip(direction) {
@@ -370,7 +522,7 @@ pub fn apply_deposits(
             *slot *= factor;
         }
         applied.add(received);
-        deposits.cells.push(CellDeposit {
+        cells.push(CellDeposit {
             cell,
             after,
             moment,

@@ -163,7 +163,14 @@ weights: the reference F32 profile of §10.3.
 - The reference controller is scalar and single-threaded: 9,856 multiply-adds per default evaluation, written for
   a declared order rather than for speed. Population inference is FL-025 (FrankenTorch CPU) and FL-030 (Metal),
   each a separate numerical profile compared against this one under declared tolerances. Metal contracts
-  multiply-adds by default, so bitwise parity is not expected there.
+  multiply-adds by default, so bitwise parity is not expected there. (FrankenTorch's gateway compiles in an
+  IEEE-safe mode, which may make it reachable; not yet tested.)
+- Measured and not adopted (2026-11-09): the hidden `tanh` is the largest single item in a steady-state CPU profile
+  (`expm1_neg` under `tanh` under `evaluate`), about 9.5 ns a call. Replacing its series divisions by `k` with
+  multiplications by `1/k` and guarding the F32 rounding is exact after rounding for every F32 (checked
+  exhaustively over the 1.1e9 positive inputs below 20), but measured 9.6 ns a call and no faster per tick
+  (interleaved A/B, 1 and 16 threads, same digest): on this core F64 division pipelines as well as the
+  multiplications do. A faster activation needs fewer operations, not cheaper ones.
 - Genome storage, the `f32` weight-dtype entry (canonical rounding and checkpoint identity), the
   `fan-in-scaled-symmetric-v1` initializer and the topology catalog are FL-009. The tests draw A.3 item 2's
   distribution from a local generator, not from FL-010's Philox addressing.

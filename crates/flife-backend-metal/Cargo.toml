@@ -1,0 +1,16 @@
+[package]
+name = "flife-backend-metal"
+description = "FrankenLife's Metal backend: every due organism's own controller in one fused dispatch, bit-identical to the reference controller, through FrankenTorch's Metal compute gateway"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+flife-core = { path = "../flife-core" }
+flife-neural = { path = "../flife-neural" }
+ft-kernel-metal.workspace = true
+
+[lints]
+workspace = true

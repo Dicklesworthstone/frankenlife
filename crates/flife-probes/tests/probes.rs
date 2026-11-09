@@ -1,6 +1,7 @@
 //! FL-001 acceptance: each capability probe qualifies against its oracle on
 //! every host, except Metal, which is qualified on macOS and reported
-//! unavailable elsewhere. The native-input gap stays visible until FL-018.
+//! unavailable elsewhere. Native input is typed on every host since FL-018;
+//! the window half runs from the `flife-probe --window` binary.
 
 use flife_probes::{ProbeReport, Verdict};
 
@@ -65,12 +66,21 @@ fn metal_is_qualified_on_macos_and_unavailable_elsewhere() {
 }
 
 #[test]
-fn native_input_gap_is_reported_with_its_bead() {
+fn native_input_is_typed_and_bounded() {
     let report = flife_probes::native_input_probe();
-    match &report.verdict {
-        Verdict::Gap { bead, .. } => assert_eq!(*bead, flife_probes::INPUT_HOST_BEAD),
-        other => panic!("native input must stay a tracked gap until FL-018, got {other}"),
-    }
+    assert_qualified(&report);
+    let kinds = report
+        .evidence
+        .iter()
+        .find(|(key, _)| *key == "input_events")
+        .map(|(_, value)| value.as_str());
+    assert_eq!(
+        kinds,
+        Some(
+            "pointer-moved,button,scroll,key,modifiers-changed,focus-gained,focus-lost,\
+             pointer-capture-lost,resized"
+        )
+    );
 }
 
 #[test]

@@ -19,8 +19,8 @@ as NDJSON lines (`flife.probe.v1`) and exits 0 (no failure), 1 (a probe failed) 
 | `tensor` | FrankenTorch CPU `matmul` | Exact integer arithmetic |
 | `manim_frame` | `fmn::render` of a seeded 256-dot `DotCloud`, certified mode, camera route, rendered twice | Byte-identical re-render, one published frame, and a digest that differs from an empty-scene control |
 | `metal` | Gateway compiles MSL, dispatches 256 threads, reads back `2x+1` | Exact f32 arithmetic |
-| `native_input` | The presenter's event surface | The pinned `PresentationState` enum, matched without a wildcard |
-| `native_window` (opt-in) | A real window opens, is polled and closes | States observed |
+| `native_input` | The presenter's typed input API: one value of each of the nine `InputEvent` kinds, the bounded queue, the surface states (FL-018) | The pinned `InputEvent` and `PresentationState` enums, matched without a wildcard; nine distinct kind names |
+| `native_window` (opt-in) | A real window opens, its typed input is polled, and it closes (FL-018) | Its own `Resized` event reports the requested 320 × 180 points, with nothing dropped |
 
 **Invariants.** No probe reports `qualified` for work it did not do. A missing host capability is `unavailable`; a
 capability missing upstream is `gap` with its bead; a wrong answer or an error is `failed`.
@@ -35,6 +35,6 @@ and Linux x86_64 (AMD EPYC Genoa); see `franken-stack.lock` `[probes]`.
 **Validity domain.** The commits in `franken-stack.lock` and the toolchain in `rust-toolchain.toml`. The Metal and
 window probes need macOS with a GPU and, for the window, a window server and the main thread.
 
-**Known gaps.** Native typed input (pointer, scroll, key, modifier, resize, focus) is absent from the pinned
-presenter. It is tracked by FL-018 (`flife-jdf`) and blocks interactive Studio, not the headless stack. The window
-probe is not run in `cargo test`, because test threads are not the main thread.
+**Known gaps.** The window probe is not run in `cargo test`, because test threads are not the main thread. It
+observes the window's own geometry and focus events; delivery of posted pointer and key events is qualified by
+frankentorch's `native_input` test and FL-018's live Studio test, not by this probe.

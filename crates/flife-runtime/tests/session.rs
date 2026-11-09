@@ -431,6 +431,51 @@ fn a_pause_while_running_takes_effect_at_a_reported_boundary() {
     }
 }
 
+#[test]
+fn a_started_run_reports_its_start_at_once_and_its_end_later() {
+    let config = ecology(&[]);
+    for seed in 0..6 {
+        let (results, closed) = lab(seed, &config, |handle| {
+            vec![Box::pin(async move {
+                let cx = cx();
+                // An open-ended run returns its start at once and ends on a
+                // pause, at the boundary the pause reports.
+                let running = handle.start(&cx, None).await.expect("start");
+                assert_eq!(running.started().tick, Tick::new(0));
+                while handle.inspect(&cx).await.expect("inspect").boundary.tick < Tick::new(2) {
+                    yield_now().await;
+                }
+                let paused = handle.pause(&cx).await.expect("pause");
+                let end = running.ended(&cx).await.expect("end");
+                assert_eq!(end, RunEnd::Paused(paused));
+                // A bounded run ends at its tick, and the next starts there.
+                let running = handle
+                    .start(&cx, Some(Tick::new(paused.tick.get() + 3)))
+                    .await
+                    .expect("start");
+                assert_eq!(running.started(), paused);
+                let reached = running.ended(&cx).await.expect("end");
+                let RunEnd::Reached(reached) = reached else {
+                    panic!("not reached: {reached:?}");
+                };
+                assert_eq!(reached.tick.get(), paused.tick.get() + 3);
+                // A run that is open when the session closes ends closed.
+                let running = handle.start(&cx, None).await.expect("start");
+                let boundary = handle.close(&cx).await.expect("close");
+                assert_eq!(
+                    running.ended(&cx).await.expect("end"),
+                    RunEnd::Closed(boundary)
+                );
+                Some(boundary)
+            }) as Client<Option<Boundary>>]
+        });
+        let boundary = results[0].expect("closed");
+        assert_eq!(closed.boundary, boundary);
+        let expected = reference(&config, boundary.tick.get(), &[]);
+        assert_eq!(closed.world.digest(), expected.digest());
+    }
+}
+
 /// The tick at which the population cap first pauses this world.
 #[expect(
     clippy::panic,

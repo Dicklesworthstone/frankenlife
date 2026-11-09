@@ -597,12 +597,11 @@ pub fn metal_probe() -> ProbeReport {
 
 // ------------------------------------------------------------- native input
 
-/// The bead that owns the native input host (FL-018).
+/// The bead that built the native input host (FL-018).
 pub const INPUT_HOST_BEAD: &str = "flife-jdf";
 
 /// Every state the pinned presenter can report. The match has no wildcard,
-/// so an upstream variant (an input event, say) breaks this build and forces
-/// requalification of [`native_input_probe`].
+/// so an upstream variant breaks this build and forces requalification.
 #[must_use]
 pub fn surface_state_name(state: ft_kernel_metal::presentation::PresentationState) -> &'static str {
     use ft_kernel_metal::presentation::PresentationState;
@@ -613,41 +612,121 @@ pub fn surface_state_name(state: ft_kernel_metal::presentation::PresentationStat
     }
 }
 
-/// The native presenter that FrankenManim's Studio uses delivers no typed
-/// input. `NativePresenter::poll_events` returns one `PresentationState`
-/// (visible, occluded or closed), so pointer, scroll, key, modifier, resize
-/// and focus events never reach a consumer (plan §13.1, S21). This probe
-/// records the gap against the pinned API. It is closed by host work, not by
-/// a fallback.
+/// The kind of every typed input event the pinned presenter can deliver.
+/// The match has no wildcard, so an upstream variant breaks this build and
+/// forces requalification of [`native_input_probe`] and the Studio controls.
+#[must_use]
+pub fn input_event_name(event: &ft_kernel_metal::presentation::InputEvent) -> &'static str {
+    use ft_kernel_metal::presentation::InputEvent;
+    match event {
+        InputEvent::PointerMoved { .. } => "pointer-moved",
+        InputEvent::Button { .. } => "button",
+        InputEvent::Scroll { .. } => "scroll",
+        InputEvent::Key { .. } => "key",
+        InputEvent::ModifiersChanged { .. } => "modifiers-changed",
+        InputEvent::FocusGained => "focus-gained",
+        InputEvent::FocusLost => "focus-lost",
+        InputEvent::PointerCaptureLost { .. } => "pointer-capture-lost",
+        InputEvent::Resized(_) => "resized",
+    }
+}
+
+/// The pinned presenter's typed input API, checked statically: one value of
+/// each [`InputEvent`](ft_kernel_metal::presentation::InputEvent) kind
+/// decodes through [`input_event_name`], and the queue is bounded. The
+/// runtime half, a real window delivering real events, is
+/// [`native_window_probe`] and FL-018's live Studio test (plan §13.1, S21).
 #[must_use]
 pub fn native_input_probe() -> ProbeReport {
-    use ft_kernel_metal::presentation::PresentationState;
+    use ft_kernel_metal::presentation::{
+        ButtonSet, INPUT_QUEUE_CAPACITY, InputEvent, LogicalPoint, Modifiers, PointerButton,
+        PresentationState, ScrollUnit, SurfaceMetrics,
+    };
+    let at = LogicalPoint { x: 1.0, y: 2.0 };
+    let none = Modifiers::NONE;
+    let events = [
+        InputEvent::PointerMoved {
+            position: at,
+            buttons: ButtonSet::EMPTY,
+            modifiers: none,
+        },
+        InputEvent::Button {
+            button: PointerButton::Primary,
+            pressed: true,
+            position: at,
+            clicks: 1,
+            modifiers: none,
+        },
+        InputEvent::Scroll {
+            delta: [0.0, 1.0],
+            unit: ScrollUnit::Points,
+            position: at,
+            modifiers: none,
+        },
+        InputEvent::Key {
+            code: 49,
+            text: " ".into(),
+            pressed: true,
+            repeat: false,
+            modifiers: none,
+        },
+        InputEvent::ModifiersChanged { modifiers: none },
+        InputEvent::FocusGained,
+        InputEvent::FocusLost,
+        InputEvent::PointerCaptureLost {
+            released: ButtonSet::EMPTY.with(PointerButton::Primary),
+        },
+        InputEvent::Resized(SurfaceMetrics {
+            logical_width: 320.0,
+            logical_height: 180.0,
+            backing_scale: 2.0,
+            drawable_width: 320,
+            drawable_height: 180,
+        }),
+    ];
+    let kinds: Vec<&str> = events.iter().map(input_event_name).collect();
     let states = [
         PresentationState::Visible,
         PresentationState::Occluded,
         PresentationState::Closed,
     ]
     .map(surface_state_name);
+    let mut distinct = kinds.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let verdict = if distinct.len() == events.len() && INPUT_QUEUE_CAPACITY > 0 {
+        Verdict::Qualified
+    } else {
+        Verdict::Failed(format!(
+            "{} input kinds decode to {} names; queue capacity {INPUT_QUEUE_CAPACITY}",
+            events.len(),
+            distinct.len()
+        ))
+    };
     ProbeReport {
         probe: "native_input",
-        verdict: Verdict::Gap {
-            bead: INPUT_HOST_BEAD,
-            detail: "NativePresenter::poll_events reports only surface state; no pointer, scroll, \
-                     key, modifier, resize or focus event is delivered"
-                .into(),
-        },
-        evidence: vec![("presentation_states", states.join(","))],
+        verdict,
+        evidence: vec![
+            ("input_events", kinds.join(",")),
+            ("queue_capacity", INPUT_QUEUE_CAPACITY.to_string()),
+            ("presentation_states", states.join(",")),
+        ],
     }
 }
 
-/// Open a real native preview window, poll it for `polls` frames and close
-/// it, recording every surface state observed. This is the runtime half of
-/// the input-gap evidence. It must run on the main thread (a binary's
-/// `main`, not a test harness thread), and it opens a window.
+/// Open a real native preview window, poll its typed input for `polls`
+/// frames and close it. Qualified when the window reports its real content
+/// geometry (a `resized` event with the requested logical size) and every
+/// event decodes; the evidence records each kind seen, focus included. It
+/// must run on the main thread (a binary's `main`, not a test harness
+/// thread), and it opens a window.
 #[must_use]
 pub fn native_window_probe(polls: u32) -> ProbeReport {
     use ft_kernel_metal::compute::Gateway;
-    use ft_kernel_metal::presentation::{NativePresenter, PresentationConfig, PresentationError};
+    use ft_kernel_metal::presentation::{
+        InputEvent, NativePresenter, PresentationConfig, PresentationError,
+    };
+    const SIZE: [u32; 2] = [320, 180];
     let gateway = match Gateway::open() {
         Ok(gateway) => gateway,
         Err(error) => {
@@ -658,7 +737,7 @@ pub fn native_window_probe(polls: u32) -> ProbeReport {
             };
         }
     };
-    let config = PresentationConfig::new(320, 180, "FrankenLife input probe");
+    let config = PresentationConfig::new(SIZE[0], SIZE[1], "FrankenLife input probe");
     let mut presenter = match NativePresenter::open(&gateway, config) {
         Ok(presenter) => presenter,
         Err(PresentationError::Unavailable) => {
@@ -677,38 +756,62 @@ pub fn native_window_probe(polls: u32) -> ProbeReport {
         }
     };
     let mut observed: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let mut kinds: BTreeMap<&'static str, u32> = BTreeMap::new();
+    let mut geometry = None;
+    let mut events = Vec::new();
     let mut failure = None;
     for _ in 0..polls {
-        match presenter.poll_events() {
+        events.clear();
+        match presenter.poll_input(&mut events) {
             Ok(state) => *observed.entry(surface_state_name(state)).or_default() += 1,
             Err(error) => {
-                failure = Some(format!("poll_events failed: {error}"));
+                failure = Some(format!("poll_input failed: {error}"));
                 break;
+            }
+        }
+        for event in &events {
+            *kinds.entry(input_event_name(event)).or_default() += 1;
+            if let InputEvent::Resized(metrics) = event {
+                geometry = Some(*metrics);
             }
         }
         std::thread::sleep(Duration::from_millis(16));
     }
+    let dropped = presenter.input_dropped();
     let closed = presenter.close();
-    let states = observed
-        .iter()
-        .map(|(state, count)| format!("{state}x{count}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let evidence = vec![
+    let tally = |counts: &BTreeMap<&'static str, u32>| {
+        counts
+            .iter()
+            .map(|(name, count)| format!("{name}x{count}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut evidence = vec![
         ("polls", polls.to_string()),
-        ("observed_states", states),
-        (
-            "typed_input_events",
-            "0 (the API has no event channel)".into(),
-        ),
+        ("observed_states", tally(&observed)),
+        ("typed_input_events", tally(&kinds)),
+        ("input_dropped", dropped.to_string()),
     ];
+    if let Some(metrics) = geometry {
+        evidence.push((
+            "geometry",
+            format!(
+                "{}x{} points at backing scale {}",
+                metrics.logical_width, metrics.logical_height, metrics.backing_scale
+            ),
+        ));
+    }
+    let requested = geometry.is_some_and(|metrics| {
+        metrics.logical_width == f64::from(SIZE[0]) && metrics.logical_height == f64::from(SIZE[1])
+    });
     let verdict = match (failure, closed) {
         (Some(reason), _) => Verdict::Failed(reason),
         (None, Err(error)) => Verdict::Failed(format!("close failed: {error}")),
-        (None, Ok(())) => Verdict::Gap {
-            bead: INPUT_HOST_BEAD,
-            detail: "a real window opened and polled; only surface state was observable".into(),
-        },
+        (None, Ok(())) if requested && dropped == 0 => Verdict::Qualified,
+        (None, Ok(())) => Verdict::Failed(format!(
+            "the window reported geometry {geometry:?}, not {SIZE:?} points, with {dropped} \
+             events dropped"
+        )),
     };
     ProbeReport {
         probe: "native_window",

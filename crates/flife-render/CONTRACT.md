@@ -126,8 +126,9 @@ identities are sequential, so a deterministic sequence of offers and lease drops
 
 **Known gaps.**
 - No device residency. Leases are host `Arc`s. Typed Metal buffers and safe leases are FL-028's. The shared-device
-  resource bridge (§13.6: device context, layout, completion fence, read lease, release notification) is FL-018's.
-  Device reads that must finish before release do not exist yet.
+  resource bridge (§13.6: device context, layout, completion fence, read lease, release notification) is FL-033's;
+  FL-018's adapter (`flife-manim`) copies each epoch into its draw buffer on the CPU and returns the lease before
+  rendering. Device reads that must finish before release do not exist yet.
 - The field texture shows energy only. Moment channels, fixed projections and an admitted full-field diagnostic
   lease are FL-019's raw views.
 - Velocity and travel bounds let FL-020 detect ambiguous gaps. Interpolation, seam handling, snapping and trails

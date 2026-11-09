@@ -426,14 +426,28 @@ impl SessionHandle {
     /// # Errors
     /// As [`SessionHandle::resume`].
     pub async fn run_until(&self, cx: &Cx, tick: Tick) -> Result<RunEnd, CoreError> {
+        self.start(cx, Some(tick)).await?.ended(cx).await
+    }
+
+    /// Start a run, until the committed tick reaches `until` or until
+    /// paused, and return at once with the boundary it started from. The
+    /// returned [`Running`] waits for its end.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::resume`].
+    pub async fn start(&self, cx: &Cx, until: Option<Tick>) -> Result<Running, CoreError> {
         let (ended, finished) = oneshot::channel();
-        self.control(cx, |started| Control::Resume {
-            until: Some(tick),
+        let started = self
+            .control(cx, |started| Control::Resume {
+                until,
+                started,
+                ended: Some(ended),
+            })
+            .await??;
+        Ok(Running {
             started,
-            ended: Some(ended),
+            ended: finished,
         })
-        .await??;
-        answer(cx, finished).await
     }
 
     /// Authorize exactly one candidate advancement of a paused session and
@@ -466,6 +480,38 @@ impl SessionHandle {
 struct Run {
     until: Option<Tick>,
     ended: Option<oneshot::Sender<RunEnd>>,
+}
+
+/// A run started by [`SessionHandle::start`].
+pub struct Running {
+    started: Boundary,
+    ended: oneshot::Receiver<RunEnd>,
+}
+
+impl std::fmt::Debug for Running {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Running")
+            .field("started", &self.started)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Running {
+    /// The boundary the run started from.
+    #[must_use]
+    pub const fn started(&self) -> Boundary {
+        self.started
+    }
+
+    /// Wait for the run to end: at its tick, on a pause, on a capacity
+    /// shortfall, on a failed tick, or when the session closes.
+    ///
+    /// # Errors
+    /// [`CoreError::Cancelled`] when the wait is cancelled, and
+    /// [`CoreError::QueueClosed`] when the owner has gone.
+    pub async fn ended(self, cx: &Cx) -> Result<RunEnd, CoreError> {
+        answer(cx, self.ended).await
+    }
 }
 
 /// The session owner. Run it on its own task with [`SessionOwner::run`].

@@ -33,6 +33,6 @@ pub use command::{
     Durability, Outcome, Rejection, Target, VOLATILE_IN_MEMORY,
 };
 pub use session::{
-    Boundary, RunEnd, SessionClosed, SessionConfig, SessionHandle, SessionOwner, Snapshot,
-    StepOutcome, WRITE_AHEAD_BEFORE_APPLY, open, open_with,
+    Boundary, RunEnd, Running, SessionClosed, SessionConfig, SessionHandle, SessionOwner,
+    Snapshot, StepOutcome, WRITE_AHEAD_BEFORE_APPLY, open, open_with,
 };

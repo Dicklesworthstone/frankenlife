@@ -3,18 +3,20 @@ resolver = "3"
 # Create only the crates each milestone needs (plan §18.1): FL-001's capability
 # probes, FL-002's core contracts, FL-003–FL-005's field, FL-006's
 # organism-phase operators, FL-007's sensor/action ABI, FL-009's genomes,
-# FL-014's session owner, FL-015's headless command line, and FL-017's render
-# epochs.
+# FL-014's session owner, FL-015's headless command line, FL-017's render
+# epochs, and FL-018's FrankenManim world adapter and native Studio host.
 members = [
     "crates/flife-cli",
     "crates/flife-core",
     "crates/flife-engine",
     "crates/flife-field",
     "crates/flife-genome",
+    "crates/flife-manim",
     "crates/flife-neural",
     "crates/flife-probes",
     "crates/flife-render",
     "crates/flife-runtime",
+    "crates/flife-studio",
 ]
 
 [workspace.package]
@@ -32,7 +34,12 @@ publish = false
 # Asupersync v0.6.2 (crates.io 0.6.2), the same git source FrankenManim's
 # governed closure requires, so FrankenLife and Manim share one package id.
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "a5d23e8dd2c8d776bd02e2da8e38e6296600e84c", default-features = false }
-fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "ac39e721ec0297156f5f3e0f1b33916e6232e5cb" }
+fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "303189d3795dd0d13339df33f3a32dedd545b67a" }
+# FrankenManim's camera, 3D job and Metal preview, for FL-018's world adapter
+# and Studio host. Already in the closure through fmn; named directly because
+# the umbrella does not re-export the renderer's Metal route.
+fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "303189d3795dd0d13339df33f3a32dedd545b67a" }
+fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "303189d3795dd0d13339df33f3a32dedd545b67a" }
 fnp-dtype = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-ndarray = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-random-core = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
@@ -41,10 +48,10 @@ fnp-random-core = { git = "https://github.com/Dicklesworthstone/franken_numpy", 
 # rayon), so they stay on; all three were already in the closure. FrankenLife
 # never calls its entropy constructors or parallel fills.
 fnp-random = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
-ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a" }
-ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a" }
-ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a" }
-ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c611501c0280ed09a796c517e071ff78ecb61c5a", features = ["asupersync-integration"] }
+ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1fd24f9f865e3ab0ab790e9b7b0bc4b1a5bfec1e" }
+ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1fd24f9f865e3ab0ab790e9b7b0bc4b1a5bfec1e" }
+ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1fd24f9f865e3ab0ab790e9b7b0bc4b1a5bfec1e" }
+ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1fd24f9f865e3ab0ab790e9b7b0bc4b1a5bfec1e", features = ["asupersync-integration"] }
 
 # Third-party crates. serde and sha2 0.11 are already in the qualified closure;
 # toml is the one addition, confined to flife-core's config loader (Appendix A

@@ -155,6 +155,11 @@ impl Command {
 pub enum Durability {
     /// `volatile-in-memory`: lost if the process ends.
     Volatile,
+    /// `write-ahead-before-apply`: the command journal (FL-036) holds the
+    /// record. A client is told of the acceptance only once the journal's
+    /// receipt says the record and every one admitted before it are
+    /// durable, and no candidate applies the command before then.
+    WriteAhead,
 }
 
 /// What admission assigned an accepted command.

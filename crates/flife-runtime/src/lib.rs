@@ -19,15 +19,17 @@
 //!   with a cancellation boundary before publication, and is the only commit
 //!   authority.
 //!
-//! Acceptance here is `volatile-in-memory`: held by the owner and lost if
-//! the process ends. Appendix A's `write-ahead-before-apply` needs FL-036's
-//! command journal and is refused until then.
+//! Acceptance is `volatile-in-memory` (held by the owner and lost if the
+//! process ends) or, through [`journal`]'s port and [`open_journaled`],
+//! Appendix A's `write-ahead-before-apply` (FL-036): made durable before it
+//! is acknowledged or applied, and recovered from the journal.
 
 #![forbid(unsafe_code)]
 
 pub mod book;
 pub mod checkpoint;
 pub mod command;
+pub mod journal;
 pub mod session;
 
 pub use book::{COMMANDS_CHUNK_VERSION, CommandBook};
@@ -36,7 +38,11 @@ pub use command::{
     Accepted, Admission, COMMAND_SCHEMA, CancelReason, Cancellation, Command, CommandStatus,
     Durability, Outcome, Rejection, Target, VOLATILE_IN_MEMORY,
 };
+pub use journal::{
+    JOURNAL_ATTEMPTS, Journal, JournalContents, JournalRecord, JournalWriter, Watermarks,
+};
 pub use session::{
-    Boundary, RunEnd, Running, SessionClosed, SessionConfig, SessionHandle, SessionOwner, Snapshot,
-    StepOutcome, WRITE_AHEAD_BEFORE_APPLY, open, open_with,
+    Boundary, JournalState, RunEnd, Running, SessionCheckpoint, SessionClosed, SessionConfig,
+    SessionHandle, SessionOwner, Snapshot, StepOutcome, WRITE_AHEAD_BEFORE_APPLY, open,
+    open_journaled, open_with,
 };

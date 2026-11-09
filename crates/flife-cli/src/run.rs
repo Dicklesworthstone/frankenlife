@@ -20,7 +20,10 @@ use flife_backend_metal::ControllerChoice;
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, ControllerReport, NumericalProfile, World};
-use flife_runtime::{SessionClosed, SessionConfig, StepOutcome, open_with};
+use flife_runtime::{
+    Durability, SessionClosed, SessionConfig, StepOutcome, VOLATILE_IN_MEMORY,
+    WRITE_AHEAD_BEFORE_APPLY, open_with,
+};
 use serde::Serialize;
 
 use crate::observe::{Survey, Tally};
@@ -261,6 +264,15 @@ pub fn run(
     // The session's limits are checked before the world is founded, so an
     // unadmitted durability is refused without founding 4,096 organisms.
     let limits = SessionConfig::from_config(RUN_SESSION, config)?;
+    if limits.durability != Durability::Volatile {
+        return Err(CoreError::MissingCapability {
+            capability: format!(
+                "flife run opens no command journal, so it runs {VOLATILE_IN_MEMORY} only; \
+                 {WRITE_AHEAD_BEFORE_APPLY} sessions open through a journal \
+                 (flife_runtime::open_journaled, FL-036)"
+            ),
+        });
+    }
     let mut world = found(config)?;
     if let Some(workers) = options.cpu_workers {
         world.set_cpu_workers(workers)?;

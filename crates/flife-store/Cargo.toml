@@ -1,6 +1,6 @@
 [package]
 name = "flife-store"
-description = "FrankenLife checkpoint chunk store: content-addressed chunks, atomically published manifests, recovery to the last valid checkpoint after a crash, cancellation or corruption, and retention"
+description = "FrankenLife checkpoint chunk store (content-addressed chunks, atomically published manifests, recovery to the last valid checkpoint, retention) and the FrankenSQLite run catalog and command journal"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -9,10 +9,12 @@ publish.workspace = true
 
 [dependencies]
 flife-core = { path = "../flife-core" }
+flife-runtime = { path = "../flife-runtime" }
+fsqlite.workspace = true
 
 [dev-dependencies]
+asupersync.workspace = true
 flife-engine = { path = "../flife-engine" }
-flife-runtime = { path = "../flife-runtime" }
 
 [lints]
 workspace = true

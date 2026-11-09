@@ -33,6 +33,7 @@ use crate::command::{
     Accepted, Admission, CancelReason, Cancellation, Command, CommandStatus, Durability, Outcome,
     Rejection, Target,
 };
+use crate::journal::JournalContents;
 
 #[derive(Debug, Clone)]
 struct Record {
@@ -54,6 +55,7 @@ pub struct CommandBook {
     next_order: u64,
     outcomes: Vec<CommandId>,
     closed: bool,
+    durability: Durability,
 }
 
 impl CommandBook {
@@ -71,6 +73,36 @@ impl CommandBook {
             next_order: 0,
             outcomes: Vec::new(),
             closed: false,
+            durability: Durability::Volatile,
+        }
+    }
+
+    /// How new acceptances are held: [`Durability::Volatile`] unless the
+    /// session journals them.
+    #[must_use]
+    pub const fn durability(&self) -> Durability {
+        self.durability
+    }
+
+    /// Hold new acceptances as `durability`. A session that journals its
+    /// commands sets [`Durability::WriteAhead`].
+    pub const fn set_durability(&mut self, durability: Durability) {
+        self.durability = durability;
+    }
+
+    /// An accepted command, as its client submitted it.
+    #[must_use]
+    pub fn command(&self, id: CommandId) -> Option<&Command> {
+        self.records.get(&id).map(|record| &record.command)
+    }
+
+    /// The outcome at `cursor` in the outcome stream, with its command.
+    #[must_use]
+    pub fn outcome_at(&self, cursor: u64) -> Option<(CommandId, &Outcome)> {
+        let id = *self.outcomes.get(usize::try_from(cursor).ok()?)?;
+        match &self.records.get(&id)?.status {
+            CommandStatus::Terminal(outcome) => Some((id, outcome)),
+            _ => None,
         }
     }
 
@@ -227,7 +259,7 @@ impl CommandBook {
             order: self.next_order,
             effective,
             retargeted,
-            durability: Durability::Volatile,
+            durability: self.durability,
         };
         self.next_order += 1;
         self.pending.insert((effective, accepted.order), command.id);
@@ -360,6 +392,144 @@ impl CommandBook {
         self.end(id, committed, CancelReason::Requested)
     }
 
+    /// Cancel `id` for `reason`: [`CommandBook::cancel`] with its reason
+    /// stated, which a recovering session uses to replay a journaled
+    /// cancellation at the boundary where it won.
+    pub fn cancel_for(
+        &mut self,
+        id: CommandId,
+        committed: Tick,
+        reason: CancelReason,
+    ) -> Cancellation {
+        self.end(id, committed, reason)
+    }
+
+    /// Merge `journal`, everything a command journal holds for this session,
+    /// into this book, the closure of a world committed at `committed` (a
+    /// checkpoint's, or an empty book for the founding world).
+    ///
+    /// Every acceptance the book holds must be the journal's, and every
+    /// outcome in its stream must be the journal's at the same cursor: the
+    /// journal is the authority for commands, the checkpoint for the world.
+    /// Each acceptance after the book's is added as pending, held
+    /// [`Durability::WriteAhead`]. Returns the journal's outcomes after the
+    /// book's stream, in cursor order: the outcomes the recovering session
+    /// must reproduce, rather than record again, as it advances.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] naming the first disagreement: a record
+    /// of another session, an admission order or cursor out of sequence, an
+    /// acceptance or outcome that differs from the book's, a journal behind
+    /// the book, a command due before `committed`, or an outcome at a
+    /// boundary already passed or naming a command never accepted.
+    pub fn recover(
+        &mut self,
+        journal: &JournalContents,
+        committed: Tick,
+    ) -> Result<Vec<(CommandId, Outcome)>, CoreError> {
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "recover command book",
+            detail,
+        };
+        for (position, (command, accepted)) in journal.accepted.iter().enumerate() {
+            let position = u64::try_from(position).unwrap_or(u64::MAX);
+            if accepted.order != position || command.session != self.session {
+                return Err(conflict(format!(
+                    "journal acceptance {position} is {} of session {} in order {}",
+                    command.id, command.session, accepted.order
+                )));
+            }
+            let content = command.content_hash();
+            if let Some(record) = self.records.get(&command.id) {
+                if record.content != content
+                    || record.accepted.order != accepted.order
+                    || record.accepted.effective != accepted.effective
+                    || record.accepted.retargeted != accepted.retargeted
+                {
+                    return Err(conflict(format!(
+                        "{} differs between the journal and the checkpoint",
+                        command.id
+                    )));
+                }
+                continue;
+            }
+            if accepted.order != self.next_order {
+                return Err(conflict(format!(
+                    "journal acceptance {} ({}) is not in the checkpoint, which admitted {}",
+                    accepted.order, command.id, self.next_order
+                )));
+            }
+            if accepted.effective < committed {
+                return Err(conflict(format!(
+                    "{} is due at tick {}, before the committed tick {}",
+                    command.id,
+                    accepted.effective.get(),
+                    committed.get()
+                )));
+            }
+            self.pending
+                .insert((accepted.effective, accepted.order), command.id);
+            self.records.insert(
+                command.id,
+                Record {
+                    content,
+                    command: *command,
+                    accepted: Accepted {
+                        durability: Durability::WriteAhead,
+                        ..*accepted
+                    },
+                    status: CommandStatus::Pending,
+                },
+            );
+            self.next_order += 1;
+        }
+        let journaled = u64::try_from(journal.accepted.len()).unwrap_or(u64::MAX);
+        if journaled < self.next_order {
+            return Err(conflict(format!(
+                "the journal holds {journaled} acceptances; the checkpoint admitted {}",
+                self.next_order
+            )));
+        }
+        if journal.outcomes.len() < self.outcomes.len() {
+            return Err(conflict(format!(
+                "the journal holds {} outcomes; the checkpoint's stream {}",
+                journal.outcomes.len(),
+                self.outcomes.len()
+            )));
+        }
+        let mut replay = Vec::new();
+        for (cursor, (id, outcome)) in journal.outcomes.iter().enumerate() {
+            let at = u64::try_from(cursor).unwrap_or(u64::MAX);
+            if outcome.cursor() != at {
+                return Err(conflict(format!(
+                    "journal outcome {at} is numbered {}",
+                    outcome.cursor()
+                )));
+            }
+            if let Some(&recorded) = self.outcomes.get(cursor) {
+                if recorded != *id || self.outcome_at(at).map(|(_, held)| held) != Some(outcome) {
+                    return Err(conflict(format!(
+                        "outcome {at} differs between the journal and the checkpoint"
+                    )));
+                }
+                continue;
+            }
+            let passed = match outcome {
+                Outcome::Applied { tick, .. } => *tick < committed,
+                Outcome::Cancelled { boundary, .. } => *boundary < committed,
+                Outcome::Failed { .. } => false,
+            };
+            if passed || !self.records.contains_key(id) {
+                return Err(conflict(format!(
+                    "journal outcome {at} for {id} cannot be reached from tick {}",
+                    committed.get()
+                )));
+            }
+            replay.push((*id, outcome.clone()));
+        }
+        Ok(replay)
+    }
+
     fn end(&mut self, id: CommandId, committed: Tick, reason: CancelReason) -> Cancellation {
         let cursor = self.outcome_cursor();
         let Some(record) = self.records.get_mut(&id) else {
@@ -468,6 +638,7 @@ impl CommandBook {
             out.u8(u8::from(record.accepted.retargeted));
             match record.accepted.durability {
                 Durability::Volatile => out.u8(0),
+                Durability::WriteAhead => out.u8(1),
             }
             match &record.status {
                 CommandStatus::Pending => out.u8(0),
@@ -566,6 +737,7 @@ impl CommandBook {
             next_order,
             outcomes: Vec::new(),
             closed,
+            durability: Durability::Volatile,
         };
         let mut orders = BTreeSet::new();
         for _ in 0..count {
@@ -577,6 +749,7 @@ impl CommandBook {
                 retargeted: input.flag()?,
                 durability: match input.u8()? {
                     0 => Durability::Volatile,
+                    1 => Durability::WriteAhead,
                     other => return Err(refuse(format!("unknown durability {other}"))),
                 },
             };

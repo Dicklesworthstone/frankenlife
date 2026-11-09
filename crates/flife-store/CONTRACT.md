@@ -3,13 +3,18 @@
 **Purpose.** FL-035 (`flife-rmr`) is the checkpoint chunk store and its atomic manifest (plan §16.4, §16.6, §16.7,
 Appendix B.2). It publishes FL-016's checkpoints so that a crash, a cancellation, a refused storage operation or
 damage to stored bytes always leaves the last valid checkpoint recoverable. It keeps the newest valid checkpoints
-under a retention limit.
+under a retention limit. FL-036 (`flife-ka2`) adds the run catalog and command journal (§12.3, §16.6, Appendix B.1,
+C.14): one FrankenSQLite database that records each run, makes a `write-ahead-before-apply` session's acceptances,
+cancellations and outcomes durable through `flife_runtime`'s `Journal` port, and indexes the checkpoints published
+to the chunk store.
 
 **Inputs.**
 - A checkpoint: FL-016's sealed container (`flife_runtime::checkpoint` writes one).
 - A store directory and a `Durability` profile, `process-crash` or `power-loss`.
 - An observer for `publish_observed`, called after each step, which may cancel before the commit point.
 - An acceptance function for `latest_valid` and `retain`, normally `flife_runtime::restore`.
+- For the journal (FL-036): a database path, a `SessionId` and its configuration hash, `flife_runtime` journal
+  records, and checkpoint index rows (sequence, tick, epoch, container SHA-256).
 
 **Outputs.**
 - `ChunkStore` with `open`, `publish`, `publish_observed`, `load`, `latest_valid`, `retain`, `sequences`,
@@ -20,6 +25,9 @@ under a retention limit.
 - `Step` and `Flow`, and the constants `STORE_FORMAT` and `MANIFEST_FILE_MAX_BYTES`.
 - In `flife-core`: `checkpoint::CheckpointManifest` and `ManifestEntry`, which verify a container's sealed prefix
   without its payload (`CheckpointReader::parse` now builds on them), and the `storage-failed` error class.
+- `CommandJournal` (FL-036) with `open`, `path`, `session`, `modes`, `watermarks`, `index_checkpoint`,
+  `checkpoints` and `runs`, implementing `flife_runtime::Journal` (`open_run`, `append`); `IndexedCheckpoint`; and
+  `CATALOG_FORMAT`.
 
 **Invariants — layout.**
 - `FLIFESTORE` holds `frankenlife.chunk-store.v1`. A directory that is neither empty nor a store is not taken over.
@@ -59,13 +67,36 @@ under a retention limit.
   than the oldest kept one stay, for inspection. With fewer than `n` valid checkpoints nothing is removed, and
   `n = 0` is refused. Manifests go before chunks, so a failure part way never breaks a kept checkpoint.
 
+**Invariants — the run catalog and command journal (FL-036; §12.3, §16.6, B.1).**
+- One FrankenSQLite file, opened in WAL mode with `synchronous = FULL` (FrankenSQLite's per-commit sync), so every
+  append's commit is flushed before it returns. `catalog` holds `frankenlife.run-catalog.v1`.
+- `runs` records each session once, with its configuration hash and the command schema. Opening a run under
+  another hash or schema is refused.
+- `commands` holds each acceptance, keyed by `(session, admission order)` and unique by `(session, command id)`,
+  with its effective tick, retargeting, content hash and canonical `frankenlife.command.v1` record. `outcomes`
+  holds each terminal outcome, keyed by `(session, cursor)` and unique by `(session, command id)`.
+- Every append is one transaction. It returns the held watermarks without writing when the identity is already
+  held with exactly that record, refuses the identity with other content, and otherwise requires the next number of
+  its kind (admission order or outcome cursor) before inserting. An outcome needs its command's acceptance. So the
+  two watermarks are contiguous counts, distinct from each other: an acceptance for tick 40 is durable while the
+  outcome of one for tick 12 is the only outcome.
+- A journal is bound to one session by `open_run`; an append before binding, or of a command addressed to another
+  session, is refused.
+- `checkpoints` indexes chunk-store publications by `(session, sequence)`; re-indexing the same row is a no-op and
+  a different row for the same sequence is refused. The index never makes a checkpoint resumable: recovery asks the
+  chunk store (`latest_valid`), whose manifests stay the authority (§16.6).
+- The connection is `!Send`, so the journal is opened on the thread that uses it (the session's writer thread),
+  and its async calls are driven by `flife_runtime::block_on_inline`, never on an Asupersync runtime thread.
+
 **Refusal cases.**
 - `incompatible-checkpoint`: a container that does not verify, or a missing, oversized, mis-sealed or extended
   manifest, or a missing, mis-sized or damaged chunk (when loading).
-- `state-conflict`: a second writer, a non-store directory, and `retain(0)`.
-- `schema-mismatch`: another store format.
+- `state-conflict`: a second writer, a non-store directory, and `retain(0)`. In the journal: a run under another
+  configuration hash, an append before `open_run` or to another session, an identity held with other content, a
+  record that is not the next of its kind, an outcome without an acceptance, and a conflicting index row.
+- `schema-mismatch`: another store format, or another catalog format.
 - `storage-failed`: any operation the host refuses (a full disk, a device or permission failure, a path in the way),
-  naming the operation and path.
+  naming the operation and path. FrankenSQLite's errors map here too.
 - `cancelled`: the observer cancelled before the commit point.
 - `overflow`: sequence numbers exhausted.
 
@@ -106,16 +137,70 @@ manifests.
   `flife-core`'s `tests/checkpoint.rs`. One (`load` skipping its own chunk hash) first survived, because restoring
   re-verifies the hashes; a direct `load` check now catches it.
 
+- `tests/journal.rs` (FL-036, 12 tests; about 2 s), against FL-013's 48-founder ecology with Appendix A's
+  `write-ahead-before-apply` durability, sessions on Asupersync's native runtime with the journal's writer thread.
+  Every committed world is compared with one stepped directly with the same interventions at the same ticks:
+  - The catalog: WAL and `synchronous = FULL` read back; acceptances and outcomes numbered and idempotent; a
+    conflicting reuse, a skipped or repeated number, a command addressed to another session, an unknown command's
+    outcome and another outcome for an ended command refused; watermarks `(2, 1)` with the tick-40 acceptance pending; everything read back after
+    reopening; the checkpoint index idempotent; another configuration hash and another catalog format refused.
+  - A journaled session: acceptances answered as `WriteAhead`; retries, conflicting reuse and cancellation;
+    commands applied at their ticks; the journal holding each record once; and a session reopened from the
+    journal alone, from the founding world, replaying to the same world.
+  - A gated journal: while an acceptance due at the boundary waits for its receipt, the boundary, a step and a
+    checkpoint wait and inspection, status and pause answer; once released, the client hears, the step applies it
+    and the checkpoint restores to its boundary's world. While a cancellation waits, the boundary and a step wait
+    the same way, and the step publishes without the command once the canceller has heard.
+  - The bound: with command capacity 4 and control capacity 1, four unacknowledged outcomes and one acceptance
+    stop the owner taking submissions (they queue unadmitted) and hold the boundary; once released, all eight
+    commands apply at their ticks.
+  - C.14's lost receipt, from a journal that persists a record and then reports failure: reconciled within the
+    writer's retries, and, when every retry fails, the client told the outcome is uncertain, the run stopped, a new
+    command refused and not recorded, and a reopened session finding the record by identity and applying it once.
+  - A failed append fails every record behind it: with a journal that would take the second record, nothing after
+    the failed one is appended, and both clients hear the failure.
+  - Recovery refusals, each naming the first disagreement: a journal behind the checkpoint, an acceptance with other
+    content than the checkpoint's, a new command due before the checkpoint, an outcome at a boundary already passed,
+    an outcome the replay does not reproduce, and a journaled cancellation of a command that already ended (which
+    first made the replay loop forever; it now refuses). The unaltered journal opens from the checkpoint and from the
+    founding world.
+  - C.14's cancellation racing publication: won at the cancellation boundary (the candidate rebuilt without it
+    once durable), or too late after publication, with the journal holding the winner.
+  - C.14's crash points: a child process runs the energy brush and is killed (`SIGKILL`) at each of six points
+    (before durable acceptance, after it, after the client's acknowledgement, after publication, after the outcome
+    is durable, and after the client has the durable outcome). The journal holds the acceptance exactly when it was
+    durable and the outcome exactly from its receipt on. The recovered session recognises the client's retry (or
+    admits it afresh), refuses conflicting reuse, and applies the brush once, at tick 3.
+  - C.14 with a checkpoint: A for tick 40 accepted before B for tick 12, C cancelled durably, a checkpoint at tick
+    13 published to the chunk store and indexed, then a kill. Recovered from the checkpoint and the journal, A is
+    pending and applies at tick 40, B applied once, C cancelled, each outcome journaled once. With the checkpoint's
+    manifest damaged, its index row does not make it resumable: recovery falls back to the founding world and the
+    journal, and replays to the checkpoint's world.
+- 32 planted mutants in the write-ahead session, recovery and replay, the writer thread, the FrankenSQLite journal
+  and `flife run`'s guard, each caught by these tests, `flife-runtime`'s `tests/session.rs` or `flife-cli`'s smoke
+  test: 31 by a failing assertion, and one (the replay without its progress guard) by the recovery test hanging
+  until the harness's timeout. A first pass over 31 left 12 surviving and one hanging. Each got a test or an
+  assertion; the hang exposed a replay that looped forever on a journaled cancellation of a command that had
+  already ended, which now refuses.
+
 **Validity domain.** `frankenlife.chunk-store.v1` over checkpoint format 1 with raw chunks. A local POSIX
 filesystem with atomic `rename`, hard links and advisory `flock` locks: APFS on macOS, and ext4, XFS or btrfs on
-Linux. One writer per store.
+Linux. One writer per store. The journal: `frankenlife.run-catalog.v1` on FrankenSQLite 074c2033 (the `native`
+file-backed engine), one writer thread per session, one session per database at a time.
 
 **Known gaps.**
 - `power-loss` is a protocol, not a proven guarantee. The flush order is tested only by the step sequence: no test
   cuts power, and a drive that ignores flushes defeats it. Process crashes are tested.
 - A real full disk is not exercised: the size limit produces the same short write, from the same code path.
-- No index: a database of checkpoints, runs and lineage is FL-036, and `flife checkpoint`/`resume` and resuming a
-  session from the store are FL-037.
+- A run's catalog row is its identity, configuration hash and command schema, plus its journal and checkpoint
+  index. The rest of Appendix B.1's run manifest (source and suite revisions, toolchain, numerics, clocks,
+  hardware, capacity, results and artifacts) is not recorded yet; a complete run catalog is FL-041's evidence.
+- The catalog indexes runs and checkpoints, not lineage or branches (FL-039, FL-040). `flife checkpoint`/`resume`, a CLI
+  that opens a journal (`flife run` refuses `write-ahead-before-apply`) and resuming from the store are FL-037.
+- The journal's power-loss durability rests on FrankenSQLite's WAL and `synchronous = FULL` flush; only process
+  crashes are tested. Two sessions writing one catalog at once, and two processes opening one session's journal,
+  are not tested; FrankenSQLite's concurrent writers are not relied on.
+- No journal compaction or bounded idempotency window: every record is kept for the session's life.
 - No readers' leases: retention assumes no other process is reading the store. Pinned discoveries and branch
   closures (§16.7) are not retained specially yet (FL-039).
 - Chunks are whole families: a single birth rewrites the full genome chunk. Per-genome pages, deltas and

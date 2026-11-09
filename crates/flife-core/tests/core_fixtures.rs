@@ -59,6 +59,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-runtime/tests/observation.rs"),
     ),
     (
+        "flife-store::tests/journal.rs",
+        include_str!("../../flife-store/tests/journal.rs"),
+    ),
+    (
         "flife-neural::tests/sensing.rs",
         include_str!("../../flife-neural/tests/sensing.rs"),
     ),

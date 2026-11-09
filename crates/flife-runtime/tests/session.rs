@@ -23,8 +23,8 @@ use flife_core::ids::CommandId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Advance, Intervention, Stepped};
 use flife_runtime::{
-    Admission, Boundary, CancelReason, Cancellation, CommandStatus, Outcome, Rejection, RunEnd,
-    SessionConfig, StepOutcome, Target, open,
+    Admission, Boundary, CancelReason, Cancellation, CommandStatus, Durability, Outcome, Rejection,
+    RunEnd, SessionConfig, StepOutcome, Target, open,
 };
 
 #[expect(
@@ -53,23 +53,26 @@ fn published(outcome: &StepOutcome) -> (&Boundary, &[CommandId], Tick) {
     }
 }
 
-/// `volatile-in-memory` is admitted with `[execution]`'s capacities;
-/// Appendix A's `write-ahead-before-apply` is refused until FL-036's
-/// journal exists.
+/// `volatile-in-memory` is admitted with `[execution]`'s capacities.
+/// Appendix A's `write-ahead-before-apply` is a valid durability, but a
+/// session holding it needs a command journal: `open` refuses it, and
+/// FL-036's `open_journaled` (tested in `flife-store`) opens it.
 #[test]
-fn the_session_admits_volatile_in_memory_and_refuses_write_ahead_until_the_journal() {
+fn the_session_admits_volatile_in_memory_and_write_ahead_needs_a_journal() {
     let appendix = config(&[]);
-    let error = SessionConfig::from_config(SESSION, &appendix).expect_err("write-ahead");
+    let limits = SessionConfig::from_config(SESSION, &appendix).expect("write-ahead");
+    assert_eq!(limits.durability, Durability::WriteAhead);
+    let error = open(found(&appendix), &appendix, SESSION).expect_err("needs a journal");
     assert!(
-        matches!(&error, CoreError::MissingCapability { capability } if capability.contains("FL-036")),
+        matches!(&error, CoreError::MissingCapability { capability } if capability.contains("open_journaled")),
         "{error}"
     );
-    assert!(open(found(&appendix), &appendix, SESSION).is_err());
     let volatile = ecology(&[
         ("execution", "command_queue_capacity", "5"),
         ("execution", "control_queue_capacity", "3"),
     ]);
     let limits = SessionConfig::from_config(SESSION, &volatile).expect("volatile");
+    assert_eq!(limits.durability, Durability::Volatile);
     assert_eq!(limits.session, SESSION);
     assert_eq!(limits.command_capacity, 5);
     assert_eq!(limits.control_capacity, 3);

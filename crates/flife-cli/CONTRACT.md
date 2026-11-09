@@ -95,7 +95,8 @@ Versus Appendix A it changes:
 | `reproduction.cooldown_seconds` | 1.0 | 0.5 |
 
 It also changes the name, and `command_durability` from `write-ahead-before-apply` to `volatile-in-memory`. The
-durability change is a capability: the write-ahead journal is FL-036.
+durability change is a capability: `flife run` opens no command journal, so it refuses `write-ahead-before-apply`
+(FL-036's journal opens such sessions through `flife_runtime::open_journaled`; a CLI that opens one is FL-037).
 
 Appendix A as written has no birth and no death in its first 1,024 ticks. Its founders start at 2.0, below the 4.0
 threshold, take at most 0.4 energy per second, and emit from the first tick. The preset keeps their 2.0 start, so

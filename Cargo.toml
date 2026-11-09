@@ -54,6 +54,9 @@ fnp-random-core = { git = "https://github.com/Dicklesworthstone/franken_numpy", 
 # rayon), so they stay on; all three were already in the closure. FrankenLife
 # never calls its entropy constructors or parallel fills.
 fnp-random = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
+# FrankenSQLite (FL-036): the run catalog and command journal. Only the
+# native file-backed engine; no io_uring backend and no SQL extensions.
+fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "074c2033b4dd5212bf2f6c6aa80480ff711dfd9f", default-features = false, features = ["native"] }
 ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810" }
 ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810" }
 ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810" }

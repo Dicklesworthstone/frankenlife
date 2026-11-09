@@ -29,8 +29,17 @@
 //! checkpoints and removes older manifests and every chunk no remaining
 //! manifest names.
 //!
-//! The store holds checkpoints; it does not decode them. A database index
-//! over them is FL-036, and resuming a session from one is FL-037.
+//! The store holds checkpoints; it does not decode them. Resuming a session
+//! from one is FL-037.
+//!
+//! [`journal`] is FL-036's run catalog and command journal: a FrankenSQLite
+//! database implementing `flife_runtime`'s journal port, through which a
+//! `write-ahead-before-apply` session makes acceptances and outcomes
+//! durable, and which indexes the checkpoints published here.
+
+pub mod journal;
+
+pub use journal::{CATALOG_FORMAT, CommandJournal, IndexedCheckpoint};
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};

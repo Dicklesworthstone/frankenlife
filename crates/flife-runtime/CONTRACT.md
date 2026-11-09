@@ -6,7 +6,10 @@ only commit authority. Clients submit simulation-changing commands and control r
 `SessionHandle`. Admission gives every accepted command one admission order and one exact effective tick, and every
 accepted command ends in exactly one terminal outcome. The control loop stays responsive at a committed boundary
 while paused. Cancellation races publication at a declared boundary, and exactly one side wins. FL-016
-(`flife-gh0`) checkpoints a session, the world and its command book, in one container (§16.3, C.14, B.2).
+(`flife-gh0`) checkpoints a session, the world and its command book, in one container (§16.3, C.14, B.2). FL-036
+(`flife-ka2`) adds `write-ahead-before-apply` sessions: the owner makes every acceptance, cancellation and outcome
+durable through a command journal before relying on it, and a session reopens from what the journal holds (§12.3,
+§12.4, §16.6, C.14). The journal is a port here; `flife-store` implements it over FrankenSQLite.
 
 **Inputs.**
 - A `World` founded from a validated configuration, the same configuration, and a `SessionId`.
@@ -15,11 +18,15 @@ while paused. Cancellation races publication at a declared boundary, and exactly
 - `Command`: the session, a client `CommandId`, a `Target` (`At { tick, retarget }` or `NextAdmissible`), an
   optional expected revision, and a validated `flife_engine::Intervention`. The only intervention so far is
   `InjectEnergy { cell, amount }`: declared external energy added to one field cell.
-- Control requests: pause, resume, run until a tick, step, cancel, status, inspect and close.
+- Control requests: pause, resume, run until a tick, step, cancel, status, inspect and close; for a journaled
+  session also checkpoint and durable outcome (FL-036).
+- For `open_journaled` (FL-036): a `JournalWriter` started over a `Journal` implementation, and the
+  `JournalContents` it read back when it opened the session's run.
 
 **Outputs.**
 - `Admission`: `Accepted { accepted, status, retry }` with the admission order, the effective tick, whether a late
-  target was retargeted, and `Durability::Volatile`; or `Rejected(Rejection)`. A rejection records nothing.
+  target was retargeted, and its `Durability` (`Volatile`, or `WriteAhead` once the journal holds it); or
+  `Rejected(Rejection)`. A rejection records nothing.
 - `CommandStatus`: `Pending`, `Sealed` or `Terminal(Outcome)`. `Outcome` is one of:
   - `Applied`: the boundary tick, the published tick and epoch, and the energy that entered the field;
   - `Cancelled`: the boundary, and `Requested` or `SessionClosed`;
@@ -39,6 +46,15 @@ while paused. Cancellation races publication at a declared boundary, and exactly
 - `Snapshot`: the committed boundary and world digest, live count, running state, unfinished, admitted and outcome
   counts, whether the run stopped, and the render publisher's `RenderStats` (FL-017).
 - `SessionClosed`: the committed world, the closed book, the final boundary and the render counters.
+- FL-036, for a journaled session:
+  - `JournalState` in `Snapshot` and `SessionClosed`: the durable `Watermarks` (acceptances and outcomes, two
+    contiguous counts), how many records wait for a receipt, and the journal's failure, if any;
+  - `SessionHandle::checkpoint`: a `SessionCheckpoint` (its boundary and FL-016 container) taken by the owner at a
+    committed boundary with nothing waiting for a receipt;
+  - `SessionHandle::durable_outcome`: a command's terminal outcome once the journal holds it, the explicitly
+    durable response (§12.3);
+  - the `journal` module: the `Journal` port, `JournalRecord`, `Watermarks`, `JournalContents`, `JournalWriter`,
+    `JOURNAL_ATTEMPTS` and `block_on_inline`; `CommandBook::recover`, `set_durability` and `cancel_for`.
 - `SessionHandle::feed` (FL-017): the session's `flife_render::Feed`. Viewers lease epochs from it directly, never
   through the lanes. `open_with` now returns a `Result`, because it allocates the render slots.
 - In `flife-engine`, FL-014 adds `World::advance_with` and `World::step_with`, plus each `TickReport`'s applied
@@ -125,11 +141,44 @@ while paused. Cancellation races publication at a declared boundary, and exactly
   retry of an admitted command returns its first outcome, reuse with other content is still refused, and a
   sealed boundary stays sealed.
 
+**Invariants — write-ahead-before-apply (FL-036; §12.3, §12.4, §16.6, C.14).**
+- One writer thread (`flife-journal`) owns the journal and appends records in the order the owner sends them,
+  answering each with one receipt. The owner never waits on it: it sends records and reads receipts as messages.
+- An acceptance is answered only once its receipt says it, and every acceptance before it, is durable. A retry of
+  an identity still waiting shares that receipt. Its durability is then `WriteAhead`.
+- A boundary is held while an acceptance due there waits for its receipt, while any cancellation does, or while
+  the records waiting reach the session's limit (command plus control capacity). The control lane stays live
+  meanwhile; a step or checkpoint requested then waits with the boundary. An acceptance for a later tick never
+  holds the current one.
+- A cancellation is answered once its record is durable. One that wins at the cancellation boundary discards the
+  candidate first, and the candidate is rebuilt without the command only once the record is durable.
+- Outcomes are journaled as they occur without holding the boundary; one lost in a crash is reproduced by replay.
+  `durable_outcome` answers only once the outcome's cursor is below the durable outcome watermark.
+- Appends are idempotent by identity, and each record must be the next of its kind (admission order, outcome
+  cursor), so the journal never holds a record without every earlier one. The writer retries a failed append
+  `JOURNAL_ATTEMPTS` (3) times; then the failure is sticky and every later record fails without being tried.
+- A failure is uncertain, not a refusal: every request waiting on it is answered with the error, the uncertain
+  identities are remembered, the run stops and new commands are refused, while control and close still work. A
+  retry of an uncertain identity is refused in that session; a reopened session reconciles it from what the journal
+  actually holds, by identity.
+- `open_journaled` merges the journal into the starting book (`CommandBook::recover`): acceptances numbered from
+  zero, those the book holds identical in content and admission, new ones due at or after the committed tick, a
+  journal never behind the book, and outcomes contiguous by cursor, the prefix equal to the book's. Every outcome
+  the book does not hold is replayed: the world advances through the same boundaries with the same commands, each
+  journaled cancellation is applied at its boundary, and every outcome must be reproduced exactly. The session
+  then starts at the boundary the replay reached, with every later acceptance pending and nothing journaled twice.
+- Closing journals the session-closed cancellations, answers everything queued, waits for every receipt and then
+  stops the writer, so `SessionClosed.journal` reports the final durable watermarks.
+
 **Refusal cases.**
 - `SessionConfig::from_config`:
-  - `write-ahead-before-apply` is refused as `MissingCapability`, because its journal is FL-036;
-  - any other durability than `volatile-in-memory` is refused as `UnknownAlgorithm`;
+  - any durability other than `volatile-in-memory` and `write-ahead-before-apply` is refused as
+    `UnknownAlgorithm`;
   - a zero capacity is refused.
+- `open` and `open_with` refuse `write-ahead-before-apply` as `MissingCapability`, naming `open_journaled`.
+  `open_journaled` refuses (`StateConflict`) a volatile configuration, a book, world and limits that disagree on the
+  session or configuration, a journal that disagrees with the book, and a replay that does not reproduce the
+  journal (an outcome that differs, or a journaled cancellation of a command that already ended). `durable_outcome` on a volatile session is a `StateConflict`.
 - `Rejection`s:
   - `WrongSession`, `RevisionMismatch`, `Invalid`;
   - `Late`, with the requested and earliest boundaries;
@@ -161,7 +210,8 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - every admission refusal, closing, and failing every unfinished command when the run stops.
 - `tests/session.rs` (12 tests), with the owner and clients as separate Asupersync Lab tasks, quiescent and
   invariant-clean under each seed:
-  - `volatile-in-memory` admitted and `write-ahead-before-apply` refused;
+  - `volatile-in-memory` admitted, and `write-ahead-before-apply` refused by `open` with a pointer to
+    `open_journaled`;
   - C.14's full scientific queue while paused, with inspect, step, run, pause, resume and close still served;
   - commands applied at exactly their ticks in admission order, with the world equal to the direct one;
   - retries returning the first outcome, conflicting reuse, late and retargeted targets, and a wrong revision;
@@ -214,21 +264,25 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - 20 planted mutants in the encoders, decoders, container and path resumption, each caught by these tests or
     `flife-core`'s.
 
-**Validity domain.** `volatile-in-memory` durability; `cpu-reference` and `qualified-reference`; one owner task on
-any Asupersync runtime; `InjectEnergy` as the only intervention.
+- FL-036's journaled sessions are tested in `flife-store`'s `tests/journal.rs`, against its FrankenSQLite journal
+  and test journals that gate, lose or crash at appends (see that crate's contract).
+
+**Validity domain.** `volatile-in-memory` and `write-ahead-before-apply` durability; `cpu-reference` and
+`qualified-reference`; one owner task on any Asupersync runtime, plus the journal's writer thread for a journaled
+session; `InjectEnergy` as the only intervention.
 
 **Known gaps.**
-- No durability. Acceptance is held in memory, and everything since the session opened is lost if the process
-  ends. Appendix A's `write-ahead-before-apply` needs FL-036's FrankenSQLite command journal, with:
-  - durable admission and cancellation records, and persistence receipts;
-  - reconciliation of an uncertain append by command identity and journal watermark;
-  - crash and retry tests (C.14's interrupted energy brush).
-- Idempotency records are kept for the session's whole life. A bounded window belongs to the journal.
-- FL-016 encodes the schedule, sealed boundary and outcome stream with the world. C.14's checkpoint after B
-  across a crash also needs the journal (FL-036) and resume (FL-037); FL-035's `flife-store` holds the
-  checkpoints. There is no
-  checkpoint command or session resume yet: `checkpoint` and `restore` are library calls on a closed or
-  quiescent world and book.
+- `volatile-in-memory` sessions still lose everything since opening when the process ends; that is the profile.
+- Write-ahead durability is as strong as the journal's flush: process crashes are tested (SIGKILL at each C.14
+  point), power loss is not.
+- Idempotency records, in the book and the journal, are kept for the session's whole life. No bounded window or
+  journal compaction yet.
+- A failed journal stops the session for good; recovering means reopening from the journal. No in-place retry.
+- Replay from a checkpoint re-runs every tick after it: there is no resume CLI, and `flife run` refuses
+  `write-ahead-before-apply` (FL-037 opens journaled runs and resumes them from the newest valid checkpoint).
+  `SessionHandle::checkpoint` and the library calls `checkpoint`/`restore` are the only checkpoint paths.
+- `block_on_inline` must not run on an Asupersync runtime thread (FrankenSQLite reaches for the thread's runtime
+  while it parks, and an open never completes), so journal I/O runs on the writer thread or a plain thread.
 - Brushes, regions, material, removal, seeded introduction, source edits and their native input mapping are FL-022.
   FL-014's single-cell `InjectEnergy` is the canonical payload they will extend.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,

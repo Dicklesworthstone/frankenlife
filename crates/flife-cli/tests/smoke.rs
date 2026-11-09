@@ -19,8 +19,8 @@ use flife_cli::{
     ControllerChoice, ERROR_SCHEMA, Finished, Heredity, RUN_SCHEMA, RUN_SESSION, Record,
     RunOptions, Stop, Survey, Tally, VALIDATE_SCHEMA, Validation, run,
 };
-use flife_core::{CoreError, ValidatedConfig};
-use flife_runtime::SessionConfig;
+use flife_core::ValidatedConfig;
+use flife_runtime::{Durability, SessionConfig};
 use serde_json::Value;
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -157,8 +157,9 @@ fn the_preset_is_appendix_a_with_exactly_its_declared_changes() {
 }
 
 /// The preset validates at the Reference profile's scale (§19.5), and its
-/// session admits it. Appendix A as written is refused only for its
-/// durability, which needs FL-036's journal.
+/// session admits it. Appendix A as written declares
+/// `write-ahead-before-apply`, which a session holds only through a command
+/// journal (FL-036); `flife run` opens none, so the binary refuses it.
 #[test]
 fn the_preset_validates_at_the_reference_scale_and_its_session_admits_it() {
     let config = preset();
@@ -181,10 +182,12 @@ fn the_preset_validates_at_the_reference_scale_and_its_session_admits_it() {
 
     let appendix = ValidatedConfig::from_toml(appendix_a());
     assert!(appendix.is_ok(), "{appendix:?}");
-    let refused = appendix.map(|appendix| SessionConfig::from_config(RUN_SESSION, &appendix));
+    let durability = appendix.map(|appendix| {
+        SessionConfig::from_config(RUN_SESSION, &appendix).map(|limits| limits.durability)
+    });
     assert!(
-        matches!(refused, Ok(Err(CoreError::MissingCapability { .. }))),
-        "{refused:?}"
+        matches!(durability, Ok(Ok(Durability::WriteAhead))),
+        "{durability:?}"
     );
 }
 
@@ -496,6 +499,12 @@ fn the_flife_binary_validates_runs_and_refuses_with_typed_errors() {
     assert_eq!(status, Some(2));
     assert!(out.is_empty());
     assert_eq!(err[0]["kind"], "missing-capability");
+    assert!(
+        err[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("flife run opens no command journal")),
+        "refused by flife run before founding the world: {err:?}"
+    );
 }
 
 /// A run that pauses on capacity reports it and exits with status 1: with

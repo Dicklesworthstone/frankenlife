@@ -617,7 +617,7 @@ The repository holds:
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
   (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015), and
-  `crates/flife-manim` and `crates/flife-studio` (FL-018), and `crates/flife-store` (FL-035), each with its
+  `crates/flife-manim` and `crates/flife-studio` (FL-018), and `crates/flife-store` (FL-035, FL-036), each with its
   `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
@@ -716,7 +716,12 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
 - The owner seals a boundary's commands, prepares with `World::advance_with`, then yields and drains control before
   publishing. A cancellation that arrives there discards the candidate and rebuilds it. Never publish a candidate
   that holds a cancelled command, and never add a second commit path around the owner.
-- Durability is `volatile-in-memory` only. `write-ahead-before-apply` is refused until FL-036's journal exists.
+- Durability (FL-036): `volatile-in-memory` sessions open with `open`/`open_with`; `write-ahead-before-apply` ones
+  only with `open_journaled`, over a `JournalWriter` (the `Journal` port; `flife-store`'s `CommandJournal` is the
+  FrankenSQLite one). Answer an acceptance or cancellation only from its receipt, hold the boundary a waiting
+  record is due at, and never wait on journal I/O on the owner. `block_on_inline` deadlocks on an Asupersync
+  runtime thread: run journal I/O on the writer thread or a plain thread. Crash tests kill a child process at a
+  named point (`FLIFE_JOURNAL_CHILD`) and recover from what the files actually hold.
 - Session tests run the owner and clients as Lab tasks. Assert outcomes against a directly stepped world, and sweep
   seeds or yields until every side of a race is exercised.
 - The owner offers every published boundary to its render feed (FL-017) before replying, and again at each

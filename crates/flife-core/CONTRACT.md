@@ -200,8 +200,10 @@ Every issue is reported, not just the first.
   stops on the committed state), and the founders' `uniform` initial positions and `zero` initial velocity, moved
   from FL-015. Founder positions draw words 0 and 1 of `(founders, organism, 0, lane (0, position, 0), 0)`.
 - FL-014, in `flife-runtime`: the command durability `volatile-in-memory`, §12.3's labelled best-effort mode.
-  Acceptance is held by the session owner and lost if the process ends. Appendix A's `write-ahead-before-apply`
-  stays `Specified` under FL-036, and a session refuses it until the journal exists.
+  Acceptance is held by the session owner and lost if the process ends.
+- FL-036, in `flife-runtime` and `flife-store`: Appendix A's command durability `write-ahead-before-apply`. A
+  session opened with `open_journaled` relies on an acceptance, cancellation or outcome only once its FrankenSQLite
+  command journal has made it durable; the evidence is C.14's crash at each point of an energy brush.
 - FL-017, in `flife-render` and `flife-runtime`: the observer pressure policy
   `drop-observer-or-pause-unchanged-world`.
   - The render feed takes its drop arm: a busy feed skips the boundary and keeps the last displayable epoch, and

@@ -616,18 +616,28 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         ..entry("qualified-reference", Role::Determinism, "§16.1", "FL-013")
     },
     entry("specified", Role::MathMode, "§10.3, A.1", "FL-008"),
-    entry(
-        "write-ahead-before-apply",
-        Role::CommandDurability,
-        "§12.3",
-        "FL-036",
-    ),
+    // FL-036: `flife_runtime::open_journaled` over `flife-store`'s
+    // FrankenSQLite command journal. An acceptance, cancellation or outcome
+    // is relied on only once the journal's receipt says it is durable, and a
+    // process killed at each point of C.14's energy brush recovers with the
+    // brush applied once.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-store::tests/journal.rs::c14_a_crash_at_each_point_recovers_and_a_retry_applies_once",
+        },
+        ..entry(
+            "write-ahead-before-apply",
+            Role::CommandDurability,
+            "§12.3",
+            "FL-036",
+        )
+    },
     // §12.3's labelled best-effort mode: the session owner holds acceptance
     // in memory and acknowledges it as volatile, lost if the process ends
     // (FL-014). The write-ahead journal above is FL-036's.
     AlgorithmEntry {
         status: Status::Implemented {
-            evidence: "test:flife-runtime::tests/session.rs::the_session_admits_volatile_in_memory_and_refuses_write_ahead_until_the_journal",
+            evidence: "test:flife-runtime::tests/session.rs::the_session_admits_volatile_in_memory_and_write_ahead_needs_a_journal",
         },
         ..entry(
             "volatile-in-memory",

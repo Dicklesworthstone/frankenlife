@@ -15,10 +15,12 @@
 #![forbid(unsafe_code)]
 
 pub mod observe;
+pub mod render;
 pub mod run;
 pub mod validate;
 
 pub use observe::{Heredity, Survey, Tally};
+pub use render::{RENDER_SCHEMA, RenderOptions, RenderRecord, render};
 pub use run::{
     AUTO_WORKER_CEILING, Finished, RUN_SCHEMA, RUN_SESSION, Record, RunOptions, Stop, auto_workers,
     found, run, start,

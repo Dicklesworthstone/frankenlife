@@ -26,8 +26,9 @@ use fmn_render::metal::{
     INPUT_QUEUE_CAPACITY, InputEvent, NativePreviewRenderer, PresentOutcome, PresentationState,
     SurfaceMetrics,
 };
+use std::num::NonZeroUsize;
 
-use crate::{Controls, SessionThread, Status};
+use crate::{Controls, Intent, SessionThread, Status};
 
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
@@ -42,6 +43,12 @@ pub struct StudioOptions {
     pub size: Option<[u32; 2]>,
     /// Whether the user may resize the window.
     pub resizable: bool,
+    /// Threads for the world's field and organism phases, replacing
+    /// `[execution] cpu_workers`; no result depends on it.
+    pub cpu_workers: Option<NonZeroUsize>,
+    /// Whether the world starts running when the window opens, as if Space
+    /// had been pressed.
+    pub run_on_open: bool,
 }
 
 impl Default for StudioOptions {
@@ -50,6 +57,8 @@ impl Default for StudioOptions {
             title: "FrankenLife Studio".into(),
             size: None,
             resizable: true,
+            cpu_workers: None,
+            run_on_open: false,
         }
     }
 }
@@ -152,11 +161,14 @@ impl Studio {
         preview
             .set_resizable(options.resizable)
             .map_err(|error| missing(format!("a resizable preview window: {error}")))?;
-        let world = World::found(
+        let mut world = World::found(
             config,
             Arrangement::FreeList,
             NumericalProfile::reference_f32()?,
         )?;
+        if let Some(workers) = options.cpu_workers {
+            world.set_cpu_workers(workers)?;
+        }
         let (owner, handle) = flife_runtime::open(world, config, STUDIO_SESSION)?;
         let feed = handle.feed();
         // Each epoch is copied into the cloud and its lease returned before
@@ -175,6 +187,9 @@ impl Studio {
                 bytes: u64::try_from(INPUT_QUEUE_CAPACITY * size_of::<InputEvent>())
                     .unwrap_or(u64::MAX),
             })?;
+        if options.run_on_open {
+            session.send(Intent::Resume)?;
+        }
         Ok(Self {
             preview,
             session,

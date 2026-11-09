@@ -127,5 +127,8 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   commands are FL-020's and FL-022's.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here. The
   synchronous present path is an integration starting point, not latency evidence.
+- The field layer and halos are a first legibility pass, not FL-019's mappings. The field is drawn from the epoch's
+  bounded `FieldTexture` at its texel resolution, so the picture is soft rather than detailed. Motion between ticks
+  is not interpolated (FL-020).
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later
   work (FL-023, FL-038).

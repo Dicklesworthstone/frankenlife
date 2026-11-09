@@ -4,9 +4,9 @@
 use flife_core::CoreError;
 use flife_render::{Epoch, Prior};
 use fmn_core::color::{LinearRgba, Srgb};
-use fmn_render::{ThreeDCamera, ThreeDJob, Tiling};
+use fmn_render::{ThreeDCamera, ThreeDDraw, ThreeDJob, Tiling};
 
-use crate::{ParticleCloud, Viewport};
+use crate::{FieldLayer, ParticleCloud, Viewport};
 
 /// A `#rrggbb` colour, as `[presentation] background` spells it.
 #[must_use]
@@ -30,6 +30,7 @@ pub struct WorldView {
     background: LinearRgba,
     viewport: Viewport,
     camera: ThreeDCamera,
+    field: FieldLayer,
     cloud: ParticleCloud,
     shown: Option<Prior>,
 }
@@ -53,6 +54,7 @@ impl WorldView {
         Ok(Self {
             camera: viewport.camera(background)?,
             background,
+            field: FieldLayer::new(&viewport),
             viewport,
             cloud: ParticleCloud::with_capacity(capacity)?,
             shown: None,
@@ -95,6 +97,7 @@ impl WorldView {
     /// As [`ParticleCloud::update`]; what is shown is unchanged on error.
     pub fn show(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
         self.cloud.update(epoch, &self.viewport)?;
+        self.field.update(epoch.field())?;
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),
@@ -108,12 +111,62 @@ impl WorldView {
     /// [`CoreError::NumericalInvalid`] when FrankenManim refuses to compile
     /// the draws.
     pub fn job(&self) -> Result<ThreeDJob<'_>, CoreError> {
-        ThreeDJob::new(self.camera.camera(), self.cloud.draws(), Tiling::default()).map_err(
-            |error| CoreError::NumericalInvalid {
+        // Painter order: the field, every halo, then every dot.
+        let halos = self.cloud.halos();
+        let dots = self.cloud.draws();
+        let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
+        draws
+            .try_reserve_exact(1 + halos.len() + dots.len())
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "world view frame draws",
+                bytes: u64::try_from(
+                    (1 + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
+                )
+                .unwrap_or(u64::MAX),
+            })?;
+        draws.extend(self.field.draw());
+        draws.extend_from_slice(halos);
+        draws.extend_from_slice(dots);
+        ThreeDJob::new(self.camera.camera(), &draws, Tiling::default()).map_err(|error| {
+            CoreError::NumericalInvalid {
                 quantity: "world view frame",
                 detail: error.to_string(),
-            },
-        )
+            }
+        })
+    }
+
+    /// Render the current frame on the CPU with up to `threads` threads, as
+    /// tight top-row-first sRGB RGBA8: FrankenManim's reference 3D route,
+    /// for offline frames and video.
+    ///
+    /// # Errors
+    /// As [`WorldView::job`]; [`CoreError::NumericalInvalid`] when
+    /// FrankenManim cannot render or convert the frame.
+    pub fn render_rgba8(&self, threads: usize) -> Result<Vec<u8>, CoreError> {
+        let refused = |error: String| CoreError::NumericalInvalid {
+            quantity: "world view offline frame",
+            detail: error,
+        };
+        let frame = self
+            .job()?
+            .render(threads.max(1))
+            .map_err(|error| refused(error.to_string()))?;
+        let [width, height] = self.viewport.drawable();
+        let bytes = usize::try_from(u64::from(width) * u64::from(height) * 4).map_err(|_| {
+            CoreError::Overflow {
+                quantity: "offline frame bytes",
+            }
+        })?;
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(bytes)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "offline frame",
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            })?;
+        rgba.resize(bytes, 0);
+        fmn_frame::convert::rgba16f_to_rgba8_slice(&frame, &mut rgba)
+            .map_err(|error| refused(error.to_string()))?;
+        Ok(rgba)
     }
 
     /// The epoch currently shown.
@@ -140,10 +193,16 @@ impl WorldView {
         &self.cloud
     }
 
-    /// Scene objects in the view: the one particle cloud, however many
-    /// organisms it draws.
+    /// Scene objects in the view: the field layer and the one particle
+    /// cloud, however many organisms it draws.
     #[must_use]
     pub const fn scene_objects(&self) -> usize {
-        1
+        2
+    }
+
+    /// The field layer.
+    #[must_use]
+    pub const fn field(&self) -> &FieldLayer {
+        &self.field
     }
 }

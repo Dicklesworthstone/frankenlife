@@ -125,6 +125,10 @@ fn live() -> Result<Vec<String>, String> {
         title: "FrankenLife Studio (live test)".into(),
         size: Some([640, 400]),
         resizable: true,
+        // Several threads, so the closing digest check below also shows the
+        // parallel tick computes the directly stepped (one-thread) world.
+        cpu_workers: std::num::NonZeroUsize::new(4),
+        run_on_open: false,
     };
     let studio = Studio::open(&config, &options).map_err(|error| format!("opening: {error}"))?;
     let mut live = Live {
@@ -166,9 +170,12 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     let reserved = live.studio.view().cloud().reserved_bytes();
     live.check(
-        live.studio.view().scene_objects() == 1
+        live.studio.view().scene_objects() == 2
             && live.studio.view().cloud().capacity() == ceiling as usize,
-        format!("one scene object, its draws reserved once for the {ceiling}-organism ceiling"),
+        format!(
+            "two scene objects (the field and one cloud), the cloud reserved once for the \
+             {ceiling}-organism ceiling"
+        ),
     )?;
 
     // Space runs: the live world advances on screen.

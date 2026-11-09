@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -39,7 +40,31 @@ struct Cli {
     /// Keep the window at its opening size.
     #[arg(long)]
     fixed: bool,
+    /// Open paused; Space starts the world.
+    #[arg(long)]
+    paused: bool,
+    /// Threads for the world's field and organism phases: a count, or
+    /// `auto` (the default) for one per available core, up to 16. No result
+    /// depends on it.
+    #[arg(long, default_value = "auto", value_parser = parse_workers)]
+    cpu_workers: NonZeroUsize,
 }
+
+/// A worker count, or `auto`.
+fn parse_workers(text: &str) -> Result<NonZeroUsize, String> {
+    if text == "auto" {
+        return Ok(std::thread::available_parallelism()
+            .map_or(NonZeroUsize::MIN, |cores| cores.min(AUTO_WORKER_CEILING)));
+    }
+    text.parse()
+        .map_err(|_| format!("`{text}` is not a positive worker count or `auto`"))
+}
+
+/// The most workers `auto` picks.
+const AUTO_WORKER_CEILING: NonZeroUsize = match NonZeroUsize::new(16) {
+    Some(ceiling) => ceiling,
+    None => NonZeroUsize::MIN,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case", tag = "record")]
@@ -52,6 +77,7 @@ enum Record<'a> {
         capacity: usize,
         window: [u32; 2],
         frames_per_second: u32,
+        cpu_workers: usize,
     },
     Status {
         schema: &'static str,
@@ -108,6 +134,8 @@ fn main() -> ExitCode {
             .zip(cli.height)
             .map(|(width, height)| [width, height]),
         resizable: !cli.fixed,
+        cpu_workers: Some(cli.cpu_workers),
+        run_on_open: !cli.paused,
         ..StudioOptions::default()
     };
     let clock = Instant::now();
@@ -125,6 +153,7 @@ fn main() -> ExitCode {
         capacity: studio.view().cloud().capacity(),
         window: studio.view().viewport().drawable(),
         frames_per_second: fps,
+        cpu_workers: cli.cpu_workers.get(),
     });
 
     let period = Duration::from_secs(1) / fps;

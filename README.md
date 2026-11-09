@@ -68,7 +68,7 @@ next.**
 - When every slot is busy the boundary is skipped and the last displayable epoch stays.
 - Viewers hold a bounded number of leases each and read the feed directly, never through the session's lanes.
 
-Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. `crates/flife-manim` (FL-018) is the FrankenManim adapter: an exact viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from each epoch onto FrankenManim's 3D camera route (checked against FrankenManim's own CPU renderer to 0.05 px). `crates/flife-studio` (FL-018) is the native host. The window, typed input and Metal presentation stay on the main thread, and the session owner runs on its own Asupersync thread behind a bounded intent lane. A harness-free live test drives the real preset entirely with real AppKit events. No checkpoints, palettes, camera control or selection exist yet |
+Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. `crates/flife-manim` (FL-018) is the FrankenManim adapter: an exact viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from each epoch onto FrankenManim's 3D camera route (checked against FrankenManim's own CPU renderer to 0.05 px). `crates/flife-studio` (FL-018) is the native host. The window, typed input and Metal presentation stay on the main thread, and the session owner runs on its own Asupersync thread behind a bounded intent lane. A harness-free live test drives the real preset entirely with real AppKit events. The view draws the energy field under glowing lineage-coloured organisms, and `flife render` writes the same view to PNG frames and MP4. No checkpoints, camera control or selection exist yet |
 | Does the stack compose? | **Yes (FL-001, FL-018).** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter now delivers typed pointer, button, scroll, key, modifier, focus, capture-loss and resize events (FL-018 added the bridge upstream in FrankenTorch), and a real window probe qualifies it. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
@@ -317,21 +317,24 @@ ecology comes before any broad infrastructure.
 
 ## Planned command surface
 
-**Mostly proposed** (§14.6). `flife validate` and `flife run` exist (FL-015), and so does `flife-studio`
-(FL-018, macOS); the rest are later work items. Try the real preset headlessly, then live:
+**Mostly proposed** (§14.6). `flife validate`, `flife run` and `flife render` exist, and so does `flife-studio`
+(FL-018, macOS); the rest are later work items. Try the real preset headlessly, as frames and video, then live:
 
 ```bash
 cargo run --release -p flife-cli -- validate presets/reference-small-world.toml
 cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128
+cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 2560 --every 4 \
+    --width 1080 --height 1080 --out frames --video world.mp4
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540
 ```
 
-In the Studio, Space runs or pauses, → or `.` steps one tick while paused, and Esc or ⌘W closes. It prints
-`frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary and the closing world digest).
+The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
+and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary and the
+closing world digest). The organisms glow in their lineage colours over the energy field they feed on.
 
-On one core of an Apple-silicon Mac a tick at 4,096 organisms takes about 70 ms in release. The preset's 1,024
-ticks (8 simulated seconds, as the population falls to a few hundred) take about 30 s. The full surface, as
-planned:
+A tick at 4,096 organisms takes about 45 ms on one core of an Apple-silicon Mac in release, and about 14 ms on 16
+(`--cpu-workers`, default `auto`; measured on a heavily loaded M5 Ultra, so these are rough). Every worker count
+computes the same world bit for bit. The full surface, as planned:
 
 ```bash
 flife validate <config>     # range-check a config; report real memory and the worst admitted allocation
@@ -341,7 +344,7 @@ flife step | inspect        # advance one tick; a bounded snapshot of one organi
 flife checkpoint | resume   # durable, verified world state and exact resumption
 flife branch                # control and intervention branches from one checkpoint
 flife sweep | analyze       # seed ensembles, parameter sweeps, ablations and their metrics
-flife render | export       # simulation-time frames and video through FrankenManim
+flife render | export       # simulation-time frames and video through FrankenManim (render exists)
 flife-studio <preset>       # the interactive microscope
 ```
 

@@ -13,8 +13,9 @@ use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
 use flife_field::transport::{MAX_SUBSTEPS, transport};
 use flife_field::{
-    BufferLimits, Cell, ConeTolerance, FieldGrid, FieldPair, FieldState, PathSegment, Source,
-    SourceKernel, SourceSupport, TransportPlan, TransportScratch, advance_field,
+    BufferLimits, Cell, ConeTolerance, FieldGrid, FieldPair, FieldState, FieldWork, PathSegment,
+    Source, SourceKernel, SourceSupport, TransportPlan, TransportScratch, advance_field,
+    advance_field_on,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -740,4 +741,81 @@ fn field_step_accounts_for_every_joule() {
         "128 ticks: E = {}, injected {injected}, decayed {removed}, cumulative residual {cumulative_residual:e} ({normalized:e} normalized)",
         summary.energy_total
     );
+}
+
+#[test]
+fn the_field_step_on_any_number_of_workers_is_the_serial_step_bit_for_bit() {
+    let config = appendix_a();
+    let world = FieldGrid::from_config(&config).expect("grid");
+    let kernel = SourceKernel::from_config(&config).expect("kernel");
+    let step = config.report().timestep;
+    let limits = BufferLimits::host();
+    let mut draw = lcg(11);
+    let sources: Vec<Source> = (0..8_u32)
+        .map(|id| {
+            let normals = [(); CHANNELS].map(|()| draw() * 2.0 - 1.0);
+            Source::new(
+                SourceId::new(id),
+                [draw() * 128.0, draw() * 128.0],
+                unit_direction(&normals).expect("direction"),
+                80.0,
+            )
+            .expect("source")
+        })
+        .collect();
+    // Appendix A's plan takes one substep; strong diffusion takes several,
+    // which exercises each worker's own transport scratch.
+    let plans = [
+        TransportPlan::from_config(&config).expect("plan"),
+        TransportPlan::new(&world, step, 2_000.0, 0.05).expect("plan"),
+    ];
+    assert!(plans[1].substeps() > 1, "the second plan substeps");
+    for plan in &plans {
+        let bits = |pair: &FieldPair| -> Vec<u32> {
+            pair.current()
+                .as_slice()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        let mut serial = FieldPair::zeroed(world, &limits).expect("pair");
+        let mut scratch = TransportScratch::new(&world, &limits).expect("scratch");
+        let mut support = SourceSupport::new();
+        let reference: Vec<(String, Vec<u32>)> = (0..12)
+            .map(|_| {
+                let report = advance_field(
+                    &mut serial,
+                    plan,
+                    &kernel,
+                    &sources,
+                    step,
+                    &mut scratch,
+                    &mut support,
+                )
+                .expect("tick");
+                serial.commit();
+                (format!("{report:?}"), bits(&serial))
+            })
+            .collect();
+        for workers in [1, 2, 5, 32, 33, 40] {
+            let mut pair = FieldPair::zeroed(world, &limits).expect("pair");
+            let mut work = FieldWork::new(
+                &world,
+                &limits,
+                std::num::NonZeroUsize::new(workers).expect("nonzero"),
+            )
+            .expect("work");
+            for (tick, expected) in reference.iter().enumerate() {
+                let report = advance_field_on(&mut pair, plan, &kernel, &sources, step, &mut work)
+                    .expect("tick");
+                pair.commit();
+                let got = (format!("{report:?}"), bits(&pair));
+                assert!(
+                    &got == expected,
+                    "{workers} workers diverge at tick {tick} ({} substeps)",
+                    plan.substeps()
+                );
+            }
+        }
+    }
 }

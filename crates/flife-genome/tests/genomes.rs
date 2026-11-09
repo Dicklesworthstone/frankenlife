@@ -816,3 +816,53 @@ fn traits_are_bounded() {
     assert!(TraitLimits::new(1.0, 1.0, [16.0, 1.0], 4.0).is_err());
     assert!(TraitLimits::new(1.0, 1.0, [1.0, 16.0], f64::INFINITY).is_err());
 }
+
+#[test]
+fn a_sealed_genome_is_rescanned_only_under_a_tighter_bound() {
+    let config = appendix_a();
+    let catalog = catalog();
+    let limits = TraitLimits::from_config(&config).expect("limits");
+    let default = catalog.default_topology();
+    let topology = member(&catalog, default);
+    let mut quota = GenomeQuota::from_config(&config).expect("quota");
+    let traits = Traits::new(unit_affinity(), [0.1; 33], 1.0, &limits).expect("traits");
+    let mut buffer = quota.allocate(&catalog, default).expect("buffer");
+    initialize(topology, buffer.values_mut(), |address| {
+        address_word(7, address)
+    })
+    .expect("init");
+    // Inside Appendix A's ±4, outside ±3.
+    buffer.values_mut()[17] = 3.5;
+    let genome = Genome::seal(buffer, GenomeId::new(1), &catalog, traits, None, &limits)
+        .map_err(|unsealed| unsealed.error)
+        .expect("seal");
+
+    // Under the sealing bound (or a looser one) the controller is the one a
+    // full check builds, and evaluates identically.
+    let x = inputs(5);
+    let mut scratch = ControllerScratch::default();
+    let checked = ReferenceController::new(topology, genome.parameters(), 4.0)
+        .expect("checked")
+        .evaluate(&x, &mut scratch)
+        .expect("evaluate");
+    let looser = TraitLimits::new(1.0, 1.0, [1.0, 16.0], 8.0).expect("looser");
+    for bound in [&limits, &looser] {
+        let sealed = genome
+            .controller(&catalog, bound)
+            .expect("sealed")
+            .evaluate(&x, &mut scratch)
+            .expect("evaluate");
+        assert_eq!(
+            sealed.map(f32::to_bits),
+            checked.map(f32::to_bits),
+            "the sealed controller is the checked one"
+        );
+    }
+
+    // A tighter bound rescans, and refuses the parameter it no longer admits.
+    let tighter = TraitLimits::new(1.0, 1.0, [1.0, 16.0], 3.0).expect("tighter");
+    assert!(matches!(
+        genome.controller(&catalog, &tighter),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+}

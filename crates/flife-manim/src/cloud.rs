@@ -62,6 +62,24 @@ pub fn lineage_color(lineage: u64) -> LinearRgba {
     Srgb::from_rgb8(r, g, b).to_linear(1.0)
 }
 
+/// A halo's opacity: the soft glow around each organism.
+pub const HALO_ALPHA: f64 = 0.42;
+
+/// The energy at which a halo reaches half its extra size.
+pub const HALO_HALF_ENERGY: f64 = 2.0;
+
+/// A halo's radius as a multiple of the dot's: from `2` for an organism
+/// with no energy towards `4.5` for a very energetic one.
+#[must_use]
+pub fn halo_factor(energy: f32) -> f64 {
+    let energy = if energy.is_finite() {
+        f64::from(energy).max(0.0)
+    } else {
+        0.0
+    };
+    2.0 + 2.5 * (energy / (energy + HALO_HALF_ENERGY))
+}
+
 /// The dot radius in world units for a viewport.
 #[must_use]
 pub fn dot_radius(viewport: &Viewport) -> f64 {
@@ -72,6 +90,9 @@ pub fn dot_radius(viewport: &Viewport) -> f64 {
 #[derive(Debug)]
 pub struct ParticleCloud {
     draws: Vec<ThreeDDraw<'static>>,
+    /// One soft glow per organism, drawn under every dot; sized by energy.
+    halos: Vec<ThreeDDraw<'static>>,
+    radius: f64,
     capacity: usize,
 }
 
@@ -81,15 +102,23 @@ impl ParticleCloud {
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the buffer cannot be reserved.
     pub fn with_capacity(capacity: usize) -> Result<Self, CoreError> {
-        let mut draws = Vec::new();
-        draws
-            .try_reserve_exact(capacity)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "particle cloud draws",
-                bytes: u64::try_from(capacity.saturating_mul(size_of::<ThreeDDraw<'static>>()))
-                    .unwrap_or(u64::MAX),
-            })?;
-        Ok(Self { draws, capacity })
+        let reserve = |buffer| {
+            let mut draws = Vec::new();
+            draws
+                .try_reserve_exact(capacity)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer,
+                    bytes: u64::try_from(capacity.saturating_mul(size_of::<ThreeDDraw<'static>>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+            Ok::<_, CoreError>(draws)
+        };
+        Ok(Self {
+            draws: reserve("particle cloud draws")?,
+            halos: reserve("particle cloud halos")?,
+            radius: DOT_RADIUS,
+            capacity,
+        })
     }
 
     /// A cloud sized for `epoch`'s population ceiling.
@@ -132,13 +161,27 @@ impl ParticleCloud {
             });
         }
         let radius = dot_radius(viewport);
+        self.radius = radius;
         self.draws.clear();
-        for (position, &lineage) in epoch.positions().iter().zip(epoch.lineages()) {
+        self.halos.clear();
+        for ((position, &lineage), &energy) in epoch
+            .positions()
+            .iter()
+            .zip(epoch.lineages())
+            .zip(epoch.energies())
+        {
             let world = [f64::from(position[0]), f64::from(position[1])];
-            self.draws.push(ThreeDDraw::TrueDot(TrueDotDraw::new(
-                viewport.scene_point(world),
-                radius,
-                lineage_color(lineage),
+            let center = viewport.scene_point(world);
+            let color = lineage_color(lineage);
+            self.draws
+                .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
+            self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                center,
+                radius * halo_factor(energy),
+                LinearRgba {
+                    a: HALO_ALPHA,
+                    ..color
+                },
             )));
         }
         Ok(&self.draws)
@@ -149,11 +192,24 @@ impl ParticleCloud {
     /// can change.
     pub fn refit(&mut self, viewport: &Viewport) {
         let radius = dot_radius(viewport);
+        let ratio = radius / self.radius;
+        self.radius = radius;
         for draw in &mut self.draws {
             if let ThreeDDraw::TrueDot(dot) = draw {
                 dot.radius = radius;
             }
         }
+        for halo in &mut self.halos {
+            if let ThreeDDraw::TrueDot(dot) = halo {
+                dot.radius *= ratio;
+            }
+        }
+    }
+
+    /// The current halos, one per dot and in the same order.
+    #[must_use]
+    pub fn halos(&self) -> &[ThreeDDraw<'static>] {
+        &self.halos
     }
 
     /// The current draws, one per organism of the last epoch lowered.
@@ -172,8 +228,7 @@ impl ParticleCloud {
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
         u64::try_from(
-            self.draws
-                .capacity()
+            (self.draws.capacity() + self.halos.capacity())
                 .saturating_mul(size_of::<ThreeDDraw<'static>>()),
         )
         .unwrap_or(u64::MAX)

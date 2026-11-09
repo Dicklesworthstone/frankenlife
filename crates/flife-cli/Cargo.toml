@@ -17,7 +17,10 @@ clap.workspace = true
 flife-core = { path = "../flife-core" }
 flife-engine = { path = "../flife-engine" }
 flife-genome = { path = "../flife-genome" }
+flife-manim = { path = "../flife-manim" }
+flife-render = { path = "../flife-render" }
 flife-runtime = { path = "../flife-runtime" }
+fmn-codec.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

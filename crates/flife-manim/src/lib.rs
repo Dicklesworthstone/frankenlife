@@ -17,12 +17,14 @@
 #![forbid(unsafe_code)]
 
 mod cloud;
+mod field;
 mod viewport;
 mod world;
 
 pub use cloud::{
-    DOT_RADIUS, DOT_RADIUS_MIN_PIXELS, LINEAGE_PALETTE, ParticleCloud, dot_radius, lineage_color,
-    lineage_slot,
+    DOT_RADIUS, DOT_RADIUS_MIN_PIXELS, HALO_ALPHA, HALO_HALF_ENERGY, LINEAGE_PALETTE,
+    ParticleCloud, dot_radius, halo_factor, lineage_color, lineage_slot,
 };
+pub use field::{FIELD_PALETTE, FieldLayer, SCALE_DECAY, display_value, palette};
 pub use viewport::Viewport;
 pub use world::{WorldView, hex_rgb};

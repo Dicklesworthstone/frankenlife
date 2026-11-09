@@ -23,7 +23,12 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
   - `end`: why the run stopped (`reached`, `capacity-paused` or `failed` with the error's kind), the committed tick
     and world digest, the whole tally, and the survey of the committed world.
 
-  `progress` and `end` also carry `wall_seconds`, which is not scientific state.
+  `progress` and `end` also carry `wall_seconds`, which is not scientific state. `start` carries `cpu_workers`,
+  which no result depends on.
+- `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
+  render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
+  the video path if encoded, wall seconds). Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
+  route. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg`.
 - `Tally`:
   - published ticks;
   - births, rejected births, and deaths by the budget stage that exhausted them;
@@ -135,6 +140,10 @@ test.
   the first viable birth has no slot under `pause-before-commit`. The run ends `capacity-paused` before tick 1,024,
   with no birth published, and `flife` exits with status 1.
 
+`tests/render.rs` (1 test): `rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it`. Six ticks
+at three world threads write PNG frames at ticks 0, 3 and 6 with the requested size in their headers, and the end
+digest is a plain one-thread run's.
+
 The test profile is optimized (`[profile.test] opt-level = 3`, with debug assertions and overflow checks on), so
 the smoke run takes about 30 s. Rust floating point has no fast-math and no implicit contraction, so optimization
 changes no result. FL-013's digest, pinned before the change, still holds under it.
@@ -146,8 +155,12 @@ Twenty-two planted bugs were each caught by at least one of these tests or `flif
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client.
 
 **Known gaps.**
-- Only `validate` and `run`. Capabilities, step and inspect, checkpoint and resume, branch, sweep, analyze, render
+- Only `validate`, `run` and `render`. Capabilities, step and inspect, checkpoint and resume, branch, sweep, analyze
   and export are later items (§14.6): FL-016, FL-021, FL-037, FL-039, FL-041 and FL-023.
+- `render` draws on FrankenManim's CPU reference 3D route, a tick per frame at most, at the epoch's texel resolution
+  for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio. The
+  MP4 encoder is an external `ffmpeg` on `PATH`; without it `--video` is a typed `missing-capability` refusal after
+  the frames are written.
 - The run sends no commands. Interventions from the command line come with FL-022's recorded commands.
 - The survey sees only live organisms. Pairs and triples need their relatives alive, and lineage history beyond the
   live population is FL-040's incremental lineage summaries.

@@ -427,7 +427,13 @@ velocity, first-order splitting at the configured fixed timestep.
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet
   (FL-017), and the reference has no device fences. A candidate is exclusive by borrowing, not by a lease.
-- One thread. `execution.cpu_workers` is not read, and parallel phases must keep these reduction orders.
+- `execution.cpu_workers` (or `World::set_cpu_workers`) sets the threads for organism decisions and the field step;
+  no result depends on it (`the_cpu_worker_count_changes_no_result`: 1, 2, 3, 6 and 64 workers, 96 ticks with
+  births). Decisions read only committed state and split into contiguous identity-ordered chunks of at least 128,
+  the first error in identity order winning. The field splits transport by plane, and each moment plane keeps its
+  per-source deposit order. The threads are scoped `std` threads spawned per tick: a bounded, reported reference
+  adapter (§3.4, §12.5), not Asupersync-scheduled work. Invariant checks, chemistry composition, uptake and the
+  commit stay on one thread, and a persistent pool is later work. Parallel phases must keep these reduction orders.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.

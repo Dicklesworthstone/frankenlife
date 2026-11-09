@@ -7,11 +7,12 @@ The live ecology enters a FrankenManim scene as one bulk primitive, never as one
   and the 3D camera whose frame it is.
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
-- `WorldView` holds both, and builds each frame's `ThreeDJob`.
+- `FieldLayer` draws the epoch's energy field under the organisms as one vertex-coloured grid.
+- `WorldView` holds all three, and builds each frame's `ThreeDJob`.
 
 **Inputs.**
-- An FL-017 `Epoch`, read only: identity-ordered positions and lineages, the world extent and the population
-  ceiling (`Epoch::capacity`).
+- An FL-017 `Epoch`, read only: identity-ordered positions, energies and lineages, the bounded field texture, the
+  world extent and the population ceiling (`Epoch::capacity`).
 - A drawable size in pixels. A logical window size in points, for pointer conversion.
 - `[presentation] background` as `#rrggbb` (`hex_rgb`).
 
@@ -38,16 +39,28 @@ The live ecology enters a FrankenManim scene as one bulk primitive, never as one
   - radius `max(DOT_RADIUS = 0.35 world units, DOT_RADIUS_MIN_PIXELS = 1.5 px / scale)`;
   - colour `lineage_color(lineage)`: a fixed SplitMix64 mix of the lineage identity into a 12-colour categorical
     palette.
-  - `refit(viewport)` changes only the radius, because scene points do not depend on the drawable.
+  - one glow halo per dot, in the same order and drawn under every dot: the lineage colour at alpha
+    `HALO_ALPHA = 0.42`, radius `dot · halo_factor(energy)` with `halo_factor(e) = 2 + 2.5·e/(e + 2)` (2 to 4.5;
+    2 for non-finite or negative energy).
+  - `refit(viewport)` changes only the radii, halos in proportion, because scene points do not depend on the
+    drawable.
+- `FieldLayer::update(field)`:
+  - one vertex per texel corner, `(texels + 1)²`, spanning the world exactly; each coloured by the mean of the four
+    texels around it, wrapping, so opposite edges match and the torus shows no seam;
+  - the mean maps through `sqrt(value / scale)` and the six-stop `FIELD_PALETTE`; `scale` is the brightest texel,
+    or the previous scale times `SCALE_DECAY = 0.98` if larger, so the picture follows the field down slowly;
+  - drawn unshaded and without depth test (`SurfaceDraw`, vertex colours), which FrankenManim's CPU and Metal 3D
+    routes both accept.
 - `WorldView`:
   - `show(epoch)` lowers an epoch and records it as `shown()`, a `Prior`;
   - `resize(drawable)` refits the viewport, camera and radii, returning whether the size changed;
-  - `job()` is the frame;
-  - `scene_objects()` is 1.
+  - `job()` is the frame: the field, then every halo, then every dot;
+  - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
+  - `scene_objects()` is 2: the field and the cloud.
 
 **Invariants.**
-- *Bounded scene objects (§13.2).* The whole population is one scene object and one 3D job. There is no mobject,
-  animation handle or draw call per organism.
+- *Bounded scene objects (§13.2).* The whole population is one scene object, the field another, and a frame one 3D
+  job. There is no mobject or animation handle per organism.
 - *Bounded memory.* The draw buffer is reserved once, with fallible reservation, at the population ceiling. No
   update or refit allocates or moves it: `reserved_bytes` and the buffer's address are constant for the cloud's
   life.
@@ -89,6 +102,15 @@ route.
   - A resize refits only the radius, and the pixel floor binds when the world is small.
   - The palette spreads 4,096 lineages over all 12 colours, between 250 and 450 each.
   - `#rrggbb` parsing.
+- `tests/field.rs` (5 tests):
+  - The palette is monotone dark to bright; the display value is a clamped square root, zero for NaN, negatives and
+    a zero scale.
+  - A ramp field's grid spans the world, matches across both seams, and colours the seam corner by its wrapped
+    neighbours (3.5, not the interior 0.5).
+  - The display scale rises at once and falls by `SCALE_DECAY` per update.
+  - Every dot of a real epoch has one halo at its centre, sized by its energy, in the lineage colour at
+    `HALO_ALPHA`; a resize keeps halos proportional.
+  - A real frame rendered offline is opaque and lit by the field beyond the black background.
 - In `flife-studio`, `tests/live.rs` shows real epochs of the 4,096-organism reference world through this adapter in
   a real window.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).

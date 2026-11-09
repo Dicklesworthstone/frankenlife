@@ -49,6 +49,39 @@ enum Command {
         #[arg(long, value_parser = parse_workers)]
         cpu_workers: Option<NonZeroUsize>,
     },
+    /// Run a configuration headlessly and render it to PNG frames (and
+    /// optionally an MP4) through the Studio's FrankenManim view.
+    Render {
+        /// The configuration or preset, as TOML.
+        config: PathBuf,
+        /// Ticks to run after the founding frame.
+        #[arg(long, default_value_t = 1280)]
+        ticks: u64,
+        /// Draw a frame every this many ticks.
+        #[arg(long, default_value_t = 4)]
+        every: u64,
+        /// Frame width in pixels.
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        /// Frame height in pixels.
+        #[arg(long, default_value_t = 1280)]
+        height: u32,
+        /// The directory for the PNG frames.
+        #[arg(long)]
+        out: PathBuf,
+        /// Threads for the world: a count or `auto`.
+        #[arg(long, default_value = "auto", value_parser = parse_workers)]
+        cpu_workers: NonZeroUsize,
+        /// Threads for FrankenManim's CPU renderer: a count or `auto`.
+        #[arg(long, default_value = "auto", value_parser = parse_workers)]
+        render_threads: NonZeroUsize,
+        /// Encode the frames into this MP4 with ffmpeg.
+        #[arg(long)]
+        video: Option<PathBuf>,
+        /// The video's frames per second.
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+    },
 }
 
 #[derive(Serialize)]
@@ -67,6 +100,28 @@ fn main() -> ExitCode {
             }
             Err(code) => code,
         },
+        Command::Render {
+            config,
+            ticks,
+            every,
+            width,
+            height,
+            out,
+            cpu_workers,
+            render_threads,
+            video,
+            fps,
+        } => render(
+            &config,
+            ticks,
+            every,
+            [width, height],
+            out,
+            cpu_workers,
+            render_threads,
+            video,
+            fps,
+        ),
         Command::Run {
             config,
             ticks,
@@ -101,6 +156,41 @@ fn parse_workers(text: &str) -> Result<NonZeroUsize, String> {
     }
     text.parse()
         .map_err(|_| format!("`{text}` is not a positive worker count or `auto`"))
+}
+
+#[expect(clippy::too_many_arguments, reason = "one argument per flag")]
+fn render(
+    config: &PathBuf,
+    ticks: u64,
+    every: u64,
+    size: [u32; 2],
+    out: PathBuf,
+    cpu_workers: NonZeroUsize,
+    render_threads: NonZeroUsize,
+    video: Option<PathBuf>,
+    fps: u32,
+) -> ExitCode {
+    let config = match load(config) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let options = flife_cli::RenderOptions {
+        ticks,
+        every,
+        size,
+        out,
+        cpu_workers: Some(cpu_workers),
+        render_threads,
+        video,
+        fps,
+    };
+    match flife_cli::render(&config, &options, print) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            fail(error.kind(), error.to_string());
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn load(path: &PathBuf) -> Result<ValidatedConfig, ExitCode> {

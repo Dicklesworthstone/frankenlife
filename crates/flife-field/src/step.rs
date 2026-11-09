@@ -15,7 +15,7 @@ use crate::sources::{
     DepositReport, Source, SourceKernel, SourceSupport, component, deposit, deposit_energy,
     deposit_moment,
 };
-use crate::state::FieldPair;
+use crate::state::{FieldPair, FieldState};
 use crate::transport::{
     TransportPlan, TransportReport, TransportScratch, sum, transport, transport_on,
 };
@@ -56,24 +56,69 @@ pub fn advance_field(
     let (current, next) = pair.stage();
     let transported = transport(plan, current, next, scratch)?;
     let mut deposits = Vec::with_capacity(sources.len());
-    let (mut injected_declared, mut injected_applied) = (0.0, 0.0);
     for source in sources {
-        let report = deposit(next, kernel, source, step, support)?;
+        deposits.push(deposit(next, kernel, source, step, support)?);
+    }
+    Ok(step_report(transported, deposits, next))
+}
+
+/// The report of a step whose transport and deposits are done, with `next`
+/// the candidate field: the injected totals in source order, the
+/// candidate's energy and the step's residual. An accelerator that runs the
+/// step itself reports through this, so its report is the reference's.
+#[must_use]
+pub fn step_report(
+    transport: TransportReport,
+    deposits: Vec<DepositReport>,
+    next: &FieldState,
+) -> FieldStepReport {
+    let (mut injected_declared, mut injected_applied) = (0.0, 0.0);
+    for report in &deposits {
         injected_declared += report.declared;
         injected_applied += report.applied;
-        deposits.push(report);
     }
     let energy_after = sum(next.energy());
-    let residual = (energy_after - transported.energy_before)
-        - (injected_declared - transported.decay_removed);
-    Ok(FieldStepReport {
-        transport: transported,
+    let residual =
+        (energy_after - transport.energy_before) - (injected_declared - transport.decay_removed);
+    FieldStepReport {
+        transport,
         deposits,
         injected_declared,
         injected_applied,
         energy_after,
         residual,
-    })
+    }
+}
+
+/// The field backend port (plan §10.7, §11.1): phase 2 of the tick on an
+/// accelerator. The composition root (the CLI, the Studio) chooses an
+/// implementation and gives it to the world; the engine depends only on
+/// this trait, and no backend depends on the engine.
+///
+/// A backend is an exact replacement for [`advance_field_on`], not an
+/// approximation: the candidate it writes and the report it returns are the
+/// reference's, bit for bit. Any error hands the step back to the
+/// reference, which reproduces the reference's own error or finds none. So
+/// no result of a run depends on the backend.
+pub trait FieldBackend: std::fmt::Debug + Send {
+    /// The backend and its device, for run records.
+    fn describe(&self) -> String;
+
+    /// [`advance_field_on`]'s step: transport `pair`'s committed field into
+    /// its candidate, then deposit `sources`.
+    ///
+    /// # Errors
+    /// Any; the candidate is then incomplete. The world redoes the step on
+    /// the reference, and stops using the backend if the reference finds
+    /// no error.
+    fn advance(
+        &mut self,
+        pair: &mut FieldPair,
+        plan: &TransportPlan,
+        kernel: &SourceKernel,
+        sources: &[Source],
+        step: TimeStep,
+    ) -> Result<FieldStepReport, CoreError>;
 }
 
 /// Reusable scratch for [`advance_field_on`]: one transport scratch per CPU
@@ -160,13 +205,9 @@ pub fn advance_field_on(
     let supports = &mut supports[..sources.len()];
     let grid = *next.grid();
     let mut deposits = Vec::with_capacity(sources.len());
-    let (mut injected_declared, mut injected_applied) = (0.0, 0.0);
     for (source, support) in sources.iter().zip(supports.iter_mut()) {
         kernel.support_into(&grid, source.center(), support)?;
-        let report = deposit_energy(next, source, step, support)?;
-        injected_declared += report.declared;
-        injected_applied += report.applied;
-        deposits.push(report);
+        deposits.push(deposit_energy(next, source, step, support)?);
     }
 
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
@@ -210,16 +251,5 @@ pub fn advance_field_on(
         }
         result
     })?;
-
-    let energy_after = sum(next.energy());
-    let residual = (energy_after - transported.energy_before)
-        - (injected_declared - transported.decay_removed);
-    Ok(FieldStepReport {
-        transport: transported,
-        deposits,
-        injected_declared,
-        injected_applied,
-        energy_after,
-        residual,
-    })
+    Ok(step_report(transported, deposits, next))
 }

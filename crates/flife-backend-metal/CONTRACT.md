@@ -20,6 +20,13 @@ dispatched, about 1.8 KiB each (+368 MB over 200,000 dispatches on an M5 Ultra).
 went through it, so a long run with Metal controllers grew by that much per tick. `71bbe52e` fixes `dispatch`, and
 the batch drains a pool per submission.
 
+FL-031 (`flife-8le`), first part: phase 2 of the tick (transport, decay and the external sources) on Metal,
+bit-identical to `flife_field::advance_field_on` (plan §8.1, §10.7, §11.1), in `field`. `MetalField` is a
+`flife_field::FieldBackend`. The device does the per-cell work in `field.metal` on `softfloat64.metal`'s binary64:
+every plane's substeps, every candidate cell's source weight (its `exp`) and every moment value's decay and
+deposits. The host does every sequential F64 sum through flife-field's own functions. The software binary64 moved
+from `controller.metal` into `softfloat64.metal`, which both kernels now share.
+
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
@@ -40,6 +47,11 @@ the batch drains a pool per submission.
   - commands: `submit(&pipeline, &[buffer.reads(), buffer.writes(), …], grid)` for one kernel, and FL-029's
     `submit_batch(&[Kernel { pipeline, bindings, grid }, …])` for several in order;
   - `retire(buffer)`, `state`, `epoch`, `elements` and `usage`.
+
+- FL-031, the field: `MetalField::open()` (or `with_owner(owner)`), given to a world with
+  `World::set_field_backend`. Each step receives the field pair, transport plan, source kernel, the tick's
+  sources and the time step, exactly what `advance_field_on` takes. No CLI or Studio choice selects it yet (see
+  the known gaps).
 
 **Outputs.** One entry per organism, in batch order: its 36 raw outputs, or `None` for a deferred organism. The
 caller evaluates a deferred organism on the reference controller.
@@ -128,6 +140,30 @@ kernel cannot shape, or whose inputs are not finite in F32, is deferred without 
   consumer that exits or unwinds frees what it held.
 - Live bytes never exceed `Limits::bytes`, retiring buffers included, and each purpose holds at most
   `leases_per_purpose` read leases.
+
+**Invariants — the field (FL-031; §8.1, §10.7).**
+- The candidate field and every F64 term of the step's report are `advance_field_on`'s, bit for bit.
+- Field values cross to the device and back as F32 bit patterns and are never held in a device `float`. This
+  device flushes subnormal F32 arithmetic to zero, and these bits keep them.
+- The device computes the reference's per-cell expressions operation for operation in software binary64, with
+  no fused multiply-add:
+  - each substep `((c·u + r_x·(u_w + u_e)) + r_y·(u_s + u_n))` from exact F32 inputs, rounded once;
+  - each candidate's minimum-image displacement, `d²` against `r²`, and `exp_neg(d²/2σ²)` (flife-core's
+    numerics, ported);
+  - each moment's decay `f32(f64(m) × factor)` (skipped at factor 1, as the reference does), then each source's
+    deposit in source order, `f32(f64(m) + q·a)`, skipping a zero component.
+- The host keeps the sequential F64 sums and the order-dependent steps, using flife-field's own functions: the
+  energy totals and the energy plane's decay (`energy_report`), each source's support and weight sum from the
+  device's weights (`weigh_into`), the energy-plane deposits and their amounts `q` (`deposit_energy`), and the
+  report (`step_report`). A sum of thousands of terms in a fixed order is serial, and one GPU thread's software
+  F64 is far slower at it than the host.
+- One step is two commands: the substeps and the weights, then the moments once the host has written each
+  candidate's amount over its weight. The field is uploaded and the candidate read back every step.
+- A non-finite operand anywhere sets the device's fault word, and the step is refused (`NumericalInvalid`). So
+  is a non-finite amount, which could alias a weight marker. A displacement the reference refuses is refused the
+  same way. The world then takes the step on the reference, which gives the reference's own result or error.
+- A backend of the engine path: an error from `advance` hands that step to the reference and drops the backend
+  (`flife-engine`'s `World::field_report`).
 
 **Refusal cases.** No Metal device, which is always the case off macOS: `MissingCapability`. A kernel that does not
 compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `LayoutMismatch`. FL-028's owner refuses:
@@ -236,8 +272,52 @@ A refusal changes nothing.
 - `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's five buffers, with
   no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
   crate, every output still bit-identical.
+- `tests/field.rs` (FL-031, 5 tests), each step against `advance_field_on` on the same input, every candidate value
+  and report term compared as bits:
+  - `the_metal_step_is_the_reference_step_bit_for_bit`, three random fields each (zeros, subnormals, both signs,
+    magnitudes to 1e6) over: the preset's scale (128², eight sources of radius 40, decay); the preset's plan
+    without sources; centers on the seams and corners of a non-square grid of non-unit cells; two and five
+    substeps; a support covering the whole torus; one-cell supports; centers on cell centers with an integer
+    radius, so candidates lie at exactly `d² = r²`, which the reference includes; and no sources. More than
+    1.5 million values in all.
+  - `a_support_whose_far_weights_underflow_is_still_the_reference`: a radius of 45σ, where `exp` underflows to
+    zero and those cells stay in the support.
+  - `a_non_finite_operand_is_refused`: an infinity in one moment value is refused, and the next finite step
+    succeeds.
+  - `a_zero_component_leaves_negative_zero_moments_negative`: moment planes of `-0.0` keep them through the
+    stencil and decay, where a source with a zero component in a channel must skip it.
+  - `random_worlds_step_as_the_reference`: 48 random worlds (grid shapes, cell sizes, kernels from a few cells
+    to the whole torus, one to eight sources anywhere, substeps and decay). Any refusal must be the reference's
+    too.
+- `tests/field_world.rs` (FL-031, 4 tests), the engine path, on the real preset:
+  - with its field on Metal, the world's digest equals the reference's at every one of 400 ticks; every step came
+    from the device, none failed, and the owner holds exactly the backend's twelve buffers, with no lease, command
+    or retiring buffer left;
+  - with field and controllers both on Metal, 200 ticks, the same;
+  - the planted negative flips one bit of one moment value after the device's seventh step, and the digests must
+    differ at exactly tick 7;
+  - a backend failing at its fifth step (after leaving a damaged value in the candidate) hands that step to the
+    reference and is dropped: the world stays the reference's, with 4 device steps, 1 reference step and the
+    failure recorded.
 
 Planted mutants, each run in a scratch copy.
+- FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
+  - the stencil's sum re-associated;
+  - the east neighbour not wrapping;
+  - the stencil's fault check dropped;
+  - the substeps' ping-pong parity inverted;
+  - the cell center's half-cell offset dropped;
+  - the radius test made exclusive (caught by the integer-radius case, added for it);
+  - decay never applied;
+  - a zero component not skipped (caught by the negative-zero test, added for it);
+  - an absent candidate not skipped;
+  - the column rank read from the row table;
+  - the sources deposited in reverse order;
+  - the host's amounts not written over the weights;
+  - the weights kernel's source lookup off by one at a source's first entry.
+
+  One survived, and it is equivalent: the minimum image taking `+L/2` instead of `-L/2` at exactly half the world.
+  The displacement enters the weight only squared.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -288,6 +368,39 @@ dispatch over fresh buffers pays page mapping, and the upload is the per-call bu
 `evaluate` would lose to the CPU. The engine path must keep buffers resident; FrankenTorch `1c4febfb` adds the
 in-place `SharedBuffer::write_f32/write_u32` for that.
 
+**The field's frontier (FL-031).** On the preset (128², 33 planes, eight sources of about 5,000 cells, one
+substep) on an M5 Ultra, 2026-11-09. Other workloads held the host at load 45–90 throughout, so the wall times
+are indicative; the device times are steadier. The CPU reference's phase 2 takes 1.8–2.0 ms per tick on one worker
+and 2.7–2.9 ms on sixteen, inside whole ticks.
+
+| Metal step, per tick | First version | With host amounts |
+|---|---|---|
+| device: substeps (540,672 values) | 0.53 ms | 0.54 ms |
+| device: weights (about 52,000 candidates, each an `exp`) | 0.44 ms | 0.42 ms |
+| device: moments (524,288 values) | 1.00 ms | 0.42 ms |
+| wall: command 1, including the upload | 1.6–2.2 ms | 1.6–2.4 ms |
+| wall: host sums and deposits | 0.18 ms | 0.21 ms |
+| wall: command 2, including the readback | 1.3–1.5 ms | 0.7–1.3 ms |
+| phase 2 inside whole ticks, one worker | 3.4–6.3 ms | 2.7–6.5 ms |
+
+The first version divided each moment's weight by its source's sum on the device. Writing the host's amounts `q`
+over the weights instead removed a software division per value and 58% of the moments' device time, with
+identical results. Whole ticks (256, ABBA, same digest in every run) still ran 0.80× as fast with the Metal field
+on one worker and 0.95× on sixteen. The device's arithmetic alone (1.4 ms) is about three quarters of the CPU's
+phase 2. Two synchronous round trips and the field's copies each way (2.1 MB up, 2.1 MB down) cost more than the
+rest. Software binary64 on this GPU therefore does not pay for phase 2 on its own. It can pay once the field stays
+resident and the phases around it (pyramid, sensing, uptake) run on the device too, so that the copies and most
+round trips disappear. That is the rest of FL-031 and FL-032.
+
+**The softfloat miscompile.** While building the weights kernel, every in-radius weight came out wrong, always
+the same wrong value. Instrumented variants and a trace kernel computed the right one. `exp_neg`'s series indexed
+a `constant ulong INTEGER[17]` table of binary64 integers inside its loop; computing the divisor with
+`d_from_u32(term)` instead made every parity test pass. Unrelated edits to the kernel had also changed the
+outcome. The cause is not established (a compiler fault is suspected, macOS 27 on an M5 Ultra), and no reduced
+reproducer was built. `softfloat64.metal` says so where the table was. Because the controllers' exact path uses
+the same series, `tests/arithmetic.rs`'s exhaustive tests were rerun on the new code and pass. Those tests and
+`tests/field.rs` are the guard: a change to the shared binary64 is proven by running them, not by reading it.
+
 **Validity domain.** Apple GPUs through the gateway's safe math mode; the dense-104-36-v1 catalog's shapes. The
 owner: `f32` and `u32` buffers. Each command is one command buffer of one or more kernels, submitted synchronously.
 
@@ -320,4 +433,15 @@ per-pass thread spawning (6%).
   - Only `f32` and `u32` elements. Textures, heaps and private-storage buffers are not owned yet.
   - `ResourceState` reports the dominant use when several overlap, by precedence: retiring, computing,
     checkpointing, rendering, committed, available. `usage` gives the lease counts.
+- FL-031 gaps (the item stays open):
+  - Only phase 2 runs on the device. The sensor pyramid and sampling (phase 3), and demand and grants with
+    oversubscribed cells (uptake), are the item's remaining evidence.
+  - The field is not resident: it is uploaded and read back every step, in two synchronous commands. Residency
+    needs the phases that read and write the field around phase 2 on the device too.
+  - Measured slower than the CPU on the preset (above), so nothing selects it by default: no CLI or Studio
+    choice exists yet, unlike `ControllerChoice`. The engine port and these tests are its only users.
+  - The host sums stay serial on the CPU by design. A device reduction would need a fixed tree, which is a
+    different numerical profile (§11.3).
+  - The world's invariant checks (about 10% of a one-worker tick in a profile) run on the CPU over the read-back
+    field.
 - No CUDA backend exists: FrankenTorch has no CUDA crate, and no host here has an NVIDIA GPU.

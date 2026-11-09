@@ -68,10 +68,16 @@ pub use seeding::{
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, chemical_direction, initial_center,
     initial_source, travel_direction,
 };
-pub use sources::{DepositReport, PathSegment, Source, SourceKernel, SourceSupport};
+pub use sources::{
+    DepositReport, PathSegment, Source, SourceKernel, SourceSupport, deposit_energy,
+};
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
-pub use step::{FieldStepReport, FieldWork, advance_field, advance_field_on};
-pub use transport::{TransportPlan, TransportReport, TransportScratch, transport_on};
+pub use step::{
+    FieldBackend, FieldStepReport, FieldWork, advance_field, advance_field_on, step_report,
+};
+pub use transport::{
+    TransportPlan, TransportReport, TransportScratch, energy_report, transport_on,
+};
 pub use uptake::{
     CellDebit, Demand, GrantPacket, Grants, UptakeSummary, apply_grants, resolve_uptake,
 };

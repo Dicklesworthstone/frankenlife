@@ -64,6 +64,18 @@
   `SeededPath` (source, segment ordinal and current segment). FL-016 adds `SeededPath::resume`, which rebuilds
   a path from its source, ordinal and anchor, `PathSegment::anchor`, and `ConeTolerance::{absolute, relative}`.
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
+- FL-031's port for a device phase 2: `FieldBackend` (`describe`, and `advance(pair, plan, kernel, sources,
+  step)`, which must equal `advance_field_on`). Alongside it are the reference's own pieces, which a backend
+  calls so that its sequential F64 sums stay the reference's:
+  - `SourceKernel::candidates_into` (the candidate rows and columns, `SourceSupport::rows` and `columns`),
+    `SourceKernel::weight` (one candidate's raw weight, `None` beyond the radius), `weight_constants` (`r²`,
+    `2σ²`) and `weigh_into` (the support and its sum from weights the caller supplies, in the reference's order
+    with its refusals). `support_into` is `candidates_into` then `weigh_into` with `weight`.
+  - `deposit_energy`, one source's energy-plane deposits. `SourceSupport::amounts` then holds each cell's `q_c`
+    for the moment planes.
+  - `transport::sum`, `energy_report` (the energy plane's decay and its `TransportReport` from a transported
+    plane) and `step_report` (the step's report from the transport and deposit reports).
+  - `FieldState::moments_mut`.
 - `numerics`: the host-independent `exp_neg`, `expm1_neg`, `tanh`, `sigmoid` and `log2`, re-exported from
   `flife-core::numerics`.
 - `SensorPyramid`: reusable coarse-level storage admitted against `BufferLimits`, with its `LevelGrid`s and level
@@ -135,6 +147,8 @@
   the Appendix A decay factor and the kernel cutoff. The implementation lives in `flife-core::numerics`.
 - `advance_field` writes only the candidate buffer and reports `ε = (E' − E) − (I − D_decay)`. On error the
   candidate must be discarded; the committed field is untouched.
+- FL-031 split `support_into`, the transport's energy accounting and the step's report into the pieces above.
+  No operation or order changed: every existing test and the world digests are unchanged.
 
 **Invariants — uptake (FL-005).**
 - Consumption is local. The `grid-cic-v1` footprint at `x` uses the continuous index `(x/h_x − ½, y/h_y − ½)`.
@@ -355,11 +369,12 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
 - Cone tolerance. The values belong to an undeclared numerical profile. One finding: far from sources,
   diffusion leaves subnormal F32 energies (about 1e-40) with no relative precision. A cone tolerance therefore
   needs an absolute floor at F32's subnormal scale, and the 128-tick test uses `f32::MIN_POSITIVE`. Metal
-  commonly flushes subnormals to zero, so CPU–Metal parity (FL-031) must declare its subnormal policy.
+  flushes subnormal F32 arithmetic to zero. FL-031's phase 2 therefore never computes in device F32: field
+  values cross as bit patterns into software binary64, so subnormals survive and its parity is bit identity.
 - Phase 2's residual drifts slowly upward (+1.3e-7 per tick at Appendix A scale). That is far inside budget, but
   the endurance gate (G8) should track the slope.
 - The reference stencil computes in F64. A production F32 kernel is a separate numerical profile with its own
-  tolerances (§21.4).
+  tolerances (§21.4). FL-031's Metal phase 2 keeps this profile, in software binary64 (`flife-backend-metal`).
 - `cell-quantum-largest-remainder-v1` is this crate's reconciliation. The configuration schema does not name a
   reconciliation, so a different one would be a different numerical profile.
 - `UptakeSummary::contended_cells` counts every cell whose demand exceeds its energy, including empty cells

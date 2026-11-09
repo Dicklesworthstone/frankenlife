@@ -296,8 +296,8 @@ each runs and owns the field.
   evaluation stays due.
 - A faulted world is refused (`StateConflict`). `stop-and-preserve`'s fault is a diagnosis, not a state to
   resume.
-- Scratch buffers and the controller backend are not state. A restored world evaluates on the reference path
-  until its owner calls `set_controller_backend`, and no result depends on the backend.
+- Scratch buffers and the controller and field backends are not state. A restored world runs on the reference
+  path until its owner calls `set_controller_backend` or `set_field_backend`, and no result depends on either.
 
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
@@ -487,6 +487,13 @@ velocity, first-order splitting at the configured fixed timestep.
   preset at 512 founders for 300 ticks through a CPU batch backend that defers one job in seven, and the digests
   match the reference at every tick. Two planted negatives: one flipped output bit must change that tick's digest,
   and a planted device failure must leave the world unchanged and be reported.
+- `World::set_field_backend` (FL-031) hands phase 2 to a `flife_field::FieldBackend`, which must equal
+  `advance_field_on`. If it errs, the step is redone on the reference from the same committed field: the
+  backend writes only the candidate, so nothing it left there survives. The backend is then dropped, and
+  `World::field_report` (`FieldReport`: backend, device and reference steps, failure) records why. If the
+  reference errs too, its error is the tick's. No result depends on the backend. Like the controller backend,
+  it is not state: a restored world steps on the reference until its owner sets one. The tests are in
+  `flife-backend-metal`'s `tests/field_world.rs`.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.

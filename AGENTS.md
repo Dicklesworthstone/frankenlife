@@ -506,6 +506,11 @@ Prove an owner change with `tests/owner.rs`, `tests/batch.rs` and the 400-tick `
 bit-identical to the reference. Run `tests/batch.rs` once without `--release` as well: the gateway's command-buffer
 fault seam exists only with debug assertions, and the release build skips the failure half of the test.
 
+The field kernels (FL-031, `field.metal`) and the controllers' exact path share `softfloat64.metal`. Prove a change to
+either with `tests/field.rs`, `tests/field_world.rs` and `tests/arithmetic.rs`, not by reasoning about the source:
+this toolchain has compiled an innocent-looking softfloat table lookup into wrong exponentials, and unrelated edits
+moved the fault (see the crate contract).
+
 The Metal backend, the native presenter and Studio input can only be qualified on an Apple Silicon host. A Linux
 worker validates the CPU reference route and headless frame export, nothing more (plan §13.6, §20.1). Say which
 host produced every result.
@@ -625,7 +630,7 @@ The repository holds:
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
   (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039), and
   `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-039), and
-  `crates/flife-backend-metal` (FL-030, FL-028, FL-029), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
+  `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
 

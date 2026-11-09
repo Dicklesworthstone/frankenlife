@@ -112,12 +112,32 @@ impl SourceKernel {
     /// Fill `support` with the cells whose centers lie within the radius of
     /// `center` on the torus, with their raw weights, in cell-index order.
     /// Each cell appears once, even when the support wraps around the
-    /// whole grid.
+    /// whole grid. This is [`SourceKernel::candidates_into`], then
+    /// [`SourceKernel::weigh_into`] with [`SourceKernel::weight`].
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] when `center` is not a wrapped
     /// position or the support holds no cell (A.3 item 9).
     pub fn support_into(
+        &self,
+        grid: &FieldGrid,
+        center: [f64; 2],
+        support: &mut SourceSupport,
+    ) -> Result<(), CoreError> {
+        self.candidates_into(grid, center, support)?;
+        self.weigh_into(grid, center, support, |column, row| {
+            self.weight(grid, center, column, row)
+        })
+    }
+
+    /// The first half of [`SourceKernel::support_into`]: the candidate rows
+    /// and columns whose cells may lie within the radius of `center`
+    /// ([`SourceSupport::rows`], [`SourceSupport::columns`]). It empties the
+    /// support's cells.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonfinite `center`.
+    pub fn candidates_into(
         &self,
         grid: &FieldGrid,
         center: [f64; 2],
@@ -145,32 +165,47 @@ impl SourceKernel {
                 detail: format!("{center:?} is not a finite position"),
             });
         }
-        let radius_squared = self.radius * self.radius;
-        let two_sigma_squared = 2.0 * self.sigma * self.sigma;
-        for &row in &support.rows {
-            for &column in &support.columns {
-                let cell_center = [
-                    (f64::from(column) + 0.5) * grid.cell_width(),
-                    (f64::from(row) + 0.5) * grid.cell_height(),
-                ];
-                let [dx, dy] = grid.displacement(center, cell_center)?;
-                let distance_squared = dx * dx + dy * dy;
-                if distance_squared > radius_squared {
+        Ok(())
+    }
+
+    /// The second half of [`SourceKernel::support_into`]: every candidate
+    /// cell, rows ascending and then columns ascending (which is cell-index
+    /// order), given its raw weight by `weigh(column, row)` or left out for
+    /// `None`. The weights are summed in that order. An accelerator that
+    /// computes [`SourceKernel::weight`] itself passes its results here, so
+    /// the support, its sum and its refusals are this function's.
+    ///
+    /// # Errors
+    /// `weigh`'s errors, and [`CoreError::NumericalInvalid`] when the
+    /// support holds no cell or its weights do not sum to a finite positive
+    /// value.
+    pub fn weigh_into(
+        &self,
+        grid: &FieldGrid,
+        center: [f64; 2],
+        support: &mut SourceSupport,
+        mut weigh: impl FnMut(u32, u32) -> Result<Option<f64>, CoreError>,
+    ) -> Result<(), CoreError> {
+        let SourceSupport {
+            cells,
+            weight_sum,
+            columns,
+            rows,
+            ..
+        } = support;
+        cells.clear();
+        *weight_sum = 0.0;
+        for &row in rows.iter() {
+            for &column in columns.iter() {
+                let Some(weight) = weigh(column, row)? else {
                     continue;
-                }
-                let weight = exp_neg(distance_squared / two_sigma_squared).ok_or_else(|| {
-                    CoreError::NumericalInvalid {
-                        quantity: "source weight",
-                        detail: format!("|d|² = {distance_squared:?} has no weight"),
-                    }
-                })?;
+                };
                 let index = grid.cell_index(column, row).ok_or_else(overflow)?;
-                support.cells.push((index, weight));
-                support.weight_sum += weight;
+                cells.push((index, weight));
+                *weight_sum += weight;
             }
         }
-        if support.cells.is_empty() || support.weight_sum <= 0.0 || !support.weight_sum.is_finite()
-        {
+        if cells.is_empty() || *weight_sum <= 0.0 || !weight_sum.is_finite() {
             return Err(CoreError::NumericalInvalid {
                 quantity: "source support",
                 detail: format!(
@@ -180,6 +215,44 @@ impl SourceKernel {
             });
         }
         Ok(())
+    }
+
+    /// `(r², 2σ²)`, the constants of [`SourceKernel::weight`].
+    #[must_use]
+    pub fn weight_constants(&self) -> (f64, f64) {
+        (self.radius * self.radius, 2.0 * self.sigma * self.sigma)
+    }
+
+    /// The raw weight `exp(−|d|²/(2σ²))` of cell `(column, row)` for a source
+    /// at `center`, where `d` is the minimum-image displacement from
+    /// `center` to the cell's center; `None` beyond the radius.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] when `center` is not a wrapped
+    /// position, or the weight does not exist.
+    pub fn weight(
+        &self,
+        grid: &FieldGrid,
+        center: [f64; 2],
+        column: u32,
+        row: u32,
+    ) -> Result<Option<f64>, CoreError> {
+        let (radius_squared, two_sigma_squared) = self.weight_constants();
+        let cell_center = [
+            (f64::from(column) + 0.5) * grid.cell_width(),
+            (f64::from(row) + 0.5) * grid.cell_height(),
+        ];
+        let [dx, dy] = grid.displacement(center, cell_center)?;
+        let distance_squared = dx * dx + dy * dy;
+        if distance_squared > radius_squared {
+            return Ok(None);
+        }
+        exp_neg(distance_squared / two_sigma_squared)
+            .map(Some)
+            .ok_or_else(|| CoreError::NumericalInvalid {
+                quantity: "source weight",
+                detail: format!("|d|² = {distance_squared:?} has no weight"),
+            })
     }
 }
 
@@ -251,6 +324,28 @@ impl SourceSupport {
     #[must_use]
     pub const fn weight_sum(&self) -> f64 {
         self.weight_sum
+    }
+
+    /// The candidate rows of the last [`SourceKernel::candidates_into`],
+    /// ascending.
+    #[must_use]
+    pub fn rows(&self) -> &[u32] {
+        &self.rows
+    }
+
+    /// The candidate columns of the last [`SourceKernel::candidates_into`],
+    /// ascending.
+    #[must_use]
+    pub fn columns(&self) -> &[u32] {
+        &self.columns
+    }
+
+    /// Each cell's energy from the last [`deposit_energy`], in support order:
+    /// the amounts the moment planes receive in proportion to the source's
+    /// direction.
+    #[must_use]
+    pub fn amounts(&self) -> &[f64] {
+        &self.amounts
     }
 
     /// `(cell index, k_c / Σ k)` in cell-index order.
@@ -429,8 +524,12 @@ pub fn deposit(
 
 /// The energy part of [`deposit`], in support order, for a `support`
 /// already computed at the source's center. It records each cell's amount
-/// for [`deposit_moment`].
-pub(crate) fn deposit_energy(
+/// for the moment planes. An accelerator that deposits the moments itself
+/// calls this for the energy plane, so the report is this function's.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if a support cell falls outside `state`.
+pub fn deposit_energy(
     state: &mut FieldState,
     source: &Source,
     step: TimeStep,

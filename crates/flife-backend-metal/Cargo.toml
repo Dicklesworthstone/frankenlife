@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 flife-core = { path = "../flife-core" }
+flife-field = { path = "../flife-field" }
 flife-neural = { path = "../flife-neural" }
 ft-kernel-metal.workspace = true
 

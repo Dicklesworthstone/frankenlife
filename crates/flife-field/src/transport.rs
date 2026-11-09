@@ -379,14 +379,31 @@ pub fn transport_on(
         }
         energy.ok_or_else(missing_plane)
     })?;
-    Ok(TransportReport {
+    Ok(report(plan, energy_before, energy))
+}
+
+/// The energy plane's part of [`transport`], for an accelerator that
+/// diffused every plane itself: `plane` is the energy plane after
+/// diffusion and `energy_before` the committed field's [`sum`]. The plane is
+/// decayed in place, and the report is the one [`transport`] gives.
+#[must_use]
+pub fn energy_report(
+    plan: &TransportPlan,
+    energy_before: f64,
+    plane: &mut [f32],
+) -> TransportReport {
+    report(plan, energy_before, energy_terms(plan.decay_factor, plane))
+}
+
+fn report(plan: &TransportPlan, energy_before: f64, energy: EnergyTerms) -> TransportReport {
+    TransportReport {
         substeps: plan.substeps,
         energy_before,
         energy_transported: energy.transported,
         energy_after: energy.after,
         decay_removed: energy.decay_removed,
         transport_residual: energy.transported - energy_before,
-    })
+    }
 }
 
 /// One plane's sums, which only the energy plane reports.
@@ -408,17 +425,28 @@ fn transport_plane(
     is_energy: bool,
 ) -> Option<EnergyTerms> {
     diffuse(coefficients, plan.substeps, source, target, scratch);
-    let transported = if is_energy { sum(target) } else { 0.0 };
-    let decay_removed = if plan.decay_factor == 1.0 {
+    if is_energy {
+        return Some(energy_terms(plan.decay_factor, target));
+    }
+    if plan.decay_factor != 1.0 {
+        decay(target, plan.decay_factor);
+    }
+    None
+}
+
+/// Decay the diffused energy plane and take its sums, in cell order.
+fn energy_terms(decay_factor: f64, plane: &mut [f32]) -> EnergyTerms {
+    let transported = sum(plane);
+    let decay_removed = if decay_factor == 1.0 {
         0.0
     } else {
-        decay(target, plan.decay_factor)
+        decay(plane, decay_factor)
     };
-    is_energy.then(|| EnergyTerms {
+    EnergyTerms {
         transported,
         decay_removed,
-        after: sum(target),
-    })
+        after: sum(plane),
+    }
 }
 
 struct Coefficients {
@@ -562,7 +590,9 @@ fn decay(plane: &mut [f32], factor: f64) -> f64 {
 }
 
 /// `Σ values` in F64, in index order.
-pub(crate) fn sum(values: &[f32]) -> f64 {
+/// `Σ values` in F64, in order: every energy total of the field step.
+#[must_use]
+pub fn sum(values: &[f32]) -> f64 {
     values
         .iter()
         .fold(0.0, |total, &value| total + f64::from(value))

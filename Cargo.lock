@@ -804,6 +804,7 @@ version = "0.0.1"
 dependencies = [
  "flife-core",
  "flife-engine",
+ "flife-field",
  "flife-neural",
  "ft-kernel-metal",
 ]

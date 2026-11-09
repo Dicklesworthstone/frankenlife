@@ -46,7 +46,7 @@ use flife_genome::{DENSE_104_36_CATALOG_V1, Genome, GenomeQuota, Traits};
 use flife_neural::ACTION_WIDTH;
 
 use super::{
-    Controllers, NumericalProfile, Rules, Scratch, World, initial_sources, organism_total,
+    Controllers, Fields, NumericalProfile, Rules, Scratch, World, initial_sources, organism_total,
 };
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
@@ -762,6 +762,7 @@ impl World {
             fault: None,
             scratch,
             controllers: Controllers::default(),
+            fields: Fields::default(),
         })
     }
 }

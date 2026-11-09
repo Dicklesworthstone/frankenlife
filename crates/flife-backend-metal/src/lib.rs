@@ -29,16 +29,22 @@ use flife_core::ids::GenomeId;
 use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH};
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
+pub mod field;
 pub mod owner;
 
+pub use field::MetalField;
 use owner::metal;
 pub use owner::{
     Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
     ResourceState, Usage, WriteLease,
 };
 
-/// The kernel source.
-pub const CONTROLLER_MSL: &str = include_str!("controller.metal");
+/// The controller kernel source, with the software binary64
+/// (`softfloat64.metal`, shared with [`field::FIELD_MSL`]) ahead of it.
+pub const CONTROLLER_MSL: &str = concat!(
+    include_str!("softfloat64.metal"),
+    include_str!("controller.metal")
+);
 
 /// The widest hidden layer the kernel's threadgroup storage holds.
 pub const WIDEST_HIDDEN: usize = 128;

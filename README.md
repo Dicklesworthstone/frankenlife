@@ -62,7 +62,10 @@ Studio use it by default (`--controllers auto`). FL-028 puts every device buffer
 buffers, read and write leases that exclude each other, commands that hold what they bind until the GPU reports
 completion, and retirement that frees nothing still in use. FL-029 lets the owner submit several ordered kernels as
 one command: one command buffer, checked and held as a unit, whose receipt gives the epochs written, the kernels run
-and the GPU time. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
+and the GPU time. FL-031's first part runs phase 2 (transport, decay and the external sources) on Metal in software
+binary64, bit for bit the CPU reference's, through a field backend port in the engine. At the preset's scale it is
+slower than the CPU's hardware F64, so it is not on by default: the measured frontier is in the Metal crate's
+contract. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
 comparison sort: linear however organisms crowd, with scratch declared from the population maximum, in the same
 cell-then-identity order, so the world is bit-identical. FL-019 adds five colour mappings (lineage, energy, generation,
 motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.

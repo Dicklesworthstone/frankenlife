@@ -77,8 +77,8 @@ use flife_core::{
     Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
-    Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldGrid, FieldPair,
-    FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
+    Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
+    FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorPyramid, Source, SourceKernel,
     TransportPlan, UptakeSummary, advance_field_on, apply_deposits, apply_grants, initial_source,
     resolve_uptake, saturating_request,
@@ -482,6 +482,28 @@ pub struct ControllerReport {
     pub failure: Option<String>,
 }
 
+/// What the world's field backend did, for run records (FL-031). Not
+/// scientific state: no result depends on the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldReport {
+    /// The backend serving the world, or `None` for the reference alone.
+    pub backend: Option<String>,
+    /// Field steps (phase 2) the backend computed.
+    pub steps: u64,
+    /// Steps the reference redid because the backend met an error: the
+    /// reference reproduces that error exactly, or finds none.
+    pub reference_steps: u64,
+    /// Why the backend stopped serving the world, if it failed.
+    pub failure: Option<String>,
+}
+
+/// The world's field backend.
+#[derive(Debug, Default)]
+struct Fields {
+    backend: Option<Box<dyn FieldBackend>>,
+    report: FieldReport,
+}
+
 /// The world's controller backend and its scratch.
 #[derive(Debug, Default)]
 struct Controllers {
@@ -533,6 +555,7 @@ pub struct World {
     fault: Option<NumericalFault>,
     scratch: Scratch,
     controllers: Controllers,
+    fields: Fields,
 }
 
 impl World {
@@ -646,6 +669,7 @@ impl World {
             fault: None,
             scratch,
             controllers: Controllers::default(),
+            fields: Fields::default(),
         })
     }
 
@@ -727,6 +751,25 @@ impl World {
     #[must_use]
     pub const fn controller_report(&self) -> &ControllerReport {
         &self.controllers.report
+    }
+
+    /// Run phase 2 (transport and the external sources) on `backend` from
+    /// the next tick, or on the reference alone with `None` (FL-031). No
+    /// result depends on it: a backend writes the reference's candidate and
+    /// report bit for bit ([`FieldBackend`]), and any error it meets hands
+    /// the step to the reference. A backend that fails where the reference
+    /// does not is dropped, and [`World::field_report`] says why.
+    pub fn set_field_backend(&mut self, backend: Option<Box<dyn FieldBackend>>) {
+        let fields = &mut self.fields;
+        fields.report.backend = backend.as_ref().map(|backend| backend.describe());
+        fields.report.failure = None;
+        fields.backend = backend;
+    }
+
+    /// What the field backend has done so far.
+    #[must_use]
+    pub const fn field_report(&self) -> &FieldReport {
+        &self.fields.report
     }
 
     /// The event cursor: births and deaths published so far.
@@ -938,6 +981,7 @@ impl World {
             ledger,
             scratch,
             controllers,
+            fields,
             ..
         } = self;
         let Scratch {
@@ -986,8 +1030,7 @@ impl World {
             let u = segment.mid_tick(from.get() - start)?;
             sampled.push(source.moved_to(segment.position(&rules.grid, u)?)?);
         }
-        let field_step =
-            advance_field_on(field, &rules.plan, &rules.kernel, sampled, step, field_work)?;
+        let field_step = advance_field_with(field, rules, sampled, step, field_work, fields)?;
         tick_ledger.record(Flow::SourcePower, field_step.injected_declared)?;
         tick_ledger.record(Flow::Decay, field_step.transport.decay_removed)?;
         let mut applied = Vec::new();
@@ -1387,6 +1430,39 @@ fn lanes(workers: u32) -> Result<Vec<DecisionLane>, CoreError> {
         })?;
     lanes.resize_with(workers.max(1), DecisionLane::default);
     Ok(lanes)
+}
+
+/// Phase 2 on the world's field backend if it has one. Any error there
+/// hands the step to [`advance_field_on`], which reproduces the reference's
+/// own error or finds none; with none, the backend failed where the
+/// reference does not, and the world stops using it. Either way the step is
+/// the reference's.
+fn advance_field_with(
+    pair: &mut FieldPair,
+    rules: &Rules,
+    sources: &[Source],
+    step: TimeStep,
+    work: &mut FieldWork,
+    fields: &mut Fields,
+) -> Result<FieldStepReport, CoreError> {
+    let Fields { backend, report } = fields;
+    if let Some(device) = backend.as_deref_mut() {
+        match device.advance(pair, &rules.plan, &rules.kernel, sources, step) {
+            Ok(stepped) => {
+                report.steps = report.steps.saturating_add(1);
+                return Ok(stepped);
+            }
+            Err(error) => {
+                report.reference_steps = report.reference_steps.saturating_add(1);
+                let stepped =
+                    advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)?;
+                report.failure = Some(error.to_string());
+                *backend = None;
+                return Ok(stepped);
+            }
+        }
+    }
+    advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
 }
 
 /// Phase 3 for one organism (§8.1): its observation at its sensing scale.

@@ -151,7 +151,8 @@ fn live() -> Result<Vec<String>, String> {
         "a real FocusGained event arrives with the window",
     )?;
     live.check(
-        shown_tick(&frame) == Some(0) && live.studio.view().cloud().draws().len() == founders as usize,
+        shown_tick(&frame) == Some(0)
+            && live.studio.view().cloud().draws().len() == founders as usize,
         format!("the founding epoch is on screen as {founders} dots in one cloud"),
     )?;
     let reserved = live.studio.view().cloud().reserved_bytes();
@@ -174,13 +175,18 @@ fn live() -> Result<Vec<String>, String> {
     })?;
     live.check(
         frame.outcome.is_some(),
-        format!("Space runs the session and live epochs reach the screen (tick {:?})", shown_tick(&frame)),
+        format!(
+            "Space runs the session and live epochs reach the screen (tick {:?})",
+            shown_tick(&frame)
+        ),
     )?;
 
     // Space again pauses at a committed boundary.
     live.key(KEY_SPACE, " ")?;
     live.until("the pause and the end of run 1", |_, _, statuses| {
-        let paused = statuses.iter().any(|status| matches!(status, Status::Paused { .. }));
+        let paused = statuses
+            .iter()
+            .any(|status| matches!(status, Status::Paused { .. }));
         let ended = statuses.iter().any(|status| {
             matches!(
                 status,
@@ -231,7 +237,10 @@ fn live() -> Result<Vec<String>, String> {
             tick: Tick::new(paused + 2),
         }) && shown_tick(frame) == Some(paused + 2)
     })?;
-    live.check(true, format!("→ and . each step one tick, to {}", paused + 2))?;
+    live.check(
+        true,
+        format!("→ and . each step one tick, to {}", paused + 2),
+    )?;
 
     // A real resize refits the viewport and camera to the new content area.
     live.post(&SyntheticInput::Resize {
@@ -252,9 +261,9 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     let after = live.until("a frame at the new size", |studio, frame, _| {
         frame.outcome.is_some()
-            && studio
-                .surface_metrics()
-                .is_ok_and(|metrics| metrics.drawable_width == 800 && metrics.drawable_height == 450)
+            && studio.surface_metrics().is_ok_and(|metrics| {
+                metrics.drawable_width == 800 && metrics.drawable_height == 450
+            })
     })?;
     live.check(
         after.outcome.is_some(),
@@ -299,7 +308,9 @@ fn live() -> Result<Vec<String>, String> {
     live.until("focus loss", |studio, _, _| !studio.controls().focused())?;
     let tally = live.studio.controls().tally();
     live.check(
-        tally.capture_lost == 1 && tally.focus_lost == 1 && live.studio.controls().buttons().is_empty(),
+        tally.capture_lost == 1
+            && tally.focus_lost == 1
+            && live.studio.controls().buttons().is_empty(),
         "real focus loss with a button held loses the pointer capture and clears the drag",
     )?;
     live.post(&SyntheticInput::Focus(true))?;
@@ -342,7 +353,9 @@ fn live() -> Result<Vec<String>, String> {
     for _ in 0..final_tick {
         match direct.step().map_err(|error| error.to_string())? {
             Stepped::Published(_) => {}
-            Stepped::Paused(shortfall) => return Err(format!("the direct world paused: {shortfall:?}")),
+            Stepped::Paused(shortfall) => {
+                return Err(format!("the direct world paused: {shortfall:?}"));
+            }
         }
     }
     let live_digest = closed.session.world.digest();

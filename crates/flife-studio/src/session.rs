@@ -290,8 +290,8 @@ async fn act(
                 let _ = report.send(status);
             });
             match watched {
-                Ok(run) => {
-                    runs.push(run);
+                Ok(watcher) => {
+                    runs.push(watcher);
                     Status::Running { run, from }
                 }
                 // The run goes on; only its end will not be reported.

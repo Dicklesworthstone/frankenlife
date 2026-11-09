@@ -139,12 +139,11 @@ impl Studio {
     ///   [`flife_runtime::open`] and [`WorldView::new`].
     pub fn open(config: &ValidatedConfig, options: &StudioOptions) -> Result<Self, CoreError> {
         let model = config.config();
-        let background = hex_rgb(&model.presentation.background).ok_or_else(|| {
-            CoreError::NumericalInvalid {
+        let background =
+            hex_rgb(&model.presentation.background).ok_or_else(|| CoreError::NumericalInvalid {
                 quantity: "presentation background",
                 detail: format!("`{}` is not #rrggbb", model.presentation.background),
-            }
-        })?;
+            })?;
         let [width, height] = options
             .size
             .unwrap_or([model.presentation.width, model.presentation.height]);
@@ -253,7 +252,10 @@ impl Studio {
             self.tally.refits += 1;
         }
 
-        let seen = self.view.shown().map_or(RenderEpoch::new(0), |shown| shown.id);
+        let seen = self
+            .view
+            .shown()
+            .map_or(RenderEpoch::new(0), |shown| shown.id);
         let new_epoch = match self.viewer.latest_after(seen)? {
             Some(lease) => {
                 self.view.show(&lease)?;

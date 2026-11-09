@@ -103,7 +103,10 @@ fn main() -> ExitCode {
         Err(code) => return code,
     };
     let options = StudioOptions {
-        size: cli.width.zip(cli.height).map(|(width, height)| [width, height]),
+        size: cli
+            .width
+            .zip(cli.height)
+            .map(|(width, height)| [width, height]),
         resizable: !cli.fixed,
         ..StudioOptions::default()
     };
@@ -192,7 +195,9 @@ fn status_record(status: &Status) -> Record<'static> {
         detail,
     };
     match status {
-        Status::Running { run, from } => record("running", Some(*run), Some(from.get()), None, None),
+        Status::Running { run, from } => {
+            record("running", Some(*run), Some(from.get()), None, None)
+        }
         Status::Paused { at } => record("paused", None, Some(at.get()), None, None),
         Status::Ended { run, at, why } => {
             let (why, detail) = end(why);

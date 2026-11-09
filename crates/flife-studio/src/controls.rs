@@ -238,7 +238,10 @@ impl Controls {
                 None
             }
         };
-        Some([whole(metrics.logical_width)?, whole(metrics.logical_height)?])
+        Some([
+            whole(metrics.logical_width)?,
+            whole(metrics.logical_height)?,
+        ])
     }
 
     /// The world point under the pointer in `viewport`, or `None` off the

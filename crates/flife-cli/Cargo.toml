@@ -26,6 +26,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The frame-route measurement example renders on FrankenManim's Metal route.
+fmn-render = { workspace = true, features = ["metal"] }
 toml.workspace = true
 
 [lints]

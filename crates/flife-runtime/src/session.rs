@@ -34,7 +34,9 @@
 //! Closing (a close request, every handle dropped, running or paused, or the
 //! owner's context cancelled) discards any unpublished candidate, cancels every unfinished
 //! command as `session-closed`, refuses whatever is still queued, and
-//! returns the committed world.
+//! returns the committed world. Suspending ([`SessionHandle::suspend`],
+//! FL-037) closes the same way but leaves every unfinished command pending,
+//! for a later session of the same run.
 //!
 //! Under `write-ahead-before-apply` ([`open_journaled`], FL-036) the owner
 //! makes commands durable through a [`JournalWriter`] before relying on
@@ -274,7 +276,9 @@ pub struct SessionCheckpoint {
 pub struct SessionClosed {
     /// The committed world.
     pub world: World,
-    /// The book, closed.
+    /// The book: closed, or for a session suspended
+    /// ([`SessionHandle::suspend`]) with every pending command still
+    /// pending.
     pub book: CommandBook,
     /// The committed boundary.
     pub boundary: Boundary,
@@ -311,6 +315,7 @@ enum Control {
     Inspect(oneshot::Sender<Snapshot>),
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
     Close(oneshot::Sender<Boundary>),
+    Suspend(oneshot::Sender<Boundary>),
 }
 
 struct Submission {
@@ -348,6 +353,7 @@ impl std::fmt::Debug for Control {
             Self::Inspect(_) => "Inspect",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Close(_) => "Close",
+            Self::Suspend(_) => "Suspend",
         })
     }
 }
@@ -568,6 +574,20 @@ impl SessionHandle {
     /// As [`SessionHandle::submit`].
     pub async fn close(&self, cx: &Cx) -> Result<Boundary, CoreError> {
         self.control(cx, Control::Close).await
+    }
+
+    /// Close the session without ending its commands (FL-037): every
+    /// pending command stays pending in the book the owner returns and, for
+    /// a `write-ahead-before-apply` session, unended in its journal, so a
+    /// later session of the same run, restored from a checkpoint with the
+    /// journal replayed, applies it at its tick. [`SessionHandle::close`],
+    /// and every handle dropped, cancel them as `session-closed`; a close
+    /// requested alongside a suspension wins.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`].
+    pub async fn suspend(&self, cx: &Cx) -> Result<Boundary, CoreError> {
+        self.control(cx, Control::Suspend).await
     }
 }
 
@@ -923,6 +943,8 @@ pub struct SessionOwner {
     released: mpsc::Receiver<()>,
     run: Option<Run>,
     closing: Vec<oneshot::Sender<Boundary>>,
+    /// Whether every close requested is a suspension.
+    suspending: bool,
     deferred: VecDeque<Control>,
     journal: Option<Durable>,
     held: VecDeque<Control>,
@@ -969,6 +991,24 @@ pub fn open_with(
     world: World,
     limits: SessionConfig,
 ) -> Result<(SessionOwner, SessionHandle), CoreError> {
+    let book = CommandBook::new(limits.session, limits.revision, limits.command_capacity);
+    open_restored(world, book, limits)
+}
+
+/// Open a `volatile-in-memory` session on committed `world` and its `book`,
+/// as [`crate::restore`] returns them from a checkpoint (FL-037). The
+/// session continues as the uninterrupted one: pending commands apply at
+/// their ticks, a retry returns its first outcome, and a sealed boundary
+/// stays sealed. Its founding state is render epoch 1.
+///
+/// # Errors
+/// As [`open_with`]; [`CoreError::StateConflict`] when the book, world and
+/// limits disagree on the session or configuration.
+pub fn open_restored(
+    world: World,
+    book: CommandBook,
+    limits: SessionConfig,
+) -> Result<(SessionOwner, SessionHandle), CoreError> {
     if limits.durability != Durability::Volatile {
         return Err(CoreError::MissingCapability {
             capability: format!(
@@ -977,8 +1017,36 @@ pub fn open_with(
             ),
         });
     }
-    let book = CommandBook::new(limits.session, limits.revision, limits.command_capacity);
+    agree(&world, &book, &limits, "open restored session")?;
     build(world, book, limits, None)
+}
+
+/// Refuse a `book`, `world` and `limits` that disagree on the session or the
+/// configuration.
+fn agree(
+    world: &World,
+    book: &CommandBook,
+    limits: &SessionConfig,
+    operation: &'static str,
+) -> Result<(), CoreError> {
+    if book.session() != limits.session
+        || book.revision() != limits.revision
+        || world.config().config_hash() != limits.revision
+    {
+        return Err(CoreError::StateConflict {
+            operation,
+            detail: format!(
+                "the book is session {} running {}, the world runs {}, the limits name session \
+                 {} running {}",
+                book.session(),
+                book.revision().to_hex(),
+                world.config().config_hash().to_hex(),
+                limits.session,
+                limits.revision.to_hex()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Open a `write-ahead-before-apply` session (FL-036) on committed `world`
@@ -1017,20 +1085,7 @@ pub fn open_journaled(
             limits.durability
         )));
     }
-    if book.session() != limits.session
-        || book.revision() != limits.revision
-        || world.config().config_hash() != limits.revision
-    {
-        return Err(conflict(format!(
-            "the book is session {} running {}, the world runs {}, the limits name session {} \
-             running {}",
-            book.session(),
-            book.revision().to_hex(),
-            world.config().config_hash().to_hex(),
-            limits.session,
-            limits.revision.to_hex()
-        )));
-    }
+    agree(&world, &book, &limits, "open journaled session")?;
     book.set_durability(Durability::WriteAhead);
     let replay = book.recover(journal, world.tick())?;
     replay_journal(&mut world, &mut book, replay)?;
@@ -1186,6 +1241,7 @@ fn build(
         released,
         run: None,
         closing: Vec::new(),
+        suspending: false,
         deferred: VecDeque::new(),
         journal,
         held: VecDeque::new(),
@@ -1418,7 +1474,14 @@ impl SessionOwner {
                 });
                 let _ = reply.send_blocking(taken);
             }
-            Control::Close(reply) => self.closing.push(reply),
+            Control::Close(reply) => {
+                self.suspending = false;
+                self.closing.push(reply);
+            }
+            Control::Suspend(reply) => {
+                self.suspending = self.closing.is_empty() || self.suspending;
+                self.closing.push(reply);
+            }
         }
     }
 
@@ -1453,6 +1516,7 @@ impl SessionOwner {
                 control,
                 science,
                 closing,
+                suspending,
                 deferred,
                 run,
                 journal,
@@ -1490,6 +1554,12 @@ impl SessionOwner {
                     }
                     Control::Pause(reply) => pause.push(reply),
                     Control::Close(reply) => {
+                        *suspending = false;
+                        closing.push(reply);
+                        discard = true;
+                    }
+                    Control::Suspend(reply) => {
+                        *suspending = closing.is_empty() || *suspending;
                         closing.push(reply);
                         discard = true;
                     }
@@ -1711,10 +1781,12 @@ impl SessionOwner {
         self.offer_render();
         self.render.close();
         self.end_run(RunEnd::Closed(boundary));
-        let from = self.book.outcome_cursor();
-        self.book.close(boundary.tick);
-        if let Some(journal) = &mut self.journal {
-            journal.outcomes(&self.book, from);
+        if !self.suspending {
+            let from = self.book.outcome_cursor();
+            self.book.close(boundary.tick);
+            if let Some(journal) = &mut self.journal {
+                journal.outcomes(&self.book, from);
+            }
         }
         self.control.close();
         self.science.close();
@@ -1735,7 +1807,7 @@ impl SessionOwner {
         };
         for message in queued {
             match message {
-                Control::Pause(reply) | Control::Close(reply) => {
+                Control::Pause(reply) | Control::Close(reply) | Control::Suspend(reply) => {
                     let _ = reply.send_blocking(boundary);
                 }
                 Control::Resume { started, ended, .. } => {

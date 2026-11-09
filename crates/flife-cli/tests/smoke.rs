@@ -159,7 +159,8 @@ fn the_preset_is_appendix_a_with_exactly_its_declared_changes() {
 /// The preset validates at the Reference profile's scale (§19.5), and its
 /// session admits it. Appendix A as written declares
 /// `write-ahead-before-apply`, which a session holds only through a command
-/// journal (FL-036); `flife run` opens none, so the binary refuses it.
+/// journal (FL-036); `flife run` without a run directory opens none, so
+/// the binary refuses it (FL-037's resume tests run it with one).
 #[test]
 fn the_preset_validates_at_the_reference_scale_and_its_session_admits_it() {
     let config = preset();
@@ -502,8 +503,9 @@ fn the_flife_binary_validates_runs_and_refuses_with_typed_errors() {
     assert!(
         err[0]["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("flife run opens no command journal")),
-        "refused by flife run before founding the world: {err:?}"
+            .is_some_and(|detail| detail.contains("needs a command journal")
+                && detail.contains("flife run --run-dir")),
+        "refused by flife run before founding the world, pointing at a run directory: {err:?}"
     );
 }
 

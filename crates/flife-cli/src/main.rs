@@ -4,7 +4,7 @@
 //! one `frankenlife.error.v1` record on standard error. Exit status: 0 when
 //! the command did what it was asked, 1 when a run stopped early (a
 //! capacity pause or a failed tick), 2 for an unreadable or invalid
-//! configuration or a refused session.
+//! configuration, a refused session or run directory.
 
 #![forbid(unsafe_code)]
 
@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use flife_cli::{
-    ColorMapping, ControllerChoice, ERROR_SCHEMA, Look, Particles, RunOptions, Stop, Style,
-    Validation,
+    ColorMapping, ControllerChoice, ERROR_SCHEMA, Injection, Look, Particles, Persistence,
+    ResumeOptions, RunOptions, Stop, StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -56,6 +56,41 @@ enum Command {
         /// CPU workers (where it measured faster). No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
+        /// Keep the run in this new (or empty) directory: its
+        /// configuration, command journal and checkpoints, so `flife
+        /// resume` can continue it. A `write-ahead-before-apply`
+        /// configuration needs one.
+        #[arg(long)]
+        run_dir: Option<PathBuf>,
+        #[command(flatten)]
+        checkpoints: CheckpointFlags,
+        /// Inject energy into a field cell at a committed tick, written
+        /// `TICK:X,Y:AMOUNT`; repeatable. Commands 1, 2, … in order.
+        #[arg(long = "inject", value_name = "TICK:X,Y:AMOUNT")]
+        injections: Vec<Injection>,
+    },
+    /// Continue the run in a run directory from its newest checkpoint that
+    /// restores, replaying its command journal, to a committed tick.
+    Resume {
+        /// The run directory `flife run --run-dir` made.
+        run_dir: PathBuf,
+        /// The committed tick to reach.
+        #[arg(long)]
+        until: u64,
+        /// Print a progress record at every multiple of this tick; 0 for
+        /// none.
+        #[arg(long, default_value_t = 128)]
+        every: u64,
+        /// Threads for the organism phases: a count or `auto`. No result
+        /// depends on it.
+        #[arg(long, value_parser = parse_workers)]
+        cpu_workers: Option<NonZeroUsize>,
+        /// Where due controllers are evaluated: `metal`, `cpu` or `auto`.
+        /// No result depends on it.
+        #[arg(long, default_value = "auto")]
+        controllers: ControllerChoice,
+        #[command(flatten)]
+        checkpoints: CheckpointFlags,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -109,6 +144,20 @@ enum Command {
         #[arg(long)]
         no_field: bool,
     },
+}
+
+#[derive(Debug, clap::Args)]
+struct CheckpointFlags {
+    /// With a run directory, publish a checkpoint at every multiple of
+    /// this tick and at the end; 0 for only the end. The default is the
+    /// configuration's `[persistence]
+    /// checkpoint_interval_simulation_seconds`.
+    #[arg(long)]
+    checkpoint_every: Option<u64>,
+    /// `power-loss` (the default) flushes each checkpoint to stable storage
+    /// before publishing it; `process-crash` relies on atomic renames.
+    #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
+    checkpoint_durability: StoreDurability,
 }
 
 #[derive(Serialize)]
@@ -173,12 +222,25 @@ fn main() -> ExitCode {
             every,
             cpu_workers,
             controllers,
+            run_dir,
+            checkpoints,
+            injections,
         } => {
             let config = match load(&config) {
                 Ok(config) => config,
                 Err(code) => return code,
             };
-            match flife_cli::run(
+            let persistence = run_dir.map(|run_dir| {
+                let defaults = Persistence::new(run_dir, &config);
+                Persistence {
+                    checkpoint_every: checkpoints
+                        .checkpoint_every
+                        .unwrap_or(defaults.checkpoint_every),
+                    durability: checkpoints.checkpoint_durability,
+                    ..defaults
+                }
+            });
+            exit(flife_cli::run_with(
                 &config,
                 RunOptions {
                     ticks,
@@ -186,14 +248,49 @@ fn main() -> ExitCode {
                     cpu_workers,
                     controllers,
                 },
+                &injections,
+                persistence.as_ref(),
                 print,
-            ) {
-                Ok(finished) if finished.stop == Stop::Reached => ExitCode::SUCCESS,
-                Ok(_) => ExitCode::from(1),
-                Err(error) => fail(error.kind(), error.to_string()),
-            }
+            ))
         }
+        Command::Resume {
+            run_dir,
+            until,
+            every,
+            cpu_workers,
+            controllers,
+            checkpoints,
+        } => exit(flife_cli::resume(
+            &run_dir,
+            &ResumeOptions {
+                until,
+                every,
+                cpu_workers,
+                controllers,
+                checkpoint_every: checkpoints.checkpoint_every,
+                durability: checkpoints.checkpoint_durability,
+            },
+            print,
+        )),
     }
+}
+
+/// 0 for a run that reached its tick, 1 for one that stopped early, 2 (and
+/// an error record) for one refused.
+fn exit(finished: Result<flife_cli::Finished, flife_core::CoreError>) -> ExitCode {
+    match finished {
+        Ok(finished) if finished.stop == Stop::Reached => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(1),
+        Err(error) => fail(error.kind(), error.to_string()),
+    }
+}
+
+/// A checkpoint durability profile by name.
+fn parse_durability(text: &str) -> Result<StoreDurability, String> {
+    [StoreDurability::PowerLoss, StoreDurability::ProcessCrash]
+        .into_iter()
+        .find(|durability| durability.name() == text)
+        .ok_or_else(|| format!("`{text}` is not `power-loss` or `process-crash`"))
 }
 
 /// A worker count, or `auto`.

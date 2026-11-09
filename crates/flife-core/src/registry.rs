@@ -709,12 +709,24 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "FL-023",
     ),
     entry("frankensqlite", Role::PersistenceCatalog, "§16.6", "FL-036"),
-    entry(
-        "pause-and-stream",
-        Role::CheckpointMode,
-        "§16.5, A.2",
-        "FL-037",
-    ),
+    // FL-037: `flife run --run-dir` and `flife resume`. The client takes no
+    // step while a checkpoint is taken and published to the chunk store, so
+    // the committed world cannot move under it; a run stopped by a damaged
+    // newest checkpoint or by SIGKILL resumes to the uninterrupted run's
+    // digest and final checkpoint bytes. The container is encoded whole in
+    // memory before it is published; admitting that copy against a memory
+    // budget (§16.5's low-memory bound) is FL-038's.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-cli::tests/resume.rs::a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_state",
+        },
+        ..entry(
+            "pause-and-stream",
+            Role::CheckpointMode,
+            "§16.5, A.2",
+            "FL-037",
+        )
+    },
 ];
 
 /// Resolve `name` for `role`.

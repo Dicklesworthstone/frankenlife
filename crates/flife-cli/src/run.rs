@@ -10,8 +10,12 @@
 //!
 //! The scientific content of the records (everything except
 //! `wall_seconds`) depends only on the configuration and the tick count.
+//!
+//! [`run_with`] adds scheduled commands and, with a run directory
+//! ([`crate::persist`], FL-037), checkpoints and the command journal.
 
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -21,12 +25,13 @@ use flife_core::ids::SessionId;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, ControllerReport, NumericalProfile, World};
 use flife_runtime::{
-    Durability, SessionClosed, SessionConfig, StepOutcome, VOLATILE_IN_MEMORY,
-    WRITE_AHEAD_BEFORE_APPLY, open_with,
+    Admission, Command, CommandBook, Durability, SessionClosed, SessionConfig, SessionHandle,
+    SessionOwner, StepOutcome, VOLATILE_IN_MEMORY, WRITE_AHEAD_BEFORE_APPLY, open_with,
 };
 use serde::Serialize;
 
 use crate::observe::{Survey, Tally};
+use crate::persist::{Checkpoints, Injection, Persistence};
 
 /// The schema of every record a run emits.
 pub const RUN_SCHEMA: &str = "frankenlife.run.v1";
@@ -190,7 +195,91 @@ pub enum Record {
         controllers: ControllerSummary,
         /// Wall-clock seconds the run took. Not scientific state.
         wall_seconds: f64,
+        /// For a run directory: what is durable, reported apart from the
+        /// committed tick (§8.3).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        persisted: Option<Persisted>,
     },
+    /// A checkpoint published to the run directory's chunk store and
+    /// indexed in its catalog (FL-037).
+    Checkpoint {
+        /// [`RUN_SCHEMA`].
+        schema: &'static str,
+        /// The committed tick it holds.
+        tick: u64,
+        /// The committed epoch it holds.
+        epoch: u64,
+        /// Its chunk-store sequence number.
+        sequence: u64,
+        /// The container's SHA-256.
+        sha256: String,
+        /// The container's size.
+        bytes: u64,
+        /// Chunks written, and chunks already stored and shared.
+        chunks: [usize; 2],
+        /// Older checkpoints removed under `retain_recent_checkpoints`.
+        retired: Vec<u64>,
+    },
+    /// Where a resumed run starts (FL-037).
+    Resume {
+        /// [`RUN_SCHEMA`].
+        schema: &'static str,
+        /// The checkpoint it recovered, or none for the founding world.
+        checkpoint: Option<CheckpointAt>,
+        /// Newer checkpoints passed over, newest first.
+        skipped: Vec<SkippedCheckpoint>,
+        /// The committed tick after replaying the command journal past the
+        /// checkpoint.
+        tick: u64,
+        /// The committed world's digest there.
+        digest: String,
+        /// The journal's durable watermarks, for a write-ahead run.
+        journal: Option<JournalMarks>,
+    },
+}
+
+/// A checkpoint by its sequence number and tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CheckpointAt {
+    /// Its chunk-store sequence number.
+    pub sequence: u64,
+    /// The committed tick it holds.
+    pub tick: u64,
+}
+
+/// A checkpoint recovery passed over, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedCheckpoint {
+    /// Its sequence number.
+    pub sequence: u64,
+    /// The error's class.
+    pub kind: &'static str,
+    /// The error.
+    pub reason: String,
+}
+
+/// The command journal's durable watermarks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct JournalMarks {
+    /// Acceptances durable, by admission order.
+    pub admitted: u64,
+    /// Terminal outcomes durable, by cursor.
+    pub outcomes: u64,
+}
+
+/// What a run directory holds durably when a run ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Persisted {
+    /// The run directory.
+    pub run_dir: String,
+    /// The command durability: `volatile-in-memory` or
+    /// `write-ahead-before-apply`.
+    pub durability: &'static str,
+    /// The newest checkpoint published, the tick a crash now recovers from
+    /// before replaying the journal.
+    pub checkpoint: Option<CheckpointAt>,
+    /// The journal's durable watermarks, for a write-ahead run.
+    pub journal: Option<JournalMarks>,
 }
 
 /// What a run returns besides its records.
@@ -253,41 +342,151 @@ pub fn start(
 /// passing every record to `emit` in order.
 ///
 /// # Errors
-/// The world's founding errors, the session's opening errors (such as a
-/// refused command durability), and [`CoreError::MissingCapability`] when
-/// the native runtime cannot be built or its tasks spawned.
+/// As [`run_with`].
 pub fn run(
     config: &ValidatedConfig,
     options: RunOptions,
-    mut emit: impl FnMut(&Record) + Send + 'static,
+    emit: impl FnMut(&Record) + Send + 'static,
+) -> Result<Finished, CoreError> {
+    run_with(config, options, &[], None, emit)
+}
+
+/// Run `config` headlessly for `options.ticks` through a session owner,
+/// first submitting `injections` (commands 1, 2, … in order) and, with
+/// `persistence`, keeping the run in a new run directory: the command
+/// journal for a `write-ahead-before-apply` configuration, and a
+/// checkpoint at every multiple of `persistence.checkpoint_every` and at
+/// the end ([`crate::persist`]).
+///
+/// # Errors
+/// The world's founding errors; the session's opening errors;
+/// [`CoreError::MissingCapability`] for a `write-ahead-before-apply`
+/// configuration without a run directory, or when the native runtime
+/// cannot be built or its tasks spawned; [`CoreError::StateConflict`] for a
+/// scheduled command that is not admitted, or a run directory that already
+/// holds a run or other files; the store's and catalog's errors.
+pub fn run_with(
+    config: &ValidatedConfig,
+    options: RunOptions,
+    injections: &[Injection],
+    persistence: Option<&Persistence>,
+    emit: impl FnMut(&Record) + Send + 'static,
 ) -> Result<Finished, CoreError> {
     // The session's limits are checked before the world is founded, so an
     // unadmitted durability is refused without founding 4,096 organisms.
     let limits = SessionConfig::from_config(RUN_SESSION, config)?;
-    if limits.durability != Durability::Volatile {
+    if persistence.is_none() && limits.durability != Durability::Volatile {
         return Err(CoreError::MissingCapability {
             capability: format!(
-                "flife run opens no command journal, so it runs {VOLATILE_IN_MEMORY} only; \
-                 {WRITE_AHEAD_BEFORE_APPLY} sessions open through a journal \
-                 (flife_runtime::open_journaled, FL-036)"
+                "a {WRITE_AHEAD_BEFORE_APPLY} run needs a command journal: give it a run \
+                 directory (flife run --run-dir), or run {VOLATILE_IN_MEMORY}"
             ),
         });
     }
-    let mut world = found(config)?;
-    if let Some(workers) = options.cpu_workers {
-        world.set_cpu_workers(workers)?;
+    let commands = crate::persist::commands(injections);
+    if let Some(persistence) = persistence {
+        crate::persist::create(&persistence.run_dir, config)?;
     }
-    install(&mut world, options.controllers)?;
+    let mut world = found(config)?;
+    configure(&mut world, options.cpu_workers, options.controllers)?;
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;
-    let (owner, handle) = open_with(world, limits)?;
-    emit(&start(config, options.ticks, cpu_workers, controllers));
+    let (owner, handle, checkpoints) = match persistence {
+        Some(persistence) => {
+            let checkpoints = Checkpoints::open(persistence, config)?;
+            let book = CommandBook::new(limits.session, limits.revision, limits.command_capacity);
+            let (owner, handle) =
+                crate::persist::open_session(world, book, limits, &persistence.run_dir)?;
+            (owner, handle, Some(checkpoints))
+        }
+        None => {
+            let (owner, handle) = open_with(world, limits)?;
+            (owner, handle, None)
+        }
+    };
+    let clock = Instant::now();
+    let plan = Plan {
+        start: start(config, options.ticks, cpu_workers, controllers),
+        until: options.ticks,
+        every: options.every,
+        commands,
+        resumed: None,
+    };
+    let driven = drive(owner, handle, plan, checkpoints, emit, clock)?;
+    Ok(finish(
+        driven,
+        persistence.map(|persistence| persistence.run_dir.as_path()),
+        limits.durability,
+        clock,
+    ))
+}
+
+/// Give `world` `cpu_workers`, if set, and the controller backend `choice`
+/// selects on this host.
+///
+/// # Errors
+/// [`World::set_cpu_workers`]'s and [`install`]'s.
+pub fn configure(
+    world: &mut World,
+    cpu_workers: Option<NonZeroUsize>,
+    choice: ControllerChoice,
+) -> Result<(), CoreError> {
+    if let Some(workers) = cpu_workers {
+        world.set_cpu_workers(workers)?;
+    }
+    install(world, choice)
+}
+
+/// What a session is driven to do.
+pub(crate) struct Plan {
+    /// The [`Record::Start`] emitted first.
+    pub start: Record,
+    /// The committed tick to reach.
+    pub until: u64,
+    /// Emit a progress record at every multiple of this tick; zero for
+    /// none.
+    pub every: u64,
+    /// Commands to submit, in order, before the first step. Each must be
+    /// admitted afresh.
+    pub commands: Vec<Command>,
+    /// For a resumed run: the checkpoint it recovered and those it passed
+    /// over, reported in a [`Record::Resume`] before anything else.
+    pub resumed: Option<(Option<CheckpointAt>, Vec<SkippedCheckpoint>)>,
+}
+
+/// What driving a session returned.
+pub(crate) struct Driven<E> {
+    pub stop: Stop,
+    pub tally: Tally,
+    pub closed: SessionClosed,
+    pub emit: E,
+    pub checkpoints: Option<Checkpoints>,
+}
+
+/// Drive the session from a client task on Asupersync's native
+/// current-thread runtime: submit the plan's commands, then step one tick at
+/// a time until the committed tick reaches `plan.until`, a capacity pause
+/// or a failure, emitting a progress record at every multiple of
+/// `plan.every`. With `checkpoints`, publish one at each tick it is due (the
+/// starting tick included, once the commands are admitted) and at the end
+/// unless the run stopped on a fault, then suspend the session; without
+/// them, close it.
+pub(crate) fn drive<E>(
+    owner: SessionOwner,
+    handle: SessionHandle,
+    plan: Plan,
+    checkpoints: Option<Checkpoints>,
+    mut emit: E,
+    clock: Instant,
+) -> Result<Driven<E>, CoreError>
+where
+    E: FnMut(&Record) + Send + 'static,
+{
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| missing(format!("an Asupersync runtime: {error}")))?;
     let spawner = runtime.handle();
-    let clock = Instant::now();
-    let (stop, tally, closed, emit) = runtime.block_on(async move {
+    runtime.block_on(async move {
         let owner = spawner
             .try_spawn(async move {
                 let cx = Cx::current().ok_or_else(|| missing("a task context".into()))?;
@@ -297,22 +496,76 @@ pub fn run(
         let client = spawner
             .try_spawn(async move {
                 let cx = Cx::current().ok_or_else(|| missing("a task context".into()))?;
+                let mut checkpoints = checkpoints;
+                let snapshot = handle.inspect(&cx).await?;
+                let mut committed = snapshot.boundary.tick.get();
+                if plan.until < committed {
+                    return Err(CoreError::StateConflict {
+                        operation: "continue the run",
+                        detail: format!(
+                            "the run is already at tick {committed}, past tick {}",
+                            plan.until
+                        ),
+                    });
+                }
+                emit(&plan.start);
+                if let Some((checkpoint, skipped)) = plan.resumed {
+                    emit(&Record::Resume {
+                        schema: RUN_SCHEMA,
+                        checkpoint,
+                        skipped,
+                        tick: committed,
+                        digest: snapshot.digest.to_hex(),
+                        journal: snapshot.journal.map(|journal| JournalMarks {
+                            admitted: journal.durable.admitted,
+                            outcomes: journal.durable.outcomes,
+                        }),
+                    });
+                }
+                for command in plan.commands {
+                    let admission = handle.submit(&cx, command).await?;
+                    if !matches!(admission, Admission::Accepted { retry: false, .. }) {
+                        return Err(CoreError::StateConflict {
+                            operation: "submit a scheduled command",
+                            detail: format!(
+                                "{} was not admitted afresh: {admission:?}",
+                                command.id
+                            ),
+                        });
+                    }
+                }
+                // The starting state, commands included, when it is due and
+                // not already stored.
+                if let Some(checkpoints) = &mut checkpoints
+                    && checkpoints.due(committed)
+                    && checkpoints.last_tick() != Some(committed)
+                {
+                    let taken = handle.checkpoint(&cx).await?;
+                    emit(&checkpoints.publish(&taken)?);
+                }
                 let mut tally = Tally::default();
                 let stop = loop {
-                    if tally.ticks >= options.ticks {
+                    if committed >= plan.until {
                         break Stop::Reached;
                     }
                     match handle.step(&cx).await? {
                         StepOutcome::Published { report, .. } => {
                             tally.record(&report);
-                            if options.every > 0 && tally.ticks % options.every == 0 {
+                            committed = report.tick.get();
+                            if plan.every > 0 && committed.is_multiple_of(plan.every) {
                                 emit(&Record::Progress {
                                     schema: RUN_SCHEMA,
-                                    tick: report.tick.get(),
+                                    tick: committed,
                                     live: report.live,
                                     tally: Box::new(tally.clone()),
                                     wall_seconds: clock.elapsed().as_secs_f64(),
                                 });
+                            }
+                            if let Some(checkpoints) = &mut checkpoints
+                                && checkpoints.due(committed)
+                            {
+                                let taken = handle.checkpoint(&cx).await?;
+                                emit(&checkpoints.publish(&taken)?);
                             }
                         }
                         StepOutcome::Paused { shortfall, .. } => {
@@ -329,17 +582,65 @@ pub fn run(
                         }
                     }
                 };
-                handle.close(&cx).await?;
-                Ok::<_, CoreError>((stop, tally, emit))
+                // The last committed state, unless a fault stopped the run.
+                if let Some(checkpoints) = &mut checkpoints
+                    && !matches!(stop, Stop::Failed { stopped: true, .. })
+                    && checkpoints.last_tick() != Some(committed)
+                {
+                    let taken = handle.checkpoint(&cx).await?;
+                    emit(&checkpoints.publish(&taken)?);
+                }
+                // A kept run is suspended, not closed: commands still
+                // pending stay pending in its checkpoint and journal, to
+                // apply when it is resumed past their ticks.
+                if checkpoints.is_some() {
+                    handle.suspend(&cx).await?;
+                } else {
+                    handle.close(&cx).await?;
+                }
+                Ok::<_, CoreError>((stop, tally, emit, checkpoints))
             })
             .map_err(|error| missing(format!("the client task: {error}")))?;
         let client = client.await;
         let closed = owner.await?;
-        let (stop, tally, emit) = client?;
-        Ok::<_, CoreError>((stop, tally, closed, emit))
-    })?;
-    let mut emit = emit;
+        let (stop, tally, emit, checkpoints) = client?;
+        Ok(Driven {
+            stop,
+            tally,
+            closed,
+            emit,
+            checkpoints,
+        })
+    })
+}
+
+/// Emit the [`Record::End`] for `driven` and return what the run did.
+pub(crate) fn finish<E: FnMut(&Record)>(
+    driven: Driven<E>,
+    run_dir: Option<&Path>,
+    durability: Durability,
+    clock: Instant,
+) -> Finished {
+    let Driven {
+        stop,
+        tally,
+        closed,
+        mut emit,
+        checkpoints,
+    } = driven;
     let survey = Survey::of(&closed.world);
+    let persisted = run_dir.map(|run_dir| Persisted {
+        run_dir: run_dir.display().to_string(),
+        durability: match durability {
+            Durability::Volatile => VOLATILE_IN_MEMORY,
+            Durability::WriteAhead => WRITE_AHEAD_BEFORE_APPLY,
+        },
+        checkpoint: checkpoints.as_ref().and_then(Checkpoints::last),
+        journal: closed.journal.as_ref().map(|journal| JournalMarks {
+            admitted: journal.durable.admitted,
+            outcomes: journal.durable.outcomes,
+        }),
+    });
     emit(&Record::End {
         schema: RUN_SCHEMA,
         stop: stop.clone(),
@@ -349,13 +650,14 @@ pub fn run(
         survey: Box::new(survey.clone()),
         controllers: ControllerSummary::of(&closed.world),
         wall_seconds: clock.elapsed().as_secs_f64(),
+        persisted,
     });
-    Ok(Finished {
+    Finished {
         stop,
         tally,
         survey,
         closed,
-    })
+    }
 }
 
 fn missing(capability: String) -> CoreError {

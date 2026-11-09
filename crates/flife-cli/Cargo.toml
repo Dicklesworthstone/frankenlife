@@ -1,6 +1,6 @@
 [package]
 name = "flife-cli"
-description = "FrankenLife's headless command line: preset validation and a headless run through the Asupersync session owner, with versioned NDJSON records of births, deaths, emissions and heritable variation read from raw state"
+description = "FrankenLife's headless command line: preset validation, headless runs through the Asupersync session owner and checkpointed, resumable run directories, with versioned NDJSON records of births, deaths, emissions and heritable variation read from raw state"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true
@@ -21,6 +21,7 @@ flife-genome = { path = "../flife-genome" }
 flife-manim = { path = "../flife-manim" }
 flife-render = { path = "../flife-render" }
 flife-runtime = { path = "../flife-runtime" }
+flife-store = { path = "../flife-store" }
 fmn-codec.workspace = true
 serde.workspace = true
 serde_json.workspace = true

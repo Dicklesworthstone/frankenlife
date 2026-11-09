@@ -12,6 +12,8 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::future::Future;
+use std::task::Poll;
 
 use asupersync::runtime::{RuntimeBuilder, yield_now};
 use common::{
@@ -19,12 +21,12 @@ use common::{
     reference,
 };
 use flife_core::canonical::Sha256Digest;
-use flife_core::ids::CommandId;
+use flife_core::ids::{CommandId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Advance, Intervention, Stepped};
 use flife_runtime::{
-    Admission, Boundary, CancelReason, Cancellation, CommandStatus, Durability, Outcome, Rejection,
-    RunEnd, SessionConfig, StepOutcome, Target, open,
+    Admission, Boundary, CancelReason, Cancellation, CommandBook, CommandStatus, Durability,
+    Outcome, Rejection, RunEnd, SessionConfig, StepOutcome, Target, open, open_restored,
 };
 
 #[expect(
@@ -701,6 +703,162 @@ fn closing_discards_an_unpublished_candidate_and_cancels_unfinished_commands() {
         let expected = reference(&config, boundary.tick.get(), &[]);
         assert_eq!(closed.world.digest(), expected.digest());
     }
+}
+
+/// Suspending while running (FL-037) discards any unpublished candidate as
+/// closing does and refuses later requests, but leaves every unfinished
+/// command pending and the book open, for a later session of the run. A
+/// close that reaches the owner together with a suspension wins: the
+/// command is cancelled as `session-closed`.
+#[test]
+fn suspending_leaves_unfinished_commands_pending_unless_a_close_comes_too() {
+    type Answers = (
+        Result<Boundary, CoreError>,
+        Option<Result<Boundary, CoreError>>,
+    );
+    let config = ecology(&[]);
+    for seed in 0..4 {
+        for with_close in [false, true] {
+            let (results, closed) = lab(seed, &config, |handle| {
+                let suspender = handle.clone();
+                let late = handle.clone();
+                vec![
+                    Box::pin(async move {
+                        let cx = cx();
+                        accepted(
+                            &handle
+                                .submit(&cx, command(1, at(1000), inject([1, 1], 1.0)))
+                                .await
+                                .expect("x"),
+                        );
+                        handle.resume(&cx).await.expect("resume");
+                        None
+                    }) as Client<Option<Answers>>,
+                    Box::pin(async move {
+                        let cx = cx();
+                        while !suspender.inspect(&cx).await.expect("inspect").running {
+                            yield_now().await;
+                        }
+                        for _ in 0..(3 * seed) {
+                            yield_now().await;
+                        }
+                        let answers = if with_close {
+                            // Both requests are queued before the owner runs.
+                            let closer = suspender.clone();
+                            let mut suspend = std::pin::pin!(suspender.suspend(&cx));
+                            let mut close = std::pin::pin!(closer.close(&cx));
+                            let (mut suspended, mut closed) = (None, None);
+                            std::future::poll_fn(|context| {
+                                if suspended.is_none()
+                                    && let Poll::Ready(answer) = suspend.as_mut().poll(context)
+                                {
+                                    suspended = Some(answer);
+                                }
+                                if closed.is_none()
+                                    && let Poll::Ready(answer) = close.as_mut().poll(context)
+                                {
+                                    closed = Some(answer);
+                                }
+                                if suspended.is_some() && closed.is_some() {
+                                    Poll::Ready(())
+                                } else {
+                                    Poll::Pending
+                                }
+                            })
+                            .await;
+                            (suspended.expect("answered"), closed)
+                        } else {
+                            (suspender.suspend(&cx).await, None)
+                        };
+                        let refused = late
+                            .submit(&cx, command(2, Target::NextAdmissible, inject([1, 1], 1.0)))
+                            .await;
+                        assert!(
+                            matches!(
+                                refused,
+                                Err(CoreError::QueueClosed { .. })
+                                    | Ok(Admission::Rejected(Rejection::Closed))
+                            ),
+                            "{refused:?}"
+                        );
+                        Some(answers)
+                    }),
+                ]
+            });
+            let (suspended, closing) = results[1].clone().expect("answers");
+            let boundary = suspended.expect("the suspension is answered");
+            assert_eq!(closed.boundary, boundary);
+            let expected = reference(&config, boundary.tick.get(), &[]);
+            assert_eq!(closed.world.digest(), expected.digest());
+            let status = closed.book.status(CommandId::new(1));
+            if with_close {
+                assert_eq!(closing, Some(Ok(boundary)), "seed {seed}");
+                assert!(
+                    matches!(
+                        status,
+                        Some(CommandStatus::Terminal(Outcome::Cancelled {
+                            reason: CancelReason::SessionClosed,
+                            boundary: at,
+                            ..
+                        })) if *at == boundary.tick
+                    ),
+                    "seed {seed}: {status:?}"
+                );
+                assert!(closed.book.is_closed());
+            } else {
+                assert_eq!(status, Some(&CommandStatus::Pending), "seed {seed}");
+                assert!(!closed.book.is_closed());
+                assert_eq!(closed.book.outcome_cursor(), 0);
+            }
+        }
+    }
+}
+
+/// `open_restored` (FL-037) opens a volatile session on a restored world and
+/// book, refusing a book of another session or configuration, and a
+/// write-ahead configuration, which needs `open_journaled`.
+#[test]
+fn open_restored_refuses_a_book_that_is_not_the_worlds() {
+    let config = ecology(&[]);
+    let limits = SessionConfig::from_config(SESSION, &config).expect("limits");
+    let book = |session: u64, revision: Sha256Digest| {
+        CommandBook::new(SessionId::new(session), revision, limits.command_capacity)
+    };
+    assert!(
+        open_restored(
+            found(&config),
+            book(SESSION.get(), config.config_hash()),
+            limits
+        )
+        .is_ok()
+    );
+    for (other, what) in [
+        (book(SESSION.get() + 1, config.config_hash()), "session"),
+        (
+            book(SESSION.get(), Sha256Digest::of(b"another")),
+            "revision",
+        ),
+    ] {
+        let refused = open_restored(found(&config), other, limits).map(|_| ());
+        assert!(
+            matches!(refused, Err(CoreError::StateConflict { .. })),
+            "{what}: {refused:?}"
+        );
+    }
+    let journaled = SessionConfig {
+        durability: Durability::WriteAhead,
+        ..limits
+    };
+    let refused = open_restored(
+        found(&config),
+        book(SESSION.get(), config.config_hash()),
+        journaled,
+    )
+    .map(|_| ());
+    assert!(
+        matches!(refused, Err(CoreError::MissingCapability { .. })),
+        "{refused:?}"
+    );
 }
 
 /// When every handle is dropped the owner closes on its own.

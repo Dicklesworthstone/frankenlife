@@ -7,6 +7,11 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
 - `run` is a headless run through the FL-014 session owner;
 - `observe` holds a tally of the published reports and a survey of a committed world's raw state.
 
+FL-037 (`flife-e5u`) adds run directories and `flife resume` (plan G3, §12.3, §16.3–§16.7, C.13, C.14), in
+`persist`: a run kept in one publishes checkpoints to FL-035's chunk store, indexes them in FL-036's run catalog,
+journals its commands there under `write-ahead-before-apply`, and resumes from its newest restorable checkpoint to
+exactly the state of the uninterrupted run.
+
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
@@ -16,6 +21,17 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
   render` takes the same `--controllers`.
 - In the library, `run(config, RunOptions { ticks, every, cpu_workers, controllers }, emit)`. `emit` receives every
   record in order.
+- FL-037, on `flife run`:
+  - `--run-dir DIR`: a new or empty directory to keep the run in;
+  - `--checkpoint-every T`: a checkpoint at every multiple of tick T, the starting tick included, and at the
+    end; 0 for the end alone. The default is `[persistence] checkpoint_interval_simulation_seconds` in ticks,
+    rounded up;
+  - `--checkpoint-durability power-loss|process-crash`: FL-035's profiles, `power-loss` by default;
+  - `--inject TICK:X,Y:AMOUNT`, repeatable: an `InjectEnergy` command at exactly that committed tick, as commands
+    1, 2, … in order, each required to be admitted afresh.
+- `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
+- In the library: `run_with(config, options, injections, persistence, emit)` and `resume(dir, ResumeOptions,
+  emit)`, with `Persistence::new(dir, config)` giving the configured defaults.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
@@ -26,6 +42,14 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
   - one `progress` every K published ticks: tick, live count and the tally so far;
   - `end`: why the run stopped (`reached`, `capacity-paused` or `failed` with the error's kind), the committed tick
     and world digest, the whole tally, and the survey of the committed world.
+  - FL-037, for a run kept in a run directory:
+    - `checkpoint`: the committed tick and epoch, the chunk-store sequence, the container's SHA-256 and size,
+      chunks written and shared, and the sequences retired under `retain_recent_checkpoints`;
+    - `resume` (after `start`, from `flife resume`): the checkpoint recovered (sequence and tick, or null for the
+      founding world), every newer one passed over with its error kind and reason, the committed tick and digest
+      after replaying the journal, and the journal's durable watermarks;
+    - `end.persisted`: the run directory, the command durability, the newest checkpoint, and the journal's final
+      durable watermarks.
 
   `progress` and `end` also carry `wall_seconds`, which is not scientific state. `start` carries `cpu_workers` and
   `controllers` (the backend and device, or `cpu-reference`), which no result depends on. `end` carries
@@ -59,7 +83,9 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
     carries, and the child's trait distance to its parent and to its grandparent.
 - Errors: one `frankenlife.error.v1` record on standard error. Its `kind` is `CoreError::kind`, or `io` for an
   unreadable file. Exit status is 0 on success, 1 when a run stops early (a capacity pause or a failed tick), and 2
-  for an unreadable or invalid configuration or a refused session.
+  for an unreadable or invalid configuration, a refused session or a refused run directory.
+- A run directory (FL-037) holds `config.toml` (the configuration's canonical TOML, written, flushed and renamed
+  into place), `catalog.db` (the run catalog and command journal) and `store/` (the chunk store).
 - In `flife-core`, FL-015 adds `CoreError::kind`, a stable kebab-case class name, distinct for every variant.
 
 **Invariants.**
@@ -77,6 +103,23 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
   founding the population or emitting a `start` record.
 - The preset is Appendix A with exactly its declared changes. Its header declares each one, and the smoke test
   refuses any other difference.
+- FL-037:
+  - Checkpoints are `pause-and-stream`: the client takes no step while one is taken and published, and the session
+    takes one only once every journal record has its receipt, so the catalog's index is written while the journal
+    is idle. Keeping a run changes nothing in it: a `volatile-in-memory` run ends at the same digest with or
+    without a run directory (tested), and a `write-ahead-before-apply` one at the same digest with checkpoints
+    every 7 ticks or only at the end (observed when FL-037 was written).
+  - Commands are admitted before the founding checkpoint is taken, so it holds them: a `volatile-in-memory`
+    run's scheduled commands survive a crash through its checkpoints.
+  - A kept run suspends its session at the end instead of closing it: commands still pending stay pending in the
+    final checkpoint and the journal alike, and apply when the run is resumed past their ticks.
+  - Resume takes the newest checkpoint that loads and restores to a world of the run's configuration hash, falling
+    back to the founding world, and reports every newer one it passed over. `write-ahead-before-apply` then
+    replays every journaled outcome past it, each reproduced exactly (FL-036). The resumed run's committed digest
+    and final checkpoint bytes (world and command closure) equal the uninterrupted run's.
+  - After each publication the store keeps the newest `retain_recent_checkpoints` that restore; the catalog's
+    index keeps every row, and only a manifest makes a checkpoint resumable (§16.6).
+  - A resumed run's tally covers the ticks that call published.
 
 **The preset.** `reference-small-world` is a viability-calibrated start with declared parameter tuning (§7.2) at
 the Reference profile's scale (§19.5):
@@ -95,8 +138,8 @@ Versus Appendix A it changes:
 | `reproduction.cooldown_seconds` | 1.0 | 0.5 |
 
 It also changes the name, and `command_durability` from `write-ahead-before-apply` to `volatile-in-memory`. The
-durability change is a capability: `flife run` opens no command journal, so it refuses `write-ahead-before-apply`
-(FL-036's journal opens such sessions through `flife_runtime::open_journaled`; a CLI that opens one is FL-037).
+durability change is a capability: `flife run` without a run directory opens no command journal, so it refuses
+`write-ahead-before-apply`; with `--run-dir` it opens FL-036's journal there (FL-037).
 
 Appendix A as written has no birth and no death in its first 1,024 ticks. Its founders start at 2.0, below the 4.0
 threshold, take at most 0.4 energy per second, and emit from the first tick. The preset keeps their 2.0 start, so
@@ -115,7 +158,12 @@ test.
 **Refusal cases.**
 - An unreadable file: `io`.
 - An invalid configuration, such as an unknown key: `invalid-config`.
-- `write-ahead-before-apply`: `missing-capability`, before anything is founded.
+- `write-ahead-before-apply` without a run directory: `missing-capability`, before anything is founded.
+- FL-037, each before anything runs or is printed on standard output: `--run-dir` naming a directory that already
+  holds a run, or any other files: `state-conflict`; `flife resume` of a directory without `config.toml` and
+  `catalog.db`, of a run whose `config.toml` no longer hashes to the catalog's configuration, of a run already past
+  `--until`, or of a run another process holds (the chunk store's writer lock): `state-conflict`; a journal that
+  disagrees with the checkpoint: FL-036's `state-conflict` refusals.
 - Any other refusal from founding or the session, by its `CoreError` kind.
 - A run that pauses on capacity or fails a tick ends with that `stop` and exit status 1. Its records up to that
   point are still emitted.
@@ -125,7 +173,7 @@ test.
   the plan's own Appendix A. It refuses any difference except the eight declared, and checks that the header
   declares each one.
 - `the_preset_validates_at_the_reference_scale_and_its_session_admits_it`. Appendix A as written validates, and
-  its session refuses it as `MissingCapability`.
+  `flife run` without a run directory refuses it as `missing-capability`, naming the command journal it needs.
 - `the_smoke_run_shows_births_deaths_emissions_and_heritable_variation_in_raw_state`. It runs 1,024 ticks of the
   preset through the session on the native runtime.
   - The records: one start, progress at 256, 512, 768 and 1,024, and one end carrying the returned tally and
@@ -174,13 +222,54 @@ changes no result. FL-013's digest, pinned before the change, still holds under 
 Twenty-two planted bugs were each caught by at least one of these tests or `flife-core`'s `errors_name_their_class`
 (listed in the FL-015 commit).
 
+`tests/resume.rs` (5 tests, FL-037, about 11 s), each on a 32 × 32 Appendix A ecology of 48 founders that breeds,
+controllers every 4 ticks in per-organism phases, checkpoints every 7 ticks, energy brushes at ticks 3, 66, 150
+and 230 on cells whose X and Y differ, and a 240-tick horizon whose uninterrupted run is the reference (it
+publishes the founding checkpoint, every multiple of 7 and 240, keeps 4, journals 4 acceptances and 4 outcomes,
+and its catalog indexes exactly the checkpoints it published):
+- `a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_state`. A run to tick 152 journals 3
+  outcomes and no cancellation. Its checkpoint at 147 holds controller outputs evaluated before 147, a cooldown
+  running past it, newborn genomes, command 2 applied and commands 3 and 4 pending. With the 152 manifest damaged,
+  `flife resume --until 240` reports 152 passed over, recovers 147, replays command 3's outcome to tick 150 or
+  later, and ends at the reference digest and final checkpoint SHA-256, with 4 outcomes journaled.
+- `a_killed_write_ahead_run_resumes_to_the_uninterrupted_state`. A run with no horizon is SIGKILLed after
+  reporting tick 70 (exit by signal 9, no `end`); resume recovers a checkpoint at 63 or later, publishes nothing
+  at or before it, and reaches the reference. Over 10 consecutive runs of the final binary it always recovered
+  63; 6 times the journal held command 2's outcome (replayed to 67), 4 times only its acceptance (applied again
+  at 66), so both recovery paths ran.
+- `a_killed_volatile_run_resumes_to_the_uninterrupted_state`. The same at `volatile-in-memory` under `power-loss`
+  publication: no journal, and the end digest equals the same configuration run without a run directory.
+- `checkpoints_of_another_configuration_are_passed_over`. With another configuration's store moved in, resume
+  passes over all three of its checkpoints by name and replays the journal from the founding world to the digest
+  of the same run made directly.
+- `run_directories_refuse_what_they_cannot_continue`: an existing run, a non-empty directory, a non-run
+  directory, an edited `config.toml`, a tick already passed, and a run directory another live process holds; and
+  the configured interval (3,840 ticks), giving only the founding and final checkpoints of a 10-tick run.
+
+A `persist` unit test pins `--inject` parsing. Twenty-four planted mutants in the run directories, the driver,
+suspension, `open_restored` and the CLI guard were each caught. One, `flife run` without its own write-ahead
+guard, was caught only after the smoke test checked that the refusal names `--run-dir`: the session refuses in
+the same words, but after founding the world.
+
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
-`volatile-in-memory`, on the native current-thread runtime with one owner and one client.
+`volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories
+also at `write-ahead-before-apply`, one process per run directory, on local file systems (APFS tested here).
 
 **Known gaps.**
-- Only `validate`, `run` and `render`. Capabilities, step and inspect, checkpoint and resume, branch, sweep, analyze
-  and export are later items (§14.6): FL-021, FL-037, FL-039, FL-041 and FL-023. FL-016's checkpoint encoding
-  exists in `flife-runtime`; the `checkpoint` and `resume` commands are FL-037.
+- Only `validate`, `run`, `resume` and `render`. Capabilities, step and inspect, branch, sweep, analyze and export
+  are later items (§14.6): FL-021, FL-039, FL-041 and FL-023.
+- FL-037 gaps:
+  - The checkpoint container is encoded whole in memory before it is published (one extra copy of the committed
+    state). §16.5's low-memory bound on it, and bounded or background checkpoints, are FL-038.
+  - Each publication restores the retained checkpoints to choose which to keep: O(`retain_recent_checkpoints`)
+    restores per checkpoint. Checkpoints of the 48-founder test ecology are about 2 MB each.
+  - Power loss is FL-035's protocol (flush order), exercised by publishing under `power-loss`, never by cutting
+    power. Kills are tested at whatever point the process reached, not at every step of a checkpoint (FL-035 and
+    FL-036 test those).
+  - Commands come only from `--inject` at the start of a run. Commands submitted to a resumed run, and the other
+    interventions, are FL-022.
+  - Retention is by count. Pinned discoveries and journal compaction (§16.7) are later, and the catalog's
+    checkpoint index keeps rows for retired manifests.
 - `render` draws on FrankenManim's CPU reference 3D route, a tick per frame at most, at the epoch's texel resolution
   for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio.
   FrankenManim's Metal 3D route was measured on these frames (`examples/frame_routes.rs`, M5 Ultra, GPU shared
@@ -192,7 +281,8 @@ Twenty-two planted bugs were each caught by at least one of these tests or `flif
   the bytes (332 of 1.6 M pixels at tick 64), so it would also change the written frames. The
   MP4 encoder is an external `ffmpeg` on `PATH`; without it `--video` is a typed `missing-capability` refusal after
   the frames are written.
-- The run sends no commands. Interventions from the command line come with FL-022's recorded commands.
+- `--inject` (FL-037) is the only command source: single-cell energy brushes at fixed ticks. The other
+  interventions and recorded commands are FL-022's.
 - The survey sees only live organisms. Pairs and triples need their relatives alive, and lineage history beyond the
   live population is FL-040's incremental lineage summaries.
 - The survey compares whole genomes and hashes every live genome, which is cheap at this scale. Bounded, sampled

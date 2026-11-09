@@ -204,6 +204,10 @@ Every issue is reported, not just the first.
 - FL-036, in `flife-runtime` and `flife-store`: Appendix A's command durability `write-ahead-before-apply`. A
   session opened with `open_journaled` relies on an acceptance, cancellation or outcome only once its FrankenSQLite
   command journal has made it durable; the evidence is C.14's crash at each point of an energy brush.
+- FL-037, in `flife-cli`: Appendix A's checkpoint mode `pause-and-stream`. `flife run --run-dir` takes no step
+  while a checkpoint is taken and published, and a run stopped by a damaged newest checkpoint or by SIGKILL
+  resumes with `flife resume` to the uninterrupted run's digest and final checkpoint bytes. The container is
+  encoded whole in memory first; §16.5's memory bound on that copy is FL-038's.
 - FL-017, in `flife-render` and `flife-runtime`: the observer pressure policy
   `drop-observer-or-pause-unchanged-world`.
   - The render feed takes its drop arm: a busy feed skips the boundary and keeps the last displayable epoch, and

@@ -18,8 +18,8 @@ durable through a command journal before relying on it, and a session reopens fr
 - `Command`: the session, a client `CommandId`, a `Target` (`At { tick, retarget }` or `NextAdmissible`), an
   optional expected revision, and a validated `flife_engine::Intervention`. The only intervention so far is
   `InjectEnergy { cell, amount }`: declared external energy added to one field cell.
-- Control requests: pause, resume, run until a tick, step, cancel, status, inspect and close; for a journaled
-  session also checkpoint and durable outcome (FL-036).
+- Control requests: pause, resume, run until a tick, step, cancel, status, inspect, close and suspend (FL-037);
+  checkpoint and durable outcome (FL-036).
 - For `open_journaled` (FL-036): a `JournalWriter` started over a `Journal` implementation, and the
   `JournalContents` it read back when it opened the session's run.
 
@@ -45,7 +45,8 @@ durable through a command journal before relying on it, and a session reopens fr
 - `RunEnd` for a bounded run: `Reached`, `Paused`, `CapacityPaused`, `Failed` or `Closed`, each with its boundary.
 - `Snapshot`: the committed boundary and world digest, live count, running state, unfinished, admitted and outcome
   counts, whether the run stopped, and the render publisher's `RenderStats` (FL-017).
-- `SessionClosed`: the committed world, the closed book, the final boundary and the render counters.
+- `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
+  still pending), the final boundary and the render counters.
 - FL-036, for a journaled session:
   - `JournalState` in `Snapshot` and `SessionClosed`: the durable `Watermarks` (acceptances and outcomes, two
     contiguous counts), how many records wait for a receipt, and the journal's failure, if any;
@@ -112,6 +113,11 @@ durable through a command journal before relying on it, and a session reopens fr
   everything still queued, and returns the committed world. A close request, the last handle being dropped, or the
   owner's context being cancelled each close the session. A running owner notices the dropped handles at its next
   committed boundary, so an abandoned session never runs on unobserved.
+- Suspending (`SessionHandle::suspend`, FL-037) closes the same way but cancels nothing: every unfinished command
+  stays pending in the returned book and unended in the journal, so a later session of the same run, restored from
+  a checkpoint taken before it, applies it at its tick. A close that reaches the owner with a suspension wins.
+- `open_restored` (FL-037) opens a `volatile-in-memory` session on a restored world and book, refusing a book of
+  another session or revision as `open_journaled` does.
 - Scientific ticks are never skipped and the timestep never changes. A run to tick `t` stops exactly at `t`.
 
 **Invariants — render epochs and observer pressure (FL-017; §7.5, §9.5, §12.4, INV-09).**
@@ -167,8 +173,8 @@ durable through a command journal before relying on it, and a session reopens fr
   the book does not hold is replayed: the world advances through the same boundaries with the same commands, each
   journaled cancellation is applied at its boundary, and every outcome must be reproduced exactly. The session
   then starts at the boundary the replay reached, with every later acceptance pending and nothing journaled twice.
-- Closing journals the session-closed cancellations, answers everything queued, waits for every receipt and then
-  stops the writer, so `SessionClosed.journal` reports the final durable watermarks.
+- Closing journals the session-closed cancellations (suspending journals none), answers everything queued, waits
+  for every receipt and then stops the writer, so `SessionClosed.journal` reports the final durable watermarks.
 
 **Refusal cases.**
 - `SessionConfig::from_config`:
@@ -208,7 +214,7 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - energy reconciliation: the injection applies at exactly its tick, never above the request, and is recorded as
     `command-injection` and closed by the ledger;
   - every admission refusal, closing, and failing every unfinished command when the run stops.
-- `tests/session.rs` (12 tests), with the owner and clients as separate Asupersync Lab tasks, quiescent and
+- `tests/session.rs` (13 tests), with the owner and clients as separate Asupersync Lab tasks, quiescent and
   invariant-clean under each seed:
   - `volatile-in-memory` admitted, and `write-ahead-before-apply` refused by `open` with a pointer to
     `open_journaled`;
@@ -224,6 +230,8 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - a numerical fault that fails every unfinished command, refuses new work, steps and runs, and preserves the
     committed state;
   - closing while running, which cancels unfinished commands and refuses later requests;
+  - suspending while running, over four seeds: the unfinished command stays pending, the book open and no outcome
+    recorded, later requests are refused; with a close sent in the same poll the close wins;
   - dropping every handle, while paused and while running (the latter within a 2,000-step Lab bound, so an owner
     that ignores the dropped handles fails quickly instead of hanging);
   - the same protocol on the native current-thread runtime.
@@ -278,16 +286,16 @@ session; `InjectEnergy` as the only intervention.
 - Idempotency records, in the book and the journal, are kept for the session's whole life. No bounded window or
   journal compaction yet.
 - A failed journal stops the session for good; recovering means reopening from the journal. No in-place retry.
-- Replay from a checkpoint re-runs every tick after it: there is no resume CLI, and `flife run` refuses
-  `write-ahead-before-apply` (FL-037 opens journaled runs and resumes them from the newest valid checkpoint).
-  `SessionHandle::checkpoint` and the library calls `checkpoint`/`restore` are the only checkpoint paths.
+- Replay from a checkpoint re-runs every tick after it. `flife run --run-dir` and `flife resume` (FL-037, in
+  `flife-cli`) open journaled runs and resume them from the newest valid checkpoint; `SessionHandle::checkpoint` and
+  the library calls `checkpoint`/`restore` remain the only checkpoint paths here.
 - `block_on_inline` must not run on an Asupersync runtime thread (FrankenSQLite reaches for the thread's runtime
   while it parks, and an open never completes), so journal I/O runs on the writer thread or a plain thread.
 - Brushes, regions, material, removal, seeded introduction, source edits and their native input mapping are FL-022.
   FL-014's single-cell `InjectEnergy` is the canonical payload they will extend.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
-- Checkpoint commands and branching (FL-037, FL-039) are not commands yet. Render epochs are not commands: viewers
+- Branching (FL-039) is not a command yet; checkpoints are control requests, not commands. Render epochs are not commands: viewers
   read the feed directly (FL-017).
 - The render projection runs on the owner task, O(live + texels) per published boundary.
 - Lab tests cover protocol outcomes and publication invariants under seeded interleavings, not every possible

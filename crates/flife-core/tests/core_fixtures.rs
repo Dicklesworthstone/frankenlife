@@ -59,6 +59,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-runtime/tests/observation.rs"),
     ),
     (
+        "flife-cli::tests/resume.rs",
+        include_str!("../../flife-cli/tests/resume.rs"),
+    ),
+    (
         "flife-store::tests/journal.rs",
         include_str!("../../flife-store/tests/journal.rs"),
     ),

@@ -69,7 +69,11 @@ and retention keeps the newest valid ones. FL-036 adds the run catalog and comma
 database. A `write-ahead-before-apply` session answers an acceptance or cancellation only once the journal holds
 it, and holds a boundary until the records due there are durable while its control lane stays live. A process
 killed at each point of an energy brush's life recovers from the journal and applies the brush exactly once.
-`flife checkpoint`/`resume`, and a `flife run` that opens a journal, are FL-037.
+FL-037 keeps a run in a directory: `flife run --run-dir DIR` writes its configuration, journals its commands
+(`--inject TICK:X,Y:AMOUNT`), and checkpoints at the configured interval, without changing the run. `flife resume
+DIR --until T` continues it from its newest checkpoint that restores. A run SIGKILLed part way, or whose newest
+checkpoint is damaged, resumes to exactly the uninterrupted run's world and final checkpoint bytes, across
+controller phases, cooldowns, newborns and commands still in the future.
 Camera, zoom and selection come next.**
 
 | Question | Answer |
@@ -400,7 +404,7 @@ flife validate <config>     # range-check a config; report real memory and the w
 flife capabilities          # what this machine and build can actually run, with explicit refusals
 flife run <config>          # a headless run
 flife step | inspect        # advance one tick; a bounded snapshot of one organism at an exact tick
-flife checkpoint | resume   # durable, verified world state and exact resumption
+flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
 flife branch                # control and intervention branches from one checkpoint
 flife sweep | analyze       # seed ensembles, parameter sweeps, ablations and their metrics
 flife render | export       # simulation-time frames and video through FrankenManim (render exists)

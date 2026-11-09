@@ -316,6 +316,32 @@ impl<'a> ReferenceController<'a> {
         })
     }
 
+    /// A controller over `parameters` that [`ReferenceController::new`]
+    /// already admitted, under a bound no larger than the one the caller
+    /// would check, and that have not changed since: a sealed genome's
+    /// immutable parameters. Only the layout is checked again, so evaluating a
+    /// sealed genome does not rescan every parameter each tick.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for a parameter count the topology does
+    /// not have.
+    pub fn sealed(topology: &'a DenseTopology, parameters: &'a [f32]) -> Result<Self, CoreError> {
+        if parameters.len() != topology.parameters {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller parameters",
+                detail: format!(
+                    "{} values for a topology of {} parameters",
+                    parameters.len(),
+                    topology.parameters
+                ),
+            });
+        }
+        Ok(Self {
+            topology,
+            parameters,
+        })
+    }
+
     /// The topology this controller is read through.
     #[must_use]
     pub const fn topology(&self) -> &'a DenseTopology {

@@ -290,6 +290,9 @@ pub struct Genome {
     parent: Option<GenomeId>,
     logical: u64,
     allocated: u64,
+    /// The `maximum_absolute_parameter` every parameter was checked against
+    /// when the genome was sealed. The parameters never change afterwards.
+    sealed_bound: f64,
 }
 
 impl Genome {
@@ -331,6 +334,7 @@ impl Genome {
             parent,
             logical,
             allocated,
+            sealed_bound: limits.maximum_absolute_parameter,
         })
     }
 
@@ -399,10 +403,17 @@ impl Genome {
                     buffer: "genome parameters",
                     detail: format!("member {} is not in the catalog", self.topology.index()),
                 })?;
-        ReferenceController::new(
-            topology,
-            self.parameters(),
-            limits.maximum_absolute_parameter,
-        )
+        // Sealing checked every parameter against `sealed_bound`, and they
+        // are immutable, so under the same or a looser bound only the layout
+        // needs checking again. A tighter bound rescans them.
+        if limits.maximum_absolute_parameter >= self.sealed_bound {
+            ReferenceController::sealed(topology, self.parameters())
+        } else {
+            ReferenceController::new(
+                topology,
+                self.parameters(),
+                limits.maximum_absolute_parameter,
+            )
+        }
     }
 }

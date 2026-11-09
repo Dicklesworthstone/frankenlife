@@ -11,6 +11,7 @@
 //! The scientific content of the records (everything except
 //! `wall_seconds`) depends only on the configuration and the tick count.
 
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -26,6 +27,19 @@ use crate::observe::{Survey, Tally};
 /// The schema of every record a run emits.
 pub const RUN_SCHEMA: &str = "frankenlife.run.v1";
 
+/// One worker per available core, at most 16: the `auto` worker count.
+#[must_use]
+pub fn auto_workers() -> NonZeroUsize {
+    std::thread::available_parallelism()
+        .map_or(NonZeroUsize::MIN, |cores| cores.min(AUTO_WORKER_CEILING))
+}
+
+/// The most workers `auto` picks.
+pub const AUTO_WORKER_CEILING: NonZeroUsize = match NonZeroUsize::new(16) {
+    Some(ceiling) => ceiling,
+    None => NonZeroUsize::MIN,
+};
+
 /// The session a headless run opens.
 pub const RUN_SESSION: SessionId = SessionId::new(1);
 
@@ -37,6 +51,9 @@ pub struct RunOptions {
     /// Emit a progress record every this many published ticks; zero for
     /// none.
     pub every: u64,
+    /// Threads for the organism phases, replacing `[execution] cpu_workers`.
+    /// No result depends on it.
+    pub cpu_workers: Option<NonZeroUsize>,
 }
 
 /// Why the run stopped.
@@ -83,6 +100,8 @@ pub enum Record {
         timestep: [u64; 2],
         /// Ticks requested.
         ticks: u64,
+        /// Threads the organism phases use.
+        cpu_workers: usize,
     },
     /// The run so far.
     Progress {
@@ -144,7 +163,7 @@ pub fn found(config: &ValidatedConfig) -> Result<World, CoreError> {
 
 /// The [`Record::Start`] for running `config` for `ticks`.
 #[must_use]
-pub fn start(config: &ValidatedConfig, ticks: u64) -> Record {
+pub fn start(config: &ValidatedConfig, ticks: u64, cpu_workers: usize) -> Record {
     let model = config.config();
     let timestep = config.report().timestep;
     Record::Start {
@@ -162,6 +181,7 @@ pub fn start(config: &ValidatedConfig, ticks: u64) -> Record {
             u64::from(timestep.denominator()),
         ],
         ticks,
+        cpu_workers,
     }
 }
 
@@ -180,8 +200,13 @@ pub fn run(
     // The session's limits are checked before the world is founded, so an
     // unadmitted durability is refused without founding 4,096 organisms.
     let limits = SessionConfig::from_config(RUN_SESSION, config)?;
-    let (owner, handle) = open_with(found(config)?, limits)?;
-    emit(&start(config, options.ticks));
+    let mut world = found(config)?;
+    if let Some(workers) = options.cpu_workers {
+        world.set_cpu_workers(workers)?;
+    }
+    let cpu_workers = world.cpu_workers();
+    let (owner, handle) = open_with(world, limits)?;
+    emit(&start(config, options.ticks, cpu_workers));
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| missing(format!("an Asupersync runtime: {error}")))?;

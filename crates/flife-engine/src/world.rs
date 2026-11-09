@@ -63,6 +63,7 @@
 //! organism's ordered stages. Fixed-step reproducibility is not a claim of
 //! continuum accuracy.
 
+use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use flife_core::clock::{Tick, TimeStep, age_seconds, stable_phase};
@@ -77,10 +78,10 @@ use flife_core::{
 };
 use flife_field::{
     BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldGrid, FieldPair,
-    FieldState, FieldStepReport, FieldSummary, GrantPacket, Grants, SEEDED_SMOOTH_TORUS_V1,
-    SEEDED_UNIT_VECTORS, SeededPath, SensorPyramid, Source, SourceKernel, SourceSupport,
-    TransportPlan, TransportScratch, UptakeSummary, advance_field, apply_deposits, apply_grants,
-    initial_source, resolve_uptake, saturating_request,
+    FieldState, FieldStepReport, FieldSummary, GrantPacket, Grants, PyramidView,
+    SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorPyramid, Source, SourceKernel,
+    SourceSupport, TransportPlan, TransportScratch, UptakeSummary, advance_field, apply_deposits,
+    apply_grants, initial_source, resolve_uptake, saturating_request,
 };
 use flife_genome::{
     Genome, GenomeQuota, MutationParameters, MutationRecord, Mutator, TopologyCatalog, TraitLimits,
@@ -423,7 +424,10 @@ struct Scratch {
     transport: TransportScratch,
     support: SourceSupport,
     pyramid: SensorPyramid,
-    controller: ControllerScratch,
+    /// The committed rows, in identity order, that phases 3 and 4 read.
+    rows: Vec<Organism>,
+    /// One per CPU worker (`[execution] cpu_workers`).
+    lanes: Vec<DecisionLane>,
     sampled: Vec<Source>,
     working: Vec<Working>,
     demands: Vec<Demand>,
@@ -435,6 +439,26 @@ struct Scratch {
     survivors: Vec<Organism>,
     deaths: Vec<Death>,
 }
+
+/// Phases 3 and 4 for one organism: what it observed, and its held or newly
+/// evaluated controller output decoded into actions.
+#[derive(Debug, Clone, Copy)]
+struct Decision {
+    held: HeldOutput,
+    evaluated: bool,
+    actions: DecodedActions,
+    gradients: [[f64; 2]; RESPONSE_TERMS],
+}
+
+/// One CPU worker's scratch for phases 3 and 4.
+#[derive(Debug, Default)]
+struct DecisionLane {
+    controller: ControllerScratch,
+    decisions: Vec<Decision>,
+}
+
+/// The fewest organisms worth handing to another thread.
+const MINIMUM_ROWS_PER_LANE: usize = 128;
 
 /// One organism's state during a candidate tick.
 #[derive(Debug, Clone, Copy)]
@@ -577,7 +601,8 @@ impl World {
             transport: TransportScratch::new(&rules.grid, &limits)?,
             support: SourceSupport::new(),
             pyramid: SensorPyramid::from_config(config, &limits)?,
-            controller: ControllerScratch::default(),
+            rows: Vec::new(),
+            lanes: lanes(model.execution.cpu_workers)?,
             sampled: Vec::with_capacity(sources.len()),
             working: Vec::new(),
             demands: Vec::new(),
@@ -617,6 +642,36 @@ impl World {
     #[must_use]
     pub const fn epoch(&self) -> ResourceEpoch {
         self.epoch
+    }
+
+    /// How many threads phases 3 and 4 use: `[execution] cpu_workers`
+    /// unless [`World::set_cpu_workers`] changed it.
+    #[must_use]
+    pub fn cpu_workers(&self) -> usize {
+        self.scratch.lanes.len()
+    }
+
+    /// Use `workers` threads for phases 3 and 4 from the next tick. No result
+    /// depends on the count: each organism's decision reads only committed
+    /// state, and the decisions are gathered in identity order.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] if the lanes cannot be reserved; the
+    /// count is then unchanged.
+    pub fn set_cpu_workers(&mut self, workers: NonZeroUsize) -> Result<(), CoreError> {
+        let lanes = &mut self.scratch.lanes;
+        let workers = workers.get();
+        if workers > lanes.len() {
+            lanes
+                .try_reserve_exact(workers - lanes.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "decision lanes",
+                    bytes: u64::try_from(workers.saturating_mul(size_of::<DecisionLane>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+        }
+        lanes.resize_with(workers, DecisionLane::default);
+        Ok(())
     }
 
     /// The event cursor: births and deaths published so far.
@@ -827,7 +882,8 @@ impl World {
             transport,
             support,
             pyramid,
-            controller,
+            rows,
+            lanes,
             sampled,
             working,
             demands,
@@ -891,48 +947,34 @@ impl World {
         // Phases 3 and 4: the pyramid, then every organism's observation and
         // its due or forced evaluation, in identity order.
         let view = pyramid.build(observed)?;
+        rows.clear();
+        rows.extend(population.iter());
+        decide_all(rules, population, &view, rows, [from, to], lanes)?;
         working.clear();
         let mut evaluated = 0;
-        for organism in population.iter() {
-            let genome = genome_of(population, organism.id)?;
-            let traits = genome.traits();
-            let raw = view.sample(organism.position, traits.sensing_scale())?;
-            let intrinsic = Intrinsic {
-                energy: organism.energy,
-                age_seconds: age_seconds(organism.birth_tick, from, step)?,
-                velocity: organism.velocity,
-                energy_change_per_second: organism.energy_change_rate,
-            };
-            let observation = observe(&raw, &intrinsic, &rules.scales)?;
-            let due = !organism.held.is_valid()
-                || to.get() % u64::from(rules.interval) == u64::from(organism.phase);
-            let held = if due {
-                evaluated += 1;
-                let outputs = genome
-                    .controller(&rules.catalog, &rules.limits)?
-                    .evaluate(&observation.inputs, controller)?;
-                HeldOutput::evaluated(to, outputs)?
-            } else {
-                organism.held
-            };
-            let outputs = held.outputs().ok_or_else(|| CoreError::StateConflict {
-                operation: "decode held output",
-                detail: format!("{} holds no valid output", organism.id),
-            })?;
+        let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
+        for (&organism, decision) in rows.iter().zip(decisions) {
+            evaluated += usize::from(decision.evaluated);
             working.push(Working {
                 committed: organism,
                 budget: EnergyBudget::new(organism.energy)?,
                 vitality: Vitality::new(),
-                held,
-                evaluated: due,
-                actions: decode(&widen(outputs), step, &rules.decoding)?,
-                gradients: observation.gradients,
+                held: decision.held,
+                evaluated: decision.evaluated,
+                actions: decision.actions,
+                gradients: decision.gradients,
                 absorbed: 0.0,
                 position: organism.position,
                 velocity: organism.velocity,
                 cooldown_deadline: organism.cooldown_deadline,
                 emitted: false,
                 intent: None,
+            });
+        }
+        if working.len() != rows.len() {
+            return Err(CoreError::StateConflict {
+                operation: "gather decisions",
+                detail: format!("{} decisions for {} organisms", working.len(), rows.len()),
             });
         }
 
@@ -1205,6 +1247,142 @@ fn organism_total(population: &Population) -> f64 {
         total.add(organism.energy);
     }
     total.value()
+}
+
+/// `workers` empty decision lanes.
+fn lanes(workers: u32) -> Result<Vec<DecisionLane>, CoreError> {
+    let workers = usize::try_from(workers).map_err(|_| CoreError::Overflow {
+        quantity: "execution.cpu_workers",
+    })?;
+    let mut lanes = Vec::new();
+    lanes
+        .try_reserve_exact(workers)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "decision lanes",
+            bytes: u64::try_from(workers.saturating_mul(size_of::<DecisionLane>()))
+                .unwrap_or(u64::MAX),
+        })?;
+    lanes.resize_with(workers.max(1), DecisionLane::default);
+    Ok(lanes)
+}
+
+/// Phases 3 and 4 for one organism (§8.1): its observation at its sensing
+/// scale, then its due or forced evaluation, decoded.
+fn decide(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    organism: &Organism,
+    [from, to]: [Tick; 2],
+    controller: &mut ControllerScratch,
+) -> Result<Decision, CoreError> {
+    let genome = genome_of(population, organism.id)?;
+    let traits = genome.traits();
+    let raw = view.sample(organism.position, traits.sensing_scale())?;
+    let intrinsic = Intrinsic {
+        energy: organism.energy,
+        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
+        velocity: organism.velocity,
+        energy_change_per_second: organism.energy_change_rate,
+    };
+    let observation = observe(&raw, &intrinsic, &rules.scales)?;
+    let due = !organism.held.is_valid()
+        || to.get() % u64::from(rules.interval) == u64::from(organism.phase);
+    let held = if due {
+        let outputs = genome
+            .controller(&rules.catalog, &rules.limits)?
+            .evaluate(&observation.inputs, controller)?;
+        HeldOutput::evaluated(to, outputs)?
+    } else {
+        organism.held
+    };
+    let outputs = held.outputs().ok_or_else(|| CoreError::StateConflict {
+        operation: "decode held output",
+        detail: format!("{} holds no valid output", organism.id),
+    })?;
+    Ok(Decision {
+        held,
+        evaluated: due,
+        actions: decode(&widen(outputs), rules.step, &rules.decoding)?,
+        gradients: observation.gradients,
+    })
+}
+
+/// Phases 3 and 4 for every row, on at most `lanes.len()` threads: this one
+/// and scoped workers it joins before returning. That is plan §3.4's bounded
+/// reference adapter, not Asupersync-scheduled parallelism. The rows are split
+/// into contiguous identity-ordered runs, one per lane, and each lane's
+/// decisions follow its run. An organism's decision reads only committed
+/// state, so the split cannot change any result, and the error returned is the
+/// first in identity order, as a single thread would report it.
+fn decide_all(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    rows: &[Organism],
+    ticks: [Tick; 2],
+    lanes: &mut [DecisionLane],
+) -> Result<(), CoreError> {
+    for lane in lanes.iter_mut() {
+        lane.decisions.clear();
+    }
+    let used = lanes
+        .len()
+        .min(rows.len().div_ceil(MINIMUM_ROWS_PER_LANE))
+        .max(1);
+    let run = |rows: &[Organism], lane: &mut DecisionLane| -> Result<(), CoreError> {
+        lane.decisions
+            .try_reserve(rows.len())
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "decisions",
+                bytes: u64::try_from(rows.len().saturating_mul(size_of::<Decision>()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        for organism in rows {
+            let decision = decide(
+                rules,
+                population,
+                view,
+                organism,
+                ticks,
+                &mut lane.controller,
+            )?;
+            lane.decisions.push(decision);
+        }
+        Ok(())
+    };
+    let Some((first, others)) = lanes.split_first_mut() else {
+        return Err(CoreError::StateConflict {
+            operation: "decide",
+            detail: "no decision lane".to_owned(),
+        });
+    };
+    if used == 1 {
+        return run(rows, first);
+    }
+    let length = rows.len().div_ceil(used);
+    let mut runs = rows.chunks(length);
+    let head = runs.next().unwrap_or(&[]);
+    let run = &run;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = runs
+            .zip(others.iter_mut())
+            .map(|(rows, lane)| scope.spawn(move || run(rows, lane)))
+            .collect();
+        let mut result = run(head, first);
+        for worker in workers {
+            let joined = worker.join().unwrap_or_else(|_| {
+                Err(CoreError::StateConflict {
+                    operation: "decide",
+                    detail: "a decision worker panicked".to_owned(),
+                })
+            });
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        result
+    })
 }
 
 fn genome_of(population: &Population, id: OrganismId) -> Result<&Genome, CoreError> {

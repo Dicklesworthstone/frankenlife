@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -42,6 +43,11 @@ enum Command {
         /// Print a progress record every this many ticks; 0 for none.
         #[arg(long, default_value_t = 128)]
         every: u64,
+        /// Threads for the organism phases, replacing `[execution]
+        /// cpu_workers`; `auto` for one per available core, up to 16. No
+        /// result depends on it.
+        #[arg(long, value_parser = parse_workers)]
+        cpu_workers: Option<NonZeroUsize>,
     },
 }
 
@@ -65,18 +71,36 @@ fn main() -> ExitCode {
             config,
             ticks,
             every,
+            cpu_workers,
         } => {
             let config = match load(&config) {
                 Ok(config) => config,
                 Err(code) => return code,
             };
-            match flife_cli::run(&config, RunOptions { ticks, every }, print) {
+            match flife_cli::run(
+                &config,
+                RunOptions {
+                    ticks,
+                    every,
+                    cpu_workers,
+                },
+                print,
+            ) {
                 Ok(finished) if finished.stop == Stop::Reached => ExitCode::SUCCESS,
                 Ok(_) => ExitCode::from(1),
                 Err(error) => fail(error.kind(), error.to_string()),
             }
         }
     }
+}
+
+/// A worker count, or `auto`.
+fn parse_workers(text: &str) -> Result<NonZeroUsize, String> {
+    if text == "auto" {
+        return Ok(flife_cli::auto_workers());
+    }
+    text.parse()
+        .map_err(|_| format!("`{text}` is not a positive worker count or `auto`"))
 }
 
 fn load(path: &PathBuf) -> Result<ValidatedConfig, ExitCode> {

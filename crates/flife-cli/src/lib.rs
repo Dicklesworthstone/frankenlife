@@ -19,7 +19,10 @@ pub mod run;
 pub mod validate;
 
 pub use observe::{Heredity, Survey, Tally};
-pub use run::{Finished, RUN_SCHEMA, RUN_SESSION, Record, RunOptions, Stop, found, run, start};
+pub use run::{
+    AUTO_WORKER_CEILING, Finished, RUN_SCHEMA, RUN_SESSION, Record, RunOptions, Stop, auto_workers,
+    found, run, start,
+};
 pub use validate::{VALIDATE_SCHEMA, Validation};
 
 /// The schema of an error record.

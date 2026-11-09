@@ -195,9 +195,17 @@ fn the_preset_validates_at_the_reference_scale_and_its_session_admits_it() {
 fn smoke(ticks: u64, every: u64) -> (Finished, Vec<Record>) {
     let records = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&records);
-    let finished = run(&preset(), RunOptions { ticks, every }, move |record| {
-        sink.lock().expect("records").push(record.clone());
-    })
+    let finished = run(
+        &preset(),
+        RunOptions {
+            ticks,
+            every,
+            cpu_workers: None,
+        },
+        move |record| {
+            sink.lock().expect("records").push(record.clone());
+        },
+    )
     .expect("the smoke run runs");
     let records = records.lock().expect("records").clone();
     (finished, records)

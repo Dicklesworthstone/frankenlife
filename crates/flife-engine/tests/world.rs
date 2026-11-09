@@ -792,3 +792,46 @@ fn a_whole_tick_commit_accounts_for_every_organism_once() {
     let two_small = charged(&[8], 2);
     assert!(check(&rows[1..], &[death], &two_small).is_err());
 }
+
+/// Step `world` once, rendering the outcome for comparison: the report of a
+/// published tick, or the shortfall of a paused one.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn outcome(world: &mut World) -> String {
+    match world.step().expect("the tick runs") {
+        Stepped::Published(report) => format!("{report:?}"),
+        Stepped::Paused(shortfall) => format!("paused {shortfall:?}"),
+    }
+}
+
+#[test]
+fn the_cpu_worker_count_changes_no_result() {
+    // Enough organisms that every lane gets a run of its own, and enough
+    // ticks that births, deaths and held outputs all happen.
+    let config = ecology(&[("population", "initial_count", "720")]);
+    let ticks = 96;
+    let mut serial = found(&config, Arrangement::FreeList);
+    assert_eq!(serial.cpu_workers(), 1, "Appendix A asks for one worker");
+    let reference: Vec<(String, String)> = (0..ticks)
+        .map(|_| (outcome(&mut serial), serial.digest().to_hex()))
+        .collect();
+    assert!(
+        reference
+            .iter()
+            .any(|(report, _)| report.contains("births: [B")),
+        "the reference run has births"
+    );
+    for workers in [2, 3, 6, 64] {
+        let mut world = found(&config, Arrangement::FreeList);
+        world
+            .set_cpu_workers(std::num::NonZeroUsize::new(workers).expect("nonzero"))
+            .expect("lanes");
+        assert_eq!(world.cpu_workers(), workers);
+        for (tick, expected) in reference.iter().enumerate() {
+            let got = (outcome(&mut world), world.digest().to_hex());
+            assert_eq!(&got, expected, "{workers} workers diverge at tick {tick}");
+        }
+    }
+}

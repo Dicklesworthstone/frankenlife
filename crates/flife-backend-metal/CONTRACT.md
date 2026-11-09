@@ -10,6 +10,16 @@ FL-028 (`flife-xbm`) adds the Metal owner, typed buffers and safe leases (plan �
 buffers through it. Readers and writers hold typed leases, and a buffer in use is never freed. `MetalControllers`
 and `MetalBackend` now allocate, write, dispatch and read back only through their owner.
 
+FL-029 (`flife-g81`) adds batched submission (plan §10.4, §22.4). `DeviceOwner::submit_batch` runs several ordered
+kernels as one command: one command buffer and one serial compute encoder, committed once and waited for once, encoded
+by FrankenTorch `71bbe52e`'s `compute::Batch`. The command holds every buffer it binds from its first kernel until its
+last has verifiably completed: written buffers exclusively, read-only ones shared. Its receipt gives the epochs it
+wrote, the kernels it ran and its device time. `submit` is now a batch of one kernel. While building this, FrankenTorch's
+`Gateway::dispatch` turned out to have no autorelease pool: a thread that never exits kept every command buffer it
+dispatched, about 1.8 KiB each (+368 MB over 200,000 dispatches on an M5 Ultra). The owner's single-kernel `submit`
+went through it, so a long run with Metal controllers grew by that much per tick. `71bbe52e` fixes `dispatch`, and
+the batch drains a pool per submission.
+
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
@@ -27,7 +37,8 @@ and `MetalBackend` now allocate, write, dispatch and read back only through thei
     for buffers retired when dropped;
   - leases: `write(buffer)` and `read(buffer, Purpose)`, where a purpose is `Rendering`, `Checkpointing` or
     `Readback`;
-  - commands: `submit(&pipeline, &[buffer.reads(), buffer.writes(), …], grid)`;
+  - commands: `submit(&pipeline, &[buffer.reads(), buffer.writes(), …], grid)` for one kernel, and FL-029's
+    `submit_batch(&[Kernel { pipeline, bindings, grid }, …])` for several in order;
   - `retire(buffer)`, `state`, `epoch`, `elements` and `usage`.
 
 **Outputs.** One entry per organism, in batch order: its 36 raw outputs, or `None` for a deferred organism. The
@@ -37,7 +48,10 @@ FL-028's outputs:
 - `Buffer<T>`, a typed handle that only names a buffer: its owner, slot and generation.
 - `ReadLease<T>`, which reads, gives the epoch it reads, and is released when dropped.
 - `WriteLease<T>`, which writes in place and is released when dropped.
-- `Receipt`, the epochs a completed command wrote.
+- `Receipt`, for a completed command:
+  - `written`, the epoch each buffer it wrote now holds, in order of each buffer's first binding;
+  - `kernels`, the kernels it ran (FL-029);
+  - `device_seconds`, its command buffer's time on the GPU, from start to end (FL-029).
 - `ResourceState`: `Available`, `Computing`, `Committed`, `Rendering`, `Checkpointing` or `Retiring` (§9.5).
 - `Usage`: buffers, bytes, retiring, read leases by purpose, write leases and running commands.
 
@@ -80,18 +94,27 @@ kernel cannot shape, or whose inputs are not finite in F32, is deferred without 
 - A buffer has any number of readers or one writer, never both:
   - readers are read leases and the commands that read it;
   - the writer is a write lease or the command that writes it;
-  - a buffer bound to one command twice, once written, is an alias and is refused (reading it twice is not).
+  - a buffer bound to one kernel twice, once written, is an alias and is refused (reading it twice is not).
+- A command is one or more kernels (FL-029), encoded in order into one command buffer, so each kernel reads what
+  earlier ones wrote. Its bindings are checked and held as one:
+  - a buffer any kernel writes needs no other reader or writer, and the command holds it exclusively;
+  - a buffer the kernels only read needs no writer, and the command holds it shared;
+  - one kernel may read a buffer that another, earlier or later, writes.
 - The order of a submission:
-  1. Every binding is checked before any is marked, so a refused submission binds nothing.
-  2. The bindings are marked, and the table's lock is released while the gateway dispatches and waits.
+  1. Every binding of every kernel is checked before any is marked, so a refused submission binds nothing.
+  2. The bindings are marked, and the table's lock is released while the gateway encodes, commits and waits.
   3. Once the command buffer's status is known, the bindings are released.
 
   So for the whole run, every other thread sees the bound buffers `Computing`, and is refused incompatible access.
 - Outcomes:
-  - a completed command makes each written buffer defined, at its next epoch;
-  - a command that failed after commit (the gateway's `CommandBuffer` error) makes each written buffer undefined,
-    at its next epoch, and reads of it are refused until it is rewritten;
-  - a command the gateway refused before encoding (a bad grid or threadgroup) changes no buffer.
+  - a completed command makes each written buffer defined, at its next epoch: one epoch per command, however many
+    of its kernels wrote the buffer, since only the command's final contents are ever observable;
+  - a command whose command buffer did not complete (the gateway's `CommandBuffer` error) makes each written
+    buffer undefined, at its next epoch, and reads of it are refused until it is rewritten;
+  - a command whose first binding of a buffer reads it needs defined contents, but one that writes an undefined
+    buffer first may read it in a later kernel;
+  - a command the gateway refused before encoding (a bad grid or threadgroup in any of its kernels) changes no
+    buffer, and none of its kernels runs.
 - Epochs and leases:
   - an epoch counts writes: 0 for a zeroed buffer, 1 for an upload, and one more per completed write;
   - a read lease's epoch cannot change while the lease is held;
@@ -113,7 +136,8 @@ compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `Lay
 - one the device refuses: `AllocationFailed`;
 - a read lease beyond its purpose's limit: `BudgetExhausted` ("metal read leases");
 - `StateConflict` for: a stale or foreign handle; a retiring buffer; a writer beside a reader or another writer; a
-  reader beside a writer; a read of undefined contents; an alias; and an out-of-range host read or write.
+  reader beside a writer; a read of undefined contents (for a command, its first binding of the buffer); an alias;
+  a command of no kernels (FL-029); and an out-of-range host read or write.
 
 A refusal changes nothing.
 
@@ -186,12 +210,47 @@ A refusal changes nothing.
   (`MTL_SHADER_VALIDATION=1`) still returned success for an out-of-bounds store. So the test settles real
   bindings with the gateway's own `CommandBuffer(Error)`. The written buffer becomes `Available` at epoch 2,
   refuses leases and command reads, and is defined again after a host rewrite. The read buffer is unchanged, and
-  a refusal before encoding changes nothing.
+  a refusal before encoding changes nothing. FL-029's `tests/batch.rs` adds a command buffer that really fails.
+- `tests/batch.rs` (FL-029, 3 tests), on this host's device:
+  - `a_batch_runs_its_kernels_in_order_as_one_command`: `b = a + 1`, `c = b + 1`, then `a = b + c`, as one
+    command. Each kernel sees its predecessors' writes. The receipt counts 3 kernels and gives epochs `[2, 1, 1]`:
+    `a`, read first and written last, advances once. Afterwards every buffer is `Committed` and nothing is held.
+  - `a_batch_is_checked_as_one_command_and_a_refused_one_runs_nothing`. Each refusal leaves every buffer's state,
+    epoch and values unchanged, with nothing held or running:
+    - an empty batch;
+    - an alias in the second kernel;
+    - a rendering lease on a buffer a later kernel writes (a kernel reading it twice beside the lease is admitted);
+    - a host write lease on a buffer a later kernel reads;
+    - a threadgroup above the pipeline's maximum in the second kernel, which the gateway refuses after accepting
+      the first.
+  - `a_failed_command_buffer_leaves_what_the_batch_writes_undefined`, through FrankenTorch's fault seam. The seam
+    leaves the next command buffer uncommitted, and it reports `NotEnqueued`, as one a GPU restart aborted does.
+    - Both written buffers become `Available`, undefined at epoch 1, and refuse reads.
+    - The buffer the batch only read stays `Committed` at epoch 1.
+    - A batch that reads an undefined buffer first is refused.
+    - The same batch again, whose first kernel rewrites `b` before the second reads it, is admitted: epochs
+      `[2, 2]`, and `c = a + 2`.
+
+    The seam exists only with debug assertions, so this test runs in full under `cargo test` (the dev profile).
+    A release build only checks that the seam is absent.
 - `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's five buffers, with
   no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
   crate, every output still bit-identical.
 
 Planted mutants, each run in a scratch copy.
+- FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
+  - later kernels' bindings unchecked;
+  - a later kernel's write forgotten;
+  - an alias within one kernel admitted;
+  - an undefined buffer read first;
+  - an undefined buffer refused even when rewritten first;
+  - a written buffer admitted beside readers;
+  - a read-only buffer admitted beside a writer;
+  - an empty batch admitted;
+  - a kernel the gateway refused skipped, and the rest submitted;
+  - a failed batch's outputs left defined, or keeping their epoch;
+  - a command not counted running;
+  - a read-only or a written buffer not held while the command runs.
 - Caught:
   - binary64 or F32 ties away from even;
   - the activation's sign dropped;
@@ -230,7 +289,7 @@ dispatch over fresh buffers pays page mapping, and the upload is the per-call bu
 in-place `SharedBuffer::write_f32/write_u32` for that.
 
 **Validity domain.** Apple GPUs through the gateway's safe math mode; the dense-104-36-v1 catalog's shapes. The
-owner: `f32` and `u32` buffers, and the gateway's synchronous dispatch (one command buffer per submission).
+owner: `f32` and `u32` buffers. Each command is one command buffer of one or more kernels, submitted synchronously.
 
 Whole ticks (`flife run`, preset, 512 ticks, median of three interleaved runs, cv ≤ 2.5%, same digest in all 12
 runs): one CPU worker 27.7 ms per tick with the reference and 12.5 ms with Metal (41.2 and 17.8 ms over the first
@@ -243,13 +302,18 @@ per-pass thread spawning (6%).
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them). On many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
-- FL-030's closure also needs FL-026's packed genome arenas and FL-029's batched submission upstream, and its
-  resident-bandwidth benchmark against §19.2's weight-stream bound.
+- FL-030's closure also needs FL-026's packed genome arenas, and its resident-bandwidth benchmark against §19.2's
+  weight-stream bound. FL-029's batched submission is now in place.
+- FL-029 gaps:
+  - Submission is still synchronous: `submit_batch` returns once the command buffer completes, and the calling
+    thread waits for it. The owner's bind/release split is where an asynchronous completion would plug in
+    (submit, then wait or poll for the receipt, with the bindings held meanwhile). No consumer needs it yet.
+  - The engine path still submits one kernel per tick (`MetalBackend::evaluate`). Several kernels per command pay
+    off once FL-032 moves the CPU phases around the controllers onto the device.
+  - `device_seconds` is in the receipt but not yet in run records or the throughput example.
+  - A failed command buffer is tested through the gateway's seam: a real command buffer, left uncommitted. No
+    device fault on this host fails a committed one (see the tests).
 - FL-028 gaps:
-  - Submission is synchronous: the owner holds a command's bindings for exactly the gateway's dispatch-and-wait.
-    Several ordered kernels in one command buffer, retained across submissions with completion receipts, are
-    FL-029 upstream. The owner's bind/settle split is where an asynchronous completion will plug in.
-  - The post-commit failure path is tested with the gateway's error value, not a real device fault (see the tests).
   - The controllers and backend open their owners `UNBOUNDED`. Declaring the backend's byte budget at preflight,
     and admitting observers' and checkpoints' peaks against it, is FL-043. Render and checkpoint consumers of
     device leases are FL-033 and FL-038; today's renderer reads the CPU world's epochs (FL-017).

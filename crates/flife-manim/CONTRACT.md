@@ -171,8 +171,8 @@ route.
   binary takes its colour from the configuration unless `--color` overrides it.
 - Planted bugs in this crate were each caught (FL-018's listed in its commit; FL-019's 14 in its commit).
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `f401a947`, CPU and
-Metal. The whole torus is fitted into one drawable.
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `2fe8d299` (unchanged since
+`f401a947`; that repin moved only frankentorch), CPU and Metal. The whole torus is fitted into one drawable.
 
 **Known gaps.**
 - Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). Resident

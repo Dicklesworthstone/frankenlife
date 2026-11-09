@@ -501,8 +501,10 @@ say so.
 
 Every Metal buffer belongs to a `DeviceOwner` (FL-028, `flife-backend-metal::owner`). Allocate, write, dispatch
 and read back through it, never through the gateway's buffers directly: it is what keeps a running command's
-buffers from being written, read or freed under it. Prove an owner change with `tests/owner.rs` and the 400-tick
-`tests/world.rs`, which must stay bit-identical to the reference.
+buffers from being written, read or freed under it. Several kernels go in one command with `submit_batch` (FL-029).
+Prove an owner change with `tests/owner.rs`, `tests/batch.rs` and the 400-tick `tests/world.rs`, which must stay
+bit-identical to the reference. Run `tests/batch.rs` once without `--release` as well: the gateway's command-buffer
+fault seam exists only with debug assertions, and the release build skips the failure half of the test.
 
 The Metal backend, the native presenter and Studio input can only be qualified on an Apple Silicon host. A Linux
 worker validates the CPU reference route and headless frame export, nothing more (plan §13.6, §20.1). Say which
@@ -623,7 +625,7 @@ The repository holds:
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
   (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039), and
   `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-039), and
-  `crates/flife-backend-metal` (FL-030, FL-028), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
+  `crates/flife-backend-metal` (FL-030, FL-028, FL-029), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
 

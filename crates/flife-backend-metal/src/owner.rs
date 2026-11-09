@@ -4,15 +4,19 @@
 //!
 //! - [`DeviceOwner`] allocates typed buffers ([`Buffer<f32>`],
 //!   [`Buffer<u32>`]) within a declared byte budget. It is the only path by
-//!   which a command binds them ([`DeviceOwner::submit`]).
+//!   which a command binds them ([`DeviceOwner::submit_batch`], or
+//!   [`DeviceOwner::submit`] for one kernel).
+//! - A command is one or more ordered kernels in one command buffer (FL-029):
+//!   each kernel reads what earlier ones wrote, and the bindings of all of
+//!   them are checked, held and released as one command.
 //! - A buffer has any number of immutable readers or one writer, never
 //!   both. Readers are [`ReadLease`]s (rendering, checkpointing, host
 //!   readback) and the commands that read it. The writer is a
 //!   [`WriteLease`] (host writes) or the command that writes it. One buffer
 //!   bound twice to a command, once written, is refused as an alias.
 //! - A command keeps every buffer it binds until its completion is
-//!   verified. The gateway's dispatch waits for the command buffer and
-//!   checks its status, and only then are the bindings released. While it
+//!   verified. The gateway's batch waits for the command buffer and checks
+//!   its status, and only then are the bindings released. While it
 //!   runs, every other thread sees those buffers as
 //!   [`ResourceState::Computing`] and is refused incompatible access.
 //! - A command that fails after it was committed may have written part of
@@ -28,12 +32,14 @@
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use flife_core::CoreError;
 use flife_core::ids::ResourceEpoch;
 use ft_kernel_metal::Error as MetalError;
-use ft_kernel_metal::compute::{Gateway, Grid, Library, MathMode, Pipeline, SharedBuffer};
+use ft_kernel_metal::compute::{
+    Argument, Gateway, Grid, Input, Library, MathMode, Output, Pipeline, SharedBuffer,
+};
 
 /// An element type a device buffer holds: `f32` or `u32`.
 pub trait Element: Copy + Default + Send + Sync + 'static {
@@ -241,12 +247,61 @@ pub struct Binding {
     access: Access,
 }
 
-/// A completed command: the epoch each buffer it wrote now holds, in
-/// binding order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One kernel of a command (FL-029): `pipeline` over `grid`, with
+/// `bindings` at argument indices `0..`.
+#[derive(Clone, Copy)]
+pub struct Kernel<'a> {
+    /// The compute pipeline.
+    pub pipeline: &'a Pipeline,
+    /// Its buffer arguments, in index order, each read or written.
+    pub bindings: &'a [Binding],
+    /// Its dispatch geometry.
+    pub grid: Grid,
+}
+
+impl fmt::Debug for Kernel<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Kernel")
+            .field("bindings", &self.bindings)
+            .field("grid", &self.grid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A completed command.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Receipt {
-    /// The written buffers' new epochs.
+    /// The epoch each buffer it wrote now holds, in order of each buffer's
+    /// first binding. A buffer several of its kernels wrote advances one
+    /// epoch: only the command's final contents are ever observable.
     pub written: Vec<ResourceEpoch>,
+    /// Kernels it ran, in order, in one command buffer.
+    pub kernels: usize,
+    /// The device's time for its command buffer, in seconds, from the GPU
+    /// starting it to finishing it.
+    pub device_seconds: f64,
+}
+
+/// One buffer a command binds, after its bindings were checked.
+struct Bound {
+    handle: Handle,
+    written: bool,
+    memory: Arc<RwLock<SharedBuffer>>,
+}
+
+/// A bound buffer's lock while its command runs: written buffers are held
+/// exclusively, read ones shared.
+enum Held<'a> {
+    Read(RwLockReadGuard<'a, SharedBuffer>),
+    Write(RwLockWriteGuard<'a, SharedBuffer>),
+}
+
+/// A bound buffer's registration in the gateway's batch.
+#[derive(Clone, Copy)]
+enum Slot {
+    Input(Input),
+    Output(Output),
 }
 
 /// What an owner holds.
@@ -700,133 +755,207 @@ impl DeviceOwner {
     }
 
     /// Run `pipeline` over `grid` with `bindings` at argument indices
-    /// `0..`, and release them once its completion is verified (see the
-    /// [module documentation](self)).
+    /// `0..`: [`DeviceOwner::submit_batch`] of that one kernel.
     ///
     /// # Errors
-    /// [`CoreError::StateConflict`], with nothing bound or run, for a stale,
-    /// foreign or retiring buffer, a buffer bound twice and written, a
-    /// written buffer with any reader or writer, or a read buffer being
-    /// written or undefined. The gateway's refusal or failure, after which
-    /// the bindings are released: buffers it wrote are undefined if the
-    /// command failed after it was committed, and unchanged if it was
-    /// refused before it was encoded.
+    /// As [`DeviceOwner::submit_batch`].
     pub fn submit(
         &self,
         pipeline: &Pipeline,
         bindings: &[Binding],
         grid: Grid,
     ) -> Result<Receipt, CoreError> {
-        let memories = self.bind(bindings)?;
-        let outcome = {
-            let mut unique: Vec<&Arc<RwLock<SharedBuffer>>> = Vec::with_capacity(memories.len());
-            for memory in &memories {
-                if !unique.iter().any(|seen| Arc::ptr_eq(seen, memory)) {
-                    unique.push(memory);
-                }
-            }
-            let guards: Vec<_> = unique
-                .iter()
-                .map(|memory| memory.read().unwrap_or_else(PoisonError::into_inner))
-                .collect();
-            let mut arguments: Vec<&SharedBuffer> = Vec::with_capacity(memories.len());
-            for memory in &memories {
-                if let Some(at) = unique.iter().position(|seen| Arc::ptr_eq(seen, memory))
-                    && let Some(guard) = guards.get(at)
-                {
-                    arguments.push(&**guard);
-                }
-            }
-            self.shared.gateway.dispatch(pipeline, &arguments, grid)
-        };
-        let written = self.release(bindings, &outcome);
-        outcome.map_err(metal).map(|()| Receipt { written })
+        self.submit_batch(&[Kernel {
+            pipeline,
+            bindings,
+            grid,
+        }])
     }
 
-    /// Check every binding, then mark them all, returning their memory in
-    /// binding order.
-    fn bind(&self, bindings: &[Binding]) -> Result<Vec<Arc<RwLock<SharedBuffer>>>, CoreError> {
-        let mut table = self.shared.table();
-        for (at, binding) in bindings.iter().enumerate() {
-            let aliased = bindings[..at].iter().any(|earlier| {
-                earlier.handle == binding.handle
-                    && (earlier.access == Access::Write || binding.access == Access::Write)
-            });
-            if aliased {
-                return Err(conflict(format!(
-                    "buffer #{} is bound twice and written: an alias",
-                    binding.handle.index
-                )));
+    /// Run `kernels` in order as one command: one command buffer, committed
+    /// once, its completion verified once. Each kernel reads what earlier
+    /// ones wrote. The command keeps every buffer it binds from the first
+    /// kernel to the verified completion of the last (see the [module
+    /// documentation](self)).
+    ///
+    /// The bindings are checked as one command. A buffer any kernel writes
+    /// needs no other reader or writer; a buffer the kernels only read needs
+    /// no writer. A buffer whose first binding reads it needs defined
+    /// contents, so an undefined buffer may be rewritten by one kernel and
+    /// read by a later one.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`], with nothing bound or run, for no
+    /// kernels, a stale, foreign or retiring buffer, one buffer bound twice
+    /// to a kernel and written there, a written buffer with any reader or
+    /// writer, a read-only buffer being written, or a buffer read first
+    /// while undefined. The gateway's refusal or failure, after which the
+    /// bindings are released: buffers the command wrote are undefined if its
+    /// command buffer failed, and unchanged if the gateway refused a kernel
+    /// before anything was encoded.
+    pub fn submit_batch(&self, kernels: &[Kernel<'_>]) -> Result<Receipt, CoreError> {
+        let lists: Vec<&[Binding]> = kernels.iter().map(|kernel| kernel.bindings).collect();
+        let bound = self.bind(&lists)?;
+        let outcome = {
+            let mut held: Vec<Held<'_>> = bound
+                .iter()
+                .map(|buffer| {
+                    if buffer.written {
+                        Held::Write(
+                            buffer
+                                .memory
+                                .write()
+                                .unwrap_or_else(PoisonError::into_inner),
+                        )
+                    } else {
+                        Held::Read(buffer.memory.read().unwrap_or_else(PoisonError::into_inner))
+                    }
+                })
+                .collect();
+            let mut batch = self.shared.gateway.batch();
+            let slots: Vec<Slot> = held
+                .iter_mut()
+                .map(|guard| match guard {
+                    Held::Read(memory) => Slot::Input(batch.input(memory)),
+                    Held::Write(memory) => Slot::Output(batch.output(memory)),
+                })
+                .collect();
+            let mut encoded = Ok(());
+            for kernel in kernels {
+                let arguments: Option<Vec<Argument>> = kernel
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        let at = bound
+                            .iter()
+                            .position(|buffer| buffer.handle == binding.handle)?;
+                        match (slots.get(at)?, binding.access) {
+                            (Slot::Output(output), Access::Write) => Some(output.write()),
+                            (Slot::Output(output), Access::Read) => Some(output.read()),
+                            (Slot::Input(input), Access::Read) => Some(input.read()),
+                            (Slot::Input(_), Access::Write) => None,
+                        }
+                    })
+                    .collect();
+                let Some(arguments) = arguments else {
+                    encoded = Err(MetalError::Kernel(
+                        "a binding does not match what its buffer was bound for".to_owned(),
+                    ));
+                    break;
+                };
+                encoded = batch.dispatch(kernel.pipeline, &arguments, kernel.grid);
+                if encoded.is_err() {
+                    break;
+                }
             }
-            let resident = table.resident(self.shared.id, binding.handle)?;
-            let name = || format!("buffer #{} ({})", binding.handle.index, resident.element);
+            encoded.and_then(|()| batch.submit())
+        };
+        let written = self.release(&bound, outcome.as_ref().map(|_| ()));
+        outcome.map_err(metal).map(|completed| Receipt {
+            written,
+            kernels: completed.kernels,
+            device_seconds: completed.device_seconds,
+        })
+    }
+
+    /// Check every kernel's bindings as one command, then mark every buffer
+    /// it binds, returning them in order of first binding.
+    fn bind(&self, kernels: &[&[Binding]]) -> Result<Vec<Bound>, CoreError> {
+        if kernels.is_empty() {
+            return Err(conflict("a command of no kernels".to_owned()));
+        }
+        // Each buffer once: whether any kernel writes it, and whether its
+        // first binding reads it.
+        let mut uses: Vec<(Binding, bool)> = Vec::new();
+        for bindings in kernels {
+            for (at, binding) in bindings.iter().enumerate() {
+                let aliased = bindings[..at].iter().any(|earlier| {
+                    earlier.handle == binding.handle
+                        && (earlier.access == Access::Write || binding.access == Access::Write)
+                });
+                if aliased {
+                    return Err(conflict(format!(
+                        "buffer #{} is bound twice and written: an alias",
+                        binding.handle.index
+                    )));
+                }
+                match uses
+                    .iter_mut()
+                    .find(|(first, _)| first.handle == binding.handle)
+                {
+                    Some((_, written)) => *written |= binding.access == Access::Write,
+                    None => uses.push((*binding, binding.access == Access::Write)),
+                }
+            }
+        }
+        let mut table = self.shared.table();
+        for &(first, written) in &uses {
+            let resident = table.resident(self.shared.id, first.handle)?;
+            let name = || format!("buffer #{} ({})", first.handle.index, resident.element);
             if resident.retiring {
                 return Err(conflict(format!("{} is retiring", name())));
             }
-            match binding.access {
-                Access::Write if resident.writer.is_some() || resident.readers() > 0 => {
-                    return Err(conflict(format!(
-                        "{} is {:?}: a command writes it only unread and unwritten",
-                        name(),
-                        resident.state()
-                    )));
-                }
-                Access::Read if resident.writer.is_some() => {
-                    return Err(conflict(format!("{} is being written", name())));
-                }
-                Access::Read if resident.contents == Contents::Undefined => {
-                    return Err(conflict(format!(
-                        "{} is undefined: a command failed while writing it",
-                        name()
-                    )));
-                }
-                _ => {}
+            if written && (resident.writer.is_some() || resident.readers() > 0) {
+                return Err(conflict(format!(
+                    "{} is {:?}: a command writes it only unread and unwritten",
+                    name(),
+                    resident.state()
+                )));
+            }
+            if !written && resident.writer.is_some() {
+                return Err(conflict(format!("{} is being written", name())));
+            }
+            if first.access == Access::Read && resident.contents == Contents::Undefined {
+                return Err(conflict(format!(
+                    "{} is undefined: a command failed while writing it",
+                    name()
+                )));
             }
         }
-        let mut memories = Vec::with_capacity(bindings.len());
-        for binding in bindings {
-            let resident = table.resident(self.shared.id, binding.handle)?;
-            match binding.access {
-                Access::Write => resident.writer = Some(Writer::Command),
-                Access::Read => resident.computing += 1,
+        let mut bound = Vec::with_capacity(uses.len());
+        for (first, written) in uses {
+            let resident = table.resident(self.shared.id, first.handle)?;
+            if written {
+                resident.writer = Some(Writer::Command);
+            } else {
+                resident.computing += 1;
             }
-            memories.push(Arc::clone(&resident.memory));
+            bound.push(Bound {
+                handle: first.handle,
+                written,
+                memory: Arc::clone(&resident.memory),
+            });
         }
         table.running += 1;
-        Ok(memories)
+        Ok(bound)
     }
 
-    /// Release a command's bindings once its outcome is known, returning
-    /// the epochs of the buffers it wrote.
-    fn release(
-        &self,
-        bindings: &[Binding],
-        outcome: &Result<(), MetalError>,
-    ) -> Vec<ResourceEpoch> {
+    /// Release a command's buffers once its outcome is known, returning the
+    /// epochs of the buffers it wrote.
+    fn release(&self, bound: &[Bound], outcome: Result<(), &MetalError>) -> Vec<ResourceEpoch> {
         let mut table = self.shared.table();
         let mut written = Vec::new();
-        for binding in bindings {
-            if let Ok(resident) = table.resident(self.shared.id, binding.handle) {
-                match binding.access {
-                    Access::Read => resident.computing = resident.computing.saturating_sub(1),
-                    Access::Write => {
-                        resident.writer = None;
-                        match outcome {
-                            Ok(()) => {
-                                resident.contents = Contents::Defined;
-                                resident.epoch = resident.epoch.saturating_add(1);
-                            }
-                            Err(MetalError::CommandBuffer(_)) => {
-                                resident.contents = Contents::Undefined;
-                                resident.epoch = resident.epoch.saturating_add(1);
-                            }
-                            Err(_) => {}
+        for buffer in bound {
+            if let Ok(resident) = table.resident(self.shared.id, buffer.handle) {
+                if buffer.written {
+                    resident.writer = None;
+                    match outcome {
+                        Ok(()) => {
+                            resident.contents = Contents::Defined;
+                            resident.epoch = resident.epoch.saturating_add(1);
                         }
-                        written.push(ResourceEpoch::new(resident.epoch));
+                        Err(MetalError::CommandBuffer(_)) => {
+                            resident.contents = Contents::Undefined;
+                            resident.epoch = resident.epoch.saturating_add(1);
+                        }
+                        Err(_) => {}
                     }
+                    written.push(ResourceEpoch::new(resident.epoch));
+                } else {
+                    resident.computing = resident.computing.saturating_sub(1);
                 }
             }
-            table.settle(binding.handle);
+            table.settle(buffer.handle);
         }
         table.running = table.running.saturating_sub(1);
         written
@@ -885,8 +1014,8 @@ impl DeviceOwner {
         bindings: &[Binding],
         outcome: &Result<(), MetalError>,
     ) -> Result<(), CoreError> {
-        self.bind(bindings)?;
-        self.release(bindings, outcome);
+        let bound = self.bind(&[bindings])?;
+        self.release(&bound, outcome.as_ref().copied());
         Ok(())
     }
 }

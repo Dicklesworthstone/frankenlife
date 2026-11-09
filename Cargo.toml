@@ -37,15 +37,15 @@ publish = false
 # Asupersync v0.6.2 (crates.io 0.6.2), the same git source FrankenManim's
 # governed closure requires, so FrankenLife and Manim share one package id.
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "a5d23e8dd2c8d776bd02e2da8e38e6296600e84c", default-features = false }
-fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
+fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "2fe8d299aacd87605b2d6fb3baef77313ce8ec6a" }
 # FrankenManim's camera, 3D job and Metal preview, for FL-018's world adapter
 # and Studio host. Already in the closure through fmn; named directly because
 # the umbrella does not re-export the renderer's Metal route.
-fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
-fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
+fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "2fe8d299aacd87605b2d6fb3baef77313ce8ec6a" }
+fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "2fe8d299aacd87605b2d6fb3baef77313ce8ec6a" }
 # Offline frames (`flife render`): Rgba16F to sRGB RGBA8, and PNG.
-fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
-fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "f401a9472fb1143e9820314aa77c1dade452bb6c" }
+fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "2fe8d299aacd87605b2d6fb3baef77313ce8ec6a" }
+fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "2fe8d299aacd87605b2d6fb3baef77313ce8ec6a" }
 fnp-dtype = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-ndarray = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-random-core = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
@@ -57,10 +57,10 @@ fnp-random = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev =
 # FrankenSQLite (FL-036): the run catalog and command journal. Only the
 # native file-backed engine; no io_uring backend and no SQL extensions.
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "074c2033b4dd5212bf2f6c6aa80480ff711dfd9f", default-features = false, features = ["native"] }
-ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810" }
-ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810" }
-ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810" }
-ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "1c4febfb9c5cf7ffad3b1bde9996b847a4bb2810", features = ["asupersync-integration"] }
+ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "71bbe52e4a2ae41c9b23034ee566254175a40780" }
+ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "71bbe52e4a2ae41c9b23034ee566254175a40780" }
+ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "71bbe52e4a2ae41c9b23034ee566254175a40780" }
+ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "71bbe52e4a2ae41c9b23034ee566254175a40780", features = ["asupersync-integration"] }
 
 # Third-party crates. serde and sha2 0.11 are already in the qualified closure;
 # toml is the one addition, confined to flife-core's config loader (Appendix A

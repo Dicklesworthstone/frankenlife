@@ -33,7 +33,7 @@ pub mod owner;
 
 use owner::metal;
 pub use owner::{
-    Binding, Buffer, DeviceOwner, Element, Limits, Owned, Purpose, ReadLease, Receipt,
+    Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
     ResourceState, Usage, WriteLease,
 };
 

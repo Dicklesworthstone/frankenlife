@@ -11,6 +11,11 @@
 //!   directory from a checkpoint of another, as a new session that
 //!   inherits its commands and shares its stored chunks; each branch then
 //!   resumes on its own.
+//! - [`metrics`]: incremental metrics and lineage summaries (FL-040). A
+//!   run with `metrics_every` folds every report into a [`Tracker`] and
+//!   emits a [`Metrics`] record every so many ticks: complete window,
+//!   population and lineage statistics, and statistics sampled from the
+//!   render epoch at the record's tick.
 //! - [`observe`]: what a run did. A [`Tally`] of the published reports, and
 //!   a [`Survey`] of a committed world's raw state: generations, lineages,
 //!   distinct genomes and position-by-position heredity between live
@@ -25,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod branch;
+pub mod metrics;
 pub mod observe;
 pub mod persist;
 pub mod render;
@@ -37,6 +43,7 @@ pub use branch::{
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Particles, Style};
+pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};
 pub use observe::{Heredity, Survey, Tally};
 pub use persist::{
     CATALOG_FILE, CONFIG_FILE, Injection, Persistence, ResumeOptions, STORE_DIR, StoreDurability,

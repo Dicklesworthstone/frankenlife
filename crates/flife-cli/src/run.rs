@@ -13,6 +13,10 @@
 //!
 //! [`run_with`] adds scheduled commands and, with a run directory
 //! ([`crate::persist`], FL-037), checkpoints and the command journal.
+//!
+//! With `metrics_every`, a [`Tracker`] folds every report too and a
+//! [`Record::Metrics`] follows at every multiple of it and at the end when
+//! ticks remain ([`crate::metrics`], FL-040).
 
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -26,11 +30,12 @@ use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, ControllerReport, NumericalProfile, World};
 use flife_runtime::{
     Admission, Command, CommandBook, Durability, SessionClosed, SessionConfig, SessionHandle,
-    SessionOwner, StepOutcome, VOLATILE_IN_MEMORY, WRITE_AHEAD_BEFORE_APPLY, open_with,
+    SessionOwner, StepOutcome, VOLATILE_IN_MEMORY, WRITE_AHEAD_BEFORE_APPLY, open_with, restore,
 };
 use serde::Serialize;
 
 use crate::branch::{BranchParent, ForkRecord, FoundingChunks, Inherited};
+use crate::metrics::{Declaration, Metrics, Tracker};
 use crate::observe::{Survey, Tally};
 use crate::persist::{Checkpoints, Injection, Persistence};
 
@@ -66,6 +71,9 @@ pub struct RunOptions {
     pub cpu_workers: Option<NonZeroUsize>,
     /// Where due controllers are evaluated. No result depends on it.
     pub controllers: ControllerChoice,
+    /// Emit a metrics record at every multiple of this committed tick and
+    /// at the end; zero for none.
+    pub metrics_every: u64,
 }
 
 /// What the controller backend did over a run (FL-030). Not scientific
@@ -164,6 +172,9 @@ pub enum Record {
         /// Where due controllers are evaluated: a backend and device, or
         /// `cpu-reference`.
         controllers: String,
+        /// The metrics records to follow and how they are computed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metrics: Option<Declaration>,
     },
     /// The run so far.
     Progress {
@@ -178,6 +189,8 @@ pub enum Record {
         /// Wall-clock seconds since the run started. Not scientific state.
         wall_seconds: f64,
     },
+    /// Incremental metrics and lineage summaries (FL-040).
+    Metrics(Box<Metrics>),
     /// How the run ended, and the committed world's raw state.
     End {
         /// [`RUN_SCHEMA`].
@@ -337,13 +350,15 @@ pub fn found(config: &ValidatedConfig) -> Result<World, CoreError> {
     )
 }
 
-/// The [`Record::Start`] for running `config` for `ticks`.
+/// The [`Record::Start`] for running `config` for `ticks`, declaring a
+/// metrics record every `metrics_every` ticks unless it is zero.
 #[must_use]
 pub fn start(
     config: &ValidatedConfig,
     ticks: u64,
     cpu_workers: usize,
     controllers: String,
+    metrics_every: u64,
 ) -> Record {
     let model = config.config();
     let timestep = config.report().timestep;
@@ -364,6 +379,7 @@ pub fn start(
         ticks,
         cpu_workers,
         controllers,
+        metrics: (metrics_every > 0).then(|| Declaration::new(metrics_every)),
     }
 }
 
@@ -420,6 +436,7 @@ pub fn run_with(
     configure(&mut world, options.cpu_workers, options.controllers)?;
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;
+    let metrics = tracker(&world, options.metrics_every)?;
     let (owner, handle, checkpoints) = match persistence {
         Some(persistence) => {
             let checkpoints = Checkpoints::open(persistence, config, RUN_SESSION)?;
@@ -435,11 +452,18 @@ pub fn run_with(
     };
     let clock = Instant::now();
     let plan = Plan {
-        start: start(config, options.ticks, cpu_workers, controllers),
+        start: start(
+            config,
+            options.ticks,
+            cpu_workers,
+            controllers,
+            options.metrics_every,
+        ),
         until: options.ticks,
         every: options.every,
         commands,
         resumed: None,
+        metrics,
     };
     let driven = drive(owner, handle, plan, checkpoints, emit, clock)?;
     Ok(finish(
@@ -448,6 +472,15 @@ pub fn run_with(
         limits.durability,
         clock,
     ))
+}
+
+/// A metrics tracker over `world` for a record every `every` ticks; none
+/// for zero.
+///
+/// # Errors
+/// [`Tracker::new`]'s.
+pub(crate) fn tracker(world: &World, every: u64) -> Result<Option<Tracker>, CoreError> {
+    (every > 0).then(|| Tracker::new(world, every)).transpose()
 }
 
 /// Give `world` `cpu_workers`, if set, and the controller backend `choice`
@@ -481,6 +514,8 @@ pub(crate) struct Plan {
     /// For a resumed run: the checkpoint it recovered and those it passed
     /// over, reported in a [`Record::Resume`] before anything else.
     pub resumed: Option<(Option<CheckpointAt>, Vec<SkippedCheckpoint>)>,
+    /// The metrics tracker, from the world the session was opened with.
+    pub metrics: Option<Tracker>,
 }
 
 /// What driving a session returned.
@@ -499,7 +534,10 @@ pub(crate) struct Driven<E> {
 /// `plan.every`. With `checkpoints`, publish one at each tick it is due (the
 /// starting tick included, once the commands are admitted) and at the end
 /// unless the run stopped on a fault, then suspend the session; without
-/// them, close it.
+/// them, close it. With a metrics tracker, fold every report into it and
+/// emit a metrics record at each tick it is due and at the end when ticks
+/// remain; a tracker behind the session's starting tick (a resumed session
+/// replayed its journal) starts again from a checkpoint of it.
 pub(crate) fn drive<E>(
     owner: SessionOwner,
     handle: SessionHandle,
@@ -526,6 +564,11 @@ where
             .try_spawn(async move {
                 let cx = Cx::current().ok_or_else(|| missing("a task context".into()))?;
                 let mut checkpoints = checkpoints;
+                let mut metrics = plan.metrics;
+                let viewer = match metrics {
+                    Some(_) => Some(handle.feed().viewer(1)?),
+                    None => None,
+                };
                 let snapshot = handle.inspect(&cx).await?;
                 let mut committed = snapshot.boundary.tick.get();
                 if plan.until < committed {
@@ -550,6 +593,13 @@ where
                             outcomes: journal.durable.outcomes,
                         }),
                     });
+                }
+                if let Some(tracker) = &mut metrics
+                    && tracker.tick() != committed
+                {
+                    let taken = handle.checkpoint(&cx).await?;
+                    let restored = restore(&taken.bytes, NumericalProfile::reference_f32()?)?;
+                    tracker.refound(&restored.world)?;
                 }
                 for command in plan.commands {
                     let admission = handle.submit(&cx, command).await?;
@@ -581,6 +631,15 @@ where
                         StepOutcome::Published { report, .. } => {
                             tally.record(&report);
                             committed = report.tick.get();
+                            if let Some(tracker) = &mut metrics {
+                                tracker.record(&report)?;
+                                if tracker.due(committed)
+                                    && let Some(viewer) = &viewer
+                                {
+                                    let epoch = viewer.latest()?;
+                                    emit(&Record::Metrics(Box::new(tracker.sample(&epoch)?)));
+                                }
+                            }
                             if plan.every > 0 && committed.is_multiple_of(plan.every) {
                                 emit(&Record::Progress {
                                     schema: RUN_SCHEMA,
@@ -611,6 +670,14 @@ where
                         }
                     }
                 };
+                // The last window, when ticks remain in it.
+                if let Some(tracker) = &mut metrics
+                    && tracker.pending() > 0
+                    && let Some(viewer) = &viewer
+                {
+                    let epoch = viewer.latest()?;
+                    emit(&Record::Metrics(Box::new(tracker.sample(&epoch)?)));
+                }
                 // The last committed state, unless a fault stopped the run.
                 if let Some(checkpoints) = &mut checkpoints
                     && !matches!(stop, Stop::Failed { stopped: true, .. })

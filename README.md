@@ -88,6 +88,11 @@ tick T, a control branch, or an intervention branch with `--inject` brushes of i
 the parent's verified chunk files instead of copying them and writes only its command closure. Its journal
 starts with the history it inherited. A control branch resumes to exactly the parent's uninterrupted world,
 while its intervention sibling matches it until its brush applies and differs after.
+FL-040 adds metrics to `flife run` and `flife resume`: `--metrics-every M` folds every published tick's report
+into a tracker that checks every identity as it goes, and prints a record every M ticks. The complete figures are
+births, deaths, lifespans, mutation acceptance, energy flows, uptake contention, the architecture distribution and
+lineage diversity. Motility, clustering and resource concentration are sampled from the render epoch, and the
+start record declares which figures are which.
 Camera, zoom and selection come next.**
 
 | Question | Answer |
@@ -353,7 +358,8 @@ ecology comes before any broad infrastructure.
 
 ```bash
 cargo run --release -p flife-cli -- validate presets/reference-small-world.toml
-cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128
+cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128 \
+    --metrics-every 128
 cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 2560 --every 4 \
     --width 1080 --height 1080 --out frames --video world.mp4
 cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 1200 --every 1200 \

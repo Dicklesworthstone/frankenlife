@@ -53,7 +53,7 @@ use flife_store::{ChunkStore, CommandJournal, IndexedCheckpoint};
 
 use crate::run::{
     CheckpointAt, ControllerSummary, Finished, Plan, RUN_SCHEMA, RUN_SESSION, Record,
-    SkippedCheckpoint, configure, drive, finish, found, start,
+    SkippedCheckpoint, configure, drive, finish, found, start, tracker,
 };
 
 pub use flife_store::Durability as StoreDurability;
@@ -491,6 +491,10 @@ pub struct ResumeOptions {
     pub checkpoint_every: Option<u64>,
     /// How checkpoints are published.
     pub durability: StoreDurability,
+    /// Emit a metrics record at every multiple of this committed tick and
+    /// at the end; zero for none. Its lineage counts start where the
+    /// resumed run does.
+    pub metrics_every: u64,
 }
 
 /// Resume the run in `run_dir` to committed tick `options.until`, passing
@@ -547,14 +551,22 @@ pub fn resume(
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;
     let from = checkpoints.last();
+    let metrics = tracker(&world, options.metrics_every)?;
     let (owner, handle) = open_session(world, book, limits, run_dir)?;
     let clock = Instant::now();
     let plan = Plan {
-        start: start(&config, options.until, cpu_workers, controllers),
+        start: start(
+            &config,
+            options.until,
+            cpu_workers,
+            controllers,
+            options.metrics_every,
+        ),
         until: options.until,
         every: options.every,
         commands: Vec::new(),
         resumed: Some((from, skipped)),
+        metrics,
     };
     let driven = drive(owner, handle, plan, Some(checkpoints), emit, clock)?;
     Ok(finish(driven, Some(run_dir), limits.durability, clock))

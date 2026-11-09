@@ -628,7 +628,7 @@ The repository holds:
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid, FL-011 deposits and FL-027 bins), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
-  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039), and
+  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039, FL-040), and
   `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-039), and
   `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
@@ -800,6 +800,11 @@ behind it.
   session (`admitting_session`); keep the book, `recover` and the journal on that one rule. Prove a branch
   change with `tests/branch.rs` in `flife-cli`, `flife-runtime` and `flife-store`. A control branch must reach
   the uninterrupted run's digest and journal.
+- Metrics (FL-040, `metrics`): a `Tracker` folds every published report and never reads the world after its
+  start; it checks each identity as it folds (fresh child identities, live parents, deaths under the tracked
+  genome, lineage and generation, the live count) and each sample against its render epoch. Keep complete figures
+  (folded from every report) apart from sampled ones (from the epoch) and say which in the declaration. Prove a
+  change with `tests/metrics.rs`: the tracker's organisms must equal the committed world's at every tick.
 - Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1` and `frankenlife.error.v1`. An
   error's `kind` is `CoreError::kind`. Add a new variant's kind there, never a string match on `Display`.
 - `observe` has two halves:

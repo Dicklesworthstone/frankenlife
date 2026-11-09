@@ -237,7 +237,8 @@ file-backed engine), one writer thread per session, one session per database at 
 - A run's catalog row is its identity, configuration hash and command schema, plus its journal and checkpoint
   index. The rest of Appendix B.1's run manifest (source and suite revisions, toolchain, numerics, clocks,
   hardware, capacity, results and artifacts) is not recorded yet; a complete run catalog is FL-041's evidence.
-- The catalog records a branch's lineage and origin (FL-039), but not lineage of organisms (FL-040). `flife checkpoint`/`resume`, a CLI
+- The catalog records a branch's lineage and origin (FL-039), but not lineage of organisms: FL-040's lineage
+  summaries are `flife run` records, not catalog rows. `flife checkpoint`/`resume`, a CLI
   that opens a journal (`flife run` refuses `write-ahead-before-apply`) and resuming from the store are FL-037.
 - The journal's power-loss durability rests on FrankenSQLite's WAL and `synchronous = FULL` flush; only process
   crashes are tested. Two sessions writing one catalog at once, and two processes opening one session's journal,

@@ -207,6 +207,7 @@ fn smoke(ticks: u64, every: u64) -> (Finished, Vec<Record>) {
             every,
             cpu_workers: None,
             controllers: ControllerChoice::Cpu,
+            metrics_every: 0,
         },
         move |record| {
             sink.lock().expect("records").push(record.clone());

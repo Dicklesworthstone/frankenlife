@@ -17,6 +17,11 @@ directory that starts from a durable checkpoint of another run directory, as a n
 commands of its own; an intervention branch schedules its own. Each branch shares the parent's immutable chunk files
 and keeps its own command history, and runs on with `flife resume` independently of its parent and its siblings.
 
+FL-040 (`flife-aex`) adds incremental metrics and lineage summaries (plan §15.2, §7.7, §16.8), in `metrics`. A run
+given `--metrics-every M` folds every published report into a `Tracker` and emits a `metrics` record at every
+multiple of M and at the end. Each record separates what is complete, folded from every tick, from what is sampled
+from the render epoch at the record's tick, and the start record declares both rules.
+
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
@@ -37,6 +42,9 @@ and keeps its own command history, and runs on with `flife resume` independently
 - `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
 - In the library: `run_with(config, options, injections, persistence, emit)` and `resume(dir, ResumeOptions,
   emit)`, with `Persistence::new(dir, config)` giving the configured defaults.
+- FL-040: `--metrics-every M` on `flife run` and `flife resume`, 0 (none) by default; `RunOptions::metrics_every`
+  and `ResumeOptions::metrics_every` in the library. `Tracker::new(world, M)`, `Tracker::record(report)` and
+  `Tracker::sample(epoch)` are public, so a client that steps a world itself can use them.
 - FL-039: `flife branch PARENT DIR --at T --name NAME --inject TICK:X,Y:AMOUNT --checkpoint-durability D`.
   - `PARENT` is a run directory that no process holds; `DIR` is new or empty.
   - `--at` is the committed tick of a parent checkpoint. By default it is the newest one that restores.
@@ -70,11 +78,32 @@ and keeps its own command history, and runs on with `flife resume` independently
     - the branch's own command identities;
     - its founding checkpoint: sequence and tick, SHA-256 and size, and the chunks written and linked;
     - the world's digest, which is the parent's at that tick.
+  - FL-040, with `--metrics-every M`:
+    - `start.metrics` declares `frankenlife.metrics.v1`: M, the complete and sampled rules in words, the bin grid
+      (16 a side) and the lineages listed (8);
+    - one `metrics` record at every multiple of M and, when ticks remain, at the end (a capacity pause or a failed
+      tick included), so the windows partition the run. Each holds:
+      - `window`, complete, the ticks since the previous record: a `Tally` of their reports (births, deaths by
+        stage, mutation acceptance, emission, the live range), viable attempts, every flow and every transfer's
+        credited total by canonical name, `I`, `O` and `D`, the holdings when it closed, uptake (energy requested and
+        granted, contended and drained cell-ticks, the most packets on one cell), lifespans of the organisms that
+        died (count, total, shortest, longest, and a histogram by power of two), and lineages that went extinct;
+      - `population`, complete, at the record's tick: live, the capacity and occupancy, the next identity, the
+        highest and mean generation, and live counts by topology (the architecture distribution);
+      - `lineages`, complete: lineages alive and extinct, the Shannon entropy of the live lineage shares (nats) and
+        its exponential, the inverse Simpson index, the largest share, and the 8 largest lineages with their live
+        count, births, deaths and deepest generation;
+      - `sampled`, from the render epoch (the epoch's identity and tick, and the lag behind the record's tick):
+        motility (mean and top speed, the speed limit, the moving fraction), dispersion of organisms over a 16 × 16
+        torus grid (occupied fraction, variance-to-mean ratio, Morisita's index, Moran's I with rook neighbours), and
+        the energy-density texture (texels and block, mean and top density, Gini, top-decile share, Moran's I).
 
   `progress` and `end` also carry `wall_seconds`, which is not scientific state. `start` carries `cpu_workers` and
   `controllers` (the backend and device, or `cpu-reference`), which no result depends on. `end` carries
   `controllers`: the backend, the evaluations it returned and deferred, the ticks the reference redid whole, and why
   the backend failed if it did. Those say where the arithmetic ran, so a record shows whether the GPU did the work.
+  `metrics` carries `window.record_seconds` and `sample_seconds`, the tracker's own wall-clock cost, which are not
+  scientific state either.
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
   the video path if encoded, the controller summary, wall seconds, and the style: `mapping`, its `meaning`, `look`,
@@ -156,6 +185,30 @@ and keeps its own command history, and runs on with `flife resume` independently
     intervention branch matches its control until its first command applies.
   - Resuming a branch takes the newest checkpoint of its own session that restores. Checkpoints of another session
     are passed over, and a branch has no founding world to fall back to.
+- FL-040:
+  - The tracker never reads the world after its start. It starts from the committed population (each organism's
+    identity, genome, lineage, generation, birth tick and topology) and then folds each published report: births
+    first (a child takes its parent's lineage, the next generation, and its parent's topology or the one its
+    mutation changed to), then deaths. Per tick its work is proportional to that tick's births and deaths, plus a
+    constant for the window's sums.
+  - Identities are checked as they are folded. A report must advance from the tracker's tick. A child's parent must
+    be alive, and its identity must be above every one issued before it. A topology change must start at the
+    parent's topology. A death must be of a live organism with the genome, lineage and generation the tracker holds,
+    and the live count must equal the report's. The first disagreement stops the run with `state-conflict`; nothing
+    wrong is summarized.
+  - A sample is checked against its epoch. At the tracker's tick the epoch must list the same identities in order,
+    with the same lineages, generations and topologies. An epoch ahead of the tracker is refused. One behind it is
+    summarized with its lag, unchecked. A session publishes each tick's epoch before the client hears of the tick,
+    so in a run the lag is 0 unless every render slot is leased.
+  - The sample costs O(live + 16² + texels · log texels), at most once per M ticks, and is timed in the record. It
+    runs on the client between steps, so it delays the next step by that much and no more.
+  - Sums run in tick, identity, lineage or cell order, and the entropy uses `flife_core::numerics`, so the records'
+    scientific content is identical on every qualified host. Tracking changes nothing in the world: a run with
+    metrics ends at the digest of one without (tested).
+  - A resumed `write-ahead-before-apply` session replays its journal before the client sees a tick. When the
+    tracker is behind the session's starting tick, it starts again from a checkpoint the session takes there.
+    Lineage births and deaths count from the tracker's start, so they cover the ticks this call publishes, like the
+    tally.
   - The parent's chunk store is opened as its writer for the whole branch operation, so nothing moves under the
     checkpoint while it is read and linked.
 
@@ -211,6 +264,8 @@ test.
 
   The first four are refused before the branch directory is made. `flife resume` of a branch none of whose
   checkpoints restores is also refused.
+- FL-040: a report or an epoch that disagrees with the tracker stops the run with `state-conflict` (operation
+  `track run metrics`), exit status 2. The records before it are still emitted.
 - Any other refusal from founding or the session, by its `CoreError` kind.
 - A run that pauses on capacity or fails a tick ends with that `stop` and exit status 1. Its records up to that
   point are still emitted.
@@ -335,6 +390,47 @@ admissions, and forks out of order, each accepted on restore, and a restored rec
 reachable only through a crafted checkpoint. `flife-runtime`'s `a_crafted_lineage_is_refused_on_restore` now
 catches each of them.
 
+`tests/metrics.rs` (6 tests, FL-040, about 14 s):
+- `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
+  a quarter of births, stepped directly for 1,200 ticks, and the preset's first 320 ticks. The tracker is fed only
+  the reports and sampled every tick.
+  - At every tick its organisms (identity, genome, lineage, generation, birth tick, topology) equal the committed
+    world's, and so do its population figures and its lineage figures. The lineages' births, deaths and deepest
+    generation are recounted from the world and the reports' identities.
+  - Each one-tick window equals that report: tally, flows, transfers, `I`/`O`/`D`, holdings and uptake. Its lifespans
+    equal the deaths' ticks minus the birth ticks the world held before the step.
+  - A second tracker sampled every 64 ticks has windows equal to sums over those reports in tick order, and the same
+    population, lineage and sampled figures.
+  - Every 160 ticks the sampled figures equal brute-force ones: speeds by `sqrt`, bins counted naively, Gini by the
+    Lorenz curve, and Moran's I from an explicit list of neighbour pairs.
+  - In the ecology, children change topology (16 times), organisms born in the run die (30) and lineages go extinct
+    (39). In the preset, founders die by the thousand.
+- `the_spatial_statistics_are_the_textbook_ones`. A checkerboard's Moran's I is −1, stripes' 0 and a constant's
+  undefined. One unit among 50 has Gini 49/50 and all of the top decile. Gini and Moran's I equal the
+  mean-absolute-difference and neighbour-pair formulas on pseudo-random grids. A clump in one bin has Morisita Q and
+  an even spread 0, and a position at the extent wraps to the first bin.
+- `a_run_declares_its_metrics_and_its_windows_partition_it`. 400 ticks with M = 96 give records at 96, 192, 288, 384
+  and 400. The windows abut, their births, deaths, rejected births and lifespans add up to the end tally, every
+  sample's lag is 0, and the last record agrees with the end survey. Without metrics the start record has no
+  `metrics` key, no metrics records are emitted, and the digest is the same.
+- `a_resumed_run_tracks_from_the_state_its_journal_replayed_to`. FL-037's damaged-newest case: resumed from tick
+  147, the journal replays to 150. The tracker starts there, and every record after it agrees with an uninterrupted
+  run's: population, lineage shares, sampled figures, and every window that starts after the resume.
+- `the_tracker_refuses_reports_that_break_identity`. Real reports tampered one field at a time: a report from
+  another tick, an unknown parent, a child given the identity of a live organism or of a dead one, a topology change
+  from another topology, an unknown death, a death under another genome, lineage or generation, and another live
+  count. Each is refused by the check meant for it, named in the error; the untampered report is then followed.
+- `a_sample_refuses_an_epoch_of_another_world`. Refused: the preset's founders against the ecology's (by count); a
+  seed-7 world at the first tick where it holds as many organisms as seed 42's but not the same ones (row by row);
+  and an epoch one tick ahead, each by the check meant for it. An epoch behind is summarized with its lag.
+
+Twenty-six planted mutants were run against `tests/metrics.rs`: in the tracker's births, deaths, identity checks,
+lineage and window sums, lifespan buckets, the epoch check, the statistics, and the run's re-founding and final
+window. A first pass caught 25. The survivor (the check that a child's identity is above every one issued, disabled)
+was not equivalent: the test had reused a live organism's identity, which the live count also refuses. The test now
+also reuses a dead organism's identity, which only that check refuses, and requires each refusal to name its check.
+The survivor and the five other mutants the refusal tests catch were run again, and all six were caught.
+
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories
 also at `write-ahead-before-apply`, one process per run directory, on local file systems (APFS tested here).
@@ -384,10 +480,24 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   the frames are written.
 - `--inject` (FL-037) is the only command source: single-cell energy brushes at fixed ticks. The other
   interventions and recorded commands are FL-022's.
-- The survey sees only live organisms. Pairs and triples need their relatives alive, and lineage history beyond the
-  live population is FL-040's incremental lineage summaries.
-- The survey compares whole genomes and hashes every live genome, which is cheap at this scale. Bounded, sampled
-  diversity metrics at 400k are FL-040 (§15.2).
+- The survey sees only live organisms. Pairs and triples need their relatives alive. FL-040's records carry each
+  lineage's births, deaths, deepest generation and extinction, but no ancestry tree.
+- The survey compares whole genomes and hashes every live genome, which is cheap at this scale.
+- FL-040 gaps:
+  - Metrics are NDJSON records only. §16.6 puts lineage summaries and sampled metrics in the run catalog; no catalog
+    table holds them yet. FL-041's complete run catalog is where they would be stored and compared.
+  - No genome-content diversity per window. The client sees genome identities, not contents. Every birth perturbs
+    the traits, so distinct contents would equal the live count. Sampled trait distances need genome access, which
+    only the end survey has (exact, once).
+  - The sample runs on the client between steps. It is bounded and timed, but not in the background: a sampler that
+    holds the epoch's lease while the session steps on is not built.
+  - The sampled figures are of the F32 epoch: positions, velocities, and the field averaged over texel blocks (at
+    most 512 a side). They are not the F64 committed state.
+  - Measured at 48 and 4,096 organisms (the preset for 1,024 ticks on 16 CPU workers with a record every 128
+    ticks: folding took 4 ms in all and a sample 0.7 ms median, 3.2 ms at most; the digest is the pinned one with
+    and without metrics; whole runs took 9.15 s against 8.86 s (medians of three interleaved runs each), inside the
+    spread of the runs without metrics (8.85–9.78 s) at host load 55–65). 400k is not measured.
+  - A resumed run's lineage counts start at its tracker's start. Lineages extinct before it are not reported.
 - The preset is calibrated for viability, not studied. It is not an evolved population, a selected seed or a claim
   of indefinite persistence. Ecological parameters are refined through declared experiments in FL-048.
 - Deaths recycle energy only on explicit removal, which is not a command yet (FL-022). In the preset every death is

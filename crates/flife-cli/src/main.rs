@@ -46,6 +46,11 @@ enum Command {
         /// Print a progress record every this many ticks; 0 for none.
         #[arg(long, default_value_t = 128)]
         every: u64,
+        /// Print a metrics record (complete window, population and lineage
+        /// statistics; spatial statistics sampled from the render epoch) at
+        /// every multiple of this tick and at the end; 0 for none.
+        #[arg(long, default_value_t = 0)]
+        metrics_every: u64,
         /// Threads for the organism phases, replacing `[execution]
         /// cpu_workers`; `auto` for one per available core, up to 16. No
         /// result depends on it.
@@ -81,6 +86,11 @@ enum Command {
         /// none.
         #[arg(long, default_value_t = 128)]
         every: u64,
+        /// Print a metrics record (complete window, population and lineage
+        /// statistics; spatial statistics sampled from the render epoch) at
+        /// every multiple of this tick and at the end; 0 for none.
+        #[arg(long, default_value_t = 0)]
+        metrics_every: u64,
         /// Threads for the organism phases: a count or `auto`. No result
         /// depends on it.
         #[arg(long, value_parser = parse_workers)]
@@ -247,6 +257,7 @@ fn main() -> ExitCode {
             config,
             ticks,
             every,
+            metrics_every,
             cpu_workers,
             controllers,
             run_dir,
@@ -274,6 +285,7 @@ fn main() -> ExitCode {
                     every,
                     cpu_workers,
                     controllers,
+                    metrics_every,
                 },
                 &injections,
                 persistence.as_ref(),
@@ -307,6 +319,7 @@ fn main() -> ExitCode {
             run_dir,
             until,
             every,
+            metrics_every,
             cpu_workers,
             controllers,
             checkpoints,
@@ -319,6 +332,7 @@ fn main() -> ExitCode {
                 controllers,
                 checkpoint_every: checkpoints.checkpoint_every,
                 durability: checkpoints.checkpoint_durability,
+                metrics_every,
             },
             print,
         )),

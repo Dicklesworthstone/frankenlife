@@ -12,6 +12,7 @@ asupersync.workspace = true
 flife-core = { path = "../flife-core" }
 flife-engine = { path = "../flife-engine" }
 flife-field = { path = "../flife-field" }
+flife-render = { path = "../flife-render" }
 
 [lints]
 workspace = true

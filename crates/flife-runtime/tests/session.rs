@@ -12,96 +12,20 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::pin::Pin;
 
-use asupersync::Cx;
-use asupersync::lab::{AutoAdvanceTermination, LabConfig, LabRuntime};
 use asupersync::runtime::{RuntimeBuilder, yield_now};
-use asupersync::types::Budget;
-use common::{SESSION, at, command, config, ecology, found, inject, publish, reference};
+use common::{
+    Client, SESSION, at, bounded_lab, command, config, cx, ecology, found, inject, lab, publish,
+    reference,
+};
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::CommandId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Advance, Intervention, Stepped};
 use flife_runtime::{
     Admission, Boundary, CancelReason, Cancellation, CommandStatus, Outcome, Rejection, RunEnd,
-    SessionClosed, SessionConfig, SessionHandle, StepOutcome, Target, open,
+    SessionConfig, StepOutcome, Target, open,
 };
-
-type Client<T> = Pin<Box<dyn Future<Output = T> + Send>>;
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a failure here is a test failure"
-)]
-fn cx() -> Cx {
-    Cx::current().expect("a task context")
-}
-
-/// Run a session on `config`'s world in the Lab under `seed`: the owner on
-/// one task and each client on its own. The clients' handles are their only
-/// ones, so the session closes when they all finish, if no client closed it
-/// first. Returns each client's result and what the owner returned.
-fn lab<T: Send + 'static>(
-    seed: u64,
-    config: &ValidatedConfig,
-    clients: impl FnOnce(SessionHandle) -> Vec<Client<T>>,
-) -> (Vec<T>, SessionClosed) {
-    bounded_lab(seed, config, 5_000_000, clients)
-}
-
-/// [`lab`] within `steps` scheduler steps, so a session that never closes
-/// fails the quiescence check promptly instead of running on.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a failure here is a test failure"
-)]
-fn bounded_lab<T: Send + 'static>(
-    seed: u64,
-    config: &ValidatedConfig,
-    steps: u64,
-    clients: impl FnOnce(SessionHandle) -> Vec<Client<T>>,
-) -> (Vec<T>, SessionClosed) {
-    let (owner, handle) = open(found(config), config, SESSION).expect("the session opens");
-    let clients = clients(handle);
-    let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(steps).with_auto_advance());
-    let root = lab.state.create_root_region(Budget::INFINITE);
-    let (owner_task, mut owner_join) = lab
-        .state
-        .create_task(root, Budget::INFINITE, async move {
-            let cx = cx();
-            owner.run(&cx).await
-        })
-        .expect("the owner task");
-    lab.scheduler.lock().schedule(owner_task, 0);
-    let mut joins = Vec::new();
-    for client in clients {
-        let (task, join) = lab
-            .state
-            .create_task(root, Budget::INFINITE, client)
-            .expect("a client task");
-        lab.scheduler.lock().schedule(task, 0);
-        joins.push(join);
-    }
-    let report = lab.run_with_auto_advance();
-    assert_eq!(report.termination, AutoAdvanceTermination::Quiescent);
-    let violations = lab.check_invariants();
-    assert!(violations.is_empty(), "{violations:?}");
-    let results = joins
-        .iter_mut()
-        .map(|join| {
-            join.try_join()
-                .expect("the client joins")
-                .expect("the client finished")
-        })
-        .collect();
-    let closed = owner_join
-        .try_join()
-        .expect("the owner joins")
-        .expect("the owner finished");
-    (results, closed)
-}
 
 #[expect(
     clippy::panic,

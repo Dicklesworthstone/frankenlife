@@ -51,6 +51,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-runtime/tests/session.rs"),
     ),
     (
+        "flife-runtime::tests/observation.rs",
+        include_str!("../../flife-runtime/tests/observation.rs"),
+    ),
+    (
         "flife-neural::tests/sensing.rs",
         include_str!("../../flife-neural/tests/sensing.rs"),
     ),
@@ -295,6 +299,12 @@ fn nonfinite_and_out_of_bound_numbers_are_refused() {
         "> 0",
     );
     assert_refused(|c| c.seed = u64::MAX, "seed", "TOML integer range");
+    // One displayable render epoch and one being written (§9.5, FL-017).
+    assert_refused(
+        |c| c.execution.render_queue_capacity = 1,
+        "execution.render_queue_capacity",
+        "at least 2, got 1",
+    );
 }
 
 #[test]

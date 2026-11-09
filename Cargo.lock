@@ -797,6 +797,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flife-render"
+version = "0.0.1"
+dependencies = [
+ "flife-core",
+ "flife-engine",
+]
+
+[[package]]
 name = "flife-runtime"
 version = "0.0.1"
 dependencies = [
@@ -804,6 +812,7 @@ dependencies = [
  "flife-core",
  "flife-engine",
  "flife-field",
+ "flife-render",
 ]
 
 [[package]]

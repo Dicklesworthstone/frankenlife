@@ -636,12 +636,23 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-014",
         )
     },
-    entry(
-        "drop-observer-or-pause-unchanged-world",
-        Role::ObserverPressure,
-        "§7.5, §9.5",
-        "FL-017",
-    ),
+    // FL-017's render feed takes the drop arm. When every slot is leased or
+    // displayable it skips the boundary, keeps the last displayable epoch
+    // and retries when a lease is released. The world is never touched. An
+    // observer whose retention competes with the world's own resources
+    // takes the pause arm at a committed boundary. Its first instances are
+    // FL-021's inspector snapshots and FL-038's checkpoint pages.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-runtime::tests/observation.rs::retained_leases_skip_epochs_but_never_change_the_world",
+        },
+        ..entry(
+            "drop-observer-or-pause-unchanged-world",
+            Role::ObserverPressure,
+            "§7.5, §9.5",
+            "FL-017",
+        )
+    },
     entry("franken-manim", Role::PresentationEngine, "§13.1", "FL-018"),
     entry("founder-lineage-v1", Role::ColorMapping, "§13.4", "FL-019"),
     entry(

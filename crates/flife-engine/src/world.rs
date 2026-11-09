@@ -631,6 +631,15 @@ impl World {
         self.rules.step
     }
 
+    /// The speed limit (`chemistry.maximum_speed`): no organism moves
+    /// farther than `Δt` times it in one tick (§5.4). Render epochs carry it
+    /// so a viewer can tell whether a skipped-epoch gap is unambiguous
+    /// (§13.5, C.15).
+    #[must_use]
+    pub const fn maximum_speed(&self) -> f64 {
+        self.rules.motion.maximum_speed()
+    }
+
     /// The committed field.
     #[must_use]
     pub const fn field(&self) -> &FieldState {

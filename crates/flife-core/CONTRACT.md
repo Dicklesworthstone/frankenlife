@@ -175,6 +175,13 @@ Every issue is reported, not just the first.
 - FL-014, in `flife-runtime`: the command durability `volatile-in-memory`, §12.3's labelled best-effort mode.
   Acceptance is held by the session owner and lost if the process ends. Appendix A's `write-ahead-before-apply`
   stays `Specified` under FL-036, and a session refuses it until the journal exists.
+- FL-017, in `flife-render` and `flife-runtime`: the observer pressure policy
+  `drop-observer-or-pause-unchanged-world`.
+  - The render feed takes its drop arm: a busy feed skips the boundary and keeps the last displayable epoch, and
+    the world is never touched.
+  - Its pause arm belongs to observers whose retention competes with the world's resources (FL-021, FL-038).
+  - `execution.render_queue_capacity` must be at least 2 (`IntBound::AtLeastTwo`): one displayable epoch and one
+    being written.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
   vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it.
 - An `Implemented` entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited

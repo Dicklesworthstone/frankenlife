@@ -616,7 +616,8 @@ The repository holds:
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
-  (FL-014) and `crates/flife-cli` (FL-015), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
+  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017) and `crates/flife-cli` (FL-015), each with its
+  `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
 
@@ -715,6 +716,26 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
 - Durability is `volatile-in-memory` only. `write-ahead-before-apply` is refused until FL-036's journal exists.
 - Session tests run the owner and clients as Lab tasks. Assert outcomes against a directly stepped world, and sweep
   seeds or yields until every side of a race is exercised.
+- The owner offers every published boundary to its render feed (FL-017) before replying, and again at each
+  committed boundary while one is pending. A lease release wakes a paused owner on a third lane. Viewers never go
+  through the lanes. Keep render work off the science: a render failure is recorded, never fatal.
+
+`flife-render` (FL-017) holds the immutable compact render epochs.
+- An `Epoch` is exactly one committed world, read through `&World`:
+  - views in stable identity order, never slot order (C.7);
+  - a declared `Layout` for each view;
+  - a bounded block-mean field texture;
+  - `Metrics`.
+- The `Publisher` preallocates `render_queue_capacity` slots, at least 2, at the population ceiling, so projection
+  never allocates. It writes a slot only through `Arc::get_mut`. A lease or the displayable cell therefore makes a
+  slot unwritable by construction. Do not add interior mutability to epochs or a write path around `get_mut`.
+- When every slot is busy, an offer returns `Busy`: the boundary stays pending and the last displayable epoch
+  stays. That is the drop arm of `drop-observer-or-pause-unchanged-world`. Observers whose retention competes with
+  world resources (FL-021, FL-038) must take the pause arm at a committed boundary instead.
+- Viewer lease limits are in `1..capacity`, so no single consumer can hold every slot. A lease drops its slot
+  reference before running the release hook; keep that field order.
+- `pairing::pairs` merges by identity. `Gap` tells FL-020 whether a skipped-epoch gap still allows
+  minimum-image interpolation (C.15).
 
 `flife-cli` (FL-015) is the `flife` binary (`validate`, `run`) and the library behind it.
 - `run` founds the world, opens a session, and steps it from a client task on the native runtime. It never touches

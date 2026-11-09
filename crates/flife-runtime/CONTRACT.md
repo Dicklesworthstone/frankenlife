@@ -10,7 +10,7 @@ while paused. Cancellation races publication at a declared boundary, and exactly
 **Inputs.**
 - A `World` founded from a validated configuration, the same configuration, and a `SessionId`.
   `SessionConfig::from_config` reads `[execution]`: `command_durability`, `command_queue_capacity`,
-  `control_queue_capacity`, and the configuration hash as the session's revision.
+  `control_queue_capacity`, `render_queue_capacity` (FL-017), and the configuration hash as the session's revision.
 - `Command`: the session, a client `CommandId`, a `Target` (`At { tick, retarget }` or `NextAdmissible`), an
   optional expected revision, and a validated `flife_engine::Intervention`. The only intervention so far is
   `InjectEnergy { cell, amount }`: declared external energy added to one field cell.
@@ -36,8 +36,10 @@ while paused. Cancellation races publication at a declared boundary, and exactly
   - `Failed`: the error, and whether the run stopped.
 - `RunEnd` for a bounded run: `Reached`, `Paused`, `CapacityPaused`, `Failed` or `Closed`, each with its boundary.
 - `Snapshot`: the committed boundary and world digest, live count, running state, unfinished, admitted and outcome
-  counts, and whether the run stopped.
-- `SessionClosed`: the committed world, the closed book and the final boundary.
+  counts, whether the run stopped, and the render publisher's `RenderStats` (FL-017).
+- `SessionClosed`: the committed world, the closed book, the final boundary and the render counters.
+- `SessionHandle::feed` (FL-017): the session's `flife_render::Feed`. Viewers lease epochs from it directly, never
+  through the lanes. `open_with` now returns a `Result`, because it allocates the render slots.
 - In `flife-engine`, FL-014 adds `World::advance_with` and `World::step_with`, plus each `TickReport`'s applied
   interventions: tick, position, intervention and applied energy.
 
@@ -92,6 +94,18 @@ while paused. Cancellation races publication at a declared boundary, and exactly
   committed boundary, so an abandoned session never runs on unobserved.
 - Scientific ticks are never skipped and the timestep never changes. A run to tick `t` stops exactly at `t`.
 
+**Invariants — render epochs and observer pressure (FL-017; §7.5, §9.5, §12.4, INV-09).**
+- The founding state is render epoch 1. Every published tick is offered to the feed before anyone hears of the
+  boundary: before a step's reply, a pause's reply or a run's end. Every committed boundary offers again, which is a
+  no-op unless a boundary is pending.
+- When every slot is leased or displayable, the boundary stays pending and the last displayable epoch stays. A
+  lease release signals the owner on a third lane, which holds at most one pending signal. A paused owner wakes on
+  it and publishes the newest boundary without advancing.
+- The world is read through `&World` alone. A retained, slow or cross-thread viewer changes display freshness and
+  wall time only, never a tick, a command, an admission decision or a birth. A render failure is recorded in the
+  counters and never stops the run.
+- At close the owner offers the final boundary once more and marks the feed closed. The last epoch stays readable.
+
 **Refusal cases.**
 - `SessionConfig::from_config`:
   - `write-ahead-before-apply` is refused as `MissingCapability`, because its journal is FL-036;
@@ -144,7 +158,19 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - dropping every handle, while paused and while running (the latter within a 2,000-step Lab bound, so an owner
     that ignores the dropped handles fails quickly instead of hanging);
   - the same protocol on the native current-thread runtime.
-- Twenty-nine planted bugs were each caught by at least one of these tests (listed in the FL-014 commit).
+- `tests/observation.rs` (3 tests, FL-017), each world compared with one stepped directly with no session and no
+  feed:
+  - G3 over three Lab seeds. A viewer retaining two epochs makes boundaries 3–48 busy while the feed keeps tick 2
+    and reports each pending tick. Every step's digest, births and deaths still equal the direct trajectory.
+    Releasing the leases while paused publishes tick 48 without a tick advancing. A run to 96 under renewed
+    pressure reaches the direct world, with 92 busy boundaries.
+  - C.14 over five Lab seeds: idle, retaining and slow readers on a near-capacity birth tick. Each run pauses at the
+    same boundary with the same shortfall, the identical retry pauses identically, and each returns the direct
+    world.
+  - A reader thread leasing and checking every epoch it can while the native runtime runs 160 ticks: the direct
+    world, and only complete epochs in increasing order.
+- Twenty-nine planted bugs were each caught by at least one of these tests (listed in the FL-014 commit). FL-017's
+  twenty-five, three of them in the session's feed, are listed in its commit.
 
 **Validity domain.** `volatile-in-memory` durability; `cpu-reference` and `qualified-reference`; one owner task on
 any Asupersync runtime; `InjectEnergy` as the only intervention.
@@ -161,7 +187,8 @@ any Asupersync runtime; `InjectEnergy` as the only intervention.
   FL-014's single-cell `InjectEnergy` is the canonical payload they will extend.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
-- Observers, render epochs and leases (FL-017), checkpoint commands and branching (FL-016, FL-039) are not
-  commands yet.
+- Checkpoint commands and branching (FL-016, FL-039) are not commands yet. Render epochs are not commands: viewers
+  read the feed directly (FL-017).
+- The render projection runs on the owner task, O(live + texels) per published boundary.
 - Lab tests cover protocol outcomes and publication invariants under seeded interleavings, not every possible
   execution schedule (§12.7).

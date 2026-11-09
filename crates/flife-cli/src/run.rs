@@ -180,7 +180,7 @@ pub fn run(
     // The session's limits are checked before the world is founded, so an
     // unadmitted durability is refused without founding 4,096 organisms.
     let limits = SessionConfig::from_config(RUN_SESSION, config)?;
-    let (owner, handle) = open_with(found(config)?, limits);
+    let (owner, handle) = open_with(found(config)?, limits)?;
     emit(&start(config, options.ticks));
     let runtime = RuntimeBuilder::current_thread()
         .build()

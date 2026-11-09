@@ -151,6 +151,12 @@ impl Motion {
         self.response_norm_limit
     }
 
+    /// The speed limit every committed velocity is clamped to.
+    #[must_use]
+    pub const fn maximum_speed(&self) -> f64 {
+        self.maximum_speed
+    }
+
     /// `f = bound[g_u Σ_j χ_j ∇_j]` for uptake ratio `g_u ∈ [0, 1]`, summed
     /// in coefficient order: energy first, then channels.
     ///

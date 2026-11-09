@@ -4,10 +4,16 @@
 
 #![allow(dead_code, reason = "each test file uses a different subset")]
 
+use std::future::Future;
+use std::pin::Pin;
+
+use asupersync::Cx;
+use asupersync::lab::{AutoAdvanceTermination, LabConfig, LabRuntime};
+use asupersync::types::Budget;
 use flife_core::ids::{CommandId, SessionId};
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, Intervention, NumericalProfile, Stepped, TickReport, World};
-use flife_runtime::{Command, CommandBook, Target};
+use flife_runtime::{Command, CommandBook, SessionClosed, SessionHandle, Target, open};
 
 const PLAN: &str = include_str!("../../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
 
@@ -162,4 +168,79 @@ pub(crate) fn reference(
         publish(&mut world, &due);
     }
     world
+}
+
+/// A client task's future.
+pub(crate) type Client<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+pub(crate) fn cx() -> Cx {
+    Cx::current().expect("a task context")
+}
+
+/// Run a session on `config`'s world in the Lab under `seed`: the owner on
+/// one task and each client on its own. The clients' handles are their only
+/// ones, so the session closes when they all finish, if no client closed it
+/// first. Returns each client's result and what the owner returned.
+pub(crate) fn lab<T: Send + 'static>(
+    seed: u64,
+    config: &ValidatedConfig,
+    clients: impl FnOnce(SessionHandle) -> Vec<Client<T>>,
+) -> (Vec<T>, SessionClosed) {
+    bounded_lab(seed, config, 5_000_000, clients)
+}
+
+/// [`lab`] within `steps` scheduler steps, so a session that never closes
+/// fails the quiescence check promptly instead of running on.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+pub(crate) fn bounded_lab<T: Send + 'static>(
+    seed: u64,
+    config: &ValidatedConfig,
+    steps: u64,
+    clients: impl FnOnce(SessionHandle) -> Vec<Client<T>>,
+) -> (Vec<T>, SessionClosed) {
+    let (owner, handle) = open(found(config), config, SESSION).expect("the session opens");
+    let clients = clients(handle);
+    let mut lab = LabRuntime::new(LabConfig::new(seed).max_steps(steps).with_auto_advance());
+    let root = lab.state.create_root_region(Budget::INFINITE);
+    let (owner_task, mut owner_join) = lab
+        .state
+        .create_task(root, Budget::INFINITE, async move {
+            let cx = cx();
+            owner.run(&cx).await
+        })
+        .expect("the owner task");
+    lab.scheduler.lock().schedule(owner_task, 0);
+    let mut joins = Vec::new();
+    for client in clients {
+        let (task, join) = lab
+            .state
+            .create_task(root, Budget::INFINITE, client)
+            .expect("a client task");
+        lab.scheduler.lock().schedule(task, 0);
+        joins.push(join);
+    }
+    let report = lab.run_with_auto_advance();
+    assert_eq!(report.termination, AutoAdvanceTermination::Quiescent);
+    let violations = lab.check_invariants();
+    assert!(violations.is_empty(), "{violations:?}");
+    let results = joins
+        .iter_mut()
+        .map(|join| {
+            join.try_join()
+                .expect("the client joins")
+                .expect("the client finished")
+        })
+        .collect();
+    let closed = owner_join
+        .try_join()
+        .expect("the owner joins")
+        .expect("the owner finished");
+    (results, closed)
 }

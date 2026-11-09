@@ -141,6 +141,8 @@ fn check_generic(config: &RunConfig, issues: &mut Issues) {
                     issues.add(path, format!("{value} exceeds the TOML integer range"));
                 } else if bound == IntBound::AtLeastOne && value == 0 {
                     issues.add(path, "must be at least 1, got 0");
+                } else if bound == IntBound::AtLeastTwo && value < 2 {
+                    issues.add(path, format!("must be at least 2, got {value}"));
                 }
             }
             (Kind::Name(role), Value::Str(name)) => {

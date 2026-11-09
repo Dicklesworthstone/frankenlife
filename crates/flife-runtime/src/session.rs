@@ -24,6 +24,12 @@
 //! - stops running on a capacity pause (the boundary stays sealed for the
 //!   identical retry), and stops the run on a numerical fault under
 //!   `stop-and-preserve`, failing every unfinished command.
+//! - offers each committed boundary to its render feed (FL-017) before
+//!   anyone hears of it. Viewers lease epochs from the feed directly,
+//!   never through the lanes. When every slot is busy the boundary stays
+//!   pending, and a lease release wakes a paused owner to retry it. A
+//!   retained lease costs display freshness, never a tick, a command or a
+//!   birth decision (§7.5, INV-09).
 //!
 //! Closing (a close request, every handle dropped, running or paused, or the
 //! owner's context cancelled) discards any unpublished candidate, cancels every unfinished
@@ -43,6 +49,7 @@ use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Advance, CapacityShortfall, Intervention, TickReport, World};
 use flife_field::FieldGrid;
+use flife_render::{Feed, Publisher, RenderStats};
 
 use crate::book::CommandBook;
 use crate::command::{
@@ -71,6 +78,8 @@ pub struct SessionConfig {
     /// The scientific lane's capacity, which is also the most unfinished
     /// commands the book holds.
     pub command_capacity: usize,
+    /// Render epoch slots (`execution.render_queue_capacity`, at least 2).
+    pub render_capacity: usize,
     /// The configuration hash the session runs.
     pub revision: Sha256Digest,
 }
@@ -120,6 +129,10 @@ impl SessionConfig {
             command_capacity: capacity(
                 "execution.command_queue_capacity",
                 execution.command_queue_capacity,
+            )?,
+            render_capacity: capacity(
+                "execution.render_queue_capacity",
+                execution.render_queue_capacity,
             )?,
             revision: config.config_hash(),
         })
@@ -206,6 +219,8 @@ pub struct Snapshot {
     pub outcomes: u64,
     /// Whether the run stopped under `stop-and-preserve`.
     pub stopped: bool,
+    /// The render publisher's counters.
+    pub render: RenderStats,
 }
 
 /// What the owner returns when the session closes.
@@ -217,6 +232,8 @@ pub struct SessionClosed {
     pub book: CommandBook,
     /// The committed boundary.
     pub boundary: Boundary,
+    /// The render publisher's counters.
+    pub render: RenderStats,
 }
 
 enum Control {
@@ -247,6 +264,7 @@ struct Submission {
 enum Inbound {
     Control(Control),
     Science(Submission),
+    Released,
     Ended,
 }
 
@@ -257,6 +275,7 @@ pub struct SessionHandle {
     revision: Sha256Digest,
     control: mpsc::Sender<Control>,
     science: mpsc::Sender<Submission>,
+    feed: Feed,
 }
 
 impl std::fmt::Debug for Control {
@@ -299,6 +318,14 @@ impl SessionHandle {
     #[must_use]
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// The session's render epochs (FL-017). Reading them never goes
+    /// through the owner's lanes, so no viewer can delay a command or a
+    /// tick.
+    #[must_use]
+    pub fn feed(&self) -> Feed {
+        self.feed.clone()
     }
 
     /// The configuration hash the session runs.
@@ -447,8 +474,10 @@ pub struct SessionOwner {
     world: World,
     book: CommandBook,
     grid: FieldGrid,
+    render: Publisher,
     control: mpsc::Receiver<Control>,
     science: mpsc::Receiver<Submission>,
+    released: mpsc::Receiver<()>,
     run: Option<Run>,
     closing: Vec<oneshot::Sender<Boundary>>,
     deferred: VecDeque<Control>,
@@ -472,24 +501,37 @@ pub fn open(
     config: &ValidatedConfig,
     session: SessionId,
 ) -> Result<(SessionOwner, SessionHandle), CoreError> {
-    Ok(open_with(
-        world,
-        SessionConfig::from_config(session, config)?,
-    ))
+    open_with(world, SessionConfig::from_config(session, config)?)
 }
 
-/// Open a session on `world` with explicit limits.
-#[must_use]
-pub fn open_with(world: World, limits: SessionConfig) -> (SessionOwner, SessionHandle) {
+/// Open a session on `world` with explicit limits. Its founding state is
+/// render epoch 1.
+///
+/// # Errors
+/// [`Publisher::new`]'s: fewer than two render slots, or a slot that cannot
+/// be allocated.
+pub fn open_with(
+    world: World,
+    limits: SessionConfig,
+) -> Result<(SessionOwner, SessionHandle), CoreError> {
     let (control_sender, control) = mpsc::channel(limits.control_capacity);
     let (science_sender, science) = mpsc::channel(limits.command_capacity);
+    // One pending release signal is enough: the owner retries the newest
+    // boundary, not one per lease.
+    let (release_sender, released) = mpsc::channel(1);
+    let render = Publisher::new(&world, limits.render_capacity, move || {
+        let _ = release_sender.try_send(());
+    })?;
+    let feed = render.feed();
     let grid = *world.field().grid();
     let owner = SessionOwner {
         world,
         book: CommandBook::new(limits.session, limits.revision, limits.command_capacity),
         grid,
+        render,
         control,
         science,
+        released,
         run: None,
         closing: Vec::new(),
         deferred: VecDeque::new(),
@@ -499,8 +541,9 @@ pub fn open_with(world: World, limits: SessionConfig) -> (SessionOwner, SessionH
         revision: limits.revision,
         control: control_sender,
         science: science_sender,
+        feed,
     };
-    (owner, handle)
+    Ok((owner, handle))
 }
 
 enum Ticked {
@@ -533,7 +576,15 @@ impl SessionOwner {
             admitted: self.book.admitted(),
             outcomes: self.book.outcome_cursor(),
             stopped: self.stopped(),
+            render: self.render.stats().clone(),
         }
+    }
+
+    /// Offer the committed state to the render feed. A busy feed leaves the
+    /// boundary pending, and a failure is recorded in its counters; neither
+    /// touches the world.
+    fn offer_render(&mut self) {
+        let _ = self.render.offer(&self.world);
     }
 
     fn admit(&mut self, submission: Submission, committed: Tick, stopped: bool) {
@@ -649,6 +700,7 @@ impl SessionOwner {
                 world,
                 book,
                 grid,
+                render,
                 control,
                 science,
                 closing,
@@ -724,6 +776,9 @@ impl SessionOwner {
             if let Err(error) = book.published(&report, &sealed) {
                 return Ticked::Failed(error);
             }
+            // Before anyone hears of the boundary: a viewer that is told of
+            // a published tick finds its epoch unless every slot is busy.
+            let _ = render.offer(world);
             if !pause.is_empty() {
                 let boundary = Boundary {
                     tick: world.tick(),
@@ -749,9 +804,11 @@ impl SessionOwner {
         cx: &Cx,
         control: &mut mpsc::Receiver<Control>,
         science: &mut mpsc::Receiver<Submission>,
+        released: &mut mpsc::Receiver<()>,
     ) -> Inbound {
         let mut control = pin!(control.recv(cx));
         let mut science = pin!(science.recv(cx));
+        let mut released = pin!(released.recv(cx));
         poll_fn(|task| {
             match control.as_mut().poll(task) {
                 Poll::Ready(Ok(message)) => return Poll::Ready(Inbound::Control(message)),
@@ -759,9 +816,15 @@ impl SessionOwner {
                 Poll::Pending => {}
             }
             match science.as_mut().poll(task) {
-                Poll::Ready(Ok(submission)) => Poll::Ready(Inbound::Science(submission)),
-                Poll::Ready(Err(_)) => Poll::Ready(Inbound::Ended),
-                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(submission)) => return Poll::Ready(Inbound::Science(submission)),
+                Poll::Ready(Err(_)) => return Poll::Ready(Inbound::Ended),
+                Poll::Pending => {}
+            }
+            // The publisher holds the release sender, so this lane never
+            // closes while the owner runs; a lease release only wakes it.
+            match released.as_mut().poll(task) {
+                Poll::Ready(Ok(())) => Poll::Ready(Inbound::Released),
+                Poll::Ready(Err(_)) | Poll::Pending => Poll::Pending,
             }
         })
         .await
@@ -770,8 +833,10 @@ impl SessionOwner {
     /// Own the world until the session closes, then return it.
     pub async fn run(mut self, cx: &Cx) -> SessionClosed {
         'session: loop {
-            // Every committed boundary: deferred control, then both lanes,
+            // Every committed boundary: the render offer (a no-op unless a
+            // boundary is pending), deferred control, then both lanes,
             // control first.
+            self.offer_render();
             while let Some(message) = self.deferred.pop_front() {
                 self.handle(cx, message).await;
             }
@@ -824,13 +889,17 @@ impl SessionOwner {
                 yield_now().await;
                 continue;
             }
-            let inbound = Self::next_inbound(cx, &mut self.control, &mut self.science).await;
+            let inbound =
+                Self::next_inbound(cx, &mut self.control, &mut self.science, &mut self.released)
+                    .await;
             match inbound {
                 Inbound::Control(message) => self.handle(cx, message).await,
                 Inbound::Science(submission) => {
                     let (committed, stopped) = (self.world.tick(), self.stopped());
                     self.admit(submission, committed, stopped);
                 }
+                // A slot may be free: the loop's next offer retries.
+                Inbound::Released => {}
                 Inbound::Ended => break 'session,
             }
         }
@@ -839,6 +908,8 @@ impl SessionOwner {
 
     fn shut_down(mut self) -> SessionClosed {
         let boundary = self.boundary();
+        self.offer_render();
+        self.render.close();
         self.end_run(RunEnd::Closed(boundary));
         self.book.close(boundary.tick);
         self.control.close();
@@ -897,6 +968,7 @@ impl SessionOwner {
             let _ = reply.send_blocking(boundary);
         }
         SessionClosed {
+            render: self.render.stats().clone(),
             world: self.world,
             book: self.book,
             boundary,

@@ -32,6 +32,9 @@ pub enum IntBound {
     Any,
     /// At least 1.
     AtLeastOne,
+    /// At least 2: a render queue needs one displayable epoch and one
+    /// being written (§9.5).
+    AtLeastTwo,
 }
 
 /// What kind of value a key holds.
@@ -930,7 +933,7 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
         "render_queue_capacity",
         x.render_queue_capacity,
         U::Count,
-        AtLeastOne,
+        IntBound::AtLeastTwo,
     );
     r.int(
         "execution",

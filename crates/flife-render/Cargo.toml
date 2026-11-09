@@ -1,0 +1,16 @@
+[package]
+name = "flife-render"
+description = "FrankenLife immutable compact render epochs: stable-identity projections of exactly one committed world, a bounded field texture, preallocated slots, per-consumer typed leases and latest-value publication that skips instead of overwriting"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Core contracts and read-only access to the committed world (plan §18.1).
+[dependencies]
+flife-core = { path = "../flife-core" }
+flife-engine = { path = "../flife-engine" }
+
+[lints]
+workspace = true

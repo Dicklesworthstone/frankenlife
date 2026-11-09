@@ -15,6 +15,12 @@
 //!   session. The chunk store's manifest stays the authority for whether a
 //!   checkpoint is complete (§16.6): recovery loads it from the store, and a
 //!   row here never makes a missing or damaged checkpoint resumable.
+//! - `lineage` and `branches` (FL-039): for a branch session, each fork it
+//!   descends through (root first) and where it was made: its name, the
+//!   parent run, the parent checkpoint's sequence and the creation time.
+//!   A branch's journal starts with the history it inherited
+//!   ([`CommandJournal::open_branch`]); acceptances below a fork are of the
+//!   session that admitted them, every later one is the branch's own.
 //!
 //! Every append is one transaction that checks the record is the next of
 //! its kind, or exactly a record already held, before inserting it. The
@@ -29,13 +35,15 @@ use flife_core::{CoreError, Tick};
 use flife_runtime::journal::{
     Journal, JournalContents, JournalRecord, Watermarks, block_on_inline,
 };
-use flife_runtime::{Accepted, COMMAND_SCHEMA, CancelReason, Command, Durability, Outcome};
+use flife_runtime::{
+    Accepted, COMMAND_SCHEMA, CancelReason, Command, Durability, Fork, Outcome, admitting_session,
+};
 use fsqlite::{Connection, FrankenError, SqliteValue};
 
 /// The catalog's format marker.
 pub const CATALOG_FORMAT: &str = "frankenlife.run-catalog.v1";
 
-const SCHEMA: [&str; 8] = [
+const SCHEMA: [&str; 10] = [
     "CREATE TABLE IF NOT EXISTS catalog (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS runs (session INTEGER PRIMARY KEY, revision BLOB NOT NULL, \
      command_schema TEXT NOT NULL)",
@@ -51,8 +59,28 @@ const SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS checkpoints (session INTEGER NOT NULL, sequence INTEGER NOT NULL, \
      tick INTEGER NOT NULL, epoch INTEGER NOT NULL, digest BLOB NOT NULL, \
      PRIMARY KEY (session, sequence))",
+    "CREATE TABLE IF NOT EXISTS lineage (session INTEGER NOT NULL, depth INTEGER NOT NULL, \
+     parent INTEGER NOT NULL, admitted INTEGER NOT NULL, tick INTEGER NOT NULL, \
+     checkpoint BLOB NOT NULL, PRIMARY KEY (session, depth))",
+    "CREATE TABLE IF NOT EXISTS branches (session INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+     parent_run TEXT NOT NULL, parent_sequence INTEGER NOT NULL, \
+     created_unix_seconds INTEGER NOT NULL)",
     "INSERT OR IGNORE INTO catalog (key, value) VALUES ('format', 'frankenlife.run-catalog.v1')",
 ];
+
+/// Where a branch run was made (Appendix B.1's identity): what
+/// [`CommandJournal::open_branch`] records beside its lineage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchOrigin {
+    /// The branch's name.
+    pub name: String,
+    /// The parent run, as it was given.
+    pub parent_run: String,
+    /// The parent checkpoint's sequence number in the parent's store.
+    pub parent_sequence: u64,
+    /// When the branch was made, in seconds since the Unix epoch.
+    pub created_unix_seconds: u64,
+}
 
 /// A checkpoint the catalog indexes for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,8 +573,35 @@ impl CommandJournal {
         .await
     }
 
+    async fn lineage_of(&self, session: SessionId) -> Result<Vec<Fork>, CoreError> {
+        let rows = self
+            .connection
+            .query_with_params(
+                "SELECT depth, parent, admitted, tick, checkpoint FROM lineage \
+                 WHERE session = ?1 ORDER BY depth",
+                &[int(session.get())],
+            )
+            .await
+            .map_err(|error| storage("read lineage", &self.path, &error))?;
+        rows.iter()
+            .enumerate()
+            .map(|(position, row)| {
+                if integer(row, 0)? != u64::try_from(position).unwrap_or(u64::MAX) {
+                    return Err(malformed(format!("lineage depth {position} is missing")));
+                }
+                Ok(Fork {
+                    parent: SessionId::new(integer(row, 1)?),
+                    admitted: integer(row, 2)?,
+                    tick: Tick::new(integer(row, 3)?),
+                    checkpoint: digest(row, 4)?,
+                })
+            })
+            .collect()
+    }
+
     async fn contents(&self, session: SessionId) -> Result<JournalContents, CoreError> {
         let fail = |error: &FrankenError| storage("read command journal", &self.path, error);
+        let lineage = self.lineage_of(session).await?;
         let mut contents = JournalContents::default();
         let rows = self
             .connection
@@ -562,7 +617,7 @@ impl CommandJournal {
             let command = Command::from_canonical_bytes(bytes(row, 5)?)?;
             if order != u64::try_from(position).unwrap_or(u64::MAX)
                 || command.id.get() != integer(row, 1)?
-                || command.session != session
+                || command.session != admitting_session(&lineage, session, order)
                 || command.content_hash() != digest(row, 4)?
             {
                 return Err(malformed(format!(
@@ -685,6 +740,197 @@ impl CommandJournal {
                     })
                 })
                 .collect()
+        })
+    }
+
+    /// Record branch `session` running configuration `revision`, forked
+    /// through `lineage` (root first; the last fork is its own) at
+    /// `origin`, and start its journal with `history`, the commands and
+    /// outcomes it inherited (empty for a session that journals nothing),
+    /// all in one transaction. Then bind the session, as
+    /// [`Journal::open_run`] does.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when the catalog already records
+    /// `session`, `lineage` is empty, or `history` is not numbered from
+    /// zero with each acceptance of the session that admitted its order;
+    /// [`CoreError::StorageFailed`] when the host refuses.
+    pub fn open_branch(
+        &mut self,
+        session: SessionId,
+        revision: Sha256Digest,
+        lineage: &[Fork],
+        origin: &BranchOrigin,
+        history: &JournalContents,
+    ) -> Result<(), CoreError> {
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "record branch",
+            detail,
+        };
+        if lineage.is_empty() {
+            return Err(conflict(format!("{session} has no fork")));
+        }
+        for (position, (command, accepted)) in history.accepted.iter().enumerate() {
+            let order = u64::try_from(position).unwrap_or(u64::MAX);
+            if accepted.order != order
+                || command.session != admitting_session(lineage, session, order)
+            {
+                return Err(conflict(format!(
+                    "inherited acceptance {position} is {} of {} in order {}",
+                    command.id, command.session, accepted.order
+                )));
+            }
+        }
+        for (position, (id, outcome)) in history.outcomes.iter().enumerate() {
+            if outcome.cursor() != u64::try_from(position).unwrap_or(u64::MAX) {
+                return Err(conflict(format!(
+                    "inherited outcome {position} ({id}) is numbered {}",
+                    outcome.cursor()
+                )));
+            }
+        }
+        let path = self.path.clone();
+        block_on_inline(self.transaction("record branch", async |connection| {
+            let insert = |error: &FrankenError| storage("record branch", &path, error);
+            let held = connection
+                .query_with_params(
+                    "SELECT session FROM runs WHERE session = ?1",
+                    &[int(session.get())],
+                )
+                .await
+                .map_err(|error| insert(&error))?;
+            if !held.is_empty() {
+                return Err(CoreError::StateConflict {
+                    operation: "record branch",
+                    detail: format!("the catalog already records {session}"),
+                });
+            }
+            connection
+                .execute_with_params(
+                    "INSERT INTO runs (session, revision, command_schema) VALUES (?1, ?2, ?3)",
+                    &[
+                        int(session.get()),
+                        blob(revision.as_bytes()),
+                        text(COMMAND_SCHEMA),
+                    ],
+                )
+                .await
+                .map_err(|error| insert(&error))?;
+            for (depth, fork) in (0_u64..).zip(lineage) {
+                connection
+                    .execute_with_params(
+                        "INSERT INTO lineage (session, depth, parent, admitted, tick, \
+                         checkpoint) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        &[
+                            int(session.get()),
+                            int(depth),
+                            int(fork.parent.get()),
+                            int(fork.admitted),
+                            int(fork.tick.get()),
+                            blob(fork.checkpoint.as_bytes()),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| insert(&error))?;
+            }
+            connection
+                .execute_with_params(
+                    "INSERT INTO branches (session, name, parent_run, parent_sequence, \
+                     created_unix_seconds) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    &[
+                        int(session.get()),
+                        text(&origin.name),
+                        text(&origin.parent_run),
+                        int(origin.parent_sequence),
+                        int(origin.created_unix_seconds),
+                    ],
+                )
+                .await
+                .map_err(|error| insert(&error))?;
+            for (command, accepted) in &history.accepted {
+                connection
+                    .execute_with_params(
+                        "INSERT INTO commands (session, admission, command, effective, \
+                         retargeted, content, record) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        &[
+                            int(session.get()),
+                            int(accepted.order),
+                            int(command.id.get()),
+                            int(accepted.effective.get()),
+                            int(u64::from(accepted.retargeted)),
+                            blob(command.content_hash().as_bytes()),
+                            blob(&command.canonical_bytes()),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| insert(&error))?;
+            }
+            for (id, outcome) in &history.outcomes {
+                let [kind, tick, published, epoch, applied, reason, detail] =
+                    outcome_columns(outcome);
+                connection
+                    .execute_with_params(
+                        "INSERT INTO outcomes (session, cursor, command, kind, tick, published, \
+                         epoch, applied_bits, reason, detail) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        &[
+                            int(session.get()),
+                            int(outcome.cursor()),
+                            int(id.get()),
+                            kind,
+                            tick,
+                            published,
+                            epoch,
+                            applied,
+                            reason,
+                            detail,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| insert(&error))?;
+            }
+            Ok(())
+        }))?;
+        self.session = Some(session);
+        Ok(())
+    }
+
+    /// The bound session's lineage, root first: empty unless it is a
+    /// branch.
+    ///
+    /// # Errors
+    /// As [`CommandJournal::index_checkpoint`].
+    pub fn lineage(&self) -> Result<Vec<Fork>, CoreError> {
+        let session = self.bound()?;
+        block_on_inline(self.lineage_of(session))
+    }
+
+    /// Where the bound session was branched, if it is a branch.
+    ///
+    /// # Errors
+    /// As [`CommandJournal::index_checkpoint`].
+    pub fn branch_origin(&self) -> Result<Option<BranchOrigin>, CoreError> {
+        let session = self.bound()?;
+        block_on_inline(async {
+            let rows = self
+                .connection
+                .query_with_params(
+                    "SELECT name, parent_run, parent_sequence, created_unix_seconds \
+                     FROM branches WHERE session = ?1",
+                    &[int(session.get())],
+                )
+                .await
+                .map_err(|error| storage("read branch", &self.path, &error))?;
+            rows.first()
+                .map(|row| {
+                    Ok(BranchOrigin {
+                        name: string(row, 0)?.unwrap_or_default().to_owned(),
+                        parent_run: string(row, 1)?.unwrap_or_default().to_owned(),
+                        parent_sequence: integer(row, 2)?,
+                        created_unix_seconds: integer(row, 3)?,
+                    })
+                })
+                .transpose()
         })
     }
 

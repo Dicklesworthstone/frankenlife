@@ -7,6 +7,9 @@ under a retention limit. FL-036 (`flife-ka2`) adds the run catalog and command j
 C.14): one FrankenSQLite database that records each run, makes a `write-ahead-before-apply` session's acceptances,
 cancellations and outcomes durable through `flife_runtime`'s `Journal` port, and indexes the checkpoints published
 to the chunk store.
+FL-039 (`flife-05q`) adds publication from a donor store and branch catalogs (§14.4, §16.7, B.1). A branch's
+founding checkpoint links the parent store's verified chunk files instead of copying them. A branch's catalog
+records its lineage and origin, and starts its journal with the history it inherited.
 
 **Inputs.**
 - A checkpoint: FL-016's sealed container (`flife_runtime::checkpoint` writes one).
@@ -28,6 +31,10 @@ to the chunk store.
 - `CommandJournal` (FL-036) with `open`, `path`, `session`, `modes`, `watermarks`, `index_checkpoint`,
   `checkpoints` and `runs`, implementing `flife_runtime::Journal` (`open_run`, `append`); `IndexedCheckpoint`; and
   `CATALOG_FORMAT`.
+- FL-039:
+  - `ChunkStore::publish_sharing` and `publish_sharing_observed`, taking a donor `ChunkStore`;
+  - `Step::ChunkLinked`, and `Publication::linked`, a part of `written`;
+  - `CommandJournal::open_branch`, `lineage` and `branch_origin`, and `BranchOrigin`.
 
 **Invariants — layout.**
 - `FLIFESTORE` holds `frankenlife.chunk-store.v1`. A directory that is neither empty nor a store is not taken over.
@@ -54,6 +61,12 @@ to the chunk store.
   the link on, a cancellation is too late and the checkpoint is published.
 - `power-loss` flushes with `File::sync_all`, which on macOS is `fcntl(F_FULLFSYNC)` and on Linux `fsync`.
   `process-crash` relies only on rename and link atomicity.
+- FL-039, `publish_sharing(checkpoint, donor)`: the same protocol, except for each chunk the store does not hold
+  intact. If the donor holds that chunk intact (length and SHA-256 checked), the donor's file is hard-linked into
+  `tmp/` and then renamed into place, so one inode carries both names. Otherwise the chunk is written. A linked
+  chunk counts as written, and also as linked, with no bytes written. Under `power-loss` it is flushed like a
+  written one, and so is its directory. The donor is only read. It is never written, and its retention removes only
+  its own names, so a chunk both stores hold stays whole in the other.
 
 **Invariants — recovery and retention (§16.7, B.2).**
 - `load` checks that the manifest is a regular file of at most `MANIFEST_FILE_MAX_BYTES`, and verifies its seal
@@ -87,6 +100,15 @@ to the chunk store.
   chunk store (`latest_valid`), whose manifests stay the authority (§16.6).
 - The connection is `!Send`, so the journal is opened on the thread that uses it (the session's writer thread),
   and its async calls are driven by `flife_runtime::block_on_inline`, never on an Asupersync runtime thread.
+- FL-039, branches:
+  - `lineage` holds each branch session's forks, keyed by `(session, depth)`, root first. A fork row holds the
+    parent session, the admissions it had made, the tick and the parent checkpoint's SHA-256.
+  - `branches` holds each branch's origin: its name, the parent run, the parent checkpoint's sequence and the
+    creation time.
+  - `open_branch` records the run, its lineage, its origin and its inherited history (acceptances and outcomes) in
+    one transaction, and then binds the session.
+  - Reading a journal back applies `flife_runtime::admitting_session`. An acceptance before a fork's admissions
+    must be of that fork's parent, and one after must be of the branch's own session.
 
 **Refusal cases.**
 - `incompatible-checkpoint`: a container that does not verify, or a missing, oversized, mis-sealed or extended
@@ -94,6 +116,8 @@ to the chunk store.
 - `state-conflict`: a second writer, a non-store directory, and `retain(0)`. In the journal: a run under another
   configuration hash, an append before `open_run` or to another session, an identity held with other content, a
   record that is not the next of its kind, an outcome without an acceptance, and a conflicting index row.
+  `open_branch` of a session the catalog already records, with no fork, or with a history that is not numbered
+  from zero, or whose acceptance is not of the session that admitted its order.
 - `schema-mismatch`: another store format, or another catalog format.
 - `storage-failed`: any operation the host refuses (a full disk, a device or permission failure, a path in the way),
   naming the operation and path. FrankenSQLite's errors map here too.
@@ -182,6 +206,24 @@ manifests.
   until the harness's timeout. A first pass over 31 left 12 surviving and one hanging. Each got a test or an
   assertion; the hang exposed a replay that looped forever on a journaled cancellation of a command that had
   already ended, which now refuses.
+- `tests/branch.rs` (FL-039, 3 tests), over three checkpoints of FL-013's ecology:
+  - `a_donors_verified_chunks_are_linked_not_written`, under both durabilities:
+    - every chunk of the first checkpoint is linked: the donor's inode under the same name, with no bytes written;
+    - the second checkpoint's chunks are shared or linked, with `ChunkLinked` and no `ChunkWritten` steps, and as
+      many flushes as links under `power-loss`;
+    - a chunk the donor holds damaged is written, as the recipient's own file;
+    - each publication restores to its world;
+    - the donor's retention removes its first checkpoint, and the recipient's copy still restores.
+  - `cancelling_a_sharing_publication_at_any_step_leaves_both_stores_as_they_were`, under both durabilities. A
+    cancellation at every step before the link refuses as `cancelled` and leaves no temporaries and the recipient's
+    checkpoints as they were. From the link on, it publishes. The donor's files are unchanged.
+  - `a_branch_catalog_records_its_lineage_and_starts_with_its_inherited_history`:
+    - a branch catalog opens with the inherited watermarks and takes its own acceptance and an inherited command's
+      outcome;
+    - it refuses a parent-session acceptance after the fork, and recording the branch twice;
+    - reopened, it reads back the history in order, the lineage, the origin and one run;
+    - no fork, an inherited acceptance of the branch's session, and an outcome out of turn are each refused, with
+      nothing recorded.
 
 **Validity domain.** `frankenlife.chunk-store.v1` over checkpoint format 1 with raw chunks. A local POSIX
 filesystem with atomic `rename`, hard links and advisory `flock` locks: APFS on macOS, and ext4, XFS or btrfs on
@@ -195,14 +237,17 @@ file-backed engine), one writer thread per session, one session per database at 
 - A run's catalog row is its identity, configuration hash and command schema, plus its journal and checkpoint
   index. The rest of Appendix B.1's run manifest (source and suite revisions, toolchain, numerics, clocks,
   hardware, capacity, results and artifacts) is not recorded yet; a complete run catalog is FL-041's evidence.
-- The catalog indexes runs and checkpoints, not lineage or branches (FL-039, FL-040). `flife checkpoint`/`resume`, a CLI
+- The catalog records a branch's lineage and origin (FL-039), but not lineage of organisms (FL-040). `flife checkpoint`/`resume`, a CLI
   that opens a journal (`flife run` refuses `write-ahead-before-apply`) and resuming from the store are FL-037.
 - The journal's power-loss durability rests on FrankenSQLite's WAL and `synchronous = FULL` flush; only process
   crashes are tested. Two sessions writing one catalog at once, and two processes opening one session's journal,
   are not tested; FrankenSQLite's concurrent writers are not relied on.
 - No journal compaction or bounded idempotency window: every record is kept for the session's life.
 - No readers' leases: retention assumes no other process is reading the store. Pinned discoveries and branch
-  closures (§16.7) are not retained specially yet (FL-039).
+  closures (§16.7) are not retained specially. A branch shares its parent's chunks by hard links instead
+  (FL-039), so a parent's retention cannot remove a chunk a branch names. Across file systems a link fails and the
+  chunk is written, which is not tested. A linked chunk damaged in place is damaged in every store that names it.
+  It is detected on load, as any damage is.
 - Chunks are whole families: a single birth rewrites the full genome chunk. Per-genome pages, deltas and
   compression are later work (§16.5, FL-026), as are incremental and background checkpoint modes (§16.5).
 - No RaptorQ or other error correction: damage is detected and recovery falls back, but damaged bytes are not

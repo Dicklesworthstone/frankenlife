@@ -10,7 +10,8 @@
 //! - [`book`]: the owner's [`CommandBook`], a deterministic state machine:
 //!   idempotent admission by `(session, command id)`, the pending schedule
 //!   ordered by `(effective tick, admission order)`, sealed boundaries,
-//!   cancellation and the outcome stream.
+//!   cancellation and the outcome stream; a [`Fork`] into a branch
+//!   session (FL-039).
 //! - [`checkpoint`]: a committed world and its complete command closure as
 //!   one verified checkpoint, and their exact restoration (FL-016).
 //! - [`session`]: the Asupersync owner task. It holds the committed world
@@ -32,7 +33,9 @@ pub mod command;
 pub mod journal;
 pub mod session;
 
-pub use book::{COMMANDS_CHUNK_VERSION, CommandBook};
+pub use book::{
+    BRANCHED_COMMANDS_CHUNK_VERSION, COMMANDS_CHUNK_VERSION, CommandBook, Fork, admitting_session,
+};
 pub use checkpoint::{Restored, SESSION_CHECKPOINT_CHUNKS, checkpoint, restore};
 pub use command::{
     Accepted, Admission, COMMAND_SCHEMA, CancelReason, Cancellation, Command, CommandStatus,

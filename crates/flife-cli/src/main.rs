@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use flife_cli::{
-    ColorMapping, ControllerChoice, ERROR_SCHEMA, Injection, Look, Particles, Persistence,
-    ResumeOptions, RunOptions, Stop, StoreDurability, Style, Validation,
+    BranchOptions, ColorMapping, ControllerChoice, ERROR_SCHEMA, Injection, Look, Particles,
+    Persistence, ResumeOptions, RunOptions, Stop, StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -91,6 +91,33 @@ enum Command {
         controllers: ControllerChoice,
         #[command(flatten)]
         checkpoints: CheckpointFlags,
+    },
+    /// Branch a run directory at one of its checkpoints into a new run
+    /// directory: a control branch, or with `--inject` an intervention
+    /// branch. Continue it with `flife resume`.
+    Branch {
+        /// The run directory to branch.
+        parent: PathBuf,
+        /// The new (or empty) run directory.
+        run_dir: PathBuf,
+        /// The committed tick of the checkpoint to branch from; the newest
+        /// that restores if omitted.
+        #[arg(long)]
+        at: Option<u64>,
+        /// The branch's name, part of its identity; the new directory's
+        /// name if omitted.
+        #[arg(long)]
+        name: Option<String>,
+        /// The branch's own command: energy into a field cell at a
+        /// committed tick at or after the checkpoint's, written
+        /// `TICK:X,Y:AMOUNT`; repeatable.
+        #[arg(long = "inject", value_name = "TICK:X,Y:AMOUNT")]
+        injections: Vec<Injection>,
+        /// `power-loss` (the default) flushes the founding checkpoint to
+        /// stable storage before publishing it; `process-crash` relies on
+        /// atomic renames.
+        #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
+        checkpoint_durability: StoreDurability,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -253,6 +280,29 @@ fn main() -> ExitCode {
                 print,
             ))
         }
+        Command::Branch {
+            parent,
+            run_dir,
+            at,
+            name,
+            injections,
+            checkpoint_durability,
+        } => match flife_cli::branch(
+            &parent,
+            &run_dir,
+            &BranchOptions {
+                at,
+                name,
+                injections,
+                durability: checkpoint_durability,
+            },
+        ) {
+            Ok(record) => {
+                print(&record);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error.kind(), error.to_string()),
+        },
         Command::Resume {
             run_dir,
             until,

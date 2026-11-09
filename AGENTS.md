@@ -616,8 +616,8 @@ The repository holds:
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
-  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037), and
-  `crates/flife-manim` and `crates/flife-studio` (FL-018), and `crates/flife-store` (FL-035, FL-036), each with its
+  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039), and
+  `crates/flife-manim` and `crates/flife-studio` (FL-018), and `crates/flife-store` (FL-035, FL-036, FL-039), each with its
   `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
@@ -772,7 +772,8 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
   the closed world with a directly stepped one. Run it on macOS with a window server whenever input, the session
   bridge or the frame loop changes. Never ship `synthetic-input`.
 
-`flife-cli` (FL-015) is the `flife` binary (`validate`, `run`, `resume`, `render`) and the library behind it.
+`flife-cli` (FL-015) is the `flife` binary (`validate`, `run`, `resume`, `render`, `branch`) and the library
+behind it.
 - `run` founds the world, opens a session, and steps it from a client task on the native runtime. It never touches
   the world outside the session.
 - Run directories (FL-037, `persist`): `config.toml`, `catalog.db` and `store/`. A kept run checkpoints only
@@ -780,6 +781,13 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
   so pending commands survive into `resume`. FrankenSQLite calls go on a plain thread (`on_plain_thread`), never
   the runtime's. Prove a resume change with `tests/resume.rs`: the resumed digest and final checkpoint SHA-256
   must equal the uninterrupted run's.
+- Branches (FL-039, `branch`): a new session (`branch_session` of the parent checkpoint's SHA-256 and the
+  name) whose book inherits every command and records the fork (`CommandBook::branch`, version 2 commands
+  chunk). The founding checkpoint links the parent's chunk files (`ChunkStore::publish_sharing`), and the
+  catalog records the lineage (`CommandJournal::open_branch`). Every admission order has one admitting
+  session (`admitting_session`); keep the book, `recover` and the journal on that one rule. Prove a branch
+  change with `tests/branch.rs` in `flife-cli`, `flife-runtime` and `flife-store`. A control branch must reach
+  the uninterrupted run's digest and journal.
 - Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1` and `frankenlife.error.v1`. An
   error's `kind` is `CoreError::kind`. Add a new variant's kind there, never a string match on `Display`.
 - `observe` has two halves:

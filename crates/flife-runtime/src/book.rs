@@ -17,6 +17,12 @@
 //!   from the published tick's report.
 //! - The outcome stream numbers terminal outcomes in the order they occur.
 //!   Its cursor is not the admission order.
+//! - [`CommandBook::branch`] forks a book at a checkpoint into a new
+//!   session (FL-039, plan §14.4): the branch inherits every command and
+//!   outcome, numbering continues, and the [`Fork`] it records names the
+//!   parent session, how many commands that session had admitted, and the
+//!   checkpoint. Commands admitted below a fork belong to the session that
+//!   admitted them; the branch admits only its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,6 +41,32 @@ use crate::command::{
 };
 use crate::journal::JournalContents;
 
+/// Where a session forked from its parent (plan §14.4, §16.3): the parent
+/// session, the commands it had admitted, and the checkpoint the branch
+/// starts from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fork {
+    /// The session the branch forked from.
+    pub parent: SessionId,
+    /// Commands the parent had admitted: admission orders below this are
+    /// its, or its ancestors'.
+    pub admitted: u64,
+    /// The committed tick of the checkpoint.
+    pub tick: Tick,
+    /// The SHA-256 of the checkpoint's container.
+    pub checkpoint: Sha256Digest,
+}
+
+/// The session that admitted order `order` in a book of `session` with
+/// `lineage`, root first.
+#[must_use]
+pub fn admitting_session(lineage: &[Fork], session: SessionId, order: u64) -> SessionId {
+    lineage
+        .iter()
+        .find(|fork| order < fork.admitted)
+        .map_or(session, |fork| fork.parent)
+}
+
 #[derive(Debug, Clone)]
 struct Record {
     content: Sha256Digest,
@@ -47,6 +79,7 @@ struct Record {
 #[derive(Debug, Clone)]
 pub struct CommandBook {
     session: SessionId,
+    lineage: Vec<Fork>,
     revision: Sha256Digest,
     capacity: usize,
     records: BTreeMap<CommandId, Record>,
@@ -65,6 +98,7 @@ impl CommandBook {
     pub const fn new(session: SessionId, revision: Sha256Digest, capacity: usize) -> Self {
         Self {
             session,
+            lineage: Vec::new(),
             revision,
             capacity,
             records: BTreeMap::new(),
@@ -110,6 +144,84 @@ impl CommandBook {
     #[must_use]
     pub const fn session(&self) -> SessionId {
         self.session
+    }
+
+    /// The forks this session descends through, root first; empty for a
+    /// session that is not a branch.
+    #[must_use]
+    pub fn lineage(&self) -> &[Fork] {
+        &self.lineage
+    }
+
+    /// The session that admitted order `order`.
+    #[must_use]
+    pub fn admitted_by(&self, order: u64) -> SessionId {
+        admitting_session(&self.lineage, self.session, order)
+    }
+
+    /// This book, the closure of a checkpoint whose container's SHA-256 is
+    /// `checkpoint` holding a world committed at `tick`, as the book of a
+    /// new branch `session` (plan §14.4). The branch inherits every
+    /// command, pending or ended, and the outcome stream, so its world
+    /// continues exactly as this one would; admission numbering and the
+    /// outcome cursor continue too. It admits only commands of `session`,
+    /// and is open even if this book was closed.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when `session` is this session or one
+    /// it descends from.
+    pub fn branch(
+        &self,
+        session: SessionId,
+        tick: Tick,
+        checkpoint: Sha256Digest,
+    ) -> Result<Self, CoreError> {
+        if session == self.session || self.lineage.iter().any(|fork| fork.parent == session) {
+            return Err(CoreError::StateConflict {
+                operation: "branch session",
+                detail: format!("{session} is already in the lineage of {}", self.session),
+            });
+        }
+        let mut branch = self.clone();
+        branch.lineage.push(Fork {
+            parent: self.session,
+            admitted: self.next_order,
+            tick,
+            checkpoint,
+        });
+        branch.session = session;
+        branch.closed = false;
+        branch.durability = Durability::Volatile;
+        Ok(branch)
+    }
+
+    /// Everything a command journal would hold for this book: every
+    /// acceptance in admission order and every outcome in cursor order.
+    /// A branch's journal starts with its inherited history.
+    #[must_use]
+    pub fn history(&self) -> JournalContents {
+        let mut accepted: Vec<(Command, Accepted)> = self
+            .records
+            .values()
+            .map(|record| (record.command, record.accepted))
+            .collect();
+        accepted.sort_by_key(|(_, accepted)| accepted.order);
+        let outcomes = self
+            .outcomes
+            .iter()
+            .filter_map(|id| match &self.records.get(id)?.status {
+                CommandStatus::Terminal(outcome) => Some((*id, outcome.clone())),
+                _ => None,
+            })
+            .collect();
+        JournalContents { accepted, outcomes }
+    }
+
+    /// The largest command identity the book holds, if any. A branch's own
+    /// commands need identities its inherited ones do not use.
+    #[must_use]
+    pub fn last_command(&self) -> Option<CommandId> {
+        self.records.keys().next_back().copied()
     }
 
     /// The configuration hash the session runs.
@@ -433,7 +545,7 @@ impl CommandBook {
         };
         for (position, (command, accepted)) in journal.accepted.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
-            if accepted.order != position || command.session != self.session {
+            if accepted.order != position || command.session != self.admitted_by(position) {
                 return Err(conflict(format!(
                     "journal acceptance {position} is {} of session {} in order {}",
                     command.id, command.session, accepted.order
@@ -596,8 +708,14 @@ impl CommandBook {
     }
 }
 
-/// The command chunk's schema version.
+/// The command chunk's schema version for a session that is not a branch.
 pub const COMMANDS_CHUNK_VERSION: u16 = 1;
+
+/// The command chunk version that carries a lineage: a branch's.
+pub const BRANCHED_COMMANDS_CHUNK_VERSION: u16 = 2;
+
+/// The deepest lineage a checkpoint may carry.
+const LINEAGE_MAX: usize = 1 << 16;
 
 /// The longest command record or failure detail a checkpoint may carry.
 const RECORD_MAX_BYTES: usize = 64 * 1024;
@@ -617,7 +735,10 @@ impl CommandBook {
     /// acceptance and its status (pending, sealed or terminal with its
     /// outcome), the outcome stream, the admission counter, the sealed
     /// boundary and whether the book is closed. Pending future commands
-    /// are carried whole, not as a cursor.
+    /// are carried whole, not as a cursor. A branch's chunk is
+    /// [`BRANCHED_COMMANDS_CHUNK_VERSION`] and carries its lineage after
+    /// the revision; any other book's is [`COMMANDS_CHUNK_VERSION`], byte
+    /// for byte as before branches existed.
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] if `writer` lacks the
@@ -626,6 +747,15 @@ impl CommandBook {
         let mut out = ByteWriter::new();
         out.u64(self.session.get());
         out.bytes(self.revision.as_bytes());
+        if !self.lineage.is_empty() {
+            out.u64(u64::try_from(self.lineage.len()).unwrap_or(u64::MAX));
+            for fork in &self.lineage {
+                out.u64(fork.parent.get());
+                out.u64(fork.admitted);
+                out.u64(fork.tick.get());
+                out.bytes(fork.checkpoint.as_bytes());
+            }
+        }
         out.u64(u64::try_from(self.capacity).unwrap_or(u64::MAX));
         out.u64(self.next_order);
         out.option_u64(self.sealed.map(Tick::get));
@@ -683,7 +813,11 @@ impl CommandBook {
         }
         writer.chunk(
             ChunkFamily::Commands,
-            COMMANDS_CHUNK_VERSION,
+            if self.lineage.is_empty() {
+                COMMANDS_CHUNK_VERSION
+            } else {
+                BRANCHED_COMMANDS_CHUNK_VERSION
+            },
             u64::try_from(self.records.len()).unwrap_or(u64::MAX),
             out.into_bytes(),
             &[ChunkFamily::Configuration],
@@ -698,14 +832,27 @@ impl CommandBook {
     /// this book could have reached: another revision; a record whose
     /// identity, content hash, admission order or status disagrees; a
     /// pending command due before `committed`; a sealed boundary other than
-    /// `committed`; or an outcome stream that is not exactly the terminal
-    /// commands in cursor order.
+    /// `committed`; an outcome stream that is not exactly the terminal
+    /// commands in cursor order; or a lineage that is not one: forks out of
+    /// order, after the committed tick or past the commands admitted, a
+    /// session repeated, or a command of a session that did not admit its
+    /// order.
     pub fn read_checkpoint(
         reader: &CheckpointReader<'_>,
         committed: Tick,
         revision: Sha256Digest,
     ) -> Result<Self, CoreError> {
-        let chunk = reader.versioned(ChunkFamily::Commands, COMMANDS_CHUNK_VERSION)?;
+        let chunk = reader.chunk(ChunkFamily::Commands)?;
+        let branched = match chunk.version {
+            COMMANDS_CHUNK_VERSION => false,
+            BRANCHED_COMMANDS_CHUNK_VERSION => true,
+            other => {
+                return Err(refuse(format!(
+                    "chunk commands is version {other}; this build reads \
+                     {COMMANDS_CHUNK_VERSION} and {BRANCHED_COMMANDS_CHUNK_VERSION}"
+                )));
+            }
+        };
         let mut input = ByteReader::new(chunk.bytes, "commands chunk");
         let session = SessionId::new(input.u64()?);
         let recorded = Sha256Digest::from_bytes(input.array()?);
@@ -716,8 +863,44 @@ impl CommandBook {
                 revision.to_hex()
             )));
         }
+        let mut lineage = Vec::new();
+        if branched {
+            let forks = input.count(LINEAGE_MAX, 56)?;
+            if forks == 0 {
+                return Err(refuse("a branched commands chunk carries no fork"));
+            }
+            for _ in 0..forks {
+                lineage.push(Fork {
+                    parent: SessionId::new(input.u64()?),
+                    admitted: input.u64()?,
+                    tick: Tick::new(input.u64()?),
+                    checkpoint: Sha256Digest::from_bytes(input.array()?),
+                });
+            }
+        }
         let capacity = usize::try_from(input.u64()?).unwrap_or(usize::MAX);
         let next_order = input.u64()?;
+        let mut sessions = BTreeSet::from([session]);
+        let mut previous: Option<&Fork> = None;
+        for fork in &lineage {
+            if !sessions.insert(fork.parent)
+                || fork.admitted > next_order
+                || fork.tick > committed
+                || previous.is_some_and(|before| {
+                    fork.admitted < before.admitted || fork.tick < before.tick
+                })
+            {
+                return Err(refuse(format!(
+                    "the fork from {} at tick {} after {} admissions is not a lineage of \
+                     {session} at tick {} with {next_order} admissions",
+                    fork.parent,
+                    fork.tick.get(),
+                    fork.admitted,
+                    committed.get()
+                )));
+            }
+            previous = Some(fork);
+        }
         let sealed = input.option_u64()?.map(Tick::new);
         if sealed.is_some_and(|sealed| sealed != committed) {
             return Err(refuse(format!(
@@ -729,6 +912,7 @@ impl CommandBook {
         let count = input.count(RECORDS_MAX, 8)?;
         let mut book = Self {
             session,
+            lineage,
             revision,
             capacity,
             records: BTreeMap::new(),
@@ -753,7 +937,7 @@ impl CommandBook {
                     other => return Err(refuse(format!("unknown durability {other}"))),
                 },
             };
-            if command.session != session
+            if command.session != book.admitted_by(accepted.order)
                 || accepted.order >= next_order
                 || !orders.insert(accepted.order)
             {

@@ -21,6 +21,15 @@
 //! published checkpoints as they were, plus at most some unreferenced
 //! chunks and temporary files.
 //!
+//! [`ChunkStore::publish_sharing`] (FL-039) publishes the same way, but
+//! takes a chunk it lacks from a donor store, another run's, by linking the
+//! donor's file (a hard link: one immutable file under two names) after
+//! verifying its hash, rather than writing the bytes again; a branch shares
+//! its parent's genomes, field and every other unchanged chunk this way. A
+//! chunk the donor lacks or holds damaged, or one the host will not link
+//! (another file system), is written as usual. Removing a name in one store
+//! leaves the other's: retention in either never reaches into the other.
+//!
 //! [`ChunkStore::latest_valid`] reads checkpoints newest first. It checks
 //! each manifest's seal, each chunk's stored length before allocating, and
 //! each chunk's hash, then offers the reassembled checkpoint to the caller
@@ -39,7 +48,7 @@
 
 pub mod journal;
 
-pub use journal::{CATALOG_FORMAT, CommandJournal, IndexedCheckpoint};
+pub use journal::{BranchOrigin, CATALOG_FORMAT, CommandJournal, IndexedCheckpoint};
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -102,12 +111,19 @@ pub enum Step {
         /// The chunk's position in the manifest.
         index: usize,
     },
+    /// Chunk `index` is linked from the donor store into a temporary name
+    /// ([`ChunkStore::publish_sharing`]).
+    ChunkLinked {
+        /// The chunk's position in the manifest.
+        index: usize,
+    },
     /// Chunk `index`'s bytes are in a temporary file.
     ChunkWritten {
         /// The chunk's position in the manifest.
         index: usize,
     },
-    /// That file is flushed ([`Durability::PowerLoss`] only).
+    /// That file is flushed ([`Durability::PowerLoss`] only), whether
+    /// written or linked.
     ChunkFlushed {
         /// The chunk's position in the manifest.
         index: usize,
@@ -144,8 +160,11 @@ pub enum Flow {
 pub struct Publication {
     /// The new checkpoint's sequence number.
     pub sequence: u64,
-    /// Chunks the store did not hold before.
+    /// Chunks the store did not hold before, written or linked.
     pub written: usize,
+    /// Of those and the repaired ones, how many were linked from a donor
+    /// store rather than written ([`ChunkStore::publish_sharing`]).
+    pub linked: usize,
     /// Chunks already stored intact, now shared.
     pub shared: usize,
     /// Chunks stored again because the stored copy was damaged.
@@ -475,6 +494,44 @@ impl ChunkStore {
         checkpoint: &[u8],
         observe: &mut dyn FnMut(Step) -> Flow,
     ) -> Result<Publication, CoreError> {
+        self.publish_from(checkpoint, None, observe)
+    }
+
+    /// Publish `checkpoint`, linking each chunk this store lacks (or holds
+    /// damaged) from `donor` when the donor holds it intact and the host
+    /// can link it, and writing it otherwise (see the
+    /// [module documentation](self)).
+    ///
+    /// # Errors
+    /// As [`ChunkStore::publish_observed`].
+    pub fn publish_sharing(
+        &mut self,
+        checkpoint: &[u8],
+        donor: &Self,
+    ) -> Result<Publication, CoreError> {
+        self.publish_sharing_observed(checkpoint, donor, &mut |_| Flow::Continue)
+    }
+
+    /// [`ChunkStore::publish_sharing`], reporting each [`Step`] to
+    /// `observe` as [`ChunkStore::publish_observed`] does.
+    ///
+    /// # Errors
+    /// As [`ChunkStore::publish_observed`].
+    pub fn publish_sharing_observed(
+        &mut self,
+        checkpoint: &[u8],
+        donor: &Self,
+        observe: &mut dyn FnMut(Step) -> Flow,
+    ) -> Result<Publication, CoreError> {
+        self.publish_from(checkpoint, Some(donor), observe)
+    }
+
+    fn publish_from(
+        &mut self,
+        checkpoint: &[u8],
+        donor: Option<&Self>,
+        observe: &mut dyn FnMut(Step) -> Flow,
+    ) -> Result<Publication, CoreError> {
         CheckpointReader::parse(checkpoint, &[])?;
         let manifest = CheckpointManifest::parse(checkpoint)?;
         let sequence = self.next;
@@ -482,7 +539,14 @@ impl ChunkStore {
             quantity: "checkpoint sequence",
         })?;
         let mut temporaries = Vec::new();
-        let outcome = self.stage(checkpoint, &manifest, sequence, observe, &mut temporaries);
+        let outcome = self.stage(
+            checkpoint,
+            &manifest,
+            sequence,
+            donor,
+            observe,
+            &mut temporaries,
+        );
         remove_all(&temporaries);
         outcome
     }
@@ -492,6 +556,7 @@ impl ChunkStore {
         checkpoint: &[u8],
         manifest: &CheckpointManifest<'_>,
         sequence: u64,
+        donor: Option<&Self>,
         observe: &mut dyn FnMut(Step) -> Flow,
         temporaries: &mut Vec<PathBuf>,
     ) -> Result<Publication, CoreError> {
@@ -502,6 +567,7 @@ impl ChunkStore {
         let mut publication = Publication {
             sequence,
             written: 0,
+            linked: 0,
             shared: 0,
             repaired: 0,
             bytes_written: 0,
@@ -538,9 +604,36 @@ impl ChunkStore {
                 .root
                 .join(TEMPORARY)
                 .join(format!("{sequence:016x}-{index}.chunk"));
-            let file = create_new(&temporary, bytes, temporaries)?;
-            publication.bytes_written = publication.bytes_written.saturating_add(entry.length);
-            flow(observe(Step::ChunkWritten { index }))?;
+            // The donor's copy, verified, under a temporary name; or `None`
+            // when there is no intact copy or the host will not link it.
+            let linked = match donor {
+                Some(donor) => {
+                    let source = donor.chunk_path(&entry.digest);
+                    if matches!(stored(&source, entry)?, Stored::Intact)
+                        && fs::hard_link(&source, &temporary).is_ok()
+                    {
+                        temporaries.push(temporary.clone());
+                        // Flushing the shared file covers a donor that
+                        // published without flushing.
+                        let file = File::open(&temporary)
+                            .map_err(|error| storage("open linked chunk", &temporary, &error))?;
+                        Some(file)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+            let file = if let Some(file) = linked {
+                publication.linked += 1;
+                flow(observe(Step::ChunkLinked { index }))?;
+                file
+            } else {
+                let file = create_new(&temporary, bytes, temporaries)?;
+                publication.bytes_written = publication.bytes_written.saturating_add(entry.length);
+                flow(observe(Step::ChunkWritten { index }))?;
+                file
+            };
             if flushes {
                 file.sync_all()
                     .map_err(|error| storage("flush chunk", &temporary, &error))?;

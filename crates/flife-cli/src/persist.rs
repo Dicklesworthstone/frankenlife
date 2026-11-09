@@ -21,6 +21,11 @@
 //! command still pending stays pending, in the final checkpoint and the
 //! journal alike, and applies when the run is resumed past its tick.
 //!
+//! A run directory made by [`crate::branch()`] (FL-039) is a branch: its
+//! catalog records a session other than [`RUN_SESSION`] and the fork it
+//! descends from, and it resumes only from a checkpoint of that session.
+//! It has no founding world of its own to fall back to.
+//!
 //! Checkpoints are `pause-and-stream`: the client takes no step while one is
 //! taken and published, so the committed world cannot move under it. The
 //! container is encoded whole in memory first; admitting that copy against
@@ -41,7 +46,7 @@ use flife_core::ids::{CommandId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Intervention, NumericalProfile, World};
 use flife_runtime::{
-    Command, CommandBook, Durability, Journal, JournalWriter, Restored, SessionCheckpoint,
+    Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored, SessionCheckpoint,
     SessionConfig, SessionHandle, SessionOwner, Target, open_journaled, open_restored, restore,
 };
 use flife_store::{ChunkStore, CommandJournal, IndexedCheckpoint};
@@ -127,11 +132,17 @@ impl FromStr for Injection {
 /// order, each for exactly its tick.
 #[must_use]
 pub fn commands(injections: &[Injection]) -> Vec<Command> {
+    scheduled(RUN_SESSION, 1, injections)
+}
+
+/// `session`'s commands for `injections`: identities `first`, `first + 1`,
+/// … in order, each for exactly its tick.
+pub(crate) fn scheduled(session: SessionId, first: u64, injections: &[Injection]) -> Vec<Command> {
     injections
         .iter()
-        .zip(1_u64..)
+        .zip(first..)
         .map(|(injection, id)| Command {
-            session: RUN_SESSION,
+            session,
             id: CommandId::new(id),
             target: Target::At {
                 tick: Tick::new(injection.tick),
@@ -226,7 +237,7 @@ pub fn read_config(run_dir: &Path) -> Result<ValidatedConfig, CoreError> {
 
 /// Run `work` on a plain thread and wait for it: FrankenSQLite's calls must
 /// not run on an Asupersync runtime's thread (`block_on_inline`).
-fn on_plain_thread<T: Send>(
+pub(crate) fn on_plain_thread<T: Send>(
     operation: &'static str,
     work: impl FnOnce() -> Result<T, CoreError> + Send,
 ) -> Result<T, CoreError> {
@@ -276,11 +287,13 @@ pub fn open_session(
 }
 
 /// Restore `bytes` if they hold a world of the configuration `revision`
-/// names: what makes a stored checkpoint one this run can resume from.
-fn restorable(
+/// names and the commands of `session`: what makes a stored checkpoint one
+/// this run can resume from.
+pub(crate) fn restorable(
     bytes: &[u8],
     profile: NumericalProfile,
     revision: Sha256Digest,
+    session: SessionId,
 ) -> Result<Restored, CoreError> {
     let restored = restore(bytes, profile)?;
     if restored.world.config().config_hash() != revision {
@@ -289,7 +302,46 @@ fn restorable(
             detail: "the checkpoint holds another configuration's world".into(),
         });
     }
+    if restored.book.session() != session {
+        return Err(CoreError::StateConflict {
+            operation: "resume run",
+            detail: format!(
+                "the checkpoint holds the commands of {}, not {session}",
+                restored.book.session()
+            ),
+        });
+    }
     Ok(restored)
+}
+
+/// The session the run in `run_dir` records, running configuration
+/// `revision`, and its lineage (empty unless it is a branch).
+///
+/// # Errors
+/// [`CoreError::StateConflict`] when the catalog records no run or more
+/// than one, or the run under another configuration; the catalog's
+/// errors.
+pub(crate) fn run_identity(
+    run_dir: &Path,
+    revision: Sha256Digest,
+) -> Result<(SessionId, Vec<Fork>), CoreError> {
+    let catalog = run_dir.join(CATALOG_FILE);
+    on_plain_thread("read the run catalog", || {
+        let mut journal = CommandJournal::open(&catalog)?;
+        let runs = journal.runs()?;
+        let [(session, _)] = runs.as_slice() else {
+            return Err(CoreError::StateConflict {
+                operation: "resume run",
+                detail: format!(
+                    "{} records {} runs; a run directory records one",
+                    catalog.display(),
+                    runs.len()
+                ),
+            });
+        };
+        journal.open_run(*session, revision)?;
+        Ok((*session, journal.lineage()?))
+    })
 }
 
 /// The run's checkpoints: its chunk store, and the catalog that indexes
@@ -307,15 +359,16 @@ pub(crate) struct Checkpoints {
 
 impl Checkpoints {
     /// Open the run directory's chunk store under `persistence`'s profile,
-    /// for the run of `config`.
+    /// for `session`'s run of `config`.
     pub(crate) fn open(
         persistence: &Persistence,
         config: &ValidatedConfig,
+        session: SessionId,
     ) -> Result<Self, CoreError> {
         Ok(Self {
             store: ChunkStore::open(persistence.run_dir.join(STORE_DIR), persistence.durability)?,
             catalog: persistence.run_dir.join(CATALOG_FILE),
-            session: RUN_SESSION,
+            session,
             revision: config.config_hash(),
             profile: NumericalProfile::reference_f32()?,
             every: persistence.checkpoint_every,
@@ -328,10 +381,10 @@ impl Checkpoints {
     /// The newest stored checkpoint this run can resume from, and those
     /// passed over, newest first.
     fn recover(&mut self) -> Result<(Option<Restored>, Vec<SkippedCheckpoint>), CoreError> {
-        let (profile, revision) = (self.profile, self.revision);
+        let (profile, revision, session) = (self.profile, self.revision, self.session);
         let recovered = self
             .store
-            .latest_valid(|_, bytes| restorable(bytes, profile, revision))?;
+            .latest_valid(|_, bytes| restorable(bytes, profile, revision, session))?;
         let skipped = recovered
             .skipped
             .into_iter()
@@ -370,7 +423,21 @@ impl Checkpoints {
     /// keep the newest `retain_recent_checkpoints` this run can resume
     /// from.
     pub(crate) fn publish(&mut self, taken: &SessionCheckpoint) -> Result<Record, CoreError> {
-        let publication = self.store.publish(&taken.bytes)?;
+        self.publish_from(taken, None).map(|(record, _)| record)
+    }
+
+    /// [`Checkpoints::publish`], linking the chunks `donor` holds intact
+    /// rather than writing them. Returns the record and how many chunks
+    /// were linked.
+    pub(crate) fn publish_from(
+        &mut self,
+        taken: &SessionCheckpoint,
+        donor: Option<&ChunkStore>,
+    ) -> Result<(Record, usize), CoreError> {
+        let publication = match donor {
+            Some(donor) => self.store.publish_sharing(&taken.bytes, donor)?,
+            None => self.store.publish(&taken.bytes)?,
+        };
         let digest = Sha256Digest::of(&taken.bytes);
         let indexed = IndexedCheckpoint {
             sequence: publication.sequence,
@@ -391,9 +458,9 @@ impl Checkpoints {
         self.last = Some(at);
         let profile = self.profile;
         let retention = self.store.retain(self.keep, |_, bytes| {
-            restorable(bytes, profile, revision).map(|_| ())
+            restorable(bytes, profile, revision, session).map(|_| ())
         })?;
-        Ok(Record::Checkpoint {
+        let record = Record::Checkpoint {
             schema: RUN_SCHEMA,
             tick: at.tick,
             epoch: taken.boundary.epoch.get(),
@@ -402,7 +469,8 @@ impl Checkpoints {
             bytes: u64::try_from(taken.bytes.len()).unwrap_or(u64::MAX),
             chunks: [publication.written, publication.shared],
             retired: retention.removed,
-        })
+        };
+        Ok((record, publication.linked))
     }
 }
 
@@ -433,29 +501,43 @@ pub struct ResumeOptions {
 /// `write-ahead-before-apply` run first replays every journaled outcome
 /// past the checkpoint, and its pending commands apply at their ticks.
 ///
-/// The tally covers the ticks this call publishes.
+/// The tally covers the ticks this call publishes. A branch resumes the
+/// same way, as its own session, from its own checkpoints.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] when `run_dir` is not a run directory, its
 /// catalog records the run under another configuration, the journal
-/// disagrees with the checkpoint, or the run is already past
-/// `options.until`; the store's, catalog's and session's errors.
+/// disagrees with the checkpoint, the run is already past `options.until`,
+/// or it is a branch none of whose checkpoints restores; the store's,
+/// catalog's and session's errors.
 pub fn resume(
     run_dir: &Path,
     options: &ResumeOptions,
     emit: impl FnMut(&Record) + Send + 'static,
 ) -> Result<Finished, CoreError> {
     let config = read_config(run_dir)?;
-    let limits = SessionConfig::from_config(RUN_SESSION, &config)?;
+    let (session, lineage) = run_identity(run_dir, config.config_hash())?;
+    let limits = SessionConfig::from_config(session, &config)?;
     let mut persistence = Persistence::new(run_dir, &config);
     if let Some(every) = options.checkpoint_every {
         persistence.checkpoint_every = every;
     }
     persistence.durability = options.durability;
-    let mut checkpoints = Checkpoints::open(&persistence, &config)?;
+    let mut checkpoints = Checkpoints::open(&persistence, &config, session)?;
     let (restored, skipped) = checkpoints.recover()?;
     let (mut world, book) = match restored {
         Some(restored) => (restored.world, restored.book),
+        None if !lineage.is_empty() => {
+            return Err(CoreError::StateConflict {
+                operation: "resume run",
+                detail: format!(
+                    "{} is a branch from tick {}, and none of its checkpoints restores; a branch \
+                     has no founding world to fall back to",
+                    run_dir.display(),
+                    crate::branch::fork_tick(&lineage).map_or(0, Tick::get)
+                ),
+            });
+        }
         None => (
             found(&config)?,
             CommandBook::new(limits.session, limits.revision, limits.command_capacity),

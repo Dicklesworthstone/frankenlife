@@ -10,6 +10,8 @@ while paused. Cancellation races publication at a declared boundary, and exactly
 (`flife-ka2`) adds `write-ahead-before-apply` sessions: the owner makes every acceptance, cancellation and outcome
 durable through a command journal before relying on it, and a session reopens from what the journal holds (§12.3,
 §12.4, §16.6, C.14). The journal is a port here; `flife-store` implements it over FrankenSQLite.
+FL-039 (`flife-05q`) forks a command book at a checkpoint into a branch session (§14.4, §16.3). The branch
+inherits every command and outcome, records the fork, and from then on admits only its own session's commands.
 
 **Inputs.**
 - A `World` founded from a validated configuration, the same configuration, and a `SessionId`.
@@ -63,6 +65,12 @@ durable through a command journal before relying on it, and a session reopens fr
 - Checkpoints (FL-016): `checkpoint`, `restore` and `Restored`, `SESSION_CHECKPOINT_CHUNKS`,
   `CommandBook::{write_checkpoint, read_checkpoint}` with `COMMANDS_CHUNK_VERSION`, and
   `Command::from_canonical_bytes`.
+- FL-039:
+  - `CommandBook::branch(session, tick, checkpoint)` returns the branch's book;
+  - `Fork { parent, admitted, tick, checkpoint }`, and `CommandBook::lineage` and `admitted_by`;
+  - `admitting_session(lineage, session, order)`, the same rule for a journal;
+  - `CommandBook::history`, the `JournalContents` a journal of the book would hold, and `last_command`;
+  - `BRANCHED_COMMANDS_CHUNK_VERSION` (2), the commands chunk of a branch.
 
 **Invariants — admission and the schedule (§12.3).**
 - A command's identity is `(session, command id)`, and its content is the SHA-256 of its canonical record
@@ -147,6 +155,27 @@ durable through a command journal before relying on it, and a session reopens fr
   retry of an admitted command returns its first outcome, reuse with other content is still refused, and a
   sealed boundary stays sealed.
 
+**Invariants — branches (FL-039; §14.4, §16.3).**
+- `book.branch(session, tick, checkpoint)` copies the book: every record, pending or ended, the outcome stream, the
+  admission numbering and the outcome cursor. The world it is checkpointed with therefore continues exactly as the
+  parent's would. It appends one `Fork`: the parent session, the next admission order at the fork, the tick and
+  the parent checkpoint's SHA-256. The branch is open even if the parent was closed. It starts `Volatile`, and the
+  caller sets its durability. The parent book is unchanged.
+- Every admission order has exactly one admitting session, `admitted_by(order)`. An order before a fork's
+  `admitted` belongs to that fork's parent, taking the oldest such fork; any later order belongs to the book's
+  own session. A branch admits only its own session's commands (`WrongSession` otherwise). Identities are still
+  one namespace per book, so a branch command that reuses an inherited identity is `ConflictingReuse`.
+- A book that is not a branch writes FL-016's commands chunk, version 1, byte for byte as before. A branch writes
+  version 2: the same fields, then its lineage, each fork with its parent, admitted order, tick and checkpoint
+  SHA-256. Only the commands chunk of a branch's checkpoint differs from its parent's checkpoint at the same
+  tick (tested).
+- `restore` of a version 2 chunk requires a lineage of at least one fork. Each fork's session must be distinct
+  from the others and from the book's. Each fork's admitted order must be at most the next order, and its tick at
+  most the committed tick. Forks must be in order of admissions and ticks. Every record's command must be of the
+  session that `admitted_by` its order.
+- `recover` and the journal (`flife-store`) apply the same rule. An inherited acceptance must be the parent's, and
+  an acceptance after the fork must be the branch's.
+
 **Invariants — write-ahead-before-apply (FL-036; §12.3, §12.4, §16.6, C.14).**
 - One writer thread (`flife-journal`) owns the journal and appends records in the order the owner sends them,
   answering each with one receipt. The owner never waits on it: it sends records and reads receipts as messages.
@@ -196,6 +225,9 @@ durable through a command journal before relying on it, and a session reopens fr
 - `World::advance_with` checks every intervention before preparing and refuses an invalid one without stopping the
   run. An `InjectEnergy` is refused for a cell outside the grid, or an amount that is not finite, not strictly
   positive or above `f32::MAX`.
+- FL-039: `CommandBook::branch` refuses (`StateConflict`) the book's own session or one in its lineage.
+  `restore` refuses (`IncompatibleCheckpoint`) a commands chunk of another version, a version 2 chunk with no fork,
+  and a lineage that is not one (see the branch invariants).
 
 **Determinism.** The book is a deterministic state machine over `BTreeMap`s. The schedule, the sealed sets and the
 outcome stream depend only on the order of admissions, cancellations and publications, never on hashing or wall
@@ -274,6 +306,24 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
 
 - FL-036's journaled sessions are tested in `flife-store`'s `tests/journal.rs`, against its FrankenSQLite journal
   and test journals that gate, lose or crash at appends (see that crate's contract).
+- `tests/branch.rs` (4 tests, FL-039), on a book that applied one command and holds another pending at its fork:
+  - `a_branch_inherits_every_command_and_admits_only_its_own`. The fork is recorded, and `admitted_by` attributes
+    each order to its session. The branch has the same history, cursor and pending command. It refuses the
+    parent's session and a reuse of an inherited identity, and numbers its own command next. The parent is
+    unchanged. Re-branching into a session of the lineage is refused, and a closed book branches into an open,
+    volatile one.
+  - `a_branch_round_trips_with_its_lineage_and_continues_its_parents_world`. The branch's checkpoint has a
+    version 2 commands chunk, restores to the same lineage and history, and re-encodes to the same bytes. It
+    differs from the parent's checkpoint in the commands chunk alone. A grandchild carries both forks. The parent
+    and the branch both continue to the digest of the world stepped directly with the same interventions, with the
+    same outcomes.
+  - `a_lineage_that_is_not_one_is_refused`. A fork tick after the committed tick is refused on restore. `recover`
+    refuses an inherited acceptance of the branch's session and a later one of the parent's, and accepts the
+    branch's own.
+  - `a_crafted_lineage_is_refused_on_restore`. A grandchild's checkpoint is re-sealed with its commands chunk
+    edited, and an unedited rewrite reproduces it byte for byte. Each of these is refused: a repeated session;
+    the book's own session as a parent; a fork past the admissions; forks out of admission or tick order; a
+    lineage that gives an inherited command to the branch; a version 2 chunk with no fork; and version 3.
 
 **Validity domain.** `volatile-in-memory` and `write-ahead-before-apply` durability; `cpu-reference` and
 `qualified-reference`; one owner task on any Asupersync runtime, plus the journal's writer thread for a journaled
@@ -295,7 +345,8 @@ session; `InjectEnergy` as the only intervention.
   FL-014's single-cell `InjectEnergy` is the canonical payload they will extend.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
-- Branching (FL-039) is not a command yet; checkpoints are control requests, not commands. Render epochs are not commands: viewers
+- Branching (FL-039) is a library operation on a book at a checkpoint (`flife branch` in `flife-cli`), not a session
+  request or a command; checkpoints are control requests, not commands. Render epochs are not commands: viewers
   read the feed directly (FL-017).
 - The render projection runs on the owner task, O(live + texels) per published boundary.
 - Lab tests cover protocol outcomes and publication invariants under seeded interleavings, not every possible

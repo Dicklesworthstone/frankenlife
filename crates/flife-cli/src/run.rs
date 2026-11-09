@@ -30,6 +30,7 @@ use flife_runtime::{
 };
 use serde::Serialize;
 
+use crate::branch::{BranchParent, ForkRecord, FoundingChunks, Inherited};
 use crate::observe::{Survey, Tally};
 use crate::persist::{Checkpoints, Injection, Persistence};
 
@@ -220,6 +221,34 @@ pub enum Record {
         /// Older checkpoints removed under `retain_recent_checkpoints`.
         retired: Vec<u64>,
     },
+    /// A branch made from a parent run's checkpoint (FL-039).
+    Branch {
+        /// [`RUN_SCHEMA`].
+        schema: &'static str,
+        /// The branch's name.
+        name: String,
+        /// Its session.
+        session: u64,
+        /// The checkpoint it starts from.
+        parent: BranchParent,
+        /// Every fork it descends through, root first; the last is its own.
+        lineage: Vec<ForkRecord>,
+        /// The commands and outcomes it inherited.
+        inherited: Inherited,
+        /// Its own commands' identities.
+        commands: Vec<u64>,
+        /// Its founding checkpoint.
+        checkpoint: CheckpointAt,
+        /// The founding checkpoint container's SHA-256.
+        sha256: String,
+        /// The container's size.
+        bytes: u64,
+        /// The founding checkpoint's chunks written and linked from the
+        /// parent's store.
+        chunks: FoundingChunks,
+        /// The committed world's digest, the parent's at the checkpoint.
+        digest: String,
+    },
     /// Where a resumed run starts (FL-037).
     Resume {
         /// [`RUN_SCHEMA`].
@@ -393,7 +422,7 @@ pub fn run_with(
     let controllers = ControllerSummary::of(&world).backend;
     let (owner, handle, checkpoints) = match persistence {
         Some(persistence) => {
-            let checkpoints = Checkpoints::open(persistence, config)?;
+            let checkpoints = Checkpoints::open(persistence, config, RUN_SESSION)?;
             let book = CommandBook::new(limits.session, limits.revision, limits.command_capacity);
             let (owner, handle) =
                 crate::persist::open_session(world, book, limits, &persistence.run_dir)?;

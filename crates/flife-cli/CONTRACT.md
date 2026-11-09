@@ -12,6 +12,11 @@ FL-037 (`flife-e5u`) adds run directories and `flife resume` (plan G3, §12.3, �
 journals its commands there under `write-ahead-before-apply`, and resumes from its newest restorable checkpoint to
 exactly the state of the uninterrupted run.
 
+FL-039 (`flife-05q`) adds `flife branch` (plan §14.4, §15.3, §16.3, §16.7, B.1), in `branch`. It makes a new run
+directory that starts from a durable checkpoint of another run directory, as a new session. A control branch has no
+commands of its own; an intervention branch schedules its own. Each branch shares the parent's immutable chunk files
+and keeps its own command history, and runs on with `flife resume` independently of its parent and its siblings.
+
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
@@ -32,6 +37,12 @@ exactly the state of the uninterrupted run.
 - `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
 - In the library: `run_with(config, options, injections, persistence, emit)` and `resume(dir, ResumeOptions,
   emit)`, with `Persistence::new(dir, config)` giving the configured defaults.
+- FL-039: `flife branch PARENT DIR --at T --name NAME --inject TICK:X,Y:AMOUNT --checkpoint-durability D`.
+  - `PARENT` is a run directory that no process holds; `DIR` is new or empty.
+  - `--at` is the committed tick of a parent checkpoint. By default it is the newest one that restores.
+  - `--name` is 1 to 256 bytes, `DIR`'s name by default.
+  - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command.
+  - In the library: `branch(parent, dir, &BranchOptions { at, name, injections, durability })`.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
@@ -50,6 +61,15 @@ exactly the state of the uninterrupted run.
       after replaying the journal, and the journal's durable watermarks;
     - `end.persisted`: the run directory, the command durability, the newest checkpoint, and the journal's final
       durable watermarks.
+  - FL-039, `branch` (the only record of `flife branch`):
+    - the branch's name and session;
+    - the parent: run directory, session, and the checkpoint's sequence, tick and SHA-256;
+    - the lineage, one fork per ancestor, oldest first: the session forked from, the admissions it had made, the
+      tick, and the checkpoint's SHA-256;
+    - what was inherited: admissions, outcomes, and commands still pending;
+    - the branch's own command identities;
+    - its founding checkpoint: sequence and tick, SHA-256 and size, and the chunks written and linked;
+    - the world's digest, which is the parent's at that tick.
 
   `progress` and `end` also carry `wall_seconds`, which is not scientific state. `start` carries `cpu_workers` and
   `controllers` (the backend and device, or `cpu-reference`), which no result depends on. `end` carries
@@ -85,7 +105,8 @@ exactly the state of the uninterrupted run.
   unreadable file. Exit status is 0 on success, 1 when a run stops early (a capacity pause or a failed tick), and 2
   for an unreadable or invalid configuration, a refused session or a refused run directory.
 - A run directory (FL-037) holds `config.toml` (the configuration's canonical TOML, written, flushed and renamed
-  into place), `catalog.db` (the run catalog and command journal) and `store/` (the chunk store).
+  into place), `catalog.db` (the run catalog and command journal) and `store/` (the chunk store). A branch's catalog also records
+  its lineage and its origin: the name, the parent run, the parent checkpoint's sequence and the creation time.
 - In `flife-core`, FL-015 adds `CoreError::kind`, a stable kebab-case class name, distinct for every variant.
 
 **Invariants.**
@@ -120,6 +141,23 @@ exactly the state of the uninterrupted run.
   - After each publication the store keeps the newest `retain_recent_checkpoints` that restore; the catalog's
     index keeps every row, and only a manifest makes a checkpoint resumable (§16.6).
   - A resumed run's tally covers the ticks that call published.
+- FL-039:
+  - A branch is a new session, `branch_session(SHA-256 of the parent checkpoint, name)`. Making the same branch again
+    gives the same session and the same founding checkpoint bytes; siblings with different names differ (tested).
+    A session already in the lineage is refused.
+  - The founding checkpoint is the parent checkpoint's world with the branch's command book: every inherited command
+    and outcome, the lineage, and the branch's own commands. Its ten world chunks are byte-identical to the
+    parent's. The branch's store links the parent's verified chunk files instead of writing them (FL-035's
+    `publish_sharing`), and writes only the command closure. A parent chunk that does not verify is written.
+  - Command histories are independent. A branch admits only its own session's commands. Its
+    `write-ahead-before-apply` journal starts with the history it inherited and then holds its own commands. The
+    parent's journal never holds a branch's command, and a branch's never holds a later command of its parent.
+  - A control branch continues exactly as its parent would have: the same world digests and the same outcomes. An
+    intervention branch matches its control until its first command applies.
+  - Resuming a branch takes the newest checkpoint of its own session that restores. Checkpoints of another session
+    are passed over, and a branch has no founding world to fall back to.
+  - The parent's chunk store is opened as its writer for the whole branch operation, so nothing moves under the
+    checkpoint while it is read and linked.
 
 **The preset.** `reference-small-world` is a viability-calibrated start with declared parameter tuning (§7.2) at
 the Reference profile's scale (§19.5):
@@ -164,6 +202,15 @@ test.
   `catalog.db`, of a run whose `config.toml` no longer hashes to the catalog's configuration, of a run already past
   `--until`, or of a run another process holds (the chunk store's writer lock): `state-conflict`; a journal that
   disagrees with the checkpoint: FL-036's `state-conflict` refusals.
+- FL-039, `flife branch`, all `state-conflict` with nothing printed on standard output:
+  - a parent that is not a run directory, or that another process holds;
+  - a parent with no checkpoint that restores (at `--at`, when given);
+  - a name that is empty or longer than 256 bytes;
+  - a command due before the checkpoint's tick;
+  - a target that holds a run or any other files.
+
+  The first four are refused before the branch directory is made. `flife resume` of a branch none of whose
+  checkpoints restores is also refused.
 - Any other refusal from founding or the session, by its `CoreError` kind.
 - A run that pauses on capacity or fails a tick ends with that `stop` and exit status 1. Its records up to that
   point are still emitted.
@@ -251,13 +298,67 @@ suspension, `open_restored` and the CLI guard were each caught. One, `flife run`
 guard, was caught only after the smoke test checked that the refusal names `--run-dir`: the session refuses in
 the same words, but after founding the world.
 
+`tests/branch.rs` (3 tests, FL-039, about 11 s) uses FL-037's ecology, injections and horizon. A
+`write-ahead-before-apply` parent runs to tick 120 and is branched at its checkpoint at 112, which holds commands 1
+and 2 applied and 3 and 4 pending:
+- `a_control_branch_continues_as_its_parent_while_an_intervention_branch_diverges`.
+  - Branching: a control branch and an intervention branch with a brush at tick 130 (its command 5). Each
+    inherits 4 admissions, 2 outcomes and 2 pending commands, writes 1 chunk and links 10, which are the same
+    inodes as the parent's files. Their founding SHA-256 differs from the parent checkpoint's.
+  - The parent alone: it resumes to 240 at the uninterrupted run's digest and journal. Its retention removes its
+    own names for chunks the branches share, and the control's founding checkpoint still loads.
+  - Paired runs: the control and the intervention are identical at 129. A branch of the control at 129 carries
+    both forks and links the control's 10 chunks.
+  - At 240: the control and its branch reach the uninterrupted digest, and the intervention differs. The control's
+    journal equals the uninterrupted run's. The intervention's holds the same four inherited acceptances, then its
+    brush (order 4, effective at 130) and its outcome.
+  - The catalog: the nested branch records both forks and its origin.
+  - Admission after a restore: the intervention's checkpoint holds its brush accepted write-ahead. It refuses a
+    control-session command (`WrongSession`) and a reuse of identity 3 (`ConflictingReuse`), and admits its own
+    command 6.
+- `a_volatile_branch_shares_its_parents_chunks_and_journals_nothing`. The same sharing and control trajectory at
+  `volatile-in-memory`. The branch is named after its directory, its session is `branch_session` of the parent
+  checkpoint and that name, and its catalog holds the lineage but no journal.
+- `branching_refuses_what_it_cannot_branch`, covering:
+  - every refusal above, each with exit status 2 and nothing made;
+  - the same branch made twice, and a sibling with another name;
+  - the default `--at`;
+  - a branch whose only manifest is damaged, which refuses to resume while its parent still resumes;
+  - another session's checkpoint copied into a branch's store as sequence 9, which resume passes over, naming the
+    session.
+
+`flife-runtime` and `flife-store` each have their own `tests/branch.rs`, for the command book's lineage and for the
+linked publication and branch catalog. Thirty-four planted mutants were run against the three `tests/branch.rs`
+and `tests/resume.rs`: in the book's lineage, its encoding and checks, chunk linking, the branch catalog, and
+`flife branch` and resume. A first pass caught 30. The four survivors (a repeated session, a fork past the
+admissions, and forks out of order, each accepted on restore, and a restored record's session left unchecked) are
+reachable only through a crafted checkpoint. `flife-runtime`'s `a_crafted_lineage_is_refused_on_restore` now
+catches each of them.
+
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories
 also at `write-ahead-before-apply`, one process per run directory, on local file systems (APFS tested here).
 
 **Known gaps.**
-- Only `validate`, `run`, `resume` and `render`. Capabilities, step and inspect, branch, sweep, analyze and export
-  are later items (§14.6): FL-021, FL-039, FL-041 and FL-023.
+- Only `validate`, `run`, `resume`, `render` and `branch`. Capabilities, step and inspect, sweep, analyze and export
+  are later items (§14.6): FL-021, FL-041 and FL-023.
+- FL-039 gaps:
+  - §14.4's synchronized simulation-time views and paired metrics are not here: a branch's paired comparison is two
+    `flife resume` runs and their records. Experiment reports are FL-041, and side-by-side views are the studio's.
+    Nothing assumes common random numbers stay coupled after the branches' births differ.
+  - A branch runs the parent's configuration. Changing parameters at a fork (an intervention that is not a
+    command) is not supported.
+  - Sharing is hard links, so the parent and the branch must be on one file system. Across file systems the
+    store falls back to writing each chunk. That path is shared with damaged parent chunks, which are tested, but a
+    cross-file-system branch is not.
+  - A linked chunk is one file under several names. Damage in place, such as a bit flip, therefore reaches every
+    store that links it. Each store verifies a chunk's SHA-256 on load, so the damage is detected but not repaired.
+    Retention removes only a store's own names.
+  - A branch needs its own founding checkpoint, or a later one, to resume. If none restores, it is refused rather
+    than re-derived from the parent.
+  - The parent must not be running while it is branched (its store's writer lock refuses it). Branching a live
+    session at a checkpoint taken by its owner is not supported.
+  - `run_identity`'s refusal of a catalog recording more than one run is not tested.
 - FL-037 gaps:
   - The checkpoint container is encoded whole in memory before it is published (one extra copy of the committed
     state). §16.5's low-memory bound on it, and bounded or background checkpoints, are FL-038.

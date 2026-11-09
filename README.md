@@ -74,6 +74,11 @@ FL-037 keeps a run in a directory: `flife run --run-dir DIR` writes its configur
 DIR --until T` continues it from its newest checkpoint that restores. A run SIGKILLed part way, or whose newest
 checkpoint is damaged, resumes to exactly the uninterrupted run's world and final checkpoint bytes, across
 controller phases, cooldowns, newborns and commands still in the future.
+FL-039 branches a run: `flife branch PARENT DIR --at T` starts a new session from the parent's checkpoint at
+tick T, a control branch, or an intervention branch with `--inject` brushes of its own. The branch links
+the parent's verified chunk files instead of copying them and writes only its command closure. Its journal
+starts with the history it inherited. A control branch resumes to exactly the parent's uninterrupted world,
+while its intervention sibling matches it until its brush applies and differs after.
 Camera, zoom and selection come next.**
 
 | Question | Answer |
@@ -405,7 +410,7 @@ flife capabilities          # what this machine and build can actually run, with
 flife run <config>          # a headless run
 flife step | inspect        # advance one tick; a bounded snapshot of one organism at an exact tick
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
-flife branch                # control and intervention branches from one checkpoint
+flife branch                # control and intervention branches from one checkpoint (exists)
 flife sweep | analyze       # seed ensembles, parameter sweeps, ablations and their metrics
 flife render | export       # simulation-time frames and video through FrankenManim (render exists)
 flife-studio <preset>       # the interactive microscope

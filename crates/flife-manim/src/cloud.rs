@@ -176,6 +176,6 @@ impl ParticleCloud {
                 .capacity()
                 .saturating_mul(size_of::<ThreeDDraw<'static>>()),
         )
-            .unwrap_or(u64::MAX)
+        .unwrap_or(u64::MAX)
     }
 }

@@ -39,7 +39,10 @@ impl Viewport {
     /// [`CoreError::NumericalInvalid`] for an extent that is not finite and
     /// positive, or an empty drawable.
     pub fn fit(extent: [f64; 2], drawable: [u32; 2]) -> Result<Self, CoreError> {
-        if !extent.iter().all(|length| length.is_finite() && *length > 0.0) {
+        if !extent
+            .iter()
+            .all(|length| length.is_finite() && *length > 0.0)
+        {
             return Err(CoreError::NumericalInvalid {
                 quantity: "viewport world extent",
                 detail: format!("{extent:?} must be finite and positive"),

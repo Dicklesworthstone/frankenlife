@@ -100,3 +100,6 @@ panic = "deny"
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+# An eagerly built error message in a hot loop cost 13% of every tick
+# (`format!` inside `ok_or`), so build fallbacks lazily.
+or_fun_call = "deny"

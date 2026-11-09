@@ -68,8 +68,8 @@ pub use seeding::{
 };
 pub use sources::{DepositReport, PathSegment, Source, SourceKernel, SourceSupport};
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
-pub use step::{FieldStepReport, advance_field};
-pub use transport::{TransportPlan, TransportReport, TransportScratch};
+pub use step::{FieldStepReport, FieldWork, advance_field, advance_field_on};
+pub use transport::{TransportPlan, TransportReport, TransportScratch, transport_on};
 pub use uptake::{
     CellDebit, Demand, GrantPacket, Grants, UptakeSummary, apply_grants, resolve_uptake,
 };

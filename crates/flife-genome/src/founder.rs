@@ -64,7 +64,7 @@ pub fn founder(
             }
         },
     );
-    if let Some(error) = lane_error.or(filled.err()) {
+    if let Some(error) = lane_error.or_else(|| filled.err()) {
         quota.abandon(buffer)?;
         return Err(error);
     }

@@ -165,6 +165,18 @@ impl FieldState {
         self.data.get(range)
     }
 
+    /// Every value, writable, in planar order. The length is fixed, so the
+    /// layout cannot change through it.
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    /// The moment planes, channels 0 to 31 in order, writable.
+    pub(crate) fn moments_mut(&mut self) -> &mut [f32] {
+        let cells = usize::try_from(self.grid().cell_count()).unwrap_or(usize::MAX);
+        self.data.get_mut(cells..).unwrap_or(&mut [])
+    }
+
     /// Plane `plane`, writable.
     #[must_use]
     pub fn plane_mut(&mut self, plane: u32) -> Option<&mut [f32]> {

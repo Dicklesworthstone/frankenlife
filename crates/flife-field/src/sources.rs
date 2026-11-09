@@ -158,12 +158,12 @@ impl SourceKernel {
                 if distance_squared > radius_squared {
                     continue;
                 }
-                let weight = exp_neg(distance_squared / two_sigma_squared).ok_or(
+                let weight = exp_neg(distance_squared / two_sigma_squared).ok_or_else(|| {
                     CoreError::NumericalInvalid {
                         quantity: "source weight",
                         detail: format!("|d|² = {distance_squared:?} has no weight"),
-                    },
-                )?;
+                    }
+                })?;
                 let index = grid.cell_index(column, row).ok_or_else(overflow)?;
                 support.cells.push((index, weight));
                 support.weight_sum += weight;
@@ -224,6 +224,8 @@ pub struct SourceSupport {
     weight_sum: f64,
     columns: Vec<u32>,
     rows: Vec<u32>,
+    /// Each cell's deposited energy this tick, in `cells` order.
+    amounts: Vec<f64>,
 }
 
 impl SourceSupport {
@@ -417,27 +419,41 @@ pub fn deposit(
 ) -> Result<DepositReport, CoreError> {
     let grid = *state.grid();
     kernel.support_into(&grid, source.center, support)?;
+    let report = deposit_energy(state, source, step, support)?;
+    for (channel, &component) in (0_u32..).zip(source.direction.iter()) {
+        let plane = state.moment_mut(channel).ok_or_else(outside)?;
+        deposit_moment(plane, component, support)?;
+    }
+    Ok(report)
+}
+
+/// The energy part of [`deposit`], in support order, for a `support`
+/// already computed at the source's center. It records each cell's amount
+/// for [`deposit_moment`].
+pub(crate) fn deposit_energy(
+    state: &mut FieldState,
+    source: &Source,
+    step: TimeStep,
+    support: &mut SourceSupport,
+) -> Result<DepositReport, CoreError> {
     let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
     let mut normalized_total = 0.0;
     let mut applied = 0.0;
-    for (index, weight) in support.normalized() {
+    support.amounts.clear();
+    let energy = state.energy_mut();
+    for (index, weight) in support
+        .cells
+        .iter()
+        .map(|&(index, weight)| (index, weight / support.weight_sum))
+    {
         let amount = declared * weight;
         normalized_total += amount;
-        let energy = state.energy_mut().get_mut(index).ok_or_else(outside)?;
+        let energy = energy.get_mut(index).ok_or_else(outside)?;
         let before = f64::from(*energy);
         let after = (before + amount) as f32;
         applied += f64::from(after) - before;
         *energy = after;
-        for (channel, &component) in (0_u32..).zip(source.direction.iter()) {
-            if component == 0.0 {
-                continue;
-            }
-            let moment = state
-                .moment_mut(channel)
-                .and_then(|plane| plane.get_mut(index))
-                .ok_or_else(outside)?;
-            *moment = (f64::from(*moment) + amount * component) as f32;
-        }
+        support.amounts.push(amount);
     }
     Ok(DepositReport {
         source: source.id,
@@ -446,6 +462,29 @@ pub fn deposit(
         normalized_total,
         applied,
     })
+}
+
+/// One moment plane's part of [`deposit`]: `component` of each amount
+/// [`deposit_energy`] recorded. A source adds to a cell's moment once, so
+/// updating plane by plane computes exactly what cell by cell would.
+pub(crate) fn deposit_moment(
+    plane: &mut [f32],
+    component: f64,
+    support: &SourceSupport,
+) -> Result<(), CoreError> {
+    if component == 0.0 {
+        return Ok(());
+    }
+    for (&(index, _), &amount) in support.cells.iter().zip(&support.amounts) {
+        let moment = plane.get_mut(index).ok_or_else(outside)?;
+        *moment = (f64::from(*moment) + amount * component) as f32;
+    }
+    Ok(())
+}
+
+/// The direction component `channel` of `source`; zero past the last.
+pub(crate) fn component(source: &Source, channel: usize) -> f64 {
+    source.direction.get(channel).copied().unwrap_or(0.0)
 }
 
 fn outside() -> CoreError {

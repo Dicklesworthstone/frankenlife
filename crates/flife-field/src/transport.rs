@@ -119,7 +119,7 @@ impl TransportPlan {
             let center = 1.0 - 2.0 * r_x - 2.0 * r_y;
             if center >= 0.0 {
                 let decay = decay_per_second * numerator / denominator;
-                let decay_factor = exp_neg(decay).ok_or(CoreError::NumericalInvalid {
+                let decay_factor = exp_neg(decay).ok_or_else(|| CoreError::NumericalInvalid {
                     quantity: "world.decay_per_second",
                     detail: format!("λΔt = {decay:?} has no decay factor"),
                 })?;
@@ -271,18 +271,39 @@ pub fn transport(
     next: &mut FieldState,
     scratch: &mut TransportScratch,
 ) -> Result<TransportReport, CoreError> {
+    transport_on(plan, current, next, std::slice::from_mut(scratch))
+}
+
+/// [`transport`] with the planes split over up to `scratches.len()`
+/// threads: this one and scoped workers it joins before returning (plan
+/// §3.4's bounded reference adapter). Every plane is transported on its own,
+/// so the split cannot change a value, and the energy plane's sums are taken
+/// in cell order as before.
+///
+/// # Errors
+/// As [`transport`], for any scratch; [`CoreError::StateConflict`] for none,
+/// or a worker that panicked.
+pub fn transport_on(
+    plan: &TransportPlan,
+    current: &FieldState,
+    next: &mut FieldState,
+    scratches: &mut [TransportScratch],
+) -> Result<TransportReport, CoreError> {
     let expected = crate::layout::FieldLayout::planar(plan.grid)?;
     expected.ensure_compatible(current.layout())?;
     expected.ensure_compatible(next.layout())?;
-    if scratch.cells != scratch.first.len()
-        || scratch.cells != scratch.second.len()
-        || u64::try_from(scratch.cells).ok() != Some(plan.grid.cell_count())
-    {
-        return Err(mismatch(format!(
-            "transport scratch for {} cells on a grid of {}",
-            scratch.cells,
-            plan.grid.cell_count()
-        )));
+    let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+    for scratch in scratches.iter() {
+        if scratch.cells != scratch.first.len()
+            || scratch.cells != scratch.second.len()
+            || scratch.cells != cells
+        {
+            return Err(mismatch(format!(
+                "transport scratch for {} cells on a grid of {}",
+                scratch.cells,
+                plan.grid.cell_count()
+            )));
+        }
     }
     let width = usize::try_from(plan.grid.cells_x()).map_err(|_| overflow())?;
     let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
@@ -293,35 +314,110 @@ pub fn transport(
         width,
         height,
     };
+    let planes = usize::try_from(FIELD_PLANES).map_err(|_| overflow())?;
+    let source = current.as_slice();
+    let target = next.as_mut_slice();
+    if cells == 0 || source.len() != cells * planes || target.len() != cells * planes {
+        return Err(missing_plane());
+    }
 
     let energy_before = sum(current.energy());
-    let mut energy_transported = 0.0;
-    let mut energy_after = 0.0;
-    let mut decay_removed = 0.0;
-    for plane in 0..FIELD_PLANES {
-        let source = current.plane(plane).ok_or_else(missing_plane)?;
-        let target = next.plane_mut(plane).ok_or_else(missing_plane)?;
-        diffuse(&coefficients, plan.substeps, source, target, scratch);
-        if plane == ENERGY_PLANE {
-            energy_transported = sum(target);
-        }
-        if plan.decay_factor != 1.0 {
-            let removed = decay(target, plan.decay_factor);
-            if plane == ENERGY_PLANE {
-                decay_removed = removed;
+    let used = scratches.len().min(planes);
+    let per = planes.div_ceil(used.max(1));
+    let run = |first_plane: usize,
+               source: &[f32],
+               target: &mut [f32],
+               scratch: &mut TransportScratch|
+     -> Option<EnergyTerms> {
+        let mut energy = None;
+        for (offset, (source, target)) in source
+            .chunks_exact(cells)
+            .zip(target.chunks_exact_mut(cells))
+            .enumerate()
+        {
+            let is_energy = first_plane + offset == ENERGY_PLANE as usize;
+            if let Some(terms) =
+                transport_plane(&coefficients, plan, source, target, scratch, is_energy)
+            {
+                energy = Some(terms);
             }
         }
-        if plane == ENERGY_PLANE {
-            energy_after = sum(target);
+        energy
+    };
+    let Some((head_scratch, others)) = scratches.split_first_mut() else {
+        return Err(CoreError::StateConflict {
+            operation: "transport",
+            detail: "no transport scratch".to_owned(),
+        });
+    };
+    let mut sources = source.chunks(per * cells);
+    let mut targets = target.chunks_mut(per * cells);
+    let (Some(head_source), Some(head_target)) = (sources.next(), targets.next()) else {
+        return Err(missing_plane());
+    };
+    let run = &run;
+    let energy = std::thread::scope(|scope| {
+        let workers: Vec<_> = sources
+            .zip(targets)
+            .zip(others.iter_mut())
+            .enumerate()
+            .map(|(index, ((source, target), scratch))| {
+                scope.spawn(move || run((index + 1) * per, source, target, scratch))
+            })
+            .collect();
+        let mut energy = run(0, head_source, head_target, head_scratch);
+        for worker in workers {
+            match worker.join() {
+                Ok(terms) => energy = energy.or(terms),
+                Err(_) => {
+                    return Err(CoreError::StateConflict {
+                        operation: "transport",
+                        detail: "a transport worker panicked".to_owned(),
+                    });
+                }
+            }
         }
-    }
+        energy.ok_or_else(missing_plane)
+    })?;
     Ok(TransportReport {
         substeps: plan.substeps,
         energy_before,
-        energy_transported,
-        energy_after,
+        energy_transported: energy.transported,
+        energy_after: energy.after,
+        decay_removed: energy.decay_removed,
+        transport_residual: energy.transported - energy_before,
+    })
+}
+
+/// One plane's sums, which only the energy plane reports.
+#[derive(Debug, Clone, Copy)]
+struct EnergyTerms {
+    transported: f64,
+    decay_removed: f64,
+    after: f64,
+}
+
+/// Transport then decay one plane. The energy plane also reports its sums,
+/// in cell order.
+fn transport_plane(
+    coefficients: &Coefficients,
+    plan: &TransportPlan,
+    source: &[f32],
+    target: &mut [f32],
+    scratch: &mut TransportScratch,
+    is_energy: bool,
+) -> Option<EnergyTerms> {
+    diffuse(coefficients, plan.substeps, source, target, scratch);
+    let transported = if is_energy { sum(target) } else { 0.0 };
+    let decay_removed = if plan.decay_factor == 1.0 {
+        0.0
+    } else {
+        decay(target, plan.decay_factor)
+    };
+    is_energy.then(|| EnergyTerms {
+        transported,
         decay_removed,
-        transport_residual: energy_transported - energy_before,
+        after: sum(target),
     })
 }
 
@@ -366,6 +462,67 @@ fn diffuse(
 
 /// One periodic five-point step in the reference arithmetic.
 fn stencil(coefficients: &Coefficients, source: &[f32], target: &mut [f32]) {
+    let Coefficients { width, height, .. } = *coefficients;
+    let cells = width.checked_mul(height);
+    match cells {
+        Some(cells) if width > 0 && source.len() == cells && target.len() == cells => {
+            stencil_rows(coefficients, source, target);
+        }
+        _ => stencil_checked(coefficients, source, target),
+    }
+}
+
+/// [`stencil`] on whole planes, row by row. Each cell is the same
+/// expression, evaluated in the same order, as in [`stencil_checked`]; the
+/// row slices only let the interior compile to vector code.
+fn stencil_rows(coefficients: &Coefficients, source: &[f32], target: &mut [f32]) {
+    let Coefficients {
+        center,
+        r_x,
+        r_y,
+        width,
+        height,
+    } = *coefficients;
+    let value = |c: f32, w: f32, e: f32, s: f32, n: f32| {
+        // Round once to the F32 field dtype.
+        (center * f64::from(c)
+            + r_x * (f64::from(w) + f64::from(e))
+            + r_y * (f64::from(s) + f64::from(n))) as f32
+    };
+    for (y, out) in target.chunks_exact_mut(width).enumerate() {
+        let south = if y == 0 { height - 1 } else { y - 1 };
+        let north = if y + 1 == height { 0 } else { y + 1 };
+        let row = &source[y * width..][..width];
+        let row_south = &source[south * width..][..width];
+        let row_north = &source[north * width..][..width];
+        let edge = |x: usize| {
+            let west = if x == 0 { width - 1 } else { x - 1 };
+            let east = if x + 1 == width { 0 } else { x + 1 };
+            value(row[x], row[west], row[east], row_south[x], row_north[x])
+        };
+        out[0] = edge(0);
+        if width > 1 {
+            out[width - 1] = edge(width - 1);
+        }
+        if width > 2 {
+            let inner = 1..width - 1;
+            for (((((slot, &c), &w), &e), &s), &n) in out[inner.clone()]
+                .iter_mut()
+                .zip(&row[inner.clone()])
+                .zip(&row[..width - 2])
+                .zip(&row[2..])
+                .zip(&row_south[inner.clone()])
+                .zip(&row_north[inner])
+            {
+                *slot = value(c, w, e, s, n);
+            }
+        }
+    }
+}
+
+/// [`stencil`] for planes of any length: a missing source cell reads as zero
+/// and a missing target cell is skipped.
+fn stencil_checked(coefficients: &Coefficients, source: &[f32], target: &mut [f32]) {
     let Coefficients {
         center,
         r_x,
@@ -415,5 +572,46 @@ fn missing_plane() -> CoreError {
     CoreError::LayoutMismatch {
         buffer: BUFFER,
         detail: "a field plane is missing".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Coefficients, stencil_checked, stencil_rows};
+
+    /// A deterministic plane with every magnitude class the field holds.
+    fn plane(cells: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..cells)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let bits = (state >> 40) as u32;
+                let scale = [1e-30_f32, 1e-3, 1.0, 1e3, 3e7][(state >> 33) as usize % 5];
+                (bits as f32 / 16_777_216.0 - 0.25) * scale
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_row_stencil_is_the_reference_stencil_bit_for_bit() {
+        for (width, height) in [(1, 1), (1, 4), (2, 1), (2, 3), (3, 3), (7, 5), (128, 128)] {
+            let coefficients = Coefficients {
+                center: 0.6,
+                r_x: 0.1,
+                r_y: 0.1,
+                width,
+                height,
+            };
+            let source = plane(width * height, (width * 31 + height) as u64);
+            let mut fast = vec![f32::NAN; width * height];
+            let mut checked = vec![f32::NAN; width * height];
+            stencil_rows(&coefficients, &source, &mut fast);
+            stencil_checked(&coefficients, &source, &mut checked);
+            let fast: Vec<u32> = fast.iter().map(|v| v.to_bits()).collect();
+            let checked: Vec<u32> = checked.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(fast, checked, "{width} x {height}");
+        }
     }
 }

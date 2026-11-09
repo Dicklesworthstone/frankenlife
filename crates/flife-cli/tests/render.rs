@@ -3,7 +3,7 @@
 
 use std::num::NonZeroUsize;
 
-use flife_cli::{RENDER_SCHEMA, RenderOptions, RenderRecord, render};
+use flife_cli::{ControllerChoice, RENDER_SCHEMA, RenderOptions, RenderRecord, render};
 use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 
@@ -20,6 +20,7 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
         size: [96, 64],
         out: out.clone(),
         cpu_workers: NonZeroUsize::new(3),
+        controllers: ControllerChoice::Auto,
         render_threads: NonZeroUsize::MIN,
         video: None,
         fps: 30,

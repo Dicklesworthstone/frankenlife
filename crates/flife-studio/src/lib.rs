@@ -19,6 +19,7 @@ mod session;
 pub use controls::{
     Controls, InputTally, Intent, KEY_ESCAPE, KEY_PERIOD, KEY_RIGHT, KEY_SPACE, KEY_W,
 };
+pub use flife_backend_metal::ControllerChoice;
 pub use host::{Frame, FrameTally, STUDIO_SESSION, Studio, StudioClosed, StudioOptions};
 pub use session::{End, INTENT_CAPACITY, SessionThread, Status};
 

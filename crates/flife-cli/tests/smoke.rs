@@ -16,8 +16,8 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use flife_cli::{
-    ERROR_SCHEMA, Finished, Heredity, RUN_SCHEMA, RUN_SESSION, Record, RunOptions, Stop, Survey,
-    Tally, VALIDATE_SCHEMA, Validation, run,
+    ControllerChoice, ERROR_SCHEMA, Finished, Heredity, RUN_SCHEMA, RUN_SESSION, Record,
+    RunOptions, Stop, Survey, Tally, VALIDATE_SCHEMA, Validation, run,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_runtime::SessionConfig;
@@ -202,6 +202,7 @@ fn smoke(ticks: u64, every: u64) -> (Finished, Vec<Record>) {
             ticks,
             every,
             cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
         },
         move |record| {
             sink.lock().expect("records").push(record.clone());

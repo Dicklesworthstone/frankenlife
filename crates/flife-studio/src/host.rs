@@ -16,9 +16,10 @@
 //! The world is only ever read through epochs. Nothing on this thread
 //! waits for a tick, a command or the session's lanes.
 
+use flife_backend_metal::ControllerChoice;
 use flife_core::ids::{RenderEpoch, SessionId};
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, World};
+use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
 use flife_manim::{WorldView, hex_rgb};
 use flife_render::{Prior, Viewer};
 use flife_runtime::SessionClosed;
@@ -49,6 +50,8 @@ pub struct StudioOptions {
     /// Whether the world starts running when the window opens, as if Space
     /// had been pressed.
     pub run_on_open: bool,
+    /// Where due controllers are evaluated. No result depends on it.
+    pub controllers: ControllerChoice,
 }
 
 impl Default for StudioOptions {
@@ -59,6 +62,7 @@ impl Default for StudioOptions {
             resizable: true,
             cpu_workers: None,
             run_on_open: false,
+            controllers: ControllerChoice::Auto,
         }
     }
 }
@@ -133,6 +137,8 @@ pub struct Studio {
     statuses: Vec<Status>,
     tally: FrameTally,
     window_closed: bool,
+    /// Where due controllers are evaluated.
+    controllers: String,
 }
 
 impl Studio {
@@ -169,6 +175,12 @@ impl Studio {
         if let Some(workers) = options.cpu_workers {
             world.set_cpu_workers(workers)?;
         }
+        world.set_controller_backend(options.controllers.backend()?);
+        let controllers = world
+            .controller_report()
+            .backend
+            .clone()
+            .unwrap_or_else(|| CPU_REFERENCE.to_owned());
         let (owner, handle) = flife_runtime::open(world, config, STUDIO_SESSION)?;
         let feed = handle.feed();
         // Each epoch is copied into the cloud and its lease returned before
@@ -200,7 +212,15 @@ impl Studio {
             statuses: Vec::new(),
             tally: FrameTally::default(),
             window_closed: false,
+            controllers,
         })
+    }
+
+    /// Where due controllers are evaluated: a backend and device, or
+    /// `cpu-reference`.
+    #[must_use]
+    pub fn controllers(&self) -> &str {
+        &self.controllers
     }
 
     /// Run one frame.

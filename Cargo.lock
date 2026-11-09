@@ -726,6 +726,7 @@ name = "flife-backend-metal"
 version = "0.0.1"
 dependencies = [
  "flife-core",
+ "flife-engine",
  "flife-neural",
  "ft-kernel-metal",
 ]
@@ -736,6 +737,7 @@ version = "0.0.1"
 dependencies = [
  "asupersync",
  "clap",
+ "flife-backend-metal",
  "flife-core",
  "flife-engine",
  "flife-genome",
@@ -845,6 +847,7 @@ version = "0.0.1"
 dependencies = [
  "asupersync",
  "clap",
+ "flife-backend-metal",
  "flife-core",
  "flife-engine",
  "flife-manim",

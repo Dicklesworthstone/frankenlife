@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use flife_backend_metal::ControllerChoice;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::Stepped;
 use flife_manim::{WorldView, hex_rgb};
@@ -16,6 +17,7 @@ use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
 use crate::found;
+use crate::run::{ControllerSummary, install};
 
 /// The schema of `flife render`'s NDJSON records.
 pub const RENDER_SCHEMA: &str = "frankenlife.render.v1";
@@ -33,6 +35,8 @@ pub struct RenderOptions {
     pub out: PathBuf,
     /// Threads for the world, replacing `[execution] cpu_workers`.
     pub cpu_workers: Option<NonZeroUsize>,
+    /// Where due controllers are evaluated. No result depends on it.
+    pub controllers: ControllerChoice,
     /// Threads FrankenManim's CPU renderer may use.
     pub render_threads: NonZeroUsize,
     /// An MP4 to encode the frames into with `ffmpeg`, at `fps`.
@@ -76,6 +80,8 @@ pub enum RenderRecord {
         digest: String,
         /// The encoded video, if any.
         video: Option<String>,
+        /// What the controller backend did. Not scientific state.
+        controllers: ControllerSummary,
         /// Wall seconds for the whole run.
         wall_seconds: f64,
     },
@@ -103,6 +109,7 @@ pub fn render(
     if let Some(workers) = options.cpu_workers {
         world.set_cpu_workers(workers)?;
     }
+    install(&mut world, options.controllers)?;
     std::fs::create_dir_all(&options.out)
         .map_err(|error| io("create the frame directory", &options.out, &error))?;
     let mut publisher = Publisher::new(&world, 3, || {})?;
@@ -170,6 +177,7 @@ pub fn render(
         tick: world.tick().get(),
         digest: world.digest().to_hex(),
         video,
+        controllers: ControllerSummary::of(&world),
         wall_seconds: clock.elapsed().as_secs_f64(),
     });
     Ok(())

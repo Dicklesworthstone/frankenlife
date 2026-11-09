@@ -56,8 +56,9 @@ and heritable variation from raw state. FL-017 adds immutable compact render epo
 at every committed boundary. A viewer that retains them skips frames, never ticks or births. FL-018 draws the
 live world on screen: `flife-studio` shows the 4,096-organism preset in a native Metal window as one FrankenManim
 particle cloud. Its real pointer, key, scroll, focus and resize events run, pause and step the session, and a closed
-Studio's world is bit-identical to the same world stepped directly. Palettes, camera, zoom and selection come
-next.**
+Studio's world is bit-identical to the same world stepped directly. FL-030's first part evaluates every due
+controller on the Mac's GPU in one fused Metal dispatch, bit for bit the CPU reference's, and `run`, `render` and the
+Studio use it by default (`--controllers auto`). Palettes, camera, zoom and selection come next.**
 
 | Question | Answer |
 |---|---|
@@ -332,9 +333,20 @@ The Studio opens running (`--paused` to start paused). Space runs or pauses, →
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary and the
 closing world digest). The organisms glow in their lineage colours over the energy field they feed on.
 
-A tick at 4,096 organisms takes about 45 ms on one core of an Apple-silicon Mac in release, and about 14 ms on 16
-(`--cpu-workers`, default `auto`; measured on a heavily loaded M5 Ultra, so these are rough). Every worker count
-computes the same world bit for bit. The full surface, as planned:
+`--controllers auto` (the default) evaluates the organisms' controllers on the Mac's GPU, and `cpu` keeps them on
+the CPU reference; `metal` refuses to run without a Metal device. Whatever the choice and the `--cpu-workers`
+count, the world is the same bit for bit; the run's `start` record names the backend and `end` counts what it
+evaluated. Measured over 512 ticks of the preset on an M5 Ultra under other load (median of three interleaved
+runs, cv ≤ 2.5%), with all 4,096 founders alive:
+
+| `--cpu-workers` | `--controllers cpu` | `--controllers metal` |
+|---|---|---|
+| 1 | 41 ms per tick | 18 ms per tick |
+| 16 | 12.9 ms per tick | 13.7 ms per tick |
+
+On one worker the controllers are about three quarters of a tick, and the GPU halves it. On 16 workers they are
+already spread thin, and the tick is bound by its serial phases (chemistry, uptake, deposits, invariant checks).
+There the GPU frees CPU cores but does not shorten the tick. The full surface, as planned:
 
 ```bash
 flife validate <config>     # range-check a config; report real memory and the worst admitted allocation
@@ -398,9 +410,10 @@ crates/flife-render/                                  FL-017 immutable compact r
 crates/flife-cli/                                     FL-015 the flife binary (validate, run), run records, raw-state tally and survey
 crates/flife-manim/                                   FL-018 FrankenManim adapter: exact viewport and camera, one bounded particle cloud per epoch
 crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
+crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; resident parameter arena behind the engine's controller port
 presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation
-crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller
+crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
 .beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
 ```

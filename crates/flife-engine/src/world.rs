@@ -88,8 +88,8 @@ use flife_genome::{
     Traits, founder, initial_scale,
 };
 use flife_neural::{
-    ActionDecoding, ControllerScratch, DecodedActions, Intrinsic, SensorScales, decode, observe,
-    widen,
+    ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
+    DecodedActions, Intrinsic, Observation, SensorScales, decode, observe, widen,
 };
 
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
@@ -454,7 +454,38 @@ struct Decision {
 #[derive(Debug, Default)]
 struct DecisionLane {
     controller: ControllerScratch,
+    /// The batched path's observations of this lane's run.
+    observed: Vec<Observation>,
     decisions: Vec<Decision>,
+}
+
+/// What the world's controller backend did, for run records. Not
+/// scientific state: no result depends on the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControllerReport {
+    /// The backend serving the world, or `None` for the reference alone.
+    pub backend: Option<String>,
+    /// Evaluations the backend returned.
+    pub batched: u64,
+    /// Evaluations it deferred, which the reference did.
+    pub deferred: u64,
+    /// Ticks whose phases 3 and 4 the reference redid whole, because the
+    /// batched path met an error: the reference reproduces it exactly, or
+    /// finds none (an allocation that failed only on the batched path).
+    pub reference_ticks: u64,
+    /// Why the backend stopped serving the world, if it failed.
+    pub failure: Option<String>,
+}
+
+/// The world's controller backend and its scratch.
+#[derive(Debug, Default)]
+struct Controllers {
+    backend: Option<Box<dyn ControllerBackend>>,
+    report: ControllerReport,
+    /// One per due evaluation, in identity order.
+    outputs: Vec<Option<[f32; ACTION_WIDTH]>>,
+    /// One per row: the backend's outputs for a due organism it evaluated.
+    by_row: Vec<Option<[f32; ACTION_WIDTH]>>,
 }
 
 /// The fewest organisms worth handing to another thread.
@@ -495,6 +526,7 @@ pub struct World {
     ledger: EnergyLedger,
     fault: Option<NumericalFault>,
     scratch: Scratch,
+    controllers: Controllers,
 }
 
 impl World {
@@ -627,6 +659,7 @@ impl World {
             ledger,
             fault: None,
             scratch,
+            controllers: Controllers::default(),
         })
     }
 
@@ -674,6 +707,28 @@ impl World {
         }
         lanes.resize_with(workers, DecisionLane::default);
         Ok(())
+    }
+
+    /// Evaluate due controllers in one batch on `backend` from the next
+    /// tick, or on the reference alone with `None`. No result depends on
+    /// it: a backend returns the reference's outputs bit for bit and defers
+    /// what it cannot reproduce, and the reference evaluates those
+    /// ([`flife_neural::backend`]). A backend that fails is dropped, and
+    /// [`World::controller_report`] says why.
+    pub fn set_controller_backend(&mut self, backend: Option<Box<dyn ControllerBackend>>) {
+        let controllers = &mut self.controllers;
+        controllers.report.backend = backend.as_ref().map(|backend| backend.describe());
+        controllers.report.failure = None;
+        controllers.backend = backend.map(|mut backend| {
+            backend.forget();
+            backend
+        });
+    }
+
+    /// What the controller backend has done so far.
+    #[must_use]
+    pub const fn controller_report(&self) -> &ControllerReport {
+        &self.controllers.report
     }
 
     /// The event cursor: births and deaths published so far.
@@ -884,6 +939,7 @@ impl World {
             quota,
             ledger,
             scratch,
+            controllers,
             ..
         } = self;
         let Scratch {
@@ -949,7 +1005,15 @@ impl World {
         let view = pyramid.build(observed)?;
         rows.clear();
         rows.extend(population.iter());
-        decide_all(rules, population, &view, rows, [from, to], lanes)?;
+        decide_with(
+            rules,
+            population,
+            &view,
+            rows,
+            [from, to],
+            lanes,
+            controllers,
+        )?;
         working.clear();
         let mut evaluated = 0;
         let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
@@ -1277,6 +1341,51 @@ fn lanes(workers: u32) -> Result<Vec<DecisionLane>, CoreError> {
     Ok(lanes)
 }
 
+/// Phase 3 for one organism (§8.1): its observation at its sensing scale.
+fn observation(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    organism: &Organism,
+    from: Tick,
+) -> Result<Observation, CoreError> {
+    let genome = genome_of(population, organism.id)?;
+    let raw = view.sample(organism.position, genome.traits().sensing_scale())?;
+    let intrinsic = Intrinsic {
+        energy: organism.energy,
+        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
+        velocity: organism.velocity,
+        energy_change_per_second: organism.energy_change_rate,
+    };
+    observe(&raw, &intrinsic, &rules.scales)
+}
+
+/// Whether the organism evaluates its controller for tick `to`: due on its
+/// phase, or forced because it holds no valid output.
+fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
+    !organism.held.is_valid() || to.get() % u64::from(rules.interval) == u64::from(organism.phase)
+}
+
+/// The rest of phase 4: the held output, newly evaluated or not, decoded.
+fn finish(
+    rules: &Rules,
+    organism: &Organism,
+    held: HeldOutput,
+    evaluated: bool,
+    observation: &Observation,
+) -> Result<Decision, CoreError> {
+    let outputs = held.outputs().ok_or_else(|| CoreError::StateConflict {
+        operation: "decode held output",
+        detail: format!("{} holds no valid output", organism.id),
+    })?;
+    Ok(Decision {
+        held,
+        evaluated,
+        actions: decode(&widen(outputs), rules.step, &rules.decoding)?,
+        gradients: observation.gradients,
+    })
+}
+
 /// Phases 3 and 4 for one organism (§8.1): its observation at its sensing
 /// scale, then its due or forced evaluation, decoded.
 fn decide(
@@ -1287,81 +1396,34 @@ fn decide(
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
-    let genome = genome_of(population, organism.id)?;
-    let traits = genome.traits();
-    let raw = view.sample(organism.position, traits.sensing_scale())?;
-    let intrinsic = Intrinsic {
-        energy: organism.energy,
-        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
-        velocity: organism.velocity,
-        energy_change_per_second: organism.energy_change_rate,
-    };
-    let observation = observe(&raw, &intrinsic, &rules.scales)?;
-    let due = !organism.held.is_valid()
-        || to.get() % u64::from(rules.interval) == u64::from(organism.phase);
+    let observation = observation(rules, population, view, organism, from)?;
+    let due = due(rules, organism, to);
     let held = if due {
-        let outputs = genome
+        let outputs = genome_of(population, organism.id)?
             .controller(&rules.catalog, &rules.limits)?
             .evaluate(&observation.inputs, controller)?;
         HeldOutput::evaluated(to, outputs)?
     } else {
         organism.held
     };
-    let outputs = held.outputs().ok_or_else(|| CoreError::StateConflict {
-        operation: "decode held output",
-        detail: format!("{} holds no valid output", organism.id),
-    })?;
-    Ok(Decision {
-        held,
-        evaluated: due,
-        actions: decode(&widen(outputs), rules.step, &rules.decoding)?,
-        gradients: observation.gradients,
-    })
+    finish(rules, organism, held, due, &observation)
 }
 
-/// Phases 3 and 4 for every row, on at most `lanes.len()` threads: this one
-/// and scoped workers it joins before returning. That is plan §3.4's bounded
-/// reference adapter, not Asupersync-scheduled parallelism. The rows are split
-/// into contiguous identity-ordered runs, one per lane, and each lane's
-/// decisions follow its run. An organism's decision reads only committed
-/// state, so the split cannot change any result, and the error returned is the
-/// first in identity order, as a single thread would report it.
-fn decide_all(
-    rules: &Rules,
-    population: &Population,
-    view: &PyramidView<'_>,
-    rows: &[Organism],
-    ticks: [Tick; 2],
-    lanes: &mut [DecisionLane],
-) -> Result<(), CoreError> {
-    for lane in lanes.iter_mut() {
-        lane.decisions.clear();
-    }
+/// Run `work` over `rows` on at most `lanes.len()` threads: this one and
+/// scoped workers it joins before returning. That is plan §3.4's bounded
+/// reference adapter, not Asupersync-scheduled parallelism. The rows are
+/// split into contiguous identity-ordered runs, the same split for the same
+/// row and lane counts, one per lane; `work` gets the index of its run's
+/// first row. The error returned is the first in identity order, as a
+/// single thread would report it.
+fn in_runs<F>(rows: &[Organism], lanes: &mut [DecisionLane], work: &F) -> Result<(), CoreError>
+where
+    F: Fn(usize, &[Organism], &mut DecisionLane) -> Result<(), CoreError> + Sync,
+{
     let used = lanes
         .len()
         .min(rows.len().div_ceil(MINIMUM_ROWS_PER_LANE))
         .max(1);
-    let run = |rows: &[Organism], lane: &mut DecisionLane| -> Result<(), CoreError> {
-        lane.decisions
-            .try_reserve(rows.len())
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "decisions",
-                bytes: u64::try_from(rows.len().saturating_mul(size_of::<Decision>()))
-                    .unwrap_or(u64::MAX),
-            })?;
-        for organism in rows {
-            let decision = decide(
-                rules,
-                population,
-                view,
-                organism,
-                ticks,
-                &mut lane.controller,
-            )?;
-            lane.decisions.push(decision);
-        }
-        Ok(())
-    };
     let Some((first, others)) = lanes.split_first_mut() else {
         return Err(CoreError::StateConflict {
             operation: "decide",
@@ -1369,18 +1431,18 @@ fn decide_all(
         });
     };
     if used == 1 {
-        return run(rows, first);
+        return work(0, rows, first);
     }
     let length = rows.len().div_ceil(used);
     let mut runs = rows.chunks(length);
     let head = runs.next().unwrap_or(&[]);
-    let run = &run;
     std::thread::scope(|scope| {
         let workers: Vec<_> = runs
             .zip(others.iter_mut())
-            .map(|(rows, lane)| scope.spawn(move || run(rows, lane)))
+            .enumerate()
+            .map(|(index, (run, lane))| scope.spawn(move || work((index + 1) * length, run, lane)))
             .collect();
-        let mut result = run(head, first);
+        let mut result = work(0, head, first);
         for worker in workers {
             let joined = worker.join().unwrap_or_else(|_| {
                 Err(CoreError::StateConflict {
@@ -1393,6 +1455,212 @@ fn decide_all(
             }
         }
         result
+    })
+}
+
+fn reserve_for<T>(
+    vector: &mut Vec<T>,
+    count: usize,
+    buffer: &'static str,
+) -> Result<(), CoreError> {
+    vector
+        .try_reserve(count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer,
+            bytes: u64::try_from(count.saturating_mul(size_of::<T>())).unwrap_or(u64::MAX),
+        })
+}
+
+/// Phases 3 and 4 for every row on the reference, each lane's decisions
+/// following its run (see [`in_runs`]). An organism's decision reads only
+/// committed state, so the split cannot change any result.
+fn decide_all(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    rows: &[Organism],
+    ticks: [Tick; 2],
+    lanes: &mut [DecisionLane],
+) -> Result<(), CoreError> {
+    for lane in lanes.iter_mut() {
+        lane.decisions.clear();
+    }
+    in_runs(rows, lanes, &|_, run, lane| {
+        reserve_for(&mut lane.decisions, run.len(), "decisions")?;
+        for organism in run {
+            let decision = decide(
+                rules,
+                population,
+                view,
+                organism,
+                ticks,
+                &mut lane.controller,
+            )?;
+            lane.decisions.push(decision);
+        }
+        Ok(())
+    })
+}
+
+/// How the batched path ended.
+enum Batched {
+    /// Every decision is made: `batched` evaluations came from the backend
+    /// and `deferred` from the reference.
+    Done { batched: u64, deferred: u64 },
+    /// The backend failed.
+    Device(CoreError),
+}
+
+/// Phases 3 and 4 for every row, with the due evaluations batched on the
+/// world's backend if it has one. Any error on the batched path hands the
+/// tick to [`decide_all`], which reproduces the reference's own error (or
+/// finds none), so the result is always the reference's.
+fn decide_with(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    rows: &[Organism],
+    ticks: [Tick; 2],
+    lanes: &mut [DecisionLane],
+    controllers: &mut Controllers,
+) -> Result<(), CoreError> {
+    let Controllers {
+        backend,
+        report,
+        outputs,
+        by_row,
+    } = controllers;
+    let Some(device) = backend.as_deref_mut() else {
+        return decide_all(rules, population, view, rows, ticks, lanes);
+    };
+    match decide_batched(
+        rules, population, view, rows, ticks, lanes, device, outputs, by_row,
+    ) {
+        Ok(Batched::Done { batched, deferred }) => {
+            report.batched = report.batched.saturating_add(batched);
+            report.deferred = report.deferred.saturating_add(deferred);
+            Ok(())
+        }
+        Ok(Batched::Device(error)) => {
+            report.failure = Some(error.to_string());
+            *backend = None;
+            report.reference_ticks = report.reference_ticks.saturating_add(1);
+            decide_all(rules, population, view, rows, ticks, lanes)
+        }
+        Err(_) => {
+            report.reference_ticks = report.reference_ticks.saturating_add(1);
+            decide_all(rules, population, view, rows, ticks, lanes)
+        }
+    }
+}
+
+/// The batched path: every observation on the lanes, the due evaluations
+/// in one call to `device`, then each lane's decisions, evaluating what the
+/// device deferred on the reference.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "phase 3 and 4's inputs and the backend's two scratch vectors"
+)]
+fn decide_batched(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    rows: &[Organism],
+    [from, to]: [Tick; 2],
+    lanes: &mut [DecisionLane],
+    device: &mut dyn ControllerBackend,
+    outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+    by_row: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+) -> Result<Batched, CoreError> {
+    for lane in lanes.iter_mut() {
+        lane.observed.clear();
+        lane.decisions.clear();
+    }
+    in_runs(rows, lanes, &|_, run, lane| {
+        reserve_for(&mut lane.observed, run.len(), "observations")?;
+        for organism in run {
+            let observed = observation(rules, population, view, organism, from)?;
+            lane.observed.push(observed);
+        }
+        Ok(())
+    })?;
+
+    let observed = lanes.iter().flat_map(|lane| lane.observed.iter());
+    let mut jobs = Vec::new();
+    reserve_for(&mut jobs, rows.len(), "controller jobs")?;
+    let mut seen = 0;
+    for (organism, observation) in rows.iter().zip(observed) {
+        seen += 1;
+        if due(rules, organism, to) {
+            jobs.push(ControllerJob {
+                genome: organism.genome,
+                controller: genome_of(population, organism.id)?
+                    .controller(&rules.catalog, &rules.limits)?,
+                inputs: &observation.inputs,
+            });
+        }
+    }
+    if seen != rows.len() {
+        return Err(CoreError::StateConflict {
+            operation: "batch observations",
+            detail: format!("{seen} observations for {} organisms", rows.len()),
+        });
+    }
+    outputs.clear();
+    if !jobs.is_empty() {
+        if let Err(error) = device.evaluate(&jobs, outputs) {
+            return Ok(Batched::Device(error));
+        }
+        if outputs.len() != jobs.len() {
+            return Ok(Batched::Device(CoreError::StateConflict {
+                operation: "batch controllers",
+                detail: format!("{} outputs for {} jobs", outputs.len(), jobs.len()),
+            }));
+        }
+    }
+    drop(jobs);
+
+    by_row.clear();
+    reserve_for(by_row, rows.len(), "batched outputs")?;
+    let mut next = outputs.iter();
+    for organism in rows {
+        let output = if due(rules, organism, to) {
+            next.next().copied().flatten()
+        } else {
+            None
+        };
+        by_row.push(output);
+    }
+    let by_row: &[Option<[f32; ACTION_WIDTH]>] = by_row;
+    in_runs(rows, lanes, &|start, run, lane| {
+        let DecisionLane {
+            controller,
+            observed,
+            decisions,
+        } = lane;
+        reserve_for(decisions, run.len(), "decisions")?;
+        for (index, (organism, observation)) in run.iter().zip(observed.iter()).enumerate() {
+            let evaluated = due(rules, organism, to);
+            let held = if evaluated {
+                let outputs = match by_row.get(start + index).copied().flatten() {
+                    Some(outputs) => outputs,
+                    None => genome_of(population, organism.id)?
+                        .controller(&rules.catalog, &rules.limits)?
+                        .evaluate(&observation.inputs, controller)?,
+                };
+                HeldOutput::evaluated(to, outputs)?
+            } else {
+                organism.held
+            };
+            decisions.push(finish(rules, organism, held, evaluated, observation)?);
+        }
+        Ok(())
+    })?;
+    let deferred = outputs.iter().filter(|output| output.is_none()).count();
+    let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+    Ok(Batched::Done {
+        batched: count(outputs.len() - deferred),
+        deferred: count(deferred),
     })
 }
 

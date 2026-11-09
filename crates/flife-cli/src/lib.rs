@@ -19,6 +19,7 @@ pub mod render;
 pub mod run;
 pub mod validate;
 
+pub use flife_backend_metal::ControllerChoice;
 pub use observe::{Heredity, Survey, Tally};
 pub use render::{RENDER_SCHEMA, RenderOptions, RenderRecord, render};
 pub use run::{

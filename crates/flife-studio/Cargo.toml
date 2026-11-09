@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 asupersync.workspace = true
 clap.workspace = true
+flife-backend-metal = { path = "../flife-backend-metal" }
 flife-core = { path = "../flife-core" }
 flife-engine = { path = "../flife-engine" }
 flife-manim = { path = "../flife-manim" }

@@ -348,6 +348,12 @@ impl<'a> ReferenceController<'a> {
         self.topology
     }
 
+    /// The parameters, in the topology's layout.
+    #[must_use]
+    pub const fn parameters(&self) -> &'a [f32] {
+        self.parameters
+    }
+
     /// Evaluate the controller on one observation's inputs, giving the 36
     /// raw outputs of its linear final layer.
     ///

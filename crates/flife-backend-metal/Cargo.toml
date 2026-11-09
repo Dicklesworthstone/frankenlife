@@ -12,5 +12,8 @@ flife-core = { path = "../flife-core" }
 flife-neural = { path = "../flife-neural" }
 ft-kernel-metal.workspace = true
 
+[dev-dependencies]
+flife-engine = { path = "../flife-engine" }
+
 [lints]
 workspace = true

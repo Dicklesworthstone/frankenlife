@@ -13,15 +13,20 @@
 //!   F32 accumulation in a declared order, `tanh` hidden layers and a
 //!   linear output layer, over each organism's own parameters.
 //!
+//! - [`backend`]: the port through which the engine hands a tick's due
+//!   evaluations to an exact batch backend (FL-030's Metal kernel).
+//!
 //! The density pyramid itself is `flife_field::pyramid`. The FrankenTorch
 //! population adapter is FL-025.
 
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod backend;
 pub mod controller;
 pub mod sensors;
 
 pub use actions::{ACTION_WIDTH, ActionDecoding, DecodedActions, Emission, decode};
+pub use backend::{ControllerBackend, ControllerJob};
 pub use controller::{ControllerScratch, DenseTopology, LayerShape, ReferenceController, widen};
 pub use sensors::{Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe};

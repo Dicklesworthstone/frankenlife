@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use flife_backend_metal::ControllerChoice;
 use flife_core::ValidatedConfig;
 use flife_studio::{End, STUDIO_SCHEMA, Status, Studio, StudioOptions};
 use serde::Serialize;
@@ -48,6 +49,10 @@ struct Cli {
     /// depends on it.
     #[arg(long, default_value = "auto", value_parser = parse_workers)]
     cpu_workers: NonZeroUsize,
+    /// Where due controllers are evaluated: `metal`, `cpu`, or `auto` (the
+    /// default) for Metal where this host has it. No result depends on it.
+    #[arg(long, default_value = "auto")]
+    controllers: ControllerChoice,
 }
 
 /// A worker count, or `auto`.
@@ -78,6 +83,7 @@ enum Record<'a> {
         window: [u32; 2],
         frames_per_second: u32,
         cpu_workers: usize,
+        controllers: &'a str,
     },
     Status {
         schema: &'static str,
@@ -111,6 +117,9 @@ enum Record<'a> {
         pointer_moves: u64,
         resizes: u64,
         input_dropped: u64,
+        controller_evaluations: u64,
+        deferred_evaluations: u64,
+        controller_failure: Option<String>,
         wall_seconds: f64,
     },
 }
@@ -136,6 +145,7 @@ fn main() -> ExitCode {
         resizable: !cli.fixed,
         cpu_workers: Some(cli.cpu_workers),
         run_on_open: !cli.paused,
+        controllers: cli.controllers,
         ..StudioOptions::default()
     };
     let clock = Instant::now();
@@ -154,6 +164,7 @@ fn main() -> ExitCode {
         window: studio.view().viewport().drawable(),
         frames_per_second: fps,
         cpu_workers: cli.cpu_workers.get(),
+        controllers: studio.controllers(),
     });
 
     let period = Duration::from_secs(1) / fps;
@@ -206,6 +217,9 @@ fn main() -> ExitCode {
                 pointer_moves: closed.input.pointer_moves,
                 resizes: closed.input.resizes,
                 input_dropped: closed.input_dropped,
+                controller_evaluations: closed.session.world.controller_report().batched,
+                deferred_evaluations: closed.session.world.controller_report().deferred,
+                controller_failure: closed.session.world.controller_report().failure.clone(),
                 wall_seconds: clock.elapsed().as_secs_f64(),
             });
             ExitCode::SUCCESS

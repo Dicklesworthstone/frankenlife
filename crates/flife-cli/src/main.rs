@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use flife_cli::{ERROR_SCHEMA, RunOptions, Stop, Validation};
+use flife_cli::{ControllerChoice, ERROR_SCHEMA, RunOptions, Stop, Validation};
 use flife_core::ValidatedConfig;
 use serde::Serialize;
 
@@ -48,6 +48,10 @@ enum Command {
         /// result depends on it.
         #[arg(long, value_parser = parse_workers)]
         cpu_workers: Option<NonZeroUsize>,
+        /// Where due controllers are evaluated: `metal`, `cpu`, or `auto`
+        /// for Metal where this host has it. No result depends on it.
+        #[arg(long, default_value = "auto")]
+        controllers: ControllerChoice,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -72,6 +76,9 @@ enum Command {
         /// Threads for the world: a count or `auto`.
         #[arg(long, default_value = "auto", value_parser = parse_workers)]
         cpu_workers: NonZeroUsize,
+        /// Where due controllers are evaluated: `metal`, `cpu`, or `auto`.
+        #[arg(long, default_value = "auto")]
+        controllers: ControllerChoice,
         /// Threads for FrankenManim's CPU renderer: a count or `auto`.
         #[arg(long, default_value = "auto", value_parser = parse_workers)]
         render_threads: NonZeroUsize,
@@ -108,6 +115,7 @@ fn main() -> ExitCode {
             height,
             out,
             cpu_workers,
+            controllers,
             render_threads,
             video,
             fps,
@@ -117,7 +125,7 @@ fn main() -> ExitCode {
             every,
             [width, height],
             out,
-            cpu_workers,
+            (cpu_workers, controllers),
             render_threads,
             video,
             fps,
@@ -127,6 +135,7 @@ fn main() -> ExitCode {
             ticks,
             every,
             cpu_workers,
+            controllers,
         } => {
             let config = match load(&config) {
                 Ok(config) => config,
@@ -138,6 +147,7 @@ fn main() -> ExitCode {
                     ticks,
                     every,
                     cpu_workers,
+                    controllers,
                 },
                 print,
             ) {
@@ -165,7 +175,7 @@ fn render(
     every: u64,
     size: [u32; 2],
     out: PathBuf,
-    cpu_workers: NonZeroUsize,
+    (cpu_workers, controllers): (NonZeroUsize, ControllerChoice),
     render_threads: NonZeroUsize,
     video: Option<PathBuf>,
     fps: u32,
@@ -180,6 +190,7 @@ fn render(
         size,
         out,
         cpu_workers: Some(cpu_workers),
+        controllers,
         render_threads,
         video,
         fps,

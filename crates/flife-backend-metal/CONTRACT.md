@@ -6,12 +6,23 @@ FrankenTorch's generic compute gateway (`ft_kernel_metal::compute`), compiled in
 This crate is `forbid(unsafe_code)`; the Metal FFI is upstream.
 
 **Inputs.**
-- `Batch::push(topology, parameters, inputs)`: one organism's catalog topology, its parameters in the reference
-  layout, and its observation's 104 F64 inputs. Organisms of different topologies share a batch.
-- `MetalControllers::open()`, then `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.
+- The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
+  `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
+  one batch (`ControllerJob`: genome identity, admitted controller, inputs). `ControllerChoice` (`cpu`, `metal`,
+  `auto`) is what the CLI and Studio select it with.
+- The kernel alone: `Batch::push(topology, parameters, inputs)` for one organism's catalog topology, its parameters
+  in the reference layout and its observation's 104 F64 inputs (topologies may mix in a batch); then
+  `MetalControllers::open()`, `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.
 
 **Outputs.** One entry per organism, in batch order: its 36 raw outputs, or `None` for a deferred organism. The
 caller evaluates a deferred organism on the reference controller.
+
+**Residency.** `MetalBackend` keeps every buffer on the device across ticks. A genome's parameters are copied once
+and found again by genome identity. A hit is used only if the slot was copied from the same memory (pointer and
+length): genome parameters are immutable, so that identifies them even if a world were rewound. Each tick writes
+only the inputs and job words in place (`SharedBuffer::write_f32/write_u32`, FrankenTorch `1c4febfb`). When the
+parameter buffer fills, it is rebuilt at 1.5 times the current batch's need, which drops dead genomes. A job the
+kernel cannot shape, or whose inputs are not finite in F32, is deferred without dispatch.
 
 **Invariants.**
 - Every non-deferred output is the reference controller's, bit for bit:
@@ -56,6 +67,12 @@ compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `Lay
     1,101,004,800 patterns, zero and subnormals included, in about 3 s each. The fast path must fall back at least
     once and fewer than 1,000,000 times, so the fallback is exercised and the fast path carries the load.
   - Negative inputs (64 random windows of 65,536) and the saturated region equal the reference.
+- `tests/world.rs` (2 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
+  evaluated every tick) runs 400 ticks with its controllers on Metal next to the reference world. The digests
+  match at every tick, through the founder crash, 42 births and mutation. All 1,254,756 evaluations came from the
+  device (none deferred, no tick redone on the reference). The planted negative flips one output bit of one
+  organism at tick 9 inside a wrapping backend, and the digests must differ at exactly tick 9. Off macOS the test
+  checks the typed `MissingCapability` refusal instead.
 - `tests/forward.rs` (2 tests):
   - 2,000 organisms in one batch, over all five catalog topologies and six regimes: typical, saturating, small,
     subnormal, hidden overflow and output overflow. Every output is bit-identical to the reference, and the batch
@@ -105,7 +122,17 @@ in-place `SharedBuffer::write_f32/write_u32` for that.
 
 **Validity domain.** Apple GPUs through the gateway's safe math mode; the dense-104-36-v1 catalog's shapes.
 
+Whole ticks (`flife run`, preset, 512 ticks, median of three interleaved runs, cv ≤ 2.5%, same digest in all 12
+runs): one CPU worker 27.7 ms per tick with the reference and 12.5 ms with Metal (41.2 and 17.8 ms over the first
+128 ticks, with all founders alive); 16 workers 9.5 and 9.6 ms. On 16 workers the main thread spends 19% in phases 3
+and 4 (10% waiting on `MetalBackend::evaluate`) and most of the rest in serial phases. Those are chemistry
+composition (14%), the field step (11%), uptake, deposits, grants and invariant checks (each about 5%), and
+per-pass thread spawning (6%).
+
 **Known gaps.**
-- The engine does not call this yet. Still to do: wiring the batch into the tick (`decide_all`) behind a switch with
-  a resident parameter arena, and showing a whole-world digest equal to the CPU run's.
+- Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
+  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them). On many CPU workers the tick
+  is bound by those, so Metal does not shorten it there.
+- FL-030's closure also needs FL-026's packed genome arenas and FL-029's batched submission upstream, and its
+  resident-bandwidth benchmark against §19.2's weight-stream bound.
 - No CUDA backend exists: FrankenTorch has no CUDA crate, and no host here has an NVIDIA GPU.

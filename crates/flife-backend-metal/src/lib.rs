@@ -22,8 +22,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
+
 use flife_core::CoreError;
-use flife_neural::{ACTION_WIDTH, DenseTopology, SENSOR_WIDTH};
+use flife_core::ids::GenomeId;
+use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH};
 use ft_kernel_metal::Error as MetalError;
 use ft_kernel_metal::compute::{Gateway, Grid, Pipeline, SharedBuffer};
 
@@ -473,5 +476,328 @@ impl MetalControllers {
         out.clear();
         out.extend(values.as_chunks::<3>().0.iter().copied());
         Ok(())
+    }
+}
+
+/// Where one genome's parameters sit in the resident buffer, and which
+/// memory they were copied from.
+#[derive(Debug, Clone, Copy)]
+struct Slot {
+    offset: usize,
+    address: usize,
+    length: usize,
+}
+
+/// [`MetalControllers`] behind the engine's controller port, with every
+/// buffer resident. A genome's parameters are copied to the device once and
+/// reused while it lives; each tick writes only the inputs and job words in
+/// place. When the parameter buffer fills, it is rebuilt from the current
+/// batch alone, which drops the genomes that died.
+pub struct MetalBackend {
+    controllers: MetalControllers,
+    slots: HashMap<GenomeId, Slot>,
+    parameters: Option<SharedBuffer>,
+    /// F32s the parameter buffer holds, and how many are in use.
+    capacity: usize,
+    used: usize,
+    /// Per-organism buffers, sized for `organisms`.
+    organisms: usize,
+    inputs: Option<SharedBuffer>,
+    jobs: Option<SharedBuffer>,
+    raw: Option<SharedBuffer>,
+    faults: Option<SharedBuffer>,
+    /// Host staging, reused.
+    staged_inputs: Vec<f32>,
+    staged_jobs: Vec<u32>,
+    dispatched: Vec<usize>,
+    values: Vec<f32>,
+    flags: Vec<u32>,
+}
+
+impl std::fmt::Debug for MetalBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetalBackend")
+            .field("device", &self.controllers.device_name())
+            .field("resident_genomes", &self.slots.len())
+            .field("parameter_capacity", &self.capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MetalBackend {
+    /// Open the default Metal device and compile the kernels.
+    ///
+    /// # Errors
+    /// As [`MetalControllers::open`].
+    pub fn open() -> Result<Self, CoreError> {
+        Ok(Self {
+            controllers: MetalControllers::open()?,
+            slots: HashMap::new(),
+            parameters: None,
+            capacity: 0,
+            used: 0,
+            organisms: 0,
+            inputs: None,
+            jobs: None,
+            raw: None,
+            faults: None,
+            staged_inputs: Vec::new(),
+            staged_jobs: Vec::new(),
+            dispatched: Vec::new(),
+            values: Vec::new(),
+            flags: Vec::new(),
+        })
+    }
+
+    /// Genomes whose parameters are resident.
+    #[must_use]
+    pub fn resident_genomes(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Make every dispatched job's parameters resident, rebuilding the
+    /// buffer from this batch alone when they do not fit.
+    fn place(&mut self, jobs: &[ControllerJob<'_>]) -> Result<(), CoreError> {
+        let mut missing = 0_usize;
+        for &index in &self.dispatched {
+            let Some(job) = jobs.get(index) else { continue };
+            let parameters = job.controller.parameters();
+            let hit = self.slots.get(&job.genome).is_some_and(|slot| {
+                slot.address == parameters.as_ptr() as usize && slot.length == parameters.len()
+            });
+            if !hit {
+                missing = missing.saturating_add(parameters.len());
+            }
+        }
+        if self.parameters.is_none() || self.used.saturating_add(missing) > self.capacity {
+            let needed: usize = self
+                .dispatched
+                .iter()
+                .filter_map(|&index| jobs.get(index))
+                .map(|job| job.controller.parameters().len())
+                .sum();
+            let capacity = needed.saturating_add(needed / 2).max(1 << 16);
+            self.parameters = Some(
+                self.controllers
+                    .gateway
+                    .buffer_zeroed(capacity * size_of::<f32>())
+                    .map_err(metal)?,
+            );
+            self.capacity = capacity;
+            self.used = 0;
+            self.slots.clear();
+        }
+        let Some(buffer) = self.parameters.as_mut() else {
+            return Err(CoreError::StateConflict {
+                operation: "metal controller residency",
+                detail: "no parameter buffer".to_owned(),
+            });
+        };
+        for &index in &self.dispatched {
+            let Some(job) = jobs.get(index) else { continue };
+            let parameters = job.controller.parameters();
+            let address = parameters.as_ptr() as usize;
+            let hit = self
+                .slots
+                .get(&job.genome)
+                .is_some_and(|slot| slot.address == address && slot.length == parameters.len());
+            if hit {
+                continue;
+            }
+            buffer.write_f32(self.used, parameters).map_err(metal)?;
+            self.slots.insert(
+                job.genome,
+                Slot {
+                    offset: self.used,
+                    address,
+                    length: parameters.len(),
+                },
+            );
+            self.used += parameters.len();
+        }
+        Ok(())
+    }
+
+    /// Grow the per-organism buffers to hold `count` organisms.
+    fn hold(&mut self, count: usize) -> Result<(), CoreError> {
+        if count <= self.organisms && self.inputs.is_some() {
+            return Ok(());
+        }
+        let organisms = count.next_power_of_two().max(256);
+        let gateway = &self.controllers.gateway;
+        let zeroed = |bytes: usize| gateway.buffer_zeroed(bytes).map_err(metal);
+        self.inputs = Some(zeroed(organisms * SENSOR_WIDTH * size_of::<f32>())?);
+        self.jobs = Some(zeroed(organisms * JOB_WORDS * size_of::<u32>())?);
+        self.raw = Some(zeroed(organisms * ACTION_WIDTH * size_of::<f32>())?);
+        self.faults = Some(zeroed(organisms * size_of::<u32>())?);
+        self.organisms = organisms;
+        Ok(())
+    }
+}
+
+impl ControllerBackend for MetalBackend {
+    fn describe(&self) -> String {
+        format!("metal ({})", self.controllers.device_name())
+    }
+
+    fn forget(&mut self) {
+        self.slots.clear();
+        self.used = 0;
+    }
+
+    fn evaluate(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+    ) -> Result<(), CoreError> {
+        outputs.clear();
+        reserve(outputs, jobs.len(), "metal controller outputs")?;
+        self.dispatched.clear();
+        self.staged_inputs.clear();
+        // A job the kernel cannot take, or whose inputs the reference
+        // refuses, is deferred: the reference evaluates it, or refuses it.
+        for (index, entry) in jobs.iter().enumerate() {
+            let finite = entry.inputs.iter().all(|&value| (value as f32).is_finite());
+            let shaped = job(
+                entry.controller.topology(),
+                entry.controller.parameters().len(),
+                0,
+            )
+            .is_ok();
+            if finite && shaped {
+                reserve(&mut self.dispatched, 1, "metal controller dispatch")?;
+                self.dispatched.push(index);
+            }
+        }
+        if !self.dispatched.is_empty() {
+            self.place(jobs)?;
+            let count = self.dispatched.len();
+            self.hold(count)?;
+            reserve(
+                &mut self.staged_inputs,
+                count * SENSOR_WIDTH,
+                "metal inputs",
+            )?;
+            self.staged_jobs.clear();
+            reserve(&mut self.staged_jobs, count * JOB_WORDS, "metal jobs")?;
+            for &index in &self.dispatched {
+                let Some(job_entry) = jobs.get(index) else {
+                    continue;
+                };
+                let offset = self
+                    .slots
+                    .get(&job_entry.genome)
+                    .map(|slot| slot.offset)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "metal controller residency",
+                        detail: format!("{} is not resident", job_entry.genome),
+                    })?;
+                let words = job(
+                    job_entry.controller.topology(),
+                    job_entry.controller.parameters().len(),
+                    offset,
+                )?;
+                self.staged_jobs.extend_from_slice(&words);
+                self.staged_inputs
+                    .extend(job_entry.inputs.iter().map(|&value| value as f32));
+            }
+            let (Some(parameters), Some(inputs), Some(job_words), Some(raw), Some(faults)) = (
+                self.parameters.as_ref(),
+                self.inputs.as_mut(),
+                self.jobs.as_mut(),
+                self.raw.as_ref(),
+                self.faults.as_ref(),
+            ) else {
+                return Err(CoreError::StateConflict {
+                    operation: "metal controller residency",
+                    detail: "buffers missing".to_owned(),
+                });
+            };
+            inputs.write_f32(0, &self.staged_inputs).map_err(metal)?;
+            job_words.write_u32(0, &self.staged_jobs).map_err(metal)?;
+            self.controllers
+                .gateway
+                .dispatch(
+                    &self.controllers.forward,
+                    &[parameters, inputs, job_words, raw, faults],
+                    Grid::linear(count, FORWARD_THREADS),
+                )
+                .map_err(metal)?;
+            self.values.clear();
+            self.values.resize(count * ACTION_WIDTH, 0.0);
+            raw.read_f32(&mut self.values).map_err(metal)?;
+            self.flags.clear();
+            self.flags.resize(count, 0);
+            faults.read_u32(&mut self.flags).map_err(metal)?;
+        }
+        let mut dispatched = self.dispatched.iter().zip(
+            self.values
+                .as_chunks::<ACTION_WIDTH>()
+                .0
+                .iter()
+                .zip(&self.flags),
+        );
+        let mut next = dispatched.next();
+        for index in 0..jobs.len() {
+            match next {
+                Some((&at, (row, &flag))) if at == index => {
+                    outputs.push((flag == 0).then_some(*row));
+                    next = dispatched.next();
+                }
+                _ => outputs.push(None),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which controller evaluator a run uses. No result depends on the choice;
+/// it decides only where the arithmetic runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ControllerChoice {
+    /// The CPU reference alone.
+    Cpu,
+    /// The Metal backend; refused on a host without a Metal device.
+    Metal,
+    /// Metal where this host has a Metal device, otherwise the CPU
+    /// reference.
+    #[default]
+    Auto,
+}
+
+impl ControllerChoice {
+    /// The backend this choice selects on this host, or `None` for the CPU
+    /// reference.
+    ///
+    /// # Errors
+    /// For [`ControllerChoice::Metal`], [`MetalBackend::open`]'s errors. For
+    /// [`ControllerChoice::Auto`], those other than a missing Metal device:
+    /// a Mac whose kernel does not compile is a defect to report, not a
+    /// reason to fall back quietly.
+    pub fn backend(self) -> Result<Option<Box<dyn ControllerBackend>>, CoreError> {
+        let boxed = |backend: MetalBackend| -> Box<dyn ControllerBackend> { Box::new(backend) };
+        match self {
+            Self::Cpu => Ok(None),
+            Self::Metal => MetalBackend::open().map(boxed).map(Some),
+            Self::Auto => match MetalBackend::open() {
+                Ok(backend) => Ok(Some(boxed(backend))),
+                Err(CoreError::MissingCapability { .. }) => Ok(None),
+                Err(error) => Err(error),
+            },
+        }
+    }
+}
+
+impl std::str::FromStr for ControllerChoice {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "cpu" => Ok(Self::Cpu),
+            "metal" => Ok(Self::Metal),
+            "auto" => Ok(Self::Auto),
+            other => Err(format!("`{other}` is not `cpu`, `metal` or `auto`")),
+        }
     }
 }

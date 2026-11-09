@@ -10,8 +10,11 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
-- `flife run <config> --ticks N --every K`, with N = 1,024 and K = 128 by default.
-- In the library, `run(config, RunOptions { ticks, every }, emit)`. `emit` receives every record in order.
+- `flife run <config> --ticks N --every K --cpu-workers W --controllers C`, with N = 1,024, K = 128, W from the
+  configuration and C = `auto` by default. C is `cpu` (the reference alone), `metal` (refused without a Metal device)
+  or `auto` (Metal where the host has it). `flife render` takes the same `--controllers`.
+- In the library, `run(config, RunOptions { ticks, every, cpu_workers, controllers }, emit)`. `emit` receives every
+  record in order.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
@@ -23,11 +26,13 @@ preset is `presets/reference-small-world.toml`. The crate is the `flife` command
   - `end`: why the run stopped (`reached`, `capacity-paused` or `failed` with the error's kind), the committed tick
     and world digest, the whole tally, and the survey of the committed world.
 
-  `progress` and `end` also carry `wall_seconds`, which is not scientific state. `start` carries `cpu_workers`,
-  which no result depends on.
+  `progress` and `end` also carry `wall_seconds`, which is not scientific state. `start` carries `cpu_workers` and
+  `controllers` (the backend and device, or `cpu-reference`), which no result depends on. `end` carries
+  `controllers`: the backend, the evaluations it returned and deferred, the ticks the reference redid whole, and why
+  the backend failed if it did. Those say where the arithmetic ran, so a record shows whether the GPU did the work.
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
-  the video path if encoded, wall seconds). Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
+  the video path if encoded, the controller summary, wall seconds). Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
   route. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg`.
 - `Tally`:
   - published ticks;

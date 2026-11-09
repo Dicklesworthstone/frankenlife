@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_studio::{
-    End, Frame, KEY_ESCAPE, KEY_PERIOD, KEY_RIGHT, KEY_SPACE, Status, Studio, StudioOptions,
+    ControllerChoice, End, Frame, KEY_ESCAPE, KEY_PERIOD, KEY_RIGHT, KEY_SPACE, Status, Studio,
+    StudioOptions,
 };
 use fmn_render::metal::{LogicalPoint, Modifiers, PointerButton, SyntheticInput};
 
@@ -129,6 +130,9 @@ fn live() -> Result<Vec<String>, String> {
         // parallel tick computes the directly stepped (one-thread) world.
         cpu_workers: std::num::NonZeroUsize::new(4),
         run_on_open: false,
+        // Metal where the host has it: the closing digest check then also
+        // shows the GPU-evaluated world is the directly stepped one.
+        controllers: ControllerChoice::Auto,
     };
     let studio = Studio::open(&config, &options).map_err(|error| format!("opening: {error}"))?;
     let mut live = Live {

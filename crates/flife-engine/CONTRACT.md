@@ -434,6 +434,14 @@ velocity, first-order splitting at the configured fixed timestep.
   per-source deposit order. The threads are scoped `std` threads spawned per tick: a bounded, reported reference
   adapter (§3.4, §12.5), not Asupersync-scheduled work. Invariant checks, chemistry composition, uptake and the
   commit stay on one thread, and a persistent pool is later work. Parallel phases must keep these reduction orders.
+- `World::set_controller_backend` (FL-030) hands each tick's due evaluations to a `flife_neural::ControllerBackend`
+  in one batch, in identity order. Observations are made on the lanes first, then the backend is called once, then
+  each lane decodes its run, evaluating what the backend deferred on the reference. Any error on that path hands
+  the tick to the reference path, which reproduces the reference's own error. A backend that fails is dropped, with
+  the reason in `World::controller_report`. No result depends on the backend. `tests/controller_backend.rs` runs the
+  preset at 512 founders for 300 ticks through a CPU batch backend that defers one job in seven, and the digests
+  match the reference at every tick. Two planted negatives: one flipped output bit must change that tick's digest,
+  and a planted device failure must leave the world unchanged and be reported.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.

@@ -161,10 +161,11 @@ weights: the reference F32 profile of §10.3.
   under FL-010. This crate samples at any admitted scale.
 - Charging for emission, reproduction attempts and their budget order are FL-011.
 - The reference controller is scalar and single-threaded: 9,856 multiply-adds per default evaluation, written for
-  a declared order rather than for speed. Population inference is FL-025 (FrankenTorch CPU) and FL-030 (Metal),
-  each a separate numerical profile compared against this one under declared tolerances. Metal contracts
-  multiply-adds by default, so bitwise parity is not expected there. (FrankenTorch's gateway compiles in an
-  IEEE-safe mode, which may make it reachable; not yet tested.)
+  a declared order rather than for speed. Batched population inference goes through `backend::ControllerBackend`
+  (FL-030), whose implementations must return this evaluator's outputs bit for bit and defer the rest to it. The
+  Metal one (`flife-backend-metal`) does: in the gateway's IEEE-safe mode, with contraction off and a software
+  binary64 behind its fast `tanh`, it matches this evaluator exactly. FL-025's FrankenTorch CPU route is still to
+  come.
 - Measured and not adopted (2026-11-09): the hidden `tanh` is the largest single item in a steady-state CPU profile
   (`expm1_neg` under `tanh` under `evaluate`), about 9.5 ns a call. Replacing its series divisions by `k` with
   multiplications by `1/k` and guarding the F32 rounding is exact after rounding for every F32 (checked

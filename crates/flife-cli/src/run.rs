@@ -16,9 +16,10 @@ use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
+use flife_backend_metal::ControllerChoice;
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, World};
+use flife_engine::{Arrangement, CPU_REFERENCE, ControllerReport, NumericalProfile, World};
 use flife_runtime::{SessionClosed, SessionConfig, StepOutcome, open_with};
 use serde::Serialize;
 
@@ -54,6 +55,55 @@ pub struct RunOptions {
     /// Threads for the organism phases, replacing `[execution] cpu_workers`.
     /// No result depends on it.
     pub cpu_workers: Option<NonZeroUsize>,
+    /// Where due controllers are evaluated. No result depends on it.
+    pub controllers: ControllerChoice,
+}
+
+/// What the controller backend did over a run (FL-030). Not scientific
+/// state: it says where the arithmetic ran, so a record shows whether the
+/// GPU did the work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ControllerSummary {
+    /// The backend, or `cpu-reference`.
+    pub backend: String,
+    /// Evaluations the backend returned.
+    pub batched: u64,
+    /// Evaluations it deferred to the reference.
+    pub deferred: u64,
+    /// Ticks the reference redid whole after an error on the batched path.
+    pub reference_ticks: u64,
+    /// Why the backend stopped serving, if it failed.
+    pub failure: Option<String>,
+}
+
+impl ControllerSummary {
+    /// `world`'s controller report.
+    #[must_use]
+    pub fn of(world: &World) -> Self {
+        let ControllerReport {
+            backend,
+            batched,
+            deferred,
+            reference_ticks,
+            failure,
+        } = world.controller_report().clone();
+        Self {
+            backend: backend.unwrap_or_else(|| CPU_REFERENCE.to_owned()),
+            batched,
+            deferred,
+            reference_ticks,
+            failure,
+        }
+    }
+}
+
+/// Give `world` the backend `choice` selects on this host.
+///
+/// # Errors
+/// [`ControllerChoice::backend`]'s.
+pub fn install(world: &mut World, choice: ControllerChoice) -> Result<(), CoreError> {
+    world.set_controller_backend(choice.backend()?);
+    Ok(())
 }
 
 /// Why the run stopped.
@@ -102,6 +152,9 @@ pub enum Record {
         ticks: u64,
         /// Threads the organism phases use.
         cpu_workers: usize,
+        /// Where due controllers are evaluated: a backend and device, or
+        /// `cpu-reference`.
+        controllers: String,
     },
     /// The run so far.
     Progress {
@@ -130,6 +183,8 @@ pub enum Record {
         tally: Box<Tally>,
         /// The committed world, surveyed directly.
         survey: Box<Survey>,
+        /// What the controller backend did. Not scientific state.
+        controllers: ControllerSummary,
         /// Wall-clock seconds the run took. Not scientific state.
         wall_seconds: f64,
     },
@@ -163,7 +218,12 @@ pub fn found(config: &ValidatedConfig) -> Result<World, CoreError> {
 
 /// The [`Record::Start`] for running `config` for `ticks`.
 #[must_use]
-pub fn start(config: &ValidatedConfig, ticks: u64, cpu_workers: usize) -> Record {
+pub fn start(
+    config: &ValidatedConfig,
+    ticks: u64,
+    cpu_workers: usize,
+    controllers: String,
+) -> Record {
     let model = config.config();
     let timestep = config.report().timestep;
     Record::Start {
@@ -182,6 +242,7 @@ pub fn start(config: &ValidatedConfig, ticks: u64, cpu_workers: usize) -> Record
         ],
         ticks,
         cpu_workers,
+        controllers,
     }
 }
 
@@ -204,9 +265,11 @@ pub fn run(
     if let Some(workers) = options.cpu_workers {
         world.set_cpu_workers(workers)?;
     }
+    install(&mut world, options.controllers)?;
     let cpu_workers = world.cpu_workers();
+    let controllers = ControllerSummary::of(&world).backend;
     let (owner, handle) = open_with(world, limits)?;
-    emit(&start(config, options.ticks, cpu_workers));
+    emit(&start(config, options.ticks, cpu_workers, controllers));
     let runtime = RuntimeBuilder::current_thread()
         .build()
         .map_err(|error| missing(format!("an Asupersync runtime: {error}")))?;
@@ -272,6 +335,7 @@ pub fn run(
         digest: closed.world.digest().to_hex(),
         tally: Box::new(tally.clone()),
         survey: Box::new(survey.clone()),
+        controllers: ControllerSummary::of(&closed.world),
         wall_seconds: clock.elapsed().as_secs_f64(),
     });
     Ok(Finished {

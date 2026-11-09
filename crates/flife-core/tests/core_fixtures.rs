@@ -786,4 +786,75 @@ fn errors_name_their_class() {
         CoreError::Overflow { quantity: "tick" }.to_string(),
         "tick overflow refused"
     );
+
+    // Machine output names each class by a stable kebab-case kind, distinct
+    // for every variant (§14.6).
+    let every = [
+        (
+            CoreError::MissingCapability {
+                capability: "x".into(),
+            },
+            "missing-capability",
+        ),
+        (budget, "budget-exhausted"),
+        (
+            CoreError::SchemaMismatch {
+                expected: "a".into(),
+                found: "b".into(),
+            },
+            "schema-mismatch",
+        ),
+        (
+            CoreError::IncompatibleCheckpoint { reason: "x".into() },
+            "incompatible-checkpoint",
+        ),
+        (CoreError::QueueClosed { queue: "control" }, "queue-closed"),
+        (
+            CoreError::NumericalInvalid {
+                quantity: "energy",
+                detail: "NaN".into(),
+            },
+            "numerical-invalid",
+        ),
+        (CoreError::Cancelled { reason: "x".into() }, "cancelled"),
+        (CoreError::Overflow { quantity: "tick" }, "overflow"),
+        (
+            CoreError::UnknownAlgorithm {
+                role: "backend",
+                name: "x".into(),
+            },
+            "unknown-algorithm",
+        ),
+        (CoreError::InvalidConfig(Vec::new()), "invalid-config"),
+        (
+            CoreError::LayoutMismatch {
+                buffer: "field",
+                detail: "x".into(),
+            },
+            "layout-mismatch",
+        ),
+        (
+            CoreError::AllocationFailed {
+                buffer: "field",
+                bytes: 1,
+            },
+            "allocation-failed",
+        ),
+        (
+            CoreError::StateConflict {
+                operation: "grants",
+                detail: "x".into(),
+            },
+            "state-conflict",
+        ),
+    ];
+    let mut kinds = std::collections::BTreeSet::new();
+    for (error, kind) in &every {
+        assert_eq!(error.kind(), *kind, "{error:?}");
+        assert!(
+            kind.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+            "{kind}"
+        );
+        assert!(kinds.insert(*kind), "{kind} is not distinct");
+    }
 }

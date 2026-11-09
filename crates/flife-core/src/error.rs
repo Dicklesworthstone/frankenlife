@@ -114,6 +114,29 @@ pub enum CoreError {
     },
 }
 
+impl CoreError {
+    /// The error's class: a stable kebab-case name for machine output
+    /// (plan §14.6), distinct for every variant.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::MissingCapability { .. } => "missing-capability",
+            Self::BudgetExhausted { .. } => "budget-exhausted",
+            Self::SchemaMismatch { .. } => "schema-mismatch",
+            Self::IncompatibleCheckpoint { .. } => "incompatible-checkpoint",
+            Self::QueueClosed { .. } => "queue-closed",
+            Self::NumericalInvalid { .. } => "numerical-invalid",
+            Self::Cancelled { .. } => "cancelled",
+            Self::Overflow { .. } => "overflow",
+            Self::UnknownAlgorithm { .. } => "unknown-algorithm",
+            Self::InvalidConfig(_) => "invalid-config",
+            Self::LayoutMismatch { .. } => "layout-mismatch",
+            Self::AllocationFailed { .. } => "allocation-failed",
+            Self::StateConflict { .. } => "state-conflict",
+        }
+    }
+}
+
 impl fmt::Display for CoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

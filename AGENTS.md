@@ -615,8 +615,10 @@ The repository holds:
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
-  `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010) and `crates/flife-runtime`
-  (FL-014), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and `flife_field::seeding`.
+  `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
+  (FL-014) and `crates/flife-cli` (FL-015), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
+  `flife_field::seeding`;
+- `presets/reference-small-world.toml` (FL-015), the first real preset.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
@@ -713,6 +715,24 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
 - Durability is `volatile-in-memory` only. `write-ahead-before-apply` is refused until FL-036's journal exists.
 - Session tests run the owner and clients as Lab tasks. Assert outcomes against a directly stepped world, and sweep
   seeds or yields until every side of a race is exercised.
+
+`flife-cli` (FL-015) is the `flife` binary (`validate`, `run`) and the library behind it.
+- `run` founds the world, opens a session, and steps it from a client task on the native runtime. It never touches
+  the world outside the session.
+- Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1` and `frankenlife.error.v1`. An
+  error's `kind` is `CoreError::kind`. Add a new variant's kind there, never a string match on `Display`.
+- `observe` has two halves:
+  - `Tally` folds published reports;
+  - `Survey` reads one committed world's raw state: generations, lineages, distinct genomes and `Heredity`.
+- `Heredity` compares live parents, children and grandchildren bit for bit over parameters, and by distance over
+  traits. Every birth perturbs the whole trait vectors, so bitwise trait comparison measures nothing. Survey floats
+  use `flife_core::numerics`, not platform libm, so records are identical on every host.
+- `presets/reference-small-world.toml` is Appendix A plus a declared viability tuning. `tests/smoke.rs` refuses
+  any undeclared difference from the plan's Appendix A. Change a preset value only together with its header
+  declaration, the test's `DECLARED` list and the pinned smoke figures, and say why.
+- The smoke test runs the real 4,096-organism preset for 1,024 ticks and pins the digest, tally and survey.
+  `[profile.test]` is `opt-level = 3` for it. Optimization never changes a result, so a moved pin means the science
+  changed.
 
 `flife-neural` (FL-007) is the sensor/action ABI. `observe` encodes a blended pyramid sample and the organism's
 own state into the 104 inputs in their fixed order (`q`, `Z_0..Z_31`, x then y gradients saturated with

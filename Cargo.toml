@@ -2,9 +2,10 @@
 resolver = "3"
 # Create only the crates each milestone needs (plan §18.1): FL-001's capability
 # probes, FL-002's core contracts, FL-003–FL-005's field, FL-006's
-# organism-phase operators, FL-007's sensor/action ABI, FL-009's genomes, and
-# FL-014's session owner.
+# organism-phase operators, FL-007's sensor/action ABI, FL-009's genomes,
+# FL-014's session owner, and FL-015's headless command line.
 members = [
+    "crates/flife-cli",
     "crates/flife-core",
     "crates/flife-engine",
     "crates/flife-field",
@@ -45,8 +46,12 @@ ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dickl
 
 # Third-party crates. serde and sha2 0.11 are already in the qualified closure;
 # toml is the one addition, confined to flife-core's config loader (Appendix A
-# is TOML, and the loader must refuse unknown keys).
+# is TOML, and the loader must refuse unknown keys). clap and serde_json, for
+# flife-cli's arguments and NDJSON records (FL-015), were already in the
+# closure, so they add no package.
+clap = { version = "4.6.7", features = ["derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 sha2 = "0.11.1"
 toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
 
@@ -62,6 +67,14 @@ asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "a
 # Objective-C class symbol by raw address instead of an uninhabited extern
 # static. Same revision as FrankenManim's SUITE.lock [patches] row.
 block = { git = "https://github.com/Dicklesworthstone/rust-block", rev = "b39ae859d1ee8e8cb5eef6a516471f1578d26b96" }
+
+# Tests run optimized. FL-015's smoke test runs the real 4,096-organism preset
+# for 1,024 ticks, and unoptimized a tick at that scale takes about 40 times
+# longer. Optimization does not change results: Rust floating point has no
+# fast-math and no implicit FMA contraction, so every pinned digest is the
+# same at every opt-level. Debug assertions and overflow checks stay on.
+[profile.test]
+opt-level = 3
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

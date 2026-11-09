@@ -187,6 +187,9 @@ Every issue is reported, not just the first.
 - `StateConflict` covers work prepared against one state and then offered to another state, or offered twice.
   Examples are uptake grants applied to a changed field, a ledger tick that does not continue the last one, and
   a credit to an exhausted budget. Nothing is changed.
+- `CoreError::kind` (FL-015) names each class for machine output (§14.6), such as `missing-capability` or
+  `numerical-invalid`. Every name is stable, kebab-case and distinct. `flife-cli`'s error records carry it, and
+  `errors_name_their_class` pins all thirteen.
 
 **Determinism.** Pure functions of their inputs. No hash-map iteration and no floating clocks. The canonical forms
 and both digests are pinned by tests. Ledger sums run in a fixed order.

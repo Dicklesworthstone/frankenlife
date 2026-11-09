@@ -78,7 +78,8 @@ fn the_device_rounds_f32_products_and_sums_as_the_cpu_does_above_the_tiny_range(
     controllers.binary32_ops(&pairs, &mut results)?;
     let mut checked = 0;
     let mut flushed = 0;
-    for (index, ([a, b], [product, sum])) in pairs.iter().zip(&results).enumerate() {
+    let mut fused = 0;
+    for (index, ([a, b], [product, sum, error])) in pairs.iter().zip(&results).enumerate() {
         if !a.is_finite()
             || !b.is_finite()
             || tiny(*a)
@@ -102,8 +103,20 @@ fn the_device_rounds_f32_products_and_sums_as_the_cpu_does_above_the_tiny_range(
             "pair {index}: {a:e} + {b:e} gave {sum:e}, not {:e}",
             a + b
         );
+        // The fast path's exact products: the fused multiply-add rounds once,
+        // so it gives the product's rounding error, which is normal when the
+        // product is at least 2^-70.
+        if (a * b).is_finite() && (a * b).abs() >= 2.0_f32.powi(-70) {
+            let want = a.mul_add(*b, -(a * b));
+            assert!(
+                same_f32(*error, want),
+                "pair {index}: fma({a:e}, {b:e}, -p) gave {error:e}, not {want:e}"
+            );
+            fused += 1;
+        }
     }
     assert!(checked > 600_000, "only {checked} pairs in range");
+    assert!(fused > 250_000, "only {fused} fused multiply-adds checked");
     // The deferral is needed: the device does flush.
     assert!(flushed > 0, "the device flushed no subnormal result");
     Ok(())
@@ -195,9 +208,10 @@ fn compare(
     controllers: &MetalControllers,
     base: u32,
     count: usize,
+    software_only: bool,
     out: &mut [u32],
-) -> Result<(), CoreError> {
-    controllers.activation_bits(base, count, out)?;
+) -> Result<u32, CoreError> {
+    let fallbacks = controllers.activation_bits(base, count, software_only, out)?;
     let threads = thread::available_parallelism().map_or(8, usize::from);
     let length = count.div_ceil(threads);
     thread::scope(|scope| {
@@ -218,32 +232,56 @@ fn compare(
             });
         }
     });
-    Ok(())
+    Ok(fallbacks)
 }
 
 /// Every positive F32 below 20, where the reference stops saturating, and
-/// zero and the subnormals with them: 1,101,004,800 patterns.
-#[test]
-fn the_activation_is_the_reference_tanh_for_every_positive_f32_below_saturation()
--> Result<(), CoreError> {
+/// zero and the subnormals with them: 1,101,004,800 patterns. Returns the
+/// fallbacks to the software binary64.
+fn every_positive_f32_below_saturation(software_only: bool) -> Result<u64, CoreError> {
     let Some(controllers) = controllers() else {
-        return Ok(());
+        return Ok(0);
     };
     let saturation = 20.0_f32.to_bits();
     const CHUNK: u32 = 1 << 24;
     let mut out = vec![0_u32; CHUNK as usize];
     let mut base = 0_u32;
+    let mut fallbacks = 0_u64;
     while base < saturation {
         let count = CHUNK.min(saturation - base);
-        compare(
+        fallbacks += u64::from(compare(
             &controllers,
             base,
             count as usize,
+            software_only,
             &mut out[..count as usize],
-        )?;
+        )?);
         base += count;
     }
+    Ok(fallbacks)
+}
+
+/// The forward pass's activation, fast path and fallback together.
+#[test]
+fn the_activation_is_the_reference_tanh_for_every_positive_f32_below_saturation()
+-> Result<(), CoreError> {
+    let fallbacks = every_positive_f32_below_saturation(false)?;
+    if cfg!(target_os = "macos") {
+        // The guard does refuse some values, so the fallback is exercised,
+        // and the fast path settles nearly all of them.
+        assert!(
+            (1..1_000_000).contains(&fallbacks),
+            "{fallbacks} fallbacks in 1,101,004,800"
+        );
+    }
     Ok(())
+}
+
+/// The software binary64 alone, which the fast path falls back to.
+#[test]
+fn the_software_activation_is_the_reference_tanh_for_every_positive_f32_below_saturation()
+-> Result<(), CoreError> {
+    every_positive_f32_below_saturation(true).map(|_| ())
 }
 
 /// The sign is the reference's: negatives sampled across their whole range,
@@ -259,10 +297,10 @@ fn the_activation_is_odd_and_saturates_as_the_reference_does() -> Result<(), Cor
         // A random 2^16-pattern window of negatives below -0 and above -inf,
         // and one of positives from 20 to infinity.
         let negative = 0x8000_0000 + (draws.next() as u32 % (0x7F80_0000 - (1 << 16)));
-        compare(&controllers, negative & !0xFF, 1 << 16, &mut out)?;
+        compare(&controllers, negative & !0xFF, 1 << 16, false, &mut out)?;
         let large = 20.0_f32.to_bits()
             + (draws.next() as u32 % (0x7F80_0000 - 20.0_f32.to_bits() - (1 << 16)));
-        compare(&controllers, large & !0xFF, 1 << 16, &mut out)?;
+        compare(&controllers, large & !0xFF, 1 << 16, false, &mut out)?;
     }
     Ok(())
 }

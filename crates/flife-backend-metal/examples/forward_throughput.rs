@@ -65,6 +65,7 @@ fn main() -> Result<(), CoreError> {
     let mut metal = Vec::new();
     let mut packing = Vec::new();
     let mut uploading = Vec::new();
+    let mut warm = Vec::new();
     for _ in 0..ROUNDS {
         let start = Instant::now();
         batch.clear();
@@ -78,6 +79,10 @@ fn main() -> Result<(), CoreError> {
         let start = Instant::now();
         controllers.run(&resident, &mut outputs)?;
         metal.push(start.elapsed().as_secs_f64());
+        // Again on the same buffers: the steady state of resident buffers.
+        let start = Instant::now();
+        controllers.run(&resident, &mut outputs)?;
+        warm.push(start.elapsed().as_secs_f64());
     }
 
     let reference = |range: std::ops::Range<usize>| -> Result<Vec<[f32; ACTION_WIDTH]>, CoreError> {
@@ -125,10 +130,11 @@ fn main() -> Result<(), CoreError> {
         });
     let deferred = outputs.iter().filter(|o| o.is_none()).count();
     println!(
-        "{{\"device\":{:?},\"organisms\":{organisms},\"hidden\":{widths:?},\"parameters\":{},\"identical\":{identical},\"deferred\":{deferred},\"metal_ms\":{:.3},\"upload_ms\":{:.3},\"pack_ms\":{:.3},\"cpu_1_ms\":{:.3},\"cpu_threads\":{threads},\"cpu_all_ms\":{:.3}}}",
+        "{{\"device\":{:?},\"organisms\":{organisms},\"hidden\":{widths:?},\"parameters\":{},\"identical\":{identical},\"deferred\":{deferred},\"first_touch_ms\":{:.3},\"warm_ms\":{:.3},\"upload_ms\":{:.3},\"pack_ms\":{:.3},\"cpu_1_ms\":{:.3},\"cpu_threads\":{threads},\"cpu_all_ms\":{:.3}}}",
         controllers.device_name(),
         topology.parameter_count(),
         median(metal) * 1e3,
+        median(warm) * 1e3,
         median(uploading) * 1e3,
         median(packing) * 1e3,
         median(single) * 1e3,

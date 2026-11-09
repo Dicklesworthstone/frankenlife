@@ -7,7 +7,10 @@
 //! declared order (bias, then the inputs ascending, every product and sum
 //! rounded, no fused multiply-add), and the hidden activation is
 //! `flife_core::numerics::tanh` run on a software binary64 (Apple GPUs have
-//! no F64), rounded once to F32 as the reference rounds it. The gateway
+//! no F64), rounded once to F32 as the reference rounds it. Its fast path
+//! computes the activation in float-float on the hardware's F32 and keeps
+//! the result only where every value within 2^-38 of it rounds to the same
+//! F32; elsewhere it falls back to the software binary64. The gateway
 //! compiles the kernel in its IEEE-safe math mode.
 //!
 //! The device flushes subnormal F32 results to zero, and the reference does
@@ -345,8 +348,11 @@ impl MetalControllers {
 
     /// The kernel's activation alone, for `count` consecutive F32 bit
     /// patterns from `base`: each result is the F32 bits of
-    /// `numerics::tanh(f64::from(z)) as f32`, as the kernel computes it.
-    /// `count` must be a positive multiple of 256.
+    /// `numerics::tanh(f64::from(z)) as f32` as the kernel computes it, by
+    /// the forward pass's activation or, with `software_only`, by the
+    /// software binary64 alone. Returns how many of the forward pass's
+    /// evaluations fell back to the software binary64. `count` must be a
+    /// positive multiple of 256.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for another count, or one running past
@@ -355,8 +361,9 @@ impl MetalControllers {
         &self,
         base: u32,
         count: usize,
+        software_only: bool,
         out: &mut [u32],
-    ) -> Result<(), CoreError> {
+    ) -> Result<u32, CoreError> {
         let end = u64::from(base) + count as u64;
         if count == 0 || !count.is_multiple_of(256) || out.len() != count || end > 1 << 32 {
             return Err(CoreError::LayoutMismatch {
@@ -364,19 +371,29 @@ impl MetalControllers {
                 detail: format!("{count} patterns from {base:#x} into {}", out.len()),
             });
         }
-        let start = self.gateway.buffer_u32(&[base]).map_err(metal)?;
+        let start = self
+            .gateway
+            .buffer_u32(&[base, u32::from(software_only)])
+            .map_err(metal)?;
         let results = self
             .gateway
             .buffer_zeroed(count * size_of::<u32>())
             .map_err(metal)?;
+        let fallbacks = self
+            .gateway
+            .buffer_zeroed(size_of::<u32>())
+            .map_err(metal)?;
         self.gateway
             .dispatch(
                 &self.activation,
-                &[&start, &results],
+                &[&start, &results, &fallbacks],
                 Grid::linear(count / 256, 256),
             )
             .map_err(metal)?;
-        results.read_u32(out).map_err(metal)
+        results.read_u32(out).map_err(metal)?;
+        let mut fell = [0_u32];
+        fallbacks.read_u32(&mut fell).map_err(metal)?;
+        Ok(fell[0])
     }
 
     /// The kernel's software binary64 on operand pairs `(a, b)` as bit
@@ -421,15 +438,16 @@ impl MetalControllers {
         Ok(())
     }
 
-    /// The device's F32 product and sum of each pair, as the forward pass
-    /// computes them. `pairs.len()` must be a positive multiple of 64.
+    /// The device's F32 product, sum and `fma(a, b, -(a * b))` of each pair,
+    /// as the kernel computes them. `pairs.len()` must be a positive multiple
+    /// of 64.
     ///
     /// # Errors
     /// As [`Self::binary64_ops`].
     pub fn binary32_ops(
         &self,
         pairs: &[[f32; 2]],
-        out: &mut Vec<[f32; 2]>,
+        out: &mut Vec<[f32; 3]>,
     ) -> Result<(), CoreError> {
         if pairs.is_empty() || !pairs.len().is_multiple_of(64) {
             return Err(CoreError::LayoutMismatch {
@@ -441,7 +459,7 @@ impl MetalControllers {
         let operands = self.gateway.buffer_f32(&flat).map_err(metal)?;
         let results = self
             .gateway
-            .buffer_zeroed(flat.len() * size_of::<f32>())
+            .buffer_zeroed(pairs.len() * 3 * size_of::<f32>())
             .map_err(metal)?;
         self.gateway
             .dispatch(
@@ -450,10 +468,10 @@ impl MetalControllers {
                 Grid::linear(pairs.len() / 64, 64),
             )
             .map_err(metal)?;
-        let mut values = vec![0.0_f32; flat.len()];
+        let mut values = vec![0.0_f32; pairs.len() * 3];
         results.read_f32(&mut values).map_err(metal)?;
         out.clear();
-        out.extend(values.as_chunks::<2>().0.iter().copied());
+        out.extend(values.as_chunks::<3>().0.iter().copied());
         Ok(())
     }
 }

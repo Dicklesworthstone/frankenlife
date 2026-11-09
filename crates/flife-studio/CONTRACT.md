@@ -9,8 +9,8 @@ adapter.
 - A `ValidatedConfig`. `[presentation]` gives the window size, the background and the frame rate.
   `StudioOptions` can override the size and make the window fixed.
 - The process main thread, macOS, Metal and a window server.
-- The presenter's typed input. It comes from frankentorch `ft-kernel-metal` at rev `1fd24f9f`, through FrankenManim
-  `fmn-render` at rev `303189d3`.
+- The presenter's typed input. It comes from frankentorch `ft-kernel-metal` at rev `1c4febfb`, through FrankenManim
+  `fmn-render` at rev `abd57cbf`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and

@@ -616,16 +616,18 @@ The repository holds:
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid and FL-011 deposits), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
-  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017) and `crates/flife-cli` (FL-015), each with its
-  `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
+  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015), and
+  `crates/flife-manim` and `crates/flife-studio` (FL-018), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
-lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and the
-native-input gap. Run them with `cargo run -p flife-probes --bin flife-probe -- --window`, which prints NDJSON and
-opens a window. `cargo test` runs every probe except the window probe. Native typed input is a recorded gap,
-tracked by FL-018 (`flife-jdf`). The probes qualify on macOS arm64 and Linux x86_64.
+lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and
+typed native input. Run them with `cargo run -p flife-probes --bin flife-probe -- --window`, which prints NDJSON and
+opens a window. `cargo test` runs every probe except the window probe. `native_input` checks the pinned presenter's
+typed event API with an exhaustive match (`input_event_name`), so an upstream variant breaks the build.
+`native_window` opens a real window and requires its real geometry event. The probes qualify on macOS arm64 and
+Linux x86_64.
 
 `flife-core` holds the shared contracts: stable IDs and epochs, integer ticks with exact seconds-to-ticks
 conversion, units, `CoreError`, the named-algorithm registry, and `frankenlife.config.v1`. That configuration
@@ -719,6 +721,9 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
 - The owner offers every published boundary to its render feed (FL-017) before replying, and again at each
   committed boundary while one is pending. A lease release wakes a paused owner on a third lane. Viewers never go
   through the lanes. Keep render work off the science: a render failure is recorded, never fatal.
+- `SessionHandle::start` (FL-018) starts a run and returns its start boundary at once, as a `Running` whose
+  `ended` waits for the `RunEnd`. `run_until` is `start` then `ended`. Use it when a controller must keep taking
+  intents while a run goes on.
 
 `flife-render` (FL-017) holds the immutable compact render epochs.
 - An `Epoch` is exactly one committed world, read through `&World`:
@@ -736,6 +741,30 @@ FL-013 adds `world` to `flife-engine`: the ordered candidate tick and epoch publ
   reference before running the release hook; keep that field order.
 - `pairing::pairs` merges by identity. `Gap` tells FL-020 whether a skipped-epoch gap still allows
   minimum-image interpolation (C.15).
+
+`flife-manim` (FL-018) is the FrankenManim bulk world adapter.
+- `Viewport` is the exact map between world units (y down), FrankenManim's scene (centred, y up), drawable pixels
+  and logical points: the whole torus fitted, aspect kept, letterboxed. Its camera's frame is the whole drawable,
+  so a scene point at `z = 0` lands at `world_to_drawable`. `tests/viewport.rs` checks that against FrankenManim's
+  own CPU 3D renderer; keep that oracle when changing the camera.
+- `ParticleCloud` lowers an epoch to one `ThreeDDraw::TrueDot` per row, in identity order, into a buffer reserved
+  once at the population ceiling. Never allocate in `update`, and never create a scene object, handle or draw call
+  per organism. A refusal keeps the previous draws.
+- Radius and lineage colours are provisional. FL-019 owns the mappings. Wrapped views, pan and zoom are FL-020's,
+  and resident buffers are FL-033's.
+
+`flife-studio` (FL-018) is the native Studio host and the `flife-studio` binary.
+- The process main thread owns the window, typed input, viewport and presentation (`Studio::frame`). The session
+  owner and one controller task run on an Asupersync current-thread runtime on their own thread
+  (`SessionThread`). The main thread never blocks on the session: intents go through a bounded lane by `try_send`,
+  and statuses come back on a channel drained by `try_iter`. Keep it that way.
+- `Controls` is pure: input events in, intents and presentation state out. Keys are virtual key codes. Every intent
+  gets exactly one `Status`. Run ends carry their run number, so a late end never changes a newer run.
+- The viewer holds one lease, only while lowering. Read the world only through epochs.
+- `tests/live.rs` is harness-free (it needs the main thread) and needs `--features synthetic-input`:
+  `cargo test -p flife-studio --features synthetic-input --test live`. It posts real AppKit events and compares
+  the closed world with a directly stepped one. Run it on macOS with a window server whenever input, the session
+  bridge or the frame loop changes. Never ship `synthetic-input`.
 
 `flife-cli` (FL-015) is the `flife` binary (`validate`, `run`) and the library behind it.
 - `run` founds the world, opens a session, and steps it from a client task on the native runtime. It never touches

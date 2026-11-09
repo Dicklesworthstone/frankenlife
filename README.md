@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Status](https://img.shields.io/badge/status-headless%20world%20%2B%20session%20%2B%20CLI%20%2B%20render%20epochs%20%C2%B7%20no%20studio%20yet-orange)](#honest-status)
+[![Status](https://img.shields.io/badge/status-headless%20world%20%2B%20session%20%2B%20CLI%20%2B%20live%20native%20Studio-orange)](#honest-status)
 [![Runtime](https://img.shields.io/badge/runtime-asupersync-6f42c1)](#the-stack)
 [![Core](https://img.shields.io/badge/core-Rust%202024%20%C2%B7%20forbid%28unsafe%29-b7410e)](#architecture)
 [![Animation](https://img.shields.io/badge/animation-FrankenManim-1f6feb)](#the-stack)
@@ -53,8 +53,11 @@ closed every tick. FL-014 puts it behind an Asupersync session owner that admits
 identities and exact effective ticks. FL-015 adds the first real preset: a 4,096-organism, 128 × 128 reference
 world, and a `flife run` smoke run through the session. Within 1,024 ticks it reads births, deaths, paid emission
 and heritable variation from raw state. FL-017 adds immutable compact render epochs, which the session publishes
-at every committed boundary. A viewer that retains them skips frames, never ticks or births. Nothing is drawn on
-screen yet.**
+at every committed boundary. A viewer that retains them skips frames, never ticks or births. FL-018 draws the
+live world on screen: `flife-studio` shows the 4,096-organism preset in a native Metal window as one FrankenManim
+particle cloud. Its real pointer, key, scroll, focus and resize events run, pause and step the session, and a closed
+Studio's world is bit-identical to the same world stepped directly. Palettes, camera, zoom and selection come
+next.**
 
 | Question | Answer |
 |---|---|
@@ -65,8 +68,8 @@ screen yet.**
 - When every slot is busy the boundary is skipped and the last displayable epoch stays.
 - Viewers hold a bounded number of leases each and read the feed directly, never through the session's lanes.
 
-Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. No checkpoints, on-screen renderer or Studio exist yet |
-| Does the stack compose? | **Yes (FL-001), except for input.** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter still delivers no pointer or keyboard events (§13.1); a real window probe records that, and FL-018 owns the fix. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
+Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. `crates/flife-manim` (FL-018) is the FrankenManim adapter: an exact viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from each epoch onto FrankenManim's 3D camera route (checked against FrankenManim's own CPU renderer to 0.05 px). `crates/flife-studio` (FL-018) is the native host. The window, typed input and Metal presentation stay on the main thread, and the session owner runs on its own Asupersync thread behind a bounded intent lane. A harness-free live test drives the real preset entirely with real AppKit events. No checkpoints, palettes, camera control or selection exist yet |
+| Does the stack compose? | **Yes (FL-001, FL-018).** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter now delivers typed pointer, button, scroll, key, modifier, focus, capture-loss and resize events (FL-018 added the bridge upstream in FrankenTorch), and a real window probe qualifies it. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
 | Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 58 beads with the plan's 141 dependency edges in `.beads/` for `br` |
@@ -314,13 +317,17 @@ ecology comes before any broad infrastructure.
 
 ## Planned command surface
 
-**Mostly proposed** (§14.6). `flife validate` and `flife run` exist (FL-015); the rest are later work items.
-Try the real preset headlessly:
+**Mostly proposed** (§14.6). `flife validate` and `flife run` exist (FL-015), and so does `flife-studio`
+(FL-018, macOS); the rest are later work items. Try the real preset headlessly, then live:
 
 ```bash
 cargo run --release -p flife-cli -- validate presets/reference-small-world.toml
 cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128
+cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540
 ```
+
+In the Studio, Space runs or pauses, → or `.` steps one tick while paused, and Esc or ⌘W closes. It prints
+`frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary and the closing world digest).
 
 On one core of an Apple-silicon Mac a tick at 4,096 organisms takes about 70 ms in release. The preset's 1,024
 ticks (8 simulated seconds, as the population falls to a few hundred) take about 30 s. The full surface, as
@@ -351,7 +358,7 @@ substitutes a different neural model.
 |---|---|
 | Rust toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition |
 | Asupersync | v0.6.2 (`a5d23e8d`), one package id across the closure; the root `[patch.crates-io]` maps FrankenTorch's crates.io edge onto the same commit |
-| FrankenManim, FrankenTorch, FrankenNumPy | `ac39e721`, `c611501c`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
+| FrankenManim, FrankenTorch, FrankenNumPy | `303189d3`, `1fd24f9f`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
 | `rust-block` override | Reviewed revision `b39ae859…`, carried at this workspace root because Cargo ignores a dependency's own `[patch]` (§12.8) |
 
 ---
@@ -386,6 +393,8 @@ crates/flife-engine/                                  FL-006 per-packet chemistr
 crates/flife-runtime/                                 FL-014 Asupersync session owner, command admission, sealed boundaries and cancellation
 crates/flife-render/                                  FL-017 immutable compact render epochs, bounded slots, per-viewer leases, identity matching
 crates/flife-cli/                                     FL-015 the flife binary (validate, run), run records, raw-state tally and survey
+crates/flife-manim/                                   FL-018 FrankenManim adapter: exact viewport and camera, one bounded particle cloud per epoch
+crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
 presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller

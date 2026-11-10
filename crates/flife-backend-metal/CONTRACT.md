@@ -30,8 +30,9 @@ from `controller.metal` into `softfloat64.metal`, which both kernels now share.
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
-  one batch (`ControllerJob`: genome identity, admitted controller, inputs). `ControllerChoice` (`cpu`, `metal`,
-  `auto`) is what the CLI and Studio select it with: `backend(cpu_workers)` gives `auto` Metal only on a host with
+  one batch (`ControllerJob`: genome identity, admitted controller, inputs). `ControllerChoice` (`cpu`, `torch`,
+  `metal`, `auto`) is what the CLI and Studio select it with (`torch` is `flife-backend-cpu`'s `CpuBackend` on the
+  world's workers, on any host): `backend(cpu_workers)` gives `auto` Metal only on a host with
   a device and at most `AUTO_METAL_MAX_WORKERS` = 8 workers, where it measured faster (whole ticks, 256 ticks, two
   interleaved runs: 2 workers 27.5 → 16.3 ms, 4 workers 19.5 → 14.8 ms, 8 workers 15.8 → 14.3 ms). Test
   `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling`.

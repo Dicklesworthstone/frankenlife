@@ -156,7 +156,8 @@ fn one_flipped_metal_output_bit_changes_the_world() {
 
 /// `auto` takes Metal up to `AUTO_METAL_MAX_WORKERS` CPU workers on a host
 /// with a device, and the CPU reference above that or without one; `cpu`
-/// never opens a device, and `metal` ignores the worker count.
+/// never opens a device, `torch` is the FrankenTorch CPU route on the
+/// world's workers on any host, and `metal` ignores the worker count.
 #[test]
 fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let device = metal().is_some();
@@ -181,6 +182,20 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
         );
     }
     assert!(described(ControllerChoice::Cpu, 1).expect("cpu").is_none());
+    for workers in [1, 4, 64] {
+        let torch = described(ControllerChoice::Torch, workers)
+            .expect("torch never refuses")
+            .expect("torch is a backend");
+        assert_eq!(
+            torch,
+            format!("cpu (frankentorch population_affine_f32_into, {workers} lanes)")
+        );
+    }
+    assert_eq!(
+        "torch".parse::<ControllerChoice>(),
+        Ok(ControllerChoice::Torch)
+    );
+    assert!("gpu".parse::<ControllerChoice>().is_err());
     let forced = described(ControllerChoice::Metal, 64);
     if device {
         assert!(forced.expect("metal on a device").is_some());

@@ -5,8 +5,10 @@ resolver = "3"
 # organism-phase operators, FL-007's sensor/action ABI, FL-009's genomes,
 # FL-014's session owner, FL-015's headless command line, FL-017's render
 # epochs, FL-018's FrankenManim world adapter and native Studio host, and
-# FL-030's fused Metal controller kernel, and FL-035's checkpoint chunk store.
+# FL-030's fused Metal controller kernel, FL-035's checkpoint chunk store, and
+# FL-025's FrankenTorch CPU controller route.
 members = [
+    "crates/flife-backend-cpu",
     "crates/flife-backend-metal",
     "crates/flife-cli",
     "crates/flife-core",
@@ -37,15 +39,15 @@ publish = false
 # Asupersync v0.6.2 (crates.io 0.6.2), the same git source FrankenManim's
 # governed closure requires, so FrankenLife and Manim share one package id.
 asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "a5d23e8dd2c8d776bd02e2da8e38e6296600e84c", default-features = false }
-fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "721b04b9ceb8d7ec4b955b6cf81d224a32180e88" }
+fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "8ec44366c62c163b9bb2bf3c26c6e7543faed869" }
 # FrankenManim's camera, 3D job and Metal preview, for FL-018's world adapter
 # and Studio host. Already in the closure through fmn; named directly because
 # the umbrella does not re-export the renderer's Metal route.
-fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "721b04b9ceb8d7ec4b955b6cf81d224a32180e88" }
-fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "721b04b9ceb8d7ec4b955b6cf81d224a32180e88" }
+fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "8ec44366c62c163b9bb2bf3c26c6e7543faed869" }
+fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "8ec44366c62c163b9bb2bf3c26c6e7543faed869" }
 # Offline frames (`flife render`): Rgba16F to sRGB RGBA8, and PNG.
-fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "721b04b9ceb8d7ec4b955b6cf81d224a32180e88" }
-fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "721b04b9ceb8d7ec4b955b6cf81d224a32180e88" }
+fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "8ec44366c62c163b9bb2bf3c26c6e7543faed869" }
+fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "8ec44366c62c163b9bb2bf3c26c6e7543faed869" }
 fnp-dtype = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-ndarray = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
 fnp-random-core = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev = "6492ff310c45ad72abf27e4394f68b9059770193" }
@@ -57,10 +59,13 @@ fnp-random = { git = "https://github.com/Dicklesworthstone/franken_numpy", rev =
 # FrankenSQLite (FL-036): the run catalog and command journal. Only the
 # native file-backed engine; no io_uring backend and no SQL extensions.
 fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "074c2033b4dd5212bf2f6c6aa80480ff711dfd9f", default-features = false, features = ["native"] }
-ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c22e1415fc5d3c2eb2accf87c9f8904a047900db" }
-ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c22e1415fc5d3c2eb2accf87c9f8904a047900db" }
-ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c22e1415fc5d3c2eb2accf87c9f8904a047900db" }
-ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "c22e1415fc5d3c2eb2accf87c9f8904a047900db", features = ["asupersync-integration"] }
+ft-api = { package = "frankentorch-api", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "0ae728fe02609cf941bfbc161b78b3f98348a62c" }
+ft-core = { package = "frankentorch-core", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "0ae728fe02609cf941bfbc161b78b3f98348a62c" }
+# FL-025: the serial population kernel (population_affine_f32_into). Already in
+# the closure through ft-api; named directly for flife-backend-cpu.
+ft-kernel-cpu = { package = "frankentorch-kernel-cpu", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "0ae728fe02609cf941bfbc161b78b3f98348a62c" }
+ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", rev = "0ae728fe02609cf941bfbc161b78b3f98348a62c" }
+ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "0ae728fe02609cf941bfbc161b78b3f98348a62c", features = ["asupersync-integration"] }
 
 # Third-party crates. serde and sha2 0.11 are already in the qualified closure;
 # toml is the one addition, for flife-core's config loader (Appendix A is TOML,

@@ -58,9 +58,11 @@ enum Command {
         /// result depends on it.
         #[arg(long, value_parser = parse_workers)]
         cpu_workers: Option<NonZeroUsize>,
-        /// Where due controllers are evaluated: `metal`, `cpu`, or `auto`
-        /// for Metal where this host has it and the world uses at most 8
-        /// CPU workers (where it measured faster). No result depends on it.
+        /// Where due controllers are evaluated: `metal`, `cpu` (the
+        /// reference), `torch` (FrankenTorch's CPU kernel on the world's
+        /// workers), or `auto` for Metal where this host has it and the
+        /// world uses at most 8 CPU workers (where it measured faster), else
+        /// the reference. No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
         /// Keep the run in this new (or empty) directory: its
@@ -119,7 +121,8 @@ enum Command {
         /// depends on it.
         #[arg(long, value_parser = parse_workers)]
         cpu_workers: Option<NonZeroUsize>,
-        /// Where due controllers are evaluated: `metal`, `cpu` or `auto`.
+        /// Where due controllers are evaluated: `metal`, `cpu`, `torch` or
+        /// `auto`.
         /// No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
@@ -188,7 +191,8 @@ enum Command {
         /// result depends on it.
         #[arg(long, value_parser = parse_workers)]
         cpu_workers: Option<NonZeroUsize>,
-        /// Where due controllers are evaluated: `metal`, `cpu` or `auto`.
+        /// Where due controllers are evaluated: `metal`, `cpu`, `torch` or
+        /// `auto`.
         /// No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
@@ -230,8 +234,8 @@ enum Command {
         /// Threads for the world: a count or `auto`.
         #[arg(long, default_value = "auto", value_parser = parse_workers)]
         cpu_workers: NonZeroUsize,
-        /// Where due controllers are evaluated: `metal`, `cpu`, or `auto`
-        /// (Metal at most 8 CPU workers). No result depends on it.
+        /// Where due controllers are evaluated: `metal`, `cpu`, `torch`, or
+        /// `auto` (Metal at most 8 CPU workers). No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
         /// Threads for FrankenManim's CPU renderer: a count or `auto`.

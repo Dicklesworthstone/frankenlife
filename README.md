@@ -399,8 +399,9 @@ while running or paused, and change only the picture:
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density` and `--no-field`.
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.
 
-`--controllers metal` evaluates the organisms' controllers on the Mac's GPU, and `cpu` keeps them on the CPU
-reference; `metal` refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and
+`--controllers metal` evaluates the organisms' controllers on the Mac's GPU, `torch` on FrankenTorch's serial CPU
+population kernel on the world's own workers (FL-025, any host), and `cpu` keeps them on the CPU reference; `metal`
+refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and
 the world uses at most 8 CPU workers, where it measured faster (2.2× on one worker, 1.7× on two, 1.3× on four, 1.1×
 on eight). Whatever the choice and the `--cpu-workers`
 count, the world is the same bit for bit; the run's `start` record names the backend and `end` counts what it
@@ -418,6 +419,21 @@ There the GPU frees CPU cores but does not shorten the tick, so `auto` stays on 
 presentation uses the same GPU, measured slower with Metal under FrankenManim `dfdc7d18` (72 against 119 ticks per
 second). With `f401a947`'s lighter Metal frames it is level: 132 against 120 at 960×540 and 152 against 161 at
 1,920×1,080, four interleaved runs each.
+
+`torch` measured in one process next to the reference and Metal (`flife-backend-metal`'s `tick_throughput`
+example: eight 20-tick blocks per world in rotating order after 40 warm-up ticks, the digests equal after every
+block, nothing deferred; M5 Ultra under other load). Whole ticks against the reference:
+
+| `--cpu-workers` | `torch` | `metal` |
+|---|---|---|
+| 1 | 1.62× | 2.22× |
+| 4 | 1.26× | 1.32× |
+| 8 | 1.10× | 1.04× |
+| 16 | 1.01× | 0.94× |
+
+At 8 and 16 workers the samples varied by more than 5%, so those rows show no admissible difference. On one
+worker Metal is clearly faster than `torch`. On four it led by 5% while its own samples varied by 5.1%. So `auto`
+is unchanged.
 
 `flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
 frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,
@@ -499,6 +515,7 @@ crates/flife-render/                                  FL-017 immutable compact r
 crates/flife-cli/                                     FL-015 the flife binary (validate, run), run records, raw-state tally and survey
 crates/flife-manim/                                   FL-018 FrankenManim adapter: exact viewport and camera, one bounded particle cloud per epoch
 crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
+crates/flife-backend-cpu/                             FL-025 FrankenTorch CPU controller route: the serial population kernel on the world's lanes, bit-identical to the reference
 crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; resident parameter arena behind the engine's controller port
 presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation

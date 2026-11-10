@@ -53,9 +53,11 @@ struct Cli {
     /// depends on it.
     #[arg(long, default_value = "auto", value_parser = parse_workers)]
     cpu_workers: NonZeroUsize,
-    /// Where due controllers are evaluated: `metal`, `cpu`, or `auto` (the
-    /// default): Metal where this host has it and the world uses at most 8
-    /// CPU workers (with 16 it measured no faster). No result depends on it.
+    /// Where due controllers are evaluated: `metal`, `cpu` (the reference),
+    /// `torch` (FrankenTorch's CPU kernel on the world's workers), or `auto`
+    /// (the default): Metal where this host has it and the world uses at
+    /// most 8 CPU workers (with 16 it measured no faster). No result depends
+    /// on it.
     #[arg(long, default_value = "auto")]
     controllers: ControllerChoice,
     /// What the organisms' colour means: `lineage`, `energy`, `generation`,

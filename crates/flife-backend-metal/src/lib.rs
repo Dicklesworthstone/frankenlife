@@ -23,7 +23,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
+use flife_backend_cpu::CpuBackend;
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH};
@@ -757,6 +759,10 @@ impl ControllerBackend for MetalBackend {
 pub enum ControllerChoice {
     /// The CPU reference alone.
     Cpu,
+    /// FrankenTorch's serial population kernel on the world's CPU workers
+    /// ([`CpuBackend`], FL-025), on any host. Bit-identical to the
+    /// reference, and it defers nothing the reference evaluates.
+    Torch,
     /// The Metal backend; refused on a host without a Metal device.
     Metal,
     /// Metal where this host has a Metal device and the world runs on at
@@ -792,6 +798,10 @@ impl ControllerChoice {
         let boxed = |backend: MetalBackend| -> Box<dyn ControllerBackend> { Box::new(backend) };
         match self {
             Self::Cpu => Ok(None),
+            Self::Torch => {
+                let lanes = NonZeroUsize::new(cpu_workers).unwrap_or(NonZeroUsize::MIN);
+                Ok(Some(Box::new(CpuBackend::new(lanes))))
+            }
             Self::Metal => MetalBackend::open().map(boxed).map(Some),
             Self::Auto if cpu_workers > AUTO_METAL_MAX_WORKERS => Ok(None),
             Self::Auto => match MetalBackend::open() {
@@ -809,9 +819,12 @@ impl std::str::FromStr for ControllerChoice {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         match text {
             "cpu" => Ok(Self::Cpu),
+            "torch" => Ok(Self::Torch),
             "metal" => Ok(Self::Metal),
             "auto" => Ok(Self::Auto),
-            other => Err(format!("`{other}` is not `cpu`, `metal` or `auto`")),
+            other => Err(format!(
+                "`{other}` is not `cpu`, `torch`, `metal` or `auto`"
+            )),
         }
     }
 }

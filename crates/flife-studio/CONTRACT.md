@@ -90,7 +90,7 @@ adapter.
   [--look glow|raw] [--density] [--no-field]`: the binary. M is `lineage`, `energy`, `generation`, `motion` or
   `topology` (or a registered name such as `founder-lineage-v1`); the default is the configuration's
   `[presentation] color_mapping`. C is
-  `cpu`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8. The
+  `cpu`, `torch`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8. The
   Studio's default W is one per core up to 16, so on a host with more than 8 cores the controllers run on the CPU
   reference by default. With 16 workers Metal
   measured slower in the Studio under FrankenManim `dfdc7d18` (72 against 119 ticks per second, one 12 s run each),

@@ -630,7 +630,7 @@ The repository holds:
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
   (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037–FL-041), and
   `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-038, FL-039, FL-041), and
-  `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
+  `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field), and `crates/flife-backend-cpu` (FL-025), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
 

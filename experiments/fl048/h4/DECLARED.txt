@@ -1,0 +1,6 @@
+2026-11-10T05:35:43Z
+e89bacaef9f20ae7fc3ca865321d35daf86f471f0d3533dd2a6882abc9863614  declared/h4.py
+9c59b55eec8b4573b72642def6f133f3821550131089035a7271a8a34593ad2f  declared/colony.py
+2ee7faefe4ffbff656c0231f1a6d978d50e9c121966157624c30aa9132ae307a  ../../bin49/flife
+flife at be7acdb/d4dab04 (inspect + RemoveOrganisms); pilot seed 42 excluded
+relaunched 2026-11-10T05:36:17Z with FLIFE=/private/tmp/claude-501/-Users-jemanuel-projects-frankenlife/d0624505-4db6-4489-98f3-4a5b1872641d/scratchpad/bin49/flife (first launch failed before any flife ran: default path wrong from declared/)

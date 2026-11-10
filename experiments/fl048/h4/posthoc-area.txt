@@ -1,0 +1,25 @@
+seed  treat     colony_cells_in_disk  dP3_total  dP3_in_disk  dP3_rest_of_colony
+   21 boundary          78 of  113      +96.78      +90.96        +5.82
+   21 interior          61 of   61      +52.28      +49.27        +3.01
+   21 distant            0 of   37       -0.08       +0.00        -0.08
+   22 boundary          72 of  113     +145.91     +138.07        +7.84
+   22 interior          69 of   69      +99.88      +97.31        +2.57
+   22 distant            0 of   61       -0.00       +0.00        -0.00
+   23 boundary          74 of  113     +190.29     +177.70       +12.59
+   23 interior          88 of   89     +216.72     +207.78        +8.94
+   23 distant            0 of   61       +0.00       +0.00        +0.00
+   24 boundary          80 of  113     +169.69     +163.21        +6.49
+   24 interior          69 of   69      +81.52      +79.50        +2.03
+   24 distant            0 of   89       +0.00       +0.00        +0.00
+ 3021 boundary          84 of  113     +130.67     +127.04        +3.64
+ 3021 interior          69 of   69      +86.01      +79.30        +6.70
+ 3021 distant            0 of   97       +0.35       +0.00        +0.35
+ 3022 boundary         110 of  113     +240.89     +210.24       +30.65
+ 3022 interior          49 of   49     +157.30     +143.04       +14.27
+ 3022 distant            0 of   69       +2.05       +0.00        +2.05
+ 3023 boundary          69 of  113     +145.42     +139.25        +6.17
+ 3023 interior          37 of   37      +43.21      +37.56        +5.65
+ 3023 distant            0 of   97       -0.02       +0.00        -0.02
+ 3024 boundary          69 of  113      +94.99      +92.84        +2.15
+ 3024 interior          45 of   45     +103.15      +87.63       +15.52
+ 3024 distant            0 of   89       -0.08       +0.00        -0.08

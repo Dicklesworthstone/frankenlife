@@ -1,0 +1,28 @@
+schema = "frankenlife.experiment.v1"
+name = "fl048-e2-h1-sweep"
+hypothesis = """H1: the field-only model can produce persistent heterogeneous colonies. A run shows them when it \
+survives to tick 8,192 with organism_morisita above 1 and organism_morans_i above 0 at its last sample. \
+The sweep varies source power and basal maintenance around the reference-small-world preset (power 960, \
+basal 0.8, the control) to see whether the result depends on that calibration. Primary measures, declared \
+before any run: survived, final_live, organism_morisita, organism_morans_i; capacity pauses are reported \
+as such, not as persistence."""
+base = "../reference-small-world.toml"
+ticks = 8192
+metrics_every = 1024
+control = "control"
+selection = """No selection by the tool: every condition runs on every discovery and held-out seed and every run \
+is reported. Refinement rule, declared before any run: the sweep condition whose discovery runs all reach \
+tick 8,192 alive with the highest mean organism_morisita is the candidate; it is adopted only if its \
+held-out runs also all reach tick 8,192 alive and its held-out organism_morisita effect against the control \
+has the sign of its discovery effect. Otherwise the preset stays as calibrated."""
+
+[seeds]
+discovery = [11, 12, 13, 14]
+held_out = [2011, 2012, 2013, 2014]
+
+[[conditions]]
+name = "control"
+
+[sweep]
+"sources.power_per_source" = [480.0, 1920.0]
+"costs.basal_energy_per_second" = [0.4, 1.2]

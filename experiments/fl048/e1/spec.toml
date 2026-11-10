@@ -1,0 +1,48 @@
+schema = "frankenlife.experiment.v1"
+name = "fl048-e1-ablations"
+hypothesis = """H2 (controller ablations: chemistry-only, fixed-controller), H3 (no-emission), H5 (fixed-topology), \
+and the inheritance (fresh-offspring) and complexity-cost (no-complexity-cost) controls of plan 15.3 and 21.6, \
+each against the unablated reference-small-world preset over 8,192 ticks (64 simulated seconds). \
+H1 is read from the control runs: a run shows persistent heterogeneous colonies when it survives to tick 8,192 \
+with organism_morisita above 1 and organism_morans_i above 0 at its last sample. \
+Primary measures, declared before any run: final_live, births and lineages_alive for every condition; \
+organism_morisita and field_gini for H3 (spatial organization); topologies_alive for H5. \
+emission_paid (H3), topology_changes (H5) and mutated_parameters (fixed-controller) are manipulation checks, \
+not outcomes; every other measure is secondary. A hypothesis is supported only by a held-out effect in the \
+same direction as its discovery effect."""
+base = "../reference-small-world.toml"
+ticks = 8192
+metrics_every = 1024
+control = "control"
+selection = "No selection: every condition runs on every discovery and held-out seed, and every run, extinct, paused or failed, is reported."
+
+[seeds]
+discovery = [1, 2, 3, 4, 5, 6, 7, 8]
+held_out = [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]
+
+[[conditions]]
+name = "control"
+
+[[conditions]]
+name = "chemistry-only"
+ablation = "chemistry-only"
+
+[[conditions]]
+name = "fixed-controller"
+ablation = "fixed-controller"
+
+[[conditions]]
+name = "no-emission"
+ablation = "no-emission"
+
+[[conditions]]
+name = "fixed-topology"
+ablation = "fixed-topology"
+
+[[conditions]]
+name = "fresh-offspring"
+ablation = "fresh-offspring"
+
+[[conditions]]
+name = "no-complexity-cost"
+ablation = "no-complexity-cost"

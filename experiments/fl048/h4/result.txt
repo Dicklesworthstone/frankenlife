@@ -1,0 +1,69 @@
+
+seed 21 (discovery): 2 colonies, focal 2023 members; removed boundary 90 (r 6.0, members 73), interior 99 (r 4.25, members 99), distant 90 (r 3.25, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0.003077  interior +0.003119  distant +0
+  P1@1024  boundary +0.01026  interior +0.01507  distant -0.0009886
+  P2@ 256  boundary -0.00276  interior +0.001878  distant +0.005565
+  P2@1024  boundary +0.01339  interior +0.0192  distant +0.005288
+  P3@ 256  boundary +96.78  interior +52.28  distant -0.083
+  P3@1024  boundary +0.4096  interior -4.648  distant +1.101
+
+seed 22 (discovery): 6 colonies, focal 977 members; removed boundary 90 (r 6.0, members 72), interior 96 (r 4.5, members 96), distant 98 (r 4.25, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0  interior +0.001135  distant +0
+  P1@1024  boundary +0.001105  interior +0.0193  distant -0.002047
+  P2@ 256  boundary -0.007398  interior -0.005015  distant +0.003409
+  P2@1024  boundary -0.005086  interior +0.01842  distant -0.003667
+  P3@ 256  boundary +145.9  interior +99.88  distant -0.0002154
+  P3@1024  boundary +12.28  interior +11.94  distant -1.385
+
+seed 23 (discovery): 5 colonies, focal 953 members; removed boundary 91 (r 6.0, members 78), interior 97 (r 5.25, members 97), distant 94 (r 4.25, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0  interior +0.002336  distant +0
+  P1@1024  boundary +0.005714  interior +0.01636  distant -0.006296
+  P2@ 256  boundary -0.01009  interior -0.01389  distant +0.006928
+  P2@1024  boundary -0.01286  interior -0.0001438  distant -0.02145
+  P3@ 256  boundary +190.3  interior +216.7  distant +1.18e-07
+  P3@1024  boundary +52.6  interior +39.4  distant +9.856
+
+seed 24 (discovery): 4 colonies, focal 860 members; removed boundary 83 (r 6.0, members 69), interior 91 (r 4.5, members 91), distant 87 (r 5.25, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0.002528  interior +0  distant +0
+  P1@1024  boundary +0.02276  interior +0.02211  distant -0.003488
+  P2@ 256  boundary -0.007877  interior -0.001397  distant +0.004969
+  P2@1024  boundary +0.002458  interior +0.009401  distant -0.01302
+  P3@ 256  boundary +169.7  interior +81.52  distant +0
+  P3@1024  boundary +7.73  interior -1.893  distant -4.946
+
+seed 3021 (held-out): 7 colonies, focal 858 members; removed boundary 93 (r 6.0, members 76), interior 93 (r 4.75, members 93), distant 98 (r 5.5, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0.002558  interior +0.001307  distant +0
+  P1@1024  boundary -0.001279  interior +0.00915  distant +0
+  P2@ 256  boundary -0.01243  interior -0.008671  distant +0.007853
+  P2@1024  boundary -0.0279  interior +0.007375  distant +0
+  P3@ 256  boundary +130.7  interior +86.01  distant +0.3486
+  P3@1024  boundary +3.426  interior +1.548  distant +0.1793
+
+seed 3022 (held-out): 3 colonies, focal 2057 members; removed boundary 84 (r 6.0, members 83), interior 84 (r 4.0, members 84), distant 86 (r 4.5, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0.0005066  interior +0.0005068  distant +0
+  P1@1024  boundary +0.004559  interior +0.00963  distant -0.005834
+  P2@ 256  boundary -0.002624  interior +0.01066  distant +0.009009
+  P2@1024  boundary +0.005043  interior +0.006538  distant +0.0006819
+  P3@ 256  boundary +240.9  interior +157.3  distant +2.055
+  P3@1024  boundary -2.189  interior +5.282  distant -7.411
+
+seed 3023 (held-out): 5 colonies, focal 2071 members; removed boundary 104 (r 6.0, members 93), interior 107 (r 3.5, members 107), distant 108 (r 5.5, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary +0.001517  interior +0.0005092  distant +0
+  P1@1024  boundary +0.01264  interior +0.005092  distant -0.0004829
+  P2@ 256  boundary -0.00378  interior +0.005582  distant +0.005266
+  P2@1024  boundary +0.007191  interior -0.002517  distant -0.004733
+  P3@ 256  boundary +145.4  interior +43.21  distant -0.02175
+  P3@1024  boundary +2.024  interior +8.447  distant +10.27
+
+seed 3024 (held-out): 5 colonies, focal 1459 members; removed boundary 97 (r 6.0, members 81), interior 98 (r 3.75, members 98), distant 101 (r 5.25, members 0); counts match geometry {'boundary': True, 'interior': True, 'distant': True}
+  P1@ 256  boundary -0.001451  interior +0.003674  distant +0
+  P1@1024  boundary +0.01597  interior +0.03012  distant +0.003427
+  P2@ 256  boundary -0.006612  interior +0.005225  distant +0.005482
+  P2@1024  boundary +0.002193  interior +0.01015  distant -0.006641
+  P3@ 256  boundary +94.99  interior +103.1  distant -0.07928
+  P3@1024  boundary -5.645  interior -1.194  distant -9.228
+
+== declared criterion (rule 6)
+P1@1024: boundary-specific in discovery 1 of 4, held-out 1 of 4 -> does not meet 3-of-4 in both
+P3@256: boundary-specific in discovery 3 of 4, held-out 3 of 4 -> meets 3-of-4 in both
+H4 SUPPORTED by the declared criterion (8 seed reports; a split with fewer than 4 finished seeds cannot meet it)

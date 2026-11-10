@@ -541,6 +541,8 @@ pub struct MetalBackend {
     values: Vec<f32>,
     flags: Vec<u32>,
     uploads: u64,
+    /// The last batch's command: kernels run and device seconds.
+    last_command: Option<(usize, f64)>,
 }
 
 impl std::fmt::Debug for MetalBackend {
@@ -583,6 +585,7 @@ impl MetalBackend {
             values: Vec::new(),
             flags: Vec::new(),
             uploads: 0,
+            last_command: None,
         })
     }
 
@@ -619,6 +622,15 @@ impl MetalBackend {
     #[must_use]
     pub const fn owner(&self) -> &DeviceOwner {
         self.controllers.owner()
+    }
+
+    /// The last batch's command: the kernels it ran (one per shard it
+    /// touched) and its command buffer's time on the device, in seconds.
+    /// `None` before the first batch and after a batch that dispatched
+    /// nothing.
+    #[must_use]
+    pub const fn last_command(&self) -> Option<(usize, f64)> {
+        self.last_command
     }
 
     /// The bucket serving `job`, made on its topology's first job; `None`
@@ -833,6 +845,7 @@ impl ControllerBackend for MetalBackend {
     ) -> Result<(), CoreError> {
         outputs.clear();
         reserve(outputs, jobs.len(), "metal controller outputs")?;
+        self.last_command = None;
         self.eligible.clear();
         // A job the kernel cannot take, or whose inputs the reference
         // refuses, is deferred: the reference evaluates it, or refuses it.
@@ -929,7 +942,8 @@ impl ControllerBackend for MetalBackend {
                     grid: Grid::linear(*staged, FORWARD_THREADS),
                 })
                 .collect();
-            owner.submit_batch(&kernels)?;
+            let receipt = owner.submit_batch(&kernels)?;
+            self.last_command = Some((receipt.kernels, receipt.device_seconds));
             self.values.clear();
             self.values.resize(count * ACTION_WIDTH, 0.0);
             owner.read_back(raw, &mut self.values)?;

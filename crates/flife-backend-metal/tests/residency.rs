@@ -160,6 +160,12 @@ fn a_genome_is_uploaded_once_and_a_later_occupant_takes_its_place() -> Result<()
     // 60 genomes of each topology, 16 to a shard: four shards each.
     assert_eq!((backend.uploads(), backend.resident_genomes()), (300, 300));
     assert_eq!(backend.shards(), 5 * 4);
+    // FL-030: the command ran one kernel per shard, and the device timed it.
+    let command = backend.last_command();
+    assert!(
+        command.is_some_and(|(kernels, seconds)| kernels == 20 && seconds > 0.0),
+        "{command:?}"
+    );
 
     // Batches of a few upload nothing and drop nothing.
     backend.evaluate(&jobs[..100], &mut outputs)?;
@@ -219,6 +225,11 @@ fn a_genome_is_uploaded_once_and_a_later_occupant_takes_its_place() -> Result<()
     );
     backend.evaluate(&[], &mut outputs)?;
     assert!(outputs.is_empty());
+    assert_eq!(
+        backend.last_command(),
+        None,
+        "a batch of nothing ran no command"
+    );
     Ok(())
 }
 

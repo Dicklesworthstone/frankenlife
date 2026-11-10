@@ -82,6 +82,7 @@ FL-028's outputs:
   - `device_seconds`, its command buffer's time on the GPU, from start to end (FL-029).
 - `ResourceState`: `Available`, `Computing`, `Committed`, `Rendering`, `Checkpointing` or `Retiring` (§9.5).
 - `Usage`: buffers, bytes, retiring, read leases by purpose, write leases and running commands.
+- `MetalBackend::last_command` (FL-030): the last batch's kernels and its command buffer's device seconds.
 
 **Residency.** `MetalBackend` keeps every buffer on the device across ticks. FL-026: each topology has a bucket of
 fixed-size parameter shards of at most `SHARD_BYTES` (256 MiB, 6,718 genomes of the preset's topology), fewer
@@ -496,6 +497,38 @@ Each extra kernel cost 0.1–0.2 ms a tick. FrankenTorch encodes a command's ker
 waits for the last. Against 256-genome shards (16 kernels a tick), the default is 1.13× at four workers and 1.34× at
 eight. At one worker the 256-slot samples varied by more than 5% in both runs, so that ratio is not claimed.
 
+**Resident bandwidth (FL-030, plan §19.2).** `examples/resident_bandwidth.rs` gives the engine path
+(`MetalBackend::evaluate`) `N` distinct genomes resident in its shards. Every output is compared with the
+reference, bit for bit. Each warm batch's device time (`last_command`, the command buffer's GPU time) becomes the
+weight bytes it streamed per second. A plain streaming read of the same bytes on the same device, alternated with
+it round by round, gives the ceiling. 21 rounds each, M5 Ultra, 2026-11-10. Other GPU work shared the device (load
+average about 20, device times varying by 27–74%), so the fastest round is the better estimate of capability,
+and the medians show contention. Every output was identical and none was deferred:
+
+| Topology (parameters) | Genomes | Weights | Kernels | Weight stream, fastest / median | Plain read, fastest / median | Fastest fraction |
+|---|---|---|---|---|---|---|
+| `[64, 32]` (9,988) | 5,000 | 0.20 GB | 1 | 449 / 441 GB/s | 956 / 911 GB/s | 0.47 |
+| | 20,000 | 0.80 GB | 3 | 512 / 473 | 980 / 906 | 0.52 |
+| | 80,000 | 3.20 GB | 12 | 564 / 276 | 1,049 / 359 | 0.54 |
+| | 160,000 | 6.39 GB | 24 | 748 / 572 | 1,082 / 812 | 0.69 |
+| `[128, 96]` (29,316) | 2,000 | 0.23 GB | 1 | 426 / 414 | 969 / 909 | 0.44 |
+| | 10,000 | 1.17 GB | 5 | 449 / 378 | 994 / 934 | 0.45 |
+| | 40,000 | 4.69 GB | 18 | 719 / 493 | 1,082 / 921 | 0.66 |
+
+Against §19.2's bank (four billion F32 parameters, 16 GB a sweep), 450–750 GB/s is 28–47 full sweeps a second in
+the fastest rounds, and 17–36 at the medians. So the F32 bandwidth of the 15- and 30-sweep rows (240 and 480 GB/s)
+is reached. The 60-sweep row's 960 GB/s is about this device's plain read ceiling, out of reach for F32 weights
+with this kernel; F16 weights would halve it. A batch's wall time is 1.5–2.9 times its device time: the host
+stages inputs and job words and reads the outputs back (160,000 genomes: 30.7 ms wall, 11.2 ms on the device).
+That is the controllers alone; §19.2's sensors, fields, births and deaths are additional.
+
+Negative evidence: storing each layer's weights `[in][out]`, so that a threadgroup's lanes read adjacent words, was
+measured in one process against the kernel's `[out][in]`. One template instantiated both orders; the two backends
+and the stream alternated over 21 paired rounds. Every output was identical. The paired `[out][in]`/`[in][out]`
+device-time ratio's median was 1.02, 0.93 and 1.04 at 5,000, 20,000 and 80,000 genomes (cv 32–100%), and the
+fastest rounds differed by at most 5%. That is neutral, so it was not kept. Each lane reads its own row
+sequentially, which the caches already serve well.
+
 **The field's frontier (FL-031).** On the preset (128², 33 planes, eight sources of about 5,000 cells, one
 substep) on an M5 Ultra, 2026-11-09. Other workloads held the host at load 45–90 throughout, so the wall times
 are indicative; the device times are steadier. The CPU reference's phase 2 takes 1.8–2.0 ms per tick on one worker
@@ -563,8 +596,11 @@ per-pass thread spawning (6%).
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them). On many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
-- FL-030's closure also needs its resident-bandwidth benchmark against §19.2's weight-stream bound. FL-026's
-  per-topology shards are in place.
+- FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above. Only F32 weights
+  exist, so per-dtype parity covers F32 alone; F16 waits for an F16 weight dtype (`flife-genome`). The kernel
+  reaches 44–69% of a plain read in its fastest rounds, and nothing measured explains the rest: it is not
+  profiled. Each per-product subnormal check is a candidate, as are the 64-lane threadgroup that the 32- and
+  36-wide layers half fill, and one barrier per layer.
 - Parameter shards are never freed before `forget`: after a population crash, device memory stays at the peak in
   whole shards. A topology's first genome allocates a whole 256 MiB shard, so the five catalog members can hold
   1.25 GiB however few their genomes. Backend memory is not yet part of admission (FL-043).

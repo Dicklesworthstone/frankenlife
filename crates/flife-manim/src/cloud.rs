@@ -12,15 +12,19 @@
 //! never allocates. A dot's colour is the style's [`ColorMapping`] of its
 //! row; the glow look adds a halo under every dot, the raw look none.
 //!
+//! Between two committed epochs (FL-020), [`ParticleCloud::update_between`]
+//! draws each organism where an interpolation places it, and fades out the
+//! organisms that died in the gap.
+//!
 //! [`ColorMapping`]: crate::ColorMapping
 
 use flife_core::CoreError;
-use flife_render::Epoch;
+use flife_render::{Epoch, Interpolation};
 use fmn_core::color::LinearRgba;
 use fmn_render::{ThreeDDraw, TrueDotDraw};
 
 use crate::Viewport;
-use crate::mapping::{Look, Particles, Style, mapped_color, traits};
+use crate::mapping::{Look, Particles, Style, Traits, mapped_color, traits};
 
 /// Dot radius in world units.
 pub const DOT_RADIUS: f64 = 0.35;
@@ -155,32 +159,160 @@ impl ParticleCloud {
                 ),
             });
         }
-        let radius = dot_radius(viewport);
-        self.radius = radius;
-        self.draws.clear();
-        self.halos.clear();
+        self.begin(viewport);
         if style.particles == Particles::Density {
             return Ok(&self.draws);
         }
         let speed = epoch.maximum_speed();
         for (position, traits) in epoch.positions().iter().zip(traits(epoch)) {
             let world = [f64::from(position[0]), f64::from(position[1])];
-            let center = viewport.scene_point(world);
-            let color = mapped_color(style.mapping, &traits, speed);
-            self.draws
-                .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
-            if style.look == Look::Glow {
-                self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
-                    center,
-                    radius * halo_factor(traits.energy),
-                    LinearRgba {
-                        a: HALO_ALPHA,
-                        ..color
-                    },
+            self.push(viewport.scene_point(world), &traits, speed, style, 1.0);
+        }
+        Ok(&self.draws)
+    }
+
+    /// Lower the display `fraction` of the way from `prior` to `current`
+    /// (FL-020, plan §13.5), as `between` places it ([`interpolate`]):
+    /// first each organism that died in the gap, at its `prior` position in
+    /// its `prior` colour, its dot and halo faded by `1 − fraction` and gone
+    /// at fraction 1; then each of `current`'s rows that `between` shows, in
+    /// identity order, at its drawn position in its `current` colour. The
+    /// dead fade under the living. Nothing is allocated: while the display
+    /// moves, births are not yet shown, so the living and the fading
+    /// together are `prior`'s rows.
+    ///
+    /// # Errors
+    /// - [`CoreError::LayoutMismatch`] when `between` does not row for row
+    ///   describe `current`, names a fading row `prior` lacks (or fading
+    ///   rows with no `prior`), or either epoch's world is not the
+    ///   viewport's. The previous draws are kept.
+    /// - [`CoreError::BudgetExhausted`] when the dots to draw exceed the
+    ///   cloud's capacity. The previous draws are kept.
+    /// - [`CoreError::NumericalInvalid`] for a fraction outside `[0, 1]`.
+    ///
+    /// [`interpolate`]: flife_render::interpolate
+    pub fn update_between(
+        &mut self,
+        prior: Option<&Epoch>,
+        current: &Epoch,
+        between: &Interpolation,
+        fraction: f64,
+        viewport: &Viewport,
+        style: &Style,
+    ) -> Result<&[ThreeDDraw<'static>], CoreError> {
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "particle cloud display fraction",
+                detail: format!("{fraction} is outside [0, 1]"),
+            });
+        }
+        let mismatch = |detail: String| CoreError::LayoutMismatch {
+            buffer: "particle cloud",
+            detail,
+        };
+        if between.positions.len() != current.len() || between.shown.len() != current.len() {
+            return Err(mismatch(format!(
+                "{} drawn positions and {} visibilities for an epoch of {} rows",
+                between.positions.len(),
+                between.shown.len(),
+                current.len()
+            )));
+        }
+        let fade = 1.0 - fraction;
+        let fading = if fade > 0.0 { between.fading.len() } else { 0 };
+        let prior_rows = prior.map_or(0, Epoch::len);
+        if between.fading.iter().any(|&row| row >= prior_rows) {
+            return Err(mismatch(format!(
+                "fading rows beyond the {prior_rows} rows of the prior epoch"
+            )));
+        }
+        for epoch in prior.into_iter().chain([current]) {
+            if epoch.extent().map(f64::to_bits) != viewport.extent().map(f64::to_bits) {
+                return Err(mismatch(format!(
+                    "epoch world {:?} is not the viewport's {:?}",
+                    epoch.extent(),
+                    viewport.extent()
                 )));
             }
         }
+        let drawn = between.shown.iter().filter(|&&shown| shown).count() + fading;
+        if drawn > self.capacity {
+            return Err(CoreError::BudgetExhausted {
+                budget: "particle cloud draws",
+                required: u64::try_from(drawn).unwrap_or(u64::MAX),
+                available: u64::try_from(self.capacity).unwrap_or(u64::MAX),
+            });
+        }
+        self.begin(viewport);
+        if style.particles == Particles::Density {
+            return Ok(&self.draws);
+        }
+        if let Some(prior) = prior.filter(|_| fading > 0) {
+            // Fading rows are in identity order, so increasing rows: one
+            // pass over the prior epoch's traits finds them all.
+            let speed = prior.maximum_speed();
+            let mut rows = between.fading.iter().copied().peekable();
+            for (row, (position, traits)) in prior.positions().iter().zip(traits(prior)).enumerate()
+            {
+                if rows.peek() != Some(&row) {
+                    continue;
+                }
+                rows.next();
+                let world = [f64::from(position[0]), f64::from(position[1])];
+                self.push(viewport.scene_point(world), &traits, speed, style, fade);
+            }
+        }
+        let speed = current.maximum_speed();
+        for ((position, &shown), traits) in between
+            .positions
+            .iter()
+            .zip(&between.shown)
+            .zip(traits(current))
+        {
+            if shown {
+                self.push(viewport.scene_point(*position), &traits, speed, style, 1.0);
+            }
+        }
         Ok(&self.draws)
+    }
+
+    /// Clear the draws for a new lowering through `viewport`.
+    fn begin(&mut self, viewport: &Viewport) {
+        self.radius = dot_radius(viewport);
+        self.draws.clear();
+        self.halos.clear();
+    }
+
+    /// One organism's dot, and its halo for the glow look, at `center`,
+    /// with every alpha multiplied by `opacity`.
+    fn push(
+        &mut self,
+        center: [f64; 3],
+        traits: &Traits,
+        maximum_speed: f64,
+        style: &Style,
+        opacity: f64,
+    ) {
+        let color = mapped_color(style.mapping, traits, maximum_speed);
+        let radius = self.radius;
+        self.draws.push(ThreeDDraw::TrueDot(TrueDotDraw::new(
+            center,
+            radius,
+            LinearRgba {
+                a: color.a * opacity,
+                ..color
+            },
+        )));
+        if style.look == Look::Glow {
+            self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                center,
+                radius * halo_factor(traits.energy),
+                LinearRgba {
+                    a: HALO_ALPHA * opacity,
+                    ..color
+                },
+            )));
+        }
     }
 
     /// Refit the current draws' radius to a new viewport. Scene points do

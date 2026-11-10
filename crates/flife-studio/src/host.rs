@@ -11,13 +11,20 @@
 //! 4. applies the camera moves the input made, in order (zoom about the
 //!    pointer, pan, reset), and picks under a click through the view as it
 //!    was at that click, among the shown epoch's organisms (FL-020);
-//! 5. leases the newest render epoch, if newer than the one shown, lowers
-//!    it into the particle cloud and returns the lease at once, keeping the
-//!    selection only if that epoch still has its identity; after a style
-//!    key or a camera move it lowers the newest epoch again, so the change
-//!    shows while paused too;
+//! 5. leases the newest render epoch, if newer than the one shown, and
+//!    shows it one committed state late: its organisms move from where the
+//!    previous epoch had them, over about the interval at which epochs
+//!    arrive while the world runs, or [`MOTION_MAX`](crate::MOTION_MAX) for a step while
+//!    paused ([`Pacer`]), and the selection stays only if that epoch still
+//!    has its identity; after a style key or a camera move it lowers the
+//!    pair again, so the change shows while paused too, and otherwise
+//!    advances the motion;
 //! 6. renders the cloud with FrankenManim's Metal 3D route straight into
 //!    the window's drawable, with no pixel readback.
+//!
+//! The viewer holds the epoch shown and, while the display moves towards
+//! it, the one before: [`DISPLAY_PAIR`] leases. At rest only the shown one
+//! is held, so the publisher has every other slot.
 //!
 //! The world is only ever read through epochs, which are projections of
 //! committed worlds: a selection is validated against the newest one by
@@ -25,19 +32,20 @@
 //! tick, a command or the session's lanes.
 
 use flife_backend_metal::ControllerChoice;
-use flife_core::ids::{OrganismId, RenderEpoch, SessionId};
+use flife_core::ids::{OrganismId, SessionId};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
-use flife_manim::{Style, Viewport, WorldView, hex_rgb};
-use flife_render::{Prior, Viewer};
+use flife_manim::{Motion, Style, Viewport, WorldView, hex_rgb};
+use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
     INPUT_QUEUE_CAPACITY, InputEvent, NativePreviewRenderer, PresentOutcome, PresentationState,
     SurfaceMetrics,
 };
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
-use crate::{CameraMove, Controls, Intent, SessionThread, Status};
+use crate::{CameraMove, Controls, Intent, Pacer, SessionThread, Status};
 
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
@@ -102,8 +110,11 @@ pub struct Frame {
     pub restyled: bool,
     /// Whether a camera move changed the view this frame.
     pub moved: bool,
-    /// The epoch on screen.
+    /// The epoch shown: the newest lowered, which the display has reached
+    /// unless it is still moving towards it.
     pub shown: Option<Prior>,
+    /// The display's motion towards the shown epoch; `None` at rest.
+    pub motion: Option<Motion>,
     /// The selected organism, which the epoch on screen has.
     pub selected: Option<OrganismId>,
     /// The world point under the pointer.
@@ -156,7 +167,13 @@ pub struct StudioClosed {
 pub struct Studio {
     preview: NativePreviewRenderer,
     session: SessionThread,
+    feed: Feed,
     viewer: Viewer,
+    /// The shown epoch.
+    current: Lease,
+    /// While the display moves: the epoch it moves from.
+    prior: Option<Lease>,
+    pacer: Pacer,
     view: WorldView,
     controls: Controls,
     events: Vec<InputEvent>,
@@ -209,14 +226,14 @@ impl Studio {
             .unwrap_or_else(|| CPU_REFERENCE.to_owned());
         let (owner, handle) = flife_runtime::open(world, config, STUDIO_SESSION)?;
         let feed = handle.feed();
-        // Each epoch is copied into the cloud and its lease returned before
-        // the frame renders, so one lease is all this viewer ever holds.
-        let viewer = feed.viewer(1)?;
+        // The shown epoch and, while the display moves, its prior.
+        let viewer = feed.viewer(DISPLAY_PAIR)?;
         let founding = viewer.latest()?;
         let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
         view.set_style(options.style);
         view.show(&founding)?;
-        drop(founding);
+        let mut pacer = Pacer::new();
+        pacer.arrive(Instant::now());
         let session = SessionThread::spawn(owner, handle)?;
         let mut events = Vec::new();
         events
@@ -235,7 +252,11 @@ impl Studio {
         Ok(Self {
             preview,
             session,
+            feed,
             viewer,
+            current: founding,
+            prior: None,
+            pacer,
             view,
             controls,
             events,
@@ -351,33 +372,42 @@ impl Studio {
             self.tally.selections += 1;
         }
 
-        let seen = self
-            .view
-            .shown()
-            .map_or(RenderEpoch::new(0), |shown| shown.id);
-        let new_epoch = match self.viewer.latest_after(seen)? {
-            Some(lease) => {
-                self.view.show(&lease)?;
-                true
-            }
-            None => false,
-        };
-        if new_epoch {
-            self.tally.epochs += 1;
-        } else if restyled {
-            // The same (or a newer) epoch again, lowered in the new style.
-            let lease = self.viewer.latest()?;
-            self.view.show(&lease)?;
-        } else if moved {
-            // The shown epoch placed in the new view, its display scales
-            // unmoved; an epoch published since is shown as usual.
-            let lease = self.viewer.latest()?;
-            if self.view.shown().map(|shown| shown.id) == Some(lease.id()) {
-                self.view.place(&lease)?;
-            } else {
-                self.view.show(&lease)?;
+        let now = Instant::now();
+        let shown = self.current.id();
+        let mut new_epoch = false;
+        if self.feed.latest().is_some_and(|latest| latest.id > shown) {
+            // The pair is this viewer's whole budget: release the prior
+            // first. The shown epoch becomes the prior of the newer one.
+            self.prior = None;
+            if let Some(lease) = self.viewer.latest_after(shown)? {
+                self.prior = Some(std::mem::replace(&mut self.current, lease));
+                if self.controls.running() {
+                    self.pacer.arrive(now);
+                } else {
+                    self.pacer.arrive_alone(now);
+                }
+                new_epoch = true;
                 self.tally.epochs += 1;
             }
+        }
+        let fraction = if self.prior.is_some() {
+            self.pacer.fraction(now)
+        } else {
+            1.0
+        };
+        let prior = self.prior.as_deref();
+        if new_epoch || restyled {
+            // A newer epoch, or the pair again in the new style.
+            self.view.show_between(prior, &self.current, fraction)?;
+        } else if moved {
+            // The pair placed in the new view, its display scales unmoved.
+            self.view.place_between(prior, &self.current, fraction)?;
+        } else if self.view.motion().is_some() {
+            self.view.advance(prior, &self.current, fraction)?;
+        }
+        if self.view.motion().is_none() {
+            // At rest: the publisher may have the prior's slot back.
+            self.prior = None;
         }
 
         let outcome = if state == PresentationState::Visible {
@@ -409,6 +439,7 @@ impl Studio {
             restyled,
             moved,
             shown: self.view.shown(),
+            motion: self.view.motion(),
             selected: self.view.selected(),
             hover: self.controls.hover(self.view.viewport()),
             outcome,
@@ -436,6 +467,19 @@ impl Studio {
     #[must_use]
     pub const fn view(&self) -> &WorldView {
         &self.view
+    }
+
+    /// The pacer that times the display's motion.
+    #[must_use]
+    pub const fn pacer(&self) -> &Pacer {
+        &self.pacer
+    }
+
+    /// The epoch shown and, while the display moves towards it, the epoch
+    /// it moves from: the leases the Studio holds.
+    #[must_use]
+    pub fn display_pair(&self) -> (Option<&Epoch>, &Epoch) {
+        (self.prior.as_deref(), &self.current)
     }
 
     /// Frame counts so far.
@@ -481,6 +525,9 @@ impl Studio {
             .preview
             .close()
             .map_err(|error| conflict("close the studio window", error));
+        // The display's leases go before the session closes.
+        drop(self.prior.take());
+        drop(self.current);
         let input_dropped = self.preview.input_dropped();
         let session = self.session.close()?;
         window?;

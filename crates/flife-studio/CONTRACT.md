@@ -3,7 +3,8 @@
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
 rendering (§13.4). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
-reset) and selection by displayed stable identity (§13.6). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
+reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
+between epochs by identity (§13.5). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
@@ -65,13 +66,22 @@ adapter.
      position, a pan by the drag times drawable pixels per point, a reset to the fit; a click picks among the shown
      epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
      (scaled to drawable pixels); then takes the view and the selection;
-  6. leases the newest epoch if it is newer than the one shown, lowers it and drops the lease, which keeps the
-     selection only if that epoch has its identity; after a style change or a camera move with no newer epoch, it
-     lowers (or, for a camera move, places) the shown epoch again, so a paused world restyles and moves at once;
+  6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
+     makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
+     fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
+     style change it shows the pair again, after a camera move it places it, and otherwise, while the display
+     moves, it advances it; once the display rests the prior lease is released;
   7. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
 
   It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
-  `Prior`, selected organism, hover, outcome). `close()` closes the window and the session and returns the committed world (`StudioClosed`).
+  `Prior`, the `Motion` or `None` at rest, selected organism, hover, outcome). `display_pair()` is the epochs it
+  holds and `pacer()` the pacer.
+- `Pacer` times the display's motion (§13.5, one-state display latency): `arrive(now)` for an epoch of a running
+  stream moves the smoothed interval between arrivals by `ARRIVAL_SMOOTHING = 0.25` of the difference, and a wait
+  of `MOTION_MAX = 100 ms` or more restarts it at `MOTION_MAX`; `arrive_alone(now)`, for an epoch that arrives
+  while the controls are not running (a step), sets it to `MOTION_MAX`; `fraction(now)` is the time since the last
+  arrival over the interval, at most 1, and 1 before an interval is known. So a running world is drawn about one
+  arrival interval late, and a step is seen moving within 100 ms. `close()` closes the window and the session and returns the committed world (`StudioClosed`).
 - `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
   [--look glow|raw] [--density] [--no-field]`: the binary. M is `lineage`, `energy`, `generation`, `motion` or
   `topology` (or a registered name such as `founder-lineage-v1`); the default is the configuration's
@@ -99,13 +109,18 @@ adapter.
 - *Main-thread presentation (§13.6).* Window creation, event polling, presentation and close happen on the process
   main thread. Nothing on it waits for a tick, a command or the session's lanes: intents use `try_send`, statuses
   use `try_iter`, and epochs come from the lock-free feed.
-- *Observation neutrality.* The main thread reads the world only through render epochs. It holds at most one lease,
-  and only while lowering. Input reaches the world only as session intents: camera moves and selection never do.
+- *Observation neutrality.* The main thread reads the world only through render epochs. It holds at most
+  `DISPLAY_PAIR` = 2 leases: the shown epoch, and while the display moves, its prior; at rest, one. Input reaches the
+  world only as session intents: camera moves, selection and the display's motion never do.
+- *Committed states only (§13.5).* The display is drawn only between two committed epochs of one world, by
+  identity: a birth appears with the first epoch that has it, a death fades and is never picked, an ambiguous gap
+  snaps, and a prior that is not an earlier state of the same world is not drawn between.
 - *Selection by identity (§13.6).* A click picks the displayed epoch's stable identity; each newer epoch shown
   revalidates it by identity and drops it when absent, never reinterpreting a stale hit as its slot's new
   occupant.
-- *Bounded everything.* The presenter queue holds 1024 events, the intent lane 16, the viewer one lease, the cloud
-  its ceiling, and the main thread's event buffer is reserved once at 1024 events. An intent refused because the lane
+- *Bounded everything.* The presenter queue holds 1024 events, the intent lane 16, the viewer two leases (below the
+  reference preset's three render slots, so the publisher always has one), the cloud its ceiling, and the main
+  thread's event buffer is reserved once at 1024 events. An intent refused because the lane
   is full is counted, and a refused resume leaves the controls paused.
 - *Capture safety.* Losing focus with buttons held delivers `PointerCaptureLost` before `FocusLost`, and the controls
   clear the held buttons.
@@ -137,7 +152,12 @@ presentation state, not scientific state.
     lost to capture loss pans no further; scrolls zoom by `exp(rate · dy)` in both units, limited, with no move for
     a zero or non-finite delta; 0 resets once (not on repeat or with ⌘) and is no style key; 256 moves wait in
     order until taken.
-- `tests/live.rs` (harness-free, 28 checks, `--features synthetic-input`): the real 4,096-organism reference preset
+- `tests/pacing.rs` (5 tests, FL-020): at rest before an interval is known; the display moves over the interval
+  between arrivals (worked fractions, capped at 1, a frame before the arrival at 0) and later intervals smooth by a
+  quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
+  too; a step alone moves over `MOTION_MAX` whatever came before and smooths down once epochs flow; arrivals with
+  no time between leave the display at rest.
+- `tests/live.rs` (harness-free, 30 checks, `--features synthetic-input`): the real 4,096-organism reference preset
   in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
   and delivered through the presenter's typed bridge:
   - the first poll's real `Resized` (640 × 400 points), and a real `FocusGained` (made key by a real key-window
@@ -145,8 +165,14 @@ presentation state, not scientific state.
   - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling, in four scene
     objects (the field, the cloud, the density layer and the selection ring);
   - Space runs, and live epochs reach the screen;
-  - Space pauses at a reported boundary, which is what is shown, and no epoch arrives while paused;
-  - → and `.` each step one tick;
+  - Space pauses at a reported boundary, where the display comes to rest holding only that epoch's lease, and no
+    epoch arrives while paused;
+  - → and `.` each step one tick; FL-020: steps are shown one committed state late. Each arrival frame draws every
+    organism at its previous committed position, and every moving frame draws exactly what `interpolate` places
+    between the two epochs the Studio holds, at the frame's own fraction (part-way frames required). The `.` is
+    pressed as soon as the → step is on screen, so it arrives while the display still moves, and is paced over
+    `MOTION_MAX` all the same (a running-stream pacing would give less); the display rests on the `.` step with the
+    prior lease released;
   - while paused: 2 recolours the shown dots by energy; R drops the halos; D draws density on the Metal route, its
     bins counting every organism; 1, R, D and F restore the lineage colours bit for bit, and no restyle steps the
     world or changes the shown tick;
@@ -180,14 +206,16 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   high-DPI displays. Rendering at backing resolution needs the presenter to size the drawable apart from the content
   area (an upstream frankentorch change, then repins). `Viewport`, the pan and the pick radius already convert
   through the drawable-per-point ratio, but only a ratio of 1 is exercised by a real window.
-- Camera smoothing at display cadence, interpolated motion with fading and trails, and a pinch-zoom gesture are not
-  implemented (FL-020's remaining parts). Brushes as `CommandPort` commands are FL-022's.
+- Camera smoothing, trails and a pinch-zoom gesture are not implemented (§13.5 allows smoothing and trails; G6's
+  100 ms budget argues against smoothing the camera). Brushes as `CommandPort` commands are FL-022's.
+- While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the
+  previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
+  seen when epochs arrive slower than frames, and for steps.
 - A selection shows only as the ring and the `selection` record: there is no inspector (FL-021).
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here. The
   synchronous present path is an integration starting point, not latency evidence.
 - There is no on-screen legend: the Metal 3D route has no text, and the presenter has no window-title setter. The
   style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
-  at its texel resolution, so the picture is soft rather than detailed. Motion between ticks
-  is not interpolated in the live view yet (`flife-render`'s `interpolate` exists; FL-020).
+  at its texel resolution, so the picture is soft rather than detailed.
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later
   work (FL-023, FL-038).

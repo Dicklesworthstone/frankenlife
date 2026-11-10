@@ -16,7 +16,8 @@
 //! - [`Style`] and its parts: §13.4's colour mappings ([`ColorMapping`]),
 //!   the glow and raw looks ([`Look`]), points or density ([`Particles`]).
 //! - [`WorldView`]: all of them, with the per-frame
-//!   [`fmn_render::ThreeDJob`].
+//!   [`fmn_render::ThreeDJob`], drawn at rest or part of the way from one
+//!   committed epoch to the next ([`Motion`], FL-020).
 //!
 //! Nothing here reads or writes the world: everything comes from an
 //! immutable [`flife_render::Epoch`]. The metric overlay and camera track
@@ -51,4 +52,4 @@ pub use selection::{
     SELECTION_RING_WIDTH_PIXELS, pick, selection_ring,
 };
 pub use viewport::{MAXIMUM_ZOOM, Viewport};
-pub use world::{WorldView, hex_rgb};
+pub use world::{Motion, WorldView, hex_rgb};

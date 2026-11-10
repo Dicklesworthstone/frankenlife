@@ -3,7 +3,7 @@
 
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
-use flife_render::{Epoch, Prior};
+use flife_render::{Epoch, Gap, Interpolation, Prior, interpolate};
 use fmn_core::color::{LinearRgba, Srgb};
 use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDCamera, ThreeDDraw, ThreeDJob, Tiling};
 
@@ -28,10 +28,15 @@ pub fn hex_rgb(text: &str) -> Option<[u8; 3]> {
 /// last showed as a [`Prior`], so a host can tell what is on screen and
 /// request only newer epochs.
 ///
-/// It also keeps the shown epoch's identities and positions, so a pick
-/// reads the epoch on screen, and at most one selected organism, held by
-/// identity: every newly shown epoch revalidates it, and an organism the
+/// It also keeps the shown epoch's identities and where each is drawn, so
+/// a pick reads what is on screen, and at most one selected organism, held
+/// by identity: every newly shown epoch revalidates it, and an organism the
 /// epoch no longer has is deselected, whatever occupies its old slot.
+///
+/// The display can lag one committed state behind (FL-020, plan §13.5):
+/// [`WorldView::show_between`] draws the organisms part of the way from the
+/// prior epoch to the shown one, matched by identity, and fades out the
+/// ones that died in the gap ([`Motion`]).
 #[derive(Debug)]
 pub struct WorldView {
     background: LinearRgba,
@@ -44,10 +49,27 @@ pub struct WorldView {
     shown: Option<Prior>,
     /// The shown epoch's identities, in identity order.
     ids: Vec<u64>,
-    /// The shown epoch's positions, row for row with `ids`.
-    positions: Vec<[f32; 2]>,
+    /// Where the shown epoch's rows are drawn and whether they are yet,
+    /// row for row with `ids`, and the prior rows fading.
+    between: Interpolation,
+    motion: Option<Motion>,
     selected: Option<OrganismId>,
     ring: Option<SurfaceMesh>,
+}
+
+/// Where the display is between two committed epochs (FL-020, plan §13.5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Motion {
+    /// The epoch the display moves from.
+    pub prior: Prior,
+    /// How far it has come, in `[0, 1)`: 0 is `prior`, 1 the shown epoch
+    /// (where it no longer moves, so there is no motion).
+    pub fraction: f64,
+    /// The gap between the two. An ambiguous one snapped every continuing
+    /// organism to the shown epoch.
+    pub gap: Gap,
+    /// The organisms of `prior` that died in the gap, drawn fading.
+    pub fading: usize,
 }
 
 impl WorldView {
@@ -73,10 +95,19 @@ impl WorldView {
         let mut ids = Vec::new();
         ids.try_reserve_exact(capacity)
             .map_err(|_| refused("world view identities", size_of::<u64>()))?;
-        let mut positions = Vec::new();
-        positions
+        let mut between = Interpolation::default();
+        between
+            .positions
             .try_reserve_exact(capacity)
-            .map_err(|_| refused("world view positions", size_of::<[f32; 2]>()))?;
+            .map_err(|_| refused("world view drawn positions", size_of::<[f64; 2]>()))?;
+        between
+            .shown
+            .try_reserve_exact(capacity)
+            .map_err(|_| refused("world view visibilities", size_of::<bool>()))?;
+        between
+            .fading
+            .try_reserve_exact(capacity)
+            .map_err(|_| refused("world view fading rows", size_of::<usize>()))?;
         Ok(Self {
             camera: viewport.camera(background)?,
             background,
@@ -87,7 +118,8 @@ impl WorldView {
             style: Style::default(),
             shown: None,
             ids,
-            positions,
+            between,
+            motion: None,
             selected: None,
             ring: None,
         })
@@ -185,13 +217,169 @@ impl WorldView {
     /// As [`ParticleCloud::update_styled`], [`DensityLayer::update`] and
     /// [`FieldLayer::update_look`].
     pub fn show(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
+        self.show_between(None, epoch, 1.0).map(|_| ())
+    }
+
+    /// Show `current` with the display `fraction` of the way from `prior`
+    /// to it (FL-020, plan §13.5): as [`WorldView::show`], but each organism
+    /// alive in both is drawn where [`interpolate`] places it, by identity
+    /// (by the minimum wrapped displacement when the gap is unambiguous,
+    /// snapped to `current` when it is not), an organism born in the gap
+    /// appears only at fraction 1, and one that died fades out at its
+    /// `prior` position. The field and density are `current`'s.
+    ///
+    /// Only two committed states of one world, the later after the earlier,
+    /// are drawn between. Without a `prior`, at fraction 1, or for a
+    /// `prior` that is not an earlier state of `current`'s world (a branch,
+    /// a restored checkpoint, another world), `current` is shown at rest.
+    /// Returns the motion on screen, if any.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a fraction outside `[0, 1]`;
+    /// [`CoreError::BudgetExhausted`] for an epoch above the view's ceiling;
+    /// [`CoreError::LayoutMismatch`] for an epoch of another world than the
+    /// viewport's; and as [`WorldView::show`]. The organisms are unchanged
+    /// on the first three.
+    pub fn show_between(
+        &mut self,
+        prior: Option<&Epoch>,
+        current: &Epoch,
+        fraction: f64,
+    ) -> Result<Option<Motion>, CoreError> {
         let style = self.style;
-        self.cloud.update_styled(epoch, &self.viewport, &style)?;
+        let motion = self.lower(prior, current, fraction)?;
         if style.particles == Particles::Density {
-            self.density.update(epoch, &style)?;
+            self.density.update(current, &style)?;
         }
-        self.field.update_look(epoch.field(), style.look)?;
-        self.remember(epoch)
+        self.field.update_look(current.field(), style.look)?;
+        Ok(motion)
+    }
+
+    /// Place `current` again with the display `fraction` of the way from
+    /// `prior`, as [`WorldView::show_between`] draws it, without moving the
+    /// field's or density's display scale: a pan or zoom while the display
+    /// moves.
+    ///
+    /// # Errors
+    /// As [`WorldView::show_between`].
+    pub fn place_between(
+        &mut self,
+        prior: Option<&Epoch>,
+        current: &Epoch,
+        fraction: f64,
+    ) -> Result<Option<Motion>, CoreError> {
+        let style = self.style;
+        let motion = self.lower(prior, current, fraction)?;
+        if style.particles == Particles::Density {
+            self.density.place(&style)?;
+        }
+        self.field.place(current.field(), style.look)?;
+        Ok(motion)
+    }
+
+    /// Move the display to `fraction` of the way from `prior` to the shown
+    /// epoch `current`, redrawing only the organisms and the selection
+    /// ring: the field and density stay as they are. What a frame redraws
+    /// while the display catches up with the shown epoch.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when `current` is not the shown epoch;
+    /// as [`WorldView::show_between`].
+    pub fn advance(
+        &mut self,
+        prior: Option<&Epoch>,
+        current: &Epoch,
+        fraction: f64,
+    ) -> Result<Option<Motion>, CoreError> {
+        if self.shown.map(|shown| shown.id) != Some(current.id()) {
+            return Err(CoreError::StateConflict {
+                operation: "advance the world view",
+                detail: format!(
+                    "epoch {} is not the shown epoch {:?}",
+                    current.id(),
+                    self.shown.map(|shown| shown.id)
+                ),
+            });
+        }
+        self.lower(prior, current, fraction)
+    }
+
+    /// Lower the organisms of the display `fraction` of the way from
+    /// `prior` to `current`, and remember `current` as shown.
+    fn lower(
+        &mut self,
+        prior: Option<&Epoch>,
+        current: &Epoch,
+        fraction: f64,
+    ) -> Result<Option<Motion>, CoreError> {
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "world view display fraction",
+                detail: format!("{fraction} is outside [0, 1]"),
+            });
+        }
+        let capacity = self.cloud.capacity();
+        for epoch in prior.into_iter().chain([current]) {
+            if epoch.len() > capacity {
+                return Err(CoreError::BudgetExhausted {
+                    budget: "world view rows",
+                    required: u64::try_from(epoch.len()).unwrap_or(u64::MAX),
+                    available: u64::try_from(capacity).unwrap_or(u64::MAX),
+                });
+            }
+            if epoch.extent().map(f64::to_bits) != self.viewport.extent().map(f64::to_bits) {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "world view",
+                    detail: format!(
+                        "epoch world {:?} is not the viewport's {:?}",
+                        epoch.extent(),
+                        self.viewport.extent()
+                    ),
+                });
+            }
+        }
+        // Only an earlier state of the same world is drawn between; the
+        // gap check refuses anything else, which is then shown at rest.
+        let pair = prior
+            .filter(|_| fraction < 1.0)
+            .and_then(|prior| Gap::between(prior, current).ok().map(|gap| (prior, gap)));
+        // Every buffer was reserved at the ceiling both epochs are within,
+        // so neither path allocates.
+        match pair {
+            Some((prior, _)) => {
+                interpolate(prior, current, fraction, &mut self.between)?;
+            }
+            None => {
+                self.between.positions.clear();
+                self.between
+                    .positions
+                    .extend(current.positions().iter().map(|p| p.map(f64::from)));
+                self.between.shown.clear();
+                self.between.shown.resize(current.len(), true);
+                self.between.fading.clear();
+                self.between.snapped = false;
+            }
+        }
+        let shown_fraction = if pair.is_some() { fraction } else { 1.0 };
+        self.cloud.update_between(
+            pair.map(|(prior, _)| prior),
+            current,
+            &self.between,
+            shown_fraction,
+            &self.viewport,
+            &self.style,
+        )?;
+        self.motion = pair.map(|(prior, gap)| Motion {
+            prior: Prior {
+                id: prior.id(),
+                tick: prior.tick(),
+            },
+            fraction,
+            gap,
+            fading: self.between.fading.len(),
+        });
+        self.remember(current)?;
+        Ok(self.motion)
     }
 
     /// Draw `epoch` again at the current viewport and style without moving
@@ -202,36 +390,33 @@ impl WorldView {
     /// # Errors
     /// As [`WorldView::show`].
     pub fn place(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
-        let style = self.style;
-        self.cloud.update_styled(epoch, &self.viewport, &style)?;
-        if style.particles == Particles::Density {
-            self.density.place(&style)?;
-        }
-        self.field.place(epoch.field(), style.look)?;
-        self.remember(epoch)
+        self.place_between(None, epoch, 1.0).map(|_| ())
     }
 
-    /// Keep `epoch` as the shown one: its identities and positions, and the
-    /// selection only if the epoch still has that identity.
+    /// Keep `epoch` as the shown one, with its identities, and the
+    /// selection only if the epoch still has that identity drawn.
     fn remember(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),
         });
-        // The cloud has already refused an epoch above the ceiling these
-        // were reserved for, so neither grows.
+        // `lower` has refused an epoch above the ceiling this was reserved
+        // for, so it does not grow.
         self.ids.clear();
         self.ids.extend_from_slice(epoch.ids());
-        self.positions.clear();
-        self.positions.extend_from_slice(epoch.positions());
         self.reselect(self.selected)
     }
 
+    /// The row of `organism` in the shown epoch, if it is drawn.
+    fn drawn_row(&self, organism: OrganismId) -> Option<usize> {
+        let row = self.ids.binary_search(&organism.get()).ok()?;
+        self.between.shown[row].then_some(row)
+    }
+
     fn reselect(&mut self, organism: Option<OrganismId>) -> Result<(), CoreError> {
-        let row = organism.and_then(|id| self.ids.binary_search(&id.get()).ok());
-        match row {
+        match organism.and_then(|id| self.drawn_row(id)) {
             Some(row) => {
-                let position = self.positions[row].map(f64::from);
+                let position = self.between.positions[row];
                 self.ring = Some(selection_ring(&self.viewport, position)?);
                 self.selected = organism;
             }
@@ -244,9 +429,9 @@ impl WorldView {
     }
 
     /// The organism drawn nearest the drawable position `at`, within
-    /// `radius_pixels`, among the shown epoch's rows placed through
-    /// `viewport` (this view's, or one a host is about to set): see
-    /// [`pick`].
+    /// `radius_pixels`, among the shown epoch's drawn rows, where they are
+    /// drawn, placed through `viewport` (this view's, or one a host is about
+    /// to set): see [`pick`]. A fading organism is dead and is never picked.
     #[must_use]
     pub fn pick_in(
         &self,
@@ -257,17 +442,21 @@ impl WorldView {
         pick(viewport, self.shown_rows(), at, radius_pixels)
     }
 
-    /// The shown epoch's rows: each organism's identity and world position,
-    /// in identity order.
+    /// The shown epoch's drawn rows: each drawn organism's identity and the
+    /// world position it is drawn at, in identity order. At rest these are
+    /// all the epoch's rows at their positions.
     pub fn shown_rows(&self) -> impl Iterator<Item = (u64, [f64; 2])> + '_ {
         self.ids
             .iter()
-            .zip(&self.positions)
-            .map(|(&id, position)| (id, position.map(f64::from)))
+            .zip(&self.between.positions)
+            .zip(&self.between.shown)
+            .filter(|(_, shown)| **shown)
+            .map(|((&id, &position), _)| (id, position))
     }
 
     /// Select `organism`, or nothing. An identity the shown epoch does not
-    /// have selects nothing. Returns the selection now held.
+    /// have, or has not drawn yet, selects nothing. Returns the selection
+    /// now held.
     ///
     /// # Errors
     /// As [`selection_ring`]; the selection is unchanged on error.
@@ -285,12 +474,11 @@ impl WorldView {
         self.selected
     }
 
-    /// The selected organism's world position in the shown epoch.
+    /// The world position the selected organism is drawn at.
     #[must_use]
     pub fn selected_position(&self) -> Option<[f64; 2]> {
-        let id = self.selected?.get();
-        let row = self.ids.binary_search(&id).ok()?;
-        Some(self.positions[row].map(f64::from))
+        let row = self.drawn_row(self.selected?)?;
+        Some(self.between.positions[row])
     }
 
     /// The selection ring's draw, while an organism is selected: unlit,
@@ -389,10 +577,17 @@ impl WorldView {
         Ok(rgba)
     }
 
-    /// The epoch currently shown.
+    /// The epoch currently shown: the newest lowered, which the display
+    /// reaches at the end of its [`Motion`].
     #[must_use]
     pub const fn shown(&self) -> Option<Prior> {
         self.shown
+    }
+
+    /// The display's motion towards the shown epoch, or `None` at rest.
+    #[must_use]
+    pub const fn motion(&self) -> Option<Motion> {
+        self.motion
     }
 
     /// The viewport.

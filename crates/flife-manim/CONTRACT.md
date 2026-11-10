@@ -2,7 +2,8 @@
 
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's FrankenManim bulk world adapter (plan §13.1, §13.2, §13.6).
 FL-019 (`flife-g90`) adds the visual mappings, raw views and density rendering (plan §2.3, §13.3 step 5, §13.4).
-FL-020 (`flife-err`, part) adds the camera, which pans and zooms across the torus's seams, and picking by identity
+FL-020 (`flife-err`, part) adds the camera, which pans and zooms across the torus's seams, picking by identity, and
+the display between two committed epochs: organisms matched by identity, births at their epoch, deaths fading
 (plan §13.5, §13.6, C.15).
 The live ecology enters a FrankenManim scene as a few bulk primitives, never as one scene object per organism:
 
@@ -94,6 +95,14 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - with `Particles::Density`, no dots or halos: the density layer draws instead.
   - `refit(viewport)` changes only the radii, halos in proportion, because scene points do not depend on the
     drawable.
+- `ParticleCloud::update_between(prior, current, between, fraction, viewport, style)` (FL-020) draws the display
+  `fraction` of the way from `prior` to `current`, as an `flife_render::Interpolation` places it:
+  - first each organism that died in the gap, at its `prior` position in its `prior` colour, dot and halo alpha
+    multiplied by `1 − fraction` (none at fraction 1), in identity order, so the dead fade under the living;
+  - then each of `current`'s rows the interpolation shows, in identity order, at its drawn position in its
+    `current` colour; a birth is not shown before fraction 1;
+  - while the display moves the living and the dying are `prior`'s rows, so the ceiling holds and nothing
+    allocates. At opacity 1 a dot is bit for bit what `update_styled` draws.
 - `FieldLayer::update(field)`:
   - one vertex per texel corner, `(texels + 1)²`, spanning the world exactly; each coloured by the mean of the four
     texels around it, wrapping, so opposite edges match and the torus shows no seam;
@@ -125,11 +134,22 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `set_view(viewport)` takes a new view of the same world and drawable (returning whether it changed), and
     `place(epoch)` re-lowers the shown epoch there without moving the field's or density's display scale, so a pan
     or zoom does not age the picture;
-  - it keeps the shown epoch's identities and positions (`shown_rows()`, reserved once at the ceiling), so
-    `pick_in(viewport, at, radius)` picks among the organisms on screen;
-  - `select(organism)` holds at most one organism by identity, only if the shown epoch has it; every `show` or
-    `place` revalidates it and drops an identity the new epoch lacks, whatever now occupies its old slot;
-    `selected()`, `selected_position()`, and `selection_draw()`, the ring, rebuilt for every view change;
+  - `show_between(prior, current, fraction)` (FL-020, §13.5) shows `current` with the display `fraction` of the
+    way from `prior`: each organism alive in both where `flife_render::interpolate` places it, by identity (the
+    minimum wrapped displacement for an unambiguous gap, snapped to `current` for an ambiguous one), births from
+    fraction 1, deaths fading (`ParticleCloud::update_between`). The field and density are `current`'s. It returns
+    the `Motion` (the prior `Prior`, the fraction, the `Gap`, the fading count), also `motion()`. At fraction 1,
+    without a prior, or for a prior that is not an earlier state of the same world (`Gap::between` refuses it: a
+    later or equal tick, another extent, timestep or speed limit), `current` is shown at rest and the motion is
+    `None`. `place_between` does the same without moving the display scales; `advance` redraws only the organisms
+    and the ring, for the shown epoch only. `show` and `place` are these with no prior;
+  - it keeps the shown epoch's identities and where each row is drawn, and whether it is yet (an
+    `Interpolation`, reserved once at the ceiling): `shown_rows()` is the drawn rows at their drawn positions, so
+    `pick_in(viewport, at, radius)` picks among what is on screen, never the fading dead or the unborn;
+  - `select(organism)` holds at most one organism by identity, only if the shown epoch has it drawn; every
+    lowering revalidates it and drops an identity the new epoch lacks, whatever now occupies its old slot;
+    `selected()`, `selected_position()` (where it is drawn), and `selection_draw()`, the ring, which follows the
+    organism as the display moves and is rebuilt for every view change;
   - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
     grid, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
   - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
@@ -142,8 +162,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   update or refit allocates or moves it: `reserved_bytes` and the buffer's address are constant for the cloud's
   life.
 - *Observation neutrality.* Everything comes from an immutable epoch. Nothing here reaches the world.
-- *Stable identity.* Draw `i` is epoch row `i`, which is identity order (FL-017). A lineage keeps its colour for the
-  whole run, and a colour is a function of its own row alone.
+- *Stable identity.* At rest, draw `i` is epoch row `i`, which is identity order (FL-017); between epochs, the
+  fading dead come first, then the drawn rows in identity order. A lineage keeps its colour for the whole run, and a
+  colour is a function of its own row alone. Interpolation pairs an organism only with itself: a reused storage
+  slot never continues another organism's path (§13.5).
 - *Observation-neutral styles.* A style changes only what is drawn. Rendering one run in every style gives the same
   world digest.
 - *Exact mapping.* `world_to_drawable` and `drawable_to_world` are inverses on the world, through any view, up to
@@ -157,6 +179,12 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - An epoch with more rows than the cloud holds: `BudgetExhausted`. An epoch of another world than the viewport's:
   `LayoutMismatch`, from the cloud or the density layer. Either way the previous draws, and what `WorldView` shows,
   are kept.
+- `show_between`, `place_between` or `advance` with a fraction outside `[0, 1]`: `NumericalInvalid`; with either
+  epoch above the ceiling: `BudgetExhausted`; of another world than the viewport's: `LayoutMismatch`. The organisms
+  drawn are kept. `advance` for an epoch that is not the shown one: `StateConflict`.
+- `ParticleCloud::update_between` with an interpolation that does not describe `current` row for row, or fading
+  rows `prior` lacks: `LayoutMismatch`; more dots than the ceiling: `BudgetExhausted`; a fraction outside
+  `[0, 1]`: `NumericalInvalid`. The previous draws are kept.
 - `ColorMapping::configured` for a name that is not a registered colour mapping this crate draws:
   `UnknownAlgorithm`. Configuration validation already refuses unregistered names.
 - A failed reservation: `AllocationFailed`.
@@ -202,6 +230,20 @@ route.
     two circles (within 1e-9) around the organism, through a pan and zoom too; an identity the epoch lacks selects
     nothing; once the organism is removed and an introduced one takes its slot, the next shown epoch drops the
     selection and the old identity selects nothing; a living selection follows its organism a tick on.
+- `tests/motion.rs` (3 tests, FL-020), on real epochs of one world from one publisher; the oracle for every drawn
+  position is `flife_render::interpolate`, which `flife-render`'s tests check against tick-by-tick paths:
+  - A gap of four ticks with one organism removed and one introduced: at fractions 0, 0.25, 0.5 and 0.75 the motion
+    is reported exactly; every dot is the oracle's (the dead first at their prior positions and colours, alpha
+    `1 − fraction`, halos too; then every drawn row at its interpolated position), the dots are the prior's rows,
+    the newborn is not drawn, fraction 0 is the prior state, nothing grows; picks and `shown_rows()` read the drawn
+    rows; the dead and the unborn select nothing; a continuing organism is picked and selected where it is drawn.
+    At fraction 1 the view is at rest and draws bit for bit what showing the later epoch alone draws, and the
+    newborn is selectable.
+  - `advance` moves the organisms and the selection's position along the oracle without redrawing the field or
+    moving its scale, rests at fraction 1, and refuses an epoch that is not shown.
+  - A 600-tick gap on a 32-unit world is ambiguous: every drawn organism is at its later position, none on a path.
+    A later or equal prior is shown at rest, bit for bit; a prior of another world is refused; fractions -0.1, 1.5
+    and NaN are refused with the organisms kept.
 - `tests/cloud.rs` (6 tests):
   - Every row of a real 24-tick epoch becomes one dot, in identity order, at its scene point with its lineage
     colour.
@@ -255,10 +297,12 @@ route.
   pixel would be about four million triangles at 1080p.
 - `[presentation] point_radius_pixels`, bloom and trails are not applied yet.
 - Human review of the mappings against the plan's reference images (G5) has not been done.
-- FL-020's remaining parts: drawing an interpolated epoch and fading the dead in the live view; trails; camera
-  smoothing at display cadence; and a drawable at the screen's backing scale (the Studio still draws one pixel per
-  point). A selection is validated against the newest shown epoch, a projection of a committed world, not by a
-  query to the session's world.
+- FL-020's remaining part: a drawable at the screen's backing scale (the Studio still draws one pixel per point).
+  There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). Births appear at the first
+  epoch that has them, not at their tick within a longer gap: an epoch does not carry birth ticks. The field and
+  density show the newer epoch of a pair at once, up to one state ahead of the moving organisms. A selection is
+  validated against the newest shown epoch, a projection of a committed world, not by a query to the session's
+  world.
 - Density bins do not refine with the zoom (they keep the fit's), so a deep zoom shows wide bins.
 - FrankenManim's frame is a perspective one; there is no orthographic camera, so dots are capped on screen rather
   than drawn at world size at deep zoom.

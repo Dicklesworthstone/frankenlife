@@ -21,10 +21,11 @@ use std::time::{Duration, Instant};
 use flife_core::ids::OrganismId;
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
+use flife_render::{Interpolation, interpolate};
 use flife_studio::{
     ColorMapping, ControllerChoice, End, Frame, KEY_D, KEY_DIGITS, KEY_ESCAPE, KEY_F, KEY_PERIOD,
-    KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, PICK_RADIUS_POINTS, Particles, Status, Studio,
-    StudioOptions, Style,
+    KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, MOTION_MAX, Motion, PICK_RADIUS_POINTS, Particles,
+    Status, Studio, StudioOptions, Style,
 };
 use fmn_render::metal::{LogicalPoint, Modifiers, PointerButton, SyntheticInput};
 
@@ -118,6 +119,72 @@ impl Live {
 
 fn shown_tick(frame: &Frame) -> Option<u64> {
     frame.shown.map(|shown| shown.tick.get())
+}
+
+/// Checks every frame of a moving display against `interpolate` over the
+/// two epochs the Studio holds (FL-020).
+#[derive(Default)]
+struct MotionAudit {
+    oracle: Interpolation,
+    moving: u32,
+    part_way: u32,
+    arrivals: u32,
+    faded: usize,
+    wrong: Vec<String>,
+    last: Option<Motion>,
+}
+
+impl MotionAudit {
+    /// Audit `frame`; return the previous frame's motion.
+    fn see(&mut self, studio: &Studio, frame: &Frame) -> Option<Motion> {
+        let before = std::mem::replace(&mut self.last, frame.motion);
+        let Some(motion) = frame.motion else {
+            return before;
+        };
+        self.moving += 1;
+        let (Some(prior), current) = studio.display_pair() else {
+            self.wrong
+                .push(format!("no prior epoch held while moving: {motion:?}"));
+            return before;
+        };
+        let gap = interpolate(prior, current, motion.fraction, &mut self.oracle);
+        let rows: Vec<(u64, [f64; 2])> = studio.view().shown_rows().collect();
+        let expected: Vec<(u64, [f64; 2])> = current
+            .ids()
+            .iter()
+            .zip(self.oracle.positions.iter().zip(&self.oracle.shown))
+            .filter(|(_, (_, shown))| **shown)
+            .map(|(&id, (&position, _))| (id, position))
+            .collect();
+        let at_prior = motion.fraction > 0.0
+            || rows.iter().all(|&(id, position)| {
+                prior
+                    .row(OrganismId::new(id))
+                    .is_some_and(|row| prior.positions()[row].map(f64::from) == position)
+            });
+        if gap.as_ref().ok() != Some(&motion.gap)
+            || prior.id() != motion.prior.id
+            || frame.shown.map(|shown| shown.id) != Some(current.id())
+            || motion.fading != self.oracle.fading.len()
+            || rows != expected
+            || studio.view().cloud().draws().len() != prior.len()
+            || !at_prior
+        {
+            self.wrong.push(format!(
+                "a moving frame at fraction {} does not draw the interpolation of epochs {} and {}",
+                motion.fraction,
+                prior.id(),
+                current.id()
+            ));
+        }
+        if motion.fraction == 0.0 {
+            self.arrivals += 1;
+        } else {
+            self.part_way += 1;
+        }
+        self.faded = self.faded.max(motion.fading);
+        before
+    }
 }
 
 fn live() -> Result<Vec<String>, String> {
@@ -230,12 +297,17 @@ fn live() -> Result<Vec<String>, String> {
             _ => None,
         })
         .ok_or("no pause boundary")?;
-    let frame = live.until("the paused boundary on screen", |_, frame, _| {
-        shown_tick(frame) == Some(paused)
+    let frame = live.until("the paused boundary on screen, at rest", |_, frame, _| {
+        shown_tick(frame) == Some(paused) && frame.motion.is_none()
     })?;
     live.check(
-        !live.studio.controls().running() && shown_tick(&frame) == Some(paused),
-        format!("Space pauses at tick {paused}, which is what the screen shows"),
+        !live.studio.controls().running()
+            && shown_tick(&frame) == Some(paused)
+            && live.studio.display_pair().0.is_none(),
+        format!(
+            "Space pauses at tick {paused}, where the display comes to rest, holding only that \
+             epoch's lease"
+        ),
     )?;
     // Paused stays paused: no newer epoch arrives.
     let settled = live.studio.tally().epochs;
@@ -247,19 +319,75 @@ fn live() -> Result<Vec<String>, String> {
         "no epoch arrives while paused",
     )?;
 
-    // → and `.` each step exactly one tick.
+    // → and `.` each step exactly one tick. FL-020: a step is shown one
+    // committed state late, over MOTION_MAX. Every frame while the display
+    // moves draws the organisms exactly where `interpolate` puts them
+    // between the epochs the Studio holds, at the frame's own fraction. The
+    // `.` is pressed as soon as the → step is on screen, so it arrives while
+    // the display is still moving: the display starts again from the → step's
+    // committed state, again over MOTION_MAX, and comes to rest on the `.`
+    // step.
     live.key(KEY_RIGHT, "\u{f703}")?;
-    live.until("the right-arrow step", |_, frame, statuses| {
-        statuses.contains(&Status::Stepped {
-            tick: Tick::new(paused + 1),
-        }) && shown_tick(frame) == Some(paused + 1)
-    })?;
+    let mut audit = MotionAudit::default();
+    let first = live.until(
+        "the right-arrow step on screen",
+        |studio, frame, statuses| {
+            audit.see(studio, frame);
+            statuses.contains(&Status::Stepped {
+                tick: Tick::new(paused + 1),
+            }) && shown_tick(frame) == Some(paused + 1)
+        },
+    )?;
     live.key(KEY_PERIOD, ".")?;
-    live.until("the period step", |_, frame, statuses| {
+    let mut second: Option<(Option<Motion>, Option<Duration>)> = None;
+    let rest = live.until("the period step, at rest", |studio, frame, statuses| {
+        let before = audit.see(studio, frame);
+        if second.is_none() && shown_tick(frame) == Some(paused + 2) {
+            second = Some((before, studio.pacer().interval()));
+        }
         statuses.contains(&Status::Stepped {
             tick: Tick::new(paused + 2),
         }) && shown_tick(frame) == Some(paused + 2)
+            && frame.motion.is_none()
     })?;
+    let (held, current) = live.studio.display_pair();
+    let resting = live.studio.view().shown_rows().eq(current
+        .ids()
+        .iter()
+        .zip(current.positions())
+        .map(|(&id, p)| (id, p.map(f64::from))));
+    live.check(
+        audit.wrong.is_empty()
+            && first.motion.map(|motion| motion.fraction) == Some(0.0)
+            && audit.arrivals >= 2
+            && audit.part_way > 0
+            && rest.motion.is_none()
+            && held.is_none()
+            && resting,
+        format!(
+            "real steps are shown one committed state late: each arrival frame draws every \
+             organism at its previous committed position, then {} moving frames ({} part way) \
+             each draw exactly what interpolate places by identity at the frame's fraction, with \
+             up to {} dead fading and the born waiting, until the display rests on tick {} with \
+             only that epoch held ({:?})",
+            audit.moving,
+            audit.part_way,
+            audit.faded,
+            paused + 2,
+            audit.wrong
+        ),
+    )?;
+    let (interrupted, interval) = second.unwrap_or((None, None));
+    live.check(
+        interrupted.is_some_and(|motion| motion.prior.tick.get() == paused)
+            && interval == Some(MOTION_MAX),
+        format!(
+            "a step taken while paused moves over MOTION_MAX even when it arrives while the \
+             previous step is still moving (from tick {paused}, at fraction {:?}): interval \
+             {interval:?}",
+            interrupted.map(|motion| motion.fraction)
+        ),
+    )?;
     live.check(
         true,
         format!("→ and . each step one tick, to {}", paused + 2),
@@ -583,10 +711,11 @@ fn live() -> Result<Vec<String>, String> {
 
     // A step: the selection is kept only if the new epoch has the organism.
     live.key(KEY_RIGHT, "\u{f703}")?;
-    let frame = live.until("the step after selecting", |_, frame, statuses| {
+    let frame = live.until("the step after selecting, at rest", |_, frame, statuses| {
         statuses.contains(&Status::Stepped {
             tick: Tick::new(paused + 3),
         }) && shown_tick(frame) == Some(paused + 3)
+            && frame.motion.is_none()
     })?;
     let alive = live.studio.view().shown_rows().any(|(id, _)| id == target);
     live.check(

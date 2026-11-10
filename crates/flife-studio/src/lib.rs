@@ -15,11 +15,17 @@
 //! pointer, a primary drag pans across the torus's seams, a click selects
 //! the organism drawn under it by identity, and 0 shows the whole torus
 //! again (FL-020).
+//!
+//! The display runs one committed state behind the world: each new epoch's
+//! organisms move from where the previous epoch had them, matched by
+//! identity, over about the interval at which epochs arrive ([`Pacer`]),
+//! and the organisms that died fade out (FL-020, plan §13.5).
 
 #![forbid(unsafe_code)]
 
 mod controls;
 mod host;
+mod pacing;
 mod session;
 
 pub use controls::{
@@ -28,10 +34,11 @@ pub use controls::{
     ZOOM_STEP_LIMIT, scroll_zoom,
 };
 pub use flife_backend_metal::ControllerChoice;
-pub use flife_manim::{ColorMapping, Look, Particles, Style};
+pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
 };
+pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, SessionThread, Status};
 
 /// The schema of the Studio's NDJSON records.

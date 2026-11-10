@@ -34,11 +34,11 @@ mod viewport;
 mod world;
 
 pub use cloud::{
-    DOT_RADIUS, DOT_RADIUS_MAX_PIXELS, DOT_RADIUS_MIN_PIXELS, HALO_ALPHA, HALO_HALF_ENERGY,
+    DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, HALO_ALPHA, HALO_HALF_ENERGY,
     ParticleCloud, dot_radius, halo_factor,
 };
 pub use density::{
-    DENSITY_BIN_PIXELS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,
+    DENSITY_BIN_POINTS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,
 };
 pub use field::{FIELD_PALETTE, FieldLayer, SCALE_DECAY, display_value, palette, raw_value};
 pub use mapping::{
@@ -48,8 +48,8 @@ pub use mapping::{
     ramp, speed_level, traits, wheel,
 };
 pub use selection::{
-    PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_PIXELS, SELECTION_RING_SEGMENTS,
-    SELECTION_RING_WIDTH_PIXELS, pick, selection_ring,
+    PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,
+    SELECTION_RING_WIDTH_POINTS, pick, selection_ring,
 };
 pub use viewport::{MAXIMUM_ZOOM, Viewport};
 pub use world::{Motion, WorldView, hex_rgb};

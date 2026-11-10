@@ -18,11 +18,12 @@ use crate::{Viewport, dot_radius};
 /// The default pick radius in drawable pixels.
 pub const PICK_RADIUS_PIXELS: f64 = 8.0;
 
-/// The selection ring's gap outside the organism's dot, in drawable pixels.
-pub const SELECTION_RING_GAP_PIXELS: f64 = 3.0;
+/// The selection ring's gap outside the organism's dot, in points (drawable
+/// pixels at one pixel per point).
+pub const SELECTION_RING_GAP_POINTS: f64 = 3.0;
 
-/// The selection ring's width, in drawable pixels.
-pub const SELECTION_RING_WIDTH_PIXELS: f64 = 2.0;
+/// The selection ring's width, in points.
+pub const SELECTION_RING_WIDTH_POINTS: f64 = 2.0;
 
 /// The selection ring's colour: near-white, nearly opaque, linear light.
 pub const SELECTION_RING_COLOR: LinearRgba = LinearRgba {
@@ -37,17 +38,19 @@ pub const SELECTION_RING_SEGMENTS: usize = 48;
 
 /// The ring around a selected organism at world `position`: an annulus in
 /// the view's scene, centred on the organism's scene point, from
-/// [`SELECTION_RING_GAP_PIXELS`] outside its dot to
-/// [`SELECTION_RING_WIDTH_PIXELS`] beyond that, whatever the zoom.
+/// [`SELECTION_RING_GAP_POINTS`] outside its dot to
+/// [`SELECTION_RING_WIDTH_POINTS`] beyond that, whatever the zoom or the
+/// screen's density.
 ///
 /// # Errors
 /// [`CoreError::AllocationFailed`] when the mesh cannot be reserved;
 /// [`CoreError::NumericalInvalid`] when FrankenManim refuses it (a
 /// non-finite position).
 pub fn selection_ring(viewport: &Viewport, position: [f64; 2]) -> Result<SurfaceMesh, CoreError> {
+    let pixels = viewport.pixels_per_point();
     let scale = viewport.scale();
-    let inner = dot_radius(viewport) + SELECTION_RING_GAP_PIXELS / scale;
-    let outer = inner + SELECTION_RING_WIDTH_PIXELS / scale;
+    let inner = dot_radius(viewport) + SELECTION_RING_GAP_POINTS * pixels / scale;
+    let outer = inner + SELECTION_RING_WIDTH_POINTS * pixels / scale;
     let [x, y, z] = viewport.scene_point(position);
     let segments = SELECTION_RING_SEGMENTS;
     let mut vertices = Vec::new();

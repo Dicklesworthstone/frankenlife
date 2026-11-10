@@ -27,7 +27,10 @@ use flife_studio::{
     KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, MOTION_MAX, Motion, PICK_RADIUS_POINTS, Particles,
     Status, Studio, StudioOptions, Style,
 };
-use fmn_render::metal::{LogicalPoint, Modifiers, PointerButton, SyntheticInput};
+use fmn_render::metal::{
+    LogicalPoint, Modifiers, PixelDensity, PointerButton, PresentOutcome, SurfaceMetrics,
+    SyntheticInput,
+};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -233,6 +236,48 @@ fn live() -> Result<Vec<String>, String> {
         metrics.logical_width == 640.0 && metrics.logical_height == 400.0,
         format!("a real Resized event reports the 640 x 400 content area: {metrics:?}"),
     )?;
+    // FL-020: frames are drawn at the screen's density, one drawable pixel
+    // per device pixel, and the window keeps its size in points. Every
+    // position below is a drawable one, posted at `density` pixels per point.
+    let density = metrics.backing_scale;
+    let backing = metrics
+        .backing_size()
+        .ok_or_else(|| format!("no backing size for {metrics:?}"))?;
+    let dense = live.until("a frame at the screen's density", |studio, frame, _| {
+        frame.outcome.is_some()
+            && studio
+                .surface_metrics()
+                .is_ok_and(|now| [now.drawable_width, now.drawable_height] == backing)
+    })?;
+    let now = live
+        .studio
+        .surface_metrics()
+        .map_err(|error| error.to_string())?;
+    let view = *live.studio.view().viewport();
+    live.check(
+        dense.outcome == Some(PresentOutcome::Presented)
+            && live.studio.pixel_density() == PixelDensity::Backing
+            && now.logical_width == 640.0
+            && now.logical_height == 400.0
+            && view.drawable() == backing
+            && view.pixels_per_point() == density
+            && now.to_drawable(LogicalPoint { x: 10.5, y: 3.0 })
+                == Some([
+                    10.5 * f64::from(backing[0]) / 640.0,
+                    3.0 * f64::from(backing[1]) / 400.0,
+                ]),
+        format!(
+            "frames are drawn at the {density}x screen's density: {} x {} pixels in the 640 x 400 \
+             point window, which keeps its size, the view at {} pixels per point",
+            backing[0],
+            backing[1],
+            view.pixels_per_point()
+        ),
+    )?;
+    let to_logical = |at: [f64; 2]| LogicalPoint {
+        x: at[0] / density,
+        y: at[1] / density,
+    };
     live.check(
         live.studio.controls().tally().focus_gained >= 1,
         "a real FocusGained event arrives when the window becomes key",
@@ -482,39 +527,55 @@ fn live() -> Result<Vec<String>, String> {
         ),
     )?;
 
-    // A real resize refits the viewport and camera to the new content area.
+    // A real resize refits the viewport and camera to the new content area,
+    // at the screen's density.
+    let refits = live.studio.tally().refits;
     live.post(&SyntheticInput::Resize {
         width: 800.0,
         height: 450.0,
     })?;
+    let resized = SurfaceMetrics {
+        logical_width: 800.0,
+        logical_height: 450.0,
+        ..metrics
+    }
+    .backing_size()
+    .ok_or("no backing size for 800 x 450 points")?;
     live.until("the resize", |studio, _, _| {
-        studio.view().viewport().drawable() == [800, 450]
+        studio.view().viewport().drawable() == resized
     })?;
     let viewport = *live.studio.view().viewport();
-    let scale = (800.0_f64 / 128.0).min(450.0 / 128.0);
+    let [wide, high] = resized.map(f64::from);
+    let scale = (wide / 128.0).min(high / 128.0);
     live.check(
         viewport.scale() == scale
-            && viewport.origin() == [(800.0 - 128.0 * scale) / 2.0, 0.0]
-            && live.studio.tally().refits == 1
+            && viewport.origin() == [(wide - 128.0 * scale) / 2.0, 0.0]
+            && viewport.pixels_per_point() == density
+            && live.studio.tally().refits == refits + 1
             && live.studio.view().cloud().reserved_bytes() == reserved,
-        format!("a real resize refits the viewport to 800 x 450 at {scale} px per world unit, with no new draw storage"),
+        format!(
+            "a real resize to 800 x 450 points refits the viewport to {} x {} pixels at {scale} px \
+             per world unit, with no new draw storage",
+            resized[0], resized[1]
+        ),
     )?;
     let after = live.until("a frame at the new size", |studio, frame, _| {
         frame.outcome.is_some()
             && studio.surface_metrics().is_ok_and(|metrics| {
-                metrics.drawable_width == 800 && metrics.drawable_height == 450
+                [metrics.drawable_width, metrics.drawable_height] == resized
+                    && metrics.logical_width == 800.0
             })
     })?;
     live.check(
         after.outcome.is_some(),
-        "the next frame is presented at the new drawable size",
+        "the next frame is presented at the new drawable size, the window at 800 x 450 points",
     )?;
 
     // The pointer reports the world point under it.
     let world = [32.0, 96.0];
     let at = viewport.world_to_drawable(world);
     live.post(&SyntheticInput::PointerMoved {
-        position: LogicalPoint { x: at[0], y: at[1] },
+        position: to_logical(at),
         dragging: None,
         modifiers: Modifiers::NONE,
     })?;
@@ -526,7 +587,7 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     live.post(&SyntheticInput::Scroll {
         delta: [0, -3],
-        position: LogicalPoint { x: at[0], y: at[1] },
+        position: to_logical(at),
     })?;
     live.until("the scroll", |studio, _, _| {
         studio.controls().tally().scrolls >= 1
@@ -537,7 +598,7 @@ fn live() -> Result<Vec<String>, String> {
     live.post(&SyntheticInput::Button {
         button: PointerButton::Primary,
         pressed: true,
-        position: LogicalPoint { x: at[0], y: at[1] },
+        position: to_logical(at),
         clicks: 1,
         modifiers: Modifiers::NONE,
     })?;
@@ -565,11 +626,10 @@ fn live() -> Result<Vec<String>, String> {
         "real focus regain arrives as FocusGained",
     )?;
 
-    // FL-020: the camera and selection through real pointer input. The
-    // drawable is one pixel per point here, so logical and drawable
-    // positions coincide.
+    // FL-020: the camera and selection through real pointer input, posted
+    // at the logical point of each drawable position.
     let fitted = *live.studio.view().viewport();
-    let point = |at: [f64; 2]| LogicalPoint { x: at[0], y: at[1] };
+    let point = to_logical;
     let torus = |a: [f64; 2], b: [f64; 2]| {
         let axis = |d: f64| d.abs().min(128.0 - d.abs());
         axis(a[0] - b[0]).max(axis(a[1] - b[1]))
@@ -616,11 +676,12 @@ fn live() -> Result<Vec<String>, String> {
         "the paused epoch is placed again in the zoomed view: every dot at its scene point there",
     )?;
 
-    let press = [400.0, 225.0];
+    // The window's center, and a drag of (40, 25) points from it.
+    let press = [400.0 * density, 225.0 * density];
     let grabbed = zoomed
         .drawable_to_world(press)
         .ok_or("no world under the press")?;
-    let release = [press[0] + 40.0, press[1] + 25.0];
+    let release = [press[0] + 40.0 * density, press[1] + 25.0 * density];
     let before = live.studio.tally();
     let buttons = live.studio.controls().tally().buttons;
     live.post(&SyntheticInput::Button {
@@ -632,7 +693,7 @@ fn live() -> Result<Vec<String>, String> {
     })?;
     for step in [[20.0, 10.0], [40.0, 25.0]] {
         live.post(&SyntheticInput::PointerMoved {
-            position: point([press[0] + step[0], press[1] + step[1]]),
+            position: point([press[0] + step[0] * density, press[1] + step[1] * density]),
             dragging: Some(PointerButton::Primary),
             modifiers: Modifiers::NONE,
         })?;
@@ -672,7 +733,10 @@ fn live() -> Result<Vec<String>, String> {
         .map(|&(id, position)| (id, panned.world_to_drawable(position)))
         .min_by(|a, b| distance(a.1, press).total_cmp(&distance(b.1, press)))
         .ok_or("no organisms shown")?;
-    let expected = flife_manim::pick(&panned, rows.iter().copied(), spot, PICK_RADIUS_POINTS);
+    // The Studio picks within PICK_RADIUS_POINTS points: that many pixels
+    // times the density.
+    let radius = PICK_RADIUS_POINTS * density;
+    let expected = flife_manim::pick(&panned, rows.iter().copied(), spot, radius);
     let click = |live: &mut Live, at: [f64; 2]| -> Result<(), String> {
         for pressed in [true, false] {
             live.post(&SyntheticInput::Button {
@@ -734,10 +798,10 @@ fn live() -> Result<Vec<String>, String> {
     let viewport = *live.studio.view().viewport();
     let shown: Vec<(u64, [f64; 2])> = live.studio.view().shown_rows().collect();
     let empty = (2..44)
-        .flat_map(|y| (2..80).map(move |x| [f64::from(x) * 10.0, f64::from(y) * 10.0]))
-        .find(|&at| {
-            flife_manim::pick(&viewport, shown.iter().copied(), at, PICK_RADIUS_POINTS).is_none()
+        .flat_map(|y| {
+            (2..80).map(move |x| [f64::from(x) * 10.0 * density, f64::from(y) * 10.0 * density])
         })
+        .find(|&at| flife_manim::pick(&viewport, shown.iter().copied(), at, radius).is_none())
         .ok_or("no empty spot in the window")?;
     let selections = live.studio.tally().selections;
     click(&mut live, empty)?;

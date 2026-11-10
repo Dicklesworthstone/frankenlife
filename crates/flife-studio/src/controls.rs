@@ -500,23 +500,13 @@ impl Controls {
         self.tally
     }
 
-    /// The drawable size the next frame should have: the content area in
-    /// whole points. The presenter draws one drawable pixel per point.
+    /// The drawable size the next frame should have: the content area at
+    /// the screen's density ([`SurfaceMetrics::backing_size`]), one drawable
+    /// pixel per device pixel. `None` before the geometry is known or while
+    /// it is empty.
     #[must_use]
     pub fn drawable_size(&self) -> Option<[u32; 2]> {
-        let metrics = self.metrics?;
-        let whole = |points: f64| {
-            if points.is_finite() && points >= 1.0 {
-                // Bounded by the screen; the conversion saturates.
-                Some(points.round() as u32)
-            } else {
-                None
-            }
-        };
-        Some([
-            whole(metrics.logical_width)?,
-            whole(metrics.logical_height)?,
-        ])
+        self.metrics?.backing_size()
     }
 
     /// The world point under the pointer in `viewport`, or `None` off the

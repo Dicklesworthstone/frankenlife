@@ -153,6 +153,23 @@ impl WorldView {
         Ok(true)
     }
 
+    /// Draw for a screen of `pixels_per_point` drawable pixels per point,
+    /// keeping the view: the dot's smallest and largest radius and the
+    /// selection ring keep their size on screen at once, and the density
+    /// bins from the next shown epoch. Returns whether the density changed.
+    ///
+    /// # Errors
+    /// As [`Viewport::with_pixels_per_point`] and [`Viewport::camera`]; the
+    /// view is unchanged on error.
+    pub fn set_pixels_per_point(&mut self, pixels_per_point: f64) -> Result<bool, CoreError> {
+        if pixels_per_point.to_bits() == self.viewport.pixels_per_point().to_bits() {
+            return Ok(false);
+        }
+        let viewport = self.viewport.with_pixels_per_point(pixels_per_point)?;
+        self.adopt(viewport)?;
+        Ok(true)
+    }
+
     /// Look at `viewport` (the same world): a pan, a zoom or a reset. Place
     /// the shown epoch again ([`WorldView::place`]) to draw it there.
     /// Returns whether the view changed.

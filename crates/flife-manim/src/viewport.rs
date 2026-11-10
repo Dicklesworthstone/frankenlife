@@ -13,6 +13,12 @@
 //!   which the native host reports. A logical point maps to the drawable by
 //!   the ratio of drawable pixels to logical points on each axis.
 //!
+//! A viewport also carries the drawable's pixels per point, 1 unless a host
+//! draws at a screen's density (2 on a typical high-DPI screen). It changes
+//! no mapping; the sizes that should look the same on any screen, such as
+//! the smallest dot and the selection ring, are given in points and scaled
+//! by it.
+//!
 //! A [`Viewport`] shows one image of the torus: the window `[lo, lo + L]`
 //! on each axis, where `lo = center − L/2`, centered on the drawable and
 //! scaled by `zoom` times the scale that fits the whole torus. Every world
@@ -45,11 +51,12 @@ pub struct Viewport {
     zoom: f64,
     scale: f64,
     origin: [f64; 2],
+    pixels_per_point: f64,
 }
 
 impl Viewport {
     /// Fit a world of `extent` world units into a drawable of `drawable`
-    /// pixels: centered, zoom 1.
+    /// pixels: centered, zoom 1, one pixel per point.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for an extent that is not finite and
@@ -78,6 +85,7 @@ impl Viewport {
             fit_scale,
             extent.map(|length| length / 2.0),
             1.0,
+            1.0,
         ))
     }
 
@@ -87,6 +95,7 @@ impl Viewport {
         fit_scale: f64,
         center: [f64; 2],
         zoom: f64,
+        pixels_per_point: f64,
     ) -> Self {
         let pixels = drawable.map(f64::from);
         let scale = if zoom == 1.0 {
@@ -108,6 +117,7 @@ impl Viewport {
             zoom,
             scale,
             origin,
+            pixels_per_point,
         }
     }
 
@@ -140,6 +150,7 @@ impl Viewport {
             self.fit_scale,
             center,
             zoom,
+            self.pixels_per_point,
         ))
     }
 
@@ -155,7 +166,41 @@ impl Viewport {
             fitted.fit_scale,
             self.center,
             self.zoom,
+            self.pixels_per_point,
         ))
+    }
+
+    /// The whole torus again, centered at zoom 1, in this drawable and at
+    /// this density.
+    #[must_use]
+    pub fn refit(&self) -> Self {
+        Self::placed(
+            self.extent,
+            self.drawable,
+            self.fit_scale,
+            self.extent.map(|length| length / 2.0),
+            1.0,
+            self.pixels_per_point,
+        )
+    }
+
+    /// The same view on a drawable of `pixels_per_point` pixels per point.
+    /// The mapping is unchanged.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a density that is not finite and
+    /// positive.
+    pub fn with_pixels_per_point(&self, pixels_per_point: f64) -> Result<Self, CoreError> {
+        if !(pixels_per_point.is_finite() && pixels_per_point > 0.0) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "viewport pixels per point",
+                detail: format!("{pixels_per_point} must be finite and positive"),
+            });
+        }
+        Ok(Self {
+            pixels_per_point,
+            ..*self
+        })
     }
 
     /// The view zoomed by `factor` about the drawable position `anchor`:
@@ -233,6 +278,13 @@ impl Viewport {
     #[must_use]
     pub const fn fit_scale(&self) -> f64 {
         self.fit_scale
+    }
+
+    /// Drawable pixels per point on the screen: 1 unless a host draws at the
+    /// screen's density.
+    #[must_use]
+    pub const fn pixels_per_point(&self) -> f64 {
+        self.pixels_per_point
     }
 
     /// The world point at the drawable's center.

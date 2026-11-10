@@ -12,8 +12,8 @@ adapter.
 - A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate and the colour
   mapping. `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
 - The process main thread, macOS, Metal and a window server.
-- The presenter's typed input. It comes from frankentorch `ft-kernel-metal` at rev `71bbe52e`, through FrankenManim
-  `fmn-render` at rev `2fe8d299`.
+- The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
+  `c22e1415`, through FrankenManim `fmn-render` at rev `721b04b9`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and
@@ -47,7 +47,8 @@ adapter.
     - a vertical scroll is `Zoom { anchor, factor }` about the pointer, `factor = scroll_zoom(dy, unit) =
       exp(rate · dy)` with `ZOOM_PER_POINT = 0.01` (trackpad points) or `ZOOM_PER_LINE = 0.1` (wheel lines), the
       exponent limited to ±`ZOOM_STEP_LIMIT = 8`; up zooms in.
-  - `drawable_size` is the content area in whole points. `hover` is the world point under the pointer.
+  - `drawable_size` is the content area at the screen's density (`SurfaceMetrics::backing_size`: the logical size
+    times the backing scale, rounded on each axis). `hover` is the world point under the pointer.
 - `SessionThread`: the FL-014 session owner and one controller task on an Asupersync current-thread runtime, on its
   own thread.
   - Intents arrive on a bounded lane of `INTENT_CAPACITY` = 16. The main thread only `try_send`s.
@@ -57,10 +58,13 @@ adapter.
     why }`, and run numbers keep a late end from touching a newer run.
   - A pause reports `Paused { at }`. A step reports `Stepped { tick }` or `StepHeld { at, why }`. A refusal reports
     `Refused`, and close reports `Closed { at }`.
-- `Studio` is the main-thread host. Each `frame()`:
+- `Studio` is the main-thread host. It opens the window at `PixelDensity::Backing`: the window keeps its size in
+  points, and each frame fills its device pixels (FL-020). Each `frame()`:
   1. drains typed input through `Controls` and offers the resulting intents;
   2. drains statuses;
-  3. refits the `WorldView` when the content area changed;
+  3. refits the `WorldView` when the content area or the screen's density changed. The view's pixels per point is
+     the backing scale, so sizes given in points (dot floor and ceiling, the selection ring, density bins, the pick
+     radius) look the same on any screen;
   4. takes the controls' style if it changed;
   5. applies the frame's camera moves in order to a copy of the viewport: a zoom about the pointer's drawable
      position, a pan by the drag times drawable pixels per point, a reset to the fit; a click picks among the shown
@@ -157,11 +161,14 @@ presentation state, not scientific state.
   quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
   too; a step alone moves over `MOTION_MAX` whatever came before and smooths down once epochs flow; arrivals with
   no time between leave the display at rest.
-- `tests/live.rs` (harness-free, 30 checks, `--features synthetic-input`): the real 4,096-organism reference preset
+- `tests/live.rs` (harness-free, 31 checks, `--features synthetic-input`): the real 4,096-organism reference preset
   in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
   and delivered through the presenter's typed bridge:
   - the first poll's real `Resized` (640 × 400 points), and a real `FocusGained` (made key by a real key-window
     change if another application holds the keyboard);
+  - FL-020: frames drawn at the screen's density (1280 × 800 pixels on a 2× display), the window kept at 640 × 400
+    points, the view at the backing scale in pixels per point, and logical points mapped to the drawable at that
+    ratio. Every later position is a drawable one, posted at its logical point;
   - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling, in four scene
     objects (the field, the cloud, the density layer and the selection ring);
   - Space runs, and live epochs reach the screen;
@@ -176,8 +183,9 @@ presentation state, not scientific state.
   - while paused: 2 recolours the shown dots by energy; R drops the halos; D draws density on the Metal route, its
     bins counting every organism; 1, R, D and F restore the lineage colours bit for bit, and no restyle steps the
     world or changes the shown tick;
-  - a real resize to 800 × 450 refits the viewport (3.515625 px per world unit) without new draw storage, and the
-    next frame is presented at the new drawable size;
+  - a real resize to 800 × 450 points refits the viewport at the screen's density (1600 × 900 pixels and 7.03125 px
+    per world unit on a 2× display) without new draw storage, and the next frame is presented at the new drawable
+    size with the window at 800 × 450 points;
   - real pointer motion hovers the right world point within a pixel, and a real scroll arrives;
   - focus loss with a button held loses the capture and clears the drag, and focus regain arrives;
   - FL-020, all real events: a scroll up zooms (e^0.5 for 50 precise points) about the pointer, which stays over
@@ -192,7 +200,8 @@ presentation state, not scientific state.
   - Off macOS it reports itself skipped.
 - In `flife-runtime`, `tests/session.rs` checks `SessionHandle::start` across six Lab seeds: the start comes back at
   once, and the end comes back for a pause, a reached tick and a close.
-- In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (12 real-window cases) qualifies the bridge itself.
+- In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
+  backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
   --window`) are qualified.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
@@ -201,18 +210,18 @@ presentation state, not scientific state.
 reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headless runs and frame export.
 
 **Known gaps.**
-- The presenter sizes the window's content area to the frame (`resize` calls `setContentSize:` with the frame's
-  pixel size). So the Studio renders one drawable pixel per logical point, and the compositor scales that up on
-  high-DPI displays. Rendering at backing resolution needs the presenter to size the drawable apart from the content
-  area (an upstream frankentorch change, then repins). `Viewport`, the pan and the pick radius already convert
-  through the drawable-per-point ratio, but only a ratio of 1 is exercised by a real window.
+- Moving the window to a screen of another density changes the backing scale; the next frame then takes the new
+  drawable size and the view its new pixels per point. Only one 2× display is exercised here, so that path has no
+  real-window test, and frankentorch's planted bug for `contentsScale` following a screen change survives for the
+  same reason.
 - Camera smoothing, trails and a pinch-zoom gesture are not implemented (§13.5 allows smoothing and trails; G6's
   100 ms budget argues against smoothing the camera). Brushes as `CommandPort` commands are FL-022's.
 - While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
 - A selection shows only as the ring and the `selection` record: there is no inspector (FL-021).
-- Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here. The
+- Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
+  one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.
 - There is no on-screen legend: the Metal 3D route has no text, and the presenter has no window-title setter. The
   style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`

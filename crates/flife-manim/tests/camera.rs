@@ -10,9 +10,9 @@ use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_engine::{Disposition, Intervention, Stepped};
 use flife_manim::{
-    DOT_RADIUS, DOT_RADIUS_MAX_PIXELS, MAXIMUM_ZOOM, PICK_RADIUS_PIXELS, Particles,
-    SELECTION_RING_COLOR, SELECTION_RING_GAP_PIXELS, SELECTION_RING_SEGMENTS,
-    SELECTION_RING_WIDTH_PIXELS, Style, Viewport, WorldView, dot_radius, pick,
+    DOT_RADIUS, DOT_RADIUS_MAX_POINTS, MAXIMUM_ZOOM, PICK_RADIUS_PIXELS, Particles,
+    SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,
+    SELECTION_RING_WIDTH_POINTS, Style, Viewport, WorldView, dot_radius, pick,
 };
 use fmn_render::ThreeDDraw;
 
@@ -224,7 +224,7 @@ fn the_world_view_keeps_its_camera_and_places_without_moving_scales() {
     view_.set_view(deep).expect("set");
     view_.place(&epoch).expect("placed");
     let radius = dot_radius(view_.viewport());
-    assert_eq!(radius * view_.viewport().scale(), DOT_RADIUS_MAX_PIXELS);
+    assert_eq!(radius * view_.viewport().scale(), DOT_RADIUS_MAX_POINTS);
     assert!(radius < DOT_RADIUS);
     let fitted = Viewport::fit(epoch.extent(), [640, 480]).expect("a viewport");
     assert_eq!(dot_radius(&fitted), DOT_RADIUS.max(1.5 / fitted.scale()));
@@ -232,12 +232,13 @@ fn the_world_view_keeps_its_camera_and_places_without_moving_scales() {
 }
 
 /// The selection ring's vertices lie on its two circles around the scene
-/// point of `position` in `viewport`: [`SELECTION_RING_GAP_PIXELS`] and
-/// that plus [`SELECTION_RING_WIDTH_PIXELS`] outside the dot, in pixels.
+/// point of `position` in `viewport`: [`SELECTION_RING_GAP_POINTS`] and
+/// that plus [`SELECTION_RING_WIDTH_POINTS`] outside the dot, in points at
+/// the viewport's density.
 fn assert_ring(mesh: &fmn_render::SurfaceMesh, viewport: &Viewport, position: [f64; 2]) {
-    let scale = viewport.scale();
-    let inner = dot_radius(viewport) + SELECTION_RING_GAP_PIXELS / scale;
-    let outer = inner + SELECTION_RING_WIDTH_PIXELS / scale;
+    let pixel = viewport.pixels_per_point() / viewport.scale();
+    let inner = dot_radius(viewport) + SELECTION_RING_GAP_POINTS * pixel;
+    let outer = inner + SELECTION_RING_WIDTH_POINTS * pixel;
     let [x, y, _] = viewport.scene_point(position);
     let vertices = mesh.vertices();
     assert_eq!(vertices.len(), 2 * SELECTION_RING_SEGMENTS);

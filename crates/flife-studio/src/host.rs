@@ -39,8 +39,8 @@ use flife_manim::{Motion, Style, Viewport, WorldView, hex_rgb};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
-    INPUT_QUEUE_CAPACITY, InputEvent, NativePreviewRenderer, PresentOutcome, PresentationState,
-    SurfaceMetrics,
+    INPUT_QUEUE_CAPACITY, InputEvent, NativePreviewRenderer, PixelDensity, PresentOutcome,
+    PresentationState, SurfaceMetrics,
 };
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -210,6 +210,11 @@ impl Studio {
         preview
             .set_resizable(options.resizable)
             .map_err(|error| missing(format!("a resizable preview window: {error}")))?;
+        // One drawable pixel per device pixel: the window keeps its size in
+        // points and each frame is drawn at the screen's density.
+        preview
+            .set_pixel_density(PixelDensity::Backing)
+            .map_err(|error| missing(format!("a preview window at screen density: {error}")))?;
         let mut world = World::found(
             config,
             Arrangement::FreeList,
@@ -318,10 +323,17 @@ impl Studio {
             self.tally.restyles += 1;
         }
 
-        let refitted = match self.controls.drawable_size() {
+        let resized = match self.controls.drawable_size() {
             Some(size) => self.view.resize(size)?,
             None => false,
         };
+        let redensed = match self.controls.metrics() {
+            Some(metrics) if metrics.backing_scale.is_finite() && metrics.backing_scale > 0.0 => {
+                self.view.set_pixels_per_point(metrics.backing_scale)?
+            }
+            _ => false,
+        };
+        let refitted = resized || redensed;
         if refitted {
             self.tally.refits += 1;
         }
@@ -350,7 +362,7 @@ impl Studio {
                     }
                 }
                 CameraMove::Reset => {
-                    viewport = Viewport::fit(viewport.extent(), viewport.drawable())?;
+                    viewport = viewport.refit();
                 }
                 CameraMove::Select { at } => {
                     if let Some(size) = logical
@@ -502,6 +514,13 @@ impl Studio {
         self.preview
             .surface_metrics()
             .map_err(|error| conflict("read the studio surface", error))
+    }
+
+    /// How frames map to the window: [`PixelDensity::Backing`] from
+    /// [`Studio::open`], so each frame is drawn at the screen's density.
+    #[must_use]
+    pub fn pixel_density(&self) -> PixelDensity {
+        self.preview.pixel_density()
     }
 
     /// Post one real AppKit event into the application queue for this

@@ -134,9 +134,16 @@ fn focus_geometry_and_hover_follow_the_window() {
     assert_eq!(controls.drawable_size(), None);
     controls.apply(&InputEvent::FocusGained);
     assert!(controls.focused());
-    controls.apply(&InputEvent::Resized(metrics(800.4, 449.6)));
+    // At one pixel per point the drawable is the content area in whole
+    // points; on the 2x screen of `metrics`, twice that, rounded.
+    controls.apply(&InputEvent::Resized(SurfaceMetrics {
+        backing_scale: 1.0,
+        ..metrics(800.4, 449.6)
+    }));
     assert_eq!(controls.drawable_size(), Some([800, 450]));
-    let viewport = Viewport::fit([128.0, 128.0], [800, 450]).ok();
+    controls.apply(&InputEvent::Resized(metrics(800.4, 449.6)));
+    assert_eq!(controls.drawable_size(), Some([1601, 899]));
+    let viewport = Viewport::fit([128.0, 128.0], [1601, 899]).ok();
     let Some(viewport) = viewport else {
         return;
     };
@@ -150,7 +157,7 @@ fn focus_geometry_and_hover_follow_the_window() {
     assert_eq!(controls.hover(&viewport), None);
     let at = viewport.world_to_drawable([64.0, 32.0]);
     controls.apply(&InputEvent::PointerMoved {
-        position: point(at[0] * 800.4 / 800.0, at[1] * 449.6 / 450.0),
+        position: point(at[0] * 800.4 / 1601.0, at[1] * 449.6 / 899.0),
         buttons: ButtonSet::EMPTY,
         modifiers: Modifiers::NONE,
     });
@@ -161,7 +168,8 @@ fn focus_geometry_and_hover_follow_the_window() {
     );
     controls.apply(&InputEvent::FocusLost);
     assert!(!controls.focused());
-    controls.apply(&InputEvent::Resized(metrics(0.4, 100.0)));
+    // Under half a pixel wide at 2x: empty.
+    controls.apply(&InputEvent::Resized(metrics(0.2, 100.0)));
     assert_eq!(controls.drawable_size(), None);
     let tally = controls.tally();
     assert_eq!(
@@ -171,7 +179,7 @@ fn focus_geometry_and_hover_follow_the_window() {
             tally.resizes,
             tally.scrolls
         ),
-        (1, 1, 2, 1)
+        (1, 1, 3, 1)
     );
 }
 

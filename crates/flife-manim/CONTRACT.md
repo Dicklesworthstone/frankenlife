@@ -23,7 +23,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - An FL-017 `Epoch`, read only: identity-ordered positions, velocities, energies, lineages, generations and
   topology catalog indices, the bounded field texture, the world extent, the speed limit and the population ceiling
   (`Epoch::capacity`).
-- A drawable size in pixels. A logical window size in points, for pointer conversion.
+- A drawable size in pixels, and its pixels per point (1 unless set; the Studio sets the screen's backing scale). A
+  logical window size in points, for pointer conversion.
 - A camera view: a center (a world point) and a zoom in `[1, MAXIMUM_ZOOM = 4096]`.
 - `[presentation] background` as `#rrggbb` (`hex_rgb`), and `[presentation] color_mapping`, a registered
   `presentation.color_mapping` name (`ColorMapping::configured`).
@@ -52,7 +53,11 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     bit;
   - `zoomed_about(anchor, factor)` clamps the zoom to `[1, 4096]` and keeps the world point under the drawable
     anchor under it; `panned(delta)` moves the center by `−delta / scale`, so the world follows a drag;
-    `resized(drawable)` keeps the view in a new drawable;
+    `resized(drawable)` keeps the view in a new drawable; `refit()` is the whole torus again, centered at zoom 1, in
+    the same drawable;
+  - a viewport carries its drawable's pixels per point (`fit` gives 1). It changes no mapping, and every view above
+    keeps it. `with_pixels_per_point(d)` takes a finite positive density; sizes given in points below are that many
+    drawable pixels times it;
   - `periodic_grid(cells, buffers, corner)` places a periodic corner grid covering the torus once: the lattice at
     `L · k / n` when the window starts on a cell boundary (always at the fit), otherwise cut at the window's edges,
     `n + 2` lines per cut axis, the edge vertices coloured `(1 − w) · corner(k) + w · corner(k + 1)` (bilinear where
@@ -62,8 +67,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   lowest identity among equals; `None` for nothing in reach or a non-finite position or radius. It returns an
   identity, which a host validates against the world, never a slot.
 - `selection_ring(viewport, position)`: an annulus of `SELECTION_RING_SEGMENTS = 48` quads around the organism's
-  scene point, from `SELECTION_RING_GAP_PIXELS = 3` outside its dot to `SELECTION_RING_WIDTH_PIXELS = 2` beyond,
-  in drawable pixels at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the grids.
+  scene point, from `SELECTION_RING_GAP_POINTS = 3` outside its dot to `SELECTION_RING_WIDTH_POINTS = 2` beyond,
+  in points at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the grids.
 - `Viewport::camera(background)`:
   - a FrankenManim `ThreeDCamera` at the drawable's resolution;
   - its frame is `frame_shape() = (Dw / scale, Dh / scale)`, centred at the origin, at `DEFAULT_FOVY`, `zxz`;
@@ -84,8 +89,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
-  - radius `DOT_RADIUS = 0.35` world units, at least `DOT_RADIUS_MIN_PIXELS = 1.5` and at most
-    `DOT_RADIUS_MAX_PIXELS = 24` drawable pixels (FL-020): zoomed in past the cap, dots stop growing on screen, so
+  - radius `DOT_RADIUS = 0.35` world units, at least `DOT_RADIUS_MIN_POINTS = 1.5` and at most
+    `DOT_RADIUS_MAX_POINTS = 24` points (FL-020): zoomed in past the cap, dots stop growing on screen, so
     close organisms separate, and a dot stays small against the perspective frame's focal distance (about 1.2 frame
     heights), where its projection is the disk the viewport places;
   - colour `mapped_color(style.mapping, row, speed limit)`;
@@ -115,8 +120,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `update_look(field, Look::Raw)` draws linear grey `raw_value = clamp(value / scale, 0, 1)` instead: no square
     root, no palette.
 - `DensityLayer::update(epoch, style)`:
-  - bins of about `DENSITY_BIN_PIXELS = 6` drawable pixels at the fit, aligned to the world so the torus wraps
-    exactly: `ceil(extent · fit_scale / 6)` per axis, in `1..=DENSITY_BINS_MAX = 512`; the zoom does not change them;
+  - bins of about `DENSITY_BIN_POINTS = 6` points at the fit, aligned to the world so the torus wraps exactly:
+    `ceil(extent · fit_scale / (6 · pixels per point))` per axis, in `1..=DENSITY_BINS_MAX = 512`; the zoom does not change them;
   - each organism counted once, in the bin `floor(position / extent · bins)`;
   - `scale` is the fullest bin, or the previous scale times `SCALE_DECAY` if larger; it restarts when the bin grid
     changes;
@@ -130,7 +135,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `show(epoch)` lowers an epoch in the current style and records it as `shown()`, a `Prior`;
   - `set_style(style)` takes effect at the next `show`; showing the same epoch again redraws it in the new style;
   - `resize(drawable)` refits the viewport, camera, radii and density bins, keeping the view's center and zoom,
-    returning whether the size changed;
+    returning whether the size changed; `set_pixels_per_point(d)` refits the same way for a new density;
   - `set_view(viewport)` takes a new view of the same world and drawable (returning whether it changed), and
     `place(epoch)` re-lowers the shown epoch there without moving the field's or density's display scale, so a pan
     or zoom does not age the picture;
@@ -200,7 +205,7 @@ exactly to F64, one F64 affine map, fixed ramps and a fixed integer colour hash.
 route.
 
 **Independent tests.**
-- `tests/viewport.rs` (15 tests):
+- `tests/viewport.rs` (16 tests):
   - Letterbox fit for wide, tall and exact aspects.
   - World and drawable round trips; the margin and the half-open far edges are not the world.
   - Retina-style logical points through the drawable ratio; empty and NaN logical sizes.
@@ -218,6 +223,8 @@ route.
     lattice at the fit and, panned, is cut into `n + 2` columns at worked offsets with matching edge colours that
     blend the cut cell's corners `0.75 / 0.25`; and the CPU render oracle at three panned and zoomed views, the dot
     a few pixels across at every zoom.
+  - FL-020 density: pixels per point changes no mapping at the fit or in a view, survives a view, a zoom, a pan, a
+    resize and a refit, and only a finite positive density is taken.
 - `tests/camera.rs` (4 tests, FL-020):
   - A pick through a view centered on the seam is the nearest drawn identity across it; out of reach, none; ties
     to the lowest identity; non-finite inputs; at zoom 64 a pick reaches only the organism under the pointer.
@@ -244,7 +251,7 @@ route.
   - A 600-tick gap on a 32-unit world is ambiguous: every drawn organism is at its later position, none on a path.
     A later or equal prior is shown at rest, bit for bit; a prior of another world is refused; fractions -0.1, 1.5
     and NaN are refused with the organisms kept.
-- `tests/cloud.rs` (6 tests):
+- `tests/cloud.rs` (7 tests):
   - Every row of a real 24-tick epoch becomes one dot, in identity order, at its scene point with its lineage
     colour.
   - Six re-lowerings and a resize keep the reserved bytes and the buffer address; one scene object.
@@ -252,6 +259,9 @@ route.
   - A resize refits only the radius, and the pixel floor binds when the world is small.
   - The palette spreads 4,096 lineages over all 12 colours, between 250 and 450 each.
   - `#rrggbb` parsing.
+  - FL-020 density: a 128-pixel view at 2 pixels per point draws what a 64-pixel view at 1 draws (the floored and the
+    capped dots, halos, the selection ring and the density bins); the change refits the shown epoch without a new
+    show, an unchanged density is no change, and NaN is refused.
 - `tests/mapping.rs` (14 tests), on real render epochs where they matter:
   - The energy and generation ramps rise monotonically in CIE L*, from above 15 with a range above 50.
   - Energy maps through the fixed saturating `e / (e + 2)`, generations logarithmically to a fixed 256.
@@ -283,8 +293,7 @@ route.
 - Planted bugs in this crate were each caught (FL-018's listed in its commit; FL-019's 14 in its commit; FL-020's
   camera, picking and world-view mutants, with `flife-render`'s interpolation ones, in its commit).
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `2fe8d299` (unchanged since
-`f401a947`; that repin moved only frankentorch), CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `721b04b9`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**
@@ -297,7 +306,6 @@ route.
   pixel would be about four million triangles at 1080p.
 - `[presentation] point_radius_pixels`, bloom and trails are not applied yet.
 - Human review of the mappings against the plan's reference images (G5) has not been done.
-- FL-020's remaining part: a drawable at the screen's backing scale (the Studio still draws one pixel per point).
   There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). Births appear at the first
   epoch that has them, not at their tick within a longer gap: an epoch does not carry birth ticks. The field and
   density show the newer epoch of a pair at once, up to one state ahead of the moving organisms. A selection is

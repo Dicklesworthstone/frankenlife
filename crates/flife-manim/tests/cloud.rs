@@ -5,8 +5,9 @@ mod common;
 
 use flife_core::CoreError;
 use flife_manim::{
-    DOT_RADIUS, DOT_RADIUS_MIN_PIXELS, LINEAGE_PALETTE, ParticleCloud, Viewport, WorldView,
-    dot_radius, hex_rgb, lineage_color, lineage_slot,
+    DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, LINEAGE_PALETTE, MAXIMUM_ZOOM,
+    ParticleCloud, Viewport, WorldView, density_bins, dot_radius, hex_rgb, lineage_color,
+    lineage_slot, selection_ring,
 };
 use fmn_render::ThreeDDraw;
 
@@ -138,7 +139,7 @@ fn a_shown_epoch_survives_a_refused_show_and_a_resize_refits_only_the_radius()
     let shown = view.shown();
     let small = dots(view.cloud().draws());
     // 64 px over 32 world units: 2 px per unit, so the pixel floor binds.
-    assert_eq!(small[0].radius, DOT_RADIUS_MIN_PIXELS / 2.0);
+    assert_eq!(small[0].radius, DOT_RADIUS_MIN_POINTS / 2.0);
     // 640 px: 20 px per unit, so the world radius binds.
     assert!(view.resize([640, 640])?);
     assert!(!view.resize([640, 640])?);
@@ -189,4 +190,70 @@ fn presentation_backgrounds_parse_as_rrggbb() {
     ] {
         assert_eq!(hex_rgb(bad), None, "{bad:?}");
     }
+}
+
+/// FL-020: on a 2x screen the sizes given in points double in pixels, so a
+/// view twice as many pixels across draws what the 1x view draws, in world
+/// units: the floored and the capped dot and its halo, the selection ring
+/// and the density bins. A density change refits what is shown, as a resize
+/// does.
+#[test]
+fn sizes_in_points_look_the_same_on_a_2x_screen() -> Result<(), CoreError> {
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    let mut one = WorldView::for_epoch(&epoch, [64, 64], [0, 0, 0])?;
+    let mut two = WorldView::for_epoch(&epoch, [128, 128], [0, 0, 0])?;
+    one.show(&epoch)?;
+    two.show(&epoch)?;
+    assert_ne!(summary(two.cloud().draws()), summary(one.cloud().draws()));
+    // The shown epoch is refitted at once, without showing it again.
+    assert!(two.set_pixels_per_point(2.0)?);
+    assert!(!two.set_pixels_per_point(2.0)?);
+    // 2 px per world unit at 1x, 4 at 2x: the floor binds at both, 1.5
+    // points, so 0.75 world units.
+    assert_eq!(
+        dots(one.cloud().draws())[0].radius,
+        DOT_RADIUS_MIN_POINTS / 2.0
+    );
+    assert_eq!(summary(two.cloud().draws()), summary(one.cloud().draws()));
+    assert_eq!(summary(two.cloud().halos()), summary(one.cloud().halos()));
+    assert_eq!(two.density().bins(), one.density().bins());
+    // Showing it again draws the same.
+    two.show(&epoch)?;
+    assert_eq!(summary(two.cloud().draws()), summary(one.cloud().draws()));
+    let at = [3.0, 29.0];
+    assert_eq!(
+        selection_ring(two.viewport(), at)?.vertices(),
+        selection_ring(one.viewport(), at)?.vertices()
+    );
+    assert_eq!(density_bins(two.viewport()), density_bins(one.viewport()));
+    assert_eq!(two.density().bins(), one.density().bins());
+    // Zoomed all the way in, the cap binds at both: 24 points, so 24 /
+    // (2 * 4096) world units.
+    for view in [&mut one, &mut two] {
+        let deep = view.viewport().with_view([16.0, 16.0], MAXIMUM_ZOOM)?;
+        assert!(view.set_view(deep)?);
+        view.place(&epoch)?;
+    }
+    assert_eq!(
+        dots(one.cloud().draws())[0].radius,
+        DOT_RADIUS_MAX_POINTS / (2.0 * MAXIMUM_ZOOM)
+    );
+    assert_eq!(summary(two.cloud().draws()), summary(one.cloud().draws()));
+    let fitted = two.viewport().refit();
+    assert!(two.set_view(fitted)?);
+    // Back to one pixel per point, the 2x drawable's floor is 1.5 px: the
+    // world radius binds again.
+    assert!(two.set_pixels_per_point(1.0)?);
+    two.show(&epoch)?;
+    assert_eq!(
+        dots(two.cloud().draws())[0].radius,
+        DOT_RADIUS.max(1.5 / 4.0)
+    );
+    assert!(matches!(
+        two.set_pixels_per_point(f64::NAN),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    Ok(())
 }

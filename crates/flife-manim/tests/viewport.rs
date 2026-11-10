@@ -546,3 +546,46 @@ fn frankenmanim_draws_each_world_point_where_a_panned_zoomed_view_says() {
         }
     }
 }
+
+/// FL-020: a viewport's pixels per point changes no mapping, survives every
+/// view change, and comes back with a refit; a density that is not finite
+/// and positive is refused.
+#[test]
+fn pixels_per_point_changes_no_mapping_and_survives_every_view() {
+    let one = fit([64.0, 32.0], [640, 320]);
+    assert_eq!(one.pixels_per_point().to_bits(), 1.0_f64.to_bits());
+    let two = one.with_pixels_per_point(2.0).expect("2x");
+    assert_eq!(two.pixels_per_point().to_bits(), 2.0_f64.to_bits());
+    for point in [[0.0, 0.0], [12.5, 30.0], [63.9, 0.1], [32.0, 16.0]] {
+        assert_eq!(two.world_to_drawable(point), one.world_to_drawable(point));
+        assert_eq!(two.scene_point(point), one.scene_point(point));
+    }
+    assert_eq!(
+        (two.scale(), two.origin(), two.center(), two.zoom()),
+        (one.scale(), one.origin(), one.center(), one.zoom())
+    );
+    let moved = two
+        .zoomed_about([100.0, 50.0], 3.0)
+        .and_then(|view| view.panned([7.0, -4.0]))
+        .and_then(|view| view.with_view([3.0, 31.0], 5.0))
+        .and_then(|view| view.resized([1280, 640]))
+        .expect("moved");
+    assert_eq!(moved.pixels_per_point().to_bits(), 2.0_f64.to_bits());
+    assert_eq!(
+        moved.refit(),
+        fit([64.0, 32.0], [1280, 640])
+            .with_pixels_per_point(2.0)
+            .expect("2x")
+    );
+    let zoomed = one.zoomed_about([10.0, 10.0], 4.0).expect("zoomed");
+    assert_eq!(zoomed.refit(), one);
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(
+                one.with_pixels_per_point(bad),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "{bad}"
+        );
+    }
+}

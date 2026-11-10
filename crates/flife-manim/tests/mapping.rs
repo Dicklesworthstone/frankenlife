@@ -332,7 +332,7 @@ fn density_counts_every_organism_once_in_its_own_bin() {
         );
         let fullest = expected.iter().copied().max().unwrap_or(0);
         assert_eq!(layer.scale(), f64::from(fullest));
-        // At most DENSITY_BIN_PIXELS per bin, and one bin fewer would be
+        // At most DENSITY_BIN_POINTS per bin, and one bin fewer would be
         // wider.
         let span = epoch.extent()[0] * viewport.scale();
         assert!(span / f64::from(bins[0]) <= 6.0);

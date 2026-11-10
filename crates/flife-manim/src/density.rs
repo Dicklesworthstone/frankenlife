@@ -1,8 +1,8 @@
 //! Density rendering (plan §2.3, §13.3 step 5): when organisms crowd below
 //! a screen pixel, count them per screen bin instead of drawing dots.
 //!
-//! The world is cut into bins of about [`DENSITY_BIN_PIXELS`] drawable
-//! pixels, aligned to the world so the torus wraps exactly. Each bin holds
+//! The world is cut into bins of about [`DENSITY_BIN_POINTS`] points on
+//! screen, aligned to the world so the torus wraps exactly. Each bin holds
 //! its organism count and the mean linear colour of the current mapping
 //! over them. The bins are drawn like the field: one vertex-coloured grid
 //! whose vertices sit on bin corners, each the alpha-weighted mean of the
@@ -28,20 +28,22 @@ use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDDraw};
 use crate::mapping::{Look, Style, mapped_color, traits};
 use crate::{SCALE_DECAY, Viewport};
 
-/// The target bin width in drawable pixels.
-pub const DENSITY_BIN_PIXELS: f64 = 6.0;
+/// The target bin width in points (drawable pixels at one pixel per point).
+pub const DENSITY_BIN_POINTS: f64 = 6.0;
 
 /// The most bins per axis.
 pub const DENSITY_BINS_MAX: u32 = 512;
 
 /// Bins per axis for `viewport`: the world's drawable span at the
-/// whole-torus fit over [`DENSITY_BIN_PIXELS`], rounded up, in
-/// `1..=DENSITY_BINS_MAX`. The zoom does not change them: zoomed in, a bin
-/// is wider than its target on screen.
+/// whole-torus fit over [`DENSITY_BIN_POINTS`] at the viewport's pixels per
+/// point, rounded up, in `1..=DENSITY_BINS_MAX`. The zoom does not change
+/// them: zoomed in, a bin is wider than its target on screen.
 #[must_use]
 pub fn density_bins(viewport: &Viewport) -> [u32; 2] {
+    // Exact at one pixel per point, so the bins are as before there.
+    let bin = DENSITY_BIN_POINTS * viewport.pixels_per_point();
     viewport.extent().map(|extent| {
-        let bins = (extent * viewport.fit_scale() / DENSITY_BIN_PIXELS).ceil();
+        let bins = (extent * viewport.fit_scale() / bin).ceil();
         if bins.is_finite() {
             (bins as u32).clamp(1, DENSITY_BINS_MAX)
         } else {

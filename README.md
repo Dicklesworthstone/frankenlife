@@ -405,7 +405,8 @@ Every style renders the same world: nine styles of one 1,200-tick render all end
 population kernel on the world's own workers (FL-025, any host), and `cpu` keeps them on the CPU reference; `metal`
 refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and
 the world uses at most 8 CPU workers, where it measured faster (2.2× on one worker, 1.7× on two, 1.3× on four, 1.1×
-on eight). Whatever the choice and the `--cpu-workers`
+on eight). On a host without Metal it takes `torch` at up to 4 workers, where Linux measured it 1.41× on one worker
+and 1.11× on four (0.91× on eight). Whatever the choice and the `--cpu-workers`
 count, the world is the same bit for bit; the run's `start` record names the backend and `end` counts what it
 evaluated. Measured over 512 ticks of the preset on an M5 Ultra under other load (median of three interleaved
 runs, cv ≤ 2.5%), with all 4,096 founders alive:
@@ -435,7 +436,9 @@ block, nothing deferred; M5 Ultra under other load). Whole ticks against the ref
 
 At 8 and 16 workers the samples varied by more than 5%, so those rows show no admissible difference. On one
 worker Metal is clearly faster than `torch`. On four it led by 5% while its own samples varied by 5.1%. So `auto`
-is unchanged.
+keeps Metal where the host has it. On Linux x86-64 (one invocation per worker count, every row's cv at most 4.5%)
+`torch` was 1.41× on one worker, 1.11× on four and 0.91× on eight. So without Metal `auto` takes `torch` at up to
+four workers (`flife-backend-cpu`'s contract has the rows).
 
 `flife render` encodes each frame's PNG on its own thread (up to four at once) while the world steps and the next
 frame draws. The files are byte-identical to encoding them one by one, and 128 ticks at every second tick, 1,280²,

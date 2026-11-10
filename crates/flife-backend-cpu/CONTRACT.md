@@ -98,8 +98,22 @@ reasons: with weights packed `[in][out]`, the kernel's output loop can run in SI
 which the reference's per-output dot product cannot do without reassociating; and with more workers the controllers
 are a smaller part of a tick, while the batched path adds passes (three lane splits a tick instead of one, a serial
 pass building the jobs). On one worker Metal is clearly faster than `torch`. On four it led by 5% while
-its own samples varied by 5.1%. So `auto` is unchanged. A host without Metal
-would gain from `torch` at low worker counts if Linux measures like this. That is not yet measured.
+its own samples varied by 5.1%. So `auto` keeps Metal where the host has it.
+
+On Linux x86-64 (RCH workers, 2026-11-10, `tick_throughput -- W 20 8 40 cpu,torch` on the clean tree of commit
+974eb02), each row is one invocation on one worker. All digests were equal and nothing was deferred:
+
+| W | reference | `torch` | worker |
+|---|---|---|---|
+| 1 | 10.96 ticks/s (cv 0.33%) | 15.46 (cv 0.36%), 1.41× | hz4 (64 CPUs) |
+| 4 | 24.10 (cv 3.28%) | 26.75 (cv 4.48%), 1.11× | ts1 (64 CPUs) |
+| 8 | 28.97 (cv 3.47%) | 26.31 (cv 2.89%), 0.91× | hz3 (64 CPUs) |
+
+The rows ran on different workers, so only the ratio within a row compares. Every row is admissible. `torch` is
+faster at one and four workers on both hosts and slower at eight on Linux, so `auto` takes it where it does not
+take Metal, at up to `AUTO_TORCH_MAX_WORKERS` = 4 workers (`flife-backend-metal`). Two and three workers were not
+measured. The ceiling assumes that they lie between one and four, where the ratio fell from 1.41× to 1.11× on
+Linux and from 1.62× to 1.26× on macOS.
 
 **Validity domain.** The `dense-104-36-v1` catalog's shapes, the reference F32 profile, any CPU Rust targets.
 
@@ -108,6 +122,8 @@ would gain from `torch` at low worker counts if Linux measures like this. That i
   call needs their weights adjacent. That is FL-026's packed genome arenas, and the kernel already takes `[B, I, O]`
   for it.
 - Packing a newborn's parameters is a copy and a transpose, once per genome.
-- `auto` never takes this backend. Making it `auto`'s choice on hosts without Metal needs those hosts' numbers.
+- `auto` takes this backend only on a host without Metal, at up to four workers. The crossover between four and
+  eight workers is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis
+  for many workers.
 - At 16 workers the batched path is no faster than the reference's own lanes. Observing on the lanes, building the
   jobs, evaluating and deciding each split the batch again, so a tick pays for three sets of threads.

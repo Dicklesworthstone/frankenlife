@@ -768,8 +768,9 @@ pub enum ControllerChoice {
     /// The Metal backend; refused on a host without a Metal device.
     Metal,
     /// Metal where this host has a Metal device and the world runs on at
-    /// most [`AUTO_METAL_MAX_WORKERS`] CPU workers, otherwise the CPU
-    /// reference.
+    /// most [`AUTO_METAL_MAX_WORKERS`] CPU workers; otherwise
+    /// [`ControllerChoice::Torch`] on at most [`AUTO_TORCH_MAX_WORKERS`];
+    /// otherwise the CPU reference.
     #[default]
     Auto,
 }
@@ -784,7 +785,30 @@ pub enum ControllerChoice {
 /// against 161 at 1920x1080, four interleaved 10 s runs each).
 pub const AUTO_METAL_MAX_WORKERS: usize = 8;
 
+/// The most CPU workers at which [`ControllerChoice::Auto`] takes
+/// FrankenTorch's CPU route where it does not take Metal (FL-025). Measured
+/// on the preset (`tick_throughput`, whole ticks, each against the reference
+/// in the same process, cv at most 5%, the same digests): 1.41x on one
+/// worker, 1.11x on four and 0.91x on eight on Linux x86-64 (2026-11-10),
+/// and 1.62x on one and 1.26x on four on an M5 Ultra.
+pub const AUTO_TORCH_MAX_WORKERS: usize = 4;
+
 impl ControllerChoice {
+    /// What [`ControllerChoice::Auto`] is for a world on `cpu_workers`
+    /// threads on a host with or without a Metal device: Metal up to
+    /// [`AUTO_METAL_MAX_WORKERS`] where there is one, otherwise `torch` up to
+    /// [`AUTO_TORCH_MAX_WORKERS`], otherwise the CPU reference.
+    #[must_use]
+    pub const fn auto_for(cpu_workers: usize, metal_device: bool) -> Self {
+        if metal_device && cpu_workers <= AUTO_METAL_MAX_WORKERS {
+            Self::Metal
+        } else if cpu_workers <= AUTO_TORCH_MAX_WORKERS {
+            Self::Torch
+        } else {
+            Self::Cpu
+        }
+    }
+
     /// The backend this choice selects on this host for a world on
     /// `cpu_workers` threads, or `None` for the CPU reference.
     ///
@@ -805,12 +829,18 @@ impl ControllerChoice {
                 Ok(Some(Box::new(CpuBackend::new(lanes))))
             }
             Self::Metal => MetalBackend::open().map(boxed).map(Some),
-            Self::Auto if cpu_workers > AUTO_METAL_MAX_WORKERS => Ok(None),
-            Self::Auto => match MetalBackend::open() {
-                Ok(backend) => Ok(Some(boxed(backend))),
-                Err(CoreError::MissingCapability { .. }) => Ok(None),
-                Err(error) => Err(error),
-            },
+            Self::Auto => {
+                // Opening the device is how this host says whether it has
+                // one, so only where `auto_for` could choose it.
+                if Self::auto_for(cpu_workers, true) == Self::Metal {
+                    match MetalBackend::open() {
+                        Ok(backend) => return Ok(Some(boxed(backend))),
+                        Err(CoreError::MissingCapability { .. }) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Self::auto_for(cpu_workers, false).backend(cpu_workers)
+            }
         }
     }
 }

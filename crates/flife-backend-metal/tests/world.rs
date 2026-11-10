@@ -5,7 +5,9 @@
 //! FL-028: every buffer it uses is the owner's, and none is left leased,
 //! bound or retiring.
 
-use flife_backend_metal::{AUTO_METAL_MAX_WORKERS, ControllerChoice, MetalBackend};
+use flife_backend_metal::{
+    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, ControllerChoice, MetalBackend,
+};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob};
@@ -155,9 +157,11 @@ fn one_flipped_metal_output_bit_changes_the_world() {
 }
 
 /// `auto` takes Metal up to `AUTO_METAL_MAX_WORKERS` CPU workers on a host
-/// with a device, and the CPU reference above that or without one; `cpu`
-/// never opens a device, `torch` is the FrankenTorch CPU route on the
-/// world's workers on any host, and `metal` ignores the worker count.
+/// with a device. Without one it takes the FrankenTorch CPU route up to
+/// `AUTO_TORCH_MAX_WORKERS`, and the CPU reference above that; above
+/// `AUTO_METAL_MAX_WORKERS` it is the reference on any host. `cpu` never
+/// opens a device, `torch` is the FrankenTorch CPU route on the world's
+/// workers on any host, and `metal` ignores the worker count.
 #[test]
 fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let device = metal().is_some();
@@ -166,11 +170,59 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
             .backend(workers)
             .map(|backend| backend.map(|backend| backend.describe()))
     };
-    for workers in [1, 2, AUTO_METAL_MAX_WORKERS] {
+    // The rule on both kinds of host, wherever this runs.
+    use ControllerChoice::{Cpu, Metal, Torch};
+    let rule = [
+        (1, Metal, Torch),
+        (2, Metal, Torch),
+        (AUTO_TORCH_MAX_WORKERS, Metal, Torch),
+        (AUTO_TORCH_MAX_WORKERS + 1, Metal, Cpu),
+        (AUTO_METAL_MAX_WORKERS, Metal, Cpu),
+        (AUTO_METAL_MAX_WORKERS + 1, Cpu, Cpu),
+        (64, Cpu, Cpu),
+    ];
+    for (workers, with_device, without) in rule {
+        assert_eq!(
+            ControllerChoice::auto_for(workers, true),
+            with_device,
+            "{workers}"
+        );
+        assert_eq!(
+            ControllerChoice::auto_for(workers, false),
+            without,
+            "{workers}"
+        );
+        // And this host's `auto` is the rule's choice for it.
+        let expected = described(ControllerChoice::auto_for(workers, device), workers)
+            .expect("the rule's choice opens");
+        assert_eq!(
+            described(ControllerChoice::Auto, workers).expect("auto never refuses"),
+            expected,
+            "auto at {workers} workers"
+        );
+    }
+    for workers in [
+        1,
+        2,
+        AUTO_TORCH_MAX_WORKERS,
+        AUTO_TORCH_MAX_WORKERS + 1,
+        AUTO_METAL_MAX_WORKERS,
+    ] {
         let chosen = described(ControllerChoice::Auto, workers).expect("auto never refuses");
-        assert_eq!(chosen.is_some(), device, "auto at {workers} workers");
-        if let Some(name) = chosen {
-            assert!(name.starts_with("metal"), "{name}");
+        let torch = format!("cpu (frankentorch population_affine_f32_into, {workers} lanes)");
+        match chosen {
+            Some(name) if device => assert!(name.starts_with("metal"), "{name}"),
+            Some(name) => {
+                assert!(
+                    workers <= AUTO_TORCH_MAX_WORKERS,
+                    "auto at {workers} workers: {name}"
+                );
+                assert_eq!(name, torch);
+            }
+            None => assert!(
+                !device && workers > AUTO_TORCH_MAX_WORKERS,
+                "auto at {workers} workers is the reference"
+            ),
         }
     }
     for workers in [AUTO_METAL_MAX_WORKERS + 1, 16, 64] {

@@ -34,7 +34,8 @@ bytes at any worker count and backend, and after a kill and a continuation.
 - `flife validate <config>`.
 - `flife run <config> --ticks N --every K --cpu-workers W --controllers C`, with N = 1,024, K = 128, W from the
   configuration and C = `auto` by default. C is `cpu` (the reference alone), `torch` (FrankenTorch's CPU kernel on
-  the world's workers, `flife-backend-cpu`), `metal` (refused without a Metal device) or `auto` (Metal where the host has it and W ≤ `AUTO_METAL_MAX_WORKERS` = 8, otherwise the reference). `flife
+  the world's workers, `flife-backend-cpu`), `metal` (refused without a Metal device) or `auto` (Metal where the host has it and W ≤ `AUTO_METAL_MAX_WORKERS` = 8,
+  otherwise `torch` at W ≤ `AUTO_TORCH_MAX_WORKERS` = 4, otherwise the reference). `flife
   render` takes the same `--controllers`.
 - In the library, `run(config, RunOptions { ticks, every, cpu_workers, controllers }, emit)`. `emit` receives every
   record in order.

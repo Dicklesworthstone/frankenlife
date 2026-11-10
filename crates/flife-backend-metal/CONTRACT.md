@@ -41,8 +41,11 @@ through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
   `metal`, `auto`) is what the CLI and Studio select it with (`torch` is `flife-backend-cpu`'s `CpuBackend` on the
   world's workers, on any host): `backend(cpu_workers)` gives `auto` Metal only on a host with
   a device and at most `AUTO_METAL_MAX_WORKERS` = 8 workers, where it measured faster (whole ticks, 256 ticks, two
-  interleaved runs: 2 workers 27.5 → 16.3 ms, 4 workers 19.5 → 14.8 ms, 8 workers 15.8 → 14.3 ms). Test
-  `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling`.
+  interleaved runs: 2 workers 27.5 → 16.3 ms, 4 workers 19.5 → 14.8 ms, 8 workers 15.8 → 14.3 ms). Where it does
+  not take Metal, it takes `torch` at most `AUTO_TORCH_MAX_WORKERS` = 4 workers, where that measured faster on
+  Linux and macOS (`flife-backend-cpu`'s contract). `ControllerChoice::auto_for(cpu_workers, metal_device)` states
+  the rule for either kind of host. Test `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling` checks the
+  rule for both kinds on any host, and that this host's `auto` is the rule's choice for it.
 - The kernel alone: `Batch::push(topology, parameters, inputs)` for one organism's catalog topology, its parameters
   in the reference layout and its observation's 104 F64 inputs (topologies may mix in a batch); then
   `MetalControllers::open()`, `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.

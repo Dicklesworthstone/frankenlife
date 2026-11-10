@@ -61,8 +61,9 @@ enum Command {
         /// Where due controllers are evaluated: `metal`, `cpu` (the
         /// reference), `torch` (FrankenTorch's CPU kernel on the world's
         /// workers), or `auto` for Metal where this host has it and the
-        /// world uses at most 8 CPU workers (where it measured faster), else
-        /// the reference. No result depends on it.
+        /// world uses at most 8 CPU workers, else `torch` at most 4 (where
+        /// each measured faster), else the reference. No result depends on
+        /// it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
         /// Keep the run in this new (or empty) directory: its
@@ -235,7 +236,8 @@ enum Command {
         #[arg(long, default_value = "auto", value_parser = parse_workers)]
         cpu_workers: NonZeroUsize,
         /// Where due controllers are evaluated: `metal`, `cpu`, `torch`, or
-        /// `auto` (Metal at most 8 CPU workers). No result depends on it.
+        /// `auto` (Metal at most 8 CPU workers, else `torch` at most 4). No
+        /// result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
         /// Threads for FrankenManim's CPU renderer: a count or `auto`.

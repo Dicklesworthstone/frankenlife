@@ -71,6 +71,9 @@ use flife_core::ids::{
     Generation, GenomeId, IdSequence, LineageId, OrganismId, ResourceEpoch, SourceId,
 };
 use flife_core::ledger::CompensatedSum;
+use flife_core::model::{
+    FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+};
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
     CoreError, EnergyBudget, EnergyLedger, Flow, Holdings, LedgerReport, ResidualBudget,
@@ -101,7 +104,7 @@ use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
     BirthContext, BirthIntent, BirthRequest, BirthResolution, CapacityShortfall, Identities,
-    ParentState, PopulationQuota, RejectedBirth, Reproduction, ReproductionProposal,
+    Offspring, ParentState, PopulationQuota, RejectedBirth, Reproduction, ReproductionProposal,
     resolve_births,
 };
 
@@ -340,6 +343,42 @@ struct Rules {
     interval: u32,
     maximum_population: u64,
     profile: NumericalProfile,
+    variant: ModelVariant,
+    initial_scale: f64,
+}
+
+/// Which `field-ecology-v1` model a world runs: the baseline, or one of
+/// FL-041's ablation models, each changing exactly one rule (plan §15.3,
+/// §21.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelVariant {
+    /// `field-ecology-v1`.
+    Baseline,
+    /// `field-ecology-v1-chemistry-only`: controllers are evaluated and
+    /// charged as in the baseline, and their actions decoded from an
+    /// all-zero raw output.
+    ChemistryOnly,
+    /// `field-ecology-v1-fresh-offspring`: a newborn's genome is a
+    /// founder's genome drawn at its own identity.
+    FreshOffspring,
+}
+
+impl ModelVariant {
+    /// The variant `model` names.
+    ///
+    /// # Errors
+    /// [`CoreError::UnknownAlgorithm`] for another model.
+    pub fn of(model: &str) -> Result<Self, CoreError> {
+        match model {
+            FIELD_ECOLOGY_V1 => Ok(Self::Baseline),
+            FIELD_ECOLOGY_V1_CHEMISTRY_ONLY => Ok(Self::ChemistryOnly),
+            FIELD_ECOLOGY_V1_FRESH_OFFSPRING => Ok(Self::FreshOffspring),
+            other => Err(CoreError::UnknownAlgorithm {
+                role: "model",
+                name: other.to_owned(),
+            }),
+        }
+    }
 }
 
 impl Rules {
@@ -416,6 +455,8 @@ impl Rules {
             interval: model.controller.evaluation_interval_ticks,
             maximum_population: u64::from(model.population.maximum_count),
             profile,
+            variant: ModelVariant::of(&model.model)?,
+            initial_scale: initial_scale(config),
         })
     }
 }
@@ -1162,6 +1203,14 @@ impl World {
             grid: &rules.grid,
             reproduction: &rules.reproduction,
             mutator: &mutator,
+            offspring: match rules.variant {
+                ModelVariant::FreshOffspring => Offspring::Fresh {
+                    catalog: &rules.catalog,
+                    limits: &rules.limits,
+                    initial_scale: rules.initial_scale,
+                },
+                ModelVariant::Baseline | ModelVariant::ChemistryOnly => Offspring::Inherited,
+            },
         };
         let mut next_identities = identities.clone();
         let mut next_quota = quota.clone();
@@ -1502,10 +1551,14 @@ fn finish(
         operation: "decode held output",
         detail: format!("{} holds no valid output", organism.id),
     })?;
+    let raw = match rules.variant {
+        ModelVariant::ChemistryOnly => [0.0; ACTION_WIDTH],
+        ModelVariant::Baseline | ModelVariant::FreshOffspring => widen(outputs),
+    };
     Ok(Decision {
         held,
         evaluated,
-        actions: decode(&widen(outputs), rules.step, &rules.decoding)?,
+        actions: decode(&raw, rules.step, &rules.decoding)?,
         gradients: observation.gradients,
     })
 }

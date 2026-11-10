@@ -6,6 +6,20 @@ use crate::error::CoreError;
 /// The model identity this build implements.
 pub const FIELD_ECOLOGY_V1: &str = "field-ecology-v1";
 
+/// `field-ecology-v1` with one rule changed, for the chemistry-only control
+/// (plan §15.3, §21.6, H2; FL-041): every controller is evaluated, and its
+/// evaluation charged, exactly as in `field-ecology-v1`, but its actions
+/// are decoded from an all-zero raw output, so no organism's decisions
+/// depend on what it senses or on its controller.
+pub const FIELD_ECOLOGY_V1_CHEMISTRY_ONLY: &str = "field-ecology-v1-chemistry-only";
+
+/// `field-ecology-v1` with one rule changed, for the inheritance control
+/// (plan §15.3 "freshly randomized offspring", §21.6; FL-041): a newborn's
+/// genome is drawn as a founder's would be at the newborn's own organism
+/// identity (A.3 items 2–3), instead of mutated from its parent's. Births,
+/// their energy and every other rule are unchanged.
+pub const FIELD_ECOLOGY_V1_FRESH_OFFSPRING: &str = "field-ecology-v1-fresh-offspring";
+
 /// Chemical moment channels per field cell (§4.2).
 pub const MOMENT_CHANNELS: u32 = 32;
 

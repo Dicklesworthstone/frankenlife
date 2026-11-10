@@ -19,8 +19,8 @@ use flife_core::{
 };
 use flife_engine::{
     BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity, EmissionPolicy,
-    Identities, Motion, ParentState, PopulationQuota, Reproduction, ReproductionProposal,
-    ReproductionRules, Unviable, Viability, resolve_births,
+    Identities, Motion, Offspring, ParentState, PopulationQuota, Reproduction,
+    ReproductionProposal, ReproductionRules, Unviable, Viability, resolve_births,
 };
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
@@ -1030,6 +1030,7 @@ fn c5_birth_splits_energy_and_dissipates_the_birth_cost() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let state = parent(1, [10.0, 20.0], 0);
     let request = BirthRequest {
@@ -1278,6 +1279,7 @@ fn child_offsets_are_uniform_by_area_inside_the_disk_and_wrap() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     for (id, position) in (1..).zip([[0.01, 127.99], [127.99, 0.0], [0.0, 0.0]]) {
         let births = staged(
@@ -1372,6 +1374,7 @@ fn cooldown_gates_attempts_and_only_a_birth_resets_it() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &strict,
+        offspring: Offspring::Inherited,
     };
     let requests = [
         BirthRequest {
@@ -1426,6 +1429,7 @@ fn newborns_start_inert_and_join_on_the_next_tick() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let state = parent(21, [64.0, 32.0], 0);
     let request = BirthRequest {
@@ -1506,6 +1510,7 @@ fn six_births(order: &[usize]) -> (Vec<String>, GenomeQuota, Identities, u64) {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let requests: Vec<BirthRequest<'_>> = order
         .iter()
@@ -1644,6 +1649,7 @@ fn settling_refuses_a_parent_whose_budget_moved_and_records_nothing() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let births = staged(
         resolve_births(
@@ -1692,6 +1698,7 @@ fn c5_a_rejected_allocation_commits_no_child_no_transfer_and_no_cost() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let requests = [
         BirthRequest {
@@ -1803,6 +1810,7 @@ fn population_slots_are_reserved_before_any_genome_work() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let requests: Vec<BirthRequest<'_>> = genomes
         .iter()
@@ -1894,6 +1902,7 @@ fn rejected_births_charge_nothing_and_take_no_identity() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &strict,
+        offspring: Offspring::Inherited,
     };
     let requests = [
         BirthRequest {
@@ -1956,6 +1965,7 @@ fn malformed_birth_requests_are_refused_before_anything_is_staged() {
         grid: &world,
         reproduction: &reproduction,
         mutator: &mutator,
+        offspring: Offspring::Inherited,
     };
     let at = |tick| BirthRequest {
         intent: intent(&reproduction, &parent(1, [1.0, 1.0], 0), tick, 9.0, 0.5),

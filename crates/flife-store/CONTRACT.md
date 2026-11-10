@@ -10,6 +10,9 @@ to the chunk store.
 FL-039 (`flife-05q`) adds publication from a donor store and branch catalogs (§14.4, §16.7, B.1). A branch's
 founding checkpoint links the parent store's verified chunk files instead of copying them. A branch's catalog
 records its lineage and origin, and starts its journal with the history it inherited.
+FL-041 (`flife-rln`) adds the experiment catalog (§15.5, B.1): one FrankenSQLite file per experiment directory
+that keeps the experiment's identity and design and one row per run, however the run ended, so a continued
+experiment knows what already ran and a report can list every run.
 
 **Inputs.**
 - A checkpoint: FL-016's sealed container (`flife_runtime::checkpoint` writes one).
@@ -19,6 +22,8 @@ records its lineage and origin, and starts its journal with the history it inher
 - FL-038: a checkpoint encoded into a `Stream` (`flife_runtime::checkpoint_into`) and its sealed prefix.
 - For the journal (FL-036): a database path, a `SessionId` and its configuration hash, `flife_runtime` journal
   records, and checkpoint index rows (sequence, tick, epoch, container SHA-256).
+- FL-041: a database path, an experiment identity and its design text, and `CatalogedRun` rows (ordinal,
+  condition, split, seed, configuration hash, status, and the caller's result and manifest JSON and records hash).
 
 **Outputs.**
 - `ChunkStore` with `open`, `publish`, `publish_observed`, `load`, `latest_valid`, `retain`, `sequences`,
@@ -38,6 +43,8 @@ records its lineage and origin, and starts its journal with the history it inher
   - `ChunkStore::publish_sharing` and `publish_sharing_observed`, taking a donor `ChunkStore`;
   - `Step::ChunkLinked`, and `Publication::linked`, a part of `written`;
   - `CommandJournal::open_branch`, `lineage` and `branch_origin`, and `BranchOrigin`.
+- FL-041: `ExperimentCatalog` with `open`, `path`, `design`, `runs` and `record`; `CatalogedRun`; and
+  `EXPERIMENT_CATALOG_FORMAT`.
 
 **Invariants — layout.**
 - `FLIFESTORE` holds `frankenlife.chunk-store.v1`. A directory that is neither empty nor a store is not taken over.
@@ -129,6 +136,18 @@ records its lineage and origin, and starts its journal with the history it inher
   - Reading a journal back applies `flife_runtime::admitting_session`. An acceptance before a fork's admissions
     must be of that fork's parent, and one after must be of the branch's own session.
 
+**Invariants — the experiment catalog (FL-041; §15.5, B.1).**
+- One FrankenSQLite file in WAL mode with `synchronous = FULL`. `catalog` holds the format
+  `frankenlife.experiment-catalog.v1`, the experiment's identity and its design (written once, when the catalog is
+  created); `runs` holds one row per run, keyed by ordinal and unique by `(condition, split, seed)`.
+- The format is checked before anything else is created, so opening a database of another format (a run catalog,
+  say) is refused without adding a table to it. Opening it for another identity is refused.
+- `record` is one transaction. The same row again is a no-op; another row under a cataloged ordinal, or a
+  cataloged `(condition, split, seed)` under another ordinal, is refused and nothing is written. `runs` reads back
+  in ordinal order, whatever order they were recorded in. A `u64` is stored by its bits, so the full range of
+  seeds round-trips.
+- The catalog never interprets the result or manifest JSON; `flife-cli` writes and reads them.
+
 **Refusal cases.**
 - `incompatible-checkpoint`: a container that does not verify, or a missing, oversized, mis-sealed or extended
   manifest, or a missing, mis-sized or damaged chunk (when loading).
@@ -137,7 +156,9 @@ records its lineage and origin, and starts its journal with the history it inher
   record that is not the next of its kind, an outcome without an acceptance, and a conflicting index row.
   `open_branch` of a session the catalog already records, with no fork, or with a history that is not numbered
   from zero, or whose acceptance is not of the session that admitted its order.
-- `schema-mismatch`: another store format, or another catalog format.
+- FL-041, `state-conflict`: an experiment catalog of another identity, a conflicting run row, or a malformed
+  stored row.
+- `schema-mismatch`: another store format, or another catalog format (FL-041: the experiment catalog's too).
 - `storage-failed`: any operation the host refuses (a full disk, a device or permission failure, a path in the way),
   naming the operation and path. FrankenSQLite's errors map here too.
 - `cancelled`: the observer cancelled before the commit point.
@@ -264,6 +285,19 @@ manifests.
     - no fork, an inherited acceptance of the branch's session, and an outcome out of turn are each refused, with
       nothing recorded.
 
+`tests/experiment_catalog.rs` (2 tests, FL-041):
+- `the_catalog_keeps_each_run_once_in_run_order_across_reopening`: four rows (reached, error, capacity-paused,
+  failed; one with seed `u64::MAX`) recorded out of order read back in order, before and after reopening, with
+  the design kept from creation. The same row again is a no-op; a changed row under its ordinal and a moved
+  `(condition, split, seed)` are each refused with nothing written; the same condition and seed in the other split
+  is another run.
+- `a_catalog_of_another_experiment_or_format_is_refused_unchanged`: another identity is refused, naming the held
+  one, and the catalog still opens for its own; an FL-036 run catalog is refused as `schema-mismatch` (expected
+  and found formats) and still opens as a run catalog afterwards.
+
+Four planted mutants were each caught: the schema created before the format check, the format not checked, an
+identical row refused, and a conflicting row accepted without being written.
+
 **Validity domain.** `frankenlife.chunk-store.v1` over checkpoint format 1 with raw chunks. A local POSIX
 filesystem with atomic `rename`, hard links and advisory `flock` locks: APFS on macOS, and ext4, XFS or btrfs on
 Linux. One writer per store. The journal: `frankenlife.run-catalog.v1` on FrankenSQLite 074c2033 (the `native`
@@ -275,7 +309,8 @@ file-backed engine), one writer thread per session, one session per database at 
 - A real full disk is not exercised: the size limit produces the same short write, from the same code path.
 - A run's catalog row is its identity, configuration hash and command schema, plus its journal and checkpoint
   index. The rest of Appendix B.1's run manifest (source and suite revisions, toolchain, numerics, clocks,
-  hardware, capacity, results and artifacts) is not recorded yet; a complete run catalog is FL-041's evidence.
+  hardware, capacity, results and artifacts) is recorded only for experiment runs, in FL-041's experiment catalog;
+  a run kept with `flife run --run-dir` has none.
 - The catalog records a branch's lineage and origin (FL-039), but not lineage of organisms: FL-040's lineage
   summaries are `flife run` records, not catalog rows. `flife checkpoint`/`resume`, a CLI
   that opens a journal (`flife run` refuses `write-ahead-before-apply`) and resuming from the store are FL-037.
@@ -298,3 +333,6 @@ file-backed engine), one writer thread per session, one session per database at 
   correctly but do not decode (a writer bug, never damage) would be kept. `latest_valid` still restores.
 - No RaptorQ or other error correction: damage is detected and recovery falls back, but damaged bytes are not
   reconstructed (§16.7).
+- FL-041: the experiment catalog is written by one process at a time; two processes continuing one experiment
+  directory are not prevented (no lock) or tested. `CommandJournal::open` still creates its tables before checking
+  the format, so pointing it at an experiment catalog adds empty journal tables to that file before refusing it.

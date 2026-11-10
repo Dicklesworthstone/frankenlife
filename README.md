@@ -97,6 +97,12 @@ into a tracker that checks every identity as it goes, and prints a record every 
 births, deaths, lifespans, mutation acceptance, energy flows, uptake contention, the architecture distribution and
 lineage diversity. Motility, clustering and resource concentration are sampled from the render epoch, and the
 start record declares which figures are which.
+FL-041 runs experiments: `flife experiment SPEC --out DIR` runs a control and its conditions (six named ablations,
+overrides, a parameter sweep) over discovery and held-out seeds. It catalogs every run in FrankenSQLite whether it
+reached its tick, died out, paused or was refused, keeps each run's records and Appendix B.1 manifest, and reports
+each condition against the control as an effect over k of n paired seeds with an exact sign-flip p-value. A
+selection rule sees only the discovery runs. The report is the same bytes at any worker count, and after a kill and
+a continuation.
 Camera, zoom and selection come next.**
 
 | Question | Answer |
@@ -430,7 +436,8 @@ flife run <config>          # a headless run
 flife step | inspect        # advance one tick; a bounded snapshot of one organism at an exact tick
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
 flife branch                # control and intervention branches from one checkpoint (exists)
-flife sweep | analyze       # seed ensembles, parameter sweeps, ablations and their metrics
+flife experiment            # seed ensembles, sweeps and ablations against a control, every run cataloged (exists)
+flife analyze               # cross-experiment analysis of cataloged metrics
 flife render | export       # simulation-time frames and video through FrankenManim (render exists)
 flife-studio <preset>       # the interactive microscope
 ```

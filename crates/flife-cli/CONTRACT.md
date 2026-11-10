@@ -22,6 +22,13 @@ given `--metrics-every M` folds every published report into a `Tracker` and emit
 multiple of M and at the end. Each record separates what is complete, folded from every tick, from what is sampled
 from the render epoch at the record's tick, and the start record declares both rules.
 
+FL-041 (`flife-rln`) adds `flife experiment` (plan §15.3–§15.5, §21.6, Appendix B.1), in `experiment`. An
+experiment specification names a base configuration, a control, conditions (named ablations, overrides, a sweep),
+discovery and held-out seeds and the selection procedure in words. `flife experiment` runs every condition on every
+seed it plans, catalogs every run however it ended in FrankenSQLite (`flife-store`'s experiment catalog), keeps each
+run's records and Appendix B.1 manifest, and writes a report computed from the catalog alone. A report is the same
+bytes at any worker count and backend, and after a kill and a continuation.
+
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
@@ -51,6 +58,26 @@ from the render epoch at the record's tick, and the start record declares both r
   - `--name` is 1 to 256 bytes, `DIR`'s name by default.
   - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command.
   - In the library: `branch(parent, dir, &BranchOptions { at, name, injections, durability })`.
+
+- FL-041: `flife experiment SPEC --out DIR --cpu-workers W --controllers C`. `DIR` is new, empty, or holds this
+  experiment's catalog; W and C are as for `run` and change no reported byte. `SPEC` is TOML
+  (`frankenlife.experiment.v1`, unknown keys refused):
+  - `name`, `hypothesis`, `selection` (the procedure in words, §15.5), `control` (a condition's name), `ticks`,
+    `metrics_every` (0 by default), and `base`, a configuration file relative to the specification;
+  - `[seeds] discovery = [...]`, `held_out = [...]`: distinct, at least one discovery seed, each a TOML integer;
+  - `[set]`: dotted overrides of keys the base already has, shared by every condition;
+  - `[[conditions]]`: `name`, optional `ablation` (one of `ABLATIONS`), optional `[conditions.set]`, which replaces
+    `[set]` key by key;
+  - `[sweep] "key" = [values]`: one more condition per combination, named `key=value;…`;
+  - `[select] measure = M, rule = "max"|"min"`: optional; picks one non-control condition from the discovery runs.
+  - The named ablations (`ABLATIONS`, each a fixed set of validated keys): `no-emission` (emission rate 0),
+    `fixed-topology` (architecture mutation off), `no-complexity-cost` (neural cost per parameter evaluation 0),
+    `fixed-controller` (weight and replacement probabilities 0 and architecture mutation off; traits still mutate),
+    `chemistry-only` (model `field-ecology-v1-chemistry-only`) and `fresh-offspring` (model
+    `field-ecology-v1-fresh-offspring`); the two models are `flife-engine`'s.
+  - In the library: `Experiment::load(path)` or `Experiment::new(spec, base_text)`, then `experiment(&experiment,
+    dir, ExperimentOptions { cpu_workers, controllers }, emit)`. `Experiment::configuration(condition, seed)` gives
+    any planned run's validated configuration.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
@@ -130,6 +157,35 @@ from the render epoch at the record's tick, and the start record declares both r
     scale: dimensionless, so it compares across motility gains), against consecutive live founders as the unrelated
     baseline. Live grandparent–parent–child triples report how many of the parent's parameter variants the child
     carries, and the child's trait distance to its parent and to its grandparent.
+- `flife experiment` (`frankenlife.experiment.v1`): `experiment-start` (name, identity, conditions, and how many
+  runs the catalog already holds), one `experiment-run` per run as it is cataloged (ordinal, condition, split,
+  seed, result, wall seconds), `experiment-select` when a rule picked, and `experiment-end` (runs, complete, extinct,
+  the report path and its SHA-256). Its directory holds:
+  - `experiment.sqlite`: the identity, the canonical design, and one row per run (ordinal, condition, split, seed,
+    configuration hash, status, result, manifest, the records file's SHA-256);
+  - `runs/run-NNNNNN.ndjson`: the run's `flife run` records (with `metrics` records when `metrics_every` is set),
+    or the `frankenlife.error.v1` record of a run that was refused;
+  - `report.json` (`frankenlife.experiment-report.v1`): the design as resolved (conditions with every override
+    their ablation and overrides set, the seeds, the control, the base configuration's hash), the selection (the
+    procedure in words, the rule, each candidate's mean over its complete discovery runs, the pick), run counts by
+    condition and split (reached, extinct, capacity-paused, failed, error), every comparison with the control, and
+    every cataloged run with its result.
+  - A result is `reached`, `capacity-paused`, `failed` or `error` (refused before or broken during the run, with
+    its `CoreError` kind), the committed tick and digest, whether it is extinct, and 13 measures from the end tally
+    and survey (`MEASURES`: survived, final, peak and least live, births, deaths, deepest generation, lineages and
+    distinct genomes alive, emitter-ticks, emission paid, topology changes, mutated parameters).
+  - A comparison, per split and condition: the paired seeds (both runs reached their tick), the unpaired ones, and
+    per measure n, both means, the mean difference, seeds higher, lower and equal, the differences in seed order,
+    and the exact two-sided sign-flip p-value over all 2^n sign assignments (up to `EXACT_TEST_MAX_SEEDS` = 20).
+    That is the "effect e over k of n seeds versus control" a claim is worded in.
+  - A run manifest (`frankenlife.run-manifest.v1`) in each catalog row, grouped as Appendix B.1: identity
+    (experiment, ordinal, condition, ablation, split, seed, parent, creation time), model (model, descriptor
+    digest, configuration hash, version), source (FrankenLife revision, the FrankenSuite commits `Cargo.lock`
+    resolves, rustc, target, profile), numerics, clocks, hardware (CPU, cores, memory, OS, CPU workers, controller
+    backend), capacity, provenance (seed, founders, initializer, RNG, durability, interventions), results (the
+    result, wall seconds, ticks per second) and artifacts (the records file and its SHA-256).
+  - Exit status 0 once the report is written, whatever the runs' endings; 2 for a refused specification or
+    directory.
 - Errors: one `frankenlife.error.v1` record on standard error. Its `kind` is `CoreError::kind`, or `io` for an
   unreadable file. Exit status is 0 on success, 1 when a run stops early (a capacity pause or a failed tick), and 2
   for an unreadable or invalid configuration, a refused session or a refused run directory.
@@ -235,6 +291,26 @@ from the render epoch at the record's tick, and the start record declares both r
     tally.
   - The parent's chunk store is opened as its writer for the whole branch operation, so nothing moves under the
     checkpoint while it is read and linked.
+- FL-041:
+  - Runs are planned in order: every condition on every discovery seed, then the held-out seeds, ordinals from 1.
+    With a `[select]` rule only the control and the pick run on the held-out seeds; without one, every condition.
+  - The rule reads only complete discovery runs, so the held-out runs cannot influence the pick, and picks again
+    the same way when the experiment is continued after its held-out runs are cataloged. A tie goes to the
+    condition listed first; when no candidate has a complete discovery run, nothing is picked and only the control
+    runs on the held-out seeds.
+  - A run's records are written, flushed and renamed into place before its catalog row is committed. A continued
+    experiment skips every cataloged ordinal and runs the rest; a run killed before its row commits runs again.
+    Cataloging an ordinal again with another row is refused.
+  - The report is computed from the catalog and the specification alone: no wall time, host, build or worker count
+    enters it (those are in the manifests). Runs execute one at a time, and each run's result is the same at any
+    worker count and backend (`flife-engine`'s determinism), so the report's bytes are too.
+  - An experiment's identity is the SHA-256 of its canonical design: the base configuration's hash, every resolved
+    condition, the seeds, ticks, metrics interval, control, selection words and rule. A directory cataloging one
+    identity refuses another.
+  - Every planned run is cataloged and listed, whatever its ending. Extinct runs that reached their tick are
+    compared like any other; runs that paused, failed or were refused are counted and named as unpaired seeds.
+    Nothing is dropped from the report.
+  - Every condition's configuration is validated at the first discovery seed before anything runs.
 
 **The preset.** `reference-small-world` is a viability-calibrated start with declared parameter tuning (§7.2) at
 the Reference profile's scale (§19.5):
@@ -290,6 +366,14 @@ test.
   checkpoints restores is also refused.
 - FL-040: a report or an epoch that disagrees with the tracker stops the run with `state-conflict` (operation
   `track run metrics`), exit status 2. The records before it are still emitted.
+- FL-041, before anything runs: a specification with an unknown key, another schema, an empty name, hypothesis or
+  selection, zero ticks, no discovery seed, a repeated seed (a held-out seed equal to a discovery seed included), a
+  seed beyond a TOML integer, an override of a key the base lacks or of `seed` or `schema`, a condition or `[set]`
+  that sets a key its ablation sets, an unknown ablation, an empty or repeated condition name, a control that names
+  no condition, fewer than two conditions, an empty sweep, an unknown measure or rule, or a condition whose
+  configuration does not validate (`invalid-config` or `unknown-algorithm`); a directory holding files but no
+  catalog, or another experiment's catalog (`state-conflict`). A run's own refusal (for example
+  `write-ahead-before-apply` without a run directory) is cataloged as an `error` run, not returned.
 - Any other refusal from founding or the session, by its `CoreError` kind.
 - A run that pauses on capacity or fails a tick ends with that `stop` and exit status 1. Its records up to that
   point are still emitted.
@@ -455,17 +539,66 @@ was not equivalent: the test had reused a live organism's identity, which the li
 also reuses a dead organism's identity, which only that check refuses, and requires each refusal to name its check.
 The survivor and the five other mutants the refusal tests catch were run again, and all six were caught.
 
+`tests/experiment.rs` (6 tests, FL-041, about 7 s in release), on FL-037's 32 × 32 ecology from the plan's own
+Appendix A:
+- `repeated_experiments_report_byte_identically_at_any_worker_count_and_across_a_kill`. Control, `no-emission` and
+  `chemistry-only` over three discovery and two held-out seeds (15 runs). One CPU worker on the reference and three
+  on `auto` write byte-identical reports. The `flife` binary is killed with SIGKILL after its fourth
+  `experiment-run` record, then continued with another worker count: the start record counts what was cataloged,
+  only the rest run, and the report is byte-identical to the uninterrupted one; the end record's hash is the
+  report's. Another experiment is refused in that directory. Every comparison is recomputed by the test's own code
+  (pairs, means, counts, and the p-value by recursive enumeration of sign assignments).
+- `the_catalog_keeps_every_run_whatever_its_ending`. Four conditions over two discovery and one held-out seed: a
+  control, `starved` (extinct by tick 120), `crowded` (paused at the population ceiling) and `journaled` (refused:
+  `write-ahead-before-apply` without a run directory). All 12 are cataloged and listed in order with their status,
+  extinction, tick and detail. Each records file hashes to its row; its last line is the end record (same digest
+  and tick) or the error. Each manifest names its experiment, condition, split, seed, ordinal, configuration hash,
+  result, records file and hash, a host with cores, and the asupersync commit `Cargo.lock` resolves. Counts match
+  per condition and split; the extinct runs are compared (survival difference −1 on every seed); the paused and
+  refused ones are unpaired.
+- `a_selection_rule_sees_only_discovery_runs_and_holds_out_the_rest`. A basal-cost sweep (0.3 and 1.2) with `max
+  final_live`. The pick is the condition with the higher discovery mean, the candidates' means and run counts are
+  the discovery runs', and only the control and the pick run on the held-out seeds, with one held-out comparison.
+  Continuing the finished experiment runs nothing and gives the same selection and the same report bytes.
+- `every_named_ablation_changes_what_it_names`. All six ablations against a control with architecture mutation at
+  half of births, 240 ticks, from each run's own records: no emission paid; no topology change but parameters
+  still mutated; a controller-cost flow under 1e-9 of the control's (rounding residue, below); no mutated
+  parameter or topology change, births still happen and live parent–child pairs are bit-identical; no emitter-tick
+  but births; under fresh offspring under a quarter of parent–child parameters identical against over 90% in the
+  control.
+- `specifications_that_would_hide_a_choice_are_refused`. A good specification resolves, with each condition's
+  ablation keys and shared overrides recorded. Thirteen one-change variants are refused (overlapping seeds, no
+  discovery seed, no control, a blank selection, an override of a key the base lacks, the seed, an ablation's key,
+  an unknown ablation, a repeated name, an invalid value, an empty sweep, an unknown measure, an unknown field), and
+  so is a directory holding other files.
+- `the_sign_flip_test_by_hand`: [1, 2, 3] → 1/4, [3, 1] → 1/2, [1, −1] and zeros → 1, twenty ones → 2/2^20, and no
+  value for no seeds or more than twenty.
+
+Eleven planted mutants were run against `tests/experiment.rs` (the two model mutants also against `flife-engine`'s
+`tests/ablation.rs`), and every one was caught:
+- a continuation that reruns cataloged runs (the kill test and the selection test's continuation);
+- a selection rule that also counts held-out runs (the selection test's continuation);
+- incomplete runs paired, the report leaving out runs that did not reach their tick, and only complete runs
+  cataloged (the endings test);
+- the sign-flip test counting only strictly more extreme sums, and its denominator off by one (the test by hand
+  and the recomputed comparisons);
+- a condition allowed to set its ablation's key, and held-out seeds allowed to repeat discovery seeds (the
+  refusals test);
+- `chemistry-only` decoding the controller's output and `fresh-offspring` inheriting the parent's genome (the
+  ablation test here, and each model's own evidence test in `tests/ablation.rs`).
+
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories
 also at `write-ahead-before-apply`, one process per run directory, on local file systems (APFS tested here).
 
 **Known gaps.**
-- Only `validate`, `run`, `resume`, `render` and `branch`. Capabilities, step and inspect, sweep, analyze and export
-  are later items (§14.6): FL-021, FL-041 and FL-023.
+- Only `validate`, `run`, `resume`, `render`, `branch` and `experiment`. Capabilities, step and inspect, analyze
+  and export are later items (§14.6): FL-021 and FL-023.
 - FL-039 gaps:
   - §14.4's synchronized simulation-time views and paired metrics are not here: a branch's paired comparison is two
-    `flife resume` runs and their records. Experiment reports are FL-041, and side-by-side views are the studio's.
-    Nothing assumes common random numbers stay coupled after the branches' births differ.
+    `flife resume` runs and their records. Experiment reports (FL-041) compare runs founded afresh per seed, not
+    branches, and side-by-side views are the studio's. Nothing assumes common random numbers stay coupled after the
+    branches' births differ.
   - A branch runs the parent's configuration. Changing parameters at a fork (an intervention that is not a
     command) is not supported.
   - Sharing is hard links, so the parent and the branch must be on one file system. Across file systems the
@@ -546,7 +679,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
 - The survey compares whole genomes and hashes every live genome, which is cheap at this scale.
 - FL-040 gaps:
   - Metrics are NDJSON records only. §16.6 puts lineage summaries and sampled metrics in the run catalog; no catalog
-    table holds them yet. FL-041's complete run catalog is where they would be stored and compared.
+    table holds them yet. FL-041's experiment catalog hashes each run's records file, metrics included, but does
+    not index the metrics themselves.
   - No genome-content diversity per window. The client sees genome identities, not contents. Every birth perturbs
     the traits, so distinct contents would equal the live count. Sampled trait distances need genome access, which
     only the end survey has (exact, once).
@@ -563,3 +697,22 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   of indefinite persistence. Ecological parameters are refined through declared experiments in FL-048.
 - Deaths recycle energy only on explicit removal, which is not a command yet (FL-022). In the preset every death is
   exhaustion.
+- FL-041 gaps:
+  - Runs execute one after another in one process, each without a run directory: no checkpoints, no journal, so
+    `write-ahead-before-apply` conditions are refused (and cataloged as such), and a killed run restarts from its
+    founding. Runs on several hosts or processes are not supported.
+  - §21.6's shuffled-inheritance and shuffled- or frozen-controller variants are not implemented; `chemistry-only`
+    decodes every action from zero (σ(0) everywhere), and `fresh-offspring` gives each newborn its founder genome.
+  - `no-emission` sets the emission rate to 0, so gates still open (emitter-ticks are counted) but nothing is paid
+    or deposited. A gate threshold of 1.0 passes configuration validation but `ActionDecoding::new` refuses it at
+    founding ("out of range"); that inconsistency predates FL-041 and is why the ablation uses the rate.
+  - `no-complexity-cost` leaves a controller-cost flow of a few ulps per tick: `MaintenanceBill::settle` attributes
+    the rounded payment's remainder after basal and sensor to the controller term. Removing it would change the
+    model's arithmetic (a new model identity); the test bounds it instead.
+  - The measures are end-of-run scalars from the tally and survey. Time series, trait distributions and lineage
+    shapes stay in the records files; the report does not compare them.
+  - The sign-flip test is exact up to 20 paired seeds and absent beyond; no multiple-comparison correction is
+    applied, so a claim names its measure in advance (§15.5) and the report lists every comparison.
+  - The source revision is `git rev-parse HEAD` when the build script last ran (uncommitted edits are not
+    detected; `unavailable` outside a checkout). The hardware group reads `sysctl`/`sw_vers` on macOS and
+    `/proc` and `/etc/os-release` elsewhere; a fact a host does not expose is absent.

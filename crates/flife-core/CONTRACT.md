@@ -226,6 +226,12 @@ Every issue is reported, not just the first.
   - Its pause arm belongs to observers whose retention competes with the world's resources (FL-021, FL-038).
   - `execution.render_queue_capacity` must be at least 2 (`IntBound::AtLeastTwo`): one displayable epoch and one
     being written.
+- FL-041, in `flife-engine`: two more `Role::Model` entries, `field-ecology-v1-chemistry-only` and
+  `field-ecology-v1-fresh-offspring` (`model::FIELD_ECOLOGY_V1_CHEMISTRY_ONLY` and
+  `FIELD_ECOLOGY_V1_FRESH_OFFSPRING`), each `field-ecology-v1` with one rule changed for §15.3's controls, cited to
+  `flife-engine`'s `tests/ablation.rs`.
+  A configuration naming one validates like `field-ecology-v1` and has its own configuration hash and model
+  descriptor.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer
   vectors yet. A run naming one cannot pass G1 or G3 until its owner implements it.
 - An `Implemented` entry cites a `test:<crate>::<path>::<fn>`, and the registry test checks that the cited
@@ -288,5 +294,6 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
     truncation are refused too.
   - Counts bounded by their cap and by the bytes left, a flag byte of 2, and unread bytes.
 
-**Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` and `frankenlife.model-descriptor.v1`. FL-016:
+**Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` (and FL-041's two ablation models) and
+`frankenlife.model-descriptor.v1`. FL-016:
 checkpoint format 1 with SHA-256 and raw chunks.

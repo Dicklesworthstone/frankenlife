@@ -19,9 +19,9 @@ use flife_core::{
 use flife_engine::{
     Arrangement, BirthContext, BirthRequest, BirthResolution, BudgetStage, Death, DeathCause,
     DeathSettlement, Disposition, EmissionPolicy, Entrant, Fate, HeldOutput, Identities,
-    MaintenanceBill, MaintenanceCosts, Motion, Organism, ParentState, Population, PopulationQuota,
-    Recycling, Reproduction, ReproductionProposal, ReproductionRules, TinyEnergyPolicy, Vitality,
-    resolve_births, settle_efficiencies,
+    MaintenanceBill, MaintenanceCosts, Motion, Offspring, Organism, ParentState, Population,
+    PopulationQuota, Recycling, Reproduction, ReproductionProposal, ReproductionRules,
+    TinyEnergyPolicy, Vitality, resolve_births, settle_efficiencies,
 };
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
@@ -1610,6 +1610,7 @@ fn births_and_deaths_commit_together_with_the_birth_transaction() {
             grid: &grid,
             reproduction: &reproduction,
             mutator: &mutator,
+            offspring: Offspring::Inherited,
         };
         let parent_genome = population.genome(one.id).expect("genome");
         let mut identities = Identities {

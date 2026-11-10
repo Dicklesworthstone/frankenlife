@@ -626,10 +626,10 @@ The repository holds:
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid, FL-011 deposits and FL-027 bins), `crates/flife-engine`
-  (FL-006, FL-011–FL-014),
+  (FL-006, FL-011–FL-014, FL-041's ablation models),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
-  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-038, FL-039, FL-040), and
-  `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-038, FL-039), and
+  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037–FL-041), and
+  `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-038, FL-039, FL-041), and
   `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
@@ -810,8 +810,17 @@ behind it.
   genome, lineage and generation, the live count) and each sample against its render epoch. Keep complete figures
   (folded from every report) apart from sampled ones (from the epoch) and say which in the declaration. Prove a
   change with `tests/metrics.rs`: the tracker's organisms must equal the committed world's at every tick.
-- Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1` and `frankenlife.error.v1`. An
-  error's `kind` is `CoreError::kind`. Add a new variant's kind there, never a string match on `Display`.
+- Experiments (FL-041, `experiment`): the report is computed from `flife-store`'s `ExperimentCatalog` and the
+  specification alone. Keep wall time, host, build and worker count out of it (they go in the run manifest), keep
+  every run in it whatever its ending, and let a selection rule read only complete discovery runs. A run's records
+  file is written before its row is committed, and a continued experiment skips cataloged ordinals. An ablation is
+  validated configuration keys (`ABLATIONS`) or a registered model (`flife-engine`'s `ModelVariant`); one that
+  changes the rules gets its own model name. Prove a change with `tests/experiment.rs` (byte-identical reports
+  across worker counts and a SIGKILL) and, for the models, `flife-engine`'s `tests/ablation.rs`.
+- Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1`, `frankenlife.experiment.v1` and
+  `frankenlife.error.v1`; an experiment also writes `frankenlife.experiment-report.v1` and
+  `frankenlife.run-manifest.v1`. An error's `kind` is `CoreError::kind`. Add a new variant's kind there, never a
+  string match on `Display`.
 - `observe` has two halves:
   - `Tally` folds published reports;
   - `Survey` reads one committed world's raw state: generations, lineages, distinct genomes and `Heredity`.

@@ -47,6 +47,11 @@ and seals them is `flife-runtime`.
 FL-016 (`flife-gh0`) writes and restores the whole world as ten checkpoint chunks (plan §16.1, §16.3, INV-14,
 Appendix B.2, C.13).
 
+FL-041 (`flife-rln`) adds two ablation models (plan §15.3, §21.6), each `field-ecology-v1` with one rule changed
+and its own registered model name, so an ablated run never shares a model identity with the baseline:
+`field-ecology-v1-chemistry-only` (decisions decode from an all-zero output) and `field-ecology-v1-fresh-offspring`
+(a newborn's genome is the one a founder would have at its identity).
+
 It runs on the scalar CPU reference (`cpu-reference`) in the `qualified-reference` determinism class. The other
 modules compute settlements, proposals and staged births and store the committed organisms; `world` decides when
 each runs and owns the field.
@@ -69,6 +74,8 @@ each runs and owns the field.
 - FL-013: a whole validated configuration; the `Arrangement`; a `NumericalProfile` (the ledger's
   `ResidualBudget` and the field's `ConeTolerance`). `NumericalProfile::reference_f32` is §21.4's initial F32 gate:
   `1e-5` per tick and cumulatively, and `1e-5` of a cell's energy for the cone, each above the smallest normal F32.
+- FL-041: the configuration's `model`, read by `ModelVariant::of`: `field-ecology-v1`, or one of the two
+  ablation models.
 
 **Outputs.**
 - `Chemistry::efficiency`: `η(z) = η_max tanh(k a·z − b)`.
@@ -122,6 +129,9 @@ each runs and owns the field.
 - FL-014: `Intervention` (`InjectEnergy { cell, amount }`) with `check` and `declared_energy`;
   `World::advance_with` and `World::step_with`; and each `TickReport`'s `interventions`, the
   `AppliedIntervention`s (input tick, sealed position, intervention, applied energy) in sealed order.
+- FL-041: `ModelVariant` (`Baseline`, `ChemistryOnly`, `FreshOffspring`) and `ModelVariant::of(model)`;
+  `reproduction::Offspring` (`Inherited`, or `Fresh { catalog, limits, initial_scale }`), the new `offspring`
+  field of `BirthContext`.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -299,6 +309,20 @@ each runs and owns the field.
 - Scratch buffers and the controller and field backends are not state. A restored world runs on the reference
   path until its owner calls `set_controller_backend` or `set_field_backend`, and no result depends on either.
 
+**Invariants — ablation models (FL-041; §15.3, §21.6).**
+- `field-ecology-v1-chemistry-only`: every due controller is evaluated and its cost charged exactly as in the
+  baseline (same evaluations, same `controller-cost`, `sensor-cost`, `motion-cost` and `maintenance` bits on the
+  first tick from one founding), and the held output is kept, but `finish` decodes every decision from
+  `[0.0; ACTION_WIDTH]`. With Appendix A's decoding that is σ(0) = 1/2 everywhere: the emission gate sits at its
+  threshold of 1/2 and never opens, and every birth gives the child the share β = 0.1 + 0.8 / 2 = 1/2 of what
+  remains after the birth cost. Chemistry, motion physics, uptake, costs and reproduction thresholds are unchanged.
+- `field-ecology-v1-fresh-offspring`: a birth stages `flife_genome::founder(rng, child, genome_id, catalog,
+  quota, limits, initial_scale)`, the genome a founder would draw at the child's organism identity (A.3 items
+  2–3), with an empty mutation record. Its energy, position, lineage, generation and quota charge follow the
+  baseline's birth transaction. Nothing of the parent's parameters is carried except by chance (founders' zero
+  biases).
+- The founding is the same under all three models: the model name changes no founder.
+
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
@@ -444,6 +468,17 @@ streams. The small ecology pins its world digest, checked on Linux x86_64.
     written, and the quota's count not checked.
 - FL-016's world chunks are tested through the session, in `flife-runtime`'s `tests/checkpoint.rs`.
 
+`tests/ablation.rs` (3 tests, FL-041), on the 32 × 32 Appendix A ecology:
+- `the_model_key_names_each_variant_and_refuses_others`: each name maps to its variant and validates; another name
+  (`field-ecology-v2`, `field-ecology-v1-shuffled`) is refused.
+- `a_chemistry_only_world_pays_the_same_evaluations_and_decides_from_zero`: the same founders as the baseline; on
+  the first tick the same evaluations and the same cost flows bit for bit; over 240 ticks no organism emits (the
+  baseline does) and every birth's child share is 1/2 within 1e-12, where the baseline's vary.
+- `a_fresh_offspring_child_holds_the_founder_genome_of_its_own_identity`: every child equals, in topology,
+  parameter bits and traits, `flife_genome::founder` at its identity, with an empty mutation record; under
+  `field-ecology-v1` none does. Under 1/4 of the parameters a fresh child shares with its parent are identical,
+  against over 9/10 when inherited.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
 `pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`; FL-013 at
@@ -514,3 +549,6 @@ velocity, first-order splitting at the configured fixed timestep.
   contract's cone-tolerance gap).
 - Sensor gradients come from FL-007.
 - A Metal implementation is FL-032; its parity with this reference is a separate numerical profile.
+- FL-041: §21.6's shuffled-inheritance and shuffled- or frozen-controller variants are not models here.
+  `chemistry-only` fixes every decision at the zero output rather than at a random or frozen one, and keeps the
+  controller's cost, so it isolates the decisions, not the cost of having a controller.

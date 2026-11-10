@@ -25,12 +25,14 @@ flife-store = { path = "../flife-store" }
 fmn-codec.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Experiment specifications (FL-041) are TOML, and their overrides are
+# applied to the base configuration's TOML before it is validated.
+toml.workspace = true
 
 [dev-dependencies]
 peak_alloc.workspace = true
 # The frame-route measurement example renders on FrankenManim's Metal route.
 fmn-render = { workspace = true, features = ["metal"] }
-toml.workspace = true
 
 [lints]
 workspace = true

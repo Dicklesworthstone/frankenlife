@@ -63,13 +63,13 @@ pub use population::{
 };
 pub use reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity,
-    CapacityShortfall, Identities, NEXT_TICK_ACTIVATION, Newborn, ParentState, PopulationQuota,
-    RejectedBirth, Reproduction, ReproductionProposal, ReproductionRules, Split, Unviable,
-    Viability, resolve_births,
+    CapacityShortfall, Identities, NEXT_TICK_ACTIVATION, Newborn, Offspring, ParentState,
+    PopulationQuota, RejectedBirth, Reproduction, ReproductionProposal, ReproductionRules, Split,
+    Unviable, Viability, resolve_births,
 };
 pub use world::{
-    Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport, NumericalFault,
-    NumericalProfile, PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE, Stepped,
-    TickReport, UNIFORM_POSITIONS, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION,
+    Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport, ModelVariant,
+    NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE,
+    Stepped, TickReport, UNIFORM_POSITIONS, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION,
     WORLD_DIGEST_SCHEMA, World, ZERO_VELOCITY, founder_position,
 };

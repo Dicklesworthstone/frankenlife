@@ -63,8 +63,9 @@ ft-kernel-metal = { git = "https://github.com/Dicklesworthstone/frankentorch", r
 ft-runtime = { package = "frankentorch-runtime", git = "https://github.com/Dicklesworthstone/frankentorch", rev = "71bbe52e4a2ae41c9b23034ee566254175a40780", features = ["asupersync-integration"] }
 
 # Third-party crates. serde and sha2 0.11 are already in the qualified closure;
-# toml is the one addition, confined to flife-core's config loader (Appendix A
-# is TOML, and the loader must refuse unknown keys). clap and serde_json, for
+# toml is the one addition, for flife-core's config loader (Appendix A is TOML,
+# and the loader must refuse unknown keys) and flife-cli's experiment
+# specifications (FL-041). clap and serde_json, for
 # flife-cli's arguments and NDJSON records (FL-015), were already in the
 # closure, so they add no package.
 clap = { version = "4.6.7", features = ["derive"] }

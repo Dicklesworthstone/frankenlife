@@ -27,7 +27,9 @@
 //!    population quota. This happens before any genome work, so the quota
 //!    is enforced early.
 //! 2. The mutated child is constructed and validated by
-//!    `flife_genome::Mutator::propose`. The fixed logical genome quota is
+//!    `flife_genome::Mutator::propose` (under
+//!    `field-ecology-v1-fresh-offspring`, FL-041, the child's genome is
+//!    instead a founder's drawn at its own identity, [`Offspring::Fresh`]). The fixed logical genome quota is
 //!    charged before any parameter buffer is allocated. A birth whose
 //!    candidates are all rejected is itself rejected and charges nothing
 //!    (`reject-birth-no-charge`). It takes no slot and no identity.
@@ -72,7 +74,7 @@ use flife_core::{CoreError, ValidatedConfig};
 use flife_field::FieldGrid;
 use flife_genome::{
     BirthAttempt, CandidateRejection, Genome, GenomeQuota, LOGICAL_GENOME_BYTES, MutationRecord,
-    Mutator, Proposal,
+    Mutator, Proposal, TopologyCatalog, TraitLimits, founder,
 };
 use flife_neural::DecodedActions;
 
@@ -519,6 +521,28 @@ pub struct BirthContext<'a> {
     pub reproduction: &'a Reproduction,
     /// The mutation operator.
     pub mutator: &'a Mutator<'a>,
+    /// Where a newborn's genome comes from.
+    pub offspring: Offspring<'a>,
+}
+
+/// Where a newborn's genome comes from.
+#[derive(Debug, Clone, Copy)]
+pub enum Offspring<'a> {
+    /// Its parent's genome through [`Mutator::propose`]
+    /// (`field-ecology-v1`).
+    Inherited,
+    /// A founder's genome drawn at the newborn's own organism identity
+    /// (`field-ecology-v1-fresh-offspring`, FL-041): the default topology,
+    /// founder weights and zero biases, founder traits. Nothing of the
+    /// parent's genome passes to it, and no mutation is proposed.
+    Fresh {
+        /// The topology catalog.
+        catalog: &'a TopologyCatalog,
+        /// The trait limits.
+        limits: &'a TraitLimits,
+        /// The configured initial sensing scale.
+        initial_scale: f64,
+    },
 }
 
 /// The run's identity sequences: the next organism and genome identities
@@ -855,10 +879,35 @@ fn stage(
         parent: intent.parent,
         tick: intent.tick,
     };
-    let proposal = match context
-        .mutator
-        .propose(request.genome, attempt, genome_id, quota)
-    {
+    let proposed = match context.offspring {
+        Offspring::Inherited => context
+            .mutator
+            .propose(request.genome, attempt, genome_id, quota),
+        Offspring::Fresh {
+            catalog,
+            limits,
+            initial_scale,
+        } => founder(
+            context.rng,
+            child,
+            genome_id,
+            catalog,
+            quota,
+            limits,
+            initial_scale,
+        )
+        .map(|genome| Proposal::Child {
+            genome: Box::new(genome),
+            record: MutationRecord {
+                candidate: 0,
+                topology: None,
+                replaced: 0,
+                perturbed: 0,
+                rejected: Vec::new(),
+            },
+        }),
+    };
+    let proposal = match proposed {
         Ok(proposal) => proposal,
         Err(CoreError::BudgetExhausted {
             budget,

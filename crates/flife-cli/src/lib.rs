@@ -22,6 +22,12 @@
 //!   emits a [`Metrics`] record every so many ticks: complete window,
 //!   population and lineage statistics, and statistics sampled from the
 //!   render epoch at the record's tick.
+//! - [`mod@experiment`]: seed ensembles, sweeps and ablations (FL-041).
+//!   [`experiment()`] runs an [`Experiment`]'s conditions over discovery
+//!   and held-out seeds into an experiment directory, catalogs every run
+//!   with its manifest whatever its ending, continues after a kill, and
+//!   writes a [`Report`] of paired comparisons with the control that
+//!   depends only on the catalog.
 //! - [`observe`]: what a run did. A [`Tally`] of the published reports, and
 //!   a [`Survey`] of a committed world's raw state: generations, lineages,
 //!   distinct genomes and position-by-position heredity between live
@@ -29,14 +35,16 @@
 //!
 //! The `flife` binary wraps these as `flife validate <config>`,
 //! `flife run <config> --ticks N --every K [--run-dir DIR]`,
-//! `flife resume DIR --until T` and
-//! `flife branch PARENT DIR [--at T] [--name N] [--inject …]`. The repository's presets live
+//! `flife resume DIR --until T`,
+//! `flife branch PARENT DIR [--at T] [--name N] [--inject …]` and
+//! `flife experiment SPEC --out DIR`. The repository's presets live
 //! in `presets/`.
 
 #![forbid(unsafe_code)]
 
 pub mod branch;
 pub mod checkpointing;
+pub mod experiment;
 pub mod metrics;
 pub mod observe;
 pub mod persist;
@@ -51,6 +59,11 @@ pub use branch::{
 pub use checkpointing::{
     BOUNDED_BACKGROUND, CHECKPOINT_FIXED_BYTES, CheckpointAdmission, CheckpointMode,
     PAUSE_AND_STREAM, admit,
+};
+pub use experiment::{
+    ABLATIONS, Ablation, Condition, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA, Experiment,
+    ExperimentOptions, ExperimentRecord, MANIFEST_SCHEMA, MEASURES, Measures, REPORT_FILE,
+    REPORT_SCHEMA, Report, RunResult, Spec, experiment,
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Particles, Style};

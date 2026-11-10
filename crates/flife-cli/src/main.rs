@@ -15,8 +15,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use flife_cli::{
-    BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Injection, Look,
-    Particles, Persistence, ResumeOptions, RunOptions, Stop, StoreDurability, Style, Validation,
+    BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
+    ExperimentOptions, Injection, Look, Particles, Persistence, ResumeOptions, RunOptions, Stop,
+    StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -128,6 +129,26 @@ enum Command {
         /// atomic renames.
         #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
         checkpoint_durability: StoreDurability,
+    },
+    /// Run an experiment specification's conditions over its discovery
+    /// and held-out seeds into an experiment directory, cataloging every
+    /// run, and write its report. Continues the experiment the directory
+    /// already holds.
+    Experiment {
+        /// The experiment specification, as TOML.
+        spec: PathBuf,
+        /// The experiment directory: new, empty, or holding this
+        /// experiment.
+        #[arg(long)]
+        out: PathBuf,
+        /// Threads for each run's organism phases: a count or `auto`. No
+        /// result depends on it.
+        #[arg(long, value_parser = parse_workers)]
+        cpu_workers: Option<NonZeroUsize>,
+        /// Where due controllers are evaluated: `metal`, `cpu` or `auto`.
+        /// No result depends on it.
+        #[arg(long, default_value = "auto")]
+        controllers: ControllerChoice,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -331,6 +352,29 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(error.kind(), error.to_string()),
         },
+        Command::Experiment {
+            spec,
+            out,
+            cpu_workers,
+            controllers,
+        } => {
+            let experiment = match Experiment::load(&spec) {
+                Ok(experiment) => experiment,
+                Err(error) => return fail(error.kind(), error.to_string()),
+            };
+            match flife_cli::experiment(
+                &experiment,
+                &out,
+                ExperimentOptions {
+                    cpu_workers,
+                    controllers,
+                },
+                print,
+            ) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(error) => fail(error.kind(), error.to_string()),
+            }
+        }
         Command::Resume {
             run_dir,
             until,

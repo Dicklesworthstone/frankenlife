@@ -45,10 +45,16 @@
 //! database implementing `flife_runtime`'s journal port, through which a
 //! `write-ahead-before-apply` session makes acceptances and outcomes
 //! durable, and which indexes the checkpoints published here.
+//!
+//! [`experiment`] is FL-041's experiment catalog: a FrankenSQLite database
+//! per experiment directory holding the experiment's identity and design
+//! and one row per run, whatever its ending.
 
+pub mod experiment;
 pub mod journal;
 mod stream;
 
+pub use experiment::{CatalogedRun, EXPERIMENT_CATALOG_FORMAT, ExperimentCatalog};
 pub use journal::{BranchOrigin, CATALOG_FORMAT, CommandJournal, IndexedCheckpoint};
 pub use stream::{Observer, Stream};
 

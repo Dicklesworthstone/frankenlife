@@ -132,7 +132,7 @@ pub const ABLATIONS: &[Ablation] = &[
     Ablation {
         name: "fresh-offspring",
         question: "Does inheritance matter? (§15.3): each newborn gets the genome a founder \
-                   would have at its identity instead of its parent's, mutated",
+                   would have at its identity, unmutated, instead of its parent's mutated genome",
         set: &[("model", "\"field-ecology-v1-fresh-offspring\"")],
     },
 ];

@@ -27,6 +27,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{CommandId, SessionId};
@@ -114,8 +115,23 @@ fn ecology(durability: &str) -> PathBuf {
         ),
     ]);
     let path = scratch().join(format!("ecology-{durability}.toml"));
-    fs::write(&path, text).expect("writes the configuration");
+    write_whole(&path, &text);
     path
+}
+
+/// Write `text` to `path` through a uniquely named temporary file renamed
+/// into place. Tests run in parallel and several write the same
+/// configuration path: written in place, a `flife` started by another test
+/// could read it truncated (seen on Linux: "missing field `schema`").
+fn write_whole(path: &Path, text: &str) {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temporary = path.with_extension(format!(
+        "{}.{}.partial",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&temporary, text).expect("writes the configuration");
+    fs::rename(&temporary, path).expect("renames it into place");
 }
 
 fn config_hash(config: &Path) -> Sha256Digest {

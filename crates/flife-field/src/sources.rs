@@ -443,8 +443,10 @@ impl Source {
     }
 }
 
-/// `Σ a_k²` in channel order.
-fn squared_norm(values: &[f64]) -> f64 {
+/// `Σ a_k²` in channel order, in F64: the norm rule for every chemical
+/// direction (a source's, a material brush's).
+#[must_use]
+pub fn squared_norm(values: &[f64]) -> f64 {
     values
         .iter()
         .fold(0.0, |total, &value| total + value * value)

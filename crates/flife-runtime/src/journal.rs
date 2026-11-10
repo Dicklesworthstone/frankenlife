@@ -45,6 +45,10 @@ pub const JOURNAL_ATTEMPTS: u32 = 3;
 
 /// One record the journal makes durable, for the session it is bound to.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a material command's direction makes acceptances large; records are built one per command"
+)]
 pub enum JournalRecord {
     /// An acceptance: the command's canonical record and what admission
     /// assigned it. Numbered by `accepted.order`.

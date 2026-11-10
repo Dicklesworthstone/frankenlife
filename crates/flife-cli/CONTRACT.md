@@ -48,12 +48,16 @@ bytes at any worker count and backend, and after a kill and a continuation.
     1, 2, … in order, each required to be admitted afresh.
   - FL-022: `--remove TICK:X,Y:RADIUS:DISPOSITION`, repeatable: a `RemoveOrganisms` command, every organism
     within RADIUS world units of (X, Y) removed at that committed tick with the disposition `remove`, `dissipate`
-    or `recycle`, numbered after the `--inject` commands.
+    or `recycle`, numbered after the `--inject` and `--inject-material` commands.
+  - FL-022: `--inject-material TICK:X,Y:AMOUNT:K=V,…`, repeatable: an `InjectMaterial` command, AMOUNT energy
+    into cell (X, Y) with the signed composition whose channel K is V for each named K (each below 32, at most
+    once) and zero elsewhere, numbered after the `--inject` commands. A direction with norm above one is refused
+    at admission: exit 2 before any tick, naming `material direction`.
 - `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
 - In the library: `run_with(config, options, scheduled, persistence, emit)` and `resume(dir, ResumeOptions,
   emit)`, with `Persistence::new(dir, config)` giving the configured defaults. `scheduled` is a list of
-  `ScheduledCommand`s (`Inject(Injection)` or `Remove(Removal)`, FL-022); `ScheduledCommand::listed(injections,
-  removals)` numbers them as the command line does.
+  `ScheduledCommand`s (`Inject(Injection)`, `Material(Material)` or `Remove(Removal)`, FL-022);
+  `ScheduledCommand::listed(injections, materials, removals)` numbers them as the command line does.
 - FL-040: `--metrics-every M` on `flife run` and `flife resume`, 0 (none) by default; `RunOptions::metrics_every`
   and `ResumeOptions::metrics_every` in the library. `Tracker::new(world, M)`, `Tracker::record(report)` and
   `Tracker::sample(epoch)` are public, so a client that steps a world itself can use them.
@@ -61,8 +65,9 @@ bytes at any worker count and backend, and after a kill and a continuation.
   - `PARENT` is a run directory that no process holds; `DIR` is new or empty.
   - `--at` is the committed tick of a parent checkpoint. By default it is the newest one that restores.
   - `--name` is 1 to 256 bytes, `DIR`'s name by default.
-  - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command, and
-    `--remove` (FL-022) its own removals, numbered after its brushes.
+  - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command, then
+    `--inject-material` (FL-022) its own material brushes, and `--remove` (FL-022) its own removals, numbered
+    after both.
   - In the library: `branch(parent, dir, &BranchOptions { at, name, commands, durability })`.
 
 - FL-041: `flife experiment SPEC --out DIR --cpu-workers W --controllers C`. `DIR` is new, empty, or holds this
@@ -493,6 +498,24 @@ uninterrupted world and final checkpoint bytes; SIGKILLed after tick 130 it does
 tick 112 with `--remove` at 125: the removal is command 5, the branches match at 125 and differ at 126, where only
 the treated branch has removed organisms. A `persist` unit test pins `--remove` parsing.
 
+FL-022's material brush: `materials_are_journaled_checkpointed_and_replayed_like_any_command` (in
+`tests/resume.rs`) runs the ecology with two materials (tick 100 at the centre, `0=0.6,1=-0.8`; tick 160 at a
+corner cell, `5=1`): it journals six commands and ends elsewhere than the run without them, and elsewhere than a
+run with the same energies as plain `--inject`s, so the composition reached the field. Stopped at 102 with its
+newest checkpoint damaged, it resumes from 98 with both materials pending, replays the first's outcome and reaches
+the uninterrupted world and final checkpoint bytes. A direction of norm √2 is refused with exit 2 and no end
+record. `a_material_branch_matches_its_control_until_the_material_and_differs_after` (in `tests/branch.rs`):
+command 5, the same world at 125, another at 126. `persist` unit tests pin `--inject-material` parsing (named
+channels, each once, below 32) and `listed`'s order (injections, materials, removals).
+Thirteen planted mutants across the material brush (engine, codec, CLI) each ran against suites that first passed
+unmutated: the moment written from the declared rather than the applied energy, the norm bound exclusive, no norm
+check, zero components written, the channel off by one, a material removing organisms, a material skipping the
+cell and amount check, the direction encoded backwards, the amount decoded after the direction, a repeated channel
+accepted, removals listed before materials, a scheduled material sent as an energy injection, and the last channel
+entry dropped. Twelve were caught on their first run. The survivor, `removes_at` answering true for a material,
+is unreachable from the world (phase 1 asks only removals) and was caught once the engine test asked the public
+`removes_at` directly.
+
 A `persist` unit test pins `--inject` parsing. Twenty-four planted mutants in the run directories, the driver,
 suspension, `open_restored` and the CLI guard were each caught. One, `flife run` without its own write-ahead
 guard, was caught only after the smoke test checked that the refusal names `--run-dir`: the session refuses in
@@ -677,8 +700,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - Power loss is FL-035's protocol (flush order), exercised by publishing under `power-loss`, never by cutting
     power. Kills are tested at whatever point the process reached, not at every step of a checkpoint (FL-035 and
     FL-036 test those).
-  - Commands come only from `--inject` and `--remove` at the start of a run or branch. Commands submitted to a
-    resumed run, and the other interventions, are FL-022.
+  - Commands come only from `--inject`, `--inject-material` and `--remove` at the start of a run or branch.
+    Commands submitted to a resumed run, and the other interventions, are FL-022.
   - Retention is by count. Pinned discoveries and journal compaction (§16.7) are later, and the catalog's
     checkpoint index keeps rows for retired manifests.
 - FL-038 evidence (`tests/checkpoint_memory.rs`, a counting global allocator, `peak_alloc`, test only; and

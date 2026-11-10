@@ -52,7 +52,7 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::checkpoint::{CheckpointManifest, ChunkSink as _};
 use flife_core::ids::{CommandId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Disposition, Intervention, NumericalProfile, World};
+use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, World};
 use flife_runtime::{
     Boundary, Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored,
     SessionCheckpoint, SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into,
@@ -150,6 +150,69 @@ impl FromStr for Injection {
     }
 }
 
+/// A material brush scheduled from the command line: `amount` energy with
+/// the signed composition `direction` into field cell `cell` at committed
+/// tick `tick` (FL-022's `InjectMaterial`). Written `TICK:X,Y:AMOUNT:K=V,…`:
+/// the direction's nonzero channels, each channel index `K` below
+/// [`MATERIAL_CHANNELS`] named at most once, every other channel zero.
+/// Admission checks the norm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Material {
+    /// The committed tick whose boundary it applies at.
+    pub tick: u64,
+    /// The field cell, `[x, y]`.
+    pub cell: [u32; 2],
+    /// The energy to add.
+    pub amount: f64,
+    /// The composition per unit energy, channel by channel.
+    pub direction: [f64; MATERIAL_CHANNELS],
+}
+
+impl FromStr for Material {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let bad = || {
+            format!(
+                "`{text}` is not TICK:X,Y:AMOUNT:K=V,… (channels K below {MATERIAL_CHANNELS}, \
+                 each at most once)"
+            )
+        };
+        let mut parts = text.split(':');
+        let (Some(tick), Some(cell), Some(amount), Some(channels), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(bad());
+        };
+        let (x, y) = cell.split_once(',').ok_or_else(bad)?;
+        let mut direction = [0.0; MATERIAL_CHANNELS];
+        let mut named = [false; MATERIAL_CHANNELS];
+        for entry in channels.split(',') {
+            let (channel, value) = entry.split_once('=').ok_or_else(bad)?;
+            let channel: usize = channel.trim().parse().map_err(|_| bad())?;
+            let slot = named.get_mut(channel).ok_or_else(bad)?;
+            if *slot {
+                return Err(bad());
+            }
+            *slot = true;
+            direction[channel] = value.trim().parse().map_err(|_| bad())?;
+        }
+        Ok(Self {
+            tick: tick.trim().parse().map_err(|_| bad())?,
+            cell: [
+                x.trim().parse().map_err(|_| bad())?,
+                y.trim().parse().map_err(|_| bad())?,
+            ],
+            amount: amount.trim().parse().map_err(|_| bad())?,
+            direction,
+        })
+    }
+}
+
 /// A removal scheduled from the command line: every organism within
 /// `radius` world units of `center` at committed tick `tick` dies, its
 /// energy treated by `disposition` (FL-022's `RemoveOrganisms`). Written
@@ -199,9 +262,15 @@ impl FromStr for Removal {
 
 /// A command scheduled from the command line.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a material's 32 components keep the command `Copy`; a command line schedules a handful"
+)]
 pub enum ScheduledCommand {
     /// Energy into a field cell.
     Inject(Injection),
+    /// Energy with a composition into a field cell.
+    Material(Material),
     /// Organisms out of a disk.
     Remove(Removal),
 }
@@ -212,6 +281,7 @@ impl ScheduledCommand {
     pub const fn tick(&self) -> u64 {
         match self {
             Self::Inject(injection) => injection.tick,
+            Self::Material(material) => material.tick,
             Self::Remove(removal) => removal.tick,
         }
     }
@@ -223,6 +293,16 @@ impl ScheduledCommand {
             Self::Inject(Injection { cell, amount, .. }) => {
                 Intervention::InjectEnergy { cell, amount }
             }
+            Self::Material(Material {
+                cell,
+                amount,
+                direction,
+                ..
+            }) => Intervention::InjectMaterial {
+                cell,
+                amount,
+                direction,
+            },
             Self::Remove(Removal {
                 center,
                 radius,
@@ -236,14 +316,19 @@ impl ScheduledCommand {
         }
     }
 
-    /// `injections`, then `removals`: the command line's order of
-    /// identities.
+    /// `injections`, then `materials`, then `removals`: the command line's
+    /// order of identities.
     #[must_use]
-    pub fn listed(injections: &[Injection], removals: &[Removal]) -> Vec<Self> {
+    pub fn listed(
+        injections: &[Injection],
+        materials: &[Material],
+        removals: &[Removal],
+    ) -> Vec<Self> {
         injections
             .iter()
             .copied()
             .map(Self::Inject)
+            .chain(materials.iter().copied().map(Self::Material))
             .chain(removals.iter().copied().map(Self::Remove))
             .collect()
     }
@@ -252,6 +337,12 @@ impl ScheduledCommand {
 impl From<Injection> for ScheduledCommand {
     fn from(injection: Injection) -> Self {
         Self::Inject(injection)
+    }
+}
+
+impl From<Material> for ScheduledCommand {
+    fn from(material: Material) -> Self {
+        Self::Material(material)
     }
 }
 
@@ -1057,8 +1148,88 @@ pub fn resume(
 
 #[cfg(test)]
 mod tests {
-    use super::{Injection, Removal};
-    use flife_engine::Disposition;
+    use super::{Injection, Material, Removal, ScheduledCommand};
+    use flife_engine::{Disposition, MATERIAL_CHANNELS};
+
+    /// `TICK:X,Y:AMOUNT:K=V,…`: named channels below the channel count,
+    /// each once, the rest zero; nothing else.
+    #[test]
+    fn a_material_is_tick_cell_amount_and_named_channels() {
+        let mut direction = [0.0; MATERIAL_CHANNELS];
+        direction[0] = 0.6;
+        direction[31] = -0.8;
+        assert_eq!(
+            "40:3,7:2.5:0=0.6,31=-0.8".parse::<Material>(),
+            Ok(Material {
+                tick: 40,
+                cell: [3, 7],
+                amount: 2.5,
+                direction,
+            })
+        );
+        let mut direction = [0.0; MATERIAL_CHANNELS];
+        direction[4] = 1.0;
+        assert_eq!(
+            " 1 : 0 , 0 : 1 : 4 = 1 ".parse::<Material>(),
+            Ok(Material {
+                tick: 1,
+                cell: [0, 0],
+                amount: 1.0,
+                direction,
+            })
+        );
+        for bad in [
+            "",
+            "40:3,7:2.5",
+            "40:3,7:2.5:",
+            "40:3:2.5:0=1",
+            "40:3,7:2.5:32=0.5",
+            "40:3,7:2.5:1=0.5,1=0.2",
+            "40:3,7:2.5:1",
+            "40:3,7:2.5:x=0.5",
+            "40:3,7:2.5:1=y",
+            "40:3,7:2.5:1=0.5:9",
+        ] {
+            assert!(bad.parse::<Material>().is_err(), "{bad}");
+        }
+    }
+
+    /// Injections, then materials, then removals, each in the order given:
+    /// the identities 1, 2, … the command line assigns.
+    #[test]
+    fn listed_commands_are_injections_then_materials_then_removals() {
+        let injection = |tick| Injection {
+            tick,
+            cell: [1, 2],
+            amount: 1.0,
+        };
+        let material = |tick| Material {
+            tick,
+            cell: [3, 4],
+            amount: 2.0,
+            direction: [0.0; MATERIAL_CHANNELS],
+        };
+        let removal = Removal {
+            tick: 1,
+            center: [5.0, 6.0],
+            radius: 1.0,
+            disposition: Disposition::Remove,
+        };
+        assert_eq!(
+            ScheduledCommand::listed(
+                &[injection(9), injection(8)],
+                &[material(7), material(6)],
+                &[removal]
+            ),
+            vec![
+                ScheduledCommand::Inject(injection(9)),
+                ScheduledCommand::Inject(injection(8)),
+                ScheduledCommand::Material(material(7)),
+                ScheduledCommand::Material(material(6)),
+                ScheduledCommand::Remove(removal),
+            ]
+        );
+    }
 
     /// `TICK:X,Y:RADIUS:DISPOSITION`, in that order, and nothing else.
     #[test]

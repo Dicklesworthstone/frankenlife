@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
-    ExperimentOptions, Injection, InspectOptions, Look, Particles, Persistence, Removal,
+    ExperimentOptions, Injection, InspectOptions, Look, Material, Particles, Persistence, Removal,
     ResumeOptions, RunOptions, ScheduledCommand, Stop, StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
@@ -74,11 +74,18 @@ enum Command {
         /// `TICK:X,Y:AMOUNT`; repeatable. Commands 1, 2, … in order.
         #[arg(long = "inject", value_name = "TICK:X,Y:AMOUNT")]
         injections: Vec<Injection>,
+        /// Inject energy with a signed chemical composition into a field
+        /// cell at a committed tick (the material brush), written
+        /// `TICK:X,Y:AMOUNT:K=V,…` with the direction's nonzero channels,
+        /// its norm at most 1; repeatable. Numbered after the `--inject`
+        /// commands, in order.
+        #[arg(long = "inject-material", value_name = "TICK:X,Y:AMOUNT:K=V,...")]
+        materials: Vec<Material>,
         /// Remove every organism within RADIUS world units of (X, Y) at a
         /// committed tick, its energy removed from the world, dissipated or
         /// recycled into the field, written
         /// `TICK:X,Y:RADIUS:DISPOSITION`; repeatable. Numbered after the
-        /// `--inject` commands, in order.
+        /// `--inject` and `--inject-material` commands, in order.
         #[arg(long = "remove", value_name = "TICK:X,Y:RADIUS:DISPOSITION")]
         removals: Vec<Removal>,
     },
@@ -131,11 +138,17 @@ enum Command {
         /// `TICK:X,Y:AMOUNT`; repeatable.
         #[arg(long = "inject", value_name = "TICK:X,Y:AMOUNT")]
         injections: Vec<Injection>,
+        /// The branch's own command: energy with a signed chemical
+        /// composition into a field cell at a committed tick at or after the
+        /// checkpoint's, written `TICK:X,Y:AMOUNT:K=V,…`; repeatable,
+        /// numbered after the `--inject` commands.
+        #[arg(long = "inject-material", value_name = "TICK:X,Y:AMOUNT:K=V,...")]
+        materials: Vec<Material>,
         /// The branch's own command: every organism within RADIUS world
         /// units of (X, Y) removed at a committed tick at or after the
         /// checkpoint's, written `TICK:X,Y:RADIUS:DISPOSITION` (`remove`,
         /// `dissipate` or `recycle`); repeatable, numbered after the
-        /// `--inject` commands.
+        /// `--inject` and `--inject-material` commands.
         #[arg(long = "remove", value_name = "TICK:X,Y:RADIUS:DISPOSITION")]
         removals: Vec<Removal>,
         /// `power-loss` (the default) flushes the founding checkpoint to
@@ -324,6 +337,7 @@ fn main() -> ExitCode {
             run_dir,
             checkpoints,
             injections,
+            materials,
             removals,
         } => {
             let config = match load(&config) {
@@ -353,7 +367,7 @@ fn main() -> ExitCode {
                     controllers,
                     metrics_every,
                 },
-                &ScheduledCommand::listed(&injections, &removals),
+                &ScheduledCommand::listed(&injections, &materials, &removals),
                 persistence.as_ref(),
                 print,
             ))
@@ -364,6 +378,7 @@ fn main() -> ExitCode {
             at,
             name,
             injections,
+            materials,
             removals,
             checkpoint_durability,
         } => match flife_cli::branch(
@@ -372,7 +387,7 @@ fn main() -> ExitCode {
             &BranchOptions {
                 at,
                 name,
-                commands: ScheduledCommand::listed(&injections, &removals),
+                commands: ScheduledCommand::listed(&injections, &materials, &removals),
                 durability: checkpoint_durability,
             },
         ) {

@@ -11,7 +11,7 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::checkpoint::ByteReader;
 use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick};
-use flife_engine::{Disposition, Intervention};
+use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS};
 
 /// The canonical command record's schema.
 pub const COMMAND_SCHEMA: &str = "frankenlife.command.v1";
@@ -61,9 +61,10 @@ impl Command {
     /// The canonical record of everything the client stated: schema,
     /// session, identity, target, expected revision and payload, with every
     /// number as its little-endian bits. The payload opens with its
-    /// NUL-terminated tag: `inject-energy` and the cell and amount, or
-    /// `remove-organisms`, the centre, the radius and the NUL-terminated
-    /// disposition name.
+    /// NUL-terminated tag: `inject-energy` and the cell and amount;
+    /// `inject-material`, the cell, the amount and the 32 direction
+    /// components in channel order; or `remove-organisms`, the centre, the
+    /// radius and the NUL-terminated disposition name.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(128);
@@ -93,6 +94,20 @@ impl Command {
                 bytes.extend_from_slice(&cell[0].to_le_bytes());
                 bytes.extend_from_slice(&cell[1].to_le_bytes());
                 bytes.extend_from_slice(&amount.to_bits().to_le_bytes());
+            }
+            Intervention::InjectMaterial {
+                cell,
+                amount,
+                direction,
+            } => {
+                bytes.extend_from_slice(b"inject-material");
+                bytes.push(0);
+                bytes.extend_from_slice(&cell[0].to_le_bytes());
+                bytes.extend_from_slice(&cell[1].to_le_bytes());
+                bytes.extend_from_slice(&amount.to_bits().to_le_bytes());
+                for component in direction {
+                    bytes.extend_from_slice(&component.to_bits().to_le_bytes());
+                }
             }
             Intervention::RemoveOrganisms {
                 center,
@@ -144,6 +159,19 @@ impl Command {
                 cell: [input.u32()?, input.u32()?],
                 amount: input.f64()?,
             },
+            b"inject-material" => {
+                let cell = [input.u32()?, input.u32()?];
+                let amount = input.f64()?;
+                let mut direction = [0.0; MATERIAL_CHANNELS];
+                for component in &mut direction {
+                    *component = input.f64()?;
+                }
+                Intervention::InjectMaterial {
+                    cell,
+                    amount,
+                    direction,
+                }
+            }
             b"remove-organisms" => {
                 let center = [input.f64()?, input.f64()?];
                 let radius = input.f64()?;

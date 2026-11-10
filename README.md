@@ -90,7 +90,9 @@ store byte-identical checkpoints, and a run whose memory cannot hold a checkpoin
 FL-039 branches a run: `flife branch PARENT DIR --at T` starts a new session from the parent's checkpoint at
 tick T, a control branch, or an intervention branch with `--inject` brushes or `--remove` removals of its own
 (`--remove TICK:X,Y:RADIUS:DISPOSITION` takes out every organism in a disk, its energy removed, dissipated or
-recycled; `flife run` takes it too). The branch links
+recycled; `flife run` takes it too). `--inject-material TICK:X,Y:AMOUNT:K=V,…` is the material brush: declared
+energy into one cell carrying a signed chemical composition, a direction of norm at most one, so it can never
+write composition the cell's energy cannot hold. The branch links
 the parent's verified chunk files instead of copying them and writes only its command closure. Its journal
 starts with the history it inherited. A control branch resumes to exactly the parent's uninterrupted world,
 while its intervention sibling matches it until its brush applies and differs after.

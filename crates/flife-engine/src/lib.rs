@@ -52,7 +52,7 @@ pub use chemistry::{
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
-pub use intervention::{AppliedIntervention, Intervention};
+pub use intervention::{AppliedIntervention, Intervention, MATERIAL_CHANNELS};
 pub use lifecycle::{
     BudgetStage, DISSIPATE_AND_RECORD, Death, DeathCause, DeathSettlement, Disposition, Fate,
     GENETIC_AFFINITY, Recycling, TinyEnergyPolicy, Vitality,

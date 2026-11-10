@@ -47,7 +47,9 @@ and seals them is `flife-runtime`.
 FL-022 (`flife-2jj`, the world-space half) adds `Intervention::RemoveOrganisms`: every organism in a disk on the
 torus dies at the boundary, its energy removed, dissipated or recycled as the command says (plan §7.6, §12.3,
 §14.3). It is the perturbation FL-048's H4 boundary test needs. The native brush input that would produce it is
-still FL-022's.
+still FL-022's. FL-022 also adds `Intervention::InjectMaterial`, the material brush (§14.3): declared energy into
+one cell with a signed composition direction `a`, `||a||₂ ≤ 1`, so the packet `(Δe, Δe a)` is admissible and the
+brush cannot write an `m` that breaks `||m||₂ ≤ e`.
 
 FL-016 (`flife-gh0`) writes and restores the whole world as ten checkpoint chunks (plan §16.1, §16.3, INV-14,
 Appendix B.2, C.13).
@@ -137,6 +139,9 @@ each runs and owns the field.
 - FL-022: `Intervention::RemoveOrganisms { center, radius, disposition }` and `Intervention::removes_at(grid,
   position)`; `AppliedIntervention::removed`, the organisms a removal removed (zero for an injection), with
   `applied` the energy they held; `Disposition::ALL`, `name` (`remove`, `dissipate`, `recycle`) and `from_name`.
+- FL-022: `Intervention::InjectMaterial { cell, amount, direction }` and `MATERIAL_CHANNELS` (32, one component
+  per moment channel). `flife_field::sources::squared_norm` is now public, the one norm rule for a source's and a
+  material's direction.
 - FL-041: `ModelVariant` (`Baseline`, `ChemistryOnly`, `FreshOffspring`) and `ModelVariant::of(model)`;
   `reproduction::Offspring` (`Inherited`, or `Fresh { catalog, limits, initial_scale }`), the new `offspring`
   field of `BirthContext`.
@@ -293,6 +298,14 @@ each runs and owns the field.
   intervention in its sealed position, though removals apply before injections.
 - A centre outside `[0, L_x) × [0, L_y)`, or a radius that is not finite, not strictly positive or above half the
   shorter world side, is refused before anything changes. Half the world is admitted.
+- FL-022: an `InjectMaterial` applies where and when an injection does, in sealed order with them. Its energy is
+  raised exactly as `InjectEnergy` raises it (rounded down, never above the request), to the change `Δe` actually
+  made. Each moment channel `k` with `a_k ≠ 0` then becomes `m_k + Δe · a_k` (F64, rounded to the nearest `f32`),
+  in channel order; channels with `a_k = 0` are not written, so a direction of zeros makes exactly the world the
+  energy brush makes. The composition follows `Δe`, not the request, so `||Δe a||₂ ≤ Δe` holds even when the cell
+  rounds down. The `command-injection` flow is `Δe`. A direction whose squares, summed in channel order in F64,
+  exceed one, or with a non-finite component (its sum is then NaN or infinite), is refused like a bad cell or
+  amount; a norm of exactly one is admitted.
 
 **Invariants — checkpoints (FL-016; §16.3, INV-14, B.2).**
 - `World::write_checkpoint` writes the ten world chunks of `WORLD_CHECKPOINT_CHUNKS` at version 1, each declaring
@@ -517,6 +530,28 @@ organism dying twice, half the residual, every disposition dissipating, half the
 in application order, removal deaths unreported, and in `flife-runtime` the disposition unencoded or decoded as
 `recycle` always.
 
+`tests/material.rs` (5 tests, FL-022), on the 32 × 32 Appendix A ecology:
+- `a_material_with_no_composition_is_the_energy_brush`: the metamorphic oracle. A zero direction gives the energy
+  brush's applied energy and flow bit for bit and the same digest, then and 20 ticks on.
+- `a_material_adds_the_energy_brush_energy_and_its_composition`: a composition changes the digest but not the
+  applied energy or the flow, and the tick closes within its allowance; a material removes nothing, and
+  `removes_at` says so even at its own cell's centre.
+- `materials_outside_the_unit_ball_are_refused_unchanged`: norms one ulp and 1e-14 above one, NaN and infinite
+  components, a cell outside, a zero and a NaN amount, each refused with the tick and digest unchanged; then a unit
+  direction (`0.6, 0.8`, exactly one in channel order) and `-1` in the last channel admitted.
+- `a_material_world_is_the_same_at_any_worker_count`: 1, 3 and 8 workers, 20 ticks on.
+- `a_material_and_an_injection_at_one_cell_apply_in_sealed_order`: each sees the cell the one before it left; a
+  0.01 material after a 10⁶ injection adds nothing (below one `f32` ulp), before it adds energy.
+
+`intervention.rs`'s unit tests check the packet on a bare 4 × 3 field, where nothing else touches the cell, against
+`f32` values written out: channels 0 and 3 become exactly `2.3` and `-2.65` from `(0.5, -0.25)` with `Δe = 3` and
+`a = (0.6, -0.8)`, every other plane value keeps its bits (a `-0.0` moment included); a cell that rounds `1 + 0.1`
+down takes composition for the energy it took, not `0.1`; unit material keeps the cone into an empty cell and onto
+a cell already on it, exactly.
+
+Thirteen planted mutants (with `flife-runtime`'s and `flife-cli`'s) are listed in `flife-cli`'s contract under
+FL-022.
+
 `tests/ablation.rs` (3 tests, FL-041), on the 32 × 32 Appendix A ecology:
 - `the_model_key_names_each_variant_and_refuses_others`: each name maps to its variant and validates; another name
   (`field-ecology-v2`, `field-ecology-v1-shuffled`) is refused.
@@ -537,9 +572,9 @@ velocity, first-order splitting at the configured fixed timestep.
 **Known gaps.**
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
-- Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and disk `RemoveOrganisms`
-  (FL-022). Area energy brushes, material, seeded introduction, source edits and the native input that maps a
-  brush stroke to these payloads are still FL-022. The exhibition-mode stable-ID birth rejection policy has no
+- Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
+  and disk `RemoveOrganisms` (FL-022). Area brushes, seeded introduction, source edits and the native input that
+  maps a brush stroke to these payloads are still FL-022. The exhibition-mode stable-ID birth rejection policy has no
   registered name yet.
 - `stop-and-preserve` keeps the committed state and the fault's description, which names the quantity and,
   where the operator knows it, the organism. It does not yet retain the faulted candidate's buffers for

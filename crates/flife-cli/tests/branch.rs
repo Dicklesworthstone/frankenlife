@@ -777,3 +777,33 @@ fn a_removal_branch_matches_its_control_until_the_removal_and_differs_after() {
         one(&treated_after, "end")
     );
 }
+
+/// FL-022's material brush in a branch: branched at [`FORK`] with
+/// `--inject-material` (signed composition at the centre at tick 125), it
+/// numbers the material after the inherited commands, matches its control
+/// branch until the material's boundary, and differs after it.
+#[test]
+fn a_material_branch_matches_its_control_until_the_material_and_differs_after() {
+    let config = ecology("write-ahead-before-apply");
+    let parent = fresh("material-parent");
+    run(&config, &parent, FORK);
+    let control = fresh("material-control");
+    branch(&parent, &control, FORK, &[]);
+    let treated = fresh("material-treated");
+    let made = branch(
+        &parent,
+        &treated,
+        FORK,
+        &["--inject-material", "125:16,16:20:0=0.6,1=-0.8"],
+    );
+    assert_eq!(made["commands"], json!([5]), "numbered after command 4");
+    assert_eq!(
+        reached(&resume(&control, 125), 125),
+        reached(&resume(&treated, 125), 125),
+        "no difference before the material's boundary"
+    );
+    assert_ne!(
+        reached(&resume(&control, 126), 126),
+        reached(&resume(&treated, 126), 126)
+    );
+}

@@ -328,6 +328,10 @@ struct Submission {
     reply: AdmissionReply,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a material command's direction makes submissions large; one message per request"
+)]
 enum Inbound {
     Control(Control),
     Science(Submission),

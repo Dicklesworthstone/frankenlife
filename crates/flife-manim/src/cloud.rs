@@ -29,6 +29,13 @@ pub const DOT_RADIUS: f64 = 0.35;
 /// window still shows every organism.
 pub const DOT_RADIUS_MIN_PIXELS: f64 = 1.5;
 
+/// The largest dot radius in drawable pixels (FL-020): zoomed in past it,
+/// dots stop growing on screen, so organisms close together separate, and
+/// a dot stays small against the camera's focal distance (FrankenManim's
+/// frame is a perspective one, about 1.2 frame heights away), where its
+/// projection is the disk the viewport places.
+pub const DOT_RADIUS_MAX_PIXELS: f64 = 24.0;
+
 /// A halo's opacity: the soft glow around each organism.
 pub const HALO_ALPHA: f64 = 0.42;
 
@@ -47,10 +54,15 @@ pub fn halo_factor(energy: f32) -> f64 {
     2.0 + 2.5 * (energy / (energy + HALO_HALF_ENERGY))
 }
 
-/// The dot radius in world units for a viewport.
+/// The dot radius in world units for a viewport: [`DOT_RADIUS`], but at
+/// least [`DOT_RADIUS_MIN_PIXELS`] and at most [`DOT_RADIUS_MAX_PIXELS`] on
+/// screen.
 #[must_use]
 pub fn dot_radius(viewport: &Viewport) -> f64 {
-    DOT_RADIUS.max(DOT_RADIUS_MIN_PIXELS / viewport.scale())
+    let scale = viewport.scale();
+    DOT_RADIUS
+        .max(DOT_RADIUS_MIN_PIXELS / scale)
+        .min(DOT_RADIUS_MAX_PIXELS / scale)
 }
 
 /// The live population as one bounded scene object.

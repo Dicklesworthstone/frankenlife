@@ -23,7 +23,7 @@
 use flife_core::CoreError;
 use flife_render::Epoch;
 use fmn_core::color::LinearRgba;
-use fmn_render::{SurfaceDraw, SurfaceMesh, SurfaceVertex, ThreeDDraw};
+use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDDraw};
 
 use crate::mapping::{Look, Style, mapped_color, traits};
 use crate::{SCALE_DECAY, Viewport};
@@ -34,12 +34,14 @@ pub const DENSITY_BIN_PIXELS: f64 = 6.0;
 /// The most bins per axis.
 pub const DENSITY_BINS_MAX: u32 = 512;
 
-/// Bins per axis for `viewport`: the world's drawable span over
-/// [`DENSITY_BIN_PIXELS`], rounded up, in `1..=DENSITY_BINS_MAX`.
+/// Bins per axis for `viewport`: the world's drawable span at the
+/// whole-torus fit over [`DENSITY_BIN_PIXELS`], rounded up, in
+/// `1..=DENSITY_BINS_MAX`. The zoom does not change them: zoomed in, a bin
+/// is wider than its target on screen.
 #[must_use]
 pub fn density_bins(viewport: &Viewport) -> [u32; 2] {
     viewport.extent().map(|extent| {
-        let bins = (extent * viewport.scale() / DENSITY_BIN_PIXELS).ceil();
+        let bins = (extent * viewport.fit_scale() / DENSITY_BIN_PIXELS).ceil();
         if bins.is_finite() {
             (bins as u32).clamp(1, DENSITY_BINS_MAX)
         } else {
@@ -156,7 +158,24 @@ impl DensityLayer {
         let fullest = self.counts.iter().copied().max().unwrap_or(0);
         self.scale = f64::from(fullest).max(self.scale * SCALE_DECAY);
         self.bins = bins;
+        self.place_binned(style)
+    }
 
+    /// Re-place the last binned epoch in the layer's grid at the current
+    /// viewport and display scale, which does not move: what a pan or zoom
+    /// redraws. Nothing happens before the first update.
+    ///
+    /// # Errors
+    /// As [`DensityLayer::update`].
+    pub fn place(&mut self, style: &Style) -> Result<(), CoreError> {
+        if self.bins == [0, 0] {
+            return Ok(());
+        }
+        self.place_binned(style)
+    }
+
+    fn place_binned(&mut self, style: &Style) -> Result<(), CoreError> {
+        let [columns, rows] = self.bins.map(|n| n as usize);
         // Each bin's straight colour: the mean mapped colour at the glow
         // opacity, or opaque grey for raw.
         let shown = |cell: usize| -> LinearRgba {
@@ -181,19 +200,10 @@ impl DensityLayer {
                 }
             }
         };
-
-        let mut vertices = Vec::new();
-        vertices
-            .try_reserve_exact((columns + 1) * (rows + 1))
-            .map_err(|_| {
-                allocation(
-                    "density layer vertices",
-                    (columns + 1) * (rows + 1),
-                    size_of::<SurfaceVertex>(),
-                )
-            })?;
-        for row in 0..=rows {
-            for column in 0..=columns {
+        let (vertices, indices) = self.viewport.periodic_grid(
+            [columns, rows],
+            ["density layer vertices", "density layer indices"],
+            |[column, row]| {
                 // The corner between bins (column - 1, row - 1) and
                 // (column, row), wrapping; premultiplied mean, then straight.
                 let (left, up) = ((column + columns - 1) % columns, (row + rows - 1) % rows);
@@ -211,7 +221,7 @@ impl DensityLayer {
                     sum[2] += color.b * color.a;
                     sum[3] += color.a;
                 }
-                let color = if sum[3] > 0.0 {
+                if sum[3] > 0.0 {
                     LinearRgba {
                         r: sum[0] / sum[3],
                         g: sum[1] / sum[3],
@@ -225,35 +235,9 @@ impl DensityLayer {
                         b: 0.0,
                         a: 0.0,
                     }
-                };
-                let world = [
-                    width * column as f64 / columns as f64,
-                    height * row as f64 / rows as f64,
-                ];
-                vertices.push(SurfaceVertex::colored(
-                    self.viewport.scene_point(world),
-                    [0.0, 0.0, 1.0],
-                    color,
-                ));
-            }
-        }
-        let mut indices = Vec::new();
-        indices
-            .try_reserve_exact(cells * 6)
-            .map_err(|_| allocation("density layer indices", cells * 6, size_of::<u32>()))?;
-        let stride = columns + 1;
-        for row in 0..rows {
-            for column in 0..columns {
-                let at = |c: usize, r: usize| u32::try_from(r * stride + c).unwrap_or(u32::MAX);
-                let (a, b, c, d) = (
-                    at(column, row),
-                    at(column + 1, row),
-                    at(column + 1, row + 1),
-                    at(column, row + 1),
-                );
-                indices.extend_from_slice(&[a, b, c, a, c, d]);
-            }
-        }
+                }
+            },
+        )?;
         let mesh =
             SurfaceMesh::new(vertices, indices).map_err(|error| CoreError::NumericalInvalid {
                 quantity: "density layer grid",

@@ -79,22 +79,58 @@ impl WorldView {
     }
 
     /// Refit the viewport, camera and dot radius to a new drawable size,
-    /// keeping the shown epoch. Returns whether the size changed.
+    /// keeping the shown epoch and the camera's center and zoom. Returns
+    /// whether the size changed.
     ///
     /// # Errors
-    /// As [`Viewport::fit`] and [`Viewport::camera`]; the view is unchanged
-    /// on error.
+    /// As [`Viewport::resized`] and [`Viewport::camera`]; the view is
+    /// unchanged on error.
     pub fn resize(&mut self, drawable: [u32; 2]) -> Result<bool, CoreError> {
         if drawable == self.viewport.drawable() {
             return Ok(false);
         }
-        let viewport = Viewport::fit(self.viewport.extent(), drawable)?;
+        let viewport = self.viewport.resized(drawable)?;
+        self.adopt(viewport)?;
+        Ok(true)
+    }
+
+    /// Look at `viewport` (the same world): a pan, a zoom or a reset. Place
+    /// the shown epoch again ([`WorldView::place`]) to draw it there.
+    /// Returns whether the view changed.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for a viewport of another world or
+    /// drawable; as [`Viewport::camera`]. The view is unchanged on error.
+    pub fn set_view(&mut self, viewport: Viewport) -> Result<bool, CoreError> {
+        if viewport.extent().map(f64::to_bits) != self.viewport.extent().map(f64::to_bits)
+            || viewport.drawable() != self.viewport.drawable()
+        {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "world view viewport",
+                detail: format!(
+                    "a {:?} world at {:?} pixels is not this view's {:?} at {:?}",
+                    viewport.extent(),
+                    viewport.drawable(),
+                    self.viewport.extent(),
+                    self.viewport.drawable()
+                ),
+            });
+        }
+        if viewport == self.viewport {
+            return Ok(false);
+        }
+        self.adopt(viewport)?;
+        Ok(true)
+    }
+
+    fn adopt(&mut self, viewport: Viewport) -> Result<(), CoreError> {
         let camera = viewport.camera(self.background)?;
         self.viewport = viewport;
         self.camera = camera;
         self.cloud.refit(&self.viewport);
         self.density.refit(&self.viewport);
-        Ok(true)
+        self.field.refit(&self.viewport);
+        Ok(())
     }
 
     /// The style frames are drawn in.
@@ -123,6 +159,27 @@ impl WorldView {
             self.density.update(epoch, &style)?;
         }
         self.field.update_look(epoch.field(), style.look)?;
+        self.shown = Some(Prior {
+            id: epoch.id(),
+            tick: epoch.tick(),
+        });
+        Ok(())
+    }
+
+    /// Draw `epoch` again at the current viewport and style without moving
+    /// the field's or density's display scale: what a pan or zoom redraws
+    /// for the epoch already shown. The density layer re-places the epoch
+    /// it last binned.
+    ///
+    /// # Errors
+    /// As [`WorldView::show`].
+    pub fn place(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
+        let style = self.style;
+        self.cloud.update_styled(epoch, &self.viewport, &style)?;
+        if style.particles == Particles::Density {
+            self.density.place(&style)?;
+        }
+        self.field.place(epoch.field(), style.look)?;
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),

@@ -10,7 +10,8 @@
 //! Latest-value publication can skip many ticks. A [`Gap`] states whether
 //! minimum-image interpolation is still safe: it is only if no organism can
 //! have moved half of either domain extent in the gap. Otherwise a viewer
-//! must snap to the later state (FL-020).
+//! must snap to the later state. [`interpolate`] draws an epoch between two
+//! by these rules (FL-020).
 
 use flife_core::CoreError;
 
@@ -147,4 +148,122 @@ pub fn pairs<'a>(prior: &'a Epoch, current: &'a Epoch) -> Pairs<'a> {
         i: 0,
         j: 0,
     }
+}
+
+/// `from` moved `fraction` of the way to `to` along a periodic axis of
+/// `length` by the minimum wrapped displacement, wrapped into
+/// `[0, length)`. It is `from` at fraction 0 and `to` at fraction 1, and
+/// the true path in between only when the true displacement is under half
+/// of `length`, which a [`Gap`] decides.
+#[must_use]
+pub fn wrapped_between(from: f64, to: f64, length: f64, fraction: f64) -> f64 {
+    if fraction <= 0.0 {
+        return from;
+    }
+    if fraction >= 1.0 {
+        return to;
+    }
+    let mut displacement = to - from;
+    if displacement >= length / 2.0 {
+        displacement -= length;
+    } else if displacement < -length / 2.0 {
+        displacement += length;
+    }
+    let wrapped = (from + fraction * displacement).rem_euclid(length);
+    // A tiny negative value wraps to `length` itself in floating point.
+    if wrapped >= length { 0.0 } else { wrapped }
+}
+
+/// Where an epoch's organisms are drawn between two committed epochs (plan
+/// §13.5): one-state display latency, the display moving from `prior` to
+/// `current`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Interpolation {
+    /// Per row of `current`: where its organism is drawn.
+    pub positions: Vec<[f64; 2]>,
+    /// Per row of `current`: whether it is drawn yet. An organism born in
+    /// the gap appears with the epoch that first shows it, never before
+    /// its birth.
+    pub shown: Vec<bool>,
+    /// Rows of `prior` whose organisms died in the gap: drawn, if at all,
+    /// at their `prior` positions and fading (they are dead scientifically
+    /// from the death on).
+    pub fading: Vec<usize>,
+    /// Whether the gap was ambiguous: every continuing organism snapped to
+    /// `current`, and trails must reset.
+    pub snapped: bool,
+}
+
+/// Fill `into` with where `current`'s organisms are drawn `fraction` of the
+/// way from `prior` to `current`, matched by identity. A continuing
+/// organism moves by the minimum wrapped displacement when the [`Gap`] is
+/// unambiguous, and snaps to `current` otherwise, so no invented reverse
+/// path is ever drawn. At fraction 0 every continuing organism is at its
+/// `prior` position and at fraction 1 at its `current` one, exactly.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a fraction outside `[0, 1]`; as
+/// [`Gap::between`]; [`CoreError::AllocationFailed`] when `into` cannot
+/// grow. `into` is cleared first.
+pub fn interpolate(
+    prior: &Epoch,
+    current: &Epoch,
+    fraction: f64,
+    into: &mut Interpolation,
+) -> Result<Gap, CoreError> {
+    if !(0.0..=1.0).contains(&fraction) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "interpolation fraction",
+            detail: format!("{fraction} is outside [0, 1]"),
+        });
+    }
+    let gap = Gap::between(prior, current)?;
+    into.positions.clear();
+    into.shown.clear();
+    into.fading.clear();
+    into.snapped = false;
+    let rows = current.len();
+    let grow = |buffer: &'static str, bytes: usize| CoreError::AllocationFailed {
+        buffer,
+        bytes: u64::try_from(rows.saturating_mul(bytes)).unwrap_or(u64::MAX),
+    };
+    into.positions
+        .try_reserve_exact(rows)
+        .map_err(|_| grow("interpolated positions", size_of::<[f64; 2]>()))?;
+    into.shown
+        .try_reserve_exact(rows)
+        .map_err(|_| grow("interpolated visibility", size_of::<bool>()))?;
+    let [width, height] = current.extent();
+    let (from, to) = (prior.positions(), current.positions());
+    for found in pairs(prior, current) {
+        match found {
+            Match::Continuing {
+                prior: i,
+                current: j,
+            } => {
+                let (a, b) = (from[i].map(f64::from), to[j].map(f64::from));
+                if gap.unambiguous {
+                    into.positions.push([
+                        wrapped_between(a[0], b[0], width, fraction),
+                        wrapped_between(a[1], b[1], height, fraction),
+                    ]);
+                } else {
+                    into.snapped = true;
+                    into.positions.push(b);
+                }
+                into.shown.push(true);
+            }
+            Match::Born { current: j } => {
+                into.positions.push(to[j].map(f64::from));
+                into.shown.push(fraction >= 1.0);
+            }
+            Match::Died { prior: i } => {
+                into.fading
+                    .try_reserve(1)
+                    .map_err(|_| grow("fading rows", size_of::<usize>()))?;
+                into.fading.push(i);
+            }
+        }
+    }
+    Ok(gap)
 }

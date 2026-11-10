@@ -14,7 +14,7 @@
 use flife_core::CoreError;
 use flife_render::FieldTexture;
 use fmn_core::color::{LinearRgba, Srgb};
-use fmn_render::{SurfaceDraw, SurfaceMesh, SurfaceVertex, ThreeDDraw};
+use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDDraw};
 
 use crate::Viewport;
 use crate::mapping::Look;
@@ -124,14 +124,40 @@ impl FieldLayer {
             .fold(0.0_f32, f32::max);
         self.scale = f64::from(brightest).max(self.scale * SCALE_DECAY);
 
-        let [width, height] = self.viewport.extent();
+        self.place_scaled(field, look)
+    }
+
+    /// Use `viewport` from the next update or placement.
+    pub const fn refit(&mut self, viewport: &Viewport) {
+        self.viewport = *viewport;
+    }
+
+    /// Place `field` in the layer's grid at the current viewport and
+    /// display scale, which does not move: what a pan or zoom redraws.
+    ///
+    /// # Errors
+    /// As [`FieldLayer::update_look`].
+    pub fn place(&mut self, field: &FieldTexture, look: Look) -> Result<(), CoreError> {
+        let [columns, rows] = field.texels().map(|n| n as usize);
+        let values = field.values();
+        if values.len() != columns * rows || values.is_empty() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "field layer",
+                detail: format!("{} values for {columns} x {rows} texels", values.len()),
+            });
+        }
+        self.place_scaled(field, look)
+    }
+
+    fn place_scaled(&mut self, field: &FieldTexture, look: Look) -> Result<(), CoreError> {
+        let [columns, rows] = field.texels().map(|n| n as usize);
+        let values = field.values();
+        let scale = self.scale;
         let texel = |column: usize, row: usize| values[(row % rows) * columns + column % columns];
-        let mut vertices = Vec::new();
-        vertices
-            .try_reserve_exact((columns + 1) * (rows + 1))
-            .map_err(|_| allocation("field layer vertices", (columns + 1) * (rows + 1)))?;
-        for row in 0..=rows {
-            for column in 0..=columns {
+        let (vertices, indices) = self.viewport.periodic_grid(
+            [columns, rows],
+            ["field layer vertices", "field layer indices"],
+            |[column, row]| {
                 // The corner between texels (column - 1, row - 1) and
                 // (column, row), wrapping.
                 let (left, up) = (column + columns - 1, row + rows - 1);
@@ -140,13 +166,13 @@ impl FieldLayer {
                     + f64::from(texel(left, row))
                     + f64::from(texel(column, row)))
                     / 4.0;
-                let color = match look {
+                match look {
                     Look::Glow => {
-                        let [r, g, b] = palette(display_value(mean as f32, self.scale));
+                        let [r, g, b] = palette(display_value(mean as f32, scale));
                         Srgb::from_rgb8(r, g, b).to_linear(1.0)
                     }
                     Look::Raw => {
-                        let grey = raw_value(mean as f32, self.scale);
+                        let grey = raw_value(mean as f32, scale);
                         LinearRgba {
                             r: grey,
                             g: grey,
@@ -154,35 +180,9 @@ impl FieldLayer {
                             a: 1.0,
                         }
                     }
-                };
-                let world = [
-                    width * column as f64 / columns as f64,
-                    height * row as f64 / rows as f64,
-                ];
-                vertices.push(SurfaceVertex::colored(
-                    self.viewport.scene_point(world),
-                    [0.0, 0.0, 1.0],
-                    color,
-                ));
-            }
-        }
-        let mut indices = Vec::new();
-        indices
-            .try_reserve_exact(columns * rows * 6)
-            .map_err(|_| allocation("field layer indices", columns * rows * 6))?;
-        let stride = columns + 1;
-        for row in 0..rows {
-            for column in 0..columns {
-                let at = |c: usize, r: usize| u32::try_from(r * stride + c).unwrap_or(u32::MAX);
-                let (a, b, c, d) = (
-                    at(column, row),
-                    at(column + 1, row),
-                    at(column + 1, row + 1),
-                    at(column, row + 1),
-                );
-                indices.extend_from_slice(&[a, b, c, a, c, d]);
-            }
-        }
+                }
+            },
+        )?;
         let mesh =
             SurfaceMesh::new(vertices, indices).map_err(|error| CoreError::NumericalInvalid {
                 quantity: "field layer grid",
@@ -210,12 +210,5 @@ impl FieldLayer {
                 ..SurfaceDraw::new(mesh)
             })
         })
-    }
-}
-
-fn allocation(buffer: &'static str, count: usize) -> CoreError {
-    CoreError::AllocationFailed {
-        buffer,
-        bytes: u64::try_from(count.saturating_mul(size_of::<SurfaceVertex>())).unwrap_or(u64::MAX),
     }
 }

@@ -5,7 +5,8 @@
 //!
 //! - [`Viewport`]: the exact map between world units, FrankenManim's scene,
 //!   drawable pixels and logical window points (§13.6), and the 3D camera
-//!   whose frame it is.
+//!   whose frame it is; it pans and zooms across the torus's seams (FL-020).
+//! - [`pick`]: the organism drawn under the pointer, by stable identity.
 //! - [`ParticleCloud`]: the `ParticleCloudView`, one bounded cloud lowered
 //!   from a render epoch onto FrankenManim's 3D camera route.
 //! - [`FieldLayer`]: the energy field under the organisms.
@@ -26,12 +27,13 @@ mod cloud;
 mod density;
 mod field;
 mod mapping;
+mod selection;
 mod viewport;
 mod world;
 
 pub use cloud::{
-    DOT_RADIUS, DOT_RADIUS_MIN_PIXELS, HALO_ALPHA, HALO_HALF_ENERGY, ParticleCloud, dot_radius,
-    halo_factor,
+    DOT_RADIUS, DOT_RADIUS_MAX_PIXELS, DOT_RADIUS_MIN_PIXELS, HALO_ALPHA, HALO_HALF_ENERGY,
+    ParticleCloud, dot_radius, halo_factor,
 };
 pub use density::{
     DENSITY_BIN_PIXELS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,
@@ -43,5 +45,6 @@ pub use mapping::{
     generation_level, heading, lineage_color, lineage_slot, linear, mapped_color, mapped_rgb8, mix,
     ramp, speed_level, traits, wheel,
 };
-pub use viewport::Viewport;
+pub use selection::{PICK_RADIUS_PIXELS, pick};
+pub use viewport::{MAXIMUM_ZOOM, Viewport};
 pub use world::{WorldView, hex_rgb};

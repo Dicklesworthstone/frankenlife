@@ -1,7 +1,8 @@
 # flife-render contract
 
 **Purpose.** FL-017 (`flife-0cg`) covers immutable compact render epochs (plan §9.5, §12.4, §13.2–§13.5,
-Appendix B.3, C.7, C.15, INV-09, INV-10).
+Appendix B.3, C.7, C.15, INV-09, INV-10). FL-020 (`flife-err`, part) adds interpolation between two epochs (§13.5,
+C.15).
 
 - An `Epoch` is a compact projection of exactly one committed world, with every row in stable identity order.
 - A `Publisher` owned by the world's owner fills preallocated slots and publishes the latest one.
@@ -57,7 +58,13 @@ A slow consumer can therefore cost display freshness, never the world.
 - `pairing`:
   - `pairs(prior, current)`: a merge by identity, yielding `Continuing`, `Born` or `Died` rows;
   - `Gap::between`: the tick gap, the travel bound `ticks · Δt · maximum speed`, and whether twice that bound, with
-    `ROUNDING_MARGIN` (2⁻²⁰), is under each extent.
+    `ROUNDING_MARGIN` (2⁻²⁰), is under each extent;
+  - `wrapped_between(from, to, length, fraction)`: `from` moved `fraction` of the minimum wrapped displacement
+    toward `to`, wrapped into `[0, length)`; exactly `from` at 0 and `to` at 1;
+  - `interpolate(prior, current, fraction, into)` (FL-020) fills an `Interpolation` per row of `current`: a
+    continuing organism at `wrapped_between` on each axis when the gap is unambiguous, otherwise snapped to its
+    `current` position with `snapped` set (trails reset); a birth at its `current` position, shown only at
+    fraction 1 (never before its birth); and `fading`, the `prior` rows of the dead. `into` is reused.
 
 **Invariants.**
 - *One committed world.* A projection reads only committed state, through `&World`. It writes the slot alone, and
@@ -85,7 +92,8 @@ A slow consumer can therefore cost display freshness, never the world.
 - An exhausted identity sequence: `Overflow`, recorded, with the last epoch kept.
 - A slot that cannot be allocated: `AllocationFailed`.
 - A world of another size than its slots: `LayoutMismatch`. More rows than the ceiling: `BudgetExhausted`.
-- `Gap::between` between epochs of different worlds, or not in order: `StateConflict`.
+- `Gap::between` between epochs of different worlds, or not in order: `StateConflict`; `interpolate` likewise, and
+  `NumericalInvalid` for a fraction outside `[0, 1]`.
 - `FieldTexture::from_plane` with an empty grid or a plane of the wrong length: `LayoutMismatch`.
 
 **Determinism.** A projection is a pure function of the committed world. Its F32 values are round-to-nearest
@@ -117,6 +125,20 @@ identities are sequential, so a deterministic sequence of offers and lease drops
     last epoch is kept.
   - Two reader threads check every epoch they lease while the owner publishes 200 boundaries. Every offer is
     published or busy, and the budgets return to zero.
+- `tests/interpolation.rs` (4 tests, FL-020). The oracle for a gap's true displacement is each organism's
+  tick-by-tick path in the world (per-tick minimum-image steps summed), never the endpoints' minimum image.
+  - Over unambiguous 40-tick gaps of a fast-moving ecology (ten times the acceleration limit, almost no drag: the
+    plain ecology's founders move a few hundredths of a unit per gap), every continuing organism is at its prior
+    position at fraction 0 and its current one at 1, exactly, and within 1e-4 of its true path at 0.25, 0.5 and
+    0.875; at least three seam crossings are drawn within the gap's travel of both ends; every position is in the
+    world.
+  - C.15: `wrapped_between` draws a forward move of 80 units on a width-128 axis 48 units in reverse (worked
+    numbers), and the true path across the seam under half the world. Over a 600-tick gap every continuing
+    organism snaps to its current position, exactly, with `snapped` set.
+  - Every founder removed and five organisms introduced in one tick, one taking a removed organism's storage slot:
+    the 48 dead fade from their prior rows, and the five new identities are drawn only at fraction 1, at their own
+    positions.
+  - Refusals: fractions outside `[0, 1]`, and epochs out of order.
 - In `flife-runtime`, `tests/observation.rs` (3 tests) checks that the session stays state-neutral under pressure.
 - Twenty-five planted bugs in this crate, the session's feed, the validator and `World::maximum_speed` were each
   caught by at least one of these tests or `flife-runtime`'s (listed in the FL-017 commit).
@@ -131,8 +153,9 @@ identities are sequential, so a deterministic sequence of offers and lease drops
   rendering. Device reads that must finish before release do not exist yet.
 - The field texture shows energy only. Moment channels, fixed projections and an admitted full-field diagnostic
   lease are FL-019's raw views.
-- Velocity and travel bounds let FL-020 detect ambiguous gaps. Interpolation, seam handling, snapping and trails
-  are FL-020's.
+- Epochs carry no birth ticks, so a birth appears with the first epoch that shows it rather than at its exact
+  birth tick within a skipped gap. Recorded winding or displacement (the alternative to snapping) does not exist.
+- Trails, and drawing interpolated epochs in the Studio, are FL-020's remaining parts.
 - No every-state export path. Recording that needs every sampled state uses its own bounded backpressure policy
   (FL-023).
 - The pause arm of `drop-observer-or-pause-unchanged-world` is for observers whose retention competes with the

@@ -27,4 +27,6 @@ pub use epoch::{
     View,
 };
 pub use feed::{DISPLAY_PAIR, Feed, Lease, Publication, Publisher, RenderStats, Viewer};
-pub use pairing::{Gap, Match, Pairs, ROUNDING_MARGIN, pairs};
+pub use pairing::{
+    Gap, Interpolation, Match, Pairs, ROUNDING_MARGIN, interpolate, pairs, wrapped_between,
+};

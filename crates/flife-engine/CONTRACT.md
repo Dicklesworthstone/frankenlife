@@ -724,6 +724,15 @@ velocity, first-order splitting at the configured fixed timestep.
   `World::sensor_report` (`SensorReport`: backend, device and reference ticks, failure) records why. If the
   reference errs too, its error is the tick's. No result depends on the backend, and it is not state. The tests
   are in `flife-backend-metal`'s `tests/sensor_world.rs`.
+- Phase 5's demands are `flife_field::demands` with the world's `RequestRule`, over the working organisms in
+  identity order: the same expressions as before, in the same order. `World::set_uptake_backend` (FL-031) hands
+  phase 5's densities, requests, cell demands and quanta to a `flife_field::UptakeBackend`, through
+  `demands_on` and `resolve_uptake_on`. If either errs, the tick's phase 5 is redone on the reference from the
+  same observed field, and the backend is dropped, with `World::uptake_report` (`UptakeReport`: backend, device
+  and reference ticks, failure) recording why. If the reference errs too, its error is the tick's. Installing a
+  backend reserves its `UptakeWork` for the population's capacity on the grid (FL-043, counted in the footprint's
+  scratch). If the host refuses that, the backend is not installed and the report says why. No result depends on
+  the backend, and it is not state. The tests are in `flife-backend-metal`'s `tests/uptake_world.rs`.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.

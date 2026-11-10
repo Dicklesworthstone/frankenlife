@@ -58,7 +58,7 @@ pub mod uptake;
 
 pub use bins::Bins;
 pub use deposit::{DepositSummary, Deposits, apply_deposits};
-pub use exchange::{ExchangeStencil, saturating_request};
+pub use exchange::{ExchangeStencil, check_request, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldSummary};
@@ -81,5 +81,6 @@ pub use transport::{
     TransportPlan, TransportReport, TransportScratch, energy_report, transport_on,
 };
 pub use uptake::{
-    CellDebit, Demand, GrantPacket, Grants, UptakeSummary, apply_grants, resolve_uptake,
+    CellDebit, Demand, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell, UptakeSummary,
+    UptakeWork, apply_grants, demands, demands_on, resolve_uptake, resolve_uptake_on,
 };

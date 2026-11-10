@@ -38,6 +38,7 @@ use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 pub mod field;
 pub mod owner;
 pub mod sensors;
+pub mod uptake;
 
 pub use field::MetalField;
 /// The memory a controller backend may hold (FL-043), for composition
@@ -49,6 +50,7 @@ pub use owner::{
     ResourceState, Usage, WriteLease,
 };
 pub use sensors::MetalSensors;
+pub use uptake::MetalUptake;
 
 /// The controller kernel source, with the software binary64
 /// (`softfloat64.metal`, shared with [`field::FIELD_MSL`]) ahead of it.

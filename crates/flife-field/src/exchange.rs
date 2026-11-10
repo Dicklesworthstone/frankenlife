@@ -131,6 +131,21 @@ pub fn saturating_request(
     half_saturation_density: f64,
     density: f64,
 ) -> Result<f64, CoreError> {
+    check_request(capacity_per_second, half_saturation_density, density)?;
+    Ok(step.seconds_per_tick() * capacity_per_second * density
+        / (half_saturation_density + density))
+}
+
+/// [`saturating_request`]'s checks alone, which a device computing the
+/// request applies to its own density (FL-031).
+///
+/// # Errors
+/// As [`saturating_request`].
+pub fn check_request(
+    capacity_per_second: f64,
+    half_saturation_density: f64,
+    density: f64,
+) -> Result<(), CoreError> {
     for (quantity, value, positive) in [
         (
             "chemistry.uptake_capacity_per_second",
@@ -152,8 +167,7 @@ pub fn saturating_request(
             });
         }
     }
-    Ok(step.seconds_per_tick() * capacity_per_second * density
-        / (half_saturation_density + density))
+    Ok(())
 }
 
 /// The floor of a continuous index and its fractional part.

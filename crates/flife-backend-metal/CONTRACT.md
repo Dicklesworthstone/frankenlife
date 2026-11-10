@@ -34,6 +34,13 @@ organism's 33 planes, value and both derivatives, at its one or two levels, blen
 `sensors.metal` on the same `softfloat64.metal`. The host gives each query its level, weight and corner cells
 through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
 
+FL-031, last part: phase 5's demands and grants on Metal, bit-identical to `flife_field::demands` and
+`flife_field::resolve_uptake` (plan §5.2, §8.1, §10.7), in `uptake`. `MetalUptake` is a `flife_field::UptakeBackend`.
+The device computes each organism's footprint density and saturating request, and each occupied cell's compensated
+demand, quantum, target, floor shares, remainders and largest-remainder deficit, in `uptake.metal` on the same
+`softfloat64.metal`. The host takes the footprints, stages and groups the packets in identity order through
+flife-field's `demands_on` and `resolve_uptake_on`, and refuses a cell whose quanta do not sum to its grant.
+
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
@@ -72,6 +79,11 @@ through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
   field and every live organism's `SensorQuery` (position, sensing scale), in row order. No CLI or Studio choice
   selects it yet either. `examples/tick_throughput.rs` measures it: a choice such as `cpu+sensors` or
   `metal+sensors+field` puts phase 3 (and phase 2) on Metal beside the controllers.
+- FL-031, uptake: `MetalUptake::open()` (or `with_owner(owner)`), given to a world with
+  `World::set_uptake_backend`. Each tick it receives the observed field, the request rule (`Δt`, `U_max`, `K`)
+  and every organism's footprint, in identity order; then each occupied cell (its first packet, packet count and
+  F32 energy) and every packet's request, in (cell, identity) order. No CLI or Studio choice selects it;
+  `tick_throughput`'s `+uptake` measures it.
 
 **Outputs.** One entry per organism, in batch order: its 36 raw outputs, or `None` for a deferred organism. The
 caller evaluates a deferred organism on the reference controller.
@@ -234,6 +246,44 @@ vectors and each shard's host records.
   the coarse levels, four level parameters, the sample parameters, queries and samples.
 - A backend of the engine path: an error from `sample` hands the tick's sampling to the reference and drops the
   backend (`flife-engine`'s `World::sensor_report`).
+
+**Invariants — uptake (FL-031; §5.2, §8.1, §10.7, INV-04).**
+- Every demand's amount is `demands`'s, and every packet's grant, every cell's debit (energy before and after,
+  demand, grant, contended), every organism's total and the summary are `resolve_uptake`'s, bit for bit.
+- The energy plane crosses to the device as F32 bit patterns, so a subnormal energy keeps its value.
+- The device computes the reference's expressions operation for operation in software binary64, with no fused
+  multiply-add:
+  - a footprint's density `(0 + Σ w_c e_c)/(h_x h_y)`, in footprint order, and its request
+    `((Δt U_max) r)/(K + r)`;
+  - a cell's demand `A_c`, the Neumaier `CompensatedSum` of its packets' requests in identity order;
+  - its quantum `Q = 2^(max(exp, 1) − 150)` and count `n` from the F32 bits, whether `A_c > e_c`, its target (`n`,
+    or `round_ties_even(A_c/Q)` and at most `n`) and scale (`n/A_c`, or `1/Q`);
+  - each packet's ideal share `q·scale`, its floor and its remainder.
+- A deficit is apportioned as the reference's passes give it, in closed form. One thread per packet ranks it
+  largest remainder first, ties to the lower identity, by comparing remainder bits: a remainder is +0 or positive,
+  so its bits order as `total_cmp` does. Every packet gains `deficit / len` quanta, and the first `deficit % len`
+  in that order one more.
+- The device never apportions a surplus (floors above the target). The reference handles one, but no valid input
+  makes one. Uncontended, the floors of `q_i/Q` pass `round(A_c/Q)` only if `Σ q_i − A_c ≥ Q/2`, while the
+  compensated sum is within about `2^-52 A_c ≤ 2^-28 Q` of the exact sum. Contended, the ideal shares sum to at most
+  `n(1 + 5·2^-53) < n + 1`. Such a cell would keep its floors, the host's sum check would refuse it, and the world
+  would compute the tick on the reference. None of the tests' 48,711 occupied cells had one. A first version
+  ported the reference's surplus passes: a planted mutant in them survived, because nothing reaches them, so they
+  were removed.
+- The host computes every footprint, and stages and groups the packets in identity order, with flife-field's own
+  code (`demands_on`, `resolve_uptake_on`). It checks each density with the reference's rule and each cell's energy,
+  and records each debit from the device's demand and quanta with the reference's `cell_target`. A cell whose
+  quanta do not sum to its grant is refused (INV-04).
+- Refused before any command: a footprint naming a cell outside the field (`LayoutMismatch`, the reference's own
+  refusal), and cells that do not partition the packets in order (`StateConflict`). Refused after it: any
+  non-finite density, request or demand the device returns (`StateConflict`). softfloat64 gives a NaN where IEEE
+  gives an infinity (an overflowing request, or a cell's demand), so the device never returns a value the reference
+  would not. The world then computes the tick on the reference, which reports its own error if it has one.
+- Two commands a tick: the requests, then the grants (each cell, then the deficit ranks). The energy plane, the
+  footprints and the packets are uploaded, and the results read back, every tick. Buffers grow to the next power
+  of two; the preset holds eleven.
+- A backend of the engine path: an error hands the tick's phase 5 to the reference and drops the backend
+  (`flife-engine`'s `World::uptake_report`).
 
 **Refusal cases.** No Metal device, which is always the case off macOS: `MissingCapability`. A kernel that does not
 compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `LayoutMismatch`. FL-028's owner refuses:
@@ -413,6 +463,35 @@ A refusal changes nothing.
     digests must differ at exactly tick 7;
   - a backend failing at its fifth tick (after leaving damaged samples) hands that tick to the reference and is
     dropped: the world stays the reference's, with 4 device ticks, 1 reference tick and the failure recorded.
+- `tests/uptake.rs` (FL-031, 4 tests), every value compared as bits:
+  - `the_metal_grants_are_the_reference_grants_bit_for_bit`: every packet, debit, total and summary of
+    `resolve_uptake_on` against `resolve_uptake`. The cases: scattered organisms over mixed energies (zeros of both
+    signs, subnormals, 1e-30 to 1e30); 4,000 organisms oversubscribing every cell; a hotspot of 4,000 organisms,
+    3,000 of them at one cell center, contended, uncontended and at an irrational amount, with tied remainders;
+    subnormal cells asked for a few quanta and for 1e9 times more; zero cells and requests below half a quantum;
+    one organism at each cell center asking exactly `k + ½` quanta, exactly its energy, just above it, or a random
+    multiple of it; and every regime at once on a stretched torus, then on buffers grown and shrunk. 87,774
+    packets: 5,179 contended, 5,253 deficit, 1,470 exact and 957 empty cells.
+  - `the_metal_demands_are_the_reference_demands_bit_for_bit`: 3,000 organisms on each of three grids and rules,
+    at cell centers, knots, edges, the seams and far away, then three of them again.
+  - `the_metal_uptake_of_the_running_preset_is_the_reference_uptake`: the running preset's field and full
+    population at ticks 1, 31, 61 and 91: 16,384 demands and 65,304 packets.
+  - `the_metal_uptake_refuses_what_the_reference_refuses`: a NaN, an infinity and a negative energy under a
+    footprint (a footprint away from it is served); a negative or NaN amount, a NaN position, and a NaN or
+    negative cell energy (the grants left empty); cells that do not partition the packets; a cell whose demand
+    overflows; a request that overflows (the reference's infinity, the device's refusal); a stencil from a larger
+    grid. The device matches the reference again afterwards.
+- `tests/uptake_world.rs` (FL-031, 4 tests), the engine path, on the real preset:
+  - with its uptake on Metal, the world's digest equals the reference's at every one of 400 ticks (42 births).
+    Every tick's phase 5 came from the device. Installing it reserves 2,752,512 bytes of host lists (FL-043),
+    stepping never grows them, and removing the backend releases them. The owner holds the eleven buffers, with no
+    lease, command or retiring buffer left;
+  - with field, sensors, uptake and controllers on Metal (the first three on one owner), 200 ticks, the same;
+  - the planted negative moves one quantum between two packets of one cell at the seventh tick, which the host's
+    sum check cannot see: the digests must differ at exactly tick 7;
+  - a backend failing at its fifth tick (leaving damaged quanta), and one granting a cell one quantum too many at
+    its sixth, each hand that tick to the reference and are dropped: the world stays the reference's, and the
+    failure is recorded.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -450,6 +529,19 @@ Planted mutants, each run in a scratch copy.
   So the fault word was redundant. It was also wrong in one case: it refused a tick over a value no query reads,
   which would drop the backend where the reference succeeds. It was removed, and the refusal test now requires a
   far query to be served bit for bit.
+- FL-031's uptake: 22 planted against `tests/uptake.rs` and `tests/uptake_world.rs`, on the final code, 21 caught:
+  - on the device: the demand's compensation dropped; Neumaier's branch always taken; ties rounded away from
+    zero; a deficit's ties going to the higher identity; its remainders ranked smallest first; its whole passes
+    dropped; the cell area not divided; the saturation dropped; the subnormal quantum's exponent not clamped; a
+    floor keeping a value below one; the remainder taken as the ideal share;
+  - on the host: a non-finite request, or demand, accepted; the cell partition, or the footprint's bounds,
+    unchecked;
+  - in flife-field: the sum check dropped; a device density not checked;
+  - in the engine: a failing backend kept; its lists not reserved; the backend never called; its lists left out
+    of the footprint.
+
+  One survived, and it is equivalent: `A_c > e_c` made `A_c ≥ e_c`. At equality both branches give the target
+  `n` and the scale `1/Q` exactly, and the contended flag recorded is the host's.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -591,6 +683,22 @@ device's call runs on the calling thread before the lanes start. So nothing sele
 second phase of the chain that pays only once the field and the samples stay on the device, with the observation
 encoding there too (FL-032).
 
+**Uptake's frontier (FL-031).** Whole ticks of the preset (`tick_throughput -- 1 20 8 40 cpu,cpu+uptake` and
+`-- 16 20 8 40 metal,metal+uptake,metal+sensors+field+uptake`, in rotating 20-tick blocks in one process, medians
+of 8 blocks after 40 warm-up ticks, the same digest after every block), on an M5 Ultra under other load (load
+average 27 at the end), 2026-11-10:
+
+| workers | incumbent | uptake on Metal | field, sensors and uptake on Metal |
+|---|---|---|---|
+| 1 | reference 24.9 ticks/s (cv 1.9%) | 23.8 (cv 2.4%), 0.95× | |
+| 16 | Metal controllers 83.1 (cv 3.6%) | 74.6 (cv 4.4%), 0.90× | 58.3 (cv 3.1%), 0.70× |
+
+Every row is admissible (cv ≤ 5%), and the device path is slower in each. It was not profiled, so the causes are
+hypotheses. The device does the cells' arithmetic, but the host still takes every footprint and stages and groups
+every packet, as the reference does. Two synchronous commands are added, with the energy plane, 4,096 footprints
+and about 16,000 packets uploaded and the results read back. So nothing selects it. Like phases 2 and 3, it pays
+only once the field stays on the device between phases (FL-032).
+
 **The softfloat miscompile.** While building the weights kernel, every in-radius weight came out wrong, always
 the same wrong value. Instrumented variants and a trace kernel computed the right one. `exp_neg`'s series indexed
 a `constant ulong INTEGER[17]` table of binary64 integers inside its loop; computing the divisor with
@@ -646,17 +754,19 @@ per-pass thread spawning (6%).
   - Only `f32` and `u32` elements. Textures, heaps and private-storage buffers are not owned yet.
   - `ResourceState` reports the dominant use when several overlap, by precedence: retiring, computing,
     checkpointing, rendering, committed, available. `usage` gives the lease counts.
-- FL-031 gaps (the item stays open):
-  - Phases 2 and 3 run on the device. Demand and grants with oversubscribed cells (uptake) are the item's
-    remaining evidence.
-  - The field is not resident: phase 2 uploads and reads it back every step, in two synchronous commands, and
-    phase 3 uploads it again and reads every sample back (3.2 MB on the preset) in a third. Residency needs the
-    field kept on the device between them, and the observation encoding on the device to keep the samples there
-    (FL-032).
+- FL-031 gaps:
+  - Phases 2, 3 and 5 run on the device, bit for bit. A surplus is never apportioned there (no valid input makes
+    one; see the uptake invariants).
+  - The field is not resident: phase 2 uploads and reads it back every step, in two synchronous commands; phase 3
+    uploads it again and reads every sample back (3.2 MB on the preset) in a third; and phase 5 uploads the energy
+    plane again, with the footprints and packets, in two more. Residency needs the field kept on the device between
+    them, and the observation encoding on the device to keep the samples there (FL-032).
   - Measured slower than the CPU on the preset (above), so nothing selects it by default: no CLI or Studio
-    choice exists yet, unlike `ControllerChoice`. The engine port and these tests are its only users.
+    choice exists yet, unlike `ControllerChoice`. The engine ports, these tests and `tick_throughput` are its only
+    users.
   - The host sums stay serial on the CPU by design. A device reduction would need a fixed tree, which is a
-    different numerical profile (§11.3).
+    different numerical profile (§11.3). Phase 5's per-cell compensated sums run on the device in the reference's
+    order, one thread per cell, so a hotspot cell is one thread's work.
   - The world's invariant checks (about 10% of a one-worker tick in a profile) run on the CPU over the read-back
     field.
 - No CUDA backend exists: FrankenTorch has no CUDA crate, and no host here has an NVIDIA GPU.

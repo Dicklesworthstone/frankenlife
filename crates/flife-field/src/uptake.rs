@@ -39,20 +39,27 @@
 //! field cannot represent that change, and granting it anyway would create
 //! energy.
 //!
+//! FL-031: [`UptakeBackend`] is the port for a device phase 5. A backend
+//! computes each organism's density and request ([`demands_on`]) and each
+//! cell's demand and grants ([`resolve_uptake_on`]); the host keeps the
+//! footprints, the packets' staging and grouping, the checks and the
+//! records, through this module's own code, so both paths give the same
+//! demands and grants bit for bit.
+//!
 //! Applying grants debits each cell's energy and scales its moment by
 //! `e'_c/e_c`, which removes the same proportion of composition. Grants
 //! carry the pre-debit cell energies. Applying them to a field that no
 //! longer holds those values, or applying them twice, is refused before
 //! anything is written.
 
-use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, add_down};
-use flife_core::memory::{capacity_bytes, total};
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MOMENT_CHANNELS;
+use flife_core::{CoreError, TimeStep};
 
 use crate::bins::Bins;
-use crate::exchange::ExchangeStencil;
+use crate::exchange::{ExchangeStencil, check_request, saturating_request};
 use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
 use crate::state::FieldState;
@@ -361,6 +368,34 @@ fn resolve_into(
     grants: &mut Grants,
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
+    stage(&grid, demands, grants)?;
+    group_packets(&grid, grants)?;
+
+    let energy = field.energy();
+    let Grants {
+        bins,
+        packets,
+        debits,
+        shares,
+        rank,
+        ..
+    } = grants;
+    let mut tally = Tally::default();
+    for (cell, range) in bins.occupied() {
+        let value = cell_energy(energy, cell)?;
+        let length = range.len();
+        let Some(group) = packets.get_mut(range) else {
+            continue;
+        };
+        let debit = resolve_cell(group, cell, value, shares, rank)?;
+        tally.record(&debit, length);
+        debits.push(debit);
+    }
+    Ok(finish(grid, demands.len(), grants, tally))
+}
+
+/// Check `demands` and stage their packets in identity order.
+fn stage(grid: &FieldGrid, demands: &[Demand], grants: &mut Grants) -> Result<(), CoreError> {
     if demands.len() > grants.organisms {
         return Err(CoreError::BudgetExhausted {
             budget: UPTAKE_PACKETS,
@@ -397,13 +432,13 @@ fn resolve_into(
         let Some(demand) = demands.get(index) else {
             continue;
         };
-        let stencil = match footprint(&grid, demand) {
+        let stencil = match footprint(grid, demand) {
             Ok(stencil) => stencil,
             // Report the first invalid demand in the order given.
             Err(error) => {
                 return Err(demands
                     .iter()
-                    .find_map(|demand| footprint(&grid, demand).err())
+                    .find_map(|demand| footprint(grid, demand).err())
                     .unwrap_or(error));
             }
         };
@@ -420,13 +455,16 @@ fn resolve_into(
             }
         }
     }
+    Ok(())
+}
+
+/// Group the staged packets by cell, in identity order within each cell,
+/// into [`Grants::packets`].
+fn group_packets(grid: &FieldGrid, grants: &mut Grants) -> Result<(), CoreError> {
     let Grants {
         staged,
         bins,
         packets,
-        debits,
-        shares,
-        rank,
         ..
     } = grants;
     let cells = usize::try_from(grid.cell_count()).map_err(|_| CoreError::Overflow {
@@ -440,74 +478,84 @@ fn resolve_into(
             .iter()
             .filter_map(|&at| staged.get(at as usize).copied()),
     );
+    Ok(())
+}
 
-    let energy = field.energy();
-    let mut summary = UptakeSummary::default();
-    let (mut requested, mut granted) = (CompensatedSum::ZERO, CompensatedSum::ZERO);
-    for (cell, range) in bins.occupied() {
-        let value = energy
-            .get(cell)
-            .copied()
-            .ok_or_else(|| CoreError::LayoutMismatch {
-                buffer: "field",
-                detail: format!("exchange cell {cell} is not in this field"),
-            })?;
-        let length = range.len();
-        let Some(group) = packets.get_mut(range) else {
-            continue;
-        };
-        let debit = resolve_cell(group, cell, value, shares, rank)?;
-        requested.add(debit.demanded);
-        granted.add(debit.granted);
+/// A footprint cell's energy in `energy`.
+fn cell_energy(energy: &[f32], cell: usize) -> Result<f32, CoreError> {
+    energy
+        .get(cell)
+        .copied()
+        .ok_or_else(|| CoreError::LayoutMismatch {
+            buffer: "field",
+            detail: format!("exchange cell {cell} is not in this field"),
+        })
+}
+
+/// The resolution's totals, cell by cell in ascending order.
+#[derive(Debug, Default)]
+struct Tally {
+    summary: UptakeSummary,
+    requested: CompensatedSum,
+    granted: CompensatedSum,
+}
+
+impl Tally {
+    fn record(&mut self, debit: &CellDebit, length: usize) {
+        let summary = &mut self.summary;
+        self.requested.add(debit.demanded);
+        self.granted.add(debit.granted);
         summary.cells += 1;
         summary.contended_cells += usize::from(debit.contended);
         summary.drained_cells += usize::from(debit.granted > 0.0 && debit.energy_after == 0.0);
         summary.largest_cell_packets = summary.largest_cell_packets.max(length);
-        debits.push(debit);
     }
-    summary.requested = requested.value();
-    summary.granted = granted.value();
+}
 
-    grants.totals.resize(demands.len(), 0.0);
+/// Each demand's total and the summary, once every cell is resolved.
+fn finish(grid: FieldGrid, demands: usize, grants: &mut Grants, tally: Tally) -> UptakeSummary {
+    let mut summary = tally.summary;
+    summary.requested = tally.requested.value();
+    summary.granted = tally.granted.value();
+    grants.totals.resize(demands, 0.0);
     for packet in &grants.packets {
         let total = &mut grants.totals[packet.demand];
         *total = add_down(*total, packet.granted);
     }
     grants.summary = summary;
     grants.grid = Some(grid);
-    Ok(summary)
+    summary
 }
 
-/// Resolve one cell's packets, which are in identity order.
-fn resolve_cell(
-    packets: &mut [GrantPacket],
-    cell: usize,
-    energy: f32,
-    shares: &mut Vec<Share>,
-    rank: &mut Vec<usize>,
-) -> Result<CellDebit, CoreError> {
-    if !energy.is_finite() || energy < 0.0 {
-        return Err(CoreError::NumericalInvalid {
-            quantity: "field energy",
-            detail: format!("cell {cell} holds {energy}"),
-        });
-    }
-    let mut demand = CompensatedSum::ZERO;
-    for packet in packets.iter() {
-        demand.add(packet.requested);
-    }
-    let demanded = demand.value();
+/// A cell's grant under `cell-quantum-largest-remainder-v1`, from its
+/// energy and demand.
+#[derive(Debug, Clone, Copy)]
+struct CellTarget {
+    /// `Q_c`.
+    quantum: f64,
+    /// `n_c`.
+    quanta: u64,
+    /// `A_c > e_c`.
+    contended: bool,
+    /// `K_c`: every quantum when contended, else the demand in quanta
+    /// rounded to even and at most `n_c`.
+    target: u64,
+    /// What a packet's request is multiplied by for its ideal share in
+    /// quanta.
+    scale: f64,
+}
+
+fn cell_target(energy: f32, demanded: f64) -> CellTarget {
     let contended = demanded > f64::from(energy);
     let (quantum, quanta) = quanta_of(energy);
     if quanta == 0 {
-        return Ok(CellDebit {
-            cell,
-            energy_before: energy,
-            energy_after: energy,
-            demanded,
-            granted: 0.0,
+        return CellTarget {
+            quantum,
+            quanta,
             contended,
-        });
+            target: 0,
+            scale: 0.0,
+        };
     }
     // `quanta < 2^24`, so these conversions are exact.
     let whole = quanta as f64;
@@ -519,6 +567,74 @@ fn resolve_cell(
         let ideal = (demanded / quantum).round_ties_even().min(whole);
         (ideal as u64, 1.0 / quantum)
     };
+    CellTarget {
+        quantum,
+        quanta,
+        contended,
+        target,
+        scale,
+    }
+}
+
+/// The debit of a cell that grants its target.
+fn debit_of(cell: usize, energy: f32, demanded: f64, at: &CellTarget) -> CellDebit {
+    if at.quanta == 0 {
+        return CellDebit {
+            cell,
+            energy_before: energy,
+            energy_after: energy,
+            demanded,
+            granted: 0.0,
+            contended: at.contended,
+        };
+    }
+    CellDebit {
+        cell,
+        energy_before: energy,
+        // `(n_c − K_c) Q_c` is an integer below 2^24 times a power of two
+        // at least 2^-149, so it is exact in F32.
+        energy_after: ((at.quanta - at.target) as f64 * at.quantum) as f32,
+        demanded,
+        granted: at.target as f64 * at.quantum,
+        contended: at.contended,
+    }
+}
+
+/// A cell's energy as the resolver admits it.
+fn check_energy(cell: usize, energy: f32) -> Result<(), CoreError> {
+    if !energy.is_finite() || energy < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "field energy",
+            detail: format!("cell {cell} holds {energy}"),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve one cell's packets, which are in identity order.
+fn resolve_cell(
+    packets: &mut [GrantPacket],
+    cell: usize,
+    energy: f32,
+    shares: &mut Vec<Share>,
+    rank: &mut Vec<usize>,
+) -> Result<CellDebit, CoreError> {
+    check_energy(cell, energy)?;
+    let mut demand = CompensatedSum::ZERO;
+    for packet in packets.iter() {
+        demand.add(packet.requested);
+    }
+    let demanded = demand.value();
+    let at = cell_target(energy, demanded);
+    if at.quanta == 0 {
+        return Ok(debit_of(cell, energy, demanded, &at));
+    }
+    let CellTarget {
+        quantum,
+        target,
+        scale,
+        ..
+    } = at;
 
     shares.clear();
     let mut floors = 0_u64;
@@ -577,17 +693,7 @@ fn resolve_cell(
     for (packet, share) in packets.iter_mut().zip(shares.iter()) {
         packet.granted = share.quanta as f64 * quantum;
     }
-    // `(n_c − K_c) Q_c` is an integer below 2^24 times a power of two at
-    // least 2^-149, so it is exact in F32.
-    let energy_after = ((quanta - target) as f64 * quantum) as f32;
-    Ok(CellDebit {
-        cell,
-        energy_before: energy,
-        energy_after,
-        demanded,
-        granted: target as f64 * quantum,
-        contended,
-    })
+    Ok(debit_of(cell, energy, demanded, &at))
 }
 
 /// A nonnegative F32 energy as `(Q, n)` with `energy = n Q` exactly: `Q` is
@@ -661,4 +767,332 @@ pub fn apply_grants(field: &mut FieldState, grants: &mut Grants) -> Result<f64, 
     }
     grants.applied = true;
     Ok(grants.summary.granted)
+}
+
+/// A.1's saturating request rule with its run's constants: what phase 5's
+/// demand is computed by, on the reference ([`demands`]) or a backend
+/// ([`demands_on`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequestRule {
+    /// The tick's step.
+    pub step: TimeStep,
+    /// `U_max`, ecological-energy per simulation-second.
+    pub capacity_per_second: f64,
+    /// `K`, the half-saturation density.
+    pub half_saturation_density: f64,
+}
+
+impl RequestRule {
+    /// [`saturating_request`] at `density`.
+    ///
+    /// # Errors
+    /// As [`saturating_request`].
+    pub fn request(&self, density: f64) -> Result<f64, CoreError> {
+        saturating_request(
+            self.step,
+            self.capacity_per_second,
+            self.half_saturation_density,
+            density,
+        )
+    }
+}
+
+/// Phase 5's demands on the reference: for each `(organism, position)`, in
+/// order, its [`Demand`] at its footprint's density,
+/// `rule.request(ExchangeStencil::at(grid, position)?.density(field)?)`.
+///
+/// # Errors
+/// The first organism's footprint, density or request refusal, in order.
+pub fn demands(
+    field: &FieldState,
+    rule: &RequestRule,
+    requesters: impl IntoIterator<Item = (OrganismId, [f64; 2])>,
+    demands: &mut Vec<Demand>,
+) -> Result<(), CoreError> {
+    demands.clear();
+    for (organism, position) in requesters {
+        let density = ExchangeStencil::at(field.grid(), position)?.density(field)?;
+        demands.push(Demand {
+            organism,
+            position,
+            amount: rule.request(density)?,
+        });
+    }
+    Ok(())
+}
+
+/// One occupied cell for [`UptakeBackend::resolve`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UptakeCell {
+    /// Its first packet in the requests the backend is given.
+    pub start: usize,
+    /// Its packets, in identity order: at least one.
+    pub len: usize,
+    /// Its energy, finite and nonnegative.
+    pub energy: f32,
+}
+
+/// FL-031's port for a device phase 5. Each method must give the
+/// reference's values bit for bit; the host keeps everything else (see the
+/// module documentation).
+pub trait UptakeBackend: std::fmt::Debug + Send {
+    /// The backend and its device, for run records.
+    fn describe(&self) -> String;
+
+    /// For each of `stencils` (an organism's footprint on `field`), its
+    /// density, [`ExchangeStencil::density`], and the request
+    /// `rule.request` makes at that density: `densities[i]` and
+    /// `requests[i]`. The caller checks the densities and the rule.
+    ///
+    /// # Errors
+    /// Any. The world then computes the tick's phase 5 on the reference.
+    fn request(
+        &mut self,
+        field: &FieldState,
+        rule: &RequestRule,
+        stencils: &[ExchangeStencil],
+        densities: &mut Vec<f64>,
+        requests: &mut Vec<f64>,
+    ) -> Result<(), CoreError>;
+
+    /// For each of `cells`, whose packets request
+    /// `requested[start..start + len]`, its demand `A_c` (their
+    /// [`CompensatedSum`] in order) in `demanded`, and each packet's whole
+    /// quanta of its cell under `cell-quantum-largest-remainder-v1` in
+    /// `quanta`, one per request.
+    ///
+    /// # Errors
+    /// Any. The world then computes the tick's phase 5 on the reference.
+    fn resolve(
+        &mut self,
+        cells: &[UptakeCell],
+        requested: &[f64],
+        demanded: &mut Vec<f64>,
+        quanta: &mut Vec<u32>,
+    ) -> Result<(), CoreError>;
+}
+
+/// The host's lists for a backend's phase 5, reusable from tick to tick.
+#[derive(Debug, Default)]
+pub struct UptakeWork {
+    stencils: Vec<ExchangeStencil>,
+    densities: Vec<f64>,
+    requests: Vec<f64>,
+    cells: Vec<UptakeCell>,
+    requested: Vec<f64>,
+    demanded: Vec<f64>,
+    quanta: Vec<u32>,
+}
+
+impl UptakeWork {
+    /// Empty lists.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Room for `organisms` demands on a grid of `cells` cells, so that a
+    /// tick within them allocates nothing (FL-043).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses the room.
+    pub fn reserve(&mut self, organisms: usize, cells: usize) -> Result<(), CoreError> {
+        let packets = organisms.saturating_mul(PACKETS_PER_DEMAND as usize);
+        let occupied = packets.min(cells);
+        fit(&mut self.stencils, organisms, "uptake footprints")?;
+        fit(&mut self.densities, organisms, "uptake densities")?;
+        fit(&mut self.requests, organisms, "uptake requests")?;
+        fit(&mut self.cells, occupied, "uptake cells")?;
+        fit(&mut self.requested, packets, "uptake packet requests")?;
+        fit(&mut self.demanded, occupied, "uptake cell demands")?;
+        fit(&mut self.quanta, packets, "uptake packet quanta")
+    }
+
+    /// Bytes its lists hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total([
+            capacity_bytes(&self.stencils),
+            capacity_bytes(&self.densities),
+            capacity_bytes(&self.requests),
+            capacity_bytes(&self.cells),
+            capacity_bytes(&self.requested),
+            capacity_bytes(&self.demanded),
+            capacity_bytes(&self.quanta),
+        ])
+    }
+}
+
+/// `list` emptied and holding room for exactly `count`.
+fn fit<T>(list: &mut Vec<T>, count: usize, buffer: &'static str) -> Result<(), CoreError> {
+    list.clear();
+    list.shrink_to(count);
+    list.try_reserve_exact(count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer,
+            bytes: bytes_for::<T>(count),
+        })
+}
+
+fn backend_conflict(detail: String) -> CoreError {
+    CoreError::StateConflict {
+        operation: "uptake backend",
+        detail,
+    }
+}
+
+/// [`demands`] with each density and request computed on `backend`, the
+/// footprints and checks on the host: the same demands, bit for bit.
+///
+/// # Errors
+/// A footprint, density or rule refusal, or anything the backend meets. The
+/// order may differ from [`demands`]'s, so the caller recomputes on the
+/// reference to report the reference's own error.
+pub fn demands_on(
+    backend: &mut dyn UptakeBackend,
+    field: &FieldState,
+    rule: &RequestRule,
+    requesters: impl IntoIterator<Item = (OrganismId, [f64; 2])>,
+    work: &mut UptakeWork,
+    demands: &mut Vec<Demand>,
+) -> Result<(), CoreError> {
+    demands.clear();
+    work.stencils.clear();
+    for (organism, position) in requesters {
+        work.stencils
+            .push(ExchangeStencil::at(field.grid(), position)?);
+        demands.push(Demand {
+            organism,
+            position,
+            amount: 0.0,
+        });
+    }
+    let UptakeWork {
+        stencils,
+        densities,
+        requests,
+        ..
+    } = work;
+    backend.request(field, rule, stencils, densities, requests)?;
+    if densities.len() != demands.len() || requests.len() != demands.len() {
+        return Err(backend_conflict(format!(
+            "{} densities and {} requests for {} organisms",
+            densities.len(),
+            requests.len(),
+            demands.len()
+        )));
+    }
+    for ((demand, &density), &request) in demands
+        .iter_mut()
+        .zip(densities.iter())
+        .zip(requests.iter())
+    {
+        check_request(
+            rule.capacity_per_second,
+            rule.half_saturation_density,
+            density,
+        )?;
+        demand.amount = request;
+    }
+    Ok(())
+}
+
+/// [`resolve_uptake`] with each cell's demand and grants computed on
+/// `backend`: the same grants, bit for bit. The host stages and groups the
+/// packets, checks every cell's energy, and records each debit from the
+/// backend's demand and quanta, refusing quanta that do not sum to the
+/// cell's grant (INV-04).
+///
+/// # Errors
+/// As [`resolve_uptake`], or anything the backend meets. On error `grants`
+/// is left empty.
+pub fn resolve_uptake_on(
+    backend: &mut dyn UptakeBackend,
+    field: &FieldState,
+    demands: &[Demand],
+    work: &mut UptakeWork,
+    grants: &mut Grants,
+) -> Result<UptakeSummary, CoreError> {
+    grants.reset();
+    let result = resolve_on(backend, field, demands, work, grants);
+    if result.is_err() {
+        grants.reset();
+    }
+    result
+}
+
+fn resolve_on(
+    backend: &mut dyn UptakeBackend,
+    field: &FieldState,
+    demands: &[Demand],
+    work: &mut UptakeWork,
+    grants: &mut Grants,
+) -> Result<UptakeSummary, CoreError> {
+    let grid = *field.grid();
+    stage(&grid, demands, grants)?;
+    group_packets(&grid, grants)?;
+    let energy = field.energy();
+    let UptakeWork {
+        cells,
+        requested,
+        demanded,
+        quanta,
+        ..
+    } = work;
+    cells.clear();
+    for (cell, range) in grants.bins.occupied() {
+        let value = cell_energy(energy, cell)?;
+        check_energy(cell, value)?;
+        cells.push(UptakeCell {
+            start: range.start,
+            len: range.len(),
+            energy: value,
+        });
+    }
+    requested.clear();
+    requested.extend(grants.packets.iter().map(|packet| packet.requested));
+    backend.resolve(cells, requested, demanded, quanta)?;
+    if demanded.len() != cells.len() || quanta.len() != requested.len() {
+        return Err(backend_conflict(format!(
+            "{} demands and {} quanta for {} cells and {} packets",
+            demanded.len(),
+            quanta.len(),
+            cells.len(),
+            requested.len()
+        )));
+    }
+    let mut tally = Tally::default();
+    let Grants {
+        bins,
+        packets,
+        debits,
+        ..
+    } = grants;
+    for (((cell, range), occupied), &demand) in
+        bins.occupied().zip(cells.iter()).zip(demanded.iter())
+    {
+        let at = cell_target(occupied.energy, demand);
+        let (Some(shares), Some(group)) = (quanta.get(range.clone()), packets.get_mut(range))
+        else {
+            return Err(backend_conflict(format!(
+                "cell {cell}'s packets are out of range"
+            )));
+        };
+        let granted: u64 = shares.iter().map(|&share| u64::from(share)).sum();
+        if granted != at.target {
+            return Err(backend_conflict(format!(
+                "cell {cell} granted {granted} quanta, not its {}",
+                at.target
+            )));
+        }
+        if at.quanta > 0 {
+            for (packet, &share) in group.iter_mut().zip(shares) {
+                packet.granted = f64::from(share) * at.quantum;
+            }
+        }
+        let debit = debit_of(cell, occupied.energy, demand, &at);
+        tally.record(&debit, group.len());
+        debits.push(debit);
+    }
+    Ok(finish(grid, demands.len(), grants, tally))
 }

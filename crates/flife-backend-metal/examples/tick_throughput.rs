@@ -6,8 +6,9 @@
 //! `cargo run --release -p flife-backend-metal --example tick_throughput -- [workers] [ticks per block] [blocks] [warm-up ticks] [choices]`,
 //! for example `-- 1 20 8 40 cpu,torch,metal`. A choice may add phases on
 //! Metal after a `+`: `cpu+sensors` samples phase 3 on `MetalSensors`, and
-//! `cpu+field` steps phase 2 on `MetalField` (FL-031), for example
-//! `cpu,cpu+sensors,metal+sensors+field`. `+slots=N` puts the controllers on
+//! `cpu+field` steps phase 2 on `MetalField`, and `cpu+uptake` computes
+//! phase 5's demands and grants on `MetalUptake` (FL-031), for example
+//! `cpu,cpu+sensors,metal+sensors+field+uptake`. `+slots=N` puts the controllers on
 //! a `MetalBackend` with `N` genomes to a parameter shard (FL-026), for
 //! example `metal,metal+slots=4096`. A choice this host refuses
 //! (`metal` without a device) is reported and left out. Prints one JSON line.
@@ -16,7 +17,7 @@ use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use flife_backend_metal::{
-    BackendBudget, ControllerChoice, MetalBackend, MetalField, MetalSensors,
+    BackendBudget, ControllerChoice, MetalBackend, MetalField, MetalSensors, MetalUptake,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -42,12 +43,15 @@ fn found(workers: NonZeroUsize, name: &str) -> Result<World, CoreError> {
         match phase {
             "sensors" => world.set_sensor_backend(Some(Box::new(MetalSensors::open()?))),
             "field" => world.set_field_backend(Some(Box::new(MetalField::open()?))),
+            "uptake" => world.set_uptake_backend(Some(Box::new(MetalUptake::open()?))),
             other => {
                 let slots: u64 = other
                     .strip_prefix("slots=")
                     .and_then(|slots| slots.parse().ok())
                     .ok_or_else(|| {
-                        refused(format!("`{other}` is not `sensors`, `field` or `slots=N`"))
+                        refused(format!(
+                            "`{other}` is not `sensors`, `field`, `uptake` or `slots=N`"
+                        ))
                     })?;
                 world
                     .set_controller_backend(Some(Box::new(MetalBackend::with_shard_slots(slots)?)));
@@ -150,11 +154,13 @@ fn main() -> Result<(), CoreError> {
         .map(|entry| {
             let report = entry.world.controller_report();
             let (sensors, field) = (entry.world.sensor_report(), entry.world.field_report());
+            let uptake = entry.world.uptake_report();
             let rate = median(&entry.rates);
             format!(
                 "{{\"choice\":\"{}\",\"ticks_per_s\":{rate:.3},\"cv_percent\":{:.2},\
                  \"ratio_to_first\":{:.3},\"samples\":{:?},\"batched\":{},\"deferred\":{},\
-                 \"reference_ticks\":{},\"sensor_ticks\":[{},{}],\"field_steps\":[{},{}]}}",
+                 \"reference_ticks\":{},\"sensor_ticks\":[{},{}],\"field_steps\":[{},{}],\
+                 \"uptake_ticks\":[{},{}]}}",
                 entry.name,
                 cv(&entry.rates),
                 rate / baseline,
@@ -165,7 +171,9 @@ fn main() -> Result<(), CoreError> {
                 sensors.ticks,
                 sensors.reference_ticks,
                 field.steps,
-                field.reference_steps
+                field.reference_steps,
+                uptake.ticks,
+                uptake.reference_ticks
             )
         })
         .collect();

@@ -82,12 +82,12 @@ use flife_core::{
     Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
-    Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
-    FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
-    RawSample, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
-    SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeSummary,
-    advance_field_on, apply_deposits, apply_grants, initial_source, resolve_uptake,
-    saturating_request,
+    Bins, BufferLimits, ConeTolerance, Demand, Deposits, FieldBackend, FieldGrid, FieldPair,
+    FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView, RawSample,
+    RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
+    SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary,
+    UptakeWork, advance_field_on, apply_deposits, apply_grants, demands as reference_demands,
+    demands_on, initial_source, resolve_uptake, resolve_uptake_on,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -648,6 +648,29 @@ struct Sensors {
     samples: Vec<RawSample>,
 }
 
+/// What the world's uptake backend did, for run records (FL-031). Not
+/// scientific state: no result depends on the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UptakeReport {
+    /// The backend serving the world, or `None` for the reference alone.
+    pub backend: Option<String>,
+    /// Ticks whose phase 5 demands and grants the backend computed.
+    pub ticks: u64,
+    /// Ticks the reference computed because the backend met an error: the
+    /// reference reproduces that error exactly, or finds none.
+    pub reference_ticks: u64,
+    /// Why the backend stopped serving the world, if it failed.
+    pub failure: Option<String>,
+}
+
+/// The world's uptake backend and the host's lists for it.
+#[derive(Debug, Default)]
+struct Uptake {
+    backend: Option<Box<dyn UptakeBackend>>,
+    report: UptakeReport,
+    work: UptakeWork,
+}
+
 /// The world's controller backend and its scratch.
 #[derive(Debug, Default)]
 struct Controllers {
@@ -701,6 +724,7 @@ pub struct World {
     controllers: Controllers,
     fields: Fields,
     sensors: Sensors,
+    uptake: Uptake,
 }
 
 impl World {
@@ -816,6 +840,7 @@ impl World {
             controllers: Controllers::default(),
             fields: Fields::default(),
             sensors: Sensors::default(),
+            uptake: Uptake::default(),
         })
     }
 
@@ -999,6 +1024,48 @@ impl World {
         &self.sensors.report
     }
 
+    /// Compute phase 5's demands and grants on `backend` from the next
+    /// tick, or on the reference alone with `None` (FL-031). No result
+    /// depends on it: a backend returns the reference's densities, requests,
+    /// cell demands and quanta bit for bit ([`UptakeBackend`]), the host
+    /// refuses a cell whose quanta do not sum to its grant, and any error
+    /// hands the tick's phase 5 to the reference. A backend that fails where
+    /// the reference does not is dropped, and [`World::uptake_report`] says
+    /// why.
+    ///
+    /// Installing a backend reserves its lists for the population's
+    /// capacity on this grid (FL-043). If the host refuses them, the backend
+    /// is not installed, and the report says why.
+    pub fn set_uptake_backend(&mut self, backend: Option<Box<dyn UptakeBackend>>) {
+        let uptake = &mut self.uptake;
+        uptake.report.backend = backend.as_ref().map(|backend| backend.describe());
+        uptake.report.failure = None;
+        uptake.work = UptakeWork::new();
+        uptake.backend = None;
+        if backend.is_none() {
+            return;
+        }
+        let grid = &self.rules.grid;
+        let reserved = capacity_of(&self.rules).and_then(|rows| {
+            let cells = usize::try_from(grid.cell_count()).map_err(|_| CoreError::Overflow {
+                quantity: "field cells",
+            })?;
+            uptake.work.reserve(rows, cells)
+        });
+        if let Err(error) = reserved {
+            uptake.report.failure = Some(error.to_string());
+            uptake.work = UptakeWork::new();
+            return;
+        }
+        uptake.backend = backend;
+    }
+
+    /// What the uptake backend has done so far.
+    #[must_use]
+    pub const fn uptake_report(&self) -> &UptakeReport {
+        &self.uptake.report
+    }
+
     /// The event cursor: births and deaths published so far.
     #[must_use]
     pub const fn events(&self) -> u64 {
@@ -1128,6 +1195,7 @@ impl World {
                 capacity_bytes(&self.controllers.by_row),
                 capacity_bytes(&self.sensors.queries),
                 capacity_bytes(&self.sensors.samples),
+                self.uptake.work.allocated_bytes(),
             ]
             .into_iter()
             .chain(lanes),
@@ -1306,6 +1374,7 @@ impl World {
             controllers,
             fields,
             sensors,
+            uptake: uptake_state,
             ..
         } = self;
         let Scratch {
@@ -1432,22 +1501,9 @@ impl World {
             });
         }
 
-        // Phase 5: requests from the observation field, resolved per cell.
-        demands.clear();
-        for organism in working.iter() {
-            let density = ExchangeStencil::at(&rules.grid, organism.position)?.density(observed)?;
-            demands.push(Demand {
-                organism: organism.committed.id,
-                position: organism.position,
-                amount: saturating_request(
-                    step,
-                    rules.uptake_capacity,
-                    rules.half_saturation,
-                    density,
-                )?,
-            });
-        }
-        let uptake = resolve_uptake(observed, demands, grants)?;
+        // Phase 5: requests from the observation field, resolved per cell,
+        // on the uptake backend if the world has one.
+        let uptake = uptake_with(rules, working, observed, demands, grants, uptake_state)?;
         // The packets are in (cell, identity) order, so grouping them by
         // demand keeps each organism's in cell order.
         let granted = grants.packets();
@@ -2021,6 +2077,57 @@ fn sample_on(
         });
     }
     Ok(())
+}
+
+/// Phase 5 on the world's uptake backend if it has one: every organism's
+/// demand at its footprint's density, then the grants. Any error there
+/// hands the tick's phase 5 to the reference, which reproduces the
+/// reference's own error or finds none; with none, the backend failed where
+/// the reference does not, and the world stops using it. Either way the
+/// demands and grants are the reference's.
+fn uptake_with(
+    rules: &Rules,
+    working: &[Working],
+    field: &FieldState,
+    demands: &mut Vec<Demand>,
+    grants: &mut Grants,
+    uptake: &mut Uptake,
+) -> Result<UptakeSummary, CoreError> {
+    let rule = RequestRule {
+        step: rules.step,
+        capacity_per_second: rules.uptake_capacity,
+        half_saturation_density: rules.half_saturation,
+    };
+    let requesters = || {
+        working
+            .iter()
+            .map(|organism| (organism.committed.id, organism.position))
+    };
+    let Uptake {
+        backend,
+        report,
+        work,
+    } = uptake;
+    if let Some(device) = backend.as_deref_mut() {
+        let served = demands_on(device, field, &rule, requesters(), work, demands)
+            .and_then(|()| resolve_uptake_on(device, field, demands, work, grants));
+        match served {
+            Ok(summary) => {
+                report.ticks = report.ticks.saturating_add(1);
+                return Ok(summary);
+            }
+            Err(error) => {
+                report.reference_ticks = report.reference_ticks.saturating_add(1);
+                reference_demands(field, &rule, requesters(), demands)?;
+                let summary = resolve_uptake(field, demands, grants)?;
+                report.failure = Some(error.to_string());
+                *backend = None;
+                return Ok(summary);
+            }
+        }
+    }
+    reference_demands(field, &rule, requesters(), demands)?;
+    resolve_uptake(field, demands, grants)
 }
 
 /// Phase 3 for one organism (§8.1): its observation at its sensing scale,

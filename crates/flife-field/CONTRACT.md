@@ -95,6 +95,18 @@
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
   `CellDebit` per demanded cell, each organism's total `U_i` in input order, and an `UptakeSummary`.
   `apply_grants` debits the field.
+- FL-031's phase 5: `RequestRule` (`Δt`, `U_max`, `K`; `request(density)` is `saturating_request`), and `demands`,
+  each organism's `Demand` at its footprint's density, in order: the reference the engine runs. The port for a
+  device is `UptakeBackend` (`describe`; `request(field, rule, stencils, densities, requests)`, each footprint's
+  density and request; `resolve(cells, requested, demanded, quanta)`, each `UptakeCell`'s compensated demand and
+  each packet's whole quanta), each bit for bit the reference's. `demands_on` and `resolve_uptake_on` run it with
+  the reference's own staging, grouping and checks, in `UptakeWork`'s reusable lists (`reserve(organisms,
+  cells)`, `allocated_bytes`): the footprints and every check are host code. `check_request` is
+  `saturating_request`'s checks alone, which the host applies to a device's density. `resolve_uptake_on` records
+  each debit from the backend's demand and quanta through `resolve_uptake`'s own `cell_target` and `debit_of`, and
+  refuses a cell whose quanta do not sum to its grant (`StateConflict`, "uptake backend"). `resolve_uptake` was
+  factored into those pieces (`stage`, `group_packets`, `cell_target`, `debit_of`, `Tally`, `finish`) with its
+  arithmetic unchanged.
 - `deposit` (FL-011): reusable `Deposits` (`push`, `clear`, `len`, `is_applied`) and `apply_deposits`, which adds
   them to the field and returns a `DepositSummary` (organisms, cells, paid, offered and applied).
   `DepositSummary::record` books the reduction as one `emission` transfer in a `TickLedger`.

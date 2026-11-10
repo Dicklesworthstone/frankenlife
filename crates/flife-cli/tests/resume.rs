@@ -15,6 +15,8 @@
     reason = "test helpers: a failure in one is a test failure"
 )]
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::process::ExitStatusExt;
@@ -27,7 +29,7 @@ use flife_core::ids::CommandId;
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::NumericalProfile;
 use flife_runtime::{CommandStatus, Journal, Outcome, restore};
-use flife_store::{ChunkStore, CommandJournal, Durability};
+use flife_store::{CommandJournal, Durability};
 use serde_json::{Value, json};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -150,10 +152,7 @@ fn lines(bytes: &[u8]) -> Vec<Value> {
 /// Run `flife` to completion: its status, stdout records and stderr
 /// records.
 fn flife(args: &[&str]) -> (Option<i32>, Vec<Value>, Vec<Value>) {
-    let output = Command::new(env!("CARGO_BIN_EXE_flife"))
-        .args(args)
-        .output()
-        .expect("flife runs");
+    let output = common::output(Command::new(env!("CARGO_BIN_EXE_flife")).args(args));
     (
         output.status.code(),
         lines(&output.stdout),
@@ -322,7 +321,7 @@ fn uninterrupted() -> &'static Uninterrupted {
         assert_eq!(persisted["journal"], json!({"admitted": 4, "outcomes": 4}));
         assert_eq!(persisted["checkpoint"]["tick"], HORIZON);
         // The configuration's retain_recent_checkpoints is 4.
-        let store = ChunkStore::open(run_dir.join("store"), Durability::ProcessCrash)
+        let store = common::open_store(run_dir.join("store"), Durability::ProcessCrash)
             .expect("the store opens");
         assert_eq!(store.sequences().expect("lists").len(), 4);
         indexes_what_it_published(&run_dir, &config, &out);
@@ -358,11 +357,11 @@ fn killed_after(args: &[&str], tick: u64) -> Vec<Value> {
 /// Run `args`, call `meanwhile` once the process has reported tick `tick`,
 /// then SIGKILL it; its records up to its death.
 fn killed_when(args: &[&str], tick: u64, meanwhile: impl FnOnce()) -> Vec<Value> {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_flife"))
-        .args(args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("flife starts");
+    let mut child = common::spawn(
+        Command::new(env!("CARGO_BIN_EXE_flife"))
+            .args(args)
+            .stdout(Stdio::piped()),
+    );
     let stdout = child.stdout.take().expect("its output");
     let mut reader = BufReader::new(stdout).lines();
     let mut records = Vec::new();
@@ -412,7 +411,7 @@ fn a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_stat
         .expect("a sequence");
 
     {
-        let store = ChunkStore::open(run_dir.join("store"), Durability::ProcessCrash)
+        let store = common::open_store(run_dir.join("store"), Durability::ProcessCrash)
             .expect("the store opens");
         let bytes = store.load(before).expect("checkpoint 147 loads");
         let restored =
@@ -805,7 +804,7 @@ fn removals_are_journaled_checkpointed_and_replayed_like_any_command() {
         .as_u64()
         .expect("a sequence");
     {
-        let store = ChunkStore::open(part.join("store"), Durability::ProcessCrash)
+        let store = common::open_store(part.join("store"), Durability::ProcessCrash)
             .expect("the store opens");
         let bytes = store.load(before).expect("checkpoint 98 loads");
         let restored =

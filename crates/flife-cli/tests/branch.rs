@@ -21,6 +21,8 @@
     reason = "test helpers: a failure in one is a test failure"
 )]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -37,7 +39,7 @@ use flife_runtime::{
     Admission, Command as ClientCommand, Durability as CommandDurability, Journal, JournalContents,
     Rejection, Target, restore,
 };
-use flife_store::{ChunkStore, CommandJournal, Durability};
+use flife_store::{CommandJournal, Durability};
 use serde_json::{Value, json};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -169,10 +171,7 @@ fn lines(bytes: &[u8]) -> Vec<Value> {
 /// Run `flife` to completion: its status, stdout records and stderr
 /// records.
 fn flife(args: &[&str]) -> (Option<i32>, Vec<Value>, Vec<Value>) {
-    let output = Command::new(env!("CARGO_BIN_EXE_flife"))
-        .args(args)
-        .output()
-        .expect("flife runs");
+    let output = common::output(Command::new(env!("CARGO_BIN_EXE_flife")).args(args));
     (
         output.status.code(),
         lines(&output.stdout),
@@ -364,7 +363,7 @@ fn a_control_branch_continues_as_its_parent_while_an_intervention_branch_diverge
     let fork_sha = sha(&fork["sha256"]);
     let fork_digest = {
         let store =
-            ChunkStore::open(parent.join("store"), Durability::ProcessCrash).expect("opens");
+            common::open_store(parent.join("store"), Durability::ProcessCrash).expect("opens");
         let bytes = store
             .load(fork["sequence"].as_u64().expect("a sequence"))
             .expect("the fork checkpoint loads");
@@ -449,7 +448,7 @@ fn a_control_branch_continues_as_its_parent_while_an_intervention_branch_diverge
     );
     {
         let store =
-            ChunkStore::open(control.join("store"), Durability::ProcessCrash).expect("opens");
+            common::open_store(control.join("store"), Durability::ProcessCrash).expect("opens");
         store
             .load(1)
             .expect("the control's founding checkpoint still loads whole");
@@ -468,13 +467,14 @@ fn a_control_branch_continues_as_its_parent_while_an_intervention_branch_diverge
     // A branch of the control at 129 carries both forks.
     let deeper = fresh("deeper");
     let nested = branch(&control, &deeper, 129, &[]);
-    let control_129_checkpoint = ChunkStore::open(control.join("store"), Durability::ProcessCrash)
-        .expect("opens")
-        .latest_valid(|_, bytes| Ok(Sha256Digest::of(bytes).to_hex()))
-        .expect("lists")
-        .latest
-        .expect("a checkpoint")
-        .1;
+    let control_129_checkpoint =
+        common::open_store(control.join("store"), Durability::ProcessCrash)
+            .expect("opens")
+            .latest_valid(|_, bytes| Ok(Sha256Digest::of(bytes).to_hex()))
+            .expect("lists")
+            .latest
+            .expect("a checkpoint")
+            .1;
     assert_eq!(
         nested["lineage"],
         json!([
@@ -538,7 +538,7 @@ fn a_control_branch_continues_as_its_parent_while_an_intervention_branch_diverge
 
     // Each branch admits its own session's commands only.
     let store =
-        ChunkStore::open(intervention.join("store"), Durability::ProcessCrash).expect("opens");
+        common::open_store(intervention.join("store"), Durability::ProcessCrash).expect("opens");
     let latest = store.sequences().expect("lists");
     let bytes = store.load(*latest.last().expect("one")).expect("loads");
     let mut restored =
@@ -660,7 +660,7 @@ fn branching_refuses_what_it_cannot_branch() {
         "is not a run directory",
     );
     {
-        let _held = ChunkStore::open(parent.join("store"), Durability::ProcessCrash)
+        let _held = common::open_store(parent.join("store"), Durability::ProcessCrash)
             .expect("the test holds the parent");
         refused(
             &["branch", parent_text, target_text],

@@ -16,8 +16,10 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use flife_core::checkpoint::{CheckpointManifest, ChunkFamily, ChunkSink};
@@ -34,6 +36,52 @@ const CHILD: &str = "FLIFE_STORE_CHILD";
 const CHILD_LIMITED: &str = "FLIFE_STORE_CHILD_LIMITED";
 const STREAM_CHILD: &str = "FLIFE_STORE_STREAM_CHILD";
 const BOTH: [Durability; 2] = [Durability::ProcessCrash, Durability::PowerLoss];
+
+/// Spawning a child duplicates every open descriptor, a store's lock file
+/// included, until the child executes, and a store closed meanwhile stays
+/// locked until then. On Linux that window is real: a reopen right after a
+/// drop was refused once ("another writer holds", rch vmi1227854 at
+/// 372cbc8) while other tests spawned their crash children. macOS spawns
+/// without the window. Children are spawned holding this shared, and
+/// `Command::spawn` returns only once the child has executed; a [`Store`]
+/// is closed holding it exclusively, so no child holds a copy of its lock
+/// when it closes, and its lock is free the moment it is dropped.
+static SPAWNING: RwLock<()> = RwLock::new(());
+
+/// A chunk store closed under [`SPAWNING`].
+struct Store(Option<ChunkStore>);
+
+impl Deref for Store {
+    type Target = ChunkStore;
+
+    fn deref(&self) -> &ChunkStore {
+        self.0.as_ref().expect("open until dropped")
+    }
+}
+
+impl DerefMut for Store {
+    fn deref_mut(&mut self) -> &mut ChunkStore {
+        self.0.as_mut().expect("open until dropped")
+    }
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _quiet = SPAWNING.write().unwrap_or_else(PoisonError::into_inner);
+        drop(self.0.take());
+    }
+}
+
+/// [`ChunkStore::open`], closed under [`SPAWNING`].
+fn open_store(root: impl AsRef<Path>, durability: Durability) -> Result<Store, CoreError> {
+    ChunkStore::open(root, durability).map(|store| Store(Some(store)))
+}
+
+/// `command` spawned under [`SPAWNING`].
+fn spawn(command: &mut Command) -> Child {
+    let _spawning = SPAWNING.read().unwrap_or_else(PoisonError::into_inner);
+    command.spawn().expect("spawns")
+}
 
 /// Appendix A with `overrides`, each `(section, key, value)`.
 fn config(overrides: &[(&str, &str, &str)]) -> ValidatedConfig {
@@ -198,7 +246,7 @@ fn published_checkpoints_load_back_byte_for_byte_and_restore() {
         .unwrap_or_else(|_| panic!("two checkpoints"));
     for durability in BOTH {
         let root = fresh(&format!("roundtrip-{}", durability.name()));
-        let mut store = ChunkStore::open(&root, durability).expect("creates");
+        let mut store = open_store(&root, durability).expect("creates");
         assert_eq!(
             fs::read_to_string(root.join("FLIFESTORE")).expect("a marker"),
             format!("{STORE_FORMAT}\n")
@@ -245,11 +293,11 @@ fn published_checkpoints_load_back_byte_for_byte_and_restore() {
 
         // One writer at a time; the lock goes with the store.
         assert!(matches!(
-            ChunkStore::open(&root, durability),
+            open_store(&root, durability),
             Err(CoreError::StateConflict { .. })
         ));
         drop(store);
-        let store = ChunkStore::open(&root, durability).expect("reopens");
+        let store = open_store(&root, durability).expect("reopens");
         assert_eq!((store.next_sequence(), store.swept()), (3, 0));
         assert_eq!(latest(&store).0, Some((2, b_world)));
         assert_ne!(a_world, b_world);
@@ -259,14 +307,14 @@ fn published_checkpoints_load_back_byte_for_byte_and_restore() {
     fs::create_dir_all(&foreign).expect("creates");
     fs::write(foreign.join("notes.txt"), b"not a store").expect("writes");
     assert!(matches!(
-        ChunkStore::open(&foreign, Durability::ProcessCrash),
+        open_store(&foreign, Durability::ProcessCrash),
         Err(CoreError::StateConflict { .. })
     ));
     let other = fresh("other-format");
-    drop(ChunkStore::open(&other, Durability::ProcessCrash).expect("creates"));
+    drop(open_store(&other, Durability::ProcessCrash).expect("creates"));
     fs::write(other.join("FLIFESTORE"), b"frankenlife.chunk-store.v9\n").expect("writes");
     assert!(matches!(
-        ChunkStore::open(&other, Durability::ProcessCrash),
+        open_store(&other, Durability::ProcessCrash),
         Err(CoreError::SchemaMismatch { .. })
     ));
 }
@@ -289,7 +337,7 @@ fn child_publishes_until_its_planned_crash() {
         .find(|candidate| candidate.name() == durability)
         .expect("a durability");
     let bytes = fs::read(checkpoint).expect("the checkpoint");
-    let mut store = ChunkStore::open(root, durability).expect("opens");
+    let mut store = open_store(root, durability).expect("opens");
     let mut count = 0;
     let mut out = std::io::stdout();
     store
@@ -315,27 +363,27 @@ fn child_publishes_until_its_planned_crash() {
 fn crash_at(root: &Path, checkpoint: &Path, stop: usize, durability: Durability) -> Option<String> {
     let stderr_path = root.with_extension("stderr");
     let stderr = fs::File::create(&stderr_path).expect("creates the child's stderr file");
-    let mut child = Command::new(std::env::current_exe().expect("this test binary"))
-        .args([
-            "--exact",
-            "child_publishes_until_its_planned_crash",
-            "--nocapture",
-            "--test-threads",
-            "1",
-        ])
-        .env(
-            CHILD,
-            format!(
-                "{}|{}|{stop}|{}",
-                root.display(),
-                checkpoint.display(),
-                durability.name()
-            ),
-        )
-        .stdout(Stdio::piped())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawns");
+    let mut child = spawn(
+        Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "child_publishes_until_its_planned_crash",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(
+                CHILD,
+                format!(
+                    "{}|{}|{stop}|{}",
+                    root.display(),
+                    checkpoint.display(),
+                    durability.name()
+                ),
+            )
+            .stdout(Stdio::piped())
+            .stderr(stderr),
+    );
     let stdout = child.stdout.take().expect("a pipe");
     for line in BufReader::new(stdout).lines() {
         let line = line.expect("a line");
@@ -372,7 +420,7 @@ fn a_crash_at_every_step_leaves_the_last_valid_checkpoint() {
         let mut expected = Vec::new();
         {
             let root = fresh(&format!("crash-steps-{}", durability.name()));
-            let mut store = ChunkStore::open(&root, durability).expect("creates");
+            let mut store = open_store(&root, durability).expect("creates");
             store.publish(&a).expect("publishes");
             store
                 .publish_observed(&b, &mut |step| {
@@ -385,14 +433,14 @@ fn a_crash_at_every_step_leaves_the_last_valid_checkpoint() {
         let mut after_publication = 0;
         for stop in 0.. {
             let root = fresh(&format!("crash-{}", durability.name()));
-            ChunkStore::open(&root, durability)
+            open_store(&root, durability)
                 .expect("creates")
                 .publish(&a)
                 .expect("publishes");
             let Some(step) = crash_at(&root, &b_path, stop, durability) else {
                 break;
             };
-            let mut store = ChunkStore::open(&root, durability).expect("reopens after a kill");
+            let mut store = open_store(&root, durability).expect("reopens after a kill");
             assert_eq!(temporaries(&root), 0, "{step}: temporaries swept");
             let (recovered, skipped) = latest(&store);
             assert!(skipped.is_empty(), "{step}: {skipped:?}");
@@ -442,7 +490,7 @@ fn cancellation_at_every_step_leaves_the_store_as_it_was() {
         let mut cancelled = 0;
         for stop in 0.. {
             let root = fresh(&format!("cancel-{}", durability.name()));
-            let mut store = ChunkStore::open(&root, durability).expect("creates");
+            let mut store = open_store(&root, durability).expect("creates");
             store.publish(&a).expect("publishes");
             let mut count = 0;
             let mut last = None;
@@ -502,7 +550,7 @@ fn damage_falls_back_to_the_last_valid_checkpoint_and_publishing_repairs_it() {
         <[_; 3]>::try_from(checkpoints(&config, &[8, 16, 24]))
             .unwrap_or_else(|_| panic!("three checkpoints"));
     let root = fresh("damage");
-    let mut store = ChunkStore::open(&root, Durability::ProcessCrash).expect("creates");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
     store.publish(&a).expect("publishes");
     store.publish(&b).expect("publishes");
     let unique = store.chunk_path(&chunk_digest(&b, ChunkFamily::Particles));
@@ -579,7 +627,7 @@ fn damage_falls_back_to_the_last_valid_checkpoint_and_publishing_repairs_it() {
     fs::write(store.manifest_path(4), b"not a manifest").expect("writes");
     assert_eq!(latest(&store).1.len(), 2, "both newer ones skipped");
     drop(store);
-    let mut store = ChunkStore::open(&root, Durability::ProcessCrash).expect("reopens");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("reopens");
     assert_eq!(
         store.next_sequence(),
         5,
@@ -622,7 +670,7 @@ fn child_publishes_under_a_file_size_limit() {
         .find(|candidate| candidate.name() == durability)
         .expect("a durability");
     let bytes = fs::read(checkpoint).expect("the checkpoint");
-    let mut store = ChunkStore::open(root, durability).expect("opens");
+    let mut store = open_store(root, durability).expect("opens");
     let refused = store.publish(&bytes);
     let tmp = temporaries(Path::new(root));
     match refused {
@@ -660,33 +708,37 @@ fn a_write_that_fails_part_way_leaves_the_last_valid_checkpoint() {
     );
     for durability in BOTH {
         let root = fresh(&format!("limited-{}", durability.name()));
-        ChunkStore::open(&root, durability)
+        open_store(&root, durability)
             .expect("creates")
             .publish(&a)
             .expect("publishes");
         // 64 blocks: 32 KiB or 64 KiB depending on the shell's unit.
-        let output = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("trap '' XFSZ; ulimit -f 64; exec \"$0\" \"$@\"")
-            .arg(std::env::current_exe().expect("this test binary"))
-            .args([
-                "--exact",
-                "child_publishes_under_a_file_size_limit",
-                "--nocapture",
-                "--test-threads",
-                "1",
-            ])
-            .env(
-                CHILD_LIMITED,
-                format!(
-                    "{}|{}|{}",
-                    root.display(),
-                    b_path.display(),
-                    durability.name()
-                ),
-            )
-            .output()
-            .expect("runs");
+        let output = spawn(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' XFSZ; ulimit -f 64; exec \"$0\" \"$@\"")
+                .arg(std::env::current_exe().expect("this test binary"))
+                .args([
+                    "--exact",
+                    "child_publishes_under_a_file_size_limit",
+                    "--nocapture",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(
+                    CHILD_LIMITED,
+                    format!(
+                        "{}|{}|{}",
+                        root.display(),
+                        b_path.display(),
+                        durability.name()
+                    ),
+                )
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .wait_with_output()
+        .expect("runs");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let report = stdout
             .lines()
@@ -703,7 +755,7 @@ fn a_write_that_fails_part_way_leaves_the_last_valid_checkpoint() {
             "{}: {report}",
             durability.name()
         );
-        let store = ChunkStore::open(&root, durability).expect("reopens");
+        let store = open_store(&root, durability).expect("reopens");
         assert_eq!(store.swept(), 0, "nothing left to sweep");
         assert_eq!(latest(&store), (Some((1, a_world)), Vec::new()));
         println!("ok: {}: {report}", durability.name());
@@ -719,7 +771,7 @@ fn refused_storage_operations_leave_the_last_valid_checkpoint() {
         .unwrap_or_else(|_| panic!("two checkpoints"));
     for durability in BOTH {
         let root = fresh(&format!("refused-{}", durability.name()));
-        let mut store = ChunkStore::open(&root, durability).expect("creates");
+        let mut store = open_store(&root, durability).expect("creates");
         store.publish(&a).expect("publishes");
 
         // A directory where one of b's chunks goes: storing it fails.
@@ -773,7 +825,7 @@ fn retention_keeps_the_newest_valid_checkpoints_and_the_chunks_they_name() {
     let config = ecology();
     let published = checkpoints(&config, &[0, 4, 8, 12, 16, 20]);
     let root = fresh("retain");
-    let mut store = ChunkStore::open(&root, Durability::ProcessCrash).expect("creates");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
     for (bytes, _) in &published {
         store.publish(bytes).expect("publishes");
     }
@@ -830,7 +882,7 @@ fn the_reference_preset_publishes_and_recovers_at_its_scale() {
             .unwrap_or_else(|_| panic!("two checkpoints"));
     for durability in BOTH {
         let root = fresh(&format!("preset-{}", durability.name()));
-        let mut store = ChunkStore::open(&root, durability).expect("creates");
+        let mut store = open_store(&root, durability).expect("creates");
         let clock = Instant::now();
         let one = store.publish(&first).expect("publishes");
         let written = clock.elapsed();
@@ -905,8 +957,8 @@ fn streams_as_the_whole_one(durability: Durability) {
     let config = ecology();
     let streamed_root = fresh(&format!("stream-identity-{}", durability.name()));
     let whole_root = fresh(&format!("stream-identity-whole-{}", durability.name()));
-    let mut streamed = ChunkStore::open(&streamed_root, durability).expect("creates");
-    let mut whole = ChunkStore::open(&whole_root, durability).expect("creates");
+    let mut streamed = open_store(&streamed_root, durability).expect("creates");
+    let mut whole = open_store(&whole_root, durability).expect("creates");
     for (round, tick) in [0_u64, 8, 16].into_iter().enumerate() {
         let (world, book) = world_at(&config, tick);
         let bytes = checkpoint(&world, &book).expect("checkpoints");
@@ -967,7 +1019,7 @@ fn cancellation_at_every_streamed_step_leaves_the_store_as_it_was() {
         let mut cancelled = 0;
         for stop in 0.. {
             let root = fresh(&format!("stream-cancel-{}", durability.name()));
-            let mut store = ChunkStore::open(&root, durability).expect("creates");
+            let mut store = open_store(&root, durability).expect("creates");
             store.publish(&a).expect("publishes");
             let last = std::sync::Arc::new(std::sync::Mutex::new(None));
             let seen = std::sync::Arc::clone(&last);
@@ -1036,7 +1088,7 @@ fn child_streams_until_its_planned_crash() {
         .find(|candidate| candidate.name() == durability)
         .expect("a durability");
     let (world, book) = world_at(&ecology(), 16);
-    let mut store = ChunkStore::open(root, durability).expect("opens");
+    let mut store = open_store(root, durability).expect("opens");
     let mut count = 0;
     stream_into(
         &mut store,
@@ -1074,7 +1126,7 @@ fn a_crash_at_every_streamed_step_leaves_the_last_valid_checkpoint() {
         let mut expected = Vec::new();
         {
             let root = fresh(&format!("stream-crash-steps-{}", durability.name()));
-            let mut store = ChunkStore::open(&root, durability).expect("creates");
+            let mut store = open_store(&root, durability).expect("creates");
             store.publish(&a).expect("publishes");
             let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let seen = std::sync::Arc::clone(&steps);
@@ -1093,14 +1145,14 @@ fn a_crash_at_every_streamed_step_leaves_the_last_valid_checkpoint() {
         let mut killed = Vec::new();
         for stop in 0.. {
             let root = fresh(&format!("stream-crash-{}", durability.name()));
-            ChunkStore::open(&root, durability)
+            open_store(&root, durability)
                 .expect("creates")
                 .publish(&a)
                 .expect("publishes");
             let Some(step) = stream_crash_at(&root, stop, durability) else {
                 break;
             };
-            let mut store = ChunkStore::open(&root, durability).expect("reopens after a kill");
+            let mut store = open_store(&root, durability).expect("reopens after a kill");
             assert_eq!(temporaries(&root), 0, "{step}: temporaries swept");
             let (recovered, skipped) = latest(&store);
             assert!(skipped.is_empty(), "{step}: {skipped:?}");
@@ -1136,22 +1188,22 @@ fn a_crash_at_every_streamed_step_leaves_the_last_valid_checkpoint() {
 fn stream_crash_at(root: &Path, stop: usize, durability: Durability) -> Option<String> {
     let stderr_path = root.with_extension("stderr");
     let stderr = fs::File::create(&stderr_path).expect("creates the child's stderr file");
-    let mut child = Command::new(std::env::current_exe().expect("this test binary"))
-        .args([
-            "--exact",
-            "child_streams_until_its_planned_crash",
-            "--nocapture",
-            "--test-threads",
-            "1",
-        ])
-        .env(
-            STREAM_CHILD,
-            format!("{}|{stop}|{}", root.display(), durability.name()),
-        )
-        .stdout(Stdio::piped())
-        .stderr(stderr)
-        .spawn()
-        .expect("spawns");
+    let mut child = spawn(
+        Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--exact",
+                "child_streams_until_its_planned_crash",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env(
+                STREAM_CHILD,
+                format!("{}|{stop}|{}", root.display(), durability.name()),
+            )
+            .stdout(Stdio::piped())
+            .stderr(stderr),
+    );
     let stdout = child.stdout.take().expect("a pipe");
     for line in BufReader::new(stdout).lines() {
         let line = line.expect("a line");
@@ -1185,8 +1237,8 @@ fn a_commit_refuses_what_its_stream_did_not_store() {
     let (b_world, b_book) = world_at(&config, 16);
     let root = fresh("stream-refusals");
     let other_root = fresh("stream-refusals-other");
-    let mut store = ChunkStore::open(&root, Durability::ProcessCrash).expect("creates");
-    let mut other = ChunkStore::open(&other_root, Durability::ProcessCrash).expect("creates");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
+    let mut other = open_store(&other_root, Durability::ProcessCrash).expect("creates");
 
     // Another checkpoint's sealed prefix.
     let mut stream = store.stream().expect("streams");
@@ -1296,7 +1348,7 @@ fn retention_by_verification_decides_as_retention_by_restoring() {
     let published = checkpoints(&config, &[0, 4, 8, 12, 16, 20]);
     let make = |name: &str| {
         let root = fresh(name);
-        let mut store = ChunkStore::open(&root, Durability::ProcessCrash).expect("creates");
+        let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
         for (bytes, _) in &published {
             store.publish(bytes).expect("publishes");
         }

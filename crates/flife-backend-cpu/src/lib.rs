@@ -27,34 +27,51 @@
 //! before returning. So the controllers of a tick use at most `lanes` threads,
 //! and the composition root gives it the world's `cpu_workers`.
 //!
-//! **Residency.** A genome's parameters are packed once, each layer's weights
-//! transposed to `[inputs][outputs]` (the kernel's `[B, I, O]` with `B = 1`),
-//! and kept while the genome is in every batch. A batch drops the packed sets
-//! of genomes it did not contain, so memory follows the live population. As
-//! [`flife_neural::ControllerJob`] requires, a resident set is reused only for
-//! the same memory: the parameters' address and length.
+//! **Residency** (FL-026, plan §9.2). Each catalog member's genomes are
+//! packed into that topology's slabs, at their arena slots
+//! ([`flife_neural::ArenaSlot`]): fixed-size slots, [`SHARD_SLOTS`] to a
+//! shard ([`flife_neural::ShardGeometry`]), each layer's weights transposed
+//! to `[inputs][outputs]` (the kernel's `[B, I, O]` with `B = 1`). A genome
+//! is packed once, the first time it is due, and kept until a later
+//! occupant of its slot (a higher generation) is packed in its place. A
+//! batch never drops what it does not contain, so a genome that is due only
+//! every K ticks is not packed again each time it is. The slabs follow each
+//! topology's peak live count, in whole slots, and a shard's capacity is
+//! reserved when it is made, so growing it never moves packed values. A
+//! resident slot is used only for the same generation and genome.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::num::NonZeroUsize;
 
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
 use flife_core::numerics::tanh;
-use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH};
+use flife_neural::{
+    ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH, ShardGeometry,
+};
 use ft_kernel_cpu::population_affine_f32_into;
 
 /// The fewest jobs worth handing to another thread, as for the engine's own
 /// decision lanes.
 pub const MINIMUM_JOBS_PER_LANE: usize = 128;
 
+/// Slots per packed shard, unless [`CpuBackend::with_shard_slots`] says
+/// otherwise: 10 MB of the preset's 9,988-parameter topology.
+pub const SHARD_SLOTS: u64 = 256;
+
+/// The most F32s one shard holds (1 GiB); a larger topology takes fewer
+/// slots to a shard.
+pub const MAXIMUM_SHARD_ELEMENTS: u64 = 1 << 28;
+
 // The evaluation below is written out for zero, one or two hidden layers.
 const _: () = assert!(MAXIMUM_HIDDEN_LAYERS == 2);
 
-/// One layer of a packed parameter set: offsets into [`Packed::values`].
-#[derive(Debug, Clone, Copy)]
+/// One layer of a packed slot: offsets from the slot's first element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Layer {
     inputs: usize,
     outputs: usize,
@@ -83,141 +100,123 @@ impl Layer {
     }
 }
 
-/// A genome's parameters, packed for the kernel.
-#[derive(Debug)]
-struct Packed {
-    /// The parameters it was packed from: their address and length.
-    address: usize,
-    length: usize,
-    /// The batch that last contained it.
-    batch: u64,
-    layers: Vec<Layer>,
-    values: Vec<f32>,
-}
-
-impl Packed {
-    /// The layers of `topology` over `length` parameters, or `None` for a
-    /// shape this backend does not take.
-    fn shape(topology: &DenseTopology, length: usize) -> Option<Vec<Layer>> {
-        let layers = topology.layers();
-        let (last, _) = layers.split_last()?;
-        if layers.len() > MAXIMUM_HIDDEN_LAYERS + 1 || last.outputs != ACTION_WIDTH {
+/// The layers of `topology` over `length` parameters, or `None` for a shape
+/// this backend does not take.
+fn shape(topology: &DenseTopology, length: usize) -> Option<Vec<Layer>> {
+    let layers = topology.layers();
+    let (last, _) = layers.split_last()?;
+    if layers.len() > MAXIMUM_HIDDEN_LAYERS + 1 || last.outputs != ACTION_WIDTH {
+        return None;
+    }
+    let mut fan_in = SENSOR_WIDTH;
+    let mut packed = Vec::new();
+    let mut offset = 0;
+    for layer in layers {
+        let weights = layer.inputs.checked_mul(layer.outputs)?;
+        let in_bounds = layer.weights.checked_add(weights) == Some(layer.biases)
+            && layer.biases.checked_add(layer.outputs)? <= length;
+        if layer.inputs != fan_in || layer.inputs == 0 || layer.outputs == 0 || !in_bounds {
             return None;
         }
-        let mut fan_in = SENSOR_WIDTH;
-        let mut packed = Vec::new();
-        let mut offset = 0;
-        for layer in layers {
-            let weights = layer.inputs.checked_mul(layer.outputs)?;
-            let in_bounds = layer.weights.checked_add(weights) == Some(layer.biases)
-                && layer.biases.checked_add(layer.outputs)? <= length;
-            if layer.inputs != fan_in || layer.inputs == 0 || layer.outputs == 0 || !in_bounds {
-                return None;
-            }
-            packed.push(Layer {
-                inputs: layer.inputs,
-                outputs: layer.outputs,
-                weights: offset,
-                biases: offset + weights,
-            });
-            offset += weights + layer.outputs;
-            fan_in = layer.outputs;
-        }
-        (offset == length).then_some(packed)
+        packed.push(Layer {
+            inputs: layer.inputs,
+            outputs: layer.outputs,
+            weights: offset,
+            biases: offset + weights,
+        });
+        offset += weights + layer.outputs;
+        fan_in = layer.outputs;
     }
+    (offset == length).then_some(packed)
+}
 
-    /// Pack `parameters` (`weight[out][in]` then `bias[out]`, layer by layer)
-    /// into `layers`' order.
-    fn pack(
-        address: usize,
-        parameters: &[f32],
-        topology: &DenseTopology,
-        layers: Vec<Layer>,
-        batch: u64,
-    ) -> Result<Self, CoreError> {
-        let mut values = Vec::new();
-        reserve(&mut values, parameters.len(), "cpu controller parameters")?;
-        for (source, layer) in topology.layers().iter().zip(&layers) {
-            let weights = parameters.get(source.weights..source.biases);
-            let biases = parameters.get(source.biases..source.biases + layer.outputs);
-            let (Some(weights), Some(biases)) = (weights, biases) else {
-                return Err(CoreError::LayoutMismatch {
-                    buffer: "controller parameters",
-                    detail: format!("a layer outside {} parameters", parameters.len()),
-                });
-            };
-            // Input `i`'s column, `weight[0][i], weight[1][i], …`, becomes
-            // the packed row `i`.
-            for input in 0..layer.inputs {
-                values.extend(weights.iter().skip(input).step_by(layer.inputs));
-            }
-            values.extend_from_slice(biases);
-        }
-        Ok(Self {
-            address,
-            length: parameters.len(),
-            batch,
-            layers,
-            values,
-        })
-    }
-
-    /// The widest hidden layer.
-    fn widest_hidden(&self) -> usize {
-        self.layers.split_last().map_or(0, |(_, hidden)| {
-            hidden.iter().map(|layer| layer.outputs).max().unwrap_or(0)
-        })
-    }
-
-    /// One organism's 36 raw outputs, or `None` where the reference would
-    /// refuse it.
-    fn evaluate(
-        &self,
-        inputs: &[f64; SENSOR_WIDTH],
-        scratch: &mut Scratch,
-    ) -> Result<Option<[f32; ACTION_WIDTH]>, CoreError> {
-        let mut rounded = [0.0_f32; SENSOR_WIDTH];
-        for (slot, &value) in rounded.iter_mut().zip(inputs) {
-            // Rounding each input once to F32 is the declared arithmetic.
-            *slot = value as f32;
-            if !slot.is_finite() {
-                return Ok(None);
+/// Pack `parameters` (`weight[out][in]` then `bias[out]`, layer by layer)
+/// into `out`, in `layers`' order.
+fn pack(
+    parameters: &[f32],
+    topology: &DenseTopology,
+    layers: &[Layer],
+    out: &mut [f32],
+) -> Result<(), CoreError> {
+    let outside = || CoreError::LayoutMismatch {
+        buffer: "controller parameters",
+        detail: format!("a layer outside {} parameters", parameters.len()),
+    };
+    for (source, layer) in topology.layers().iter().zip(layers) {
+        let weights = parameters
+            .get(source.weights..source.biases)
+            .ok_or_else(outside)?;
+        let biases = parameters
+            .get(source.biases..source.biases + layer.outputs)
+            .ok_or_else(outside)?;
+        let packed = out
+            .get_mut(layer.weights..layer.biases + layer.outputs)
+            .ok_or_else(outside)?;
+        let (packed_weights, packed_biases) = packed.split_at_mut(layer.inputs * layer.outputs);
+        // Input `i`'s column, `weight[0][i], weight[1][i], …`, becomes the
+        // packed row `i`.
+        for (input, row) in packed_weights.chunks_exact_mut(layer.outputs).enumerate() {
+            for (slot, &value) in row
+                .iter_mut()
+                .zip(weights.iter().skip(input).step_by(layer.inputs))
+            {
+                *slot = value;
             }
         }
-        let mut raw = [0.0_f32; ACTION_WIDTH];
-        let Some((output, hidden)) = self.layers.split_last() else {
+        packed_biases.copy_from_slice(biases);
+    }
+    Ok(())
+}
+
+/// One organism's 36 raw outputs from its packed slot, or `None` where the
+/// reference would refuse it.
+fn evaluate(
+    layers: &[Layer],
+    values: &[f32],
+    inputs: &[f64; SENSOR_WIDTH],
+    scratch: &mut Scratch,
+) -> Result<Option<[f32; ACTION_WIDTH]>, CoreError> {
+    let mut rounded = [0.0_f32; SENSOR_WIDTH];
+    for (slot, &value) in rounded.iter_mut().zip(inputs) {
+        // Rounding each input once to F32 is the declared arithmetic.
+        *slot = value as f32;
+        if !slot.is_finite() {
             return Ok(None);
-        };
-        let Scratch { first, second } = scratch;
-        let activated = match hidden {
-            [] => {
-                output.apply(&self.values, &rounded, &mut raw)?;
+        }
+    }
+    let mut raw = [0.0_f32; ACTION_WIDTH];
+    let Some((output, hidden)) = layers.split_last() else {
+        return Ok(None);
+    };
+    let Scratch { first, second } = scratch;
+    let activated = match hidden {
+        [] => {
+            output.apply(values, &rounded, &mut raw)?;
+            true
+        }
+        [one] => {
+            let first = &mut first[..one.outputs];
+            one.apply(values, &rounded, first)?;
+            activate(first) && {
+                output.apply(values, first, &mut raw)?;
                 true
             }
-            [one] => {
-                let first = &mut first[..one.outputs];
-                one.apply(&self.values, &rounded, first)?;
-                activate(first) && {
-                    output.apply(&self.values, first, &mut raw)?;
+        }
+        [one, two] => {
+            let first = &mut first[..one.outputs];
+            let second = &mut second[..two.outputs];
+            one.apply(values, &rounded, first)?;
+            activate(first) && {
+                two.apply(values, first, second)?;
+                activate(second) && {
+                    output.apply(values, second, &mut raw)?;
                     true
                 }
             }
-            [one, two] => {
-                let first = &mut first[..one.outputs];
-                let second = &mut second[..two.outputs];
-                one.apply(&self.values, &rounded, first)?;
-                activate(first) && {
-                    two.apply(&self.values, first, second)?;
-                    activate(second) && {
-                        output.apply(&self.values, second, &mut raw)?;
-                        true
-                    }
-                }
-            }
-            _ => false,
-        };
-        Ok((activated && raw.iter().all(|value| value.is_finite())).then_some(raw))
-    }
+        }
+        _ => false,
+    };
+    Ok((activated && raw.iter().all(|value| value.is_finite())).then_some(raw))
 }
 
 /// The reference's hidden activation in place: `tanh` of each F32
@@ -252,29 +251,146 @@ impl Scratch {
     }
 }
 
+/// One shard of a topology's packed slots.
+#[derive(Debug, Default)]
+struct Shard {
+    /// The shard's slots back to back. Its capacity is the whole shard,
+    /// reserved when it is made, and it grows a slot at a time within it.
+    values: Vec<f32>,
+    /// Each slot's packed occupant, its generation and genome, or `None`
+    /// before its first.
+    occupants: Vec<Option<(u32, GenomeId)>>,
+}
+
+/// One catalog member's packed slots, in shards.
+#[derive(Debug)]
+struct Packing {
+    layers: Vec<Layer>,
+    widest: usize,
+    geometry: ShardGeometry,
+    shards: HashMap<u64, Shard>,
+}
+
+impl Packing {
+    /// The packed values of `job`'s slot, if they are its generation's and
+    /// genome's.
+    fn resident(&self, job: &ControllerJob<'_>) -> Option<&[f32]> {
+        let at = self.geometry.locate(job.slot.slot());
+        let shard = self.shards.get(&at.shard)?;
+        let local = usize::try_from(at.slot_in_shard).ok()?;
+        let occupant = shard.occupants.get(local).copied().flatten()?;
+        if occupant != (job.slot.generation(), job.genome) {
+            return None;
+        }
+        let offset = usize::try_from(at.offset).ok()?;
+        let length = usize::try_from(at.length).ok()?;
+        shard.values.get(offset..offset.checked_add(length)?)
+    }
+
+    /// Pack `job`'s parameters into its slot, in place of any earlier
+    /// occupant's, unless they are resident. Whether it packed them.
+    fn place(&mut self, job: &ControllerJob<'_>) -> Result<bool, CoreError> {
+        if self.resident(job).is_some() {
+            return Ok(false);
+        }
+        let too_large = |quantity: &'static str| CoreError::Overflow { quantity };
+        let at = self.geometry.locate(job.slot.slot());
+        let local = usize::try_from(at.slot_in_shard).map_err(|_| too_large("arena slot"))?;
+        let offset = usize::try_from(at.offset).map_err(|_| too_large("arena offset"))?;
+        let length = usize::try_from(at.length).map_err(|_| too_large("arena slot length"))?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| too_large("arena offset"))?;
+        let shard_elements = usize::try_from(self.geometry.shard_elements())
+            .map_err(|_| too_large("arena shard elements"))?;
+        let shard = match self.shards.entry(at.shard) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let mut shard = Shard::default();
+                shard
+                    .values
+                    .try_reserve_exact(shard_elements)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "cpu controller shard",
+                        bytes: self.geometry.shard_elements().saturating_mul(4),
+                    })?;
+                entry.insert(shard)
+            }
+        };
+        if shard.values.len() < end {
+            shard.values.resize(end, 0.0);
+        }
+        if shard.occupants.len() <= local {
+            let more = local + 1 - shard.occupants.len();
+            reserve(&mut shard.occupants, more, "cpu controller slots")?;
+            shard.occupants.resize(local + 1, None);
+        }
+        // The old occupant is gone before anything of the new one is
+        // written, so a failure leaves the slot empty, never mixed.
+        shard.occupants[local] = None;
+        pack(
+            job.controller.parameters(),
+            job.controller.topology(),
+            &self.layers,
+            &mut shard.values[offset..end],
+        )?;
+        shard.occupants[local] = Some((job.slot.generation(), job.genome));
+        Ok(true)
+    }
+}
+
+/// One catalog member, as this backend first saw it.
+#[derive(Debug)]
+struct Bucket {
+    topology: DenseTopology,
+    /// `None` for a shape this backend does not take: its jobs are
+    /// deferred.
+    packing: Option<Packing>,
+}
+
+impl Bucket {
+    /// The packing that serves `job`, if its topology is this bucket's and
+    /// its shape one this backend takes.
+    fn serving(&self, job: &ControllerJob<'_>) -> Option<&Packing> {
+        let packing = self.packing.as_ref()?;
+        let length = job.controller.parameters().len() as u64;
+        (*job.controller.topology() == self.topology && length == packing.geometry.parameters())
+            .then_some(packing)
+    }
+}
+
 /// The CPU controller backend: FrankenTorch's serial population kernel on at
 /// most `lanes` threads.
 #[derive(Debug)]
 pub struct CpuBackend {
     lanes: NonZeroUsize,
-    batch: u64,
-    packed: HashMap<GenomeId, Packed>,
+    shard_slots: u64,
+    buckets: Vec<Option<Bucket>>,
     scratch: Vec<Scratch>,
     /// The threads the last batch ran on.
     used: usize,
+    packs: u64,
 }
 
 impl CpuBackend {
     /// A backend evaluating on at most `lanes` threads, the calling one
     /// included. Give it the world's `cpu_workers`.
     #[must_use]
-    pub fn new(lanes: NonZeroUsize) -> Self {
+    pub const fn new(lanes: NonZeroUsize) -> Self {
+        Self::with_shard_slots(lanes, SHARD_SLOTS)
+    }
+
+    /// As [`CpuBackend::new`], with at most `shard_slots` slots to a shard
+    /// (at least one).
+    #[must_use]
+    pub const fn with_shard_slots(lanes: NonZeroUsize, shard_slots: u64) -> Self {
         Self {
             lanes,
-            batch: 0,
-            packed: HashMap::new(),
+            shard_slots: if shard_slots == 0 { 1 } else { shard_slots },
+            buckets: Vec::new(),
             scratch: Vec::new(),
             used: 0,
+            packs: 0,
         }
     }
 
@@ -292,59 +408,104 @@ impl CpuBackend {
         self.used
     }
 
-    /// How many genomes' parameters are packed and resident.
+    /// Slots holding a packed genome. A dead genome's slot stays packed
+    /// until a newborn takes it, so this follows each topology's peak live
+    /// count, not the batch.
     #[must_use]
     pub fn resident(&self) -> usize {
-        self.packed.len()
+        self.buckets
+            .iter()
+            .flatten()
+            .filter_map(|bucket| bucket.packing.as_ref())
+            .flat_map(|packing| packing.shards.values())
+            .map(|shard| shard.occupants.iter().flatten().count())
+            .sum()
     }
 
-    /// Pack every job's parameters that is not resident, drop those no job
-    /// uses, and give the widest hidden layer among them.
+    /// Shards across every topology.
+    #[must_use]
+    pub fn shards(&self) -> usize {
+        self.buckets
+            .iter()
+            .flatten()
+            .filter_map(|bucket| bucket.packing.as_ref())
+            .map(|packing| packing.shards.len())
+            .sum()
+    }
+
+    /// Genomes packed since the backend was made or last forgot: once per
+    /// genome while it lives, however often it is due.
+    #[must_use]
+    pub const fn packs(&self) -> u64 {
+        self.packs
+    }
+
+    /// Pack every job's parameters that are not resident, and give the
+    /// widest hidden layer among them.
     fn place(&mut self, jobs: &[ControllerJob<'_>]) -> Result<usize, CoreError> {
-        self.batch += 1;
-        let batch = self.batch;
         let mut widest = 0;
         for job in jobs {
-            let parameters = job.controller.parameters();
-            let address = parameters.as_ptr().addr();
-            let resident = self
-                .packed
-                .get_mut(&job.genome)
-                .filter(|packed| packed.address == address && packed.length == parameters.len());
-            if let Some(packed) = resident {
-                packed.batch = batch;
-                widest = widest.max(packed.widest_hidden());
-                continue;
-            }
-            let topology = job.controller.topology();
-            let Some(layers) = Packed::shape(topology, parameters.len()) else {
-                self.packed.remove(&job.genome);
+            let Ok(index) = usize::try_from(job.slot.topology()) else {
                 continue;
             };
-            let packed = Packed::pack(address, parameters, topology, layers, batch)?;
-            widest = widest.max(packed.widest_hidden());
-            self.packed.insert(job.genome, packed);
+            if self.buckets.len() <= index {
+                let more = index + 1 - self.buckets.len();
+                reserve(&mut self.buckets, more, "cpu controller buckets")?;
+                self.buckets.resize_with(index + 1, || None);
+            }
+            let topology = job.controller.topology();
+            let length = job.controller.parameters().len();
+            let bucket = self.buckets[index].get_or_insert_with(|| Bucket {
+                topology: topology.clone(),
+                packing: shape(topology, length).and_then(|layers| {
+                    let geometry = ShardGeometry::fitting(
+                        length as u64,
+                        MAXIMUM_SHARD_ELEMENTS,
+                        self.shard_slots,
+                    )
+                    .ok()?;
+                    let widest = layers.split_last().map_or(0, |(_, hidden)| {
+                        hidden.iter().map(|layer| layer.outputs).max().unwrap_or(0)
+                    });
+                    Some(Packing {
+                        layers,
+                        widest,
+                        geometry,
+                        shards: HashMap::new(),
+                    })
+                }),
+            });
+            if bucket.serving(job).is_none() {
+                continue;
+            }
+            let Some(packing) = bucket.packing.as_mut() else {
+                continue;
+            };
+            if packing.place(job)? {
+                self.packs += 1;
+            }
+            widest = widest.max(packing.widest);
         }
-        self.packed.retain(|_, packed| packed.batch == batch);
         Ok(widest)
     }
 }
 
 /// Evaluate a run of jobs into its outputs.
 fn run(
-    packed: &HashMap<GenomeId, Packed>,
+    buckets: &[Option<Bucket>],
     jobs: &[ControllerJob<'_>],
     outputs: &mut [Option<[f32; ACTION_WIDTH]>],
     scratch: &mut Scratch,
 ) -> Result<(), CoreError> {
     for (job, output) in jobs.iter().zip(outputs) {
-        let parameters = job.controller.parameters();
-        let address = parameters.as_ptr().addr();
-        *output = match packed.get(&job.genome) {
-            Some(set) if set.address == address && set.length == parameters.len() => {
-                set.evaluate(job.inputs, scratch)?
-            }
-            _ => None,
+        let packing = usize::try_from(job.slot.topology())
+            .ok()
+            .and_then(|index| buckets.get(index))
+            .and_then(Option::as_ref)
+            .and_then(|bucket| bucket.serving(job));
+        *output = match packing.and_then(|packing| Some((packing, packing.resident(job)?))) {
+            Some((packing, values)) => evaluate(&packing.layers, values, job.inputs, scratch)?,
+            None => None,
         };
     }
     Ok(())
@@ -359,7 +520,8 @@ impl ControllerBackend for CpuBackend {
     }
 
     fn forget(&mut self) {
-        self.packed.clear();
+        self.buckets.clear();
+        self.packs = 0;
     }
 
     fn evaluate(
@@ -387,7 +549,7 @@ impl ControllerBackend for CpuBackend {
         for scratch in &mut self.scratch[..lanes] {
             scratch.hold(widest)?;
         }
-        let packed = &self.packed;
+        let buckets = &self.buckets;
         let length = jobs.len().div_ceil(lanes);
         let mut runs = jobs
             .chunks(length)
@@ -398,16 +560,16 @@ impl ControllerBackend for CpuBackend {
         };
         if lanes == 1 {
             self.used = 1;
-            return run(packed, head_jobs, head_outputs, head_scratch);
+            return run(buckets, head_jobs, head_outputs, head_scratch);
         }
         let (result, used) = std::thread::scope(|scope| {
             let workers: Vec<_> = runs
                 .map(|((jobs, outputs), scratch)| {
-                    scope.spawn(move || run(packed, jobs, outputs, scratch))
+                    scope.spawn(move || run(buckets, jobs, outputs, scratch))
                 })
                 .collect();
             let used = 1 + workers.len();
-            let mut result = run(packed, head_jobs, head_outputs, head_scratch);
+            let mut result = run(buckets, head_jobs, head_outputs, head_scratch);
             for worker in workers {
                 let joined = worker.join().unwrap_or_else(|_| {
                     Err(CoreError::StateConflict {

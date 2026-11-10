@@ -1,7 +1,7 @@
 //! The CPU backend against the reference controller, organism by organism
 //! and bit for bit, over every catalog topology in one mixed batch, on one
-//! lane and on several; residency; and the executor: it needs no rayon
-//! worker.
+//! lane and on several, in shards of any size and at slots far past 32 bits;
+//! residency by arena slot; and the executor: it needs no rayon worker.
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Barrier, mpsc};
@@ -11,7 +11,7 @@ use flife_backend_cpu::{CpuBackend, MINIMUM_JOBS_PER_LANE};
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_neural::{
-    ACTION_WIDTH, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
+    ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
     ReferenceController, SENSOR_WIDTH,
 };
 use rayon::prelude::*;
@@ -148,16 +148,31 @@ fn cases(count: usize, seed: u64) -> Vec<Case> {
         .collect()
 }
 
+fn jobs<'a>(topologies: &'a [DenseTopology], cases: &'a [Case]) -> Vec<ControllerJob<'a>> {
+    jobs_from(topologies, cases, 0)
+}
+
+/// As [`jobs`], each topology's slots numbered from `first` in case order.
 #[expect(
     clippy::expect_used,
     reason = "test helper: a failure is a test failure"
 )]
-fn jobs<'a>(topologies: &'a [DenseTopology], cases: &'a [Case]) -> Vec<ControllerJob<'a>> {
+fn jobs_from<'a>(
+    topologies: &'a [DenseTopology],
+    cases: &'a [Case],
+    first: u64,
+) -> Vec<ControllerJob<'a>> {
+    let mut next = [first; TOPOLOGIES.len()];
     cases
         .iter()
         .enumerate()
         .map(|(index, case)| ControllerJob {
             genome: GenomeId::new(index as u64 + 1),
+            slot: {
+                let slot = next[case.topology];
+                next[case.topology] += 1;
+                ArenaSlot::new(case.topology as u32, slot, 1)
+            },
             controller: ReferenceController::new(
                 &topologies[case.topology],
                 &case.parameters,
@@ -244,62 +259,99 @@ fn every_topology_matches_the_reference_bit_for_bit_on_one_lane_and_on_many()
         many.evaluate(&jobs, &mut split)?;
         assert_eq!(bits(&split), bits(&outputs), "{count} lanes");
     }
+
+    // In shards of one, two or three slots, and with every slot far past
+    // 32 bits, they are the same bits too.
+    for slots in [1, 2, 3] {
+        let mut sharded = CpuBackend::with_shard_slots(lanes(4), slots);
+        let mut split = Vec::new();
+        sharded.evaluate(&jobs, &mut split)?;
+        assert_eq!(bits(&split), bits(&outputs), "{slots} slots to a shard");
+        assert!(sharded.shards() * slots as usize >= cases.len());
+    }
+    for first in [u64::from(u32::MAX) - 7, 1 << 40] {
+        let far = jobs_from(&topologies, &cases, first);
+        let mut backend = CpuBackend::new(lanes(4));
+        let mut split = Vec::new();
+        backend.evaluate(&far, &mut split)?;
+        assert_eq!(bits(&split), bits(&outputs), "slots from {first}");
+    }
     Ok(())
 }
 
+/// A genome's parameters are packed once while it lives, whatever the
+/// batches between; a later occupant of its slot is packed in its place; a
+/// job is evaluated only from its own generation's and genome's parameters,
+/// and its topology's.
 #[test]
-fn resident_parameters_follow_the_batch_and_are_reused_only_for_the_same_memory()
--> Result<(), CoreError> {
+fn a_genome_is_packed_once_and_a_later_occupant_takes_its_place() -> Result<(), CoreError> {
     let topologies = topologies();
     let cases = cases(300, 7);
     let jobs = jobs(&topologies, &cases);
     let mut backend = CpuBackend::new(lanes(1));
     let mut outputs = Vec::new();
     backend.evaluate(&jobs, &mut outputs)?;
-    assert_eq!(backend.resident(), cases.len());
+    assert_eq!((backend.resident(), backend.packs()), (300, 300));
     let first = bits(&outputs);
 
-    // A batch of the first 100 drops the other 200, and evaluates the same.
+    // Batches of a few: nothing is packed again and nothing is dropped, so a
+    // genome due only now and then is not packed each time it is.
     backend.evaluate(&jobs[..100], &mut outputs)?;
-    assert_eq!(backend.resident(), 100);
     assert_eq!(bits(&outputs), first[..100].to_vec());
+    backend.evaluate(&jobs[200..], &mut outputs)?;
+    assert_eq!(bits(&outputs), first[200..].to_vec());
+    backend.evaluate(&jobs, &mut outputs)?;
+    assert_eq!(bits(&outputs), first);
+    assert_eq!((backend.resident(), backend.packs()), (300, 300));
 
-    // Genome 1 now names other memory with other values: the backend packs
-    // it again and gives the new reference's outputs, not the old ones.
+    // Genome 1's slot at the next generation: another genome, with other
+    // values, packed in its place. It gets its own reference's outputs.
     let mut moved = cases[0].parameters.clone();
     for value in &mut moved {
         *value = -*value;
     }
-    let mut changed = jobs[..100].to_vec();
-    changed[0].controller =
-        ReferenceController::new(&topologies[cases[0].topology], &moved, BOUND)?;
+    let topology = &topologies[cases[0].topology];
+    let mut changed = jobs.clone();
+    changed[0].genome = GenomeId::new(1_000);
+    changed[0].slot = ArenaSlot::new(jobs[0].slot.topology(), jobs[0].slot.slot(), 2);
+    changed[0].controller = ReferenceController::new(topology, &moved, BOUND)?;
     backend.evaluate(&changed, &mut outputs)?;
-    let mut scratch = ControllerScratch::new(&topologies[cases[0].topology])?;
+    let mut scratch = ControllerScratch::new(topology)?;
     let want = changed[0]
         .controller
-        .evaluate(&cases[0].inputs, &mut scratch);
-    assert_eq!(
-        outputs[0].map(|raw| raw.map(f32::to_bits)),
-        want.ok().map(|raw| raw.map(f32::to_bits))
-    );
+        .evaluate(&cases[0].inputs, &mut scratch)
+        .ok()
+        .map(|raw| raw.map(f32::to_bits));
+    assert_eq!(outputs[0].map(|raw| raw.map(f32::to_bits)), want);
     assert_ne!(bits(&outputs)[0], first[0]);
-    assert_eq!(bits(&outputs)[1..], first[1..100]);
+    assert_eq!(bits(&outputs)[1..], first[1..]);
+    assert_eq!((backend.resident(), backend.packs()), (300, 301));
 
-    // One batch naming genome 1 with both memories: each job gets its own
-    // memory's outputs or is deferred, never the other memory's. The last
-    // one packed is evaluated.
+    // One batch naming the slot at both generations: the slot holds the last
+    // one packed, and the other is deferred, never given its outputs.
     let both = [changed[0], jobs[0]];
     backend.evaluate(&both, &mut outputs)?;
-    for (job, got) in both.iter().zip(&outputs) {
-        if let Some(got) = got {
-            let want = job.controller.evaluate(job.inputs, &mut scratch)?;
-            assert_eq!(got.map(f32::to_bits), want.map(f32::to_bits));
-        }
-    }
+    assert_eq!(outputs[0], None);
     assert_eq!(bits(&outputs)[1], first[0]);
 
+    // The same slot and generation with another genome is another occupant.
+    let mut renamed = changed[0];
+    renamed.slot = jobs[0].slot;
+    backend.evaluate(&[renamed], &mut outputs)?;
+    assert_eq!(outputs[0].map(|raw| raw.map(f32::to_bits)), want);
+
+    // A job naming a bucket made for another topology is deferred.
+    let other = cases
+        .iter()
+        .position(|case| case.topology != cases[0].topology)
+        .expect("two topologies");
+    let mut misfiled = jobs[other];
+    misfiled.slot = ArenaSlot::new(jobs[0].slot.topology(), 999, 1);
+    backend.evaluate(&[misfiled], &mut outputs)?;
+    assert_eq!(outputs, [None]);
+
     backend.forget();
-    assert_eq!(backend.resident(), 0);
+    assert_eq!((backend.resident(), backend.packs()), (0, 0));
     backend.evaluate(&[], &mut outputs)?;
     assert!(outputs.is_empty());
     Ok(())

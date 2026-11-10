@@ -1253,6 +1253,98 @@ fn reused_slots_carry_no_stale_controller_state() {
     assert_ne!(compact.slots(), free.slots());
 }
 
+/// FL-026: every live genome holds an arena slot of its topology. A death
+/// frees it and a newborn in the same commit takes it at the next
+/// generation, so the old name is stale; a survivor keeps its slot when the
+/// compact arrangement moves it; the slots are the same under both
+/// arrangements.
+#[test]
+fn genomes_hold_arena_slots_that_newborns_reuse_at_the_next_generation() {
+    let world = World::new();
+    let topology = world.catalog.default_topology();
+    let mut held_by = Vec::new();
+    for arrangement in [Arrangement::FreeList, Arrangement::Compact] {
+        let mut genomes = quota();
+        let mut population = population(arrangement, 8);
+        let mut founders: Vec<Entrant> = (1..=3)
+            .map(|id| world.founder(id, 2.0, &mut genomes))
+            .collect();
+        population.admit(&mut founders).expect("founders");
+        let slot = |population: &Population, id: u64| {
+            population
+                .arena_slot(OrganismId::new(id))
+                .expect("a live genome's slot")
+        };
+        for (id, index) in [(1, 0), (2, 1), (3, 2)] {
+            let held = slot(&population, id);
+            assert_eq!(
+                (held.topology() as usize, held.slot(), held.generation()),
+                (topology.index(), index, 1),
+                "{arrangement:?}: founder {id}"
+            );
+        }
+        let two = alive(&population, 2);
+        let old = slot(&population, 2);
+        let three = slot(&population, 3);
+        let one = alive(&population, 1);
+        let mut births = vec![world.child(10, &one, 5, 0.5, &mut genomes)];
+        population
+            .commit(Tick::new(5), &[exhausted(&two, 5)], &mut births)
+            .expect("commit");
+        let newborn = slot(&population, 10);
+        assert_eq!(
+            (newborn.slot(), newborn.generation()),
+            (1, 2),
+            "{arrangement:?}"
+        );
+        assert!(
+            !population.arena().is_live(old),
+            "the dead genome's name is stale"
+        );
+        assert!(population.arena().is_live(newborn));
+        assert_eq!(population.arena_slot(two.id), None);
+        assert_eq!(
+            slot(&population, 3),
+            three,
+            "{arrangement:?}: 3 keeps its slot"
+        );
+        assert_eq!(
+            (
+                population.arena().live(topology),
+                population.arena().slots(topology)
+            ),
+            (3, 3)
+        );
+        // A death with no birth frees a slot; the next newborn takes the
+        // lowest free one.
+        let ten = alive(&population, 10);
+        population
+            .commit(Tick::new(6), &[exhausted(&ten, 6)], &mut Vec::new())
+            .expect("commit");
+        assert_eq!(population.arena().live(topology), 2);
+        let mut births = vec![world.child(11, &one, 7, 0.5, &mut genomes)];
+        population
+            .commit(Tick::new(7), &[], &mut births)
+            .expect("commit");
+        let eleven = slot(&population, 11);
+        assert_eq!(
+            (eleven.slot(), eleven.generation()),
+            (1, 3),
+            "{arrangement:?}"
+        );
+        held_by.push(
+            population
+                .ids()
+                .map(|id| population.arena_slot(id))
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        held_by[0], held_by[1],
+        "the arrangements assign the same slots"
+    );
+}
+
 #[test]
 fn c7_two_storage_arrangements_hold_the_same_world() {
     let world = World::new();

@@ -37,7 +37,7 @@ through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
-  one batch (`ControllerJob`: genome identity, admitted controller, inputs). `ControllerChoice` (`cpu`, `torch`,
+  one batch (`ControllerJob`: genome identity, arena slot, admitted controller, inputs). `ControllerChoice` (`cpu`, `torch`,
   `metal`, `auto`) is what the CLI and Studio select it with (`torch` is `flife-backend-cpu`'s `CpuBackend` on the
   world's workers, on any host): `backend(cpu_workers)` gives `auto` Metal only on a host with
   a device and at most `AUTO_METAL_MAX_WORKERS` = 8 workers, where it measured faster (whole ticks, 256 ticks, two
@@ -83,13 +83,23 @@ FL-028's outputs:
 - `ResourceState`: `Available`, `Computing`, `Committed`, `Rendering`, `Checkpointing` or `Retiring` (§9.5).
 - `Usage`: buffers, bytes, retiring, read leases by purpose, write leases and running commands.
 
-**Residency.** `MetalBackend` keeps every buffer on the device across ticks. A genome's parameters are copied once
-and found again by genome identity. A hit is used only if the slot was copied from the same memory (pointer and
-length): genome parameters are immutable, so that identifies them even if a world were rewound. Its five resident buffers are
-`Owned` by its `DeviceOwner`, and a rebuilt buffer retires the one it replaces. Each tick writes
-only the inputs and job words in place (`SharedBuffer::write_f32/write_u32`, FrankenTorch `1c4febfb`). When the
-parameter buffer fills, it is rebuilt at 1.5 times the current batch's need, which drops dead genomes. A job the
-kernel cannot shape, or whose inputs are not finite in F32, is deferred without dispatch.
+**Residency.** `MetalBackend` keeps every buffer on the device across ticks. FL-026: each topology has a bucket of
+fixed-size parameter shards of at most `SHARD_BYTES` (256 MiB, 6,718 genomes of the preset's topology), fewer
+slots if `with_shard_slots` says so, and no more elements than the device's largest buffer or the kernel's 32-bit
+offsets hold. A command's kernels run one after another, so each shard a batch touches adds a kernel's fixed
+latency; that is why a shard is large (the shard-size measurements below). A job's `ArenaSlot` locates
+its parameters (`ShardGeometry::locate`: shard, offset and extent, checked in 64 bits). A genome is uploaded once,
+into its slot, and used only while that slot holds the same generation and genome; a newborn at the next
+generation of a dead genome's slot is uploaded in its place. A parameter shard is allocated at its full size when
+first touched, so a topology's first genome allocates a whole shard, and it is never rebuilt or dropped before
+`forget`. Each shard has its own job words (row, offset,
+hidden width, layer widths), and a tick submits one kernel per touched shard in one command buffer. Each tick
+writes only the inputs and job words in place (`SharedBuffer::write_f32/write_u32`, FrankenTorch `1c4febfb`). The
+buffers are `Owned` by its `DeviceOwner`: two per shard, plus the inputs, outputs and fault flags. A job buffer, or
+the per-organism buffers, grow to the next power of two when a batch outgrows them, and a rebuilt buffer retires
+the one it replaces. A job whose slot holds another genome after placement (one batch naming a slot twice), whose
+bucket is another topology's, which the kernel cannot shape, or whose inputs are not finite in F32, is deferred
+without dispatch.
 
 **Invariants.**
 - Every non-deferred output is the reference controller's, bit for bit:
@@ -237,12 +247,23 @@ A refusal changes nothing.
     1,101,004,800 patterns, zero and subnormals included, in about 3 s each. The fast path must fall back at least
     once and fewer than 1,000,000 times, so the fallback is exercised and the fast path carries the load.
   - Negative inputs (64 random windows of 65,536) and the saturated region equal the reference.
-- `tests/world.rs` (3 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
+- `tests/world.rs` (4 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
   evaluated every tick) runs 400 ticks with its controllers on Metal next to the reference world. The digests
   match at every tick, through the founder crash, 42 births and mutation. All 1,254,756 evaluations came from the
   device (none deferred, no tick redone on the reference). The planted negative flips one output bit of one
   organism at tick 9 inside a wrapping backend, and the digests must differ at exactly tick 9. Off macOS the test
   checks the typed `MissingCapability` refusal instead.
+  - FL-026: in the 400-tick run, each genome was uploaded once (4,138 genomes, 4,138 uploads), newborns into dead
+    genomes' slots, so one shard holds every genome, and the owner's bytes are at most `SHARD_BYTES` and 8 MiB.
+  - At an evaluation interval of four ticks, in shards of 64 (64 kernels in one command), the world is the
+    reference world at every tick, and each of 4,139 genomes is uploaded exactly once while it lives.
+- `tests/residency.rs` (FL-026, 2 tests), in shards of 16:
+  - 300 genomes over five topologies are uploaded once into 20 shards. Batches of a few upload and drop nothing.
+    A slot at its next generation, holding another genome, is uploaded in its place with that genome's reference
+    outputs; in one batch naming a slot at both generations, the last one uploaded is served and the other
+    deferred. Another genome at the same slot and generation is another occupant; a job naming another
+    topology's bucket is deferred. The owner holds two buffers per shard and three more.
+  - Shard sizes 3, 7 and 256, and slots from `u32::MAX - 7` and from `2^40`, give the reference's bits.
 - `tests/forward.rs` (2 tests):
   - 2,000 organisms in one batch, over all five catalog topologies and six regimes: typical, saturating, small,
     subnormal, hidden overflow and output overflow. Every output is bit-identical to the reference, and the batch
@@ -316,8 +337,8 @@ A refusal changes nothing.
 
     The seam exists only with debug assertions, so this test runs in full under `cargo test` (the dev profile).
     A release build only checks that the seam is absent.
-- `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's five buffers, with
-  no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
+- `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's buffers (since
+  FL-026, two per shard and three more), with no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
   crate, every output still bit-identical.
 - `tests/field.rs` (FL-031, 5 tests), each step against `advance_field_on` on the same input, every candidate value
   and report term compared as bits:
@@ -460,6 +481,21 @@ dispatch over fresh buffers pays page mapping, and the upload is the per-call bu
 `evaluate` would lose to the CPU. The engine path must keep buffers resident; FrankenTorch `1c4febfb` adds the
 in-place `SharedBuffer::write_f32/write_u32` for that.
 
+**Shard size (FL-026).** Whole ticks of the preset, `tick_throughput -- W 20 8 40 <choices>`, each row one
+process, M5 Ultra under other load (load average 28–106), 2026-11-10. Every digest was equal, nothing was deferred,
+and every number shown varied by at most 5% (cv in parentheses). `+slots=N` caps a shard at `N` genomes; the
+default holds the preset's population in one shard.
+
+| W | reference | `torch` | 64 slots | 256 slots | 4,096 slots | default (`SHARD_BYTES`) |
+|---|---|---|---|---|---|---|
+| 4 | 51.9 ticks/s (2.8%) | 66.5 (1.2%) | 45.1 (2.1%) | 56.9 (2.8%) | 69.7 (3.7%) | |
+| 4 | 49.4 (2.3%) | 61.3 (1.9%) | | 56.7 (2.0%) | | 64.0 (3.9%) |
+| 8 | 69.3 (3.8%) | 83.3 (3.6%) | | 58.7 (3.3%) | | 78.6 (4.5%) |
+
+Each extra kernel cost 0.1–0.2 ms a tick. FrankenTorch encodes a command's kernels in one serial encoder, so each
+waits for the last. Against 256-genome shards (16 kernels a tick), the default is 1.13× at four workers and 1.34× at
+eight. At one worker the 256-slot samples varied by more than 5% in both runs, so that ratio is not claimed.
+
 **The field's frontier (FL-031).** On the preset (128², 33 planes, eight sources of about 5,000 cells, one
 substep) on an M5 Ultra, 2026-11-09. Other workloads held the host at load 45–90 throughout, so the wall times
 are indicative; the device times are steadier. The CPU reference's phase 2 takes 1.8–2.0 ms per tick on one worker
@@ -527,8 +563,17 @@ per-pass thread spawning (6%).
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them). On many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
-- FL-030's closure also needs FL-026's packed genome arenas, and its resident-bandwidth benchmark against §19.2's
-  weight-stream bound. FL-029's batched submission is now in place.
+- FL-030's closure also needs its resident-bandwidth benchmark against §19.2's weight-stream bound. FL-026's
+  per-topology shards are in place.
+- Parameter shards are never freed before `forget`: after a population crash, device memory stays at the peak in
+  whole shards. A topology's first genome allocates a whole 256 MiB shard, so the five catalog members can hold
+  1.25 GiB however few their genomes. Backend memory is not yet part of admission (FL-043).
+- A command's kernels run serially, so a population past one shard per topology pays 0.1–0.2 ms a tick per extra
+  shard. Dispatching shards concurrently, since they write disjoint rows, would remove that; FrankenTorch's batch has
+  only a serial encoder.
+- `auto`'s Metal ceiling (8 workers) was measured against the reference, not against `torch`. On the FL-026 tree at
+  eight workers, `torch` ran 1.06× faster than Metal in one admissible row. The ceiling against `torch` is not
+  re-measured. FL-029's batched submission is now in place.
 - FL-029 gaps:
   - Submission is still synchronous: `submit_batch` returns once the command buffer completes, and the calling
     thread waits for it. The owner's bind/release split is where an asynchronous completion would plug in

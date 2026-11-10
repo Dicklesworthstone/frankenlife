@@ -324,7 +324,7 @@ file-backed engine), one writer thread per session, one session per database at 
   chunk is written, which is not tested. A linked chunk damaged in place is damaged in every store that names it.
   It is detected on load, as any damage is.
 - Chunks are whole families: a single birth rewrites the full genome chunk. Per-genome pages, deltas and
-  compression are later work (§16.5, FL-026). A streamed checkpoint is written in full each time; §16.5's
+  compression are later work (§16.5; FL-026's arenas are execution copies and do not page the checkpoint). A streamed checkpoint is written in full each time; §16.5's
   incremental mode (only changed pages) does not exist. `flife-cli` adds a background mode (FL-038).
 - A `Stream` trusts the length and digest its encoder reports for each chunk; `commit` checks them against the
   sealed prefix and the stored files' lengths, not their hashes. `verify` (which `flife-cli` runs after every

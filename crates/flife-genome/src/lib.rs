@@ -18,10 +18,13 @@
 //!   proposals with `uniform-other-catalog-member` and
 //!   `reject-birth-no-charge`.
 //!
-//! Packed per-topology arenas (FL-026) are not here.
+//! - [`arena`] (FL-026): one bucket of fixed-size slots per catalog member.
+//!   Each live genome holds a slot, with a generation that names it alone,
+//!   by which backends keep its packed parameters.
 
 #![forbid(unsafe_code)]
 
+pub mod arena;
 pub mod catalog;
 mod draws;
 pub mod founder;
@@ -31,6 +34,7 @@ pub mod mutation;
 pub mod quota;
 pub mod transition;
 
+pub use arena::GenomeArena;
 pub use catalog::{DENSE_104_36_CATALOG_V1, DENSE_104_36_MEMBERS, TopologyCatalog, TopologyId};
 pub use founder::{founder, founder_traits, initial_scale};
 pub use genome::{

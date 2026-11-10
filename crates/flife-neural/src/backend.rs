@@ -15,17 +15,20 @@ use std::fmt::Debug;
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 
-use crate::{ACTION_WIDTH, ReferenceController, SENSOR_WIDTH};
+use crate::{ACTION_WIDTH, ArenaSlot, ReferenceController, SENSOR_WIDTH};
 
 /// One due organism's controller evaluation.
 #[derive(Debug, Clone, Copy)]
 pub struct ControllerJob<'a> {
-    /// The organism's genome. While a backend serves one world, one genome
-    /// names one parameter set, so a backend may keep parameters resident
-    /// by it. It must still check that a resident set is the same memory
-    /// (pointer and length of [`ReferenceController::parameters`]) before
-    /// reusing it.
+    /// The organism's genome.
     pub genome: GenomeId,
+    /// The genome's arena slot. While a backend serves one world, a slot
+    /// and generation name one immutable parameter set for as long as that
+    /// genome lives, and a later occupant of the slot has a higher
+    /// generation. So a backend keeps packed parameters by slot, and reuses
+    /// them only for the same generation and genome; anything else it
+    /// packs afresh into the same place.
+    pub slot: ArenaSlot,
     /// The organism's controller, admitted under the run's limits.
     pub controller: ReferenceController<'a>,
     /// Its observation's 104 inputs.
@@ -38,7 +41,8 @@ pub trait ControllerBackend: Debug + Send {
     fn describe(&self) -> String;
 
     /// Drop everything kept resident; the next batch uploads afresh. The
-    /// world calls this when the backend starts serving it.
+    /// world calls this when the backend starts serving it, since another
+    /// world's slots name other genomes.
     fn forget(&mut self);
 
     /// Evaluate `jobs` in order. `outputs` becomes one entry per job: its

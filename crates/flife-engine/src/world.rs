@@ -1984,6 +1984,12 @@ fn decide_batched(
         if due(rules, organism, to) {
             jobs.push(ControllerJob {
                 genome: organism.genome,
+                slot: population.arena_slot(organism.id).ok_or_else(|| {
+                    CoreError::StateConflict {
+                        operation: "controller batch",
+                        detail: format!("{} holds no arena slot", organism.id),
+                    }
+                })?,
                 controller: genome_of(population, organism.id)?
                     .controller(&rules.catalog, &rules.limits)?,
                 inputs: &observation.inputs,

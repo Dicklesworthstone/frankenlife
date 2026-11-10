@@ -7,13 +7,15 @@
 //! for example `-- 1 20 8 40 cpu,torch,metal`. A choice may add phases on
 //! Metal after a `+`: `cpu+sensors` samples phase 3 on `MetalSensors`, and
 //! `cpu+field` steps phase 2 on `MetalField` (FL-031), for example
-//! `cpu,cpu+sensors,metal+sensors+field`. A choice this host refuses
+//! `cpu,cpu+sensors,metal+sensors+field`. `+slots=N` puts the controllers on
+//! a `MetalBackend` with `N` genomes to a parameter shard (FL-026), for
+//! example `metal,metal+slots=4096`. A choice this host refuses
 //! (`metal` without a device) is reported and left out. Prints one JSON line.
 
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use flife_backend_metal::{ControllerChoice, MetalField, MetalSensors};
+use flife_backend_metal::{ControllerChoice, MetalBackend, MetalField, MetalSensors};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 
@@ -38,7 +40,16 @@ fn found(workers: NonZeroUsize, name: &str) -> Result<World, CoreError> {
         match phase {
             "sensors" => world.set_sensor_backend(Some(Box::new(MetalSensors::open()?))),
             "field" => world.set_field_backend(Some(Box::new(MetalField::open()?))),
-            other => return Err(refused(format!("`{other}` is not `sensors` or `field`"))),
+            other => {
+                let slots: u64 = other
+                    .strip_prefix("slots=")
+                    .and_then(|slots| slots.parse().ok())
+                    .ok_or_else(|| {
+                        refused(format!("`{other}` is not `sensors`, `field` or `slots=N`"))
+                    })?;
+                world
+                    .set_controller_backend(Some(Box::new(MetalBackend::with_shard_slots(slots)?)));
+            }
         }
     }
     Ok(world)

@@ -117,7 +117,10 @@ each runs and owns the field.
 - `Death` (identity, genome, lineage, generation, tick, resulting position, `DeathCause`, residual), and
   `Recycling::settle`'s `DeathSettlement` (removed, dissipated, recycled and offered; `record` books the first two).
 - `Population`: `admit`, `update`, `commit` (the `Collected` deaths, each with its last row and genome, for the
-  caller to retire), `get`, `iter` and `ids` in identity order, `slot` and `slots`, `genome`, `latest` and
+  caller to retire), `get`, `iter` and `ids` in identity order, `slot` and `slots`, `genome`, `arena_slot` and
+  `arena` (FL-026: each live genome's generation-tagged slot, assigned at admission or birth and released at
+  death, kept when the compact arrangement moves the organism, and reassigned in identity order on restore),
+  `latest` and
   `digest`, a SHA-256 of the canonical state in identity order without slots (`frankenlife.population-state.v1`).
   `HeldOutput` hides an invalid output entirely. `check_tick` and `commit_tick` (FL-013) check and commit a whole
   tick: survivors, deaths with their genome charges returned to the quota, and births.
@@ -686,8 +689,10 @@ velocity, first-order splitting at the configured fixed timestep.
   allocators either way. The checkpoint carries no toolchain or source fingerprint (B.1's run manifest).
 - Explicit removal is carried by `RemoveOrganisms` (FL-022), a disk. Other region shapes and the erase brush's
   native input are later. Environmental hazards are not part of `field-ecology-v1`.
-- `Population` stores each genome as its own heap value. Packed slabs, generation-tagged handles and
-  epoch-aware reclamation after readers finish are FL-026. FL-016 checkpoints the store's contents. The ordered
+- `Population` stores each genome as its own immutable heap value, and FL-026's arena slots name them to the
+  controller backends, which keep packed copies by slot. A slot is released in the commit that removes its
+  organism, and a backend serves a job only while the slot holds that generation and genome; there is no
+  epoch-based reclamation beyond that. FL-016 checkpoints the store's contents. The ordered
   tick returns a dead genome's quota charge in the publishing commit; readers holding its shared parameters keep
   them.
 - Field reservoirs are not cleared by the tiny-energy policy: A.1's "clears its moment consistently" has no

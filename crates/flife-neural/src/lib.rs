@@ -15,6 +15,9 @@
 //!
 //! - [`backend`]: the port through which the engine hands a tick's due
 //!   evaluations to an exact batch backend (FL-030's Metal kernel).
+//! - [`arena`]: each live genome's arena slot, by which a backend keeps its
+//!   packed parameters, and the checked 64-bit geometry of the shards it
+//!   packs them into (FL-026).
 //!
 //! The density pyramid itself is `flife_field::pyramid`. The FrankenTorch
 //! population adapter is FL-025.
@@ -22,11 +25,13 @@
 #![forbid(unsafe_code)]
 
 pub mod actions;
+pub mod arena;
 pub mod backend;
 pub mod controller;
 pub mod sensors;
 
 pub use actions::{ACTION_WIDTH, ActionDecoding, DecodedActions, Emission, decode};
+pub use arena::{ArenaSlot, Placement, ShardGeometry};
 pub use backend::{ControllerBackend, ControllerJob};
 pub use controller::{ControllerScratch, DenseTopology, LayerShape, ReferenceController, widen};
 pub use sensors::{Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe};

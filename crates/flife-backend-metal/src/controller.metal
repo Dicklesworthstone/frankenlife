@@ -223,8 +223,10 @@ constant uint FAULT_TINY = 2u;
 constant uint TINY_BITS = 0x0C800000u;
 
 // One threadgroup per organism, one thread per output neuron in turn. `jobs`
-// holds four words per organism: the offset of its parameters in `params`,
-// its hidden-layer count (1 or 2) and its hidden widths. A nonzero word in
+// holds five words per organism: its row (`slot`) in `inputs`, `outputs` and
+// `faults`, the offset of its parameters in `params`, its hidden-layer count
+// (1 or 2) and its hidden widths. One dispatch serves one parameter shard, so
+// the rows of a command's dispatches interleave. A nonzero word in
 // `faults` defers the organism to the host, which evaluates it on the
 // reference controller: for its error, or for its exact value.
 kernel void controller_forward(
@@ -245,14 +247,15 @@ kernel void controller_forward(
     if (lane == 0u) {
         atomic_store_explicit(&fault, 0u, memory_order_relaxed);
     }
+    uint slot = jobs[organism * 5u];
     for (uint i = lane; i < SENSORS; i += lanes) {
-        sensed[i] = inputs[organism * SENSORS + i];
+        sensed[i] = inputs[slot * SENSORS + i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint offset = jobs[organism * 4u];
-    uint hidden = jobs[organism * 4u + 1u];
-    uint widths[2] = {jobs[organism * 4u + 2u], jobs[organism * 4u + 3u]};
+    uint offset = jobs[organism * 5u + 1u];
+    uint hidden = jobs[organism * 5u + 2u];
+    uint widths[2] = {jobs[organism * 5u + 3u], jobs[organism * 5u + 4u]};
     threadgroup const float *source = sensed;
     uint fan_in = SENSORS;
     for (uint layer = 0u; layer <= hidden; ++layer) {
@@ -284,7 +287,7 @@ kernel void controller_forward(
                 atomic_fetch_or_explicit(&fault, FAULT_NONFINITE, memory_order_relaxed);
             }
             if (last) {
-                outputs[organism * ACTIONS + o] = z;
+                outputs[slot * ACTIONS + o] = z;
             } else {
                 target[o] = isfinite(z) ? activation(z, fallbacks) : 0.0f;
             }
@@ -295,7 +298,7 @@ kernel void controller_forward(
         source = target;
     }
     if (lane == 0u) {
-        faults[organism] = atomic_load_explicit(&fault, memory_order_relaxed);
+        faults[slot] = atomic_load_explicit(&fault, memory_order_relaxed);
     }
 }
 

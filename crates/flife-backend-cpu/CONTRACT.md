@@ -8,7 +8,8 @@ in frankentorch, added for this item. This crate is `forbid(unsafe_code)`.
 
 **Inputs.**
 - A batch of `flife_neural::ControllerJob`s from the engine (`ControllerBackend::evaluate`): each organism's genome
-  id, its admitted controller (topology and parameters) and its 104 F64 observation inputs.
+  id, its arena slot (FL-026: topology bucket, slot, generation), its admitted controller (topology and parameters)
+  and its 104 F64 observation inputs.
 - A lane count, at construction: the world's `cpu_workers`.
 - The composition root selects it with `--controllers torch` (`flife run`, `render`, `resume`, `experiment` and
   `flife-studio`): `flife_backend_metal::ControllerChoice::Torch`, whose `backend(cpu_workers)` gives this backend
@@ -47,9 +48,14 @@ thread, between its lane phases, so the backend's threads never run alongside th
 depend on the split.
 
 **Residency.** A genome's parameters are packed once, each layer's `weight[out][in]` transposed to
-`[in][out]`: the kernel's `[B, I, O]` with `B = 1`, so its output loop reads contiguous memory. They are reused only
-for the same memory, the parameters' address and length (`ControllerJob`'s rule). A batch drops the packed sets of
-genomes it did not contain, so resident memory follows the live population.
+`[in][out]`: the kernel's `[B, I, O]` with `B = 1`, so its output loop reads contiguous memory. FL-026: each
+topology has a bucket of fixed-size shards, `SHARD_SLOTS` (256) genomes to a shard unless `with_shard_slots` says
+otherwise, and at most `MAXIMUM_SHARD_ELEMENTS` (2^28) values. A job's `ArenaSlot` locates its packed set
+(`ShardGeometry::locate`: shard, offset and extent, checked in 64 bits). The set is used only while its slot holds
+the same generation and genome, so a newborn at the next generation of a dead genome's slot is packed in its
+place. A batch drops nothing: a genome due one tick in K is not packed again when it is next due. A shard is
+reserved at its full size when first touched, so memory follows the peak population in whole shards until
+`forget`.
 
 **Independent tests.**
 - In frankentorch, `crates/ft-kernel-cpu/tests/population_affine.rs` tests the kernel itself.
@@ -65,9 +71,13 @@ genomes it did not contain, so resident memory follows the live population.
   - Every reference success is the backend's output bit for bit, and every reference refusal is deferred. All
     three refusals are exercised, and subnormal organisms are evaluated, not deferred.
   - On 2, 4 and 16 lanes, the outputs are the same bits.
-  - Residency follows the batch. A genome naming other memory is packed again and gives the new reference's
-    outputs. In one batch naming a genome with two memories, each job gets its own memory's outputs or is
-    deferred, never the other's. `forget` empties it.
+  - Residency by slot (FL-026), in shards of 16: 300 genomes over five topologies are packed once. Batches
+    of a few pack nothing and drop nothing. A slot at its next generation, holding another genome with other
+    values, is packed in its place and gives that genome's reference outputs, the other slots unchanged. In one
+    batch naming a slot at both generations, the last one packed is served and the other deferred, never given
+    its outputs. Another genome at the same slot and generation is another occupant. A job naming a bucket made
+    for another topology is deferred. `forget` empties it.
+  - Shard sizes 1, 2 and 3 and slots from `u32::MAX - 7` and from `2^40` give the same bits as the reference.
   - A batch runs on at most its lanes and on no more than one thread per 128 jobs (`threads_used`, counted from
     the threads it actually started): 2,000 jobs on 1, 4, 16 and 64 lanes use 1, 4, 16 and 16; 300, 128 and 129
     jobs on 16 lanes use 3, 1 and 2. Every split gives the same bits.
@@ -77,6 +87,9 @@ genomes it did not contain, so resident memory follows the live population.
     to 16). Its digest equals the reference world's at every tick, through the founder crash, births and mutation.
   - No tick fell back to the reference, and no job was deferred.
   - One flipped output bit at one tick changes that tick's digest.
+  - At an evaluation interval of four ticks (a batch holds about a quarter of the live genomes), 400 ticks equal
+    the reference world at every tick, and every genome, newborns included, is packed exactly once while it lives
+    (4,139 genomes, 4,139 packs), in shards of 256 and of 3.
 - In `flife-backend-metal`, `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling`: `torch` gives this
   backend on the world's workers on any host, and parses from `torch`.
 
@@ -118,9 +131,11 @@ Linux and from 1.62× to 1.26× on macOS.
 **Validity domain.** The `dense-104-36-v1` catalog's shapes, the reference F32 profile, any CPU Rust targets.
 
 **Known gaps.**
-- The kernel is called once per organism over that organism's packed weights. A batch of several organisms in one
-  call needs their weights adjacent. That is FL-026's packed genome arenas, and the kernel already takes `[B, I, O]`
-  for it.
+- The kernel is called once per organism over that organism's packed weights. FL-026's shards hold a topology's
+  genomes side by side, but a batch's due organisms are not adjacent slots (some are not due, some slots are
+  free), so one call over several needs a gather or a whole-shard call. The kernel already takes `[B, I, O]`.
+- Shards are never freed before `forget`: after a population crash, memory stays at the peak in whole shards.
+  Backend memory is not yet part of admission (FL-043).
 - Packing a newborn's parameters is a copy and a transpose, once per genome.
 - `auto` takes this backend only on a host without Metal, at up to four workers. The crossover between four and
   eight workers is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis

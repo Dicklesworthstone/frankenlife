@@ -41,14 +41,20 @@
 //!
 //! [`Population::digest`] hashes the canonical scientific state in identity
 //! order, excluding slots, for comparing arrangements and runs.
+//!
+//! The population owns the genome arena (FL-026, plan §9.2): each live
+//! genome holds an arena slot of its topology, taken when it is admitted or
+//! born and freed when it dies, by which backends keep its packed
+//! parameters ([`Population::arena_slot`]). Arena slots are physical too.
+//! An organism keeps its arena slot when the compact arrangement moves it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
-use flife_genome::{Genome, GenomeQuota, MutationRecord};
-use flife_neural::ACTION_WIDTH;
+use flife_genome::{Genome, GenomeArena, GenomeQuota, MutationRecord};
+use flife_neural::{ACTION_WIDTH, ArenaSlot};
 
 use crate::lifecycle::Death;
 use crate::reproduction::{Birth, Newborn};
@@ -286,6 +292,9 @@ pub struct Population {
     phases: Vec<u32>,
     cooldown_deadlines: Vec<Tick>,
     genomes: Vec<Option<Genome>>,
+    /// Each slot's genome's arena slot, beside `genomes`.
+    arena_slots: Vec<Option<ArenaSlot>>,
+    arena: GenomeArena,
     index: BTreeMap<OrganismId, usize>,
     free: BTreeSet<usize>,
     latest: Option<OrganismId>,
@@ -344,6 +353,8 @@ impl Population {
             phases: reserve(capacity)?,
             cooldown_deadlines: reserve(capacity)?,
             genomes: reserve(capacity)?,
+            arena_slots: reserve(capacity)?,
+            arena: GenomeArena::new(),
             index: BTreeMap::new(),
             free: BTreeSet::new(),
             latest: None,
@@ -431,6 +442,20 @@ impl Population {
         self.index.values().map(|&slot| self.read(slot))
     }
 
+    /// `id`'s genome's arena slot.
+    #[must_use]
+    pub fn arena_slot(&self, id: OrganismId) -> Option<ArenaSlot> {
+        self.index
+            .get(&id)
+            .and_then(|&slot| self.arena_slots.get(slot).copied().flatten())
+    }
+
+    /// The genome arena: which slots live genomes hold.
+    #[must_use]
+    pub const fn arena(&self) -> &GenomeArena {
+        &self.arena
+    }
+
     /// `id`'s genome.
     #[must_use]
     pub fn genome(&self, id: OrganismId) -> Option<&Genome> {
@@ -448,6 +473,7 @@ impl Population {
     /// `entrants` keeps every genome so the caller can return its charge.
     pub fn admit(&mut self, entrants: &mut Vec<Entrant>) -> Result<(), CoreError> {
         self.check_entrants(entrants, self.len())?;
+        self.reserve_arena(entrants)?;
         for entrant in entrants.drain(..) {
             self.insert(entrant);
         }
@@ -512,6 +538,7 @@ impl Population {
         let dying = self.check_deaths(tick, deaths)?;
         check_birth_ticks(tick, births)?;
         self.check_entrants(births, self.len() - dying.len())?;
+        self.reserve_arena(births)?;
 
         let collected = self.remove(dying);
         for entrant in births.drain(..) {
@@ -566,6 +593,7 @@ impl Population {
         quota: &mut GenomeQuota,
     ) -> Result<(), CoreError> {
         let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
+        self.reserve_arena(births)?;
         for organism in survivors {
             if let Some(&slot) = self.index.get(&organism.id) {
                 self.write(slot, organism);
@@ -809,6 +837,7 @@ impl Population {
                     };
                     let organism = self.read(slot);
                     self.occupants[slot] = None;
+                    self.release_arena(slot);
                     if let Some(genome) = self.genomes[slot].take() {
                         collected.push(Collected {
                             death,
@@ -829,6 +858,7 @@ impl Population {
                     if let Some(death) = dying.remove(&id) {
                         self.index.remove(&id);
                         let organism = self.read(slot);
+                        self.release_arena(slot);
                         if let Some(genome) = self.genomes[slot].take() {
                             collected.push(Collected {
                                 death,
@@ -854,6 +884,7 @@ impl Population {
     /// Admit a checked entrant.
     fn insert(&mut self, entrant: Entrant) {
         let Entrant { organism, genome } = entrant;
+        let arena_slot = Some(self.arena.insert(genome.topology()));
         let slot = match self.arrangement {
             Arrangement::FreeList => self.free.pop_first(),
             Arrangement::Compact => None,
@@ -861,10 +892,12 @@ impl Population {
         let slot = if let Some(slot) = slot {
             self.write(slot, &organism);
             self.genomes[slot] = Some(genome);
+            self.arena_slots[slot] = arena_slot;
             slot
         } else {
             self.push(&organism);
             self.genomes.push(Some(genome));
+            self.arena_slots.push(arena_slot);
             self.occupants.len() - 1
         };
         self.occupants[slot] = Some(organism.id);
@@ -929,7 +962,23 @@ impl Population {
         let organism = self.read(from);
         self.write(to, &organism);
         self.genomes.swap(from, to);
+        self.arena_slots.swap(from, to);
         self.occupants[from] = None;
+    }
+
+    /// Room in the arena for `entrants`' genomes, before anything changes.
+    fn reserve_arena(&mut self, entrants: &[Entrant]) -> Result<(), CoreError> {
+        self.arena
+            .reserve(entrants.iter().map(|entrant| entrant.genome.topology()))
+    }
+
+    /// Free the arena slot of the genome in population slot `slot`.
+    fn release_arena(&mut self, slot: usize) {
+        if let Some(arena_slot) = self.arena_slots[slot].take() {
+            // Issued by `insert` and freed only here, so it is live.
+            let released = self.arena.release(arena_slot);
+            debug_assert!(released.is_ok(), "{released:?}");
+        }
     }
 
     fn truncate(&mut self, length: usize) {
@@ -947,5 +996,6 @@ impl Population {
         self.phases.truncate(length);
         self.cooldown_deadlines.truncate(length);
         self.genomes.truncate(length);
+        self.arena_slots.truncate(length);
     }
 }

@@ -14,7 +14,10 @@ FL-010 (`flife-rf8`) adds founders and mutation (plan §7.2, §7.3, §16.2, A.3 
   topology change first (`uniform-other-catalog-member`), then parameters, then traits;
 - `reject-birth-no-charge` when every candidate is invalid or an effective no-op.
 
-Births and deaths are FL-011 and FL-012. Packed per-topology arenas are FL-026.
+Births and deaths are FL-011 and FL-012. FL-026 (`flife-fsy`) adds `GenomeArena`, the allocator of arena slots
+(§9.2): per topology, the lowest free slot first, each reuse at the next generation, so a dead genome's name is
+stale. A slot whose generation reaches `u32::MAX` is retired, not reused. `reserve` before a commit makes the
+commit's inserts and releases allocation-free. The slots are physical, not scientific state.
 
 **Inputs.**
 - A `ValidatedConfig` (`[architecture_mutation]`, `[controller]`, `[chemistry]`, `[sensors]`, `[execution]`), or
@@ -210,9 +213,11 @@ F32 canonical weights and `independent-dense-mlp-v1` controllers, with traits fo
 - A strict globally unique benchmark's content-hash check at birth (§7.3) is not implemented. Parent-relative
   nonidentity is.
 - `MAXIMUM_CANDIDATES` is §7.3's eight. Device paths must reuse the same addresses (FL-032).
-- Genomes are separate heap buffers. Packed immutable slabs by topology, generation-tagged handles and device
-  sharding are FL-026. A store with an identity map, epoch-aware reclamation and checkpointed genome identity
-  belongs to the tick and the store (FL-013, FL-014).
+- Genomes are separate immutable heap buffers, the canonical genotype. §9.2 asks for the weights in packed slabs
+  by topology; FL-026 gives each genome a generation-tagged arena slot, and the packed slabs are the backends'
+  execution copies in per-topology shards (`flife-backend-cpu`, `flife-backend-metal`), not the host's canonical
+  store. A store with an identity map, epoch-aware reclamation and checkpointed genome identity belongs to the tick
+  and the store (FL-013, FL-014).
 - Pausing on quota pressure (§7.5) belongs to the birth transaction. FL-011's `flife_engine::resolve_births`
   turns a logical refusal into a `CapacityShortfall` and rolls back; FL-013 pauses the tick on it. Exhibition-mode
   birth rejection has no registered name yet. This crate reports the refusal.

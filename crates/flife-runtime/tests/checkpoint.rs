@@ -60,6 +60,23 @@ fn round_trip(world: &World, book: &CommandBook) -> (Vec<u8>, Restored) {
         );
         assert_eq!(a.allocated_bytes(), b.allocated_bytes());
     }
+    // FL-026: arena slots are physical. A restored population assigns them
+    // afresh, in identity order, from slot 0 of each topology, at the first
+    // generation, whatever slots the checkpointed world had reused.
+    let mut next = std::collections::BTreeMap::new();
+    let population = restored.world.population();
+    for organism in population.iter() {
+        let genome = population.genome(organism.id).expect("restored");
+        let slot = population.arena_slot(organism.id).expect("a slot");
+        let expected = next.entry(genome.topology()).or_insert(0_u64);
+        assert_eq!(
+            (slot.topology() as usize, slot.slot(), slot.generation()),
+            (genome.topology().index(), *expected, 1),
+            "{}'s arena slot",
+            organism.id
+        );
+        *expected += 1;
+    }
     assert_eq!(
         checkpoint(&restored.world, &restored.book).expect("re-checkpoints"),
         bytes,

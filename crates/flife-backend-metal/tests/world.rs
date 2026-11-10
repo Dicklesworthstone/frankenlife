@@ -3,24 +3,33 @@
 //! controllers on the Metal backend is the reference world, digest for
 //! digest, at every tick through the founder crash, births and mutation.
 //! FL-028: every buffer it uses is the owner's, and none is left leased,
-//! bound or retiring.
+//! bound or retiring. FL-026: each genome is uploaded once while it lives,
+//! with every controller due each tick or one tick in four, and in shards
+//! of a few slots, and no parameter shard is rebuilt.
 
 use flife_backend_metal::{
-    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, ControllerChoice, MetalBackend,
+    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, ControllerChoice, MetalBackend, SHARD_BYTES,
 };
+use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob};
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
+
+fn found() -> World {
+    found_from(PRESET)
+}
 
 #[expect(
     clippy::expect_used,
     reason = "test helper: a failure is a test failure"
 )]
-fn found() -> World {
-    let config = ValidatedConfig::from_toml(PRESET).expect("the preset validates");
+fn found_from(preset: &str) -> World {
+    let config = ValidatedConfig::from_toml(preset).expect("the preset validates");
     let mut world = World::found(
         &config,
         Arrangement::FreeList,
@@ -72,17 +81,73 @@ fn race(reference: &mut World, metal: &mut World, ticks: u64) -> (Option<u64>, u
     (difference, evaluated, births, live)
 }
 
+/// What a [`Counted`] backend saw: the genomes it was asked to evaluate,
+/// and its uploads, resident slots and shards after the last batch.
+#[derive(Debug, Default)]
+struct Seen {
+    genomes: BTreeSet<GenomeId>,
+    uploads: u64,
+    resident: usize,
+    shards: usize,
+}
+
+/// The Metal backend, recording what it saw.
+#[derive(Debug)]
+struct Counted {
+    inner: MetalBackend,
+    seen: Arc<Mutex<Seen>>,
+}
+
+impl ControllerBackend for Counted {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+
+    fn forget(&mut self) {
+        self.inner.forget();
+    }
+
+    fn evaluate(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+    ) -> Result<(), CoreError> {
+        self.inner.evaluate(jobs, outputs)?;
+        let mut seen = self.seen.lock().map_err(|_| CoreError::StateConflict {
+            operation: "count uploads",
+            detail: "poisoned".to_owned(),
+        })?;
+        seen.genomes.extend(jobs.iter().map(|job| job.genome));
+        seen.uploads = self.inner.uploads();
+        seen.resident = self.inner.resident_genomes();
+        seen.shards = self.inner.shards();
+        Ok(())
+    }
+}
+
 #[test]
 fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     let Some(backend) = metal() else { return };
     let description = backend.describe();
     let owner = backend.owner().clone();
+    let seen = Arc::new(Mutex::new(Seen::default()));
     let mut reference = found();
     let mut metal = found();
-    metal.set_controller_backend(Some(Box::new(backend)));
+    metal.set_controller_backend(Some(Box::new(Counted {
+        inner: backend,
+        seen: Arc::clone(&seen),
+    })));
     let (difference, evaluated, births, live) = race(&mut reference, &mut metal, 400);
     let report = metal.controller_report();
-    println!("evaluated {evaluated}, births {births}, live {live}: {report:?}");
+    let seen = seen.lock().expect("not poisoned");
+    println!(
+        "evaluated {evaluated}, births {births}, live {live}, genomes {}, uploads {}, \
+         resident {}, shards {}: {report:?}",
+        seen.genomes.len(),
+        seen.uploads,
+        seen.resident,
+        seen.shards
+    );
     assert_eq!(difference, None, "the worlds diverged");
     assert_eq!(report.backend.as_deref(), Some(description.as_str()));
     assert_eq!(report.failure, None);
@@ -91,9 +156,14 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     // The device, not the fallback, did the work.
     assert!(report.batched > 1_000_000, "{report:?}");
     assert!(births > 0, "newborn genomes must be uploaded mid-run");
-    // FL-028: after 400 ticks the owner holds exactly the backend's five
-    // resident buffers (parameters, inputs, jobs, outputs, fault flags),
-    // with no lease, command or retiring buffer left over.
+    // FL-026: each genome was uploaded once, newborns into dead genomes'
+    // slots, so the one shard of the founders' topology holds every genome.
+    assert_eq!(seen.uploads, seen.genomes.len() as u64);
+    assert!(seen.resident < seen.genomes.len(), "{seen:?}");
+    assert_eq!(seen.shards, 1, "{seen:?}");
+    // FL-028: after 400 ticks the owner holds exactly the backend's resident
+    // buffers (each shard's parameters and job words; the inputs, outputs
+    // and fault flags), with no lease, command or retiring buffer left over.
     let usage = owner.usage();
     assert_eq!(
         (
@@ -103,9 +173,67 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
             usage.write_leases,
             usage.running
         ),
-        (5, 0, [0; 3], 0, 0),
+        (2 * seen.shards + 3, 0, [0; 3], 0, 0),
         "{usage:?}"
     );
+    // The one shard is the default's byte budget, not the device's largest
+    // buffer: it holds every live genome (9,988 parameters each) in at most
+    // SHARD_BYTES, and the inputs, outputs, flags and job words take a few
+    // MiB.
+    assert!(
+        usage.bytes > 4_096 * 9_988 * 4 && usage.bytes <= SHARD_BYTES + (8 << 20),
+        "{usage:?}"
+    );
+}
+
+/// At K = 4 a controller is due one tick in four, so a batch never holds
+/// most of the live genomes. In shards of 64 slots, so that a tick runs
+/// dozens of kernels in one command, the world is still the reference
+/// world, and each genome is uploaded exactly once while it lives.
+#[test]
+fn at_interval_four_in_small_shards_each_genome_is_uploaded_once() {
+    let Ok(inner) = MetalBackend::with_shard_slots(64) else {
+        assert!(metal().is_none(), "this host should have Metal");
+        return;
+    };
+    let preset = PRESET.replace(
+        "evaluation_interval_ticks = 1\n",
+        "evaluation_interval_ticks = 4\n",
+    );
+    assert_ne!(preset, PRESET, "the preset names its interval");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let mut reference = found_from(&preset);
+    let mut metal = found_from(&preset);
+    metal.set_controller_backend(Some(Box::new(Counted {
+        inner,
+        seen: Arc::clone(&seen),
+    })));
+    let (difference, evaluated, births, live) = race(&mut reference, &mut metal, 400);
+    let report = metal.controller_report();
+    let seen = seen.lock().expect("not poisoned");
+    println!(
+        "evaluated {evaluated}, births {births}, live {live}, genomes {}, uploads {}, \
+         resident {}, shards {}: {report:?}",
+        seen.genomes.len(),
+        seen.uploads,
+        seen.resident,
+        seen.shards
+    );
+    assert_eq!(difference, None, "the worlds diverged");
+    assert_eq!(report.failure, None);
+    assert_eq!(report.reference_ticks, 0);
+    assert!(births > 0, "newborn genomes must be uploaded mid-run");
+    let genomes = seen.genomes.len() as u64;
+    assert!(
+        evaluated > 3 * genomes,
+        "{evaluated} evaluations of {genomes} genomes"
+    );
+    assert_eq!(
+        seen.uploads, genomes,
+        "a genome is uploaded once while it lives"
+    );
+    assert!(seen.resident < seen.genomes.len(), "{seen:?}");
+    assert_eq!(seen.shards, 4_096 / 64, "{seen:?}");
 }
 
 /// The planted negative: the same backend with one output bit of one

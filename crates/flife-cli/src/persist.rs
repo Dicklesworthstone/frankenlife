@@ -260,6 +260,50 @@ impl FromStr for Removal {
     }
 }
 
+/// A seeded introduction scheduled from the command line: `count` new
+/// organisms, each endowed with `energy`, placed in field cell `cell` at the
+/// end of committed tick `tick` (FL-022's `IntroduceOrganisms`). Written
+/// `TICK:X,Y:COUNT:ENERGY`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Introduction {
+    /// The committed tick whose boundary it applies at.
+    pub tick: u64,
+    /// The field cell, `[x, y]`.
+    pub cell: [u32; 2],
+    /// How many organisms.
+    pub count: u32,
+    /// Each one's endowment.
+    pub energy: f64,
+}
+
+impl FromStr for Introduction {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let bad = || format!("`{text}` is not TICK:X,Y:COUNT:ENERGY");
+        let mut parts = text.split(':');
+        let (Some(tick), Some(cell), Some(count), Some(energy), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(bad());
+        };
+        let (x, y) = cell.split_once(',').ok_or_else(bad)?;
+        Ok(Self {
+            tick: tick.trim().parse().map_err(|_| bad())?,
+            cell: [
+                x.trim().parse().map_err(|_| bad())?,
+                y.trim().parse().map_err(|_| bad())?,
+            ],
+            count: count.trim().parse().map_err(|_| bad())?,
+            energy: energy.trim().parse().map_err(|_| bad())?,
+        })
+    }
+}
+
 /// A command scheduled from the command line.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[expect(
@@ -273,6 +317,8 @@ pub enum ScheduledCommand {
     Material(Material),
     /// Organisms out of a disk.
     Remove(Removal),
+    /// New organisms into a field cell.
+    Introduce(Introduction),
 }
 
 impl ScheduledCommand {
@@ -283,6 +329,7 @@ impl ScheduledCommand {
             Self::Inject(injection) => injection.tick,
             Self::Material(material) => material.tick,
             Self::Remove(removal) => removal.tick,
+            Self::Introduce(introduction) => introduction.tick,
         }
     }
 
@@ -313,16 +360,27 @@ impl ScheduledCommand {
                 radius,
                 disposition,
             },
+            Self::Introduce(Introduction {
+                cell,
+                count,
+                energy,
+                ..
+            }) => Intervention::IntroduceOrganisms {
+                cell,
+                count,
+                energy,
+            },
         }
     }
 
-    /// `injections`, then `materials`, then `removals`: the command line's
-    /// order of identities.
+    /// `injections`, then `materials`, then `removals`, then
+    /// `introductions`: the command line's order of identities.
     #[must_use]
     pub fn listed(
         injections: &[Injection],
         materials: &[Material],
         removals: &[Removal],
+        introductions: &[Introduction],
     ) -> Vec<Self> {
         injections
             .iter()
@@ -330,6 +388,7 @@ impl ScheduledCommand {
             .map(Self::Inject)
             .chain(materials.iter().copied().map(Self::Material))
             .chain(removals.iter().copied().map(Self::Remove))
+            .chain(introductions.iter().copied().map(Self::Introduce))
             .collect()
     }
 }
@@ -349,6 +408,12 @@ impl From<Material> for ScheduledCommand {
 impl From<Removal> for ScheduledCommand {
     fn from(removal: Removal) -> Self {
         Self::Remove(removal)
+    }
+}
+
+impl From<Introduction> for ScheduledCommand {
+    fn from(introduction: Introduction) -> Self {
+        Self::Introduce(introduction)
     }
 }
 
@@ -1148,8 +1213,44 @@ pub fn resume(
 
 #[cfg(test)]
 mod tests {
-    use super::{Injection, Material, Removal, ScheduledCommand};
+    use super::{Injection, Introduction, Material, Removal, ScheduledCommand};
     use flife_engine::{Disposition, MATERIAL_CHANNELS};
+
+    /// `TICK:X,Y:COUNT:ENERGY`, in that order, and nothing else.
+    #[test]
+    fn an_introduction_is_tick_cell_count_and_energy() {
+        assert_eq!(
+            "40:3,7:12:2.5".parse::<Introduction>(),
+            Ok(Introduction {
+                tick: 40,
+                cell: [3, 7],
+                count: 12,
+                energy: 2.5,
+            })
+        );
+        assert_eq!(
+            " 1 : 0 , 31 : 1 : 1e-3 ".parse::<Introduction>(),
+            Ok(Introduction {
+                tick: 1,
+                cell: [0, 31],
+                count: 1,
+                energy: 0.001,
+            })
+        );
+        for bad in [
+            "",
+            "40:3,7:12",
+            "40:3,7:12:2.5:1",
+            "40:3:12:2.5",
+            "40:3,7:-1:2.5",
+            "40:3,7:1.5:2.5",
+            "40:3,7:4294967296:2.5",
+            "40:3,7:12:x",
+            "-1:3,7:12:2.5",
+        ] {
+            assert!(bad.parse::<Introduction>().is_err(), "{bad}");
+        }
+    }
 
     /// `TICK:X,Y:AMOUNT:K=V,…`: named channels below the channel count,
     /// each once, the rest zero; nothing else.
@@ -1194,10 +1295,10 @@ mod tests {
         }
     }
 
-    /// Injections, then materials, then removals, each in the order given:
-    /// the identities 1, 2, … the command line assigns.
+    /// Injections, then materials, then removals, then introductions, each
+    /// in the order given: the identities 1, 2, … the command line assigns.
     #[test]
-    fn listed_commands_are_injections_then_materials_then_removals() {
+    fn listed_commands_are_injections_then_materials_then_removals_then_introductions() {
         let injection = |tick| Injection {
             tick,
             cell: [1, 2],
@@ -1215,11 +1316,18 @@ mod tests {
             radius: 1.0,
             disposition: Disposition::Remove,
         };
+        let introduction = |tick| Introduction {
+            tick,
+            cell: [7, 8],
+            count: 3,
+            energy: 1.0,
+        };
         assert_eq!(
             ScheduledCommand::listed(
                 &[injection(9), injection(8)],
                 &[material(7), material(6)],
-                &[removal]
+                &[removal],
+                &[introduction(5), introduction(4)]
             ),
             vec![
                 ScheduledCommand::Inject(injection(9)),
@@ -1227,6 +1335,8 @@ mod tests {
                 ScheduledCommand::Material(material(7)),
                 ScheduledCommand::Material(material(6)),
                 ScheduledCommand::Remove(removal),
+                ScheduledCommand::Introduce(introduction(5)),
+                ScheduledCommand::Introduce(introduction(4)),
             ]
         );
     }

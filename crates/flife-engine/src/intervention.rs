@@ -41,19 +41,50 @@
 //! recycled residual and is first sensed in tick `n + 1`. An organism inside
 //! two removals' disks at one boundary dies by the first in sealed order. A
 //! disk that holds no organism removes nothing and still applies.
+//!
+//! `IntroduceOrganisms` is seeded organism introduction (§12.3, §14.3):
+//! `count` new organisms, each endowed with `energy` of declared external
+//! energy, placed in one field cell. They enter at the end of tick `n`, in
+//! phase 8 after the births, as the tick's last entrants, and first sense
+//! and act in tick `n + 1`. Introductions are taken in sealed order, and
+//! each one's organisms in turn. Each takes the next organism and genome
+//! identities, so introducing never changes a birth's identity, genome or
+//! randomness. Each is drawn exactly as a founder with its identity would
+//! be (A.3 item 1): its genome from the founder streams, its position from
+//! the founder position words, here scaled into the cell rather than the
+//! whole world. It is the founder of its own lineage (lineage = its
+//! identity, generation zero, no parent). It is born at tick `n + 1` with
+//! zero velocity, an invalid held output (so it is evaluated on its first
+//! advance), its stable phase, and the cooldown deadline
+//! `n + 1 + ⌈cooldown/Δt⌉` a newborn gets. Its endowment is recorded as
+//! `command-injection`. An introduction is all or none: if its organisms do
+//! not all fit under `population.maximum_count` beside the survivors, the
+//! births and the introductions before it, or the genome quota cannot cover
+//! all of their genomes, it introduces nothing and applies zero energy. It
+//! never pauses the run.
 
+use flife_core::clock::{TickSpan, stable_phase};
+use flife_core::ids::{Generation, LineageId};
 use flife_core::ledger::{Flow, TickLedger};
+use flife_core::rng::SemanticRng;
 use flife_core::{CoreError, Tick};
 use flife_field::sources::squared_norm;
 use flife_field::state::CHANNELS;
 use flife_field::{Deposits, FieldGrid, FieldState};
+use flife_genome::{GenomeQuota, TopologyCatalog, TraitLimits, founder};
 
 use crate::lifecycle::{Death, Disposition, Recycling};
-use crate::population::{Organism, Population};
+use crate::population::{Entrant, HeldOutput, Organism, Population};
+use crate::reproduction::Identities;
+use crate::world::founder_draws;
 
 /// The components of a material brush's direction: one per moment channel
 /// of the field.
 pub const MATERIAL_CHANNELS: usize = CHANNELS;
+
+/// The most organisms one introduction may add: the reference preset's
+/// founder count.
+pub const MAXIMUM_INTRODUCTION: u32 = 4096;
 
 /// A validated change to the world, effective at one tick boundary.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -92,6 +123,19 @@ pub enum Intervention {
         /// What becomes of each removed organism's energy.
         disposition: Disposition,
     },
+    /// `count` new founder-drawn organisms, each with `energy` declared
+    /// external energy, placed in the field cell at `cell = [x, y]` at the
+    /// end of the tick: seeded introduction. Recorded as
+    /// `command-injection`.
+    IntroduceOrganisms {
+        /// The cell's `[x, y]` index on the field grid.
+        cell: [u32; 2],
+        /// How many: at least one and at most [`MAXIMUM_INTRODUCTION`].
+        count: u32,
+        /// Each one's endowment: finite, strictly positive and at most
+        /// `f32::MAX`.
+        energy: f64,
+    },
 }
 
 impl Intervention {
@@ -103,7 +147,8 @@ impl Intervention {
     /// `f32::MAX`; for a material direction with a nonfinite component or
     /// a norm above one; for a centre outside the world or a radius that is
     /// not finite, not strictly positive, or above half the shorter world
-    /// side.
+    /// side; for an introduction of no organisms or more than
+    /// [`MAXIMUM_INTRODUCTION`], or an endowment refused as an amount is.
     pub fn check(&self, grid: &FieldGrid) -> Result<(), CoreError> {
         match *self {
             Self::InjectEnergy { cell, amount } => check_injection(grid, cell, amount),
@@ -153,27 +198,48 @@ impl Intervention {
                 }
                 Ok(())
             }
+            Self::IntroduceOrganisms {
+                cell,
+                count,
+                energy,
+            } => {
+                check_cell(grid, cell, "introduction cell")?;
+                if !(1..=MAXIMUM_INTRODUCTION).contains(&count) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "introduction count",
+                        detail: format!(
+                            "{count} organisms: an introduction adds 1 to \
+                             {MAXIMUM_INTRODUCTION}"
+                        ),
+                    });
+                }
+                check_energy(energy, "introduction energy")
+            }
         }
     }
 
-    /// The energy the intervention declares it adds: none for a removal.
+    /// The energy the intervention declares it adds: none for a removal,
+    /// every endowment for an introduction.
     #[must_use]
-    pub const fn declared_energy(&self) -> f64 {
+    pub fn declared_energy(&self) -> f64 {
         match *self {
             Self::InjectEnergy { amount, .. } | Self::InjectMaterial { amount, .. } => amount,
             Self::RemoveOrganisms { .. } => 0.0,
+            Self::IntroduceOrganisms { count, energy, .. } => f64::from(count) * energy,
         }
     }
 
     /// Whether `position`, a wrapped world position, lies in this removal's
     /// disk: the minimum-image distance from the centre is at most the
-    /// radius. Never for an injection.
+    /// radius. Never for an injection or an introduction.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a position outside the world.
     pub fn removes_at(&self, grid: &FieldGrid, position: [f64; 2]) -> Result<bool, CoreError> {
         match *self {
-            Self::InjectEnergy { .. } | Self::InjectMaterial { .. } => Ok(false),
+            Self::InjectEnergy { .. }
+            | Self::InjectMaterial { .. }
+            | Self::IntroduceOrganisms { .. } => Ok(false),
             Self::RemoveOrganisms { center, radius, .. } => {
                 let [dx, dy] = grid.displacement(center, position)?;
                 Ok(dx * dx + dy * dy <= radius * radius)
@@ -193,10 +259,14 @@ pub struct AppliedIntervention {
     pub intervention: Intervention,
     /// The energy it moved: for an injection, the energy that entered the
     /// field, never more than declared; for a removal, the energy the
-    /// organisms it removed held.
+    /// organisms it removed held; for an introduction, the endowments of
+    /// the organisms it introduced, `count × energy` rounded once, or zero.
     pub applied: f64,
-    /// The organisms it removed: none for an injection.
+    /// The organisms it removed: none for an injection or an introduction.
     pub removed: u64,
+    /// The organisms it introduced: `count` or none for an introduction,
+    /// none for anything else.
+    pub introduced: u64,
 }
 
 /// Phase 1: take out the organisms `interventions`' removals name, in
@@ -262,6 +332,7 @@ pub(crate) fn remove(
             intervention: *intervention,
             applied: energy,
             removed,
+            introduced: 0,
         });
     }
     let mut kept = gone.iter();
@@ -280,7 +351,10 @@ pub(crate) fn apply(
     applied: &mut Vec<AppliedIntervention>,
 ) -> Result<(), CoreError> {
     for (position, intervention) in interventions.iter().enumerate() {
-        if matches!(intervention, Intervention::RemoveOrganisms { .. }) {
+        if matches!(
+            intervention,
+            Intervention::RemoveOrganisms { .. } | Intervention::IntroduceOrganisms { .. }
+        ) {
             continue;
         }
         intervention.check(field.grid())?;
@@ -319,7 +393,9 @@ pub(crate) fn apply(
                 }
                 energy
             }
-            Intervention::RemoveOrganisms { .. } => continue,
+            Intervention::RemoveOrganisms { .. } | Intervention::IntroduceOrganisms { .. } => {
+                continue;
+            }
         };
         ledger.record(Flow::CommandInjection, energy)?;
         applied.push(AppliedIntervention {
@@ -328,16 +404,195 @@ pub(crate) fn apply(
             intervention: *intervention,
             applied: energy,
             removed: 0,
+            introduced: 0,
         });
     }
     Ok(())
 }
 
+/// The run's rules an introduction draws its organisms from.
+pub(crate) struct Founding<'a> {
+    /// The run's counter-based randomness.
+    pub rng: &'a SemanticRng,
+    /// The field grid, for the cell and the torus.
+    pub grid: &'a FieldGrid,
+    /// The topology catalog the founder genome uses.
+    pub catalog: &'a TopologyCatalog,
+    /// The trait limits the founder traits respect.
+    pub limits: &'a TraitLimits,
+    /// The founders' initial sensing scale.
+    pub initial_scale: f64,
+    /// The controller evaluation interval, for the stable phase.
+    pub interval: u32,
+    /// `⌈cooldown/Δt⌉`, for the newborn cooldown deadline.
+    pub cooldown: TickSpan,
+    /// `population.maximum_count`.
+    pub maximum_population: u64,
+}
+
+/// Phase 8, after the births: each of `interventions`' introductions in
+/// sealed order, all or none. `survivors` organisms survive the tick and
+/// `entrants` holds its births; each introduced organism is appended to
+/// `entrants`, its identities issued from `identities` and its genome
+/// charged to `quota`, and each introduction is recorded in `ledger` and
+/// appended to `applied`. A refused introduction leaves `identities`,
+/// `quota`, `entrants` and `ledger` as they were.
+///
+/// # Errors
+/// As [`Intervention::check`], identity issuance, the founder genome (other
+/// than a quota that cannot cover it, which refuses the introduction) and
+/// the ledger.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the phase's inputs and the four outputs it fills"
+)]
+pub(crate) fn introduce(
+    tick: Tick,
+    interventions: &[Intervention],
+    founding: &Founding<'_>,
+    survivors: usize,
+    identities: &mut Identities,
+    quota: &mut GenomeQuota,
+    entrants: &mut Vec<Entrant>,
+    ledger: &mut TickLedger,
+    applied: &mut Vec<AppliedIntervention>,
+) -> Result<(), CoreError> {
+    let to = tick.next()?;
+    let cooldown_deadline = to.checked_add(founding.cooldown)?;
+    for (position, intervention) in interventions.iter().enumerate() {
+        let Intervention::IntroduceOrganisms {
+            cell,
+            count,
+            energy,
+        } = *intervention
+        else {
+            continue;
+        };
+        intervention.check(founding.grid)?;
+        let live = u64::try_from(survivors.saturating_add(entrants.len())).unwrap_or(u64::MAX);
+        let staged = if live.saturating_add(u64::from(count)) <= founding.maximum_population {
+            stage_introduction(
+                founding,
+                cell,
+                count,
+                energy,
+                to,
+                cooldown_deadline,
+                identities,
+                quota,
+            )?
+        } else {
+            None
+        };
+        let (total, introduced) = match staged {
+            Some(mut staged) => {
+                let total = f64::from(count) * energy;
+                ledger.record(Flow::CommandInjection, total)?;
+                entrants.append(&mut staged);
+                (total, u64::from(count))
+            }
+            None => (0.0, 0),
+        };
+        applied.push(AppliedIntervention {
+            tick,
+            position,
+            intervention: *intervention,
+            applied: total,
+            removed: 0,
+            introduced,
+        });
+    }
+    Ok(())
+}
+
+/// One introduction's organisms in identity order, or `None` when the
+/// genome quota cannot cover them all; `identities` and `quota` change only
+/// when it returns them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the introduction's fields, its tick's two deadlines and the two sequences it draws from"
+)]
+fn stage_introduction(
+    founding: &Founding<'_>,
+    cell: [u32; 2],
+    count: u32,
+    energy: f64,
+    to: Tick,
+    cooldown_deadline: Tick,
+    identities: &mut Identities,
+    quota: &mut GenomeQuota,
+) -> Result<Option<Vec<Entrant>>, CoreError> {
+    let length = usize::try_from(count).map_err(|_| CoreError::Overflow {
+        quantity: "introduction count",
+    })?;
+    let mut staged = Vec::new();
+    staged
+        .try_reserve_exact(length)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "introduced organisms",
+            bytes: u64::try_from(length.saturating_mul(size_of::<Entrant>())).unwrap_or(u64::MAX),
+        })?;
+    let mut trial_identities = identities.clone();
+    let mut trial_quota = quota.clone();
+    let grid = founding.grid;
+    for _ in 0..count {
+        let id = trial_identities.organisms.issue()?;
+        let genome_id = trial_identities.genomes.issue()?;
+        let genome = match founder(
+            founding.rng,
+            id,
+            genome_id,
+            founding.catalog,
+            &mut trial_quota,
+            founding.limits,
+            founding.initial_scale,
+        ) {
+            Ok(genome) => genome,
+            // The trial quota and every genome staged so far are dropped
+            // together, so nothing was charged.
+            Err(CoreError::BudgetExhausted { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let [u, v] = founder_draws(founding.rng, id)?;
+        let position = grid.wrap_position([
+            (f64::from(cell[0]) + u) * grid.cell_width(),
+            (f64::from(cell[1]) + v) * grid.cell_height(),
+        ])?;
+        staged.push(Entrant {
+            organism: Organism {
+                id,
+                genome: genome_id,
+                parent: None,
+                lineage: LineageId::new(id.get()),
+                generation: Generation::FOUNDER,
+                birth_tick: to,
+                position,
+                velocity: [0.0, 0.0],
+                energy,
+                energy_change_rate: 0.0,
+                held: HeldOutput::INVALID,
+                phase: stable_phase(id, founding.interval)?,
+                cooldown_deadline,
+            },
+            genome,
+        });
+    }
+    *identities = trial_identities;
+    *quota = trial_quota;
+    Ok(Some(staged))
+}
+
 /// An injection's cell and amount, as [`Intervention::check`] requires them.
 fn check_injection(grid: &FieldGrid, cell: [u32; 2], amount: f64) -> Result<(), CoreError> {
+    check_cell(grid, cell, "injection cell")?;
+    check_energy(amount, "injection amount")
+}
+
+/// A cell on `grid`, refused as `quantity`.
+fn check_cell(grid: &FieldGrid, cell: [u32; 2], quantity: &'static str) -> Result<(), CoreError> {
     if grid.cell_index(cell[0], cell[1]).is_none() {
         return Err(CoreError::NumericalInvalid {
-            quantity: "injection cell",
+            quantity,
             detail: format!(
                 "{cell:?} is outside the {} × {} grid",
                 grid.cells_x(),
@@ -345,9 +600,15 @@ fn check_injection(grid: &FieldGrid, cell: [u32; 2], amount: f64) -> Result<(), 
             ),
         });
     }
+    Ok(())
+}
+
+/// A finite, strictly positive energy at most `f32::MAX`, refused as
+/// `quantity`.
+fn check_energy(amount: f64, quantity: &'static str) -> Result<(), CoreError> {
     if !(amount.is_finite() && amount > 0.0 && amount <= f64::from(f32::MAX)) {
         return Err(CoreError::NumericalInvalid {
-            quantity: "injection amount",
+            quantity,
             detail: format!("{amount:e} is not a finite positive energy at most f32::MAX"),
         });
     }

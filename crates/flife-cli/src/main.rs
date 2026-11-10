@@ -16,8 +16,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
-    ExperimentOptions, Injection, InspectOptions, Look, Material, Particles, Persistence, Removal,
-    ResumeOptions, RunOptions, ScheduledCommand, Stop, StoreDurability, Style, Validation,
+    ExperimentOptions, Injection, InspectOptions, Introduction, Look, Material, Particles,
+    Persistence, Removal, ResumeOptions, RunOptions, ScheduledCommand, Stop, StoreDurability,
+    Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -88,6 +89,14 @@ enum Command {
         /// `--inject` and `--inject-material` commands, in order.
         #[arg(long = "remove", value_name = "TICK:X,Y:RADIUS:DISPOSITION")]
         removals: Vec<Removal>,
+        /// Introduce COUNT new organisms, each endowed with ENERGY, into a
+        /// field cell at the end of a committed tick (seeded introduction:
+        /// founder-drawn genomes, new lineages; all or none under the
+        /// population cap), written `TICK:X,Y:COUNT:ENERGY`; repeatable.
+        /// Numbered after the `--inject`, `--inject-material` and `--remove`
+        /// commands, in order.
+        #[arg(long = "introduce", value_name = "TICK:X,Y:COUNT:ENERGY")]
+        introductions: Vec<Introduction>,
     },
     /// Continue the run in a run directory from its newest checkpoint that
     /// restores, replaying its command journal, to a committed tick.
@@ -118,8 +127,8 @@ enum Command {
         checkpoints: CheckpointFlags,
     },
     /// Branch a run directory at one of its checkpoints into a new run
-    /// directory: a control branch, or with `--inject` or `--remove` an
-    /// intervention branch. Continue it with `flife resume`.
+    /// directory: a control branch, or with `--inject`, `--inject-material`,
+    /// `--remove` or `--introduce` an intervention branch. Continue it with `flife resume`.
     Branch {
         /// The run directory to branch.
         parent: PathBuf,
@@ -151,6 +160,13 @@ enum Command {
         /// `--inject` and `--inject-material` commands.
         #[arg(long = "remove", value_name = "TICK:X,Y:RADIUS:DISPOSITION")]
         removals: Vec<Removal>,
+        /// The branch's own command: COUNT new organisms, each endowed with
+        /// ENERGY, introduced into a field cell at the end of a committed
+        /// tick at or after the checkpoint's, written
+        /// `TICK:X,Y:COUNT:ENERGY`; repeatable, numbered after the
+        /// `--inject`, `--inject-material` and `--remove` commands.
+        #[arg(long = "introduce", value_name = "TICK:X,Y:COUNT:ENERGY")]
+        introductions: Vec<Introduction>,
         /// `power-loss` (the default) flushes the founding checkpoint to
         /// stable storage before publishing it; `process-crash` relies on
         /// atomic renames.
@@ -339,6 +355,7 @@ fn main() -> ExitCode {
             injections,
             materials,
             removals,
+            introductions,
         } => {
             let config = match load(&config) {
                 Ok(config) => config,
@@ -367,7 +384,7 @@ fn main() -> ExitCode {
                     controllers,
                     metrics_every,
                 },
-                &ScheduledCommand::listed(&injections, &materials, &removals),
+                &ScheduledCommand::listed(&injections, &materials, &removals, &introductions),
                 persistence.as_ref(),
                 print,
             ))
@@ -380,6 +397,7 @@ fn main() -> ExitCode {
             injections,
             materials,
             removals,
+            introductions,
             checkpoint_durability,
         } => match flife_cli::branch(
             &parent,
@@ -387,7 +405,12 @@ fn main() -> ExitCode {
             &BranchOptions {
                 at,
                 name,
-                commands: ScheduledCommand::listed(&injections, &materials, &removals),
+                commands: ScheduledCommand::listed(
+                    &injections,
+                    &materials,
+                    &removals,
+                    &introductions,
+                ),
                 durability: checkpoint_durability,
             },
         ) {

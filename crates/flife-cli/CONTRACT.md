@@ -53,11 +53,17 @@ bytes at any worker count and backend, and after a kill and a continuation.
     into cell (X, Y) with the signed composition whose channel K is V for each named K (each below 32, at most
     once) and zero elsewhere, numbered after the `--inject` commands. A direction with norm above one is refused
     at admission: exit 2 before any tick, naming `material direction`.
+  - FL-022: `--introduce TICK:X,Y:COUNT:ENERGY`, repeatable: an `IntroduceOrganisms` command, COUNT founder-drawn
+    organisms, each endowed with ENERGY, entering cell (X, Y) at the end of that committed tick, all or none under
+    the population cap and genome quota, numbered after the `--inject`, `--inject-material` and `--remove`
+    commands. A count of 0 or above 4096, or an endowment that is not a finite positive energy at most `f32::MAX`,
+    is refused at admission: exit 2 before any tick.
 - `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
 - In the library: `run_with(config, options, scheduled, persistence, emit)` and `resume(dir, ResumeOptions,
   emit)`, with `Persistence::new(dir, config)` giving the configured defaults. `scheduled` is a list of
-  `ScheduledCommand`s (`Inject(Injection)`, `Material(Material)` or `Remove(Removal)`, FL-022);
-  `ScheduledCommand::listed(injections, materials, removals)` numbers them as the command line does.
+  `ScheduledCommand`s (`Inject(Injection)`, `Material(Material)`, `Remove(Removal)` or
+  `Introduce(Introduction)`, FL-022); `ScheduledCommand::listed(injections, materials, removals, introductions)`
+  numbers them as the command line does.
 - FL-040: `--metrics-every M` on `flife run` and `flife resume`, 0 (none) by default; `RunOptions::metrics_every`
   and `ResumeOptions::metrics_every` in the library. `Tracker::new(world, M)`, `Tracker::record(report)` and
   `Tracker::sample(epoch)` are public, so a client that steps a world itself can use them.
@@ -66,8 +72,8 @@ bytes at any worker count and backend, and after a kill and a continuation.
   - `--at` is the committed tick of a parent checkpoint. By default it is the newest one that restores.
   - `--name` is 1 to 256 bytes, `DIR`'s name by default.
   - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command, then
-    `--inject-material` (FL-022) its own material brushes, and `--remove` (FL-022) its own removals, numbered
-    after both.
+    `--inject-material` (FL-022) its own material brushes, `--remove` (FL-022) its own removals, and
+    `--introduce` (FL-022) its own introductions, in that order.
   - In the library: `branch(parent, dir, &BranchOptions { at, name, commands, durability })`.
 
 - FL-041: `flife experiment SPEC --out DIR --cpu-workers W --controllers C`. `DIR` is new, empty, or holds this
@@ -516,6 +522,33 @@ entry dropped. Twelve were caught on their first run. The survivor, `removes_at`
 is unreachable from the world (phase 1 asks only removals) and was caught once the engine test asked the public
 `removes_at` directly.
 
+FL-022's seeded introduction: `introductions_are_journaled_checkpointed_and_replayed_like_any_command` (in
+`tests/resume.rs`) runs the ecology with two introductions (six organisms at the centre at tick 100, three at a
+corner cell at 160): it journals six commands and ends elsewhere than the run without them. Stopped at 102 with its
+newest checkpoint damaged, it resumes from 98 with both pending, replays the first's outcome and reaches the
+uninterrupted world and final checkpoint bytes, so the introduced organisms, genomes and identities come back from
+checkpoint and journal alike. An introduction of no organisms is refused with exit 2, no end record and
+`introduction count` named. `an_introduction_branch_matches_its_control_until_the_introduction_and_differs_after`
+(in `tests/branch.rs`): command 5, the same world at 125, another at 126. `persist` unit tests pin `--introduce`
+parsing and `listed`'s order (injections, materials, removals, introductions). The metrics tracker admits each
+report's introductions as founders of their own lineages (generation zero, born at the tick, above every earlier
+identity): `the_tracker_follows_introduced_organisms_until_they_die` (in `tests/metrics.rs`) introduces six
+organisms at ticks 0 and 40 and checks at every one of 600 ticks that the tracker holds exactly the committed world,
+through the introduced organisms' deaths. A tracker that ignores the introductions refuses the introduction's own
+tick, its live count short of the report's (planted mutant M20).
+Twenty planted mutants across the introduction (engine, codec, CLI, metrics) each ran against suites that first
+passed unmutated: the cap exclusive, the cap ignoring the tick's earlier entrants, a quota shortfall keeping the organisms
+staged so far, a refused introduction still spending identities, the x and y cells swapped, every organism in
+lineage 0, no cooldown, phase zero, the endowments unrecorded, a refused introduction reporting its declared
+energy, no lower bound on the count, the limit itself refused, the introduced energy left out of the holdings,
+the report not resorted, the count not encoded, the energy decoded before the count, introductions listed before
+removals, a scheduled introduction sent as an energy injection, the report listing no introductions, and the
+metrics tracker ignoring them. Seventeen were caught on their first run. Phase
+zero survived because the ecology evaluates every tick (every phase is zero), and the unsorted report survived
+because no test mixed an introduction with an earlier-phase intervention; both were caught once a test ran a
+controller interval of 4 and one sealed an introduction before an injection and a removal. The energy-injection
+mutant first failed to compile (`intervention` is `const`) and was caught once rewritten.
+
 A `persist` unit test pins `--inject` parsing. Twenty-four planted mutants in the run directories, the driver,
 suspension, `open_restored` and the CLI guard were each caught. One, `flife run` without its own write-ahead
 guard, was caught only after the smoke test checked that the refusal names `--run-dir`: the session refuses in
@@ -700,8 +733,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - Power loss is FL-035's protocol (flush order), exercised by publishing under `power-loss`, never by cutting
     power. Kills are tested at whatever point the process reached, not at every step of a checkpoint (FL-035 and
     FL-036 test those).
-  - Commands come only from `--inject`, `--inject-material` and `--remove` at the start of a run or branch.
-    Commands submitted to a resumed run, and the other interventions, are FL-022.
+  - Commands come only from `--inject`, `--inject-material`, `--remove` and `--introduce` at the start of a run
+    or branch. Commands submitted to a resumed run, and the other interventions, are FL-022.
   - Retention is by count. Pinned discoveries and journal compaction (§16.7) are later, and the catalog's
     checkpoint index keeps rows for retired manifests.
 - FL-038 evidence (`tests/checkpoint_memory.rs`, a counting global allocator, `peak_alloc`, test only; and

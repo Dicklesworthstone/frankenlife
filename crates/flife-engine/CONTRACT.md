@@ -49,7 +49,9 @@ torus dies at the boundary, its energy removed, dissipated or recycled as the co
 §14.3). It is the perturbation FL-048's H4 boundary test needs. The native brush input that would produce it is
 still FL-022's. FL-022 also adds `Intervention::InjectMaterial`, the material brush (§14.3): declared energy into
 one cell with a signed composition direction `a`, `||a||₂ ≤ 1`, so the packet `(Δe, Δe a)` is admissible and the
-brush cannot write an `m` that breaks `||m||₂ ≤ e`.
+brush cannot write an `m` that breaks `||m||₂ ≤ e`. And it adds `Intervention::IntroduceOrganisms`, seeded
+introduction (§12.3, §14.3): `count` new organisms, each endowed with declared energy, placed in one cell at the end
+of the tick, each drawn exactly as a founder with its identity would be.
 
 FL-016 (`flife-gh0`) writes and restores the whole world as ten checkpoint chunks (plan §16.1, §16.3, INV-14,
 Appendix B.2, C.13).
@@ -142,6 +144,11 @@ each runs and owns the field.
 - FL-022: `Intervention::InjectMaterial { cell, amount, direction }` and `MATERIAL_CHANNELS` (32, one component
   per moment channel). `flife_field::sources::squared_norm` is now public, the one norm rule for a source's and a
   material's direction.
+- FL-022: `Intervention::IntroduceOrganisms { cell, count, energy }` and `MAXIMUM_INTRODUCTION` (4096, the reference
+  preset's founder count); `AppliedIntervention::introduced`, the organisms an introduction introduced (zero for
+  anything else); `TickReport::introductions`, an `IntroductionEvent { organism, genome, topology }` per introduced
+  organism in identity order, after the births (the event range counts them last).
+  `Intervention::declared_energy` is no longer `const` (it multiplies the count).
 - FL-041: `ModelVariant` (`Baseline`, `ChemistryOnly`, `FreshOffspring`) and `ModelVariant::of(model)`;
   `reproduction::Offspring` (`Inherited`, or `Fresh { catalog, limits, initial_scale }`), the new `offspring`
   field of `BirthContext`.
@@ -306,6 +313,21 @@ each runs and owns the field.
   rounds down. The `command-injection` flow is `Δe`. A direction whose squares, summed in channel order in F64,
   exceed one, or with a non-finite component (its sum is then NaN or infinite), is refused like a bad cell or
   amount; a norm of exactly one is admitted.
+- FL-022: an `IntroduceOrganisms` adds its organisms in phase 8, after the births are staged and every fate is
+  decided, as the tick's last entrants; they first sense and act in tick `n + 1`, and a removal at the same
+  boundary cannot touch them. Introductions go in sealed order, each one's organisms in turn, each taking the next
+  organism and genome identities after the births', so an introduction never changes a birth's identity, genome or
+  randomness. Each organism's genome is `flife_genome::founder` for its identity, its position the founder
+  position words (`founder_position`'s, now shared through `founder_draws`) scaled into the cell, uniform there; it
+  founds its own lineage (lineage = identity, generation zero, no parent), is born at `n + 1` with the endowment,
+  zero velocity and change rate, an invalid held output, its stable phase and the newborn cooldown deadline
+  `n + 1 + ⌈cooldown/Δt⌉`. The endowments, `count × energy` rounded once, are `command-injection`, and the organisms'
+  energies join the closing holdings. An introduction is all or none: if its organisms do not all fit under
+  `population.maximum_count` beside the survivors, the births and the introductions before it, or the genome quota
+  refuses any of their genomes, it introduces nothing, spends no identity or quota and applies zero. It never pauses
+  the run. A count of zero or above `MAXIMUM_INTRODUCTION`, an endowment that is not a finite positive energy at
+  most `f32::MAX`, or a cell outside the grid is refused before anything changes. No new model identity: a world
+  never sent the command is the world it was.
 
 **Invariants — checkpoints (FL-016; §16.3, INV-14, B.2).**
 - `World::write_checkpoint` writes the ten world chunks of `WORLD_CHECKPOINT_CHUNKS` at version 1, each declaring
@@ -552,6 +574,33 @@ a cell already on it, exactly.
 Thirteen planted mutants (with `flife-runtime`'s and `flife-cli`'s) are listed in `flife-cli`'s contract under
 FL-022.
 
+`tests/introduction.rs` (7 tests, FL-022), on the 32 × 32 Appendix A ecology. The oracle is a second founding:
+- `introduced_organisms_are_the_founders_a_larger_founding_draws`: five organisms introduced into the 48-founder
+  world at tick 0 carry the genomes (parameters bit for bit), traits and phases of founders 48–52 of the same world
+  founded with 53; each position is that founder's position words scaled into cell (15, 17) within 1e-12, inside the
+  cell; each founds its own lineage, is born at tick 1 with the endowment, zero velocity, an invalid held output and
+  that founder's cooldown deadline one tick later. Applied 12.5, `introduced` 5, the flow 12.5, five more live and
+  five more events, and the report's introductions name them with the larger founding's genomes and topologies; on
+  the next advance they are evaluated, and 30 ticks follow.
+- `introduced_phases_follow_identity_under_a_longer_interval`: under a controller interval of 4 the introduced
+  organisms take the founders' stable phases, not all zero (the ecology's interval of 1 makes every phase zero).
+- `the_report_lists_an_introduction_in_its_sealed_position`: an introduction, an injection, a removal and another
+  introduction are reported in sealed order although they apply in phases 8, 2, 1 and 8.
+- `an_introduction_is_all_or_none_under_the_cap_and_the_quota`: with 48 live under a cap of 51, introductions of
+  2, 2 and 1 apply 2, none and 1 in sealed order, and the world equals one sent only the two that fit; with a
+  logical genome quota of exactly 50 genomes, an introduction of 3 introduces none and one of 2 both, leaving 50
+  live genomes and identity 50 next.
+- `introductions_enter_after_the_births_and_never_change_them`: at the first tick with births, the births, rejected
+  births and deaths equal the plain world's, and every introduced identity is above the newest child's.
+- `introductions_outside_the_rules_are_refused_unchanged`: a count of 0 or 4097, endowments 0, −1, NaN, ∞ and
+  2 × `f32::MAX`, and two cells outside, each refused naming its quantity with the tick and digest unchanged; the
+  limit itself is admitted, `declared_energy` is every endowment, `removes_at` is false, and 4096 over the cap
+  introduces nothing.
+- `an_introduced_world_is_the_same_at_any_worker_count`: 1, 3 and 8 workers, 40 ticks on.
+
+Twenty planted mutants for the introduction (with `flife-runtime`'s and `flife-cli`'s) are listed in
+`flife-cli`'s contract under FL-022.
+
 `tests/ablation.rs` (3 tests, FL-041), on the 32 × 32 Appendix A ecology:
 - `the_model_key_names_each_variant_and_refuses_others`: each name maps to its variant and validates; another name
   (`field-ecology-v2`, `field-ecology-v1-shuffled`) is refused.
@@ -573,8 +622,9 @@ velocity, first-order splitting at the configured fixed timestep.
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
-  and disk `RemoveOrganisms` (FL-022). Area brushes, seeded introduction, source edits and the native input that
-  maps a brush stroke to these payloads are still FL-022. The exhibition-mode stable-ID birth rejection policy has no
+  disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
+  brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a
+  brush stroke to these payloads are still FL-022. The exhibition-mode stable-ID birth rejection policy has no
   registered name yet.
 - `stop-and-preserve` keeps the committed state and the fault's description, which names the quantity and,
   where the operator knows it, the organism. It does not yet retain the faulted candidate's buffers for

@@ -807,3 +807,28 @@ fn a_material_branch_matches_its_control_until_the_material_and_differs_after() 
         reached(&resume(&treated, 126), 126)
     );
 }
+
+/// FL-022's seeded introduction in a branch: branched at [`FORK`] with
+/// `--introduce` (six organisms at the centre at tick 125), it numbers the
+/// introduction after the inherited commands, matches its control branch
+/// until the introduction's boundary, and differs after it.
+#[test]
+fn an_introduction_branch_matches_its_control_until_the_introduction_and_differs_after() {
+    let config = ecology("write-ahead-before-apply");
+    let parent = fresh("introduction-parent");
+    run(&config, &parent, FORK);
+    let control = fresh("introduction-control");
+    branch(&parent, &control, FORK, &[]);
+    let treated = fresh("introduction-treated");
+    let made = branch(&parent, &treated, FORK, &["--introduce", "125:16,16:6:2.5"]);
+    assert_eq!(made["commands"], json!([5]), "numbered after command 4");
+    assert_eq!(
+        reached(&resume(&control, 125), 125),
+        reached(&resume(&treated, 125), 125),
+        "no difference before the introduction's boundary"
+    );
+    assert_ne!(
+        reached(&resume(&control, 126), 126),
+        reached(&resume(&treated, 126), 126)
+    );
+}

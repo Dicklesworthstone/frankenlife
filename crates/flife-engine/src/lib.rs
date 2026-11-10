@@ -52,7 +52,9 @@ pub use chemistry::{
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
-pub use intervention::{AppliedIntervention, Intervention, MATERIAL_CHANNELS};
+pub use intervention::{
+    AppliedIntervention, Intervention, MATERIAL_CHANNELS, MAXIMUM_INTRODUCTION,
+};
 pub use lifecycle::{
     BudgetStage, DISSIPATE_AND_RECORD, Death, DeathCause, DeathSettlement, Disposition, Fate,
     GENETIC_AFFINITY, Recycling, TinyEnergyPolicy, Vitality,
@@ -68,8 +70,9 @@ pub use reproduction::{
     Unviable, Viability, resolve_births,
 };
 pub use world::{
-    Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport, ModelVariant,
-    NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE,
-    Stepped, TickReport, UNIFORM_POSITIONS, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION,
-    WORLD_DIGEST_SCHEMA, World, ZERO_VELOCITY, founder_position,
+    Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport,
+    IntroductionEvent, ModelVariant, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT,
+    QUALIFIED_REFERENCE, STOP_AND_PRESERVE, Stepped, TickReport, UNIFORM_POSITIONS,
+    WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, World, ZERO_VELOCITY,
+    founder_position,
 };

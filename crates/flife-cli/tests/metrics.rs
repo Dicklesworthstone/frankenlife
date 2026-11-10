@@ -40,7 +40,7 @@ use flife_cli::{
 use flife_core::ids::{GenomeId, LineageId, OrganismId};
 use flife_core::ledger::{Flow, Transfer};
 use flife_core::{CoreError, ValidatedConfig, numerics};
-use flife_engine::{Stepped, TickReport, World};
+use flife_engine::{Intervention, Stepped, TickReport, World};
 use flife_render::{Epoch, Publisher};
 use flife_store::{ChunkStore, Durability};
 
@@ -695,6 +695,49 @@ fn the_tracker_holds_the_committed_world_at_every_tick() {
     assert!(ecology.topology_changes > 0, "children change topology");
     let preset = oracle(&preset(), 320);
     assert!(preset.extinctions > 1_000, "founder lineages die out");
+}
+
+/// FL-022: introduced organisms enter the tracker from the report's
+/// introductions, as founders of their own lineages, and leave it when they
+/// die: at every tick the tracker holds exactly the committed world, through
+/// introductions at ticks 0 and 40 and the introduced organisms' deaths.
+#[test]
+fn the_tracker_follows_introduced_organisms_until_they_die() {
+    let mut world = found(&ecology("volatile-in-memory")).expect("founds");
+    let mut tracker = Tracker::new(&world, 1).expect("a tracker");
+    let mut introduced = BTreeSet::new();
+    let mut deaths = 0;
+    for tick in 0..600 {
+        let cell = if tick == 0 { [15, 17] } else { [3, 28] };
+        let interventions = if tick == 0 || tick == 40 {
+            vec![Intervention::IntroduceOrganisms {
+                cell,
+                count: 6,
+                energy: 0.75,
+            }]
+        } else {
+            Vec::new()
+        };
+        let report = match world.step_with(&interventions).expect("the tick runs") {
+            Stepped::Published(report) => report,
+            Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+        };
+        introduced.extend(report.introductions.iter().map(|event| event.organism));
+        deaths += report
+            .deaths
+            .iter()
+            .filter(|death| introduced.contains(&death.id))
+            .count();
+        tracker.record(&report).expect("the tracker follows");
+        assert_eq!(
+            tracker.organisms().collect::<Vec<_>>(),
+            committed(&world),
+            "tick {}",
+            report.tick.get()
+        );
+    }
+    assert_eq!(introduced.len(), 12);
+    assert!(deaths > 0, "introduced organisms die within 600 ticks");
 }
 
 /// The sampled statistics on known patterns, and against the brute-force

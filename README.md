@@ -92,7 +92,9 @@ tick T, a control branch, or an intervention branch with `--inject` brushes or `
 (`--remove TICK:X,Y:RADIUS:DISPOSITION` takes out every organism in a disk, its energy removed, dissipated or
 recycled; `flife run` takes it too). `--inject-material TICK:X,Y:AMOUNT:K=V,…` is the material brush: declared
 energy into one cell carrying a signed chemical composition, a direction of norm at most one, so it can never
-write composition the cell's energy cannot hold. The branch links
+write composition the cell's energy cannot hold. `--introduce TICK:X,Y:COUNT:ENERGY` is seeded introduction: COUNT
+new organisms, each endowed with ENERGY, enter one cell at the end of the tick, each drawn exactly as a founder
+with its identity would be and founding its own lineage, all or none under the population cap. The branch links
 the parent's verified chunk files instead of copying them and writes only its command closure. Its journal
 starts with the history it inherited. A control branch resumes to exactly the parent's uninterrupted world,
 while its intervention sibling matches it until its brush applies and differs after.

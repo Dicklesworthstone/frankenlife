@@ -517,6 +517,24 @@ impl Tracker {
             self.admit(member);
             self.lineages.entry(member.lineage).or_default().births += 1;
         }
+        for introduced in &report.introductions {
+            if introduced.organism.get() < self.next {
+                return Err(conflict(format!(
+                    "{} is not above every identity issued before it (next {})",
+                    introduced.organism, self.next
+                )));
+            }
+            let member = Member {
+                genome: introduced.genome,
+                lineage: LineageId::new(introduced.organism.get()),
+                generation: 0,
+                birth_tick: tick,
+                topology: introduced.topology.index(),
+            };
+            self.next = introduced.organism.get().saturating_add(1);
+            self.live.insert(introduced.organism, member);
+            self.admit(member);
+        }
         for death in &report.deaths {
             let member = self
                 .live

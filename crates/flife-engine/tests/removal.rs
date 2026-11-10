@@ -429,6 +429,7 @@ fn a_disk_that_holds_no_organism_changes_nothing() {
             intervention,
             applied: 0.0,
             removed: 0,
+            introduced: 0,
         }]
     );
     assert_eq!(removing.digest(), plain.digest());

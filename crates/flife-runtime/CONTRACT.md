@@ -20,11 +20,14 @@ inherits every command and outcome, records the fork, and from then on admits on
 - `Command`: the session, a client `CommandId`, a `Target` (`At { tick, retarget }` or `NextAdmissible`), an
   optional expected revision, and a validated `flife_engine::Intervention`: `InjectEnergy { cell, amount }`,
   declared external energy added to one field cell; (FL-022) `RemoveOrganisms { center, radius, disposition }`,
-  every organism in a disk removed at the boundary; or (FL-022) `InjectMaterial { cell, amount, direction }`, the
-  material brush: declared energy with a signed composition direction, `||direction||₂ ≤ 1`. The canonical
-  record's payload opens with its NUL-terminated tag (`inject-energy`, `inject-material` or `remove-organisms`); a
-  removal's disposition is its NUL-terminated name; a material record carries the 32 direction components' bits in
-  channel order after the amount. An energy injection's record is byte for byte FL-014's.
+  every organism in a disk removed at the boundary; (FL-022) `InjectMaterial { cell, amount, direction }`, the
+  material brush: declared energy with a signed composition direction, `||direction||₂ ≤ 1`; or (FL-022)
+  `IntroduceOrganisms { cell, count, energy }`, seeded introduction: `count` founder-drawn organisms, each endowed
+  with `energy`, entering one cell at the end of the tick. The canonical record's payload opens with its
+  NUL-terminated tag (`inject-energy`, `inject-material`, `remove-organisms` or `introduce-organisms`); a removal's
+  disposition is its NUL-terminated name; a material record carries the 32 direction components' bits in channel
+  order after the amount; an introduction carries the cell, the count (`u32`) and the energy's bits. An energy
+  injection's record is byte for byte FL-014's, and every earlier record decodes unchanged.
 - Control requests: pause, resume, run until a tick, step, cancel, status, inspect, close and suspend (FL-037);
   checkpoint and durable outcome (FL-036).
 - For `open_journaled` (FL-036): a `JournalWriter` started over a `Journal` implementation, and the
@@ -355,8 +358,8 @@ session; `InjectEnergy` and `RemoveOrganisms` as the interventions.
   the library calls `checkpoint`/`restore` remain the only checkpoint paths here.
 - `block_on_inline` must not run on an Asupersync runtime thread (FrankenSQLite reaches for the thread's runtime
   while it parks, and an open never completes), so journal I/O runs on the writer thread or a plain thread.
-- Area brushes, seeded introduction, source edits and the native input mapping are FL-022. Single-cell
-  `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022) and disk `RemoveOrganisms` (FL-022) are the canonical
+- Area brushes, source edits and the native input mapping are FL-022. Single-cell `InjectEnergy` (FL-014),
+  `InjectMaterial` and `IntroduceOrganisms` (FL-022) and disk `RemoveOrganisms` (FL-022) are the canonical
   payloads so far.
 - `tests/removal.rs` (3 tests, FL-022): an injection's record against one written out by hand, and a removal's
   round trip for each disposition, three distinct content hashes; unknown, unterminated, trailing and truncated
@@ -368,6 +371,11 @@ session; `InjectEnergy` and `RemoveOrganisms` as the interventions.
   byte short, one byte long or with a misspelled tag is refused; the book refuses a direction of norm above one,
   admits one inside for tick 9 and applies it there, its outcome the reported energy's bits and the world equal
   to one stepped directly with the same material.
+- `tests/introduction.rs` (3 tests, FL-022): an introduction's record ends with its tag, cell, count and energy
+  written out by hand, shares the injection's prefix and round-trips, and a different cell, count or energy gives
+  another content hash; a record one byte short, one byte long or with a misspelled tag is refused; the book
+  refuses an introduction of no organisms, admits seven at 2.25 for tick 9 and applies them there, its outcome
+  `7 × 2.25` bit for bit and the world equal to one stepped directly with the same introduction.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
 - Branching (FL-039) is a library operation on a book at a checkpoint (`flife branch` in `flife-cli`), not a session

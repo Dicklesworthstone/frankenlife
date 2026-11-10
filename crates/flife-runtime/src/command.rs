@@ -63,8 +63,9 @@ impl Command {
     /// number as its little-endian bits. The payload opens with its
     /// NUL-terminated tag: `inject-energy` and the cell and amount;
     /// `inject-material`, the cell, the amount and the 32 direction
-    /// components in channel order; or `remove-organisms`, the centre, the
-    /// radius and the NUL-terminated disposition name.
+    /// components in channel order; `remove-organisms`, the centre, the
+    /// radius and the NUL-terminated disposition name; or
+    /// `introduce-organisms`, the cell, the count and the energy.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(128);
@@ -121,6 +122,18 @@ impl Command {
                 bytes.extend_from_slice(&radius.to_bits().to_le_bytes());
                 bytes.extend_from_slice(disposition.name().as_bytes());
                 bytes.push(0);
+            }
+            Intervention::IntroduceOrganisms {
+                cell,
+                count,
+                energy,
+            } => {
+                bytes.extend_from_slice(b"introduce-organisms");
+                bytes.push(0);
+                bytes.extend_from_slice(&cell[0].to_le_bytes());
+                bytes.extend_from_slice(&cell[1].to_le_bytes());
+                bytes.extend_from_slice(&count.to_le_bytes());
+                bytes.extend_from_slice(&energy.to_bits().to_le_bytes());
             }
         }
         bytes
@@ -186,6 +199,11 @@ impl Command {
                     disposition,
                 }
             }
+            b"introduce-organisms" => Intervention::IntroduceOrganisms {
+                cell: [input.u32()?, input.u32()?],
+                count: input.u32()?,
+                energy: input.f64()?,
+            },
             _ => return Err(refuse("unknown payload")),
         };
         input.finish()?;

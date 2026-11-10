@@ -24,7 +24,8 @@
 //! 7. Motion, then emission, then the reproduction proposal.
 //! 8. Clear tiny reservoirs and decide every fate. Stage the births as one
 //!    transaction and settle their parents. Collect the deaths and settle
-//!    their residuals.
+//!    their residuals. Then add the introduced organisms (see
+//!    [`intervention`]).
 //! 9. Debit the grants, then reduce the emission deposits, then the
 //!    recycling deposits, into the next field.
 //! 10. Check the next field (INV-01, INV-02), close the tick's ledger and
@@ -87,8 +88,8 @@ use flife_field::{
     resolve_uptake, saturating_request,
 };
 use flife_genome::{
-    Genome, GenomeQuota, MutationParameters, MutationRecord, Mutator, TopologyCatalog, TraitLimits,
-    Traits, founder, initial_scale,
+    Genome, GenomeQuota, MutationParameters, MutationRecord, Mutator, TopologyCatalog, TopologyId,
+    TraitLimits, Traits, founder, initial_scale,
 };
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
@@ -181,6 +182,19 @@ pub struct BirthEvent {
     pub record: MutationRecord,
 }
 
+/// One organism a published tick introduced (FL-022's seeded
+/// introduction): a founder of its own lineage, generation zero, born at the
+/// tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntroductionEvent {
+    /// The organism, also its lineage.
+    pub organism: OrganismId,
+    /// Its founder genome.
+    pub genome: GenomeId,
+    /// Its genome's topology.
+    pub topology: TopologyId,
+}
+
 /// What one candidate tick did. A published tick's report is the tick's
 /// state, events and accounting, published together.
 #[derive(Debug, Clone, PartialEq)]
@@ -192,7 +206,7 @@ pub struct TickReport {
     /// The resource epoch the candidate publishes as.
     pub epoch: ResourceEpoch,
     /// The event cursor's range for this tick: deaths in identity order,
-    /// then births in identity order.
+    /// then births in identity order, then introductions in identity order.
     pub events: Range<u64>,
     /// Live organisms after the tick.
     pub live: usize,
@@ -204,6 +218,10 @@ pub struct TickReport {
     pub attempted: usize,
     /// The births, in identity order.
     pub births: Vec<BirthEvent>,
+    /// The organisms introduced at the end of the tick, in identity order
+    /// (sealed order, then each introduction's own order), after every
+    /// birth.
+    pub introductions: Vec<IntroductionEvent>,
     /// Attempts whose every mutation candidate was rejected.
     pub rejected: Vec<RejectedBirth>,
     /// The deaths, in identity order.
@@ -1318,6 +1336,40 @@ impl World {
             });
             entrants.push(entrant);
         }
+        // The introductions enter after the births, in sealed order, each
+        // all or none.
+        let first_introduced = entrants.len();
+        intervention::introduce(
+            from,
+            interventions,
+            &intervention::Founding {
+                rng: &rules.rng,
+                grid: &rules.grid,
+                catalog: &rules.catalog,
+                limits: &rules.limits,
+                initial_scale: rules.initial_scale,
+                interval: rules.interval,
+                cooldown: rules.reproduction.rules().cooldown,
+                maximum_population: rules.maximum_population,
+            },
+            survivors.len(),
+            &mut next_identities,
+            &mut next_quota,
+            &mut entrants,
+            &mut tick_ledger,
+            &mut applied,
+        )?;
+        let introduced = entrants.get(first_introduced..).unwrap_or(&[]);
+        let mut introductions = Vec::with_capacity(introduced.len());
+        for entrant in introduced {
+            organisms.add(entrant.organism.energy);
+            introductions.push(IntroductionEvent {
+                organism: entrant.organism.id,
+                genome: entrant.organism.genome,
+                topology: entrant.genome.topology(),
+            });
+        }
+        applied.sort_by_key(|intervention| intervention.position);
 
         // Phase 9: the grants' debits, then the paid deposits, then
         // recycling, reduced into the next field.
@@ -1351,6 +1403,7 @@ impl World {
             emitted,
             attempted,
             births: born_events,
+            introductions,
             rejected,
             deaths: deaths.clone(),
             uptake,
@@ -1385,6 +1438,20 @@ pub fn founder_position(
     grid: &FieldGrid,
     organism: OrganismId,
 ) -> Result<[f64; 2], CoreError> {
+    let [u, v] = founder_draws(rng, organism)?;
+    grid.wrap_position([u * grid.world_width(), v * grid.world_height()])
+}
+
+/// The two half-open uniforms behind a founder's position: words 0 and 1 of
+/// `(founders, organism, 0, lane (0, position, 0), 0)`. An introduced
+/// organism scales them into its cell.
+///
+/// # Errors
+/// As [`Lane::new`], which does not fail for this lane.
+pub(crate) fn founder_draws(
+    rng: &SemanticRng,
+    organism: OrganismId,
+) -> Result<[f64; 2], CoreError> {
     let [first, second, ..] = rng.block(Address {
         stream: Stream::Founders,
         entity: organism.get(),
@@ -1392,10 +1459,7 @@ pub fn founder_position(
         lane: Lane::new(0, LaneKind::Position, 0)?,
         draw: 0,
     });
-    grid.wrap_position([
-        half_open_unit(first) * grid.world_width(),
-        half_open_unit(second) * grid.world_height(),
-    ])
+    Ok([half_open_unit(first), half_open_unit(second)])
 }
 
 /// `path` advanced to the segment that contains `tick`.

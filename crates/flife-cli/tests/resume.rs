@@ -952,3 +952,108 @@ fn materials_are_journaled_checkpointed_and_replayed_like_any_command() {
         "{err:?}"
     );
 }
+
+/// FL-022's seeded introductions at ticks 100 (six organisms at the
+/// centre) and 160 (three at a corner cell): commands 5 and 6, after the
+/// injections.
+const INTRODUCTIONS: [&str; 2] = ["100:16,16:6:2.5", "160:0,31:3:4.0"];
+
+/// [`run_args`] with [`INTRODUCTIONS`].
+fn with_introductions(config: &Path, run_dir: &Path, ticks: u64, every: u64) -> Vec<String> {
+    let mut args = run_args(config, run_dir, ticks, every);
+    for introduction in INTRODUCTIONS {
+        args.extend(["--introduce".to_owned(), introduction.to_owned()]);
+    }
+    args
+}
+
+/// FL-022: seeded introductions given on the command line are journaled,
+/// held pending in checkpoints and replayed like any command. A run with
+/// them ends elsewhere than the run without them. Stopped at tick 102 with
+/// its newest checkpoint damaged, it resumes from tick 98, before the
+/// first introduction, replays that introduction's journaled outcome at
+/// tick 100, applies the second at 160 from the journal, and reaches the
+/// uninterrupted state: the introduced organisms, their genomes and
+/// identities come back from checkpoint and journal alike.
+#[test]
+fn introductions_are_journaled_checkpointed_and_replayed_like_any_command() {
+    let reference = uninterrupted();
+    let config = ecology("write-ahead-before-apply");
+    let whole = fresh("introduction-whole");
+    let (status, out, err) = flife(&strs(&with_introductions(&config, &whole, HORIZON, 0)));
+    assert_eq!(status, Some(0), "{err:?}");
+    let end = one(&out, "end");
+    assert_eq!(
+        end["persisted"]["journal"],
+        json!({"admitted": 6, "outcomes": 6})
+    );
+    assert_ne!(
+        end["digest"], reference.digest,
+        "the introductions changed the world"
+    );
+    let introduced = (
+        end["digest"].clone(),
+        checkpoint_at(&out, HORIZON)["sha256"].clone(),
+    );
+
+    let part = fresh("introduction-damaged-newest");
+    let (status, out, err) = flife(&strs(&with_introductions(&config, &part, 102, 0)));
+    assert_eq!(status, Some(0), "{err:?}");
+    // Injections 1 and 2 and introduction 5 are applied; 3, 4 and 6 are
+    // pending.
+    assert_eq!(
+        one(&out, "end")["persisted"]["journal"],
+        json!({"admitted": 6, "outcomes": 3})
+    );
+    let newest = checkpoint_at(&out, 102)["sequence"]
+        .as_u64()
+        .expect("a sequence");
+    let before = checkpoint_at(&out, 98)["sequence"]
+        .as_u64()
+        .expect("a sequence");
+    {
+        let store = common::open_store(part.join("store"), Durability::ProcessCrash)
+            .expect("the store opens");
+        let bytes = store.load(before).expect("checkpoint 98 loads");
+        let restored =
+            restore(&bytes, NumericalProfile::reference_f32().expect("profile")).expect("restores");
+        let status = |id: u64| restored.book.status(CommandId::new(id)).cloned();
+        assert_eq!(status(5), Some(CommandStatus::Pending), "due at 100");
+        assert_eq!(status(6), Some(CommandStatus::Pending), "due at 160");
+        fs::write(store.manifest_path(newest), b"damaged").expect("damages the manifest");
+    }
+    let (status, out, err) = resume(&part);
+    assert_eq!(status, Some(0), "{err:?}");
+    let resumed = one(&out, "resume");
+    assert_eq!(
+        resumed["checkpoint"],
+        json!({"sequence": before, "tick": 98})
+    );
+    assert_eq!(resumed["journal"], json!({"admitted": 6, "outcomes": 3}));
+    reaches_the_uninterrupted_state(&out, (&introduced.0, &introduced.1));
+    assert_eq!(
+        one(&out, "end")["persisted"]["journal"],
+        json!({"admitted": 6, "outcomes": 6})
+    );
+
+    // An introduction of no organisms is refused before any tick.
+    let refused = fresh("introduction-refused");
+    let (status, out, err) = flife(&[
+        "run",
+        text(&config),
+        "--ticks",
+        "3",
+        "--run-dir",
+        text(&refused),
+        "--introduce",
+        "1:1,1:0:1",
+    ]);
+    assert_eq!(status, Some(2), "{out:?} {err:?}");
+    assert!(all(&out, "end").is_empty(), "nothing ran: {out:?}");
+    assert!(
+        err[0]["detail"]
+            .as_str()
+            .is_some_and(|text| text.contains("introduction count")),
+        "{err:?}"
+    );
+}

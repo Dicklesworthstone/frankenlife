@@ -47,6 +47,9 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
   each layer's `LayerShape`, which maps `weight[out][in]` and `bias[out]` to packed offsets.
 - `ReferenceController::evaluate` returns the 36 raw F32 outputs of the linear final layer, and `widen` gives the
   exact F64 values `decode` reads. `ControllerScratch` is reusable activation storage.
+- FL-043: `ControllerBackend::resident_bytes`, required, the host and device bytes a backend holds now;
+  `BackendBudget { bytes, organisms }` with `UNBOUNDED`, what a backend may hold and for how many organisms; and
+  `ControllerScratch::allocated_bytes`.
 
 **Invariants.**
 - Normalization comes after blending. The pyramid stores raw densities only. A coarse composition is a ratio of

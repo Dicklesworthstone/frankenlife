@@ -22,6 +22,7 @@
 //! `((c·u + r_x·(u_w + u_e)) + r_y·(u_s + u_n))`, evaluated in that order
 //! and rounded once to F32. Decay is `f32(f64(u) × factor)`.
 
+use flife_core::memory::capacity_bytes;
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
 
 use crate::footprint::BufferLimits;
@@ -236,6 +237,12 @@ impl TransportScratch {
             first: plane()?,
             second: plane()?,
         })
+    }
+
+    /// Bytes its two planes hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        capacity_bytes(&self.first).saturating_add(capacity_bytes(&self.second))
     }
 }
 

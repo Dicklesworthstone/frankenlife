@@ -52,6 +52,10 @@ impl ControllerBackend for ReferenceBatch {
         "reference batch (test)".to_owned()
     }
 
+    fn resident_bytes(&self) -> u64 {
+        self.scratch.allocated_bytes()
+    }
+
     fn forget(&mut self) {}
 
     fn evaluate(
@@ -84,6 +88,35 @@ impl ControllerBackend for ReferenceBatch {
         }
         Ok(())
     }
+}
+
+#[test]
+fn installing_a_backend_reserves_exactly_its_batched_bytes() {
+    let mut world = found(&config());
+    let before = world.allocated();
+    let batched = world.batched_bytes();
+    assert!(batched > 0);
+    world.set_controller_backend(Some(Box::new(ReferenceBatch {
+        defer_every: 3,
+        ..ReferenceBatch::default()
+    })));
+    assert_eq!(world.controller_report().failure, None);
+    let installed = world.allocated();
+    assert_eq!(installed.scratch, before.scratch + batched);
+    assert_eq!(
+        (installed.state, installed.field),
+        (before.state, before.field)
+    );
+    for _ in 0..60 {
+        assert!(matches!(world.step(), Ok(Stepped::Published(_))));
+        assert_eq!(
+            world.allocated().scratch,
+            installed.scratch,
+            "the batched path grew"
+        );
+    }
+    world.set_controller_backend(None);
+    assert_eq!(world.allocated().scratch, before.scratch);
 }
 
 /// Step both worlds `ticks` times, returning the first tick whose digests

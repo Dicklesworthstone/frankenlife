@@ -8,7 +8,8 @@
 //! of a few slots, and no parameter shard is rebuilt.
 
 use flife_backend_metal::{
-    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, ControllerChoice, MetalBackend, SHARD_BYTES,
+    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, BackendBudget, ControllerChoice, MetalBackend,
+    SHARD_BYTES,
 };
 use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
@@ -103,6 +104,10 @@ impl ControllerBackend for Counted {
         self.inner.describe()
     }
 
+    fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
     fn forget(&mut self) {
         self.inner.forget();
     }
@@ -186,6 +191,56 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     );
 }
 
+/// FL-043: under half of what an unbounded backend holds after 40 ticks,
+/// shards that would not fit are not made and their jobs go to the
+/// reference, so the world is the reference world at every tick while the
+/// device owner and the backend's host vectors hold no more than the
+/// budget. A backend that ignored the budget would hold twice as much.
+#[test]
+fn under_half_its_bytes_metal_defers_and_the_world_is_the_reference() {
+    let Some(backend) = metal() else { return };
+    let mut probe = found();
+    probe.set_controller_backend(Some(Box::new(backend)));
+    let mut reference = found();
+    let (difference, ..) = race(&mut reference, &mut probe, 40);
+    assert_eq!(difference, None);
+    let unbounded = probe.controller_report().resident_peak_bytes;
+    assert!(unbounded > 0);
+    let budget = BackendBudget {
+        bytes: unbounded / 2,
+        organisms: probe.population().capacity() as u64,
+    };
+    drop(probe);
+
+    let backend = MetalBackend::with_budget(u64::MAX, budget).expect("a budgeted backend");
+    let owner = backend.owner().clone();
+    // The owner refuses any device buffer past the budget too.
+    assert_eq!(owner.limits().bytes, budget.bytes);
+    let mut reference = found();
+    let mut tight = found();
+    tight.set_controller_backend(Some(Box::new(backend)));
+    let (difference, evaluated, births, _) = race(&mut reference, &mut tight, 400);
+    let report = tight.controller_report();
+    let usage = owner.usage();
+    println!(
+        "unbounded {unbounded}, budget {budget:?}: evaluated {evaluated}, births {births}, \
+         owner {usage:?}: {report:?}"
+    );
+    assert_eq!(difference, None, "the worlds diverged");
+    assert_eq!(report.failure, None);
+    assert_eq!(report.reference_ticks, 0);
+    assert_eq!(report.batched + report.deferred, evaluated);
+    assert!(report.deferred > 0 && report.batched > 0, "{report:?}");
+    assert!(births > 0, "newborns must be uploaded under the budget");
+    assert!(usage.bytes <= budget.bytes, "{usage:?} over {budget:?}");
+    assert!(
+        report.resident_peak_bytes <= budget.bytes,
+        "the backend held {} of a {}-byte budget",
+        report.resident_peak_bytes,
+        budget.bytes
+    );
+}
+
 /// At K = 4 a controller is due one tick in four, so a batch never holds
 /// most of the live genomes. In shards of 64 slots, so that a tick runs
 /// dozens of kernels in one command, the world is still the reference
@@ -250,6 +305,10 @@ impl ControllerBackend for Flipped {
         self.inner.describe()
     }
 
+    fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
     fn forget(&mut self) {
         self.inner.forget();
     }
@@ -295,7 +354,7 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let device = metal().is_some();
     let described = |choice: ControllerChoice, workers: usize| {
         choice
-            .backend(workers)
+            .backend(workers, BackendBudget::UNBOUNDED)
             .map(|backend| backend.map(|backend| backend.describe()))
     };
     // The rule on both kinds of host, wherever this runs.

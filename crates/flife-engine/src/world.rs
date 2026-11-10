@@ -72,6 +72,7 @@ use flife_core::ids::{
     Generation, GenomeId, IdSequence, LineageId, OrganismId, ResourceEpoch, SourceId,
 };
 use flife_core::ledger::CompensatedSum;
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
 };
@@ -89,8 +90,9 @@ use flife_field::{
     saturating_request,
 };
 use flife_genome::{
-    Genome, GenomeQuota, MutationParameters, MutationRecord, Mutator, TopologyCatalog, TopologyId,
-    TraitLimits, Traits, founder, initial_scale,
+    CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
+    MutationRecord, Mutator, TopologyCatalog, TopologyId, TraitLimits, Traits, founder,
+    initial_scale,
 };
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
@@ -105,7 +107,7 @@ use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vi
 use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
-    BirthContext, BirthIntent, BirthRequest, BirthResolution, CapacityShortfall, Identities,
+    Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, CapacityShortfall, Identities,
     Offspring, ParentState, PopulationQuota, RejectedBirth, Reproduction, ReproductionProposal,
     resolve_births,
 };
@@ -540,7 +542,65 @@ pub struct ControllerReport {
     pub reference_ticks: u64,
     /// Why the backend stopped serving the world, if it failed.
     pub failure: Option<String>,
+    /// The most bytes the backend has held after a batch, host and device
+    /// ([`ControllerBackend::resident_bytes`], FL-043).
+    pub resident_peak_bytes: u64,
 }
+
+/// What a world holds on the host, by plan §19.4's terms (FL-043): each
+/// buffer's capacity times its element size, in bytes. Genome parameters
+/// are apart from it: the genome quota charges them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Footprint {
+    /// The population (its columns, genome arena and each organism's index
+    /// entries and genome header), the sources and their paths.
+    pub state: u64,
+    /// The committed and candidate fields, the field step's per-worker
+    /// transport scratch and source supports, and the sensor pyramid.
+    pub field: u64,
+    /// The tick's scratch: rows, decision lanes, demands, grants, packets,
+    /// deposits, survivors and deaths, and the controller and sensor
+    /// backends' vectors.
+    pub scratch: u64,
+    /// What a step holds only while it runs: birth requests, births and
+    /// rejected births with their mutation records, newborn entrants,
+    /// events, the report's deaths and the controller batch's jobs.
+    pub staging: u64,
+}
+
+impl Footprint {
+    /// Every term.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        total([self.state, self.field, self.scratch, self.staging])
+    }
+}
+
+/// [`Footprint::staging`] per organism the population can hold. Every list
+/// a step fills is reserved for its count before it is filled, so each is
+/// charged once: per organism, at most one birth request, its place in the
+/// resolution order and in a pause's proposal; a place in both the births
+/// and the rejected births, since either may take every request; one boxed
+/// genome and at most [`MAXIMUM_CANDIDATES`] candidate rejections, as a
+/// birth's record or a rejected birth's (a list grown by pushing to at most
+/// that many holds no more); one newborn entrant, and one more while an
+/// introduction's are staged; one birth or introduction event, one death in
+/// the report and one controller job. A list's minimum capacity of a few
+/// elements is a constant the reserve covers.
+const STAGING_PER_ORGANISM: u64 = {
+    bytes_for::<BirthRequest<'static>>(1)
+        + bytes_for::<usize>(1)
+        + bytes_for::<OrganismId>(1)
+        + bytes_for::<Birth>(1)
+        + bytes_for::<RejectedBirth>(1)
+        + bytes_for::<Genome>(1)
+        + bytes_for::<CandidateRejection>(MAXIMUM_CANDIDATES as usize)
+        + 2 * bytes_for::<Entrant>(1)
+        + bytes_for::<BirthEvent>(1)
+        + bytes_for::<IntroductionEvent>(1)
+        + bytes_for::<Death>(1)
+        + bytes_for::<ControllerJob<'static>>(1)
+};
 
 /// What the world's field backend did, for run records (FL-031). Not
 /// scientific state: no result depends on the backend.
@@ -802,19 +862,26 @@ impl World {
     /// count is then unchanged.
     pub fn set_cpu_workers(&mut self, workers: NonZeroUsize) -> Result<(), CoreError> {
         self.scratch.field.set_workers(workers)?;
-        let lanes = &mut self.scratch.lanes;
         let workers = workers.get();
+        let mut added = Vec::new();
+        for _ in self.scratch.lanes.len()..workers {
+            added.push(lane(&self.rules)?);
+        }
+        let lanes = &mut self.scratch.lanes;
         if workers > lanes.len() {
             lanes
                 .try_reserve_exact(workers - lanes.len())
                 .map_err(|_| CoreError::AllocationFailed {
                     buffer: "decision lanes",
-                    bytes: u64::try_from(workers.saturating_mul(size_of::<DecisionLane>()))
-                        .unwrap_or(u64::MAX),
+                    bytes: bytes_for::<DecisionLane>(workers),
                 })?;
         }
-        lanes.resize_with(workers, DecisionLane::default);
-        Ok(())
+        lanes.extend(added);
+        lanes.truncate(workers);
+        lanes.shrink_to(workers);
+        // A lane's share of the rows follows the count (FL-043).
+        let batched = self.controllers.backend.is_some();
+        fit_lanes(lanes, capacity_of(&self.rules)?, batched)
     }
 
     /// Evaluate due controllers in one batch on `backend` from the next
@@ -823,14 +890,49 @@ impl World {
     /// what it cannot reproduce, and the reference evaluates those
     /// ([`flife_neural::backend`]). A backend that fails is dropped, and
     /// [`World::controller_report`] says why.
+    ///
+    /// Installing a backend reserves the batched path's lists for the
+    /// population's capacity (FL-043): its outputs, a slot per row and each
+    /// lane's observations. If the host refuses them, the backend is not
+    /// installed, and the report says why.
     pub fn set_controller_backend(&mut self, backend: Option<Box<dyn ControllerBackend>>) {
+        let reserved = if backend.is_some() {
+            capacity_of(&self.rules).and_then(|rows| self.reserve_batched(rows))
+        } else {
+            self.release_batched();
+            Ok(())
+        };
         let controllers = &mut self.controllers;
         controllers.report.backend = backend.as_ref().map(|backend| backend.describe());
         controllers.report.failure = None;
+        if let Err(error) = reserved {
+            controllers.report.failure = Some(error.to_string());
+            controllers.backend = None;
+            self.release_batched();
+            return;
+        }
         controllers.backend = backend.map(|mut backend| {
             backend.forget();
             backend
         });
+    }
+
+    /// Reserve the batched path's lists for `rows` rows: the outputs, a slot
+    /// per row, and each lane's observations.
+    fn reserve_batched(&mut self, rows: usize) -> Result<(), CoreError> {
+        let controllers = &mut self.controllers;
+        fit(&mut controllers.outputs, rows, "controller outputs")?;
+        fit(&mut controllers.by_row, rows, "controller outputs by row")?;
+        fit_lanes(&mut self.scratch.lanes, rows, true)
+    }
+
+    /// Release the batched path's lists.
+    fn release_batched(&mut self) {
+        self.controllers.outputs = Vec::new();
+        self.controllers.by_row = Vec::new();
+        for lane in &mut self.scratch.lanes {
+            lane.observed = Vec::new();
+        }
     }
 
     /// What the controller backend has done so far.
@@ -864,10 +966,30 @@ impl World {
     /// ([`SensorBackend`]), and any error it meets hands the tick's sampling
     /// to the reference. A backend that fails where the reference does not
     /// is dropped, and [`World::sensor_report`] says why.
+    ///
+    /// Installing a backend reserves its queries and samples for the
+    /// population's capacity (FL-043). If the host refuses them, the backend
+    /// is not installed, and the report says why.
     pub fn set_sensor_backend(&mut self, backend: Option<Box<dyn SensorBackend>>) {
+        let rows = if backend.is_some() {
+            capacity_of(&self.rules)
+        } else {
+            Ok(0)
+        };
         let sensors = &mut self.sensors;
         sensors.report.backend = backend.as_ref().map(|backend| backend.describe());
         sensors.report.failure = None;
+        let reserved = rows.and_then(|rows| {
+            fit(&mut sensors.queries, rows, "sensor queries")?;
+            fit(&mut sensors.samples, rows, "sensor samples")
+        });
+        if let Err(error) = reserved {
+            sensors.report.failure = Some(error.to_string());
+            sensors.queries = Vec::new();
+            sensors.samples = Vec::new();
+            sensors.backend = None;
+            return;
+        }
         sensors.backend = backend;
     }
 
@@ -914,6 +1036,102 @@ impl World {
     #[must_use]
     pub const fn population(&self) -> &Population {
         &self.population
+    }
+
+    /// What the world holds on the host now (FL-043, plan §19.4): see
+    /// [`Footprint`]. Its staging is zero; a step holds that only while it
+    /// runs.
+    #[must_use]
+    pub fn allocated(&self) -> Footprint {
+        Footprint {
+            state: self.state_bytes(self.population.allocated_bytes()),
+            field: self.field_bytes(),
+            scratch: self.scratch_bytes(),
+            staging: 0,
+        }
+    }
+
+    /// The most the world holds on the host while its population stays
+    /// within its capacity (FL-043, plan §19.4). Its buffers count as they
+    /// are reserved: the population's columns, and the tick's per-organism
+    /// lists, are reserved for `population.maximum_count` when the world is
+    /// founded, its workers set or a backend installed, and filling them
+    /// never allocates. The genome arena and each organism's index entries
+    /// count at their bounds for a full population of the catalog's members,
+    /// and a step's staging at [`Footprint::staging`]'s charge for every
+    /// organism.
+    #[must_use]
+    pub fn footprint(&self) -> Footprint {
+        let organisms = self.population.capacity();
+        Footprint {
+            state: self.state_bytes(self.population.bound_bytes(self.rules.catalog.len())),
+            field: self.field_bytes(),
+            scratch: self.scratch_bytes(),
+            staging: (organisms as u64).saturating_mul(STAGING_PER_ORGANISM),
+        }
+    }
+
+    /// What installing a controller backend reserves on top of
+    /// [`World::footprint`] (FL-043): its outputs and a slot per row for the
+    /// population's capacity, and each lane's observations for the most
+    /// rows it can take.
+    #[must_use]
+    pub fn batched_bytes(&self) -> u64 {
+        let organisms = self.population.capacity();
+        let lanes = self.scratch.lanes.len();
+        total([
+            bytes_for::<Option<[f32; ACTION_WIDTH]>>(organisms).saturating_mul(2),
+            bytes_for::<Observation>(lane_rows(organisms, lanes)).saturating_mul(lanes as u64),
+        ])
+    }
+
+    fn state_bytes(&self, population: u64) -> u64 {
+        total([
+            population,
+            capacity_bytes(&self.sources),
+            capacity_bytes(&self.paths),
+        ])
+    }
+
+    fn field_bytes(&self) -> u64 {
+        total([
+            self.field.allocated_bytes(),
+            self.scratch.field.allocated_bytes(),
+            self.scratch.pyramid.allocated_bytes(),
+        ])
+    }
+
+    fn scratch_bytes(&self) -> u64 {
+        let scratch = &self.scratch;
+        let lanes = scratch.lanes.iter().map(|lane| {
+            total([
+                lane.controller.allocated_bytes(),
+                capacity_bytes(&lane.observed),
+                capacity_bytes(&lane.decisions),
+            ])
+        });
+        total(
+            [
+                capacity_bytes(&scratch.rows),
+                capacity_bytes(&scratch.lanes),
+                capacity_bytes(&scratch.sampled),
+                capacity_bytes(&scratch.working),
+                capacity_bytes(&scratch.demands),
+                scratch.grants.allocated_bytes(),
+                scratch.by_demand.allocated_bytes(),
+                capacity_bytes(&scratch.packets),
+                scratch.emissions.allocated_bytes(),
+                scratch.recycling.allocated_bytes(),
+                capacity_bytes(&scratch.survivors),
+                capacity_bytes(&scratch.deaths),
+                capacity_bytes(&self.controllers.outputs),
+                capacity_bytes(&self.controllers.by_row),
+                capacity_bytes(&self.sensors.queries),
+                capacity_bytes(&self.sensors.samples),
+            ]
+            .into_iter()
+            .chain(lanes),
+        )
     }
 
     /// The source paths at the committed tick's segments.
@@ -1279,6 +1497,14 @@ impl World {
             }
         }
         let mut requests = Vec::new();
+        reserve_for(
+            &mut requests,
+            working
+                .iter()
+                .filter(|organism| organism.intent.is_some())
+                .count(),
+            "birth requests",
+        )?;
         for organism in working.iter() {
             if let Some(intent) = organism.intent {
                 requests.push(BirthRequest {
@@ -1377,7 +1603,17 @@ impl World {
         }
         let attempted = requests.len();
         let (born, rejected) = births.into_parts();
-        let mut entrants = Vec::with_capacity(born.len());
+        // Room for the births and every introduction the population's
+        // bound admits, so that appending introductions never grows it
+        // (FL-043).
+        let mut entrants = Vec::new();
+        reserve_for(
+            &mut entrants,
+            capacity_of(rules)?
+                .saturating_sub(survivors.len())
+                .max(born.len()),
+            "entrants",
+        )?;
         let mut born_events = Vec::with_capacity(born.len());
         for birth in born {
             let parent = birth.parent;
@@ -1564,21 +1800,26 @@ impl Scratch {
         let packets = organisms.checked_mul(4).ok_or(CoreError::Overflow {
             quantity: "organism packets",
         })?;
+        // Every per-organism list is reserved for the largest population too
+        // (FL-043), so the footprint taken now bounds every later tick.
+        let rows = capacity_of(rules)?;
+        let mut field = FieldWork::new(&rules.grid, &limits, workers(workers_configured)?)?;
+        field.reserve_supports(sources, &rules.kernel)?;
         Ok(Self {
-            field: FieldWork::new(&rules.grid, &limits, workers(workers_configured)?)?,
+            field,
             pyramid: SensorPyramid::from_config(config, &limits)?,
-            rows: Vec::new(),
-            lanes: lanes(workers_configured)?,
+            rows: reserved(rows, "organism rows")?,
+            lanes: lanes(workers(workers_configured)?.get(), rules)?,
             sampled: Vec::with_capacity(sources),
-            working: Vec::new(),
-            demands: Vec::new(),
+            working: reserved(rows, "working organisms")?,
+            demands: reserved(rows, "organism demands")?,
             grants: Grants::with_capacity(&rules.grid, organisms, &limits)?,
             by_demand: Bins::with_capacity("organism packets", organisms, packets, &limits)?,
-            packets: Vec::new(),
+            packets: reserved(4, "organism packets")?,
             emissions: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
-            survivors: Vec::new(),
-            deaths: Vec::new(),
+            survivors: reserved(rows, "survivors")?,
+            deaths: reserved(rows, "deaths")?,
         })
     }
 }
@@ -1602,21 +1843,90 @@ fn workers(workers: u32) -> Result<NonZeroUsize, CoreError> {
         })
 }
 
-/// `workers` empty decision lanes.
-fn lanes(workers: u32) -> Result<Vec<DecisionLane>, CoreError> {
-    let workers = usize::try_from(workers).map_err(|_| CoreError::Overflow {
-        quantity: "execution.cpu_workers",
-    })?;
-    let mut lanes = Vec::new();
-    lanes
-        .try_reserve_exact(workers)
-        .map_err(|_| CoreError::AllocationFailed {
-            buffer: "decision lanes",
-            bytes: u64::try_from(workers.saturating_mul(size_of::<DecisionLane>()))
-                .unwrap_or(u64::MAX),
-        })?;
-    lanes.resize_with(workers.max(1), DecisionLane::default);
+/// `workers` decision lanes, each with its decisions reserved for the most
+/// rows it can take and its controller scratch for the catalog's widest
+/// member (FL-043).
+fn lanes(workers: usize, rules: &Rules) -> Result<Vec<DecisionLane>, CoreError> {
+    let workers = workers.max(1);
+    let mut lanes = reserved(workers, "decision lanes")?;
+    for _ in 0..workers {
+        lanes.push(lane(rules)?);
+    }
+    fit_lanes(&mut lanes, capacity_of(rules)?, false)?;
     Ok(lanes)
+}
+
+/// An empty decision lane with its controller scratch for the catalog's
+/// widest member.
+fn lane(rules: &Rules) -> Result<DecisionLane, CoreError> {
+    let widest = rules
+        .catalog
+        .ids()
+        .filter_map(|id| rules.catalog.topology(id))
+        .max_by_key(|topology| topology.hidden_widths().iter().copied().max().unwrap_or(0));
+    Ok(DecisionLane {
+        controller: match widest {
+            Some(topology) => ControllerScratch::new(topology)?,
+            None => ControllerScratch::default(),
+        },
+        observed: Vec::new(),
+        decisions: Vec::new(),
+    })
+}
+
+/// The population's capacity, as a row count.
+fn capacity_of(rules: &Rules) -> Result<usize, CoreError> {
+    usize::try_from(rules.maximum_population).map_err(|_| CoreError::Overflow {
+        quantity: "population.maximum_count",
+    })
+}
+
+/// The most rows one of `lanes` lanes takes of `organisms` (see
+/// [`in_runs`]): an even share, or fewer than [`MINIMUM_ROWS_PER_LANE`]
+/// rows on fewer lanes.
+fn lane_rows(organisms: usize, lanes: usize) -> usize {
+    organisms
+        .div_ceil(lanes.max(1))
+        .max(MINIMUM_ROWS_PER_LANE)
+        .min(organisms)
+}
+
+/// Reserve each lane's decisions, and with `batched` its observations, for
+/// the most rows it can take of `organisms`; without `batched`, release its
+/// observations.
+fn fit_lanes(lanes: &mut [DecisionLane], organisms: usize, batched: bool) -> Result<(), CoreError> {
+    let rows = lane_rows(organisms, lanes.len());
+    for lane in lanes {
+        fit(&mut lane.decisions, rows, "decisions")?;
+        if batched {
+            fit(&mut lane.observed, rows, "observations")?;
+        } else {
+            lane.observed = Vec::new();
+        }
+    }
+    Ok(())
+}
+
+/// An empty list with room for exactly `count` values.
+fn reserved<T>(count: usize, buffer: &'static str) -> Result<Vec<T>, CoreError> {
+    let mut vector = Vec::new();
+    fit(&mut vector, count, buffer)?;
+    Ok(vector)
+}
+
+/// Empty `vector` and give it room for `count` values, and no more than it
+/// needs: filling it to `count` then never allocates.
+fn fit<T>(vector: &mut Vec<T>, count: usize, buffer: &'static str) -> Result<(), CoreError> {
+    vector.clear();
+    if vector.capacity() > count {
+        vector.shrink_to(count);
+    }
+    vector
+        .try_reserve_exact(count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer,
+            bytes: bytes_for::<T>(count),
+        })
 }
 
 /// Phase 2 on the world's field backend if it has one. Any error there
@@ -1921,9 +2231,11 @@ fn decide_with(
     let Some(device) = backend.as_deref_mut() else {
         return decide_all(rules, population, view, sampled, rows, ticks, lanes);
     };
-    match decide_batched(
+    let decided = decide_batched(
         rules, population, view, sampled, rows, ticks, lanes, device, outputs, by_row,
-    ) {
+    );
+    report.resident_peak_bytes = report.resident_peak_bytes.max(device.resident_bytes());
+    match decided {
         Ok(Batched::Done { batched, deferred }) => {
             report.batched = report.batched.saturating_add(batched);
             report.deferred = report.deferred.saturating_add(deferred);

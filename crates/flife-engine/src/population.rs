@@ -52,6 +52,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
+use flife_core::memory::{capacity_bytes, total};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_genome::{Genome, GenomeArena, GenomeQuota, MutationRecord};
 use flife_neural::{ACTION_WIDTH, ArenaSlot};
@@ -318,6 +319,21 @@ fn check_birth_ticks(tick: Tick, births: &[Entrant]) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// The host bytes each live organism is charged beyond its columns and its
+/// genome's parameters (FL-043, plan §19.4). An ordered map's or set's
+/// nodes are at least half full, so an entry takes at most twice its key and
+/// value, with its share of the links counted as two more words: the
+/// identity index's entry and the free list's. A genome's shared parameters
+/// carry two reference counts and a vector header beside the values the
+/// genome quota charges.
+pub const PER_ORGANISM_BYTES: u64 = {
+    const WORD: u64 = size_of::<usize>() as u64;
+    let index = 2 * (size_of::<OrganismId>() as u64 + WORD) + 2 * WORD;
+    let free = 2 * WORD + 2 * WORD;
+    let header = 2 * WORD + size_of::<Vec<f32>>() as u64;
+    index + free + header
+};
+
 fn reserve<T>(capacity: usize) -> Result<Vec<T>, CoreError> {
     let mut column = Vec::new();
     column
@@ -386,6 +402,52 @@ impl Population {
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Bytes its columns hold, reserved for its capacity (FL-043).
+    fn column_bytes(&self) -> u64 {
+        total([
+            capacity_bytes(&self.occupants),
+            capacity_bytes(&self.genome_ids),
+            capacity_bytes(&self.parents),
+            capacity_bytes(&self.lineages),
+            capacity_bytes(&self.generations),
+            capacity_bytes(&self.birth_ticks),
+            capacity_bytes(&self.positions),
+            capacity_bytes(&self.velocities),
+            capacity_bytes(&self.energies),
+            capacity_bytes(&self.energy_change_rates),
+            capacity_bytes(&self.held),
+            capacity_bytes(&self.phases),
+            capacity_bytes(&self.cooldown_deadlines),
+            capacity_bytes(&self.genomes),
+            capacity_bytes(&self.arena_slots),
+        ])
+    }
+
+    /// Host bytes it holds now apart from its genomes' parameters (FL-043):
+    /// its columns, its genome arena, and [`PER_ORGANISM_BYTES`] for each
+    /// live organism.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total([
+            self.column_bytes(),
+            self.arena.allocated_bytes(),
+            (self.len() as u64).saturating_mul(PER_ORGANISM_BYTES),
+        ])
+    }
+
+    /// The most host bytes it can hold apart from its genomes' parameters,
+    /// with genomes of at most `topologies` catalog members: its columns,
+    /// its arena at [`GenomeArena::bound_bytes`], and
+    /// [`PER_ORGANISM_BYTES`] for every organism it can hold (FL-043).
+    #[must_use]
+    pub fn bound_bytes(&self, topologies: usize) -> u64 {
+        total([
+            self.column_bytes(),
+            GenomeArena::bound_bytes(topologies, self.capacity),
+            (self.capacity as u64).saturating_mul(PER_ORGANISM_BYTES),
+        ])
     }
 
     /// The number of live organisms.

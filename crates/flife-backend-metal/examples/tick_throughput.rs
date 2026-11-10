@@ -15,7 +15,9 @@
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use flife_backend_metal::{ControllerChoice, MetalBackend, MetalField, MetalSensors};
+use flife_backend_metal::{
+    BackendBudget, ControllerChoice, MetalBackend, MetalField, MetalSensors,
+};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 
@@ -35,7 +37,7 @@ fn found(workers: NonZeroUsize, name: &str) -> Result<World, CoreError> {
         NumericalProfile::reference_f32()?,
     )?;
     world.set_cpu_workers(workers)?;
-    world.set_controller_backend(choice.backend(workers.get())?);
+    world.set_controller_backend(choice.backend(workers.get(), BackendBudget::UNBOUNDED)?);
     for phase in parts {
         match phase {
             "sensors" => world.set_sensor_backend(Some(Box::new(MetalSensors::open()?))),

@@ -49,6 +49,8 @@ are no hidden defaults.
   (the sealed prefix) and `payload_length`, and `canonical::Sha256Stream`. A streaming writer hands each chunk to
   its sink a page at a time and keeps only the manifest; `seal` returns the prefix the in-memory container would
   start with. `finish` (in memory) now reserves the container's exact length once.
+- FL-043: `memory::{capacity_bytes, bytes_for, total}`, the one rule every footprint term is counted by: a buffer is
+  charged its capacity times its element size, saturating.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.

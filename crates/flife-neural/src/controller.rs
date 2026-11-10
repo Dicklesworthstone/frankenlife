@@ -29,6 +29,7 @@
 //! parameters. Organisms of one topology share only the shape (§6.5,
 //! INV-13).
 
+use flife_core::memory::capacity_bytes;
 use flife_core::model::{MAXIMUM_HIDDEN_LAYERS, dense_parameter_count};
 use flife_core::numerics::tanh;
 use flife_core::{CoreError, ValidatedConfig};
@@ -246,6 +247,12 @@ impl ControllerScratch {
         let mut scratch = Self::default();
         scratch.reserve(topology.widest_hidden)?;
         Ok(scratch)
+    }
+
+    /// Bytes its two activation buffers hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        capacity_bytes(&self.first).saturating_add(capacity_bytes(&self.second))
     }
 
     fn reserve(&mut self, width: usize) -> Result<(), CoreError> {

@@ -48,6 +48,7 @@
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, add_down};
+use flife_core::memory::{capacity_bytes, total};
 use flife_core::model::MOMENT_CHANNELS;
 
 use crate::bins::Bins;
@@ -156,6 +157,22 @@ struct Share {
 }
 
 impl Grants {
+    /// Bytes its packets, debits, totals and resolution scratch hold
+    /// (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total([
+            capacity_bytes(&self.packets),
+            capacity_bytes(&self.debits),
+            capacity_bytes(&self.totals),
+            capacity_bytes(&self.identities),
+            capacity_bytes(&self.staged),
+            self.bins.allocated_bytes(),
+            capacity_bytes(&self.shares),
+            capacity_bytes(&self.rank),
+        ])
+    }
+
     /// Empty grants with no declared capacity: their scratch grows on demand
     /// within the `u32` index range.
     #[must_use]

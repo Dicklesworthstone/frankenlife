@@ -31,7 +31,7 @@
 //! identity, never by storage slot. Nothing on this thread waits for a
 //! tick, a command or the session's lanes.
 
-use flife_backend_metal::ControllerChoice;
+use flife_backend_metal::{BackendBudget, ControllerChoice};
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
@@ -223,7 +223,13 @@ impl Studio {
         if let Some(workers) = options.cpu_workers {
             world.set_cpu_workers(workers)?;
         }
-        world.set_controller_backend(options.controllers.backend(world.cpu_workers())?);
+        // The Studio's observers are not yet admitted against the memory
+        // budget (FL-043), so its backend is not bounded by it.
+        world.set_controller_backend(
+            options
+                .controllers
+                .backend(world.cpu_workers(), BackendBudget::UNBOUNDED)?,
+        );
         let controllers = world
             .controller_report()
             .backend

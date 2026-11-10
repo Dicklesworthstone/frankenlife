@@ -32,6 +32,6 @@ pub mod sensors;
 
 pub use actions::{ACTION_WIDTH, ActionDecoding, DecodedActions, Emission, decode};
 pub use arena::{ArenaSlot, Placement, ShardGeometry};
-pub use backend::{ControllerBackend, ControllerJob};
+pub use backend::{BackendBudget, ControllerBackend, ControllerJob};
 pub use controller::{ControllerScratch, DenseTopology, LayerShape, ReferenceController, widen};
 pub use sensors::{Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe};

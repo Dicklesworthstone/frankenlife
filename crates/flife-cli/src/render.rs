@@ -122,10 +122,21 @@ pub fn render(
     if let Some(workers) = options.cpu_workers {
         world.set_cpu_workers(workers)?;
     }
-    install(&mut world, options.controllers)?;
+    let mut publisher = Publisher::new(&world, 3, || {})?;
+    // The observer's term (FL-043): the feed's epoch slots as reserved, and
+    // the frames in flight, each held raw and encoded. The view's own
+    // drawing buffers are not counted.
+    let [width, height] = options.size;
+    let frame = u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4);
+    let observer = publisher
+        .reserved_bytes()
+        .saturating_add(frame.saturating_mul(2 * (ENCODERS as u64 + 1)));
+    let memory = crate::memory::admit(config, &world, options.controllers, None, observer)?;
+    install(&mut world, options.controllers, memory.backend)?;
     std::fs::create_dir_all(&options.out)
         .map_err(|error| io("create the frame directory", &options.out, &error))?;
-    let mut publisher = Publisher::new(&world, 3, || {})?;
     let viewer = publisher.feed().viewer(1)?;
     let founding = viewer.latest()?;
     let mut view = WorldView::for_epoch(&founding, options.size, background)?;

@@ -102,6 +102,10 @@
   `range` and `bucket` (one bucket), `occupied` (nonempty buckets, ascending), `largest` (the hotspot) and
   `allocated`. `Grants::bins` and `Deposits::bins` expose the last reduction's bins, and their `allocated` gives
   every scratch buffer's capacity.
+- FL-043: `allocated_bytes` on `TransportScratch`, `SourceSupport`, `FieldWork`, `Bins`, `Deposits` and `Grants`,
+  each buffer at its capacity. `SourceKernel::candidate_bound(grid)`, the most candidate columns and rows one
+  support takes (per axis `⌈2r/h⌉ + 5`, at most the axis); `SourceSupport::for_kernel(kernel, grid)`, a support
+  with room for any of them; and `FieldWork::reserve_supports(sources, kernel)`, so that no step grows a support.
 
 **Invariants — representation (FL-003).**
 - Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy

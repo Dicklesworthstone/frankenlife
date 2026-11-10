@@ -789,8 +789,12 @@ pub fn resolve_births(
     let deadline = birth_tick.checked_add(context.reproduction.rules.cooldown)?;
 
     let mut working = identities.clone();
+    // Each request ends in one birth or one rejected birth: room for every
+    // request in both lists, so neither grows (FL-043).
     let mut born: Vec<Birth> = Vec::new();
-    let mut rejected = Vec::new();
+    let mut rejected: Vec<RejectedBirth> = Vec::new();
+    reserve_births(&mut born, order.len(), "births")?;
+    reserve_births(&mut rejected, order.len(), "rejected births")?;
     for request in &order {
         match stage(
             context,
@@ -957,6 +961,19 @@ fn stage(
 }
 
 /// Return every staged genome's charge, newest first.
+/// Room for exactly `count` more in `list`.
+fn reserve_births<T>(
+    list: &mut Vec<T>,
+    count: usize,
+    buffer: &'static str,
+) -> Result<(), CoreError> {
+    list.try_reserve_exact(count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer,
+            bytes: flife_core::memory::bytes_for::<T>(count),
+        })
+}
+
 fn roll_back(born: Vec<Birth>, quota: &mut GenomeQuota) -> Result<(), CoreError> {
     for birth in born.into_iter().rev() {
         quota.retire(*birth.genome)?;

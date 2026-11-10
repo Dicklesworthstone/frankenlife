@@ -89,6 +89,13 @@ FL-038 bounds a checkpoint's memory. `pause-and-stream` streams the committed wo
 a time: the preset's 160.7 MiB checkpoint peaks at about 1 MiB of heap, where encoding it whole peaked at 421.5 MiB.
 `bounded-background` lets the run step on while a writer drains at most `checkpoint_retained_bytes` of pages. Both
 store byte-identical checkpoints, and a run whose memory cannot hold a checkpoint is refused before it starts.
+FL-043 (first slice) admits a run's peak memory before it starts. `flife run`, `resume` and `render` add up the
+genome quota, the world's state, fields and tick scratch (reserved for the population's capacity, so they never
+grow while it steps), a step's births, observers, checkpoints and a declared reserve against
+`maximum_total_bytes`, and refuse the run before creating anything if those do not fit. The preset admits at
+1,375.7 MiB of its 2,048. What is left is the controller backend's budget: a parameter shard that would not fit is
+not made and its organisms are evaluated on the reference, so a small budget slows a run and never changes its
+digest. Studio is not admitted yet.
 FL-039 branches a run: `flife branch PARENT DIR --at T` starts a new session from the parent's checkpoint at
 tick T, a control branch, or an intervention branch with `--inject` brushes or `--remove` removals of its own
 (`--remove TICK:X,Y:RADIUS:DISPOSITION` takes out every organism in a disk, its energy removed, dissipated or

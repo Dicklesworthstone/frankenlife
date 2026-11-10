@@ -26,6 +26,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use flife_core::CoreError;
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_neural::ArenaSlot;
 
 use crate::catalog::TopologyId;
@@ -211,6 +212,32 @@ impl GenomeArena {
         self.buckets
             .get(topology.index())
             .map_or(0, |bucket| bucket.slots.len() as u64)
+    }
+
+    /// Bytes its buckets hold: each slot list's and free heap's capacity
+    /// times its element size (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total(
+            std::iter::once(capacity_bytes(&self.buckets)).chain(self.buckets.iter().map(
+                |bucket| {
+                    capacity_bytes(&bucket.slots)
+                        .saturating_add(bytes_for::<Reverse<u64>>(bucket.free.capacity()))
+                },
+            )),
+        )
+    }
+
+    /// The most bytes an arena of `topologies` buckets holds while at most
+    /// `live` genomes are live at once. A bucket issues a new slot only when
+    /// none is free, so it never has more than `live` slots; a list that
+    /// grows by doubling holds at most twice its length, and three times
+    /// while it moves.
+    #[must_use]
+    pub const fn bound_bytes(topologies: usize, live: usize) -> u64 {
+        let per_slot = bytes_for::<SlotState>(live).saturating_add(bytes_for::<Reverse<u64>>(live));
+        bytes_for::<Bucket>(topologies)
+            .saturating_add(per_slot.saturating_mul(3).saturating_mul(topologies as u64))
     }
 
     /// Set a slot's generation, to reach the last one without four billion

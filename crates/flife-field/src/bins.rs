@@ -28,6 +28,7 @@
 use std::ops::Range;
 
 use flife_core::CoreError;
+use flife_core::memory::capacity_bytes;
 
 use crate::footprint::BufferLimits;
 
@@ -48,6 +49,12 @@ pub struct Bins {
 }
 
 impl Bins {
+    /// Bytes its offsets and order hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        capacity_bytes(&self.offsets).saturating_add(capacity_bytes(&self.order))
+    }
+
     /// Bins named `name` for at most `buckets` buckets and `items` items,
     /// allocated now. `name` labels refusals.
     ///

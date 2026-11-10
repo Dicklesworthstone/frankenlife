@@ -44,6 +44,7 @@
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, TickLedger, Transfer, add_down, sub_down};
+use flife_core::memory::{capacity_bytes, total};
 use flife_core::model::MOMENT_CHANNELS;
 
 use crate::bins::Bins;
@@ -147,6 +148,20 @@ impl Default for Deposits {
 }
 
 impl Deposits {
+    /// Bytes its entries, packets, cells and reduction scratch hold
+    /// (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total([
+            capacity_bytes(&self.entries),
+            capacity_bytes(&self.packets),
+            capacity_bytes(&self.cells),
+            capacity_bytes(&self.identities),
+            capacity_bytes(&self.sequence),
+            self.bins.allocated_bytes(),
+        ])
+    }
+
     /// No deposits, with no declared capacity: their scratch grows on demand
     /// within the `u32` index range.
     #[must_use]

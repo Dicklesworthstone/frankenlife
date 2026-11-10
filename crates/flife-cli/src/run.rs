@@ -24,7 +24,7 @@ use std::time::Instant;
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
-use flife_backend_metal::ControllerChoice;
+use flife_backend_metal::{BackendBudget, ControllerChoice};
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, ControllerReport, NumericalProfile, World};
@@ -36,6 +36,7 @@ use serde::Serialize;
 
 use crate::branch::{BranchParent, ForkRecord, FoundingChunks, Inherited};
 use crate::checkpointing::CheckpointAdmission;
+use crate::memory::MemoryAdmission;
 use crate::metrics::{Declaration, Metrics, Tracker};
 use crate::observe::{Survey, Tally};
 use crate::persist::{Checkpoints, Persistence, ScheduledCommand};
@@ -92,6 +93,9 @@ pub struct ControllerSummary {
     pub reference_ticks: u64,
     /// Why the backend stopped serving, if it failed.
     pub failure: Option<String>,
+    /// The most bytes it held after a batch, host and device (FL-043):
+    /// within the start record's `memory.backend`.
+    pub resident_peak_bytes: u64,
 }
 
 impl ControllerSummary {
@@ -104,6 +108,7 @@ impl ControllerSummary {
             deferred,
             reference_ticks,
             failure,
+            resident_peak_bytes,
         } = world.controller_report().clone();
         Self {
             backend: backend.unwrap_or_else(|| CPU_REFERENCE.to_owned()),
@@ -111,16 +116,22 @@ impl ControllerSummary {
             deferred,
             reference_ticks,
             failure,
+            resident_peak_bytes,
         }
     }
 }
 
-/// Give `world` the backend `choice` selects on this host.
+/// Give `world` the backend `choice` selects on this host, holding at most
+/// `bytes` (FL-043) for batches of the population's capacity.
 ///
 /// # Errors
 /// [`ControllerChoice::backend`]'s.
-pub fn install(world: &mut World, choice: ControllerChoice) -> Result<(), CoreError> {
-    world.set_controller_backend(choice.backend(world.cpu_workers())?);
+pub fn install(world: &mut World, choice: ControllerChoice, bytes: u64) -> Result<(), CoreError> {
+    let budget = BackendBudget {
+        bytes,
+        organisms: world.population().capacity() as u64,
+    };
+    world.set_controller_backend(choice.backend(world.cpu_workers(), budget)?);
     Ok(())
 }
 
@@ -180,6 +191,10 @@ pub enum Record {
         /// memory admission (FL-038).
         #[serde(skip_serializing_if = "Option::is_none")]
         checkpoints: Option<CheckpointAdmission>,
+        /// The peak-memory preflight (FL-043): §19.4's terms, and the
+        /// controller backend's budget.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        memory: Option<MemoryAdmission>,
     },
     /// The run so far.
     Progress {
@@ -394,6 +409,7 @@ pub fn start(
         cpu_workers,
         controllers,
         checkpoints: None,
+        memory: None,
         metrics: (metrics_every > 0).then(|| Declaration::new(metrics_every)),
     }
 }
@@ -446,13 +462,23 @@ pub fn run_with(
         });
     }
     let commands = crate::persist::commands(scheduled);
+    // Checkpoint memory, then the whole peak (FL-043), are admitted before
+    // anything is created.
+    let checkpointing = persistence
+        .map(|persistence| {
+            crate::checkpointing::admit(config, persistence.mode, persistence.retained_bytes)
+        })
+        .transpose()?;
+    let mut world = found(config)?;
+    let memory = configure(
+        &mut world,
+        options.cpu_workers,
+        options.controllers,
+        checkpointing.as_ref(),
+    )?;
     if let Some(persistence) = persistence {
-        // Checkpoint memory is admitted before anything is created.
-        crate::checkpointing::admit(config, persistence.mode, persistence.retained_bytes)?;
         crate::persist::create(&persistence.run_dir, config)?;
     }
-    let mut world = found(config)?;
-    configure(&mut world, options.cpu_workers, options.controllers)?;
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;
     let metrics = tracker(&world, options.metrics_every)?;
@@ -471,12 +497,15 @@ pub fn run_with(
     };
     let clock = Instant::now();
     let plan = Plan {
-        start: start(
-            config,
-            options.ticks,
-            cpu_workers,
-            controllers,
-            options.metrics_every,
+        start: with_memory(
+            start(
+                config,
+                options.ticks,
+                cpu_workers,
+                controllers,
+                options.metrics_every,
+            ),
+            memory,
         ),
         until: options.ticks,
         every: options.every,
@@ -502,20 +531,35 @@ pub(crate) fn tracker(world: &World, every: u64) -> Result<Option<Tracker>, Core
     (every > 0).then(|| Tracker::new(world, every)).transpose()
 }
 
-/// Give `world` `cpu_workers`, if set, and the controller backend `choice`
-/// selects on this host.
+/// Give `world` `cpu_workers`, if set; admit its peak memory with
+/// `choice`'s backend and `checkpoint`'s admission
+/// ([`crate::memory::admit`]); and give it the controller backend `choice`
+/// selects on this host, within the admitted budget.
 ///
 /// # Errors
-/// [`World::set_cpu_workers`]'s and [`install`]'s.
+/// [`World::set_cpu_workers`]'s, [`crate::memory::admit`]'s and
+/// [`install`]'s.
 pub fn configure(
     world: &mut World,
     cpu_workers: Option<NonZeroUsize>,
     choice: ControllerChoice,
-) -> Result<(), CoreError> {
+    checkpoint: Option<&CheckpointAdmission>,
+) -> Result<MemoryAdmission, CoreError> {
     if let Some(workers) = cpu_workers {
         world.set_cpu_workers(workers)?;
     }
-    install(world, choice)
+    let config = world.config().clone();
+    let memory = crate::memory::admit(&config, world, choice, checkpoint, 0)?;
+    install(world, choice, memory.backend)?;
+    Ok(memory)
+}
+
+/// `start` with the preflight's admission.
+pub(crate) fn with_memory(mut start: Record, admission: MemoryAdmission) -> Record {
+    if let Record::Start { memory, .. } = &mut start {
+        *memory = Some(admission);
+    }
+    start
 }
 
 /// What a session is driven to do.

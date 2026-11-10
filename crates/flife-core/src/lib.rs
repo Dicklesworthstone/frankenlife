@@ -34,6 +34,7 @@ pub mod descriptor;
 pub mod error;
 pub mod ids;
 pub mod ledger;
+pub mod memory;
 pub mod model;
 pub mod numerics;
 pub mod registry;

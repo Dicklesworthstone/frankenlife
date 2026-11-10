@@ -48,10 +48,12 @@ use std::num::NonZeroUsize;
 
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
 use flife_core::numerics::tanh;
 use flife_neural::{
-    ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH, ShardGeometry,
+    ACTION_WIDTH, BackendBudget, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH,
+    ShardGeometry,
 };
 use ft_kernel_cpu::population_affine_f32_into;
 
@@ -239,6 +241,11 @@ struct Scratch {
 }
 
 impl Scratch {
+    /// The bytes its activations hold.
+    fn allocated_bytes(&self) -> u64 {
+        capacity_bytes(&self.first).saturating_add(capacity_bytes(&self.second))
+    }
+
     /// Room for activations `width` wide.
     fn hold(&mut self, width: usize) -> Result<(), CoreError> {
         for buffer in [&mut self.first, &mut self.second] {
@@ -249,6 +256,19 @@ impl Scratch {
         }
         Ok(())
     }
+}
+
+/// The bytes one shard of `geometry` holds: its values, reserved whole, and
+/// a word pair per slot naming its occupant.
+const fn shard_bytes(geometry: &ShardGeometry) -> u64 {
+    geometry
+        .shard_elements()
+        .saturating_mul(size_of::<f32>() as u64)
+        .saturating_add(
+            geometry
+                .slots_per_shard()
+                .saturating_mul(size_of::<Option<(u32, GenomeId)>>() as u64),
+        )
 }
 
 /// One shard of a topology's packed slots.
@@ -288,10 +308,12 @@ impl Packing {
     }
 
     /// Pack `job`'s parameters into its slot, in place of any earlier
-    /// occupant's, unless they are resident. Whether it packed them.
-    fn place(&mut self, job: &ControllerJob<'_>) -> Result<bool, CoreError> {
+    /// occupant's, unless they are resident, or their shard is not made yet
+    /// and would need more than `room` bytes (FL-043). Whether it packed
+    /// them, and the bytes of any shard it made.
+    fn place(&mut self, job: &ControllerJob<'_>, room: u64) -> Result<(bool, u64), CoreError> {
         if self.resident(job).is_some() {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let too_large = |quantity: &'static str| CoreError::Overflow { quantity };
         let at = self.geometry.locate(job.slot.slot());
@@ -303,9 +325,16 @@ impl Packing {
             .ok_or_else(|| too_large("arena offset"))?;
         let shard_elements = usize::try_from(self.geometry.shard_elements())
             .map_err(|_| too_large("arena shard elements"))?;
+        let slots = usize::try_from(self.geometry.slots_per_shard())
+            .map_err(|_| too_large("arena shard slots"))?;
+        let mut made = 0;
         let shard = match self.shards.entry(at.shard) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
+                let bytes = shard_bytes(&self.geometry);
+                if bytes > room {
+                    return Ok((false, 0));
+                }
                 let mut shard = Shard::default();
                 shard
                     .values
@@ -314,6 +343,13 @@ impl Packing {
                         buffer: "cpu controller shard",
                         bytes: self.geometry.shard_elements().saturating_mul(4),
                     })?;
+                shard.occupants.try_reserve_exact(slots).map_err(|_| {
+                    CoreError::AllocationFailed {
+                        buffer: "cpu controller slots",
+                        bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
+                    }
+                })?;
+                made = bytes;
                 entry.insert(shard)
             }
         };
@@ -335,7 +371,7 @@ impl Packing {
             &mut shard.values[offset..end],
         )?;
         shard.occupants[local] = Some((job.slot.generation(), job.genome));
-        Ok(true)
+        Ok((true, made))
     }
 }
 
@@ -365,6 +401,9 @@ impl Bucket {
 pub struct CpuBackend {
     lanes: NonZeroUsize,
     shard_slots: u64,
+    budget: BackendBudget,
+    /// The bytes its shards hold.
+    held: u64,
     buckets: Vec<Option<Bucket>>,
     scratch: Vec<Scratch>,
     /// The threads the last batch ran on.
@@ -384,9 +423,21 @@ impl CpuBackend {
     /// (at least one).
     #[must_use]
     pub const fn with_shard_slots(lanes: NonZeroUsize, shard_slots: u64) -> Self {
+        Self::with_budget(lanes, shard_slots, BackendBudget::UNBOUNDED)
+    }
+
+    /// As [`CpuBackend::with_shard_slots`], holding at most `budget.bytes`
+    /// (FL-043, plan §19.4): its shards and its lanes' activations. A shard
+    /// that would leave too little for the lanes' activations at the widest
+    /// topology served is not made, and its jobs are deferred to the
+    /// reference, which gives the same bits.
+    #[must_use]
+    pub const fn with_budget(lanes: NonZeroUsize, shard_slots: u64, budget: BackendBudget) -> Self {
         Self {
             lanes,
             shard_slots: if shard_slots == 0 { 1 } else { shard_slots },
+            budget,
+            held: 0,
             buckets: Vec::new(),
             scratch: Vec::new(),
             used: 0,
@@ -440,10 +491,11 @@ impl CpuBackend {
         self.packs
     }
 
-    /// Pack every job's parameters that are not resident, and give the
-    /// widest hidden layer among them.
+    /// Pack every job's parameters that are not resident and whose shard
+    /// fits the budget, and give the widest hidden layer among them.
     fn place(&mut self, jobs: &[ControllerJob<'_>]) -> Result<usize, CoreError> {
         let mut widest = 0;
+        let lanes = self.lanes.get() as u64;
         for job in jobs {
             let Ok(index) = usize::try_from(job.slot.topology()) else {
                 continue;
@@ -481,10 +533,24 @@ impl CpuBackend {
             let Some(packing) = bucket.packing.as_mut() else {
                 continue;
             };
-            if packing.place(job)? {
+            // The lanes' activations: two buffers of the widest layer served,
+            // or what they already hold.
+            let activations = lanes
+                .saturating_mul(2)
+                .saturating_mul(bytes_for::<f32>(widest.max(packing.widest)))
+                .max(total(self.scratch.iter().map(Scratch::allocated_bytes)));
+            let room = self
+                .budget
+                .bytes
+                .saturating_sub(self.held.saturating_add(activations));
+            let (packed, made) = packing.place(job, room)?;
+            self.held = self.held.saturating_add(made);
+            if packed {
                 self.packs += 1;
             }
-            widest = widest.max(packing.widest);
+            if packing.resident(job).is_some() {
+                widest = widest.max(packing.widest);
+            }
         }
         Ok(widest)
     }
@@ -519,8 +585,22 @@ impl ControllerBackend for CpuBackend {
         )
     }
 
+    fn resident_bytes(&self) -> u64 {
+        let shards = self
+            .buckets
+            .iter()
+            .flatten()
+            .filter_map(|bucket| bucket.packing.as_ref())
+            .flat_map(|packing| packing.shards.values())
+            .map(|shard| {
+                capacity_bytes(&shard.values).saturating_add(capacity_bytes(&shard.occupants))
+            });
+        total(shards.chain(self.scratch.iter().map(Scratch::allocated_bytes)))
+    }
+
     fn forget(&mut self) {
         self.buckets.clear();
+        self.held = 0;
         self.packs = 0;
     }
 

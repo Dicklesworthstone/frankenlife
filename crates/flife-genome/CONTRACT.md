@@ -39,6 +39,10 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
 - `initialize` fills founders' parameters. `fan_in_weight` gives one weight from a word.
 - `map_parameters` writes a child's parameters from a parent's and reports the `Transition` kind.
 - `founder` and `founder_traits` (FL-010): a founder's charged, sealed genome and its traits.
+- FL-043: `GenomeArena::allocated_bytes` (its buckets' capacities) and `GenomeArena::bound_bytes(topologies,
+  live)`, the most it holds for `live` genomes over at most `topologies` topologies: three slots' records for each
+  genome in each topology, since a bucket grown by pushing holds at most twice its length and three times while it
+  moves.
 - `MutationParameters` (from `[mutation]` and `[architecture_mutation]`) and `Mutator::propose`, which returns
   either `Proposal::Child` with its `MutationRecord` or `Proposal::Rejected` with every candidate's
   `RejectionReason`. Also `perturb` and `reflect_log_scale`.

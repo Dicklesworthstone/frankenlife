@@ -35,10 +35,35 @@ pub struct ControllerJob<'a> {
     pub inputs: &'a [f64; SENSOR_WIDTH],
 }
 
+/// The memory a controller backend may hold for one world (FL-043, plan
+/// §19.4): the preflight's backend term, given to a backend when it is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendBudget {
+    /// Bytes it may hold at once, host and device: resident parameters,
+    /// staging and scratch. A backend makes no parameter shard that would
+    /// leave too little of it for its staging of a batch of `organisms`
+    /// jobs; it defers that shard's jobs to the reference instead.
+    pub bytes: u64,
+    /// The most jobs one batch holds: the world's population capacity.
+    pub organisms: u64,
+}
+
+impl BackendBudget {
+    /// No limit but the host's and the device's.
+    pub const UNBOUNDED: Self = Self {
+        bytes: u64::MAX,
+        organisms: u64::MAX,
+    };
+}
+
 /// A batch evaluator of the reference controller.
 pub trait ControllerBackend: Debug + Send {
     /// The backend and its device, for run records.
     fn describe(&self) -> String;
+
+    /// The bytes it holds now, host and device: resident parameters,
+    /// staging and scratch (FL-043). Within its [`BackendBudget`]'s bytes.
+    fn resident_bytes(&self) -> u64;
 
     /// Drop everything kept resident; the next batch uploads afresh. The
     /// world calls this when the backend starts serving it, since another

@@ -39,13 +39,17 @@ through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
   one batch (`ControllerJob`: genome identity, arena slot, admitted controller, inputs). `ControllerChoice` (`cpu`, `torch`,
   `metal`, `auto`) is what the CLI and Studio select it with (`torch` is `flife-backend-cpu`'s `CpuBackend` on the
-  world's workers, on any host): `backend(cpu_workers)` gives `auto` Metal only on a host with
+  world's workers, on any host): `backend(cpu_workers, budget)` gives `auto` Metal only on a host with
   a device and at most `AUTO_METAL_MAX_WORKERS` = 8 workers, where it measured faster (whole ticks, 256 ticks, two
   interleaved runs: 2 workers 27.5 → 16.3 ms, 4 workers 19.5 → 14.8 ms, 8 workers 15.8 → 14.3 ms). Where it does
   not take Metal, it takes `torch` at most `AUTO_TORCH_MAX_WORKERS` = 4 workers, where that measured faster on
   Linux and macOS (`flife-backend-cpu`'s contract). `ControllerChoice::auto_for(cpu_workers, metal_device)` states
   the rule for either kind of host. Test `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling` checks the
   rule for both kinds on any host, and that this host's `auto` is the rule's choice for it.
+- FL-043: `backend(cpu_workers, budget)` takes a `BackendBudget` (re-exported from `flife-neural`: bytes, and the
+  organisms the world can hold), `BackendBudget::UNBOUNDED` for none. `MetalBackend::with_budget(shard_slots,
+  budget)` opens its own `DeviceOwner` with `Limits { bytes: budget.bytes, .. }`; `open` and `with_shard_slots` are
+  unbounded. `SHARD_SHARE` (8) and `staging_bytes(organisms, shards)` are public.
 - The kernel alone: `Batch::push(topology, parameters, inputs)` for one organism's catalog topology, its parameters
   in the reference layout and its observation's 104 F64 inputs (topologies may mix in a batch); then
   `MetalControllers::open()`, `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.
@@ -101,6 +105,14 @@ the per-organism buffers, grow to the next power of two when a batch outgrows th
 the one it replaces. A job whose slot holds another genome after placement (one batch naming a slot twice), whose
 bucket is another topology's, which the kernel cannot shape, or whose inputs are not finite in F32, is deferred
 without dispatch.
+
+FL-043: under a budget, a shard holds at most `1/SHARD_SHARE` of what a batch's staging bound leaves
+(`staging_bytes`: the per-organism device buffers and the host's staged inputs, outputs, flags, dispatch lists and
+job words for every organism the world can hold, and each shard's job words), so a small budget still makes several
+shards. A shard is made only if its parameters and host records, with the staging bound for one more shard, fit
+in what the shards already held leave; the owner refuses any device buffer past the budget as well. A job whose shard is not made is deferred, and the world
+evaluates it on the reference, which gives the same bits. `resident_bytes` is the owner's bytes plus the host
+vectors and each shard's host records.
 
 **Invariants.**
 - Every non-deferred output is the reference controller's, bit for bit:
@@ -258,6 +270,12 @@ A refusal changes nothing.
     genomes' slots, so one shard holds every genome, and the owner's bytes are at most `SHARD_BYTES` and 8 MiB.
   - At an evaluation interval of four ticks, in shards of 64 (64 kernels in one command), the world is the
     reference world at every tick, and each of 4,139 genomes is uploaded exactly once while it lives.
+  - FL-043, `under_half_its_bytes_metal_defers_and_the_world_is_the_reference`: an unbounded backend holds 273.4 MB
+    after 40 ticks of the preset; under half of that (136.7 MB), whose owner's limit is that budget, 400 ticks
+    equal the reference world at every tick, with 42 births, 721,847 evaluations on the device and 532,909
+    deferred, no tick redone and no failure. The owner holds 96.1 MB and the backend's resident peak is 97.6 MB.
+    Planted mutants: dropping the shard check fails it, and so does an unbounded owner (by the limit's
+    assertion; with the check in place the owner's limit is never reached, so the run alone would not show it).
 - `tests/residency.rs` (FL-026, 2 tests), in shards of 16:
   - 300 genomes over five topologies are uploaded once into 20 shards. Batches of a few upload and drop nothing.
     A slot at its next generation, holding another genome, is uploaded in its place with that genome's reference
@@ -601,6 +619,8 @@ per-pass thread spawning (6%).
   reaches 44–69% of a plain read in its fastest rounds, and nothing measured explains the rest: it is not
   profiled. Each per-product subnormal check is a candidate, as are the 64-lane threadgroup that the 32- and
   36-wide layers half fill, and one barrier per layer.
+- FL-043: the budget bounds the device's peak, but shards are still not freed when their genomes die, so a
+  crash keeps the room they took.
 - Parameter shards are never freed before `forget`: after a population crash, device memory stays at the peak in
   whole shards. A topology's first genome allocates a whole 256 MiB shard, so the five catalog members can hold
   1.25 GiB however few their genomes. Backend memory is not yet part of admission (FL-043).

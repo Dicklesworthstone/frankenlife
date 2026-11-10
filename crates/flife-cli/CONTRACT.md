@@ -29,6 +29,13 @@ seed it plans, catalogs every run however it ended in FrankenSQLite (`flife-stor
 run's records and Appendix B.1 manifest, and writes a report computed from the catalog alone. A report is the same
 bytes at any worker count and backend, and after a kill and a continuation.
 
+FL-043 (`flife-8gy`), first slice, adds the peak-memory preflight (plan §7.5, §19.3, §19.4, INV-12, INV-15), in
+`memory`. Before a run, resume or render steps, `memory::admit` adds up §19.4's terms against `[execution]
+maximum_total_bytes` and refuses the run when the terms other than the backend's do not fit. The remainder goes to
+the controller backend as its `BackendBudget`. A backend never holds more than its budget: a parameter shard that
+would not fit is not made, and its jobs go to the reference, which gives the same bits. So a small budget slows a
+run and never changes it.
+
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
@@ -153,6 +160,11 @@ bytes at any worker count and backend, and after a kill and a continuation.
   the backend failed if it did. Those say where the arithmetic ran, so a record shows whether the GPU did the work.
   `metrics` carries `window.record_seconds` and `sample_seconds`, the tracker's own wall-clock cost, which are not
   scientific state either.
+- FL-043: `start.memory` is the admission: `budget_bytes`, the fixed logical quota (`logical_parameters`,
+  `logical_genome_bytes`), and the terms in bytes: `genomes` (the allocated genome quota), `state`, `field`,
+  `scratch`, `births`, `render`, `checkpoint`, `reserve` and `backend`, with `peak_bytes` their sum. `end.controllers`
+  carries `resident_peak_bytes`, the most the backend held after any batch. A run admitted on the reference alone
+  has `backend` 0. None of these is scientific state.
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
   the video path if encoded, the controller summary, wall seconds, and the style: `mapping`, its `meaning`, `look`,
@@ -246,6 +258,19 @@ bytes at any worker count and backend, and after a kill and a continuation.
   - re-surveying the returned world gives the same survey.
 - The session's limits are checked before the world is founded. An unadmitted durability is refused without
   founding the population or emitting a `start` record.
+- FL-043, the preflight's terms:
+  - `genomes` is `maximum_allocated_genome_bytes`, which the genome quota already enforces. The logical quota stays
+    the fixed scientific one: the preflight never changes which birth is accepted (§7.5).
+  - `state`, `field`, `scratch` and `births` are the founded world's `World::footprint`, after its workers are set,
+    plus `World::batched_bytes` for a run with a controller backend. The engine reserves the fields and the tick's
+    scratch for `population.maximum_count` when the world is founded, its workers are set or a backend is
+    installed, so they do not grow while the run steps.
+  - `render` is what an observer reserves (`flife render`: the publisher's slots and its frames in flight); a
+    headless run has none. `checkpoint` is FL-038's admitted peak, or 0 without a run directory. `reserve` is
+    `RESERVE_BYTES` (64 MiB), a declared allowance for the runtime, the session, the store and the device driver.
+  - `backend` is `budget_bytes` minus the other terms, or 0 for `--controllers cpu`.
+- FL-043: the admission comes before anything is created. A refused run makes no run directory and prints nothing.
+  `flife resume` admits the resumed world under the same rule.
 - The preset is Appendix A with exactly its declared changes. Its header declares each one, and the smoke test
   refuses any other difference.
 - FL-037:
@@ -414,6 +439,8 @@ test.
   configuration does not validate (`invalid-config` or `unknown-algorithm`); a directory holding files but no
   catalog, or another experiment's catalog (`state-conflict`). A run's own refusal (for example
   `write-ahead-before-apply` without a run directory) is cataloged as an `error` run, not returned.
+- FL-043: a run whose terms other than the backend's exceed `maximum_total_bytes`: `budget-exhausted` (budget
+  `peak memory (maximum_total_bytes)`), before a run directory is made or a record is printed.
 - Any other refusal from founding or the session, by its `CoreError` kind.
 - A run that pauses on capacity or fails a tick ends with that `stop` and exit status 1. Its records up to that
   point are still emitted.
@@ -704,11 +731,47 @@ refused. `a_directory_without_a_run_is_refused_untouched`. Six planted mutants (
 position, the field plane reversed, affinity left out, a founder its own parent, organism energy doubled) were each
 caught.
 
+`tests/memory_admission.rs` (5 tests, FL-043, about 7 s; a counting global allocator, `peak_alloc`, test only):
+- `the_preset_is_admitted_term_by_term`: on the preset each term is its source (the configuration's quotas, the
+  world's footprint, `RESERVE_BYTES`) and the peak is their sum: 1,375.7 MiB on the reference (genomes 1,152.0,
+  state 19.63, field 6.95, scratch 79.25, births 53.88, reserve 64.0). With `torch` the scratch adds the batched
+  lists (105.13 MiB) and the backend is granted the remaining 646.4 MiB of the 2,048.
+- `a_budget_below_the_terms_is_refused_before_anything_is_created`: a budget of the genome quota plus 8 MiB, with
+  `pause-and-stream` checkpoints, is refused with `budget-exhausted`, and the run directory does not exist.
+- `a_small_backend_budget_defers_and_never_changes_the_run`: a 48 MiB backend grant on `torch` for 24 ticks ends
+  at the reference's digest, with both batched and deferred evaluations, and the backend's resident peak at most
+  the grant (40.9 MB of 50.3 MB).
+- `a_full_population_holds_no_more_heap_than_its_terms`: `population.maximum_count` 4,096, the founders' count, on
+  `torch` for 48 ticks, the population full throughout. The allocated fields and scratch never change, and the
+  process's heap peak from founding (356.5 MiB) is
+  at most the admitted terms with the genome term at the arena's actual peak and the backend at its resident peak
+  (370.8 MiB).
+- `a_filling_introduction_stays_within_the_staging_term`: 512 founders of a capacity of 4,096, and at tick 0 an
+  introduction of the other 3,584. The step holds 142.60 MiB above the world before it: within the staging term
+  (13.47 MiB), the introduced genomes' parameters (136.55 MiB) and the state's room to its bound (1.34 MiB).
+
+Eleven planted mutants were run against these tests and `flife-engine`'s, `flife-backend-cpu`'s and
+`flife-backend-metal`'s FL-043 tests, and every one was caught: the source supports, the lanes at a new worker
+count and the batched lanes left unreserved (the footprint and installation tests); the CPU backend making a shard
+whatever its budget, the Metal backend skipping its shard check, and its owner unbounded (the budget world tests);
+the admission never refusing, the births term left out of the sum, and the run directory created before the
+admission (the tests here); and the staging term set to zero (the filling introduction). Two were first missed:
+the unbounded owner, until the Metal test asserted the owner's limit, and the zero staging term, until the
+filling introduction was added. The full-population heap test alone has too little margin to see it.
+
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories
 also at `write-ahead-before-apply`, one process per run directory, on local file systems (APFS tested here).
 
 **Known gaps.**
+- FL-043 gaps (first slice):
+  - `flife-studio`'s backends are unbounded (`BackendBudget::UNBOUNDED`), and its observers and windows are not
+    admitted.
+  - `flife render` admits the publisher and its frames in flight, not the view's own drawing buffers.
+  - `reserve` is a declared allowance, not a measurement of the runtime's, the store's or the driver's heap.
+  - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
+    in which every organism reproduces, which would test its birth part, is not made.
+  - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
 - Only `validate`, `run`, `resume`, `render`, `branch` and `experiment`. Capabilities, step and inspect, analyze
   and export are later items (§14.6): FL-021 and FL-023.
 - FL-039 gaps:

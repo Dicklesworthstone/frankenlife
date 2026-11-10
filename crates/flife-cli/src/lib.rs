@@ -49,6 +49,7 @@ pub mod branch;
 pub mod checkpointing;
 pub mod experiment;
 pub mod inspect;
+pub mod memory;
 pub mod metrics;
 pub mod observe;
 pub mod persist;
@@ -69,12 +70,13 @@ pub use experiment::{
     ExperimentOptions, ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measure, Measures,
     REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, experiment,
 };
-pub use flife_backend_metal::ControllerChoice;
+pub use flife_backend_metal::{BackendBudget, ControllerChoice};
 pub use flife_manim::{ColorMapping, Look, Particles, Style};
 pub use inspect::{
     INSPECT_SCHEMA, InspectOptions, Inspected, InspectedCheckpoint, InspectedExtent,
     InspectedField, InspectedOrganism, Inspection, inspect,
 };
+pub use memory::{MemoryAdmission, RESERVE_BYTES};
 pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};
 pub use observe::{Heredity, Survey, Tally};
 pub use persist::{

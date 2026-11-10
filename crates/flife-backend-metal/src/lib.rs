@@ -29,6 +29,7 @@ use std::num::NonZeroUsize;
 use flife_backend_cpu::CpuBackend;
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_neural::{
     ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH, ShardGeometry,
 };
@@ -39,6 +40,9 @@ pub mod owner;
 pub mod sensors;
 
 pub use field::MetalField;
+/// The memory a controller backend may hold (FL-043), for composition
+/// roots that make one through [`ControllerChoice::backend`].
+pub use flife_neural::BackendBudget;
 use owner::metal;
 pub use owner::{
     Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
@@ -271,7 +275,15 @@ impl MetalControllers {
     /// [`CoreError::MissingCapability`] without a Metal device (always, off
     /// macOS); [`CoreError::StateConflict`] if the kernels do not compile.
     pub fn open() -> Result<Self, CoreError> {
-        let owner = DeviceOwner::open(Limits::UNBOUNDED)?;
+        Self::open_with(Limits::UNBOUNDED)
+    }
+
+    /// As [`MetalControllers::open`], its owner holding at most `limits`.
+    ///
+    /// # Errors
+    /// As [`MetalControllers::open`].
+    pub fn open_with(limits: Limits) -> Result<Self, CoreError> {
+        let owner = DeviceOwner::open(limits)?;
         let library = owner.library(CONTROLLER_MSL, MathMode::Safe)?;
         let pipeline = |name: &str| library.pipeline(name).map_err(metal);
         Ok(Self {
@@ -495,6 +507,41 @@ impl MetalControllers {
 /// shard.
 pub const SHARD_BYTES: u64 = 256 << 20;
 
+/// Under a budget, a shard holds at most this fraction of what a full
+/// batch's staging leaves of it (FL-043): room for the five catalog
+/// members' first shards and three more.
+pub const SHARD_SHARE: u64 = 8;
+
+/// The host bytes one shard holds beside its occupants: its job list and
+/// its places in a batch's touched shards and kernel bindings.
+const SHARD_HOST_BYTES: u64 = 256;
+
+/// The most a batch's staging holds, device and host, for at most
+/// `organisms` jobs over `shards` shards (FL-043): the per-organism device
+/// buffers, a power of two of at least 256 rows; each shard's job words, a
+/// power of two of at least 64 jobs; and the host's staged inputs, outputs,
+/// fault flags, dispatch lists and job words, which grow by doubling.
+#[must_use]
+pub const fn staging_bytes(organisms: u64, shards: u64) -> u64 {
+    let rows = match organisms.checked_next_power_of_two() {
+        Some(rows) if rows < 256 => 256,
+        Some(rows) => rows,
+        None => u64::MAX,
+    };
+    let row = ((SENSOR_WIDTH + ACTION_WIDTH + 1) * size_of::<f32>()) as u64;
+    let words = (JOB_WORDS * size_of::<u32>()) as u64;
+    let device = rows.saturating_mul(row).saturating_add(
+        organisms
+            .saturating_mul(2)
+            .saturating_add(shards.saturating_mul(64))
+            .saturating_mul(words),
+    );
+    let host = organisms
+        .saturating_mul(2)
+        .saturating_mul(row + words + 2 * size_of::<usize>() as u64);
+    device.saturating_add(host)
+}
+
 /// One shard of a topology's slots on the device: a whole shard's buffer,
 /// made when its first slot is needed and never moved or rebuilt.
 struct DeviceShard {
@@ -528,6 +575,10 @@ struct DeviceBucket {
 pub struct MetalBackend {
     controllers: MetalControllers,
     shard_slots: u64,
+    budget: BackendBudget,
+    /// Shards made, and the bytes they hold, device and host.
+    shard_count: u64,
+    held: u64,
     buckets: Vec<Option<DeviceBucket>>,
     /// Per-organism buffers, sized for `organisms`.
     organisms: usize,
@@ -571,9 +622,29 @@ impl MetalBackend {
     /// # Errors
     /// As [`MetalControllers::open`].
     pub fn with_shard_slots(shard_slots: u64) -> Result<Self, CoreError> {
+        Self::with_budget(shard_slots, BackendBudget::UNBOUNDED)
+    }
+
+    /// As [`MetalBackend::with_shard_slots`], holding at most `budget.bytes`
+    /// device and host (FL-043, plan §19.4). Its owner refuses device bytes
+    /// past it. A shard is at most a [`SHARD_SHARE`]th of what a batch of
+    /// `budget.organisms` jobs leaves for parameters, and one that would
+    /// leave too little for that batch's staging ([`staging_bytes`]) is not
+    /// made: its jobs are deferred to the reference, which gives the same
+    /// bits.
+    ///
+    /// # Errors
+    /// As [`MetalControllers::open`].
+    pub fn with_budget(shard_slots: u64, budget: BackendBudget) -> Result<Self, CoreError> {
         Ok(Self {
-            controllers: MetalControllers::open()?,
+            controllers: MetalControllers::open_with(Limits {
+                bytes: budget.bytes,
+                leases_per_purpose: u32::MAX,
+            })?,
             shard_slots: shard_slots.max(1),
+            budget,
+            shard_count: 0,
+            held: 0,
             buckets: Vec::new(),
             organisms: 0,
             inputs: None,
@@ -647,10 +718,16 @@ impl MetalBackend {
         let topology = job.controller.topology();
         let length = job.controller.parameters().len() as u64;
         let (owner, shard_slots) = (&self.controllers.owner, self.shard_slots);
+        let share = match self.budget.bytes {
+            u64::MAX => u64::MAX,
+            bytes => bytes.saturating_sub(staging_bytes(self.budget.organisms, 0)) / SHARD_SHARE,
+        };
         let bucket = self.buckets[index].get_or_insert_with(|| {
             // A 32-bit job word offsets every element of a shard.
-            let limit =
-                (owner.max_buffer_bytes() as u64).min(SHARD_BYTES) / size_of::<f32>() as u64;
+            let limit = (owner.max_buffer_bytes() as u64)
+                .min(SHARD_BYTES)
+                .min(share)
+                / size_of::<f32>() as u64;
             DeviceBucket {
                 topology: topology.clone(),
                 geometry: ShardGeometry::fitting(
@@ -676,6 +753,10 @@ impl MetalBackend {
         let eligible = std::mem::take(&mut self.eligible);
         let owner = self.controllers.owner.clone();
         let mut uploads = 0;
+        let budget = self.budget;
+        // What the shards hold, written back once the batch is placed. An
+        // error drops the backend, so a lost count is never used.
+        let (mut held, mut shard_count) = (self.held, self.shard_count);
         for &index in &eligible {
             let Some(job) = jobs.get(index) else { continue };
             let Some(bucket) = self.bucket(job)? else {
@@ -701,11 +782,30 @@ impl MetalBackend {
                             quantity: "arena shard slots",
                         }
                     })?;
+                    let bytes = bytes_for::<f32>(elements)
+                        .saturating_add(bytes_for::<Option<(u32, GenomeId)>>(slots))
+                        .saturating_add(SHARD_HOST_BYTES);
+                    let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
+                    if held.saturating_add(bytes).saturating_add(staging) > budget.bytes {
+                        continue;
+                    }
+                    let parameters = match owner.zeroed_owned::<f32>(elements) {
+                        Ok(parameters) => parameters,
+                        Err(CoreError::BudgetExhausted { .. }) => continue,
+                        Err(error) => return Err(error),
+                    };
                     let mut occupants = Vec::new();
-                    reserve(&mut occupants, slots, "metal controller slots")?;
+                    occupants.try_reserve_exact(slots).map_err(|_| {
+                        CoreError::AllocationFailed {
+                            buffer: "metal controller slots",
+                            bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
+                        }
+                    })?;
                     occupants.resize(slots, None);
+                    held = held.saturating_add(bytes);
+                    shard_count = shard_count.saturating_add(1);
                     entry.insert(DeviceShard {
-                        parameters: owner.zeroed_owned::<f32>(elements)?,
+                        parameters,
                         occupants,
                         jobs: None,
                         job_capacity: 0,
@@ -733,6 +833,7 @@ impl MetalBackend {
             uploads += 1;
         }
         self.uploads += uploads;
+        (self.held, self.shard_count) = (held, shard_count);
         self.dispatched.clear();
         for &index in &eligible {
             let Some(job) = jobs.get(index) else { continue };
@@ -833,8 +934,31 @@ impl ControllerBackend for MetalBackend {
         format!("metal ({})", self.controllers.device_name())
     }
 
+    fn resident_bytes(&self) -> u64 {
+        let shards = self
+            .buckets
+            .iter()
+            .flatten()
+            .flat_map(|bucket| bucket.shards.values())
+            .map(|shard| {
+                capacity_bytes(&shard.occupants)
+                    .saturating_add(capacity_bytes(&shard.staged))
+                    .saturating_add(SHARD_HOST_BYTES)
+            });
+        total(shards.chain([
+            self.controllers.owner.usage().bytes,
+            capacity_bytes(&self.staged_inputs),
+            capacity_bytes(&self.eligible),
+            capacity_bytes(&self.dispatched),
+            capacity_bytes(&self.values),
+            capacity_bytes(&self.flags),
+        ]))
+    }
+
     fn forget(&mut self) {
         self.buckets.clear();
+        self.shard_count = 0;
+        self.held = 0;
         self.uploads = 0;
     }
 
@@ -1034,29 +1158,38 @@ impl ControllerChoice {
     /// [`ControllerChoice::Auto`], those other than a missing Metal device:
     /// a Mac whose kernel does not compile is a defect to report, not a
     /// reason to fall back quietly.
+    ///
+    /// The backend holds at most `budget` (FL-043): see
+    /// [`CpuBackend::with_budget`] and [`MetalBackend::with_budget`].
     pub fn backend(
         self,
         cpu_workers: usize,
+        budget: BackendBudget,
     ) -> Result<Option<Box<dyn ControllerBackend>>, CoreError> {
         let boxed = |backend: MetalBackend| -> Box<dyn ControllerBackend> { Box::new(backend) };
+        let metal = || MetalBackend::with_budget(u64::MAX, budget);
         match self {
             Self::Cpu => Ok(None),
             Self::Torch => {
                 let lanes = NonZeroUsize::new(cpu_workers).unwrap_or(NonZeroUsize::MIN);
-                Ok(Some(Box::new(CpuBackend::new(lanes))))
+                Ok(Some(Box::new(CpuBackend::with_budget(
+                    lanes,
+                    flife_backend_cpu::SHARD_SLOTS,
+                    budget,
+                ))))
             }
-            Self::Metal => MetalBackend::open().map(boxed).map(Some),
+            Self::Metal => metal().map(boxed).map(Some),
             Self::Auto => {
                 // Opening the device is how this host says whether it has
                 // one, so only where `auto_for` could choose it.
                 if Self::auto_for(cpu_workers, true) == Self::Metal {
-                    match MetalBackend::open() {
+                    match metal() {
                         Ok(backend) => return Ok(Some(boxed(backend))),
                         Err(CoreError::MissingCapability { .. }) => {}
                         Err(error) => return Err(error),
                     }
                 }
-                Self::auto_for(cpu_workers, false).backend(cpu_workers)
+                Self::auto_for(cpu_workers, false).backend(cpu_workers, budget)
             }
         }
     }

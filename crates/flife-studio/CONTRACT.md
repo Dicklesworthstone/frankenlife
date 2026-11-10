@@ -220,6 +220,8 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
 - A selection shows only as the ring and the `selection` record: there is no inspector (FL-021).
+- FL-043: Studio's controller backends are unbounded (`BackendBudget::UNBOUNDED`), and its world, view and window
+  are not admitted against `maximum_total_bytes`. Only `flife run`, `resume` and `render` admit their peak memory.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.

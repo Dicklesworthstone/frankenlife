@@ -6,6 +6,7 @@
 
 use std::num::NonZeroUsize;
 
+use flife_core::memory::{capacity_bytes, total};
 use flife_core::{CoreError, TimeStep};
 
 use crate::footprint::BufferLimits;
@@ -155,6 +156,45 @@ impl FieldWork {
     #[must_use]
     pub fn workers(&self) -> usize {
         self.transport.len()
+    }
+
+    /// Give it a support for each of `sources` sources, each with room for
+    /// any of `kernel`'s on its grid, so that no step allocates one (FL-043).
+    ///
+    /// # Errors
+    /// As [`SourceSupport::for_kernel`]; nothing changes then.
+    pub fn reserve_supports(
+        &mut self,
+        sources: usize,
+        kernel: &SourceKernel,
+    ) -> Result<(), CoreError> {
+        let mut supports = Vec::new();
+        supports
+            .try_reserve_exact(sources)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "source supports",
+                bytes: flife_core::memory::bytes_for::<SourceSupport>(sources),
+            })?;
+        for _ in 0..sources {
+            supports.push(SourceSupport::for_kernel(kernel, &self.grid)?);
+        }
+        self.supports = supports;
+        Ok(())
+    }
+
+    /// Bytes its transport scratch, one per worker, and its source supports
+    /// hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total(
+            [
+                capacity_bytes(&self.transport),
+                capacity_bytes(&self.supports),
+            ]
+            .into_iter()
+            .chain(self.transport.iter().map(TransportScratch::allocated_bytes))
+            .chain(self.supports.iter().map(SourceSupport::allocated_bytes)),
+        )
     }
 
     /// Use `workers` threads from the next step.

@@ -12,8 +12,11 @@ in frankentorch, added for this item. This crate is `forbid(unsafe_code)`.
   and its 104 F64 observation inputs.
 - A lane count, at construction: the world's `cpu_workers`.
 - The composition root selects it with `--controllers torch` (`flife run`, `render`, `resume`, `experiment` and
-  `flife-studio`): `flife_backend_metal::ControllerChoice::Torch`, whose `backend(cpu_workers)` gives this backend
-  on that many lanes, on any host. `auto` does not take it (see Measurements).
+  `flife-studio`): `flife_backend_metal::ControllerChoice::Torch`, whose `backend(cpu_workers, budget)` gives this
+  backend on that many lanes, on any host. `auto` does not take it (see Measurements).
+- FL-043: a `flife_neural::BackendBudget` (bytes, and the organisms the world can hold), at construction:
+  `CpuBackend::with_budget(lanes, shard_slots, budget)`. `new` and `with_shard_slots` are unbounded. The CLI grants
+  what its preflight leaves (`flife-cli`'s `memory`).
 
 **Outputs.** One entry per job, in batch order: its 36 raw outputs, or `None` for a deferred job, which the world
 evaluates on the reference.
@@ -57,6 +60,12 @@ place. A batch drops nothing: a genome due one tick in K is not packed again whe
 reserved at its full size when first touched, so memory follows the peak population in whole shards until
 `forget`.
 
+FL-043: a shard, its parameters and its occupants' records alike, is reserved whole when it is made, and is made
+only if it fits in what the budget leaves after the shards already held and the lanes' activation scratch. A job
+whose shard would not fit is deferred, and the world evaluates it on the reference, which gives the same bits. So
+a small budget moves work to the reference and never changes a result. `resident_bytes` is the shards' and the
+lanes' scratch's capacities.
+
 **Independent tests.**
 - In frankentorch, `crates/ft-kernel-cpu/tests/population_affine.rs` tests the kernel itself.
   - Every output of FrankenLife's layer shapes (`[37, 104, 64]` to `[1, 1, 1]`) equals an independent scalar loop
@@ -90,6 +99,10 @@ reserved at its full size when first touched, so memory follows the peak populat
   - At an evaluation interval of four ticks (a batch holds about a quarter of the live genomes), 400 ticks equal
     the reference world at every tick, and every genome, newborns included, is packed exactly once while it lives
     (4,139 genomes, 4,139 packs), in shards of 256 and of 3.
+  - FL-043, `under_half_its_bytes_the_backend_defers_and_the_world_is_the_reference`: an unbounded backend holds
+    163.7 MB after 40 ticks of the preset; under half of that (81.9 MB), 400 ticks equal the reference world at
+    every tick, with 42 births, 553,606 jobs batched and 701,150 deferred, no tick redone and no failure, and the
+    backend's resident peak at 71.6 MB. Planted mutant: a shard made whatever the budget leaves fails it.
 - In `flife-backend-metal`, `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling`: `torch` gives this
   backend on the world's workers on any host, and parses from `torch`.
 
@@ -135,7 +148,8 @@ Linux and from 1.62× to 1.26× on macOS.
   genomes side by side, but a batch's due organisms are not adjacent slots (some are not due, some slots are
   free), so one call over several needs a gather or a whole-shard call. The kernel already takes `[B, I, O]`.
 - Shards are never freed before `forget`: after a population crash, memory stays at the peak in whole shards.
-  Backend memory is not yet part of admission (FL-043).
+  FL-043's budget bounds that peak, but a crash keeps the room the dead genomes' shards took, so later shards of
+  other topologies may be deferred.
 - Packing a newborn's parameters is a copy and a transpose, once per genome.
 - `auto` takes this backend only on a host without Metal, at up to four workers. The crossover between four and
   eight workers is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis

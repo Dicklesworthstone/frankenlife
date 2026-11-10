@@ -66,7 +66,7 @@ use crate::checkpointing::{
 
 use crate::run::{
     CheckpointAt, ControllerSummary, Finished, Plan, RUN_SCHEMA, RUN_SESSION, Record,
-    SkippedCheckpoint, configure, drive, finish, found, start, tracker,
+    SkippedCheckpoint, configure, drive, finish, found, start, tracker, with_memory,
 };
 
 pub use flife_store::Durability as StoreDurability;
@@ -1186,7 +1186,12 @@ pub fn resume(
             CommandBook::new(limits.session, limits.revision, limits.command_capacity),
         ),
     };
-    configure(&mut world, options.cpu_workers, options.controllers)?;
+    let memory = configure(
+        &mut world,
+        options.cpu_workers,
+        options.controllers,
+        Some(checkpoints.admission()),
+    )?;
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;
     let from = checkpoints.last();
@@ -1194,12 +1199,15 @@ pub fn resume(
     let (owner, handle) = open_session(world, book, limits, run_dir)?;
     let clock = Instant::now();
     let plan = Plan {
-        start: start(
-            &config,
-            options.until,
-            cpu_workers,
-            controllers,
-            options.metrics_every,
+        start: with_memory(
+            start(
+                &config,
+                options.until,
+                cpu_workers,
+                controllers,
+                options.metrics_every,
+            ),
+            memory,
         ),
         until: options.until,
         every: options.every,

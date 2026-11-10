@@ -20,6 +20,7 @@
 //! arithmetic those draws feed.
 
 use flife_core::ids::SourceId;
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::{CoreError, TickSpan, TimeStep, ValidatedConfig};
 
 use crate::grid::{FieldGrid, wrap_coordinate};
@@ -128,6 +129,28 @@ impl SourceKernel {
         self.weigh_into(grid, center, support, |column, row| {
             self.weight(grid, center, column, row)
         })
+    }
+
+    /// The most candidate columns and rows one support on `grid` takes
+    /// (FL-043): the cells whose centers lie within the radius of a center,
+    /// widened by one on each side against rounding, which is at most
+    /// `2r/h + 5` of an axis's cells, and at most the whole axis.
+    #[must_use]
+    pub fn candidate_bound(&self, grid: &FieldGrid) -> [usize; 2] {
+        let axis = |cell: f64, cells: u32| {
+            let span = (2.0 * self.radius / cell).ceil() + 5.0;
+            let whole = cells as usize;
+            if span.is_finite() && span < f64::from(cells) {
+                // Below the axis's cell count, so it fits.
+                (span as usize).min(whole)
+            } else {
+                whole
+            }
+        };
+        [
+            axis(grid.cell_width(), grid.cells_x()),
+            axis(grid.cell_height(), grid.cells_y()),
+        ]
     }
 
     /// The first half of [`SourceKernel::support_into`]: the candidate rows
@@ -306,6 +329,50 @@ impl SourceSupport {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty support with room for any of `kernel`'s on `grid`
+    /// ([`SourceKernel::candidate_bound`]), so that filling it never
+    /// allocates (FL-043).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses the room.
+    pub fn for_kernel(kernel: &SourceKernel, grid: &FieldGrid) -> Result<Self, CoreError> {
+        let [columns, rows] = kernel.candidate_bound(grid);
+        let cells = columns.saturating_mul(rows);
+        let mut support = Self::new();
+        let refused = |bytes: u64| CoreError::AllocationFailed {
+            buffer: "source support",
+            bytes,
+        };
+        support
+            .columns
+            .try_reserve_exact(columns)
+            .map_err(|_| refused(bytes_for::<u32>(columns)))?;
+        support
+            .rows
+            .try_reserve_exact(rows)
+            .map_err(|_| refused(bytes_for::<u32>(rows)))?;
+        support
+            .cells
+            .try_reserve_exact(cells)
+            .map_err(|_| refused(bytes_for::<(usize, f64)>(cells)))?;
+        support
+            .amounts
+            .try_reserve_exact(cells)
+            .map_err(|_| refused(bytes_for::<f64>(cells)))?;
+        Ok(support)
+    }
+
+    /// Bytes its cell lists hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total([
+            capacity_bytes(&self.cells),
+            capacity_bytes(&self.columns),
+            capacity_bytes(&self.rows),
+            capacity_bytes(&self.amounts),
+        ])
     }
 
     /// Cells in the support.

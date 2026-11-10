@@ -61,6 +61,11 @@ and its own registered model name, so an ablated run never shares a model identi
 `field-ecology-v1-chemistry-only` (decisions decode from an all-zero output) and `field-ecology-v1-fresh-offspring`
 (a newborn's genome is the one a founder would have at its identity).
 
+FL-043 (`flife-8gy`), first slice, gives the world a footprint (plan §19.4): the bytes its state, fields and tick
+scratch hold, each buffer charged its capacity, and the most they hold while the population stays within
+`population.maximum_count`. The fields and the tick's scratch are reserved for that capacity, so stepping never
+grows them. `flife-cli`'s preflight admits these terms against `[execution] maximum_total_bytes`.
+
 It runs on the scalar CPU reference (`cpu-reference`) in the `qualified-reference` determinism class. The other
 modules compute settlements, proposals and staged births and store the committed organisms; `world` decides when
 each runs and owns the field.
@@ -155,6 +160,11 @@ each runs and owns the field.
 - FL-041: `ModelVariant` (`Baseline`, `ChemistryOnly`, `FreshOffspring`) and `ModelVariant::of(model)`;
   `reproduction::Offspring` (`Inherited`, or `Fresh { catalog, limits, initial_scale }`), the new `offspring`
   field of `BirthContext`.
+- FL-043: `Footprint { state, field, scratch, staging }` with `total()`; `World::allocated()` (what the world holds
+  now, staging 0), `World::footprint()` (the most it holds within its capacity) and `World::batched_bytes()` (what
+  installing a controller backend adds). `Population::allocated_bytes()`, `Population::bound_bytes(topologies)`
+  and `PER_ORGANISM_BYTES` (an organism's index, free-list and genome-header entries). `ControllerReport` gains
+  `resident_peak_bytes`, the most `ControllerBackend::resident_bytes` reported after any batch.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -382,6 +392,29 @@ each runs and owns the field.
   baseline's birth transaction. Nothing of the parent's parameters is carried except by chance (founders' zero
   biases).
 - The founding is the same under all three models: the model name changes no founder.
+
+**Invariants — the footprint (FL-043; §7.5, §19.4).**
+- Every term charges a buffer its capacity times its element size (`flife_core::memory`). Genome parameters are
+  apart: the genome quota charges them.
+- `state` is the population (its columns at capacity, the genome arena, and each organism's index entries), the
+  sources and their paths. `allocated` counts the arena and the entries as they are; `footprint` counts them at
+  their bounds for a full population of the catalog's members.
+- `field` is both fields, the field step's per-worker transport scratch and one source support per source, and the
+  sensor pyramid. Each support is reserved at founding for its kernel's most candidate cells on the grid (per axis
+  at most `⌈2r/h⌉ + 5` cells, and at most the axis), so a step never grows one.
+- `scratch` is the tick's rows, decision lanes, demands, grants, packets, deposits, survivors and deaths, and the
+  sensor backend's queries and samples. They are reserved for the capacity when the world is founded, its workers
+  are set or a sensor backend is installed. Each lane's share of the rows follows the worker count, and lanes
+  removed by a smaller count are released.
+- Installing a controller backend reserves the batched path's outputs, a slot per row, and each lane's observations
+  for the most rows it can take: exactly `batched_bytes()`. Removing it releases them. If the host refuses them,
+  no backend is installed and the report says why.
+- `staging` is what a step holds only while it runs, charged per organism of capacity: a birth request and its
+  place in the resolution order and in a pause's proposal; a place in both the births and the rejected births; one
+  boxed genome and at most `MAXIMUM_CANDIDATES` candidate rejections; two entrants (one while an introduction's
+  are staged); one birth or introduction event, one death in the report and one controller job: 3,448 bytes on
+  this build. Each of those lists is reserved for its count before it is filled, so none grows past it.
+- `footprint()` does not change as the world steps. No result depends on any of this.
 
 **Refusal cases.**
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
@@ -616,6 +649,18 @@ Twenty planted mutants for the introduction (with `flife-runtime`'s and `flife-c
   `field-ecology-v1` none does. Under 1/4 of the parameters a fresh child shares with its parent are identical,
   against over 9/10 when inherited.
 
+`tests/footprint.rs` (2 tests, FL-043), on the preset at 512 founders:
+- `a_founded_world_holds_its_footprint_and_stepping_never_grows_it`: at founding the allocated fields and scratch
+  are the footprint's, and the state is below it. For 300 ticks with births and deaths the fields and scratch hold
+  exactly their founding bytes, the state stays within the footprint's, and no staging outlives a step. The
+  footprint itself does not move.
+- `changing_workers_keeps_the_footprint_reserved`: at four workers the scratch and fields are larger and again
+  fixed for 300 ticks with births; back at one worker the scratch is exactly the one-worker scratch, and fixed.
+
+`tests/controller_backend.rs`'s `installing_a_backend_reserves_exactly_its_batched_bytes`: installing a backend
+adds exactly `batched_bytes()` to the scratch and nothing to the state or fields, 60 ticks grow nothing, and
+removing it returns the scratch to its bytes before.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
 `pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`; FL-013 at
@@ -640,8 +685,9 @@ velocity, first-order splitting at the configured fixed timestep.
   and admits it against `BufferLimits`: the grants, both deposit reductions, and `Bins` grouping each organism's
   grant packets. The tick groups packets by cell and by organism with `flife_field::Bins` counting sorts instead
   of comparison sorts, in the same order, so the world is bit-identical. A reduction within the declaration
-  allocates nothing, a hotspot included. Admitting the rest of the scratch, with the CPU worker budget, comes
-  later (§12.5, FL-043).
+  allocates nothing, a hotspot included. FL-043 reserves the rest of the scratch for the capacity and charges each
+  tick's own lists at the staging bound. That bound is analytic: no test makes every organism reproduce in one
+  tick.
 - The live-population quota counts every parent with a viable attempt as live. Its kept share is at least
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet

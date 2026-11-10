@@ -83,6 +83,13 @@
   so a view cannot outlive, or disagree with, the snapshot it was built from. The view gives `density`, `blend`
   (level and `t`), `sample_level` and `sample`; the last two return a `RawSample` of 33 raw densities with their
   derivatives along x and y.
+- FL-031's port for a device phase 3: `SensorBackend` (`describe`, and `sample(pyramid, field, queries,
+  samples)`, where each `SensorQuery` is a position and a sensing scale and `samples[i]` must equal
+  `PyramidView::sample` of `queries[i]`, bit for bit). A backend calls the reference's own geometry so that its
+  wrapping and floors stay the reference's: `SensorPyramid::blend` (a scale's level and `t`, which `PyramidView`
+  now delegates to) and `SensorPyramid::corners` (a level's `Corners` at a position: its `LevelGrid`, the two
+  wrapped columns and rows, and the fractions `fx`, `fy`). `sample_level` reads its corners through the same
+  function.
 - `ExchangeStencil`: an organism's footprint cells and weights, and its local density `Σ w_c e_c / (h_x h_y)`.
   `saturating_request` gives `d = Δt U_max r/(K + r)`.
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
@@ -387,6 +394,6 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   cell's sum stays sequential in identity order there too, which keeps it bit-identical: a hotspot cell's sum
   is serial over its packets. A fixed parallel reduction tree would change the rounding, so it would be a
   separate numerical profile (§11.3, §11.4).
-- The pyramid is rebuilt in full every tick in F64 (two thirds of the F32 base field's bytes). An F32 or Metal
-  pyramid is a separate numerical profile. Its contract, with the sensor encoding, is
-  `crates/flife-neural/CONTRACT.md`.
+- The pyramid is rebuilt in full every tick in F64 (two thirds of the F32 base field's bytes). An F32 pyramid is a
+  separate numerical profile. FL-031's Metal pyramid (`flife-backend-metal`'s `MetalSensors`) is this profile,
+  computed in software binary64. Its contract, with the sensor encoding, is `crates/flife-neural/CONTRACT.md`.

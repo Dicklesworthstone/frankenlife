@@ -4,19 +4,28 @@
 //! compared with the first's after every block.
 //!
 //! `cargo run --release -p flife-backend-metal --example tick_throughput -- [workers] [ticks per block] [blocks] [warm-up ticks] [choices]`,
-//! for example `-- 1 20 8 40 cpu,torch,metal`. A choice this host refuses
+//! for example `-- 1 20 8 40 cpu,torch,metal`. A choice may add phases on
+//! Metal after a `+`: `cpu+sensors` samples phase 3 on `MetalSensors`, and
+//! `cpu+field` steps phase 2 on `MetalField` (FL-031), for example
+//! `cpu,cpu+sensors,metal+sensors+field`. A choice this host refuses
 //! (`metal` without a device) is reported and left out. Prints one JSON line.
 
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use flife_backend_metal::ControllerChoice;
+use flife_backend_metal::{ControllerChoice, MetalField, MetalSensors};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
-fn found(workers: NonZeroUsize, choice: ControllerChoice) -> Result<World, CoreError> {
+fn found(workers: NonZeroUsize, name: &str) -> Result<World, CoreError> {
+    let refused = |detail: String| CoreError::StateConflict {
+        operation: "tick_throughput",
+        detail,
+    };
+    let mut parts = name.split('+');
+    let choice: ControllerChoice = parts.next().unwrap_or_default().parse().map_err(refused)?;
     let config = ValidatedConfig::from_toml(PRESET)?;
     let mut world = World::found(
         &config,
@@ -25,6 +34,13 @@ fn found(workers: NonZeroUsize, choice: ControllerChoice) -> Result<World, CoreE
     )?;
     world.set_cpu_workers(workers)?;
     world.set_controller_backend(choice.backend(workers.get())?);
+    for phase in parts {
+        match phase {
+            "sensors" => world.set_sensor_backend(Some(Box::new(MetalSensors::open()?))),
+            "field" => world.set_field_backend(Some(Box::new(MetalField::open()?))),
+            other => return Err(refused(format!("`{other}` is not `sensors` or `field`"))),
+        }
+    }
     Ok(world)
 }
 
@@ -83,11 +99,7 @@ fn main() -> Result<(), CoreError> {
 
     let mut entries = Vec::new();
     for name in choices.split(',') {
-        let choice: ControllerChoice = name.parse().map_err(|detail| CoreError::StateConflict {
-            operation: "tick_throughput",
-            detail,
-        })?;
-        match found(workers, choice) {
+        match found(workers, name) {
             Ok(mut world) => {
                 block(&mut world, warm)?;
                 entries.push(Entry {
@@ -124,18 +136,23 @@ fn main() -> Result<(), CoreError> {
         .iter()
         .map(|entry| {
             let report = entry.world.controller_report();
+            let (sensors, field) = (entry.world.sensor_report(), entry.world.field_report());
             let rate = median(&entry.rates);
             format!(
                 "{{\"choice\":\"{}\",\"ticks_per_s\":{rate:.3},\"cv_percent\":{:.2},\
                  \"ratio_to_first\":{:.3},\"samples\":{:?},\"batched\":{},\"deferred\":{},\
-                 \"reference_ticks\":{}}}",
+                 \"reference_ticks\":{},\"sensor_ticks\":[{},{}],\"field_steps\":[{},{}]}}",
                 entry.name,
                 cv(&entry.rates),
                 rate / baseline,
                 entry.rates,
                 report.batched,
                 report.deferred,
-                report.reference_ticks
+                report.reference_ticks,
+                sensors.ticks,
+                sensors.reference_ticks,
+                field.steps,
+                field.reference_steps
             )
         })
         .collect();

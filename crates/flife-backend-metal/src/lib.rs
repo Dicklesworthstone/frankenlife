@@ -33,6 +33,7 @@ use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 pub mod field;
 pub mod owner;
+pub mod sensors;
 
 pub use field::MetalField;
 use owner::metal;
@@ -40,6 +41,7 @@ pub use owner::{
     Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
     ResourceState, Usage, WriteLease,
 };
+pub use sensors::MetalSensors;
 
 /// The controller kernel source, with the software binary64
 /// (`softfloat64.metal`, shared with [`field::FIELD_MSL`]) ahead of it.

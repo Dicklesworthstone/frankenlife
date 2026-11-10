@@ -83,9 +83,10 @@ use flife_core::{
 use flife_field::{
     Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
     FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
-    SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorPyramid, Source, SourceKernel,
-    TransportPlan, UptakeSummary, advance_field_on, apply_deposits, apply_grants, initial_source,
-    resolve_uptake, saturating_request,
+    RawSample, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
+    SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeSummary,
+    advance_field_on, apply_deposits, apply_grants, initial_source, resolve_uptake,
+    saturating_request,
 };
 use flife_genome::{
     Genome, GenomeQuota, MutationParameters, MutationRecord, Mutator, TopologyCatalog, TopologyId,
@@ -563,6 +564,30 @@ struct Fields {
     report: FieldReport,
 }
 
+/// What the world's sensor backend did, for run records (FL-031). Not
+/// scientific state: no result depends on the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SensorReport {
+    /// The backend serving the world, or `None` for the reference alone.
+    pub backend: Option<String>,
+    /// Ticks whose phase 3 samples the backend computed.
+    pub ticks: u64,
+    /// Ticks the reference sampled because the backend met an error: the
+    /// reference reproduces that error exactly, or finds none.
+    pub reference_ticks: u64,
+    /// Why the backend stopped serving the world, if it failed.
+    pub failure: Option<String>,
+}
+
+/// The world's sensor backend and the tick's queries and samples.
+#[derive(Debug, Default)]
+struct Sensors {
+    backend: Option<Box<dyn SensorBackend>>,
+    report: SensorReport,
+    queries: Vec<SensorQuery>,
+    samples: Vec<RawSample>,
+}
+
 /// The world's controller backend and its scratch.
 #[derive(Debug, Default)]
 struct Controllers {
@@ -615,6 +640,7 @@ pub struct World {
     scratch: Scratch,
     controllers: Controllers,
     fields: Fields,
+    sensors: Sensors,
 }
 
 impl World {
@@ -729,6 +755,7 @@ impl World {
             scratch,
             controllers: Controllers::default(),
             fields: Fields::default(),
+            sensors: Sensors::default(),
         })
     }
 
@@ -829,6 +856,25 @@ impl World {
     #[must_use]
     pub const fn field_report(&self) -> &FieldReport {
         &self.fields.report
+    }
+
+    /// Sample phase 3's sensor pyramid on `backend` from the next tick, or
+    /// on the reference alone with `None` (FL-031). No result depends on it:
+    /// a backend returns the reference's raw samples bit for bit
+    /// ([`SensorBackend`]), and any error it meets hands the tick's sampling
+    /// to the reference. A backend that fails where the reference does not
+    /// is dropped, and [`World::sensor_report`] says why.
+    pub fn set_sensor_backend(&mut self, backend: Option<Box<dyn SensorBackend>>) {
+        let sensors = &mut self.sensors;
+        sensors.report.backend = backend.as_ref().map(|backend| backend.describe());
+        sensors.report.failure = None;
+        sensors.backend = backend;
+    }
+
+    /// What the sensor backend has done so far.
+    #[must_use]
+    pub const fn sensor_report(&self) -> &SensorReport {
+        &self.sensors.report
     }
 
     /// The event cursor: births and deaths published so far.
@@ -1041,6 +1087,7 @@ impl World {
             scratch,
             controllers,
             fields,
+            sensors,
             ..
         } = self;
         let Scratch {
@@ -1122,15 +1169,23 @@ impl World {
         // Phases 3 and 4: the pyramid, then every remaining organism's
         // observation and its due or forced evaluation, in identity order.
         let view = pyramid.build(observed)?;
+        let (sampled, sensor_failure) = sample_with(population, rows, &view, observed, sensors);
         decide_with(
             rules,
             population,
             &view,
+            sampled,
             rows,
             [from, to],
             lanes,
             controllers,
         )?;
+        // The reference sampled the tick without an error, so a backend that
+        // met one failed where the reference does not.
+        if let Some(failure) = sensor_failure {
+            sensors.report.failure = Some(failure);
+            sensors.backend = None;
+        }
         working.clear();
         let mut evaluated = 0;
         let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
@@ -1597,16 +1652,82 @@ fn advance_field_with(
     advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
 }
 
-/// Phase 3 for one organism (§8.1): its observation at its sensing scale.
+/// Phase 3's raw samples on the world's sensor backend, if it has one and
+/// it succeeds; `None` leaves each organism's sampling to the reference, in
+/// its observation. The second value is the backend's error, if it met one:
+/// the caller drops the backend once the reference has sampled the tick
+/// without an error.
+fn sample_with<'a>(
+    population: &Population,
+    rows: &[Organism],
+    view: &PyramidView<'_>,
+    field: &FieldState,
+    sensors: &'a mut Sensors,
+) -> (Option<&'a [RawSample]>, Option<String>) {
+    let Sensors {
+        backend,
+        report,
+        queries,
+        samples,
+    } = sensors;
+    let Some(device) = backend.as_deref_mut() else {
+        return (None, None);
+    };
+    match sample_on(device, population, rows, view, field, queries, samples) {
+        Ok(()) => {
+            report.ticks = report.ticks.saturating_add(1);
+            (Some(samples.as_slice()), None)
+        }
+        Err(error) => {
+            report.reference_ticks = report.reference_ticks.saturating_add(1);
+            (None, Some(error.to_string()))
+        }
+    }
+}
+
+/// Every row's query, then the device's samples, one per row.
+fn sample_on(
+    device: &mut dyn SensorBackend,
+    population: &Population,
+    rows: &[Organism],
+    view: &PyramidView<'_>,
+    field: &FieldState,
+    queries: &mut Vec<SensorQuery>,
+    samples: &mut Vec<RawSample>,
+) -> Result<(), CoreError> {
+    queries.clear();
+    reserve_for(queries, rows.len(), "sensor queries")?;
+    for organism in rows {
+        queries.push(SensorQuery {
+            position: organism.position,
+            scale: genome_of(population, organism.id)?.traits().sensing_scale(),
+        });
+    }
+    device.sample(view.pyramid(), field, queries, samples)?;
+    if samples.len() != rows.len() {
+        return Err(CoreError::StateConflict {
+            operation: "sensor samples",
+            detail: format!("{} samples for {} organisms", samples.len(), rows.len()),
+        });
+    }
+    Ok(())
+}
+
+/// Phase 3 for one organism (§8.1): its observation at its sensing scale,
+/// from the backend's `raw` sample if there is one.
 fn observation(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
     organism: &Organism,
+    raw: Option<&RawSample>,
     from: Tick,
 ) -> Result<Observation, CoreError> {
     let genome = genome_of(population, organism.id)?;
-    let raw = view.sample(organism.position, genome.traits().sensing_scale())?;
+    let raw = match raw {
+        Some(raw) => *raw,
+        None => view.sample(organism.position, genome.traits().sensing_scale())?,
+    };
     let intrinsic = Intrinsic {
         energy: organism.energy,
         age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
@@ -1652,11 +1773,11 @@ fn decide(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
-    organism: &Organism,
+    (organism, raw): (&Organism, Option<&RawSample>),
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
-    let observation = observation(rules, population, view, organism, from)?;
+    let observation = observation(rules, population, view, organism, raw, from)?;
     let due = due(rules, organism, to);
     let held = if due {
         let outputs = genome_of(population, organism.id)?
@@ -1738,6 +1859,7 @@ fn decide_all(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
+    sampled: Option<&[RawSample]>,
     rows: &[Organism],
     ticks: [Tick; 2],
     lanes: &mut [DecisionLane],
@@ -1745,14 +1867,15 @@ fn decide_all(
     for lane in lanes.iter_mut() {
         lane.decisions.clear();
     }
-    in_runs(rows, lanes, &|_, run, lane| {
+    in_runs(rows, lanes, &|start, run, lane| {
         reserve_for(&mut lane.decisions, run.len(), "decisions")?;
-        for organism in run {
+        for (index, organism) in run.iter().enumerate() {
+            let raw = sampled.and_then(|samples| samples.get(start + index));
             let decision = decide(
                 rules,
                 population,
                 view,
-                organism,
+                (organism, raw),
                 ticks,
                 &mut lane.controller,
             )?;
@@ -1775,10 +1898,15 @@ enum Batched {
 /// world's backend if it has one. Any error on the batched path hands the
 /// tick to [`decide_all`], which reproduces the reference's own error (or
 /// finds none), so the result is always the reference's.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "phases 3 and 4's inputs, the backend's samples and the controllers"
+)]
 fn decide_with(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
+    sampled: Option<&[RawSample]>,
     rows: &[Organism],
     ticks: [Tick; 2],
     lanes: &mut [DecisionLane],
@@ -1791,10 +1919,10 @@ fn decide_with(
         by_row,
     } = controllers;
     let Some(device) = backend.as_deref_mut() else {
-        return decide_all(rules, population, view, rows, ticks, lanes);
+        return decide_all(rules, population, view, sampled, rows, ticks, lanes);
     };
     match decide_batched(
-        rules, population, view, rows, ticks, lanes, device, outputs, by_row,
+        rules, population, view, sampled, rows, ticks, lanes, device, outputs, by_row,
     ) {
         Ok(Batched::Done { batched, deferred }) => {
             report.batched = report.batched.saturating_add(batched);
@@ -1805,11 +1933,11 @@ fn decide_with(
             report.failure = Some(error.to_string());
             *backend = None;
             report.reference_ticks = report.reference_ticks.saturating_add(1);
-            decide_all(rules, population, view, rows, ticks, lanes)
+            decide_all(rules, population, view, sampled, rows, ticks, lanes)
         }
         Err(_) => {
             report.reference_ticks = report.reference_ticks.saturating_add(1);
-            decide_all(rules, population, view, rows, ticks, lanes)
+            decide_all(rules, population, view, sampled, rows, ticks, lanes)
         }
     }
 }
@@ -1825,6 +1953,7 @@ fn decide_batched(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
+    sampled: Option<&[RawSample]>,
     rows: &[Organism],
     [from, to]: [Tick; 2],
     lanes: &mut [DecisionLane],
@@ -1836,10 +1965,11 @@ fn decide_batched(
         lane.observed.clear();
         lane.decisions.clear();
     }
-    in_runs(rows, lanes, &|_, run, lane| {
+    in_runs(rows, lanes, &|start, run, lane| {
         reserve_for(&mut lane.observed, run.len(), "observations")?;
-        for organism in run {
-            let observed = observation(rules, population, view, organism, from)?;
+        for (index, organism) in run.iter().enumerate() {
+            let raw = sampled.and_then(|samples| samples.get(start + index));
+            let observed = observation(rules, population, view, organism, raw, from)?;
             lane.observed.push(observed);
         }
         Ok(())

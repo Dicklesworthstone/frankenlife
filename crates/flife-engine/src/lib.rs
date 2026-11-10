@@ -72,7 +72,7 @@ pub use reproduction::{
 pub use world::{
     Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport,
     IntroductionEvent, ModelVariant, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT,
-    QUALIFIED_REFERENCE, STOP_AND_PRESERVE, Stepped, TickReport, UNIFORM_POSITIONS,
+    QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SensorReport, Stepped, TickReport, UNIFORM_POSITIONS,
     WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, World, ZERO_VELOCITY,
     founder_position,
 };

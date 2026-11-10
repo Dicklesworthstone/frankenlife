@@ -63,9 +63,11 @@ buffers, read and write leases that exclude each other, commands that hold what 
 completion, and retirement that frees nothing still in use. FL-029 lets the owner submit several ordered kernels as
 one command: one command buffer, checked and held as a unit, whose receipt gives the epochs written, the kernels run
 and the GPU time. FL-031's first part runs phase 2 (transport, decay and the external sources) on Metal in software
-binary64, bit for bit the CPU reference's, through a field backend port in the engine. At the preset's scale it is
-slower than the CPU's hardware F64, so it is not on by default: the measured frontier is in the Metal crate's
-contract. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
+binary64, bit for bit the CPU reference's, through a field backend port in the engine. Its second part does the
+same for phase 3: the sensor pyramid and every organism's sample, value and gradients at its sensing scale, through
+a sensor backend port. At the preset's scale neither is faster than the CPU yet (the sampler is 0.98× on one
+worker and 0.80× beside the Metal controllers on sixteen), so neither is on by default: the measured frontier is in
+the Metal crate's contract. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
 comparison sort: linear however organisms crowd, with scratch declared from the population maximum, in the same
 cell-then-identity order, so the world is bit-identical. FL-019 adds five colour mappings (lineage, energy, generation,
 motion, topology), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
@@ -516,7 +518,7 @@ crates/flife-cli/                                     FL-015 the flife binary (v
 crates/flife-manim/                                   FL-018 FrankenManim adapter: exact viewport and camera, one bounded particle cloud per epoch
 crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
 crates/flife-backend-cpu/                             FL-025 FrankenTorch CPU controller route: the serial population kernel on the world's lanes, bit-identical to the reference
-crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; resident parameter arena behind the engine's controller port
+crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; resident parameter arena behind the engine's controller port; FL-031 field step and sensor pyramid behind the engine's field and sensor ports
 presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port

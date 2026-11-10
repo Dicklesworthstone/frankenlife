@@ -63,7 +63,9 @@ pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
-pub use pyramid::{LevelGrid, PyramidView, RawSample, SensorPyramid};
+pub use pyramid::{
+    Corners, LevelGrid, PyramidView, RawSample, SensorBackend, SensorPyramid, SensorQuery,
+};
 pub use seeding::{
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, chemical_direction, initial_center,
     initial_source, travel_direction,

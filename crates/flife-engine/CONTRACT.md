@@ -362,8 +362,9 @@ each runs and owns the field.
   evaluation stays due.
 - A faulted world is refused (`StateConflict`). `stop-and-preserve`'s fault is a diagnosis, not a state to
   resume.
-- Scratch buffers and the controller and field backends are not state. A restored world runs on the reference
-  path until its owner calls `set_controller_backend` or `set_field_backend`, and no result depends on either.
+- Scratch buffers and the controller, field and sensor backends are not state. A restored world runs on the
+  reference path until its owner calls `set_controller_backend`, `set_field_backend` or `set_sensor_backend`, and
+  no result depends on any of them.
 
 **Invariants — ablation models (FL-041; §15.3, §21.6).**
 - `field-ecology-v1-chemistry-only`: every due controller is evaluated and its cost charged exactly as in the
@@ -664,6 +665,16 @@ velocity, first-order splitting at the configured fixed timestep.
   reference errs too, its error is the tick's. No result depends on the backend. Like the controller backend,
   it is not state: a restored world steps on the reference until its owner sets one. The tests are in
   `flife-backend-metal`'s `tests/field_world.rs`.
+- `World::set_sensor_backend` (FL-031) hands phase 3's raw sampling to a `flife_field::SensorBackend`, which must
+  equal `PyramidView::sample`. The world still builds the reference pyramid. It then gives the backend every live
+  organism's query (its position and its genome's sensing scale) in row order, once per tick, before the lanes
+  run. Each lane's observations read the backend's sample at the organism's row, `start + index`. The
+  encoding, controllers and decoding are unchanged. If the backend errs, or returns a different number of
+  samples, the lanes sample on the reference instead, and whatever the backend left in its samples is not read.
+  Once the reference has made the tick's decisions without an error, the backend is dropped and
+  `World::sensor_report` (`SensorReport`: backend, device and reference ticks, failure) records why. If the
+  reference errs too, its error is the tick's. No result depends on the backend, and it is not state. The tests
+  are in `flife-backend-metal`'s `tests/sensor_world.rs`.
 - First-order splitting only. Strang splitting and timestep-refinement studies are later items with their own
   scheme identity (§8.4).
 - INV-08 is tested by isolation: an organism outside the field's reach evolves bit for bit as if alone.

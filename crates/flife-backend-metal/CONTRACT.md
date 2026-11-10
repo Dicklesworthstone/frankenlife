@@ -27,6 +27,13 @@ every plane's substeps, every candidate cell's source weight (its `exp`) and eve
 deposits. The host does every sequential F64 sum through flife-field's own functions. The software binary64 moved
 from `controller.metal` into `softfloat64.metal`, which both kernels now share.
 
+FL-031, second part: phase 3's sensor pyramid and sampling on Metal, bit-identical to
+`flife_field::PyramidView::sample` (plan §6.1, §8.1, §10.7), in `sensors`. `MetalSensors` is a
+`flife_field::SensorBackend`. The device builds every coarse level of `positive-box-v1` and samples every
+organism's 33 planes, value and both derivatives, at its one or two levels, blended by `log-linear-v1`, in
+`sensors.metal` on the same `softfloat64.metal`. The host gives each query its level, weight and corner cells
+through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
+
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
@@ -53,6 +60,11 @@ from `controller.metal` into `softfloat64.metal`, which both kernels now share.
   `World::set_field_backend`. Each step receives the field pair, transport plan, source kernel, the tick's
   sources and the time step, exactly what `advance_field_on` takes. No CLI or Studio choice selects it yet (see
   the known gaps).
+- FL-031, the sensors: `MetalSensors::open()` (or `with_owner(owner)`, to share the field's owner), given to a
+  world with `World::set_sensor_backend`. Each tick receives the pyramid (its grid and level count), the observed
+  field and every live organism's `SensorQuery` (position, sensing scale), in row order. No CLI or Studio choice
+  selects it yet either. `examples/tick_throughput.rs` measures it: a choice such as `cpu+sensors` or
+  `metal+sensors+field` puts phase 3 (and phase 2) on Metal beside the controllers.
 
 **Outputs.** One entry per organism, in batch order: its 36 raw outputs, or `None` for a deferred organism. The
 caller evaluates a deferred organism on the reference controller.
@@ -165,6 +177,37 @@ kernel cannot shape, or whose inputs are not finite in F32, is deferred without 
   same way. The world then takes the step on the reference, which gives the reference's own result or error.
 - A backend of the engine path: an error from `advance` hands that step to the reference and drops the backend
   (`flife-engine`'s `World::field_report`).
+
+**Invariants — the sensors (FL-031; §6.1, §8.1, §10.7).**
+- Every query's sample is `PyramidView::sample`'s, bit for bit: 33 values, 33 x-derivatives and 33
+  y-derivatives in binary64.
+- The field crosses to the device as F32 bit patterns, never held in a device `float`. The coarse levels live
+  on the device as binary64 words, planar per level, one level after another in one buffer.
+- The device computes the reference's expressions operation for operation in software binary64, with no fused
+  multiply-add:
+  - level 1's densities `f64(u)/(h_x h_y)`, and each coarse value `¼((a + b) + (c + d))` with `a, b` the block's
+    lower row;
+  - each plane's lerp-form bilinear value at the query's corners, its derivatives
+    `(Δ_lower + f_y(Δ_upper − Δ_lower))/spacing_x` and `(Δ_left + f_x(Δ_right − Δ_left))/spacing_y`, and, where
+    `t ≠ 0`, the blend `low + t(high − low)` of each.
+- The host computes the per-query geometry with the reference's own functions: the level and `t`
+  (`SensorPyramid::blend`), and each level's wrapped columns, rows and fractions (`SensorPyramid::corners`).
+  So the torus wrapping, the floors and the scale's `log₂` are the reference's code, not a port.
+- One tick is one command (FL-029): level 1 from the field, each further level from the one below, then the
+  samples. The field is uploaded and the samples read back every tick.
+- The device refuses exactly the queries the reference refuses. softfloat64 is the CPU's, bit for bit, on finite
+  operands, and it turns every non-finite operand into a quiet NaN (its conversion, add, subtract, multiply and
+  divide each test for one first). In the reference, too, an infinity or a NaN that reaches a lerp or a division
+  by a spacing never becomes finite again. So a non-finite field value makes every sample that reads it, directly
+  or through a coarse level, non-finite on both sides. The host checks every sample, as the reference does, and
+  refuses the call (`NumericalInvalid`, "sensor sample"). A query that does not read the value is served bit for
+  bit. A scale outside `[s_0, s_L]`, a non-finite scale or position, and a field on another grid are refused
+  before any command, as the reference refuses them.
+- Buffers are allocated on first use and again when the grid, the level count or the query count outgrows them
+  (to the next power of two); the old ones retire when dropped. The 4,096-organism preset holds nine: the field,
+  the coarse levels, four level parameters, the sample parameters, queries and samples.
+- A backend of the engine path: an error from `sample` hands the tick's sampling to the reference and drops the
+  backend (`flife-engine`'s `World::sensor_report`).
 
 **Refusal cases.** No Metal device, which is always the case off macOS: `MissingCapability`. A kernel that does not
 compile, or a failed dispatch: `StateConflict`. An empty batch to `upload`: `LayoutMismatch`. FL-028's owner refuses:
@@ -301,6 +344,33 @@ A refusal changes nothing.
     reference and is dropped: the world stays the reference's, with 4 device steps, 1 reference step and the
     failure recorded.
 
+- `tests/sensors.rs` (FL-031, 3 tests), each sample against `PyramidView::sample` on the same pyramid and field,
+  every value compared as bits:
+  - `the_metal_samples_are_the_reference_samples_bit_for_bit`: six grids, from no coarse level to four, square,
+    stretched (`1.25 × 3` cells), a `64 × 8` torus whose coarsest level is one row, and odd spacings (`17/48`,
+    `31/48`), each on a random field (zeros, subnormals, both signs of moment, magnitudes to 1e6). Queries at the
+    first, middle and last knot of every level, the cell edges beside them and the value just below each knot,
+    the seams from both sides (`0`, `-0`, `L`, just below `L`, `-1e-300`), positions a few lengths away, and 400
+    random ones; scales at every `s_l` (`t = 0`), just above it, at `√2·s_l`, just below `s_(l+1)`, at `s_L`, and
+    random. Then the first grid again on buffers sized for another, with fewer queries and with more than its
+    capacity. 9,960 samples in all.
+  - `the_metal_samples_of_the_running_preset_are_the_reference_samples`: the preset's field at ticks 1, 21 and
+    41 of a running world, about 3,800 queries each.
+  - `the_metal_sampler_refuses_what_the_reference_refuses`: eight scales and positions the reference refuses; a
+    field on another grid; no queries (and no samples left from the call before); an infinity, a NaN and a
+    negative infinity in three planes. The reference refuses a query at that cell and a coarsest-level query
+    above it, and so does the device, alone or beside a good query; a far query is served bit for bit. The
+    same without coarse levels, and the device matches again afterwards.
+- `tests/sensor_world.rs` (FL-031, 4 tests), the engine path, on the real preset:
+  - with its sensors on Metal, the world's digest equals the reference's at every one of 400 ticks; every tick's
+    samples came from the device, none failed, and the owner holds exactly the backend's nine buffers, with no
+    lease, command or retiring buffer left;
+  - with sensors, field and controllers on Metal (sensors and field on one owner), 200 ticks, the same;
+  - the planted negative flips bit 51 of every sample's energy density after the device's seventh tick, and the
+    digests must differ at exactly tick 7;
+  - a backend failing at its fifth tick (after leaving damaged samples) hands that tick to the reference and is
+    dropped: the world stays the reference's, with 4 device ticks, 1 reference tick and the failure recorded.
+
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
   - the stencil's sum re-associated;
@@ -319,6 +389,24 @@ Planted mutants, each run in a scratch copy.
 
   One survived, and it is equivalent: the minimum image taking `+L/2` instead of `-L/2` at exactly half the world.
   The displacement enters the weight only squared.
+- FL-031's sensors: 19 planted against `tests/sensors.rs` and `tests/sensor_world.rs`, 19 caught:
+  - on the device: the 2×2 average pairing columns instead of rows; level 1 averaging an energy instead of its
+    density; a coarse level stored over the finer; the x-derivative divided by the y spacing; the interpolant
+    written as `(1 − f)a + fb` instead of in lerp form; the upper level never blended; the blend run from the
+    upper level;
+  - on the host: a zero weight still blending; buffers kept when the queries outgrow them, or for another grid;
+    every level's spacing taken as the base grid's; the upper level's corners taken from the lower level; a
+    non-finite sample not refused;
+  - in the engine: the backend's samples not used (caught by the planted negative); a decision lane, or an
+    observation lane, reading the samples from 0 instead of its run's start; a failing backend kept; a failing
+    backend's samples used; the backend never called.
+
+  A first version held a device fault word, set by any kernel that read a non-finite field value. Of 21 mutants
+  planted against it, 20 were caught. The survivor, the level-0 read's check dropped, was equivalent: softfloat64
+  turns every non-finite operand into a NaN, so the sample came out non-finite and the host refused it anyway.
+  So the fault word was redundant. It was also wrong in one case: it refused a tick over a value no query reads,
+  which would drop the backend where the reference succeeds. It was removed, and the refusal test now requires a
+  far query to be served bit for bit.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -393,6 +481,26 @@ rest. Software binary64 on this GPU therefore does not pay for phase 2 on its ow
 resident and the phases around it (pyramid, sensing, uptake) run on the device too, so that the copies and most
 round trips disappear. That is the rest of FL-031 and FL-032.
 
+**The sensors' frontier (FL-031).** Whole ticks of the preset (`tick_throughput -- W 20 8 40
+cpu,cpu+sensors,metal,metal+sensors`, the four worlds in rotating 20-tick blocks in one process, medians of 8
+blocks after 40 warm-up ticks, the same digest after every block), on an M5 Ultra under other load (load averages
+39–58 at the end), 2026-11-10:
+
+| workers | reference | sensors on Metal | Metal controllers | Metal controllers and sensors |
+|---|---|---|---|---|
+| 1 | 23.4 ticks/s (cv 3.3%) | 22.9 (cv 3.1%), 0.98× | 52.4 (cv 2.8%) | 48.5 (cv 7.9%) |
+| 16 | 76.6 (cv 6.1%) | 60.3 (cv 1.8%) | 75.4 (cv 4.2%) | 60.4 (cv 4.4%), 0.80× of Metal controllers |
+
+Rows with a cv above 5% are not admissible: there is no admissible ratio for Metal sensors beside Metal
+controllers on one worker, or for sensors on Metal against the reference on sixteen. The admissible ones: on one
+worker the Metal sampler roughly matches the reference's (0.98×), and on sixteen it costs a fifth of the tick
+beside the Metal controllers (0.80×). Not profiled, so the causes are hypotheses. On one worker the reference
+samples serially, and the device's round trip (the field up, 2.1 MB; the samples down, 3.2 MB; one synchronous
+command) costs about what that sampling does. On sixteen the reference samples on all lanes in parallel, while the
+device's call runs on the calling thread before the lanes start. So nothing selects the Metal sampler. It is the
+second phase of the chain that pays only once the field and the samples stay on the device, with the observation
+encoding there too (FL-032).
+
 **The softfloat miscompile.** While building the weights kernel, every in-radius weight came out wrong, always
 the same wrong value. Instrumented variants and a trace kernel computed the right one. `exp_neg`'s series indexed
 a `constant ulong INTEGER[17]` table of binary64 integers inside its loop; computing the divisor with
@@ -435,10 +543,12 @@ per-pass thread spawning (6%).
   - `ResourceState` reports the dominant use when several overlap, by precedence: retiring, computing,
     checkpointing, rendering, committed, available. `usage` gives the lease counts.
 - FL-031 gaps (the item stays open):
-  - Only phase 2 runs on the device. The sensor pyramid and sampling (phase 3), and demand and grants with
-    oversubscribed cells (uptake), are the item's remaining evidence.
-  - The field is not resident: it is uploaded and read back every step, in two synchronous commands. Residency
-    needs the phases that read and write the field around phase 2 on the device too.
+  - Phases 2 and 3 run on the device. Demand and grants with oversubscribed cells (uptake) are the item's
+    remaining evidence.
+  - The field is not resident: phase 2 uploads and reads it back every step, in two synchronous commands, and
+    phase 3 uploads it again and reads every sample back (3.2 MB on the preset) in a third. Residency needs the
+    field kept on the device between them, and the observation encoding on the device to keep the samples there
+    (FL-032).
   - Measured slower than the CPU on the preset (above), so nothing selects it by default: no CLI or Studio
     choice exists yet, unlike `ControllerChoice`. The engine port and these tests are its only users.
   - The host sums stay serial on the CPU by design. A device reduction would need a fixed tree, which is a

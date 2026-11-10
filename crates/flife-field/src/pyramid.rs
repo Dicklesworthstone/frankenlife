@@ -248,6 +248,113 @@ impl SensorPyramid {
     fn finest_scale(&self) -> f64 {
         self.grid.cell_width().max(self.grid.cell_height())
     }
+
+    /// The level and blend weight `(l, t)` for sensing scale `scale`, with
+    /// `s_l ≤ s < s_(l+1)` and `t = log₂(s/s_l) ∈ [0, 1)`; at the coarsest
+    /// scale, `(L, 0)`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonfinite scale, or one outside
+    /// `[s_0, s_L]`.
+    pub fn blend(&self, scale: f64) -> Result<(u32, f64), CoreError> {
+        let finest = self.finest_scale();
+        let coarsest = finest * f64::from(1_u32 << self.levels);
+        let ratio = scale / finest;
+        if !scale.is_finite() || !(1.0..=f64::from(1_u32 << self.levels)).contains(&ratio) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensing scale",
+                detail: format!("{scale} is outside the pyramid's [{finest}, {coarsest}]"),
+            });
+        }
+        let log = log2(ratio).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "sensing scale",
+            detail: format!("log₂({ratio}) is undefined"),
+        })?;
+        // `0 ≤ log ≤ L < 32`: the floor is an exact small integer and
+        // `log − floor` is exact.
+        let floor = log.floor();
+        let level = (floor as u32).min(self.levels);
+        Ok((level, log - f64::from(level)))
+    }
+
+    /// Where `level`'s interpolant reads at `position`: its geometry, the
+    /// four corner cells and the fractions between them.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a level above the coarsest or a
+    /// nonfinite position.
+    pub fn corners(&self, level: u32, position: [f64; 2]) -> Result<Corners, CoreError> {
+        let geometry = self
+            .level_grid(level)
+            .ok_or_else(|| CoreError::NumericalInvalid {
+                quantity: "pyramid level",
+                detail: format!("{level} is above the coarsest level {}", self.levels),
+            })?;
+        let [x, y] = self.grid.wrap_position(position)?;
+        let (column, fx) = split(x / geometry.spacing_x - 0.5);
+        let (row, fy) = split(y / geometry.spacing_y - 0.5);
+        let wrap =
+            |index: i64, cells: u32| u32::try_from(index.rem_euclid(i64::from(cells))).unwrap_or(0);
+        Ok(Corners {
+            geometry,
+            columns: [
+                wrap(column, geometry.cells_x),
+                wrap(column + 1, geometry.cells_x),
+            ],
+            rows: [wrap(row, geometry.cells_y), wrap(row + 1, geometry.cells_y)],
+            fx,
+            fy,
+        })
+    }
+}
+
+/// Where one level's bilinear interpolant reads at a position (§6.1): the
+/// cell centers to the left of and below it, the next ones (wrapped), and
+/// the fractions of the way from the first to the second.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Corners {
+    /// The level's geometry.
+    pub geometry: LevelGrid,
+    /// The left and right columns.
+    pub columns: [u32; 2],
+    /// The lower and upper rows.
+    pub rows: [u32; 2],
+    /// The fraction along x, in `[0, 1)`.
+    pub fx: f64,
+    /// The fraction along y, in `[0, 1)`.
+    pub fy: f64,
+}
+
+/// One organism's sensing query (§8.1 phase 3): its position and its
+/// sensing scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SensorQuery {
+    /// Where it senses, in world-length.
+    pub position: [f64; 2],
+    /// Its sensing scale, in world-length.
+    pub scale: f64,
+}
+
+/// Phase 3's raw sampling on another device (plan §10.7; FL-031).
+pub trait SensorBackend: std::fmt::Debug + Send {
+    /// The backend and its device, for run records.
+    fn describe(&self) -> String;
+
+    /// Every query's raw sample, in order: `samples[i]` is
+    /// [`PyramidView::sample`] of `queries[i]` on `pyramid` built from
+    /// `field`, bit for bit.
+    ///
+    /// # Errors
+    /// Any. The world then samples the tick on the reference, which
+    /// reproduces the error or finds none, and stops using a backend that
+    /// failed where the reference did not.
+    fn sample(
+        &mut self,
+        pyramid: &SensorPyramid,
+        field: &FieldState,
+        queries: &[SensorQuery],
+        samples: &mut Vec<RawSample>,
+    ) -> Result<(), CoreError>;
 }
 
 /// `target[y][x] = ¼((a + b) + (c + d))` over the 2×2 block of `source`
@@ -326,24 +433,7 @@ impl PyramidView<'_> {
     /// [`CoreError::NumericalInvalid`] for a nonfinite scale, or one outside
     /// `[s_0, s_L]`.
     pub fn blend(&self, scale: f64) -> Result<(u32, f64), CoreError> {
-        let finest = self.pyramid.finest_scale();
-        let coarsest = finest * f64::from(1_u32 << self.pyramid.levels);
-        let ratio = scale / finest;
-        if !scale.is_finite() || !(1.0..=f64::from(1_u32 << self.pyramid.levels)).contains(&ratio) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "sensing scale",
-                detail: format!("{scale} is outside the pyramid's [{finest}, {coarsest}]"),
-            });
-        }
-        let log = log2(ratio).ok_or_else(|| CoreError::NumericalInvalid {
-            quantity: "sensing scale",
-            detail: format!("log₂({ratio}) is undefined"),
-        })?;
-        // `0 ≤ log ≤ L < 32`: the floor is an exact small integer and
-        // `log − floor` is exact.
-        let floor = log.floor();
-        let level = (floor as u32).min(self.pyramid.levels);
-        Ok((level, log - f64::from(level)))
+        self.pyramid.blend(scale)
     }
 
     /// Raw densities and derivatives of `level` at `position`.
@@ -352,26 +442,13 @@ impl PyramidView<'_> {
     /// [`CoreError::NumericalInvalid`] for a level above the coarsest, a
     /// nonfinite position or a nonfinite result.
     pub fn sample_level(&self, level: u32, position: [f64; 2]) -> Result<RawSample, CoreError> {
-        let geometry =
-            self.pyramid
-                .level_grid(level)
-                .ok_or_else(|| CoreError::NumericalInvalid {
-                    quantity: "pyramid level",
-                    detail: format!(
-                        "{level} is above the coarsest level {}",
-                        self.pyramid.levels
-                    ),
-                })?;
-        let [x, y] = self.pyramid.grid.wrap_position(position)?;
-        let (column, fx) = split(x / geometry.spacing_x - 0.5);
-        let (row, fy) = split(y / geometry.spacing_y - 0.5);
-        let wrap =
-            |index: i64, cells: u32| u32::try_from(index.rem_euclid(i64::from(cells))).unwrap_or(0);
-        let (x0, x1) = (
-            wrap(column, geometry.cells_x),
-            wrap(column + 1, geometry.cells_x),
-        );
-        let (y0, y1) = (wrap(row, geometry.cells_y), wrap(row + 1, geometry.cells_y));
+        let Corners {
+            geometry,
+            columns: [x0, x1],
+            rows: [y0, y1],
+            fx,
+            fy,
+        } = self.pyramid.corners(level, position)?;
         let mut sample = RawSample {
             values: [0.0; PLANES],
             dx: [0.0; PLANES],

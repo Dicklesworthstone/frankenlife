@@ -11,10 +11,13 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::checkpoint::ByteReader;
 use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick};
-use flife_engine::Intervention;
+use flife_engine::{Disposition, Intervention};
 
 /// The canonical command record's schema.
 pub const COMMAND_SCHEMA: &str = "frankenlife.command.v1";
+
+/// The longest payload or disposition tag a record may carry.
+const TAG_LIMIT: usize = 32;
 
 /// `volatile-in-memory`: acceptance and outcomes are held by the session
 /// owner and acknowledged as volatile. Everything since the session opened
@@ -57,7 +60,10 @@ pub struct Command {
 impl Command {
     /// The canonical record of everything the client stated: schema,
     /// session, identity, target, expected revision and payload, with every
-    /// number as its little-endian bits.
+    /// number as its little-endian bits. The payload opens with its
+    /// NUL-terminated tag: `inject-energy` and the cell and amount, or
+    /// `remove-organisms`, the centre, the radius and the NUL-terminated
+    /// disposition name.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(128);
@@ -87,6 +93,19 @@ impl Command {
                 bytes.extend_from_slice(&cell[0].to_le_bytes());
                 bytes.extend_from_slice(&cell[1].to_le_bytes());
                 bytes.extend_from_slice(&amount.to_bits().to_le_bytes());
+            }
+            Intervention::RemoveOrganisms {
+                center,
+                radius,
+                disposition,
+            } => {
+                bytes.extend_from_slice(b"remove-organisms");
+                bytes.push(0);
+                bytes.extend_from_slice(&center[0].to_bits().to_le_bytes());
+                bytes.extend_from_slice(&center[1].to_bits().to_le_bytes());
+                bytes.extend_from_slice(&radius.to_bits().to_le_bytes());
+                bytes.extend_from_slice(disposition.name().as_bytes());
+                bytes.push(0);
             }
         }
         bytes
@@ -120,13 +139,26 @@ impl Command {
         } else {
             None
         };
-        let kind = b"inject-energy";
-        if input.bytes(kind.len())? != kind || input.u8()? != 0 {
-            return Err(refuse("unknown payload"));
-        }
-        let intervention = Intervention::InjectEnergy {
-            cell: [input.u32()?, input.u32()?],
-            amount: input.f64()?,
+        let intervention = match tag(&mut input)?.as_slice() {
+            b"inject-energy" => Intervention::InjectEnergy {
+                cell: [input.u32()?, input.u32()?],
+                amount: input.f64()?,
+            },
+            b"remove-organisms" => {
+                let center = [input.f64()?, input.f64()?];
+                let radius = input.f64()?;
+                let name = tag(&mut input)?;
+                let disposition = std::str::from_utf8(&name)
+                    .ok()
+                    .and_then(Disposition::from_name)
+                    .ok_or_else(|| refuse("unknown disposition"))?;
+                Intervention::RemoveOrganisms {
+                    center,
+                    radius,
+                    disposition,
+                }
+            }
+            _ => return Err(refuse("unknown payload")),
         };
         input.finish()?;
         let command = Self {
@@ -147,6 +179,22 @@ impl Command {
     #[must_use]
     pub fn content_hash(&self) -> Sha256Digest {
         Sha256Digest::of(&self.canonical_bytes())
+    }
+}
+
+/// The NUL-terminated tag at `input`'s position, without its NUL.
+fn tag(input: &mut ByteReader<'_>) -> Result<Vec<u8>, CoreError> {
+    let mut tag = Vec::new();
+    loop {
+        match input.u8()? {
+            0 => return Ok(tag),
+            _ if tag.len() == TAG_LIMIT => {
+                return Err(CoreError::IncompatibleCheckpoint {
+                    reason: format!("command record: a tag longer than {TAG_LIMIT} bytes"),
+                });
+            }
+            byte => tag.push(byte),
+        }
     }
 }
 
@@ -195,7 +243,8 @@ pub enum Outcome {
         published: Tick,
         /// The epoch that publication committed.
         epoch: ResourceEpoch,
-        /// The energy that entered the field.
+        /// The energy it moved: into the field for an injection, out of
+        /// the organisms it removed for a removal.
         applied: f64,
         /// Its index in the session's outcome stream.
         cursor: u64,

@@ -735,3 +735,45 @@ fn branching_refuses_what_it_cannot_branch() {
         "{resumed}"
     );
 }
+
+/// FL-022 and FL-048's H4 design: a removal branch is an intervention
+/// branch like a brush branch. Branched at [`FORK`] with `--remove` (a
+/// disk of radius 10 at the centre at tick 125), it numbers the removal
+/// after the inherited commands, matches its control branch until the
+/// removal's boundary, and differs after it, having removed organisms.
+#[test]
+fn a_removal_branch_matches_its_control_until_the_removal_and_differs_after() {
+    let config = ecology("write-ahead-before-apply");
+    let parent = fresh("removal-parent");
+    run(&config, &parent, FORK);
+    let control = fresh("removal-control");
+    branch(&parent, &control, FORK, &[]);
+    let treated = fresh("removal-treated");
+    let made = branch(
+        &parent,
+        &treated,
+        FORK,
+        &["--remove", "125:16,16:10:remove"],
+    );
+    assert_eq!(made["commands"], json!([5]), "numbered after command 4");
+
+    assert_eq!(
+        reached(&resume(&control, 125), 125),
+        reached(&resume(&treated, 125), 125),
+        "no difference before the removal's boundary"
+    );
+    let control_after = resume(&control, 126);
+    let treated_after = resume(&treated, 126);
+    assert_ne!(reached(&control_after, 126), reached(&treated_after, 126));
+    let removed = |records: &[Value]| {
+        one(records, "end")["tally"]["deaths_by_stage"]["removed"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    assert_eq!(removed(&control_after), 0);
+    assert!(
+        removed(&treated_after) > 0,
+        "{}",
+        one(&treated_after, "end")
+    );
+}

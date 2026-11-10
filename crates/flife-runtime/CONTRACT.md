@@ -18,8 +18,11 @@ inherits every command and outcome, records the fork, and from then on admits on
   `SessionConfig::from_config` reads `[execution]`: `command_durability`, `command_queue_capacity`,
   `control_queue_capacity`, `render_queue_capacity` (FL-017), and the configuration hash as the session's revision.
 - `Command`: the session, a client `CommandId`, a `Target` (`At { tick, retarget }` or `NextAdmissible`), an
-  optional expected revision, and a validated `flife_engine::Intervention`. The only intervention so far is
-  `InjectEnergy { cell, amount }`: declared external energy added to one field cell.
+  optional expected revision, and a validated `flife_engine::Intervention`: `InjectEnergy { cell, amount }`,
+  declared external energy added to one field cell, or (FL-022) `RemoveOrganisms { center, radius, disposition }`,
+  every organism in a disk removed at the boundary. The canonical record's payload opens with its NUL-terminated
+  tag (`inject-energy` or `remove-organisms`); a removal's disposition is its NUL-terminated name. An injection's
+  record is byte for byte FL-014's.
 - Control requests: pause, resume, run until a tick, step, cancel, status, inspect, close and suspend (FL-037);
   checkpoint and durable outcome (FL-036).
 - For `open_journaled` (FL-036): a `JournalWriter` started over a `Journal` implementation, and the
@@ -30,7 +33,8 @@ inherits every command and outcome, records the fork, and from then on admits on
   target was retargeted, and its `Durability` (`Volatile`, or `WriteAhead` once the journal holds it); or
   `Rejected(Rejection)`. A rejection records nothing.
 - `CommandStatus`: `Pending`, `Sealed` or `Terminal(Outcome)`. `Outcome` is one of:
-  - `Applied`: the boundary tick, the published tick and epoch, and the energy that entered the field;
+  - `Applied`: the boundary tick, the published tick and epoch, and the energy the command moved: into the field
+    for an injection, out of the organisms it removed for a removal;
   - `Cancelled`: the boundary, and `Requested` or `SessionClosed`;
   - `Failed`.
 
@@ -229,7 +233,10 @@ inherits every command and outcome, records the fork, and from then on admits on
   context is cancelled.
 - `World::advance_with` checks every intervention before preparing and refuses an invalid one without stopping the
   run. An `InjectEnergy` is refused for a cell outside the grid, or an amount that is not finite, not strictly
-  positive or above `f32::MAX`.
+  positive or above `f32::MAX`. A `RemoveOrganisms` is refused for a centre outside the world, or a radius that
+  is not finite, not strictly positive or above half the shorter world side.
+- `Command::from_canonical_bytes` refuses (`IncompatibleCheckpoint`) an unknown payload or disposition tag, a tag
+  longer than 32 bytes, and trailing or missing bytes.
 - FL-039: `CommandBook::branch` refuses (`StateConflict`) the book's own session or one in its lineage.
   `restore` refuses (`IncompatibleCheckpoint`) a commands chunk of another version, a version 2 chunk with no fork,
   and a lineage that is not one (see the branch invariants).
@@ -332,7 +339,7 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
 
 **Validity domain.** `volatile-in-memory` and `write-ahead-before-apply` durability; `cpu-reference` and
 `qualified-reference`; one owner task on any Asupersync runtime, plus the journal's writer thread for a journaled
-session; `InjectEnergy` as the only intervention.
+session; `InjectEnergy` and `RemoveOrganisms` as the interventions.
 
 **Known gaps.**
 - `volatile-in-memory` sessions still lose everything since opening when the process ends; that is the profile.
@@ -346,8 +353,12 @@ session; `InjectEnergy` as the only intervention.
   the library calls `checkpoint`/`restore` remain the only checkpoint paths here.
 - `block_on_inline` must not run on an Asupersync runtime thread (FrankenSQLite reaches for the thread's runtime
   while it parks, and an open never completes), so journal I/O runs on the writer thread or a plain thread.
-- Brushes, regions, material, removal, seeded introduction, source edits and their native input mapping are FL-022.
-  FL-014's single-cell `InjectEnergy` is the canonical payload they will extend.
+- Area brushes, material, seeded introduction, source edits and the native input mapping are FL-022. Single-cell
+  `InjectEnergy` (FL-014) and disk `RemoveOrganisms` (FL-022) are the canonical payloads so far.
+- `tests/removal.rs` (3 tests, FL-022): an injection's record against one written out by hand, and a removal's
+  round trip for each disposition, three distinct content hashes; unknown, unterminated, trailing and truncated
+  records refused; and the book admitting a removal for tick 20 and applying it there, its applied outcome the
+  removed organisms' energy (1e-12) and the world equal to one stepped directly with the same removal.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
 - Branching (FL-039) is a library operation on a book at a checkpoint (`flife branch` in `flife-cli`), not a session

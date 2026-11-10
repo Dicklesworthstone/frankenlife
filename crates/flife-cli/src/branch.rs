@@ -44,7 +44,7 @@ use flife_store::{BranchOrigin, ChunkStore, CommandJournal};
 use serde::Serialize;
 
 use crate::persist::{
-    CATALOG_FILE, Checkpoints, Injection, Persistence, STORE_DIR, StoreDurability, create,
+    CATALOG_FILE, Checkpoints, Persistence, STORE_DIR, ScheduledCommand, StoreDurability, create,
     on_plain_thread, read_config, restorable, run_identity, scheduled,
 };
 use crate::run::{CheckpointAt, RUN_SCHEMA, Record};
@@ -60,9 +60,9 @@ pub struct BranchOptions {
     pub at: Option<u64>,
     /// The branch's name; the new directory's name if `None`.
     pub name: Option<String>,
-    /// The branch's own commands: energy brushes at or after the
-    /// checkpoint's tick, numbered after every inherited command.
-    pub injections: Vec<Injection>,
+    /// The branch's own commands: energy brushes and removals at or after
+    /// the checkpoint's tick, numbered after every inherited command.
+    pub commands: Vec<ScheduledCommand>,
     /// How the founding checkpoint is published.
     pub durability: StoreDurability,
 }
@@ -200,7 +200,7 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
         .map_or(1, |id| id.get().saturating_add(1));
     let grid = *world.field().grid();
     let mut commands = Vec::new();
-    for command in scheduled(session, first, &options.injections) {
+    for command in scheduled(session, first, &options.commands) {
         let admission = book.admit(command, tick, &grid, false);
         if !matches!(admission, Admission::Accepted { retry: false, .. }) {
             return Err(conflict(format!(

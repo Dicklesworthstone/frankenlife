@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
-    ExperimentOptions, Injection, Look, Particles, Persistence, ResumeOptions, RunOptions, Stop,
-    StoreDurability, Style, Validation,
+    ExperimentOptions, Injection, Look, Particles, Persistence, Removal, ResumeOptions, RunOptions,
+    ScheduledCommand, Stop, StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -74,6 +74,13 @@ enum Command {
         /// `TICK:X,Y:AMOUNT`; repeatable. Commands 1, 2, … in order.
         #[arg(long = "inject", value_name = "TICK:X,Y:AMOUNT")]
         injections: Vec<Injection>,
+        /// Remove every organism within RADIUS world units of (X, Y) at a
+        /// committed tick, its energy removed from the world, dissipated or
+        /// recycled into the field, written
+        /// `TICK:X,Y:RADIUS:DISPOSITION`; repeatable. Numbered after the
+        /// `--inject` commands, in order.
+        #[arg(long = "remove", value_name = "TICK:X,Y:RADIUS:DISPOSITION")]
+        removals: Vec<Removal>,
     },
     /// Continue the run in a run directory from its newest checkpoint that
     /// restores, replaying its command journal, to a committed tick.
@@ -104,8 +111,8 @@ enum Command {
         checkpoints: CheckpointFlags,
     },
     /// Branch a run directory at one of its checkpoints into a new run
-    /// directory: a control branch, or with `--inject` an intervention
-    /// branch. Continue it with `flife resume`.
+    /// directory: a control branch, or with `--inject` or `--remove` an
+    /// intervention branch. Continue it with `flife resume`.
     Branch {
         /// The run directory to branch.
         parent: PathBuf,
@@ -124,6 +131,13 @@ enum Command {
         /// `TICK:X,Y:AMOUNT`; repeatable.
         #[arg(long = "inject", value_name = "TICK:X,Y:AMOUNT")]
         injections: Vec<Injection>,
+        /// The branch's own command: every organism within RADIUS world
+        /// units of (X, Y) removed at a committed tick at or after the
+        /// checkpoint's, written `TICK:X,Y:RADIUS:DISPOSITION` (`remove`,
+        /// `dissipate` or `recycle`); repeatable, numbered after the
+        /// `--inject` commands.
+        #[arg(long = "remove", value_name = "TICK:X,Y:RADIUS:DISPOSITION")]
+        removals: Vec<Removal>,
         /// `power-loss` (the default) flushes the founding checkpoint to
         /// stable storage before publishing it; `process-crash` relies on
         /// atomic renames.
@@ -296,6 +310,7 @@ fn main() -> ExitCode {
             run_dir,
             checkpoints,
             injections,
+            removals,
         } => {
             let config = match load(&config) {
                 Ok(config) => config,
@@ -324,7 +339,7 @@ fn main() -> ExitCode {
                     controllers,
                     metrics_every,
                 },
-                &injections,
+                &ScheduledCommand::listed(&injections, &removals),
                 persistence.as_ref(),
                 print,
             ))
@@ -335,6 +350,7 @@ fn main() -> ExitCode {
             at,
             name,
             injections,
+            removals,
             checkpoint_durability,
         } => match flife_cli::branch(
             &parent,
@@ -342,7 +358,7 @@ fn main() -> ExitCode {
             &BranchOptions {
                 at,
                 name,
-                injections,
+                commands: ScheduledCommand::listed(&injections, &removals),
                 durability: checkpoint_durability,
             },
         ) {

@@ -34,7 +34,8 @@ use std::sync::{Arc, Mutex};
 use flife_cli::metrics::{dispersion, gini, morans_i, top_decile_share};
 use flife_cli::{
     ControllerChoice, Injection, METRICS_SCHEMA, Metrics, Persistence, Record, ResumeOptions,
-    RunOptions, StoreDurability, Tally, Tracked, Tracker, found, resume, run_with,
+    RunOptions, ScheduledCommand, StoreDurability, Tally, Tracked, Tracker, found, resume,
+    run_with,
 };
 use flife_core::ids::{GenomeId, LineageId, OrganismId};
 use flife_core::ledger::{Flow, Transfer};
@@ -863,10 +864,11 @@ fn a_run_declares_its_metrics_and_its_windows_partition_it() {
 #[test]
 fn a_resumed_run_tracks_from_the_state_its_journal_replayed_to() {
     let config = ecology("write-ahead-before-apply");
-    let injections: Vec<Injection> = ["3:5,6:2.0", "66:9,2:3.0", "150:20,11:4.0", "230:1,30:1.0"]
-        .iter()
-        .map(|text| text.parse().expect("an injection"))
-        .collect();
+    let injections: Vec<ScheduledCommand> =
+        ["3:5,6:2.0", "66:9,2:3.0", "150:20,11:4.0", "230:1,30:1.0"]
+            .iter()
+            .map(|text| ScheduledCommand::from(text.parse::<Injection>().expect("an injection")))
+            .collect();
     let persistence = |run_dir: &Path| {
         let mut persistence = Persistence::new(run_dir, &config);
         persistence.checkpoint_every = 7;

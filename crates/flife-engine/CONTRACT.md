@@ -44,6 +44,11 @@ FL-014 (`flife-fp2`) adds `intervention` and `World::advance_with`: phase 1's se
 interventions, applied with phase 2's external sources and recorded in the ledger. The session owner that admits
 and seals them is `flife-runtime`.
 
+FL-022 (`flife-2jj`, the world-space half) adds `Intervention::RemoveOrganisms`: every organism in a disk on the
+torus dies at the boundary, its energy removed, dissipated or recycled as the command says (plan §7.6, §12.3,
+§14.3). It is the perturbation FL-048's H4 boundary test needs. The native brush input that would produce it is
+still FL-022's.
+
 FL-016 (`flife-gh0`) writes and restores the whole world as ten checkpoint chunks (plan §16.1, §16.3, INV-14,
 Appendix B.2, C.13).
 
@@ -129,6 +134,9 @@ each runs and owns the field.
 - FL-014: `Intervention` (`InjectEnergy { cell, amount }`) with `check` and `declared_energy`;
   `World::advance_with` and `World::step_with`; and each `TickReport`'s `interventions`, the
   `AppliedIntervention`s (input tick, sealed position, intervention, applied energy) in sealed order.
+- FL-022: `Intervention::RemoveOrganisms { center, radius, disposition }` and `Intervention::removes_at(grid,
+  position)`; `AppliedIntervention::removed`, the organisms a removal removed (zero for an injection), with
+  `applied` the energy they held; `Disposition::ALL`, `name` (`remove`, `dissipate`, `recycle`) and `from_name`.
 - FL-041: `ModelVariant` (`Baseline`, `ChemistryOnly`, `FreshOffspring`) and `ModelVariant::of(model)`;
   `reproduction::Offspring` (`Inherited`, or `Fresh { catalog, limits, initial_scale }`), the new `offspring`
   field of `BirthContext`.
@@ -272,6 +280,19 @@ each runs and owns the field.
   `command-injection`: never more than declared, and within one `f32` ulp of the cell.
 - The interventions are checked before anything is prepared. A refused one changes nothing and does not stop the
   run. A non-finite cell after an admitted injection is a numerical fault like any other.
+- FL-022: a `RemoveOrganisms` applies at the boundary itself, before transport. It takes out every organism whose
+  committed position lies within `radius` of `center` by the minimum-image distance, the circle included. The
+  removed sense nothing, ask for nothing, pay nothing and leave no offspring in tick `n`. Each dies once, at its
+  committed position, with its whole energy as the residual and `Removed(disposition)` as its cause. `remove`
+  records the residual as `command-removal`. `dissipate` records it as `unrecycled-death`. `recycle` offers the
+  configured fraction to the field in phase 9 like any recycled residual, first sensed in tick `n + 1`, and the
+  rest is the recycling transfer's `unrecycled-death`.
+- An organism in two removals' disks at one boundary dies by the first in sealed order. A disk that holds no
+  organism removes nothing, still applies, and leaves the tick exactly as it would be without it. The tick's
+  deaths list phase 1's removals first, in sealed and then identity order. Its `interventions` list every
+  intervention in its sealed position, though removals apply before injections.
+- A centre outside `[0, L_x) × [0, L_y)`, or a radius that is not finite, not strictly positive or above half the
+  shorter world side, is refused before anything changes. Half the world is admitted.
 
 **Invariants — checkpoints (FL-016; §16.3, INV-14, B.2).**
 - `World::write_checkpoint` writes the ten world chunks of `WORLD_CHECKPOINT_CHUNKS` at version 1, each declaring
@@ -468,6 +489,34 @@ streams. The small ecology pins its world digest, checked on Linux x86_64.
     written, and the quota's count not checked.
 - FL-016's world chunks are tested through the session, in `flife-runtime`'s `tests/checkpoint.rs`.
 
+`tests/removal.rs` (8 tests, FL-022), on the 32 × 32 Appendix A ecology at tick 40. The oracle for which
+organisms a disk holds is the test's own minimum-image distance (`rem_euclid`), not `FieldGrid::displacement`:
+- `a_removal_takes_out_exactly_the_organisms_in_its_disk_across_the_seam`: a disk placed so that one organism is
+  inside only by wrapping; exactly the organisms the oracle names die, in identity order and first among the
+  tick's deaths, at their committed positions, with their committed energies' bits as residuals and their genome,
+  lineage and generation; none of them remains; `command-removal` is their energy.
+- `each_disposition_sends_the_residual_where_it_says_and_nowhere_else`: one disk, three worlds. `remove`,
+  `dissipate` and `recycle` put the residual in `command-removal`, `unrecycled-death`, or the recycling transfer
+  (credit at most half, loss as `unrecycled-death`). The recycling world's field exceeds the dissipating world's
+  by exactly the credit (1e-9), the other two fields are bit-identical, and the survivors are the same in all
+  three.
+- `overlapping_removals_kill_each_organism_once_and_the_removed_take_no_part`: four radius-16 disks cover the
+  torus; each organism dies once, by the first disk holding it, with that disk's disposition and count; nothing
+  is evaluated, requested, granted, emitted or born, and the empty world advances.
+- `a_disk_that_holds_no_organism_changes_nothing`: the same digest and deaths as a tick without it, and an applied
+  record of zero.
+- `removals_outside_the_world_or_wider_than_half_of_it_are_refused_unchanged`: ten refusals with the tick and
+  digest unchanged, then half the world admitted.
+- `a_removal_world_is_the_same_at_any_worker_count`: 1, 3 and 8 workers, 20 ticks on.
+- `the_disk_includes_its_circle_and_wraps_both_seams`: `[3, 4]` and `[29, 28]` exactly 5 from the origin are
+  inside a radius of 5; a millionth farther is not.
+- `an_injection_and_a_removal_at_one_boundary_are_reported_in_sealed_order`.
+
+Eleven planted mutants were each caught: the circle excluded, no minimum image, the removed kept in the tick, an
+organism dying twice, half the residual, every disposition dissipating, half the world refused, the report left
+in application order, removal deaths unreported, and in `flife-runtime` the disposition unencoded or decoded as
+`recycle` always.
+
 `tests/ablation.rs` (3 tests, FL-041), on the 32 × 32 Appendix A ecology:
 - `the_model_key_names_each_variant_and_refuses_others`: each name maps to its variant and validates; another name
   (`field-ecology-v2`, `field-ecology-v1-shuffled`) is refused.
@@ -488,9 +537,10 @@ velocity, first-order splitting at the configured fixed timestep.
 **Known gaps.**
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
-- Phase 1 applies only what `flife-runtime` (FL-014) seals: single-cell `InjectEnergy`. Brushes, regions,
-  material, removal, seeded introduction and source edits are FL-022, and durable admission is FL-036. The
-  exhibition-mode stable-ID birth rejection policy has no registered name yet.
+- Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and disk `RemoveOrganisms`
+  (FL-022). Area energy brushes, material, seeded introduction, source edits and the native input that maps a
+  brush stroke to these payloads are still FL-022. The exhibition-mode stable-ID birth rejection policy has no
+  registered name yet.
 - `stop-and-preserve` keeps the committed state and the fault's description, which names the quantity and,
   where the operator knows it, the organism. It does not yet retain the faulted candidate's buffers for
   inspection, and there is no exhibition containment mode.
@@ -538,8 +588,8 @@ velocity, first-order splitting at the configured fixed timestep.
   sharing, deltas or compression. A restored store is compacted in identity order, so `Population::latest`
   names the highest live identity rather than a since-dead later one; new identities come from the restored
   allocators either way. The checkpoint carries no toolchain or source fingerprint (B.1's run manifest).
-- Explicit removal needs a command to carry it, and the erase brush is a later command item. FL-012 supplies only
-  the settlement. Environmental hazards are not part of `field-ecology-v1`.
+- Explicit removal is carried by `RemoveOrganisms` (FL-022), a disk. Other region shapes and the erase brush's
+  native input are later. Environmental hazards are not part of `field-ecology-v1`.
 - `Population` stores each genome as its own heap value. Packed slabs, generation-tagged handles and
   epoch-aware reclamation after readers finish are FL-026. FL-016 checkpoints the store's contents. The ordered
   tick returns a dead genome's quota charge in the publishing commit; readers holding its shared parameters keep

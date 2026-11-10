@@ -1051,12 +1051,30 @@ impl World {
         emissions.clear();
         recycling.clear();
 
-        // Phase 1 sealed `interventions` at this boundary; they apply below,
-        // with phase 2's external sources.
-        // Phase 2: transport, then the sources sampled at mid-tick, then the
-        // interventions in their sealed order.
+        // Phase 1 sealed `interventions` at this boundary. The removals take
+        // their organisms out here, before anything senses or acts; the
+        // injections apply below, with phase 2's external sources.
         let opening = Holdings::new(field.current().energy_total(), organism_total(population))?;
         let mut tick_ledger = ledger.open(from, opening)?;
+        rows.clear();
+        rows.extend(population.iter());
+        let mut applied = Vec::new();
+        let mut removals = Vec::new();
+        intervention::remove(
+            from,
+            interventions,
+            &rules.grid,
+            population,
+            &rules.recycling,
+            rows,
+            &mut removals,
+            recycling,
+            &mut tick_ledger,
+            &mut applied,
+        )?;
+
+        // Phase 2: transport, then the sources sampled at mid-tick, then the
+        // injections in their sealed order.
         let mut next_paths = paths.clone();
         sampled.clear();
         for (path, source) in next_paths.iter_mut().zip(sources.iter()) {
@@ -1074,19 +1092,18 @@ impl World {
         let field_step = advance_field_with(field, rules, sampled, step, field_work, fields)?;
         tick_ledger.record(Flow::SourcePower, field_step.injected_declared)?;
         tick_ledger.record(Flow::Decay, field_step.transport.decay_removed)?;
-        let mut applied = Vec::new();
         {
             let (_, next) = field.stage();
             intervention::apply(from, interventions, next, &mut tick_ledger, &mut applied)?;
         }
+        // The report lists every intervention in its sealed position.
+        applied.sort_by_key(|intervention| intervention.position);
         let (_, observed) = field.stage();
         let observed: &FieldState = observed;
 
-        // Phases 3 and 4: the pyramid, then every organism's observation and
-        // its due or forced evaluation, in identity order.
+        // Phases 3 and 4: the pyramid, then every remaining organism's
+        // observation and its due or forced evaluation, in identity order.
         let view = pyramid.build(observed)?;
-        rows.clear();
-        rows.extend(population.iter());
         decide_with(
             rules,
             population,
@@ -1250,8 +1267,10 @@ impl World {
         }
 
         // Every fate, in identity order; the deaths' residuals are settled.
+        // The deaths are listed as they happened: phase 1's removals first.
         survivors.clear();
         deaths.clear();
+        deaths.append(&mut removals);
         let mut organisms = CompensatedSum::ZERO;
         let seconds = step.seconds_per_tick();
         let mut emitted = 0;

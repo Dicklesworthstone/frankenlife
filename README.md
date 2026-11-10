@@ -88,7 +88,9 @@ a time: the preset's 160.7 MiB checkpoint peaks at about 1 MiB of heap, where en
 `bounded-background` lets the run step on while a writer drains at most `checkpoint_retained_bytes` of pages. Both
 store byte-identical checkpoints, and a run whose memory cannot hold a checkpoint is refused before it starts.
 FL-039 branches a run: `flife branch PARENT DIR --at T` starts a new session from the parent's checkpoint at
-tick T, a control branch, or an intervention branch with `--inject` brushes of its own. The branch links
+tick T, a control branch, or an intervention branch with `--inject` brushes or `--remove` removals of its own
+(`--remove TICK:X,Y:RADIUS:DISPOSITION` takes out every organism in a disk, its energy removed, dissipated or
+recycled; `flife run` takes it too). The branch links
 the parent's verified chunk files instead of copying them and writes only its command closure. Its journal
 starts with the history it inherited. A control branch resumes to exactly the parent's uninterrupted world,
 while its intervention sibling matches it until its brush applies and differs after.

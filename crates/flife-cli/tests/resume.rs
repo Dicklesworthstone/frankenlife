@@ -744,3 +744,95 @@ fn checkpoints_of_another_configuration_are_passed_over() {
     assert_eq!(status, Some(0), "{err:?}");
     assert_eq!(one(&out, "end")["digest"], one(&plain, "end")["digest"]);
 }
+
+/// FL-022's removals at ticks 100 (a disk of radius 10 at the centre,
+/// recycled) and 160 (radius 5 at the corner, across both seams,
+/// dissipated): commands 5 and 6, after the injections.
+const REMOVALS: [&str; 2] = ["100:16,16:10:recycle", "160:0.5,31.5:5:dissipate"];
+
+/// [`run_args`] with [`REMOVALS`].
+fn with_removals(config: &Path, run_dir: &Path, ticks: u64, every: u64) -> Vec<String> {
+    let mut args = run_args(config, run_dir, ticks, every);
+    for removal in REMOVALS {
+        args.extend(["--remove".to_owned(), removal.to_owned()]);
+    }
+    args
+}
+
+/// FL-022: removals given on the command line are journaled, held pending
+/// in checkpoints and replayed like any command. A run with them removes
+/// organisms and ends elsewhere than the run without them. Stopped at tick
+/// 102 with its newest checkpoint damaged, it resumes from tick 98, before
+/// the first removal, replays that removal's journaled outcome at tick 100,
+/// applies the second at 160 from the journal, and reaches the
+/// uninterrupted state. SIGKILLed between the two, it does too.
+#[test]
+fn removals_are_journaled_checkpointed_and_replayed_like_any_command() {
+    let reference = uninterrupted();
+    let config = ecology("write-ahead-before-apply");
+    let whole = fresh("removal-whole");
+    let (status, out, err) = flife(&strs(&with_removals(&config, &whole, HORIZON, 0)));
+    assert_eq!(status, Some(0), "{err:?}");
+    let end = one(&out, "end");
+    assert_eq!(
+        end["persisted"]["journal"],
+        json!({"admitted": 6, "outcomes": 6})
+    );
+    assert!(
+        end["tally"]["deaths_by_stage"]["removed"]
+            .as_u64()
+            .is_some_and(|removed| removed > 0),
+        "the removals removed organisms: {end}"
+    );
+    assert_ne!(end["digest"], reference.digest, "and changed the world");
+    let removing = (
+        end["digest"].clone(),
+        checkpoint_at(&out, HORIZON)["sha256"].clone(),
+    );
+
+    let part = fresh("removal-damaged-newest");
+    let (status, out, err) = flife(&strs(&with_removals(&config, &part, 102, 0)));
+    assert_eq!(status, Some(0), "{err:?}");
+    // Injections 1 and 2 and removal 5 are applied; 3, 4 and 6 are pending.
+    assert_eq!(
+        one(&out, "end")["persisted"]["journal"],
+        json!({"admitted": 6, "outcomes": 3})
+    );
+    let newest = checkpoint_at(&out, 102)["sequence"]
+        .as_u64()
+        .expect("a sequence");
+    let before = checkpoint_at(&out, 98)["sequence"]
+        .as_u64()
+        .expect("a sequence");
+    {
+        let store = ChunkStore::open(part.join("store"), Durability::ProcessCrash)
+            .expect("the store opens");
+        let bytes = store.load(before).expect("checkpoint 98 loads");
+        let restored =
+            restore(&bytes, NumericalProfile::reference_f32().expect("profile")).expect("restores");
+        let status = |id: u64| restored.book.status(CommandId::new(id)).cloned();
+        assert_eq!(status(5), Some(CommandStatus::Pending), "due at 100");
+        assert_eq!(status(6), Some(CommandStatus::Pending), "due at 160");
+        fs::write(store.manifest_path(newest), b"damaged").expect("damages the manifest");
+    }
+    let (status, out, err) = resume(&part);
+    assert_eq!(status, Some(0), "{err:?}");
+    let resumed = one(&out, "resume");
+    assert_eq!(
+        resumed["checkpoint"],
+        json!({"sequence": before, "tick": 98})
+    );
+    assert_eq!(resumed["journal"], json!({"admitted": 6, "outcomes": 3}));
+    reaches_the_uninterrupted_state(&out, (&removing.0, &removing.1));
+    assert_eq!(
+        one(&out, "end")["persisted"]["journal"],
+        json!({"admitted": 6, "outcomes": 6})
+    );
+
+    let killed = fresh("removal-killed");
+    killed_after(&strs(&with_removals(&config, &killed, 1_000_000, 1)), 130);
+    let (status, out, err) = resume(&killed);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(one(&out, "resume")["journal"]["admitted"], 6);
+    reaches_the_uninterrupted_state(&out, (&removing.0, &removing.1));
+}

@@ -38,7 +38,7 @@ use crate::branch::{BranchParent, ForkRecord, FoundingChunks, Inherited};
 use crate::checkpointing::CheckpointAdmission;
 use crate::metrics::{Declaration, Metrics, Tracker};
 use crate::observe::{Survey, Tally};
-use crate::persist::{Checkpoints, Injection, Persistence};
+use crate::persist::{Checkpoints, Persistence, ScheduledCommand};
 
 /// The schema of every record a run emits.
 pub const RUN_SCHEMA: &str = "frankenlife.run.v1";
@@ -412,7 +412,7 @@ pub fn run(
 }
 
 /// Run `config` headlessly for `options.ticks` through a session owner,
-/// first submitting `injections` (commands 1, 2, … in order) and, with
+/// first submitting `scheduled` (commands 1, 2, … in order) and, with
 /// `persistence`, keeping the run in a new run directory: the command
 /// journal for a `write-ahead-before-apply` configuration, and a
 /// checkpoint at every multiple of `persistence.checkpoint_every` and at
@@ -430,7 +430,7 @@ pub fn run(
 pub fn run_with(
     config: &ValidatedConfig,
     options: RunOptions,
-    injections: &[Injection],
+    scheduled: &[ScheduledCommand],
     persistence: Option<&Persistence>,
     emit: impl FnMut(&Record) + Send + 'static,
 ) -> Result<Finished, CoreError> {
@@ -445,7 +445,7 @@ pub fn run_with(
             ),
         });
     }
-    let commands = crate::persist::commands(injections);
+    let commands = crate::persist::commands(scheduled);
     if let Some(persistence) = persistence {
         // Checkpoint memory is admitted before anything is created.
         crate::checkpointing::admit(config, persistence.mode, persistence.retained_bytes)?;

@@ -46,9 +46,14 @@ bytes at any worker count and backend, and after a kill and a continuation.
   - `--checkpoint-durability power-loss|process-crash`: FL-035's profiles, `power-loss` by default;
   - `--inject TICK:X,Y:AMOUNT`, repeatable: an `InjectEnergy` command at exactly that committed tick, as commands
     1, 2, … in order, each required to be admitted afresh.
+  - FL-022: `--remove TICK:X,Y:RADIUS:DISPOSITION`, repeatable: a `RemoveOrganisms` command, every organism
+    within RADIUS world units of (X, Y) removed at that committed tick with the disposition `remove`, `dissipate`
+    or `recycle`, numbered after the `--inject` commands.
 - `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
-- In the library: `run_with(config, options, injections, persistence, emit)` and `resume(dir, ResumeOptions,
-  emit)`, with `Persistence::new(dir, config)` giving the configured defaults.
+- In the library: `run_with(config, options, scheduled, persistence, emit)` and `resume(dir, ResumeOptions,
+  emit)`, with `Persistence::new(dir, config)` giving the configured defaults. `scheduled` is a list of
+  `ScheduledCommand`s (`Inject(Injection)` or `Remove(Removal)`, FL-022); `ScheduledCommand::listed(injections,
+  removals)` numbers them as the command line does.
 - FL-040: `--metrics-every M` on `flife run` and `flife resume`, 0 (none) by default; `RunOptions::metrics_every`
   and `ResumeOptions::metrics_every` in the library. `Tracker::new(world, M)`, `Tracker::record(report)` and
   `Tracker::sample(epoch)` are public, so a client that steps a world itself can use them.
@@ -56,8 +61,9 @@ bytes at any worker count and backend, and after a kill and a continuation.
   - `PARENT` is a run directory that no process holds; `DIR` is new or empty.
   - `--at` is the committed tick of a parent checkpoint. By default it is the newest one that restores.
   - `--name` is 1 to 256 bytes, `DIR`'s name by default.
-  - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command.
-  - In the library: `branch(parent, dir, &BranchOptions { at, name, injections, durability })`.
+  - `--inject` gives the branch's own brushes, at or after T, numbered after every inherited command, and
+    `--remove` (FL-022) its own removals, numbered after its brushes.
+  - In the library: `branch(parent, dir, &BranchOptions { at, name, commands, durability })`.
 
 - FL-041: `flife experiment SPEC --out DIR --cpu-workers W --controllers C`. `DIR` is new, empty, or holds this
   experiment's catalog; W and C are as for `run` and change no reported byte. `SPEC` is TOML
@@ -467,6 +473,15 @@ and its catalog indexes exactly the checkpoints it published):
   directory, an edited `config.toml`, a tick already passed, and a run directory another live process holds; and
   the configured interval (3,840 ticks), giving only the founding and final checkpoints of a 10-tick run.
 
+FL-022: `removals_are_journaled_checkpointed_and_replayed_like_any_command` (in `tests/resume.rs`) runs the
+ecology with two removals (tick 100 at the centre, recycled; tick 160 across both seams, dissipated): it journals
+six commands, removes organisms and ends elsewhere than the run without them. Stopped at 102 with its newest
+checkpoint damaged, it resumes from 98 with both removals pending, replays the first's outcome and reaches the
+uninterrupted world and final checkpoint bytes; SIGKILLed after tick 130 it does too.
+`a_removal_branch_matches_its_control_until_the_removal_and_differs_after` (in `tests/branch.rs`) branches at
+tick 112 with `--remove` at 125: the removal is command 5, the branches match at 125 and differ at 126, where only
+the treated branch has removed organisms. A `persist` unit test pins `--remove` parsing.
+
 A `persist` unit test pins `--inject` parsing. Twenty-four planted mutants in the run directories, the driver,
 suspension, `open_restored` and the CLI guard were each caught. One, `flife run` without its own write-ahead
 guard, was caught only after the smoke test checked that the refusal names `--run-dir`: the session refuses in
@@ -643,8 +658,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - Power loss is FL-035's protocol (flush order), exercised by publishing under `power-loss`, never by cutting
     power. Kills are tested at whatever point the process reached, not at every step of a checkpoint (FL-035 and
     FL-036 test those).
-  - Commands come only from `--inject` at the start of a run. Commands submitted to a resumed run, and the other
-    interventions, are FL-022.
+  - Commands come only from `--inject` and `--remove` at the start of a run or branch. Commands submitted to a
+    resumed run, and the other interventions, are FL-022.
   - Retention is by count. Pinned discoveries and journal compaction (§16.7) are later, and the catalog's
     checkpoint index keeps rows for retired manifests.
 - FL-038 evidence (`tests/checkpoint_memory.rs`, a counting global allocator, `peak_alloc`, test only; and
@@ -698,8 +713,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   the bytes (332 of 1.6 M pixels at tick 64), so it would also change the written frames. The
   MP4 encoder is an external `ffmpeg` on `PATH`; without it `--video` is a typed `missing-capability` refusal after
   the frames are written.
-- `--inject` (FL-037) is the only command source: single-cell energy brushes at fixed ticks. The other
-  interventions and recorded commands are FL-022's.
+- `--inject` (FL-037) and `--remove` (FL-022) are the only command sources: single-cell energy brushes and disk
+  removals at fixed ticks. The other interventions and recorded commands are FL-022's.
 - The survey sees only live organisms. Pairs and triples need their relatives alive. FL-040's records carry each
   lineage's births, deaths, deepest generation and extinction, but no ancestry tree.
 - The survey compares whole genomes and hashes every live genome, which is cheap at this scale.

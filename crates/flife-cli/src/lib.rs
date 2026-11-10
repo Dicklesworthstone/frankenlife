@@ -70,8 +70,8 @@ pub use flife_manim::{ColorMapping, Look, Particles, Style};
 pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};
 pub use observe::{Heredity, Survey, Tally};
 pub use persist::{
-    CATALOG_FILE, CONFIG_FILE, Injection, Persistence, ResumeOptions, STORE_DIR, StoreDurability,
-    resume,
+    CATALOG_FILE, CONFIG_FILE, Injection, Persistence, Removal, ResumeOptions, STORE_DIR,
+    ScheduledCommand, StoreDurability, resume,
 };
 pub use render::{RENDER_SCHEMA, RenderOptions, RenderRecord, render};
 pub use run::{

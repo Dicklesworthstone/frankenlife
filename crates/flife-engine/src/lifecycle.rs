@@ -255,6 +255,29 @@ pub enum Disposition {
     Recycle,
 }
 
+impl Disposition {
+    /// Every disposition, in canonical order.
+    pub const ALL: [Self; 3] = [Self::Remove, Self::Dissipate, Self::Recycle];
+
+    /// The disposition's canonical name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Remove => "remove",
+            Self::Dissipate => "dissipate",
+            Self::Recycle => "recycle",
+        }
+    }
+
+    /// The disposition named `name`, if there is one.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|disposition| disposition.name() == name)
+    }
+}
+
 /// Why an organism died.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeathCause {

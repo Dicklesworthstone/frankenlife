@@ -52,7 +52,7 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::checkpoint::{CheckpointManifest, ChunkSink as _};
 use flife_core::ids::{CommandId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Intervention, NumericalProfile, World};
+use flife_engine::{Disposition, Intervention, NumericalProfile, World};
 use flife_runtime::{
     Boundary, Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored,
     SessionCheckpoint, SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into,
@@ -150,31 +150,143 @@ impl FromStr for Injection {
     }
 }
 
-/// The run session's commands for `injections`: identities 1, 2, … in
-/// order, each for exactly its tick.
-#[must_use]
-pub fn commands(injections: &[Injection]) -> Vec<Command> {
-    scheduled(RUN_SESSION, 1, injections)
+/// A removal scheduled from the command line: every organism within
+/// `radius` world units of `center` at committed tick `tick` dies, its
+/// energy treated by `disposition` (FL-022's `RemoveOrganisms`). Written
+/// `TICK:X,Y:RADIUS:DISPOSITION`, the disposition `remove`, `dissipate` or
+/// `recycle`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Removal {
+    /// The committed tick whose boundary it applies at.
+    pub tick: u64,
+    /// The disk's centre in world units, `[x, y]`.
+    pub center: [f64; 2],
+    /// The disk's radius in world units.
+    pub radius: f64,
+    /// What becomes of each removed organism's energy.
+    pub disposition: Disposition,
 }
 
-/// `session`'s commands for `injections`: identities `first`, `first + 1`,
+impl FromStr for Removal {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let bad = || {
+            format!("`{text}` is not TICK:X,Y:RADIUS:DISPOSITION (remove, dissipate or recycle)")
+        };
+        let mut parts = text.split(':');
+        let (Some(tick), Some(center), Some(radius), Some(disposition), None) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(bad());
+        };
+        let (x, y) = center.split_once(',').ok_or_else(bad)?;
+        Ok(Self {
+            tick: tick.trim().parse().map_err(|_| bad())?,
+            center: [
+                x.trim().parse().map_err(|_| bad())?,
+                y.trim().parse().map_err(|_| bad())?,
+            ],
+            radius: radius.trim().parse().map_err(|_| bad())?,
+            disposition: Disposition::from_name(disposition.trim()).ok_or_else(bad)?,
+        })
+    }
+}
+
+/// A command scheduled from the command line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScheduledCommand {
+    /// Energy into a field cell.
+    Inject(Injection),
+    /// Organisms out of a disk.
+    Remove(Removal),
+}
+
+impl ScheduledCommand {
+    /// The committed tick whose boundary it applies at.
+    #[must_use]
+    pub const fn tick(&self) -> u64 {
+        match self {
+            Self::Inject(injection) => injection.tick,
+            Self::Remove(removal) => removal.tick,
+        }
+    }
+
+    /// Its canonical intervention.
+    #[must_use]
+    pub const fn intervention(&self) -> Intervention {
+        match *self {
+            Self::Inject(Injection { cell, amount, .. }) => {
+                Intervention::InjectEnergy { cell, amount }
+            }
+            Self::Remove(Removal {
+                center,
+                radius,
+                disposition,
+                ..
+            }) => Intervention::RemoveOrganisms {
+                center,
+                radius,
+                disposition,
+            },
+        }
+    }
+
+    /// `injections`, then `removals`: the command line's order of
+    /// identities.
+    #[must_use]
+    pub fn listed(injections: &[Injection], removals: &[Removal]) -> Vec<Self> {
+        injections
+            .iter()
+            .copied()
+            .map(Self::Inject)
+            .chain(removals.iter().copied().map(Self::Remove))
+            .collect()
+    }
+}
+
+impl From<Injection> for ScheduledCommand {
+    fn from(injection: Injection) -> Self {
+        Self::Inject(injection)
+    }
+}
+
+impl From<Removal> for ScheduledCommand {
+    fn from(removal: Removal) -> Self {
+        Self::Remove(removal)
+    }
+}
+
+/// The run session's commands for `scheduled`: identities 1, 2, … in
+/// order, each for exactly its tick.
+#[must_use]
+pub fn commands(scheduled: &[ScheduledCommand]) -> Vec<Command> {
+    self::scheduled(RUN_SESSION, 1, scheduled)
+}
+
+/// `session`'s commands for `scheduled`: identities `first`, `first + 1`,
 /// … in order, each for exactly its tick.
-pub(crate) fn scheduled(session: SessionId, first: u64, injections: &[Injection]) -> Vec<Command> {
-    injections
+pub(crate) fn scheduled(
+    session: SessionId,
+    first: u64,
+    scheduled: &[ScheduledCommand],
+) -> Vec<Command> {
+    scheduled
         .iter()
         .zip(first..)
-        .map(|(injection, id)| Command {
+        .map(|(command, id)| Command {
             session,
             id: CommandId::new(id),
             target: Target::At {
-                tick: Tick::new(injection.tick),
+                tick: Tick::new(command.tick()),
                 retarget: false,
             },
             expected_revision: None,
-            intervention: Intervention::InjectEnergy {
-                cell: injection.cell,
-                amount: injection.amount,
-            },
+            intervention: command.intervention(),
         })
         .collect()
 }
@@ -945,7 +1057,42 @@ pub fn resume(
 
 #[cfg(test)]
 mod tests {
-    use super::Injection;
+    use super::{Injection, Removal};
+    use flife_engine::Disposition;
+
+    /// `TICK:X,Y:RADIUS:DISPOSITION`, in that order, and nothing else.
+    #[test]
+    fn a_removal_is_tick_centre_radius_and_disposition() {
+        assert_eq!(
+            "66:9.5,2:3.25:recycle".parse::<Removal>(),
+            Ok(Removal {
+                tick: 66,
+                center: [9.5, 2.0],
+                radius: 3.25,
+                disposition: Disposition::Recycle,
+            })
+        );
+        assert_eq!(
+            " 3 : 5 , 6 : 2 : remove ".parse::<Removal>(),
+            Ok(Removal {
+                tick: 3,
+                center: [5.0, 6.0],
+                radius: 2.0,
+                disposition: Disposition::Remove,
+            })
+        );
+        for bad in [
+            "",
+            "3:5,6:2",
+            "3:5:2:remove",
+            "3:5,6:2:erase",
+            "3:5,6:2:remove:1",
+            "x:5,6:2:dissipate",
+            "3:5,6:r:dissipate",
+        ] {
+            assert!(bad.parse::<Removal>().is_err(), "{bad}");
+        }
+    }
 
     /// `TICK:X,Y:AMOUNT`, in that order, and nothing else.
     #[test]

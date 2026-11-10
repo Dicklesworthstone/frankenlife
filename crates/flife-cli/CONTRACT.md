@@ -171,12 +171,22 @@ bytes at any worker count and backend, and after a kill and a continuation.
     condition and split (reached, extinct, capacity-paused, failed, error), every comparison with the control, and
     every cataloged run with its result.
   - A result is `reached`, `capacity-paused`, `failed` or `error` (refused before or broken during the run, with
-    its `CoreError` kind), the committed tick and digest, whether it is extinct, and 13 measures from the end tally
-    and survey (`MEASURES`: survived, final, peak and least live, births, deaths, deepest generation, lineages and
-    distinct genomes alive, emitter-ticks, emission paid, topology changes, mutated parameters).
+    its `CoreError` kind), the committed tick and digest, whether it is extinct, and its measures. FL-048 extends
+    them to 24 (`MEASURES`), each with its basis (§15.2), which the report lists (`measures`):
+    - complete over the run (the tally): peak and least live, births, deaths, emitter-ticks, emission paid,
+      topology changes, mutated parameters;
+    - complete at the end (the survey and the last metrics record's complete figures): survived, final live,
+      deepest generation, lineages and distinct genomes alive, live topologies, lineage entropy, the dominant
+      lineage's share, mean generation;
+    - sampled from the render epoch at the last metrics record: occupied fraction, Morisita's index and Moran's I
+      of the organisms over 16 × 16 bins, the field's Gini and Moran's I, mean speed and moving fraction.
+    The last-record measures (`LastRecord`) need `metrics_every` > 0 and a metrics record at the run's last tick;
+    otherwise they are undefined.
   - A comparison, per split and condition: the paired seeds (both runs reached their tick), the unpaired ones, and
     per measure n, both means, the mean difference, seeds higher, lower and equal, the differences in seed order,
     and the exact two-sided sign-flip p-value over all 2^n sign assignments (up to `EXACT_TEST_MAX_SEEDS` = 20).
+    A measure undefined in either run of a pair (a sampled statistic of an extinct or uniform world) leaves that
+    pair out of its effect, and the effect names the seed (`undefined_seeds`).
     That is the "effect e over k of n seeds versus control" a claim is worded in.
   - A run manifest (`frankenlife.run-manifest.v1`) in each catalog row, grouped as Appendix B.1: identity
     (experiment, ordinal, condition, ablation, split, seed, parent, creation time), model (model, descriptor
@@ -305,8 +315,9 @@ bytes at any worker count and backend, and after a kill and a continuation.
     enters it (those are in the manifests). Runs execute one at a time, and each run's result is the same at any
     worker count and backend (`flife-engine`'s determinism), so the report's bytes are too.
   - An experiment's identity is the SHA-256 of its canonical design: the base configuration's hash, every resolved
-    condition, the seeds, ticks, metrics interval, control, selection words and rule. A directory cataloging one
-    identity refuses another.
+    condition, the seeds, ticks, metrics interval, control, selection words and rule, and (FL-048) the names of the
+    measures compared. A directory cataloging one identity refuses another, so a catalog is never continued by a
+    build that measures runs differently.
   - Every planned run is cataloged and listed, whatever its ending. Extinct runs that reached their tick are
     compared like any other; runs that paused, failed or were refused are counted and named as unpaired seeds.
     Nothing is dropped from the report.
@@ -539,8 +550,8 @@ was not equivalent: the test had reused a live organism's identity, which the li
 also reuses a dead organism's identity, which only that check refuses, and requires each refusal to name its check.
 The survivor and the five other mutants the refusal tests catch were run again, and all six were caught.
 
-`tests/experiment.rs` (6 tests, FL-041, about 7 s in release), on FL-037's 32 × 32 ecology from the plan's own
-Appendix A:
+`tests/experiment.rs` (7 tests: FL-041's six and one of FL-048's, about 9 s in release), on FL-037's 32 × 32
+ecology from the plan's own Appendix A:
 - `repeated_experiments_report_byte_identically_at_any_worker_count_and_across_a_kill`. Control, `no-emission` and
   `chemistry-only` over three discovery and two held-out seeds (15 runs). One CPU worker on the reference and three
   on `auto` write byte-identical reports. The `flife` binary is killed with SIGKILL after its fourth
@@ -573,6 +584,21 @@ Appendix A:
   so is a directory holding other files.
 - `the_sign_flip_test_by_hand`: [1, 2, 3] → 1/4, [3, 1] → 1/2, [1, −1] and zeros → 1, twenty ones → 2/2^20, and no
   value for no seeds or more than twenty.
+- FL-048 extends three of them. The endings test reads each run's last `metrics` line from its records file and
+  requires the last-record measures to equal it field by field, and the live-topology count to equal the end
+  survey's. An extinct run's clumping, speed and lineage entropy are undefined, and its comparison's
+  `organism_morisita` effect has n = 0 and names every paired seed, while `field_gini` keeps every pair. The
+  report declares all 24 measures with the right basis. The refusals test requires the design to list the
+  measures and the identity to hash the design. Every comparison check now pairs per measure.
+- `a_run_is_measured_by_its_last_metrics_record_only_at_its_end` (FL-048): a 120-tick run with a metrics record
+  every 50 ticks has records at 50, 100 and 120. `Measures::of` takes `LastRecord::of` the tick-120 record, and
+  none from the tick-100 record or from no record.
+
+Seven planted mutants in FL-048's measures were each caught: undefined seeds not named, an undefined measure
+counted as zero, organism Moran's I read from the field, the identity without the measures, topologies counted
+with none alive, a sampled measure declared complete, and a last record of another tick used. The last survived
+its first run, since a run always ends with a metrics record at its last tick; the direct test above was added
+and catches it.
 
 Eleven planted mutants were run against `tests/experiment.rs` (the two model mutants also against `flife-engine`'s
 `tests/ablation.rs`), and every one was caught:
@@ -709,8 +735,10 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - `no-complexity-cost` leaves a controller-cost flow of a few ulps per tick: `MaintenanceBill::settle` attributes
     the rounded payment's remainder after basal and sensor to the controller term. Removing it would change the
     model's arithmetic (a new model identity); the test bounds it instead.
-  - The measures are end-of-run scalars from the tally and survey. Time series, trait distributions and lineage
-    shapes stay in the records files; the report does not compare them.
+  - The measures are end-of-run scalars: tally totals, the end state, and one render-epoch sample at the last
+    metrics record (FL-048). Time series, trait distributions and lineage shapes stay in the records files; the
+    report does not compare them. The sampled figures are of the F32 epoch at 16 × 16 bins, not of the F64
+    committed state.
   - The sign-flip test is exact up to 20 paired seeds and absent beyond; no multiple-comparison correction is
     applied, so a claim names its measure in advance (§15.5) and the report lists every comparison.
   - The source revision is `git rev-parse HEAD` when the build script last ran (uncommitted edits are not

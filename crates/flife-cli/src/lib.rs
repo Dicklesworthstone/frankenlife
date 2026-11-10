@@ -62,8 +62,8 @@ pub use checkpointing::{
 };
 pub use experiment::{
     ABLATIONS, Ablation, Condition, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA, Experiment,
-    ExperimentOptions, ExperimentRecord, MANIFEST_SCHEMA, MEASURES, Measures, REPORT_FILE,
-    REPORT_SCHEMA, Report, RunResult, Spec, experiment,
+    ExperimentOptions, ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measure, Measures,
+    REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, experiment,
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Particles, Style};

@@ -27,7 +27,11 @@
 //! two-sided sign-flip test over the paired differences (AGENTS.md's
 //! "effect e over k of n seeds versus control"). Runs that did not reach
 //! their tick are listed and counted, and left out of the paired
-//! differences, never silently.
+//! differences, never silently. Each measure states its basis (§15.2):
+//! complete over the run, complete at its end, or sampled from the render
+//! epoch at the run's last metrics record. A sampled measure can be
+//! undefined (no organism left to clump); its effect names the paired
+//! seeds it leaves out.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
@@ -44,8 +48,9 @@ use flife_core::{
 use flife_store::{CatalogedRun, ExperimentCatalog};
 use serde::{Deserialize, Serialize};
 
+use crate::metrics::Metrics;
 use crate::observe::{Survey, Tally};
-use crate::run::{ControllerSummary, Finished, RunOptions, Stop};
+use crate::run::{ControllerSummary, Finished, Record, RunOptions, Stop};
 
 /// The schema of an experiment specification and of the records
 /// `flife experiment` prints.
@@ -413,7 +418,10 @@ impl Experiment {
             ));
         }
         if let Some(select) = &spec.select {
-            if !MEASURES.iter().any(|(name, _)| *name == select.measure) {
+            if !MEASURES
+                .iter()
+                .any(|measure| measure.name == select.measure)
+            {
                 return Err(spec_error(
                     "select.measure",
                     format!("`{}` is not a measure", select.measure),
@@ -471,6 +479,7 @@ impl Experiment {
             seeds: &experiment.spec.seeds,
             select: experiment.spec.select.as_ref(),
             conditions: &experiment.conditions,
+            measures: MEASURES.iter().map(|measure| measure.name).collect(),
         })
         .map_err(|error| spec_error("experiment", error.to_string()))?;
         experiment.identity = Sha256Digest::of(experiment.design.as_bytes());
@@ -618,12 +627,15 @@ struct Design<'a> {
     seeds: &'a Seeds,
     select: Option<&'a Select>,
     conditions: &'a [Condition],
+    /// The measures a report compares: a catalog of runs measured by
+    /// another set is another experiment.
+    measures: Vec<&'static str>,
 }
 
 // ------------------------------------------------------------------ results
 
-/// A run's outcome measures, read from its end record: its tally and the
-/// survey of its committed world.
+/// A run's outcome measures: its tally, the survey of its committed world,
+/// and its last metrics record.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Measures {
     /// 1 when any organism is alive at the end, else 0.
@@ -652,6 +664,63 @@ pub struct Measures {
     pub topology_changes: u64,
     /// Parameters the births perturbed or replaced.
     pub mutated_parameters: u64,
+    /// Topologies with a live organism at the end: the architecture
+    /// distribution's support.
+    pub topologies_alive: u64,
+    /// From the last metrics record (none without metrics records), at the
+    /// run's end: what it holds of the committed world, and what it sampled
+    /// from the render epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last: Option<LastRecord>,
+}
+
+/// What a run's last metrics record says of its end (§15.2).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LastRecord {
+    /// Its tick: the run's last committed tick.
+    pub tick: u64,
+    /// Complete: the entropy of the live lineage shares, in nats.
+    pub lineage_entropy: Option<f64>,
+    /// Complete: the largest lineage's share of the live population.
+    pub dominant_lineage_share: Option<f64>,
+    /// Complete: the mean live generation.
+    pub mean_generation: Option<f64>,
+    /// Sampled: the fraction of the 16 × 16 bins holding an organism.
+    pub occupied_fraction: f64,
+    /// Sampled: Morisita's index of the organisms over the bins (1 random,
+    /// above 1 clumped).
+    pub organism_morisita: Option<f64>,
+    /// Sampled: Moran's I of the bin counts.
+    pub organism_morans_i: Option<f64>,
+    /// Sampled: the Gini coefficient of the field's energy density.
+    pub field_gini: Option<f64>,
+    /// Sampled: Moran's I of the field's energy density.
+    pub field_morans_i: Option<f64>,
+    /// Sampled: the mean speed, world units per simulated second.
+    pub mean_speed: Option<f64>,
+    /// Sampled: the fraction of organisms moving.
+    pub moving_fraction: Option<f64>,
+}
+
+impl LastRecord {
+    /// The end of a run as `metrics`, its last record, holds it.
+    #[must_use]
+    pub fn of(metrics: &Metrics) -> Self {
+        let sampled = &metrics.sampled;
+        Self {
+            tick: metrics.tick,
+            lineage_entropy: metrics.lineages.entropy,
+            dominant_lineage_share: metrics.lineages.dominant_share,
+            mean_generation: metrics.population.mean_generation,
+            occupied_fraction: sampled.dispersion.occupied,
+            organism_morisita: sampled.dispersion.morisita,
+            organism_morans_i: sampled.dispersion.morans_i,
+            field_gini: sampled.resources.gini,
+            field_morans_i: sampled.resources.morans_i,
+            mean_speed: sampled.motility.mean_speed,
+            moving_fraction: sampled.motility.moving,
+        }
+    }
 }
 
 fn wide(value: usize) -> u64 {
@@ -660,9 +729,11 @@ fn wide(value: usize) -> u64 {
 
 impl Measures {
     /// The measures of a run with `tally` whose committed world is
-    /// `survey`.
+    /// `survey`, and whose last metrics record, if any, is `last`. A record
+    /// of another tick than the survey's is not the run's end and is not
+    /// used.
     #[must_use]
-    pub fn of(tally: &Tally, survey: &Survey) -> Self {
+    pub fn of(tally: &Tally, survey: &Survey, last: Option<&Metrics>) -> Self {
         Self {
             survived: u64::from(survey.live > 0),
             final_live: wide(survey.live),
@@ -677,6 +748,10 @@ impl Measures {
             emission_paid: tally.emission_paid,
             topology_changes: tally.topology_changes,
             mutated_parameters: tally.perturbed_parameters + tally.replaced_parameters,
+            topologies_alive: wide(survey.topologies.values().filter(|&&live| live > 0).count()),
+            last: last
+                .filter(|metrics| metrics.tick == survey.tick)
+                .map(LastRecord::of),
         }
     }
 }
@@ -689,24 +764,90 @@ const fn real(value: u64) -> f64 {
     value as f64
 }
 
-/// How a measure is read from a run's [`Measures`].
-pub type Read = fn(&Measures) -> f64;
+/// How a measure is read from a run's [`Measures`]: none when it is
+/// undefined for that run.
+pub type Read = fn(&Measures) -> Option<f64>;
 
-/// Every measure the report compares, by name.
-pub const MEASURES: [(&str, Read); 13] = [
-    ("survived", |m| real(m.survived)),
-    ("final_live", |m| real(m.final_live)),
-    ("peak_live", |m| real(m.peak_live)),
-    ("least_live", |m| real(m.least_live)),
-    ("births", |m| real(m.births)),
-    ("deaths", |m| real(m.deaths)),
-    ("max_generation", |m| real(m.max_generation)),
-    ("lineages_alive", |m| real(m.lineages_alive)),
-    ("distinct_genomes", |m| real(m.distinct_genomes)),
-    ("emitter_ticks", |m| real(m.emitter_ticks)),
-    ("emission_paid", |m| m.emission_paid),
-    ("topology_changes", |m| real(m.topology_changes)),
-    ("mutated_parameters", |m| real(m.mutated_parameters)),
+/// One measure a report compares.
+#[derive(Debug, Clone, Copy)]
+pub struct Measure {
+    /// Its name.
+    pub name: &'static str,
+    /// What it is computed from (§15.2).
+    pub basis: &'static str,
+    /// How it is read.
+    pub read: Read,
+}
+
+/// Complete over the whole run: every published tick's report.
+pub const RUN_TALLY: &str = "complete: every tick of the run";
+/// Complete at the end: the committed world.
+pub const END_STATE: &str = "complete: the committed world at the end";
+/// Sampled at the end: the render epoch at the last metrics record.
+pub const END_SAMPLE: &str = "sampled: the render epoch at the last metrics record";
+
+const fn tally(name: &'static str, read: Read) -> Measure {
+    Measure {
+        name,
+        basis: RUN_TALLY,
+        read,
+    }
+}
+
+const fn end(name: &'static str, read: Read) -> Measure {
+    Measure {
+        name,
+        basis: END_STATE,
+        read,
+    }
+}
+
+const fn sample(name: &'static str, read: Read) -> Measure {
+    Measure {
+        name,
+        basis: END_SAMPLE,
+        read,
+    }
+}
+
+/// Every measure the report compares, by name, with its basis.
+pub const MEASURES: [Measure; 24] = [
+    end("survived", |m| Some(real(m.survived))),
+    end("final_live", |m| Some(real(m.final_live))),
+    tally("peak_live", |m| Some(real(m.peak_live))),
+    tally("least_live", |m| Some(real(m.least_live))),
+    tally("births", |m| Some(real(m.births))),
+    tally("deaths", |m| Some(real(m.deaths))),
+    end("max_generation", |m| Some(real(m.max_generation))),
+    end("lineages_alive", |m| Some(real(m.lineages_alive))),
+    end("distinct_genomes", |m| Some(real(m.distinct_genomes))),
+    tally("emitter_ticks", |m| Some(real(m.emitter_ticks))),
+    tally("emission_paid", |m| Some(m.emission_paid)),
+    tally("topology_changes", |m| Some(real(m.topology_changes))),
+    tally("mutated_parameters", |m| Some(real(m.mutated_parameters))),
+    end("topologies_alive", |m| Some(real(m.topologies_alive))),
+    end("lineage_entropy", |m| {
+        m.last.and_then(|l| l.lineage_entropy)
+    }),
+    end("dominant_lineage_share", |m| {
+        m.last.and_then(|l| l.dominant_lineage_share)
+    }),
+    end("mean_generation", |m| {
+        m.last.and_then(|l| l.mean_generation)
+    }),
+    sample("occupied_fraction", |m| m.last.map(|l| l.occupied_fraction)),
+    sample("organism_morisita", |m| {
+        m.last.and_then(|l| l.organism_morisita)
+    }),
+    sample("organism_morans_i", |m| {
+        m.last.and_then(|l| l.organism_morans_i)
+    }),
+    sample("field_gini", |m| m.last.and_then(|l| l.field_gini)),
+    sample("field_morans_i", |m| m.last.and_then(|l| l.field_morans_i)),
+    sample("mean_speed", |m| m.last.and_then(|l| l.mean_speed)),
+    sample("moving_fraction", |m| {
+        m.last.and_then(|l| l.moving_fraction)
+    }),
 ];
 
 /// A run's scientific result, as cataloged.
@@ -738,7 +879,7 @@ impl RunResult {
         self.status == "reached"
     }
 
-    fn of(finished: &Finished) -> Self {
+    fn of(finished: &Finished, last: Option<&Metrics>) -> Self {
         let (status, detail) = match &finished.stop {
             Stop::Reached => ("reached", None),
             Stop::CapacityPaused { detail } => ("capacity-paused", Some(detail.clone())),
@@ -750,7 +891,7 @@ impl RunResult {
             tick: finished.closed.boundary.tick.get(),
             digest: Some(finished.closed.world.digest().to_hex()),
             extinct: finished.survey.live == 0,
-            measures: Some(Measures::of(&finished.tally, &finished.survey)),
+            measures: Some(Measures::of(&finished.tally, &finished.survey, last)),
         }
     }
 
@@ -1019,7 +1160,7 @@ pub enum ExperimentRecord {
         /// Its seed.
         seed: u64,
         /// Its result.
-        result: RunResult,
+        result: Box<RunResult>,
         /// Wall-clock seconds it took. Not scientific state.
         wall_seconds: f64,
     },
@@ -1243,7 +1384,7 @@ fn run_all(
             condition: cataloged.row.condition.clone(),
             split: run.split,
             seed: run.seed,
-            result: cataloged.result,
+            result: Box::new(cataloged.result),
             wall_seconds: cataloged.wall_seconds,
         });
     }
@@ -1270,6 +1411,8 @@ fn run_one(
         .ok_or_else(|| spec_error("conditions", format!("no condition {}", planned.condition)))?;
     let lines = Arc::new(Mutex::new(String::new()));
     let sink = Arc::clone(&lines);
+    let last_metrics: Arc<Mutex<Option<Metrics>>> = Arc::new(Mutex::new(None));
+    let last_sink = Arc::clone(&last_metrics);
     let clock = Instant::now();
     let config = experiment.configuration(planned.condition, planned.seed);
     let finished = config.as_ref().map_err(Clone::clone).and_then(|config| {
@@ -1285,6 +1428,10 @@ fn run_one(
             &[],
             None,
             move |record| {
+                if let Record::Metrics(metrics) = record {
+                    *last_sink.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(metrics.as_ref().clone());
+                }
                 if let Ok(line) = serde_json::to_string(record) {
                     let mut held = sink.lock().unwrap_or_else(PoisonError::into_inner);
                     held.push_str(&line);
@@ -1295,7 +1442,13 @@ fn run_one(
     });
     let wall_seconds = clock.elapsed().as_secs_f64();
     let result = match &finished {
-        Ok(finished) => RunResult::of(finished),
+        Ok(finished) => RunResult::of(
+            finished,
+            last_metrics
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref(),
+        ),
         Err(error) => RunResult::error(error),
     };
     let mut records = std::mem::take(&mut *lines.lock().unwrap_or_else(PoisonError::into_inner));
@@ -1422,8 +1575,8 @@ fn results(runs: &[CatalogedRun]) -> Result<Vec<(CatalogedRun, RunResult)>, Core
 fn measure_of(name: &str) -> Option<Read> {
     MEASURES
         .iter()
-        .find(|(measure, _)| *measure == name)
-        .map(|(_, read)| *read)
+        .find(|measure| measure.name == name)
+        .map(|measure| measure.read)
 }
 
 /// Apply the specification's selection rule to the cataloged discovery
@@ -1450,7 +1603,7 @@ fn select(experiment: &Experiment, runs: &[CatalogedRun]) -> Result<Option<Selec
             .filter(|(run, result)| {
                 run.condition == condition.name && run.split == DISCOVERY && result.complete()
             })
-            .filter_map(|(_, result)| result.measures.as_ref().map(read))
+            .filter_map(|(_, result)| result.measures.as_ref().and_then(read))
             .collect();
         let average = mean(&values);
         if let Some(average) = average {
@@ -1496,7 +1649,7 @@ pub struct ReportedRun {
 /// One measure's paired comparison of a condition with the control.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Effect {
-    /// Paired seeds: both runs complete.
+    /// Paired seeds with the measure defined in both runs.
     pub n: usize,
     /// The control's mean over them.
     pub control_mean: f64,
@@ -1517,6 +1670,10 @@ pub struct Effect {
     pub p_two_sided: Option<f64>,
     /// Condition minus control, seed by seed, in seed order.
     pub differences: Vec<f64>,
+    /// Paired seeds left out because the measure is undefined in either
+    /// run (a sampled statistic of an empty or uniform world), in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub undefined_seeds: Vec<u64>,
 }
 
 /// One condition compared with the control over one split.
@@ -1580,10 +1737,21 @@ pub struct Report {
     pub selection: Selection,
     /// Run counts by condition, then split.
     pub counts: BTreeMap<String, BTreeMap<String, Counts>>,
+    /// Each measure compared, in order, with its basis (§15.2).
+    pub measures: Vec<ReportedMeasure>,
     /// Every comparison of a condition with the control, discovery first.
     pub comparisons: Vec<Comparison>,
     /// Every cataloged run, in run order: none left out.
     pub runs: Vec<ReportedRun>,
+}
+
+/// A measure as the report declares it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReportedMeasure {
+    /// Its name.
+    pub name: &'static str,
+    /// What it is computed from.
+    pub basis: &'static str,
 }
 
 /// The exact two-sided sign-flip p-value of the mean of `differences`.
@@ -1615,7 +1783,7 @@ pub fn sign_flip_p(differences: &[f64]) -> Option<f64> {
     Some(real(extreme) / real(total))
 }
 
-fn effect(pairs: &[(f64, f64)]) -> Effect {
+fn effect(pairs: &[(f64, f64)], undefined_seeds: Vec<u64>) -> Effect {
     let differences: Vec<f64> = pairs
         .iter()
         .map(|(control, condition)| condition - control)
@@ -1632,6 +1800,7 @@ fn effect(pairs: &[(f64, f64)]) -> Effect {
         equal: differences.iter().filter(|d| **d == 0.0).count(),
         p_two_sided: sign_flip_p(&differences),
         differences,
+        undefined_seeds,
     }
 }
 
@@ -1708,10 +1877,16 @@ impl Report {
                 }
                 let effects = MEASURES
                     .iter()
-                    .map(|&(name, read)| {
-                        let pairs: Vec<(f64, f64)> =
-                            paired.iter().map(|(_, a, b)| (read(a), read(b))).collect();
-                        (name, effect(&pairs))
+                    .map(|measure| {
+                        let mut pairs = Vec::new();
+                        let mut undefined = Vec::new();
+                        for (seed, a, b) in &paired {
+                            match ((measure.read)(a), (measure.read)(b)) {
+                                (Some(a), Some(b)) => pairs.push((a, b)),
+                                _ => undefined.push(*seed),
+                            }
+                        }
+                        (measure.name, effect(&pairs, undefined))
                     })
                     .collect();
                 comparisons.push(Comparison {
@@ -1741,6 +1916,13 @@ impl Report {
                 candidates: Vec::new(),
             }),
             counts,
+            measures: MEASURES
+                .iter()
+                .map(|measure| ReportedMeasure {
+                    name: measure.name,
+                    basis: measure.basis,
+                })
+                .collect(),
             comparisons,
             runs: results
                 .into_iter()

@@ -31,11 +31,13 @@ use std::fs;
 use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use flife_cli::experiment::{DISCOVERY, EXACT_TEST_MAX_SEEDS, HELD_OUT, RUNS_DIR, sign_flip_p};
 use flife_cli::{
     ABLATIONS, ControllerChoice, EXPERIMENT_CATALOG_FILE, Experiment, ExperimentOptions,
-    ExperimentRecord, MANIFEST_SCHEMA, MEASURES, REPORT_FILE, Report, RunResult, Spec,
+    ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measures, Metrics, REPORT_FILE,
+    Record, Report, RunOptions, RunResult, Spec,
 };
 use flife_core::{CoreError, Sha256Digest};
 use flife_store::{CatalogedRun, ExperimentCatalog};
@@ -202,20 +204,28 @@ fn check_comparisons(report: &Report) {
                 .collect();
             assert_eq!(comparison.seeds, paired);
             assert_eq!(comparison.unpaired_seeds.len() + paired.len(), seeds.len());
-            for (name, read) in MEASURES {
+            for measure in MEASURES {
+                let name = measure.name;
                 let effect = &comparison.effects[name];
-                let pairs: Vec<(f64, f64)> = paired
-                    .iter()
-                    .map(|&seed| {
-                        let a = find(&report.control, split, seed)
-                            .and_then(|r| r.measures)
-                            .expect("measures");
-                        let b = find(&condition.name, split, seed)
-                            .and_then(|r| r.measures)
-                            .expect("measures");
-                        (read(&a), read(&b))
-                    })
-                    .collect();
+                let mut pairs: Vec<(f64, f64)> = Vec::new();
+                let mut undefined = Vec::new();
+                for &seed in &paired {
+                    let a = find(&report.control, split, seed)
+                        .and_then(|r| r.measures)
+                        .expect("measures");
+                    let b = find(&condition.name, split, seed)
+                        .and_then(|r| r.measures)
+                        .expect("measures");
+                    match ((measure.read)(&a), (measure.read)(&b)) {
+                        (Some(a), Some(b)) => pairs.push((a, b)),
+                        _ => undefined.push(seed),
+                    }
+                }
+                assert_eq!(
+                    effect.undefined_seeds, undefined,
+                    "{split} {} {name}",
+                    condition.name
+                );
                 let differences: Vec<f64> = pairs.iter().map(|(a, b)| b - a).collect();
                 assert_eq!(
                     effect.differences, differences,
@@ -505,9 +515,72 @@ name = "journaled"
                     assert_eq!(last["record"], "end");
                     assert_eq!(last["digest"], result.digest.clone().expect("a digest"));
                     assert_eq!(last["tick"], result.tick);
-                    assert!(
-                        text.lines()
-                            .any(|line| line.contains("\"record\":\"metrics\""))
+                    // The last metrics record is at the run's end, and the
+                    // result's last-record measures are what it says.
+                    let metrics: Value = text
+                        .lines()
+                        .rev()
+                        .map(|line| serde_json::from_str::<Value>(line).expect("JSON"))
+                        .find(|line| line["record"] == "metrics")
+                        .expect("a metrics record");
+                    assert_eq!(metrics["tick"], result.tick);
+                    let held = result.measures.and_then(|m| m.last).expect("a last record");
+                    let number = |value: &Value| value.as_f64();
+                    assert_eq!(held.tick, result.tick);
+                    assert_eq!(
+                        held.lineage_entropy,
+                        number(&metrics["lineages"]["entropy"])
+                    );
+                    assert_eq!(
+                        held.dominant_lineage_share,
+                        number(&metrics["lineages"]["dominant_share"])
+                    );
+                    assert_eq!(
+                        held.mean_generation,
+                        number(&metrics["population"]["mean_generation"])
+                    );
+                    let sampled = &metrics["sampled"];
+                    assert_eq!(
+                        Some(held.occupied_fraction),
+                        number(&sampled["dispersion"]["occupied"])
+                    );
+                    assert_eq!(
+                        held.organism_morisita,
+                        number(&sampled["dispersion"]["morisita"])
+                    );
+                    assert_eq!(
+                        held.organism_morans_i,
+                        number(&sampled["dispersion"]["morans_i"])
+                    );
+                    assert_eq!(held.field_gini, number(&sampled["resources"]["gini"]));
+                    assert_eq!(
+                        held.field_morans_i,
+                        number(&sampled["resources"]["morans_i"])
+                    );
+                    assert_eq!(held.mean_speed, number(&sampled["motility"]["mean_speed"]));
+                    assert_eq!(held.moving_fraction, number(&sampled["motility"]["moving"]));
+                    // An extinct world has nothing to clump or move.
+                    if extinct {
+                        assert_eq!(
+                            (
+                                held.organism_morisita,
+                                held.mean_speed,
+                                held.lineage_entropy
+                            ),
+                            (None, None, None)
+                        );
+                    } else {
+                        assert!(held.organism_morisita.is_some() && held.lineage_entropy.is_some());
+                    }
+                    let topologies = last["survey"]["topologies"]
+                        .as_object()
+                        .expect("topologies")
+                        .values()
+                        .filter(|live| live.as_u64() > Some(0))
+                        .count();
+                    assert_eq!(
+                        result.measures.expect("measures").topologies_alive,
+                        topologies as u64
                     );
                 }
 
@@ -577,6 +650,13 @@ name = "journaled"
                 let survived = &comparison.effects["survived"];
                 assert_eq!(survived.mean_difference, -1.0, "extinct runs are compared");
                 assert_eq!(survived.lower, survived.n);
+                // A sampled statistic of an extinct world is undefined: the
+                // effect names every paired seed it leaves out.
+                let clumping = &comparison.effects["organism_morisita"];
+                assert_eq!(clumping.n, 0);
+                assert_eq!(clumping.undefined_seeds, comparison.seeds);
+                // The field still has a texture.
+                assert_eq!(comparison.effects["field_gini"].n, comparison.seeds.len());
             }
             _ => {
                 assert!(comparison.seeds.is_empty(), "{}", comparison.condition);
@@ -589,6 +669,19 @@ name = "journaled"
         .filter(|record| matches!(record, ExperimentRecord::ExperimentRun { .. }))
         .count();
     assert_eq!(ended, rows.len());
+    // The report declares every measure's basis (§15.2).
+    let declared: Vec<(&str, &str)> = report
+        .measures
+        .iter()
+        .map(|measure| (measure.name, measure.basis))
+        .collect();
+    assert_eq!(declared.len(), MEASURES.len());
+    for (name, basis) in declared {
+        let sampled = name.starts_with("organism_")
+            || name.starts_with("field_")
+            || ["occupied_fraction", "mean_speed", "moving_fraction"].contains(&name);
+        assert_eq!(basis.starts_with("sampled:"), sampled, "{name}: {basis}");
+    }
 }
 
 #[test]
@@ -812,6 +905,44 @@ discovery = [5]
     assert!(share(&fresh) < 0.25, "{fresh}");
 }
 
+#[test]
+fn a_run_is_measured_by_its_last_metrics_record_only_at_its_end() {
+    let text = format!(
+        "schema = \"frankenlife.experiment.v1\"\nbase = \"base.toml\"\n{EMISSION}\n{ECOLOGY}\n{EMISSION_CONDITIONS}"
+    );
+    let experiment = Experiment::new(spec(&text), appendix_a()).expect("resolves");
+    let config = experiment.configuration(0, 3).expect("a configuration");
+    let held: Arc<Mutex<Vec<Metrics>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&held);
+    let finished = flife_cli::run(
+        &config,
+        RunOptions {
+            ticks: 120,
+            every: 0,
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+            metrics_every: 50,
+        },
+        move |record| {
+            if let Record::Metrics(metrics) = record {
+                sink.lock()
+                    .expect("the records")
+                    .push(metrics.as_ref().clone());
+            }
+        },
+    )
+    .expect("the run");
+    let records = held.lock().expect("the records").clone();
+    let ticks: Vec<u64> = records.iter().map(|metrics| metrics.tick).collect();
+    assert_eq!(ticks, [50, 100, 120]);
+    let measure =
+        |last: Option<&Metrics>| Measures::of(&finished.tally, &finished.survey, last).last;
+    assert_eq!(measure(records.last()), Some(LastRecord::of(&records[2])));
+    // A record of another tick is not the run's end.
+    assert_eq!(measure(Some(&records[1])), None);
+    assert_eq!(measure(None), None);
+}
+
 fn spec(text: &str) -> Spec {
     toml::from_str(text).expect("parses")
 }
@@ -825,6 +956,18 @@ fn specifications_that_would_hide_a_choice_are_refused() {
     let accepted = Experiment::new(spec(&good), base).expect("the good specification resolves");
     // An ablation's keys and a condition's own overrides are resolved and
     // recorded: nothing about a condition is implicit.
+    // The identity covers the measures: a catalog measured by another set is
+    // another experiment.
+    let design: Value = serde_json::from_str(accepted.design()).expect("JSON");
+    let names: Vec<&str> = MEASURES.iter().map(|measure| measure.name).collect();
+    assert_eq!(
+        design["measures"],
+        serde_json::to_value(&names).expect("JSON")
+    );
+    assert_eq!(
+        accepted.identity(),
+        Sha256Digest::of(accepted.design().as_bytes())
+    );
     let chemistry = &accepted.conditions[2];
     assert_eq!(chemistry.ablation, Some("chemistry-only"));
     assert_eq!(

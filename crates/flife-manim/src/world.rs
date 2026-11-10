@@ -2,12 +2,13 @@
 //! field, one particle cloud and its density layer, drawn in one [`Style`].
 
 use flife_core::CoreError;
+use flife_core::ids::OrganismId;
 use flife_render::{Epoch, Prior};
 use fmn_core::color::{LinearRgba, Srgb};
-use fmn_render::{ThreeDCamera, ThreeDDraw, ThreeDJob, Tiling};
+use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDCamera, ThreeDDraw, ThreeDJob, Tiling};
 
 use crate::mapping::{Look, Particles, Style};
-use crate::{DensityLayer, FieldLayer, ParticleCloud, Viewport};
+use crate::{DensityLayer, FieldLayer, ParticleCloud, Viewport, pick, selection_ring};
 
 /// A `#rrggbb` colour, as `[presentation] background` spells it.
 #[must_use]
@@ -26,6 +27,11 @@ pub fn hex_rgb(text: &str) -> Option<[u8; 3]> {
 /// the camera fitted to the current drawable. The view holds the epoch it
 /// last showed as a [`Prior`], so a host can tell what is on screen and
 /// request only newer epochs.
+///
+/// It also keeps the shown epoch's identities and positions, so a pick
+/// reads the epoch on screen, and at most one selected organism, held by
+/// identity: every newly shown epoch revalidates it, and an organism the
+/// epoch no longer has is deselected, whatever occupies its old slot.
 #[derive(Debug)]
 pub struct WorldView {
     background: LinearRgba,
@@ -36,6 +42,12 @@ pub struct WorldView {
     density: DensityLayer,
     style: Style,
     shown: Option<Prior>,
+    /// The shown epoch's identities, in identity order.
+    ids: Vec<u64>,
+    /// The shown epoch's positions, row for row with `ids`.
+    positions: Vec<[f32; 2]>,
+    selected: Option<OrganismId>,
+    ring: Option<SurfaceMesh>,
 }
 
 impl WorldView {
@@ -54,6 +66,17 @@ impl WorldView {
         let viewport = Viewport::fit(extent, drawable)?;
         let [r, g, b] = background;
         let background = Srgb::from_rgb8(r, g, b).to_linear(1.0);
+        let refused = |buffer, each: usize| CoreError::AllocationFailed {
+            buffer,
+            bytes: u64::try_from(capacity.saturating_mul(each)).unwrap_or(u64::MAX),
+        };
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(capacity)
+            .map_err(|_| refused("world view identities", size_of::<u64>()))?;
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(capacity)
+            .map_err(|_| refused("world view positions", size_of::<[f32; 2]>()))?;
         Ok(Self {
             camera: viewport.camera(background)?,
             background,
@@ -63,6 +86,10 @@ impl WorldView {
             cloud: ParticleCloud::with_capacity(capacity)?,
             style: Style::default(),
             shown: None,
+            ids,
+            positions,
+            selected: None,
+            ring: None,
         })
     }
 
@@ -125,8 +152,13 @@ impl WorldView {
 
     fn adopt(&mut self, viewport: Viewport) -> Result<(), CoreError> {
         let camera = viewport.camera(self.background)?;
+        let ring = match self.selected_position() {
+            Some(position) => Some(selection_ring(&viewport, position)?),
+            None => None,
+        };
         self.viewport = viewport;
         self.camera = camera;
+        self.ring = ring;
         self.cloud.refit(&self.viewport);
         self.density.refit(&self.viewport);
         self.field.refit(&self.viewport);
@@ -159,11 +191,7 @@ impl WorldView {
             self.density.update(epoch, &style)?;
         }
         self.field.update_look(epoch.field(), style.look)?;
-        self.shown = Some(Prior {
-            id: epoch.id(),
-            tick: epoch.tick(),
-        });
-        Ok(())
+        self.remember(epoch)
     }
 
     /// Draw `epoch` again at the current viewport and style without moving
@@ -180,16 +208,107 @@ impl WorldView {
             self.density.place(&style)?;
         }
         self.field.place(epoch.field(), style.look)?;
+        self.remember(epoch)
+    }
+
+    /// Keep `epoch` as the shown one: its identities and positions, and the
+    /// selection only if the epoch still has that identity.
+    fn remember(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),
         });
+        // The cloud has already refused an epoch above the ceiling these
+        // were reserved for, so neither grows.
+        self.ids.clear();
+        self.ids.extend_from_slice(epoch.ids());
+        self.positions.clear();
+        self.positions.extend_from_slice(epoch.positions());
+        self.reselect(self.selected)
+    }
+
+    fn reselect(&mut self, organism: Option<OrganismId>) -> Result<(), CoreError> {
+        let row = organism.and_then(|id| self.ids.binary_search(&id.get()).ok());
+        match row {
+            Some(row) => {
+                let position = self.positions[row].map(f64::from);
+                self.ring = Some(selection_ring(&self.viewport, position)?);
+                self.selected = organism;
+            }
+            None => {
+                self.ring = None;
+                self.selected = None;
+            }
+        }
         Ok(())
     }
 
+    /// The organism drawn nearest the drawable position `at`, within
+    /// `radius_pixels`, among the shown epoch's rows placed through
+    /// `viewport` (this view's, or one a host is about to set): see
+    /// [`pick`].
+    #[must_use]
+    pub fn pick_in(
+        &self,
+        viewport: &Viewport,
+        at: [f64; 2],
+        radius_pixels: f64,
+    ) -> Option<OrganismId> {
+        pick(viewport, self.shown_rows(), at, radius_pixels)
+    }
+
+    /// The shown epoch's rows: each organism's identity and world position,
+    /// in identity order.
+    pub fn shown_rows(&self) -> impl Iterator<Item = (u64, [f64; 2])> + '_ {
+        self.ids
+            .iter()
+            .zip(&self.positions)
+            .map(|(&id, position)| (id, position.map(f64::from)))
+    }
+
+    /// Select `organism`, or nothing. An identity the shown epoch does not
+    /// have selects nothing. Returns the selection now held.
+    ///
+    /// # Errors
+    /// As [`selection_ring`]; the selection is unchanged on error.
+    pub fn select(
+        &mut self,
+        organism: Option<OrganismId>,
+    ) -> Result<Option<OrganismId>, CoreError> {
+        self.reselect(organism)?;
+        Ok(self.selected)
+    }
+
+    /// The selected organism, which the shown epoch has.
+    #[must_use]
+    pub const fn selected(&self) -> Option<OrganismId> {
+        self.selected
+    }
+
+    /// The selected organism's world position in the shown epoch.
+    #[must_use]
+    pub fn selected_position(&self) -> Option<[f64; 2]> {
+        let id = self.selected?.get();
+        let row = self.ids.binary_search(&id).ok()?;
+        Some(self.positions[row].map(f64::from))
+    }
+
+    /// The selection ring's draw, while an organism is selected: unlit,
+    /// over everything else.
+    #[must_use]
+    pub fn selection_draw(&self) -> Option<ThreeDDraw<'_>> {
+        self.ring.as_ref().map(|mesh| {
+            ThreeDDraw::Surface(SurfaceDraw {
+                shading: [0.0; 3],
+                depth_test: false,
+                ..SurfaceDraw::new(mesh)
+            })
+        })
+    }
+
     /// The current frame's draws in painter order: the field, then the
-    /// density layer, or every halo and then every dot. Raw density is
-    /// opaque, so the field is left out under it.
+    /// density layer, or every halo and then every dot, then the selection
+    /// ring. Raw density is opaque, so the field is left out under it.
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the list cannot be reserved.
@@ -200,11 +319,11 @@ impl WorldView {
         let dots = self.cloud.draws();
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
         draws
-            .try_reserve_exact(2 + halos.len() + dots.len())
+            .try_reserve_exact(3 + halos.len() + dots.len())
             .map_err(|_| CoreError::AllocationFailed {
                 buffer: "world view frame draws",
                 bytes: u64::try_from(
-                    (2 + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
+                    (3 + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
                 )
                 .unwrap_or(u64::MAX),
             })?;
@@ -217,6 +336,7 @@ impl WorldView {
             draws.extend_from_slice(halos);
             draws.extend_from_slice(dots);
         }
+        draws.extend(self.selection_draw());
         Ok(draws)
     }
 
@@ -294,10 +414,11 @@ impl WorldView {
     }
 
     /// Scene objects in the view: the field layer, the one particle cloud
-    /// however many organisms it draws, and its density layer.
+    /// however many organisms it draws, its density layer, and the
+    /// selection ring.
     #[must_use]
     pub const fn scene_objects(&self) -> usize {
-        3
+        4
     }
 
     /// The density layer.

@@ -2,7 +2,10 @@
 //! state, as a pure state machine (no window).
 
 use flife_manim::Viewport;
-use flife_studio::{Controls, Intent, KEY_ESCAPE, KEY_PERIOD, KEY_RIGHT, KEY_SPACE, KEY_W};
+use flife_studio::{
+    CameraMove, Controls, Intent, KEY_ESCAPE, KEY_PERIOD, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_ZERO,
+    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+};
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
 };
@@ -236,4 +239,200 @@ fn a_refused_resume_leaves_the_controls_paused() {
     });
     assert!(!controls.running());
     assert_eq!(tap(&mut controls, KEY_SPACE), [Intent::Resume]);
+}
+
+fn button(pressed: bool, at: LogicalPoint) -> InputEvent {
+    InputEvent::Button {
+        button: PointerButton::Primary,
+        pressed,
+        position: at,
+        clicks: 1,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+fn drag_to(at: LogicalPoint) -> InputEvent {
+    InputEvent::PointerMoved {
+        position: at,
+        buttons: ButtonSet::EMPTY.with(PointerButton::Primary),
+        modifiers: Modifiers::NONE,
+    }
+}
+
+fn moves(controls: &mut Controls) -> Vec<CameraMove> {
+    controls.take_moves().collect()
+}
+
+/// FL-020: a press that moves beyond the slop is a drag. Its first pan is
+/// the whole motion since the press, then each move; the pans sum to the
+/// pointer's whole motion, and the release selects nothing.
+#[test]
+fn a_drag_pans_by_the_whole_pointer_motion_and_selects_nothing() {
+    let mut controls = Controls::new();
+    controls.apply(&button(true, point(100.0, 100.0)));
+    // Within the slop: still a click candidate, no pan.
+    controls.apply(&drag_to(point(102.0, 103.0)));
+    assert!(moves(&mut controls).is_empty());
+    assert!(!controls.dragging());
+    controls.apply(&drag_to(point(110.0, 96.0)));
+    controls.apply(&drag_to(point(130.5, 80.0)));
+    controls.apply(&drag_to(point(130.5, 80.0)));
+    controls.apply(&button(false, point(131.0, 79.0)));
+    let made = moves(&mut controls);
+    assert_eq!(
+        made,
+        [
+            CameraMove::Pan {
+                delta: [10.0, -4.0]
+            },
+            CameraMove::Pan {
+                delta: [20.5, -16.0]
+            },
+        ]
+    );
+    let total = made.iter().fold([0.0, 0.0], |sum, change| match change {
+        CameraMove::Pan { delta } => [sum[0] + delta[0], sum[1] + delta[1]],
+        _ => sum,
+    });
+    assert_eq!(total, [30.5, -20.0]);
+    assert!(!controls.dragging());
+    assert_eq!(controls.tally().moves, 2);
+}
+
+/// A press released within the slop is a click: one selection at the
+/// press. A secondary press, a press lost to capture loss, and motion with
+/// no press make no move.
+#[test]
+fn a_click_selects_where_it_pressed_and_lost_presses_select_nothing() {
+    let mut controls = Controls::new();
+    controls.apply(&button(true, point(40.0, 50.0)));
+    controls.apply(&drag_to(point(42.0, 52.0)));
+    controls.apply(&button(false, point(42.0, 52.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [CameraMove::Select {
+            at: point(40.0, 50.0)
+        }]
+    );
+
+    controls.apply(&InputEvent::Button {
+        button: PointerButton::Secondary,
+        pressed: true,
+        position: point(1.0, 1.0),
+        clicks: 1,
+        modifiers: Modifiers::NONE,
+    });
+    controls.apply(&InputEvent::Button {
+        button: PointerButton::Secondary,
+        pressed: false,
+        position: point(1.0, 1.0),
+        clicks: 1,
+        modifiers: Modifiers::NONE,
+    });
+    controls.apply(&InputEvent::PointerMoved {
+        position: point(300.0, 300.0),
+        buttons: ButtonSet::EMPTY,
+        modifiers: Modifiers::NONE,
+    });
+    assert!(moves(&mut controls).is_empty());
+
+    controls.apply(&button(true, point(10.0, 10.0)));
+    controls.apply(&InputEvent::PointerCaptureLost {
+        released: ButtonSet::EMPTY.with(PointerButton::Primary),
+    });
+    controls.apply(&button(false, point(10.0, 10.0)));
+    controls.apply(&drag_to(point(90.0, 90.0)));
+    assert!(moves(&mut controls).is_empty(), "a lost press is no click");
+
+    // A drag lost to capture loss pans no further.
+    controls.apply(&button(true, point(0.0, 0.0)));
+    controls.apply(&drag_to(point(20.0, 0.0)));
+    controls.apply(&InputEvent::PointerCaptureLost {
+        released: ButtonSet::EMPTY.with(PointerButton::Primary),
+    });
+    controls.apply(&drag_to(point(40.0, 0.0)));
+    controls.apply(&button(false, point(40.0, 0.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [CameraMove::Pan { delta: [20.0, 0.0] }]
+    );
+}
+
+/// A vertical scroll zooms about the pointer by `exp(rate · dy)`: up in,
+/// down out, by points or lines; no movement, a horizontal scroll, and
+/// non-finite deltas make no move; a huge scroll is limited.
+#[test]
+fn a_scroll_zooms_about_the_pointer() {
+    assert_eq!(scroll_zoom(50.0, ScrollUnit::Points), Some((0.5_f64).exp()));
+    assert_eq!(scroll_zoom(-3.0, ScrollUnit::Lines), Some((-0.3_f64).exp()));
+    assert_eq!(scroll_zoom(0.0, ScrollUnit::Points), None);
+    assert_eq!(scroll_zoom(f64::NAN, ScrollUnit::Points), None);
+    assert_eq!(
+        scroll_zoom(1e9, ScrollUnit::Points),
+        Some(ZOOM_STEP_LIMIT.exp())
+    );
+    assert_eq!(
+        scroll_zoom(-1e9, ScrollUnit::Lines),
+        Some((-ZOOM_STEP_LIMIT).exp())
+    );
+    const { assert!(ZOOM_PER_POINT > 0.0 && ZOOM_PER_LINE > ZOOM_PER_POINT) };
+
+    let mut controls = Controls::new();
+    let scroll = |dy, unit| InputEvent::Scroll {
+        delta: [7.0, dy],
+        unit,
+        position: point(12.0, 34.0),
+        modifiers: Modifiers::NONE,
+    };
+    controls.apply(&scroll(50.0, ScrollUnit::Points));
+    controls.apply(&scroll(0.0, ScrollUnit::Points));
+    controls.apply(&scroll(-2.0, ScrollUnit::Lines));
+    assert_eq!(
+        moves(&mut controls),
+        [
+            CameraMove::Zoom {
+                anchor: point(12.0, 34.0),
+                factor: (0.5_f64).exp()
+            },
+            CameraMove::Zoom {
+                anchor: point(12.0, 34.0),
+                factor: (-0.2_f64).exp()
+            },
+        ]
+    );
+    assert_eq!(controls.tally().scrolls, 3);
+}
+
+/// 0 asks for the whole torus again; held (auto-repeat) or with ⌘ it does
+/// nothing, and it is no style key.
+#[test]
+fn zero_resets_the_view() {
+    let mut controls = Controls::new();
+    let style = controls.style();
+    assert!(tap(&mut controls, KEY_ZERO).is_empty());
+    controls.apply(&key(KEY_ZERO, true, true, Modifiers::NONE));
+    controls.apply(&key(
+        KEY_ZERO,
+        true,
+        false,
+        Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        },
+    ));
+    assert_eq!(moves(&mut controls), [CameraMove::Reset]);
+    assert_eq!(controls.style(), style);
+}
+
+/// Moves wait, in order, until taken; reserving room for one poll's events
+/// lets that many accumulate.
+#[test]
+fn moves_are_kept_in_order_until_taken() {
+    let mut controls = Controls::new();
+    controls.reserve_moves(256).expect("reserved");
+    for _ in 0..256 {
+        tap(&mut controls, KEY_ZERO);
+    }
+    assert_eq!(moves(&mut controls).len(), 256);
+    assert!(moves(&mut controls).is_empty());
 }

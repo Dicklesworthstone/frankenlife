@@ -3,9 +3,19 @@
 //! [`Controls`] is a pure state machine over the native host's
 //! [`InputEvent`]s. It turns keys into [`Intent`]s for the session and keeps
 //! what the presentation owner needs itself: the pointer, held buttons,
-//! focus and the surface geometry. Camera changes and hit testing stay with
-//! the presentation owner. Nothing here reaches the world; a completed
-//! brush would become a canonical command through the session (FL-022).
+//! focus and the surface geometry. It turns pointer gestures into
+//! [`CameraMove`]s, in logical points, which the presentation owner applies
+//! to its viewport and hit tests (FL-020). Nothing here reaches the world; a
+//! completed brush would become a canonical command through the session
+//! (FL-022).
+//!
+//! Pointer gestures:
+//!
+//! | Gesture | Move |
+//! |---|---|
+//! | primary drag (beyond [`CLICK_SLOP_POINTS`]) | pan: the world follows the pointer |
+//! | primary click (press and release within the slop) | select what is drawn under the press |
+//! | vertical scroll | zoom about the pointer by [`scroll_zoom`]; up zooms in |
 //!
 //! Keys, by virtual key code (`kVK_*`), so they do not depend on layout:
 //!
@@ -14,6 +24,7 @@
 //! | Space | run or pause |
 //! | → or `.` (held: repeats) | step one tick while paused |
 //! | Esc, or ⌘W | close |
+//! | 0 | the whole torus again (zoom 1, centred) |
 //!
 //! and, for the presentation owner alone (FL-019's [`Style`]):
 //!
@@ -25,7 +36,9 @@
 //! | F | field on or off |
 
 use flife_manim::{ColorMapping, Look, Particles, Style, Viewport};
-use fmn_render::metal::{ButtonSet, InputEvent, LogicalPoint, SurfaceMetrics};
+use fmn_render::metal::{
+    ButtonSet, InputEvent, LogicalPoint, PointerButton, ScrollUnit, SurfaceMetrics,
+};
 
 use crate::Status;
 
@@ -47,6 +60,65 @@ pub const KEY_R: u16 = 15;
 pub const KEY_D: u16 = 2;
 /// `kVK_ANSI_F`.
 pub const KEY_F: u16 = 3;
+/// `kVK_ANSI_0`.
+pub const KEY_ZERO: u16 = 29;
+
+/// How far, in logical points, a primary press may move and still be a
+/// click; beyond it the press is a drag.
+pub const CLICK_SLOP_POINTS: f64 = 4.0;
+/// The zoom per point of precise (trackpad) vertical scroll, as a natural
+/// logarithm: 100 points zoom by e.
+pub const ZOOM_PER_POINT: f64 = 0.01;
+/// The zoom per line of notched-wheel vertical scroll, as a natural
+/// logarithm: one line is about 10.5 %.
+pub const ZOOM_PER_LINE: f64 = 0.1;
+/// The largest zoom one scroll event may make, as a natural logarithm.
+pub const ZOOM_STEP_LIMIT: f64 = 8.0;
+
+/// The zoom factor of a vertical scroll of `delta_y` in `unit`: positive
+/// (up) zooms in, negative out; `exp(rate · delta_y)`, the exponent limited
+/// to ±[`ZOOM_STEP_LIMIT`]. `None` for no movement or a non-finite delta.
+#[must_use]
+pub fn scroll_zoom(delta_y: f64, unit: ScrollUnit) -> Option<f64> {
+    if !delta_y.is_finite() || delta_y == 0.0 {
+        return None;
+    }
+    let rate = match unit {
+        ScrollUnit::Points => ZOOM_PER_POINT,
+        ScrollUnit::Lines => ZOOM_PER_LINE,
+    };
+    Some(
+        (rate * delta_y)
+            .clamp(-ZOOM_STEP_LIMIT, ZOOM_STEP_LIMIT)
+            .exp(),
+    )
+}
+
+/// A camera or selection change for the presentation owner, in the logical
+/// points the window reports.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CameraMove {
+    /// Zoom by `factor` about the logical point `anchor`, keeping the world
+    /// under it.
+    Zoom {
+        /// The pointer.
+        anchor: LogicalPoint,
+        /// Above 1 zooms in.
+        factor: f64,
+    },
+    /// The pointer dragged by `delta` logical points: the world follows.
+    Pan {
+        /// Right and down are positive.
+        delta: [f64; 2],
+    },
+    /// The whole torus again.
+    Reset,
+    /// Select what is drawn under the logical point `at`, or nothing.
+    Select {
+        /// Where the click pressed.
+        at: LogicalPoint,
+    },
+}
 
 /// What the presentation owner asks of the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +154,8 @@ pub struct InputTally {
     pub capture_lost: u64,
     /// Surface geometry changes.
     pub resizes: u64,
+    /// Camera and selection moves made.
+    pub moves: u64,
 }
 
 /// The presentation owner's input state.
@@ -96,6 +170,11 @@ pub struct Controls {
     metrics: Option<SurfaceMetrics>,
     tally: InputTally,
     style: Style,
+    /// Where the primary button went down, while it is held.
+    press: Option<LogicalPoint>,
+    /// Whether the held press has moved beyond the click slop.
+    dragging: bool,
+    moves: Vec<CameraMove>,
 }
 
 impl Controls {
@@ -112,8 +191,9 @@ impl Controls {
                 position, buttons, ..
             } => {
                 self.tally.pointer_moves += 1;
-                self.pointer = Some(*position);
+                let last = self.pointer.replace(*position);
                 self.buttons = *buttons;
+                self.drag(*position, last);
                 None
             }
             InputEvent::Button {
@@ -129,12 +209,25 @@ impl Controls {
                 } else {
                     self.buttons.without(*button)
                 };
+                if *button == PointerButton::Primary {
+                    self.press_or_release(*pressed, *position);
+                }
                 None
             }
-            InputEvent::Scroll { position, .. } => {
-                // Zoom is FL-020's.
+            InputEvent::Scroll {
+                delta,
+                unit,
+                position,
+                ..
+            } => {
                 self.tally.scrolls += 1;
                 self.pointer = Some(*position);
+                if let Some(factor) = scroll_zoom(delta[1], *unit) {
+                    self.push(CameraMove::Zoom {
+                        anchor: *position,
+                        factor,
+                    });
+                }
                 None
             }
             InputEvent::Key {
@@ -161,6 +254,10 @@ impl Controls {
                     KEY_ESCAPE => self.request_close(),
                     KEY_W if modifiers.command => self.request_close(),
                     _ if *repeat || modifiers.command => None,
+                    KEY_ZERO => {
+                        self.push(CameraMove::Reset);
+                        None
+                    }
                     code => {
                         self.restyle(code);
                         None
@@ -184,6 +281,9 @@ impl Controls {
             InputEvent::PointerCaptureLost { .. } => {
                 self.tally.capture_lost += 1;
                 self.buttons = ButtonSet::EMPTY;
+                // A lost press is neither a click nor the rest of a drag.
+                self.press = None;
+                self.dragging = false;
                 None
             }
             InputEvent::Resized(metrics) => {
@@ -192,6 +292,85 @@ impl Controls {
                 None
             }
         }
+    }
+
+    fn push(&mut self, change: CameraMove) {
+        self.tally.moves += 1;
+        self.moves.push(change);
+    }
+
+    /// The primary button went down (start a press) or up (a press that
+    /// never left the slop is a click).
+    fn press_or_release(&mut self, pressed: bool, position: LogicalPoint) {
+        if pressed {
+            self.press = Some(position);
+            self.dragging = false;
+            return;
+        }
+        if let Some(at) = self.press.take()
+            && !self.dragging
+        {
+            self.push(CameraMove::Select { at });
+        }
+        self.dragging = false;
+    }
+
+    /// Pointer motion while the primary press is held: once beyond the
+    /// slop it is a drag, panning by the whole motion since the press and
+    /// then by each move.
+    fn drag(&mut self, position: LogicalPoint, last: Option<LogicalPoint>) {
+        let Some(press) = self.press else {
+            return;
+        };
+        if !self.buttons.contains(PointerButton::Primary) {
+            return;
+        }
+        let from = if self.dragging {
+            match last {
+                Some(last) => last,
+                None => return,
+            }
+        } else {
+            let (dx, dy) = (position.x - press.x, position.y - press.y);
+            if dx.hypot(dy) <= CLICK_SLOP_POINTS {
+                return;
+            }
+            self.dragging = true;
+            press
+        };
+        let delta = [position.x - from.x, position.y - from.y];
+        if delta.iter().all(|value| value.is_finite()) && delta != [0.0, 0.0] {
+            self.push(CameraMove::Pan { delta });
+        }
+    }
+
+    /// Take the camera and selection moves made since the last take, in
+    /// the order they were made.
+    pub fn take_moves(&mut self) -> std::vec::Drain<'_, CameraMove> {
+        self.moves.drain(..)
+    }
+
+    /// Reserve room for `capacity` moves, so draining one poll's events
+    /// (each makes at most one move) never allocates.
+    ///
+    /// # Errors
+    /// [`flife_core::CoreError::AllocationFailed`] when it cannot be
+    /// reserved.
+    pub fn reserve_moves(&mut self, capacity: usize) -> Result<(), flife_core::CoreError> {
+        let wanted = capacity.saturating_sub(self.moves.len());
+        self.moves
+            .try_reserve_exact(wanted)
+            .map_err(|_| flife_core::CoreError::AllocationFailed {
+                buffer: "studio camera moves",
+                bytes: u64::try_from(capacity.saturating_mul(size_of::<CameraMove>()))
+                    .unwrap_or(u64::MAX),
+            })
+    }
+
+    /// Whether a primary press is dragging.
+    #[must_use]
+    pub const fn dragging(&self) -> bool {
+        self.dragging
     }
 
     /// A style key's change, if `code` is one.

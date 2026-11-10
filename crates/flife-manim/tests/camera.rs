@@ -10,8 +10,9 @@ use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_engine::{Disposition, Intervention, Stepped};
 use flife_manim::{
-    DOT_RADIUS, DOT_RADIUS_MAX_PIXELS, MAXIMUM_ZOOM, PICK_RADIUS_PIXELS, Particles, Style,
-    Viewport, WorldView, dot_radius, pick,
+    DOT_RADIUS, DOT_RADIUS_MAX_PIXELS, MAXIMUM_ZOOM, PICK_RADIUS_PIXELS, Particles,
+    SELECTION_RING_COLOR, SELECTION_RING_GAP_PIXELS, SELECTION_RING_SEGMENTS,
+    SELECTION_RING_WIDTH_PIXELS, Style, Viewport, WorldView, dot_radius, pick,
 };
 use fmn_render::ThreeDDraw;
 
@@ -228,4 +229,135 @@ fn the_world_view_keeps_its_camera_and_places_without_moving_scales() {
     let fitted = Viewport::fit(epoch.extent(), [640, 480]).expect("a viewport");
     assert_eq!(dot_radius(&fitted), DOT_RADIUS.max(1.5 / fitted.scale()));
     assert!(!view_.cloud().draws().is_empty());
+}
+
+/// The selection ring's vertices lie on its two circles around the scene
+/// point of `position` in `viewport`: [`SELECTION_RING_GAP_PIXELS`] and
+/// that plus [`SELECTION_RING_WIDTH_PIXELS`] outside the dot, in pixels.
+fn assert_ring(mesh: &fmn_render::SurfaceMesh, viewport: &Viewport, position: [f64; 2]) {
+    let scale = viewport.scale();
+    let inner = dot_radius(viewport) + SELECTION_RING_GAP_PIXELS / scale;
+    let outer = inner + SELECTION_RING_WIDTH_PIXELS / scale;
+    let [x, y, _] = viewport.scene_point(position);
+    let vertices = mesh.vertices();
+    assert_eq!(vertices.len(), 2 * SELECTION_RING_SEGMENTS);
+    for (at, vertex) in vertices.iter().enumerate() {
+        let radius = (vertex.point[0] - x).hypot(vertex.point[1] - y);
+        let expected = if at % 2 == 0 { outer } else { inner };
+        assert!(
+            (radius - expected).abs() <= 1e-9 * expected.max(1.0),
+            "vertex {at} at radius {radius}, not {expected}"
+        );
+        assert_eq!(vertex.color, SELECTION_RING_COLOR);
+    }
+}
+
+/// FL-020: the world view picks among the shown epoch's organisms and
+/// selects by identity. The ring is the frame's last draw, around the
+/// selected organism at any view; an identity the shown epoch lacks selects
+/// nothing. Once a shown epoch no longer has the selected organism (removed,
+/// its storage slot reused by an introduced one), the selection is dropped:
+/// it never passes to the slot's new occupant. A living selection follows
+/// its organism through new epochs.
+#[test]
+fn the_world_view_selects_by_identity_and_drops_a_dead_selection() {
+    let config = common::small();
+    let mut world = common::found(&config);
+    let epoch = common::epoch(&world);
+    let mut view_ = WorldView::for_epoch(&epoch, [640, 640], [0, 0, 0]).expect("a view");
+    view_.show(&epoch).expect("show");
+    assert!(
+        view_
+            .shown_rows()
+            .map(|(id, _)| id)
+            .eq(epoch.ids().iter().copied())
+    );
+    let row = 7;
+    let id = OrganismId::new(epoch.ids()[row]);
+    let position = epoch.positions()[row].map(f64::from);
+    let viewport = *view_.viewport();
+    let picked = view_.pick_in(&viewport, viewport.world_to_drawable(position), 0.5);
+    assert_eq!(picked, Some(id));
+    assert_eq!(view_.select(picked).expect("select"), Some(id));
+    assert_eq!(view_.selected_position(), Some(position));
+    let draws = view_.draws().expect("draws");
+    let Some(ThreeDDraw::Surface(ring)) = draws.last() else {
+        panic!("the ring is the last draw");
+    };
+    assert_ring(ring.mesh, &viewport, position);
+    view_
+        .job()
+        .expect("FrankenManim takes the frame with its ring");
+    let with_ring = draws.len();
+    drop(draws);
+
+    // Not in the shown epoch: nothing is selected.
+    assert_eq!(
+        view_
+            .select(Some(OrganismId::new(1 << 40)))
+            .expect("select"),
+        None
+    );
+    assert!(view_.selection_draw().is_none());
+    assert_eq!(view_.draws().expect("draws").len(), with_ring - 1);
+
+    // Through a pan and a zoom the ring stays on the organism.
+    view_.select(Some(id)).expect("select");
+    let panned = viewport
+        .with_view([position[0] + 3.0, position[1] - 1.0], 4.0)
+        .expect("a view");
+    view_.set_view(panned).expect("set");
+    let Some(ThreeDDraw::Surface(ring)) = view_.selection_draw() else {
+        panic!("a ring");
+    };
+    assert_ring(ring.mesh, &panned, position);
+
+    // Removed, its slot taken by an introduced organism: the next shown
+    // epoch drops the selection, and the old identity selects nothing.
+    let slot = world.population().slot(id).expect("a slot");
+    let cell = [position[0].floor() as u32, position[1].floor() as u32];
+    match world
+        .step_with(&[
+            Intervention::RemoveOrganisms {
+                center: position,
+                radius: 0.01,
+                disposition: Disposition::Remove,
+            },
+            Intervention::IntroduceOrganisms {
+                cell,
+                count: 1,
+                energy: 2.0,
+            },
+        ])
+        .expect("the tick runs")
+    {
+        Stepped::Published(report) => assert_eq!(report.interventions[0].removed, 1),
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    }
+    let occupant = world.population().slots()[slot].expect("the slot is taken again");
+    assert_ne!(occupant, id);
+    let later = common::epoch(&world);
+    assert!(later.ids().contains(&occupant.get()));
+    view_.show(&later).expect("show");
+    assert_eq!(view_.selected(), None);
+    assert!(view_.selection_draw().is_none());
+    assert_eq!(view_.select(Some(id)).expect("select"), None);
+
+    // A living selection follows its organism.
+    let living = OrganismId::new(later.ids()[0]);
+    view_.select(Some(living)).expect("select");
+    common::advance(&mut world, 1);
+    let next = common::epoch(&world);
+    let row = next
+        .ids()
+        .binary_search(&living.get())
+        .expect("the organism lives a tick on");
+    let moved = next.positions()[row].map(f64::from);
+    view_.place(&next).expect("placed");
+    assert_eq!(view_.selected(), Some(living));
+    assert_eq!(view_.selected_position(), Some(moved));
+    let Some(ThreeDDraw::Surface(ring)) = view_.selection_draw() else {
+        panic!("a ring");
+    };
+    assert_ring(ring.mesh, view_.viewport(), moved);
 }

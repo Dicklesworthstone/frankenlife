@@ -9,7 +9,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `Viewport` is the exact map between world units, FrankenManim's scene, drawable pixels and logical window points,
   and the 3D camera whose frame it is. A view (center, zoom) shows one image of the torus, wrapping across the
   seams.
-- `pick` finds the organism drawn under the pointer, by stable identity.
+- `pick` finds the organism drawn under the pointer, by stable identity; `selection_ring` marks the selected one.
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
 - `FieldLayer` draws the epoch's energy field under the organisms as one vertex-coloured grid.
@@ -60,6 +60,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   the nearest to the drawable position `at` by drawable distance through the view, within `radius` pixels; the
   lowest identity among equals; `None` for nothing in reach or a non-finite position or radius. It returns an
   identity, which a host validates against the world, never a slot.
+- `selection_ring(viewport, position)`: an annulus of `SELECTION_RING_SEGMENTS = 48` quads around the organism's
+  scene point, from `SELECTION_RING_GAP_PIXELS = 3` outside its dot to `SELECTION_RING_WIDTH_PIXELS = 2` beyond,
+  in drawable pixels at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the grids.
 - `Viewport::camera(background)`:
   - a FrankenManim `ThreeDCamera` at the drawable's resolution;
   - its frame is `frame_shape() = (Dw / scale, Dh / scale)`, centred at the origin, at `DEFAULT_FOVY`, `zxz`;
@@ -122,14 +125,19 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `set_view(viewport)` takes a new view of the same world and drawable (returning whether it changed), and
     `place(epoch)` re-lowers the shown epoch there without moving the field's or density's display scale, so a pan
     or zoom does not age the picture;
+  - it keeps the shown epoch's identities and positions (`shown_rows()`, reserved once at the ceiling), so
+    `pick_in(viewport, at, radius)` picks among the organisms on screen;
+  - `select(organism)` holds at most one organism by identity, only if the shown epoch has it; every `show` or
+    `place` revalidates it and drops an identity the new epoch lacks, whatever now occupies its old slot;
+    `selected()`, `selected_position()`, and `selection_draw()`, the ring, rebuilt for every view change;
   - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
-    grid, or every halo and then every dot; `job()` wraps it in a `ThreeDJob`;
+    grid, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
   - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
-  - `scene_objects()` is 3: the field, the cloud and the density layer.
+  - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
 
 **Invariants.**
 - *Bounded scene objects (§13.2).* The whole population is one scene object, the field another, the density layer a
-  third, and a frame one 3D job. There is no mobject or animation handle per organism.
+  third, the selection ring a fourth, and a frame one 3D job. There is no mobject or animation handle per organism.
 - *Bounded memory.* The draw buffer is reserved once, with fallible reservation, at the population ceiling. No
   update or refit allocates or moves it: `reserved_bytes` and the buffer's address are constant for the cloud's
   life.
@@ -182,7 +190,7 @@ route.
     lattice at the fit and, panned, is cut into `n + 2` columns at worked offsets with matching edge colours that
     blend the cut cell's corners `0.75 / 0.25`; and the CPU render oracle at three panned and zoomed views, the dot
     a few pixels across at every zoom.
-- `tests/camera.rs` (3 tests, FL-020):
+- `tests/camera.rs` (4 tests, FL-020):
   - A pick through a view centered on the seam is the nearest drawn identity across it; out of reach, none; ties
     to the lowest identity; non-finite inputs; at zoom 64 a pick reaches only the organism under the pointer.
   - On a real epoch, a picked organism is removed and a new one introduced in its cell takes its storage slot: the
@@ -190,6 +198,10 @@ route.
   - The world view keeps its center and zoom through a resize, takes a new view once (not an equal one) and refuses
     another drawable's; fifty placements for a pan leave both display scales unchanged; the panned density grid is
     cut on both axes, `(n + 2)²` vertices inside the window; at zoom 4096 the dot radius is the 24 px cap.
+  - The world view picks and selects by identity on a real epoch; the ring is the last draw, every vertex on its
+    two circles (within 1e-9) around the organism, through a pan and zoom too; an identity the epoch lacks selects
+    nothing; once the organism is removed and an introduced one takes its slot, the next shown epoch drops the
+    selection and the old identity selects nothing; a living selection follows its organism a tick on.
 - `tests/cloud.rs` (6 tests):
   - Every row of a real 24-tick epoch becomes one dot, in identity order, at its scene point with its lineage
     colour.
@@ -243,10 +255,10 @@ route.
   pixel would be about four million triangles at 1080p.
 - `[presentation] point_radius_pixels`, bloom and trails are not applied yet.
 - Human review of the mappings against the plan's reference images (G5) has not been done.
-- FL-020's remaining parts: the Studio's pointer, scroll and key input for pan, zoom, reset and selection;
-  validating a pick against the world and showing the selected organism; the selection overlay; drawing an
-  interpolated epoch and fading the dead in the live view; trails; camera smoothing at display cadence; and a
-  drawable at the screen's backing scale (the Studio still draws one pixel per point).
+- FL-020's remaining parts: drawing an interpolated epoch and fading the dead in the live view; trails; camera
+  smoothing at display cadence; and a drawable at the screen's backing scale (the Studio still draws one pixel per
+  point). A selection is validated against the newest shown epoch, a projection of a committed world, not by a
+  query to the session's world.
 - Density bins do not refine with the zoom (they keep the fit's), so a deep zoom shows wide bins.
 - FrankenManim's frame is a perspective one; there is no orthographic camera, so dots are capped on screen rather
   than drawn at world size at deep zoom.

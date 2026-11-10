@@ -8,21 +8,27 @@
 //! 2. offers the intents that makes to the session thread without
 //!    blocking, and drains what the session reports;
 //! 3. refits the viewport and camera when the content area changed;
-//! 4. leases the newest render epoch, if newer than the one shown, lowers
-//!    it into the particle cloud and returns the lease at once; after a
-//!    style key it lowers the newest epoch again in the new style, so the
-//!    change shows while paused too;
-//! 5. renders the cloud with FrankenManim's Metal 3D route straight into
+//! 4. applies the camera moves the input made, in order (zoom about the
+//!    pointer, pan, reset), and picks under a click through the view as it
+//!    was at that click, among the shown epoch's organisms (FL-020);
+//! 5. leases the newest render epoch, if newer than the one shown, lowers
+//!    it into the particle cloud and returns the lease at once, keeping the
+//!    selection only if that epoch still has its identity; after a style
+//!    key or a camera move it lowers the newest epoch again, so the change
+//!    shows while paused too;
+//! 6. renders the cloud with FrankenManim's Metal 3D route straight into
 //!    the window's drawable, with no pixel readback.
 //!
-//! The world is only ever read through epochs. Nothing on this thread
-//! waits for a tick, a command or the session's lanes.
+//! The world is only ever read through epochs, which are projections of
+//! committed worlds: a selection is validated against the newest one by
+//! identity, never by storage slot. Nothing on this thread waits for a
+//! tick, a command or the session's lanes.
 
 use flife_backend_metal::ControllerChoice;
-use flife_core::ids::{RenderEpoch, SessionId};
+use flife_core::ids::{OrganismId, RenderEpoch, SessionId};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
-use flife_manim::{Style, WorldView, hex_rgb};
+use flife_manim::{Style, Viewport, WorldView, hex_rgb};
 use flife_render::{Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
@@ -31,10 +37,13 @@ use fmn_render::metal::{
 };
 use std::num::NonZeroUsize;
 
-use crate::{Controls, Intent, SessionThread, Status};
+use crate::{CameraMove, Controls, Intent, SessionThread, Status};
 
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
+
+/// How far from a click, in logical points, an organism is picked.
+pub const PICK_RADIUS_POINTS: f64 = 8.0;
 
 /// How the window opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,8 +100,12 @@ pub struct Frame {
     pub new_epoch: bool,
     /// Whether a style key changed the style this frame.
     pub restyled: bool,
+    /// Whether a camera move changed the view this frame.
+    pub moved: bool,
     /// The epoch on screen.
     pub shown: Option<Prior>,
+    /// The selected organism, which the epoch on screen has.
+    pub selected: Option<OrganismId>,
     /// The world point under the pointer.
     pub hover: Option<[f64; 2]>,
     /// The presentation outcome; `None` when the window was occluded or
@@ -115,6 +128,10 @@ pub struct FrameTally {
     pub refits: u64,
     /// Style changes.
     pub restyles: u64,
+    /// Frames whose camera moves changed the view.
+    pub camera_moves: u64,
+    /// Clicks picked (an organism, or nothing).
+    pub selections: u64,
     /// Intents accepted.
     pub intents: u64,
     /// Intents refused.
@@ -214,6 +231,7 @@ impl Studio {
         }
         let mut controls = Controls::new();
         controls.set_style(options.style);
+        controls.reserve_moves(INPUT_QUEUE_CAPACITY)?;
         Ok(Self {
             preview,
             session,
@@ -287,6 +305,52 @@ impl Studio {
             self.tally.refits += 1;
         }
 
+        let logical = self
+            .controls
+            .metrics()
+            .map(|metrics| [metrics.logical_width, metrics.logical_height]);
+        let mut viewport = *self.view.viewport();
+        let mut picked = None;
+        for change in self.controls.take_moves() {
+            match change {
+                CameraMove::Zoom { anchor, factor } => {
+                    if let Some(at) = logical
+                        .and_then(|size| viewport.logical_to_drawable([anchor.x, anchor.y], size))
+                    {
+                        viewport = viewport.zoomed_about(at, factor)?;
+                    }
+                }
+                CameraMove::Pan { delta } => {
+                    if let Some(size) = logical
+                        && let Some(per_point) = drawable_per_point(&viewport, size)
+                    {
+                        viewport =
+                            viewport.panned([delta[0] * per_point[0], delta[1] * per_point[1]])?;
+                    }
+                }
+                CameraMove::Reset => {
+                    viewport = Viewport::fit(viewport.extent(), viewport.drawable())?;
+                }
+                CameraMove::Select { at } => {
+                    if let Some(size) = logical
+                        && let Some(per_point) = drawable_per_point(&viewport, size)
+                        && let Some(point) = viewport.logical_to_drawable([at.x, at.y], size)
+                    {
+                        let radius = PICK_RADIUS_POINTS * per_point[0].min(per_point[1]);
+                        picked = Some(self.view.pick_in(&viewport, point, radius));
+                    }
+                }
+            }
+        }
+        let moved = self.view.set_view(viewport)?;
+        if moved {
+            self.tally.camera_moves += 1;
+        }
+        if let Some(choice) = picked {
+            self.view.select(choice)?;
+            self.tally.selections += 1;
+        }
+
         let seen = self
             .view
             .shown()
@@ -304,6 +368,16 @@ impl Studio {
             // The same (or a newer) epoch again, lowered in the new style.
             let lease = self.viewer.latest()?;
             self.view.show(&lease)?;
+        } else if moved {
+            // The shown epoch placed in the new view, its display scales
+            // unmoved; an epoch published since is shown as usual.
+            let lease = self.viewer.latest()?;
+            if self.view.shown().map(|shown| shown.id) == Some(lease.id()) {
+                self.view.place(&lease)?;
+            } else {
+                self.view.show(&lease)?;
+                self.tally.epochs += 1;
+            }
         }
 
         let outcome = if state == PresentationState::Visible {
@@ -333,7 +407,9 @@ impl Studio {
             refitted,
             new_epoch,
             restyled,
+            moved,
             shown: self.view.shown(),
+            selected: self.view.selected(),
             hover: self.controls.hover(self.view.viewport()),
             outcome,
         })
@@ -415,6 +491,19 @@ impl Studio {
             input_dropped,
         })
     }
+}
+
+/// Drawable pixels per logical point on each axis, or `None` while the
+/// content area is empty.
+fn drawable_per_point(viewport: &Viewport, logical: [f64; 2]) -> Option<[f64; 2]> {
+    if !logical
+        .iter()
+        .all(|length| length.is_finite() && *length > 0.0)
+    {
+        return None;
+    }
+    let [width, height] = viewport.drawable().map(f64::from);
+    Some([width / logical[0], height / logical[1]])
 }
 
 fn missing(capability: String) -> CoreError {

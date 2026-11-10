@@ -2,7 +2,8 @@
 
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
-rendering (§13.4). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
+rendering (§13.4). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
+reset) and selection by displayed stable identity (§13.6). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
@@ -33,7 +34,18 @@ adapter.
     | D | switch dots and density |
     | F | show or hide the field |
 
-    The style keys ignore auto-repeat and ⌘, and produce no intent: they only change `Controls::style()`.
+    | 0 | the whole torus again (a `CameraMove::Reset`) |
+
+    The style keys and 0 ignore auto-repeat and ⌘, and produce no intent.
+  - Pointer gestures become `CameraMove`s, in logical points, kept in order until `take_moves()` (reserved once
+    for a poll's events):
+    - a primary press that moves more than `CLICK_SLOP_POINTS = 4` is a drag: `Pan` by the whole motion since the
+      press, then by each move, so the pans sum to the pointer's motion;
+    - a primary press released within the slop is a click: `Select { at }` at the press;
+    - capture loss ends a press: no click, no more panning;
+    - a vertical scroll is `Zoom { anchor, factor }` about the pointer, `factor = scroll_zoom(dy, unit) =
+      exp(rate · dy)` with `ZOOM_PER_POINT = 0.01` (trackpad points) or `ZOOM_PER_LINE = 0.1` (wheel lines), the
+      exponent limited to ±`ZOOM_STEP_LIMIT = 8`; up zooms in.
   - `drawable_size` is the content area in whole points. `hover` is the world point under the pointer.
 - `SessionThread`: the FL-014 session owner and one controller task on an Asupersync current-thread runtime, on its
   own thread.
@@ -49,12 +61,17 @@ adapter.
   2. drains statuses;
   3. refits the `WorldView` when the content area changed;
   4. takes the controls' style if it changed;
-  5. leases the newest epoch if it is newer than the one shown, lowers it and drops the lease; after a style change
-     with no newer epoch, it lowers the shown epoch again, so a paused world restyles at once;
-  6. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
+  5. applies the frame's camera moves in order to a copy of the viewport: a zoom about the pointer's drawable
+     position, a pan by the drag times drawable pixels per point, a reset to the fit; a click picks among the shown
+     epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
+     (scaled to drawable pixels); then takes the view and the selection;
+  6. leases the newest epoch if it is newer than the one shown, lowers it and drops the lease, which keeps the
+     selection only if that epoch has its identity; after a style change or a camera move with no newer epoch, it
+     lowers (or, for a camera move, places) the shown epoch again, so a paused world restyles and moves at once;
+  7. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
 
-  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, new epoch, shown `Prior`,
-  hover, outcome). `close()` closes the window and the session and returns the committed world (`StudioClosed`).
+  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
+  `Prior`, selected organism, hover, outcome). `close()` closes the window and the session and returns the committed world (`StudioClosed`).
 - `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
   [--look glow|raw] [--density] [--no-field]`: the binary. M is `lineage`, `energy`, `generation`, `motion` or
   `topology` (or a registered name such as `founder-lineage-v1`); the default is the configuration's
@@ -69,7 +86,9 @@ adapter.
     `look`, `particles` and `field`;
   - one `status` per status;
   - one `view` per style change, with the same style fields;
-  - a `frame` summary about once a second;
+  - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
+    its identity or null, its position and the shown tick;
+  - a `frame` summary about once a second, with the camera's center and zoom;
   - `end`, with the committed tick, the world digest, and the controller evaluations the backend returned and
     deferred, and its failure if it failed.
 
@@ -81,7 +100,10 @@ adapter.
   main thread. Nothing on it waits for a tick, a command or the session's lanes: intents use `try_send`, statuses
   use `try_iter`, and epochs come from the lock-free feed.
 - *Observation neutrality.* The main thread reads the world only through render epochs. It holds at most one lease,
-  and only while lowering. Input reaches the world only as session intents.
+  and only while lowering. Input reaches the world only as session intents: camera moves and selection never do.
+- *Selection by identity (§13.6).* A click picks the displayed epoch's stable identity; each newer epoch shown
+  revalidates it by identity and drops it when absent, never reinterpreting a stale hit as its slot's new
+  occupant.
 - *Bounded everything.* The presenter queue holds 1024 events, the intent lane 16, the viewer one lease, the cloud
   its ceiling, and the main thread's event buffer is reserved once at 1024 events. An intent refused because the lane
   is full is counted, and a refused resume leaves the controls paused.
@@ -104,19 +126,24 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (7 tests):
+- `tests/controls.rs` (12 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
   - Following the session: a late end of run 1 does not stop run 2, and run 2 stopping on its own does.
   - A resume refused at the lane or by the session leaves the controls paused.
-- `tests/live.rs` (harness-free, 21 checks, `--features synthetic-input`): the real 4,096-organism reference preset
+  - FL-020: a drag pans by the pointer's whole motion (worked deltas) and selects nothing; a click within the slop
+    selects at the press, while secondary presses, lost presses and buttonless motion make no move, and a drag
+    lost to capture loss pans no further; scrolls zoom by `exp(rate · dy)` in both units, limited, with no move for
+    a zero or non-finite delta; 0 resets once (not on repeat or with ⌘) and is no style key; 256 moves wait in
+    order until taken.
+- `tests/live.rs` (harness-free, 28 checks, `--features synthetic-input`): the real 4,096-organism reference preset
   in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
   and delivered through the presenter's typed bridge:
   - the first poll's real `Resized` (640 × 400 points), and a real `FocusGained` (made key by a real key-window
     change if another application holds the keyboard);
-  - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling, in three scene
-    objects (the field, the cloud and the density layer);
+  - the founding epoch on screen as 4,096 dots in one cloud, reserved for the 16,384 ceiling, in four scene
+    objects (the field, the cloud, the density layer and the selection ring);
   - Space runs, and live epochs reach the screen;
   - Space pauses at a reported boundary, which is what is shown, and no epoch arrives while paused;
   - → and `.` each step one tick;
@@ -127,8 +154,14 @@ presentation state, not scientific state.
     next frame is presented at the new drawable size;
   - real pointer motion hovers the right world point within a pixel, and a real scroll arrives;
   - focus loss with a button held loses the capture and clears the drag, and focus regain arrives;
+  - FL-020, all real events: a scroll up zooms (e^0.5 for 50 precise points) about the pointer, which stays over
+    its world point within 1e-9, and the paused epoch is placed again, every dot at its scene point in the new
+    view; a primary drag of (40, 25) points keeps the grabbed world point under the pointer and selects nothing; a
+    click selects the organism drawn under it, by identity (the oracle is `pick` over the shown rows), with the
+    ring as the last draw; a step keeps the selection exactly when the new epoch has the organism; a click on an
+    empty spot deselects; 0 restores the fitted viewport bit for bit;
   - no intent refused and no input dropped;
-  - Esc closes at the last stepped tick;
+  - Esc closes at the last stepped tick (three steps after the pause);
   - the committed world's digest equals the directly stepped world's.
   - Off macOS it reports itself skipped.
 - In `flife-runtime`, `tests/session.rs` checks `SessionHandle::start` across six Lab seeds: the start comes back at
@@ -142,17 +175,19 @@ presentation state, not scientific state.
 reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headless runs and frame export.
 
 **Known gaps.**
-- The presenter sizes the window's content area to the frame. So the Studio renders one drawable pixel per logical
-  point, and the compositor scales that up on high-DPI displays. Rendering at backing resolution needs the presenter
-  to size the drawable apart from the content area (upstream, with FL-020's camera work). `Viewport` already maps
-  logical points through any drawable ratio.
-- Camera changes, zoom (scroll is only tallied), selection by displayed stable identity, and brushes as `CommandPort`
-  commands are FL-020's and FL-022's.
+- The presenter sizes the window's content area to the frame (`resize` calls `setContentSize:` with the frame's
+  pixel size). So the Studio renders one drawable pixel per logical point, and the compositor scales that up on
+  high-DPI displays. Rendering at backing resolution needs the presenter to size the drawable apart from the content
+  area (an upstream frankentorch change, then repins). `Viewport`, the pan and the pick radius already convert
+  through the drawable-per-point ratio, but only a ratio of 1 is exercised by a real window.
+- Camera smoothing at display cadence, interpolated motion with fading and trails, and a pinch-zoom gesture are not
+  implemented (FL-020's remaining parts). Brushes as `CommandPort` commands are FL-022's.
+- A selection shows only as the ring and the `selection` record: there is no inspector (FL-021).
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here. The
   synchronous present path is an integration starting point, not latency evidence.
 - There is no on-screen legend: the Metal 3D route has no text, and the presenter has no window-title setter. The
   style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed. Motion between ticks
-  is not interpolated (FL-020).
+  is not interpolated in the live view yet (`flife-render`'s `interpolate` exists; FL-020).
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later
   work (FL-023, FL-038).

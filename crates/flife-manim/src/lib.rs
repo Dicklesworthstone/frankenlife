@@ -6,7 +6,8 @@
 //! - [`Viewport`]: the exact map between world units, FrankenManim's scene,
 //!   drawable pixels and logical window points (§13.6), and the 3D camera
 //!   whose frame it is; it pans and zooms across the torus's seams (FL-020).
-//! - [`pick`]: the organism drawn under the pointer, by stable identity.
+//! - [`pick`]: the organism drawn under the pointer, by stable identity, and
+//!   [`selection_ring`], the mark around the selected one.
 //! - [`ParticleCloud`]: the `ParticleCloudView`, one bounded cloud lowered
 //!   from a render epoch onto FrankenManim's 3D camera route.
 //! - [`FieldLayer`]: the energy field under the organisms.
@@ -18,8 +19,8 @@
 //!   [`fmn_render::ThreeDJob`].
 //!
 //! Nothing here reads or writes the world: everything comes from an
-//! immutable [`flife_render::Epoch`]. The selection overlay, metric overlay
-//! and camera track are FL-020 and FL-024 work.
+//! immutable [`flife_render::Epoch`]. The metric overlay and camera track
+//! are FL-024 work.
 
 #![forbid(unsafe_code)]
 
@@ -45,6 +46,9 @@ pub use mapping::{
     generation_level, heading, lineage_color, lineage_slot, linear, mapped_color, mapped_rgb8, mix,
     ramp, speed_level, traits, wheel,
 };
-pub use selection::{PICK_RADIUS_PIXELS, pick};
+pub use selection::{
+    PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_PIXELS, SELECTION_RING_SEGMENTS,
+    SELECTION_RING_WIDTH_PIXELS, pick, selection_ring,
+};
 pub use viewport::{MAXIMUM_ZOOM, Viewport};
 pub use world::{WorldView, hex_rgb};

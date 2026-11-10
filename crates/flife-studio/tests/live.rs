@@ -18,11 +18,13 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use flife_core::ids::OrganismId;
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_studio::{
     ColorMapping, ControllerChoice, End, Frame, KEY_D, KEY_DIGITS, KEY_ESCAPE, KEY_F, KEY_PERIOD,
-    KEY_R, KEY_RIGHT, KEY_SPACE, Look, Particles, Status, Studio, StudioOptions, Style,
+    KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, PICK_RADIUS_POINTS, Particles, Status, Studio,
+    StudioOptions, Style,
 };
 use fmn_render::metal::{LogicalPoint, Modifiers, PointerButton, SyntheticInput};
 
@@ -175,11 +177,11 @@ fn live() -> Result<Vec<String>, String> {
     )?;
     let reserved = live.studio.view().cloud().reserved_bytes();
     live.check(
-        live.studio.view().scene_objects() == 3
+        live.studio.view().scene_objects() == 4
             && live.studio.view().cloud().capacity() == ceiling as usize,
         format!(
-            "three scene objects (the field, one cloud and its density layer), the cloud \
-             reserved once for the {ceiling}-organism ceiling"
+            "four scene objects (the field, one cloud, its density layer and the selection \
+             ring), the cloud reserved once for the {ceiling}-organism ceiling"
         ),
     )?;
 
@@ -435,6 +437,199 @@ fn live() -> Result<Vec<String>, String> {
         "real focus regain arrives as FocusGained",
     )?;
 
+    // FL-020: the camera and selection through real pointer input. The
+    // drawable is one pixel per point here, so logical and drawable
+    // positions coincide.
+    let fitted = *live.studio.view().viewport();
+    let point = |at: [f64; 2]| LogicalPoint { x: at[0], y: at[1] };
+    let torus = |a: [f64; 2], b: [f64; 2]| {
+        let axis = |d: f64| d.abs().min(128.0 - d.abs());
+        axis(a[0] - b[0]).max(axis(a[1] - b[1]))
+    };
+    let world = [32.0, 96.0];
+    let at = fitted.world_to_drawable(world);
+    let camera_moves = live.studio.tally().camera_moves;
+    live.post(&SyntheticInput::Scroll {
+        delta: [0, 50],
+        position: point(at),
+    })?;
+    live.until("the zoom", |studio, frame, _| {
+        frame.outcome.is_some() && studio.view().viewport().zoom() > 1.0
+    })?;
+    let zoomed = *live.studio.view().viewport();
+    let under = zoomed
+        .drawable_to_world(at)
+        .ok_or("no world under the pointer")?;
+    live.check(
+        torus(under, world) < 1e-9 && live.studio.tally().camera_moves == camera_moves + 1,
+        format!(
+            "a real scroll up zooms {}x about the pointer, which stays over world point {world:?} \
+             ({under:?})",
+            zoomed.zoom()
+        ),
+    )?;
+    // The paused epoch is placed again in the new view: every dot is at
+    // its organism's scene point there.
+    let placed = live
+        .studio
+        .view()
+        .shown_rows()
+        .zip(live.studio.view().cloud().draws())
+        .all(|((_, position), draw)| match draw {
+            fmn_render::ThreeDDraw::TrueDot(dot) => {
+                let [x, y, z] = zoomed.scene_point(position);
+                dot.center[0] == x && dot.center[1] == y && dot.center[2] == z
+            }
+            _ => false,
+        });
+    live.check(
+        placed
+            && live.studio.view().cloud().draws().len() == live.studio.view().shown_rows().count(),
+        "the paused epoch is placed again in the zoomed view: every dot at its scene point there",
+    )?;
+
+    let press = [400.0, 225.0];
+    let grabbed = zoomed
+        .drawable_to_world(press)
+        .ok_or("no world under the press")?;
+    let release = [press[0] + 40.0, press[1] + 25.0];
+    let before = live.studio.tally();
+    let buttons = live.studio.controls().tally().buttons;
+    live.post(&SyntheticInput::Button {
+        button: PointerButton::Primary,
+        pressed: true,
+        position: point(press),
+        clicks: 1,
+        modifiers: Modifiers::NONE,
+    })?;
+    for step in [[20.0, 10.0], [40.0, 25.0]] {
+        live.post(&SyntheticInput::PointerMoved {
+            position: point([press[0] + step[0], press[1] + step[1]]),
+            dragging: Some(PointerButton::Primary),
+            modifiers: Modifiers::NONE,
+        })?;
+    }
+    live.post(&SyntheticInput::Button {
+        button: PointerButton::Primary,
+        pressed: false,
+        position: point(release),
+        clicks: 1,
+        modifiers: Modifiers::NONE,
+    })?;
+    live.until("the drag", |studio, frame, _| {
+        frame.outcome.is_some()
+            && studio.controls().tally().buttons >= buttons + 2
+            && studio.controls().buttons().is_empty()
+    })?;
+    let panned = *live.studio.view().viewport();
+    let held = panned
+        .drawable_to_world(release)
+        .ok_or("no world under the release")?;
+    live.check(
+        torus(held, grabbed) < 1e-9
+            && panned.zoom() == zoomed.zoom()
+            && live.studio.tally().camera_moves > before.camera_moves
+            && live.studio.tally().selections == before.selections,
+        format!(
+            "a real primary drag of (40, 25) points pans the view: world point {grabbed:?} \
+             followed the pointer to the release ({held:?}), and selects nothing"
+        ),
+    )?;
+
+    // A click selects the organism drawn under it, by identity.
+    let rows: Vec<(u64, [f64; 2])> = live.studio.view().shown_rows().collect();
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let (target, spot) = rows
+        .iter()
+        .map(|&(id, position)| (id, panned.world_to_drawable(position)))
+        .min_by(|a, b| distance(a.1, press).total_cmp(&distance(b.1, press)))
+        .ok_or("no organisms shown")?;
+    let expected = flife_manim::pick(&panned, rows.iter().copied(), spot, PICK_RADIUS_POINTS);
+    let click = |live: &mut Live, at: [f64; 2]| -> Result<(), String> {
+        for pressed in [true, false] {
+            live.post(&SyntheticInput::Button {
+                button: PointerButton::Primary,
+                pressed,
+                position: point(at),
+                clicks: 1,
+                modifiers: Modifiers::NONE,
+            })?;
+        }
+        Ok(())
+    };
+    let selections = live.studio.tally().selections;
+    click(&mut live, spot)?;
+    let frame = live.until("the selection", |studio, frame, _| {
+        frame.outcome.is_some() && studio.tally().selections > selections
+    })?;
+    let ringed = matches!(
+        live.studio
+            .view()
+            .draws()
+            .map_err(|error| error.to_string())?
+            .last(),
+        Some(fmn_render::ThreeDDraw::Surface(_))
+    );
+    live.check(
+        expected == Some(OrganismId::new(target))
+            && frame.selected == expected
+            && ringed
+            && live.studio.view().selected_position().is_some(),
+        format!(
+            "a real click selects organism {target}, drawn under it, by identity, and rings it \
+             as the frame's last draw"
+        ),
+    )?;
+
+    // A step: the selection is kept only if the new epoch has the organism.
+    live.key(KEY_RIGHT, "\u{f703}")?;
+    let frame = live.until("the step after selecting", |_, frame, statuses| {
+        statuses.contains(&Status::Stepped {
+            tick: Tick::new(paused + 3),
+        }) && shown_tick(frame) == Some(paused + 3)
+    })?;
+    let alive = live.studio.view().shown_rows().any(|(id, _)| id == target);
+    live.check(
+        frame.selected == alive.then_some(OrganismId::new(target)),
+        format!(
+            "after a step the selection is held by identity: organism {target} {}",
+            if alive {
+                "lives and stays selected"
+            } else {
+                "died and is deselected"
+            }
+        ),
+    )?;
+
+    // A click where nothing is drawn selects nothing.
+    let viewport = *live.studio.view().viewport();
+    let shown: Vec<(u64, [f64; 2])> = live.studio.view().shown_rows().collect();
+    let empty = (2..44)
+        .flat_map(|y| (2..80).map(move |x| [f64::from(x) * 10.0, f64::from(y) * 10.0]))
+        .find(|&at| {
+            flife_manim::pick(&viewport, shown.iter().copied(), at, PICK_RADIUS_POINTS).is_none()
+        })
+        .ok_or("no empty spot in the window")?;
+    let selections = live.studio.tally().selections;
+    click(&mut live, empty)?;
+    let frame = live.until("the deselection", |studio, frame, _| {
+        frame.outcome.is_some() && studio.tally().selections > selections
+    })?;
+    live.check(
+        frame.selected.is_none() && live.studio.view().selection_draw().is_none(),
+        format!("a real click on an empty spot {empty:?} selects nothing and drops the ring"),
+    )?;
+
+    // 0 shows the whole torus again.
+    live.key(KEY_ZERO, "0")?;
+    live.until("the reset", |studio, frame, _| {
+        frame.outcome.is_some() && studio.view().viewport().zoom() == 1.0
+    })?;
+    live.check(
+        *live.studio.view().viewport() == fitted,
+        "0 shows the whole torus again: the fitted viewport, bit for bit",
+    )?;
+
     // Esc closes.
     live.key(KEY_ESCAPE, "\u{1b}")?;
     live.until("the close request", |studio, _, _| studio.should_close())?;
@@ -449,7 +644,7 @@ fn live() -> Result<Vec<String>, String> {
         .studio
         .close()
         .map_err(|error| format!("closing: {error}"))?;
-    let final_tick = paused + 2;
+    let final_tick = paused + 3;
     if closed.session.boundary.tick.get() != final_tick {
         return Err(format!(
             "closed at tick {}, expected {final_tick}",

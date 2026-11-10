@@ -11,7 +11,10 @@
 //! Esc or ⌘W closes. 1 to 5 colour the organisms by lineage, energy,
 //! generation, motion or topology; R switches between the glow and raw
 //! looks, D between points and density, and F shows or hides the field.
-//! The pointer reports the world point under it.
+//! The pointer reports the world point under it. Scrolling zooms about the
+//! pointer, a primary drag pans across the torus's seams, a click selects
+//! the organism drawn under it by identity, and 0 shows the whole torus
+//! again (FL-020).
 
 #![forbid(unsafe_code)]
 
@@ -20,12 +23,15 @@ mod host;
 mod session;
 
 pub use controls::{
-    Controls, InputTally, Intent, KEY_D, KEY_DIGITS, KEY_ESCAPE, KEY_F, KEY_PERIOD, KEY_R,
-    KEY_RIGHT, KEY_SPACE, KEY_W,
+    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_D, KEY_DIGITS, KEY_ESCAPE,
+    KEY_F, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT,
+    ZOOM_STEP_LIMIT, scroll_zoom,
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Particles, Style};
-pub use host::{Frame, FrameTally, STUDIO_SESSION, Studio, StudioClosed, StudioOptions};
+pub use host::{
+    Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
+};
 pub use session::{End, INTENT_CAPACITY, SessionThread, Status};
 
 /// The schema of the Studio's NDJSON records.

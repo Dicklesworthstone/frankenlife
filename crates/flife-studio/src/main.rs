@@ -1,9 +1,10 @@
 //! `flife-studio`: the live world in a native window (FL-018; plan §13.6).
 //!
 //! Every line on standard output is one `frankenlife.studio.v1` record: an
-//! `open`, then a `status` per session status, a `view` per style change
-//! and a `frame` summary about once a second, then an `end` with the
-//! committed world's digest. An error
+//! `open`, then a `status` per session status, a `view` per style change,
+//! a `selection` each time the selected organism changes (a click, or the
+//! selected organism gone from a newer epoch) and a `frame` summary about
+//! once a second, then an `end` with the committed world's digest. An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -119,6 +120,12 @@ enum Record<'a> {
         field: bool,
         shown_tick: Option<u64>,
     },
+    Selection {
+        schema: &'static str,
+        organism: Option<u64>,
+        position: Option<[f64; 2]>,
+        shown_tick: Option<u64>,
+    },
     Status {
         schema: &'static str,
         status: &'static str,
@@ -135,6 +142,8 @@ enum Record<'a> {
         epochs: u64,
         shown_tick: Option<u64>,
         hover: Option<[f64; 2]>,
+        center: [f64; 2],
+        zoom: f64,
         input_dropped: u64,
     },
     End {
@@ -225,6 +234,7 @@ fn main() -> ExitCode {
 
     let period = Duration::from_secs(1) / fps;
     let mut summary = Instant::now();
+    let mut selected = None;
     while !studio.should_close() {
         let started = Instant::now();
         let frame = match studio.frame() {
@@ -250,9 +260,19 @@ fn main() -> ExitCode {
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
             });
         }
+        if frame.selected != selected {
+            selected = frame.selected;
+            print(&Record::Selection {
+                schema: STUDIO_SCHEMA,
+                organism: selected.map(|id| id.get()),
+                position: studio.view().selected_position(),
+                shown_tick: frame.shown.map(|shown| shown.tick.get()),
+            });
+        }
         if summary.elapsed() >= Duration::from_secs(1) {
             summary = Instant::now();
             let tally = studio.tally();
+            let viewport = studio.view().viewport();
             print(&Record::Frame {
                 schema: STUDIO_SCHEMA,
                 frames: tally.frames,
@@ -261,6 +281,8 @@ fn main() -> ExitCode {
                 epochs: tally.epochs,
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
                 hover: frame.hover,
+                center: viewport.center(),
+                zoom: viewport.zoom(),
                 input_dropped: studio.input_dropped(),
             });
         }

@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
-    ExperimentOptions, Injection, Look, Particles, Persistence, Removal, ResumeOptions, RunOptions,
-    ScheduledCommand, Stop, StoreDurability, Style, Validation,
+    ExperimentOptions, Injection, InspectOptions, Look, Particles, Persistence, Removal,
+    ResumeOptions, RunOptions, ScheduledCommand, Stop, StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -163,6 +163,20 @@ enum Command {
         /// No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
+    },
+    /// Print a run directory's committed state at one of its checkpoints
+    /// as NDJSON: a header, every live organism in identity order, and with
+    /// `--field` the field's energy plane.
+    Inspect {
+        /// The run directory.
+        run_dir: PathBuf,
+        /// The committed tick of the checkpoint; the newest that restores
+        /// if omitted.
+        #[arg(long)]
+        at: Option<u64>,
+        /// Also print the field's energy plane, row-major.
+        #[arg(long)]
+        field: bool,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -368,6 +382,21 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(error.kind(), error.to_string()),
         },
+        Command::Inspect { run_dir, at, field } => {
+            match flife_cli::inspect(&run_dir, InspectOptions { at, field }) {
+                Ok(inspection) => {
+                    print(&inspection.inspected);
+                    for organism in &inspection.organisms {
+                        print(organism);
+                    }
+                    if let Some(field) = &inspection.field {
+                        print(field);
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error.kind(), error.to_string()),
+            }
+        }
         Command::Experiment {
             spec,
             out,

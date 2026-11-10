@@ -28,6 +28,8 @@
 //!   with its manifest whatever its ending, continues after a kill, and
 //!   writes a [`Report`] of paired comparisons with the control that
 //!   depends only on the catalog.
+//! - [`mod@inspect`]: a run directory's committed state at one checkpoint,
+//!   organism by organism and optionally cell by cell (plan §14.6).
 //! - [`observe`]: what a run did. A [`Tally`] of the published reports, and
 //!   a [`Survey`] of a committed world's raw state: generations, lineages,
 //!   distinct genomes and position-by-position heredity between live
@@ -36,7 +38,8 @@
 //! The `flife` binary wraps these as `flife validate <config>`,
 //! `flife run <config> --ticks N --every K [--run-dir DIR]`,
 //! `flife resume DIR --until T`,
-//! `flife branch PARENT DIR [--at T] [--name N] [--inject …]` and
+//! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
+//! `flife inspect DIR [--at T] [--field]` and
 //! `flife experiment SPEC --out DIR`. The repository's presets live
 //! in `presets/`.
 
@@ -45,6 +48,7 @@
 pub mod branch;
 pub mod checkpointing;
 pub mod experiment;
+pub mod inspect;
 pub mod metrics;
 pub mod observe;
 pub mod persist;
@@ -67,6 +71,10 @@ pub use experiment::{
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Particles, Style};
+pub use inspect::{
+    INSPECT_SCHEMA, InspectOptions, Inspected, InspectedCheckpoint, InspectedExtent,
+    InspectedField, InspectedOrganism, Inspection, inspect,
+};
 pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};
 pub use observe::{Heredity, Survey, Tally};
 pub use persist::{

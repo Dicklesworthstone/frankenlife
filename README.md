@@ -435,7 +435,8 @@ bytes, so it would change the written frames (`cargo run --release -p flife-cli 
 flife validate <config>     # range-check a config; report real memory and the worst admitted allocation
 flife capabilities          # what this machine and build can actually run, with explicit refusals
 flife run <config>          # a headless run
-flife step | inspect        # advance one tick; a bounded snapshot of one organism at an exact tick
+flife step                  # advance one tick
+flife inspect               # a run directory's committed world at one checkpoint, every organism and cell (exists)
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
 flife branch                # control and intervention branches from one checkpoint (exists)
 flife experiment            # seed ensembles, sweeps and ablations against a control, every run cataloged (exists)

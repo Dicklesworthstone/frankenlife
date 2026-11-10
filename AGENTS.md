@@ -817,8 +817,8 @@ behind it.
   validated configuration keys (`ABLATIONS`) or a registered model (`flife-engine`'s `ModelVariant`); one that
   changes the rules gets its own model name. Prove a change with `tests/experiment.rs` (byte-identical reports
   across worker counts and a SIGKILL) and, for the models, `flife-engine`'s `tests/ablation.rs`.
-- Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1`, `frankenlife.experiment.v1` and
-  `frankenlife.error.v1`; an experiment also writes `frankenlife.experiment-report.v1` and
+- Output is versioned NDJSON: `frankenlife.validate.v1`, `frankenlife.run.v1`, `frankenlife.experiment.v1`,
+  `frankenlife.inspect.v1` and `frankenlife.error.v1`; an experiment also writes `frankenlife.experiment-report.v1` and
   `frankenlife.run-manifest.v1`. An error's `kind` is `CoreError::kind`. Add a new variant's kind there, never a
   string match on `Display`.
 - `observe` has two halves:

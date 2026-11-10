@@ -85,6 +85,10 @@ bytes at any worker count and backend, and after a kill and a continuation.
     dir, ExperimentOptions { cpu_workers, controllers }, emit)`. `Experiment::configuration(condition, seed)` gives
     any planned run's validated configuration.
 
+- `flife inspect DIR --at T --field` (plan §14.6; FL-048's raw state). `DIR` is a run directory no process holds;
+  `--at` the committed tick of one of its checkpoints, the newest that restores by default. In the library:
+  `inspect(dir, InspectOptions { at, field })` returns an `Inspection`.
+
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
   parameters, the founders' and the worst admitted genome bytes, whether the worst case fits the logical quota,
@@ -209,6 +213,13 @@ bytes at any worker count and backend, and after a kill and a continuation.
   into place), `catalog.db` (the run catalog and command journal) and `store/` (the chunk store). A branch's catalog also records
   its lineage and its origin: the name, the parent run, the parent checkpoint's sequence and the creation time.
 - In `flife-core`, FL-015 adds `CoreError::kind`, a stable kebab-case class name, distinct for every variant.
+- `frankenlife.inspect.v1` (`flife inspect`): an `inspect` record (the checkpoint's sequence, tick and SHA-256, the
+  world's digest, model, size and grid, the live count, and the energy the field and the organisms hold), one
+  `organism` record per live organism in identity order (identity, genome, lineage, generation, parent, birth
+  tick, position, velocity, energy, topology index, parameter count and affinity), and with `--field` one `field`
+  record: every cell's energy, row-major (`y · cells_x + x`), each `f32` widened exactly. Every number is the stored
+  value. The directory's configuration and catalog are checked before its store is opened, so a directory that
+  holds no run is refused untouched; the store is opened as `resume` and `branch` open it.
 
 **Invariants.**
 - The run is a client of the session. The owner task holds the world and is the only commit authority. The client
@@ -627,6 +638,14 @@ Eleven planted mutants were run against `tests/experiment.rs` (the two model mut
   refusals test);
 - `chemistry-only` decoding the controller's output and `fresh-offspring` inheriting the parent's genome (the
   ablation test here, and each model's own evidence test in `tests/ablation.rs`).
+
+`tests/inspect.rs` (2 tests): `inspection_reports_the_committed_world_as_a_direct_world_holds_it` runs the
+48-founder ecology to tick 30 with checkpoints every 7 ticks; the newest inspection is tick 30 with the run's last
+digest, and inspections at 28 and 21 equal a world founded and stepped directly in the test, organism by organism
+bit for bit, every field cell, the digest and both energy totals; ticks 7 (retired) and 29 (never taken) are
+refused. `a_directory_without_a_run_is_refused_untouched`. Six planted mutants (the tick ignored, velocity for
+position, the field plane reversed, affinity left out, a founder its own parent, organism energy doubled) were each
+caught.
 
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories

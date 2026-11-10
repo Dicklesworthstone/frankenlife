@@ -30,9 +30,7 @@
 //! holdings must equal the restored field's and organisms' energy in every
 //! bit.
 
-use flife_core::checkpoint::{
-    ByteReader, ByteWriter, CheckpointReader, CheckpointWriter, Chunk, ChunkFamily,
-};
+use flife_core::checkpoint::{ByteReader, CheckpointReader, CheckpointWriter, Chunk, ChunkFamily};
 use flife_core::clock::{Tick, stable_phase};
 use flife_core::ids::{
     Generation, GenomeId, IdSequence, LineageId, OrganismId, ResourceEpoch, SourceId,
@@ -126,7 +124,7 @@ impl World {
     /// `stop-and-preserve`: a stopped run is not resumable.
     /// [`CoreError::IncompatibleCheckpoint`] if `writer` already holds one
     /// of these families.
-    pub fn write_checkpoint(&self, writer: &mut CheckpointWriter) -> Result<(), CoreError> {
+    pub fn write_checkpoint(&self, writer: &mut CheckpointWriter<'_>) -> Result<(), CoreError> {
         if let Some(fault) = &self.fault {
             return Err(CoreError::StateConflict {
                 operation: "checkpoint world",
@@ -139,224 +137,229 @@ impl World {
         }
         let version = WORLD_CHUNK_VERSION;
 
-        let mut out = ByteWriter::new();
-        out.sized(self.config.canonical_toml().as_bytes());
-        out.bytes(self.config.config_hash().as_bytes());
-        out.u8(arrangement_code(self.population.arrangement()));
-        for bits in profile_bits(&self.rules.profile) {
-            out.u64(bits);
-        }
-        writer.chunk(
-            ChunkFamily::Configuration,
-            version,
-            1,
-            out.into_bytes(),
-            &[],
-        )?;
+        writer.chunk_with(ChunkFamily::Configuration, version, 1, &[], |out| {
+            out.sized(self.config.canonical_toml().as_bytes());
+            out.bytes(self.config.config_hash().as_bytes());
+            out.u8(arrangement_code(self.population.arrangement()));
+            for bits in profile_bits(&self.rules.profile) {
+                out.u64(bits);
+            }
+            Ok(())
+        })?;
 
-        let mut out = ByteWriter::new();
-        out.sized(FNP_PHILOX_SEMANTIC_V1.as_bytes());
-        out.u64(self.rules.rng.seed());
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Random,
             version,
             1,
-            out.into_bytes(),
             &[ChunkFamily::Configuration],
+            |out| {
+                out.sized(FNP_PHILOX_SEMANTIC_V1.as_bytes());
+                out.u64(self.rules.rng.seed());
+                Ok(())
+            },
         )?;
 
         let catalog = &self.rules.catalog;
-        let mut out = ByteWriter::new();
-        out.sized(DENSE_104_36_CATALOG_V1.as_bytes());
-        out.u64(items(catalog.len()));
-        for id in catalog.ids() {
-            let (widths, parameters) = catalog.topology(id).map_or((&[][..], 0), |topology| {
-                (topology.hidden_widths(), topology.parameter_count())
-            });
-            out.u64(items(widths.len()));
-            for width in widths {
-                out.u32(*width);
-            }
-            out.u64(items(parameters));
-        }
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Topology,
             version,
             items(catalog.len()),
-            out.into_bytes(),
             &[ChunkFamily::Configuration],
+            |out| {
+                out.sized(DENSE_104_36_CATALOG_V1.as_bytes());
+                out.u64(items(catalog.len()));
+                for id in catalog.ids() {
+                    let (widths, parameters) =
+                        catalog.topology(id).map_or((&[][..], 0), |topology| {
+                            (topology.hidden_widths(), topology.parameter_count())
+                        });
+                    out.u64(items(widths.len()));
+                    for width in widths {
+                        out.u32(*width);
+                    }
+                    out.u64(items(parameters));
+                }
+                Ok(())
+            },
         )?;
 
-        let mut out = ByteWriter::new();
-        out.u64(self.tick.get());
-        out.u64(self.epoch.get());
-        out.u64(items(self.paths.len()));
-        for path in &self.paths {
-            out.u32(path.source().get());
-            out.u64(path.ordinal());
-            for value in path.segment().anchor() {
-                out.f64(value);
-            }
-        }
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Environment,
             version,
             items(self.paths.len()),
-            out.into_bytes(),
             &[ChunkFamily::Configuration],
+            |out| {
+                out.u64(self.tick.get());
+                out.u64(self.epoch.get());
+                out.u64(items(self.paths.len()));
+                for path in &self.paths {
+                    out.u32(path.source().get());
+                    out.u64(path.ordinal());
+                    for value in path.segment().anchor() {
+                        out.f64(value);
+                    }
+                }
+                Ok(())
+            },
         )?;
 
-        let mut out = ByteWriter::new();
-        out.option_u64(self.identities.organisms.next_raw());
-        out.option_u64(self.identities.genomes.next_raw());
-        out.u64(self.events);
-        out.u64(self.quota.logical_bytes());
-        out.u64(self.quota.allocated_bytes());
-        out.u64(self.quota.live());
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Lifecycle,
             version,
             1,
-            out.into_bytes(),
             &[ChunkFamily::Configuration],
+            |out| {
+                out.option_u64(self.identities.organisms.next_raw());
+                out.option_u64(self.identities.genomes.next_raw());
+                out.u64(self.events);
+                out.u64(self.quota.logical_bytes());
+                out.u64(self.quota.allocated_bytes());
+                out.u64(self.quota.live());
+                Ok(())
+            },
         )?;
 
         let field = self.field.current();
         let grid = field.grid();
-        let mut out = ByteWriter::new();
-        out.u32(grid.cells_x());
-        out.u32(grid.cells_y());
-        out.u32(FIELD_PLANES);
-        let mut values = 0_usize;
-        for plane in 0..FIELD_PLANES {
-            for value in field.plane(plane).unwrap_or(&[]) {
-                out.f32(*value);
-                values += 1;
-            }
-        }
-        writer.chunk(
+        let values: usize = (0..FIELD_PLANES)
+            .map(|plane| field.plane(plane).map_or(0, <[f32]>::len))
+            .sum();
+        writer.chunk_with(
             ChunkFamily::Field,
             version,
             items(values),
-            out.into_bytes(),
             &[ChunkFamily::Configuration],
+            |out| {
+                out.u32(grid.cells_x());
+                out.u32(grid.cells_y());
+                out.u32(FIELD_PLANES);
+                for plane in 0..FIELD_PLANES {
+                    for value in field.plane(plane).unwrap_or(&[]) {
+                        out.f32(*value);
+                    }
+                }
+                Ok(())
+            },
         )?;
 
         let live = self.population.len();
-        let mut out = ByteWriter::new();
-        out.u64(items(live));
-        for organism in self.population.iter() {
-            let genome =
-                self.population
-                    .genome(organism.id)
-                    .ok_or_else(|| CoreError::StateConflict {
-                        operation: "checkpoint world",
-                        detail: format!("{} has no genome", organism.id),
-                    })?;
-            out.u64(genome.id().get());
-            out.u64(items(genome.topology().index()));
-            out.option_u64(genome.parent().map(GenomeId::get));
-            let traits = genome.traits();
-            for value in traits.affinity().iter().chain(traits.motion_response()) {
-                out.f64(*value);
-            }
-            out.f64(traits.sensing_scale());
-            out.u64(items(genome.parameters().len()));
-            for value in genome.parameters() {
-                out.f32(*value);
-            }
-        }
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Genomes,
             version,
             items(live),
-            out.into_bytes(),
             &[ChunkFamily::Topology],
+            |out| {
+                out.u64(items(live));
+                for organism in self.population.iter() {
+                    let genome = self.population.genome(organism.id).ok_or_else(|| {
+                        CoreError::StateConflict {
+                            operation: "checkpoint world",
+                            detail: format!("{} has no genome", organism.id),
+                        }
+                    })?;
+                    out.u64(genome.id().get());
+                    out.u64(items(genome.topology().index()));
+                    out.option_u64(genome.parent().map(GenomeId::get));
+                    let traits = genome.traits();
+                    for value in traits.affinity().iter().chain(traits.motion_response()) {
+                        out.f64(*value);
+                    }
+                    out.f64(traits.sensing_scale());
+                    out.u64(items(genome.parameters().len()));
+                    for value in genome.parameters() {
+                        out.f32(*value);
+                    }
+                }
+                Ok(())
+            },
         )?;
 
-        let mut out = ByteWriter::new();
-        out.u64(items(live));
-        for organism in self.population.iter() {
-            out.u64(organism.id.get());
-            out.u64(organism.genome.get());
-            out.option_u64(organism.parent.map(OrganismId::get));
-            out.u64(organism.lineage.get());
-            out.u32(organism.generation.get());
-            for value in organism
-                .position
-                .into_iter()
-                .chain(organism.velocity)
-                .chain([organism.energy])
-            {
-                out.f64(value);
-            }
-        }
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Particles,
             version,
             items(live),
-            out.into_bytes(),
             &[ChunkFamily::Genomes],
+            |out| {
+                out.u64(items(live));
+                for organism in self.population.iter() {
+                    out.u64(organism.id.get());
+                    out.u64(organism.genome.get());
+                    out.option_u64(organism.parent.map(OrganismId::get));
+                    out.u64(organism.lineage.get());
+                    out.u32(organism.generation.get());
+                    for value in organism
+                        .position
+                        .into_iter()
+                        .chain(organism.velocity)
+                        .chain([organism.energy])
+                    {
+                        out.f64(value);
+                    }
+                }
+                Ok(())
+            },
         )?;
 
-        let mut out = ByteWriter::new();
-        out.u64(items(live));
-        for organism in self.population.iter() {
-            out.u64(organism.id.get());
-            out.option_u64(organism.held.evaluated_at().map(Tick::get));
-            if let Some(outputs) = organism.held.outputs() {
-                for value in outputs {
-                    out.f32(*value);
-                }
-            }
-            out.u32(organism.phase);
-            out.u64(organism.cooldown_deadline.get());
-            out.u64(organism.birth_tick.get());
-            out.f64(organism.energy_change_rate);
-        }
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Held,
             version,
             items(live),
-            out.into_bytes(),
             &[ChunkFamily::Particles],
+            |out| {
+                out.u64(items(live));
+                for organism in self.population.iter() {
+                    out.u64(organism.id.get());
+                    out.option_u64(organism.held.evaluated_at().map(Tick::get));
+                    if let Some(outputs) = organism.held.outputs() {
+                        for value in outputs {
+                            out.f32(*value);
+                        }
+                    }
+                    out.u32(organism.phase);
+                    out.u64(organism.cooldown_deadline.get());
+                    out.u64(organism.birth_tick.get());
+                    out.f64(organism.energy_change_rate);
+                }
+                Ok(())
+            },
         )?;
 
         let state = self.ledger.state();
-        let mut out = ByteWriter::new();
-        for holdings in [state.initial, state.last] {
-            out.f64(holdings.field());
-            out.f64(holdings.organisms());
-        }
-        out.option_u64(state.next_tick.map(Tick::get));
-        out.u64(state.ticks);
-        for sum in [
-            state.injected,
-            state.removed,
-            state.dissipated,
-            state.turnover,
-            state.residual,
-        ] {
-            for value in sum.parts() {
-                out.f64(value);
-            }
-        }
-        out.f64(state.largest_tick_residual);
-        for value in state.drift {
-            out.f64(value);
-        }
-        writer.chunk(
+        writer.chunk_with(
             ChunkFamily::Ledger,
             version,
             1,
-            out.into_bytes(),
             &[ChunkFamily::Field, ChunkFamily::Particles],
+            |out| {
+                for holdings in [state.initial, state.last] {
+                    out.f64(holdings.field());
+                    out.f64(holdings.organisms());
+                }
+                out.option_u64(state.next_tick.map(Tick::get));
+                out.u64(state.ticks);
+                for sum in [
+                    state.injected,
+                    state.removed,
+                    state.dissipated,
+                    state.turnover,
+                    state.residual,
+                ] {
+                    for value in sum.parts() {
+                        out.f64(value);
+                    }
+                }
+                out.f64(state.largest_tick_residual);
+                for value in state.drift {
+                    out.f64(value);
+                }
+                Ok(())
+            },
         )
     }
 
-    /// The world `reader` holds, checked against `profile` (see the [module
-    /// documentation](self)). It has the configuration's worker count and
-    /// no controller backend.
+    /// The world `reader` holds, checked against `profile` (each chunk's
+    /// checks are listed in this module's source documentation). It has the
+    /// configuration's worker count and no controller backend.
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] for a chunk this build does not

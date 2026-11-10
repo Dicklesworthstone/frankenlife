@@ -52,6 +52,34 @@ impl Sha256Digest {
     }
 }
 
+/// SHA-256 over bytes fed in order: the same digest as
+/// [`Sha256Digest::of`] their concatenation, without holding them.
+#[derive(Debug, Clone, Default)]
+pub struct Sha256Stream(Sha256);
+
+impl Sha256Stream {
+    /// An empty stream.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    /// Feed `bytes`.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The digest of everything fed.
+    #[must_use]
+    pub fn finish(self) -> Sha256Digest {
+        let mut digest = [0_u8; 32];
+        for (out, byte) in digest.iter_mut().zip(self.0.finalize().iter()) {
+            *out = *byte;
+        }
+        Sha256Digest(digest)
+    }
+}
+
 impl fmt::Display for Sha256Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "sha256:{}", self.to_hex())

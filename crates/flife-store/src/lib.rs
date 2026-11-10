@@ -47,8 +47,10 @@
 //! durable, and which indexes the checkpoints published here.
 
 pub mod journal;
+mod stream;
 
 pub use journal::{BranchOrigin, CATALOG_FORMAT, CommandJournal, IndexedCheckpoint};
+pub use stream::{Observer, Stream};
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -58,7 +60,7 @@ use std::path::{Path, PathBuf};
 use flife_core::checkpoint::{
     CheckpointManifest, CheckpointReader, MANIFEST_MAX_BYTES, MODEL_MAX_BYTES, ManifestEntry,
 };
-use flife_core::{CoreError, Sha256Digest};
+use flife_core::{CoreError, Sha256Digest, Sha256Stream};
 
 /// The store format written to `FLIFESTORE`.
 pub const STORE_FORMAT: &str = "frankenlife.chunk-store.v1";
@@ -275,6 +277,52 @@ fn create_new(
     Ok(file)
 }
 
+/// Where a store at `root` keeps the chunk with `digest`.
+fn chunk_path_in(root: &Path, digest: &Sha256Digest) -> PathBuf {
+    let hex = digest.to_hex();
+    root.join(CHUNKS).join(&hex[..2]).join(hex)
+}
+
+/// The bytes a streamed read holds at once.
+const READ_BUFFER_BYTES: usize = 1 << 20;
+
+/// Feed `length` bytes of the file at `path` to `chunk` and `container`,
+/// a buffer at a time. False when the file ends early.
+fn hash_file(
+    path: &Path,
+    length: u64,
+    chunk: &mut Sha256Stream,
+    mut container: Option<&mut Sha256Stream>,
+) -> Result<bool, CoreError> {
+    let mut file = File::open(path).map_err(|error| storage("read chunk", path, &error))?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(READ_BUFFER_BYTES)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "chunk read buffer",
+            bytes: READ_BUFFER_BYTES as u64,
+        })?;
+    buffer.resize(READ_BUFFER_BYTES, 0);
+    let mut remaining = length;
+    while remaining > 0 {
+        let want =
+            usize::try_from(remaining.min(READ_BUFFER_BYTES as u64)).unwrap_or(READ_BUFFER_BYTES);
+        let read = file
+            .read(&mut buffer[..want])
+            .map_err(|error| storage("read chunk", path, &error))?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let bytes = &buffer[..read];
+        chunk.update(bytes);
+        if let Some(container) = container.as_deref_mut() {
+            container.update(bytes);
+        }
+        remaining -= u64::try_from(read).unwrap_or(remaining);
+    }
+    Ok(true)
+}
+
 fn remove_all(temporaries: &[PathBuf]) {
     for path in temporaries {
         // Best effort: anything left is removed when the store is next
@@ -466,8 +514,116 @@ impl ChunkStore {
     /// Where the chunk with `digest` is stored.
     #[must_use]
     pub fn chunk_path(&self, digest: &Sha256Digest) -> PathBuf {
-        let hex = digest.to_hex();
-        self.root.join(CHUNKS).join(&hex[..2]).join(hex)
+        chunk_path_in(&self.root, digest)
+    }
+
+    /// Start publishing a checkpoint as it is encoded ([`Stream`]): pass
+    /// the stream to [`flife_core::checkpoint::CheckpointWriter::streaming`]
+    /// (or `flife_runtime::checkpoint_into`), then the sealed prefix it
+    /// returns to [`ChunkStore::commit`]. The stream takes the next sequence
+    /// number now; a stream never committed leaves a gap.
+    ///
+    /// # Errors
+    /// [`CoreError::Overflow`] if sequence numbers are exhausted.
+    pub fn stream(&mut self) -> Result<Stream, CoreError> {
+        self.stream_observed(Box::new(|_| Flow::Continue))
+    }
+
+    /// [`ChunkStore::stream`], reporting each [`Step`] to `observe`, which
+    /// may cancel the publication until the manifest is published, as
+    /// [`ChunkStore::publish_observed`] does.
+    ///
+    /// # Errors
+    /// As [`ChunkStore::stream`].
+    pub fn stream_observed(&mut self, observe: Observer) -> Result<Stream, CoreError> {
+        let sequence = self.next;
+        self.next = sequence.checked_add(1).ok_or(CoreError::Overflow {
+            quantity: "checkpoint sequence",
+        })?;
+        Ok(Stream::new(
+            self.root.clone(),
+            self.durability,
+            sequence,
+            observe,
+        ))
+    }
+
+    /// Publish the checkpoint `stream` stored, whose header, manifest and
+    /// seal are `sealed` (see [`Stream`]). Before
+    /// the manifest is written, checks that `sealed` verifies and names
+    /// exactly the chunks the stream stored, in order and tiling the
+    /// payload, and that each is still in place at its length.
+    ///
+    /// # Errors
+    /// The stream's own refusal, if it had one; [`CoreError::StateConflict`]
+    /// for a stream of another store or one with a chunk still open;
+    /// [`CoreError::IncompatibleCheckpoint`] if `sealed` does not verify or
+    /// does not match the stream; otherwise as
+    /// [`ChunkStore::publish_observed`]. Unless the error is a failure to
+    /// flush `checkpoints/` after [`Step::Published`], the store's
+    /// published checkpoints are as they were.
+    pub fn commit(&mut self, mut stream: Stream, sealed: &[u8]) -> Result<Publication, CoreError> {
+        if let Some(error) = &stream.failed {
+            return Err(error.clone());
+        }
+        if stream.root != self.root {
+            return Err(CoreError::StateConflict {
+                operation: "commit checkpoint",
+                detail: format!(
+                    "the stream writes {}, not this store",
+                    stream.root.display()
+                ),
+            });
+        }
+        if stream.is_open() {
+            return Err(CoreError::StateConflict {
+                operation: "commit checkpoint",
+                detail: "a chunk is still open".into(),
+            });
+        }
+        let manifest = CheckpointManifest::parse(sealed)?;
+        if manifest.sealed_length() != sealed.len() {
+            return Err(refuse(format!(
+                "the sealed prefix is followed by {} bytes",
+                sealed.len().saturating_sub(manifest.sealed_length())
+            )));
+        }
+        if manifest.entries().len() != stream.stored.len() {
+            return Err(refuse(format!(
+                "the manifest names {} chunks, the stream stored {}",
+                manifest.entries().len(),
+                stream.stored.len()
+            )));
+        }
+        let mut offset = 0_u64;
+        for (entry, (family, length, digest)) in manifest.entries().iter().zip(&stream.stored) {
+            if entry.family != *family
+                || entry.length != *length
+                || entry.digest != *digest
+                || entry.offset != offset
+            {
+                return Err(refuse(format!(
+                    "the manifest's chunk {} is not the one the stream stored",
+                    entry.family.name()
+                )));
+            }
+            offset = offset.saturating_add(entry.length);
+            let path = self.chunk_path(digest);
+            let present = fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == *length);
+            if !present {
+                return Err(refuse(format!(
+                    "chunk {} ({digest}) is no longer stored",
+                    family.name()
+                )));
+            }
+        }
+        let sequence = stream.sequence;
+        let mut temporaries = std::mem::take(&mut stream.temporaries);
+        let outcome =
+            self.publish_manifest(sealed, sequence, &mut *stream.observe, &mut temporaries);
+        remove_all(&temporaries);
+        outcome.map(|()| stream.publication.clone())
     }
 
     /// Publish `checkpoint` (see the [module documentation](self)).
@@ -651,6 +807,20 @@ impl ChunkStore {
         let sealed = checkpoint
             .get(..manifest.sealed_length())
             .ok_or_else(|| refuse("the sealed prefix is outside the checkpoint"))?;
+        self.publish_manifest(sealed, sequence, observe, temporaries)?;
+        Ok(publication)
+    }
+
+    /// Write `sealed` as checkpoint `sequence`'s manifest and link it into
+    /// `checkpoints/`: the commit point.
+    fn publish_manifest(
+        &self,
+        sealed: &[u8],
+        sequence: u64,
+        observe: &mut dyn FnMut(Step) -> Flow,
+        temporaries: &mut Vec<PathBuf>,
+    ) -> Result<(), CoreError> {
+        let flushes = self.durability.flushes();
         let temporary = self
             .root
             .join(TEMPORARY)
@@ -672,7 +842,7 @@ impl ChunkStore {
             flush_directory(&self.root.join(CHECKPOINTS))?;
             let _ignored = observe(Step::DirectoryFlushed);
         }
-        Ok(publication)
+        Ok(())
     }
 
     /// Checkpoint `sequence`, reassembled from its manifest and chunks.
@@ -683,6 +853,71 @@ impl ChunkStore {
     /// chunk's length is checked before anything is allocated for it);
     /// [`CoreError::StorageFailed`] if the host refuses a read.
     pub fn load(&self, sequence: u64) -> Result<Vec<u8>, CoreError> {
+        let prefix = self.sealed_prefix(sequence)?;
+        let manifest = CheckpointManifest::parse(&prefix)?;
+        let total = u64::try_from(prefix.len())
+            .ok()
+            .and_then(|sealed| sealed.checked_add(manifest.payload_length()))
+            .and_then(|total| usize::try_from(total).ok())
+            .ok_or_else(|| refuse(format!("checkpoint {sequence} is too large for this host")))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(total)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "checkpoint",
+                bytes: u64::try_from(total).unwrap_or(u64::MAX),
+            })?;
+        bytes.extend_from_slice(&prefix);
+        for entry in manifest.entries() {
+            let chunk = self.chunk_path(&entry.digest);
+            let start = bytes.len();
+            File::open(&chunk)
+                .and_then(|file| file.take(entry.length).read_to_end(&mut bytes))
+                .map_err(|error| storage("read chunk", &chunk, &error))?;
+            let read = bytes.get(start..).unwrap_or_default();
+            if u64::try_from(read.len()).ok() != Some(entry.length)
+                || Sha256Digest::of(read) != entry.digest
+            {
+                return Err(refuse(format!(
+                    "chunk {} ({}) hash mismatch",
+                    entry.family.name(),
+                    entry.digest
+                )));
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Verify checkpoint `sequence` as [`ChunkStore::load`] does, without
+    /// holding it: each chunk is hashed as it is read, a buffer at a time.
+    /// Returns the SHA-256 of the whole container, the digest of the bytes
+    /// [`ChunkStore::load`] would return.
+    ///
+    /// # Errors
+    /// As [`ChunkStore::load`].
+    pub fn verify(&self, sequence: u64) -> Result<Sha256Digest, CoreError> {
+        let prefix = self.sealed_prefix(sequence)?;
+        let manifest = CheckpointManifest::parse(&prefix)?;
+        let mut container = Sha256Stream::new();
+        container.update(&prefix);
+        for entry in manifest.entries() {
+            let path = self.chunk_path(&entry.digest);
+            let mut chunk = Sha256Stream::new();
+            let whole = hash_file(&path, entry.length, &mut chunk, Some(&mut container))?;
+            if !whole || chunk.finish() != entry.digest {
+                return Err(refuse(format!(
+                    "chunk {} ({}) hash mismatch",
+                    entry.family.name(),
+                    entry.digest
+                )));
+            }
+        }
+        Ok(container.finish())
+    }
+
+    /// Checkpoint `sequence`'s sealed prefix, verified, after checking that
+    /// every chunk it names is a file of its declared length.
+    fn sealed_prefix(&self, sequence: u64) -> Result<Vec<u8>, CoreError> {
         let path = self.manifest_path(sequence);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -727,37 +962,7 @@ impl ChunkStore {
                 Err(error) => return Err(storage("inspect chunk", &chunk, &error)),
             }
         }
-        let total = u64::try_from(prefix.len())
-            .ok()
-            .and_then(|sealed| sealed.checked_add(manifest.payload_length()))
-            .and_then(|total| usize::try_from(total).ok())
-            .ok_or_else(|| refuse(format!("checkpoint {sequence} is too large for this host")))?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(total)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "checkpoint",
-                bytes: u64::try_from(total).unwrap_or(u64::MAX),
-            })?;
-        bytes.extend_from_slice(&prefix);
-        for entry in manifest.entries() {
-            let chunk = self.chunk_path(&entry.digest);
-            let start = bytes.len();
-            File::open(&chunk)
-                .and_then(|file| file.take(entry.length).read_to_end(&mut bytes))
-                .map_err(|error| storage("read chunk", &chunk, &error))?;
-            let read = bytes.get(start..).unwrap_or_default();
-            if u64::try_from(read.len()).ok() != Some(entry.length)
-                || Sha256Digest::of(read) != entry.digest
-            {
-                return Err(refuse(format!(
-                    "chunk {} ({}) hash mismatch",
-                    entry.family.name(),
-                    entry.digest
-                )));
-            }
-        }
-        Ok(bytes)
+        Ok(prefix)
     }
 
     /// The newest checkpoint that loads and that `accept` accepts, with the
@@ -811,6 +1016,30 @@ impl ChunkStore {
         keep: usize,
         mut accept: impl FnMut(u64, &[u8]) -> Result<(), CoreError>,
     ) -> Result<Retention, CoreError> {
+        self.retain_by(keep, |store, sequence| {
+            store
+                .load(sequence)
+                .and_then(|bytes| accept(sequence, &bytes))
+                .is_ok()
+        })
+    }
+
+    /// [`ChunkStore::retain`], counting a checkpoint valid when it
+    /// [verifies](ChunkStore::verify): its seal, and every chunk's length
+    /// and hash, read a buffer at a time. It does not decode a checkpoint,
+    /// and holds at most one read buffer (FL-038).
+    ///
+    /// # Errors
+    /// As [`ChunkStore::retain`].
+    pub fn retain_intact(&mut self, keep: usize) -> Result<Retention, CoreError> {
+        self.retain_by(keep, |store, sequence| store.verify(sequence).is_ok())
+    }
+
+    fn retain_by(
+        &mut self,
+        keep: usize,
+        mut valid_checkpoint: impl FnMut(&Self, u64) -> bool,
+    ) -> Result<Retention, CoreError> {
         if keep == 0 {
             return Err(CoreError::StateConflict {
                 operation: "retain checkpoints",
@@ -823,11 +1052,7 @@ impl ChunkStore {
             if valid.len() == keep {
                 break;
             }
-            if self
-                .load(sequence)
-                .and_then(|bytes| accept(sequence, &bytes))
-                .is_ok()
-            {
+            if valid_checkpoint(self, sequence) {
                 valid.push(sequence);
             }
         }
@@ -910,15 +1135,20 @@ impl ChunkStore {
 
 /// Whether `path` holds `entry`'s chunk intact.
 fn stored(path: &Path, entry: &ManifestEntry) -> Result<Stored, CoreError> {
+    stored_as(path, entry.length, &entry.digest)
+}
+
+/// Whether `path` holds the `length` bytes with `digest` intact, hashed a
+/// buffer at a time.
+fn stored_as(path: &Path, length: u64, digest: &Sha256Digest) -> Result<Stored, CoreError> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Stored::Absent),
         Err(error) => Err(storage("inspect chunk", path, &error)),
-        Ok(metadata) if !metadata.is_file() || metadata.len() != entry.length => {
-            Ok(Stored::Damaged)
-        }
+        Ok(metadata) if !metadata.is_file() || metadata.len() != length => Ok(Stored::Damaged),
         Ok(_) => {
-            let bytes = fs::read(path).map_err(|error| storage("read chunk", path, &error))?;
-            Ok(if Sha256Digest::of(&bytes) == entry.digest {
+            let mut hash = Sha256Stream::new();
+            let whole = hash_file(path, length, &mut hash, None)?;
+            Ok(if whole && hash.finish() == *digest {
                 Stored::Intact
             } else {
                 Stored::Damaged

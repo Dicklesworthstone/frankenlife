@@ -30,11 +30,12 @@ use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, ControllerReport, NumericalProfile, World};
 use flife_runtime::{
     Admission, Command, CommandBook, Durability, SessionClosed, SessionConfig, SessionHandle,
-    SessionOwner, StepOutcome, VOLATILE_IN_MEMORY, WRITE_AHEAD_BEFORE_APPLY, open_with, restore,
+    SessionOwner, StepOutcome, VOLATILE_IN_MEMORY, WRITE_AHEAD_BEFORE_APPLY, open_with,
 };
 use serde::Serialize;
 
 use crate::branch::{BranchParent, ForkRecord, FoundingChunks, Inherited};
+use crate::checkpointing::CheckpointAdmission;
 use crate::metrics::{Declaration, Metrics, Tracker};
 use crate::observe::{Survey, Tally};
 use crate::persist::{Checkpoints, Injection, Persistence};
@@ -175,6 +176,10 @@ pub enum Record {
         /// The metrics records to follow and how they are computed.
         #[serde(skip_serializing_if = "Option::is_none")]
         metrics: Option<Declaration>,
+        /// For a run directory, how its checkpoints are taken and their
+        /// memory admission (FL-038).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        checkpoints: Option<CheckpointAdmission>,
     },
     /// The run so far.
     Progress {
@@ -233,6 +238,15 @@ pub enum Record {
         chunks: [usize; 2],
         /// Older checkpoints removed under `retain_recent_checkpoints`.
         retired: Vec<u64>,
+        /// The mode it was taken in (FL-038).
+        mode: &'static str,
+        /// The most page bytes it retained while the run stepped: zero for
+        /// `pause-and-stream`, at most `checkpoint_retained_bytes` for
+        /// `bounded-background`.
+        retained_peak: u64,
+        /// Wall-clock seconds the run took no step for it. Not scientific
+        /// state.
+        paused_seconds: f64,
     },
     /// A branch made from a parent run's checkpoint (FL-039).
     Branch {
@@ -379,6 +393,7 @@ pub fn start(
         ticks,
         cpu_workers,
         controllers,
+        checkpoints: None,
         metrics: (metrics_every > 0).then(|| Declaration::new(metrics_every)),
     }
 }
@@ -409,7 +424,9 @@ pub fn run(
 /// configuration without a run directory, or when the native runtime
 /// cannot be built or its tasks spawned; [`CoreError::StateConflict`] for a
 /// scheduled command that is not admitted, or a run directory that already
-/// holds a run or other files; the store's and catalog's errors.
+/// holds a run or other files; [`CoreError::BudgetExhausted`] when the
+/// configuration's memory cannot hold a checkpoint ([`crate::admit`]),
+/// before anything is created; the store's and catalog's errors.
 pub fn run_with(
     config: &ValidatedConfig,
     options: RunOptions,
@@ -430,6 +447,8 @@ pub fn run_with(
     }
     let commands = crate::persist::commands(injections);
     if let Some(persistence) = persistence {
+        // Checkpoint memory is admitted before anything is created.
+        crate::checkpointing::admit(config, persistence.mode, persistence.retained_bytes)?;
         crate::persist::create(&persistence.run_dir, config)?;
     }
     let mut world = found(config)?;
@@ -580,7 +599,18 @@ where
                         ),
                     });
                 }
-                emit(&plan.start);
+                let mut start = plan.start;
+                if let (
+                    Record::Start {
+                        checkpoints: admitted,
+                        ..
+                    },
+                    Some(checkpoints),
+                ) = (&mut start, &checkpoints)
+                {
+                    *admitted = Some(checkpoints.admission().clone());
+                }
+                emit(&start);
                 if let Some((checkpoint, skipped)) = plan.resumed {
                     emit(&Record::Resume {
                         schema: RUN_SCHEMA,
@@ -594,12 +624,19 @@ where
                         }),
                     });
                 }
-                if let Some(tracker) = &mut metrics
-                    && tracker.tick() != committed
-                {
-                    let taken = handle.checkpoint(&cx).await?;
-                    let restored = restore(&taken.bytes, NumericalProfile::reference_f32()?)?;
-                    tracker.refound(&restored.world)?;
+                if let Some(tracker) = metrics.take() {
+                    metrics = Some(if tracker.tick() == committed {
+                        tracker
+                    } else {
+                        // Re-found from the committed world itself, read
+                        // where a checkpoint would be: no copy of it.
+                        handle
+                            .checkpoint_with(&cx, move |world, _, _| {
+                                let mut tracker = tracker;
+                                tracker.refound(world).map(|()| tracker)
+                            })
+                            .await??
+                    });
                 }
                 for command in plan.commands {
                     let admission = handle.submit(&cx, command).await?;
@@ -619,8 +656,9 @@ where
                     && checkpoints.due(committed)
                     && checkpoints.last_tick() != Some(committed)
                 {
-                    let taken = handle.checkpoint(&cx).await?;
-                    emit(&checkpoints.publish(&taken)?);
+                    for record in checkpoints.take(&handle, &cx).await? {
+                        emit(&record);
+                    }
                 }
                 let mut tally = Tally::default();
                 let stop = loop {
@@ -652,8 +690,9 @@ where
                             if let Some(checkpoints) = &mut checkpoints
                                 && checkpoints.due(committed)
                             {
-                                let taken = handle.checkpoint(&cx).await?;
-                                emit(&checkpoints.publish(&taken)?);
+                                for record in checkpoints.take(&handle, &cx).await? {
+                                    emit(&record);
+                                }
                             }
                         }
                         StepOutcome::Paused { shortfall, .. } => {
@@ -683,8 +722,16 @@ where
                     && !matches!(stop, Stop::Failed { stopped: true, .. })
                     && checkpoints.last_tick() != Some(committed)
                 {
-                    let taken = handle.checkpoint(&cx).await?;
-                    emit(&checkpoints.publish(&taken)?);
+                    for record in checkpoints.take(&handle, &cx).await? {
+                        emit(&record);
+                    }
+                }
+                // A background checkpoint still in flight is published
+                // before the run ends.
+                if let Some(checkpoints) = &mut checkpoints {
+                    for record in checkpoints.drain(&handle, &cx).await? {
+                        emit(&record);
+                    }
                 }
                 // A kept run is suspended, not closed: commands still
                 // pending stay pending in its checkpoint and journal, to

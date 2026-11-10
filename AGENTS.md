@@ -628,8 +628,8 @@ The repository holds:
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid, FL-011 deposits and FL-027 bins), `crates/flife-engine`
   (FL-006, FL-011–FL-014),
   `crates/flife-neural` (FL-007, FL-008), `crates/flife-genome` (FL-009, FL-010), `crates/flife-runtime`
-  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-039, FL-040), and
-  `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-039), and
+  (FL-014, FL-017's session feed), `crates/flife-render` (FL-017), `crates/flife-cli` (FL-015, FL-037, FL-038, FL-039, FL-040), and
+  `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-038, FL-039), and
   `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), the first real preset.
@@ -793,6 +793,11 @@ behind it.
   so pending commands survive into `resume`. FrankenSQLite calls go on a plain thread (`on_plain_thread`), never
   the runtime's. Prove a resume change with `tests/resume.rs`: the resumed digest and final checkpoint SHA-256
   must equal the uninterrupted run's.
+- Checkpoint modes (FL-038, `checkpointing`): a run directory never encodes a checkpoint whole. `pause-and-stream`
+  streams the borrowed world (`SessionHandle::checkpoint_with` → `checkpoint_into` → `flife_store::Stream`) a page
+  at a time; `bounded-background` hands pages to a writer thread through a byte-bounded `Queue`, one checkpoint in
+  flight. Write the catalog only while the journal is idle (on the paused session). Prove a change with
+  `tests/checkpoint_memory.rs` (its counting allocator is test only) and `tests/resume.rs`.
 - Branches (FL-039, `branch`): a new session (`branch_session` of the parent checkpoint's SHA-256 and the
   name) whose book inherits every command and records the fork (`CommandBook::branch`, version 2 commands
   chunk). The founding checkpoint links the parent's chunk files (`ChunkStore::publish_sharing`), and the

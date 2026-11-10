@@ -72,6 +72,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+# Test only (FL-038): a global allocator that counts the bytes live and their
+# high-water mark, for the checkpoint path's peak-memory tests. No dependencies;
+# its unsafe allocator impl stays in the crate, never in FrankenLife code.
+peak_alloc = "=0.3.0"
 
 # Root-only overrides. Cargo reads [patch] only at the consuming workspace
 # root and ignores a dependency's own patches (plan §12.8, S20), so each one

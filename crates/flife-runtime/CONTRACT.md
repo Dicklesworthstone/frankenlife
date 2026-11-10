@@ -141,6 +141,11 @@ inherits every command and outcome, records the fork, and from then on admits on
 - At close the owner offers the final boundary once more and marks the feed closed. The last epoch stays readable.
 
 **Invariants — checkpoints (FL-016; §16.3, C.14, B.2).**
+- FL-038: `checkpoint_into(world, book, sink)` writes the same container through a `flife_core::checkpoint::ChunkSink`
+  a page at a time and returns its sealed prefix; `checkpoint` is it with an in-memory sink.
+  `SessionHandle::checkpoint_with(cx, take)` runs `take` on the owner's task with the committed world, its book
+  and the boundary, exactly where `checkpoint` would encode them: once every journal record sent has its
+  receipt, and with no step until `take` returns. A closed session answers `take` with its error.
 - `checkpoint(world, book)` writes the world's ten chunks and the commands chunk into one container
   (`SESSION_CHECKPOINT_CHUNKS`). It refuses a book whose revision is not the world's configuration hash.
 - The commands chunk holds the session, the revision, the capacity, the next admission order, the sealed

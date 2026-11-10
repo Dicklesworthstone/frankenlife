@@ -83,6 +83,10 @@ FL-037 keeps a run in a directory: `flife run --run-dir DIR` writes its configur
 DIR --until T` continues it from its newest checkpoint that restores. A run SIGKILLed part way, or whose newest
 checkpoint is damaged, resumes to exactly the uninterrupted run's world and final checkpoint bytes, across
 controller phases, cooldowns, newborns and commands still in the future.
+FL-038 bounds a checkpoint's memory. `pause-and-stream` streams the committed world into the store a 1 MiB page at
+a time: the preset's 160.7 MiB checkpoint peaks at about 1 MiB of heap, where encoding it whole peaked at 421.5 MiB.
+`bounded-background` lets the run step on while a writer drains at most `checkpoint_retained_bytes` of pages. Both
+store byte-identical checkpoints, and a run whose memory cannot hold a checkpoint is refused before it starts.
 FL-039 branches a run: `flife branch PARENT DIR --at T` starts a new session from the parent's checkpoint at
 tick T, a control branch, or an intervention branch with `--inject` brushes of its own. The branch links
 the parent's verified chunk files instead of copying them and writes only its command closure. Its journal

@@ -15,8 +15,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use flife_cli::{
-    BranchOptions, ColorMapping, ControllerChoice, ERROR_SCHEMA, Injection, Look, Particles,
-    Persistence, ResumeOptions, RunOptions, Stop, StoreDurability, Style, Validation,
+    BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Injection, Look,
+    Particles, Persistence, ResumeOptions, RunOptions, Stop, StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -195,6 +195,18 @@ struct CheckpointFlags {
     /// before publishing it; `process-crash` relies on atomic renames.
     #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
     checkpoint_durability: StoreDurability,
+    /// `pause-and-stream` waits while each checkpoint streams into the
+    /// store a page at a time; `bounded-background` steps on while a
+    /// writer drains at most `--checkpoint-retained-bytes` of its pages.
+    /// The default is the configuration's `[persistence] checkpoint_mode`.
+    /// No result depends on it.
+    #[arg(long, value_parser = parse_mode)]
+    checkpoint_mode: Option<CheckpointMode>,
+    /// The most page bytes a `bounded-background` checkpoint retains. The
+    /// default is the configuration's `[execution]
+    /// checkpoint_retained_bytes`.
+    #[arg(long)]
+    checkpoint_retained_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -275,6 +287,10 @@ fn main() -> ExitCode {
                         .checkpoint_every
                         .unwrap_or(defaults.checkpoint_every),
                     durability: checkpoints.checkpoint_durability,
+                    mode: checkpoints.checkpoint_mode.unwrap_or(defaults.mode),
+                    retained_bytes: checkpoints
+                        .checkpoint_retained_bytes
+                        .unwrap_or(defaults.retained_bytes),
                     ..defaults
                 }
             });
@@ -332,6 +348,8 @@ fn main() -> ExitCode {
                 controllers,
                 checkpoint_every: checkpoints.checkpoint_every,
                 durability: checkpoints.checkpoint_durability,
+                checkpoint_mode: checkpoints.checkpoint_mode,
+                retained_bytes: checkpoints.checkpoint_retained_bytes,
                 metrics_every,
             },
             print,
@@ -350,6 +368,16 @@ fn exit(finished: Result<flife_cli::Finished, flife_core::CoreError>) -> ExitCod
 }
 
 /// A checkpoint durability profile by name.
+fn parse_mode(text: &str) -> Result<CheckpointMode, String> {
+    [
+        CheckpointMode::PauseAndStream,
+        CheckpointMode::BoundedBackground,
+    ]
+    .into_iter()
+    .find(|mode| mode.name() == text)
+    .ok_or_else(|| format!("`{text}` is not `pause-and-stream` or `bounded-background`"))
+}
+
 fn parse_durability(text: &str) -> Result<StoreDurability, String> {
     [StoreDurability::PowerLoss, StoreDurability::ProcessCrash]
         .into_iter()

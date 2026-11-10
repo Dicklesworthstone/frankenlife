@@ -743,7 +743,7 @@ impl CommandBook {
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] if `writer` lacks the
     /// configuration chunk or already holds the commands.
-    pub fn write_checkpoint(&self, writer: &mut CheckpointWriter) -> Result<(), CoreError> {
+    pub fn write_checkpoint(&self, writer: &mut CheckpointWriter<'_>) -> Result<(), CoreError> {
         let mut out = ByteWriter::new();
         out.u64(self.session.get());
         out.bytes(self.revision.as_bytes());

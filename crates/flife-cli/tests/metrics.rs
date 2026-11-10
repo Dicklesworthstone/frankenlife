@@ -918,6 +918,8 @@ fn a_resumed_run_tracks_from_the_state_its_journal_replayed_to() {
     resume(
         &run_dir,
         &ResumeOptions {
+            checkpoint_mode: None,
+            retained_bytes: None,
             until: 240,
             every: 0,
             cpu_workers: None,

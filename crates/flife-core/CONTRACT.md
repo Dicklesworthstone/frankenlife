@@ -44,6 +44,11 @@ are no hidden defaults.
   FL-035 adds `CheckpointManifest` and `ManifestEntry`, which verify a container's sealed prefix without its
   payload, so `flife-store` can keep the prefix as a manifest and the chunks by digest. `CheckpointReader::parse`
   is that check plus the chunk hashes and the payload's exact coverage.
+- Streamed checkpoints (FL-038): `checkpoint::ChunkSink` (`begin`, `page`, `end`), `CHECKPOINT_PAGE_BYTES` (1 MiB),
+  `CheckpointWriter::streaming(model, sink)` with `chunk_with` (a chunk written through a `ChunkWriter`), `seal`
+  (the sealed prefix) and `payload_length`, and `canonical::Sha256Stream`. A streaming writer hands each chunk to
+  its sink a page at a time and keeps only the manifest; `seal` returns the prefix the in-memory container would
+  start with. `finish` (in memory) now reserves the container's exact length once.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -112,6 +117,9 @@ are no hidden defaults.
       half-open `u₂` from the second, and no cached spare.
 
 **Invariants — the checkpoint container (FL-016, B.2).**
+- A streaming writer (FL-038) and an in-memory one write the same bytes: the same chunks, digests and sealed
+  prefix. A streaming writer's chunk holds at most one page before it is handed to the sink, and a sink's
+  refusal is kept and returned when the chunk ends. `finish` refuses a streaming writer.
 - Layout, little-endian: magic `FLIFECKP`, format 1, hash algorithm 1 (SHA-256), the model identifier (UTF-8, at
   most 256 bytes), the manifest's length (at most 64 KiB), the manifest, a SHA-256 seal over every byte before it,
   then the payload.
@@ -206,8 +214,11 @@ Every issue is reported, not just the first.
   command journal has made it durable; the evidence is C.14's crash at each point of an energy brush.
 - FL-037, in `flife-cli`: Appendix A's checkpoint mode `pause-and-stream`. `flife run --run-dir` takes no step
   while a checkpoint is taken and published, and a run stopped by a damaged newest checkpoint or by SIGKILL
-  resumes with `flife resume` to the uninterrupted run's digest and final checkpoint bytes. The container is
-  encoded whole in memory first; §16.5's memory bound on that copy is FL-038's.
+  resumes with `flife resume` to the uninterrupted run's digest and final checkpoint bytes. Since FL-038 the
+  checkpoint streams into the store a page at a time from the borrowed world.
+- FL-038, in `flife-cli`: the checkpoint mode `bounded-background`. A writer thread drains the checkpoint's pages
+  through a queue of at most `checkpoint_retained_bytes` while the run steps on; its checkpoints are
+  byte-identical to `pause-and-stream`'s.
 - FL-017, in `flife-render` and `flife-runtime`: the observer pressure policy
   `drop-observer-or-pause-unchanged-world`.
   - The render feed takes its drop arm: a busy feed skips the boundary and keeps the last displayable epoch, and

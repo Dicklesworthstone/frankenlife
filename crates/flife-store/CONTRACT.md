@@ -16,6 +16,7 @@ records its lineage and origin, and starts its journal with the history it inher
 - A store directory and a `Durability` profile, `process-crash` or `power-loss`.
 - An observer for `publish_observed`, called after each step, which may cancel before the commit point.
 - An acceptance function for `latest_valid` and `retain`, normally `flife_runtime::restore`.
+- FL-038: a checkpoint encoded into a `Stream` (`flife_runtime::checkpoint_into`) and its sealed prefix.
 - For the journal (FL-036): a database path, a `SessionId` and its configuration hash, `flife_runtime` journal
   records, and checkpoint index rows (sequence, tick, epoch, container SHA-256).
 
@@ -31,6 +32,8 @@ records its lineage and origin, and starts its journal with the history it inher
 - `CommandJournal` (FL-036) with `open`, `path`, `session`, `modes`, `watermarks`, `index_checkpoint`,
   `checkpoints` and `runs`, implementing `flife_runtime::Journal` (`open_run`, `append`); `IndexedCheckpoint`; and
   `CATALOG_FORMAT`.
+- FL-038: `ChunkStore::stream`, `stream_observed`, `commit`, `verify` and `retain_intact`; `Stream` (a
+  `flife_core::checkpoint::ChunkSink`) and `Observer`.
 - FL-039:
   - `ChunkStore::publish_sharing` and `publish_sharing_observed`, taking a donor `ChunkStore`;
   - `Step::ChunkLinked`, and `Publication::linked`, a part of `written`;
@@ -67,6 +70,22 @@ records its lineage and origin, and starts its journal with the history it inher
   chunk counts as written, and also as linked, with no bytes written. Under `power-loss` it is flushed like a
   written one, and so is its directory. The donor is only read. It is never written, and its retention removes only
   its own names, so a chunk both stores hold stays whole in the other.
+
+**Invariants — streamed publication (FL-038; §16.4, §16.5).**
+- A `Stream` writes each chunk's pages to `tmp/` as they are encoded. When the chunk ends it is stored exactly as
+  `publish` stores it (shared when held intact, otherwise flushed under `power-loss`, renamed to its digest's path,
+  and its directory flushed), with the same steps. A streamed checkpoint and the same container published whole
+  give the same steps, publication, manifest and chunk files (tested under both profiles).
+- `commit(stream, sealed)` refuses a failed stream (its own error), a stream of another store, a chunk still open,
+  a sealed prefix that does not verify or is followed by bytes, one naming other chunks, other lengths or offsets,
+  or more or fewer chunks than the stream stored, and a stored chunk no longer in place at its length. It then
+  links the manifest as `publish` does, the same commit point.
+- Chunks begin in manifest order; one begun out of order is refused. A stream's first refusal (a cancellation, a
+  refused write) sticks: every later call and the commit return it. A stream dropped, cancelled or failed removes
+  its temporary files; the chunks it already stored stay unreferenced until retention removes them.
+- `verify(sequence)` checks what `load` checks, hashing each chunk a 1 MiB buffer at a time, and returns the
+  container's SHA-256 without holding it. `retain_intact(n)` is `retain(n)` counting a checkpoint valid when it
+  verifies; it never decodes one.
 
 **Invariants — recovery and retention (§16.7, B.2).**
 - `load` checks that the manifest is a regular file of at most `MANIFEST_FILE_MAX_BYTES`, and verifies its seal
@@ -161,6 +180,26 @@ manifests.
   `flife-core`'s `tests/checkpoint.rs`. One (`load` skipping its own chunk hash) first survived, because restoring
   re-verifies the hashes; a direct `load` check now catches it.
 
+- FL-038, streamed publication, against the ecology's checkpoints at ticks 0, 8 and 16:
+  - `a_streamed_checkpoint_is_stored_as_the_whole_one_byte_for_byte`, under both profiles: the same steps,
+    publication, manifest and chunk files as `publish_observed`, unchanged chunks shared, loading back to the
+    in-memory container, and `verify` equal to its SHA-256.
+  - `cancellation_at_every_streamed_step_leaves_the_store_as_it_was`: 17 steps (`process-crash`) and 23
+    (`power-loss`), each refused as `cancelled` with no temporary file and only the previous checkpoint; from the
+    link on it is published.
+  - `a_crash_at_every_streamed_step_leaves_the_last_valid_checkpoint`: a child streaming the tick-16 checkpoint
+    killed (`SIGKILL`) after each of its 18 and 25 steps; the reopened store has no temporary file and recovers the
+    previous checkpoint before the link and the new one after.
+  - `a_commit_refuses_what_its_stream_did_not_store`: another checkpoint's sealed prefix, another store's stream,
+    a removed chunk, a stream holding only the first chunk, a chunk begun out of order and a cancelled stream are
+    each refused, and nothing is published.
+  - `retention_by_verification_decides_as_retention_by_restoring`: with no damage and with damage to the newest
+    or a middle checkpoint, `retain_intact` keeps and removes exactly what `retain(restore)` does.
+  - 14 planted mutants in `commit`, `verify`, `retain_intact` and `Stream`, and 2 in `flife-core`'s chunk writer
+    (its page four times larger, caught by `flife-cli`'s memory test; a page left out of the chunk hash). 15 were
+    caught on their first run. One (`commit` not refusing a chunk still open) survived until the open-chunk
+    refusal case was added.
+
 - `tests/journal.rs` (FL-036, 12 tests; about 2 s), against FL-013's 48-founder ecology with Appendix A's
   `write-ahead-before-apply` durability, sessions on Asupersync's native runtime with the journal's writer thread.
   Every committed world is compared with one stepped directly with the same interventions at the same ticks:
@@ -250,6 +289,12 @@ file-backed engine), one writer thread per session, one session per database at 
   chunk is written, which is not tested. A linked chunk damaged in place is damaged in every store that names it.
   It is detected on load, as any damage is.
 - Chunks are whole families: a single birth rewrites the full genome chunk. Per-genome pages, deltas and
-  compression are later work (§16.5, FL-026), as are incremental and background checkpoint modes (§16.5).
+  compression are later work (§16.5, FL-026). A streamed checkpoint is written in full each time; §16.5's
+  incremental mode (only changed pages) does not exist. `flife-cli` adds a background mode (FL-038).
+- A `Stream` trusts the length and digest its encoder reports for each chunk; `commit` checks them against the
+  sealed prefix and the stored files' lengths, not their hashes. `verify` (which `flife-cli` runs after every
+  commit) is the hash check.
+- `retain_intact` counts a checkpoint that verifies, not one that restores: a checkpoint whose chunks hash
+  correctly but do not decode (a writer bug, never damage) would be kept. `latest_valid` still restores.
 - No RaptorQ or other error correction: damage is detected and recovery falls back, but damaged bytes are not
   reconstructed (§16.7).

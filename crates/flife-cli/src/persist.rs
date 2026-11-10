@@ -26,30 +26,43 @@
 //! descends from, and it resumes only from a checkpoint of that session.
 //! It has no founding world of its own to fall back to.
 //!
-//! Checkpoints are `pause-and-stream`: the client takes no step while one is
-//! taken and published, so the committed world cannot move under it. The
-//! container is encoded whole in memory first; admitting that copy against
-//! a memory budget is FL-038's. The catalog's index is written while the
-//! journal is idle: a checkpoint is taken only once every record has its
-//! receipt.
+//! Checkpoints are taken in the configuration's `checkpoint_mode`
+//! ([`crate::checkpointing`], FL-038): `pause-and-stream` encodes the
+//! committed world straight into the chunk store a page at a time while the
+//! client takes no step; `bounded-background` hands the pages to a writer
+//! thread through a queue bounded by `checkpoint_retained_bytes` and steps
+//! on once every page is queued. Either way the session takes no step while
+//! the world is encoded, so the committed world cannot move under it, and a
+//! checkpoint is taken only once every journal record has its receipt.
+//! Retention keeps the newest checkpoints the store verifies (seal, lengths
+//! and hashes, read a buffer at a time); resuming restores them.
 
 use std::fs::{self, File};
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Instant;
+
+use asupersync::Cx;
 
 use flife_backend_metal::ControllerChoice;
 use flife_core::canonical::Sha256Digest;
+use flife_core::checkpoint::{CheckpointManifest, ChunkSink as _};
 use flife_core::ids::{CommandId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Intervention, NumericalProfile, World};
 use flife_runtime::{
-    Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored, SessionCheckpoint,
-    SessionConfig, SessionHandle, SessionOwner, Target, open_journaled, open_restored, restore,
+    Boundary, Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored,
+    SessionCheckpoint, SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into,
+    open_journaled, open_restored, restore,
 };
-use flife_store::{ChunkStore, CommandJournal, IndexedCheckpoint};
+use flife_store::{ChunkStore, CommandJournal, IndexedCheckpoint, Publication, Stream};
+
+use crate::checkpointing::{
+    CheckpointAdmission, CheckpointMode, Message, Producer, Queue, WRITER_STOPPED, admit,
+};
 
 use crate::run::{
     CheckpointAt, ControllerSummary, Finished, Plan, RUN_SCHEMA, RUN_SESSION, Record,
@@ -76,18 +89,27 @@ pub struct Persistence {
     /// How checkpoints are published: `power-loss` flushes before each
     /// commit point, `process-crash` relies on atomic renames.
     pub durability: StoreDurability,
+    /// How checkpoints are taken (FL-038). No result depends on it.
+    pub mode: CheckpointMode,
+    /// The most page bytes a `bounded-background` checkpoint retains.
+    pub retained_bytes: u64,
 }
 
 impl Persistence {
     /// `config`'s persistence in `run_dir`: a checkpoint every
     /// `[persistence] checkpoint_interval_simulation_seconds`, rounded up
-    /// to whole ticks, flushed against power loss.
+    /// to whole ticks, flushed against power loss, taken in
+    /// `[persistence] checkpoint_mode` with `[execution]
+    /// checkpoint_retained_bytes`.
     #[must_use]
     pub fn new(run_dir: impl Into<PathBuf>, config: &ValidatedConfig) -> Self {
+        let config_values = config.config();
         Self {
             run_dir: run_dir.into(),
             checkpoint_every: config.report().checkpoint_interval_ticks.get(),
             durability: StoreDurability::PowerLoss,
+            mode: CheckpointMode::from_name(&config_values.persistence.checkpoint_mode),
+            retained_bytes: config_values.execution.checkpoint_retained_bytes,
         }
     }
 }
@@ -344,46 +366,197 @@ pub(crate) fn run_identity(
     })
 }
 
-/// The run's checkpoints: its chunk store, and the catalog that indexes
-/// them.
+/// The run's checkpoints: its chunk store, the catalog that indexes them,
+/// and the mode they are taken in (FL-038).
 pub(crate) struct Checkpoints {
-    store: ChunkStore,
+    /// The store; with the writer while a background checkpoint is in
+    /// flight.
+    store: Option<ChunkStore>,
+    filing: Filing,
+    profile: NumericalProfile,
+    every: u64,
+    admission: CheckpointAdmission,
+    last: Option<CheckpointAt>,
+    in_flight: Option<InFlight>,
+}
+
+/// Where and how a published checkpoint is indexed and retained.
+#[derive(Clone)]
+struct Filing {
     catalog: PathBuf,
     session: SessionId,
     revision: Sha256Digest,
-    profile: NumericalProfile,
-    every: u64,
     keep: usize,
-    last: Option<CheckpointAt>,
+}
+
+/// What a published checkpoint's record needs besides the publication.
+struct Taken {
+    boundary: Boundary,
+    mode: CheckpointMode,
+    retained_peak: u64,
+    paused_seconds: f64,
+}
+
+/// A background checkpoint's writer, and what its record needs.
+struct InFlight {
+    writer: std::thread::JoinHandle<(ChunkStore, Result<Committed, CoreError>)>,
+    queue: Arc<Queue>,
+    paused_seconds: f64,
+}
+
+/// A checkpoint published and verified, not yet indexed.
+struct Committed {
+    boundary: Boundary,
+    publication: Publication,
+    digest: Sha256Digest,
+    bytes: u64,
+}
+
+/// A checkpoint published, verified, indexed and retained.
+struct Filed {
+    committed: Committed,
+    retired: Vec<u64>,
+}
+
+impl Filing {
+    /// Index `committed` in the catalog. Called only while the session's
+    /// journal is idle: every record sent has its receipt, and the client
+    /// sends no other until this returns.
+    fn index(&self, committed: &Committed) -> Result<(), CoreError> {
+        let indexed = IndexedCheckpoint {
+            sequence: committed.publication.sequence,
+            tick: committed.boundary.tick,
+            epoch: committed.boundary.epoch,
+            digest: committed.digest,
+        };
+        let (catalog, session, revision) = (&self.catalog, self.session, self.revision);
+        on_plain_thread("index checkpoint", move || {
+            let mut journal = CommandJournal::open(catalog)?;
+            journal.open_run(session, revision)?;
+            journal.index_checkpoint(indexed)
+        })
+    }
+
+    /// Index `committed`, then keep the newest `keep` checkpoints the store
+    /// verifies.
+    fn file(&self, store: &mut ChunkStore, committed: Committed) -> Result<Filed, CoreError> {
+        self.index(&committed)?;
+        Ok(Filed {
+            committed,
+            retired: store.retain_intact(self.keep)?.removed,
+        })
+    }
+}
+
+/// A streamed checkpoint's container size: its sealed prefix and payload.
+fn container_bytes(sealed: &[u8]) -> Result<u64, CoreError> {
+    let manifest = CheckpointManifest::parse(sealed)?;
+    Ok(u64::try_from(sealed.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(manifest.payload_length()))
+}
+
+/// The background writer: store each chunk as its pages arrive, then
+/// commit and verify. Indexing and retention wait for
+/// [`Checkpoints::drain`], where the journal is idle. Returns the store
+/// either way; on a failure it stops the queue, so the encoder's next call
+/// refuses and every queued page is released.
+fn write_background(
+    mut store: ChunkStore,
+    stream: Stream,
+    queue: &Queue,
+) -> (ChunkStore, Result<Committed, CoreError>) {
+    let outcome = store_streamed(&mut store, stream, queue);
+    if outcome.is_err() {
+        queue.stop();
+    }
+    (store, outcome)
+}
+
+fn store_streamed(
+    store: &mut ChunkStore,
+    mut stream: Stream,
+    queue: &Queue,
+) -> Result<Committed, CoreError> {
+    let (sealed, boundary) = loop {
+        match queue.next() {
+            None => {
+                return Err(CoreError::Cancelled {
+                    reason: "the checkpoint was abandoned before it was sealed".into(),
+                });
+            }
+            Some(Message::Begin(index, family)) => stream.begin(index, family)?,
+            Some(Message::Page(page)) => {
+                let written = stream.page(&page);
+                queue.written(page);
+                written?;
+            }
+            Some(Message::End(length, digest)) => stream.end(length, digest)?,
+            Some(Message::Seal(sealed, boundary)) => break (sealed, boundary),
+        }
+    };
+    let publication = store.commit(stream, &sealed)?;
+    let digest = store.verify(publication.sequence)?;
+    Ok(Committed {
+        boundary,
+        publication,
+        digest,
+        bytes: container_bytes(&sealed)?,
+    })
+}
+
+fn unavailable() -> CoreError {
+    CoreError::StateConflict {
+        operation: "checkpoint run",
+        detail: "the chunk store was lost with a failed checkpoint writer".into(),
+    }
 }
 
 impl Checkpoints {
     /// Open the run directory's chunk store under `persistence`'s profile,
-    /// for `session`'s run of `config`.
+    /// for `session`'s run of `config`, admitting its checkpoint mode.
     pub(crate) fn open(
         persistence: &Persistence,
         config: &ValidatedConfig,
         session: SessionId,
     ) -> Result<Self, CoreError> {
+        let admission = admit(config, persistence.mode, persistence.retained_bytes)?;
         Ok(Self {
-            store: ChunkStore::open(persistence.run_dir.join(STORE_DIR), persistence.durability)?,
-            catalog: persistence.run_dir.join(CATALOG_FILE),
-            session,
-            revision: config.config_hash(),
+            store: Some(ChunkStore::open(
+                persistence.run_dir.join(STORE_DIR),
+                persistence.durability,
+            )?),
+            filing: Filing {
+                catalog: persistence.run_dir.join(CATALOG_FILE),
+                session,
+                revision: config.config_hash(),
+                keep: usize::try_from(config.config().persistence.retain_recent_checkpoints)
+                    .unwrap_or(usize::MAX),
+            },
             profile: NumericalProfile::reference_f32()?,
             every: persistence.checkpoint_every,
-            keep: usize::try_from(config.config().persistence.retain_recent_checkpoints)
-                .unwrap_or(usize::MAX),
+            admission,
             last: None,
+            in_flight: None,
         })
+    }
+
+    /// The checkpoint admission the run's start record reports.
+    pub(crate) const fn admission(&self) -> &CheckpointAdmission {
+        &self.admission
+    }
+
+    fn store(&mut self) -> Result<&mut ChunkStore, CoreError> {
+        self.store.as_mut().ok_or_else(unavailable)
     }
 
     /// The newest stored checkpoint this run can resume from, and those
     /// passed over, newest first.
     fn recover(&mut self) -> Result<(Option<Restored>, Vec<SkippedCheckpoint>), CoreError> {
-        let (profile, revision, session) = (self.profile, self.revision, self.session);
+        let (profile, revision, session) =
+            (self.profile, self.filing.revision, self.filing.session);
         let recovered = self
-            .store
+            .store()?
             .latest_valid(|_, bytes| restorable(bytes, profile, revision, session))?;
         let skipped = recovered
             .skipped
@@ -409,7 +582,7 @@ impl Checkpoints {
         self.every > 0 && tick.is_multiple_of(self.every)
     }
 
-    /// The newest checkpoint published, or the one the run started from.
+    /// The newest checkpoint taken, or the one the run started from.
     pub(crate) const fn last(&self) -> Option<CheckpointAt> {
         self.last
     }
@@ -419,58 +592,245 @@ impl Checkpoints {
         self.last.map(|last| last.tick)
     }
 
-    /// Publish `taken` to the chunk store, index it in the catalog, then
-    /// keep the newest `retain_recent_checkpoints` this run can resume
-    /// from.
-    pub(crate) fn publish(&mut self, taken: &SessionCheckpoint) -> Result<Record, CoreError> {
-        self.publish_from(taken, None).map(|(record, _)| record)
+    /// Take a checkpoint of `handle`'s committed boundary in the admitted
+    /// mode. Returns the records of checkpoints published meanwhile: a
+    /// background checkpoint still in flight first (this waits for it),
+    /// then, for `pause-and-stream`, this one. A background checkpoint's
+    /// record follows when it is drained.
+    pub(crate) async fn take(
+        &mut self,
+        handle: &SessionHandle,
+        cx: &Cx,
+    ) -> Result<Vec<Record>, CoreError> {
+        let mut records = self.drain(handle, cx).await?;
+        let started = Instant::now();
+        match self.admission.mode() {
+            CheckpointMode::PauseAndStream => {
+                let stream = self.store()?.stream()?;
+                let (stream, sealed, boundary) = handle
+                    .checkpoint_with(cx, move |world, book, boundary| {
+                        let mut stream = stream;
+                        let sealed = checkpoint_into(world, book, &mut stream);
+                        (stream, sealed, boundary)
+                    })
+                    .await?;
+                let sealed = sealed?;
+                let store = self.store()?;
+                let publication = store.commit(stream, &sealed)?;
+                let digest = store.verify(publication.sequence)?;
+                let committed = Committed {
+                    boundary,
+                    publication,
+                    digest,
+                    bytes: container_bytes(&sealed)?,
+                };
+                // The session answered the take once every journal record
+                // had its receipt, and the client sends none until this
+                // returns: the journal is idle.
+                let filing = self.filing.clone();
+                let filed = filing.file(self.store()?, committed)?;
+                let taken = Taken {
+                    boundary,
+                    mode: CheckpointMode::PauseAndStream,
+                    retained_peak: 0,
+                    paused_seconds: started.elapsed().as_secs_f64(),
+                };
+                records.push(self.record(&filed, &taken));
+            }
+            CheckpointMode::BoundedBackground => {
+                let mut store = self.store.take().ok_or_else(unavailable)?;
+                let stream = match store.stream() {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        self.store = Some(store);
+                        return Err(error);
+                    }
+                };
+                let sequence = stream.sequence();
+                let queue = Queue::new(self.admission.retained_bytes);
+                let producer = Producer::new(Arc::clone(&queue));
+                let writer_queue = Arc::clone(&queue);
+                let writer = std::thread::Builder::new()
+                    .name("flife-checkpoint-writer".into())
+                    .spawn(move || write_background(store, stream, &writer_queue))
+                    .map_err(|error| CoreError::StorageFailed {
+                        operation: "start checkpoint writer",
+                        path: self.filing.catalog.display().to_string(),
+                        reason: error.to_string(),
+                    })?;
+                let queued = handle
+                    .checkpoint_with(cx, move |world, book, boundary| {
+                        let mut producer = producer;
+                        checkpoint_into(world, book, &mut producer)
+                            .and_then(|sealed| producer.seal(sealed, boundary))
+                            .map(|()| boundary)
+                    })
+                    .await;
+                self.in_flight = Some(InFlight {
+                    writer,
+                    queue,
+                    paused_seconds: started.elapsed().as_secs_f64(),
+                });
+                match queued.and_then(|queued| queued) {
+                    Ok(boundary) => {
+                        self.last = Some(CheckpointAt {
+                            sequence,
+                            tick: boundary.tick.get(),
+                        });
+                    }
+                    Err(error) => {
+                        // Join the writer. When it stopped first, its own
+                        // error says more than the encoder's refusal.
+                        let writer = self.join().map(|_| ());
+                        let refused = matches!(
+                            &error,
+                            CoreError::Cancelled { reason } if reason == WRITER_STOPPED
+                        );
+                        return Err(match writer {
+                            Err(writer) if refused => writer,
+                            _ => error,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(records)
     }
 
-    /// [`Checkpoints::publish`], linking the chunks `donor` holds intact
-    /// rather than writing them. Returns the record and how many chunks
-    /// were linked.
+    /// Wait for a background checkpoint in flight, if any; index it while
+    /// `handle`'s session holds its journal idle, retain, and return its
+    /// record. The run takes no step meanwhile, and that wait counts in the
+    /// record's `paused_seconds`.
+    pub(crate) async fn drain(
+        &mut self,
+        handle: &SessionHandle,
+        cx: &Cx,
+    ) -> Result<Vec<Record>, CoreError> {
+        let started = Instant::now();
+        let Some((committed, queue, paused_seconds)) = self.join()? else {
+            return Ok(Vec::new());
+        };
+        // Index on the session's task, which answers once every journal
+        // record has its receipt and takes no step until this returns: the
+        // writer ran while the run stepped and its records were written.
+        let filing = self.filing.clone();
+        let committed = handle
+            .checkpoint_with(cx, move |_, _, _| {
+                filing.index(&committed).map(|()| committed)
+            })
+            .await??;
+        let keep = self.filing.keep;
+        let filed = Filed {
+            retired: self.store()?.retain_intact(keep)?.removed,
+            committed,
+        };
+        let taken = Taken {
+            boundary: filed.committed.boundary,
+            mode: CheckpointMode::BoundedBackground,
+            retained_peak: queue.peak(),
+            paused_seconds: paused_seconds + started.elapsed().as_secs_f64(),
+        };
+        Ok(vec![self.record(&filed, &taken)])
+    }
+
+    /// Join the writer of a background checkpoint in flight, if any, and
+    /// take its store back: the checkpoint it committed and verified, its
+    /// queue and how long the session paused for it.
+    fn join(&mut self) -> Result<Option<(Committed, Arc<Queue>, f64)>, CoreError> {
+        let Some(InFlight {
+            writer,
+            queue,
+            paused_seconds,
+        }) = self.in_flight.take()
+        else {
+            return Ok(None);
+        };
+        let (store, committed) = writer.join().map_err(|_| CoreError::StorageFailed {
+            operation: "write checkpoint",
+            path: self.filing.catalog.display().to_string(),
+            reason: "the checkpoint writer panicked".into(),
+        })?;
+        self.store = Some(store);
+        Ok(Some((committed?, queue, paused_seconds)))
+    }
+
+    fn record(&mut self, filed: &Filed, taken: &Taken) -> Record {
+        let at = CheckpointAt {
+            sequence: filed.committed.publication.sequence,
+            tick: taken.boundary.tick.get(),
+        };
+        if self.last.is_none_or(|last| last.sequence <= at.sequence) {
+            self.last = Some(at);
+        }
+        Record::Checkpoint {
+            schema: RUN_SCHEMA,
+            tick: at.tick,
+            epoch: taken.boundary.epoch.get(),
+            sequence: at.sequence,
+            sha256: filed.committed.digest.to_hex(),
+            bytes: filed.committed.bytes,
+            chunks: [
+                filed.committed.publication.written,
+                filed.committed.publication.shared,
+            ],
+            retired: filed.retired.clone(),
+            mode: taken.mode.name(),
+            retained_peak: taken.retained_peak,
+            paused_seconds: taken.paused_seconds,
+        }
+    }
+
+    /// Publish `taken`, a checkpoint encoded in memory (a branch's first),
+    /// to the chunk store, linking the chunks `donor` holds intact rather
+    /// than writing them; index it in the catalog, then keep the newest
+    /// `retain_recent_checkpoints` the store verifies. Returns the record
+    /// and how many chunks were linked.
     pub(crate) fn publish_from(
         &mut self,
         taken: &SessionCheckpoint,
         donor: Option<&ChunkStore>,
     ) -> Result<(Record, usize), CoreError> {
+        if self.in_flight.is_some() {
+            return Err(CoreError::StateConflict {
+                operation: "publish checkpoint",
+                detail: "a background checkpoint is in flight".into(),
+            });
+        }
+        let started = Instant::now();
+        let store = self.store()?;
         let publication = match donor {
-            Some(donor) => self.store.publish_sharing(&taken.bytes, donor)?,
-            None => self.store.publish(&taken.bytes)?,
+            Some(donor) => store.publish_sharing(&taken.bytes, donor)?,
+            None => store.publish(&taken.bytes)?,
         };
-        let digest = Sha256Digest::of(&taken.bytes);
-        let indexed = IndexedCheckpoint {
-            sequence: publication.sequence,
-            tick: taken.boundary.tick,
-            epoch: taken.boundary.epoch,
-            digest,
-        };
-        let (catalog, session, revision) = (&self.catalog, self.session, self.revision);
-        on_plain_thread("index checkpoint", move || {
-            let mut journal = CommandJournal::open(catalog)?;
-            journal.open_run(session, revision)?;
-            journal.index_checkpoint(indexed)
-        })?;
-        let at = CheckpointAt {
-            sequence: publication.sequence,
-            tick: taken.boundary.tick.get(),
-        };
-        self.last = Some(at);
-        let profile = self.profile;
-        let retention = self.store.retain(self.keep, |_, bytes| {
-            restorable(bytes, profile, revision, session).map(|_| ())
-        })?;
-        let record = Record::Checkpoint {
-            schema: RUN_SCHEMA,
-            tick: at.tick,
-            epoch: taken.boundary.epoch.get(),
-            sequence: at.sequence,
-            sha256: digest.to_hex(),
+        let linked = publication.linked;
+        let committed = Committed {
+            boundary: taken.boundary,
+            publication,
+            digest: Sha256Digest::of(&taken.bytes),
             bytes: u64::try_from(taken.bytes.len()).unwrap_or(u64::MAX),
-            chunks: [publication.written, publication.shared],
-            retired: retention.removed,
         };
-        Ok((record, publication.linked))
+        let filing = self.filing.clone();
+        let filed = filing.file(self.store()?, committed)?;
+        let record = self.record(
+            &filed,
+            &Taken {
+                boundary: taken.boundary,
+                mode: CheckpointMode::PauseAndStream,
+                retained_peak: 0,
+                paused_seconds: started.elapsed().as_secs_f64(),
+            },
+        );
+        Ok((record, linked))
+    }
+}
+
+impl Drop for Checkpoints {
+    fn drop(&mut self) {
+        // Never leave the writer detached: let it finish (or fail) and
+        // join it. Its result was not asked for.
+        if let Some(flight) = self.in_flight.take() {
+            let _ignored = flight.writer.join();
+        }
     }
 }
 
@@ -491,6 +851,11 @@ pub struct ResumeOptions {
     pub checkpoint_every: Option<u64>,
     /// How checkpoints are published.
     pub durability: StoreDurability,
+    /// How checkpoints are taken; `None` for the configuration's mode.
+    pub checkpoint_mode: Option<CheckpointMode>,
+    /// The `bounded-background` page budget; `None` for the
+    /// configuration's `checkpoint_retained_bytes`.
+    pub retained_bytes: Option<u64>,
     /// Emit a metrics record at every multiple of this committed tick and
     /// at the end; zero for none. Its lineage counts start where the
     /// resumed run does.
@@ -527,6 +892,12 @@ pub fn resume(
         persistence.checkpoint_every = every;
     }
     persistence.durability = options.durability;
+    if let Some(mode) = options.checkpoint_mode {
+        persistence.mode = mode;
+    }
+    if let Some(retained) = options.retained_bytes {
+        persistence.retained_bytes = retained;
+    }
     let mut checkpoints = Checkpoints::open(&persistence, &config, session)?;
     let (restored, skipped) = checkpoints.recover()?;
     let (mut world, book) = match restored {

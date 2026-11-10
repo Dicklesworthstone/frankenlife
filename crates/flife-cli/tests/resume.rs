@@ -222,10 +222,56 @@ fn checkpoint_at(records: &[Value], tick: u64) -> &Value {
 }
 
 /// What the uninterrupted write-ahead run reaches: its committed digest at
-/// [`HORIZON`] and its final checkpoint's SHA-256.
+/// [`HORIZON`], its final checkpoint's SHA-256, and every checkpoint's tick
+/// and SHA-256.
 struct Uninterrupted {
     digest: Value,
     last: Value,
+    checkpoints: Vec<(u64, Value)>,
+}
+
+/// Each checkpoint record's tick and SHA-256.
+fn stored(records: &[Value]) -> Vec<(u64, Value)> {
+    all(records, "checkpoint")
+        .iter()
+        .map(|record| {
+            (
+                record["tick"].as_u64().expect("a tick"),
+                record["sha256"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// The catalog of `run_dir`, run with the configuration at `config`, indexes
+/// every checkpoint `out` published, retired or not, under its sequence,
+/// tick and SHA-256.
+#[track_caller]
+fn indexes_what_it_published(run_dir: &Path, config: &Path, out: &[Value]) {
+    let mut catalog = CommandJournal::open(&run_dir.join("catalog.db")).expect("opens");
+    let hash = ValidatedConfig::from_toml(&fs::read_to_string(config).expect("reads"))
+        .expect("valid")
+        .config_hash();
+    catalog
+        .open_run(flife_cli::RUN_SESSION, hash)
+        .expect("the run is recorded under its configuration");
+    let indexed: Vec<(u64, u64, String)> = catalog
+        .checkpoints()
+        .expect("lists")
+        .iter()
+        .map(|row| (row.sequence, row.tick.get(), row.digest.to_hex()))
+        .collect();
+    let published: Vec<(u64, u64, String)> = all(out, "checkpoint")
+        .iter()
+        .map(|record| {
+            (
+                record["sequence"].as_u64().expect("a sequence"),
+                record["tick"].as_u64().expect("a tick"),
+                record["sha256"].as_str().expect("a digest").to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(indexed, published);
 }
 
 fn uninterrupted() -> &'static Uninterrupted {
@@ -263,35 +309,11 @@ fn uninterrupted() -> &'static Uninterrupted {
         let store = ChunkStore::open(run_dir.join("store"), Durability::ProcessCrash)
             .expect("the store opens");
         assert_eq!(store.sequences().expect("lists").len(), 4);
-        // The catalog indexes every checkpoint published, retired or not,
-        // under its sequence, tick and SHA-256.
-        let mut catalog = CommandJournal::open(&run_dir.join("catalog.db")).expect("opens");
-        let hash = ValidatedConfig::from_toml(&fs::read_to_string(&config).expect("reads"))
-            .expect("valid")
-            .config_hash();
-        catalog
-            .open_run(flife_cli::RUN_SESSION, hash)
-            .expect("the run is recorded under its configuration");
-        let indexed: Vec<(u64, u64, String)> = catalog
-            .checkpoints()
-            .expect("lists")
-            .iter()
-            .map(|row| (row.sequence, row.tick.get(), row.digest.to_hex()))
-            .collect();
-        let published: Vec<(u64, u64, String)> = all(&out, "checkpoint")
-            .iter()
-            .map(|record| {
-                (
-                    record["sequence"].as_u64().expect("a sequence"),
-                    record["tick"].as_u64().expect("a tick"),
-                    record["sha256"].as_str().expect("a digest").to_owned(),
-                )
-            })
-            .collect();
-        assert_eq!(indexed, published);
+        indexes_what_it_published(&run_dir, &config, &out);
         Uninterrupted {
             digest: end["digest"].clone(),
             last: checkpoint_at(&out, HORIZON)["sha256"].clone(),
+            checkpoints: stored(&out),
         }
     })
 }
@@ -452,6 +474,72 @@ fn a_killed_write_ahead_run_resumes_to_the_uninterrupted_state() {
         "{resumed}"
     );
     assert_eq!(resumed["journal"]["admitted"], 4);
+    publishes_after(&out, resumed);
+    reaches_the_uninterrupted_state(&out, (&reference.digest, &reference.last));
+}
+
+/// [`run_args`] taking checkpoints `bounded-background` with a one-page
+/// budget, so the encoder waits on the writer (FL-038).
+fn in_background(mut args: Vec<String>) -> Vec<String> {
+    args.extend(
+        [
+            "--checkpoint-mode",
+            "bounded-background",
+            "--checkpoint-retained-bytes",
+            "1048576",
+        ]
+        .map(str::to_owned),
+    );
+    args
+}
+
+/// FL-038: the write-ahead run with its commands, its checkpoints taken
+/// `bounded-background`, stores the checkpoints the `pause-and-stream` run
+/// stores, byte for byte at the same ticks, each retaining at most its
+/// budget of pages while the run steps on; it indexes every one in the
+/// catalog (on the paused session, while its journal is idle) and reaches
+/// the same state. SIGKILLed part way, with a checkpoint perhaps in flight,
+/// it resumes to the uninterrupted state.
+#[test]
+fn a_bounded_background_run_stores_the_same_checkpoints_and_resumes_after_a_kill() {
+    let reference = uninterrupted();
+    let config = ecology("write-ahead-before-apply");
+    let run_dir = fresh("background");
+    let (status, out, err) = flife(&strs(&in_background(run_args(
+        &config, &run_dir, HORIZON, 0,
+    ))));
+    assert_eq!(status, Some(0), "{err:?}");
+    let admission = &one(&out, "start")["checkpoints"];
+    assert_eq!(admission["admitted"], "bounded-background", "{admission}");
+    assert_eq!(admission["retained_bytes"], 1_048_576);
+    assert_eq!(stored(&out), reference.checkpoints);
+    for record in all(&out, "checkpoint") {
+        assert_eq!(record["mode"], "bounded-background");
+        assert!(
+            record["retained_peak"]
+                .as_u64()
+                .is_some_and(|peak| peak > 0 && peak <= 1_048_576),
+            "{record}"
+        );
+    }
+    let end = one(&out, "end");
+    assert_eq!(end["digest"], reference.digest);
+    assert_eq!(
+        end["persisted"]["journal"],
+        json!({"admitted": 4, "outcomes": 4})
+    );
+    indexes_what_it_published(&run_dir, &config, &out);
+
+    let run_dir = fresh("killed-background");
+    let records = killed_after(
+        &strs(&in_background(run_args(&config, &run_dir, 1_000_000, 1))),
+        70,
+    );
+    let published = all(&records, "checkpoint").len();
+    let (status, out, err) = resume(&run_dir);
+    assert_eq!(status, Some(0), "{err:?}");
+    let resumed = one(&out, "resume");
+    eprintln!("killed after {published} background checkpoint records; resumed: {resumed}");
     publishes_after(&out, resumed);
     reaches_the_uninterrupted_state(&out, (&reference.digest, &reference.last));
 }

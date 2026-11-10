@@ -25,7 +25,9 @@
 //! are equal and its hash is also its content identity, so no codec can
 //! change a genome's meaning.
 
-use crate::canonical::Sha256Digest;
+use std::fmt;
+
+use crate::canonical::{Sha256Digest, Sha256Stream};
 use crate::error::CoreError;
 
 /// The first eight bytes of every checkpoint.
@@ -158,29 +160,91 @@ pub struct Chunk<'a> {
     pub bytes: &'a [u8],
 }
 
+/// Where a streamed checkpoint's chunks go (§16.5's pause-and-stream): a
+/// chunk store writing them as they are encoded, or a bounded queue to a
+/// writer that does. [`CheckpointWriter::streaming`] calls, for each chunk
+/// in manifest order, [`ChunkSink::begin`], then [`ChunkSink::page`] with
+/// its bytes in order, at most [`CHECKPOINT_PAGE_BYTES`] at a time, then
+/// [`ChunkSink::end`] with its length and SHA-256.
+pub trait ChunkSink {
+    /// Chunk `index` (its position in the manifest), of `family`, starts.
+    ///
+    /// # Errors
+    /// The sink's own; the checkpoint stops.
+    fn begin(&mut self, index: usize, family: ChunkFamily) -> Result<(), CoreError>;
+
+    /// The chunk's next bytes.
+    ///
+    /// # Errors
+    /// The sink's own; the checkpoint stops.
+    fn page(&mut self, bytes: &[u8]) -> Result<(), CoreError>;
+
+    /// The chunk is complete: `length` bytes whose SHA-256 is `digest`.
+    ///
+    /// # Errors
+    /// The sink's own; the checkpoint stops.
+    fn end(&mut self, length: u64, digest: Sha256Digest) -> Result<(), CoreError>;
+}
+
+/// The most bytes a streamed chunk holds in memory, and so the largest
+/// page a [`ChunkSink`] receives.
+pub const CHECKPOINT_PAGE_BYTES: usize = 1 << 20;
+
 #[derive(Debug, Clone)]
 struct Written {
     family: ChunkFamily,
     version: u16,
     items: u64,
+    length: u64,
+    digest: Sha256Digest,
+    /// The bytes, for a checkpoint held in memory; empty once streamed.
     bytes: Vec<u8>,
     depends: Vec<ChunkFamily>,
 }
 
-/// Builds a checkpoint chunk by chunk.
-#[derive(Debug, Clone)]
-pub struct CheckpointWriter {
+/// Builds a checkpoint chunk by chunk: in memory ([`CheckpointWriter::new`],
+/// then [`CheckpointWriter::finish`]), or streamed to a [`ChunkSink`]
+/// ([`CheckpointWriter::streaming`], then [`CheckpointWriter::seal`]). Both
+/// produce the same bytes: the sealed prefix [`CheckpointWriter::seal`]
+/// returns is the start of the container [`CheckpointWriter::finish`]
+/// returns, and the pages a sink receives are its payload.
+pub struct CheckpointWriter<'a> {
     model: String,
     chunks: Vec<Written>,
+    sink: Option<&'a mut dyn ChunkSink>,
 }
 
-impl CheckpointWriter {
-    /// An empty checkpoint of model `model`.
+impl fmt::Debug for CheckpointWriter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointWriter")
+            .field("model", &self.model)
+            .field("chunks", &self.chunks.len())
+            .field("streaming", &self.sink.is_some())
+            .finish()
+    }
+}
+
+impl CheckpointWriter<'static> {
+    /// An empty checkpoint of model `model`, held in memory.
     #[must_use]
     pub fn new(model: &str) -> Self {
         Self {
             model: model.to_owned(),
             chunks: Vec::new(),
+            sink: None,
+        }
+    }
+}
+
+impl<'a> CheckpointWriter<'a> {
+    /// An empty checkpoint of model `model` whose chunks stream to `sink`
+    /// as they are encoded, holding at most one page of a chunk at a time.
+    #[must_use]
+    pub fn streaming(model: &str, sink: &'a mut dyn ChunkSink) -> Self {
+        Self {
+            model: model.to_owned(),
+            chunks: Vec::new(),
+            sink: Some(sink),
         }
     }
 
@@ -189,20 +253,15 @@ impl CheckpointWriter {
         self.chunks.iter().map(|chunk| chunk.family)
     }
 
-    /// Add `family`'s chunk, which reads the families in `depends`.
-    ///
-    /// # Errors
-    /// [`CoreError::IncompatibleCheckpoint`] for a family already written,
-    /// a dependency not written before it, or more than
-    /// [`DEPENDENCIES_MAX`] dependencies.
-    pub fn chunk(
-        &mut self,
-        family: ChunkFamily,
-        version: u16,
-        items: u64,
-        bytes: Vec<u8>,
-        depends: &[ChunkFamily],
-    ) -> Result<(), CoreError> {
+    /// Bytes written so far: the payload's length.
+    #[must_use]
+    pub fn payload_length(&self) -> u64 {
+        self.chunks
+            .iter()
+            .fold(0_u64, |total, chunk| total.saturating_add(chunk.length))
+    }
+
+    fn admit(&self, family: ChunkFamily, depends: &[ChunkFamily]) -> Result<(), CoreError> {
         if self.chunks.iter().any(|chunk| chunk.family == family) {
             return Err(refuse(format!("chunk {} written twice", family.name())));
         }
@@ -223,22 +282,113 @@ impl CheckpointWriter {
                 missing.name()
             )));
         }
+        Ok(())
+    }
+
+    /// Add `family`'s chunk, which reads the families in `depends`.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] for a family already written,
+    /// a dependency not written before it, or more than
+    /// [`DEPENDENCIES_MAX`] dependencies; a streaming sink's errors.
+    pub fn chunk(
+        &mut self,
+        family: ChunkFamily,
+        version: u16,
+        items: u64,
+        bytes: Vec<u8>,
+        depends: &[ChunkFamily],
+    ) -> Result<(), CoreError> {
+        if self.sink.is_some() {
+            return self.chunk_with(family, version, items, depends, |out| {
+                out.bytes(&bytes);
+                Ok(())
+            });
+        }
+        self.admit(family, depends)?;
         self.chunks.push(Written {
             family,
             version,
             items,
+            length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            digest: Sha256Digest::of(&bytes),
             bytes,
             depends: depends.to_vec(),
         });
         Ok(())
     }
 
-    /// The checkpoint's bytes.
+    /// Add `family`'s chunk, which reads the families in `depends`, as
+    /// `encode` writes it: in memory, or page by page to the sink.
+    ///
+    /// # Errors
+    /// As [`CheckpointWriter::chunk`], and `encode`'s own.
+    pub fn chunk_with(
+        &mut self,
+        family: ChunkFamily,
+        version: u16,
+        items: u64,
+        depends: &[ChunkFamily],
+        encode: impl FnOnce(&mut ChunkWriter<'_>) -> Result<(), CoreError>,
+    ) -> Result<(), CoreError> {
+        self.admit(family, depends)?;
+        let index = self.chunks.len();
+        let (length, digest, bytes) = match self.sink.as_deref_mut() {
+            None => {
+                let mut out = ChunkWriter {
+                    page: Vec::new(),
+                    spill: None,
+                };
+                encode(&mut out)?;
+                let bytes = out.page;
+                (
+                    u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    Sha256Digest::of(&bytes),
+                    bytes,
+                )
+            }
+            Some(sink) => {
+                sink.begin(index, family)?;
+                let mut page = Vec::new();
+                page.try_reserve_exact(CHECKPOINT_PAGE_BYTES).map_err(|_| {
+                    CoreError::AllocationFailed {
+                        buffer: "checkpoint page",
+                        bytes: CHECKPOINT_PAGE_BYTES as u64,
+                    }
+                })?;
+                let mut out = ChunkWriter {
+                    page,
+                    spill: Some(Spill {
+                        sink: &mut *sink,
+                        hash: Sha256Stream::new(),
+                        length: 0,
+                        failed: None,
+                    }),
+                };
+                encode(&mut out)?;
+                let (length, digest) = out.close()?;
+                sink.end(length, digest)?;
+                (length, digest, Vec::new())
+            }
+        };
+        self.chunks.push(Written {
+            family,
+            version,
+            items,
+            length,
+            digest,
+            bytes,
+            depends: depends.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// The sealed prefix: header, manifest and seal.
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] when the model identifier, the
     /// manifest or the chunk count exceeds its bound.
-    pub fn finish(self) -> Result<Vec<u8>, CoreError> {
+    pub fn seal(&self) -> Result<Vec<u8>, CoreError> {
         let model = self.model.as_bytes();
         let model_length = u16::try_from(model.len())
             .ok()
@@ -251,20 +401,19 @@ impl CheckpointWriter {
         manifest.u16(count);
         let mut offset = 0_u64;
         for chunk in &self.chunks {
-            let length = u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX);
             manifest.u8(chunk.family.code());
             manifest.u8(CODEC_RAW);
             manifest.u16(chunk.version);
             manifest.u64(chunk.items);
             manifest.u64(offset);
-            manifest.u64(length);
-            manifest.u64(length);
-            manifest.bytes(Sha256Digest::of(&chunk.bytes).as_bytes());
+            manifest.u64(chunk.length);
+            manifest.u64(chunk.length);
+            manifest.bytes(chunk.digest.as_bytes());
             manifest.u8(u8::try_from(chunk.depends.len()).unwrap_or(u8::MAX));
             for needed in &chunk.depends {
                 manifest.u8(needed.code());
             }
-            offset = offset.saturating_add(length);
+            offset = offset.saturating_add(chunk.length);
         }
         let manifest = manifest.into_bytes();
         let manifest_length = u32::try_from(manifest.len())
@@ -282,10 +431,41 @@ impl CheckpointWriter {
         out.bytes(&manifest);
         let seal = Sha256Digest::of(out.as_slice());
         out.bytes(seal.as_bytes());
-        for chunk in &self.chunks {
-            out.bytes(&chunk.bytes);
-        }
         Ok(out.into_bytes())
+    }
+
+    /// The checkpoint's bytes: [`CheckpointWriter::seal`]'s prefix, then
+    /// the chunks.
+    ///
+    /// # Errors
+    /// As [`CheckpointWriter::seal`]; [`CoreError::StateConflict`] for a
+    /// streamed checkpoint, whose chunks are no longer held;
+    /// [`CoreError::AllocationFailed`] if the container cannot be
+    /// allocated.
+    pub fn finish(self) -> Result<Vec<u8>, CoreError> {
+        if self.sink.is_some() {
+            return Err(CoreError::StateConflict {
+                operation: "finish checkpoint",
+                detail: "a streamed checkpoint's chunks went to its sink; seal it".into(),
+            });
+        }
+        let sealed = self.seal()?;
+        let total = u64::try_from(sealed.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.payload_length());
+        let mut out = Vec::new();
+        usize::try_from(total)
+            .ok()
+            .and_then(|total| out.try_reserve_exact(total).ok())
+            .ok_or(CoreError::AllocationFailed {
+                buffer: "checkpoint",
+                bytes: total,
+            })?;
+        out.extend_from_slice(&sealed);
+        for chunk in &self.chunks {
+            out.extend_from_slice(&chunk.bytes);
+        }
+        Ok(out)
     }
 }
 
@@ -590,6 +770,64 @@ impl<'a> CheckpointReader<'a> {
     }
 }
 
+/// The little-endian encodings [`ByteWriter`] and [`ChunkWriter`] share,
+/// each in terms of the type's `put`.
+macro_rules! little_endian_writes {
+    () => {
+        /// One byte.
+        pub fn u8(&mut self, value: u8) {
+            self.put(&[value]);
+        }
+
+        /// A `u16`.
+        pub fn u16(&mut self, value: u16) {
+            self.put(&value.to_le_bytes());
+        }
+
+        /// A `u32`.
+        pub fn u32(&mut self, value: u32) {
+            self.put(&value.to_le_bytes());
+        }
+
+        /// A `u64`.
+        pub fn u64(&mut self, value: u64) {
+            self.put(&value.to_le_bytes());
+        }
+
+        /// An `f32`'s bits.
+        pub fn f32(&mut self, value: f32) {
+            self.u32(value.to_bits());
+        }
+
+        /// An `f64`'s bits.
+        pub fn f64(&mut self, value: f64) {
+            self.u64(value.to_bits());
+        }
+
+        /// `None` as `0`, `Some(value)` as `1` then the value.
+        pub fn option_u64(&mut self, value: Option<u64>) {
+            match value {
+                Some(value) => {
+                    self.u8(1);
+                    self.u64(value);
+                }
+                None => self.u8(0),
+            }
+        }
+
+        /// A length (`u64`), then the bytes.
+        pub fn sized(&mut self, bytes: &[u8]) {
+            self.u64(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            self.bytes(bytes);
+        }
+
+        /// Raw bytes.
+        pub fn bytes(&mut self, bytes: &[u8]) {
+            self.put(bytes);
+        }
+    };
+}
+
 /// Little-endian encoding into a growing buffer.
 #[derive(Debug, Clone, Default)]
 pub struct ByteWriter(Vec<u8>);
@@ -601,57 +839,11 @@ impl ByteWriter {
         Self(Vec::new())
     }
 
-    /// One byte.
-    pub fn u8(&mut self, value: u8) {
-        self.0.push(value);
-    }
-
-    /// A `u16`.
-    pub fn u16(&mut self, value: u16) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-
-    /// A `u32`.
-    pub fn u32(&mut self, value: u32) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-
-    /// A `u64`.
-    pub fn u64(&mut self, value: u64) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-
-    /// An `f32`'s bits.
-    pub fn f32(&mut self, value: f32) {
-        self.u32(value.to_bits());
-    }
-
-    /// An `f64`'s bits.
-    pub fn f64(&mut self, value: f64) {
-        self.u64(value.to_bits());
-    }
-
-    /// `None` as `0`, `Some(value)` as `1` then the value.
-    pub fn option_u64(&mut self, value: Option<u64>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.u64(value);
-            }
-            None => self.u8(0),
-        }
-    }
-
-    /// A length (`u64`), then the bytes.
-    pub fn sized(&mut self, bytes: &[u8]) {
-        self.u64(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        self.bytes(bytes);
-    }
-
-    /// Raw bytes.
-    pub fn bytes(&mut self, bytes: &[u8]) {
+    fn put(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
+
+    little_endian_writes!();
 
     /// The bytes so far.
     #[must_use]
@@ -664,6 +856,83 @@ impl ByteWriter {
     pub fn into_bytes(self) -> Vec<u8> {
         self.0
     }
+}
+
+struct Spill<'s> {
+    sink: &'s mut dyn ChunkSink,
+    hash: Sha256Stream,
+    length: u64,
+    /// The sink's first refusal: later bytes are dropped, and
+    /// [`ChunkWriter::close`] returns it.
+    failed: Option<CoreError>,
+}
+
+/// One chunk's encoder ([`CheckpointWriter::chunk_with`]): the same
+/// little-endian encodings as [`ByteWriter`], into memory or, for a
+/// streamed checkpoint, through a page of [`CHECKPOINT_PAGE_BYTES`] handed
+/// to the sink whenever it fills.
+pub struct ChunkWriter<'s> {
+    page: Vec<u8>,
+    spill: Option<Spill<'s>>,
+}
+
+impl fmt::Debug for ChunkWriter<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChunkWriter")
+            .field("held", &self.page.len())
+            .field("streaming", &self.spill.is_some())
+            .finish()
+    }
+}
+
+impl ChunkWriter<'_> {
+    fn put(&mut self, mut bytes: &[u8]) {
+        if self.spill.is_none() {
+            self.page.extend_from_slice(bytes);
+            return;
+        }
+        while !bytes.is_empty() {
+            let room = CHECKPOINT_PAGE_BYTES.saturating_sub(self.page.len());
+            let (now, later) = bytes.split_at(room.min(bytes.len()));
+            self.page.extend_from_slice(now);
+            bytes = later;
+            if self.page.len() >= CHECKPOINT_PAGE_BYTES {
+                self.spill_page();
+            }
+        }
+    }
+
+    fn spill_page(&mut self) {
+        if let Some(spill) = &mut self.spill {
+            if spill.failed.is_none() && !self.page.is_empty() {
+                spill.hash.update(&self.page);
+                spill.length = spill
+                    .length
+                    .saturating_add(u64::try_from(self.page.len()).unwrap_or(u64::MAX));
+                if let Err(error) = spill.sink.page(&self.page) {
+                    spill.failed = Some(error);
+                }
+            }
+            self.page.clear();
+        }
+    }
+
+    /// Hand the last page to the sink; the chunk's length and digest.
+    fn close(mut self) -> Result<(u64, Sha256Digest), CoreError> {
+        self.spill_page();
+        match self.spill {
+            Some(spill) => match spill.failed {
+                Some(error) => Err(error),
+                None => Ok((spill.length, spill.hash.finish())),
+            },
+            None => Err(CoreError::StateConflict {
+                operation: "close checkpoint chunk",
+                detail: "an in-memory chunk is not streamed".into(),
+            }),
+        }
+    }
+
+    little_endian_writes!();
 }
 
 /// Bounded little-endian decoding of one chunk or header.

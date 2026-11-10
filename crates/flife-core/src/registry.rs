@@ -713,9 +713,9 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     // step while a checkpoint is taken and published to the chunk store, so
     // the committed world cannot move under it; a run stopped by a damaged
     // newest checkpoint or by SIGKILL resumes to the uninterrupted run's
-    // digest and final checkpoint bytes. The container is encoded whole in
-    // memory before it is published; admitting that copy against a memory
-    // budget (§16.5's low-memory bound) is FL-038's.
+    // digest and final checkpoint bytes. Since FL-038 the checkpoint streams
+    // into the store a page at a time from the borrowed world, holding at
+    // most `flife_cli::CHECKPOINT_FIXED_BYTES` beyond it.
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-cli::tests/resume.rs::a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_state",
@@ -725,6 +725,23 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             Role::CheckpointMode,
             "§16.5, A.2",
             "FL-037",
+        )
+    },
+    // FL-038: the encoder hands pages to a writer thread through a queue
+    // holding at most `[execution] checkpoint_retained_bytes`, and the run
+    // steps on once the last page is queued; one checkpoint in flight at a
+    // time. Admitted against the memory `maximum_total_bytes` leaves after
+    // the genome cap, falling back to `pause-and-stream` with its reason.
+    // Its checkpoints are byte-identical to `pause-and-stream`'s.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-cli::tests/checkpoint_memory.rs::each_mode_stores_the_same_checkpoints_within_its_admitted_peak",
+        },
+        ..entry(
+            "bounded-background",
+            Role::CheckpointMode,
+            "§16.5, §19.4, A.2",
+            "FL-038",
         )
     },
 ];

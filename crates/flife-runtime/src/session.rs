@@ -290,6 +290,10 @@ pub struct SessionClosed {
 }
 
 type AdmissionReply = oneshot::Sender<Result<Admission, CoreError>>;
+
+/// A client's function of the committed boundary
+/// ([`SessionHandle::checkpoint_with`]), or the reason it cannot run.
+type Take = Box<dyn FnOnce(Result<(&World, &CommandBook, Boundary), CoreError>) + Send>;
 type CancelReply = oneshot::Sender<Result<Cancellation, CoreError>>;
 
 enum Control {
@@ -314,6 +318,7 @@ enum Control {
     },
     Inspect(oneshot::Sender<Snapshot>),
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
+    Take(Take),
     Close(oneshot::Sender<Boundary>),
     Suspend(oneshot::Sender<Boundary>),
 }
@@ -352,6 +357,7 @@ impl std::fmt::Debug for Control {
             Self::DurableOutcome { .. } => "DurableOutcome",
             Self::Inspect(_) => "Inspect",
             Self::Checkpoint(_) => "Checkpoint",
+            Self::Take(_) => "Take",
             Self::Close(_) => "Close",
             Self::Suspend(_) => "Suspend",
         })
@@ -468,6 +474,32 @@ impl SessionHandle {
     /// [`checkpoint`](crate::checkpoint::checkpoint).
     pub async fn checkpoint(&self, cx: &Cx) -> Result<SessionCheckpoint, CoreError> {
         self.control(cx, Control::Checkpoint).await?
+    }
+
+    /// Run `take` on the committed boundary exactly where
+    /// [`SessionHandle::checkpoint`] would encode it: the world, its command
+    /// book and the boundary, with no future tick, and under
+    /// `write-ahead-before-apply` once every record sent is durable. The
+    /// session takes no step while `take` runs, so a checkpoint `take`
+    /// streams elsewhere (FL-038's pause-and-stream) holds one committed
+    /// state. `take` runs on the owner's task: it blocks the session, not
+    /// the client.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`].
+    pub async fn checkpoint_with<T: Send + 'static>(
+        &self,
+        cx: &Cx,
+        take: impl FnOnce(&World, &CommandBook, Boundary) -> T + Send + 'static,
+    ) -> Result<T, CoreError> {
+        self.control(cx, |reply| {
+            Control::Take(Box::new(move |state| {
+                let _ = reply.send_blocking(
+                    state.map(|(world, book, boundary)| take(world, book, boundary)),
+                );
+            }))
+        })
+        .await?
     }
 
     /// A command's status.
@@ -1474,6 +1506,18 @@ impl SessionOwner {
                 });
                 let _ = reply.send_blocking(taken);
             }
+            Control::Take(take) => {
+                self.settle_receipts();
+                if self
+                    .journal
+                    .as_ref()
+                    .is_some_and(|journal| !journal.waiting.is_empty())
+                {
+                    self.held.push_back(Control::Take(take));
+                    return;
+                }
+                take(Ok((&self.world, &self.book, self.boundary())));
+            }
             Control::Close(reply) => {
                 self.suspending = false;
                 self.closing.push(reply);
@@ -1822,6 +1866,7 @@ impl SessionOwner {
                 Control::Checkpoint(reply) => {
                     let _ = reply.send_blocking(Err(closed()));
                 }
+                Control::Take(take) => take(Err(closed())),
                 Control::Cancel { id, reply } => {
                     let decision = match self.book.status(id) {
                         Some(CommandStatus::Terminal(outcome)) => {

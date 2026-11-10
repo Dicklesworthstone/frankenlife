@@ -232,9 +232,9 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
         CommandJournal::open(&catalog)?.open_branch(session, revision, &lineage, &origin, &history)
     })?;
     let persistence = Persistence {
-        run_dir: run_dir.to_path_buf(),
         checkpoint_every: 0,
         durability: options.durability,
+        ..Persistence::new(run_dir, &config)
     };
     let mut checkpoints = Checkpoints::open(&persistence, &config, session)?;
     let taken = SessionCheckpoint {

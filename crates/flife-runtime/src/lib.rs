@@ -12,7 +12,7 @@
 //!   ordered by `(effective tick, admission order)`, sealed boundaries,
 //!   cancellation and the outcome stream; a [`Fork`] into a branch
 //!   session (FL-039).
-//! - [`checkpoint`]: a committed world and its complete command closure as
+//! - [`checkpoint`](mod@checkpoint): a committed world and its complete command closure as
 //!   one verified checkpoint, and their exact restoration (FL-016).
 //! - [`session`]: the Asupersync owner task. It holds the committed world
 //!   and the book, serves a reserved control lane and a bounded scientific
@@ -36,7 +36,7 @@ pub mod session;
 pub use book::{
     BRANCHED_COMMANDS_CHUNK_VERSION, COMMANDS_CHUNK_VERSION, CommandBook, Fork, admitting_session,
 };
-pub use checkpoint::{Restored, SESSION_CHECKPOINT_CHUNKS, checkpoint, restore};
+pub use checkpoint::{Restored, SESSION_CHECKPOINT_CHUNKS, checkpoint, checkpoint_into, restore};
 pub use command::{
     Accepted, Admission, COMMAND_SCHEMA, CancelReason, Cancellation, Command, CommandStatus,
     Durability, Outcome, Rejection, Target, VOLATILE_IN_MEMORY,

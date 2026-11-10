@@ -154,9 +154,9 @@ from the render epoch at the record's tick, and the start record declares both r
 - The preset is Appendix A with exactly its declared changes. Its header declares each one, and the smoke test
   refuses any other difference.
 - FL-037:
-  - Checkpoints are `pause-and-stream`: the client takes no step while one is taken and published, and the session
-    takes one only once every journal record has its receipt, so the catalog's index is written while the journal
-    is idle. Keeping a run changes nothing in it: a `volatile-in-memory` run ends at the same digest with or
+  - Checkpoints are taken in the admitted mode (FL-038, below). The session encodes one only once every journal
+    record has its receipt and takes no step meanwhile; the catalog's index is written while the journal is
+    idle. Keeping a run changes nothing in it: a `volatile-in-memory` run ends at the same digest with or
     without a run directory (tested), and a `write-ahead-before-apply` one at the same digest with checkpoints
     every 7 ticks or only at the end (observed when FL-037 was written).
   - Commands are admitted before the founding checkpoint is taken, so it holds them: a `volatile-in-memory`
@@ -167,9 +167,33 @@ from the render epoch at the record's tick, and the start record declares both r
     back to the founding world, and reports every newer one it passed over. `write-ahead-before-apply` then
     replays every journaled outcome past it, each reproduced exactly (FL-036). The resumed run's committed digest
     and final checkpoint bytes (world and command closure) equal the uninterrupted run's.
-  - After each publication the store keeps the newest `retain_recent_checkpoints` that restore; the catalog's
-    index keeps every row, and only a manifest makes a checkpoint resumable (§16.6).
+  - After each publication the store keeps the newest `retain_recent_checkpoints` that verify (FL-038: seal,
+    lengths and hashes, never decoded); the catalog's index keeps every row, and only a manifest makes a
+    checkpoint resumable (§16.6). Resume still restores.
   - A resumed run's tally covers the ticks that call published.
+- FL-038 (§16.5, §19.4, A.2), `checkpointing`:
+  - `pause-and-stream` (the preset's): `SessionHandle::checkpoint_with` hands the borrowed committed world to
+    `flife_runtime::checkpoint_into`, which streams it into a `flife_store::Stream` a 1 MiB page at a time; the
+    store commits, verifies (the container's SHA-256, read back), and the checkpoint is indexed and retained.
+  - `bounded-background`: the encoder's pages go through a `Queue` to a writer thread that stores, commits and
+    verifies them. The queue holds at most `[execution] checkpoint_retained_bytes` of pages, counting the one
+    being written, and the encoder waits while it is full; the session resumes once the last page is queued.
+    One checkpoint is in flight: the next one and the run's end wait for it, and a branch publication is refused
+    meanwhile (`state-conflict`). Its catalog
+    row is written on the paused session (`checkpoint_with`), where the journal is idle, then it is retained and
+    its record emitted, with the wait counted in `paused_seconds`.
+  - `admit` (the checkpoint term of §19.4's preflight): headroom = `maximum_total_bytes` −
+    `maximum_allocated_genome_bytes`. `pause-and-stream` peaks at `CHECKPOINT_FIXED_BYTES` (two pages, the
+    largest manifest and 1 MiB of handles, 3.06 MiB); `bounded-background` at that plus its budget. A
+    background budget under one page, or a peak over the headroom, falls back to `pause-and-stream` and the
+    start record says why; a headroom under `CHECKPOINT_FIXED_BYTES` is refused (`budget-exhausted`, budget
+    `checkpoint memory`) before the run directory is created or the world founded.
+  - `--checkpoint-mode` and `--checkpoint-retained-bytes` on `run` and `resume` override the configuration. No
+    result depends on the mode: the checkpoints are byte-identical (tested).
+  - Records: the start record's `checkpoints` (declared and admitted mode, retained bytes, peak, headroom,
+    fallback); each checkpoint record's `mode`, `retained_peak` (zero for `pause-and-stream`) and
+    `paused_seconds` (wall clock, not scientific state).
+  - A metrics tracker re-founded on resume reads the committed world through `checkpoint_with`, without a copy.
 - FL-039:
   - A branch is a new session, `branch_session(SHA-256 of the parent checkpoint, name)`. Making the same branch again
     gives the same session and the same founding checkpoint bytes; siblings with different names differ (tested).
@@ -456,10 +480,7 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
     session at a checkpoint taken by its owner is not supported.
   - `run_identity`'s refusal of a catalog recording more than one run is not tested.
 - FL-037 gaps:
-  - The checkpoint container is encoded whole in memory before it is published (one extra copy of the committed
-    state). §16.5's low-memory bound on it, and bounded or background checkpoints, are FL-038.
-  - Each publication restores the retained checkpoints to choose which to keep: O(`retain_recent_checkpoints`)
-    restores per checkpoint. Checkpoints of the 48-founder test ecology are about 2 MB each.
+  - Checkpoints of the 48-founder test ecology are about 2 MB each.
   - Power loss is FL-035's protocol (flush order), exercised by publishing under `power-loss`, never by cutting
     power. Kills are tested at whatever point the process reached, not at every step of a checkpoint (FL-035 and
     FL-036 test those).
@@ -467,6 +488,46 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
     interventions, are FL-022.
   - Retention is by count. Pinned discoveries and journal compaction (§16.7) are later, and the catalog's
     checkpoint index keeps rows for retired manifests.
+- FL-038 evidence (`tests/checkpoint_memory.rs`, a counting global allocator, `peak_alloc`, test only; and
+  `tests/resume.rs`):
+  - A `pause-and-stream` checkpoint of the preset (160.7 MiB) streamed, committed, verified and retained peaks at
+    1.02 MiB of heap beyond the live world, within `CHECKPOINT_FIXED_BYTES` (3.06 MiB). The same checkpoint
+    encoded whole in memory, the negative control, peaks at 421.5 MiB.
+  - Runs of the preset to tick 64, checkpointing every 32 ticks, in `pause-and-stream` and in
+    `bounded-background` with four pages and with one: the same checkpoints (ticks 0, 32, 64) byte for byte, the
+    same digest as a run without checkpoints, and the newest restoring to it. Background pages retained:
+    2,162,700, 4,194,304 and 4,194,304 bytes against four pages; exactly one page against one. Heap peaks (one
+    run each, M5 Ultra): the run without a run directory 226.3 MiB; `pause-and-stream` and one page the same;
+    four pages 1.95 MiB above it.
+    The bound asserted is the admitted peak plus an 8 MiB run-directory allowance.
+  - Admission by the numbers on the preset, the fallbacks and their reasons, the refusal before anything is
+    created, and the configuration naming the mode.
+  - The journaled ecology with four brushes, its checkpoints taken `bounded-background` with one page: the same
+    checkpoints as `pause-and-stream` at every multiple of 7, each indexed in the catalog, the same final world;
+    SIGKILLed once it had reported tick 70 (its checkpoint at 63 not yet committed), it resumed from 56 to the
+    uninterrupted state.
+  - The queue's own tests: a full queue holds the encoder at its budget; a stopped writer releases every queued
+    page and refuses more; an abandoned encoder ends the queue without a seal.
+  - 14 planted mutants in the queue, admission, the run's checkpoint path and its records, each caught; one
+    (`Producer`'s drop not ending the queue) by hanging the queue test until the harness's 600 s timeout.
+    Restoring the whole in-memory encoding in `pause-and-stream` peaked 419.8 MiB above the run without
+    checkpoints and failed the run-level bound. With `flife-store`'s 16, 30 in all; 29 caught on their first
+    run.
+  - Cost (the `flife` binary, the preset for 256 ticks on 16 CPU workers, checkpoints at 0, 128 and 256 under
+    `power-loss`; one run each on an M5 Ultra at host load about 25, so no speed claim): without checkpoints RSS
+    243–245 MiB and 3.3–3.4 s. `pause-and-stream` RSS 265.4 MiB, 6.23 s, each checkpoint pausing the run 0.9–1.0 s
+    (before FL-038: RSS 1,621 MiB, 6.87 s). `bounded-background` with the preset's 128 MiB: RSS 328.9 MiB, 5.00 s,
+    28–45 MiB retained, pauses 0.37–0.78 s (the last includes the wait at the run's end); with 4 MiB: RSS
+    274.5 MiB, 5.06 s, 4 MiB retained. The checkpoints are 152–169 MB; the digest is the same in every run.
+- FL-038 gaps:
+  - No incremental mode: every checkpoint is written in full and a single birth rewrites the genome chunk; there
+    is no copy-on-write paged genome bank (§16.5, A.2). A 4,096-organism checkpoint is about 161 MiB.
+  - `bounded-background` needs a budget of at least one page, or it streams instead.
+  - The admission covers the checkpoint's own heap only. §19.4's other terms (state, scratch, render, births,
+    backend) and the whole M_peak preflight are FL-043.
+  - The heap is measured by the test allocator, not RSS; file-system caches and FrankenSQLite's own pages are
+    outside it. The 400k profile is not measured.
+  - Retention verifies hashes without decoding (see `flife-store`'s gaps).
 - `render` draws on FrankenManim's CPU reference 3D route, a tick per frame at most, at the epoch's texel resolution
   for the field. There is no Metal or CUDA offline route, no motion interpolation between ticks, and no audio.
   FrankenManim's Metal 3D route was measured on these frames (`examples/frame_routes.rs`, M5 Ultra, GPU shared

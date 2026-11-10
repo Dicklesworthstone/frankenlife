@@ -42,7 +42,7 @@ pub mod schema;
 pub mod units;
 pub mod validate;
 
-pub use canonical::Sha256Digest;
+pub use canonical::{Sha256Digest, Sha256Stream};
 pub use clock::{Tick, TickSpan, TimeStep};
 pub use config::RunConfig;
 pub use descriptor::ModelDescriptor;

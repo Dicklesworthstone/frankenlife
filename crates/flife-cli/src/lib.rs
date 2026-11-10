@@ -11,6 +11,12 @@
 //!   directory from a checkpoint of another, as a new session that
 //!   inherits its commands and shares its stored chunks; each branch then
 //!   resumes on its own.
+//! - [`checkpointing`]: how a run directory's checkpoints are taken
+//!   (FL-038): `pause-and-stream`, streamed into the chunk store a page at
+//!   a time while the run waits, or `bounded-background`, drained by a
+//!   writer through a queue bounded by `checkpoint_retained_bytes` while
+//!   the run steps on; and [`checkpointing::admit`], their memory
+//!   admission.
 //! - [`metrics`]: incremental metrics and lineage summaries (FL-040). A
 //!   run with `metrics_every` folds every report into a [`Tracker`] and
 //!   emits a [`Metrics`] record every so many ticks: complete window,
@@ -30,6 +36,7 @@
 #![forbid(unsafe_code)]
 
 pub mod branch;
+pub mod checkpointing;
 pub mod metrics;
 pub mod observe;
 pub mod persist;
@@ -40,6 +47,10 @@ pub mod validate;
 pub use branch::{
     BRANCH_NAME_MAX_BYTES, BranchOptions, BranchParent, ForkRecord, FoundingChunks, Inherited,
     branch, branch_session,
+};
+pub use checkpointing::{
+    BOUNDED_BACKGROUND, CHECKPOINT_FIXED_BYTES, CheckpointAdmission, CheckpointMode,
+    PAUSE_AND_STREAM, admit,
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Particles, Style};

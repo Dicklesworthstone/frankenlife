@@ -9,6 +9,7 @@
 
 #![allow(
     clippy::expect_used,
+    clippy::panic,
     clippy::print_stdout,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -19,12 +20,15 @@
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::{Duration, Instant};
 
-use flife_core::ValidatedConfig;
-use flife_core::ids::OrganismId;
+use flife_core::ids::{CommandId, OrganismId};
+use flife_core::{Tick, ValidatedConfig};
+use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, hud_origin, linear};
+use flife_runtime::Outcome;
 use flife_studio::{
-    ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_SPACE, PICK_RADIUS_POINTS, Status,
-    Studio, StudioOptions, Surface, legends, scroll_zoom,
+    Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_M, KEY_PERIOD,
+    KEY_SPACE, PICK_RADIUS_POINTS, Status, Studio, StudioOptions, Supplies, Surface, legends,
+    material_for, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -445,4 +449,150 @@ fn an_offscreen_queue_keeps_a_native_queues_capacity() {
     let frame = studio.frame().expect("a frame");
     assert_eq!(frame.events, fmn_render::metal::INPUT_QUEUE_CAPACITY);
     studio.close().expect("closes");
+}
+
+/// FL-022's host brush path, as a window's: keys arm the brushes, and a
+/// click becomes a stroke through the frame's view and is sent as a
+/// command; the material brush takes the selected organism's affinity from
+/// its inspection. Paused at tick 0, both apply at the next step, each
+/// moving the energy that the world stepped directly with the same two
+/// strokes at tick 0 reports, bit for bit, and the Studio closes on that
+/// world.
+#[test]
+fn brush_clicks_offscreen_apply_where_they_were_made() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let config = config();
+    let mut studio = Studio::open(&config, &options(false)).expect("opens offscreen");
+    studio.frame().expect("the first frame");
+    let density = f64::from(SCALE);
+    let logical = SIZE.map(f64::from);
+    let world = &config.config().world;
+    let cells = [world.grid_width, world.grid_height];
+    let viewport = *studio.view().viewport();
+
+    // Select the shown organism nearest the centre, as a click does, and
+    // wait for its inspection: the material brush's composition.
+    let rows: Vec<(u64, [f64; 2])> = studio.view().shown_rows().collect();
+    let centre = [logical[0] * density / 2.0, logical[1] * density / 2.0];
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let spot = rows
+        .iter()
+        .map(|&(_, position)| viewport.world_to_drawable(position))
+        .min_by(|a, b| distance(*a, centre).total_cmp(&distance(*b, centre)))
+        .expect("organisms are shown");
+    click(&mut studio, [spot[0] / density, spot[1] / density]);
+    let mut affinity = None;
+    until(&mut studio, "the inspection", |studio, statuses| {
+        affinity = statuses.iter().find_map(|status| match status {
+            Status::Inspected {
+                organism,
+                snapshot: Some(snapshot),
+                ..
+            } if studio.view().selected() == Some(*organism) => Some(*snapshot.traits.affinity()),
+            _ => None,
+        });
+        affinity.is_some()
+    });
+    let material = material_for(&affinity.expect("inspected"));
+    assert!(material.is_some(), "the organism has an affinity direction");
+
+    // Arm each brush by its key and click with it, away from the organism.
+    let mut strokes = Vec::new();
+    for (code, text, brush, at) in [
+        (KEY_E, "e", Brush::Energy, [110.0, 70.0]),
+        (KEY_M, "m", Brush::Material, [210.0, 130.0]),
+    ] {
+        studio.post_input(key(code, text, true)).expect("posts");
+        studio.post_input(key(code, text, false)).expect("posts");
+        assert_eq!(studio.frame().expect("a frame").brush, Some(brush));
+        let supplies = Supplies {
+            material,
+            founder_energy: config.config().population.initial_energy,
+        };
+        strokes
+            .push(stroke(brush, &viewport, logical, cells, at, &supplies).expect("a stroke there"));
+        click(&mut studio, at);
+    }
+    let mut submitted = Vec::new();
+    until(&mut studio, "the submissions", |_, statuses| {
+        submitted = statuses
+            .iter()
+            .filter_map(|status| match status {
+                Status::Submitted {
+                    command,
+                    stroke,
+                    seen,
+                    effective,
+                } => Some((*command, *stroke, *seen, *effective)),
+                _ => None,
+            })
+            .collect();
+        submitted.len() == 2
+    });
+    assert_eq!(
+        submitted,
+        [
+            (CommandId::new(1), strokes[0], Tick::ZERO, Tick::ZERO),
+            (CommandId::new(2), strokes[1], Tick::ZERO, Tick::ZERO),
+        ]
+    );
+
+    // One step: both apply at the boundary of tick 0.
+    studio
+        .post_input(key(KEY_PERIOD, ".", true))
+        .expect("posts");
+    studio
+        .post_input(key(KEY_PERIOD, ".", false))
+        .expect("posts");
+    let mut applied = Vec::new();
+    until(&mut studio, "the outcomes", |_, statuses| {
+        applied = statuses
+            .iter()
+            .filter_map(|status| match status {
+                Status::Finished {
+                    command,
+                    outcome:
+                        Outcome::Applied {
+                            tick,
+                            published,
+                            applied,
+                            ..
+                        },
+                } => Some((*command, *tick, *published, *applied)),
+                _ => None,
+            })
+            .collect();
+        applied.len() == 2
+    });
+    applied.sort_by_key(|(command, ..)| *command);
+    let mut direct = World::found(
+        &config,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("founds");
+    let interventions: Vec<_> = strokes.iter().map(|stroke| stroke.intervention()).collect();
+    let report = match direct.step_with(&interventions).expect("steps") {
+        Stepped::Published(report) => report,
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    };
+    assert_eq!(report.interventions.len(), 2);
+    for ((command, tick, published, energy), expected) in applied.iter().zip(&report.interventions)
+    {
+        assert_eq!(
+            (*tick, *published),
+            (Tick::ZERO, Tick::new(1)),
+            "{command:?}"
+        );
+        assert_eq!(energy.to_bits(), expected.applied.to_bits(), "{command:?}");
+        assert!(*energy > 0.0, "{command:?}");
+    }
+    let tally = studio.tally();
+    assert_eq!((tally.strokes, tally.unstroked), (2, 0));
+    let closed = studio.close().expect("closes");
+    assert_eq!(closed.session.boundary.tick, Tick::new(1));
+    assert_eq!(closed.session.world.digest(), direct.digest());
 }

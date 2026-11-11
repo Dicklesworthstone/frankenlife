@@ -400,7 +400,7 @@ presentation state, not scientific state.
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
-- `tests/offscreen.rs` (5 tests, FL-024, Metal compute, no window), `Studio::open` offscreen on the preset at
+- `tests/offscreen.rs` (6 tests, FL-024, Metal compute, no window), `Studio::open` offscreen on the preset at
   320 x 200 points and 2 pixels a point:
   - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
     the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
@@ -415,7 +415,13 @@ presentation state, not scientific state.
     they were within 8 and 16 levels (printed);
   - a running world with a camera move arriving at a random moment of every third frame interval of a 60 Hz
     loop: every move reaches the next frame; frame work and arrival-to-drawn latency are printed, not asserted;
-  - the queue keeps at most `INPUT_QUEUE_CAPACITY` events between frames and counts the rest as dropped.
+  - the queue keeps at most `INPUT_QUEUE_CAPACITY` events between frames and counts the rest as dropped;
+  - FL-022's host brush path: a click selects the organism nearest the centre and its inspection answers; E and M
+    arm the energy and material brushes (the frame names the armed one), and a click with each is the stroke
+    `stroke` makes at that point through the frame's view, the material one of the selected organism's affinity
+    direction; both are submitted as commands 1 and 2 for tick 0, seen at tick 0; a step applies both at tick 0,
+    published at 1, each moving the energy, bit for bit, that a world stepped directly with the same two strokes
+    reports; and the Studio closes on that world's digest, with two strokes and none unstroked.
 - `tests/offscreen_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5
   --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen` and carries
   its admission, whose terms sum to its peak within the budget, with no backend term on the CPU reference, and
@@ -488,8 +494,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   sensing scale, motion response or affinity, which the record carries. §14.2's sampled activations, inputs,
   transactions, descendants, local efficiency and weight dumps are not implemented.
 - FL-022's brushes:
-  - The host's brush path (the click through the frame's view to `Intent::Intervene`), the printing of the
-    `brush`, `submitted` and `finished` records and the `end` record's `strokes` and `unstroked` run only in a
+  - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
+    `tests/offscreen.rs` for the energy and material brushes; the removal and introduction brushes take the same
+    path, through `stroke`, only in `tests/brush.rs` without the host. The printing of the `brush`, `submitted` and
+    `finished` records and the `end` record's `strokes` and `unstroked` are the binary's and run only in a
     window, which no test here opened. The controls, the payload mapping, the session thread and the `submitted`
     and `finished` records' serialization are tested headlessly. `tests/live.rs` has a brush case
     that was compiled and not run.
@@ -499,7 +507,7 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     material other than the selected organism's, source edits and parameter edits have no Studio brush.
   - The material brush takes the selected organism's composition from its `inspected` snapshot, which arrives
     after the click that selected it; a material click before then makes no stroke and is counted as
-    `unstroked`. The host's tracking of that snapshot runs only in a window, which no test here opened.
+    `unstroked`. The host's tracking of that snapshot runs offscreen in `tests/offscreen.rs`.
   - A finished command is reported up to `OUTCOME_POLL` after its publication; while paused, a pending
     command's watcher keeps asking every 20 ms.
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush

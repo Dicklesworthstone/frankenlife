@@ -139,6 +139,12 @@ pub fn render(
     let founding = viewer.latest()?;
     let mut view = WorldView::for_epoch(&founding, options.size, background)?;
     view.set_style(options.style);
+    let presentation = &model.presentation;
+    view.set_bloom(
+        presentation
+            .bloom_enabled
+            .then_some(presentation.bloom_strength),
+    )?;
     drop(founding);
     let (memory, encoders) = admit(&world, options, &publisher, &view)?;
     install(&mut world, options.controllers, memory.backend)?;

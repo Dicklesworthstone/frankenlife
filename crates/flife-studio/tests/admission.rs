@@ -85,6 +85,34 @@ fn the_studio_is_admitted_with_its_observers_and_the_backend_gets_the_rest() {
     assert_eq!(reference.backend, 0);
     assert_eq!(reference.render, observers);
 
+    // The preset's bloom (FL-019) keeps its row sums on the device, 16 bytes
+    // a pixel of FrankenManim's widest ring, whatever the look: a band and
+    // the widest blur's reach, 320 of the drawable's 2160 rows.
+    let presentation = &config.config().presentation;
+    assert!(presentation.bloom_enabled);
+    let mut blooming = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
+    blooming
+        .set_bloom(Some(presentation.bloom_strength))
+        .expect("a bloom");
+    assert_eq!(
+        observer_bytes(&world, &founding, &blooming, drawable),
+        observers + 3840 * 320 * 16
+    );
+    let bloomed = admit(
+        &world,
+        ControllerChoice::Torch,
+        &founding,
+        &blooming,
+        drawable,
+    )
+    .expect("admitted");
+    println!(
+        "studio with the preset's bloom: observers {:.1} MiB, backend {:.1} MiB",
+        bloomed.render as f64 / f64::from(1 << 20),
+        bloomed.backend as f64 / f64::from(1 << 20),
+    );
+    assert_eq!(bloomed.backend, torch.backend - 3840 * 320 * 16);
+
     // A budget the observers do not fit is refused.
     let others = torch.fixed_bytes() - observers;
     let short = preset_with(&[("maximum_total_bytes", others + observers - 1)]);

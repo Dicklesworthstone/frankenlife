@@ -527,7 +527,15 @@ fn a_renders_term_is_its_observers_and_a_short_budget_encodes_fewer_frames() {
         .expect("a viewer")
         .latest()
         .expect("the founding epoch");
-    let view = flife_manim::WorldView::for_epoch(&lease, size, [0, 0, 0]).expect("a view");
+    let mut view = flife_manim::WorldView::for_epoch(&lease, size, [0, 0, 0]).expect("a view");
+    // As render configures it: the preset's bloom (FL-019), whose row sums
+    // the CPU route holds.
+    let config = preset();
+    let presentation = &config.config().presentation;
+    assert!(presentation.bloom_enabled);
+    view.set_bloom(Some(presentation.bloom_strength))
+        .expect("the preset's bloom");
+    assert_eq!(view.bloom_bytes(size), 320 * 180 * 16);
     let drawing = publisher.reserved_bytes()
         + view.reserved_bytes()
         + view.frame_bytes()
@@ -671,19 +679,25 @@ fn a_pan_or_zoom_allocates_no_layer_texture() {
 }
 
 /// One frame on the CPU route, measured: a full world at 3840 x 2160 in
-/// points and in density, on four threads, holds no more heap above the
-/// view than the view's frame and offline bytes.
+/// points and in density, and in points with the preset's bloom (FL-019),
+/// on four threads, holds no more heap above the view than the view's
+/// frame and offline bytes.
 #[test]
 fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
     let _serial = serial();
     let epoch = full_epoch();
-    for particles in [flife_cli::Particles::Points, flife_cli::Particles::Density] {
+    for (particles, bloom) in [
+        (flife_cli::Particles::Points, None),
+        (flife_cli::Particles::Density, None),
+        (flife_cli::Particles::Points, Some(0.15)),
+    ] {
         let mut view =
             flife_manim::WorldView::for_epoch(&epoch, [3840, 2160], [0, 0, 0]).expect("a view");
         view.set_style(Style {
             particles,
             ..Style::default()
         });
+        view.set_bloom(bloom).expect("a bloom");
         view.show(&epoch).expect("shows");
         let base = ALLOC.current_usage();
         ALLOC.reset_peak_usage();
@@ -707,8 +721,8 @@ fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
         drop(rgba);
         let offline = view.offline_bytes(4);
         println!(
-            "{}: a 4K frame's draw list held {:.2} MiB; the frame {:.2} MiB, its job {:.2} of {:.2} MiB, \
-             the rest {:.2} of {:.2} MiB",
+            "{} (bloom {bloom:?}): a 4K frame's draw list held {:.2} MiB; the frame {:.2} MiB, its job \
+             {:.2} of {:.2} MiB, the rest {:.2} of {:.2} MiB",
             particles.name(),
             mib(listed),
             mib(held),

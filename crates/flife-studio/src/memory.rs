@@ -18,7 +18,9 @@
 //!   61% and the device copy at most 44% of that sum;
 //! - per drawable pixel, [`DEVICE_BYTES_PER_PIXEL`]: the route's RGBA16F
 //!   and RGBA8 surfaces and the window's drawables; and a status word per
-//!   16 x 16 tile.
+//!   16 x 16 tile;
+//! - while a bloom is configured, its row sums on the device
+//!   ([`WorldView::bloom_bytes`], FL-019).
 //!
 //! What a resize past the opening size adds, in pixels and density bins,
 //! is not admitted again.
@@ -61,6 +63,7 @@ pub fn observer_bytes(
             .saturating_mul(height)
             .saturating_mul(DEVICE_BYTES_PER_PIXEL),
         tiles.saturating_mul(4),
+        view.bloom_bytes(drawable),
     ])
 }
 

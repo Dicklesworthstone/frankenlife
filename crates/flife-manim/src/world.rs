@@ -7,8 +7,9 @@ use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_render::{Epoch, Gap, Interpolation, Prior, interpolate};
 use fmn_core::color::{LinearRgba, PremulRgba, Srgb};
 use fmn_render::{
-    SurfaceDraw, SurfaceMesh, SurfaceVertex, ThreeDCamera, ThreeDDraw, ThreeDJob,
-    ThreeDPreparationLimits, Tiling,
+    BLOOM_BAND_ROWS, BLOOM_SCRATCH_BYTES_PER_PIXEL, BLOOM_SIGMA_MAX_PIXELS, Bloom, SurfaceDraw,
+    SurfaceMesh, SurfaceVertex, ThreeDCamera, ThreeDDraw, ThreeDJob, ThreeDPreparationLimits,
+    Tiling,
 };
 
 use crate::mapping::{Look, Particles, Style};
@@ -45,6 +46,27 @@ pub const PREPARATION_BYTES_FIXED: u64 = 1 << 20;
 /// and the density's quads. Until FL-033 the grids' triangle allowance
 /// covered it.
 pub const JOB_BYTES_PER_DRAW: u64 = 1_024;
+
+/// The bloom's blur width in logical points (FL-019, plan §2.3): the
+/// standard deviation of FrankenManim's binomial blur, at the screen's
+/// pixel density, up to FrankenManim's widest. A presentation choice: wide
+/// enough to read as light around a dot, and the mix is convex, so a
+/// boundary keeps at least `1 - 2 x bloom_strength` of its contrast
+/// whatever the width.
+pub const BLOOM_SIGMA_POINTS: f64 = 1.5;
+
+/// The reach of FrankenManim's widest bloom, in pixels each way: three
+/// deviations of `BLOOM_SIGMA_MAX_PIXELS` (32), whatever the pixel density.
+pub const BLOOM_WIDEST_REACH_PIXELS: u32 = 96;
+
+/// The bloom of `strength` at `viewport`'s pixel density.
+fn bloom_at(strength: f64, viewport: &Viewport) -> Result<Bloom, CoreError> {
+    let sigma = (BLOOM_SIGMA_POINTS * viewport.pixels_per_point()).min(BLOOM_SIGMA_MAX_PIXELS);
+    Bloom::new(strength, sigma).map_err(|error| CoreError::NumericalInvalid {
+        quantity: "presentation bloom",
+        detail: error.to_string(),
+    })
+}
 
 /// The finest edge sampling FrankenManim's 3D route takes per pixel: a
 /// 4 x 4 grid.
@@ -117,6 +139,10 @@ pub struct WorldView {
     ring: Option<SurfaceMesh>,
     /// The texels of the field last shown; none before the first epoch.
     field_texels: [u32; 2],
+    /// The configured bloom's strength; none when it is off (FL-019).
+    bloom_strength: Option<f64>,
+    /// That bloom at the viewport's pixel density.
+    bloom: Option<Bloom>,
 }
 
 /// Where the display is between two committed epochs (FL-020, plan §13.5).
@@ -185,6 +211,8 @@ impl WorldView {
             selected: None,
             ring: None,
             field_texels: [0; 2],
+            bloom_strength: None,
+            bloom: None,
         })
     }
 
@@ -266,6 +294,10 @@ impl WorldView {
 
     fn adopt(&mut self, viewport: Viewport) -> Result<(), CoreError> {
         let camera = viewport.camera(self.background)?;
+        let bloom = self
+            .bloom_strength
+            .map(|strength| bloom_at(strength, &viewport))
+            .transpose()?;
         let ring = match self.selected_position() {
             Some(position) => Some(selection_ring(&viewport, position)?),
             None => None,
@@ -273,6 +305,7 @@ impl WorldView {
         self.viewport = viewport;
         self.camera = camera;
         self.ring = ring;
+        self.bloom = bloom;
         self.cloud.refit(&self.viewport);
         self.density.refit(&self.viewport);
         self.field.refit(&self.viewport);
@@ -289,6 +322,40 @@ impl WorldView {
     /// again to see the change at once.
     pub const fn set_style(&mut self, style: Style) {
         self.style = style;
+    }
+
+    /// Bloom frames with `strength` (`[presentation] bloom_enabled` and
+    /// `bloom_strength`, FL-019), or not at all for `None`: FrankenManim's
+    /// controlled bloom, [`BLOOM_SIGMA_POINTS`] wide at the viewport's pixel
+    /// density. Only glowing frames bloom: the raw look is the diagnostic
+    /// view, with no bloom (plan §2.3).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a strength outside `[0, 1]`;
+    /// the view is unchanged on error.
+    pub fn set_bloom(&mut self, strength: Option<f64>) -> Result<(), CoreError> {
+        self.bloom = strength
+            .map(|strength| bloom_at(strength, &self.viewport))
+            .transpose()?;
+        self.bloom_strength = strength;
+        Ok(())
+    }
+
+    /// The configured bloom at the viewport's pixel density, whatever the
+    /// look.
+    #[must_use]
+    pub const fn bloom(&self) -> Option<&Bloom> {
+        self.bloom.as_ref()
+    }
+
+    /// The bloom the current frame applies: the configured one, in the
+    /// glow look.
+    #[must_use]
+    pub const fn frame_bloom(&self) -> Option<&Bloom> {
+        match self.style.look {
+            Look::Glow => self.bloom.as_ref(),
+            Look::Raw => None,
+        }
     }
 
     /// Lower `epoch` in the current style and remember it as shown. The
@@ -612,7 +679,8 @@ impl WorldView {
     }
 
     /// The 3D job for the current frame, over [`WorldView::draws`],
-    /// compiled within [`WorldView::preparation_limit`] (FL-043).
+    /// compiled within [`WorldView::preparation_limit`] (FL-043), with
+    /// [`WorldView::frame_bloom`] (FL-019).
     /// FrankenManim leaves out a tile bin that would pass it, which only
     /// slows the frame; rows that would pass it refuse the frame.
     ///
@@ -625,12 +693,37 @@ impl WorldView {
             max_working_bytes: self.preparation_limit(),
             ..ThreeDPreparationLimits::default()
         };
-        ThreeDJob::new_with_limits(self.camera.camera(), &draws, Tiling::default(), limits).map_err(
-            |error| CoreError::NumericalInvalid {
-                quantity: "world view frame",
-                detail: error.to_string(),
-            },
-        )
+        let job =
+            ThreeDJob::new_with_limits(self.camera.camera(), &draws, Tiling::default(), limits)
+                .map_err(|error| CoreError::NumericalInvalid {
+                    quantity: "world view frame",
+                    detail: error.to_string(),
+                })?;
+        Ok(match self.frame_bloom() {
+            Some(bloom) => job.with_bloom(bloom.clone()),
+            None => job,
+        })
+    }
+
+    /// The most blooming holds for a frame of `drawable` pixels (FL-019,
+    /// FL-043), while a bloom is configured, whatever the look:
+    /// FrankenManim's row sums, [`BLOOM_SCRATCH_BYTES_PER_PIXEL`] a pixel,
+    /// for a band of `BLOOM_BAND_ROWS` and the widest blur's reach above
+    /// and below it ([`BLOOM_WIDEST_REACH_PIXELS`]), or the whole frame
+    /// when that is shorter: what `Bloom::scratch_bytes` gives at any
+    /// pixel density, so a new density needs no new admission. The CPU
+    /// route allocates them for each frame it blooms; the Metal route
+    /// keeps them on the device once it has bloomed.
+    #[must_use]
+    pub fn bloom_bytes(&self, drawable: [u32; 2]) -> u64 {
+        let [width, height] = drawable;
+        let rows = height.min(BLOOM_BAND_ROWS + 2 * BLOOM_WIDEST_REACH_PIXELS);
+        match self.bloom {
+            Some(_) => u64::from(width)
+                .saturating_mul(u64::from(rows))
+                .saturating_mul(BLOOM_SCRATCH_BYTES_PER_PIXEL),
+            None => 0,
+        }
     }
 
     /// The most bytes the view's own buffers hold (FL-043): the shown
@@ -721,7 +814,8 @@ impl WorldView {
     /// of [`WorldView::frame_bytes`] (FL-043): the RGBA16F frame
     /// FrankenManim renders, the RGBA8 frame returned, and each thread's
     /// tile scratch, a premultiplied colour and a depth for every sample of
-    /// a tile at the finest edge sampling and a flag for every pixel.
+    /// a tile at the finest edge sampling and a flag for every pixel, and
+    /// the bloom's row sums ([`WorldView::bloom_bytes`]).
     #[must_use]
     pub fn offline_bytes(&self, threads: usize) -> u64 {
         let [width, height] = self.viewport.drawable().map(u64::from);
@@ -735,6 +829,7 @@ impl WorldView {
         total([
             pixels.saturating_mul(8 + 4),
             scratch.saturating_mul(threads.max(1) as u64),
+            self.bloom_bytes(self.viewport.drawable()),
         ])
     }
 

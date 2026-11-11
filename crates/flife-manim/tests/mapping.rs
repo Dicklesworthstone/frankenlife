@@ -5,15 +5,17 @@ mod common;
 
 use flife_manim::FieldLayer;
 use flife_manim::{
-    ColorMapping, DensityLayer, ENERGY_HALF, ENERGY_RAMP, GENERATION_RAMP, GENERATION_SCALE,
-    LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL, ParticleCloud, Particles, Style,
-    TOPOLOGY_PALETTE, Traits, Viewport, WorldView, density_bins, density_level, energy_level,
-    generation_level, heading, linear, mapped_color, mapped_rgb8, mix, ramp, raw_value,
-    speed_level, traits, wheel,
+    BLOOM_SIGMA_POINTS, BLOOM_WIDEST_REACH_PIXELS, ColorMapping, DensityLayer, ENERGY_HALF,
+    ENERGY_RAMP, GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE, Look, MOTION_STILL,
+    MOTION_WHEEL, ParticleCloud, Particles, Style, TOPOLOGY_PALETTE, Traits, Viewport, WorldView,
+    density_bins, density_level, energy_level, generation_level, heading, linear, mapped_color,
+    mapped_rgb8, mix, ramp, raw_value, speed_level, traits, wheel,
 };
 use flife_render::FieldTexture;
 use fmn_core::color::LinearRgba;
-use fmn_render::{SurfaceMaterial, Texture, TextureWrap, ThreeDDraw};
+use fmn_render::{
+    BLOOM_SIGMA_MAX_PIXELS, Bloom, SurfaceMaterial, Texture, TextureWrap, ThreeDDraw,
+};
 
 /// Every texel of `texture`, rows top to bottom, unpremultiplied.
 #[expect(
@@ -311,6 +313,108 @@ fn the_raw_look_has_no_halos_and_a_linear_grey_field() {
     view.set_style(Style::default());
     view.show(&epoch).expect("show");
     assert_eq!(view.cloud().halos().len(), epoch.len());
+}
+
+#[test]
+fn the_glow_look_blooms_as_configured_and_the_raw_look_never_does() {
+    // FL-019 (plan §2.3): FrankenManim's controlled bloom, BLOOM_SIGMA_POINTS
+    // wide at the screen's pixel density, on glowing frames only. The oracle
+    // is FrankenManim's own bloom applied to the frame of the unbloomed job.
+    let config = common::small();
+    let mut world = common::found(&config);
+    common::advance(&mut world, 12);
+    let epoch = common::epoch(&world);
+    let drawable = [160, 120];
+    let pixels = 160 * 120;
+    let mut view = WorldView::for_epoch(&epoch, drawable, [2, 3, 8]).expect("view");
+    view.show(&epoch).expect("show");
+    assert_eq!(view.viewport().pixels_per_point(), 1.0);
+    assert!(view.bloom().is_none());
+    assert!(view.job().expect("job").bloom().is_none());
+    assert_eq!(view.bloom_bytes(drawable), 0);
+    let plain = view.job().expect("job").render(2).expect("frame");
+    let plain_rgba = view.render_rgba8(2).expect("frame");
+    let plain_offline = view.offline_bytes(2);
+
+    view.set_bloom(Some(0.15)).expect("a bloom");
+    let bloom = Bloom::new(0.15, BLOOM_SIGMA_POINTS).expect("bloom");
+    assert_eq!(view.bloom(), Some(&bloom));
+    let job = view.job().expect("job");
+    assert_eq!(job.bloom(), Some(&bloom));
+    let mut expected = plain.clone();
+    bloom.apply(&mut expected, 2).expect("blooms");
+    assert_ne!(expected.as_bytes(), plain.as_bytes(), "it shows");
+    assert_eq!(
+        job.render(3).expect("frame").as_bytes(),
+        expected.as_bytes()
+    );
+    assert_ne!(view.render_rgba8(2).expect("frame"), plain_rgba);
+    // The CPU route's row sums are charged.
+    assert_eq!(view.bloom_bytes(drawable), pixels * 16);
+    assert_eq!(view.offline_bytes(2), plain_offline + pixels * 16);
+    // The charge is FrankenManim's ring for its widest bloom, a band and
+    // the widest reach above and below it, so it holds at any pixel
+    // density and bounds the configured bloom's ring.
+    let widest = Bloom::new(0.15, BLOOM_SIGMA_MAX_PIXELS).expect("bloom");
+    assert_eq!(widest.radius(), BLOOM_WIDEST_REACH_PIXELS as usize);
+    for tall in [
+        [160, 120],
+        [100, 320],
+        [100, 321],
+        [3840, 2160],
+        [7, 100_000],
+    ] {
+        let charged = view.bloom_bytes(tall);
+        assert_eq!(
+            Some(charged),
+            widest.scratch_bytes(tall[0], tall[1]),
+            "{tall:?}"
+        );
+        assert!(
+            bloom.scratch_bytes(tall[0], tall[1]) <= Some(charged),
+            "{tall:?}"
+        );
+    }
+    assert_eq!(view.bloom_bytes([3840, 2160]), 3840 * 320 * 16);
+
+    // Twice the pixel density, twice the width in pixels; FrankenManim's
+    // widest at most.
+    view.set_pixels_per_point(2.0).expect("density");
+    let wide = Bloom::new(0.15, 2.0 * BLOOM_SIGMA_POINTS).expect("bloom");
+    assert_eq!(view.bloom(), Some(&wide));
+    view.set_pixels_per_point(64.0).expect("density");
+    assert_eq!(view.bloom(), Some(&widest));
+    view.set_pixels_per_point(1.0).expect("density");
+    assert_eq!(view.bloom(), Some(&bloom));
+
+    // The raw look is the diagnostic view: no bloom, though it stays
+    // configured and charged. Glowing density blooms.
+    view.set_style(Style {
+        look: Look::Raw,
+        ..Style::default()
+    });
+    view.show(&epoch).expect("show");
+    assert!(view.frame_bloom().is_none());
+    assert!(view.job().expect("job").bloom().is_none());
+    assert_eq!(view.bloom(), Some(&bloom));
+    assert_eq!(view.bloom_bytes(drawable), pixels * 16);
+    view.set_style(Style {
+        particles: Particles::Density,
+        ..Style::default()
+    });
+    view.show(&epoch).expect("show");
+    assert_eq!(view.job().expect("job").bloom(), Some(&bloom));
+
+    // A strength outside the convex mix is refused and changes nothing;
+    // none turns it off.
+    for strength in [1.5, -0.1, f64::NAN] {
+        assert!(view.set_bloom(Some(strength)).is_err(), "{strength}");
+        assert_eq!(view.bloom(), Some(&bloom));
+    }
+    view.set_bloom(None).expect("no bloom");
+    assert!(view.bloom().is_none());
+    assert!(view.job().expect("job").bloom().is_none());
+    assert_eq!(view.bloom_bytes(drawable), 0);
 }
 
 #[test]

@@ -132,6 +132,35 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
         std::fs::read(path).expect("the frame exists")
     };
     assert_ne!(frame(&records, 2), frame(&styled_records, 2));
+
+    // The preset blooms glowing frames (FL-019): with `bloom_enabled =
+    // false` the glow frame differs, and the raw frame, never bloomed, is
+    // the same.
+    assert_eq!(PRESET.matches("bloom_enabled = true").count(), 1);
+    let unbloomed = ValidatedConfig::from_toml(
+        &PRESET.replace("bloom_enabled = true", "bloom_enabled = false"),
+    )
+    .expect("still valid");
+    for (style, bloomed, same) in [
+        (Style::default(), &records, false),
+        (styled.style, &styled_records, true),
+    ] {
+        let out = out.with_file_name(format!("flife-render-test-unbloomed-{}", style.look.name()));
+        std::fs::create_dir_all(&out).expect("a scratch directory");
+        let options = RenderOptions {
+            out,
+            style,
+            ..styled.clone()
+        };
+        let mut plain = Vec::new();
+        render(&unbloomed, &options, |record| plain.push(record.clone())).expect("renders");
+        assert_eq!(
+            frame(&plain, 2) == frame(bloomed, 2),
+            same,
+            "{}",
+            style.look.name()
+        );
+    }
 }
 
 /// The `flife render` binary colours by the configuration's

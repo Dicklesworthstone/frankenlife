@@ -318,6 +318,12 @@ fn nonfinite_and_out_of_bound_numbers_are_refused() {
         "chemistry.maximum_speed",
         "> 0",
     );
+    // The bloom is a convex mix (FL-019): strength 1 is the blur alone.
+    assert_refused(
+        |c| c.presentation.bloom_strength = 1.5,
+        "presentation.bloom_strength",
+        "[0, 1]",
+    );
     assert_refused(|c| c.seed = u64::MAX, "seed", "TOML integer range");
     // One displayable render epoch and one being written (§9.5, FL-017).
     assert_refused(

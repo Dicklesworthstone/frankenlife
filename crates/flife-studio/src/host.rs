@@ -252,6 +252,12 @@ impl Studio {
         let founding = Epoch::standalone(&world)?;
         let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
         view.set_style(options.style);
+        let presentation = &model.presentation;
+        view.set_bloom(
+            presentation
+                .bloom_enabled
+                .then_some(presentation.bloom_strength),
+        )?;
         let drawable = preview
             .surface_metrics()
             .ok()

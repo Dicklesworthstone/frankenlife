@@ -2,18 +2,18 @@
 
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
-rendering (§13.4). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
+rendering (§13.4), and the configured bloom on glowing frames (§2.3). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
 **Inputs.**
-- A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate and the colour
-  mapping. `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
+- A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate, the colour
+  mapping and the bloom (`bloom_enabled`, `bloom_strength`: `WorldView::set_bloom`, FL-019). `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
-  `0ae728fe`, through FrankenManim `fmn-render` at rev `b104feec`.
+  `0ae728fe`, through FrankenManim `fmn-render` at rev `c6ad9c5b`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and
@@ -209,9 +209,13 @@ presentation state, not scientific state.
 - `tests/admission.rs` (FL-043, no window): the Studio's observer bytes are its feed (`render_queue_capacity`
   slots of the founding epoch), its view's buffers, one frame's job, the frame's upload (host staging and device
   copy, each at the preparation limit plus the view's texel bytes), `DEVICE_BYTES_PER_PIXEL` (24) per drawable
-  pixel and a status word per 16 x 16 tile. With `torch` the backend gets the budget's remainder (255.3 MiB of
-  2,048 on the preset at a 3840 x 2160 drawable, 97.2 MiB before the layers were textures), with `cpu` nothing, and
-  a budget one byte short of the observers is refused.
+  pixel and a status word per 16 x 16 tile, and, while a bloom is configured, its row sums on the device (16
+  bytes a pixel of FrankenManim's ring for its widest bloom: a band of 128 rows and 96 above and below it, or
+  the whole drawable when shorter, FL-019). With `torch` the backend gets the budget's remainder (on the
+  preset at a
+  3840 x 2160 drawable: 255.2 MiB of 2,048 without the bloom, 97.2 MiB before the layers were textures, and
+  236.5 MiB with the preset's bloom, exactly 18.75 MiB less), with `cpu` nothing, and a budget one byte short of
+  the observers is refused.
 - `tests/frame_upload.rs` (FL-043, FL-033, Metal compute, no window): on a `MetalRenderer`, 48 frames of the preset
   at 4,096 and 16,384 organisms, 1280 x 720 and 3840 x 2160, one and two pixels per point, zooms 1 and 16, in
   points, density and raw density: the host heap the route holds to upload a frame, above the frame it returns,
@@ -246,15 +250,17 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   bounded backend and reports `memory` in its `open` record runs only in a window, which no test here opened.
   - A resize past the opening size, in pixels and density bins, is not admitted again.
   - The device terms (`DEVICE_BYTES_PER_PIXEL`: the Metal route's RGBA16F and RGBA8 surfaces and three window
-    drawables) come from FrankenManim's and AppKit's buffers as declared, not from a measurement: device memory is
+    drawables; and the bloom's row sums) come from FrankenManim's and AppKit's buffers as declared, not from a measurement: device memory is
     outside the heap the tests count.
   - FrankenManim bounds neither the Metal route's host staging of a frame nor its device copy. Both are charged at
     the view's preparation limit plus its texel bytes, which they stayed within on 48 measured frames (at most
     59.7% and 43.2%); a frame beyond them is not refused. From `b104feec` the device keeps the last frame's texels
     between frames, at most the view's texel bytes, inside the same term. FrankenManim drops them before it
     uploads others, so it never holds two sets, but no test sees device memory, so that is read from its code.
-  - On the preset at 1920 x 1080 points with a 2x display, the observers take 391.1 MiB and the backend gets
-    255.3 MiB of the 2,048, where it was unbounded: parameter shards that do not fit are evaluated on the reference
+  - On the preset at 1920 x 1080 points with a 2x display, the observers take 410.0 MiB and the backend gets
+    236.5 MiB of the 2,048 (391.2 and 255.2 without the preset's bloom, whose f32 row sums are charged 18.75
+    MiB of the device: since FrankenManim `c6ad9c5b` its bloom works in bands, holding 146 rows at sigma 3
+    where it held the whole frame's 126.56 MiB), where it was unbounded: parameter shards that do not fit are evaluated on the reference
     (the same bits, slower). The Studio's frame and inference rates under that budget are not measured here.
   - FL-033: the field and density layers are textures on one quad each. Since FrankenManim `b104feec` their
     texels are copied to the device only when a frame's textures differ in content from the last frame's, so a

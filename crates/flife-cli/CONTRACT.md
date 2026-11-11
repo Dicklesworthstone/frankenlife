@@ -38,8 +38,8 @@ run and never changes it.
 
 The second slice moves the sum into `flife_engine::World::admit_memory` (`memory::admit` wraps it) and charges
 observers. `flife render` builds its view before admission and charges its feed's slots, the view's own buffers,
-one frame's FrankenManim job, the CPU route's frame buffers (`WorldView::{reserved_bytes, frame_bytes,
-offline_bytes}`) and its frames being encoded, `encoding_bytes(size, encoders)`: per pixel
+one frame's FrankenManim job, the CPU route's frame buffers and, while a bloom is configured, its row sums
+(`WorldView::{reserved_bytes, frame_bytes, offline_bytes}`) and its frames being encoded, `encoding_bytes(size, encoders)`: per pixel
 `ENCODING_BYTES_PER_PIXEL` (the frame's 4 bytes and 48 for the PNG encoder's working set) and
 `ENCODING_BYTES_FIXED` (2 MiB) per frame. `ENCODERS` (4) frames encode at once, or as many as the budget has room
 for, one at least, before a render is refused. Its first record is `start`, with `memory` and `encoders`.
@@ -180,7 +180,9 @@ for, one at least, before a render is refused. Its first record is `start`, with
   `generation`, `motion` or `topology`, or a registered name such as `founder-lineage-v1`; by default the
   configuration's `[presentation] color_mapping`), `--look glow|raw`, `--density` and `--no-field`. No style
   changes the world. Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
-  route. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
+  route, with the configuration's bloom (`[presentation] bloom_enabled`, `bloom_strength`) on glowing frames and
+  none on raw ones (FL-019); `tests/render.rs` renders the preset with `bloom_enabled = false` too: the glow frame
+  differs and the raw frame is the same. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
   frame draws; the bytes are those of encoding them in order, and a failed encode or write fails the render with
   its error. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg` after the last frame is written.
 - `Tally`:
@@ -775,7 +777,10 @@ caught.
   density's 2,074,040).
 - `a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms`: a 4K CPU frame of that world holds its draw list
   within what `frame_bytes` adds to the preparation limit (7.75 MiB in points), its job within `frame_bytes`
-  (72.1 MiB of 88.8 in points, 0.01 in density) and, above the job, within `offline_bytes` (55.6 of 95.5 MiB).
+  (72.1 MiB of 88.8 in points, 0.01 in density) and, above the job, within `offline_bytes` (55.6 of 95.5 MiB;
+  with the preset's bloom 63.65 of 114.24 MiB, 8.08 MiB more: the bloom's ring of 138 rows of row sums at sigma
+  1.5 (8.09 MiB), within the 18.75 MiB charged for the widest bloom's 320; the whole frame's took 126.56 MiB
+  before FrankenManim `c6ad9c5b`).
   FL-033 found the job's heap above FrankenManim's accounting once the grids' triangle allowance was gone (72.1 MiB
   against a `frame_bytes` of 56.8); `JOB_BYTES_PER_DRAW` now charges it.
 

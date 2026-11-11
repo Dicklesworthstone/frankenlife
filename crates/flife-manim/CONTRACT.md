@@ -167,6 +167,18 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     organism as the display moves and is rebuilt for every view change;
   - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
     layer, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
+  - `set_bloom(strength)` (FL-019, §2.3, §13.3 step 7) configures FrankenManim's controlled bloom from
+    `[presentation] bloom_enabled` and `bloom_strength` (`None` is off), which the Studio and `flife render`
+    pass: a convex mix of the raw frame with a binomial blur of it, `BLOOM_SIGMA_POINTS` (1.5) points wide at
+    the viewport's pixel density, up to FrankenManim's widest (32 pixels), rebuilt for a new density.
+    `bloom()` is the configured one; `frame_bloom()`, the one `job()` attaches, is it in the glow look and
+    none in the raw look, the diagnostic view. Because the mix is convex, a thin dark boundary keeps at
+    least `1 - 2 x strength` of its contrast (0.7 at the preset's 0.15), and dense light does not run to
+    white. The bits are FrankenManim's, the same on its CPU and Metal routes for the same raw frame;
+    `bloom_bytes(drawable)` is the most its row sums hold while a bloom is configured, whatever the look: 16
+    bytes a pixel of FrankenManim's ring for its widest bloom (`BLOOM_WIDEST_REACH_PIXELS`, 96 rows above
+    and below a band of 128), or of the whole drawable when that is shorter, so a new pixel density needs no
+    new admission;
   - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
   - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
     draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
@@ -181,7 +193,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     it refuse the frame. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
     make (FL-033: what FrankenManim's job holds beyond its preparation accounting, measured at 865 to 872 bytes a
     dot and 1,180 a quad), and that limit. `offline_bytes(threads)` is what
-    `render_rgba8` adds: the RGBA16F and RGBA8 frames and each thread's tile scratch at the finest sampling. A view
+    `render_rgba8` adds: the RGBA16F and RGBA8 frames, each thread's tile scratch at the finest sampling, and
+    `bloom_bytes` at the drawable. A view
     made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
   - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
 
@@ -222,7 +235,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `with_view` with a non-finite center or a zoom outside `[1, 4096]`; `zoomed_about` with a factor that is not
   finite and positive, or a non-finite anchor; `panned` with a non-finite delta; `periodic_quad` with an empty axis:
   `NumericalInvalid`. A layer texture FrankenManim refuses: `NumericalInvalid`, the previous texture and quad kept. `WorldView::set_view` with a viewport of another world or drawable: `LayoutMismatch`, the view
-  unchanged.
+  unchanged. `set_bloom` with a strength outside `[0, 1]` (or NaN): `NumericalInvalid`, the view unchanged;
+  configuration validation already bounds `presentation.bloom_strength` to `[0, 1]`.
 
 **Determinism.** Lowering is a pure function of the epoch, the viewport and the style, apart from the field's and
 the density layer's decaying display scales, which also read the previous frame's scale: F32 positions widened
@@ -292,7 +306,7 @@ route.
   - FL-020 density: a 128-pixel view at 2 pixels per point draws what a 64-pixel view at 1 draws (the floored and the
     capped dots, halos, the selection ring and the density bins); the change refits the shown epoch without a new
     show, an unchanged density is no change, and NaN is refused.
-- `tests/mapping.rs` (16 tests), on real render epochs where they matter:
+- `tests/mapping.rs` (17 tests), on real render epochs where they matter:
   - The energy and generation ramps rise monotonically in CIE L*, from above 15 with a range above 50.
   - Energy maps through the fixed saturating `e / (e + 2)`, generations logarithmically to a fixed 256.
   - The motion hue is the heading (y flipped to screen), its strength `√(speed / limit)`.
@@ -302,6 +316,15 @@ route.
   - A colour is a function of its row alone: an organism alive in two epochs of one world whose mapped inputs did
     not change keeps its colour bit for bit.
   - The raw look has no halos and a linear grey field; the raw field is linear in the density.
+  - The glow look blooms as configured and the raw look never does (FL-019): a real epoch's job carries the
+    bloom at the preset's strength and 1.5 points at one pixel per point, and its frame (three threads) is
+    FrankenManim's bloom of the unbloomed job's frame, byte for byte, and differs from it; twice the density
+    doubles the width and 64 pixels a point takes FrankenManim's widest; the raw look attaches none while it
+    stays configured and charged, glowing density blooms; strengths 1.5, -0.1 and NaN are refused with the
+    view unchanged; `None` turns it off; `offline_bytes` grows by exactly 16 bytes a pixel of the 160 x 120
+    frame, shorter than the ring. The charge equals FrankenManim's `scratch_bytes` for its widest bloom (radius
+    96) at 160 x 120, 100 x 320, 100 x 321, 3840 x 2160 (320 rows) and 7 x 100,000, and bounds the
+    configured bloom's.
   - Density counts every organism once, in its own bin; its texture is on the view's periodic quad, every texel's
     opacity the mean level of the four bins around its corner, wrapping (within 1e-6), and it replaces the dots;
     under raw density every texel is the opaque grey of that mean and the field is not drawn; the density scale
@@ -343,10 +366,13 @@ route.
   fixed part exactly, whatever the field or the bins; `texel_bytes` is the field's texture once known and the
   density's at the viewport's bins, each reserved twice, the field's values once, and follows a new pixel density.
   In `flife-cli`, `tests/memory_admission.rs` measures the view's own heap and a CPU frame against these terms, and
-  that a pan or zoom allocates no layer texture (at most 440 bytes, against the field's 256 KiB texture), and
+  that a pan or zoom allocates no layer texture (at most 440 bytes, against the field's 256 KiB texture); a 4K
+  CPU frame with the preset's bloom held 8.08 MiB more than without, its ring of 138 rows at sigma 1.5 (8.09
+  MiB), within the 18.75 MiB charged, where the whole frame's row sums took 126.56 MiB;
+  and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `b104feec`, CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `c6ad9c5b`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**
@@ -363,7 +389,9 @@ route.
 - FrankenManim's preparation accounting (`ThreeDJob::preparation_bytes`, which its `max_working_bytes` bounds)
   leaves out about 870 bytes a draw that its CPU job holds, so the limit does not bound the job's heap by itself;
   `frame_bytes` adds `JOB_BYTES_PER_DRAW` from a measurement, not from FrankenManim's accounting.
-- `[presentation] point_radius_pixels`, bloom and trails are not applied yet.
+- `[presentation] point_radius_pixels` and trails are not applied yet. The bloom's width is a constant
+  (`BLOOM_SIGMA_POINTS`), not a configuration key; the plan names none. The bloom runs on the raw frame before
+  the RGBA8 table: there is no separate tone-mapping step (§13.3 step 8) before or after it.
 - Human review of the mappings against the plan's reference images (G5) has not been done.
   There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). Births appear at the first
   epoch that has them, not at their tick within a longer gap: an epoch does not carry birth ticks. The field and

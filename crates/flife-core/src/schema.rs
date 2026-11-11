@@ -1018,7 +1018,7 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
         "bloom_strength",
         v.bloom_strength,
         U::Dimensionless,
-        NonNegative,
+        UnitClosed,
     );
     r.boolean("presentation", "trails_enabled", v.trails_enabled);
     r.name(

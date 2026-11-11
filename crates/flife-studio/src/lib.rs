@@ -31,7 +31,9 @@
 //! ratio beside the frames presented, which the binary reports while
 //! `[presentation] show_clock_telemetry` is set. The window draws them,
 //! what the session is doing and what a click will do as text in its
-//! top-left corner ([`overlay_text`], [`Studio::set_overlay`]).
+//! top-left corner ([`overlay_text`], [`Studio::set_overlay`]), and under
+//! them the selected organism's last inspection ([`inspector_lines`]),
+//! which [`Studio::inspect_selected`] refreshes.
 
 #![forbid(unsafe_code)]
 
@@ -59,7 +61,7 @@ pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
 };
-pub use overlay::{OverlayState, overlay_text};
+pub use overlay::{Inspected, OverlayState, inspector_lines, overlay_text};
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 

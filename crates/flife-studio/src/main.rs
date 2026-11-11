@@ -4,7 +4,8 @@
 //! `open`, then a `status` per session status, a `view` per style change,
 //! a `selection` each time the selected organism changes (a click, or the
 //! selected organism gone from a newer epoch), an `inspected` record for
-//! each organism a click selects (FL-021: it at the session's committed
+//! each organism a click selects, and about once a second while it stays
+//! selected and the world runs (FL-021: it at the session's committed
 //! boundary `tick`, selected on the epoch of `seen_tick`), a `brush` each
 //! time the armed brush changes, a `submitted` record for each brush click
 //! the session accepted as a command (FL-022: the boundary of
@@ -17,7 +18,8 @@
 //! then an `end` with the committed world's digest. The window draws the
 //! same state as text in its top-left corner: running or paused at the
 //! shown tick, the clocks while they are reported, the colour mapping, the
-//! armed brush and the selected organism (FL-024). An error
+//! armed brush and the selected organism (FL-024), and under them that
+//! organism's last inspection (FL-021's panel). An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -37,7 +39,7 @@ use flife_core::{Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ClockMeter, ClockReading, ColorMapping, End, Look, OverlayState, Particles,
+    Brush, ClockMeter, ClockReading, ColorMapping, End, Inspected, Look, OverlayState, Particles,
     STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, overlay_text,
 };
 use serde::Serialize;
@@ -415,6 +417,8 @@ fn main() -> ExitCode {
     let mut paused = None;
     let mut overlay_tick = None;
     let mut last_clock = None;
+    // The last inspection's answer and whom it was about (FL-021's panel).
+    let mut inspected = None;
     while !studio.should_close() {
         let started = Instant::now();
         let frame = match studio.frame() {
@@ -429,6 +433,9 @@ fn main() -> ExitCode {
             match &status {
                 Status::Running { .. } => paused = Some(false),
                 Status::Paused { .. } => paused = Some(true),
+                Status::Inspected {
+                    organism, snapshot, ..
+                } => inspected = Some((*organism, snapshot.clone())),
                 _ => {}
             }
             overlay_tick = frame.shown.map(|shown| shown.tick);
@@ -493,6 +500,10 @@ fn main() -> ExitCode {
                 print(&clock_record(&reading));
                 last_clock = Some(reading);
             }
+            // A running world moves on: read the selected organism again.
+            if selected.is_some() && paused == Some(false) {
+                studio.inspect_selected();
+            }
         }
         if overlay_tick.is_none() {
             overlay_tick = frame.shown.map(|shown| shown.tick);
@@ -504,6 +515,10 @@ fn main() -> ExitCode {
             mapping: studio.view().style().mapping.name(),
             brush: armed,
             selected,
+            inspected: inspected
+                .as_ref()
+                .filter(|(organism, _)| selected == Some(*organism))
+                .map(|(_, snapshot)| snapshot.as_deref().map_or(Inspected::Gone, Inspected::Read)),
         });
         if let Err(error) = studio.set_overlay(&text) {
             let code = fail(error.kind(), error.to_string(), 1);

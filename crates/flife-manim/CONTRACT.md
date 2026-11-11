@@ -220,8 +220,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     refusal). The result is a `HudText`: vertices in drawable pixels from the block's top-left, y down, each
     contour's range, and triangles.
   - A glyph whose outline cannot be read or triangulated is left out and counted (`refused`). The text stops at
-    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (6,144 each, half as much again as the Studio's longest overlay at
-    2x), counting the glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
+    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (14,336 each, a quarter as much again as the Studio's longest
+    overlay, inspector panel included, at 2x: 11,430 and 10,944; at 3x it takes 12,703 and 12,217), counting the
+    glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
     (`HudText::reserved_bytes`).
   - `hud_scene_point(viewport, position)` is the camera's own map from a drawable position to the scene: the frame
     is the whole drawable, centred on the scene's origin, `scale` pixels a scene unit, y up.
@@ -448,8 +449,9 @@ route.
     byte-identical to the frame without text; under the plate, each pixel 1.5 px or more from an outline edge is the
     text's colour (sRGB 231, within 1.5) where the winding number is nonzero, and otherwise the world under the
     plate's black at 0.6 opacity, mixed in linear light (within 1.5). Over 500 ink and 2,000 plate pixels are checked.
-- In `flife-cli`, `tests/memory_admission.rs` measures a 4K view at 2x with the overlay: the longest overlay laid out
-  twice and shown, and two zooms. Its peak heap, the texts' layout included, is 9.87 MiB of its 12.46 MiB reserved.
+- In `flife-cli`, `tests/memory_admission.rs` measures a 4K view at 2x with the overlay: the Studio's longest
+  overlay, its inspector panel included, laid out twice and shown, and two zooms. Its peak heap, the texts' layout
+  included, is 12.05 MiB of its 14.79 MiB reserved.
 
 **Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `c6ad9c5b`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.

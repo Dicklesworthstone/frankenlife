@@ -373,6 +373,30 @@ impl Studio {
         &self.overlay
     }
 
+    /// Ask the session about the selected organism again (FL-021): its
+    /// snapshot at the committed boundary arrives as a
+    /// [`Status::Inspected`], as a selection's does. The Studio's binary
+    /// refreshes the overlay's inspector panel this way, once a second while
+    /// the world runs. `false` when nothing is selected or shown, or when
+    /// the session refused it (counted as refused).
+    pub fn inspect_selected(&mut self) -> bool {
+        let (Some(organism), Some(shown)) = (self.view.selected(), self.view.shown()) else {
+            return false;
+        };
+        let intent = Intent::Inspect {
+            organism,
+            seen: shown.tick,
+        };
+        if self.session.send(intent).is_ok() {
+            self.tally.intents += 1;
+            true
+        } else {
+            self.tally.refused += 1;
+            self.controls.refused(intent);
+            false
+        }
+    }
+
     fn lay_out_overlay(&mut self, text: &str) -> Result<(), CoreError> {
         let laid = if text.is_empty() {
             None

@@ -646,10 +646,17 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
     let _serial = serial();
     let epoch = full_epoch();
     let font = flife_manim::HudFont::bundled().expect("the bundled fonts");
+    // The Studio's longest overlay, its inspector panel included (FL-021).
     let longest = concat!(
         "running · tick 18,446,744,073,709,551,615\n",
-        "123,456,789 ticks/s · 99999.99× real time · 1000 fps\n",
-        "generation · introduction brush · organism 18,446,744,073,709,551,615"
+        "123456789 ticks/s · 99999.99× real time · 1000 fps\n",
+        "chemical-affinity · introduction brush · organism 18,446,744,073,709,551,615\n",
+        "read at tick 18,446,744,073,709,551,615 · lineage 18,446,744,073,709,551,615",
+        " · generation 4,294,967,295\n",
+        "energy 99999.99 · -99999.999/s · age 18,446,744,073,709,551,615 ticks\n",
+        "speed 99999.99/s · heading 315°\n",
+        "hidden 128, 96 · 29,316 parameters\n",
+        "reproduction 100.0% a tick · emission gate 1.00"
     );
     let base = ALLOC.current_usage();
     ALLOC.reset_peak_usage();

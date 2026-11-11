@@ -5,7 +5,8 @@
 rendering (§13.4), and the configured bloom on glowing frames (§2.3). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
-bounded snapshot at its committed boundary (§14.2). FL-022 (`flife-2jj`, part) adds energy, removal, material and
+bounded snapshot at its committed boundary (§14.2), and draws it as a panel in the overlay, read again once a
+second while the world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
@@ -154,7 +155,8 @@ adapter.
   - one `view` per style change, with the same style fields;
   - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
     its identity or null, its position and the shown tick;
-  - one `inspected` per inspection answered (FL-021): the organism, `seen_tick`, the committed `tick` it was read
+  - one `inspected` per inspection answered (FL-021), on a click's selection and about once a second while it
+    stays selected and the world runs (`Studio::inspect_selected`): the organism, `seen_tick`, the committed `tick` it was read
     at (null when the world no longer holds it) and a `snapshot`: genome, parent, lineage, generation, birth tick,
     age, position, velocity, energy and its change rate, phase, cooldown, topology, hidden widths, parameter count,
     sensing scale, motion response, affinity, and the decoded held output (attempt rate and probability, child
@@ -330,14 +332,22 @@ presentation state, not scientific state.
     still counted; a window of no wall time, or a read before it opened, gives nothing and keeps its start;
   - against a running `SessionThread`'s render feed: over 300 ms the ticks read are exactly what the feed's newest
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and once paused a window reads 0.
-- `tests/overlay.rs` (2 tests, FL-024, no window):
+- `tests/overlay.rs` (3 tests, FL-024 and FL-021, no window):
   - `overlay_text` exactly: `opening` before the session reports; `running · tick 1,024`, then `128 ticks/s ·
     1.00× real time · 60 fps`, then the mapping; one decimal below 100 ticks/s; the brush and the organism, grouped
     in thousands;
-  - the longest overlay (every count at its largest, each brush) at 2x: every glyph is drawn, none refused or left
-    out, within two thirds of the overlay's budget (3,990 vertices and 3,778 triangles at most).
+  - the inspector panel exactly, from a real snapshot of the preset three ticks in with every printed value set:
+    its five lines under the selection's, `not in the committed world` for a gone organism, nothing without a
+    selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen from east (a heading a hair below
+    east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest; scientific notation from 100,000 with a
+    sign on every rate; `no controller output held`;
+  - the longest overlay (every count at its largest, each brush, the panel with every value one short of
+    scientific notation and the catalog's largest controller) at 2x: every glyph is drawn, none refused or left
+    out, within four fifths of the overlay's budget (11,430 vertices and 10,944 triangles at most); at 3x, all of
+    it is still drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 13.0 MiB at 3840 x 2160.
+  terms to the observers: 30.3 MiB at 3840 x 2160, which leaves the backend 224.3 MiB of the 2 GiB budget (205.6
+  with the preset's bloom).
 - `src/main.rs` unit tests (3, FL-022, FL-024): the `submitted` record of each brush's stroke as JSON, exactly (the
   material's 32-component `direction`; absent fields null), the `finished` record of an applied command (tick,
   published tick, energy) and of a cancelled one, and the `clock` record of a reading.
@@ -383,12 +393,16 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
 - While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
-- FL-021's inspector is a record, not a panel: the Metal 3D route has no text, so a selected organism's snapshot is
-  printed as the `inspected` record and not drawn. The host's send on a click and the record's printing run only in
-  a window, which no test here opened. While the world runs, the snapshot is read at the session's committed
-  boundary when the inspection is answered, usually later than the epoch the click selected on; the record carries
-  both ticks. §14.2's sampled activations, inputs, transactions, descendants, local efficiency and weight dumps are
-  not implemented.
+- FL-021's inspector panel is the overlay's last lines: what the last answer read (its tick, lineage, generation,
+  energy and its change, age, speed and heading, hidden widths and parameter count, and the held output's
+  reproduction probability and emission gate). The host's send on a click, `Studio::inspect_selected`'s refresh
+  once a second while the world runs, the panel's drawing and the record's printing run only in a window, which no
+  test here opened; `overlay_text` and the session thread's answers are tested without one. While the world runs,
+  the snapshot is read at the session's committed boundary when the inspection is answered, usually later than the
+  epoch the click selected on; the record carries both ticks and the panel names the tick it was read at, so it is
+  up to about a second old. The panel shows none of the snapshot's genome, parent, position, phase, cooldown,
+  sensing scale, motion response or affinity, which the record carries. §14.2's sampled activations, inputs,
+  transactions, descendants, local efficiency and weight dumps are not implemented.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`), the printing of the
     `brush`, `submitted` and `finished` records and the `end` record's `strokes` and `unstroked` run only in a

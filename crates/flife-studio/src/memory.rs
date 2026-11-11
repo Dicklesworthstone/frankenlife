@@ -10,10 +10,12 @@
 //! - the view's own buffers and one frame's job
 //!   ([`WorldView::reserved_bytes`], [`WorldView::frame_bytes`]);
 //! - the frame's upload: FrankenManim's Metal route flattens the job's
-//!   rows and bins on the host and copies them to the device, each charged
-//!   at the view's [`WorldView::preparation_limit`]. FrankenManim bounds
-//!   neither; on 48 frames, up to 16,384 organisms at 4K, two pixels per
-//!   point and a 16x zoom, the host's held at most 71% of that limit;
+//!   rows and bins and the textures it samples on the host and copies them
+//!   to the device, each charged at the view's
+//!   [`WorldView::preparation_limit`] plus its [`WorldView::texel_bytes`].
+//!   FrankenManim bounds neither; on 48 frames, up to 16,384 organisms at
+//!   4K, two pixels per point and a 16x zoom, the host held at most
+//!   61% and the device copy at most 44% of that sum;
 //! - per drawable pixel, [`DEVICE_BYTES_PER_PIXEL`]: the route's RGBA16F
 //!   and RGBA8 surfaces and the window's drawables; and a status word per
 //!   16 x 16 tile.
@@ -54,7 +56,7 @@ pub fn observer_bytes(
         founding.reserved_bytes().saturating_mul(slots),
         view.reserved_bytes(),
         view.frame_bytes(),
-        view.preparation_limit().saturating_mul(2),
+        total([view.preparation_limit(), view.texel_bytes()]).saturating_mul(2),
         width
             .saturating_mul(height)
             .saturating_mul(DEVICE_BYTES_PER_PIXEL),

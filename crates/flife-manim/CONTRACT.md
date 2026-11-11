@@ -13,7 +13,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `pick` finds the organism drawn under the pointer, by stable identity; `selection_ring` marks the selected one.
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
-- `FieldLayer` draws the epoch's energy field under the organisms as one vertex-coloured grid.
+- `FieldLayer` draws the epoch's energy field under the organisms as one texture on one quad (FL-033).
 - `DensityLayer` counts organisms per screen bin, for worlds denser than their pixels.
 - `Style` holds a frame's drawing choices: the `ColorMapping`, the `Look` (glow or raw), the `Particles` (points or
   density) and whether the field is drawn.
@@ -58,17 +58,19 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - a viewport carries its drawable's pixels per point (`fit` gives 1). It changes no mapping, and every view above
     keeps it. `with_pixels_per_point(d)` takes a finite positive density; sizes given in points below are that many
     drawable pixels times it;
-  - `periodic_grid(cells, buffers, corner)` places a periodic corner grid covering the torus once: the lattice at
-    `L · k / n` when the window starts on a cell boundary (always at the fit), otherwise cut at the window's edges,
-    `n + 2` lines per cut axis, the edge vertices coloured `(1 − w) · corner(k) + w · corner(k + 1)` (bilinear where
-    both axes are cut), so both edges, one torus line, carry the same colours.
+  - `periodic_quad(cells)` (FL-033) is the quad that draws a periodic texture of `cells` texels over the torus
+    once: the window's image, `(±W/2, ±H/2)`, two triangles of four vertices facing the camera at full opacity,
+    with texture coordinates `lo / L + ½ / n` at the window's start and one more at its end on each axis (rows
+    downward). A texel is sampled at its centre, so texel `k` lands exactly on the torus corner `L · k / n`
+    wherever the window puts its image; the texture repeats, so a window that cuts a cell shows the cut cell's
+    corners blended bilinearly on both of its edges, one torus line.
 - `pick(viewport, drawn, at, radius)` (`PICK_RADIUS_PIXELS = 8`): of the `(identity, world position)` pairs drawn,
   the nearest to the drawable position `at` by drawable distance through the view, within `radius` pixels; the
   lowest identity among equals; `None` for nothing in reach or a non-finite position or radius. It returns an
   identity, which a host validates against the world, never a slot.
 - `selection_ring(viewport, position)`: an annulus of `SELECTION_RING_SEGMENTS = 48` quads around the organism's
   scene point, from `SELECTION_RING_GAP_POINTS = 3` outside its dot to `SELECTION_RING_WIDTH_POINTS = 2` beyond,
-  in points at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the grids.
+  in points at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the quads.
 - `Viewport::camera(background)`:
   - a FrankenManim `ThreeDCamera` at the drawable's resolution;
   - its frame is `frame_shape() = (Dw / scale, Dh / scale)`, centred at the origin, at `DEFAULT_FOVY`, `zxz`;
@@ -109,14 +111,17 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - while the display moves the living and the dying are `prior`'s rows, so the ceiling holds and nothing
     allocates. At opacity 1 a dot is bit for bit what `update_styled` draws.
 - `FieldLayer::update(field)`:
-  - one vertex per texel corner, `(texels + 1)²`, spanning the world exactly; each coloured by the mean of the four
-    texels around it, wrapping, so opposite edges match and the torus shows no seam;
+  - one texel per field texel corner, the field's own `texels` each way (`texture()`, rows top to bottom,
+    premultiplied linear `f32`, opaque, built with FrankenManim's `Texture::from_premultiplied_linear`); texel
+    `(x, y)` is the colour of the mean of the four field texels around that corner, wrapping, so the seam joins its
+    two sides' colours;
   - the mean maps through `sqrt(value / scale)` and the six-stop `FIELD_PALETTE`; `scale` is the brightest texel,
     or the previous scale times `SCALE_DECAY = 0.98` if larger, so the picture follows the field down slowly;
-  - drawn unshaded and without depth test (`SurfaceDraw`, vertex colours), which FrankenManim's CPU and Metal 3D
-    routes both accept;
-  - placed through `periodic_grid`, so a panned view cuts it at the window's edges; `place(field, look)` re-places
-    it in a new view at the current display scale, and `refit(viewport)` takes the new view.
+  - drawn on the viewport's `periodic_quad` as FrankenManim's `SurfaceDraw::image`: unlit, without depth test,
+    repeating both ways, which its CPU and Metal 3D routes both sample. FrankenManim interpolates the corners
+    bilinearly, of premultiplied colour (Gouraud shading of a vertex grid before FL-033);
+  - `place(field, look)` rebuilds the texture and the quad in a new view at the current display scale, and
+    `refit(viewport)` takes the new view.
   - `update_look(field, Look::Raw)` draws linear grey `raw_value = clamp(value / scale, 0, 1)` instead: no square
     root, no palette.
 - `DensityLayer::update(epoch, style)`:
@@ -128,9 +133,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - glow: a bin shows the mean linear colour of the current mapping over its organisms, at opacity
     `ln(1 + n) / ln(1 + scale)`, over the field; an empty bin is transparent;
   - raw: opaque linear grey `n / scale`, and the field is not drawn;
-  - one vertex-coloured grid with vertices on bin corners, each the premultiplied mean of the four bins around it,
-    wrapping, drawn unshaded without depth test, placed through `periodic_grid`; `place(style)` re-places the last
-    binned epoch at the current display scale.
+  - one texture of the bins' corners (`texture()`, `bins` texels each way, rows top to bottom, premultiplied
+    linear `f32`), each the premultiplied mean of the four bins around it, wrapping, drawn like the field on the
+    viewport's `periodic_quad`; `place(style)` rebuilds the texture and quad of the last binned epoch at the
+    current display scale.
 - `WorldView`:
   - `show(epoch)` lowers an epoch in the current style and records it as `shown()`, a `Prior`;
   - `set_style(style)` takes effect at the next `show`; showing the same epoch again redraws it in the new style;
@@ -156,16 +162,20 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     `selected()`, `selected_position()` (where it is drawn), and `selection_draw()`, the ring, which follows the
     organism as the display moves and is rebuilt for every view change;
   - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
-    grid, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
+    layer, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
   - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
   - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
-    draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's, the
-    density's and the ring's grids at the most vertices and indices their cells make, twice, since a grid is built
-    before the one it replaces is dropped). `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536) for a dot
-    and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for every triangle the three
-    grids can make, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
+    draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
+    density's textures, their quads and the ring's mesh, twice, since one is built before the one it replaces is
+    dropped). `texel_bytes()` (FL-033) is the layers' textures, 16 bytes a texel: the field's once the view knows
+    it and the density's at the viewport's bins, whatever the style; FrankenManim's CPU route samples them in place
+    and its Metal route uploads those a frame draws. `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536)
+    for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads' and
+    the ring's triangles, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
     (FrankenManim's `max_working_bytes`): a tile bin past it is left out, which only slows the frame, and rows past
-    it refuse the frame. `frame_bytes()` is the draw list and that limit. `offline_bytes(threads)` is what
+    it refuse the frame. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
+    make (FL-033: what FrankenManim's job holds beyond its preparation accounting, measured at 865 to 872 bytes a
+    dot and 1,180 a quad), and that limit. `offline_bytes(threads)` is what
     `render_rgba8` adds: the RGBA16F and RGBA8 frames and each thread's tile scratch at the finest sampling. A view
     made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
   - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
@@ -205,8 +215,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - A failed reservation: `AllocationFailed`.
 - A `WorldView::resize` that fails leaves the view unchanged.
 - `with_view` with a non-finite center or a zoom outside `[1, 4096]`; `zoomed_about` with a factor that is not
-  finite and positive, or a non-finite anchor; `panned` with a non-finite delta; `periodic_grid` with an empty grid:
-  `NumericalInvalid`. `WorldView::set_view` with a viewport of another world or drawable: `LayoutMismatch`, the view
+  finite and positive, or a non-finite anchor; `panned` with a non-finite delta; `periodic_quad` with an empty axis:
+  `NumericalInvalid`. A layer texture FrankenManim refuses: `NumericalInvalid`, the previous texture and quad kept. `WorldView::set_view` with a viewport of another world or drawable: `LayoutMismatch`, the view
   unchanged.
 
 **Determinism.** Lowering is a pure function of the epoch, the viewport and the style, apart from the field's and
@@ -229,10 +239,14 @@ route.
     one image (worked numbers) and maps 200 points back within 1e-9 at zooms 1, 2.5 and 64; with the seam under
     the center, two points 0.2 apart across it are drawn 0.2 · scale apart, not across the drawable; zooming about
     five anchors keeps the world under each and clamps at 1 and 4096; a drag moves a point by the drag, and a drag
-    of the whole world returns; a panned letterboxed axis shows the torus once; refusals; the periodic grid is the
-    lattice at the fit and, panned, is cut into `n + 2` columns at worked offsets with matching edge colours that
-    blend the cut cell's corners `0.75 / 0.25`; and the CPU render oracle at three panned and zoomed views, the dot
-    a few pixels across at every zoom.
+    of the whole world returns; a panned letterboxed axis shows the torus once; refusals; and the CPU render oracle
+    at three panned and zoomed views, the dot a few pixels across at every zoom.
+  - FL-033: the periodic quad is the window at four views (the fit, a cut axis, both axes cut, and a 3x zoom across
+    both seams); there, every texel of a numbered texture samples exactly (within 1e-12) on its torus corner, both
+    window edges sample alike, and the cut edges blend the cut cell's corners `0.75 / 0.25`. On FrankenManim's CPU
+    route, every pixel of the quad at those views is the bilinear blend of the torus corners around the world point
+    the viewport maps it to, computed from world coordinates alone (largest difference 9.8e-5, the RGBA16F
+    frame's precision; bound 2e-3).
   - FL-020 density: pixels per point changes no mapping at the fit or in a view, survives a view, a zoom, a pan, a
     resize and a refit, and only a finite positive density is taken.
 - `tests/camera.rs` (4 tests, FL-020):
@@ -241,8 +255,9 @@ route.
   - On a real epoch, a picked organism is removed and a new one introduced in its cell takes its storage slot: the
     world no longer has the picked identity, and the slot's occupant is a new one.
   - The world view keeps its center and zoom through a resize, takes a new view once (not an equal one) and refuses
-    another drawable's; fifty placements for a pan leave both display scales unchanged; the panned density grid is
-    cut on both axes, `(n + 2)²` vertices inside the window; at zoom 4096 the dot radius is the 24 px cap.
+    another drawable's; fifty placements for a pan leave both display scales unchanged; the panned density layer is
+    the view's periodic quad, its corners the window's and its texture coordinates starting between corners on
+    both axes; at zoom 4096 the dot radius is the 24 px cap.
   - The world view picks and selects by identity on a real epoch; the ring is the last draw, every vertex on its
     two circles (within 1e-9) around the organism, through a pan and zoom too; an identity the epoch lacks selects
     nothing; once the organism is removed and an introduced one takes its slot, the next shown epoch drops the
@@ -282,15 +297,18 @@ route.
   - A colour is a function of its row alone: an organism alive in two epochs of one world whose mapped inputs did
     not change keeps its colour bit for bit.
   - The raw look has no halos and a linear grey field; the raw field is linear in the density.
-  - Density counts every organism once, in its own bin; the grid wraps without a seam and replaces the dots; under
-    raw density the field is not drawn; the density scale restarts when the bins change.
+  - Density counts every organism once, in its own bin; its texture is on the view's periodic quad, every texel's
+    opacity the mean level of the four bins around its corner, wrapping (within 1e-6), and it replaces the dots;
+    under raw density every texel is the opaque grey of that mean and the field is not drawn; the density scale
+    restarts when the bins change.
   - Every registered `presentation.color_mapping` entry is implemented and drawn, in order, and a configuration
     naming each one selects it.
 - `tests/field.rs` (5 tests):
   - The palette is monotone dark to bright; the display value is a clamped square root, zero for NaN, negatives and
     a zero scale.
-  - A ramp field's grid spans the world, matches across both seams, and colours the seam corner by its wrapped
-    neighbours (3.5, not the interior 0.5).
+  - A ramp field's texture has a texel per corner, each the palette colour of its wrapped mean, so the seam corner
+    is 3.5, not the interior 0.5; it is drawn as a repeating, unlit image without depth test on the view's periodic
+    quad, and a placement in a panned view moves only the quad, keeping the scale.
   - The display scale rises at once and falls by `SCALE_DECAY` per update.
   - Every dot of a real epoch has one halo at its centre, sized by its energy, in the lineage colour at
     `HALO_ALPHA`; a resize keeps halos proportional.
@@ -303,25 +321,30 @@ route.
 - Planted bugs in this crate were each caught (FL-018's listed in its commit; FL-019's 14 in its commit; FL-020's
   camera, picking and world-view mutants, with `flife-render`'s interpolation ones, in its commit).
 - `tests/frame_bytes.rs` (2 tests, FL-043): over Appendix A worlds at 1,024 and 16,384 organisms (a ceiling of
-  16,384) and at a ceiling of 64, where the grids' triangles dominate, every style, 640 x 360 to 3840 x 2160, one
-  and two pixels per point and zooms of 1, 8 and 64, 216 frames: FrankenManim's own accounting of an unlimited
-  preparation is within the view's limit (the fullest at 71.9%, and 69.4% at the ceiling of 64), so the limit
-  leaves nothing out of them, and the job compiled within it holds the same bytes. The limit is
-  the ceiling's dots, the grids' triangles and the fixed part exactly; a view made for an epoch counts the field.
+  16,384) and at a ceiling of 64, every style, 640 x 360 to 3840 x 2160, one and two pixels per point and zooms of
+  1, 8 and 64, 216 frames: FrankenManim's own accounting of an unlimited preparation is within the view's limit
+  (the fullest at 75.6%, and 27.3% at the ceiling of 64), so the limit leaves nothing out of them, and the job
+  compiled within it holds the same bytes. The limit is the ceiling's dots, the quads' and ring's triangles and the
+  fixed part exactly, whatever the field or the bins; `texel_bytes` is the field's texture once known and the
+  density's at the viewport's bins, each reserved twice, and follows a new pixel density.
   In `flife-cli`, `tests/memory_admission.rs` measures the view's own heap and a CPU frame against these terms, and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `721b04b9`, CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `8ccb702e`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**
-- Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). Resident
-  device buffers and the shared-device resource bridge are FL-033's (and FL-028's typed Metal buffers).
+- Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The layers'
+  textures are rebuilt on the CPU on every show and placement and uploaded with every Metal frame; resident device
+  textures and buffers and the shared-device resource bridge are still FL-033's (and FL-028's typed Metal buffers).
 - There is no chemical-affinity mapping (§13.4 lists one): epochs do not carry affinities.
 - There is no on-screen legend: FrankenManim's Metal 3D route has no text, so the meaning is in the Studio's and
   `flife render`'s records.
-- Density bins are about 6 px, not one per pixel: the Metal 3D route has no textured surfaces, and a vertex grid per
-  pixel would be about four million triangles at 1080p.
+- Density bins are still about 6 px, not one per pixel. Since FL-033 a finer bin costs 16 texel bytes, not two
+  triangles, but finer bins are not drawn yet.
+- FrankenManim's preparation accounting (`ThreeDJob::preparation_bytes`, which its `max_working_bytes` bounds)
+  leaves out about 870 bytes a draw that its CPU job holds, so the limit does not bound the job's heap by itself;
+  `frame_bytes` adds `JOB_BYTES_PER_DRAW` from a measurement, not from FrankenManim's accounting.
 - `[presentation] point_radius_pixels`, bloom and trails are not applied yet.
 - Human review of the mappings against the plan's reference images (G5) has not been done.
   There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). Births appear at the first
@@ -332,7 +355,9 @@ route.
 - Density bins do not refine with the zoom (they keep the fit's), so a deep zoom shows wide bins.
 - FrankenManim's frame is a perspective one; there is no orthographic camera, so dots are capped on screen rather
   than drawn at world size at deep zoom.
-- The field and density grids cover the whole torus and are re-placed on every pan, at a cost linear in their
-  vertices.
+- The field's and density's textures cover the whole torus and are rebuilt on every pan, at a cost linear in
+  their texels, though a pan changes only the quad. At a deep zoom the Metal route uploads the whole textures, where
+  FrankenManim used to cull a grid's off-screen triangles: a 4K density frame at 16x copied 1.95 MB, against 1.45 MB
+  before.
 - Rendering-performance qualification (§13.7: 1080p at 30 fps, frame-time percentiles together with simulation
   slowdown) is G6 work. Nothing here is a performance claim.

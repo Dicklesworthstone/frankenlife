@@ -107,10 +107,14 @@ fn a_frames_preparation_is_within_the_views_limit() {
 }
 
 /// The limit is what the view can draw: a dot and a halo per organism of
-/// its ceiling, its grids' triangles, and the fixed part. A view of a world
-/// at a quarter of its ceiling is charged the whole ceiling.
+/// its ceiling, the triangles of the field's and the density's quads and
+/// the ring, and the fixed part, whatever the field or the bins. A view of
+/// a world at a quarter of its ceiling is charged the whole ceiling. The
+/// layers' textures are not preparation: `texel_bytes` counts them, the
+/// field's once the view knows it and the density's at the viewport's
+/// bins, and the view reserves each twice.
 #[test]
-fn the_limit_counts_the_ceiling_and_the_grids() {
+fn the_limit_counts_the_ceiling_and_the_quads_and_the_texels_the_textures() {
     let config = common::config(&[
         ("population", "initial_count", "1024"),
         ("population", "maximum_count", "4096"),
@@ -119,42 +123,67 @@ fn the_limit_counts_the_ceiling_and_the_grids() {
     let epoch = common::epoch(&world);
     let capacity = epoch.capacity();
     let mut view = WorldView::new(epoch.extent(), capacity, [640, 360], [0, 0, 0]).expect("a view");
-    let before = view.preparation_limit();
-    // Before an epoch: no field grid yet; the density grid at the viewport's bins.
-    let [columns, rows] = flife_manim::density_bins(view.viewport()).map(u64::from);
     let ring = 2 * flife_manim::SELECTION_RING_SEGMENTS as u64;
-    let triangles = 2 * (columns + 1) * (rows + 1) + ring;
+    let limit = 2 * 4096 * PREPARATION_BYTES_PER_DOT
+        + (2 + 2 + ring) * flife_manim::PREPARATION_BYTES_PER_TRIANGLE
+        + PREPARATION_BYTES_FIXED;
     assert_eq!(capacity, 4096);
-    assert_eq!(
-        before,
-        2 * 4096 * PREPARATION_BYTES_PER_DOT
-            + triangles * flife_manim::PREPARATION_BYTES_PER_TRIANGLE
-            + PREPARATION_BYTES_FIXED
-    );
+    assert_eq!(view.preparation_limit(), limit);
+    // Before an epoch: no field texture yet; the density's at the
+    // viewport's bins.
+    let [columns, rows] = flife_manim::density_bins(view.viewport()).map(u64::from);
+    assert_eq!(view.texel_bytes(), columns * rows * 16);
+    let (reserved, frame) = (view.reserved_bytes(), view.frame_bytes());
+
     view.show(&epoch).expect("shows");
     let [x, y] = epoch.field().texels().map(u64::from);
     assert_eq!(
-        view.preparation_limit() - before,
-        2 * (x + 1) * (y + 1) * flife_manim::PREPARATION_BYTES_PER_TRIANGLE,
-        "the field's grid counts once shown"
+        view.preparation_limit(),
+        limit,
+        "the field adds no preparation"
+    );
+    assert_eq!(view.frame_bytes(), frame);
+    assert_eq!(
+        view.texel_bytes(),
+        (columns * rows + x * y) * 16,
+        "the field's texture counts once shown"
+    );
+    assert_eq!(
+        view.reserved_bytes() - reserved,
+        2 * x * y * 16,
+        "and is reserved twice"
     );
     let made = WorldView::for_epoch(&epoch, [640, 360], [0, 0, 0]).expect("a view");
     assert_eq!(
-        made.preparation_limit(),
-        view.preparation_limit(),
+        (made.texel_bytes(), made.reserved_bytes()),
+        (view.texel_bytes(), view.reserved_bytes()),
         "a view made for an epoch knows its field"
     );
-    assert_eq!(made.reserved_bytes(), view.reserved_bytes());
+    assert_eq!(made.preparation_limit(), limit);
+
     // Two pixels per point on the same drawable: bins of twice the
-    // pixels, so half as many each way, and the limit follows them.
-    let shown = view.preparation_limit();
+    // pixels, so half as many each way. The texels follow them; the limit
+    // does not.
+    let (texels, reserved) = (view.texel_bytes(), view.reserved_bytes());
     view.set_pixels_per_point(2.0).expect("a density");
     let [wide, high] = flife_manim::density_bins(view.viewport()).map(u64::from);
     assert_eq!([wide, high], [columns / 2, rows / 2]);
+    assert_eq!(view.preparation_limit(), limit);
+    let fewer = (columns * rows - wide * high) * 16;
+    assert_eq!(texels - view.texel_bytes(), fewer);
+    // The bins' counts and colours go too: 4 and 24 bytes a bin.
     assert_eq!(
-        shown - view.preparation_limit(),
-        2 * ((columns + 1) * (rows + 1) - (wide + 1) * (high + 1))
-            * flife_manim::PREPARATION_BYTES_PER_TRIANGLE
+        reserved - view.reserved_bytes(),
+        2 * fewer + (columns * rows - wide * high) * (4 + 24)
     );
-    assert!(view.reserved_bytes() > 0 && view.frame_bytes() > view.preparation_limit());
+    assert!(view.reserved_bytes() > 0);
+    // A frame: the draw list and the job's own bytes for every draw the
+    // view can make, and the limit.
+    let draws = 2 * 4096 + 3;
+    assert_eq!(
+        view.frame_bytes(),
+        draws * size_of::<fmn_render::ThreeDDraw<'static>>() as u64
+            + draws * flife_manim::JOB_BYTES_PER_DRAW
+            + limit
+    );
 }

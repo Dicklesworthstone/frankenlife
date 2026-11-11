@@ -595,8 +595,8 @@ fn full_epoch() -> flife_render::Epoch {
 }
 
 /// The view's own buffers, measured: made for a full world, shown in
-/// points and then in density (so each grid is built while the last one
-/// is held), a view holds no more heap than its reserved bytes.
+/// points and then in density (so each texture is built while the last
+/// one is held), a view holds no more heap than its reserved bytes.
 #[test]
 fn a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes() {
     let _serial = serial();

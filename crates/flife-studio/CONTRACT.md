@@ -13,7 +13,7 @@ adapter.
   mapping. `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
-  `c22e1415`, through FrankenManim `fmn-render` at rev `721b04b9`.
+  `0ae728fe`, through FrankenManim `fmn-render` at rev `8ccb702e`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and
@@ -206,13 +206,16 @@ presentation state, not scientific state.
   --window`) are qualified.
 - `tests/admission.rs` (FL-043, no window): the Studio's observer bytes are its feed (`render_queue_capacity`
   slots of the founding epoch), its view's buffers, one frame's job, the frame's upload (host staging and device
-  copy, each at the preparation limit), `DEVICE_BYTES_PER_PIXEL` (24) per drawable pixel and a status word per
-  16 x 16 tile. With `torch` the backend gets the budget's remainder (97.2 MiB of 2,048 on the preset at a
-  3840 x 2160 drawable), with `cpu` nothing, and a budget one byte short of the observers is refused.
-- `tests/frame_upload.rs` (FL-043, Metal compute, no window): on a `MetalRenderer`, 48 frames of the preset at
-  4,096 and 16,384 organisms, 1280 x 720 and 3840 x 2160, one and two pixels per point, zooms 1 and 16, in points,
-  density and raw density: the host heap the route holds to upload a frame, above the frame it returns, is within
-  the view's preparation limit (at most 70.7%).
+  copy, each at the preparation limit plus the view's texel bytes), `DEVICE_BYTES_PER_PIXEL` (24) per drawable
+  pixel and a status word per 16 x 16 tile. With `torch` the backend gets the budget's remainder (255.3 MiB of
+  2,048 on the preset at a 3840 x 2160 drawable, 97.2 MiB before the layers were textures), with `cpu` nothing, and
+  a budget one byte short of the observers is refused.
+- `tests/frame_upload.rs` (FL-043, FL-033, Metal compute, no window): on a `MetalRenderer`, 48 frames of the preset
+  at 4,096 and 16,384 organisms, 1280 x 720 and 3840 x 2160, one and two pixels per point, zooms 1 and 16, in
+  points, density and raw density: the host heap the route holds to upload a frame, above the frame it returns,
+  and the bytes it copies to the device (`MetalReport::upload_bytes`) are each within the view's preparation limit
+  plus its texel bytes (at most 60.2% and 43.2%; the largest copy 22.6 MB, a 4K frame of 16,384 dots and halos);
+  the readback is the RGBA8 frame.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -237,11 +240,19 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     drawables) come from FrankenManim's and AppKit's buffers as declared, not from a measurement: device memory is
     outside the heap the tests count.
   - FrankenManim bounds neither the Metal route's host staging of a frame nor its device copy. Both are charged at
-    the view's preparation limit, which the host staging stayed within on 48 measured frames (at most 70.7%); a
-    frame beyond them is not refused.
-  - On the preset at 1920 x 1080 points with a 2x display, the observers take 549.3 MiB and the backend gets
-    97.2 MiB of the 2,048, where it was unbounded: parameter shards that do not fit are evaluated on the reference
+    the view's preparation limit plus its texel bytes, which they stayed within on 48 measured frames (at most
+    60.2% and 43.2%); a frame beyond them is not refused.
+  - On the preset at 1920 x 1080 points with a 2x display, the observers take 391.1 MiB and the backend gets
+    255.3 MiB of the 2,048, where it was unbounded: parameter shards that do not fit are evaluated on the reference
     (the same bits, slower). The Studio's frame and inference rates under that budget are not measured here.
+  - FL-033: the field and density layers are textures on one quad each, uploaded with every frame (the window's
+    frames were not run here). Measured headlessly against the vertex grids they replace, in one interleaved
+    invocation (six runs a side, 16,384 organisms, two pixels per point): a 4K density frame copies 1.50 MB to the
+    device, not 21.46 MB, and its CPU preparation takes 4.21 ms, not 33.97 ms, at zoom 1. At zoom 16 the whole
+    textures are copied, 1.95 MB against the culled grid's 1.45 MB, and the Metal route took 13.01 ms against
+    6.69 ms (coefficients of variation 4% and 5%): every pixel now samples two textures. The frame's preparation
+    and Metal time together still fell, 38.6 ms to 17.2 ms. `MetalReport`'s upload and readback bytes are not yet
+    recorded in the Studio's `frame` records.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.

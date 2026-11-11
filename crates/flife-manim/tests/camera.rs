@@ -192,18 +192,28 @@ fn the_world_view_keeps_its_camera_and_places_without_moving_scales() {
         density,
         "placing moved the density scale"
     );
-    let Some(ThreeDDraw::Surface(grid)) = view_.density().draw() else {
+    let Some(ThreeDDraw::Surface(layer)) = view_.density().draw() else {
         panic!("the density layer draws one surface");
     };
-    let [columns, rows] = view_.density().bins().map(|n| n as usize);
     // The window starts inside a bin on both axes (x = -15, y = 14 in a
-    // 32-unit world), so the grid is cut there: two more lines each way.
-    assert_eq!(grid.mesh.vertices().len(), (columns + 2) * (rows + 2));
+    // 32-unit world): the quad still covers the window exactly, and its
+    // texture coordinates start inside the bins' texture.
+    let bins = view_.density().bins();
+    assert_eq!(
+        layer.mesh,
+        &view_.viewport().periodic_quad(bins).expect("a quad")
+    );
     assert!(
-        grid.mesh
+        layer
+            .mesh
             .vertices()
             .iter()
-            .all(|vertex| vertex.point[0].abs() <= 16.0 && vertex.point[1].abs() <= 16.0)
+            .all(|vertex| vertex.point[0].abs() == 16.0 && vertex.point[1].abs() == 16.0)
+    );
+    let start = layer.mesh.vertices()[0].uv;
+    assert!(
+        (0..2).all(|axis| (start[axis] * f64::from(bins[axis]) - 0.5).fract() != 0.0),
+        "the window starts between corners: {start:?}"
     );
 
     assert!(view_.resize([640, 480]).expect("resized"));

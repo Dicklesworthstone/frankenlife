@@ -494,7 +494,7 @@ substitutes a different neural model.
 |---|---|
 | Rust toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition |
 | Asupersync | v0.6.2 (`a5d23e8d`), one package id across the closure; the root `[patch.crates-io]` maps FrankenTorch's crates.io edge onto the same commit |
-| FrankenManim, FrankenTorch, FrankenNumPy | `721b04b9`, `c22e1415`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
+| FrankenManim, FrankenTorch, FrankenNumPy | `8ccb702e`, `0ae728fe`, `6492ff31`; the full qualified set and its probe results are in [`franken-stack.lock`](franken-stack.lock) |
 | `rust-block` override | Reviewed revision `b39ae859…`, carried at this workspace root because Cargo ignores a dependency's own `[patch]` (§12.8) |
 
 ---

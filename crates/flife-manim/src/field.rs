@@ -1,20 +1,21 @@
 //! The energy field under the organisms (plan §13.3, §9.5): the epoch's
-//! bounded [`FieldTexture`] drawn as one smoothly shaded grid covering the
-//! torus.
+//! bounded [`FieldTexture`] drawn as one texture covering the torus
+//! (FL-033).
 //!
 //! Each texel's energy density maps through a fixed dark-to-bright palette.
 //! The display scale follows the brightest texels with a slow decay, so the
-//! picture neither flickers nor saturates as the sources wander. The grid's
-//! vertices sit on texel corners, each coloured by the mean of the four
-//! texels around it, wrapping across the seam, so the torus shows no seam.
-//! FrankenManim interpolates the colours across each cell (Gouraud
-//! shading), which both its CPU and its Metal 3D routes draw. The layer is
-//! one scene object and one draw, whatever the field's size.
+//! picture neither flickers nor saturates as the sources wander. The
+//! layer's texture holds the colour of every texel corner, the mean of the
+//! four texels around it, wrapping across the seam, and
+//! [`Viewport::periodic_quad`] puts each on its corner; FrankenManim
+//! interpolates them bilinearly, wrapping, so the torus shows no seam. Its
+//! CPU and Metal 3D routes both sample textures. The layer is one scene
+//! object and one draw of two triangles, whatever the field's size.
 
 use flife_core::CoreError;
 use flife_render::FieldTexture;
 use fmn_core::color::{LinearRgba, Srgb};
-use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDDraw};
+use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
 use crate::Viewport;
 use crate::mapping::Look;
@@ -73,11 +74,12 @@ pub fn palette(t: f64) -> [u8; 3] {
     [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])]
 }
 
-/// The field layer: one vertex-coloured grid.
+/// The field layer: a texture of the field's corner colours on one quad.
 #[derive(Debug)]
 pub struct FieldLayer {
     viewport: Viewport,
-    mesh: Option<SurfaceMesh>,
+    texture: Option<Texture>,
+    quad: Option<SurfaceMesh>,
     scale: f64,
 }
 
@@ -87,12 +89,13 @@ impl FieldLayer {
     pub const fn new(viewport: &Viewport) -> Self {
         Self {
             viewport: *viewport,
-            mesh: None,
+            texture: None,
+            quad: None,
             scale: 0.0,
         }
     }
 
-    /// Map `field` through the palette into the layer's grid (the glow
+    /// Map `field` through the palette into the layer's texture (the glow
     /// look).
     ///
     /// # Errors
@@ -101,13 +104,15 @@ impl FieldLayer {
         self.update_look(field, Look::Glow)
     }
 
-    /// Map `field` into the layer's grid: through the square-root palette
-    /// for the glow look, as linear grey ([`raw_value`]) for raw.
+    /// Map `field` into the layer's texture: through the square-root
+    /// palette for the glow look, as linear grey ([`raw_value`]) for raw.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for a texture whose values do not fill
-    /// its texels; [`CoreError::NumericalInvalid`] if FrankenManim refuses
-    /// the grid. The previous grid is kept on error.
+    /// its texels; [`CoreError::AllocationFailed`] when the texels cannot be
+    /// reserved; [`CoreError::NumericalInvalid`] if FrankenManim refuses the
+    /// texture or the quad. The previous texture and quad are kept on
+    /// error.
     pub fn update_look(&mut self, field: &FieldTexture, look: Look) -> Result<(), CoreError> {
         let [columns, rows] = field.texels().map(|n| n as usize);
         let values = field.values();
@@ -132,8 +137,8 @@ impl FieldLayer {
         self.viewport = *viewport;
     }
 
-    /// Place `field` in the layer's grid at the current viewport and
-    /// display scale, which does not move: what a pan or zoom redraws.
+    /// Place `field` in the layer at the current viewport and display
+    /// scale, which does not move: what a pan or zoom redraws.
     ///
     /// # Errors
     /// As [`FieldLayer::update_look`].
@@ -150,23 +155,30 @@ impl FieldLayer {
     }
 
     fn place_scaled(&mut self, field: &FieldTexture, look: Look) -> Result<(), CoreError> {
-        let [columns, rows] = field.texels().map(|n| n as usize);
+        let cells = field.texels();
+        let [columns, rows] = cells.map(|n| n as usize);
         let values = field.values();
         let scale = self.scale;
         let texel = |column: usize, row: usize| values[(row % rows) * columns + column % columns];
-        let (vertices, indices) = self.viewport.periodic_grid(
-            [columns, rows],
-            ["field layer vertices", "field layer indices"],
-            |[column, row]| {
-                // The corner between texels (column - 1, row - 1) and
-                // (column, row), wrapping.
+        let mut texels = Vec::new();
+        texels
+            .try_reserve_exact(columns * rows)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "field layer texels",
+                bytes: u64::try_from((columns * rows).saturating_mul(size_of::<[f32; 4]>()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        for row in 0..rows {
+            for column in 0..columns {
+                // Texel (column, row) is the corner between field texels
+                // (column - 1, row - 1) and (column, row), wrapping.
                 let (left, up) = (column + columns - 1, row + rows - 1);
                 let mean = (f64::from(texel(left, up))
                     + f64::from(texel(column, up))
                     + f64::from(texel(left, row))
                     + f64::from(texel(column, row)))
                     / 4.0;
-                match look {
+                let color = match look {
                     Look::Glow => {
                         let [r, g, b] = palette(display_value(mean as f32, scale));
                         Srgb::from_rgb8(r, g, b).to_linear(1.0)
@@ -180,15 +192,20 @@ impl FieldLayer {
                             a: 1.0,
                         }
                     }
-                }
-            },
-        )?;
-        let mesh =
-            SurfaceMesh::new(vertices, indices).map_err(|error| CoreError::NumericalInvalid {
-                quantity: "field layer grid",
-                detail: error.to_string(),
-            })?;
-        self.mesh = Some(mesh);
+                };
+                // Opaque, so premultiplied is straight.
+                texels.push([color.r as f32, color.g as f32, color.b as f32, 1.0]);
+            }
+        }
+        let refused = |quantity: &'static str, detail: String| CoreError::NumericalInvalid {
+            quantity,
+            detail,
+        };
+        let texture = Texture::from_premultiplied_linear(cells[0], cells[1], texels)
+            .map_err(|error| refused("field layer texture", error.to_string()))?;
+        let quad = self.viewport.periodic_quad(cells)?;
+        self.texture = Some(texture);
+        self.quad = Some(quad);
         Ok(())
     }
 
@@ -199,16 +216,22 @@ impl FieldLayer {
         self.scale
     }
 
-    /// The layer's draw, once a field has been shown: unlit, in painter
+    /// The layer's texture once a field has been shown: one texel per
+    /// field texel corner, rows top to bottom, premultiplied linear and
+    /// opaque.
+    #[must_use]
+    pub const fn texture(&self) -> Option<&Texture> {
+        self.texture.as_ref()
+    }
+
+    /// The layer's draw, once a field has been shown: its texture on its
+    /// quad as an image, unlit, repeating, without a depth test, in painter
     /// order under the organisms.
     #[must_use]
     pub fn draw(&self) -> Option<ThreeDDraw<'_>> {
-        self.mesh.as_ref().map(|mesh| {
-            ThreeDDraw::Surface(SurfaceDraw {
-                shading: [0.0; 3],
-                depth_test: false,
-                ..SurfaceDraw::new(mesh)
-            })
-        })
+        let (Some(quad), Some(texture)) = (&self.quad, &self.texture) else {
+            return None;
+        };
+        Some(ThreeDDraw::Surface(SurfaceDraw::image(quad, texture)))
     }
 }

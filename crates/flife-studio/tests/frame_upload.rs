@@ -1,6 +1,8 @@
-//! FL-043: the host heap the Studio's Metal route holds to upload a frame
-//! (FrankenManim's flattened rows and bins), measured headlessly on a
-//! Metal device without a window, is within the view's preparation limit.
+//! FL-043 and FL-033: the host heap the Studio's Metal route holds to
+//! upload a frame (FrankenManim's flattened rows and bins and the layers'
+//! texels), and the bytes it copies to the device, measured headlessly on
+//! a Metal device without a window, are each within the view's preparation
+//! limit plus its texel bytes, the Studio's upload term.
 
 #![allow(
     clippy::expect_used,
@@ -34,14 +36,14 @@ fn preset_with(pairs: &[(&str, u64)]) -> ValidatedConfig {
 }
 
 #[test]
-fn a_frames_metal_upload_holds_no_more_host_heap_than_its_preparation_limit() {
+fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texels() {
     if !MetalRenderer::is_available() {
         println!("no Metal device: skipped");
         return;
     }
     let mut renderer = MetalRenderer::new().expect("a Metal renderer");
     let mut frames = 0;
-    let mut closest = 0.0_f64;
+    let (mut closest, mut copied, mut largest) = (0.0_f64, 0.0_f64, 0);
     for live in [4_096, 16_384] {
         let config = preset_with(&[("initial_count", live), ("maximum_count", 16_384)]);
         let world = World::found(
@@ -87,18 +89,27 @@ fn a_frames_metal_upload_holds_no_more_host_heap_than_its_preparation_limit() {
                         let job = view.job().expect("a job");
                         let base = ALLOC.current_usage();
                         ALLOC.reset_peak_usage();
-                        let (frame, _) = renderer.render_three_d_rgba8(&job).expect("renders");
+                        let (frame, report) = renderer.render_three_d_rgba8(&job).expect("renders");
                         let peak = ALLOC.peak_usage().saturating_sub(base);
                         let held = u64::try_from(peak.saturating_sub(frame.as_bytes().len()))
                             .expect("fits");
-                        let limit = view.preparation_limit();
+                        let upload = u64::try_from(report.upload_bytes).expect("fits");
+                        let limit = view.preparation_limit() + view.texel_bytes();
+                        let name = style.particles.name();
                         assert!(
                             held <= limit,
-                            "{live} live, {drawable:?} at {density}x, zoom {zoom}, {}: upload held \
-                             {held} > {limit}",
-                            style.particles.name()
+                            "{live} live, {drawable:?} at {density}x, zoom {zoom}, {name}: \
+                             upload held {held} > {limit}"
                         );
+                        assert!(
+                            upload <= limit,
+                            "{live} live, {drawable:?} at {density}x, zoom {zoom}, {name}: \
+                             upload copied {upload} > {limit}"
+                        );
+                        assert_eq!(report.readback_bytes, frame.as_bytes().len());
                         closest = closest.max(held as f64 / limit as f64);
+                        copied = copied.max(upload as f64 / limit as f64);
+                        largest = largest.max(upload);
                         frames += 1;
                     }
                 }
@@ -106,7 +117,9 @@ fn a_frames_metal_upload_holds_no_more_host_heap_than_its_preparation_limit() {
         }
     }
     println!(
-        "{frames} frames uploaded; the fullest held {:.1}% of its preparation limit",
-        closest * 100.0
+        "{frames} frames uploaded; the fullest held {:.1}% and copied {:.1}% of its preparation \
+         limit plus texels; the largest copy {largest} bytes",
+        closest * 100.0,
+        copied * 100.0
     );
 }

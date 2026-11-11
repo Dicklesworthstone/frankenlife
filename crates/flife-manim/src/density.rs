@@ -4,13 +4,10 @@
 //! The world is cut into bins of about [`DENSITY_BIN_POINTS`] points on
 //! screen, aligned to the world so the torus wraps exactly. Each bin holds
 //! its organism count and the mean linear colour of the current mapping
-//! over them. The bins are drawn like the field: one vertex-coloured grid
-//! whose vertices sit on bin corners, each the alpha-weighted mean of the
-//! four bins around it, wrapping, so the seam does not show.
-//!
-//! Bins are several pixels, not one: FrankenManim's Metal 3D route has no
-//! textured surfaces, and a vertex grid per pixel would be about four
-//! million triangles at 1080p.
+//! over them. The bins are drawn like the field (FL-033): one texture of
+//! the bins' corners, each the premultiplied mean of the four bins around
+//! it, wrapping, on one [`Viewport::periodic_quad`], so the seam does not
+//! show.
 //!
 //! - Glow: a bin's colour is its mean colour, its opacity
 //!   `ln(1 + n) / ln(1 + scale)` over the field.
@@ -23,7 +20,7 @@
 use flife_core::CoreError;
 use flife_render::Epoch;
 use fmn_core::color::LinearRgba;
-use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDDraw};
+use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
 use crate::mapping::{Look, Style, mapped_color, traits};
 use crate::{SCALE_DECAY, Viewport};
@@ -68,14 +65,15 @@ pub fn density_level(count: u32, scale: f64, look: Look) -> f64 {
     level.clamp(0.0, 1.0)
 }
 
-/// Organism counts and mean colours per screen bin, as one grid.
+/// Organism counts and mean colours per screen bin, as one texture.
 #[derive(Debug)]
 pub struct DensityLayer {
     viewport: Viewport,
     bins: [u32; 2],
     counts: Vec<u32>,
     sums: Vec<[f64; 3]>,
-    mesh: Option<SurfaceMesh>,
+    texture: Option<Texture>,
+    quad: Option<SurfaceMesh>,
     scale: f64,
 }
 
@@ -88,25 +86,27 @@ impl DensityLayer {
             bins: [0; 2],
             counts: Vec::new(),
             sums: Vec::new(),
-            mesh: None,
+            texture: None,
+            quad: None,
             scale: 0.0,
         }
     }
 
     /// Use `viewport` from the next [`DensityLayer::update`]. The current
-    /// grid stays valid meanwhile: bins are world-aligned and scene points
-    /// do not depend on the drawable.
+    /// texture and quad stay valid meanwhile: bins are world-aligned and
+    /// scene points do not depend on the drawable.
     pub const fn refit(&mut self, viewport: &Viewport) {
         self.viewport = *viewport;
     }
 
-    /// Bin `epoch` and build the grid for `style`.
+    /// Bin `epoch` and build the texture for `style`.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for an epoch of another world than the
     /// viewport's; [`CoreError::AllocationFailed`] when the bins or the
-    /// grid cannot be reserved; [`CoreError::NumericalInvalid`] if
-    /// FrankenManim refuses the grid. The previous grid is kept on error.
+    /// texels cannot be reserved; [`CoreError::NumericalInvalid`] if
+    /// FrankenManim refuses the texture or the quad. The previous texture
+    /// and quad are kept on error.
     pub fn update(&mut self, epoch: &Epoch, style: &Style) -> Result<(), CoreError> {
         if epoch.extent().map(f64::to_bits) != self.viewport.extent().map(f64::to_bits) {
             return Err(CoreError::LayoutMismatch {
@@ -163,9 +163,9 @@ impl DensityLayer {
         self.place_binned(style)
     }
 
-    /// Re-place the last binned epoch in the layer's grid at the current
-    /// viewport and display scale, which does not move: what a pan or zoom
-    /// redraws. Nothing happens before the first update.
+    /// Re-place the last binned epoch in the layer at the current viewport
+    /// and display scale, which does not move: what a pan or zoom redraws.
+    /// Nothing happens before the first update.
     ///
     /// # Errors
     /// As [`DensityLayer::update`].
@@ -202,20 +202,26 @@ impl DensityLayer {
                 }
             }
         };
-        let (vertices, indices) = self.viewport.periodic_grid(
-            [columns, rows],
-            ["density layer vertices", "density layer indices"],
-            |[column, row]| {
-                // The corner between bins (column - 1, row - 1) and
-                // (column, row), wrapping; premultiplied mean, then straight.
+        let mut texels = Vec::new();
+        texels.try_reserve_exact(columns * rows).map_err(|_| {
+            allocation(
+                "density layer texels",
+                columns * rows,
+                size_of::<[f32; 4]>(),
+            )
+        })?;
+        for row in 0..rows {
+            for column in 0..columns {
+                // Texel (column, row) is the corner between bins
+                // (column - 1, row - 1) and (column, row), wrapping: their
+                // premultiplied mean.
                 let (left, up) = ((column + columns - 1) % columns, (row + rows - 1) % rows);
-                let (right, down) = (column % columns, row % rows);
                 let mut sum = [0.0; 4];
                 for cell in [
                     up * columns + left,
-                    up * columns + right,
-                    down * columns + left,
-                    down * columns + right,
+                    up * columns + column,
+                    row * columns + left,
+                    row * columns + column,
                 ] {
                     let color = shown(cell);
                     sum[0] += color.r * color.a;
@@ -223,33 +229,22 @@ impl DensityLayer {
                     sum[2] += color.b * color.a;
                     sum[3] += color.a;
                 }
-                if sum[3] > 0.0 {
-                    LinearRgba {
-                        r: sum[0] / sum[3],
-                        g: sum[1] / sum[3],
-                        b: sum[2] / sum[3],
-                        a: sum[3] / 4.0,
-                    }
-                } else {
-                    LinearRgba {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 0.0,
-                    }
-                }
-            },
-        )?;
-        let mesh =
-            SurfaceMesh::new(vertices, indices).map_err(|error| CoreError::NumericalInvalid {
-                quantity: "density layer grid",
+                texels.push(sum.map(|component| (component / 4.0) as f32));
+            }
+        }
+        let texture = Texture::from_premultiplied_linear(self.bins[0], self.bins[1], texels)
+            .map_err(|error| CoreError::NumericalInvalid {
+                quantity: "density layer texture",
                 detail: error.to_string(),
             })?;
-        self.mesh = Some(mesh);
+        let quad = self.viewport.periodic_quad(self.bins)?;
+        self.texture = Some(texture);
+        self.quad = Some(quad);
         Ok(())
     }
 
-    /// Bins per axis of the current grid; `[0, 0]` before the first update.
+    /// Bins per axis of the current texture; `[0, 0]` before the first
+    /// update.
     #[must_use]
     pub const fn bins(&self) -> [u32; 2] {
         self.bins
@@ -267,17 +262,22 @@ impl DensityLayer {
         self.scale
     }
 
-    /// The layer's draw, once an epoch has been binned: unlit, without a
-    /// depth test, in painter order.
+    /// The layer's texture once an epoch has been binned: one texel per bin
+    /// corner, rows top to bottom, premultiplied linear.
+    #[must_use]
+    pub const fn texture(&self) -> Option<&Texture> {
+        self.texture.as_ref()
+    }
+
+    /// The layer's draw, once an epoch has been binned: its texture on its
+    /// quad as an image, unlit, repeating, without a depth test, in painter
+    /// order.
     #[must_use]
     pub fn draw(&self) -> Option<ThreeDDraw<'_>> {
-        self.mesh.as_ref().map(|mesh| {
-            ThreeDDraw::Surface(SurfaceDraw {
-                shading: [0.0; 3],
-                depth_test: false,
-                ..SurfaceDraw::new(mesh)
-            })
-        })
+        let (Some(quad), Some(texture)) = (&self.quad, &self.texture) else {
+            return None;
+        };
+        Some(ThreeDDraw::Surface(SurfaceDraw::image(quad, texture)))
     }
 }
 

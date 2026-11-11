@@ -26,40 +26,48 @@ use crate::{
 pub const PREPARATION_BYTES_PER_DOT: u64 = 1_536;
 
 /// The most FrankenManim's preparation of a frame charges for one surface
-/// triangle, its share of the grid's vertices and its places in the
-/// triangle bins included (FL-043). Measured on the pinned FrankenManim
-/// over density grids of 60 x 60 to 360 x 360 bins and a 128 x 128 field:
-/// at most 476 bytes.
+/// triangle, its share of the mesh's vertices and its places in the
+/// triangle bins included (FL-043). Measured on FrankenManim at `721b04b9`
+/// over vertex grids of 60 x 60 to 360 x 360 cells: at most 476 bytes. The
+/// field and density layers are now a quad each (FL-033), so this charges
+/// their four triangles and the selection ring's.
 pub const PREPARATION_BYTES_PER_TRIANGLE: u64 = 640;
 
 /// FrankenManim's preparation apart from its rows: the job, and the tile
 /// tables of its bins.
 pub const PREPARATION_BYTES_FIXED: u64 = 1 << 20;
 
+/// The heap FrankenManim's job holds for each draw beyond its own
+/// preparation accounting, which `ThreeDJob::preparation_bytes` and the
+/// preparation limit leave out (FL-033). Measured on FrankenManim at
+/// `8ccb702e`, CPU jobs of 1,024 and 16,384 organisms at 640 x 360 to
+/// 3840 x 2160: 865 to 872 bytes a dot, and 1,180 for each of the field's
+/// and the density's quads. Until FL-033 the grids' triangle allowance
+/// covered it.
+pub const JOB_BYTES_PER_DRAW: u64 = 1_024;
+
 /// The finest edge sampling FrankenManim's 3D route takes per pixel: a
 /// 4 x 4 grid.
 const MAXIMUM_SAMPLES_PER_PIXEL: u64 = 16;
 
-/// The most vertices and triangles a periodic grid of `cells` makes
-/// ([`Viewport::periodic_grid`]): `cells + 2` lines a side when the window
-/// cuts a cell, two triangles a quad.
-fn grid_bound(cells: [u32; 2]) -> (u64, u64) {
-    if cells.contains(&0) {
-        return (0, 0);
-    }
-    let [columns, rows] = cells.map(u64::from);
-    (
-        (columns + 2).saturating_mul(rows + 2),
-        (columns + 1).saturating_mul(rows + 1).saturating_mul(2),
-    )
-}
-
-/// The bytes of a grid of `vertices` and `triangles`.
-fn grid_bytes((vertices, triangles): (u64, u64)) -> u64 {
+/// The bytes of a mesh of `vertices` and `triangles`.
+fn mesh_bytes((vertices, triangles): (u64, u64)) -> u64 {
     total([
         vertices.saturating_mul(bytes_for::<SurfaceVertex>(1)),
         triangles.saturating_mul(bytes_for::<u32>(3)),
     ])
+}
+
+/// A periodic quad's vertices and triangles ([`Viewport::periodic_quad`]).
+const QUAD: (u64, u64) = (4, 2);
+
+/// The bytes of a layer texture of `cells`: premultiplied linear `f32`
+/// RGBA per cell (FL-033).
+fn texel_bytes_of(cells: [u32; 2]) -> u64 {
+    let [columns, rows] = cells.map(u64::from);
+    columns
+        .saturating_mul(rows)
+        .saturating_mul(bytes_for::<[f32; 4]>(1))
 }
 
 /// A `#rrggbb` colour, as `[presentation] background` spells it.
@@ -628,10 +636,10 @@ impl WorldView {
     /// The most bytes the view's own buffers hold (FL-043): the shown
     /// rows' identities and drawn positions and the cloud's draws and
     /// halos, each reserved for the population ceiling; the density bins
-    /// at the viewport's count; and the field's, the density's and the
-    /// selection ring's grids at the most vertices and indices their cells
-    /// make, each twice, since a grid is built before the one it replaces
-    /// is dropped. The field's grid counts once the view knows the field:
+    /// at the viewport's count; and the field's and the density's textures
+    /// ([`WorldView::texel_bytes`]) and quads and the selection ring's
+    /// mesh, each twice, since one is built before the one it replaces is
+    /// dropped. The field's texture counts once the view knows the field:
     /// from [`WorldView::for_epoch`] or the first shown epoch. A resize or
     /// a new pixel density changes the density's bins and so these bytes.
     #[must_use]
@@ -640,9 +648,9 @@ impl WorldView {
         let bins = columns.saturating_mul(rows);
         let ring = SELECTION_RING_SEGMENTS as u64;
         let grids = total([
-            grid_bytes(grid_bound(self.field_texels)),
-            grid_bytes(grid_bound(density_bins(&self.viewport))),
-            grid_bytes((2 * ring, 2 * ring)),
+            self.texel_bytes(),
+            mesh_bytes(QUAD).saturating_mul(2),
+            mesh_bytes((2 * ring, 2 * ring)),
         ]);
         total([
             capacity_bytes(&self.ids),
@@ -658,18 +666,15 @@ impl WorldView {
     /// The preparation bytes a frame's job is compiled within (FL-043):
     /// [`PREPARATION_BYTES_PER_DOT`] for a dot and a halo per organism the
     /// view can hold, [`PREPARATION_BYTES_PER_TRIANGLE`] for every triangle
-    /// the field's, the density's and the ring's grids can make, and
+    /// of the field's and the density's quads and the ring, and
     /// [`PREPARATION_BYTES_FIXED`], whatever the style, which a host may
-    /// change from frame to frame.
+    /// change from frame to frame. The layers' texels are not preparation:
+    /// a job samples them in place ([`WorldView::texel_bytes`]).
     #[must_use]
     pub fn preparation_limit(&self) -> u64 {
         let dots = (self.cloud.capacity() as u64).saturating_mul(2);
         let ring = 2 * SELECTION_RING_SEGMENTS as u64;
-        let triangles = total([
-            grid_bound(self.field_texels).1,
-            grid_bound(density_bins(&self.viewport)).1,
-            ring,
-        ]);
+        let triangles = total([QUAD.1, QUAD.1, ring]);
         total([
             dots.saturating_mul(PREPARATION_BYTES_PER_DOT),
             triangles.saturating_mul(PREPARATION_BYTES_PER_TRIANGLE),
@@ -677,15 +682,30 @@ impl WorldView {
         ])
     }
 
+    /// The texels a frame's draws can sample (FL-033): the field's texture,
+    /// once the view knows the field, and the density's at the viewport's
+    /// bins, whatever the style, as premultiplied linear `f32` RGBA.
+    /// FrankenManim's CPU route samples them in place; its Metal route
+    /// uploads the ones a frame draws with the frame.
+    #[must_use]
+    pub fn texel_bytes(&self) -> u64 {
+        total([
+            texel_bytes_of(self.field_texels),
+            texel_bytes_of(density_bins(&self.viewport)),
+        ])
+    }
+
     /// The most one frame's [`WorldView::job`] holds (FL-043): its draw
     /// list, a field, a density and a ring draw and a dot and a halo per
-    /// organism the view can hold, and FrankenManim's preparation, within
+    /// organism the view can hold, [`JOB_BYTES_PER_DRAW`] for each of those
+    /// draws, and FrankenManim's preparation, within
     /// [`WorldView::preparation_limit`].
     #[must_use]
     pub fn frame_bytes(&self) -> u64 {
         let draws = self.cloud.capacity().saturating_mul(2).saturating_add(3);
         total([
             bytes_for::<ThreeDDraw<'static>>(draws),
+            (draws as u64).saturating_mul(JOB_BYTES_PER_DRAW),
             self.preparation_limit(),
         ])
     }

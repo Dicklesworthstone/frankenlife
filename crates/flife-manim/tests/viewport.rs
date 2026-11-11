@@ -5,7 +5,7 @@
 use flife_core::CoreError;
 use flife_manim::{MAXIMUM_ZOOM, Viewport};
 use fmn_core::color::LinearRgba;
-use fmn_render::{ThreeDDraw, ThreeDJob, Tiling, TrueDotDraw};
+use fmn_render::{SamplerPolicy, SurfaceDraw, Texture, ThreeDDraw, ThreeDJob, Tiling, TrueDotDraw};
 
 #[expect(
     clippy::expect_used,
@@ -435,92 +435,209 @@ fn views_outside_the_rules_are_refused() {
     ));
 }
 
-fn shade(index: [usize; 2]) -> LinearRgba {
-    LinearRgba {
-        r: index[0] as f64,
-        g: index[1] as f64,
-        b: (index[0] * 7 + index[1]) as f64,
-        a: 1.0,
+/// A texture whose texels are all different, opaque:
+/// `[column / 16, row / 16, (7 · column + row) / 64, 1]`.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn numbered(cells: [u32; 2]) -> Texture {
+    let texels = (0..cells[1])
+        .flat_map(|row| {
+            (0..cells[0]).map(move |column| {
+                [
+                    column as f32 / 16.0,
+                    row as f32 / 16.0,
+                    (7 * column + row) as f32 / 64.0,
+                    1.0,
+                ]
+            })
+        })
+        .collect();
+    Texture::from_premultiplied_linear(cells[0], cells[1], texels).expect("a texture")
+}
+
+fn close(a: LinearRgba, b: LinearRgba, within: f64) -> bool {
+    [(a.r, b.r), (a.g, b.g), (a.b, b.b), (a.a, b.a)]
+        .iter()
+        .all(|(x, y)| (x - y).abs() <= within)
+}
+
+/// The windows the quad tests look through: the fit; one starting a
+/// quarter of the way into a cell; one cut on both axes; and one zoomed
+/// across both seams.
+const WINDOWS: [([f64; 2], f64); 4] = [
+    ([4.0, 2.0], 1.0),
+    ([0.5, 2.0], 1.0),
+    ([0.5, 1.5], 1.0),
+    ([7.9, 0.1], 3.0),
+];
+
+/// FL-033: the periodic quad is the window, centered, and its texture
+/// coordinates put every texel of a periodic texture on its corner of the
+/// torus, `L · k / n`, wherever the window's image of that corner falls.
+/// Where the window cuts a cell, its edges sample the cut cell's corners
+/// blended linearly, and the two edges, one torus line, agree.
+#[test]
+fn the_periodic_quad_puts_every_texel_on_its_corner_in_any_window() {
+    let fitted = fit([8.0, 4.0], [160, 80]);
+    let cells = [4, 2];
+    let texture = numbered(cells);
+    // As `SurfaceDraw::image` samples: repeating both ways.
+    let policy = SamplerPolicy::default();
+    for (center, zoom) in WINDOWS {
+        let viewport = view(&fitted, center, zoom);
+        let quad = viewport.periodic_quad(cells).expect("a quad");
+        let vertices = quad.vertices();
+        assert_eq!(vertices.len(), 4);
+        assert_eq!(quad.indices(), &[0, 1, 3, 0, 3, 2]);
+        let points: Vec<[f64; 3]> = vertices.iter().map(|vertex| vertex.point).collect();
+        assert_eq!(
+            points,
+            vec![
+                [-4.0, 2.0, 0.0],
+                [4.0, 2.0, 0.0],
+                [-4.0, -2.0, 0.0],
+                [4.0, -2.0, 0.0]
+            ]
+        );
+        assert!(
+            vertices
+                .iter()
+                .all(|vertex| vertex.normal == [0.0, 0.0, 1.0] && vertex.opacity == 1.0)
+        );
+        // One texture span across the window each way, rows downward.
+        let [top_left, top_right, bottom_left, bottom_right] =
+            [0, 1, 2, 3].map(|at| vertices[at].uv);
+        assert_eq!(top_right, [top_left[0] + 1.0, top_left[1]]);
+        assert_eq!(bottom_left, [top_left[0], top_left[1] + 1.0]);
+        assert_eq!(bottom_right, [top_left[0] + 1.0, top_left[1] + 1.0]);
+        // Texture coordinates are affine across the quad.
+        let uv_at = |scene: [f64; 3]| {
+            [
+                top_left[0] + (scene[0] + 4.0) / 8.0,
+                top_left[1] + (2.0 - scene[1]) / 4.0,
+            ]
+        };
+        for row in 0..cells[1] {
+            for column in 0..cells[0] {
+                let corner = [8.0 * f64::from(column) / 4.0, 4.0 * f64::from(row) / 2.0];
+                let got = texture.sample(uv_at(viewport.scene_point(corner)), policy);
+                let want = texture.texel(column, row).expect("a texel");
+                assert!(
+                    close(got, want, 1e-12),
+                    "{center:?} x{zoom}: corner ({column}, {row}) samples {got:?}, not {want:?}"
+                );
+            }
+        }
+        let [left, right] = [top_left, top_right].map(|uv| texture.sample(uv, policy));
+        assert!(
+            close(left, right, 1e-12),
+            "{center:?}: the seam's two images"
+        );
+    }
+
+    // Center (0.5, 2): the window starts at x = -3.5, which is 4.5 on the
+    // torus, a quarter of the way from corner 2 (x = 4) to corner 3; y = 0
+    // is aligned. Center (0.5, 1.5) also starts it at y = -0.5, three
+    // quarters of the way from corner 1 (y = -2) to corner 0.
+    let texel = |column, row| texture.texel(column, row).expect("a texel");
+    let lerp = |a: LinearRgba, b: LinearRgba, t: f64| LinearRgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    };
+    let start = |center| {
+        let quad = view(&fitted, center, 1.0)
+            .periodic_quad(cells)
+            .expect("a quad");
+        texture.sample(quad.vertices()[0].uv, policy)
+    };
+    let cut = lerp(texel(2, 0), texel(3, 0), 0.25);
+    assert!(close(start([0.5, 2.0]), cut, 1e-12));
+    let both = lerp(
+        lerp(texel(2, 1), texel(3, 1), 0.25),
+        lerp(texel(2, 0), texel(3, 0), 0.25),
+        0.75,
+    );
+    assert!(close(start([0.5, 1.5]), both, 1e-12));
+
+    for empty in [[0, 2], [4, 0]] {
+        assert!(matches!(
+            fitted.periodic_quad(empty),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
     }
 }
 
-/// At the fit, the periodic grid is the corner lattice at `L · k / n`. A
-/// panned view cuts the grid at the window's edges: both edges are the same
-/// torus line and carry the same colours, the linear blend of the cut
-/// cell's corners, and the vertices cover the window exactly, in order.
+/// FL-033, against FrankenManim's CPU 3D route: a periodic texture on the
+/// periodic quad, drawn as the field and density layers draw it, shows at
+/// every pixel the bilinear blend of the torus corners around the world
+/// point the viewport maps the pixel to, through the window's cuts and
+/// across the seams. The blend is computed from world coordinates alone.
 #[test]
-fn the_periodic_grid_is_the_lattice_at_the_fit_and_is_cut_at_a_panned_window() {
-    let extent = [8.0, 4.0];
-    let fitted = fit(extent, [160, 80]);
-    let (vertices, indices) = fitted
-        .periodic_grid([4, 2], ["v", "i"], shade)
-        .expect("a grid");
-    assert_eq!(vertices.len(), 5 * 3);
-    assert_eq!(indices.len(), 4 * 2 * 6);
-    for row in 0..3 {
-        for column in 0..5 {
-            let vertex = &vertices[row * 5 + column];
-            let world = [8.0 * column as f64 / 4.0, 4.0 * row as f64 / 2.0];
-            assert_eq!(vertex.point, fitted.scene_point(world));
-            assert_eq!(vertex.color, shade([column % 4, row % 2]));
+fn frankenmanim_draws_the_periodic_quad_bilinear_between_the_torus_corners() {
+    let fitted = fit([8.0, 4.0], [160, 80]);
+    let cells = [4, 2];
+    let texture = numbered(cells);
+    let texel = |column: i64, row: i64| {
+        let column = u32::try_from(column.rem_euclid(4)).expect("wrapped");
+        let row = u32::try_from(row.rem_euclid(2)).expect("wrapped");
+        texture.texel(column, row).expect("a texel")
+    };
+    let black = LinearRgba {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: 1.0,
+    };
+    let mut worst = 0.0_f64;
+    for (center, zoom) in WINDOWS {
+        let viewport = view(&fitted, center, zoom);
+        let quad = viewport.periodic_quad(cells).expect("a quad");
+        let camera = viewport.camera(black).expect("a camera");
+        let draws = [ThreeDDraw::Surface(SurfaceDraw::image(&quad, &texture))];
+        let frame = ThreeDJob::new(camera.camera(), &draws, Tiling::default())
+            .expect("a job")
+            .render(2)
+            .expect("a frame");
+        let stride = frame.layout().stride(0);
+        let bytes = frame.plane(0);
+        for row in 0..80_usize {
+            for column in 0..160_usize {
+                let centre = [column as f64 + 0.5, row as f64 + 0.5];
+                let world = viewport.drawable_to_world(centre).expect("in the window");
+                // The corners around the world point, and how far it is
+                // between them, on the torus.
+                let [x, y] = [world[0] * 4.0 / 8.0, world[1] * 2.0 / 4.0];
+                let [x0, y0] = [x.floor(), y.floor()];
+                let [fx, fy] = [x - x0, y - y0];
+                let [x0, y0] = [x0 as i64, y0 as i64];
+                let blend = |channel: fn(LinearRgba) -> f64| {
+                    let top = channel(texel(x0, y0)) * (1.0 - fx) + channel(texel(x0 + 1, y0)) * fx;
+                    let bottom = channel(texel(x0, y0 + 1)) * (1.0 - fx)
+                        + channel(texel(x0 + 1, y0 + 1)) * fx;
+                    top * (1.0 - fy) + bottom * fy
+                };
+                let at = row * stride + column * 8;
+                for (channel, offset) in [
+                    (blend(|c| c.r), 0),
+                    (blend(|c| c.g), 2),
+                    (blend(|c| c.b), 4),
+                ] {
+                    let drawn = half(bytes, at + offset);
+                    worst = worst.max((drawn - channel).abs());
+                    assert!(
+                        (drawn - channel).abs() <= 2e-3,
+                        "{center:?} x{zoom}: pixel ({column}, {row}) at world {world:?}: \
+                         {drawn} != {channel}"
+                    );
+                }
+            }
         }
     }
-
-    // Center (0.5, 2): the window starts at x = -3.5, a quarter of the way
-    // into cell -2 (corner 2 to corner 3); y = 0 is aligned.
-    let panned = view(&fitted, [0.5, 2.0], 1.0);
-    let (vertices, indices) = panned
-        .periodic_grid([4, 2], ["v", "i"], shade)
-        .expect("a grid");
-    let columns = 4 + 2;
-    assert_eq!(vertices.len(), columns * 3);
-    assert_eq!(indices.len(), (columns - 1) * 2 * 6);
-    let xs: Vec<f64> = vertices[..columns].iter().map(|v| v.point[0]).collect();
-    assert_eq!(xs, vec![-4.0, -2.5, -0.5, 1.5, 3.5, 4.0]);
-    for row in 0..3 {
-        let first = &vertices[row * columns];
-        let last = &vertices[row * columns + columns - 1];
-        assert_eq!(first.color, last.color, "the seam's two images agree");
-        let (a, b) = (shade([2, row % 2]), shade([3, row % 2]));
-        assert!((first.color.r - (0.75 * a.r + 0.25 * b.r)).abs() < 1e-12);
-        assert!((first.color.b - (0.75 * a.b + 0.25 * b.b)).abs() < 1e-12);
-        let corners: Vec<f64> = vertices[row * columns + 1..row * columns + columns - 1]
-            .iter()
-            .map(|v| v.color.r)
-            .collect();
-        assert_eq!(corners, vec![3.0, 0.0, 1.0, 2.0]);
-    }
-    // Both axes cut: center (0.5, 1.5) also starts the window at y = -0.5,
-    // three quarters into cell -1 (corner 1 to corner 0). The window's four
-    // corners are one torus point, coloured by the bilinear blend.
-    let both = view(&fitted, [0.5, 1.5], 1.0);
-    let (cut, _) = both
-        .periodic_grid([4, 2], ["v", "i"], shade)
-        .expect("a grid");
-    assert_eq!(cut.len(), 6 * 4);
-    let corner = cut[0].color;
-    let blend = |channel: fn(LinearRgba) -> f64| {
-        0.75 * 0.25 * channel(shade([2, 1]))
-            + 0.75 * 0.75 * channel(shade([2, 0]))
-            + 0.25 * 0.25 * channel(shade([3, 1]))
-            + 0.25 * 0.75 * channel(shade([3, 0]))
-    };
-    assert!((corner.g - 0.25).abs() < 1e-12, "{corner:?}");
-    assert!((corner.b - blend(|c| c.b)).abs() < 1e-12, "{corner:?}");
-    for at in [5, 18, 23] {
-        assert_eq!(cut[at].color, corner);
-    }
-    // Every vertex is in the window, which is centered.
-    assert!(
-        vertices
-            .iter()
-            .all(|v| v.point[0].abs() <= 4.0 && v.point[1].abs() <= 2.0)
-    );
-
-    assert!(matches!(
-        fitted.periodic_grid([0, 2], ["v", "i"], shade),
-        Err(CoreError::NumericalInvalid { .. })
-    ));
+    println!("the largest difference from the torus blend: {worst:.2e}");
 }
 
 #[test]

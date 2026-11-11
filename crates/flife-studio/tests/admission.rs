@@ -64,7 +64,7 @@ fn the_studio_is_admitted_with_its_observers_and_the_backend_gets_the_rest() {
         founding.reserved_bytes() * slots
             + view.reserved_bytes()
             + view.frame_bytes()
-            + 2 * view.preparation_limit()
+            + 2 * (view.preparation_limit() + view.texel_bytes())
             + 3840 * 2160 * DEVICE_BYTES_PER_PIXEL
             + tiles * 4
     );

@@ -36,7 +36,9 @@
 
 use flife_core::CoreError;
 use fmn_core::color::LinearRgba;
-use fmn_render::{CameraConfig, CameraFrame, DEFAULT_FOVY, SurfaceVertex, ThreeDCamera};
+use fmn_render::{
+    CameraConfig, CameraFrame, DEFAULT_FOVY, SurfaceMesh, SurfaceVertex, ThreeDCamera,
+};
 
 /// The deepest zoom: 4,096 times the whole-torus fit.
 pub const MAXIMUM_ZOOM: f64 = 4096.0;
@@ -441,76 +443,51 @@ impl Viewport {
         .map_err(refused)
     }
 
-    /// A periodic grid of `cells` (columns, rows) covering the torus once,
-    /// placed in the window as a smoothly shaded mesh: vertices on cell
-    /// corners, each coloured by `corner([column, row])` for corner indices
-    /// in `[0, columns) × [0, rows)` (corner `columns` is corner 0).
+    /// The quad that draws a periodic texture of `cells` (columns, rows)
+    /// over the torus once (FL-033): the window's image, `[lo, lo + L]` on
+    /// each axis, with texture coordinates that put texel `k` of an axis on
+    /// the torus's corner at `L · k / n`.
     ///
-    /// Where the window starts inside a cell, the grid is cut there: the
-    /// window's two edges get vertices whose colours interpolate the cut
-    /// cell's corners linearly, as the shading along that edge would. At
-    /// [`Viewport::fit`] no cell is cut, and the grid is the corner lattice
-    /// at `L · k / n`.
+    /// A texel is sampled at its centre: coordinate `u` on an axis of `n`
+    /// texels lands on texel `u · n − ½`. The quad's coordinates are
+    /// `lo / L + ½ / n` at the window's start and one more at its end, so
+    /// the corner at world `L · k / n` lands on texel `k` exactly, and the
+    /// sampler interpolates bilinearly between corners. The texture
+    /// repeats, so a window that starts inside a cell, or crosses the seam,
+    /// shows the cells it cuts without a seam. Texture rows run top to
+    /// bottom, the world's y order.
     ///
-    /// Returns the vertices, rows top to bottom, and two triangles per cell.
+    /// Returns two triangles over four textured vertices facing the camera,
+    /// at full opacity.
     ///
     /// # Errors
-    /// [`CoreError::NumericalInvalid`] for an empty grid;
-    /// [`CoreError::AllocationFailed`] naming `buffers` (vertices, indices)
-    /// when either cannot be reserved.
-    pub fn periodic_grid(
-        &self,
-        cells: [usize; 2],
-        buffers: [&'static str; 2],
-        mut corner: impl FnMut([usize; 2]) -> LinearRgba,
-    ) -> Result<(Vec<SurfaceVertex>, Vec<u32>), CoreError> {
+    /// [`CoreError::NumericalInvalid`] for an empty axis, or if FrankenManim
+    /// refuses the mesh.
+    pub fn periodic_quad(&self, cells: [u32; 2]) -> Result<SurfaceMesh, CoreError> {
+        let refused = |detail: String| CoreError::NumericalInvalid {
+            quantity: "periodic quad",
+            detail,
+        };
         if cells.contains(&0) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "periodic grid",
-                detail: format!("{cells:?} cells must be at least one each way"),
-            });
+            return Err(refused(format!(
+                "{cells:?} cells must be at least one each way"
+            )));
         }
         let start = self.window_start();
-        let columns = grid_lines(self.extent[0], start[0], cells[0]);
-        let rows = grid_lines(self.extent[1], start[1], cells[1]);
-        let count = columns.len() * rows.len();
-        let mut vertices = Vec::new();
-        vertices
-            .try_reserve_exact(count)
-            .map_err(|_| allocation(buffers[0], count, size_of::<SurfaceVertex>()))?;
-        for row in &rows {
-            for column in &columns {
-                let color = blend(column, row, &mut corner);
-                vertices.push(SurfaceVertex::colored(
-                    [
-                        column.offset - self.extent[0] / 2.0,
-                        self.extent[1] / 2.0 - row.offset,
-                        0.0,
-                    ],
-                    [0.0, 0.0, 1.0],
-                    color,
-                ));
-            }
-        }
-        let quads = (columns.len() - 1) * (rows.len() - 1);
-        let mut indices = Vec::new();
-        indices
-            .try_reserve_exact(quads * 6)
-            .map_err(|_| allocation(buffers[1], quads * 6, size_of::<u32>()))?;
-        let stride = columns.len();
-        for row in 0..rows.len() - 1 {
-            for column in 0..stride - 1 {
-                let at = |c: usize, r: usize| u32::try_from(r * stride + c).unwrap_or(u32::MAX);
-                let (a, b, c, d) = (
-                    at(column, row),
-                    at(column + 1, row),
-                    at(column + 1, row + 1),
-                    at(column, row + 1),
-                );
-                indices.extend_from_slice(&[a, b, c, a, c, d]);
-            }
-        }
-        Ok((vertices, indices))
+        let [u, v] =
+            [0, 1].map(|axis| start[axis] / self.extent[axis] + 0.5 / f64::from(cells[axis]));
+        let [x, y] = self.extent.map(|extent| extent / 2.0);
+        let vertex = |point: [f64; 2], uv: [f64; 2]| {
+            SurfaceVertex::textured([point[0], point[1], 0.0], [0.0, 0.0, 1.0], uv, 1.0)
+        };
+        let vertices = vec![
+            vertex([-x, y], [u, v]),
+            vertex([x, y], [u + 1.0, v]),
+            vertex([-x, -y], [u, v + 1.0]),
+            vertex([x, -y], [u + 1.0, v + 1.0]),
+        ];
+        SurfaceMesh::new(vertices, vec![0, 1, 3, 0, 3, 2])
+            .map_err(|error| refused(error.to_string()))
     }
 }
 
@@ -519,107 +496,4 @@ fn wrap(value: f64, length: f64) -> f64 {
     let wrapped = value.rem_euclid(length);
     // A tiny negative value wraps to `length` itself in floating point.
     if wrapped >= length { 0.0 } else { wrapped }
-}
-
-/// One vertex line of a periodic grid along an axis: its offset into the
-/// window and the corner colour it takes, `(1 − weight) · from + weight ·
-/// to`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Line {
-    offset: f64,
-    from: usize,
-    to: usize,
-    weight: f64,
-}
-
-/// The vertex lines of `count` cells of a periodic axis of `length` in the
-/// window from `start`.
-fn grid_lines(length: f64, start: f64, count: usize) -> Vec<Line> {
-    let n = count as f64;
-    let boundary = |k: i64| length * k as f64 / n;
-    let index = |k: i64| {
-        // `count` is a cell count far below `i64::MAX`.
-        usize::try_from(k.rem_euclid(count as i64)).unwrap_or(0)
-    };
-    // The cell the window starts in.
-    let first = (start / length * n).floor();
-    let first = if first.is_finite() { first as i64 } else { 0 };
-    let mut lines = Vec::with_capacity(count + 2);
-    if boundary(first) == start {
-        // Aligned: the corner lattice itself, `count + 1` lines.
-        for k in first..=first + count as i64 {
-            let corner = index(k);
-            lines.push(Line {
-                offset: boundary(k) - start,
-                from: corner,
-                to: corner,
-                weight: 0.0,
-            });
-        }
-        return lines;
-    }
-    // Cut: the window's edges fall inside cell `first`.
-    let low = boundary(first);
-    let weight = ((start - low) / (boundary(first + 1) - low)).clamp(0.0, 1.0);
-    let edge = |offset: f64| Line {
-        offset,
-        from: index(first),
-        to: index(first + 1),
-        weight,
-    };
-    lines.push(edge(0.0));
-    for k in first + 1..=first + count as i64 {
-        let corner = index(k);
-        lines.push(Line {
-            offset: (boundary(k) - start).clamp(0.0, length),
-            from: corner,
-            to: corner,
-            weight: 0.0,
-        });
-    }
-    lines.push(edge(length));
-    lines
-}
-
-/// The colour at a vertex on `column` and `row`: the corner itself when
-/// neither line is cut, otherwise the bilinear blend of the cut cell's
-/// corners.
-fn blend(
-    column: &Line,
-    row: &Line,
-    corner: &mut impl FnMut([usize; 2]) -> LinearRgba,
-) -> LinearRgba {
-    if column.weight == 0.0 && row.weight == 0.0 {
-        return corner([column.from, row.from]);
-    }
-    let mut sum = [0.0; 4];
-    for (x, wx) in [
-        (column.from, 1.0 - column.weight),
-        (column.to, column.weight),
-    ] {
-        for (y, wy) in [(row.from, 1.0 - row.weight), (row.to, row.weight)] {
-            let weight = wx * wy;
-            if weight == 0.0 {
-                continue;
-            }
-            let color = corner([x, y]);
-            sum[0] += weight * color.r;
-            sum[1] += weight * color.g;
-            sum[2] += weight * color.b;
-            sum[3] += weight * color.a;
-        }
-    }
-    LinearRgba {
-        r: sum[0],
-        g: sum[1],
-        b: sum[2],
-        a: sum[3],
-    }
-}
-
-fn allocation(buffer: &'static str, count: usize, each: usize) -> CoreError {
-    CoreError::AllocationFailed {
-        buffer,
-        bytes: u64::try_from(count.saturating_mul(each)).unwrap_or(u64::MAX),
-    }
 }

@@ -758,7 +758,7 @@ caught.
   (13.47 MiB), the introduced genomes' parameters (136.55 MiB) and the state's room to its bound (1.34 MiB).
 - `a_render_holds_no_more_heap_than_a_plain_run_and_its_render_term`: the preset rendered at 1280 x 720 for 8 ticks
   every 2, in points and in density, holds at most the heap of the same world stepped without observers plus the
-  admitted render term (observers held 57.3 MiB above the plain run, against a term of 315.4 MiB, which charges
+  admitted render term (observers held 52.7 MiB above the plain run, against a term of 302.5 MiB, which charges
   incompressible frames and the full ceiling).
 - `a_renders_term_is_its_observers_and_a_short_budget_encodes_fewer_frames`: at 320 x 180 the term is exactly the
   feed, the view's buffers, the frame's job, the CPU route's buffers and four encodings. A budget with room for two
@@ -767,10 +767,13 @@ caught.
   at 96 x 64 to 1920 x 1080 holds, with the frame, at most 47.8 bytes a pixel (noise at 640 x 360), within the
   allowance.
 - `a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes`: a view of the preset at its 16,384 ceiling, shown
-  twice in points and twice in density, holds 14.49 of its 16.41 MiB at 1280 x 720 and 45.56 of 47.82 at 4K.
+  twice in points and twice in density, holds 9.37 of its 9.61 MiB at 1280 x 720 and 15.93 of 16.20 at 4K (FL-033's
+  textures; the vertex grids held 14.49 of 16.41 and 45.56 of 47.82).
 - `a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms`: a 4K CPU frame of that world holds its draw list
   within what `frame_bytes` adds to the preparation limit (7.75 MiB in points), its job within `frame_bytes`
-  (86.5 MiB of 236.2 in points, 178.8 in density) and, above the job, within `offline_bytes` (55.6 of 95.5 MiB).
+  (72.1 MiB of 88.8 in points, 0.01 in density) and, above the job, within `offline_bytes` (55.6 of 95.5 MiB).
+  FL-033 found the job's heap above FrankenManim's accounting once the grids' triangle allowance was gone (72.1 MiB
+  against a `frame_bytes` of 56.8); `JOB_BYTES_PER_DRAW` now charges it.
 
 Eleven planted mutants were run against these tests and `flife-engine`'s, `flife-backend-cpu`'s and
 `flife-backend-metal`'s FL-043 tests, and every one was caught: the source supports, the lanes at a new worker

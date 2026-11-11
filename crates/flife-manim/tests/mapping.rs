@@ -12,7 +12,21 @@ use flife_manim::{
     speed_level, traits, wheel,
 };
 use flife_render::FieldTexture;
-use fmn_render::ThreeDDraw;
+use fmn_core::color::LinearRgba;
+use fmn_render::{SurfaceMaterial, Texture, TextureWrap, ThreeDDraw};
+
+/// Every texel of `texture`, rows top to bottom, unpremultiplied.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn texels(texture: &Texture) -> Vec<LinearRgba> {
+    (0..texture.height())
+        .flat_map(|row| {
+            (0..texture.width()).map(move |column| texture.texel(column, row).expect("a texel"))
+        })
+        .collect()
+}
 
 #[expect(
     clippy::expect_used,
@@ -280,13 +294,10 @@ fn the_raw_look_has_no_halos_and_a_linear_grey_field() {
     assert_eq!(view.cloud().draws().len(), epoch.len());
     let job_draws = view.draws().expect("draws").len();
     assert_eq!(job_draws, 1 + epoch.len(), "the field and one dot each");
-    let Some(ThreeDDraw::Surface(field)) = view.field().draw() else {
-        panic!("the field draws one surface");
-    };
+    assert!(matches!(view.field().draw(), Some(ThreeDDraw::Surface(_))));
     let scale = view.field().scale();
     assert!(scale > 0.0);
-    for vertex in field.mesh.vertices() {
-        let colour = vertex.color;
+    for colour in texels(view.field().texture().expect("the field's texture")) {
         assert!(colour.r == colour.g && colour.g == colour.b && colour.a == 1.0);
         assert!((0.0..=1.0).contains(&colour.r));
     }
@@ -345,8 +356,14 @@ fn density_counts_every_organism_once_in_its_own_bin() {
     assert_eq!(density_level(3, 0.0, Look::Raw), 0.0);
 }
 
+/// FL-033: the density layer is one texture of its bin corners on the
+/// viewport's periodic quad, drawn as a repeating image. Texel
+/// `(column, row)` is the premultiplied mean of bins `column - 1` and
+/// `column` by `row - 1` and `row`, wrapping: its opacity is the mean of
+/// their levels, and its colour, recounted here from the epoch, the
+/// level-weighted mean of their colours.
 #[test]
-fn the_density_grid_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
+fn the_density_texture_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
     let config = common::small();
     let mut world = common::found(&config);
     common::advance(&mut world, 30);
@@ -359,30 +376,105 @@ fn the_density_grid_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
     view.set_style(density);
     view.show(&epoch).expect("show");
     assert!(view.cloud().draws().is_empty() && view.cloud().halos().is_empty());
-    let Some(ThreeDDraw::Surface(grid)) = view.density().draw() else {
+    let Some(ThreeDDraw::Surface(layer)) = view.density().draw() else {
         panic!("the density layer draws one surface");
     };
-    assert!(!grid.depth_test);
-    let [columns, rows] = view.density().bins().map(|n| n as usize);
-    let vertices = grid.mesh.vertices();
-    assert_eq!(vertices.len(), (columns + 1) * (rows + 1));
-    let stride = columns + 1;
-    for row in 0..=rows {
-        assert_eq!(
-            vertices[row * stride].color,
-            vertices[row * stride + columns].color
-        );
+    assert!(!layer.depth_test);
+    let SurfaceMaterial::Texture(material) = layer.material else {
+        panic!("the density layer is textured");
+    };
+    // An image, not a surface: a surface would discard clear texels and
+    // replace their opacity with the vertices', drawing the bins opaque.
+    assert!(material.dark.is_none() && !material.discard_transparent);
+    assert_eq!(
+        (material.sampler.wrap_u, material.sampler.wrap_v),
+        (TextureWrap::Repeat, TextureWrap::Repeat),
+        "the texture wraps with the torus"
+    );
+    let bins = view.density().bins();
+    assert_eq!(
+        layer.mesh,
+        &view.viewport().periodic_quad(bins).expect("a quad"),
+        "on the viewport's periodic quad"
+    );
+    let texture = view.density().texture().expect("the density's texture");
+    assert!(std::ptr::eq(material.light, texture));
+    assert_eq!((texture.width(), texture.height()), (bins[0], bins[1]));
+    let [columns, rows] = bins.map(|n| n as usize);
+    let counts = view.density().counts();
+    let scale = view.density().scale();
+    let level = |column: usize, row: usize| {
+        density_level(
+            counts[(row % rows) * columns + column % columns],
+            scale,
+            Look::Glow,
+        )
+    };
+    let shown = texels(texture);
+    for row in 0..rows {
+        for column in 0..columns {
+            let (left, up) = (column + columns - 1, row + rows - 1);
+            let mean =
+                (level(left, up) + level(column, up) + level(left, row) + level(column, row)) / 4.0;
+            let alpha = shown[row * columns + column].a;
+            assert!(
+                (alpha - mean).abs() <= 1e-6,
+                "corner ({column}, {row}): {alpha} != {mean}"
+            );
+        }
     }
-    for column in 0..=columns {
-        assert_eq!(
-            vertices[column].color,
-            vertices[rows * stride + column].color
-        );
+    // Each bin's colour, recounted from the epoch: the mean mapped colour
+    // of its organisms.
+    let [width, height] = epoch.extent();
+    let speed = epoch.maximum_speed();
+    let mut sums = vec![[0.0_f64; 3]; columns * rows];
+    for (&[x, y], row_traits) in epoch.positions().iter().zip(traits(&epoch)) {
+        let column = ((f64::from(x) / width * columns as f64).floor() as usize).min(columns - 1);
+        let row = ((f64::from(y) / height * rows as f64).floor() as usize).min(rows - 1);
+        let colour = mapped_color(density.mapping, &row_traits, speed);
+        let sum = &mut sums[row * columns + column];
+        sum[0] += colour.r;
+        sum[1] += colour.g;
+        sum[2] += colour.b;
     }
-    assert_eq!(vertices[0].point, view.viewport().scene_point([0.0, 0.0]));
-    // Glow: translucent over the field, empty bins clear.
-    assert!(vertices.iter().any(|vertex| vertex.color.a == 0.0));
-    assert!(vertices.iter().any(|vertex| vertex.color.a > 0.0));
+    let mut coloured = 0;
+    for row in 0..rows {
+        for column in 0..columns {
+            let (left, up) = ((column + columns - 1) % columns, (row + rows - 1) % rows);
+            let mut premultiplied = [0.0_f64; 4];
+            for cell in [
+                up * columns + left,
+                up * columns + column,
+                row * columns + left,
+                row * columns + column,
+            ] {
+                if counts[cell] == 0 {
+                    continue;
+                }
+                let level = density_level(counts[cell], scale, Look::Glow);
+                for channel in 0..3 {
+                    premultiplied[channel] += sums[cell][channel] / f64::from(counts[cell]) * level;
+                }
+                premultiplied[3] += level;
+            }
+            if premultiplied[3] == 0.0 {
+                continue;
+            }
+            let texel = shown[row * columns + column];
+            for (got, sum) in [texel.r, texel.g, texel.b].into_iter().zip(premultiplied) {
+                let want = sum / premultiplied[3];
+                assert!(
+                    (got - want).abs() <= 1e-5,
+                    "corner ({column}, {row}): {got} != {want}"
+                );
+            }
+            coloured += 1;
+        }
+    }
+    assert!(coloured > 0);
+    // Glow: translucent over the field, empty corners clear.
+    assert!(shown.iter().any(|colour| colour.a == 0.0));
+    assert!(shown.iter().any(|colour| colour.a > 0.0 && colour.a < 1.0));
     assert_eq!(view.draws().expect("draws").len(), 2, "field and density");
     let glow = view.render_rgba8(2).expect("a glow density frame");
 
@@ -392,12 +484,32 @@ fn the_density_grid_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
         ..density
     });
     view.show(&epoch).expect("show");
-    let Some(ThreeDDraw::Surface(grid)) = view.density().draw() else {
-        panic!("the density layer draws one surface");
+    assert!(matches!(
+        view.density().draw(),
+        Some(ThreeDDraw::Surface(_))
+    ));
+    let counts = view.density().counts();
+    let scale = view.density().scale();
+    let level = |column: usize, row: usize| {
+        density_level(
+            counts[(row % rows) * columns + column % columns],
+            scale,
+            Look::Raw,
+        )
     };
-    for vertex in grid.mesh.vertices() {
-        let colour = vertex.color;
-        assert!(colour.r == colour.g && colour.g == colour.b && colour.a == 1.0);
+    let shown = texels(view.density().texture().expect("the density's texture"));
+    for row in 0..rows {
+        for column in 0..columns {
+            let colour = shown[row * columns + column];
+            assert!(colour.r == colour.g && colour.g == colour.b && colour.a == 1.0);
+            let (left, up) = (column + columns - 1, row + rows - 1);
+            let mean =
+                (level(left, up) + level(column, up) + level(left, row) + level(column, row)) / 4.0;
+            assert!(
+                (colour.r - mean).abs() <= 1e-6,
+                "raw grey is the mean level"
+            );
+        }
     }
     assert_eq!(view.draws().expect("draws").len(), 1, "density alone");
     let raw = view.render_rgba8(2).expect("a raw density frame");
@@ -482,17 +594,13 @@ fn the_raw_field_is_linear_in_the_density() {
     let plane: Vec<f32> = (0..32).map(|cell| (cell % 8) as f32).collect();
     let texture = FieldTexture::from_plane([8, 4], [1.0, 1.0], &plane).expect("a texture");
     layer.update_look(&texture, Look::Raw).expect("update");
-    let Some(ThreeDDraw::Surface(draw)) = layer.draw() else {
-        panic!("the layer draws one surface");
-    };
-    let vertices = draw.mesh.vertices();
-    assert_eq!(vertices[9].color.r, 0.5);
-    assert_eq!(vertices[9 + 1].color.r, raw_value(0.5, 7.0));
-    assert_eq!(vertices[9 + 4].color.r, raw_value(3.5, 7.0));
-    assert!(
-        vertices[9 + 1].color.r < 0.5_f64.powi(2),
-        "linear, not a square root"
-    );
+    let field = layer.texture().expect("the layer's texture");
+    let red = |column| field.texel(column, 1).expect("a texel").r;
+    let stored = |value: f64| f64::from(value as f32);
+    assert_eq!(red(0), 0.5);
+    assert_eq!(red(1), stored(raw_value(0.5, 7.0)));
+    assert_eq!(red(4), stored(raw_value(3.5, 7.0)));
+    assert!(red(1) < 0.5_f64.powi(2), "linear, not a square root");
 }
 
 #[test]

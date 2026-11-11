@@ -4,11 +4,11 @@
 mod common;
 
 use flife_manim::{
-    FIELD_PALETTE, FieldLayer, HALO_ALPHA, ParticleCloud, SCALE_DECAY, Viewport, WorldView,
+    FIELD_PALETTE, FieldLayer, HALO_ALPHA, Look, ParticleCloud, SCALE_DECAY, Viewport, WorldView,
     display_value, halo_factor, lineage_color, palette,
 };
 use flife_render::FieldTexture;
-use fmn_render::{SurfaceMaterial, ThreeDDraw};
+use fmn_render::{SurfaceMaterial, TextureWrap, ThreeDDraw};
 
 #[expect(
     clippy::expect_used,
@@ -45,11 +45,17 @@ fn the_palette_runs_dark_to_bright_and_the_scale_is_a_square_root() {
     assert_eq!(display_value(1.0, 0.0), 0.0);
 }
 
+/// FL-033: the field is one texture of its corner colours on the
+/// viewport's periodic quad, drawn as an image: unlit, repeating, under the
+/// organisms. Texel `(column, row)` is the palette colour of the mean of
+/// the four field texels around that corner, wrapping, so the seam joins
+/// its two sides' colours.
 #[test]
-fn the_field_grid_covers_the_torus_without_a_seam() {
+fn the_field_texture_covers_the_torus_without_a_seam() {
     let viewport = fit([8.0, 4.0], [160, 80]);
     let mut layer = FieldLayer::new(&viewport);
     assert!(layer.draw().is_none(), "nothing before a field is shown");
+    assert!(layer.texture().is_none());
     // A ramp along x: the seam joins its brightest and darkest columns.
     let plane: Vec<f32> = (0..32).map(|cell| (cell % 8) as f32).collect();
     layer.update(&texture([8, 4], &plane)).expect("update");
@@ -57,35 +63,64 @@ fn the_field_grid_covers_the_torus_without_a_seam() {
     let Some(ThreeDDraw::Surface(draw)) = layer.draw() else {
         panic!("the layer draws one surface");
     };
-    assert!(matches!(draw.material, SurfaceMaterial::VertexColor));
+    let SurfaceMaterial::Texture(material) = draw.material else {
+        panic!("the field is textured");
+    };
+    assert!(material.dark.is_none() && !material.discard_transparent);
+    assert_eq!(
+        (material.sampler.wrap_u, material.sampler.wrap_v),
+        (TextureWrap::Repeat, TextureWrap::Repeat),
+        "the texture wraps with the torus"
+    );
+    assert_eq!(draw.shading, [0.0; 3], "unlit");
     assert!(!draw.depth_test, "the field stays under the organisms");
-    let vertices = draw.mesh.vertices();
-    assert_eq!(vertices.len(), 9 * 5, "texel corners, both seams included");
-    // The corners span the world exactly.
-    let first = vertices[0].point;
-    let last = vertices[vertices.len() - 1].point;
-    assert_eq!(first, viewport.scene_point([0.0, 0.0]));
-    assert_eq!(last, viewport.scene_point([8.0, 4.0]));
-    // Wrapping: the left and right edges, and the top and bottom, match.
-    for row in 0..5 {
-        assert_eq!(
-            vertices[row * 9].color,
-            vertices[row * 9 + 8].color,
-            "row {row}"
-        );
-    }
-    for column in 0..9 {
-        assert_eq!(vertices[column].color, vertices[4 * 9 + column].color);
+    let field = layer.texture().expect("the layer's texture");
+    assert!(std::ptr::eq(material.light, field));
+    assert_eq!(
+        (field.width(), field.height()),
+        (8, 4),
+        "a texel per corner"
+    );
+    assert_eq!(
+        draw.mesh,
+        &viewport.periodic_quad([8, 4]).expect("a quad"),
+        "on the viewport's periodic quad"
+    );
+
+    let shade = |mean: f64| {
+        let [r, g, b] = palette(display_value(mean as f32, 7.0));
+        let linear = fmn_core::color::Srgb::from_rgb8(r, g, b).to_linear(1.0);
+        [linear.r, linear.g, linear.b].map(|channel| f64::from(channel as f32))
+    };
+    for row in 0..4 {
+        for column in 0..8 {
+            // Columns column - 1 and column, wrapping, in every row.
+            let mean = f64::from((column + 7) % 8 + column) / 2.0;
+            let texel = field.texel(column, row).expect("a texel");
+            assert_eq!(
+                [texel.r, texel.g, texel.b],
+                shade(mean),
+                "corner ({column}, {row})"
+            );
+            assert_eq!(texel.a, 1.0, "opaque");
+        }
     }
     // The seam corner averages column 7 (bright) with column 0 (dark); the
     // next corner averages columns 0 and 1.
-    let shade = |mean: f64| {
-        let [r, g, b] = palette(display_value(mean as f32, 7.0));
-        fmn_core::color::Srgb::from_rgb8(r, g, b).to_linear(1.0)
+    assert_eq!(shade((7.0 + 0.0) / 2.0), shade(3.5));
+    assert_ne!(field.texel(0, 1), field.texel(1, 1));
+
+    // A pan moves the quad's texture coordinates, not the texture.
+    let panned = viewport.with_view([1.0, 2.0], 2.0).expect("a view");
+    layer.refit(&panned);
+    layer
+        .place(&texture([8, 4], &plane), Look::Glow)
+        .expect("placed");
+    let Some(ThreeDDraw::Surface(draw)) = layer.draw() else {
+        panic!("the layer draws one surface");
     };
-    assert_eq!(vertices[9].color, shade(3.5));
-    assert_eq!(vertices[9 + 1].color, shade(0.5));
-    assert_ne!(vertices[9].color, vertices[9 + 1].color);
+    assert_eq!(draw.mesh, &panned.periodic_quad([8, 4]).expect("a quad"));
+    assert_eq!(layer.scale(), 7.0, "a placement keeps the scale");
 }
 
 #[test]

@@ -718,6 +718,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("topology-catalog-v1", Role::ColorMapping, "§13.4", "FL-019")
     },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale",
+        },
+        ..entry(
+            "affinity-projection-v1",
+            Role::ColorMapping,
+            "§13.4",
+            "FL-019",
+        )
+    },
     entry(
         "committed-states-one-epoch-late",
         Role::Interpolation,

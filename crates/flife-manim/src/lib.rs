@@ -42,10 +42,11 @@ pub use density::{
 };
 pub use field::{FIELD_PALETTE, FieldLayer, SCALE_DECAY, display_value, palette, raw_value};
 pub use mapping::{
-    ColorMapping, ENERGY_HALF, ENERGY_RAMP, GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE,
-    Look, MOTION_STILL, MOTION_WHEEL, Particles, Style, TOPOLOGY_PALETTE, Traits, energy_level,
-    generation_level, heading, lineage_color, lineage_slot, linear, mapped_color, mapped_rgb8, mix,
-    ramp, speed_level, traits, wheel,
+    AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, ColorMapping, ENERGY_HALF, ENERGY_RAMP,
+    GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL,
+    Particles, Style, TOPOLOGY_PALETTE, Traits, affinity_rgb8, energy_level, generation_level,
+    heading, lineage_color, lineage_slot, linear, mapped_color, mapped_rgb8, mix, ramp,
+    speed_level, traits, wheel,
 };
 pub use selection::{
     PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,

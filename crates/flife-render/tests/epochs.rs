@@ -12,8 +12,8 @@ use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_engine::{Arrangement, World};
 use flife_render::{
-    Bounds, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel, FieldTexture, Gap, Lease, Match,
-    Publication, Publisher, ROUNDING_MARGIN, View, pairs,
+    AFFINITY_AXES, Bounds, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel, FieldTexture, Gap, Lease,
+    Match, Publication, Publisher, ROUNDING_MARGIN, View, affinity_projection, pairs,
 };
 
 #[expect(
@@ -54,6 +54,47 @@ fn shown(coordinate: f64, length: f64) -> f32 {
     }
 }
 
+/// The 32 × 32 Sylvester Hadamard matrix by its recursion
+/// `H₂ₙ = [[Hₙ, Hₙ], [Hₙ, −Hₙ]]` from `H₁ = [1]`, independently of the
+/// crate's popcount form.
+fn hadamard() -> Vec<Vec<f64>> {
+    let mut matrix = vec![vec![1.0]];
+    while matrix.len() < 32 {
+        let n = matrix.len();
+        let mut next = vec![vec![0.0; 2 * n]; 2 * n];
+        for row in 0..n {
+            for column in 0..n {
+                let value = matrix[row][column];
+                next[row][column] = value;
+                next[row][column + n] = value;
+                next[row + n][column] = value;
+                next[row + n][column + n] = -value;
+            }
+        }
+        matrix = next;
+    }
+    matrix
+}
+
+/// The affinity view an epoch must show for `affinity` under the norm limit
+/// `limit`: rows 7, 14 and 25 of [`hadamard`], dotted in channel order,
+/// over `√32 × limit`, clamped and rounded to F32.
+fn projected(affinity: &[f64], limit: f64) -> [f32; 3] {
+    let matrix = hadamard();
+    [7, 14, 25].map(|row: usize| {
+        let dot = matrix[row]
+            .iter()
+            .zip(affinity)
+            .fold(
+                0.0_f64,
+                |sum, (&sign, &value)| {
+                    if sign > 0.0 { sum + value } else { sum - value }
+                },
+            );
+        (dot / (32.0_f64.sqrt() * limit)).clamp(-1.0, 1.0) as f32
+    })
+}
+
 /// Every view of `epoch` against `world`'s committed rows.
 #[expect(
     clippy::expect_used,
@@ -89,9 +130,22 @@ fn assert_shows(epoch: &Epoch, world: &World) {
         assert_eq!(epoch.energies()[row], organism.energy as f32);
         assert_eq!(epoch.lineages()[row], organism.lineage.get());
         assert_eq!(epoch.generations()[row], organism.generation.get());
-        let topology = population.genome(organism.id).expect("genome").topology();
-        assert_eq!(usize::from(epoch.topologies()[row]), topology.index());
+        let genome = population.genome(organism.id).expect("genome");
+        assert_eq!(
+            usize::from(epoch.topologies()[row]),
+            genome.topology().index()
+        );
+        assert_eq!(
+            epoch.affinities()[row].map(f32::to_bits),
+            projected(
+                genome.traits().affinity(),
+                world.trait_limits().affinity_norm()
+            )
+            .map(f32::to_bits),
+            "row {row}"
+        );
     }
+    assert_eq!(epoch.affinity_limit(), world.trait_limits().affinity_norm());
     let metrics = epoch.metrics();
     assert_eq!(metrics.tick, world.tick());
     assert_eq!(metrics.live, rows.len() as u64);
@@ -184,6 +238,7 @@ fn an_epoch_shows_exactly_one_committed_world() {
             (View::Lineage, Dtype::U64, 1),
             (View::Generation, Dtype::U32, 1),
             (View::Topology, Dtype::U8, 1),
+            (View::Affinity, Dtype::F32, 3),
             (View::Field, Dtype::F32, 1),
         ]
     );
@@ -191,12 +246,13 @@ fn an_epoch_shows_exactly_one_committed_world() {
         layouts.map(|layout| layout.view).to_vec(),
         View::ALL.to_vec()
     );
-    for layout in &layouts[..7] {
+    for layout in &layouts[..8] {
         assert_eq!(layout.count, lease.len());
     }
     assert_eq!(layouts[1].bounds, Bounds::Wrapped([32.0, 32.0]));
     assert_eq!(layouts[2].bounds, Bounds::Magnitude(4.0));
-    assert_eq!(layouts[7].count, 32 * 32);
+    assert_eq!(layouts[7].bounds, Bounds::Magnitude(1.0));
+    assert_eq!(layouts[8].count, 32 * 32);
 
     let texture = lease.field();
     let grid = world.field().grid();
@@ -368,7 +424,7 @@ fn slots_are_allocated_once_and_never_grow() {
     let config = ecology(&[("population", "maximum_count", "72")]);
     let mut world = found(&config, Arrangement::FreeList);
     let mut publisher = publisher(&world);
-    let row = 8 + 8 + 8 + 4 + 8 + 4 + 1;
+    let row = 8 + 8 + 8 + 4 + 8 + 4 + 1 + 12;
     let slot = 72 * row + 32 * 32 * 4;
     assert_eq!(publisher.reserved_bytes(), 3 * slot);
     let viewer = publisher.feed().viewer(1).expect("viewer");
@@ -489,4 +545,107 @@ fn selection_is_by_identity() {
     assert_eq!(lease.row(OrganismId::new(47)), Some(47));
     assert_eq!(lease.row(OrganismId::new(48)), None);
     assert_eq!(lease.id_at(48), None);
+}
+
+/// FL-019, plan §13.4: the affinity view is a fixed projection with a
+/// recorded matrix and scaling. The rows are 7, 14 and 25 of the Sylvester
+/// Hadamard matrix, orthonormal over √32; a direction within the norm limit
+/// lands in the unit ball, and a direction along a row lands on its axis.
+#[test]
+fn the_affinity_view_is_a_fixed_orthonormal_projection() {
+    assert_eq!(AFFINITY_AXES, [7, 14, 25]);
+    let matrix = hadamard();
+    for (index, &a) in AFFINITY_AXES.iter().enumerate() {
+        for &b in &AFFINITY_AXES[index..] {
+            let dot: f64 = matrix[a].iter().zip(&matrix[b]).map(|(x, y)| x * y).sum();
+            assert_eq!(dot, if a == b { 32.0 } else { 0.0 }, "rows {a} and {b}");
+        }
+    }
+    // Along a row, at the limit: that axis's coordinate is 1, the others 0.
+    for (axis, &row) in AFFINITY_AXES.iter().enumerate() {
+        let limit = 1.5;
+        let along: Vec<f64> = matrix[row]
+            .iter()
+            .map(|sign| sign * limit / 32.0_f64.sqrt())
+            .collect();
+        let mut expected = [0.0_f32; 3];
+        expected[axis] = 1.0;
+        let got = affinity_projection(&along, limit);
+        for (component, (&g, &e)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (g - e).abs() <= 1e-6,
+                "axis {axis} component {component}: {got:?}"
+            );
+        }
+    }
+    // Beyond the limit, a coordinate is clamped to the unit interval.
+    for (axis, &row) in AFFINITY_AXES.iter().enumerate() {
+        let beyond: Vec<f64> = matrix[row].iter().map(|sign| -3.0 * sign).collect();
+        let mut expected = [0.0_f32; 3];
+        expected[axis] = -1.0;
+        assert_eq!(affinity_projection(&beyond, 1.0), expected, "axis {axis}");
+    }
+    // Pseudorandom directions at the limit stay in the ball, equal to the
+    // oracle bit for bit.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5
+    };
+    for _ in 0..200 {
+        let raw: Vec<f64> = (0..32).map(|_| next()).collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let direction: Vec<f64> = raw.iter().map(|v| v / norm * 0.8).collect();
+        let q = affinity_projection(&direction, 0.8);
+        assert_eq!(
+            q.map(f32::to_bits),
+            projected(&direction, 0.8).map(f32::to_bits)
+        );
+        let radius = q
+            .iter()
+            .map(|&c| f64::from(c) * f64::from(c))
+            .sum::<f64>()
+            .sqrt();
+        assert!(radius <= 1.0 + 1e-6, "{q:?}");
+    }
+    // A limit that scales nothing projects to the origin.
+    let unit = [1.0; 32];
+    assert_eq!(affinity_projection(&unit, 0.0), [0.0; 3]);
+    assert_eq!(affinity_projection(&unit, f64::NAN), [0.0; 3]);
+    assert_eq!(affinity_projection(&unit, -1.0), [0.0; 3]);
+    let mut broken = [0.0; 32];
+    broken[3] = f64::INFINITY;
+    assert_eq!(affinity_projection(&broken, 1.0), [0.0; 3]);
+    // A world whose norm limit is not 1 scales its epoch by its own limit.
+    let config = ecology(&[("chemistry", "affinity_norm_limit", "0.5")]);
+    let world = found(&config, Arrangement::FreeList);
+    let limited = publisher(&world);
+    let lease = limited
+        .feed()
+        .viewer(1)
+        .expect("viewer")
+        .latest()
+        .expect("lease");
+    assert_eq!(lease.affinity_limit(), 0.5);
+    assert_shows(&lease, &world);
+    let radii: Vec<f64> = lease
+        .affinities()
+        .iter()
+        .map(|q| q.iter().map(|&c| f64::from(c).powi(2)).sum::<f64>().sqrt())
+        .collect();
+    // Founders sit at the limit, so their projections are as spread as at
+    // limit 1, not halved.
+    let mean = radii.iter().sum::<f64>() / radii.len() as f64;
+    assert!((0.15..0.5).contains(&mean), "mean radius {mean}");
+    drop(lease);
+    // A slot made for the limit-1 world, offered the 0.5 world, states and
+    // scales by the world it shows, not the one it was made for.
+    let mut publisher = publisher(&found(&ecology(&[]), Arrangement::FreeList));
+    let mut world = world;
+    step(&mut world);
+    let lease = offer_and_lease(&mut publisher, &world);
+    assert_eq!(lease.affinity_limit(), 0.5);
+    assert_shows(&lease, &world);
 }

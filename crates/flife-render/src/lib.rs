@@ -23,8 +23,8 @@ pub mod feed;
 pub mod pairing;
 
 pub use epoch::{
-    Bounds, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel, FieldTexture, Layout, Metrics, Prior,
-    View,
+    AFFINITY_AXES, Bounds, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel, FieldTexture, Layout,
+    Metrics, Prior, View, affinity_projection,
 };
 pub use feed::{DISPLAY_PAIR, Feed, Lease, Publication, Publisher, RenderStats, Viewer};
 pub use pairing::{

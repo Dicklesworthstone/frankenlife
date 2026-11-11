@@ -16,9 +16,10 @@
 //! matches organisms between epochs by identity (§13.5).
 //!
 //! The epoch carries the inputs of §13.4's mappings: lineage, energy,
-//! generation, topology and motion. Turning them into sizes and colours is
-//! a visual mapping (`presentation.color_mapping`, FL-019). Scientific code
-//! never reads an epoch back.
+//! generation, topology, motion and the chemical affinity's fixed
+//! projection ([`affinity_projection`]). Turning them into sizes and
+//! colours is a visual mapping (`presentation.color_mapping`, FL-019).
+//! Scientific code never reads an epoch back.
 
 use flife_core::ids::{OrganismId, RenderEpoch, ResourceEpoch};
 use flife_core::{CoreError, Tick, TimeStep};
@@ -28,6 +29,48 @@ use flife_engine::World;
 /// averaged over blocks of whole cells (§9.5: a bounded derived texture,
 /// never a lease on an authoritative field).
 pub const FIELD_TEXELS_MAX: u32 = 512;
+
+/// The rows of the 32 × 32 Sylvester Hadamard matrix
+/// `H[k][j] = (−1)^popcount(k & j)` that project an affinity direction onto
+/// its three display axes: plan §13.4's "fixed projection of a
+/// high-dimensional trait", whose matrix and scaling are recorded here. Any
+/// two rows of `H` are orthogonal, so over `√32` these are orthonormal.
+/// Between them they read all five bits of the channel index, and no one
+/// of them is the product of the other two.
+pub const AFFINITY_AXES: [usize; 3] = [7, 14, 25];
+
+/// An affinity direction's display coordinates (FL-019): row `k` of
+/// [`AFFINITY_AXES`] dotted with `affinity` in channel order, over
+/// `√(channels) × limit`, rounded to F32. For 32 channels the rows are
+/// orthonormal over `√32`, so a direction within the norm limit `limit`
+/// lands in the unit ball; each coordinate is clamped to `[−1, 1]` against
+/// rounding. `[0; 3]` for a nonpositive or non-finite `limit`, and `0` for
+/// a coordinate that is not finite.
+#[must_use]
+pub fn affinity_projection(affinity: &[f64], limit: f64) -> [f32; 3] {
+    let scale = (affinity.len() as f64).sqrt() * limit;
+    if !(scale.is_finite() && scale > 0.0) {
+        return [0.0; 3];
+    }
+    AFFINITY_AXES.map(|row| {
+        let dot = affinity
+            .iter()
+            .enumerate()
+            .fold(0.0_f64, |sum, (channel, &value)| {
+                if (row & channel).count_ones() % 2 == 0 {
+                    sum + value
+                } else {
+                    sum - value
+                }
+            });
+        let coordinate = dot / scale;
+        if coordinate.is_finite() {
+            coordinate.clamp(-1.0, 1.0) as f32
+        } else {
+            0.0
+        }
+    })
+}
 
 /// A view's element type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,13 +114,15 @@ pub enum View {
     Generation,
     /// Topology catalog indices.
     Topology,
+    /// Affinity directions' display coordinates ([`affinity_projection`]).
+    Affinity,
     /// The field texture, row-major.
     Field,
 }
 
 impl View {
     /// Every view, in declaration order.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Identity,
         Self::Position,
         Self::Velocity,
@@ -85,6 +130,7 @@ impl View {
         Self::Lineage,
         Self::Generation,
         Self::Topology,
+        Self::Affinity,
         Self::Field,
     ];
 
@@ -99,6 +145,7 @@ impl View {
             Self::Lineage => "lineage",
             Self::Generation => "generation",
             Self::Topology => "topology",
+            Self::Affinity => "affinity",
             Self::Field => "field",
         }
     }
@@ -330,6 +377,7 @@ pub struct Epoch {
     prior: Option<Prior>,
     step: TimeStep,
     maximum_speed: f64,
+    affinity_limit: f64,
     extent: [f64; 2],
     capacity: usize,
     ids: Vec<u64>,
@@ -339,6 +387,7 @@ pub struct Epoch {
     lineages: Vec<u64>,
     generations: Vec<u32>,
     topologies: Vec<u8>,
+    affinities: Vec<[f32; 3]>,
     field: FieldTexture,
     metrics: Metrics,
 }
@@ -395,6 +444,7 @@ impl Epoch {
             prior: None,
             step: world.step_size(),
             maximum_speed: world.maximum_speed(),
+            affinity_limit: world.trait_limits().affinity_norm(),
             extent: [grid.world_width(), grid.world_height()],
             capacity,
             ids: reserved(capacity, "render identity view")?,
@@ -404,6 +454,7 @@ impl Epoch {
             lineages: reserved(capacity, "render lineage view")?,
             generations: reserved(capacity, "render generation view")?,
             topologies: reserved(capacity, "render topology view")?,
+            affinities: reserved(capacity, "render affinity view")?,
             field: FieldTexture::sized(
                 [grid.cells_x(), grid.cells_y()],
                 [grid.cell_width(), grid.cell_height()],
@@ -456,19 +507,22 @@ impl Epoch {
         self.lineages.clear();
         self.generations.clear();
         self.topologies.clear();
+        self.affinities.clear();
+        let affinity_limit = world.trait_limits().affinity_norm();
         let mut organism_energy = 0.0_f64;
         let mut max_generation = 0_u32;
         for organism in population.iter() {
-            let topology = population
-                .genome(organism.id)
-                .map(|genome| genome.topology().index())
-                .ok_or_else(|| CoreError::StateConflict {
-                    operation: "project render epoch",
-                    detail: format!("{} has no genome", organism.id),
+            let genome =
+                population
+                    .genome(organism.id)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "project render epoch",
+                        detail: format!("{} has no genome", organism.id),
+                    })?;
+            let topology =
+                u8::try_from(genome.topology().index()).map_err(|_| CoreError::Overflow {
+                    quantity: "render topology index",
                 })?;
-            let topology = u8::try_from(topology).map_err(|_| CoreError::Overflow {
-                quantity: "render topology index",
-            })?;
             self.ids.push(organism.id.get());
             self.positions.push([
                 fold(organism.position[0], width[0]),
@@ -483,6 +537,10 @@ impl Epoch {
             self.lineages.push(organism.lineage.get());
             self.generations.push(organism.generation.get());
             self.topologies.push(topology);
+            self.affinities.push(affinity_projection(
+                genome.traits().affinity(),
+                affinity_limit,
+            ));
             organism_energy += organism.energy;
             max_generation = max_generation.max(organism.generation.get());
         }
@@ -493,6 +551,7 @@ impl Epoch {
         self.resource = world.epoch();
         self.prior = prior;
         self.step = world.step_size();
+        self.affinity_limit = affinity_limit;
         self.metrics = Metrics {
             tick: world.tick(),
             live: live as u64,
@@ -620,6 +679,20 @@ impl Epoch {
         &self.topologies
     }
 
+    /// Affinity directions' display coordinates ([`affinity_projection`]),
+    /// each in `[−1, 1]` and together within the unit ball up to rounding.
+    #[must_use]
+    pub fn affinities(&self) -> &[[f32; 3]] {
+        &self.affinities
+    }
+
+    /// The norm limit the affinity coordinates are scaled by:
+    /// `chemistry.affinity_norm_limit`.
+    #[must_use]
+    pub const fn affinity_limit(&self) -> f64 {
+        self.affinity_limit
+    }
+
     /// The field texture.
     #[must_use]
     pub const fn field(&self) -> &FieldTexture {
@@ -634,7 +707,7 @@ impl Epoch {
 
     /// Every view's declared layout, in [`View::ALL`] order.
     #[must_use]
-    pub fn layouts(&self) -> [Layout; 8] {
+    pub fn layouts(&self) -> [Layout; 9] {
         let rows = |view, dtype, components, bounds| Layout {
             view,
             dtype,
@@ -656,12 +729,13 @@ impl Epoch {
             rows(View::Lineage, Dtype::U64, 1, Bounds::Any),
             rows(View::Generation, Dtype::U32, 1, Bounds::Any),
             rows(View::Topology, Dtype::U8, 1, Bounds::Any),
+            rows(View::Affinity, Dtype::F32, 3, Bounds::Magnitude(1.0)),
             self.field.layout(),
         ]
     }
 
     /// The bytes this slot's buffers have actually reserved. Allocated
-    /// once, it is the population ceiling times 41 bytes a row plus 4 a
+    /// once, it is the population ceiling times 53 bytes a row plus 4 a
     /// texel, and a projection never changes it.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
@@ -676,6 +750,7 @@ impl Epoch {
             bytes(&self.lineages),
             bytes(&self.generations),
             bytes(&self.topologies),
+            bytes(&self.affinities),
             bytes(&self.field.values),
         ]
         .into_iter()
@@ -703,6 +778,7 @@ impl Epoch {
             (View::Lineage, self.lineages.len()),
             (View::Generation, self.generations.len()),
             (View::Topology, self.topologies.len()),
+            (View::Affinity, self.affinities.len()),
         ];
         for (view, length) in counts {
             if length != count {
@@ -735,12 +811,20 @@ impl Epoch {
                     }
                 }
                 Bounds::Magnitude(limit) => {
-                    if let Some(v) = self
-                        .velocities
-                        .iter()
-                        .find(|v| v.iter().any(|c| c.is_nan() || c.abs() > limit))
-                    {
-                        return refuse(layout.view, format!("{v:?} exceeds {limit}"));
+                    let exceeds = |c: &f32| c.is_nan() || c.abs() > limit;
+                    let found = if layout.view == View::Affinity {
+                        self.affinities
+                            .iter()
+                            .find(|a| a.iter().any(exceeds))
+                            .map(|a| format!("{a:?}"))
+                    } else {
+                        self.velocities
+                            .iter()
+                            .find(|v| v.iter().any(exceeds))
+                            .map(|v| format!("{v:?}"))
+                    };
+                    if let Some(row) = found {
+                        return refuse(layout.view, format!("{row} exceeds {limit}"));
                     }
                 }
                 Bounds::NonNegative => {

@@ -34,7 +34,7 @@ adapter.
     | Space (not auto-repeat) | `Resume` or `Pause` |
     | → or `.` (auto-repeat steps again), while paused | `Step` |
     | Esc, or ⌘W | `Close` (once) |
-    | 1 to 5 | colour by lineage, energy, generation, motion or topology |
+    | 1 to 6 | colour by lineage, energy, generation, motion, topology or chemical affinity |
     | R | switch the glow and raw looks |
     | D | switch dots and density |
     | F | show or hide the field |
@@ -162,10 +162,12 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (12 tests):
+- `tests/controls.rs` (13 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
+  - The style keys (FL-019): 1 to 6 choose the six mappings in order, R, D and F switch the look, particles and
+    field, and auto-repeat or ⌘ with a digit chooses nothing.
   - Following the session: a late end of run 1 does not stop run 2, and run 2 stopping on its own does.
   - A resume refused at the lane or by the session leaves the controls paused.
   - FL-020: a drag pans by the pointer's whole motion (worked deltas) and selects nothing; a click within the slop
@@ -236,8 +238,8 @@ presentation state, not scientific state.
   bytes a pixel of FrankenManim's ring for its widest bloom: a band of 128 rows and 96 above and below it, or
   the whole drawable when shorter, FL-019). With `torch` the backend gets the budget's remainder (on the
   preset at a
-  3840 x 2160 drawable: 255.2 MiB of 2,048 without the bloom, 97.2 MiB before the layers were textures, and
-  236.5 MiB with the preset's bloom, exactly 18.75 MiB less), with `cpu` nothing, and a budget one byte short of
+  3840 x 2160 drawable: 254.6 MiB of 2,048 without the bloom, 97.2 MiB before the layers were textures, and
+  235.9 MiB with the preset's bloom, exactly 18.75 MiB less), with `cpu` nothing, and a budget one byte short of
   the observers is refused.
 - `tests/frame_upload.rs` (FL-043, FL-033, Metal compute, no window): on a `MetalRenderer`, 48 frames of the preset
   at 4,096 and 16,384 organisms, 1280 x 720 and 3840 x 2160, one and two pixels per point, zooms 1 and 16, in
@@ -285,8 +287,8 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     59.7% and 43.2%); a frame beyond them is not refused. From `b104feec` the device keeps the last frame's texels
     between frames, at most the view's texel bytes, inside the same term. FrankenManim drops them before it
     uploads others, so it never holds two sets, but no test sees device memory, so that is read from its code.
-  - On the preset at 1920 x 1080 points with a 2x display, the observers take 410.0 MiB and the backend gets
-    236.5 MiB of the 2,048 (391.2 and 255.2 without the preset's bloom, whose f32 row sums are charged 18.75
+  - On the preset at 1920 x 1080 points with a 2x display, the observers take 410.5 MiB and the backend gets
+    235.9 MiB of the 2,048 (391.8 and 254.6 without the preset's bloom, whose f32 row sums are charged 18.75
     MiB of the device: since FrankenManim `c6ad9c5b` its bloom works in bands, holding 146 rows at sigma 3
     where it held the whole frame's 126.56 MiB), where it was unbounded: parameter shards that do not fit are evaluated on the reference
     (the same bits, slower). The Studio's frame and inference rates under that budget are not measured here.

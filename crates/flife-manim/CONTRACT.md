@@ -20,8 +20,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `WorldView` holds all of them, and builds each frame's `ThreeDJob`.
 
 **Inputs.**
-- An FL-017 `Epoch`, read only: identity-ordered positions, velocities, energies, lineages, generations and
-  topology catalog indices, the bounded field texture, the world extent, the speed limit and the population ceiling
+- An FL-017 `Epoch`, read only: identity-ordered positions, velocities, energies, lineages, generations,
+  topology catalog indices and affinity projections (FL-019), the bounded field texture, the world extent, the speed limit and the population ceiling
   (`Epoch::capacity`).
 - A drawable size in pixels, and its pixels per point (1 unless set; the Studio sets the screen's backing scale). A
   logical window size in points, for pointer conversion.
@@ -86,8 +86,13 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   | `generation` | `generation-log-v1` | generation `g` | `GENERATION_RAMP` (plasma 0.33 to 1, 7 stops) at `ln(1 + g) / ln(257)`, clamped |
   | `motion` | `motion-heading-v1` | velocity | `MOTION_WHEEL` hue for the heading (east coral, turning counter-clockwise on screen), mixed from the grey `MOTION_STILL` by `√(speed / speed limit)` |
   | `topology` | `topology-catalog-v1` | catalog index `k` | `TOPOLOGY_PALETTE[k mod 8]`; the first five are the catalog members in size order |
+  | `affinity` | `affinity-projection-v1` | the epoch's affinity projection `q` (flife-render) | `g = AFFINITY_GAIN · q`, squashed to `s = g / √(1 + ‖g‖²)`; OKLab `L = 0.74 + 0.10 s₃`, `a = 0.16 s₁`, `b = 0.16 s₂` (`AFFINITY_LIGHTNESS`, `AFFINITY_CHROMA`), then FrankenManim's `oklab_to_srgb` and its clamp to RGBA8 |
 
-  `FromStr` takes either name. Colours are for display only: no metric reads them back.
+  `FromStr` takes either name. The affinity colour is grey for no affinity; organisms with like chemistry have
+  like colours, and opposite directions have opposite hues. `AFFINITY_GAIN = √(128/3)` puts the founders, whose
+  vectors are at the limit, at a mean gained radius of about 2. About 9% of directions leave the sRGB gamut and
+  lose chroma there. The square root is correctly rounded and FrankenManim's sRGB transfer uses its own `fmn_dmath::pow`, not the
+  host's, so the colours are the same on every host. Colours are for display only: no metric reads them back.
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
@@ -317,13 +322,20 @@ route.
   - FL-020 density: a 128-pixel view at 2 pixels per point draws what a 64-pixel view at 1 draws (the floored and the
     capped dots, halos, the selection ring and the density bins); the change refits the shown epoch without a new
     show, an unchanged density is no change, and NaN is refused.
-- `tests/mapping.rs` (17 tests), on real render epochs where they matter:
+- `tests/mapping.rs` (18 tests), on real render epochs where they matter:
   - The energy and generation ramps rise monotonically in CIE L*, from above 15 with a range above 50.
   - Energy maps through the fixed saturating `e / (e + 2)`, generations logarithmically to a fixed 256.
   - The motion hue is the heading (y flipped to screen), its strength `√(speed / limit)`.
   - The lineage and topology palettes are distinct (sRGB distance above 60) and luminous (L* above 45).
+  - The affinity colour (FL-019) is its recorded formula: the gain's bits are `√(128/3)`'s, the origin and NaN or
+    infinite inputs are grey at L 0.74, five in-gamut points are the formula's OKLab values within 0.006 (computed
+    in the test from `√(128/3)`, not the constant), each axis moves only its own OKLab coordinate in its own sign,
+    chroma rises with radius, and over a grid of the unit ball every colour is luminous (L* above 45) and within the recorded
+    chroma and lightness. On a real founding epoch the mean squared gained radius is 2.4 to 5.6 and at least 90%
+    of the founders' colours are distinct.
   - Mappings parse and name themselves in both spellings.
-  - In every mapping, every dot of a real epoch takes its own row's colour.
+  - In every mapping, every dot of a real epoch takes its own row's colour, and every row's traits are the epoch's
+    own views, bit for bit.
   - A colour is a function of its row alone: an organism alive in two epochs of one world whose mapped inputs did
     not change keeps its colour bit for bit.
   - The raw look has no halos and a linear grey field; the raw field is linear in the density.
@@ -398,7 +410,6 @@ route.
   the density's, and the field's for bitwise the same values), and both are uploaded with every Metal frame;
   resident device textures and buffers and the shared-device resource bridge are still FL-033's (and FL-028's typed
   Metal buffers).
-- There is no chemical-affinity mapping (§13.4 lists one): epochs do not carry affinities.
 - There is no on-screen legend: FrankenManim's Metal 3D route has no text, so the meaning is in the Studio's and
   `flife render`'s records.
 - Density bins are still about 6 px, not one per pixel. Since FL-033 a finer bin costs 16 texel bytes, not two

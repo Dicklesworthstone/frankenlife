@@ -5,14 +5,15 @@ mod common;
 
 use flife_manim::FieldLayer;
 use flife_manim::{
-    BLOOM_SIGMA_POINTS, BLOOM_WIDEST_REACH_PIXELS, ColorMapping, DensityLayer, ENERGY_HALF,
-    ENERGY_RAMP, GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE, Look, MOTION_STILL,
-    MOTION_WHEEL, ParticleCloud, Particles, Style, TOPOLOGY_PALETTE, Traits, Viewport, WorldView,
+    AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, BLOOM_SIGMA_POINTS,
+    BLOOM_WIDEST_REACH_PIXELS, ColorMapping, DensityLayer, ENERGY_HALF, ENERGY_RAMP,
+    GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL,
+    ParticleCloud, Particles, Style, TOPOLOGY_PALETTE, Traits, Viewport, WorldView, affinity_rgb8,
     density_bins, density_level, energy_level, generation_level, heading, linear, mapped_color,
     mapped_rgb8, mix, ramp, raw_value, speed_level, traits, wheel,
 };
 use flife_render::FieldTexture;
-use fmn_core::color::LinearRgba;
+use fmn_core::color::{LinearRgba, Srgb, srgb_to_oklab};
 use fmn_render::{
     BLOOM_SIGMA_MAX_PIXELS, Bloom, SurfaceMaterial, Texture, TextureWrap, ThreeDDraw,
 };
@@ -63,7 +64,14 @@ fn row(lineage: u64, energy: f32, generation: u32, topology: u8, velocity: [f32;
         generation,
         topology,
         velocity,
+        affinity: [0.0; 3],
     }
+}
+
+/// OKLab of an sRGB byte colour.
+fn oklab([r, g, b]: [u8; 3]) -> [f64; 3] {
+    let c = srgb_to_oklab(Srgb::from_rgb8(r, g, b));
+    [c.l, c.a, c.b]
 }
 
 #[test]
@@ -227,6 +235,20 @@ fn every_dot_takes_its_own_rows_colour_in_every_mapping() {
     let mut cloud = ParticleCloud::for_epoch(&epoch).expect("cloud");
     let rows: Vec<Traits> = traits(&epoch).collect();
     assert_eq!(rows.len(), epoch.len());
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(row.lineage, epoch.lineages()[index], "row {index}");
+        assert_eq!(row.energy.to_bits(), epoch.energies()[index].to_bits());
+        assert_eq!(row.generation, epoch.generations()[index]);
+        assert_eq!(row.topology, epoch.topologies()[index]);
+        assert_eq!(
+            row.velocity.map(f32::to_bits),
+            epoch.velocities()[index].map(f32::to_bits)
+        );
+        assert_eq!(
+            row.affinity.map(f32::to_bits),
+            epoch.affinities()[index].map(f32::to_bits)
+        );
+    }
     let mut palettes = Vec::new();
     for mapping in ColorMapping::ALL {
         let style = Style {
@@ -277,6 +299,13 @@ fn every_dot_takes_its_own_rows_colour_in_every_mapping() {
     };
     assert!(distinct(rows.iter().map(|r| r.lineage).collect()) > 4);
     assert!(distinct(rows.iter().map(|r| u64::from(r.energy.to_bits())).collect()) > 4);
+    assert!(
+        distinct(
+            rows.iter()
+                .map(|r| u64::from(r.affinity[0].to_bits()))
+                .collect()
+        ) > 4
+    );
     assert!(rows.iter().any(|r| heading(r.velocity).is_some()));
 }
 
@@ -816,7 +845,7 @@ fn a_colour_is_a_function_of_its_row_alone() {
         !survivors.is_empty(),
         "some founders live through both epochs"
     );
-    let mut compared = [0_usize; 5];
+    let mut compared = [0_usize; 6];
     for (slot, mapping) in ColorMapping::ALL.into_iter().enumerate() {
         for &(row, later) in &survivors {
             let (a, b) = (early_rows[row], late_rows[later]);
@@ -828,6 +857,9 @@ fn a_colour_is_a_function_of_its_row_alone() {
                     a.velocity.map(f32::to_bits) == b.velocity.map(f32::to_bits)
                 }
                 ColorMapping::Topology => a.topology == b.topology,
+                ColorMapping::Affinity => {
+                    a.affinity.map(f32::to_bits) == b.affinity.map(f32::to_bits)
+                }
             };
             if same {
                 compared[slot] += 1;
@@ -839,10 +871,12 @@ fn a_colour_is_a_function_of_its_row_alone() {
             }
         }
     }
-    // Lineage, generation and topology are fixed for a survivor's life.
+    // Lineage, generation, topology and affinity are fixed for a
+    // survivor's life.
     assert_eq!(compared[0], survivors.len());
     assert_eq!(compared[2], survivors.len());
     assert_eq!(compared[4], survivors.len());
+    assert_eq!(compared[5], survivors.len());
     // And the colour does change when the mapped input does.
     assert_ne!(
         linear(ENERGY_RAMP[0]),
@@ -931,5 +965,133 @@ fn every_registered_colour_mapping_is_drawn_and_configurable() {
     assert_eq!(
         ColorMapping::configured(&common::config(&[])),
         Ok(ColorMapping::Lineage)
+    );
+}
+
+/// FL-019, plan §13.4: chemical affinity is a fixed projection with a
+/// recorded matrix (flife-render's `affinity_projection`) and a recorded
+/// scaling and colour: no refit, so an organism keeps its colour, grey for
+/// no affinity, opposite hues for opposite directions, and every colour
+/// visible on the dark canvas.
+#[test]
+fn affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale() {
+    assert_eq!(AFFINITY_GAIN.to_bits(), (128.0_f64 / 3.0).sqrt().to_bits());
+    assert_eq!(AFFINITY_LIGHTNESS, [0.74, 0.10]);
+    assert_eq!(AFFINITY_CHROMA, 0.16);
+    // No affinity: a neutral grey at OKLab lightness 0.74.
+    let grey = affinity_rgb8([0.0; 3]);
+    assert_eq!(grey[0], grey[1]);
+    assert_eq!(grey[1], grey[2]);
+    assert!((oklab(grey)[0] - 0.74).abs() < 0.01, "{grey:?}");
+    assert_eq!(affinity_rgb8([f32::NAN, f32::INFINITY, 0.0]), grey);
+    // In the gamut, a colour is the recorded formula's OKLab point, up to the
+    // byte rounding: gain √(128/3), the radial squash, then lightness
+    // 0.74 + 0.10 s₃ and chroma 0.16 (s₁, s₂).
+    for q in [
+        [0.05_f32, 0.0, 0.0],
+        [0.0, -0.05, 0.0],
+        [0.0, 0.0, 0.2],
+        [-0.04, 0.03, -0.1],
+        [0.02, 0.06, 0.05],
+    ] {
+        let g = q.map(|c| f64::from(c) * (128.0_f64 / 3.0).sqrt());
+        let squash = (1.0 + g.iter().map(|c| c * c).sum::<f64>()).sqrt();
+        let s = g.map(|c| c / squash);
+        let expected = [0.74 + 0.10 * s[2], 0.16 * s[0], 0.16 * s[1]];
+        let got = oklab(affinity_rgb8(q));
+        for (component, (g, e)) in got.iter().zip(expected).enumerate() {
+            assert!(
+                (g - e).abs() < 0.006,
+                "{q:?} component {component}: {got:?} for {expected:?}"
+            );
+        }
+    }
+    // The first two coordinates are the hue's axes, signs and all; the
+    // third the lightness.
+    for magnitude in [0.05_f32, 0.15, 0.3] {
+        let [_, a_plus, _] = oklab(affinity_rgb8([magnitude, 0.0, 0.0]));
+        let [_, a_minus, _] = oklab(affinity_rgb8([-magnitude, 0.0, 0.0]));
+        let [_, _, b_plus] = oklab(affinity_rgb8([0.0, magnitude, 0.0]));
+        let [_, _, b_minus] = oklab(affinity_rgb8([0.0, -magnitude, 0.0]));
+        assert!(
+            a_plus > 0.01 && a_minus < -0.01,
+            "{magnitude}: {a_plus} {a_minus}"
+        );
+        assert!(
+            b_plus > 0.01 && b_minus < -0.01,
+            "{magnitude}: {b_plus} {b_minus}"
+        );
+        let [light, ..] = oklab(affinity_rgb8([0.0, 0.0, magnitude]));
+        let [dark, ..] = oklab(affinity_rgb8([0.0, 0.0, -magnitude]));
+        assert!(light > 0.75 && dark < 0.73, "{magnitude}: {light} {dark}");
+    }
+    // Stronger along one direction is more chromatic, and never wraps.
+    let chroma = |q: [f32; 3]| {
+        let [_, a, b] = oklab(affinity_rgb8(q));
+        a.hypot(b)
+    };
+    let mut previous = 0.0;
+    for step in 1..=20 {
+        let t = step as f32 / 20.0;
+        let c = chroma([0.6 * t, 0.4 * t, 0.0]);
+        assert!(c >= previous - 0.003, "step {step}: {c} after {previous}");
+        previous = c;
+    }
+    // Every colour over a grid of the unit ball shows on the dark canvas,
+    // and the squash keeps it within the recorded chroma and lightness
+    // (gamut clipping only takes chroma away).
+    for x in -4_i8..=4 {
+        for y in -4_i8..=4 {
+            for z in -4_i8..=4 {
+                let q = [x, y, z].map(|c| f32::from(c) / 4.0);
+                if q.iter().map(|c| c * c).sum::<f32>() <= 1.0 {
+                    let rgb = affinity_rgb8(q);
+                    assert!(lightness(rgb) > 45.0, "{q:?}");
+                    let [l, a, b] = oklab(rgb);
+                    assert!(a.hypot(b) <= AFFINITY_CHROMA + 0.012, "{q:?}: {rgb:?}");
+                    assert!((0.62..0.86).contains(&l), "{q:?}: {rgb:?} at {l}");
+                }
+            }
+        }
+    }
+    // The mapping draws the row's own coordinates.
+    let mut one = row(1, 1.0, 0, 0, [0.0; 2]);
+    one.affinity = [0.2, -0.1, 0.05];
+    assert_eq!(
+        mapped_rgb8(ColorMapping::Affinity, &one, 4.0),
+        affinity_rgb8([0.2, -0.1, 0.05])
+    );
+    // On the founding epoch the gain puts founders at a radius of about 2,
+    // as recorded: their mean squared gained radius is near 4.
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    let rows: Vec<Traits> = traits(&epoch).collect();
+    let mean = rows
+        .iter()
+        .map(|row| {
+            row.affinity
+                .iter()
+                .map(|&c| (f64::from(c) * AFFINITY_GAIN).powi(2))
+                .sum::<f64>()
+        })
+        .sum::<f64>()
+        / rows.len() as f64;
+    assert!(
+        (2.4..5.6).contains(&mean),
+        "founders' mean squared radius {mean}"
+    );
+    // Distinct founders get distinct colours.
+    let mut colours: Vec<[u8; 3]> = rows
+        .iter()
+        .map(|row| mapped_rgb8(ColorMapping::Affinity, row, epoch.maximum_speed()))
+        .collect();
+    colours.sort_unstable();
+    colours.dedup();
+    assert!(
+        colours.len() * 10 >= rows.len() * 9,
+        "{} of {}",
+        colours.len(),
+        rows.len()
     );
 }

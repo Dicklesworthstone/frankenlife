@@ -30,7 +30,7 @@
 //!
 //! | Key | Style |
 //! |---|---|
-//! | 1 to 5 | colour by lineage, energy, generation, motion or topology |
+//! | 1 to 6 | colour by lineage, energy, generation, motion, topology or chemical affinity |
 //! | R | glow or raw |
 //! | D | points or density |
 //! | F | field on or off |
@@ -54,8 +54,8 @@ pub const KEY_PERIOD: u16 = 47;
 pub const KEY_ESCAPE: u16 = 53;
 /// `kVK_ANSI_W`.
 pub const KEY_W: u16 = 13;
-/// `kVK_ANSI_1` to `kVK_ANSI_5`, for [`ColorMapping::ALL`] in order.
-pub const KEY_DIGITS: [u16; 5] = [18, 19, 20, 21, 23];
+/// `kVK_ANSI_1` to `kVK_ANSI_6`, for [`ColorMapping::ALL`] in order.
+pub const KEY_DIGITS: [u16; 6] = [18, 19, 20, 21, 23, 22];
 /// `kVK_ANSI_R`.
 pub const KEY_R: u16 = 15;
 /// `kVK_ANSI_D`.

@@ -13,8 +13,8 @@ C.15).
 A slow consumer can therefore cost display freshness, never the world.
 
 **Inputs.**
-- `&World`, read only: the committed tick and resource epoch, the population rows and genome topologies, the
-  field's energy plane and grid, the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
+- `&World`, read only: the committed tick and resource epoch, the population rows, each genome's topology and
+  affinity vector and the world's `affinity_norm_limit` (FL-019), the field's energy plane and grid, the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
   event cursor.
 - The slot count: `execution.render_queue_capacity`, at least 2. The validator refuses 1 (`IntBound::AtLeastTwo`),
   because one displayable epoch and one being written need two slots.
@@ -26,7 +26,7 @@ A slow consumer can therefore cost display freshness, never the world.
 - `Epoch`, which states:
   - its source: identity (`RenderEpoch`, issued once and strictly increasing), source tick and resource epoch;
   - its `Prior`: the epoch it replaced as latest;
-  - the world's timestep, speed limit and extent.
+  - the world's timestep, speed limit and extent, and the affinity norm limit its affinity view is scaled by.
 - Its views, each with a declared `Layout` (`View`, `Dtype`, components, count, `Bounds`), in identity order:
 
   | View | Dtype × components | Bounds |
@@ -38,9 +38,17 @@ A slow consumer can therefore cost display freshness, never the world.
   | lineage | u64 × 1 | — |
   | generation | u32 × 1 | — |
   | topology | u8 × 1 | — |
+  | affinity | f32 × 3 | each component in `[−1, 1]` |
   | field | f32 × 1 per texel | finite, ≥ 0 |
 
   These are the inputs of §13.4's mappings. Turning them into sizes and colours is FL-019's.
+- The affinity view (FL-019, `affinity_projection`) is a fixed projection of each organism's 32 affinity terms
+  `a`: `q_k = (Σ_j H[r_k][j] a_j) / (√32 · L)` for the rows `r = AFFINITY_AXES = [7, 14, 25]` of the 32 × 32
+  Sylvester Hadamard matrix `H[r][j] = (−1)^popcount(r & j)`, with `L` the world's `affinity_norm_limit`. The rows
+  are orthonormal after the `√32`, so `q` is the affinity vector's orthogonal projection onto three fixed axes, in
+  units of the limit, and its length is at most 1. Each component is summed in F64 in channel order, clamped to
+  `[−1, 1]` and rounded to F32; a non-finite one, or a limit that is not finite and positive, gives 0. No row of
+  the matrix is fitted to a population, so a vector keeps its projection in every world with the same limit.
 - `FieldTexture`: channel `EnergyDensity`, the source grid, the block of cells per texel, the texel count and the
   texel size in world units. Each texel is the mean energy density of its block, summed in F64, rows then columns.
   Texels per axis are at most `FIELD_TEXELS_MAX` = 512. A grid that does not divide evenly ends in a partial block.
@@ -76,7 +84,7 @@ A slow consumer can therefore cost display freshness, never the world.
   displayable slot therefore cannot be written; the type system refuses it. A consumer only sees an epoch after it
   is complete.
 - *Bounded memory (§9.5).* Every slot is allocated once, with fallible reservation, at the population ceiling
-  (41 bytes a row) and the texture size (4 bytes a texel). No projection reallocates. `Publisher::reserved_bytes`
+  (53 bytes a row) and the texture size (4 bytes a texel). No projection reallocates. `Publisher::reserved_bytes`
   is the render budget.
 - *Busy feeds skip.* When no slot is free, nothing is written or allocated. The latest epoch stays, and the boundary
   stays pending. The next offer, or one prompted by a released lease, publishes the newest committed state, linked
@@ -104,7 +112,7 @@ conversions of the F64 state, and its sums are F64 in a fixed order. Slot choice
 identities are sequential, so a deterministic sequence of offers and lease drops gives the same publications.
 
 **Independent tests.**
-- `tests/epochs.rs` (7 tests):
+- `tests/epochs.rs` (8 tests):
   - Every view, metric and texel, at founding and over 288 ticks with births and deaths, matches the world's own
     rows and an independent block-mean oracle. Every declared layout holds.
   - A 1,030 × 515 plane gives a 344 × 258 texture of 3 × 2 blocks with partial edges, equal to the oracle. Bad
@@ -113,7 +121,13 @@ identities are sequential, so a deterministic sequence of offers and lease drops
     their slots differ.
   - Over 1,024 FreeList ticks, matching agrees with every tick's births and deaths, and every reused slot's newborn
     is a birth while its dead occupant is gone.
-  - Slots reserve exactly 72 × 41 + 32 × 32 × 4 bytes, and never more, through a run to the population ceiling.
+  - Slots reserve exactly 72 × 53 + 32 × 32 × 4 bytes, and never more, through a run to the population ceiling.
+  - The affinity view (FL-019): the axes are orthonormal rows of a Hadamard matrix built by its recursion, not the
+    crate's popcount form; a vector along a row projects onto its axis, and three times past the limit onto its
+    clamped end; 200 pseudo-random vectors project bit for
+    bit as that oracle does, inside the unit ball; a zero, NaN or negative limit and an infinite term give the
+    origin. A world at `affinity_norm_limit = 0.5` publishes its own limit and projects its founders as spread as at
+    1, not halved, and a publisher made for a limit-1 world states and scales by the 0.5 world it is offered. Every view check above includes the affinity view against the oracle.
   - C.15: a one-tick gap is unambiguous. A 600-tick skipped gap on the 32-unit world (18.75 units of reach) is not.
     Epochs out of order or from another world are refused.
   - Selection by identity.

@@ -14,6 +14,7 @@
 //! | generation | generation `g` | [`GENERATION_RAMP`] at `ln(1 + g) / ln(1 + GENERATION_SCALE)` |
 //! | motion | velocity | [`MOTION_WHEEL`] hue for the heading, mixed from [`MOTION_STILL`] by `√(speed / speed limit)` |
 //! | topology | catalog index `k` | [`TOPOLOGY_PALETTE`]`[k mod 8]`, catalog members in size order |
+//! | affinity | affinity coordinates `q` ([`flife_render::affinity_projection`]) | [`affinity_rgb8`]: OKLab hue and chroma from `q₁, q₂`, lightness from `q₃` |
 
 use std::fmt;
 use std::str::FromStr;
@@ -21,7 +22,7 @@ use std::str::FromStr;
 use flife_core::registry::{self, Role};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_render::Epoch;
-use fmn_core::color::{LinearRgba, Srgb};
+use fmn_core::color::{LinearRgba, Oklab, Srgb, oklab_to_srgb};
 
 /// What a particle's colour means (plan §13.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -37,16 +38,20 @@ pub enum ColorMapping {
     Motion,
     /// Neural architecture: one colour per catalog topology.
     Topology,
+    /// Chemical affinity: a fixed projection of the heritable affinity
+    /// direction (plan §13.4).
+    Affinity,
 }
 
 impl ColorMapping {
-    /// Every mapping, in the Studio's key order (1 to 5).
-    pub const ALL: [Self; 5] = [
+    /// Every mapping, in the Studio's key order (1 to 6).
+    pub const ALL: [Self; 6] = [
         Self::Lineage,
         Self::Energy,
         Self::Generation,
         Self::Motion,
         Self::Topology,
+        Self::Affinity,
     ];
 
     /// The mapping's name, as flags and records spell it.
@@ -58,6 +63,7 @@ impl ColorMapping {
             Self::Generation => "generation",
             Self::Motion => "motion",
             Self::Topology => "topology",
+            Self::Affinity => "affinity",
         }
     }
 
@@ -71,6 +77,7 @@ impl ColorMapping {
             Self::Generation => "generation-log-v1",
             Self::Motion => "motion-heading-v1",
             Self::Topology => "topology-catalog-v1",
+            Self::Affinity => "affinity-projection-v1",
         }
     }
 
@@ -109,6 +116,10 @@ impl ColorMapping {
                 "motion: hue is the heading, grey to full colour the square root of the speed"
             }
             Self::Topology => "neural topology: cyan, teal, lime, amber, magenta from smallest",
+            Self::Affinity => {
+                "chemical affinity: a fixed projection of the 32 affinity terms; grey is none, \
+                 like colours like chemistry, opposite directions opposite hues"
+            }
         }
     }
 }
@@ -128,7 +139,7 @@ impl FromStr for ColorMapping {
             .find(|mapping| mapping.name() == text || mapping.registry_name() == text)
             .ok_or_else(|| {
                 format!(
-                    "`{text}` is not a colour mapping: lineage, energy, generation, motion or topology"
+                    "`{text}` is not a colour mapping: lineage, energy, generation, motion, topology or affinity"
                 )
             })
     }
@@ -227,6 +238,8 @@ pub struct Traits {
     pub topology: u8,
     /// Velocity in world units per simulated second, y down.
     pub velocity: [f32; 2],
+    /// The affinity direction's display coordinates.
+    pub affinity: [f32; 3],
 }
 
 /// Every row of `epoch` as [`Traits`], in identity order.
@@ -238,13 +251,15 @@ pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
         .zip(epoch.generations())
         .zip(epoch.topologies())
         .zip(epoch.velocities())
+        .zip(epoch.affinities())
         .map(
-            |((((&lineage, &energy), &generation), &topology), &velocity)| Traits {
+            |(((((&lineage, &energy), &generation), &topology), &velocity), &affinity)| Traits {
                 lineage,
                 energy,
                 generation,
                 topology,
                 velocity,
+                affinity,
             },
         )
 }
@@ -394,6 +409,50 @@ pub const TOPOLOGY_PALETTE: [[u8; 3]; 8] = [
     [0xFE, 0xE4, 0x40],
 ];
 
+/// The gain on the affinity coordinates: `√(128/3)`. A founder's direction
+/// is isotropic at the norm limit, so each of its three coordinates has a
+/// mean square of 1/32, and this puts it at a radius of about 2: most
+/// colours near full strength, the squash still keeping them below it.
+/// About 9% of isotropic directions then leave the sRGB gamut and are
+/// clipped per channel; at half this gain under 1% did, with half the
+/// typical chroma.
+pub const AFFINITY_GAIN: f64 = 6.531_972_647_421_808;
+
+/// The OKLab lightness of an organism with no affinity, and how far the
+/// third coordinate moves it either way.
+pub const AFFINITY_LIGHTNESS: [f64; 2] = [0.74, 0.10];
+
+/// The OKLab chroma the first two coordinates approach at full strength.
+pub const AFFINITY_CHROMA: f64 = 0.16;
+
+/// The colour of affinity coordinates `q`. They are scaled by
+/// [`AFFINITY_GAIN`] to `g` and squashed radially to `s = g / √(1 + |g|²)`,
+/// so `|s| < 1` and nothing refits. Then OKLab
+/// `L = 0.74 + 0.10 s₃`, `a = 0.16 s₁`, `b = 0.16 s₂` is converted to sRGB,
+/// each channel clamped to the gamut. No affinity is a neutral grey; the
+/// hue turns with the direction in the first two coordinates, and opposite
+/// directions take opposite hues. A non-finite coordinate counts as 0.
+#[must_use]
+pub fn affinity_rgb8(q: [f32; 3]) -> [u8; 3] {
+    let g = q.map(|c| {
+        let c = f64::from(c);
+        if c.is_finite() {
+            c * AFFINITY_GAIN
+        } else {
+            0.0
+        }
+    });
+    let squash = (1.0 + g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+    let s = g.map(|c| c / squash);
+    let [lightness, swing] = AFFINITY_LIGHTNESS;
+    oklab_to_srgb(Oklab {
+        l: lightness + swing * s[2],
+        a: AFFINITY_CHROMA * s[0],
+        b: AFFINITY_CHROMA * s[1],
+    })
+    .to_rgb8()
+}
+
 /// `t ∈ [0, 1]` along evenly spaced sRGB `stops`, interpolated in sRGB
 /// bytes; a non-finite `t` is `0`.
 #[must_use]
@@ -468,6 +527,7 @@ pub fn mapped_rgb8(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) -
         ColorMapping::Topology => {
             TOPOLOGY_PALETTE[usize::from(traits.topology) % TOPOLOGY_PALETTE.len()]
         }
+        ColorMapping::Affinity => affinity_rgb8(traits.affinity),
     }
 }
 

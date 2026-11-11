@@ -66,9 +66,9 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     controllers: ControllerChoice,
     /// What the organisms' colour means: `lineage`, `energy`, `generation`,
-    /// `motion` or `topology` (or a registered name such as
+    /// `motion`, `topology` or `affinity` (or a registered name such as
     /// `founder-lineage-v1`). The default is the configuration's
-    /// `[presentation] color_mapping`. Keys 1 to 5 change it.
+    /// `[presentation] color_mapping`. Keys 1 to 6 change it.
     #[arg(long)]
     color: Option<ColorMapping>,
     /// `glow` (the default) or `raw`: no halos and a linear grey field. R

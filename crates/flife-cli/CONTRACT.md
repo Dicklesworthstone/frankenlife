@@ -177,7 +177,7 @@ for, one at least, before a render is refused. Its first record is `start`, with
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
   the video path if encoded, the controller summary, wall seconds, and the style: `mapping`, its `meaning`, `look`,
   `particles` and `field`). FL-019's style flags choose what is drawn: `--color M` (`lineage`, `energy`,
-  `generation`, `motion` or `topology`, or a registered name such as `founder-lineage-v1`; by default the
+  `generation`, `motion`, `topology` or `affinity`, or a registered name such as `founder-lineage-v1`; by default the
   configuration's `[presentation] color_mapping`), `--look glow|raw`, `--density` and `--no-field`. No style
   changes the world. Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
   route, with the configuration's bloom (`[presentation] bloom_enabled`, `bloom_strength`) on glowing frames and

@@ -376,6 +376,11 @@ fn model_abi_and_catalog_violations_are_refused() {
         "never reseeds",
     );
     assert_refused(
+        |c| c.presentation.trails_enabled = true,
+        "presentation.trails_enabled",
+        "not drawn yet",
+    );
+    assert_refused(
         |c| c.population.initial_count = 20_000,
         "population.initial_count",
         "exceeds maximum_count",

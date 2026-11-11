@@ -334,6 +334,13 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
             "the baseline never reseeds after extinction (§7.5)",
         );
     }
+    // A presentation choice nothing draws yet is refused, not ignored.
+    if config.presentation.trails_enabled {
+        issues.add(
+            "presentation.trails_enabled",
+            "trails are not drawn yet (FL-019, §13.5); set false",
+        );
+    }
     if config.population.initial_count > config.population.maximum_count {
         issues.add(
             "population.initial_count",

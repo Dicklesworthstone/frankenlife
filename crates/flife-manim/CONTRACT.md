@@ -421,7 +421,12 @@ route.
   (`BLOOM_SIGMA_POINTS`), not a configuration key; the plan names none. The bloom runs on the raw frame before
   the RGBA8 table: there is no separate tone-mapping step (§13.3 step 8) before or after it.
 - Human review of the mappings against the plan's reference images (G5) has not been done.
-  There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). Births appear at the first
+  There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). The validator refuses
+  `[presentation] trails_enabled = true` rather than ignoring it. A dot per kept position and organism is not
+  affordable on this route: the Studio charges each dot `PREPARATION_BYTES_PER_DOT` three times (in the frame and
+  in the host and device copies of its upload) and `JOB_BYTES_PER_DRAW`, 5,632 bytes before its draw rows, so four
+  kept positions at the preset's ceiling of 16,384, with 16 bytes each to keep them, come to at least 353 MiB, where
+  the torch backend gets 235.9 MiB. Trails wait for resident particle primitives (FL-033). Births appear at the first
   epoch that has them, not at their tick within a longer gap: an epoch does not carry birth ticks. The field and
   density show the newer epoch of a pair at once, up to one state ahead of the moving organisms. A selection is
   validated against the newest shown epoch, a projection of a committed world, not by a query to the session's

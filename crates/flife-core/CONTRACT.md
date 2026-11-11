@@ -157,6 +157,8 @@ are no hidden defaults.
 - A source segment that is not tick-aligned.
 - Memory quotas out of order, or an initial population above the logical genome quota.
 - Gradient training, mutation-rate evolution or automatic reseeding (none is part of `field-ecology-v1`).
+- `[presentation] trails_enabled = true` (FL-019): no renderer draws trails yet, so the key is refused rather than
+  silently ignored. Appendix A and the preset set it false.
 - An initial population above the ceiling.
 - A malformed name, background or schema string.
 

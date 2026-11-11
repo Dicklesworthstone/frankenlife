@@ -25,10 +25,16 @@
 //! organisms move from where the previous epoch had them, matched by
 //! identity, over about the interval at which epochs arrive ([`Pacer`]),
 //! and the organisms that died fade out (FL-020, plan §13.5).
+//!
+//! The clocks are honest (plan §12.2): a [`ClockMeter`] reads the achieved
+//! scientific ticks per wall second and the simulation-time to wall-time
+//! ratio beside the frames presented, which the binary reports while
+//! `[presentation] show_clock_telemetry` is set.
 
 #![forbid(unsafe_code)]
 
 pub mod brush;
+mod clock;
 mod controls;
 mod host;
 pub mod memory;
@@ -39,6 +45,7 @@ pub use brush::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Stroke, Supplies, material_for,
     stroke,
 };
+pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
     CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_D, KEY_DIGITS, KEY_E,
     KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X,

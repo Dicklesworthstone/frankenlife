@@ -7,7 +7,9 @@ reset), selection by displayed stable identity (§13.6), and the display one com
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
 bounded snapshot at its committed boundary (§14.2). FL-022 (`flife-2jj`, part) adds energy, removal, material and
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
-at and the energy it moved (§14.3, §12.3). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
+at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
+scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
+It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
@@ -144,8 +146,9 @@ adapter.
   measured slower in the Studio under FrankenManim `dfdc7d18` (72 against 119 ticks per second, one 12 s run each),
   with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
   1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
-  - `open`, naming the window, the CPU workers, the controller backend, and the style: `mapping`, its `meaning`,
-    `look`, `particles` and `field`;
+  - `open`, naming the window, the CPU workers, the controller backend, the style (`mapping`, its `meaning`,
+    `look`, `particles` and `field`) and `clock_telemetry`, the configuration's `[presentation]
+    show_clock_telemetry`;
   - one `status` per status;
   - one `view` per style change, with the same style fields;
   - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
@@ -163,6 +166,12 @@ adapter.
   - a `frame` summary about once a second, with the camera's center and zoom, and the bytes the Metal route has
     copied so far: to the device (`upload_bytes`, and the most in one frame, `peak_upload_bytes`) and back to the
     host (`readback_bytes`, none for frames presented to the window);
+  - FL-024, while `show_clock_telemetry` is set: a `clock` record after each `frame` summary but the first, over
+    the wall time since the previous one (`wall_seconds`): the `ticks` the session committed in it and
+    `ticks_per_second`; `simulation_rate`, simulated seconds per wall second (the ticks times `Δt`, 1 being real
+    time, 0 while paused); the `frames` presented and `frames_per_second`; and the newest `committed_tick`, the
+    `shown_tick` and how far the shown epoch is behind it (`behind_ticks`). The committed tick is the newest epoch
+    in the render feed (`Studio::committed`), so a slow world reads slow;
   - `end`, with the committed tick, the world digest, the strokes offered and the brush clicks that made none
     (`unstroked`), the controller evaluations the backend
     returned and deferred, and its failure if it failed, and the same copy totals.
@@ -312,9 +321,17 @@ presentation state, not scientific state.
   - paused at tick 3: a material stroke of a living organism's affinity direction and an introduction apply at the
     next step, each moving what the direct world stepped with both reports, bit for bit (the introduction 8 organisms
     at 2 energy each, 16), and the closed world is the direct one.
-- `src/main.rs` unit tests (2, FL-022): the `submitted` record of each brush's stroke as JSON, exactly (the
-  material's 32-component `direction`; absent fields null), and the `finished` record of an applied command (tick,
-  published tick, energy) and of a cancelled one.
+- `tests/clock.rs` (7 tests, FL-024, no window), the `ClockMeter` the binary reads:
+  - the first read opens a window and gives nothing; 128 ticks in one second at `Δt = 1/128` read 128 ticks/s,
+    rate 1 and the frames' 60 fps, 8 ticks behind;
+  - each window starts where the last ended (64 ticks/s and rate 0.5, then 1,024 and 8); the ratio uses the world's
+    own timestep (40 ticks of 3/40 s in 2 s are 1.5); a paused world reads 0 ticks and rate 0 with its frames
+    still counted; a window of no wall time, or a read before it opened, gives nothing and keeps its start;
+  - against a running `SessionThread`'s render feed: over 300 ms the ticks read are exactly what the feed's newest
+    epoch advanced, at that over the window's wall seconds and `Δt` times it, and once paused a window reads 0.
+- `src/main.rs` unit tests (3, FL-022, FL-024): the `submitted` record of each brush's stroke as JSON, exactly (the
+  material's 32-component `direction`; absent fields null), the `finished` record of an applied command (tick,
+  published tick, energy) and of a cancelled one, and the `clock` record of a reading.
 - In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
   backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
@@ -380,6 +397,10 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     command's watcher keeps asking every 20 ms.
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush
     does survives the process (recording is FL-023).
+- FL-024: the clocks are an NDJSON record, not an on-screen HUD: the Metal route draws no text. The `clock`
+  records are printed only in a window, which no test here opened; the meter and the record's JSON are tested
+  without one. A window shorter than the summary interval, or one in which the feed published no newer epoch,
+  reads what the feed shows: the session may have stepped further than it has published.
 - FL-043: `Studio::open` admits the world and its observers before installing the backend
   (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so, installs the
   bounded backend and reports `memory` in its `open` record runs only in a window, which no test here opened.

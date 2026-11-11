@@ -598,6 +598,13 @@ impl Studio {
         })
     }
 
+    /// The newest epoch the session has published: its committed tick,
+    /// which the display may not show yet.
+    #[must_use]
+    pub fn committed(&self) -> Option<Prior> {
+        self.feed.latest()
+    }
+
     /// Whether the window closed or a close was asked for.
     #[must_use]
     pub const fn should_close(&self) -> bool {

@@ -10,8 +10,11 @@
 //! the session accepted as a command (FL-022: the boundary of
 //! `effective_tick` it applies at) and a `finished` record when it applied
 //! (the tick, the published tick and the energy it moved) or was cancelled,
-//! and a `frame` summary about once a second, then an `end` with the
-//! committed world's digest. An error
+//! a `frame` summary about once a second and, while `[presentation]
+//! show_clock_telemetry` is set, a `clock` record beside it (plan §12.2:
+//! ticks committed per wall second, the simulation-time to wall-time
+//! ratio, frames presented per second and the display's backlog in ticks),
+//! then an `end` with the committed world's digest. An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -26,13 +29,13 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use flife_backend_metal::ControllerChoice;
-use flife_core::ValidatedConfig;
 use flife_core::memory::MemoryAdmission;
+use flife_core::{Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status, Stroke, Studio,
-    StudioOptions, Style,
+    Brush, ClockMeter, ClockReading, ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status,
+    Stroke, Studio, StudioOptions, Style,
 };
 use serde::Serialize;
 
@@ -124,6 +127,7 @@ enum Record<'a> {
         look: &'static str,
         particles: &'static str,
         field: bool,
+        clock_telemetry: bool,
     },
     View {
         schema: &'static str,
@@ -182,6 +186,19 @@ enum Record<'a> {
         /// world no longer holds it.
         tick: Option<u64>,
         snapshot: Option<Inspection>,
+    },
+    /// The clocks over the last window (plan §12.2).
+    Clock {
+        schema: &'static str,
+        wall_seconds: f64,
+        ticks: u64,
+        ticks_per_second: f64,
+        simulation_rate: f64,
+        frames: u64,
+        frames_per_second: f64,
+        committed_tick: u64,
+        shown_tick: Option<u64>,
+        behind_ticks: Option<u64>,
     },
     Frame {
         schema: &'static str,
@@ -374,10 +391,20 @@ fn main() -> ExitCode {
         look: options.style.look.name(),
         particles: options.style.particles.name(),
         field: options.style.field,
+        clock_telemetry: model.presentation.show_clock_telemetry,
     });
 
     let period = Duration::from_secs(1) / fps;
     let mut summary = Instant::now();
+    let mut clocks = ClockMeter::new(config.report().timestep);
+    if model.presentation.show_clock_telemetry {
+        let _ = clocks.read(
+            summary,
+            studio.committed().map_or(Tick::ZERO, |epoch| epoch.tick),
+            studio.tally().presented,
+            None,
+        );
+    }
     let mut selected = None;
     let mut armed = None;
     while !studio.should_close() {
@@ -440,6 +467,16 @@ fn main() -> ExitCode {
                 peak_upload_bytes: tally.peak_upload_bytes,
                 readback_bytes: tally.readback_bytes,
             });
+            if model.presentation.show_clock_telemetry
+                && let Some(reading) = clocks.read(
+                    summary,
+                    studio.committed().map_or(Tick::ZERO, |epoch| epoch.tick),
+                    tally.presented,
+                    frame.shown.map(|shown| shown.tick),
+                )
+            {
+                print(&clock_record(&reading));
+            }
         }
         if let Some(rest) = period.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);
@@ -566,6 +603,21 @@ fn status_record(status: &Status) -> Record<'static> {
             tick: snapshot.as_ref().map(|snapshot| snapshot.tick.get()),
             snapshot: snapshot.as_deref().map(inspection),
         },
+    }
+}
+
+fn clock_record(reading: &ClockReading) -> Record<'static> {
+    Record::Clock {
+        schema: STUDIO_SCHEMA,
+        wall_seconds: reading.wall_seconds,
+        ticks: reading.ticks,
+        ticks_per_second: reading.ticks_per_second,
+        simulation_rate: reading.simulation_rate,
+        frames: reading.frames,
+        frames_per_second: reading.frames_per_second,
+        committed_tick: reading.committed.get(),
+        shown_tick: reading.shown.map(Tick::get),
+        behind_ticks: reading.behind,
     }
 }
 
@@ -721,6 +773,38 @@ mod tests {
         assert_eq!(
             (&energy["cell"], &energy["amount"]),
             (&json!([0, 31]), &json!(64.0))
+        );
+    }
+
+    #[test]
+    fn clock_records_carry_the_reading() {
+        let reading = flife_studio::ClockReading {
+            wall_seconds: 1.25,
+            ticks: 160,
+            ticks_per_second: 128.0,
+            simulation_rate: 1.0,
+            frames: 75,
+            frames_per_second: 60.0,
+            committed: Tick::new(1_000),
+            shown: Some(Tick::new(999)),
+            behind: Some(1),
+        };
+        let record = serde_json::to_value(super::clock_record(&reading)).unwrap_or(Value::Null);
+        assert_eq!(
+            record,
+            json!({
+                "record": "clock",
+                "schema": "frankenlife.studio.v1",
+                "wall_seconds": 1.25,
+                "ticks": 160,
+                "ticks_per_second": 128.0,
+                "simulation_rate": 1.0,
+                "frames": 75,
+                "frames_per_second": 60.0,
+                "committed_tick": 1000,
+                "shown_tick": 999,
+                "behind_ticks": 1
+            })
         );
     }
 

@@ -889,7 +889,9 @@ dependencies = [
  "flife-render",
  "fmn-core",
  "fmn-frame",
+ "fmn-geom",
  "fmn-render",
+ "fmn-text",
 ]
 
 [[package]]

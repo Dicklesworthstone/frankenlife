@@ -29,7 +29,9 @@
 //! The clocks are honest (plan §12.2): a [`ClockMeter`] reads the achieved
 //! scientific ticks per wall second and the simulation-time to wall-time
 //! ratio beside the frames presented, which the binary reports while
-//! `[presentation] show_clock_telemetry` is set.
+//! `[presentation] show_clock_telemetry` is set. The window draws them,
+//! what the session is doing and what a click will do as text in its
+//! top-left corner ([`overlay_text`], [`Studio::set_overlay`]).
 
 #![forbid(unsafe_code)]
 
@@ -38,6 +40,7 @@ mod clock;
 mod controls;
 mod host;
 pub mod memory;
+mod overlay;
 mod pacing;
 mod session;
 
@@ -56,6 +59,7 @@ pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
 };
+pub use overlay::{OverlayState, overlay_text};
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 

@@ -45,6 +45,10 @@ fmn = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9
 # the umbrella does not re-export the renderer's Metal route.
 fmn-core = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9c5b23787acd7fe40dc0963c410ef3494f86" }
 fmn-render = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9c5b23787acd7fe40dc0963c410ef3494f86" }
+# The Studio's on-screen text (FL-024): the bundled fonts' layout and glyph
+# outlines, and the ear-clip triangulator. Already in the closure through fmn.
+fmn-text = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9c5b23787acd7fe40dc0963c410ef3494f86" }
+fmn-geom = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9c5b23787acd7fe40dc0963c410ef3494f86" }
 # Offline frames (`flife render`): Rgba16F to sRGB RGBA8, and PNG.
 fmn-frame = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9c5b23787acd7fe40dc0963c410ef3494f86" }
 fmn-codec = { git = "https://github.com/Dicklesworthstone/franken_manim", rev = "c6ad9c5b23787acd7fe40dc0963c410ef3494f86" }

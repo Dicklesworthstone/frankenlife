@@ -15,8 +15,9 @@ use fmn_render::{
 use crate::cloud::check_min_radius_points;
 use crate::mapping::{Look, Particles, Style};
 use crate::{
-    DensityLayer, FieldLayer, ParticleCloud, SELECTION_RING_SEGMENTS, Viewport, density_bins,
-    dot_radius_at_least, pick, selection_ring_around,
+    DensityLayer, FieldLayer, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HudText, ParticleCloud,
+    SELECTION_RING_SEGMENTS, Viewport, density_bins, dot_radius_at_least, hud_glyphs, hud_plate,
+    pick, selection_ring_around,
 };
 
 /// The most FrankenManim's preparation of a frame charges for one true dot
@@ -72,6 +73,9 @@ fn bloom_at(strength: f64, viewport: &Viewport) -> Result<Bloom, CoreError> {
 /// The finest edge sampling FrankenManim's 3D route takes per pixel: a
 /// 4 x 4 grid.
 const MAXIMUM_SAMPLES_PER_PIXEL: u64 = 16;
+
+/// The overlay's draws: its plate and its glyphs (FL-024).
+const OVERLAY_DRAWS: usize = 2;
 
 /// The bytes of a mesh of `vertices` and `triangles`.
 fn mesh_bytes((vertices, triangles): (u64, u64)) -> u64 {
@@ -144,6 +148,26 @@ pub struct WorldView {
     bloom_strength: Option<f64>,
     /// That bloom at the viewport's pixel density.
     bloom: Option<Bloom>,
+    /// Whether the view draws text, and so charges for it (FL-024).
+    overlay: bool,
+    /// The text drawn, with its meshes at the viewport.
+    hud: Option<Hud>,
+}
+
+/// Text over the world and its meshes at the view's viewport (FL-024).
+#[derive(Debug)]
+struct Hud {
+    text: HudText,
+    plate: SurfaceMesh,
+    glyphs: Option<SurfaceMesh>,
+}
+
+/// `text`'s plate and glyphs at `viewport`.
+fn overlay_meshes(
+    viewport: &Viewport,
+    text: &HudText,
+) -> Result<(SurfaceMesh, Option<SurfaceMesh>), CoreError> {
+    Ok((hud_plate(viewport, text)?, hud_glyphs(viewport, text)?))
 }
 
 /// Where the display is between two committed epochs (FL-020, plan §13.5).
@@ -214,6 +238,8 @@ impl WorldView {
             field_texels: [0; 2],
             bloom_strength: None,
             bloom: None,
+            overlay: false,
+            hud: None,
         })
     }
 
@@ -307,9 +333,17 @@ impl WorldView {
             )?),
             None => None,
         };
+        let hud = match &self.hud {
+            Some(hud) => Some(overlay_meshes(&viewport, &hud.text)?),
+            None => None,
+        };
         self.viewport = viewport;
         self.camera = camera;
         self.ring = ring;
+        if let (Some(hud), Some((plate, glyphs))) = (self.hud.as_mut(), hud) {
+            hud.plate = plate;
+            hud.glyphs = glyphs;
+        }
         self.bloom = bloom;
         self.cloud.refit(&self.viewport);
         self.density.refit(&self.viewport);
@@ -686,9 +720,74 @@ impl WorldView {
         })
     }
 
+    /// Draw text over the world from now on (FL-024): the view charges a
+    /// text's most in [`WorldView::reserved_bytes`],
+    /// [`WorldView::preparation_limit`] and [`WorldView::frame_bytes`]
+    /// whether it shows one or not, so a host enables it before it admits
+    /// the view.
+    pub fn enable_overlay(&mut self) {
+        self.overlay = true;
+    }
+
+    /// Whether the view draws text.
+    #[must_use]
+    pub const fn has_overlay(&self) -> bool {
+        self.overlay
+    }
+
+    /// Show `text` over the world from the next frame, or none for `None`
+    /// or an empty text. Its plate and glyphs follow the viewport.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when the view does not draw text
+    /// ([`WorldView::enable_overlay`]); as [`hud_plate`]. The view is
+    /// unchanged on error.
+    pub fn set_overlay(&mut self, text: Option<HudText>) -> Result<(), CoreError> {
+        if !self.overlay {
+            return Err(CoreError::StateConflict {
+                operation: "world view overlay",
+                detail: "the view does not draw text".to_owned(),
+            });
+        }
+        self.hud = match text {
+            Some(text) if !text.is_empty() => {
+                let (plate, glyphs) = overlay_meshes(&self.viewport, &text)?;
+                Some(Hud {
+                    text,
+                    plate,
+                    glyphs,
+                })
+            }
+            _ => None,
+        };
+        Ok(())
+    }
+
+    /// The text shown over the world.
+    #[must_use]
+    pub fn overlay(&self) -> Option<&HudText> {
+        self.hud.as_ref().map(|hud| &hud.text)
+    }
+
+    /// The overlay's draws, while it shows text: the plate, then the
+    /// glyphs, unlit and over everything else.
+    fn overlay_draws(&self) -> impl Iterator<Item = ThreeDDraw<'_>> + '_ {
+        let unlit = |mesh| {
+            ThreeDDraw::Surface(SurfaceDraw {
+                shading: [0.0; 3],
+                depth_test: false,
+                ..SurfaceDraw::new(mesh)
+            })
+        };
+        self.hud.iter().flat_map(move |hud| {
+            std::iter::once(unlit(&hud.plate)).chain(hud.glyphs.iter().map(unlit))
+        })
+    }
+
     /// The current frame's draws in painter order: the field, then the
     /// density layer, or every halo and then every dot, then the selection
-    /// ring. Raw density is opaque, so the field is left out under it.
+    /// ring, then the overlay's plate and text. Raw density is opaque, so
+    /// the field is left out under it.
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the list cannot be reserved.
@@ -698,12 +797,13 @@ impl WorldView {
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
+        let fixed = 3 + OVERLAY_DRAWS;
         draws
-            .try_reserve_exact(3 + halos.len() + dots.len())
+            .try_reserve_exact(fixed + halos.len() + dots.len())
             .map_err(|_| CoreError::AllocationFailed {
                 buffer: "world view frame draws",
                 bytes: u64::try_from(
-                    (3 + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
+                    (fixed + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
                 )
                 .unwrap_or(u64::MAX),
             })?;
@@ -717,6 +817,7 @@ impl WorldView {
             draws.extend_from_slice(dots);
         }
         draws.extend(self.selection_draw());
+        draws.extend(self.overlay_draws());
         Ok(draws)
     }
 
@@ -793,7 +894,20 @@ impl WorldView {
             mesh_bytes(QUAD).saturating_mul(2),
             mesh_bytes((2 * ring, 2 * ring)),
         ]);
+        // A text's buffers and meshes, twice: one is built before the one it
+        // replaces is dropped.
+        let overlay = if self.overlay {
+            total([
+                HudText::reserved_bytes(),
+                mesh_bytes(QUAD),
+                mesh_bytes((HUD_MAX_VERTICES as u64, HUD_MAX_TRIANGLES as u64)),
+            ])
+            .saturating_mul(2)
+        } else {
+            0
+        };
         total([
+            overlay,
             capacity_bytes(&self.ids),
             capacity_bytes(&self.between.positions),
             capacity_bytes(&self.between.shown),
@@ -816,7 +930,12 @@ impl WorldView {
     pub fn preparation_limit(&self) -> u64 {
         let dots = (self.cloud.capacity() as u64).saturating_mul(2);
         let ring = 2 * SELECTION_RING_SEGMENTS as u64;
-        let triangles = total([QUAD.1, QUAD.1, ring]);
+        let overlay = if self.overlay {
+            QUAD.1 + HUD_MAX_TRIANGLES as u64
+        } else {
+            0
+        };
+        let triangles = total([QUAD.1, QUAD.1, ring, overlay]);
         total([
             dots.saturating_mul(PREPARATION_BYTES_PER_DOT),
             triangles.saturating_mul(PREPARATION_BYTES_PER_TRIANGLE),
@@ -844,7 +963,12 @@ impl WorldView {
     /// [`WorldView::preparation_limit`].
     #[must_use]
     pub fn frame_bytes(&self) -> u64 {
-        let draws = self.cloud.capacity().saturating_mul(2).saturating_add(3);
+        let overlay = if self.overlay { OVERLAY_DRAWS } else { 0 };
+        let draws = self
+            .cloud
+            .capacity()
+            .saturating_mul(2)
+            .saturating_add(3 + overlay);
         total([
             bytes_for::<ThreeDDraw<'static>>(draws),
             (draws as u64).saturating_mul(JOB_BYTES_PER_DRAW),

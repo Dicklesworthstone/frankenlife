@@ -15,7 +15,9 @@ flife-core = { path = "../flife-core" }
 flife-render = { path = "../flife-render" }
 fmn-core.workspace = true
 fmn-frame.workspace = true
+fmn-geom.workspace = true
 fmn-render.workspace = true
+fmn-text.workspace = true
 
 [dev-dependencies]
 flife-engine = { path = "../flife-engine" }

@@ -53,12 +53,32 @@ fn the_studio_is_admitted_with_its_observers_and_the_backend_gets_the_rest() {
     let config = preset_with(&[]);
     let world = found(&config);
     let founding = Epoch::standalone(&world).expect("an epoch");
-    let view = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
+    let mut view = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
     // At two pixels per point the window's drawable has four times the pixels.
     let drawable = [3840, 2160];
+    let bare = observer_bytes(&world, &founding, &view, drawable);
+    let (reserved, frame, preparation) = (
+        view.reserved_bytes(),
+        view.frame_bytes(),
+        view.preparation_limit(),
+    );
+    // As `Studio::open` does: the overlay's text is admitted with the view
+    // (FL-024).
+    view.enable_overlay();
     let slots = u64::from(config.config().execution.render_queue_capacity);
     let tiles = (3840 / 16) * (2160 / 16);
     let observers = observer_bytes(&world, &founding, &view, drawable);
+    assert_eq!(
+        observers - bare,
+        (view.reserved_bytes() - reserved)
+            + (view.frame_bytes() - frame)
+            + 2 * (view.preparation_limit() - preparation),
+        "the overlay is charged"
+    );
+    println!(
+        "studio overlay: {:.1} MiB",
+        (observers - bare) as f64 / f64::from(1 << 20)
+    );
     assert_eq!(
         observers,
         founding.reserved_bytes() * slots
@@ -91,6 +111,7 @@ fn the_studio_is_admitted_with_its_observers_and_the_backend_gets_the_rest() {
     let presentation = &config.config().presentation;
     assert!(presentation.bloom_enabled);
     let mut blooming = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
+    blooming.enable_overlay();
     blooming
         .set_bloom(Some(presentation.bloom_strength))
         .expect("a bloom");
@@ -118,7 +139,8 @@ fn the_studio_is_admitted_with_its_observers_and_the_backend_gets_the_rest() {
     let short = preset_with(&[("maximum_total_bytes", others + observers - 1)]);
     let world = found(&short);
     let founding = Epoch::standalone(&world).expect("an epoch");
-    let view = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
+    let mut view = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
+    view.enable_overlay();
     match admit(&world, ControllerChoice::Torch, &founding, &view, drawable) {
         Err(CoreError::BudgetExhausted { budget, .. }) => {
             assert!(budget.starts_with("peak memory"), "{budget}");

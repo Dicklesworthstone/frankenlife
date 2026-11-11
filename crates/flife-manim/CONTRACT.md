@@ -4,7 +4,8 @@
 FL-019 (`flife-g90`) adds the visual mappings, raw views and density rendering (plan §2.3, §13.3 step 5, §13.4).
 FL-020 (`flife-err`, part) adds the camera, which pans and zooms across the torus's seams, picking by identity, and
 the display between two committed epochs: organisms matched by identity, births at their epoch, deaths fading
-(plan §13.5, §13.6, C.15).
+(plan §13.5, §13.6, C.15). FL-024 (`flife-xut`, part) adds the metric overlay: lines of text fixed to the
+drawable's corner, drawn by the 3D route as triangles (plan §12.2).
 The live ecology enters a FrankenManim scene as a few bulk primitives, never as one scene object per organism:
 
 - `Viewport` is the exact map between world units, FrankenManim's scene, drawable pixels and logical window points,
@@ -209,6 +210,34 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     `bloom_bytes` at the drawable. A view
     made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
   - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
+- `hud` (FL-024): the 3D route draws triangles, not text.
+  - `HudFont::bundled()` loads FrankenManim's bundled font book (`fmn-text`), once.
+  - `HudFont::text(text, em_pixels)` lays `text` out in IBM Plex Sans, `\n` breaking lines, at an em of
+    `em_pixels`. Each glyph's quadratic outline is flattened (`flatten_quadratic`: even steps in the parameter,
+    enough that no chord departs from the curve by more than `HUD_FLATNESS_PIXELS` = 0.2 px, at most
+    `HUD_MAX_CURVE_SEGMENTS` = 64 a curve). Its contours nest by containment, an even depth ink and an odd one a
+    hole, and each ink contour is ear-clipped with its holes (`fmn-geom`'s `triangulate`, an exact cover or a named
+    refusal). The result is a `HudText`: vertices in drawable pixels from the block's top-left, y down, each
+    contour's range, and triangles.
+  - A glyph whose outline cannot be read or triangulated is left out and counted (`refused`). The text stops at
+    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (6,144 each, half as much again as the Studio's longest overlay at
+    2x), counting the glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
+    (`HudText::reserved_bytes`).
+  - `hud_scene_point(viewport, position)` is the camera's own map from a drawable position to the scene: the frame
+    is the whole drawable, centred on the scene's origin, `scale` pixels a scene unit, y up.
+  - `hud_plate` is a rectangle `HUD_MARGIN_POINTS` (10) from the drawable's top and left, `HUD_PADDING_POINTS`
+    (6) around the text, black at `HUD_PLATE_OPACITY` (0.6). `hud_glyphs` puts the text at `hud_origin`, the
+    margin and the padding, in `HUD_TEXT_COLOR` (linear 0.8 grey). Both meshes are clockwise in the scene, as the
+    view's others are.
+  - `WorldView::enable_overlay()` makes a view draw text. From then on it charges, whether it shows text or not:
+    - in `reserved_bytes`, two texts' buffers and two plates and two meshes at the ceilings (one is built before
+      the one it replaces is dropped);
+    - in `preparation_limit`, the plate's and the ceiling's triangles;
+    - in `frame_bytes`, two draws.
+  - `set_overlay(Some(text))` shows a text from the next frame and `None` or an empty text shows none; without
+    `enable_overlay` it is refused (`StateConflict`). The overlay's plate and glyph draws come last in `draws()`,
+    unlit with no depth test. A pan, zoom, resize or new density rebuilds its meshes, so the text keeps its place
+    and size on the screen.
 
 **Invariants.**
 - *Bounded scene objects (§13.2).* The whole population is one scene object, the field another, the density layer a
@@ -400,6 +429,27 @@ route.
   MiB), within the 18.75 MiB charged, where the whole frame's row sums took 126.56 MiB;
   and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
+- `tests/hud.rs` (7 tests, FL-024), each oracle independent of the triangulation:
+  - six quadratics, from straight to a hairpin, flattened: the polyline ends on the anchor, a straight curve is one
+    segment, and 4,097 samples of each curve lie within 0.2 px of it;
+  - all 95 printable ASCII characters and `×·–—…°`, at ems of 13 and 26 px: one glyph each, none refused or left
+    out, inside its box. At about 12.8 million sample points on a grid an em wider than the glyph all round (those
+    within 1e-9 em of an edge left out), a point is in a triangle exactly when the winding number of the flattened
+    contours about it is nonzero, the font's fill rule;
+  - a second line is the first moved down 1.2 em exactly, and a space draws nothing; a zero or NaN em is refused;
+  - 16 lines of glyphs with holes stop within 10% of the triangle ceiling, and 16 lines of glyphs without within
+    10% of the vertex ceiling (each binds first for its kind), with every glyph drawn, refused or left out;
+  - at three drawable shapes and four viewports (fit, zoomed over a seam, 2x, zoomed into a corner), the overlay's
+    map of the drawable position of a world point is the scene point the view draws it at, to 1e-9;
+  - a view refuses text until it draws text, then charges exactly the terms above. Its last two draws are the plate
+    (four vertices at 0.6 opacity) and the glyphs, at `hud_origin` through `hud_scene_point`, inside the plate's
+    padding. After a zoom the glyphs are at the same drawable pixels, and no text or a blank one draws nothing;
+  - a CPU frame of the preset with `Hg8` at an 80 px em: every pixel more than 1 px outside the plate is
+    byte-identical to the frame without text; under the plate, each pixel 1.5 px or more from an outline edge is the
+    text's colour (sRGB 231, within 1.5) where the winding number is nonzero, and otherwise the world under the
+    plate's black at 0.6 opacity, mixed in linear light (within 1.5). Over 500 ink and 2,000 plate pixels are checked.
+- In `flife-cli`, `tests/memory_admission.rs` measures a 4K view at 2x with the overlay: the longest overlay laid out
+  twice and shown, and two zooms. Its peak heap, the texts' layout included, is 9.87 MiB of its 12.46 MiB reserved.
 
 **Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `c6ad9c5b`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
@@ -410,8 +460,12 @@ route.
   the density's, and the field's for bitwise the same values), and both are uploaded with every Metal frame;
   resident device textures and buffers and the shared-device resource bridge are still FL-033's (and FL-028's typed
   Metal buffers).
-- There is no on-screen legend: FrankenManim's Metal 3D route has no text, so the meaning is in the Studio's and
-  `flife render`'s records.
+- The overlay's text is triangles flattened for the em it was laid out at. A host lays it out again for a new pixel
+  density (the Studio does). A glyph's edges are the 3D route's triangle edges, so it is not hinted or subpixel
+  antialiased. A bloom blurs the text a little, as it does everything drawn before it, and the overlay is not
+  excluded from it.
+- There is no on-screen legend yet: the colour mapping is named in the overlay, but its key (which colour means
+  what) is not drawn. `flife render` draws no overlay.
 - Density bins are still about 6 px, not one per pixel. Since FL-033 a finer bin costs 16 texel bytes, not two
   triangles, but finer bins are not drawn yet.
 - FrankenManim's preparation accounting (`ThreeDJob::preparation_bytes`, which its `max_working_bytes` bounds)

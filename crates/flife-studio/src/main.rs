@@ -14,7 +14,10 @@
 //! show_clock_telemetry` is set, a `clock` record beside it (plan §12.2:
 //! ticks committed per wall second, the simulation-time to wall-time
 //! ratio, frames presented per second and the display's backlog in ticks),
-//! then an `end` with the committed world's digest. An error
+//! then an `end` with the committed world's digest. The window draws the
+//! same state as text in its top-left corner: running or paused at the
+//! shown tick, the clocks while they are reported, the colour mapping, the
+//! armed brush and the selected organism (FL-024). An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -34,8 +37,8 @@ use flife_core::{Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ClockMeter, ClockReading, ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status,
-    Stroke, Studio, StudioOptions, Style,
+    Brush, ClockMeter, ClockReading, ColorMapping, End, Look, OverlayState, Particles,
+    STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, overlay_text,
 };
 use serde::Serialize;
 
@@ -407,6 +410,11 @@ fn main() -> ExitCode {
     }
     let mut selected = None;
     let mut armed = None;
+    // The overlay (FL-024): the session's last reported state, the tick
+    // shown when it or the clocks last changed, and the last clock reading.
+    let mut paused = None;
+    let mut overlay_tick = None;
+    let mut last_clock = None;
     while !studio.should_close() {
         let started = Instant::now();
         let frame = match studio.frame() {
@@ -418,6 +426,12 @@ fn main() -> ExitCode {
             }
         };
         for status in studio.take_statuses() {
+            match &status {
+                Status::Running { .. } => paused = Some(false),
+                Status::Paused { .. } => paused = Some(true),
+                _ => {}
+            }
+            overlay_tick = frame.shown.map(|shown| shown.tick);
             print(&status_record(&status));
         }
         if frame.restyled {
@@ -450,6 +464,7 @@ fn main() -> ExitCode {
         }
         if summary.elapsed() >= Duration::from_secs(1) {
             summary = Instant::now();
+            overlay_tick = frame.shown.map(|shown| shown.tick);
             let tally = studio.tally();
             let viewport = studio.view().viewport();
             print(&Record::Frame {
@@ -476,7 +491,24 @@ fn main() -> ExitCode {
                 )
             {
                 print(&clock_record(&reading));
+                last_clock = Some(reading);
             }
+        }
+        if overlay_tick.is_none() {
+            overlay_tick = frame.shown.map(|shown| shown.tick);
+        }
+        let text = overlay_text(&OverlayState {
+            paused,
+            shown: overlay_tick,
+            clock: last_clock.as_ref(),
+            mapping: studio.view().style().mapping.name(),
+            brush: armed,
+            selected,
+        });
+        if let Err(error) = studio.set_overlay(&text) {
+            let code = fail(error.kind(), error.to_string(), 1);
+            let _ = studio.close();
+            return code;
         }
         if let Some(rest) = period.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);

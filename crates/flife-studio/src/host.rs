@@ -39,7 +39,7 @@ use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
-use flife_manim::{Motion, Style, Viewport, WorldView, hex_rgb};
+use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
@@ -221,6 +221,10 @@ pub struct Studio {
     material: Option<(OrganismId, Option<[f64; flife_engine::MATERIAL_CHANNELS]>)>,
     /// `population.initial_energy`: each introduced organism's endowment.
     founder_energy: f64,
+    /// The overlay's font (FL-024).
+    font: HudFont,
+    /// The text drawn over the world.
+    overlay: String,
 }
 
 impl Studio {
@@ -269,6 +273,9 @@ impl Studio {
         // the budget leaves. Frames are drawn at the window's drawable.
         let founding = Epoch::standalone(&world)?;
         let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
+        // The overlay's text is admitted with the view (FL-024, FL-043).
+        view.enable_overlay();
+        let font = HudFont::bundled()?;
         view.set_style(options.style);
         let presentation = &model.presentation;
         view.set_bloom(
@@ -337,7 +344,43 @@ impl Studio {
             memory,
             material: None,
             founder_energy: model.population.initial_energy,
+            font,
+            overlay: String::new(),
         })
+    }
+
+    /// Draw `text` over the world from the next frame (FL-024's metric
+    /// overlay; [`crate::overlay_text`] composes the Studio's): lines in
+    /// IBM Plex Sans at [`HUD_TEXT_POINTS`] on the window's screen, over a
+    /// dark plate in the drawable's top-left corner. An empty text draws
+    /// nothing; the same text again does nothing.
+    ///
+    /// # Errors
+    /// As [`HudFont::text`] and [`WorldView::set_overlay`]; the overlay is
+    /// unchanged on error.
+    pub fn set_overlay(&mut self, text: &str) -> Result<(), CoreError> {
+        if text == self.overlay {
+            return Ok(());
+        }
+        self.lay_out_overlay(text)?;
+        text.clone_into(&mut self.overlay);
+        Ok(())
+    }
+
+    /// The text drawn over the world.
+    #[must_use]
+    pub fn overlay(&self) -> &str {
+        &self.overlay
+    }
+
+    fn lay_out_overlay(&mut self, text: &str) -> Result<(), CoreError> {
+        let laid = if text.is_empty() {
+            None
+        } else {
+            let em = HUD_TEXT_POINTS * self.view.viewport().pixels_per_point();
+            Some(self.font.text(text, em)?)
+        };
+        self.view.set_overlay(laid)
     }
 
     /// Where due controllers are evaluated: a backend and device, or
@@ -415,6 +458,13 @@ impl Studio {
             }
             _ => false,
         };
+        if redensed && !self.overlay.is_empty() {
+            // The text keeps its size in points on the new screen.
+            let text = std::mem::take(&mut self.overlay);
+            let laid = self.lay_out_overlay(&text);
+            self.overlay = text;
+            laid?;
+        }
         let refitted = resized || redensed;
         if refitted {
             self.tally.refits += 1;

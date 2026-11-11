@@ -404,7 +404,9 @@ The Studio opens running (`--paused` to start paused). Space runs or pauses, →
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the
 preset, a per-second `clock` record gives the honest clocks: the ticks committed per wall second, simulated seconds
-per wall second and frames presented per second (FL-024). The organisms glow over the energy field they feed on, in
+per wall second and frames presented per second (FL-024). The window draws the same in its top-left corner, as
+text over a dark plate: running or paused at the shown tick, those clocks, the colour mapping, the armed brush and
+the selected organism. The organisms glow over the energy field they feed on, in
 the configuration's colour mapping (`[presentation] color_mapping`, lineage in the preset). The style keys work
 while running or paused, and change only the picture:
 

@@ -9,6 +9,7 @@ bounded snapshot at its committed boundary (§14.2). FL-022 (`flife-2jj`, part) 
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
+They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
 It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
@@ -329,6 +330,14 @@ presentation state, not scientific state.
     still counted; a window of no wall time, or a read before it opened, gives nothing and keeps its start;
   - against a running `SessionThread`'s render feed: over 300 ms the ticks read are exactly what the feed's newest
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and once paused a window reads 0.
+- `tests/overlay.rs` (2 tests, FL-024, no window):
+  - `overlay_text` exactly: `opening` before the session reports; `running · tick 1,024`, then `128 ticks/s ·
+    1.00× real time · 60 fps`, then the mapping; one decimal below 100 ticks/s; the brush and the organism, grouped
+    in thousands;
+  - the longest overlay (every count at its largest, each brush) at 2x: every glyph is drawn, none refused or left
+    out, within two thirds of the overlay's budget (3,990 vertices and 3,778 triangles at most).
+- `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
+  terms to the observers: 13.0 MiB at 3840 x 2160.
 - `src/main.rs` unit tests (3, FL-022, FL-024): the `submitted` record of each brush's stroke as JSON, exactly (the
   material's 32-component `direction`; absent fields null), the `finished` record of an applied command (tick,
   published tick, energy) and of a cancelled one, and the `clock` record of a reading.
@@ -397,9 +406,10 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     command's watcher keeps asking every 20 ms.
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush
     does survives the process (recording is FL-023).
-- FL-024: the clocks are an NDJSON record, not an on-screen HUD: the Metal route draws no text. The `clock`
-  records are printed only in a window, which no test here opened; the meter and the record's JSON are tested
-  without one. A window shorter than the summary interval, or one in which the feed published no newer epoch,
+- FL-024: the `clock` records and the overlay are printed and drawn only in a window, which no test here opened.
+  The meter, the record's JSON, the overlay's text and its glyphs are tested without one; `flife-manim`'s
+  `tests/hud.rs` renders the overlay through the CPU route. The overlay's tick is the shown tick when the session
+  last reported a status or the clocks last read, so while running it is up to a second old. A window shorter than the summary interval, or one in which the feed published no newer epoch,
   reads what the feed shows: the session may have stepped further than it has published.
 - FL-043: `Studio::open` admits the world and its observers before installing the backend
   (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so, installs the
@@ -438,8 +448,8 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.
-- There is no on-screen legend: the Metal 3D route has no text, and the presenter has no window-title setter. The
-  style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
+- The overlay names the colour mapping, but there is no legend (its key is not drawn), and the presenter has no
+  window-title setter. The style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed.
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later
   work (FL-023, FL-038).

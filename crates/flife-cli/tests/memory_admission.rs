@@ -635,6 +635,53 @@ fn a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes() {
     }
 }
 
+/// FL-024: a view that draws text, measured as the Studio uses it: the
+/// longest overlay laid out and shown, laid out again and shown in its
+/// place (so one text is built while the last is held), and the view
+/// zoomed twice (so its meshes are rebuilt while the last are held), at
+/// two pixels a point. The view and the texts hold no more heap than its
+/// reserved bytes; the font book is the host's, made before.
+#[test]
+fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
+    let _serial = serial();
+    let epoch = full_epoch();
+    let font = flife_manim::HudFont::bundled().expect("the bundled fonts");
+    let longest = concat!(
+        "running · tick 18,446,744,073,709,551,615\n",
+        "123,456,789 ticks/s · 99999.99× real time · 1000 fps\n",
+        "generation · introduction brush · organism 18,446,744,073,709,551,615"
+    );
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let mut view =
+        flife_manim::WorldView::for_epoch(&epoch, [3840, 2160], [0, 0, 0]).expect("a view");
+    view.set_pixels_per_point(2.0).expect("2x");
+    view.enable_overlay();
+    view.show(&epoch).expect("shows");
+    let em = flife_manim::HUD_TEXT_POINTS * 2.0;
+    let text = font.text(longest, em).expect("text");
+    assert_eq!(text.left_out(), 0);
+    view.set_overlay(Some(text)).expect("shows the text");
+    let again = font.text(longest, em).expect("text again");
+    view.set_overlay(Some(again)).expect("shows it again");
+    for zoom in [3.0, 16.0] {
+        let viewport = view
+            .viewport()
+            .zoomed_about([1500.0, 900.0], zoom)
+            .expect("zooms");
+        view.set_view(viewport).expect("looks");
+    }
+    view.show(&epoch).expect("shows again");
+    let held = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let reserved = view.reserved_bytes();
+    println!(
+        "with text: the view held {:.2} MiB of its {:.2} MiB",
+        mib(held),
+        mib(reserved)
+    );
+    assert!(held <= reserved, "the view held {held} > {reserved}");
+}
+
 /// FL-033: a pan or zoom of the shown epoch keeps the field's and the
 /// density's textures and moves only their quads, so a placement allocates
 /// less than the smaller texture, the field's. A full world at 3840 x 2160,

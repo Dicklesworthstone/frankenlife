@@ -15,19 +15,22 @@
 //!   worlds denser than their pixels (§2.3, §13.3).
 //! - [`Style`] and its parts: §13.4's colour mappings ([`ColorMapping`]),
 //!   the glow and raw looks ([`Look`]), points or density ([`Particles`]).
+//! - [`HudFont`] and [`HudText`]: lines of text over the world, fixed to
+//!   the drawable's corner, as triangles the 3D route draws (FL-024's
+//!   metric overlay).
 //! - [`WorldView`]: all of them, with the per-frame
 //!   [`fmn_render::ThreeDJob`], drawn at rest or part of the way from one
 //!   committed epoch to the next ([`Motion`], FL-020).
 //!
 //! Nothing here reads or writes the world: everything comes from an
-//! immutable [`flife_render::Epoch`]. The metric overlay and camera track
-//! are FL-024 work.
+//! immutable [`flife_render::Epoch`]. The camera track is FL-024 work.
 
 #![forbid(unsafe_code)]
 
 mod cloud;
 mod density;
 mod field;
+mod hud;
 mod mapping;
 mod selection;
 mod viewport;
@@ -41,6 +44,12 @@ pub use density::{
     DENSITY_BIN_POINTS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,
 };
 pub use field::{FIELD_PALETTE, FieldLayer, SCALE_DECAY, display_value, palette, raw_value};
+pub use hud::{
+    HUD_FLATNESS_PIXELS, HUD_MARGIN_POINTS, HUD_MAX_CURVE_SEGMENTS, HUD_MAX_RINGS,
+    HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_PADDING_POINTS, HUD_PLATE_COLOR, HUD_PLATE_OPACITY,
+    HUD_TEXT_COLOR, HUD_TEXT_POINTS, HudFont, HudText, flatten_quadratic, hud_glyphs, hud_origin,
+    hud_plate, hud_plate_rect, hud_scene_point,
+};
 pub use mapping::{
     AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, ColorMapping, ENERGY_HALF, ENERGY_RAMP,
     GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL,

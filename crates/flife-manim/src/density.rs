@@ -73,6 +73,10 @@ pub struct DensityLayer {
     counts: Vec<u32>,
     sums: Vec<[f64; 3]>,
     texture: Option<Texture>,
+    /// The look `texture` was built for from the binned counts, colours and
+    /// scale; `None` while it does not show them (before the first build,
+    /// and from the start of each update until its build succeeds).
+    built: Option<Look>,
     quad: Option<SurfaceMesh>,
     scale: f64,
 }
@@ -87,6 +91,7 @@ impl DensityLayer {
             counts: Vec::new(),
             sums: Vec::new(),
             texture: None,
+            built: None,
             quad: None,
             scale: 0.0,
         }
@@ -118,6 +123,9 @@ impl DensityLayer {
                 ),
             });
         }
+        // The bins change below: the texture shows them again only once
+        // rebuilt.
+        self.built = None;
         let bins = density_bins(&self.viewport);
         let [columns, rows] = bins.map(|n| n as usize);
         let cells = columns * rows;
@@ -165,12 +173,18 @@ impl DensityLayer {
 
     /// Re-place the last binned epoch in the layer at the current viewport
     /// and display scale, which does not move: what a pan or zoom redraws.
-    /// Nothing happens before the first update.
+    /// The texels depend on the binned counts and colours, the scale and the
+    /// look alone, so a texture built for `style`'s look is kept and only
+    /// the quad moves. Nothing happens before the first update.
     ///
     /// # Errors
     /// As [`DensityLayer::update`].
     pub fn place(&mut self, style: &Style) -> Result<(), CoreError> {
         if self.bins == [0, 0] {
+            return Ok(());
+        }
+        if self.built == Some(style.look) {
+            self.quad = Some(self.viewport.periodic_quad(self.bins)?);
             return Ok(());
         }
         self.place_binned(style)
@@ -239,6 +253,7 @@ impl DensityLayer {
             })?;
         let quad = self.viewport.periodic_quad(self.bins)?;
         self.texture = Some(texture);
+        self.built = Some(style.look);
         self.quad = Some(quad);
         Ok(())
     }

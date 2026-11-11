@@ -529,6 +529,85 @@ fn the_density_texture_wraps_without_a_seam_and_draws_in_place_of_the_dots() {
 }
 
 #[test]
+fn a_pan_or_zoom_draws_the_density_texture_a_fresh_build_draws() {
+    // A pan or zoom keeps the density texture built for the look and moves
+    // only its quad; a look it was not built for rebuilds it. Either way the
+    // layer draws what a layer built from scratch at that view draws.
+    let config = common::small();
+    let mut world = common::found(&config);
+    common::advance(&mut world, 30);
+    let epoch = common::epoch(&world);
+    let drawn = |view: &WorldView| {
+        let density = view.density();
+        let Some(ThreeDDraw::Surface(layer)) = density.draw() else {
+            panic!("the density layer draws one surface");
+        };
+        let texture = density.texture().expect("the density's texture");
+        let bits: Vec<[u64; 4]> = texels(texture)
+            .iter()
+            .map(|texel| [texel.r, texel.g, texel.b, texel.a].map(f64::to_bits))
+            .collect();
+        (
+            density.bins(),
+            density.scale().to_bits(),
+            bits,
+            layer.mesh.clone(),
+        )
+    };
+    for (look, other) in [(Look::Glow, Look::Raw), (Look::Raw, Look::Glow)] {
+        let style = Style {
+            particles: Particles::Density,
+            look,
+            ..Style::default()
+        };
+        let mut view = WorldView::for_epoch(&epoch, [192, 160], [0, 0, 0]).expect("view");
+        view.set_style(style);
+        view.show(&epoch).expect("show");
+        let shown = drawn(&view);
+        let mut last = shown.3.clone();
+        for step in 0..3 {
+            let viewport = view.viewport();
+            let moved = match step {
+                0 => viewport.zoomed_about([70.0, 100.0], 3.0),
+                1 => viewport.panned([17.0, -9.0]),
+                _ => viewport.zoomed_about([150.0, 20.0], 16.0),
+            }
+            .expect("moves");
+            view.set_view(moved).expect("looks");
+            view.place(&epoch).expect("places");
+            let mut fresh = WorldView::for_epoch(&epoch, [192, 160], [0, 0, 0]).expect("view");
+            fresh.set_style(style);
+            fresh.show(&epoch).expect("show");
+            fresh.set_view(moved).expect("looks");
+            fresh.show(&epoch).expect("show");
+            let placed = drawn(&view);
+            assert_eq!(placed, drawn(&fresh), "{look:?}, step {step}");
+            assert_eq!(
+                placed.2, shown.2,
+                "{look:?}, step {step}: the texels do not move"
+            );
+            assert_ne!(placed.3, last, "{look:?}, step {step}: the quad does");
+            last = placed.3;
+        }
+        // The other look, placed without a show, rebuilds the texels for it.
+        let restyled = Style {
+            look: other,
+            ..style
+        };
+        view.set_style(restyled);
+        view.place(&epoch).expect("places");
+        let mut fresh = WorldView::for_epoch(&epoch, [192, 160], [0, 0, 0]).expect("view");
+        fresh.set_style(restyled);
+        fresh.show(&epoch).expect("show");
+        fresh.set_view(*view.viewport()).expect("looks");
+        fresh.show(&epoch).expect("show");
+        let placed = drawn(&view);
+        assert_eq!(placed, drawn(&fresh), "{look:?} restyled to {other:?}");
+        assert_ne!(placed.2, shown.2, "{other:?} texels are not {look:?}'s");
+    }
+}
+
+#[test]
 fn a_colour_is_a_function_of_its_row_alone() {
     // Two epochs of one world: an organism alive in both, whose mapped
     // inputs did not change, keeps its colour bit for bit, whatever the

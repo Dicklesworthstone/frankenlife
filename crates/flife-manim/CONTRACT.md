@@ -135,8 +135,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - raw: opaque linear grey `n / scale`, and the field is not drawn;
   - one texture of the bins' corners (`texture()`, `bins` texels each way, rows top to bottom, premultiplied
     linear `f32`), each the premultiplied mean of the four bins around it, wrapping, drawn like the field on the
-    viewport's `periodic_quad`; `place(style)` rebuilds the texture and quad of the last binned epoch at the
-    current display scale.
+    viewport's `periodic_quad`; `place(style)` places the last binned epoch at the current viewport and display
+    scale: a texture built for the style's look is kept, since its texels depend on the binned counts and colours,
+    the scale and the look alone, and only the quad moves; for another look the texture is rebuilt.
 - `WorldView`:
   - `show(epoch)` lowers an epoch in the current style and records it as `shown()`, a `Prior`;
   - `set_style(style)` takes effect at the next `show`; showing the same epoch again redraws it in the new style;
@@ -287,7 +288,7 @@ route.
   - FL-020 density: a 128-pixel view at 2 pixels per point draws what a 64-pixel view at 1 draws (the floored and the
     capped dots, halos, the selection ring and the density bins); the change refits the shown epoch without a new
     show, an unchanged density is no change, and NaN is refused.
-- `tests/mapping.rs` (14 tests), on real render epochs where they matter:
+- `tests/mapping.rs` (15 tests), on real render epochs where they matter:
   - The energy and generation ramps rise monotonically in CIE L*, from above 15 with a range above 50.
   - Energy maps through the fixed saturating `e / (e + 2)`, generations logarithmically to a fixed 256.
   - The motion hue is the heading (y flipped to screen), its strength `√(speed / limit)`.
@@ -303,6 +304,9 @@ route.
     restarts when the bins change.
   - Every registered `presentation.color_mapping` entry is implemented and drawn, in order, and a configuration
     naming each one selects it.
+  - A pan or zoom of a density view (a zoom of 3, a pan, a zoom of 16, in both looks) draws what a view built from
+    scratch at that viewport draws, bit for bit: the same bins, scale and texels, on a quad that moved. Placed in
+    the other look without a show, the texture is rebuilt for it, again equal to a fresh build.
 - `tests/field.rs` (5 tests):
   - The palette is monotone dark to bright; the display value is a clamped square root, zero for NaN, negatives and
     a zero scale.
@@ -334,9 +338,10 @@ route.
 4,096.
 
 **Known gaps.**
-- Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The layers'
-  textures are rebuilt on the CPU on every show and placement and uploaded with every Metal frame; resident device
-  textures and buffers and the shared-device resource bridge are still FL-033's (and FL-028's typed Metal buffers).
+- Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The field's
+  texture is rebuilt on the CPU on every show and placement, the density's on every show (a placement keeps it),
+  and both are uploaded with every Metal frame; resident device textures and buffers and the shared-device resource
+  bridge are still FL-033's (and FL-028's typed Metal buffers).
 - There is no chemical-affinity mapping (§13.4 lists one): epochs do not carry affinities.
 - There is no on-screen legend: FrankenManim's Metal 3D route has no text, so the meaning is in the Studio's and
   `flife render`'s records.
@@ -355,8 +360,12 @@ route.
 - Density bins do not refine with the zoom (they keep the fit's), so a deep zoom shows wide bins.
 - FrankenManim's frame is a perspective one; there is no orthographic camera, so dots are capped on screen rather
   than drawn at world size at deep zoom.
-- The field's and density's textures cover the whole torus and are rebuilt on every pan, at a cost linear in
-  their texels, though a pan changes only the quad. At a deep zoom the Metal route uploads the whole textures, where
+- The field's texture covers the whole torus and is rebuilt on every pan, at a cost linear in its texels, though
+  a pan changes only the quad. Epoch identities are unique only within a feed (every standalone epoch is 1), so
+  the view cannot yet tell that a placed epoch's field is the one it mapped. The density's texture, which shows the
+  last binned epoch whatever epoch is placed, is kept: a pan of the 4K density view (16,384 organisms, two pixels
+  per point) placed in 0.71 ms instead of 2.73, at zoom 1 and 16 alike (one interleaved invocation, ten blocks a
+  side, coefficients of variation at most 3.7%). At a deep zoom the Metal route uploads the whole textures, where
   FrankenManim used to cull a grid's off-screen triangles: a 4K density frame at 16x copied 1.95 MB, against 1.45 MB
   before.
 - Rendering-performance qualification (§13.7: 1080p at 30 fps, frame-time percentiles together with simulation

@@ -25,7 +25,11 @@ flife-genome = { path = "../flife-genome" }
 flife-manim = { path = "../flife-manim" }
 flife-render = { path = "../flife-render" }
 flife-runtime = { path = "../flife-runtime" }
-# An offscreen frame is read back as FrankenManim's frame buffer (FL-024).
+# FL-023's export: fmn-codec's PNG and y4m, already in the closure through
+# fmn and flife-cli.
+fmn-codec.workspace = true
+# An offscreen frame is read back as FrankenManim's frame buffer (FL-024),
+# and an export's video frames are converted by its rgba_to_nv12 (FL-023).
 fmn-frame.workspace = true
 fmn-render = { workspace = true, features = ["metal"] }
 serde.workspace = true

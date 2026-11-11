@@ -401,6 +401,8 @@ cargo run --release -p flife-cli -- render presets/reference-small-world.toml --
     --color energy --density --out frames-energy
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --offscreen 20 --offscreen-zooms
+cargo run --release -p flife-studio -- presets/reference-small-world.toml --timeline session.ndjson
+cargo run --release -p flife-studio -- presets/reference-small-world.toml --export session.ndjson --out export
 ```
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
@@ -438,6 +440,18 @@ controllers on the CPU reference with 16 workers) on a shared M5 Ultra it drew 3
 delivery and the present, it is not yet measured. The Studio's frames start on a fixed schedule. Each frame used to
 wait a period from its own start, so every timer oversleep delayed all later frames: in the same runs that drew
 27.9 and 28.3 frames a second.
+
+`--timeline FILE` records what the Studio presented (FL-023, live capture), one `frankenlife.timeline.v1` record a
+line. That is every change a frame makes to the view (drawable, density, overlay, style, camera, selection, the
+epochs shown and how far the display is between them) and every frame drawn with its tick and wall time, the
+commands as the session accepts and applies them, and on a clean close the world it closed on. `--export FILE --out
+DIR` opens no Studio and no window. It founds the world again, steps it with those commands at those ticks, and
+redraws every frame through the same Metal route. Each frame lands in DIR as a PNG, byte for byte the frame the
+Studio rendered. The frames on a constant clock (`--export-fps`, the preset's 30 by default) become
+`capture.y4m` (BT.709 limited 4:2:0), its repeated and dropped frames declared. A `manifest.json` gives the
+timeline's and configuration's hashes, the ticks shown, the closing digest and each file's SHA-256. An export that
+reaches another world than the Studio's is refused, and neither command writes over a file. Simulation-time and
+checkpoint-replay export (plan §13.8) and Cinema qualification (FL-050) are later work.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density` and `--no-field`.
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.

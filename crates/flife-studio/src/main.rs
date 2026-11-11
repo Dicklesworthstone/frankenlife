@@ -31,25 +31,37 @@
 //! (FL-024's frame study): each frame is rendered through the same Metal
 //! route and read back, at `--scale` pixels a point, and nothing posts
 //! input but `--offscreen-zooms`' camera moves.
+//!
+//! `--timeline FILE` records the session's presentation timeline (FL-023,
+//! plan §13.8) to FILE, which must not exist: one `frankenlife.timeline.v1`
+//! record a line, written as the frames go, closing with an `end` record
+//! when the Studio closes cleanly. `--export TIMELINE --out DIR` opens no
+//! Studio and no window. It replays TIMELINE headless through the same
+//! Metal route and writes each frame as a PNG into DIR, which must not
+//! exist. It also writes the frames on a constant `--export-fps` clock (the
+//! configuration's `[presentation] frames_per_second` by default) as y4m,
+//! and a `frankenlife.export.v1` manifest. Then it prints one `export`
+//! record.
 
 #![forbid(unsafe_code)]
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use flife_backend_metal::ControllerChoice;
 use flife_core::memory::MemoryAdmission;
-use flife_core::{Tick, ValidatedConfig};
+use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ClockMeter, ClockReading, ColorMapping, End, FrameTimeSummary, FrameTimes, Inspected,
-    Look, OverlayState, Particles, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style,
-    Surface, legends, overlay_text,
+    Brush, ClockMeter, ClockReading, ColorMapping, End, ExportManifest, ExportOptions,
+    FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState, Particles, STUDIO_SCHEMA, Status,
+    Stroke, Studio, StudioOptions, Style, Surface, TimelineRecord, legends, overlay_text,
+    write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -121,6 +133,120 @@ struct Cli {
     /// frame's work waits for the next frame, as a native queue holds it.
     #[arg(long, requires = "offscreen")]
     offscreen_zooms: bool,
+    /// Record the session's presentation timeline (FL-023) to FILE, which
+    /// must not exist.
+    #[arg(long, value_name = "FILE", conflicts_with = "export")]
+    timeline: Option<PathBuf>,
+    /// Open no Studio: replay the timeline TIMELINE headless and export
+    /// its frames, video and manifest to `--out` (FL-023).
+    #[arg(
+        long,
+        value_name = "TIMELINE",
+        requires = "out",
+        conflicts_with = "offscreen"
+    )]
+    export: Option<PathBuf>,
+    /// The export's directory, which must not exist.
+    #[arg(long, value_name = "DIR", requires = "export")]
+    out: Option<PathBuf>,
+    /// The exported video's constant rate; the configuration's
+    /// `[presentation] frames_per_second` by default.
+    #[arg(long, value_name = "FPS", requires = "export")]
+    export_fps: Option<NonZeroU32>,
+}
+
+/// A timeline file being written (`--timeline`).
+struct TimelineFile {
+    path: PathBuf,
+    out: BufWriter<std::fs::File>,
+}
+
+impl TimelineFile {
+    fn create(path: &Path) -> Result<Self, CoreError> {
+        let file = std::fs::File::create_new(path)
+            .map_err(|error| storage("create the timeline", path, &error))?;
+        Ok(Self {
+            path: path.to_owned(),
+            out: BufWriter::new(file),
+        })
+    }
+
+    fn write<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a TimelineRecord>,
+    ) -> Result<(), CoreError> {
+        for record in records {
+            write_timeline_record(&mut self.out, record)
+                .map_err(|error| storage("write the timeline", &self.path, &error))?;
+        }
+        Ok(())
+    }
+
+    /// Write the last `records` and make the file durable.
+    fn finish<'a>(
+        mut self,
+        records: impl IntoIterator<Item = &'a TimelineRecord>,
+    ) -> Result<(), CoreError> {
+        self.write(records)?;
+        let path = self.path;
+        let file = self
+            .out
+            .into_inner()
+            .map_err(|error| storage("write the timeline", &path, error.error()))?;
+        file.sync_all()
+            .map_err(|error| storage("write the timeline", &path, &error))
+    }
+}
+
+fn storage(operation: &'static str, path: &Path, error: &std::io::Error) -> CoreError {
+    CoreError::StorageFailed {
+        operation,
+        path: path.display().to_string(),
+        reason: error.to_string(),
+    }
+}
+
+/// `--export`: replay `timeline` and export it to `out`.
+fn export_timeline(config: &ValidatedConfig, cli: &Cli, timeline: &Path, out: &Path) -> ExitCode {
+    let text = match std::fs::read_to_string(timeline) {
+        Ok(text) => text,
+        Err(error) => {
+            let error = storage("read the timeline", timeline, &error);
+            return fail(error.kind(), error.to_string(), 2);
+        }
+    };
+    let configured = config.config().presentation.frames_per_second;
+    let options = ExportOptions {
+        frames_per_second: cli
+            .export_fps
+            .unwrap_or_else(|| NonZeroU32::new(configured).unwrap_or(NonZeroU32::MIN)),
+        cpu_workers: Some(cli.cpu_workers),
+    };
+    match flife_studio::export(config, &text, options, out) {
+        Ok(manifest) => {
+            print(&export_record(&manifest, out));
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error.kind(), error.to_string(), 1),
+    }
+}
+
+fn export_record<'a>(manifest: &'a ExportManifest, out: &Path) -> Record<'a> {
+    Record::Export {
+        schema: STUDIO_SCHEMA,
+        out: out.display().to_string(),
+        timeline_sha256: &manifest.timeline_sha256,
+        frames: manifest.frames.len(),
+        ticks: manifest.ticks,
+        end_tick: manifest.end_tick,
+        digest: &manifest.digest,
+        commands: manifest.commands,
+        frames_per_second: manifest.video.as_ref().map(|video| video.frames_per_second),
+        slots: manifest.video.as_ref().map(|video| video.slots),
+        repeated: manifest.video.as_ref().map(|video| video.repeated),
+        dropped: manifest.video.as_ref().map(|video| video.dropped),
+        video_withheld: manifest.video_withheld.as_deref(),
+    }
 }
 
 /// The fixed-seed draws of `--offscreen-zooms`' arrival moments.
@@ -304,6 +430,24 @@ enum Record<'a> {
         camera_moves_unmoved: Option<u64>,
         camera_latency: Option<FrameTimeSummary>,
     },
+    /// `--export`'s summary (FL-023); the manifest in `out` has the rest.
+    Export {
+        schema: &'static str,
+        out: String,
+        timeline_sha256: &'a str,
+        frames: usize,
+        /// The ticks of the first and last frames.
+        ticks: [u64; 2],
+        end_tick: u64,
+        digest: &'a str,
+        commands: usize,
+        /// The video's rate, slots, repeats and drops; absent when withheld.
+        frames_per_second: Option<u32>,
+        slots: Option<u64>,
+        repeated: Option<u64>,
+        dropped: Option<u64>,
+        video_withheld: Option<&'a str>,
+    },
 }
 
 /// A stroke's payload, its absent fields null (FL-022).
@@ -405,6 +549,9 @@ fn main() -> ExitCode {
         Ok(config) => config,
         Err(code) => return code,
     };
+    if let (Some(timeline), Some(out)) = (&cli.export, &cli.out) {
+        return export_timeline(&config, &cli, timeline, out);
+    }
     let mapping = match cli
         .color
         .map_or_else(|| ColorMapping::configured(&config), Ok)
@@ -434,13 +581,38 @@ fn main() -> ExitCode {
         surface: cli
             .offscreen
             .map_or(Surface::Window, |_| Surface::Offscreen { scale: cli.scale }),
+        record: cli.timeline.is_some(),
         ..StudioOptions::default()
     };
+    // Refused before a window opens; creating it refuses a race as well.
+    if let Some(path) = cli.timeline.as_deref().filter(|path| path.exists()) {
+        let error = CoreError::StorageFailed {
+            operation: "create the timeline",
+            path: path.display().to_string(),
+            reason: "it exists, and a timeline is never written over".to_owned(),
+        };
+        return fail(error.kind(), error.to_string(), 2);
+    }
     let clock = Instant::now();
     let mut studio = match Studio::open(&config, &options) {
         Ok(studio) => studio,
         Err(error) => return fail(error.kind(), error.to_string(), 2),
     };
+    let mut timeline = match cli
+        .timeline
+        .as_deref()
+        .map(TimelineFile::create)
+        .transpose()
+    {
+        Ok(timeline) => timeline,
+        Err(error) => {
+            let code = fail(error.kind(), error.to_string(), 2);
+            let _ = studio.close();
+            return code;
+        }
+    };
+    // The session's statuses a frame took, for the timeline.
+    let mut noted = Vec::new();
     let model = config.config();
     let fps = model.presentation.frames_per_second.max(1);
     print(&Record::Open {
@@ -536,6 +708,9 @@ fn main() -> ExitCode {
             }
         }
         for status in studio.take_statuses() {
+            if timeline.is_some() {
+                noted.extend(TimelineRecord::status(&status));
+            }
             match &status {
                 Status::Running { .. } => paused = Some(false),
                 Status::Paused { .. } => paused = Some(true),
@@ -642,6 +817,15 @@ fn main() -> ExitCode {
             return code;
         }
         times.record(started.elapsed());
+        if let Some(timeline) = &mut timeline {
+            let records = studio.take_recorded();
+            if let Err(error) = timeline.write(records.iter().chain(&noted)) {
+                let code = fail(error.kind(), error.to_string(), 1);
+                let _ = studio.close();
+                return code;
+            }
+        }
+        noted.clear();
         slot = next_slot(slot, period, Instant::now());
         let next = slot;
         if cli.offscreen_zooms && studio.tally().frames.is_multiple_of(3) {
@@ -676,8 +860,15 @@ fn main() -> ExitCode {
         }
     }
 
+    let last = studio.take_recorded();
     match studio.close() {
         Ok(closed) => {
+            if let Some(timeline) = timeline
+                && let Err(error) =
+                    timeline.finish(last.iter().chain([&TimelineRecord::end(&closed.session)]))
+            {
+                return fail(error.kind(), error.to_string(), 1);
+            }
             print(&Record::End {
                 schema: STUDIO_SCHEMA,
                 tick: closed.session.boundary.tick.get(),
@@ -939,6 +1130,37 @@ mod tests {
             // A scale and posted moves are an offscreen surface's.
             &["--scale", "2"],
             &["--offscreen-zooms"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn timeline_and_export_arguments_are_parsed_and_refused() {
+        let parse = |args: &[&str]| {
+            super::Cli::try_parse_from(["flife-studio", "preset.toml"].iter().chain(args).copied())
+        };
+        let cli = parse(&["--timeline", "t.ndjson"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.timeline.as_deref(), Some("t.ndjson".as_ref()));
+        let cli = parse(&["--offscreen", "1", "--timeline", "t"]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(cli.timeline.is_some(), "an offscreen session records too");
+        let cli = parse(&["--export", "t", "--out", "d"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (cli.export.as_deref(), cli.out.as_deref(), cli.export_fps),
+            (Some("t".as_ref()), Some("d".as_ref()), None)
+        );
+        let cli = parse(&["--export", "t", "--out", "d", "--export-fps", "60"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(cli.export_fps.map(std::num::NonZeroU32::get), Some(60));
+        for args in [
+            // An export needs its directory, and the directory its export.
+            &["--export", "t"][..],
+            &["--out", "d"],
+            &["--export-fps", "30"],
+            &["--export", "t", "--out", "d", "--export-fps", "0"],
+            // An export opens no Studio: it neither records nor runs one.
+            &["--export", "t", "--out", "d", "--timeline", "u"],
+            &["--export", "t", "--out", "d", "--offscreen", "1"],
         ] {
             assert!(parse(args).is_err(), "{args:?}");
         }

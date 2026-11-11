@@ -58,6 +58,7 @@ use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Instant;
 
+use crate::timeline::{Exact, TimelineRecord};
 use crate::{
     Brush, CameraMove, Controls, Intent, Pacer, SessionThread, Status, Supplies, brush,
     material_for,
@@ -91,6 +92,10 @@ pub struct StudioOptions {
     pub style: Style,
     /// Where frames go: a native window, or offscreen.
     pub surface: Surface,
+    /// Whether to record the presentation timeline (FL-023): every change a
+    /// frame makes to the view and every frame drawn, as
+    /// [`TimelineRecord`]s, from [`Studio::take_recorded`].
+    pub record: bool,
 }
 
 /// Where a Studio's frames go.
@@ -122,6 +127,7 @@ impl Default for StudioOptions {
             controllers: ControllerChoice::Auto,
             style: Style::default(),
             surface: Surface::Window,
+            record: false,
         }
     }
 }
@@ -268,6 +274,11 @@ pub struct Studio {
     overlay: String,
     /// Its swatches' sRGB colours, in order (FL-019's key).
     swatches: Vec<[u8; 3]>,
+    /// The timeline recorded since it was last taken, while recording
+    /// (FL-023).
+    recorded: Option<Vec<TimelineRecord>>,
+    /// When it opened: the timeline's presentation clock.
+    opened: Instant,
 }
 
 impl Studio {
@@ -329,18 +340,14 @@ impl Studio {
         // is made now, for the founding state, and the backend holds what
         // the budget leaves. Frames are drawn at the window's drawable.
         let founding = Epoch::standalone(&world)?;
-        let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
-        // The overlay's text is admitted with the view (FL-024, FL-043).
-        view.enable_overlay();
-        let font = HudFont::bundled()?;
-        view.set_style(options.style);
-        let presentation = &model.presentation;
-        view.set_bloom(
-            presentation
-                .bloom_enabled
-                .then_some(presentation.bloom_strength),
+        let mut view = studio_view(
+            config,
+            &founding,
+            [width, height],
+            options.style,
+            background,
         )?;
-        view.set_point_radius(presentation.point_radius_pixels)?;
+        let font = HudFont::bundled()?;
         let drawable = target
             .surface_metrics()
             .ok()
@@ -404,7 +411,34 @@ impl Studio {
             font,
             overlay: String::new(),
             swatches: Vec::new(),
+            recorded: options.record.then(|| {
+                vec![TimelineRecord::header(
+                    config,
+                    [width, height],
+                    options.style,
+                )]
+            }),
+            opened: Instant::now(),
         })
+    }
+
+    /// The timeline recorded since the last call, in order: empty unless
+    /// [`StudioOptions::record`] is set. The first call's first record is
+    /// the header; the caller adds the session's statuses
+    /// ([`TimelineRecord::status`]) and, once closed, its end
+    /// ([`TimelineRecord::end`]).
+    pub fn take_recorded(&mut self) -> Vec<TimelineRecord> {
+        self.recorded
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Note `record` on the timeline while recording.
+    fn note(&mut self, record: impl FnOnce() -> TimelineRecord) {
+        if let Some(recorded) = &mut self.recorded {
+            recorded.push(record());
+        }
     }
 
     /// Draw `text` over the world from the next frame (FL-024's metric
@@ -459,14 +493,12 @@ impl Studio {
     }
 
     fn lay_out_overlay(&mut self, text: &str, swatches: &[[u8; 3]]) -> Result<(), CoreError> {
-        let laid = if text.is_empty() {
-            None
-        } else {
-            let em = HUD_TEXT_POINTS * self.view.viewport().pixels_per_point();
-            let colors: Vec<_> = swatches.iter().map(|&rgb| linear(rgb)).collect();
-            Some(self.font.text_with_swatches(text, em, &colors)?)
-        };
-        self.view.set_overlay(laid)
+        lay_out_overlay(&mut self.view, &self.font, text, swatches)?;
+        self.note(|| TimelineRecord::Overlay {
+            text: text.to_owned(),
+            swatches: swatches.to_vec(),
+        });
+        Ok(())
     }
 
     /// Where due controllers are evaluated: a backend and device, or
@@ -530,15 +562,30 @@ impl Studio {
         if restyled {
             self.view.set_style(style);
             self.tally.restyles += 1;
+            self.note(|| TimelineRecord::Style {
+                style: style.into(),
+            });
         }
 
         let resized = match self.controls.drawable_size() {
-            Some(size) => self.view.resize(size)?,
+            Some(size) => {
+                let resized = self.view.resize(size)?;
+                if resized {
+                    self.note(|| TimelineRecord::Resize { drawable: size });
+                }
+                resized
+            }
             None => false,
         };
         let redensed = match self.controls.metrics() {
             Some(metrics) if metrics.backing_scale.is_finite() && metrics.backing_scale > 0.0 => {
-                self.view.set_pixels_per_point(metrics.backing_scale)?
+                let redensed = self.view.set_pixels_per_point(metrics.backing_scale)?;
+                if redensed {
+                    self.note(|| TimelineRecord::Density {
+                        pixels_per_point: Exact(metrics.backing_scale),
+                    });
+                }
+                redensed
             }
             _ => false,
         };
@@ -620,10 +667,18 @@ impl Studio {
         let moved = self.view.set_view(viewport)?;
         if moved {
             self.tally.camera_moves += 1;
+            let taken = *self.view.viewport();
+            self.note(|| TimelineRecord::View {
+                center: taken.center().map(Exact),
+                zoom: Exact(taken.zoom()),
+            });
         }
         if let Some(choice) = picked {
             let selected = self.view.select(choice)?;
             self.tally.selections += 1;
+            self.note(|| TimelineRecord::Select {
+                organism: choice.map(OrganismId::get),
+            });
             if let Some(organism) = selected
                 && let Some(shown) = self.view.shown()
             {
@@ -682,15 +737,40 @@ impl Studio {
             1.0
         };
         let prior = self.prior.as_deref();
-        if new_epoch || restyled {
+        let ticks = (
+            prior.map(|prior| prior.tick().get()),
+            self.current.tick().get(),
+        );
+        let display = if new_epoch || restyled {
             // A newer epoch, or the pair again in the new style.
             self.view.show_between(prior, &self.current, fraction)?;
+            Some(TimelineRecord::Show {
+                prior: ticks.0,
+                current: ticks.1,
+                fraction: Exact(fraction),
+            })
         } else if moved {
             // The pair placed in the new view, its display scales unmoved.
             self.view.place_between(prior, &self.current, fraction)?;
+            Some(TimelineRecord::Place {
+                prior: ticks.0,
+                current: ticks.1,
+                fraction: Exact(fraction),
+            })
         } else if self.view.motion().is_some() {
             self.view.advance(prior, &self.current, fraction)?;
+            Some(TimelineRecord::Advance {
+                prior: ticks.0,
+                current: ticks.1,
+                fraction: Exact(fraction),
+            })
+        } else {
+            None
+        };
+        if let Some(display) = display {
+            self.note(|| display);
         }
+        let shown_tick = ticks.1;
         if self.view.motion().is_none() {
             // At rest: the publisher may have the prior's slot back.
             self.prior = None;
@@ -699,6 +779,7 @@ impl Studio {
         let mut drawn = false;
         let outcome = if state == PresentationState::Visible {
             let job = self.view.job()?;
+            let frame = self.tally.drawn();
             match &mut self.target {
                 Target::Window(preview) => {
                     let report = preview
@@ -709,6 +790,13 @@ impl Studio {
                         PresentOutcome::Presented => {
                             self.tally.presented += 1;
                             drawn = true;
+                            if let Some(recorded) = &mut self.recorded {
+                                recorded.push(TimelineRecord::Draw {
+                                    frame,
+                                    tick: shown_tick,
+                                    wall_seconds: Exact(self.opened.elapsed().as_secs_f64()),
+                                });
+                            }
                         }
                         PresentOutcome::Occluded => self.tally.occluded += 1,
                     }
@@ -719,6 +807,13 @@ impl Studio {
                     self.tally.count_copies(&report);
                     self.tally.rendered += 1;
                     drawn = true;
+                    if let Some(recorded) = &mut self.recorded {
+                        recorded.push(TimelineRecord::Draw {
+                            frame,
+                            tick: shown_tick,
+                            wall_seconds: Exact(self.opened.elapsed().as_secs_f64()),
+                        });
+                    }
                     None
                 }
             }
@@ -898,6 +993,48 @@ impl Studio {
             input_dropped,
         })
     }
+}
+
+/// The Studio's world view of `epoch`: `size` points on `background`, with
+/// an overlay (admitted with the view, FL-024, FL-043), in `style`, with
+/// the configuration's bloom and point radius. [`Studio::open`] makes it
+/// so, and FL-023's [`crate::replay`] makes it again.
+pub(crate) fn studio_view(
+    config: &ValidatedConfig,
+    epoch: &Epoch,
+    size: [u32; 2],
+    style: Style,
+    background: [u8; 3],
+) -> Result<WorldView, CoreError> {
+    let mut view = WorldView::for_epoch(epoch, size, background)?;
+    view.enable_overlay();
+    view.set_style(style);
+    let presentation = &config.config().presentation;
+    view.set_bloom(
+        presentation
+            .bloom_enabled
+            .then_some(presentation.bloom_strength),
+    )?;
+    view.set_point_radius(presentation.point_radius_pixels)?;
+    Ok(view)
+}
+
+/// Lay `text` out over `view` in `font` at [`HUD_TEXT_POINTS`] on its
+/// screen, each swatch in the next of `swatches`; empty draws nothing.
+pub(crate) fn lay_out_overlay(
+    view: &mut WorldView,
+    font: &HudFont,
+    text: &str,
+    swatches: &[[u8; 3]],
+) -> Result<(), CoreError> {
+    let laid = if text.is_empty() {
+        None
+    } else {
+        let em = HUD_TEXT_POINTS * view.viewport().pixels_per_point();
+        let colors: Vec<_> = swatches.iter().map(|&rgb| linear(rgb)).collect();
+        Some(font.text_with_swatches(text, em, &colors)?)
+    };
+    view.set_overlay(laid)
 }
 
 /// Where the Studio's frames go ([`Surface`]).

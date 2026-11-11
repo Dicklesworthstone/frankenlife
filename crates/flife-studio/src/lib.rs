@@ -34,18 +34,30 @@
 //! top-left corner ([`overlay_text`], [`Studio::set_overlay`]), and under
 //! them the selected organism's last inspection ([`inspector_lines`]),
 //! which [`Studio::inspect_selected`] refreshes.
+//!
+//! A recording Studio ([`StudioOptions::record`]) keeps its presentation
+//! timeline: every change a frame makes to the view, and every frame drawn
+//! ([`TimelineRecord`], FL-023, plan §13.8). [`replay`] steps the
+//! configuration's world again with the session's commands at their ticks.
+//! It redraws each of those frames, byte for byte, and closes on the world
+//! the Studio closed on. [`export`] writes a replay out through
+//! FrankenManim's frame and encoding paths: each frame as a PNG, the
+//! frames on a constant clock as y4m video, and a manifest of their
+//! provenance (plan §13.8's live capture).
 
 #![forbid(unsafe_code)]
 
 pub mod brush;
 mod clock;
 mod controls;
+mod export;
 mod frames;
 mod host;
 pub mod memory;
 mod overlay;
 mod pacing;
 mod session;
+mod timeline;
 
 pub use brush::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Stroke, Supplies, material_for,
@@ -57,6 +69,10 @@ pub use controls::{
     KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X,
     KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
+pub use export::{
+    EXPORT_SCHEMA, ExportManifest, ExportOptions, ExportedFrame, ExportedVideo, MANIFEST_FILE,
+    VIDEO_FILE, export, slot_counts,
+};
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
 pub use frames::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes};
@@ -67,6 +83,10 @@ pub use host::{
 pub use overlay::{Inspected, OverlayState, inspector_lines, legends, overlay_text};
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
+pub use timeline::{
+    AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineIntervention,
+    TimelineRecord, TimelineStyle, read_timeline, replay, write_timeline_record,
+};
 
 /// The schema of the Studio's NDJSON records.
 pub const STUDIO_SCHEMA: &str = "frankenlife.studio.v1";

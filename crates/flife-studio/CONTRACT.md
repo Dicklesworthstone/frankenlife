@@ -21,6 +21,13 @@ input. The live world is shown in a native window, through FrankenManim's Metal 
 adapter. For FL-024's frame study (G6, §13.7) the same Studio runs with no window (`Surface::Offscreen`): typed
 input is posted to it, each frame is rendered through the same Metal route and read back, and the binary's
 `--offscreen` runs its own loop that way and reports its frames' times and its camera moves' latency.
+FL-023 (`flife-w5q`, part) records the Studio's presentation timeline (§13.8, live capture). A recording Studio
+(`StudioOptions::record`, the binary's `--timeline FILE`) notes every change a frame makes to its view, every
+frame drawn with the tick shown and its wall time, and the commands the session applied. `replay` founds the
+world again and steps it with those commands at their ticks, and redraws each frame through the same Metal route,
+byte for byte, closing on the Studio's world or refusing. `export` (the binary's `--export FILE --out DIR`)
+writes that replay through FrankenManim's frame and encoding paths: a PNG a frame, a y4m video on a constant
+clock with its repeats and drops declared, and a manifest of the provenance (G10).
 
 **Inputs.**
 - A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate, the colour
@@ -431,7 +438,10 @@ presentation state, not scientific state.
   dropped input, a move in every third frame interval with none unmoved and every move but perhaps the last
   drawn, and ordered percentiles; and the world it closed on is the configuration stepped directly to its tick,
   digest for digest.
-- `src/main.rs` unit tests (5, FL-022, FL-024): the parser takes `--offscreen 2.5` (2 pixels a point by default),
+- `src/main.rs` unit tests (6, FL-022, FL-024, FL-023): the parser takes `--timeline FILE` (offscreen too) and
+  `--export FILE --out DIR` with or without `--export-fps`, and refuses `--export` without `--out`, `--out` or
+  `--export-fps` alone, `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never
+  opens a Studio; it takes `--offscreen 2.5` (2 pixels a point by default),
   `--scale 3` and `--offscreen-zooms` with it, and refuses `--offscreen` of 0, -1, NaN, inf or a word,
   `--scale 0`, and `--scale` or `--offscreen-zooms` alone, so no refused run can open a window; `next_slot`
   keeps 300 frames of 15 ms work on their 30 Hz slots, exactly, though every wait overshoots by 6 ms, and after
@@ -467,6 +477,45 @@ presentation state, not scientific state.
   the layers drawn (raw density draws no field). An epoch 30 ticks later copies them again. The old pin
   (FrankenManim `5d08cba2`) and a pan that moves the field's or the density's display scale each fail it. It is
   its own binary because `frame_upload.rs` counts every thread's heap.
+- `tests/timeline.rs` (2 tests, FL-023, Metal compute, no window):
+  - G10. An offscreen Studio on the preset at 320 x 200 points and 2x records its timeline while posted input
+    sets an overlay, restyles (key 3), zooms, selects the shown organism nearest the centre, arms the energy
+    brush and clicks, runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
+    Every kind of record is made (in one run: 154 records, 72 frames, 12 camera moves, 41 shows, 3 placements
+    and 17 advances, one between epochs at a fraction strictly inside (0, 1)), and the stroke applies. Written
+    as NDJSON and read back, the records are equal. The replay redraws every frame in order at the tick the
+    Studio showed it, its RGBA8 bytes hashing equal, and closes on the Studio's tick and digest with the one
+    command. It refuses, with a `StateConflict`, a timeline whose end names another world, one with its
+    command a tick late, one with a frame dated to an epoch the view was not given, and another seed's
+    configuration.
+  - Export. A 96 x 60 point Studio at 2x records 24 frames, some closer than a 30 fps slot and some farther, with
+    an overlay. `export` at 30 fps writes a PNG a frame. Each decodes to exactly the replay's bytes and hashes as
+    the manifest says. Each frame's slot count equals a fresh count in the test (slot k at the first frame's time
+    plus k/30 s shows the last frame drawn by then), with repeats and drops both present (in one run: 25 slots,
+    7 repeated, 6 dropped). The video is byte for byte the header at 30/1 and each slot's frame through
+    `rgba_to_nv12` (limited, left), it decodes at 192 x 120 with as many frames as slots, and its SHA-256 is the
+    manifest's. The manifest names the timeline's SHA-256, the configuration's hash, the closing digest and
+    tick, and parses back from disk. A second export into the directory is refused (`StorageFailed`) with the
+    manifest unchanged. The same timeline with a 191 x 120 drawable exports its frames at that size and no
+    video, with the reason (`not even, as 4:2:0 needs`), and leaves no partial video.
+- `tests/timeline_binary.rs` (1 test, FL-023, Metal compute, no window): `flife-studio --offscreen 1.5 --scale 1
+  --width 96 --height 60 --timeline T`. T opens with its header, has a draw for each frame the `end` record
+  rendered, and closes on the `end`'s tick and digest. `flife-studio --export T --out D` prints one `export`
+  record on that digest and tick, with the frame count, T's SHA-256 and the configuration's 30 fps. D's manifest
+  hashes every frame and the video as they are on disk. A second recording onto T exits 2 before a Studio opens,
+  saying it is never written over, and a second export into D exits 1, both files unchanged.
+- FL-023's planted bugs, 33 in all:
+  - 13 in the recording and the replay: a camera move, the overlay, a selection or a restyle not noted; the
+    advance's fraction halved; a command applied a tick late; a show replayed as a placement, a placement as an
+    advance; the density or the resize ignored; a frame's epoch unchecked; the founding not shown. 12 were
+    caught. An advance replayed as a show survives (see the gaps).
+  - The four missing-record bugs again, with the test's census of record kinds off, plus a camera that notes
+    only its first move. Each was caught by the frame comparison alone (5 of 5).
+  - 15 in the export and the binary: the clock at half its rate, a slot showing the frame after its time, the
+    video in full range, each frame written once, drops or repeats miscounted, the header's rate halved,
+    resizes not followed, an odd drawable not withheld, the timeline's hash of nothing; the binary writing no
+    frame's records, no end or no timeline at all, and finding an existing timeline only after the Studio
+    opens. All but one were caught. The binary dropping the session's statuses survives (see the gaps).
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -511,7 +560,8 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   - A finished command is reported up to `OUTCOME_POLL` after its publication; while paused, a pending
     command's watcher keeps asking every 20 ms.
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush
-    does survives the process (recording is FL-023).
+    does survives the process. FL-023's timeline records what was presented and the commands applied, so a
+    replay reaches the same world; it is not a journal, and no session resumes from it.
 - FL-024: the binary's `clock` records and overlay run offscreen in `tests/offscreen_binary.rs`, which checks the
   records' frames but neither their rates nor the overlay's pixels, and in a window, which no test here opened.
   `tests/offscreen.rs` draws the colour key through the Metal route; the meter, the record's JSON, the overlay's
@@ -587,5 +637,29 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   sample values, not a continuous ramp; the lineage key cannot say which lineage a colour is. The presenter has no
   window-title setter. The style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed.
-- A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later
-  work (FL-023, FL-038).
+- A run ends only on pause, capacity shortfall, failure or close. A tick limit and checkpoints are later work
+  (FL-038).
+- FL-023's timeline and export:
+  - Only live capture exists. Simulation-time export and checkpoint-replay export (§13.8's other modes) and
+    Cinema export at 1080p and 4K (FL-050) are not implemented.
+  - The video is y4m, FrankenManim's raw 4:2:0 path. It is not encoded (H.264, MP4): FrankenManim's negotiated
+    ffmpeg boundary (`fmn-output`) is not wired here.
+  - A timeline holds no audio cues, and no captions beyond the overlay's text.
+  - Recording in a window is unrun here: no test opened one. A frame drawn in a window replays as it was
+    rendered, before the window composited it. A frame the window did not draw (occluded) has no record, and
+    the video shows it as repeats.
+  - Replay founds the configuration's world and steps it from tick 0, so its time grows with the session's
+    ticks. The Studio always founds, so a timeline never starts from a checkpoint or a branch. A world that
+    paused for a capacity shortfall cannot be replayed: stepping refuses the pause.
+  - The replay's and the export's buffers (a view, a renderer, an RGBA8 frame, an NV12 frame and the encoders'
+    scratch, each bounded by one frame) are not admitted against `[resources] memory_budget_bytes` (FL-043).
+    The manifest's frame list grows with the frames.
+  - An advance replayed as a show survives the planted-bug run. A show re-lowers the field, whose display
+    scale is `max(brightest, scale × 0.98)`. That only moves when the field's brightest value falls by more
+    than 2% between the epochs an advance redraws, which G10's session never does. In such a session the
+    frames would differ, but no test has one.
+  - The binary's recording of the session's statuses is not exercised: an offscreen binary run posts no brush
+    click, so dropping them survives. The library's records of them (`TimelineRecord::status`) are checked in
+    G10.
+  - Each test run leaves its exports and timelines, about 1 MB in all, under the target's temporary directory;
+    nothing deletes them.

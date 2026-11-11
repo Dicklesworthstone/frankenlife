@@ -208,6 +208,7 @@ fn live() -> Result<Vec<String>, String> {
         controllers: ControllerChoice::Auto,
         style: Style::default(),
         surface: Surface::Window,
+        record: false,
     };
     let studio = Studio::open(&config, &options).map_err(|error| format!("opening: {error}"))?;
     let mut live = Live {

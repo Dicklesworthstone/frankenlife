@@ -844,6 +844,10 @@ fn live() -> Result<Vec<String>, String> {
         logical,
         grid,
         [at[0] / density, at[1] / density],
+        &flife_studio::Supplies {
+            material: None,
+            founder_energy: config.config().population.initial_energy,
+        },
     )
     .ok_or("no stroke under the click")?;
     let selections = live.studio.tally().selections;

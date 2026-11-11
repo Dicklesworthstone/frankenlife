@@ -150,10 +150,8 @@ enum Record<'a> {
         schema: &'static str,
         command: u64,
         brush: &'static str,
-        cell: Option<[u32; 2]>,
-        center: Option<[f64; 2]>,
-        radius: Option<f64>,
-        amount: Option<f64>,
+        #[serde(flatten)]
+        payload: Payload,
         seen_tick: u64,
         effective_tick: u64,
     },
@@ -209,6 +207,7 @@ enum Record<'a> {
         epochs: u64,
         refits: u64,
         strokes: u64,
+        unstroked: u64,
         intents: u64,
         refused: u64,
         keys: u64,
@@ -223,6 +222,57 @@ enum Record<'a> {
         readback_bytes: u64,
         wall_seconds: f64,
     },
+}
+
+/// A stroke's payload, its absent fields null (FL-022).
+#[derive(Serialize, Default)]
+struct Payload {
+    cell: Option<[u32; 2]>,
+    amount: Option<f64>,
+    /// The material's composition per unit energy.
+    direction: Option<[f64; 32]>,
+    center: Option<[f64; 2]>,
+    radius: Option<f64>,
+    /// The organisms introduced, each with `endowment`.
+    count: Option<u32>,
+    endowment: Option<f64>,
+}
+
+impl Payload {
+    fn of(stroke: Stroke) -> Self {
+        match stroke {
+            Stroke::Energy { cell, amount } => Self {
+                cell: Some(cell),
+                amount: Some(amount),
+                ..Self::default()
+            },
+            Stroke::Removal { center, radius } => Self {
+                center: Some(center),
+                radius: Some(radius),
+                ..Self::default()
+            },
+            Stroke::Material {
+                cell,
+                amount,
+                direction,
+            } => Self {
+                cell: Some(cell),
+                amount: Some(amount),
+                direction: Some(direction),
+                ..Self::default()
+            },
+            Stroke::Introduction {
+                cell,
+                count,
+                energy,
+            } => Self {
+                cell: Some(cell),
+                count: Some(count),
+                endowment: Some(energy),
+                ..Self::default()
+            },
+        }
+    }
 }
 
 /// One organism at a committed tick: its row, age, controller shape and
@@ -407,6 +457,7 @@ fn main() -> ExitCode {
                 epochs: closed.frames.epochs,
                 refits: closed.frames.refits,
                 strokes: closed.frames.strokes,
+                unstroked: closed.frames.unstroked,
                 intents: closed.frames.intents,
                 refused: closed.frames.refused,
                 keys: closed.input.keys,
@@ -459,23 +510,14 @@ fn status_record(status: &Status) -> Record<'static> {
             stroke,
             seen,
             effective,
-        } => {
-            let (cell, amount, center, radius) = match *stroke {
-                Stroke::Energy { cell, amount } => (Some(cell), Some(amount), None, None),
-                Stroke::Removal { center, radius } => (None, None, Some(center), Some(radius)),
-            };
-            Record::Submitted {
-                schema: STUDIO_SCHEMA,
-                command: command.get(),
-                brush: stroke.brush().name(),
-                cell,
-                center,
-                radius,
-                amount,
-                seen_tick: seen.get(),
-                effective_tick: effective.get(),
-            }
-        }
+        } => Record::Submitted {
+            schema: STUDIO_SCHEMA,
+            command: command.get(),
+            brush: stroke.brush().name(),
+            payload: Payload::of(*stroke),
+            seen_tick: seen.get(),
+            effective_tick: effective.get(),
+        },
         Status::Finished { command, outcome } => {
             let finished = |outcome, tick, published_tick, energy, detail| Record::Finished {
                 schema: STUDIO_SCHEMA,
@@ -598,4 +640,126 @@ fn fail(kind: &str, detail: String, code: u8) -> ExitCode {
         let _ = writeln!(std::io::stderr().lock(), "{line}");
     }
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The FL-022 records as the binary prints them: what the window-run
+    //! paths print is `status_record` serialized, which needs no window.
+
+    use flife_core::Tick;
+    use flife_core::ids::{CommandId, ResourceEpoch};
+    use flife_runtime::{CancelReason, Outcome};
+    use flife_studio::{Status, Stroke};
+    use serde_json::{Value, json};
+
+    fn line(status: &Status) -> Value {
+        serde_json::to_value(super::status_record(status)).unwrap_or(Value::Null)
+    }
+
+    #[test]
+    fn submitted_records_carry_each_strokes_payload() {
+        let mut direction = [0.0; 32];
+        direction[5] = -0.25;
+        let submitted = |stroke| Status::Submitted {
+            command: CommandId::new(7),
+            stroke,
+            seen: Tick::new(40),
+            effective: Tick::new(41),
+        };
+        let material = line(&submitted(Stroke::Material {
+            cell: [3, 4],
+            amount: 64.0,
+            direction,
+        }));
+        let mut expected = json!({
+            "record": "submitted",
+            "schema": "frankenlife.studio.v1",
+            "command": 7,
+            "brush": "material",
+            "cell": [3, 4],
+            "amount": 64.0,
+            "direction": direction.to_vec(),
+            "center": null,
+            "radius": null,
+            "count": null,
+            "endowment": null,
+            "seen_tick": 40,
+            "effective_tick": 41
+        });
+        assert_eq!(material, expected);
+        let removal = line(&submitted(Stroke::Removal {
+            center: [1.5, 2.5],
+            radius: 3.0,
+        }));
+        for (key, value) in [
+            ("brush", json!("removal")),
+            ("cell", Value::Null),
+            ("amount", Value::Null),
+            ("direction", Value::Null),
+            ("center", json!([1.5, 2.5])),
+            ("radius", json!(3.0)),
+        ] {
+            expected[key] = value;
+        }
+        assert_eq!(removal, expected);
+        let introduction = line(&submitted(Stroke::Introduction {
+            cell: [9, 1],
+            count: 8,
+            energy: 2.0,
+        }));
+        assert_eq!(introduction["brush"], "introduction");
+        assert_eq!(introduction["cell"], json!([9, 1]));
+        assert_eq!(introduction["count"], 8);
+        assert_eq!(introduction["endowment"], 2.0);
+        assert_eq!(introduction["amount"], Value::Null);
+        let energy = line(&submitted(Stroke::Energy {
+            cell: [0, 31],
+            amount: 64.0,
+        }));
+        assert_eq!(energy["brush"], "energy");
+        assert_eq!(
+            (&energy["cell"], &energy["amount"]),
+            (&json!([0, 31]), &json!(64.0))
+        );
+    }
+
+    #[test]
+    fn finished_records_reconcile_the_tick_and_energy() {
+        let applied = line(&Status::Finished {
+            command: CommandId::new(2),
+            outcome: Outcome::Applied {
+                tick: Tick::new(10),
+                published: Tick::new(11),
+                epoch: ResourceEpoch::new(12),
+                applied: 63.5,
+                cursor: 0,
+            },
+        });
+        assert_eq!(
+            applied,
+            json!({
+                "record": "finished",
+                "schema": "frankenlife.studio.v1",
+                "command": 2,
+                "outcome": "applied",
+                "tick": 10,
+                "published_tick": 11,
+                "energy": 63.5,
+                "detail": null
+            })
+        );
+        let cancelled = line(&Status::Finished {
+            command: CommandId::new(3),
+            outcome: Outcome::Cancelled {
+                boundary: Tick::new(5),
+                reason: CancelReason::SessionClosed,
+                cursor: 1,
+            },
+        });
+        assert_eq!(cancelled["outcome"], "cancelled");
+        assert_eq!(cancelled["tick"], 5);
+        assert_eq!(cancelled["energy"], Value::Null);
+        assert_eq!(cancelled["detail"], "SessionClosed");
+    }
 }

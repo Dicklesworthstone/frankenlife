@@ -18,6 +18,8 @@ clap.workspace = true
 flife-backend-metal = { path = "../flife-backend-metal" }
 flife-core = { path = "../flife-core" }
 flife-engine = { path = "../flife-engine" }
+# The material brush's unit composition is a source direction's (FL-022).
+flife-field = { path = "../flife-field" }
 flife-manim = { path = "../flife-manim" }
 flife-render = { path = "../flife-render" }
 flife-runtime = { path = "../flife-runtime" }

@@ -29,6 +29,8 @@
 //! | 0 | the whole torus again (zoom 1, centred) |
 //! | E | arm the energy brush, or disarm it (FL-022) |
 //! | X | arm the removal brush, or disarm it (FL-022) |
+//! | M | arm the material brush, or disarm it (FL-022) |
+//! | I | arm the introduction brush, or disarm it (FL-022) |
 //!
 //! and, for the presentation owner alone (FL-019's [`Style`]):
 //!
@@ -72,6 +74,10 @@ pub const KEY_ZERO: u16 = 29;
 pub const KEY_E: u16 = 14;
 /// `kVK_ANSI_X`.
 pub const KEY_X: u16 = 7;
+/// `kVK_ANSI_M`.
+pub const KEY_M: u16 = 46;
+/// `kVK_ANSI_I`.
+pub const KEY_I: u16 = 34;
 
 /// How far, in logical points, a primary press may move and still be a
 /// click; beyond it the press is a drag.
@@ -139,6 +145,10 @@ pub enum CameraMove {
 
 /// What the presentation owner asks of the session.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a material stroke's 32 components keep the intent `Copy` and unboxed; the lane holds 16"
+)]
 pub enum Intent {
     /// Run until paused.
     Resume,
@@ -302,6 +312,14 @@ impl Controls {
                     }
                     KEY_X => {
                         self.arm(Brush::Removal);
+                        None
+                    }
+                    KEY_M => {
+                        self.arm(Brush::Material);
+                        None
+                    }
+                    KEY_I => {
+                        self.arm(Brush::Introduction);
                         None
                     }
                     code => {

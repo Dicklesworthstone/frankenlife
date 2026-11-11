@@ -954,6 +954,7 @@ dependencies = [
  "flife-backend-metal",
  "flife-core",
  "flife-engine",
+ "flife-field",
  "flife-manim",
  "flife-render",
  "flife-runtime",

@@ -5,8 +5,8 @@
 rendering (§13.4), and the configured bloom on glowing frames (§2.3). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
-bounded snapshot at its committed boundary (§14.2). FL-022 (`flife-2jj`, part) adds two brushes: a click becomes a
-world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
+bounded snapshot at its committed boundary (§14.2). FL-022 (`flife-2jj`, part) adds energy, removal, material and
+seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
@@ -43,9 +43,11 @@ adapter.
     | 0 | the whole torus again (a `CameraMove::Reset`) |
     | E | arm the energy brush, or disarm it (FL-022) |
     | X | arm the removal brush, or disarm it (FL-022) |
+    | M | arm the material brush, or disarm it (FL-022) |
+    | I | arm the introduction brush, or disarm it (FL-022) |
 
-    The style keys, 0, E and X ignore auto-repeat and ⌘, and produce no intent. E or X with the other brush armed
-    switches to it. `brush()` is the armed brush.
+    The style keys, 0 and the brush keys ignore auto-repeat and ⌘, and produce no intent. A brush key with another
+    brush armed switches to its brush. `brush()` is the armed brush.
   - Pointer gestures become `CameraMove`s, in logical points, kept in order until `take_moves()` (reserved once
     for a poll's events):
     - a primary press that moves more than `CLICK_SLOP_POINTS = 4` is a drag: `Pan` by the whole motion since the
@@ -81,14 +83,23 @@ adapter.
     `Finished { command, outcome }` once the command is terminal: for `Applied`, the tick it applied at, the tick
     that published it and the energy it moved. A paused session holds the command until a step or a run reaches
     its boundary. At close, a pending command's watcher stops when the session refuses its status.
-- `brush` (FL-022): `Brush::{Energy, Removal}` and `Stroke`, a click's world-space payload.
-  `stroke(brush, viewport, logical, cells, at)` maps the logical point `at` through the viewport to the world point
-  under it, `None` in the letterbox margin or while the content area is empty:
+- `brush` (FL-022): `Brush::{Energy, Removal, Material, Introduction}` and `Stroke`, a click's world-space payload.
+  `stroke(brush, viewport, logical, cells, at, supplies)` maps the logical point `at` through the viewport to the
+  world point under it, `None` in the letterbox margin or while the content area is empty:
   - energy: `Stroke::Energy { cell, amount: BRUSH_ENERGY }` (64, 32 founders' endowments), the field cell whose
     square holds the world point, `⌊x / (L / cells)⌋` on each axis; `Intervention::InjectEnergy`;
   - removal: `Stroke::Removal { center, radius }`, centred on the world point, `BRUSH_RADIUS_POINTS` = 12 points on
     screen at the drawable's density and the view's zoom, at most half the shorter world side;
-    `Intervention::RemoveOrganisms` with `Disposition::Recycle`, so removed energy goes where a death's does.
+    `Intervention::RemoveOrganisms` with `Disposition::Recycle`, so removed energy goes where a death's does;
+  - material: `Stroke::Material { cell, amount: BRUSH_ENERGY, direction }` in the same cell, `direction` being
+    `Supplies::material`, or no stroke without one; `Intervention::InjectMaterial`. The Studio supplies the selected
+    organism's `material_for(affinity)`: the unit direction `a / ‖a‖₂`, shrunk as source directions are until
+    `‖·‖₂² ≤ 1` holds as the engine sums it (`flife_field::sources::unit_direction`). Under `bounded-affinity-v1` a
+    packet of composition `z` converts at `η_max tanh(k a·z − b)`, which over `‖z‖₂ ≤ 1` is largest along `a`, so
+    the brush adds the material that organism converts best; the cell's composition moves towards it;
+  - introduction: `Stroke::Introduction { cell, count: BRUSH_INTRODUCTION, energy }` in the same cell, 8 organisms
+    drawn as founders, each with `Supplies::founder_energy` (`population.initial_energy`);
+    `Intervention::IntroduceOrganisms`.
 - `Studio` is the main-thread host. It opens the window at `PixelDensity::Backing`: the window keeps its size in
   points, and each frame fills its device pixels (FL-020). Each `frame()`:
   1. drains typed input through `Controls` and offers the resulting intents;
@@ -104,7 +115,9 @@ adapter.
      `Intent::Inspect` for it with the shown epoch's tick as `seen` (FL-021), counted with the frame's intents or
      refusals. A brush click makes its stroke through the view as it stood at that click, over the shown epoch's
      field grid, and is offered as `Intent::Intervene` with the shown epoch's tick as `seen` (FL-022), counted in
-     `FrameTally::strokes` and with the intents or refusals;
+     `FrameTally::strokes` and with the intents or refusals. A brush click that makes no stroke (the margin, or the
+     material brush with no material) is counted in `FrameTally::unstroked`. The material is the one the last
+     `Inspected` snapshot gives, while that organism is still selected;
   6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
      makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
      fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
@@ -143,13 +156,15 @@ adapter.
     sensing scale, motion response, affinity, and the decoded held output (attempt rate and probability, child
     fraction, emission gate, emission direction and spend fraction) or null;
   - FL-022: one `brush` each time the armed brush changes (`energy`, `removal` or null); one `submitted` per
-    accepted stroke: its `command`, `brush`, the `cell` and `amount` or the `center` and `radius`, `seen_tick` and
+    accepted stroke: its `command`, `brush`, its payload (the `cell` and `amount`, with the material's 32-component
+    `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
     `effective_tick`; and one `finished` per command: `outcome` `applied` with its `tick`, `published_tick` and
     `energy`, or `cancelled` or `failed` with a `detail`;
   - a `frame` summary about once a second, with the camera's center and zoom, and the bytes the Metal route has
     copied so far: to the device (`upload_bytes`, and the most in one frame, `peak_upload_bytes`) and back to the
     host (`readback_bytes`, none for frames presented to the window);
-  - `end`, with the committed tick, the world digest, the strokes offered, the controller evaluations the backend
+  - `end`, with the committed tick, the world digest, the strokes offered and the brush clicks that made none
+    (`unstroked`), the controller evaluations the backend
     returned and deferred, and its failure if it failed, and the same copy totals.
 
   Errors are `frankenlife.error.v1` on standard error. The exit code is 0 after a clean close, 2 when the
@@ -208,9 +223,9 @@ presentation state, not scientific state.
     lost to capture loss pans no further; scrolls zoom by `exp(rate · dy)` in both units, limited, with no move for
     a zero or non-finite delta; 0 resets once (not on repeat or with ⌘) and is no style key; 256 moves wait in
     order until taken.
-  - FL-022: E and X arm, switch and disarm the brushes (their codes pinned to `kVK_ANSI_E` and `kVK_ANSI_X`), not
-    on repeat or with ⌘, with no move, intent or style change; an armed click brushes at the press with the brush
-    armed at the release, a drag still pans, and once disarmed a click selects.
+  - FL-022: E, X, M and I arm, switch and disarm the brushes (their codes pinned to `kVK_ANSI_E`, `kVK_ANSI_X`,
+    `kVK_ANSI_M` and `kVK_ANSI_I`), not on repeat or with ⌘, with no move, intent or style change; an armed click
+    brushes at the press with the brush armed at the release, a drag still pans, and once disarmed a click selects.
 - `tests/pacing.rs` (5 tests, FL-020): at rest before an interval is known; the display moves over the interval
   between arrivals (worked fractions, capped at 1, a frame before the arrival at 0) and later intervals smooth by a
   quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
@@ -268,7 +283,7 @@ presentation state, not scientific state.
   - while running: 48 inspections, then a pause; every snapshot the direct world's at its own tick, every
     organism answered with none dead at the close, and the closed world the direct one. Which ticks the answers
     land on depends on thread timing; the Lab test in `flife-runtime` is the one that requires answers mid-run.
-- `tests/brush.rs` (6 tests, FL-022, no window):
+- `tests/brush.rs` (9 tests, FL-022, no window):
   - an energy click names the cell whose square holds the world point under it (the oracle is the cell's bounds,
     on a 64 x 16 grid of non-square cells over a lattice of clicks), at fit, zoomed 2.75 and centred on the seams
     at zoom 2; both ends of both axes are reached, either side of the seams gives the last cells and the first,
@@ -276,7 +291,13 @@ presentation state, not scientific state.
   - a removal click is centred on the world point under it with the world distance to the point 12 points to its
     right as its radius (within 1e-12) at zooms 1, 4 and 13.5, a quarter at zoom 4 of zoom 1's, held to 16 in a
     16-point window over 32 world units, and none in the margin;
-  - the payloads are exactly `InjectEnergy` and `RemoveOrganisms` with `Disposition::Recycle`;
+  - the material and introduction brushes name the energy brush's cell under every click of a lattice at zoom 1.7;
+    the material brush carries the supplied composition and makes nothing without one, and the introduction brush 8
+    organisms at the supplied endowment;
+  - 24 founders' materials are within the unit ball as the engine checks it, unit to within 1e-14, parallel to
+    their affinities (so the unit composition with the largest `a·z`); a zero or nonfinite affinity has none;
+  - the payloads are exactly `InjectEnergy`, `RemoveOrganisms` with `Disposition::Recycle`, `InjectMaterial` and
+    `IntroduceOrganisms`;
   - a `SessionThread` over a 32 x 32 preset world paused at tick 2: an energy stroke (seen at 1) and a removal
     about a living organism are `Submitted` as commands 1 and 2 for the boundary of tick 2 and wait there through
     ten polls; the next step reports both `Applied` at tick 2, published at 3, with the energy a direct world
@@ -287,7 +308,13 @@ presentation state, not scientific state.
     reports every energy bit for bit and ends on the closed world's digest. Which ticks they land on depends on
     thread timing;
   - a cell off the grid and a disk wider than half the world are refused as `numerical-invalid` and take no
-    identity; a stroke still pending at close never applies, and the close returns with the founding world.
+    identity; a stroke still pending at close never applies, and the close returns with the founding world;
+  - paused at tick 3: a material stroke of a living organism's affinity direction and an introduction apply at the
+    next step, each moving what the direct world stepped with both reports, bit for bit (the introduction 8 organisms
+    at 2 energy each, 16), and the closed world is the direct one.
+- `src/main.rs` unit tests (2, FL-022): the `submitted` record of each brush's stroke as JSON, exactly (the
+  material's 32-component `direction`; absent fields null), and the `finished` record of an applied command (tick,
+  published tick, energy) and of a cancelled one.
 - In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
   backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
@@ -337,15 +364,18 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   both ticks. §14.2's sampled activations, inputs, transactions, descendants, local efficiency and weight dumps are
   not implemented.
 - FL-022's brushes:
-  - The host's brush path (the click through the frame's view to `Intent::Intervene`), the `brush`, `submitted`
-    and `finished` records and the `end` record's `strokes` run only in a window, which no test here opened. The
-    controls, the payload mapping and the session thread are tested headlessly. `tests/live.rs` has a brush case
+  - The host's brush path (the click through the frame's view to `Intent::Intervene`), the printing of the
+    `brush`, `submitted` and `finished` records and the `end` record's `strokes` and `unstroked` run only in a
+    window, which no test here opened. The controls, the payload mapping, the session thread and the `submitted`
+    and `finished` records' serialization are tested headlessly. `tests/live.rs` has a brush case
     that was compiled and not run.
   - There is no brush cursor or disk preview on screen and no applied-energy readout: the Metal 3D route has no
     text, so the armed brush and each command's outcome are records.
-  - A stroke is one click. Painting by drag, the material brush (`InjectMaterial`), seeded introduction
-    (`IntroduceOrganisms`), a choice of removal disposition, source edits and parameter edits have no Studio
-    brush; the engine's interventions for the first two exist (FL-022's earlier parts, run and branch flags).
+  - A stroke is one click of fixed size. Painting by drag, a choice of amount, count or removal disposition, a
+    material other than the selected organism's, source edits and parameter edits have no Studio brush.
+  - The material brush takes the selected organism's composition from its `inspected` snapshot, which arrives
+    after the click that selected it; a material click before then makes no stroke and is counted as
+    `unstroked`. The host's tracking of that snapshot runs only in a window, which no test here opened.
   - A finished command is reported up to `OUTCOME_POLL` after its publication; while paused, a pending
     command's watcher keeps asking every 20 ms.
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush

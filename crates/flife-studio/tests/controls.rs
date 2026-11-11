@@ -4,8 +4,8 @@
 use flife_manim::Viewport;
 use flife_studio::{
     Brush, CameraMove, ColorMapping, Controls, Intent, KEY_D, KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F,
-    KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X, KEY_ZERO, Look, Particles, Style,
-    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+    KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X, KEY_ZERO, Look, Particles,
+    Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -372,8 +372,9 @@ fn a_click_selects_where_it_pressed_and_lost_presses_select_nothing() {
 /// nothing, and neither is an intent or a style key.
 #[test]
 fn e_and_x_arm_switch_and_disarm_the_brushes() {
-    // `kVK_ANSI_E` is 0x0E and `kVK_ANSI_X` 0x07 (Carbon's `Events.h`).
-    assert_eq!([KEY_E, KEY_X], [0x0E, 0x07]);
+    // `kVK_ANSI_E` is 0x0E, `kVK_ANSI_X` 0x07, `kVK_ANSI_M` 0x2E and
+    // `kVK_ANSI_I` 0x22 (Carbon's `Events.h`).
+    assert_eq!([KEY_E, KEY_X, KEY_M, KEY_I], [0x0E, 0x07, 0x2E, 0x22]);
     let mut controls = Controls::new();
     let style = controls.style();
     assert_eq!(controls.brush(), None);
@@ -387,6 +388,14 @@ fn e_and_x_arm_switch_and_disarm_the_brushes() {
     tap(&mut controls, KEY_E);
     assert_eq!(controls.brush(), Some(Brush::Energy));
     tap(&mut controls, KEY_E);
+    assert_eq!(controls.brush(), None);
+    for (code, brush) in [(KEY_M, Brush::Material), (KEY_I, Brush::Introduction)] {
+        assert!(tap(&mut controls, code).is_empty());
+        assert_eq!(controls.brush(), Some(brush));
+    }
+    tap(&mut controls, KEY_M);
+    assert_eq!(controls.brush(), Some(Brush::Material));
+    tap(&mut controls, KEY_M);
     assert_eq!(controls.brush(), None);
 
     controls.apply(&key(KEY_E, true, true, Modifiers::NONE));

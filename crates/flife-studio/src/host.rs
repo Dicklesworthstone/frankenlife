@@ -49,7 +49,10 @@ use fmn_render::metal::{
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use crate::{Brush, CameraMove, Controls, Intent, Pacer, SessionThread, Status, brush};
+use crate::{
+    Brush, CameraMove, Controls, Intent, Pacer, SessionThread, Status, Supplies, brush,
+    material_for,
+};
 
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
@@ -151,6 +154,9 @@ pub struct FrameTally {
     pub selections: u64,
     /// Brush clicks offered to the session as strokes (FL-022).
     pub strokes: u64,
+    /// Brush clicks that made no stroke: in the letterbox margin, or the
+    /// material brush with no selected organism's affinity known.
+    pub unstroked: u64,
     /// Intents accepted.
     pub intents: u64,
     /// Intents refused.
@@ -210,6 +216,11 @@ pub struct Studio {
     controllers: String,
     /// The peak-memory admission it opened under (FL-043).
     memory: MemoryAdmission,
+    /// The last inspected organism and the material it converts best
+    /// (FL-022): the material brush's composition while it is selected.
+    material: Option<(OrganismId, Option<[f64; flife_engine::MATERIAL_CHANNELS]>)>,
+    /// `population.initial_energy`: each introduced organism's endowment.
+    founder_energy: f64,
 }
 
 impl Studio {
@@ -324,6 +335,8 @@ impl Studio {
             window_closed: false,
             controllers,
             memory,
+            material: None,
+            founder_energy: model.population.initial_energy,
         })
     }
 
@@ -373,6 +386,14 @@ impl Studio {
         let before = self.statuses.len();
         for status in self.session.statuses() {
             self.controls.follow(&status);
+            if let Status::Inspected {
+                organism,
+                snapshot: Some(snapshot),
+                ..
+            } = &status
+            {
+                self.material = Some((*organism, material_for(snapshot.traits.affinity())));
+            }
             self.statuses.push(status);
         }
         let statuses = self.statuses.len() - before;
@@ -406,6 +427,13 @@ impl Studio {
         let mut viewport = *self.view.viewport();
         let mut picked = None;
         let mut strokes = Vec::new();
+        let supplies = Supplies {
+            material: self
+                .material
+                .filter(|(organism, _)| self.view.selected() == Some(*organism))
+                .and_then(|(_, material)| material),
+            founder_energy: self.founder_energy,
+        };
         for change in self.controls.take_moves() {
             match change {
                 CameraMove::Zoom { anchor, factor } => {
@@ -437,16 +465,18 @@ impl Studio {
                 }
                 // Through the view as it was at the click, as a selection.
                 CameraMove::Brush { at, brush } => {
-                    if let Some(size) = logical
-                        && let Some(stroke) = brush::stroke(
+                    match logical.and_then(|size| {
+                        brush::stroke(
                             brush,
                             &viewport,
                             size,
                             self.current.field().cells(),
                             [at.x, at.y],
+                            &supplies,
                         )
-                    {
-                        strokes.push(stroke);
+                    }) {
+                        Some(stroke) => strokes.push(stroke),
+                        None => self.tally.unstroked += 1,
                     }
                 }
             }

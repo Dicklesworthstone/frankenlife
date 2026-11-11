@@ -27,11 +27,17 @@ use flife_engine::{
 use flife_manim::Viewport;
 use flife_runtime::Outcome;
 use flife_studio::{
-    BRUSH_ENERGY, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL, SessionThread, Status, Stroke,
-    stroke,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL,
+    SessionThread, Status, Stroke, Supplies, material_for, stroke,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
+
+/// No material, and the preset's founder endowment.
+const NONE: Supplies = Supplies {
+    material: None,
+    founder_energy: 2.0,
+};
 
 /// The preset at 32 × 32 world units on a 32 × 32 grid with 96 founders.
 fn small() -> ValidatedConfig {
@@ -164,7 +170,7 @@ fn lattice(viewport: &Viewport, logical: [f64; 2], cells: [u32; 2]) -> Vec<Click
             made.push((
                 at,
                 viewport.logical_to_world(at, logical),
-                stroke(Brush::Energy, viewport, logical, cells, at),
+                stroke(Brush::Energy, viewport, logical, cells, at, &NONE),
             ));
             x += 3.7;
         }
@@ -215,7 +221,7 @@ fn an_energy_click_names_the_cell_under_it() {
 
     // Either side of the seams the view is centred on: the last cells and
     // the first.
-    let cell_at = |at| match stroke(Brush::Energy, &seam, logical, cells, at) {
+    let cell_at = |at| match stroke(Brush::Energy, &seam, logical, cells, at, &NONE) {
         Some(Stroke::Energy { cell, .. }) => cell,
         made => panic!("{at:?} made {made:?}"),
     };
@@ -227,11 +233,11 @@ fn an_energy_click_names_the_cell_under_it() {
     assert_eq!(rows, [0, 15]);
 
     assert_eq!(
-        stroke(Brush::Energy, &fit, [0.0, 0.0], cells, [1.0, 1.0]),
+        stroke(Brush::Energy, &fit, [0.0, 0.0], cells, [1.0, 1.0], &NONE),
         None
     );
     assert_eq!(
-        stroke(Brush::Energy, &fit, logical, [0, 16], [400.0, 300.0]),
+        stroke(Brush::Energy, &fit, logical, [0, 16], [400.0, 300.0], &NONE),
         None
     );
 }
@@ -250,7 +256,7 @@ fn a_removal_click_is_a_disk_of_fixed_screen_radius() {
         let viewport = fit.with_view([12.0, 9.0], zoom).expect("views");
         let at = [380.0, 290.0];
         let Some(Stroke::Removal { center, radius }) =
-            stroke(Brush::Removal, &viewport, logical, [32, 32], at)
+            stroke(Brush::Removal, &viewport, logical, [32, 32], at, &NONE)
         else {
             panic!("no removal at zoom {zoom}");
         };
@@ -273,7 +279,14 @@ fn a_removal_click_is_a_disk_of_fixed_screen_radius() {
     // to 16.
     let tiny = Viewport::fit(extent, [32, 32]).expect("fits");
     assert_eq!(
-        stroke(Brush::Removal, &tiny, [16.0, 16.0], [32, 32], [8.0, 8.0]),
+        stroke(
+            Brush::Removal,
+            &tiny,
+            [16.0, 16.0],
+            [32, 32],
+            [8.0, 8.0],
+            &NONE
+        ),
         Some(Stroke::Removal {
             center: tiny
                 .logical_to_world([8.0, 8.0], [16.0, 16.0])
@@ -282,10 +295,116 @@ fn a_removal_click_is_a_disk_of_fixed_screen_radius() {
         })
     );
     assert_eq!(
-        stroke(Brush::Removal, &fit, logical, [32, 32], [10.0, 300.0]),
+        stroke(
+            Brush::Removal,
+            &fit,
+            logical,
+            [32, 32],
+            [10.0, 300.0],
+            &NONE
+        ),
         None,
         "the margin"
     );
+}
+
+/// The material and introduction brushes name the cell the energy brush
+/// names under every click. The material brush carries the supplied
+/// composition and makes nothing without one; the introduction brush
+/// carries [`BRUSH_INTRODUCTION`] organisms at the supplied endowment.
+#[test]
+fn material_and_introduction_clicks_carry_their_supplies() {
+    let logical = [800.0, 600.0];
+    let cells = [64, 16];
+    let viewport = Viewport::fit([32.0, 32.0], [1600, 1200])
+        .expect("fits")
+        .with_view([5.0, 27.0], 1.7)
+        .expect("views");
+    let mut direction = [0.0; 32];
+    direction[3] = 0.6;
+    direction[17] = -0.8;
+    let supplied = Supplies {
+        material: Some(direction),
+        founder_energy: 2.5,
+    };
+    let mut made = 0;
+    for (at, _, energy) in lattice(&viewport, logical, cells) {
+        let material = stroke(Brush::Material, &viewport, logical, cells, at, &supplied);
+        let introduction = stroke(
+            Brush::Introduction,
+            &viewport,
+            logical,
+            cells,
+            at,
+            &supplied,
+        );
+        assert_eq!(
+            stroke(Brush::Material, &viewport, logical, cells, at, &NONE),
+            None,
+            "{at:?}"
+        );
+        let Some(Stroke::Energy { cell, .. }) = energy else {
+            assert_eq!((material, introduction), (None, None), "{at:?}");
+            continue;
+        };
+        assert_eq!(
+            material,
+            Some(Stroke::Material {
+                cell,
+                amount: BRUSH_ENERGY,
+                direction
+            })
+        );
+        assert_eq!(
+            introduction,
+            Some(Stroke::Introduction {
+                cell,
+                count: BRUSH_INTRODUCTION,
+                energy: 2.5
+            })
+        );
+        made += 1;
+    }
+    assert!(made > 100, "{made}");
+}
+
+/// An organism's material is its affinity's unit direction: within the
+/// unit ball as the engine checks it (`‖·‖₂² ≤ 1`, summed in channel
+/// order), parallel to the affinity, and so the composition of unit norm
+/// with the largest `a·z`. A zero or nonfinite affinity has none.
+#[test]
+fn an_organisms_material_is_its_affinity_direction() {
+    let config = small();
+    let world = found(&config);
+    let mut checked = 0;
+    for id in world.population().ids().take(24) {
+        let snapshot = world
+            .organism_snapshot(id)
+            .expect("inspects")
+            .expect("alive");
+        let affinity = *snapshot.traits.affinity();
+        let norm = affinity.iter().map(|a| a * a).sum::<f64>().sqrt();
+        let Some(material) = material_for(&affinity) else {
+            assert_eq!(norm, 0.0, "{id:?}");
+            continue;
+        };
+        let squared = material.iter().fold(0.0, |total, &z| total + z * z);
+        assert!(squared <= 1.0 && squared > 1.0 - 1e-14, "{squared}");
+        for (z, a) in material.iter().zip(&affinity) {
+            assert!((z * norm - a).abs() <= 1e-14 * norm, "{z} vs {a}/{norm}");
+        }
+        let along: f64 = material.iter().zip(&affinity).map(|(z, a)| z * a).sum();
+        assert!(
+            (along - norm).abs() <= 1e-14 * norm.max(1.0),
+            "{along} vs {norm}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+    assert_eq!(material_for(&[0.0; 32]), None);
+    let mut broken = [0.1; 32];
+    broken[9] = f64::NAN;
+    assert_eq!(material_for(&broken), None);
 }
 
 /// The payloads are the canonical interventions: an injection of the
@@ -317,6 +436,133 @@ fn a_stroke_is_its_canonical_intervention() {
             disposition: Disposition::Recycle,
         }
     );
+    let mut direction = [0.0; 32];
+    direction[0] = -1.0;
+    let material = Stroke::Material {
+        cell: [7, 8],
+        amount: 12.5,
+        direction,
+    };
+    assert_eq!(material.brush(), Brush::Material);
+    assert_eq!(
+        material.intervention(),
+        Intervention::InjectMaterial {
+            cell: [7, 8],
+            amount: 12.5,
+            direction,
+        }
+    );
+    let introduction = Stroke::Introduction {
+        cell: [30, 1],
+        count: 8,
+        energy: 2.0,
+    };
+    assert_eq!(introduction.brush(), Brush::Introduction);
+    assert_eq!(
+        introduction.intervention(),
+        Intervention::IntroduceOrganisms {
+            cell: [30, 1],
+            count: 8,
+            energy: 2.0,
+        }
+    );
+    assert_eq!(
+        [
+            Brush::Energy,
+            Brush::Removal,
+            Brush::Material,
+            Brush::Introduction
+        ]
+        .map(Brush::name),
+        ["energy", "removal", "material", "introduction"]
+    );
+}
+
+/// Paused at tick 3, a material stroke of a living organism's affinity
+/// direction and an introduction apply at the next step with what the
+/// direct world stepped with both reports: the energy each moved, bit for
+/// bit, and eight introduced organisms; the session ends on that world.
+#[test]
+fn a_paused_studio_session_applies_material_and_introduction_strokes() {
+    let config = small();
+    let mut direct = found(&config);
+    for _ in 0..3 {
+        step_with(&mut direct, &[]);
+    }
+    let session = spawn(&config);
+    for _ in 0..3 {
+        session.send(Intent::Step).expect("offered");
+    }
+    let statuses = gather(&session, Vec::new(), |statuses| {
+        statuses.contains(&Status::Stepped { tick: Tick::new(3) })
+    });
+    let organism = direct.population().ids().nth(11).expect("an organism");
+    let affinity = *direct
+        .organism_snapshot(organism)
+        .expect("inspects")
+        .expect("alive")
+        .traits
+        .affinity();
+    let material = Stroke::Material {
+        cell: [20, 6],
+        amount: BRUSH_ENERGY,
+        direction: material_for(&affinity).expect("a direction"),
+    };
+    let introduction = Stroke::Introduction {
+        cell: [2, 29],
+        count: BRUSH_INTRODUCTION,
+        energy: config.config().population.initial_energy,
+    };
+    for stroke in [material, introduction] {
+        session
+            .send(Intent::Intervene {
+                stroke,
+                seen: Tick::new(3),
+            })
+            .expect("offered");
+    }
+    let statuses = gather(&session, statuses, |statuses| {
+        count(statuses, is_submitted) == 2
+    });
+    assert_eq!(
+        submissions(&statuses),
+        [
+            (CommandId::new(1), material, Tick::new(3), Tick::new(3)),
+            (CommandId::new(2), introduction, Tick::new(3), Tick::new(3)),
+        ]
+    );
+    session.send(Intent::Step).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        count(statuses, is_finished) == 2
+    });
+    let reports = match direct
+        .step_with(&[material.intervention(), introduction.intervention()])
+        .expect("steps")
+    {
+        Stepped::Published(report) => {
+            assert_eq!(report.introductions.len(), 8);
+            report.interventions
+        }
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    };
+    let finished = applied(&statuses);
+    assert_eq!(finished.len(), 2);
+    for ((command, tick, published, energy), report) in finished.iter().zip(&reports) {
+        assert_eq!(
+            (*tick, *published),
+            (Tick::new(3), Tick::new(4)),
+            "{command:?}"
+        );
+        assert_eq!(energy.to_bits(), report.applied.to_bits(), "{command:?}");
+    }
+    assert_eq!(reports[1].introduced, 8);
+    assert_eq!(
+        finished[1].3,
+        8.0 * config.config().population.initial_energy
+    );
+    let closed = session.close().expect("closes");
+    assert_eq!(closed.boundary.tick, Tick::new(4));
+    assert_eq!(closed.world.digest(), direct.digest());
 }
 
 /// Paused at tick 2, two strokes are accepted for the boundary of tick 2

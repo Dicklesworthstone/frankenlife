@@ -13,7 +13,7 @@ adapter.
   mapping. `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
-  `0ae728fe`, through FrankenManim `fmn-render` at rev `5d08cba2`.
+  `0ae728fe`, through FrankenManim `fmn-render` at rev `b104feec`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and
@@ -216,9 +216,15 @@ presentation state, not scientific state.
   at 4,096 and 16,384 organisms, 1280 x 720 and 3840 x 2160, one and two pixels per point, zooms 1 and 16, in
   points, density and raw density: the host heap the route holds to upload a frame, above the frame it returns,
   and the bytes it copies to the device (`MetalReport::upload_bytes`) are each within the view's preparation limit
-  plus its texel bytes (at most 60.2% and 43.2%; the largest copy 22.6 MB, a 4K frame of 16,384 dots and halos);
+  plus its texel bytes (at most 59.7% and 43.2%; the largest copy 22.6 MB, a 4K frame of 16,384 dots and halos);
   the readback is the RGBA8 frame. The Studio's frame tally (`FrameTally::count_copies`, the `frame` and `end`
   records' copy fields) counts the same 48 reports' copies: their sum, the largest, and the readback sum.
+- `tests/kept_texels.rs` (FL-033, Metal compute, no window): on one `MetalRenderer`, the preset 30 ticks in, in
+  points, density and raw density, a pan, a zoom and a frame between epochs copy none of the layers' texels: each
+  frame equals a fresh renderer's byte for byte, and its upload is the fresh renderer's less exactly the texels of
+  the layers drawn (raw density draws no field). An epoch 30 ticks later copies them again. The old pin
+  (FrankenManim `5d08cba2`) and a pan that moves the field's or the density's display scale each fail it. It is
+  its own binary because `frame_upload.rs` counts every thread's heap.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -244,12 +250,16 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     outside the heap the tests count.
   - FrankenManim bounds neither the Metal route's host staging of a frame nor its device copy. Both are charged at
     the view's preparation limit plus its texel bytes, which they stayed within on 48 measured frames (at most
-    60.2% and 43.2%); a frame beyond them is not refused.
+    59.7% and 43.2%); a frame beyond them is not refused. From `b104feec` the device keeps the last frame's texels
+    between frames, at most the view's texel bytes, inside the same term. FrankenManim drops them before it
+    uploads others, so it never holds two sets, but no test sees device memory, so that is read from its code.
   - On the preset at 1920 x 1080 points with a 2x display, the observers take 391.1 MiB and the backend gets
     255.3 MiB of the 2,048, where it was unbounded: parameter shards that do not fit are evaluated on the reference
     (the same bits, slower). The Studio's frame and inference rates under that budget are not measured here.
-  - FL-033: the field and density layers are textures on one quad each, uploaded with every frame (the window's
-    frames were not run here). Measured headlessly against the vertex grids they replace, in one interleaved
+  - FL-033: the field and density layers are textures on one quad each. Since FrankenManim `b104feec` their
+    texels are copied to the device only when a frame's textures differ in content from the last frame's, so a
+    pan, a zoom or a frame between epochs copies none (`tests/kept_texels.rs`, headless; the window's frames were
+    not run here). Measured headlessly against the vertex grids they replace, before that, in one interleaved
     invocation (six runs a side, 16,384 organisms, two pixels per point): a 4K density frame copies 1.50 MB to the
     device, not 21.46 MB, and its CPU preparation takes 4.21 ms, not 33.97 ms, at zoom 1. At zoom 16 the whole
     textures are copied, 1.95 MB against the culled grid's 1.45 MB, and the Metal route took 13.01 ms against

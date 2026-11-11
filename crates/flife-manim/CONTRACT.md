@@ -346,7 +346,7 @@ route.
   that a pan or zoom allocates no layer texture (at most 440 bytes, against the field's 256 KiB texture), and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `5d08cba2`, CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `b104feec`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**

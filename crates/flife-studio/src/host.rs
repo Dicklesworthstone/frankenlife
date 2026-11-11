@@ -39,7 +39,7 @@ use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
-use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb};
+use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
@@ -225,6 +225,8 @@ pub struct Studio {
     font: HudFont,
     /// The text drawn over the world.
     overlay: String,
+    /// Its swatches' sRGB colours, in order (FL-019's key).
+    swatches: Vec<[u8; 3]>,
 }
 
 impl Studio {
@@ -346,24 +348,28 @@ impl Studio {
             founder_energy: model.population.initial_energy,
             font,
             overlay: String::new(),
+            swatches: Vec::new(),
         })
     }
 
     /// Draw `text` over the world from the next frame (FL-024's metric
     /// overlay; [`crate::overlay_text`] composes the Studio's): lines in
     /// IBM Plex Sans at [`HUD_TEXT_POINTS`] on the window's screen, over a
-    /// dark plate in the drawable's top-left corner. An empty text draws
-    /// nothing; the same text again does nothing.
+    /// dark plate in the drawable's top-left corner, each
+    /// [`flife_manim::HUD_SWATCH`] in the next of `swatches` (sRGB; the
+    /// colour key's, FL-019). An empty text draws nothing; the same text and
+    /// swatches again do nothing.
     ///
     /// # Errors
-    /// As [`HudFont::text`] and [`WorldView::set_overlay`]; the overlay is
-    /// unchanged on error.
-    pub fn set_overlay(&mut self, text: &str) -> Result<(), CoreError> {
-        if text == self.overlay {
+    /// As [`HudFont::text_with_swatches`] and [`WorldView::set_overlay`];
+    /// the overlay is unchanged on error.
+    pub fn set_overlay(&mut self, text: &str, swatches: &[[u8; 3]]) -> Result<(), CoreError> {
+        if text == self.overlay && swatches == self.swatches.as_slice() {
             return Ok(());
         }
-        self.lay_out_overlay(text)?;
+        self.lay_out_overlay(text, swatches)?;
         text.clone_into(&mut self.overlay);
+        swatches.clone_into(&mut self.swatches);
         Ok(())
     }
 
@@ -397,12 +403,13 @@ impl Studio {
         }
     }
 
-    fn lay_out_overlay(&mut self, text: &str) -> Result<(), CoreError> {
+    fn lay_out_overlay(&mut self, text: &str, swatches: &[[u8; 3]]) -> Result<(), CoreError> {
         let laid = if text.is_empty() {
             None
         } else {
             let em = HUD_TEXT_POINTS * self.view.viewport().pixels_per_point();
-            Some(self.font.text(text, em)?)
+            let colors: Vec<_> = swatches.iter().map(|&rgb| linear(rgb)).collect();
+            Some(self.font.text_with_swatches(text, em, &colors)?)
         };
         self.view.set_overlay(laid)
     }
@@ -485,8 +492,10 @@ impl Studio {
         if redensed && !self.overlay.is_empty() {
             // The text keeps its size in points on the new screen.
             let text = std::mem::take(&mut self.overlay);
-            let laid = self.lay_out_overlay(&text);
+            let swatches = std::mem::take(&mut self.swatches);
+            let laid = self.lay_out_overlay(&text, &swatches);
             self.overlay = text;
+            self.swatches = swatches;
             laid?;
         }
         let refitted = resized || redensed;

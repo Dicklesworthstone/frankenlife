@@ -957,6 +957,7 @@ dependencies = [
  "flife-core",
  "flife-engine",
  "flife-field",
+ "flife-genome",
  "flife-manim",
  "flife-render",
  "flife-runtime",

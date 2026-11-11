@@ -124,6 +124,134 @@ impl ColorMapping {
     }
 }
 
+/// The energies the energy mapping's key shows.
+pub const LEGEND_ENERGIES: [f32; 6] = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0];
+
+/// The generations the generation mapping's key shows: the last is
+/// [`GENERATION_SCALE`], where the ramp ends.
+pub const LEGEND_GENERATIONS: [u32; 6] = [0, 1, 3, 15, 63, GENERATION_SCALE];
+
+/// The headings the motion mapping's key shows, as fractions of a turn
+/// counter-clockwise on screen from east, at full speed.
+pub const LEGEND_HEADINGS: [(&str, f64); 4] = [
+    ("east", 0.0),
+    ("north", 0.25),
+    ("west", 0.5),
+    ("south", 0.75),
+];
+
+/// The affinity mapping's key: no affinity, then six directions in its
+/// first two coordinates, `k · 60°` from the first, at the radius a
+/// founder's direction typically takes (`2 / AFFINITY_GAIN`).
+#[must_use]
+pub fn legend_affinities() -> [[f32; 3]; 7] {
+    let radius = 2.0 / AFFINITY_GAIN;
+    let mut out = [[0.0_f32; 3]; 7];
+    for (k, q) in out.iter_mut().skip(1).enumerate() {
+        let angle = (k as f64) * std::f64::consts::TAU / 6.0;
+        *q = [
+            (radius * angle.cos()) as f32,
+            (radius * angle.sin()) as f32,
+            0.0,
+        ];
+    }
+    out
+}
+
+/// A colour mapping's key (FL-019, plan §13.4): one line of text in which
+/// each [`HUD_SWATCH`](crate::HUD_SWATCH) is drawn in the next of
+/// `swatches`, the colour the mapping gives what follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Legend {
+    /// The line: the mapping's name, then the swatches and their labels.
+    pub text: String,
+    /// Each swatch's sRGB colour, in order.
+    pub swatches: Vec<[u8; 3]>,
+}
+
+impl ColorMapping {
+    /// The mapping's key. `topologies` are the hidden widths of the run's
+    /// catalog members in catalog order, which the topology key labels.
+    ///
+    /// - lineage: the 12 palette colours, `by founder` (a lineage's colour is
+    ///   a fixed hash of its identity, so lineages share them);
+    /// - energy: [`LEGEND_ENERGIES`] on the ramp;
+    /// - generation: [`LEGEND_GENERATIONS`], the last `256+`;
+    /// - motion: [`LEGEND_HEADINGS`] at full speed, then `still`, `greyer is
+    ///   slower`;
+    /// - topology: each member's colour and hidden widths;
+    /// - affinity: [`legend_affinities`]: `none`, then the six directions,
+    ///   `like hue, like chemistry`.
+    #[must_use]
+    pub fn legend(self, topologies: &[&[u32]]) -> Legend {
+        let swatch = crate::HUD_SWATCH;
+        let mut text = self.name().to_owned();
+        let mut swatches = Vec::new();
+        let mut labelled = |text: &mut String, color: [u8; 3], label: &str| {
+            text.push_str(&format!(" {swatch} {label}"));
+            swatches.push(color);
+        };
+        match self {
+            Self::Lineage => {
+                text.push(' ');
+                for color in LINEAGE_PALETTE {
+                    text.push(swatch);
+                    swatches.push(color);
+                }
+                text.push_str(" by founder");
+            }
+            Self::Energy => {
+                for energy in LEGEND_ENERGIES {
+                    let color = ramp(&ENERGY_RAMP, energy_level(energy));
+                    labelled(&mut text, color, &energy.to_string());
+                }
+            }
+            Self::Generation => {
+                for generation in LEGEND_GENERATIONS {
+                    let color = ramp(&GENERATION_RAMP, generation_level(generation));
+                    let label = if generation == GENERATION_SCALE {
+                        format!("{generation}+")
+                    } else {
+                        generation.to_string()
+                    };
+                    labelled(&mut text, color, &label);
+                }
+            }
+            Self::Motion => {
+                for (label, turn) in LEGEND_HEADINGS {
+                    labelled(&mut text, wheel(turn), label);
+                }
+                labelled(&mut text, MOTION_STILL, "still, greyer is slower");
+            }
+            Self::Topology => {
+                for (index, widths) in topologies.iter().enumerate() {
+                    let label = widths
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    labelled(
+                        &mut text,
+                        TOPOLOGY_PALETTE[index % TOPOLOGY_PALETTE.len()],
+                        &label,
+                    );
+                }
+            }
+            Self::Affinity => {
+                let [none, directions @ ..] = legend_affinities();
+                labelled(&mut text, affinity_rgb8(none), "none");
+                text.push(' ');
+                for q in directions {
+                    text.push(swatch);
+                    swatches.push(affinity_rgb8(q));
+                }
+                text.push_str(" like hue, like chemistry");
+            }
+        }
+        Legend { text, swatches }
+    }
+}
+
 impl fmt::Display for ColorMapping {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.name())

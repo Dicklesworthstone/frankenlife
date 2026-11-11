@@ -1,14 +1,36 @@
 //! The Studio's on-screen text (FL-024's metric overlay, plan §12.2): what
 //! the session is doing, the honest clocks and what a click will do, as
 //! lines the view draws in the drawable's top-left corner
-//! ([`flife_manim::HudText`]). While an organism is selected, its last
-//! inspection follows (FL-021's panel, plan §14.2).
+//! ([`flife_manim::HudText`]). The colour mapping's key is one of them
+//! (FL-019's legend, plan §13.4), and while an organism is selected its
+//! last inspection follows (FL-021's panel, plan §14.2).
 
-use flife_core::Tick;
 use flife_core::ids::OrganismId;
+use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
+use flife_genome::TopologyCatalog;
+use flife_manim::{ColorMapping, Legend};
 
 use crate::{Brush, ClockReading};
+
+/// Every colour mapping's key for the run `config` configures, in
+/// [`ColorMapping::ALL`]'s order: the topology key labels the run's catalog
+/// members with their hidden widths.
+///
+/// # Errors
+/// As [`TopologyCatalog::from_config`].
+pub fn legends(config: &ValidatedConfig) -> Result<Vec<(ColorMapping, Legend)>, CoreError> {
+    let catalog = TopologyCatalog::from_config(config)?;
+    let widths: Vec<&[u32]> = catalog
+        .ids()
+        .filter_map(|id| catalog.topology(id))
+        .map(|topology| topology.hidden_widths())
+        .collect();
+    Ok(ColorMapping::ALL
+        .into_iter()
+        .map(|mapping| (mapping, mapping.legend(&widths)))
+        .collect())
+}
 
 /// What the overlay shows.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -21,8 +43,10 @@ pub struct OverlayState<'a> {
     /// The last clock reading, while `[presentation] show_clock_telemetry`
     /// is set.
     pub clock: Option<&'a ClockReading>,
-    /// The colour mapping's name.
-    pub mapping: &'static str,
+    /// The colour mapping's key: its swatches are the only
+    /// [`flife_manim::HUD_SWATCH`]es in the text, so its `swatches` colour
+    /// them in order.
+    pub legend: &'a Legend,
     /// The armed brush.
     pub brush: Option<Brush>,
     /// The selected organism.
@@ -47,10 +71,15 @@ pub enum Inspected<'a> {
 /// - with a clock reading, `128 ticks/s · 1.00× real time · 60 fps`: the
 ///   ticks committed per wall second (one decimal below 100), simulated
 ///   seconds per wall second and frames presented per second;
-/// - the colour mapping, then ` · energy brush` while a brush is armed and
-///   ` · organism 42` while one is selected;
+/// - the colour mapping's key ([`ColorMapping::legend`]), such as
+///   `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16`;
+/// - `energy brush` while a brush is armed and `organism 42` while one is
+///   selected, joined by ` · `;
 /// - while one is selected and an inspection has answered, the panel
 ///   ([`inspector_lines`]).
+///
+/// A count of a trillion or more, and a magnitude of 100,000 or more, is
+/// written in scientific notation, so no line grows without bound.
 #[must_use]
 pub fn overlay_text(state: &OverlayState<'_>) -> String {
     let run = match state.paused {
@@ -63,27 +92,36 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
         None => run.to_owned(),
     };
     if let Some(clock) = state.clock {
-        let rate = if clock.ticks_per_second >= 100.0 {
-            format!("{:.0}", clock.ticks_per_second)
+        let places = if clock.ticks_per_second >= 100.0 {
+            0
         } else {
-            format!("{:.1}", clock.ticks_per_second)
+            1
         };
         text.push_str(&format!(
-            "\n{rate} ticks/s · {:.2}× real time · {:.0} fps",
-            clock.simulation_rate, clock.frames_per_second
+            "\n{} ticks/s · {}× real time · {} fps",
+            decimal(clock.ticks_per_second, places),
+            decimal(clock.simulation_rate, 2),
+            decimal(clock.frames_per_second, 0)
         ));
     }
     text.push('\n');
-    text.push_str(state.mapping);
+    text.push_str(&state.legend.text);
+    let mut doing = Vec::new();
     if let Some(brush) = state.brush {
-        text.push_str(&format!(" · {} brush", brush.name()));
+        doing.push(format!("{} brush", brush.name()));
     }
     if let Some(organism) = state.selected {
-        text.push_str(&format!(" · organism {}", grouped(organism.get())));
-        if let Some(inspected) = state.inspected {
-            text.push('\n');
-            text.push_str(&inspector_lines(inspected));
-        }
+        doing.push(format!("organism {}", grouped(organism.get())));
+    }
+    if !doing.is_empty() {
+        text.push('\n');
+        text.push_str(&doing.join(" · "));
+    }
+    if state.selected.is_some()
+        && let Some(inspected) = state.inspected
+    {
+        text.push('\n');
+        text.push_str(&inspector_lines(inspected));
     }
     text
 }
@@ -173,8 +211,17 @@ fn signed(value: f64, places: usize) -> String {
     }
 }
 
-/// `value` with its thousands separated by commas.
+/// The smallest count [`grouped`] writes in scientific notation.
+const TRILLION: u64 = 1_000_000_000_000;
+
+/// `value` with its thousands separated by commas, or in scientific
+/// notation from a trillion: no tick, identity or count of a run reaches
+/// one, and the line stays bounded if one does.
 fn grouped(value: u64) -> String {
+    if value >= TRILLION {
+        // Three significant digits are shown, so the cast loses nothing seen.
+        return format!("{:.2e}", value as f64);
+    }
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {

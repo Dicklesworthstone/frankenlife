@@ -2,7 +2,8 @@
 
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
-rendering (§13.4), and the configured bloom on glowing frames (§2.3). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
+rendering (§13.4), the configured bloom on glowing frames (§2.3), and the shown mapping's colour key in the overlay
+(§13.4's legend: `legends`, `flife_manim::ColorMapping::legend`). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
 bounded snapshot at its committed boundary (§14.2), and draws it as a panel in the overlay, read again once a
@@ -11,6 +12,10 @@ seeded-introduction brushes: a click becomes a world-space command that the sess
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
 They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
+The overlay's lines are `overlay_text`'s: the run and its tick, the clocks, the shown mapping's key (each swatch
+in the colour that mapping gives its label; the topology key labels the run's catalog members by their hidden
+widths), the armed brush and the selection, then the inspector panel. A count of a trillion or more, and a
+magnitude of 100,000 or more, is written in scientific notation, so no line grows without bound.
 It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
@@ -332,21 +337,26 @@ presentation state, not scientific state.
     still counted; a window of no wall time, or a read before it opened, gives nothing and keeps its start;
   - against a running `SessionThread`'s render feed: over 300 ms the ticks read are exactly what the feed's newest
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and once paused a window reads 0.
-- `tests/overlay.rs` (3 tests, FL-024 and FL-021, no window):
+- `tests/overlay.rs` (4 tests, FL-024, FL-021 and FL-019, no window):
   - `overlay_text` exactly: `opening` before the session reports; `running · tick 1,024`, then `128 ticks/s ·
-    1.00× real time · 60 fps`, then the mapping; one decimal below 100 ticks/s; the brush and the organism, grouped
-    in thousands;
+    1.00× real time · 60 fps`, then the key; one decimal below 100 ticks/s; the brush and the organism on one line,
+    grouped in thousands; `999,999,999,999`, then `1.00e12` and `1.84e19` from a trillion, and a clock of
+    `1.23e8 ticks/s · 2.50e5× real time`;
+  - `legends` of the preset gives each of the six mappings once, in `ColorMapping::ALL`'s order; each key's text
+    starts with its mapping's name and has one swatch for each `■`, and at 2x it is set whole, every glyph drawn
+    and every `■` coloured by its swatch in order; the topology key names the preset's five members (`8`, `32`,
+    `64, 32`, `96, 64`, `128, 96`);
   - the inspector panel exactly, from a real snapshot of the preset three ticks in with every printed value set:
     its five lines under the selection's, `not in the committed world` for a gone organism, nothing without a
     selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen from east (a heading a hair below
     east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest; scientific notation from 100,000 with a
     sign on every rate; `no controller output held`;
-  - the longest overlay (every count at its largest, each brush, the panel with every value one short of
-    scientific notation and the catalog's largest controller) at 2x: every glyph is drawn, none refused or left
-    out, within four fifths of the overlay's budget (11,430 vertices and 10,944 triangles at most); at 3x, all of
-    it is still drawn.
+  - the longest overlay (every key with every brush, every count one short of a trillion, the panel with every
+    value one short of scientific notation and the catalog's largest controller), laid out with its key's swatches,
+    at 2x: every glyph is drawn, none refused or left out, within four fifths of the overlay's budget (the motion
+    key's, 11,832 vertices and 11,434 triangles, is the longest); at 3x, all of it is still drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 30.3 MiB at 3840 x 2160, which leaves the backend 224.3 MiB of the 2 GiB budget (205.6
+  terms to the observers: 32.5 MiB at 3840 x 2160, which leaves the backend 222.1 MiB of the 2 GiB budget (203.4
   with the preset's bloom).
 - `src/main.rs` unit tests (3, FL-022, FL-024): the `submitted` record of each brush's stroke as JSON, exactly (the
   material's 32-component `direction`; absent fields null), the `finished` record of an applied command (tick,
@@ -462,7 +472,10 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.
-- The overlay names the colour mapping, but there is no legend (its key is not drawn), and the presenter has no
+- The colour key is drawn only in a window, which no test here opened: the host's choice of the shown mapping's key
+  each frame and its swatches' colours on screen. `overlay_text`, `legends` and the key's colours are tested
+  without one, and `flife-manim`'s `tests/hud.rs` draws coloured swatches through the CPU route. The key shows
+  sample values, not a continuous ramp; the lineage key cannot say which lineage a colour is. The presenter has no
   window-title setter. The style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed.
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit, checkpoints and recording are later

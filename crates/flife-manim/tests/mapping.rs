@@ -4,6 +4,7 @@
 mod common;
 
 use flife_manim::FieldLayer;
+use flife_manim::HUD_SWATCH;
 use flife_manim::{
     AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, BLOOM_SIGMA_POINTS,
     BLOOM_WIDEST_REACH_PIXELS, ColorMapping, DensityLayer, ENERGY_HALF, ENERGY_RAMP,
@@ -1094,4 +1095,138 @@ fn affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale() {
         colours.len(),
         rows.len()
     );
+}
+
+/// The run's catalog in the tests: `dense-104-36-catalog-v1`'s hidden widths.
+const CATALOG: [&[u32]; 5] = [&[8], &[32], &[64, 32], &[96, 64], &[128, 96]];
+
+/// A key's line split at its swatches: the text before the first, then
+/// each swatch's label, trimmed.
+fn key_labels(text: &str) -> (String, Vec<String>) {
+    let mut parts = text.split(HUD_SWATCH).map(str::trim);
+    let head = parts.next().unwrap_or_default().to_owned();
+    (head, parts.map(str::to_owned).collect())
+}
+
+/// FL-019's legend (plan §13.4): every swatch of every key is the colour the
+/// mapping draws an organism with the value its label names, through
+/// `mapped_rgb8`, the dots' own path.
+#[test]
+fn every_key_swatch_is_the_colour_its_mapping_gives_its_label() {
+    let limit = 3.0;
+    let with = |mapping, traits: Traits| mapped_rgb8(mapping, &traits, limit);
+    for mapping in ColorMapping::ALL {
+        let legend = mapping.legend(&CATALOG);
+        let (head, labels) = key_labels(&legend.text);
+        assert_eq!(head, mapping.name(), "{legend:?}");
+        assert_eq!(labels.len(), legend.swatches.len(), "{legend:?}");
+        match mapping {
+            ColorMapping::Energy => {
+                assert_eq!(labels, ["0", "1", "2", "4", "8", "16"]);
+                for (label, &swatch) in labels.iter().zip(&legend.swatches) {
+                    let energy: f32 = label.parse().expect("an energy");
+                    assert_eq!(
+                        swatch,
+                        with(mapping, row(0, energy, 0, 0, [0.0; 2])),
+                        "{label}"
+                    );
+                }
+            }
+            ColorMapping::Generation => {
+                assert_eq!(labels, ["0", "1", "3", "15", "63", "256+"]);
+                for (label, &swatch) in labels.iter().zip(&legend.swatches) {
+                    let generation: u32 =
+                        label.trim_end_matches('+').parse().expect("a generation");
+                    assert_eq!(swatch, with(mapping, row(0, 0.0, generation, 0, [0.0; 2])));
+                    if label.ends_with('+') {
+                        // Every later generation takes it too.
+                        let later = row(0, 0.0, generation * 40, 0, [0.0; 2]);
+                        assert_eq!(swatch, with(mapping, later));
+                    }
+                }
+            }
+            ColorMapping::Motion => {
+                // At the speed limit; world y points down, so north is -y.
+                let headings = [
+                    ("east", [3.0, 0.0]),
+                    ("north", [0.0, -3.0]),
+                    ("west", [-3.0, 0.0]),
+                    ("south", [0.0, 3.0]),
+                    ("still, greyer is slower", [0.0, 0.0]),
+                ];
+                assert_eq!(labels, headings.map(|(label, _)| label));
+                for ((_, velocity), &swatch) in headings.iter().zip(&legend.swatches) {
+                    assert_eq!(swatch, with(mapping, row(0, 0.0, 0, 0, *velocity)));
+                }
+                // Slower is greyer: half the speed limit lies nearer still.
+                let east = legend.swatches[0];
+                let half = with(mapping, row(0, 0.0, 0, 0, [1.5, 0.0]));
+                let distance = |a: [u8; 3], b: [u8; 3]| {
+                    a.iter()
+                        .zip(b)
+                        .map(|(&x, y)| (f64::from(x) - f64::from(y)).powi(2))
+                        .sum::<f64>()
+                };
+                assert!(distance(half, MOTION_STILL) < distance(east, MOTION_STILL));
+            }
+            ColorMapping::Topology => {
+                assert_eq!(labels, ["8", "32", "64, 32", "96, 64", "128, 96"]);
+                for (index, &swatch) in legend.swatches.iter().enumerate() {
+                    let topology = u8::try_from(index).expect("a catalog index");
+                    assert_eq!(swatch, with(mapping, row(0, 0.0, 0, topology, [0.0; 2])));
+                }
+            }
+            ColorMapping::Lineage => {
+                // Twelve unlabelled swatches, then what they mean.
+                assert_eq!(labels.len(), 12);
+                assert!(labels[..11].iter().all(String::is_empty), "{labels:?}");
+                assert_eq!(labels[11], "by founder");
+                // Every lineage takes one of them, and each is taken.
+                let taken: std::collections::BTreeSet<[u8; 3]> = (0..10_000)
+                    .map(|lineage| with(mapping, row(lineage, 0.0, 0, 0, [0.0; 2])))
+                    .collect();
+                let shown: std::collections::BTreeSet<[u8; 3]> =
+                    legend.swatches.iter().copied().collect();
+                assert_eq!(taken, shown);
+            }
+            ColorMapping::Affinity => {
+                assert_eq!(labels.len(), 7);
+                assert_eq!(labels[0], "none");
+                assert!(labels[1..6].iter().all(String::is_empty), "{labels:?}");
+                assert_eq!(labels[6], "like hue, like chemistry");
+                let none = Traits {
+                    affinity: [0.0; 3],
+                    ..row(0, 0.0, 0, 0, [0.0; 2])
+                };
+                assert_eq!(legend.swatches[0], with(mapping, none));
+                // Six directions 60 degrees apart in the first two
+                // coordinates, at a founder's typical radius.
+                let radius = 2.0 / AFFINITY_GAIN;
+                for (k, &swatch) in legend.swatches[1..].iter().enumerate() {
+                    let angle = (k as f64) * 60.0_f64.to_radians();
+                    let direction = Traits {
+                        affinity: [
+                            (radius * angle.cos()) as f32,
+                            (radius * angle.sin()) as f32,
+                            0.0,
+                        ],
+                        ..row(0, 0.0, 0, 0, [0.0; 2])
+                    };
+                    assert_eq!(swatch, with(mapping, direction), "direction {k}");
+                    // Its hue turns with the direction, and the opposite
+                    // direction takes the opposite hue.
+                    let [_, a, b] = oklab(swatch);
+                    let hue = b.atan2(a).to_degrees().rem_euclid(360.0);
+                    let expected = 60.0 * k as f64;
+                    let off = (hue - expected + 180.0).rem_euclid(360.0) - 180.0;
+                    assert!(off.abs() < 10.0, "direction {k}: hue {hue}");
+                }
+            }
+        }
+    }
+    // A catalog with more members than the palette repeats its colours.
+    let long: Vec<&[u32]> = (0..9).map(|_| &[8_u32][..]).collect();
+    let legend = ColorMapping::Topology.legend(&long);
+    assert_eq!(legend.swatches.len(), 9);
+    assert_eq!(legend.swatches[8], legend.swatches[0]);
 }

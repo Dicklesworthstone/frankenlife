@@ -47,15 +47,16 @@ pub const HUD_FLATNESS_PIXELS: f64 = 0.2;
 pub const HUD_MAX_CURVE_SEGMENTS: usize = 64;
 
 /// The most vertices a [`HudText`] holds: a quarter as many again as the
-/// Studio's longest overlay, its inspector panel included, takes at two
-/// pixels a point (11,430, at every count's largest value). A denser
-/// screen's finer flattening grows a curve's segments by the square root of
-/// its density, so three pixels a point fits too.
-pub const HUD_MAX_VERTICES: usize = 14_336;
+/// Studio's longest overlay, its colour key and inspector panel included,
+/// takes at two pixels a point (11,832, the motion key with every count at
+/// the largest written in full). A denser screen's finer flattening grows a
+/// curve's segments by the square root of its density, so three pixels a
+/// point fits too.
+pub const HUD_MAX_VERTICES: usize = 15_360;
 
 /// The most triangles a [`HudText`] holds (the longest overlay takes
-/// 10,944).
-pub const HUD_MAX_TRIANGLES: usize = 14_336;
+/// 11,434).
+pub const HUD_MAX_TRIANGLES: usize = 15_360;
 
 /// The most contours a [`HudText`] holds: each has at least three vertices.
 pub const HUD_MAX_RINGS: usize = HUD_MAX_VERTICES / 3;
@@ -80,6 +81,14 @@ pub const HUD_PLATE_COLOR: LinearRgba = LinearRgba {
 /// The plate's opacity: the world shows through it, dimmed.
 pub const HUD_PLATE_OPACITY: f64 = 0.6;
 
+/// The character a colour key's swatch is set as: a filled square, which
+/// [`HudFont::text_with_swatches`] draws in a swatch's colour.
+pub const HUD_SWATCH: char = '■';
+
+/// The most swatches a [`HudText`] colours; a swatch beyond them is drawn
+/// in [`HUD_TEXT_COLOR`].
+pub const HUD_MAX_SWATCHES: usize = 32;
+
 /// FrankenManim's bundled font book, loaded once.
 pub struct HudFont {
     book: FontBook,
@@ -101,6 +110,7 @@ pub struct HudText {
     vertices: Vec<[f64; 2]>,
     rings: Vec<Range<usize>>,
     triangles: Vec<[u32; 3]>,
+    swatches: Vec<(Range<usize>, LinearRgba)>,
     size: [f64; 2],
     glyphs: usize,
     refused: usize,
@@ -129,6 +139,21 @@ impl HudFont {
     /// maps); [`CoreError::AllocationFailed`] when the buffers cannot be
     /// reserved.
     pub fn text(&self, text: &str, em_pixels: f64) -> Result<HudText, CoreError> {
+        self.text_with_swatches(text, em_pixels, &[])
+    }
+
+    /// [`HudFont::text`], each [`HUD_SWATCH`] in `text` taking the next of
+    /// `swatches` (a colour key, FL-019): the first [`HUD_MAX_SWATCHES`]
+    /// are coloured, and a swatch without a colour is drawn as text.
+    ///
+    /// # Errors
+    /// As [`HudFont::text`].
+    pub fn text_with_swatches(
+        &self,
+        text: &str,
+        em_pixels: f64,
+        swatches: &[LinearRgba],
+    ) -> Result<HudText, CoreError> {
         if !em_pixels.is_finite() || em_pixels <= 0.0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "overlay em",
@@ -148,10 +173,17 @@ impl HudFont {
         let top = layout.height;
         let place = |point: Vec3| [point[0] * em_pixels, (top - point[1]) * em_pixels];
         let mut ink = [0.0_f64, 0.0];
+        let mut colors = swatches.iter().take(HUD_MAX_SWATCHES);
         for (index, glyph) in layout.glyphs.iter().enumerate() {
             if glyph.ch.is_whitespace() {
                 continue;
             }
+            // Each swatch takes its colour in order, drawn or not.
+            let color = if glyph.ch == HUD_SWATCH {
+                colors.next()
+            } else {
+                None
+            };
             let Ok(path) = glyph_quadpath(&self.book, glyph) else {
                 out.refused += 1;
                 continue;
@@ -178,6 +210,10 @@ impl HudFont {
                 break;
             }
             let base = u32::try_from(out.vertices.len()).unwrap_or(u32::MAX);
+            if let Some(&color) = color {
+                out.swatches
+                    .push((out.vertices.len()..out.vertices.len() + vertices, color));
+            }
             for ring in &rings {
                 let start = out.vertices.len();
                 for &vertex in ring {
@@ -223,6 +259,14 @@ impl HudText {
                     HUD_MAX_TRIANGLES * size_of::<[u32; 3]>(),
                 )
             })?;
+        text.swatches
+            .try_reserve_exact(HUD_MAX_SWATCHES)
+            .map_err(|_| {
+                refused(
+                    "overlay swatches",
+                    HUD_MAX_SWATCHES * size_of::<(Range<usize>, LinearRgba)>(),
+                )
+            })?;
         Ok(text)
     }
 
@@ -231,7 +275,8 @@ impl HudText {
     pub const fn reserved_bytes() -> u64 {
         (HUD_MAX_VERTICES * size_of::<[f64; 2]>()
             + HUD_MAX_RINGS * size_of::<Range<usize>>()
-            + HUD_MAX_TRIANGLES * size_of::<[u32; 3]>()) as u64
+            + HUD_MAX_TRIANGLES * size_of::<[u32; 3]>()
+            + HUD_MAX_SWATCHES * size_of::<(Range<usize>, LinearRgba)>()) as u64
     }
 
     /// The flattened outline's vertices, in drawable pixels from the
@@ -253,6 +298,13 @@ impl HudText {
     #[must_use]
     pub fn triangles(&self) -> &[[u32; 3]] {
         &self.triangles
+    }
+
+    /// Each coloured swatch's range of [`HudText::vertices`] and colour, in
+    /// order; every other vertex is drawn in [`HUD_TEXT_COLOR`].
+    #[must_use]
+    pub fn swatches(&self) -> &[(Range<usize>, LinearRgba)] {
+        &self.swatches
     }
 
     /// The block's width and height in drawable pixels: the layout's box,
@@ -487,7 +539,7 @@ pub fn hud_plate(viewport: &Viewport, text: &HudText) -> Result<SurfaceMesh, Cor
 }
 
 /// `text`'s triangles in the view's scene at [`hud_origin`], in
-/// [`HUD_TEXT_COLOR`]: clockwise in the scene, since the triangulator's
+/// [`HUD_TEXT_COLOR`] and each swatch in its colour: clockwise in the scene, since the triangulator's
 /// counter-clockwise triangles in y-down pixels flip with y. `None` for an
 /// empty text.
 ///
@@ -499,11 +551,16 @@ pub fn hud_glyphs(viewport: &Viewport, text: &HudText) -> Result<Option<SurfaceM
     }
     let origin = hud_origin(viewport);
     let mut vertices = reserve("overlay glyph vertices", text.vertices.len())?;
-    vertices.extend(text.vertices.iter().map(|vertex| {
+    vertices.extend(text.vertices.iter().enumerate().map(|(index, vertex)| {
+        let color = text
+            .swatches
+            .iter()
+            .find(|(range, _)| range.contains(&index))
+            .map_or(HUD_TEXT_COLOR, |&(_, color)| color);
         SurfaceVertex::colored(
             hud_scene_point(viewport, [origin[0] + vertex[0], origin[1] + vertex[1]]),
             [0.0, 0.0, 1.0],
-            HUD_TEXT_COLOR,
+            color,
         )
     }));
     let mut indices = reserve("overlay glyph indices", 3 * text.triangles.len())?;

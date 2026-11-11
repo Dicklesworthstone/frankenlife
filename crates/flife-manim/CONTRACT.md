@@ -94,6 +94,19 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   vectors are at the limit, at a mean gained radius of about 2. About 9% of directions leave the sRGB gamut and
   lose chroma there. The square root is correctly rounded and FrankenManim's sRGB transfer uses its own `fmn_dmath::pow`, not the
   host's, so the colours are the same on every host. Colours are for display only: no metric reads them back.
+- `ColorMapping::legend(topologies)` is the mapping's key (FL-019): one line of text, the mapping's name, then each
+  swatch (`HUD_SWATCH`, a filled square) and what it stands for. `swatches` holds each square's sRGB colour, the
+  colour `mapped_rgb8` gives that value:
+  - lineage: the 12 `LINEAGE_PALETTE` colours, then `by founder` (a lineage's colour is a hash of its identity, so
+    lineages share them);
+  - energy: `LEGEND_ENERGIES` 0, 1, 2, 4, 8, 16 on the ramp;
+  - generation: `LEGEND_GENERATIONS` 0, 1, 3, 15, 63 and `256+`;
+  - motion: east, north, west and south at the speed limit (`LEGEND_HEADINGS`), then the grey `still, greyer is
+    slower`;
+  - topology: each of `topologies` (the run's catalog members' hidden widths, in catalog order) in its palette
+    colour, labelled `64, 32`;
+  - affinity: `none`, then six directions 60 degrees apart in the first two coordinates at a founder's typical
+    radius (`legend_affinities`), then `like hue, like chemistry`.
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
@@ -212,6 +225,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
 - `hud` (FL-024): the 3D route draws triangles, not text.
   - `HudFont::bundled()` loads FrankenManim's bundled font book (`fmn-text`), once.
+  - `HudFont::text_with_swatches(text, em_pixels, swatches)` is `text` with each `HUD_SWATCH` in the next of
+    `swatches` (linear light), in order, the first `HUD_MAX_SWATCHES` (32); a swatch with no colour is drawn as
+    text. `HudText::swatches()` names each coloured square's vertices and colour.
   - `HudFont::text(text, em_pixels)` lays `text` out in IBM Plex Sans, `\n` breaking lines, at an em of
     `em_pixels`. Each glyph's quadratic outline is flattened (`flatten_quadratic`: even steps in the parameter,
     enough that no chord departs from the curve by more than `HUD_FLATNESS_PIXELS` = 0.2 px, at most
@@ -220,15 +236,15 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     refusal). The result is a `HudText`: vertices in drawable pixels from the block's top-left, y down, each
     contour's range, and triangles.
   - A glyph whose outline cannot be read or triangulated is left out and counted (`refused`). The text stops at
-    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (14,336 each, a quarter as much again as the Studio's longest
-    overlay, inspector panel included, at 2x: 11,430 and 10,944; at 3x it takes 12,703 and 12,217), counting the
-    glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
+    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (15,360 each, a quarter as much again as the Studio's longest
+    overlay, its colour key and inspector panel included, at 2x: 11,832 and 11,434; at 3x it is still set whole),
+    counting the glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
     (`HudText::reserved_bytes`).
   - `hud_scene_point(viewport, position)` is the camera's own map from a drawable position to the scene: the frame
     is the whole drawable, centred on the scene's origin, `scale` pixels a scene unit, y up.
   - `hud_plate` is a rectangle `HUD_MARGIN_POINTS` (10) from the drawable's top and left, `HUD_PADDING_POINTS`
     (6) around the text, black at `HUD_PLATE_OPACITY` (0.6). `hud_glyphs` puts the text at `hud_origin`, the
-    margin and the padding, in `HUD_TEXT_COLOR` (linear 0.8 grey). Both meshes are clockwise in the scene, as the
+    margin and the padding, in `HUD_TEXT_COLOR` (linear 0.8 grey), each coloured swatch in its colour. Both meshes are clockwise in the scene, as the
     view's others are.
   - `WorldView::enable_overlay()` makes a view draw text. From then on it charges, whether it shows text or not:
     - in `reserved_bytes`, two texts' buffers and two plates and two meshes at the ceilings (one is built before
@@ -352,7 +368,7 @@ route.
   - FL-020 density: a 128-pixel view at 2 pixels per point draws what a 64-pixel view at 1 draws (the floored and the
     capped dots, halos, the selection ring and the density bins); the change refits the shown epoch without a new
     show, an unchanged density is no change, and NaN is refused.
-- `tests/mapping.rs` (18 tests), on real render epochs where they matter:
+- `tests/mapping.rs` (19 tests), on real render epochs where they matter:
   - The energy and generation ramps rise monotonically in CIE L*, from above 15 with a range above 50.
   - Energy maps through the fixed saturating `e / (e + 2)`, generations logarithmically to a fixed 256.
   - The motion hue is the heading (y flipped to screen), its strength `√(speed / limit)`.
@@ -430,7 +446,13 @@ route.
   MiB), within the 18.75 MiB charged, where the whole frame's row sums took 126.56 MiB;
   and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
-- `tests/hud.rs` (7 tests, FL-024), each oracle independent of the triangulation:
+- `tests/mapping.rs`'s `every_key_swatch_is_the_colour_its_mapping_gives_its_label` (FL-019): each key's line is
+  its mapping's name and a label per swatch, and each swatch is the colour `mapped_rgb8`, the dots' path, gives
+  the labelled value: each energy and generation (and a later generation for `256+`); each heading at the speed
+  limit and `still` at rest, with half the limit nearer the grey; each catalog member's index; the set of colours
+  of 10,000 lineages is exactly the 12 swatches; no affinity, and six directions whose OKLab hues turn 60 degrees
+  apart (within 10). A catalog longer than the palette repeats its colours.
+- `tests/hud.rs` (8 tests, FL-024 and FL-019), each oracle independent of the triangulation:
   - six quadratics, from straight to a hairpin, flattened: the polyline ends on the anchor, a straight curve is one
     segment, and 4,097 samples of each curve lie within 0.2 px of it;
   - all 95 printable ASCII characters and `×·–—…°`, at ems of 13 and 26 px: one glyph each, none refused or left
@@ -448,10 +470,13 @@ route.
   - a CPU frame of the preset with `Hg8` at an 80 px em: every pixel more than 1 px outside the plate is
     byte-identical to the frame without text; under the plate, each pixel 1.5 px or more from an outline edge is the
     text's colour (sRGB 231, within 1.5) where the winding number is nonzero, and otherwise the world under the
-    plate's black at 0.6 opacity, mixed in linear light (within 1.5). Over 500 ink and 2,000 plate pixels are checked.
+    plate's black at 0.6 opacity, mixed in linear light (within 1.5). Over 500 ink and 2,000 plate pixels are checked;
+  - `■a■■` with two colours: the first two squares take them in order and the third is text; the triangles are the
+    uncoloured text's; the glyph mesh colours exactly the squares' vertices; in a CPU frame every pixel 2 px inside
+    a square is its sRGB colour (within 1.5), over 400 a square.
 - In `flife-cli`, `tests/memory_admission.rs` measures a 4K view at 2x with the overlay: the Studio's longest
-  overlay, its inspector panel included, laid out twice and shown, and two zooms. Its peak heap, the texts' layout
-  included, is 12.05 MiB of its 14.79 MiB reserved.
+  overlay, the motion key's swatches and the inspector panel included, laid out twice and shown, and two zooms. Its
+  peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.
 
 **Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `c6ad9c5b`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
@@ -466,8 +491,8 @@ route.
   density (the Studio does). A glyph's edges are the 3D route's triangle edges, so it is not hinted or subpixel
   antialiased. A bloom blurs the text a little, as it does everything drawn before it, and the overlay is not
   excluded from it.
-- There is no on-screen legend yet: the colour mapping is named in the overlay, but its key (which colour means
-  what) is not drawn. `flife render` draws no overlay.
+- A colour key shows sample values, not a continuous ramp, and the lineage key cannot say which lineage a colour
+  is (12 colours are shared by every lineage). `flife render` draws no overlay or key.
 - Density bins are still about 6 px, not one per pixel. Since FL-033 a finer bin costs 16 texel bytes, not two
   triangles, but finer bins are not drawn yet.
 - FrankenManim's preparation accounting (`ThreeDJob::preparation_bytes`, which its `max_working_bytes` bounds)

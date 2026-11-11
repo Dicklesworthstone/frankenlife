@@ -71,7 +71,8 @@ none is faster than the CPU yet (the sampler is 0.98× on one worker and 0.80× 
 sixteen; uptake 0.95× and 0.90×), so none is on by default: the measured frontier is in the Metal crate's contract. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
 comparison sort: linear however organisms crowd, with scratch declared from the population maximum, in the same
 cell-then-identity order, so the world is bit-identical. FL-019 adds six colour mappings (lineage, energy, generation,
-motion, topology, chemical affinity), a raw look and density rendering, switched live in the Studio and chosen for `flife render`.
+motion, topology, chemical affinity), a raw look and density rendering, switched live in the Studio and chosen for `flife render`; the Studio's overlay
+draws the shown mapping's colour key, each swatch in the colour its label maps to.
 FL-016 encodes a whole session, world and command book, as one sealed, chunked checkpoint (Appendix B.2). A
 world restored off phase, with newborns or after deaths publishes every later tick exactly as the uninterrupted
 one, pending commands apply once, and damaged checkpoints are refused by name. FL-035's `flife-store` publishes
@@ -406,8 +407,9 @@ and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the
 preset, a per-second `clock` record gives the honest clocks: the ticks committed per wall second, simulated seconds
 per wall second and frames presented per second (FL-024). The window draws the same in its top-left corner, as
-text over a dark plate: running or paused at the shown tick, those clocks, the colour mapping, the armed brush and
-the selected organism. The organisms glow over the energy field they feed on, in
+text over a dark plate: running or paused at the shown tick, those clocks, the colour mapping's key (such as `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8
+■ 16`, each square in its colour; drawn only in a window, which no test here opened), the armed brush and the
+selected organism. The organisms glow over the energy field they feed on, in
 the configuration's colour mapping (`[presentation] color_mapping`, lineage in the preset). The style keys work
 while running or paused, and change only the picture:
 

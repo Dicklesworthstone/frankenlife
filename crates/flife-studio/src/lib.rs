@@ -61,7 +61,7 @@ pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
 };
-pub use overlay::{Inspected, OverlayState, inspector_lines, overlay_text};
+pub use overlay::{Inspected, OverlayState, inspector_lines, legends, overlay_text};
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 

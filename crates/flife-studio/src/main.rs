@@ -17,9 +17,9 @@
 //! ratio, frames presented per second and the display's backlog in ticks),
 //! then an `end` with the committed world's digest. The window draws the
 //! same state as text in its top-left corner: running or paused at the
-//! shown tick, the clocks while they are reported, the colour mapping, the
-//! armed brush and the selected organism (FL-024), and under them that
-//! organism's last inspection (FL-021's panel). An error
+//! shown tick, the clocks while they are reported, the colour mapping's key
+//! (FL-019), the armed brush and the selected organism (FL-024), and under
+//! them that organism's last inspection (FL-021's panel). An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -40,7 +40,7 @@ use flife_engine::OrganismSnapshot;
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ClockMeter, ClockReading, ColorMapping, End, Inspected, Look, OverlayState, Particles,
-    STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, overlay_text,
+    STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, legends, overlay_text,
 };
 use serde::Serialize;
 
@@ -419,6 +419,15 @@ fn main() -> ExitCode {
     let mut last_clock = None;
     // The last inspection's answer and whom it was about (FL-021's panel).
     let mut inspected = None;
+    // Every colour mapping's key (FL-019's legend).
+    let keys = match legends(&config) {
+        Ok(keys) => keys,
+        Err(error) => {
+            let code = fail(error.kind(), error.to_string(), 1);
+            let _ = studio.close();
+            return code;
+        }
+    };
     while !studio.should_close() {
         let started = Instant::now();
         let frame = match studio.frame() {
@@ -508,11 +517,20 @@ fn main() -> ExitCode {
         if overlay_tick.is_none() {
             overlay_tick = frame.shown.map(|shown| shown.tick);
         }
+        let mapping = studio.view().style().mapping;
+        let Some(legend) = keys
+            .iter()
+            .find_map(|(key, legend)| (*key == mapping).then_some(legend))
+        else {
+            let code = fail("internal", format!("no key for the {mapping} mapping"), 1);
+            let _ = studio.close();
+            return code;
+        };
         let text = overlay_text(&OverlayState {
             paused,
             shown: overlay_tick,
             clock: last_clock.as_ref(),
-            mapping: studio.view().style().mapping.name(),
+            legend,
             brush: armed,
             selected,
             inspected: inspected
@@ -520,7 +538,7 @@ fn main() -> ExitCode {
                 .filter(|(organism, _)| selected == Some(*organism))
                 .map(|(_, snapshot)| snapshot.as_deref().map_or(Inspected::Gone, Inspected::Read)),
         });
-        if let Err(error) = studio.set_overlay(&text) {
+        if let Err(error) = studio.set_overlay(&text, &legend.swatches) {
             let code = fail(error.kind(), error.to_string(), 1);
             let _ = studio.close();
             return code;

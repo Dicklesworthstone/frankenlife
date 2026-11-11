@@ -23,9 +23,9 @@ mod common;
 
 use flife_manim::{
     HUD_FLATNESS_PIXELS, HUD_MAX_CURVE_SEGMENTS, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES,
-    HUD_PADDING_POINTS, HUD_PLATE_OPACITY, HudFont, HudText, JOB_BYTES_PER_DRAW,
-    PREPARATION_BYTES_PER_TRIANGLE, Viewport, WorldView, flatten_quadratic, hud_origin,
-    hud_plate_rect, hud_scene_point,
+    HUD_PADDING_POINTS, HUD_PLATE_OPACITY, HUD_TEXT_COLOR, HudFont, HudText, JOB_BYTES_PER_DRAW,
+    PREPARATION_BYTES_PER_TRIANGLE, Viewport, WorldView, flatten_quadratic, hud_glyphs, hud_origin,
+    hud_plate_rect, hud_scene_point, linear,
 };
 use fmn_render::{SurfaceVertex, ThreeDDraw};
 
@@ -488,4 +488,101 @@ fn a_frame_with_text_differs_only_under_its_plate() {
     assert!(inked > 500, "{inked} ink pixels checked");
     assert!(dimmed > 2_000, "{dimmed} plate pixels checked");
     assert!(differing > inked, "{differing} pixels changed");
+}
+
+/// FL-019's colour key: each swatch takes the next colour, a swatch without
+/// one is drawn as text, and a frame shows each in its colour.
+#[test]
+fn swatches_are_drawn_in_their_colours() {
+    let font = font();
+    let coral = [0xFF, 0x6F, 0x59];
+    let sky = [0x4E, 0xA8, 0xDE];
+    let em = 60.0;
+    let text = font
+        .text_with_swatches("■a■■", em, &[linear(coral), linear(sky)])
+        .expect("text");
+    assert_eq!(text.glyphs(), 4);
+    let swatches = text.swatches();
+    assert_eq!(swatches.len(), 2, "the third swatch has no colour");
+    // Each swatch is one square ring; the `a` lies between the first two.
+    assert_eq!(swatches[0].0, 0..4);
+    assert!(swatches[1].0.start > 4);
+    assert_eq!(swatches[1].0.len(), 4);
+    let third = swatches[1].0.end..text.vertices().len();
+    assert_eq!(third.len(), 4);
+    // The same text without colours is the same triangles.
+    let plain = font.text("■a■■", em).expect("plain");
+    assert_eq!(plain.vertices(), text.vertices());
+    assert_eq!(plain.triangles(), text.triangles());
+    assert!(plain.swatches().is_empty());
+
+    let config = common::small();
+    let mut world = common::found(&config);
+    common::advance(&mut world, 4);
+    let lease = common::epoch(&world);
+    let drawable = [480_u32, 270];
+    let mut view = WorldView::for_epoch(&lease, drawable, [0, 0, 0]).expect("view");
+    view.show(&lease).expect("show");
+    view.enable_overlay();
+    view.set_overlay(Some(text.clone())).expect("text");
+
+    // The glyph mesh colours exactly the swatches' vertices.
+    let mesh = hud_glyphs(view.viewport(), &text)
+        .expect("a mesh")
+        .expect("glyphs");
+    for (index, vertex) in mesh.vertices().iter().enumerate() {
+        let expected = if swatches[0].0.contains(&index) {
+            linear(coral)
+        } else if swatches[1].0.contains(&index) {
+            linear(sky)
+        } else {
+            HUD_TEXT_COLOR
+        };
+        assert_eq!(vertex.color, expected, "vertex {index}");
+    }
+
+    // In the frame, every pixel well inside a square is its colour.
+    let frame = view.render_rgba8(2).expect("a frame");
+    let origin = hud_origin(view.viewport());
+    let ink = linear_to_srgb8(0.8);
+    let expectations = [
+        (swatches[0].0.clone(), coral.map(f64::from)),
+        (swatches[1].0.clone(), sky.map(f64::from)),
+        (third, [ink; 3]),
+    ];
+    for (range, expected) in expectations {
+        let corners = &text.vertices()[range];
+        let low = corners
+            .iter()
+            .fold([f64::INFINITY; 2], |[x, y], c| [x.min(c[0]), y.min(c[1])]);
+        let high = corners.iter().fold([f64::NEG_INFINITY; 2], |[x, y], c| {
+            [x.max(c[0]), y.max(c[1])]
+        });
+        let mut checked = 0;
+        for row in 0..drawable[1] {
+            for column in 0..drawable[0] {
+                let local = [
+                    f64::from(column) + 0.5 - origin[0],
+                    f64::from(row) + 0.5 - origin[1],
+                ];
+                let inside = local[0] > low[0] + 2.0
+                    && local[0] < high[0] - 2.0
+                    && local[1] > low[1] + 2.0
+                    && local[1] < high[1] - 2.0;
+                if !inside {
+                    continue;
+                }
+                let at = 4 * (row * drawable[0] + column) as usize;
+                for (channel, want) in frame[at..at + 3].iter().zip(expected) {
+                    assert!(
+                        (f64::from(*channel) - want).abs() <= 1.5,
+                        "{column},{row}: {:?}, {expected:?} expected",
+                        &frame[at..at + 3]
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 400, "{checked} pixels of a square checked");
+    }
 }

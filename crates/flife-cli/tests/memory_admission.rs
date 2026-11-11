@@ -646,18 +646,25 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
     let _serial = serial();
     let epoch = full_epoch();
     let font = flife_manim::HudFont::bundled().expect("the bundled fonts");
-    // The Studio's longest overlay, its inspector panel included (FL-021).
+    // The Studio's longest overlay: the motion key (FL-019), and the
+    // inspector panel (FL-021) with every count the largest written in full.
     let longest = concat!(
-        "running · tick 18,446,744,073,709,551,615\n",
-        "123456789 ticks/s · 99999.99× real time · 1000 fps\n",
-        "chemical-affinity · introduction brush · organism 18,446,744,073,709,551,615\n",
-        "read at tick 18,446,744,073,709,551,615 · lineage 18,446,744,073,709,551,615",
-        " · generation 4,294,967,295\n",
-        "energy 99999.99 · -99999.999/s · age 18,446,744,073,709,551,615 ticks\n",
+        "running · tick 999,999,999,999\n",
+        "99999 ticks/s · 99999.99× real time · 99999 fps\n",
+        "motion ■ east ■ north ■ west ■ south ■ still, greyer is slower\n",
+        "introduction brush · organism 999,999,999,999\n",
+        "read at tick 999,999,999,999 · lineage 999,999,999,999 · generation 4,294,967,295\n",
+        "energy 99999.99 · -99999.999/s · age 999,999,999,999 ticks\n",
         "speed 99999.99/s · heading 315°\n",
         "hidden 128, 96 · 29,316 parameters\n",
         "reproduction 100.0% a tick · emission gate 1.00"
     );
+    let swatches: Vec<_> = flife_manim::ColorMapping::Motion
+        .legend(&[])
+        .swatches
+        .into_iter()
+        .map(flife_manim::linear)
+        .collect();
     let base = ALLOC.current_usage();
     ALLOC.reset_peak_usage();
     let mut view =
@@ -666,10 +673,14 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
     view.enable_overlay();
     view.show(&epoch).expect("shows");
     let em = flife_manim::HUD_TEXT_POINTS * 2.0;
-    let text = font.text(longest, em).expect("text");
+    let text = font
+        .text_with_swatches(longest, em, &swatches)
+        .expect("text");
     assert_eq!(text.left_out(), 0);
     view.set_overlay(Some(text)).expect("shows the text");
-    let again = font.text(longest, em).expect("text again");
+    let again = font
+        .text_with_swatches(longest, em, &swatches)
+        .expect("text again");
     view.set_overlay(Some(again)).expect("shows it again");
     for zoom in [3.0, 16.0] {
         let viewport = view

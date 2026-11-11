@@ -2,7 +2,8 @@
 //! upload a frame (FrankenManim's flattened rows and bins and the layers'
 //! texels), and the bytes it copies to the device, measured headlessly on
 //! a Metal device without a window, are each within the view's preparation
-//! limit plus its texel bytes, the Studio's upload term.
+//! limit plus its texel bytes, the Studio's upload term. The Studio's frame
+//! tally counts the same reports' copies.
 
 #![allow(
     clippy::expect_used,
@@ -15,6 +16,7 @@ use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, World};
 use flife_manim::{Look, Particles, Style, WorldView};
 use flife_render::Epoch;
+use flife_studio::FrameTally;
 use fmn_render::metal::MetalRenderer;
 use peak_alloc::PeakAlloc;
 
@@ -44,6 +46,8 @@ fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texel
     let mut renderer = MetalRenderer::new().expect("a Metal renderer");
     let mut frames = 0;
     let (mut closest, mut copied, mut largest) = (0.0_f64, 0.0_f64, 0);
+    let mut tally = FrameTally::default();
+    let (mut uploaded, mut read_back) = (0_u64, 0_u64);
     for live in [4_096, 16_384] {
         let config = preset_with(&[("initial_count", live), ("maximum_count", 16_384)]);
         let world = World::found(
@@ -107,6 +111,9 @@ fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texel
                              upload copied {upload} > {limit}"
                         );
                         assert_eq!(report.readback_bytes, frame.as_bytes().len());
+                        tally.count_copies(&report);
+                        uploaded += upload;
+                        read_back += u64::try_from(report.readback_bytes).expect("fits");
                         closest = closest.max(held as f64 / limit as f64);
                         copied = copied.max(upload as f64 / limit as f64);
                         largest = largest.max(upload);
@@ -122,4 +129,15 @@ fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texel
         closest * 100.0,
         copied * 100.0
     );
+    // The Studio's frame records: the copies its tally counts from the same
+    // reports.
+    assert_eq!(
+        (
+            tally.upload_bytes,
+            tally.peak_upload_bytes,
+            tally.readback_bytes
+        ),
+        (uploaded, largest, read_back)
+    );
+    assert!(tally.peak_upload_bytes < tally.upload_bytes);
 }

@@ -40,8 +40,8 @@ use flife_manim::{Motion, Style, Viewport, WorldView, hex_rgb};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::SessionClosed;
 use fmn_render::metal::{
-    INPUT_QUEUE_CAPACITY, InputEvent, NativePreviewRenderer, PixelDensity, PresentOutcome,
-    PresentationState, SurfaceMetrics,
+    INPUT_QUEUE_CAPACITY, InputEvent, MetalReport, NativePreviewRenderer, PixelDensity,
+    PresentOutcome, PresentationState, SurfaceMetrics,
 };
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -148,6 +148,24 @@ pub struct FrameTally {
     pub intents: u64,
     /// Intents refused.
     pub refused: u64,
+    /// Bytes the Metal route copied to the device, over every frame rendered.
+    pub upload_bytes: u64,
+    /// The most bytes one frame copied to the device.
+    pub peak_upload_bytes: u64,
+    /// Frame-pixel bytes copied back to the host, over every frame rendered
+    /// (none for frames presented to the window's drawable).
+    pub readback_bytes: u64,
+}
+
+impl FrameTally {
+    /// Count one rendered frame's copies, as its Metal report gives them.
+    pub fn count_copies(&mut self, metal: &MetalReport) {
+        let upload = u64::try_from(metal.upload_bytes).unwrap_or(u64::MAX);
+        let readback = u64::try_from(metal.readback_bytes).unwrap_or(u64::MAX);
+        self.upload_bytes = self.upload_bytes.saturating_add(upload);
+        self.peak_upload_bytes = self.peak_upload_bytes.max(upload);
+        self.readback_bytes = self.readback_bytes.saturating_add(readback);
+    }
 }
 
 /// What a closed Studio leaves.
@@ -457,6 +475,7 @@ impl Studio {
                 .preview
                 .render_three_d(&job)
                 .map_err(|error| conflict("present a studio frame", error))?;
+            self.tally.count_copies(&report.metal);
             match report.outcome {
                 PresentOutcome::Presented => self.tally.presented += 1,
                 PresentOutcome::Occluded => self.tally.occluded += 1,

@@ -102,9 +102,11 @@ adapter.
   - one `view` per style change, with the same style fields;
   - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
     its identity or null, its position and the shown tick;
-  - a `frame` summary about once a second, with the camera's center and zoom;
-  - `end`, with the committed tick, the world digest, and the controller evaluations the backend returned and
-    deferred, and its failure if it failed.
+  - a `frame` summary about once a second, with the camera's center and zoom, and the bytes the Metal route has
+    copied so far: to the device (`upload_bytes`, and the most in one frame, `peak_upload_bytes`) and back to the
+    host (`readback_bytes`, none for frames presented to the window);
+  - `end`, with the committed tick, the world digest, the controller evaluations the backend returned and
+    deferred, and its failure if it failed, and the same copy totals.
 
   Errors are `frankenlife.error.v1` on standard error. The exit code is 0 after a clean close, 2 when the
   configuration or window fails, and 1 after a later failure.
@@ -215,7 +217,8 @@ presentation state, not scientific state.
   points, density and raw density: the host heap the route holds to upload a frame, above the frame it returns,
   and the bytes it copies to the device (`MetalReport::upload_bytes`) are each within the view's preparation limit
   plus its texel bytes (at most 60.2% and 43.2%; the largest copy 22.6 MB, a 4K frame of 16,384 dots and halos);
-  the readback is the RGBA8 frame.
+  the readback is the RGBA8 frame. The Studio's frame tally (`FrameTally::count_copies`, the `frame` and `end`
+  records' copy fields) counts the same 48 reports' copies: their sum, the largest, and the readback sum.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -257,8 +260,9 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     textured frame's fastest device time is 2.76 ms against the grids' 2.23 ms. Its median was 8.7 ms against 3.1:
     after its first frames it ran slow almost every time, the same with the sample removed. The grids ran slow
     only now and then, as other processes shared the GPU. That cause is not identified. In a run of that frame
-    alone, both took 11.9 ms end to end (median). `MetalReport`'s upload and readback bytes are not yet recorded
-    in the Studio's `frame` records.
+    alone, both took 11.9 ms end to end (median). The Studio's `frame` and `end` records carry `MetalReport`'s
+    copies, counted per presented or occluded frame. The tally is tested on real reports without a window, but
+    no window was run here, so no session's records were read.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.

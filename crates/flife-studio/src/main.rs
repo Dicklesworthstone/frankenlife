@@ -149,6 +149,9 @@ enum Record<'a> {
         center: [f64; 2],
         zoom: f64,
         input_dropped: u64,
+        upload_bytes: u64,
+        peak_upload_bytes: u64,
+        readback_bytes: u64,
     },
     End {
         schema: &'static str,
@@ -167,6 +170,9 @@ enum Record<'a> {
         controller_evaluations: u64,
         deferred_evaluations: u64,
         controller_failure: Option<String>,
+        upload_bytes: u64,
+        peak_upload_bytes: u64,
+        readback_bytes: u64,
         wall_seconds: f64,
     },
 }
@@ -289,6 +295,9 @@ fn main() -> ExitCode {
                 center: viewport.center(),
                 zoom: viewport.zoom(),
                 input_dropped: studio.input_dropped(),
+                upload_bytes: tally.upload_bytes,
+                peak_upload_bytes: tally.peak_upload_bytes,
+                readback_bytes: tally.readback_bytes,
             });
         }
         if let Some(rest) = period.checked_sub(started.elapsed()) {
@@ -315,6 +324,9 @@ fn main() -> ExitCode {
                 controller_evaluations: closed.session.world.controller_report().batched,
                 deferred_evaluations: closed.session.world.controller_report().deferred,
                 controller_failure: closed.session.world.controller_report().failure.clone(),
+                upload_bytes: closed.frames.upload_bytes,
+                peak_upload_bytes: closed.frames.peak_upload_bytes,
+                readback_bytes: closed.frames.readback_bytes,
                 wall_seconds: clock.elapsed().as_secs_f64(),
             });
             ExitCode::SUCCESS

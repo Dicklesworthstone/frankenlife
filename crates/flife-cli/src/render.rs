@@ -145,6 +145,7 @@ pub fn render(
             .bloom_enabled
             .then_some(presentation.bloom_strength),
     )?;
+    view.set_point_radius(presentation.point_radius_pixels)?;
     drop(founding);
     let (memory, encoders) = admit(&world, options, &publisher, &view)?;
     install(&mut world, options.controllers, memory.backend)?;

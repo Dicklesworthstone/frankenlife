@@ -161,6 +161,49 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
             style.look.name()
         );
     }
+
+    // The preset's dots are at least `point_radius_pixels` (0.8 points)
+    // on screen (FL-019). At 96 x 64 the world is 0.5 px a unit, so the
+    // floor binds: the old fixed 1.5 points draws other pixels in both
+    // looks, and density, which draws no dots, the same.
+    assert_eq!(PRESET.matches("point_radius_pixels = 0.8").count(), 1);
+    let coarse = ValidatedConfig::from_toml(
+        &PRESET.replace("point_radius_pixels = 0.8", "point_radius_pixels = 1.5"),
+    )
+    .expect("still valid");
+    let raw_points = Style {
+        look: Look::Raw,
+        ..Style::default()
+    };
+    for (style, same) in [
+        (Style::default(), false),
+        (raw_points, false),
+        (styled.style, true),
+    ] {
+        let radius_frame = |config: &ValidatedConfig, name: &str| {
+            let out = out.with_file_name(format!(
+                "flife-render-test-radius-{name}-{}-{}",
+                style.look.name(),
+                style.particles.name()
+            ));
+            std::fs::create_dir_all(&out).expect("a scratch directory");
+            let options = RenderOptions {
+                out,
+                style,
+                ..styled.clone()
+            };
+            let mut records = Vec::new();
+            render(config, &options, |record| records.push(record.clone())).expect("renders");
+            frame(&records, 2)
+        };
+        assert_eq!(
+            radius_frame(&config, "fine") == radius_frame(&coarse, "coarse"),
+            same,
+            "{} {}",
+            style.look.name(),
+            style.particles.name()
+        );
+    }
 }
 
 /// The `flife render` binary colours by the configuration's

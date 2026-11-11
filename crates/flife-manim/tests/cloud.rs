@@ -4,10 +4,11 @@
 mod common;
 
 use flife_core::CoreError;
+use flife_core::ids::OrganismId;
 use flife_manim::{
     DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, LINEAGE_PALETTE, MAXIMUM_ZOOM,
-    ParticleCloud, Viewport, WorldView, density_bins, dot_radius, hex_rgb, lineage_color,
-    lineage_slot, selection_ring,
+    ParticleCloud, Viewport, WorldView, density_bins, dot_radius, dot_radius_at_least, hex_rgb,
+    lineage_color, lineage_slot, selection_ring, selection_ring_around,
 };
 use fmn_render::ThreeDDraw;
 
@@ -153,6 +154,130 @@ fn a_shown_epoch_survives_a_refused_show_and_a_resize_refits_only_the_radius()
     // A refused resize leaves the view as it was.
     assert!(view.resize([0, 640]).is_err());
     assert_eq!(view.viewport().drawable(), [640, 640]);
+    Ok(())
+}
+
+/// Whether `view`'s selection ring is the one around a dot `radius` world
+/// units across at `position`.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a missing ring is a test failure"
+)]
+fn ring_around(view: &WorldView, position: [f64; 2], radius: f64) -> Result<bool, CoreError> {
+    let Some(ThreeDDraw::Surface(ring)) = view.selection_draw() else {
+        panic!("a ring");
+    };
+    let around = selection_ring_around(view.viewport(), position, radius)?;
+    Ok(ring.mesh.vertices() == around.vertices())
+}
+
+/// FL-019: `[presentation] point_radius_pixels` is the dot's smallest
+/// radius on screen, in points like the window's size, in place of the
+/// 1.5-point default. The shown dots, their halos and the selection ring
+/// follow at once; a 2x screen doubles it in pixels; where the world radius
+/// or the cap binds it changes nothing. A radius that is not positive and
+/// finite, or is above the cap, is refused with the view unchanged.
+#[test]
+#[expect(clippy::float_cmp, reason = "radii are compared bit for bit")]
+fn the_configured_point_radius_is_the_dots_smallest_on_screen() -> Result<(), CoreError> {
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    // 64 px over 32 world units: 2 px per unit, so the floor binds.
+    let mut view = WorldView::for_epoch(&epoch, [64, 64], [0, 0, 0])?;
+    view.show(&epoch)?;
+    assert_eq!(view.point_radius(), DOT_RADIUS_MIN_POINTS);
+    assert_eq!(
+        dots(view.cloud().draws())[0].radius,
+        DOT_RADIUS_MIN_POINTS / 2.0
+    );
+    let halos = summary(view.cloud().halos());
+    let id = OrganismId::new(epoch.ids()[3]);
+    assert_eq!(view.select(Some(id))?, Some(id));
+    let position = view.selected_position().expect("drawn");
+
+    // The preset's 0.8 points: 0.4 world units here, at once.
+    view.set_point_radius(0.8)?;
+    assert_eq!(view.point_radius(), 0.8);
+    assert_eq!(view.cloud().min_radius_points(), 0.8);
+    let fine = summary(view.cloud().draws());
+    assert!(fine.iter().all(|dot| dot.1 == 0.8 / 2.0));
+    let fine_halos = summary(view.cloud().halos());
+    assert_eq!(fine_halos.len(), halos.len());
+    for (before, after) in halos.iter().zip(&fine_halos) {
+        assert_eq!((after.0, after.2), (before.0, before.2));
+        let expected = before.1 * 0.8 / DOT_RADIUS_MIN_POINTS;
+        assert!((after.1 - expected).abs() <= 1e-12 * expected, "{after:?}");
+    }
+    assert!(ring_around(&view, position, 0.8 / 2.0)?);
+    assert!(!ring_around(&view, position, dot_radius(view.viewport()))?);
+    // Showing the epoch again draws what the refit drew.
+    view.show(&epoch)?;
+    assert_eq!(summary(view.cloud().draws()), fine);
+    assert!(ring_around(&view, position, 0.8 / 2.0)?, "reselected");
+    for (shown, refit) in summary(view.cloud().halos()).iter().zip(&fine_halos) {
+        assert!((shown.1 - refit.1).abs() <= 1e-12 * refit.1, "{shown:?}");
+    }
+    assert_eq!(
+        dot_radius_at_least(view.viewport(), 0.8),
+        0.8 / 2.0,
+        "the free function is the view's"
+    );
+    assert_eq!(
+        dot_radius_at_least(view.viewport(), DOT_RADIUS_MIN_POINTS),
+        dot_radius(view.viewport())
+    );
+
+    // On a 2x screen twice as many pixels across, it is 1.6 drawable
+    // pixels: the same world radius.
+    let mut two = WorldView::for_epoch(&epoch, [128, 128], [0, 0, 0])?;
+    assert!(two.set_pixels_per_point(2.0)?);
+    two.set_point_radius(0.8)?;
+    two.show(&epoch)?;
+    assert_eq!(summary(two.cloud().draws()), fine);
+    // A density change refits the selection ring to the floor too.
+    assert!(view.set_pixels_per_point(2.0)?);
+    assert!(ring_around(&view, position, 0.8)?);
+    assert!(view.set_pixels_per_point(1.0)?);
+    assert!(ring_around(&view, position, 0.8 / 2.0)?);
+
+    // 640 px: 20 px per unit, so the world radius binds over 0.8 points; a
+    // floor of 10 points binds over it.
+    assert!(view.resize([640, 640])?);
+    assert_eq!(dots(view.cloud().draws())[0].radius, DOT_RADIUS);
+    view.set_point_radius(10.0)?;
+    assert_eq!(dots(view.cloud().draws())[0].radius, 10.0 / 20.0);
+    // Zoomed all the way in, the cap binds whatever the floor.
+    let deep = view.viewport().with_view([16.0, 16.0], MAXIMUM_ZOOM)?;
+    assert!(view.set_view(deep)?);
+    view.place(&epoch)?;
+    let capped = DOT_RADIUS_MAX_POINTS / (20.0 * MAXIMUM_ZOOM);
+    assert_eq!(dots(view.cloud().draws())[0].radius, capped);
+    view.set_point_radius(DOT_RADIUS_MAX_POINTS)?;
+    assert_eq!(dots(view.cloud().draws())[0].radius, capped);
+    view.set_point_radius(10.0)?;
+
+    let before = summary(view.cloud().draws());
+    for refused in [
+        0.0,
+        -0.8,
+        f64::NAN,
+        f64::INFINITY,
+        DOT_RADIUS_MAX_POINTS + 0.5,
+    ] {
+        assert!(
+            matches!(
+                view.set_point_radius(refused),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "{refused}"
+        );
+        assert_eq!(view.point_radius(), 10.0);
+        assert_eq!(summary(view.cloud().draws()), before);
+    }
+    let mut cloud = ParticleCloud::for_epoch(&epoch)?;
+    assert!(cloud.set_min_radius_points(-1.0, view.viewport()).is_err());
+    assert_eq!(cloud.min_radius_points(), DOT_RADIUS_MIN_POINTS);
     Ok(())
 }
 

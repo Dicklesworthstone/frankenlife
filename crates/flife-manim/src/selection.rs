@@ -47,9 +47,22 @@ pub const SELECTION_RING_SEGMENTS: usize = 48;
 /// [`CoreError::NumericalInvalid`] when FrankenManim refuses it (a
 /// non-finite position).
 pub fn selection_ring(viewport: &Viewport, position: [f64; 2]) -> Result<SurfaceMesh, CoreError> {
+    selection_ring_around(viewport, position, dot_radius(viewport))
+}
+
+/// As [`selection_ring`], around a dot `dot_radius` world units in radius:
+/// the view's own, at its configured smallest radius.
+///
+/// # Errors
+/// As [`selection_ring`].
+pub fn selection_ring_around(
+    viewport: &Viewport,
+    position: [f64; 2],
+    dot_radius: f64,
+) -> Result<SurfaceMesh, CoreError> {
     let pixels = viewport.pixels_per_point();
     let scale = viewport.scale();
-    let inner = dot_radius(viewport) + SELECTION_RING_GAP_POINTS * pixels / scale;
+    let inner = dot_radius + SELECTION_RING_GAP_POINTS * pixels / scale;
     let outer = inner + SELECTION_RING_WIDTH_POINTS * pixels / scale;
     let [x, y, z] = viewport.scene_point(position);
     let segments = SELECTION_RING_SEGMENTS;

@@ -10,7 +10,10 @@ adapter.
 
 **Inputs.**
 - A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate, the colour
-  mapping and the bloom (`bloom_enabled`, `bloom_strength`: `WorldView::set_bloom`, FL-019). `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
+  mapping, the bloom (`bloom_enabled`, `bloom_strength`: `WorldView::set_bloom`, FL-019) and the dots'
+  smallest radius on screen (`point_radius_pixels`, in points: `WorldView::set_point_radius`, FL-019; a radius
+  above 24 points refuses the start).
+  `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
 - The process main thread, macOS, Metal and a window server.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
   `0ae728fe`, through FrankenManim `fmn-render` at rev `c6ad9c5b`.

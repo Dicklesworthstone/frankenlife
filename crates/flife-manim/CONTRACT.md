@@ -91,8 +91,11 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
-  - radius `DOT_RADIUS = 0.35` world units, at least `DOT_RADIUS_MIN_POINTS = 1.5` and at most
-    `DOT_RADIUS_MAX_POINTS = 24` points (FL-020): zoomed in past the cap, dots stop growing on screen, so
+  - radius `DOT_RADIUS = 0.35` world units, at least the cloud's smallest radius on screen and at most
+    `DOT_RADIUS_MAX_POINTS = 24` points (`dot_radius_at_least`). The smallest is `DOT_RADIUS_MIN_POINTS = 1.5`
+    points unless `set_min_radius_points` sets one (finite, positive, at most 24; FL-019), and the Studio and
+    `flife render` set `[presentation] point_radius_pixels`, in points like the window's size (the preset's
+    0.8): the fine points of plan §2.3 where a world is too large for its window. Zoomed in past the cap (FL-020), dots stop growing on screen, so
     close organisms separate, and a dot stays small against the perspective frame's focal distance (about 1.2 frame
     heights), where its projection is the disk the viewport places;
   - colour `mapped_color(style.mapping, row, speed limit)`;
@@ -167,6 +170,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     organism as the display moves and is rebuilt for every view change;
   - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
     layer, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
+  - `set_point_radius(points)` (FL-019) sets the dots' smallest radius on screen
+    (`ParticleCloud::set_min_radius_points`); the shown dots, their halos and the selection ring change at
+    once, and the ring is `selection_ring_around` the view's dot at every refit and reselection;
+    `point_radius()` is the one in force;
   - `set_bloom(strength)` (FL-019, §2.3, §13.3 step 7) configures FrankenManim's controlled bloom from
     `[presentation] bloom_enabled` and `bloom_strength` (`None` is off), which the Studio and `flife render`
     pass: a convex mix of the raw frame with a binomial blur of it, `BLOOM_SIGMA_POINTS` (1.5) points wide at
@@ -236,7 +243,11 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   finite and positive, or a non-finite anchor; `panned` with a non-finite delta; `periodic_quad` with an empty axis:
   `NumericalInvalid`. A layer texture FrankenManim refuses: `NumericalInvalid`, the previous texture and quad kept. `WorldView::set_view` with a viewport of another world or drawable: `LayoutMismatch`, the view
   unchanged. `set_bloom` with a strength outside `[0, 1]` (or NaN): `NumericalInvalid`, the view unchanged;
-  configuration validation already bounds `presentation.bloom_strength` to `[0, 1]`.
+  configuration validation already bounds `presentation.bloom_strength` to `[0, 1]`. `set_point_radius` (and
+  `ParticleCloud::set_min_radius_points`) with a radius not finite and positive, or above
+  `DOT_RADIUS_MAX_POINTS`: `NumericalInvalid`, the view unchanged. Configuration validation bounds
+  `presentation.point_radius_pixels` below only (positive), so a radius above 24 fails the Studio's and
+  `flife render`'s start with that error.
 
 **Determinism.** Lowering is a pure function of the epoch, the viewport and the style, apart from the field's and
 the density layer's decaying display scales, which also read the previous frame's scale: F32 positions widened
@@ -325,6 +336,12 @@ route.
     frame, shorter than the ring. The charge equals FrankenManim's `scratch_bytes` for its widest bloom (radius
     96) at 160 x 120, 100 x 320, 100 x 321, 3840 x 2160 (320 rows) and 7 x 100,000, and bounds the
     configured bloom's.
+  - The configured point radius is the dots' smallest on screen (FL-019, `tests/cloud.rs`): at 2 px a world
+    unit, 0.8 points draws every dot 0.4 world units across at once, each halo keeping its multiple, the
+    selection ring around the 0.4-unit dot (not the default's), after a re-show and through a density
+    change; showing again draws what the refit drew; a 2x screen twice as wide draws the same world radius;
+    where the world radius binds 0.8 changes nothing and 10 points binds over it; zoomed all the way in the
+    cap binds whatever the floor; 0, -0.8, NaN, infinity and 24.5 are refused with the view unchanged.
   - Density counts every organism once, in its own bin; its texture is on the view's periodic quad, every texel's
     opacity the mean level of the four bins around its corner, wrapping (within 1e-6), and it replaces the dots;
     under raw density every texel is the opaque grey of that mean and the field is not drawn; the density scale
@@ -389,7 +406,7 @@ route.
 - FrankenManim's preparation accounting (`ThreeDJob::preparation_bytes`, which its `max_working_bytes` bounds)
   leaves out about 870 bytes a draw that its CPU job holds, so the limit does not bound the job's heap by itself;
   `frame_bytes` adds `JOB_BYTES_PER_DRAW` from a measurement, not from FrankenManim's accounting.
-- `[presentation] point_radius_pixels` and trails are not applied yet. The bloom's width is a constant
+- Trails are not applied yet. The bloom's width is a constant
   (`BLOOM_SIGMA_POINTS`), not a configuration key; the plan names none. The bloom runs on the raw frame before
   the RGBA8 table: there is no separate tone-mapping step (§13.3 step 8) before or after it.
 - Human review of the mappings against the plan's reference images (G5) has not been done.

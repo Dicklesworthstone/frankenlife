@@ -182,7 +182,9 @@ for, one at least, before a render is refused. Its first record is `start`, with
   changes the world. Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
   route, with the configuration's bloom (`[presentation] bloom_enabled`, `bloom_strength`) on glowing frames and
   none on raw ones (FL-019); `tests/render.rs` renders the preset with `bloom_enabled = false` too: the glow frame
-  differs and the raw frame is the same. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
+  differs and the raw frame is the same. Dots are at least `[presentation] point_radius_pixels` on screen
+  (FL-019); at the test's 96 x 64, where that floor binds, the preset's 0.8 and the old fixed 1.5 draw
+  different glow and raw frames and the same density frame. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
   frame draws; the bytes are those of encoding them in order, and a failed encode or write fails the render with
   its error. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg` after the last frame is written.
 - `Tally`:

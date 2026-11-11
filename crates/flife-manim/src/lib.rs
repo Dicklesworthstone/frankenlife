@@ -35,7 +35,7 @@ mod world;
 
 pub use cloud::{
     DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, HALO_ALPHA, HALO_HALF_ENERGY,
-    ParticleCloud, dot_radius, halo_factor,
+    ParticleCloud, dot_radius, dot_radius_at_least, halo_factor,
 };
 pub use density::{
     DENSITY_BIN_POINTS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,
@@ -49,7 +49,7 @@ pub use mapping::{
 };
 pub use selection::{
     PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,
-    SELECTION_RING_WIDTH_POINTS, pick, selection_ring,
+    SELECTION_RING_WIDTH_POINTS, pick, selection_ring, selection_ring_around,
 };
 pub use viewport::{MAXIMUM_ZOOM, Viewport};
 pub use world::{

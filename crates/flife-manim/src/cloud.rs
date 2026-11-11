@@ -30,7 +30,10 @@ use crate::mapping::{Look, Particles, Style, Traits, mapped_color, traits};
 pub const DOT_RADIUS: f64 = 0.35;
 
 /// The smallest dot radius in points (drawable pixels at one pixel per
-/// point): a world too large for its window still shows every organism.
+/// point) unless one is configured: a world too large for its window
+/// still shows every organism. The Studio and `flife render` set
+/// `[presentation] point_radius_pixels` in its place
+/// ([`ParticleCloud::set_min_radius_points`], FL-019).
 pub const DOT_RADIUS_MIN_POINTS: f64 = 1.5;
 
 /// The largest dot radius in points (FL-020): zoomed in past it, dots stop
@@ -63,13 +66,38 @@ pub fn halo_factor(energy: f32) -> f64 {
 /// screen, at the viewport's pixels per point.
 #[must_use]
 pub fn dot_radius(viewport: &Viewport) -> f64 {
+    dot_radius_at_least(viewport, DOT_RADIUS_MIN_POINTS)
+}
+
+/// The dot radius in world units for a viewport whose dots are at least
+/// `min_points` on screen: [`DOT_RADIUS`], but at least `min_points` and at
+/// most [`DOT_RADIUS_MAX_POINTS`] points, at the viewport's pixels per
+/// point.
+#[must_use]
+pub fn dot_radius_at_least(viewport: &Viewport, min_points: f64) -> f64 {
     // Points to pixels first: at one pixel per point the product is exact,
     // so the radius is bit for bit what a pixel bound gives.
     let pixels = viewport.pixels_per_point();
     let scale = viewport.scale();
     DOT_RADIUS
-        .max(DOT_RADIUS_MIN_POINTS * pixels / scale)
+        .max(min_points * pixels / scale)
         .min(DOT_RADIUS_MAX_POINTS * pixels / scale)
+}
+
+/// Refuse a smallest dot radius that is not finite, positive and at most
+/// [`DOT_RADIUS_MAX_POINTS`] points.
+pub(crate) fn check_min_radius_points(points: f64) -> Result<(), CoreError> {
+    if points > 0.0 && points <= DOT_RADIUS_MAX_POINTS {
+        Ok(())
+    } else {
+        Err(CoreError::NumericalInvalid {
+            quantity: "presentation point radius",
+            detail: format!(
+                "{points} points: a dot's smallest radius is positive and at most \
+                 {DOT_RADIUS_MAX_POINTS}, its largest"
+            ),
+        })
+    }
 }
 
 /// The live population as one bounded scene object.
@@ -79,6 +107,8 @@ pub struct ParticleCloud {
     /// One soft glow per organism, drawn under every dot; sized by energy.
     halos: Vec<ThreeDDraw<'static>>,
     radius: f64,
+    /// The smallest radius a dot takes on screen, in points.
+    min_points: f64,
     capacity: usize,
 }
 
@@ -103,6 +133,7 @@ impl ParticleCloud {
             draws: reserve("particle cloud draws")?,
             halos: reserve("particle cloud halos")?,
             radius: DOT_RADIUS,
+            min_points: DOT_RADIUS_MIN_POINTS,
             capacity,
         })
     }
@@ -281,7 +312,7 @@ impl ParticleCloud {
 
     /// Clear the draws for a new lowering through `viewport`.
     fn begin(&mut self, viewport: &Viewport) {
-        self.radius = dot_radius(viewport);
+        self.radius = dot_radius_at_least(viewport, self.min_points);
         self.draws.clear();
         self.halos.clear();
     }
@@ -318,11 +349,37 @@ impl ParticleCloud {
         }
     }
 
+    /// The smallest radius a dot takes on screen, in points:
+    /// [`DOT_RADIUS_MIN_POINTS`] unless one is set.
+    #[must_use]
+    pub const fn min_radius_points(&self) -> f64 {
+        self.min_points
+    }
+
+    /// Draw each dot at least `points` in radius on screen
+    /// (`[presentation] point_radius_pixels`, FL-019), refitting the current
+    /// draws through `viewport` at once.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `points` is finite, positive
+    /// and at most [`DOT_RADIUS_MAX_POINTS`]; the cloud is unchanged on
+    /// error.
+    pub fn set_min_radius_points(
+        &mut self,
+        points: f64,
+        viewport: &Viewport,
+    ) -> Result<(), CoreError> {
+        check_min_radius_points(points)?;
+        self.min_points = points;
+        self.refit(viewport);
+        Ok(())
+    }
+
     /// Refit the current draws' radius to a new viewport. Scene points do
     /// not depend on the drawable, so only the pixel floor on the radius
     /// can change.
     pub fn refit(&mut self, viewport: &Viewport) {
-        let radius = dot_radius(viewport);
+        let radius = dot_radius_at_least(viewport, self.min_points);
         let ratio = radius / self.radius;
         self.radius = radius;
         for draw in &mut self.draws {

@@ -258,6 +258,7 @@ impl Studio {
                 .bloom_enabled
                 .then_some(presentation.bloom_strength),
         )?;
+        view.set_point_radius(presentation.point_radius_pixels)?;
         let drawable = preview
             .surface_metrics()
             .ok()

@@ -12,10 +12,11 @@ use fmn_render::{
     Tiling,
 };
 
+use crate::cloud::check_min_radius_points;
 use crate::mapping::{Look, Particles, Style};
 use crate::{
-    DensityLayer, FieldLayer, ParticleCloud, SELECTION_RING_SEGMENTS, Viewport, density_bins, pick,
-    selection_ring,
+    DensityLayer, FieldLayer, ParticleCloud, SELECTION_RING_SEGMENTS, Viewport, density_bins,
+    dot_radius_at_least, pick, selection_ring_around,
 };
 
 /// The most FrankenManim's preparation of a frame charges for one true dot
@@ -299,7 +300,11 @@ impl WorldView {
             .map(|strength| bloom_at(strength, &viewport))
             .transpose()?;
         let ring = match self.selected_position() {
-            Some(position) => Some(selection_ring(&viewport, position)?),
+            Some(position) => Some(selection_ring_around(
+                &viewport,
+                position,
+                dot_radius_at_least(&viewport, self.cloud.min_radius_points()),
+            )?),
             None => None,
         };
         self.viewport = viewport;
@@ -339,6 +344,39 @@ impl WorldView {
             .transpose()?;
         self.bloom_strength = strength;
         Ok(())
+    }
+
+    /// Draw each dot at least `points` in radius on screen, in points like
+    /// the window's size (`[presentation] point_radius_pixels`, FL-019): the
+    /// fine points of plan §2.3 where a world is too large for its window,
+    /// in place of [`DOT_RADIUS_MIN_POINTS`](crate::DOT_RADIUS_MIN_POINTS).
+    /// Zoomed in, a dot grows to its world radius and stops at
+    /// [`DOT_RADIUS_MAX_POINTS`](crate::DOT_RADIUS_MAX_POINTS), as before. The
+    /// shown dots, their halos and the selection ring change at once.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `points` is finite, positive
+    /// and at most [`DOT_RADIUS_MAX_POINTS`](crate::DOT_RADIUS_MAX_POINTS); as
+    /// [`selection_ring_around`]. The view is unchanged on error.
+    pub fn set_point_radius(&mut self, points: f64) -> Result<(), CoreError> {
+        check_min_radius_points(points)?;
+        let ring = match self.selected_position() {
+            Some(position) => Some(selection_ring_around(
+                &self.viewport,
+                position,
+                dot_radius_at_least(&self.viewport, points),
+            )?),
+            None => None,
+        };
+        self.cloud.set_min_radius_points(points, &self.viewport)?;
+        self.ring = ring;
+        Ok(())
+    }
+
+    /// The smallest radius a dot takes on screen, in points.
+    #[must_use]
+    pub const fn point_radius(&self) -> f64 {
+        self.cloud.min_radius_points()
     }
 
     /// The configured bloom at the viewport's pixel density, whatever the
@@ -567,7 +605,11 @@ impl WorldView {
         match organism.and_then(|id| self.drawn_row(id)) {
             Some(row) => {
                 let position = self.between.positions[row];
-                self.ring = Some(selection_ring(&self.viewport, position)?);
+                self.ring = Some(selection_ring_around(
+                    &self.viewport,
+                    position,
+                    dot_radius_at_least(&self.viewport, self.cloud.min_radius_points()),
+                )?);
                 self.selected = organism;
             }
             None => {
@@ -609,7 +651,7 @@ impl WorldView {
     /// now held.
     ///
     /// # Errors
-    /// As [`selection_ring`]; the selection is unchanged on error.
+    /// As [`selection_ring_around`]; the selection is unchanged on error.
     pub fn select(
         &mut self,
         organism: Option<OrganismId>,

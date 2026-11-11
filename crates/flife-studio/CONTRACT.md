@@ -250,9 +250,15 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     invocation (six runs a side, 16,384 organisms, two pixels per point): a 4K density frame copies 1.50 MB to the
     device, not 21.46 MB, and its CPU preparation takes 4.21 ms, not 33.97 ms, at zoom 1. At zoom 16 the whole
     textures are copied, 1.95 MB against the culled grid's 1.45 MB, and the Metal route took 13.01 ms against
-    6.69 ms (coefficients of variation 4% and 5%): every pixel now samples two textures. The frame's preparation
-    and Metal time together still fell, 38.6 ms to 17.2 ms. `MetalReport`'s upload and readback bytes are not yet
-    recorded in the Studio's `frame` records.
+    6.69 ms (coefficients of variation 4% and 5%). The frame's preparation and Metal time together still fell,
+    38.6 ms to 17.2 ms. The cause is not the texture sampling, as first written here. A later diagnosis read the
+    command buffer's device time; the machine's load average was 17 to 58, so these figures are diagnostic, not a
+    timing claim. Removing the sample (a constant colour) saved 0.66 ms of the fastest frame's 2.76 ms. The
+    textured frame's fastest device time is 2.76 ms against the grids' 2.23 ms. Its median was 8.7 ms against 3.1:
+    after its first frames it ran slow almost every time, the same with the sample removed. The grids ran slow
+    only now and then, as other processes shared the GPU. That cause is not identified. In a run of that frame
+    alone, both took 11.9 ms end to end (median). `MetalReport`'s upload and readback bytes are not yet recorded
+    in the Studio's `frame` records.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.

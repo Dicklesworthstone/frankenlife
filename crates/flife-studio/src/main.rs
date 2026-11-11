@@ -15,7 +15,10 @@
 //! show_clock_telemetry` is set, a `clock` record beside it (plan §12.2:
 //! ticks committed per wall second, the simulation-time to wall-time
 //! ratio, frames presented per second and the display's backlog in ticks),
-//! then an `end` with the committed world's digest. The window draws the
+//! then an `end` with the committed world's digest and the frames' times
+//! (FL-024's G6 evidence: the median, 95th and 99th percentiles and the
+//! longest of each frame's work, from draining input to the overlay set,
+//! without the wait for the next frame). The window draws the
 //! same state as text in its top-left corner: running or paused at the
 //! shown tick, the clocks while they are reported, the colour mapping's key
 //! (FL-019), the armed brush and the selected organism (FL-024), and under
@@ -23,11 +26,16 @@
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
+//!
+//! `--offscreen SECONDS` runs the same loop with no window for that long
+//! (FL-024's frame study): each frame is rendered through the same Metal
+//! route and read back, at `--scale` pixels a point, and nothing posts
+//! input but `--offscreen-zooms`' camera moves.
 
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -39,9 +47,11 @@ use flife_core::{Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ClockMeter, ClockReading, ColorMapping, End, Inspected, Look, OverlayState, Particles,
-    STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, legends, overlay_text,
+    Brush, ClockMeter, ClockReading, ColorMapping, End, FrameTimeSummary, FrameTimes, Inspected,
+    Look, OverlayState, Particles, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style,
+    Surface, legends, overlay_text,
 };
+use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
 
 const ERROR_SCHEMA: &str = "frankenlife.error.v1";
@@ -95,6 +105,45 @@ struct Cli {
     /// Hide the energy field. F switches.
     #[arg(long)]
     no_field: bool,
+    /// Run for SECONDS wall seconds with no window, then close: each frame
+    /// is rendered through the same Metal route and read back, and nothing
+    /// posts input (FL-024's frame study).
+    #[arg(long, value_name = "SECONDS", value_parser = parse_seconds)]
+    offscreen: Option<f64>,
+    /// Device pixels a point offscreen, as a screen's backing scale.
+    #[arg(long, default_value = "2", requires = "offscreen")]
+    scale: NonZeroU32,
+    /// Offscreen, a camera move arrives in every third frame interval, at a
+    /// moment drawn uniformly over it (a fixed seed): a scroll of 4 points
+    /// at the content's centre, zooming in and out in turn. The `end`
+    /// record's `camera_latency` is each one's time from its arrival to the
+    /// end of the frame that drew it (G6). A move that arrives during a
+    /// frame's work waits for the next frame, as a native queue holds it.
+    #[arg(long, requires = "offscreen")]
+    offscreen_zooms: bool,
+}
+
+/// The fixed-seed draws of `--offscreen-zooms`' arrival moments.
+struct Xorshift(u64);
+
+impl Xorshift {
+    /// A draw uniform in [0, 1).
+    fn unit(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        #[expect(clippy::cast_precision_loss, reason = "53 bits fit an f64 exactly")]
+        let unit = (self.0 >> 11) as f64 / (1_u64 << 53) as f64;
+        unit
+    }
+}
+
+/// A positive, finite number of seconds.
+fn parse_seconds(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(seconds) if seconds.is_finite() && seconds > 0.0 => Ok(seconds),
+        _ => Err(format!("`{text}` is not a positive number of seconds")),
+    }
 }
 
 /// A worker count, or `auto`.
@@ -133,6 +182,8 @@ enum Record<'a> {
         particles: &'static str,
         field: bool,
         clock_telemetry: bool,
+        /// `window` or `offscreen`.
+        surface: &'static str,
     },
     View {
         schema: &'static str,
@@ -209,6 +260,7 @@ enum Record<'a> {
         schema: &'static str,
         frames: u64,
         presented: u64,
+        rendered: u64,
         occluded: u64,
         epochs: u64,
         shown_tick: Option<u64>,
@@ -226,6 +278,7 @@ enum Record<'a> {
         digest: String,
         frames: u64,
         presented: u64,
+        rendered: u64,
         epochs: u64,
         refits: u64,
         strokes: u64,
@@ -243,6 +296,13 @@ enum Record<'a> {
         peak_upload_bytes: u64,
         readback_bytes: u64,
         wall_seconds: f64,
+        /// Each frame's work (FL-024's G6 evidence); absent before a frame.
+        frame_times: Option<FrameTimeSummary>,
+        /// With `--offscreen-zooms`: the moves posted, those whose frame
+        /// did not move the view, and their latency.
+        camera_moves: Option<u64>,
+        camera_moves_unmoved: Option<u64>,
+        camera_latency: Option<FrameTimeSummary>,
     },
 }
 
@@ -371,6 +431,9 @@ fn main() -> ExitCode {
             },
             field: !cli.no_field,
         },
+        surface: cli
+            .offscreen
+            .map_or(Surface::Window, |_| Surface::Offscreen { scale: cli.scale }),
         ..StudioOptions::default()
     };
     let clock = Instant::now();
@@ -397,16 +460,29 @@ fn main() -> ExitCode {
         particles: options.style.particles.name(),
         field: options.style.field,
         clock_telemetry: model.presentation.show_clock_telemetry,
+        surface: if studio.is_offscreen() {
+            "offscreen"
+        } else {
+            "window"
+        },
     });
+    let deadline = cli
+        .offscreen
+        .map(|seconds| Instant::now() + Duration::from_secs_f64(seconds));
 
     let period = Duration::from_secs(1) / fps;
+    // Frames start on a fixed schedule, `period` apart: a wait that
+    // overshoots (macOS adds slack to a sleeping thread's timer) shortens
+    // the next wait instead of delaying every later frame, and a frame that
+    // runs past its slot starts the schedule again from its end.
+    let mut slot = Instant::now();
     let mut summary = Instant::now();
     let mut clocks = ClockMeter::new(config.report().timestep);
     if model.presentation.show_clock_telemetry {
         let _ = clocks.read(
             summary,
             studio.committed().map_or(Tick::ZERO, |epoch| epoch.tick),
-            studio.tally().presented,
+            studio.tally().drawn(),
             None,
         );
     }
@@ -428,7 +504,21 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    while !studio.should_close() {
+    let (mut times, mut latency) = match FrameTimes::new().and_then(|a| Ok((a, FrameTimes::new()?)))
+    {
+        Ok(both) => both,
+        Err(error) => {
+            let code = fail(error.kind(), error.to_string(), 1);
+            let _ = studio.close();
+            return code;
+        }
+    };
+    // `--offscreen-zooms`: the arrival of the move posted for the next
+    // frame, the moves posted and those that did not move the view.
+    let mut arrived: Option<Instant> = None;
+    let (mut moves, mut unmoved) = (0_u64, 0_u64);
+    let mut draws = Xorshift(0x9E37_79B9_7F4A_7C15);
+    while !studio.should_close() && deadline.is_none_or(|deadline| Instant::now() < deadline) {
         let started = Instant::now();
         let frame = match studio.frame() {
             Ok(frame) => frame,
@@ -438,6 +528,13 @@ fn main() -> ExitCode {
                 return code;
             }
         };
+        if let Some(at) = arrived.take() {
+            // This frame drained it and drew the move.
+            latency.record(at.elapsed());
+            if !frame.moved {
+                unmoved += 1;
+            }
+        }
         for status in studio.take_statuses() {
             match &status {
                 Status::Running { .. } => paused = Some(false),
@@ -487,6 +584,7 @@ fn main() -> ExitCode {
                 schema: STUDIO_SCHEMA,
                 frames: tally.frames,
                 presented: tally.presented,
+                rendered: tally.rendered,
                 occluded: tally.occluded,
                 epochs: tally.epochs,
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
@@ -502,7 +600,7 @@ fn main() -> ExitCode {
                 && let Some(reading) = clocks.read(
                     summary,
                     studio.committed().map_or(Tick::ZERO, |epoch| epoch.tick),
-                    tally.presented,
+                    tally.drawn(),
                     frame.shown.map(|shown| shown.tick),
                 )
             {
@@ -543,7 +641,37 @@ fn main() -> ExitCode {
             let _ = studio.close();
             return code;
         }
-        if let Some(rest) = period.checked_sub(started.elapsed()) {
+        times.record(started.elapsed());
+        slot = next_slot(slot, period, Instant::now());
+        let next = slot;
+        if cli.offscreen_zooms && studio.tally().frames.is_multiple_of(3) {
+            // Uniformly over this frame's interval; a moment already past
+            // is posted now, as the queue would have held it.
+            let at = started + (next - started).mul_f64(draws.unit());
+            if let Some(wait) = at.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+            let centre = studio.surface_metrics().map_or([0.0, 0.0], |metrics| {
+                [metrics.logical_width / 2.0, metrics.logical_height / 2.0]
+            });
+            let delta = if moves.is_multiple_of(2) { 4.0 } else { -4.0 };
+            if let Err(error) = studio.post_input(InputEvent::Scroll {
+                delta: [0.0, delta],
+                unit: ScrollUnit::Points,
+                position: LogicalPoint {
+                    x: centre[0],
+                    y: centre[1],
+                },
+                modifiers: Modifiers::NONE,
+            }) {
+                let code = fail(error.kind(), error.to_string(), 1);
+                let _ = studio.close();
+                return code;
+            }
+            arrived = Some(at);
+            moves += 1;
+        }
+        if let Some(rest) = next.checked_duration_since(Instant::now()) {
             std::thread::sleep(rest);
         }
     }
@@ -556,6 +684,7 @@ fn main() -> ExitCode {
                 digest: closed.session.world.digest().to_hex(),
                 frames: closed.frames.frames,
                 presented: closed.frames.presented,
+                rendered: closed.frames.rendered,
                 epochs: closed.frames.epochs,
                 refits: closed.frames.refits,
                 strokes: closed.frames.strokes,
@@ -573,6 +702,10 @@ fn main() -> ExitCode {
                 peak_upload_bytes: closed.frames.peak_upload_bytes,
                 readback_bytes: closed.frames.readback_bytes,
                 wall_seconds: clock.elapsed().as_secs_f64(),
+                frame_times: times.summary(),
+                camera_moves: cli.offscreen_zooms.then_some(moves),
+                camera_moves_unmoved: cli.offscreen_zooms.then_some(unmoved),
+                camera_latency: latency.summary(),
             });
             ExitCode::SUCCESS
         }
@@ -728,6 +861,14 @@ fn end(why: &End) -> (&'static str, Option<String>) {
     }
 }
 
+/// The next frame's start: one `period` after this frame's slot, so an
+/// oversleep shortens the next wait instead of delaying every later frame,
+/// or `now` when this frame ran past it, so a long frame is not followed by
+/// a burst of frames catching up.
+fn next_slot(slot: Instant, period: Duration, now: Instant) -> Instant {
+    (slot + period).max(now)
+}
+
 fn load(path: &PathBuf) -> Result<ValidatedConfig, ExitCode> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| fail("io", format!("{}: {error}", path.display()), 2))?;
@@ -763,12 +904,67 @@ fn fail(kind: &str, detail: String, code: u8) -> ExitCode {
 mod tests {
     //! The FL-022 records as the binary prints them: what the window-run
     //! paths print is `status_record` serialized, which needs no window.
+    //! And FL-024's offscreen arguments, on the parser alone.
 
+    use clap::Parser;
     use flife_core::Tick;
     use flife_core::ids::{CommandId, ResourceEpoch};
     use flife_runtime::{CancelReason, Outcome};
     use flife_studio::{Status, Stroke};
     use serde_json::{Value, json};
+
+    #[test]
+    fn offscreen_arguments_are_parsed_and_refused() {
+        let parse = |args: &[&str]| {
+            super::Cli::try_parse_from(["flife-studio", "preset.toml"].iter().chain(args).copied())
+        };
+        let cli = parse(&["--offscreen", "2.5"]).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(cli.offscreen, Some(2.5));
+        assert_eq!(cli.scale.get(), 2, "two pixels a point by default");
+        let cli = parse(&["--offscreen", "1", "--scale", "3"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((cli.offscreen, cli.scale.get()), (Some(1.0), 3));
+        let cli = parse(&[]).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(cli.offscreen, None, "a window by default");
+        assert!(!cli.offscreen_zooms);
+        let cli =
+            parse(&["--offscreen", "1", "--offscreen-zooms"]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(cli.offscreen_zooms);
+        for args in [
+            &["--offscreen", "0"][..],
+            &["--offscreen", "-1"],
+            &["--offscreen", "NaN"],
+            &["--offscreen", "inf"],
+            &["--offscreen", "soon"],
+            &["--offscreen", "1", "--scale", "0"],
+            // A scale and posted moves are an offscreen surface's.
+            &["--scale", "2"],
+            &["--offscreen-zooms"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn frames_keep_their_schedule_through_oversleeping() {
+        use std::time::{Duration, Instant};
+        let period = Duration::from_secs(1) / 30;
+        let work = Duration::from_millis(15);
+        let base = Instant::now();
+        // Every wait overshoots by 6 ms, as macOS' timer slack did (the
+        // median for a 16.7 ms sleep): frames still start `period` apart.
+        let (mut slot, mut start) = (base, base);
+        for frame in 1..=300 {
+            slot = super::next_slot(slot, period, start + work);
+            assert_eq!(slot, base + period * frame, "frame {frame} keeps its slot");
+            start = slot + Duration::from_millis(6);
+        }
+        // A frame that runs past its slot: the next starts at its end, and
+        // the schedule goes on from there, one frame a period.
+        let end = start + period * 3;
+        let next = super::next_slot(slot, period, end);
+        assert_eq!(next, end, "no frame starts before the long one ends");
+        assert_eq!(super::next_slot(next, period, next + work), end + period);
+    }
 
     fn line(status: &Status) -> Value {
         serde_json::to_value(super::status_record(status)).unwrap_or(Value::Null)

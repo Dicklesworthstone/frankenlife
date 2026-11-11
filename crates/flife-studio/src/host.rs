@@ -25,6 +25,12 @@
 //! 6. renders the cloud with FrankenManim's Metal 3D route straight into
 //!    the window's drawable, with no pixel readback.
 //!
+//! An offscreen Studio ([`Surface::Offscreen`]) has no window: its input
+//! is what [`Studio::post_input`] posts, the first frame reporting the
+//! surface's geometry and focus as a window's first poll does, and step 6
+//! renders through the same Metal 3D route to the route's RGBA8 surface and
+//! reads it back ([`Studio::last_frame`]). Every other step is the same.
+//!
 //! The viewer holds the epoch shown and, while the display moves towards
 //! it, the one before: [`DISPLAY_PAIR`] leases. At rest only the shown one
 //! is held, so the publisher has every other slot.
@@ -42,11 +48,14 @@ use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::SessionClosed;
+use fmn_frame::FrameBuffer;
+use fmn_render::ThreeDJob;
 use fmn_render::metal::{
-    INPUT_QUEUE_CAPACITY, InputEvent, MetalReport, NativePreviewRenderer, PixelDensity,
-    PresentOutcome, PresentationState, SurfaceMetrics,
+    INPUT_QUEUE_CAPACITY, InputEvent, MetalRenderer, MetalReport, NativePreviewRenderer,
+    PixelDensity, PresentOutcome, PresentationState, SurfaceMetrics,
 };
-use std::num::NonZeroUsize;
+use std::collections::VecDeque;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::time::Instant;
 
 use crate::{
@@ -80,6 +89,26 @@ pub struct StudioOptions {
     pub controllers: ControllerChoice,
     /// The style the window opens in; keys change it later.
     pub style: Style,
+    /// Where frames go: a native window, or offscreen.
+    pub surface: Surface,
+}
+
+/// Where a Studio's frames go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Surface {
+    /// A native window on the process main thread: input from AppKit,
+    /// frames presented to its drawable at the screen's density.
+    #[default]
+    Window,
+    /// No window, on any thread (FL-024's frame study): `size` points at
+    /// `scale` device pixels a point, input posted with
+    /// [`Studio::post_input`], each frame rendered through the same Metal
+    /// route and read back. The window options (`title`, `resizable`) are
+    /// unused.
+    Offscreen {
+        /// Device pixels a point, as a screen's backing scale.
+        scale: NonZeroU32,
+    },
 }
 
 impl Default for StudioOptions {
@@ -92,6 +121,7 @@ impl Default for StudioOptions {
             run_on_open: false,
             controllers: ControllerChoice::Auto,
             style: Style::default(),
+            surface: Surface::Window,
         }
     }
 }
@@ -129,8 +159,11 @@ pub struct Frame {
     /// The armed brush, if any (FL-022).
     pub brush: Option<Brush>,
     /// The presentation outcome; `None` when the window was occluded or
-    /// closed and nothing was rendered.
+    /// closed and nothing was rendered, and offscreen.
     pub outcome: Option<PresentOutcome>,
+    /// Whether the frame was drawn: presented to the window's drawable, or
+    /// rendered offscreen.
+    pub drawn: bool,
 }
 
 /// Frame counts for the Studio's life.
@@ -140,6 +173,8 @@ pub struct FrameTally {
     pub frames: u64,
     /// Frames presented to a drawable.
     pub presented: u64,
+    /// Frames rendered offscreen and read back.
+    pub rendered: u64,
     /// Frames skipped because the window was occluded.
     pub occluded: u64,
     /// Epochs lowered.
@@ -171,6 +206,12 @@ pub struct FrameTally {
 }
 
 impl FrameTally {
+    /// Frames drawn: presented to a drawable or rendered offscreen.
+    #[must_use]
+    pub const fn drawn(&self) -> u64 {
+        self.presented.saturating_add(self.rendered)
+    }
+
     /// Count one rendered frame's copies, as its Metal report gives them.
     pub fn count_copies(&mut self, metal: &MetalReport) {
         let upload = u64::try_from(metal.upload_bytes).unwrap_or(u64::MAX);
@@ -197,7 +238,7 @@ pub struct StudioClosed {
 /// The native Studio host.
 #[derive(Debug)]
 pub struct Studio {
-    preview: NativePreviewRenderer,
+    target: Target,
     session: SessionThread,
     feed: Feed,
     viewer: Viewer,
@@ -231,12 +272,15 @@ pub struct Studio {
 
 impl Studio {
     /// Found `config`'s world, open its session on a session thread and a
-    /// native window on this thread, and show the founding epoch.
+    /// native window on this thread (or an offscreen surface), and show the
+    /// founding epoch.
     ///
     /// # Errors
-    /// - [`CoreError::MissingCapability`] off the process main thread,
-    ///   without Metal or a window server, or when the session thread
-    ///   cannot start.
+    /// - [`CoreError::MissingCapability`] for a window off the process main
+    ///   thread or without a window server, without Metal, or when the
+    ///   session thread cannot start.
+    /// - [`CoreError::NumericalInvalid`] for an offscreen surface too large
+    ///   to address.
     /// - The founding, session and view errors of [`World::found`],
     ///   [`flife_runtime::open`] and [`WorldView::new`].
     /// - [`CoreError::BudgetExhausted`] when the world and its observers do
@@ -251,17 +295,28 @@ impl Studio {
         let [width, height] = options
             .size
             .unwrap_or([model.presentation.width, model.presentation.height]);
-        // The window first: without one there is nothing to run for.
-        let mut preview = NativePreviewRenderer::new(width, height, options.title.clone())
-            .map_err(|error| missing(format!("a native Metal preview window: {error}")))?;
-        preview
-            .set_resizable(options.resizable)
-            .map_err(|error| missing(format!("a resizable preview window: {error}")))?;
-        // One drawable pixel per device pixel: the window keeps its size in
-        // points and each frame is drawn at the screen's density.
-        preview
-            .set_pixel_density(PixelDensity::Backing)
-            .map_err(|error| missing(format!("a preview window at screen density: {error}")))?;
+        // The surface first: without one there is nothing to run for.
+        let target = match options.surface {
+            Surface::Window => {
+                let mut preview = NativePreviewRenderer::new(width, height, options.title.clone())
+                    .map_err(|error| missing(format!("a native Metal preview window: {error}")))?;
+                preview
+                    .set_resizable(options.resizable)
+                    .map_err(|error| missing(format!("a resizable preview window: {error}")))?;
+                // One drawable pixel per device pixel: the window keeps its
+                // size in points and each frame is drawn at the screen's
+                // density.
+                preview
+                    .set_pixel_density(PixelDensity::Backing)
+                    .map_err(|error| {
+                        missing(format!("a preview window at screen density: {error}"))
+                    })?;
+                Target::Window(preview)
+            }
+            Surface::Offscreen { scale } => {
+                Target::Offscreen(Offscreen::new([width, height], scale)?)
+            }
+        };
         let mut world = World::found(
             config,
             Arrangement::FreeList,
@@ -286,7 +341,7 @@ impl Studio {
                 .then_some(presentation.bloom_strength),
         )?;
         view.set_point_radius(presentation.point_radius_pixels)?;
-        let drawable = preview
+        let drawable = target
             .surface_metrics()
             .ok()
             .filter(|metrics| metrics.drawable_width > 0 && metrics.drawable_height > 0)
@@ -329,7 +384,7 @@ impl Studio {
         controls.set_style(options.style);
         controls.reserve_moves(INPUT_QUEUE_CAPACITY)?;
         Ok(Self {
-            preview,
+            target,
             session,
             feed,
             viewer,
@@ -431,14 +486,12 @@ impl Studio {
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] when the window cannot be polled or a
-    /// frame cannot be rendered or presented, and the view's errors.
+    /// frame cannot be rendered, presented or read back, and the view's
+    /// errors.
     pub fn frame(&mut self) -> Result<Frame, CoreError> {
         self.tally.frames += 1;
         self.events.clear();
-        let state = self
-            .preview
-            .poll_input(&mut self.events)
-            .map_err(|error| conflict("poll the studio window", error))?;
+        let state = self.target.poll_input(&mut self.events)?;
         let (mut intents, mut refused) = (0, 0);
         for event in &self.events {
             if let Some(intent) = self.controls.apply(event) {
@@ -643,18 +696,32 @@ impl Studio {
             self.prior = None;
         }
 
+        let mut drawn = false;
         let outcome = if state == PresentationState::Visible {
             let job = self.view.job()?;
-            let report = self
-                .preview
-                .render_three_d(&job)
-                .map_err(|error| conflict("present a studio frame", error))?;
-            self.tally.count_copies(&report.metal);
-            match report.outcome {
-                PresentOutcome::Presented => self.tally.presented += 1,
-                PresentOutcome::Occluded => self.tally.occluded += 1,
+            match &mut self.target {
+                Target::Window(preview) => {
+                    let report = preview
+                        .render_three_d(&job)
+                        .map_err(|error| conflict("present a studio frame", error))?;
+                    self.tally.count_copies(&report.metal);
+                    match report.outcome {
+                        PresentOutcome::Presented => {
+                            self.tally.presented += 1;
+                            drawn = true;
+                        }
+                        PresentOutcome::Occluded => self.tally.occluded += 1,
+                    }
+                    Some(report.outcome)
+                }
+                Target::Offscreen(offscreen) => {
+                    let report = offscreen.render(&job)?;
+                    self.tally.count_copies(&report);
+                    self.tally.rendered += 1;
+                    drawn = true;
+                    None
+                }
             }
-            Some(report.outcome)
         } else {
             if state == PresentationState::Occluded {
                 self.tally.occluded += 1;
@@ -678,6 +745,7 @@ impl Studio {
             hover: self.controls.hover(self.view.viewport()),
             brush: self.controls.brush(),
             outcome,
+            drawn,
         })
     }
 
@@ -730,27 +798,67 @@ impl Studio {
         self.tally
     }
 
-    /// Input the native queue dropped between polls.
+    /// Input the native queue (or the offscreen surface's) dropped between
+    /// polls.
     #[must_use]
     pub fn input_dropped(&self) -> u64 {
-        self.preview.input_dropped()
+        self.target.input_dropped()
     }
 
-    /// The native surface's geometry now.
+    /// The surface's geometry now: the window's, or the offscreen
+    /// surface's as its last drained [`InputEvent::Resized`] gave it.
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] once the window has closed.
     pub fn surface_metrics(&self) -> Result<SurfaceMetrics, CoreError> {
-        self.preview
-            .surface_metrics()
-            .map_err(|error| conflict("read the studio surface", error))
+        self.target.surface_metrics()
     }
 
-    /// How frames map to the window: [`PixelDensity::Backing`] from
-    /// [`Studio::open`], so each frame is drawn at the screen's density.
+    /// How frames map to the surface: [`PixelDensity::Backing`] from
+    /// [`Studio::open`], so each frame is drawn at the screen's density (or
+    /// the offscreen surface's scale).
     #[must_use]
     pub fn pixel_density(&self) -> PixelDensity {
-        self.preview.pixel_density()
+        match &self.target {
+            Target::Window(preview) => preview.pixel_density(),
+            Target::Offscreen(_) => PixelDensity::Backing,
+        }
+    }
+
+    /// Whether the Studio draws offscreen ([`Surface::Offscreen`]).
+    #[must_use]
+    pub const fn is_offscreen(&self) -> bool {
+        matches!(self.target, Target::Offscreen(_))
+    }
+
+    /// Post one typed input event to an offscreen Studio; the next frame
+    /// drains it as a window's next poll would. Past
+    /// [`INPUT_QUEUE_CAPACITY`] undrained events it is dropped and counted
+    /// ([`Studio::input_dropped`]), as the native queue drops them.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] for a window, whose input is AppKit's.
+    pub fn post_input(&mut self, event: InputEvent) -> Result<(), CoreError> {
+        match &mut self.target {
+            Target::Window(_) => Err(conflict(
+                "post studio input",
+                "a window's input comes from AppKit",
+            )),
+            Target::Offscreen(offscreen) => {
+                offscreen.post(event);
+                Ok(())
+            }
+        }
+    }
+
+    /// The last frame an offscreen Studio rendered, tight RGBA8 at the
+    /// drawable's size; `None` for a window or before a frame.
+    #[must_use]
+    pub fn last_frame(&self) -> Option<&FrameBuffer> {
+        match &self.target {
+            Target::Window(_) => None,
+            Target::Offscreen(offscreen) => offscreen.frame.as_ref(),
+        }
     }
 
     /// Post one real AppKit event into the application queue for this
@@ -760,9 +868,15 @@ impl Studio {
     /// [`CoreError::StateConflict`] when AppKit refuses it.
     #[cfg(feature = "synthetic-input")]
     pub fn post(&mut self, input: &fmn_render::metal::SyntheticInput) -> Result<(), CoreError> {
-        self.preview
-            .post_synthetic(input)
-            .map_err(|error| conflict("post synthetic studio input", error))
+        match &mut self.target {
+            Target::Window(preview) => preview
+                .post_synthetic(input)
+                .map_err(|error| conflict("post synthetic studio input", error)),
+            Target::Offscreen(_) => Err(conflict(
+                "post synthetic studio input",
+                "an offscreen studio has no window",
+            )),
+        }
     }
 
     /// Close the window and the session, returning the committed world.
@@ -770,14 +884,11 @@ impl Studio {
     /// # Errors
     /// The session's closing errors. The window is closed first either way.
     pub fn close(mut self) -> Result<StudioClosed, CoreError> {
-        let window = self
-            .preview
-            .close()
-            .map_err(|error| conflict("close the studio window", error));
+        let window = self.target.close();
         // The display's leases go before the session closes.
         drop(self.prior.take());
         drop(self.current);
-        let input_dropped = self.preview.input_dropped();
+        let input_dropped = self.target.input_dropped();
         let session = self.session.close()?;
         window?;
         Ok(StudioClosed {
@@ -786,6 +897,135 @@ impl Studio {
             input: self.controls.tally(),
             input_dropped,
         })
+    }
+}
+
+/// Where the Studio's frames go ([`Surface`]).
+#[derive(Debug)]
+enum Target {
+    Window(NativePreviewRenderer),
+    Offscreen(Offscreen),
+}
+
+impl Target {
+    /// Drain the input since the last poll into `events`.
+    fn poll_input(&mut self, events: &mut Vec<InputEvent>) -> Result<PresentationState, CoreError> {
+        match self {
+            Self::Window(preview) => preview
+                .poll_input(events)
+                .map_err(|error| conflict("poll the studio window", error)),
+            Self::Offscreen(offscreen) => {
+                for event in offscreen.posted.drain(..) {
+                    if let InputEvent::Resized(metrics) = event {
+                        offscreen.metrics = metrics;
+                    }
+                    events.push(event);
+                }
+                Ok(PresentationState::Visible)
+            }
+        }
+    }
+
+    fn surface_metrics(&self) -> Result<SurfaceMetrics, CoreError> {
+        match self {
+            Self::Window(preview) => preview
+                .surface_metrics()
+                .map_err(|error| conflict("read the studio surface", error)),
+            Self::Offscreen(offscreen) => Ok(offscreen.metrics),
+        }
+    }
+
+    fn input_dropped(&self) -> u64 {
+        match self {
+            Self::Window(preview) => preview.input_dropped(),
+            Self::Offscreen(offscreen) => offscreen.dropped,
+        }
+    }
+
+    fn close(&mut self) -> Result<(), CoreError> {
+        match self {
+            Self::Window(preview) => preview
+                .close()
+                .map_err(|error| conflict("close the studio window", error)),
+            Self::Offscreen(_) => Ok(()),
+        }
+    }
+}
+
+/// An offscreen surface: FrankenManim's Metal renderer, the input posted
+/// since the last frame, and the last frame read back.
+#[derive(Debug)]
+struct Offscreen {
+    renderer: MetalRenderer,
+    metrics: SurfaceMetrics,
+    posted: VecDeque<InputEvent>,
+    dropped: u64,
+    frame: Option<FrameBuffer>,
+}
+
+impl Offscreen {
+    /// `size` points at `scale` pixels a point, its first poll reporting
+    /// the geometry and the focus, as a window's does once it is key.
+    fn new(size: [u32; 2], scale: NonZeroU32) -> Result<Self, CoreError> {
+        if !MetalRenderer::is_available() {
+            return Err(missing(
+                "a Metal device for offscreen studio frames".to_owned(),
+            ));
+        }
+        let renderer = MetalRenderer::new()
+            .map_err(|error| missing(format!("a Metal renderer for offscreen frames: {error}")))?;
+        let pixels = |points: u32| {
+            points
+                .checked_mul(scale.get())
+                .ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "offscreen studio drawable",
+                    detail: format!("{points} points at {scale} pixels a point"),
+                })
+        };
+        let metrics = SurfaceMetrics {
+            logical_width: f64::from(size[0]),
+            logical_height: f64::from(size[1]),
+            backing_scale: f64::from(scale.get()),
+            drawable_width: pixels(size[0])?,
+            drawable_height: pixels(size[1])?,
+        };
+        let mut posted = VecDeque::new();
+        posted
+            .try_reserve_exact(INPUT_QUEUE_CAPACITY)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "offscreen studio input",
+                bytes: u64::try_from(INPUT_QUEUE_CAPACITY * size_of::<InputEvent>())
+                    .unwrap_or(u64::MAX),
+            })?;
+        posted.push_back(InputEvent::Resized(metrics));
+        posted.push_back(InputEvent::FocusGained);
+        Ok(Self {
+            renderer,
+            metrics,
+            posted,
+            dropped: 0,
+            frame: None,
+        })
+    }
+
+    fn post(&mut self, event: InputEvent) {
+        if self.posted.len() < INPUT_QUEUE_CAPACITY {
+            self.posted.push_back(event);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// Render `job` and read it back; the last frame goes first, so one is
+    /// held at a time.
+    fn render(&mut self, job: &ThreeDJob<'_>) -> Result<MetalReport, CoreError> {
+        self.frame = None;
+        let (frame, report) = self
+            .renderer
+            .render_three_d_rgba8(job)
+            .map_err(|error| conflict("render an offscreen studio frame", error))?;
+        self.frame = Some(frame);
+        Ok(report)
     }
 }
 

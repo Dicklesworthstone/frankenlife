@@ -40,6 +40,7 @@
 pub mod brush;
 mod clock;
 mod controls;
+mod frames;
 mod host;
 pub mod memory;
 mod overlay;
@@ -58,8 +59,10 @@ pub use controls::{
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
+pub use frames::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
+    Surface,
 };
 pub use overlay::{Inspected, OverlayState, inspector_lines, legends, overlay_text};
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};

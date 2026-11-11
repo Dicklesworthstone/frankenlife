@@ -17,8 +17,9 @@
 //!   4K, two pixels per point and a 16x zoom, the host held at most
 //!   61% and the device copy at most 44% of that sum;
 //! - per drawable pixel, [`DEVICE_BYTES_PER_PIXEL`]: the route's RGBA16F
-//!   and RGBA8 surfaces and the window's drawables; and a status word per
-//!   16 x 16 tile;
+//!   and RGBA8 surfaces and the window's drawables (offscreen, the one
+//!   frame read back to the host instead, 4 of the drawables' 12); and a
+//!   status word per 16 x 16 tile;
 //! - while a bloom is configured, its row sums on the device
 //!   ([`WorldView::bloom_bytes`], FL-019).
 //!
@@ -34,7 +35,9 @@ use flife_render::Epoch;
 
 /// What FrankenManim's Metal route and the window hold per drawable pixel:
 /// the RGBA16F surface the route renders to (8 bytes), the RGBA8 surface
-/// it converts to (4), and the window's three BGRA8 drawables (12).
+/// it converts to (4), and the window's three BGRA8 drawables (12). An
+/// offscreen Studio holds no drawable but the last frame read back, tight
+/// RGBA8 (4), dropped before the next is read: within the same charge.
 pub const DEVICE_BYTES_PER_PIXEL: u64 = 8 + 4 + 3 * 4;
 
 /// The edge of the tile the Metal route rasterizes, each with a status

@@ -400,16 +400,18 @@ cargo run --release -p flife-cli -- render presets/reference-small-world.toml --
 cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 1200 --every 1200 \
     --color energy --density --out frames-energy
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540
+cargo run --release -p flife-studio -- presets/reference-small-world.toml --offscreen 20 --offscreen-zooms
 ```
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the
 preset, a per-second `clock` record gives the honest clocks: the ticks committed per wall second, simulated seconds
-per wall second and frames presented per second (FL-024). The window draws the same in its top-left corner, as
+per wall second and frames drawn per second (FL-024). The window draws the same in its top-left corner, as
 text over a dark plate: running or paused at the shown tick, those clocks, the colour mapping's key (such as `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8
-■ 16`, each square in its colour; drawn only in a window, which no test here opened), the armed brush and the
-selected organism. The organisms glow over the energy field they feed on, in
+■ 16`, each square in its colour), the armed brush and the selected organism. Drawn offscreen through the Metal
+route, the key's squares are their colours exactly without the bloom; the preset's bloom moves them by up to 16
+levels. The organisms glow over the energy field they feed on, in
 the configuration's colour mapping (`[presentation] color_mapping`, lineage in the preset). The style keys work
 while running or paused, and change only the picture:
 
@@ -426,6 +428,16 @@ organisms within 12 points of it on screen, their energy recycled as a death's; 
 composition is the selected organism's affinity direction, the material it converts best; or introduces 8
 founder-drawn organisms there. Each click is a command: a `submitted` record names the boundary it will apply
 at, and a `finished` record the tick it applied at and the energy it moved.
+
+`--offscreen SECONDS` runs the same Studio for that long with no window (FL-024). It renders each frame through
+the same Metal route at `--scale` pixels a point (2 by default), reads it back and closes. Its `end` record gives
+the frames' work times and, with `--offscreen-zooms`, a camera move's latency from its arrival at a random moment
+of every third frame interval to the end of the frame that drew it. On the preset (1920×1080 points, its
+controllers on the CPU reference with 16 workers) on a shared M5 Ultra it drew 30.00 frames a second at 1x
+(latency p95 51.6 ms) and 29.79 at 2x (3840×2160, p95 59.9 ms). That is G6 offscreen. In a window, with AppKit's
+delivery and the present, it is not yet measured. The Studio's frames start on a fixed schedule. Each frame used to
+wait a period from its own start, so every timer oversleep delayed all later frames: in the same runs that drew
+27.9 and 28.3 frames a second.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density` and `--no-field`.
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.

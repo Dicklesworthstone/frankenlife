@@ -1,0 +1,448 @@
+//! FL-024: the Studio with no window ([`Surface::Offscreen`]). The host's
+//! whole frame path runs as a window's does: typed input through the
+//! controls, intents to the session thread and its statuses back, epochs
+//! through the pacer, the camera, picks, the overlay and its colour key,
+//! and FrankenManim's Metal 3D route, here rendering to its RGBA8 surface
+//! and reading it back. Only AppKit's event delivery and the drawable's
+//! presentation are not run. Headless Metal: without a Metal device the
+//! tests return early.
+
+#![allow(
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test: a failure is a test failure; figures are printed"
+)]
+
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::time::{Duration, Instant};
+
+use flife_core::ValidatedConfig;
+use flife_core::ids::OrganismId;
+use flife_manim::{HUD_TEXT_POINTS, HudFont, hud_origin, linear};
+use flife_studio::{
+    ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_SPACE, PICK_RADIUS_POINTS, Status,
+    Studio, StudioOptions, Surface, legends, scroll_zoom,
+};
+use fmn_render::metal::{
+    ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
+    ScrollUnit, SurfaceMetrics,
+};
+
+const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
+
+/// Points of the offscreen content area, and pixels a point.
+const SIZE: [u32; 2] = [320, 200];
+const SCALE: u32 = 2;
+
+fn config() -> ValidatedConfig {
+    ValidatedConfig::from_toml(PRESET).expect("the preset is valid")
+}
+
+fn options(run: bool) -> StudioOptions {
+    StudioOptions {
+        size: Some(SIZE),
+        cpu_workers: NonZeroUsize::new(2),
+        run_on_open: run,
+        controllers: ControllerChoice::Cpu,
+        surface: Surface::Offscreen {
+            scale: NonZeroU32::new(SCALE).expect("nonzero"),
+        },
+        ..StudioOptions::default()
+    }
+}
+
+fn point(at: [f64; 2]) -> LogicalPoint {
+    LogicalPoint { x: at[0], y: at[1] }
+}
+
+fn key(code: u16, text: &str, pressed: bool) -> InputEvent {
+    InputEvent::Key {
+        code,
+        text: text.to_owned(),
+        pressed,
+        repeat: false,
+        modifiers: Modifiers::NONE,
+    }
+}
+
+fn click(studio: &mut Studio, at: [f64; 2]) {
+    for pressed in [true, false] {
+        studio
+            .post_input(InputEvent::Button {
+                button: PointerButton::Primary,
+                pressed,
+                position: point(at),
+                clicks: 1,
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    }
+}
+
+/// Frames until `done` holds, for at most 30 s of wall time.
+fn until(studio: &mut Studio, what: &str, mut done: impl FnMut(&Studio, &[Status]) -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut statuses = Vec::new();
+    loop {
+        studio.frame().expect("a frame");
+        statuses.extend(studio.take_statuses());
+        if done(studio, &statuses) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn an_offscreen_studio_draws_its_views_frame() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let mut studio = Studio::open(&config(), &options(false)).expect("opens offscreen");
+    assert!(studio.is_offscreen());
+    assert_eq!(studio.pixel_density(), PixelDensity::Backing);
+    assert!(studio.last_frame().is_none(), "no frame before the first");
+    let frame = studio.frame().expect("a frame");
+    // The first frame drains the surface's geometry and focus, as a
+    // window's first poll does, and draws at its density.
+    assert!(frame.refitted && frame.drawn && frame.outcome.is_none());
+    assert_eq!(frame.events, 2);
+    assert!(studio.controls().focused());
+    let drawable = [SIZE[0] * SCALE, SIZE[1] * SCALE];
+    assert_eq!(studio.view().viewport().drawable(), drawable);
+    let metrics = studio.surface_metrics().expect("metrics");
+    assert_eq!([metrics.drawable_width, metrics.drawable_height], drawable);
+    assert_eq!(metrics.backing_scale, f64::from(SCALE));
+    let tally = studio.tally();
+    assert_eq!((tally.frames, tally.rendered, tally.presented), (1, 1, 0));
+    assert_eq!(tally.drawn(), 1);
+    assert_eq!(
+        tally.readback_bytes,
+        u64::from(drawable[0]) * u64::from(drawable[1]) * 4
+    );
+    // The frame read back is the view's job, as another renderer draws it.
+    let ours = studio.last_frame().expect("the frame").as_bytes().to_vec();
+    assert_eq!(ours.len(), (drawable[0] * drawable[1] * 4) as usize);
+    let job = studio.view().job().expect("the job");
+    let (theirs, _) = MetalRenderer::new()
+        .expect("a renderer")
+        .render_three_d_rgba8(&job)
+        .expect("renders");
+    drop(job);
+    assert!(ours == theirs.as_bytes(), "the frame is the view's job");
+    // Not a blank frame: the field and the founders are drawn.
+    let (pixels, _) = ours.as_chunks::<4>();
+    let background = pixels[0];
+    assert!(pixels.iter().filter(|pixel| **pixel != background).count() > 1_000);
+    let closed = studio.close().expect("closes");
+    assert_eq!(closed.frames.rendered, 1);
+    assert_eq!(closed.input_dropped, 0);
+    assert_eq!(closed.input.focus_gained, 1);
+    assert_eq!(closed.input.resizes, 1);
+}
+
+#[test]
+fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let mut studio = Studio::open(&config(), &options(false)).expect("opens offscreen");
+    studio.frame().expect("the first frame");
+    let density = f64::from(SCALE);
+
+    // Key 2: the energy mapping.
+    studio
+        .post_input(key(KEY_DIGITS[1], "2", true))
+        .expect("posts");
+    studio
+        .post_input(key(KEY_DIGITS[1], "2", false))
+        .expect("posts");
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.restyled && frame.drawn);
+    assert_eq!(studio.view().style().mapping, ColorMapping::Energy);
+
+    // A scroll zooms about the pointer by exactly the scroll's factor.
+    let before = *studio.view().viewport();
+    let anchor = [100.0, 60.0];
+    studio
+        .post_input(InputEvent::Scroll {
+            delta: [0.0, 50.0],
+            unit: ScrollUnit::Points,
+            position: point(anchor),
+            modifiers: Modifiers::NONE,
+        })
+        .expect("posts");
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.moved);
+    let factor = scroll_zoom(50.0, ScrollUnit::Points).expect("a factor");
+    let zoomed = *studio.view().viewport();
+    assert!((zoomed.zoom() / before.zoom() - factor).abs() < 1e-12);
+    let at = [anchor[0] * density, anchor[1] * density];
+    let held = before.drawable_to_world(at).expect("a world point");
+    let still = zoomed.drawable_to_world(at).expect("a world point");
+    assert!(
+        (held[0] - still[0]).hypot(held[1] - still[1]) < 1e-9,
+        "the anchor stays put"
+    );
+
+    // A click on a drawn organism selects it by identity, and its
+    // inspection answers.
+    let rows: Vec<(u64, [f64; 2])> = studio.view().shown_rows().collect();
+    let centre = [
+        f64::from(SIZE[0]) * density / 2.0,
+        f64::from(SIZE[1]) * density / 2.0,
+    ];
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let (target, spot) = rows
+        .iter()
+        .map(|&(id, position)| (id, zoomed.world_to_drawable(position)))
+        .min_by(|a, b| distance(a.1, centre).total_cmp(&distance(b.1, centre)))
+        .expect("organisms are shown");
+    let expected = flife_manim::pick(
+        &zoomed,
+        rows.iter().copied(),
+        spot,
+        PICK_RADIUS_POINTS * density,
+    );
+    assert_eq!(expected, Some(OrganismId::new(target)));
+    click(&mut studio, [spot[0] / density, spot[1] / density]);
+    until(&mut studio, "the inspection", |studio, statuses| {
+        studio.view().selected() == expected
+            && statuses.iter().any(|status| {
+                matches!(status, Status::Inspected { organism, snapshot: Some(_), .. }
+                    if Some(*organism) == expected)
+            })
+    });
+
+    // A new geometry, as a resized window reports it: the surface takes it
+    // and the view refits to its drawable.
+    let resized = SurfaceMetrics {
+        logical_width: 400.0,
+        logical_height: 250.0,
+        backing_scale: density,
+        drawable_width: 800,
+        drawable_height: 500,
+    };
+    studio
+        .post_input(InputEvent::Resized(resized))
+        .expect("posts");
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.refitted && frame.drawn);
+    assert_eq!(studio.surface_metrics().expect("metrics"), resized);
+    assert_eq!(studio.view().viewport().drawable(), [800, 500]);
+    let pixels = studio.last_frame().expect("the frame").as_bytes().len();
+    assert_eq!(pixels, 800 * 500 * 4);
+
+    // Space runs the world: the shown tick moves on.
+    studio.post_input(key(KEY_SPACE, " ", true)).expect("posts");
+    studio
+        .post_input(key(KEY_SPACE, " ", false))
+        .expect("posts");
+    until(&mut studio, "the world to run", |studio, statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Running { .. }))
+            && studio
+                .view()
+                .shown()
+                .is_some_and(|shown| shown.tick.get() >= 8)
+    });
+    let tally = studio.tally();
+    assert_eq!(tally.rendered, tally.frames, "every frame was drawn");
+    assert_eq!((tally.restyles, tally.selections), (1, 1));
+    assert!(tally.epochs >= 8);
+    let closed = studio.close().expect("closes");
+    assert!(closed.session.boundary.tick.get() >= 8);
+    assert_eq!(closed.input_dropped, 0);
+}
+
+/// The largest channel difference between each swatch's interior pixels
+/// (2 px inside its square) in the Studio's last frame and its sRGB colour,
+/// and the pixels compared.
+fn swatch_error(studio: &mut Studio, legend: &flife_manim::Legend) -> (u8, usize) {
+    studio
+        .set_overlay(&legend.text, &legend.swatches)
+        .expect("the overlay");
+    studio.frame().expect("a frame with the key");
+    let frame = studio.last_frame().expect("the frame").as_bytes().to_vec();
+    let [width, _] = studio.view().viewport().drawable();
+    // The same text, laid out as the Studio lays it out at this density.
+    let colors: Vec<_> = legend.swatches.iter().map(|&rgb| linear(rgb)).collect();
+    let text = HudFont::bundled()
+        .expect("the fonts")
+        .text_with_swatches(&legend.text, HUD_TEXT_POINTS * f64::from(SCALE), &colors)
+        .expect("the text");
+    assert_eq!(text.swatches().len(), legend.swatches.len());
+    let origin = hud_origin(studio.view().viewport());
+    let (mut largest, mut checked) = (0, 0);
+    for ((range, _), rgb) in text.swatches().iter().zip(&legend.swatches) {
+        let corners = &text.vertices()[range.clone()];
+        let low = corners
+            .iter()
+            .fold([f64::INFINITY; 2], |[x, y], c| [x.min(c[0]), y.min(c[1])]);
+        let high = corners.iter().fold([f64::NEG_INFINITY; 2], |[x, y], c| {
+            [x.max(c[0]), y.max(c[1])]
+        });
+        let mut inside = 0;
+        let rows = (origin[1] + low[1] + 2.0).ceil() as u32..(origin[1] + high[1] - 2.0) as u32;
+        for row in rows {
+            let columns =
+                (origin[0] + low[0] + 2.0).ceil() as u32..(origin[0] + high[0] - 2.0) as u32;
+            for column in columns {
+                let at = ((row * width + column) * 4) as usize;
+                for channel in 0..3 {
+                    largest = largest.max(frame[at + channel].abs_diff(rgb[channel]));
+                }
+                inside += 1;
+            }
+        }
+        assert!(inside >= 25, "{inside} pixels inside a swatch");
+        checked += inside;
+    }
+    (largest, checked)
+}
+
+/// FL-019's key on the Metal route: unbloomed, every swatch's interior is
+/// its colour; the preset's bloom moves it, and by how much is printed.
+#[test]
+fn the_colour_key_is_drawn_in_its_colours_offscreen() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let bloomed = config();
+    let unbloomed = ValidatedConfig::from_toml(
+        &PRESET.replace("bloom_enabled = true", "bloom_enabled = false"),
+    )
+    .expect("valid without the bloom");
+    assert!(!unbloomed.config().presentation.bloom_enabled);
+    for mapping in [ColorMapping::Generation, ColorMapping::Affinity] {
+        let keys = legends(&bloomed).expect("the keys");
+        let (_, legend) = keys
+            .iter()
+            .find(|(key, _)| *key == mapping)
+            .expect("the key");
+        let mut studio = Studio::open(&unbloomed, &options(false)).expect("opens offscreen");
+        studio.frame().expect("the first frame");
+        let (error, checked) = swatch_error(&mut studio, legend);
+        studio.close().expect("closes");
+        assert!(error <= 2, "{mapping}: a swatch is {error} levels off");
+        let mut studio = Studio::open(&bloomed, &options(false)).expect("opens offscreen");
+        studio.frame().expect("the first frame");
+        let (bloom, _) = swatch_error(&mut studio, legend);
+        studio.close().expect("closes");
+        println!(
+            "{mapping} key: {checked} swatch pixels within {error} levels unbloomed; with the \
+             preset's bloom within {bloom}"
+        );
+    }
+}
+
+/// G6's input latency, measured offscreen: camera moves posted at a random
+/// moment between frames of a 60 Hz loop, while the world runs, each from
+/// its post to the end of the frame that drew it. AppKit's delivery and the
+/// display's presentation are not in it. Printed, not asserted: the test
+/// asserts only that every move reached the next frame.
+#[test]
+fn camera_moves_reach_the_next_frame_while_the_world_runs() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let mut studio = Studio::open(&config(), &options(true)).expect("opens offscreen");
+    let period = Duration::from_secs(1) / 60;
+    let mut frames = FrameTimes::new().expect("frame times");
+    let mut latencies = FrameTimes::new().expect("latencies");
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut posted = None;
+    let mut moves = 0;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        let begun = Instant::now();
+        let frame = studio.frame().expect("a frame");
+        let _ = studio.take_statuses();
+        frames.record(begun.elapsed());
+        if let Some(at) = posted.take() {
+            assert!(frame.moved, "a posted zoom reached the next frame");
+            latencies.record(Instant::now().duration_since(at));
+            moves += 1;
+        }
+        let rest = period.saturating_sub(begun.elapsed());
+        // Every third frame, a scroll arrives part of the way through the
+        // wait for the next.
+        if studio.tally().frames.is_multiple_of(3) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let part = rest.mul_f64((state >> 11) as f64 / (1_u64 << 53) as f64);
+            std::thread::sleep(part);
+            posted = Some(Instant::now());
+            let delta = if moves % 2 == 0 { 4.0 } else { -4.0 };
+            studio
+                .post_input(InputEvent::Scroll {
+                    delta: [0.0, delta],
+                    unit: ScrollUnit::Points,
+                    position: point([160.0, 100.0]),
+                    modifiers: Modifiers::NONE,
+                })
+                .expect("posts");
+            std::thread::sleep(rest.saturating_sub(part));
+        } else {
+            std::thread::sleep(rest);
+        }
+    }
+    let closed = studio.close().expect("closes");
+    assert!(moves >= 20, "{moves} moves");
+    let frame = frames.summary().expect("frames");
+    let latency = latencies.summary().expect("latencies");
+    println!(
+        "offscreen {}x{} at {SCALE}x, world running to tick {}: {} frames, frame work p50 {:.1} \
+         ms, p95 {:.1}, p99 {:.1}, max {:.1}; {moves} camera moves, post to drawn p50 {:.1} ms, \
+         p95 {:.1}, max {:.1}",
+        SIZE[0] * SCALE,
+        SIZE[1] * SCALE,
+        closed.session.boundary.tick.get(),
+        frame.frames,
+        frame.p50_ms,
+        frame.p95_ms,
+        frame.p99_ms,
+        frame.max_ms,
+        latency.p50_ms,
+        latency.p95_ms,
+        latency.max_ms
+    );
+}
+
+/// The surface keeps at most a native queue's events between frames and
+/// counts the rest as dropped, as the native queue does.
+#[test]
+fn an_offscreen_queue_keeps_a_native_queues_capacity() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let mut studio = Studio::open(&config(), &options(false)).expect("opens offscreen");
+    for _ in 0..fmn_render::metal::INPUT_QUEUE_CAPACITY {
+        studio
+            .post_input(InputEvent::PointerMoved {
+                position: point([10.0, 10.0]),
+                buttons: ButtonSet::EMPTY,
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    }
+    assert_eq!(
+        studio.input_dropped(),
+        2,
+        "the opening geometry and focus fill two slots"
+    );
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.events, fmn_render::metal::INPUT_QUEUE_CAPACITY);
+    studio.close().expect("closes");
+}

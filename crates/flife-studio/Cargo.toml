@@ -25,6 +25,8 @@ flife-genome = { path = "../flife-genome" }
 flife-manim = { path = "../flife-manim" }
 flife-render = { path = "../flife-render" }
 flife-runtime = { path = "../flife-runtime" }
+# An offscreen frame is read back as FrankenManim's frame buffer (FL-024).
+fmn-frame.workspace = true
 fmn-render = { workspace = true, features = ["metal"] }
 serde.workspace = true
 serde_json.workspace = true

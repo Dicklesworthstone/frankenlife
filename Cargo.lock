@@ -961,6 +961,7 @@ dependencies = [
  "flife-manim",
  "flife-render",
  "flife-runtime",
+ "fmn-frame",
  "fmn-render",
  "peak_alloc",
  "serde",

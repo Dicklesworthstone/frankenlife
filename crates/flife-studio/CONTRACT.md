@@ -18,7 +18,9 @@ widths), the armed brush and the selection, then the inspector panel. A count of
 magnitude of 100,000 or more, is written in scientific notation, so no line grows without bound.
 It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
-adapter.
+adapter. For FL-024's frame study (G6, §13.7) the same Studio runs with no window (`Surface::Offscreen`): typed
+input is posted to it, each frame is rendered through the same Metal route and read back, and the binary's
+`--offscreen` runs its own loop that way and reports its frames' times and its camera moves' latency.
 
 **Inputs.**
 - A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate, the colour
@@ -26,7 +28,9 @@ adapter.
   smallest radius on screen (`point_radius_pixels`, in points: `WorldView::set_point_radius`, FL-019; a radius
   above 24 points refuses the start).
   `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
-- The process main thread, macOS, Metal and a window server.
+- For a window: the process main thread, macOS, Metal and a window server. Offscreen
+  (`StudioOptions::surface = Surface::Offscreen { scale }`): any thread and a Metal device; the content area is
+  `size` points at `scale` pixels a point, and `title` and `resizable` are unused.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
   `0ae728fe`, through FrankenManim `fmn-render` at rev `c6ad9c5b`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
@@ -133,9 +137,20 @@ adapter.
      style change it shows the pair again, after a camera move it places it, and otherwise, while the display
      moves, it advances it; once the display rests the prior lease is released;
   7. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
+     Offscreen, it renders the job with `MetalRenderer::render_three_d_rgba8`, which runs the same dispatch to
+     the route's RGBA8 surface and reads it back (`Studio::last_frame`, tight RGBA8 at the drawable's size; the
+     last frame is dropped before the next is read), counted in `FrameTally::rendered`.
+
+  Offscreen, step 1 drains what `Studio::post_input` posted since the last frame: the first frame drains the
+  surface's `Resized` geometry and `FocusGained`, as a key window's first poll does, and a posted `Resized`
+  becomes the surface's geometry. Past `INPUT_QUEUE_CAPACITY` undrained events a post is dropped and counted, as
+  the native queue drops events. `post_input` on a window, and `post` (AppKit's synthetic input) offscreen, are
+  `StateConflict`.
 
   It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
-  `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, outcome). `display_pair()` is the epochs it
+  `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, outcome, and `drawn`: presented
+  or rendered offscreen; the outcome is `None` offscreen). `FrameTally::drawn()` is the frames presented or
+  rendered. `display_pair()` is the epochs it
   holds and `pacer()` the pacer.
 - `Pacer` times the display's motion (§13.5, one-state display latency): `arrive(now)` for an epoch of a running
   stream moves the smoothed interval between arrivals by `ARRIVAL_SMOOTHING = 0.25` of the difference, and a wait
@@ -144,7 +159,14 @@ adapter.
   arrival over the interval, at most 1, and 1 before an interval is known. So a running world is drawn about one
   arrival interval late, and a step is seen moving within 100 ms. `close()` closes the window and the session and returns the committed world (`StudioClosed`).
 - `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
-  [--look glow|raw] [--density] [--no-field]`: the binary. M is `lineage`, `energy`, `generation`, `motion` or
+  [--look glow|raw] [--density] [--no-field] [--offscreen SECONDS [--scale N] [--offscreen-zooms]]`: the
+  binary. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
+  a point (2 by default) and closes, and nothing posts input but `--offscreen-zooms`' camera moves: in every
+  third frame interval, at a moment drawn uniformly over it (a fixed seed), a 4-point scroll at the content's
+  centre, zooming in and out in turn; a move arriving during a frame's work waits for the next frame, as the
+  native queue holds it. Frames start on a fixed schedule `1 / frames_per_second` apart: a wait that overshoots
+  (macOS adds slack to a sleeping thread's timer) shortens the next, and a frame that runs past its slot starts
+  the schedule again from its end. M is `lineage`, `energy`, `generation`, `motion` or
   `topology` (or a registered name such as `founder-lineage-v1`); the default is the configuration's
   `[presentation] color_mapping`. C is
   `cpu`, `torch`, `metal` or `auto` (the default), as for `flife run`: `auto` takes the Metal controllers only at W ≤ 8, and on a
@@ -154,8 +176,8 @@ adapter.
   with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
   1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
   - `open`, naming the window, the CPU workers, the controller backend, the style (`mapping`, its `meaning`,
-    `look`, `particles` and `field`) and `clock_telemetry`, the configuration's `[presentation]
-    show_clock_telemetry`;
+    `look`, `particles` and `field`), `clock_telemetry`, the configuration's `[presentation]
+    show_clock_telemetry`, and the `surface`, `window` or `offscreen`;
   - one `status` per status;
   - one `view` per style change, with the same style fields;
   - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
@@ -171,18 +193,29 @@ adapter.
     `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
     `effective_tick`; and one `finished` per command: `outcome` `applied` with its `tick`, `published_tick` and
     `energy`, or `cancelled` or `failed` with a `detail`;
-  - a `frame` summary about once a second, with the camera's center and zoom, and the bytes the Metal route has
-    copied so far: to the device (`upload_bytes`, and the most in one frame, `peak_upload_bytes`) and back to the
-    host (`readback_bytes`, none for frames presented to the window);
+  - a `frame` summary about once a second, with the frames `presented` and `rendered` offscreen, the camera's
+    center and zoom, and the bytes the Metal route has copied so far: to the device (`upload_bytes`, and the
+    most in one frame, `peak_upload_bytes`) and back to the host (`readback_bytes`, none for frames presented to
+    the window);
   - FL-024, while `show_clock_telemetry` is set: a `clock` record after each `frame` summary but the first, over
     the wall time since the previous one (`wall_seconds`): the `ticks` the session committed in it and
     `ticks_per_second`; `simulation_rate`, simulated seconds per wall second (the ticks times `Δt`, 1 being real
-    time, 0 while paused); the `frames` presented and `frames_per_second`; and the newest `committed_tick`, the
+    time, 0 while paused); the `frames` drawn (presented, or rendered offscreen) and `frames_per_second`; and the
+    newest `committed_tick`, the
     `shown_tick` and how far the shown epoch is behind it (`behind_ticks`). The committed tick is the newest epoch
     in the render feed (`Studio::committed`), so a slow world reads slow;
   - `end`, with the committed tick, the world digest, the strokes offered and the brush clicks that made none
     (`unstroked`), the controller evaluations the backend
-    returned and deferred, and its failure if it failed, and the same copy totals.
+    returned and deferred, and its failure if it failed, and the same copy totals; `frame_times` (FL-024's G6
+    evidence: `FrameTimes`' median, 95th and 99th percentiles and longest, in milliseconds, of each frame's work
+    from draining input to the overlay set, without the wait for the next frame); and with
+    `--offscreen-zooms` the `camera_moves` posted, those whose frame did not move the view
+    (`camera_moves_unmoved`), and `camera_latency`, each move's time from its arrival to the end of the frame
+    that drew it, as the same percentiles.
+- `FrameTimes` counts frame times in 0.1 ms buckets (`FRAME_TIME_BUCKET`) up to one second
+  (`FRAME_TIME_RANGE`), longer frames above it, and keeps the longest exactly: fixed memory for a run of any
+  length. `percentile(p)` is the upper edge of the bucket holding the `⌈p · frames⌉`-th shortest frame (at most
+  the longest), and the longest when that frame took the range or more.
 
   Errors are `frankenlife.error.v1` on standard error. The exit code is 0 after a clean close, 2 when the
   configuration or window fails, and 1 after a later failure.
@@ -213,10 +246,14 @@ adapter.
   presenter.
 
 **Refusal cases.**
-- `Studio::open` off the main thread, without Metal or without a window server: `MissingCapability`. A background
-  that is not `#rrggbb`: `NumericalInvalid`. The founding and session errors of `World::found` and
+- `Studio::open` for a window off the main thread, without Metal or without a window server, or offscreen without
+  a Metal device: `MissingCapability`. A background that is not `#rrggbb`, or an offscreen drawable past
+  `u32::MAX` pixels a side: `NumericalInvalid`. The founding and session errors of `World::found` and
   `flife_runtime::open`.
-- A window that cannot be polled, rendered, presented or closed: `StateConflict`, carrying the presenter's error.
+- A window that cannot be polled, rendered, presented or closed, or an offscreen frame that cannot be rendered or
+  read back: `StateConflict`, carrying the presenter's or the renderer's error.
+- The binary refuses (exit 2, before anything opens) an `--offscreen` that is not a positive, finite number of
+  seconds, a `--scale` of 0, and `--scale` or `--offscreen-zooms` without `--offscreen`.
 - `SessionThread::send` on a full lane: `BudgetExhausted`. On a gone thread: `QueueClosed`.
 - The session's own refusals arrive as `Status::Refused` with their error class, a rejected stroke's included.
   The Studio does not check a stroke itself: the engine's validation refuses a cell off the grid or a disk wider
@@ -358,7 +395,43 @@ presentation state, not scientific state.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
   terms to the observers: 32.5 MiB at 3840 x 2160, which leaves the backend 222.1 MiB of the 2 GiB budget (203.4
   with the preset's bloom).
-- `src/main.rs` unit tests (3, FL-022, FL-024): the `submitted` record of each brush's stroke as JSON, exactly (the
+- `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
+  frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
+  ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
+  frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
+  range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
+- `tests/offscreen.rs` (5 tests, FL-024, Metal compute, no window), `Studio::open` offscreen on the preset at
+  320 x 200 points and 2 pixels a point:
+  - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
+    the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
+    view's job, and not blank;
+  - posted input as a window's: key 2 restyles to the energy mapping; a scroll zooms by exactly `scroll_zoom`'s
+    factor about the pointer, its world point held within 1e-9; a click on the shown organism nearest the
+    centre selects it (`flife_manim::pick`'s choice) and its inspection answers; a posted `Resized` becomes the
+    surface's geometry and refits the view to 800 x 500, its frame that size; Space runs the world on; every
+    frame was rendered;
+  - FL-019's key on the Metal route: the generation and affinity keys' swatch interiors (2 px inside each square,
+    over 1,100 pixels a key) are their sRGB colours exactly with the bloom off; with the preset's bloom (0.15)
+    they were within 8 and 16 levels (printed);
+  - a running world with a camera move arriving at a random moment of every third frame interval of a 60 Hz
+    loop: every move reaches the next frame; frame work and arrival-to-drawn latency are printed, not asserted;
+  - the queue keeps at most `INPUT_QUEUE_CAPACITY` events between frames and counts the rest as dropped.
+- `tests/offscreen_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5
+  --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen` and carries
+  its admission, whose terms sum to its peak within the budget, with no backend term on the CPU reference, and
+  whose observers are charged at least the device bytes of the 640 x 400 drawable's extra pixels more than a
+  0.1 s run at one pixel a point; the world runs; every `frame` summary counts each frame rendered, none presented, and at least a 640 x 400 frame's bytes
+  read back per frame; the `clock` records count frames; the `end` counts every frame rendered, no keys and no
+  dropped input, a move in every third frame interval with none unmoved and every move but perhaps the last
+  drawn, and ordered percentiles; and the world it closed on is the configuration stepped directly to its tick,
+  digest for digest.
+- `src/main.rs` unit tests (5, FL-022, FL-024): the parser takes `--offscreen 2.5` (2 pixels a point by default),
+  `--scale 3` and `--offscreen-zooms` with it, and refuses `--offscreen` of 0, -1, NaN, inf or a word,
+  `--scale 0`, and `--scale` or `--offscreen-zooms` alone, so no refused run can open a window; `next_slot`
+  keeps 300 frames of 15 ms work on their 30 Hz slots, exactly, though every wait overshoots by 6 ms, and after
+  a frame three periods long starts the next at its end and the one after a period later (that the loop calls it
+  with its last slot, not the frame's start, is shown by the pacing A/B below, not by a test); and
+  the `submitted` record of each brush's stroke as JSON, exactly (the
   material's 32-component `direction`; absent fields null), the `finished` record of an applied command (tick,
   published tick, energy) and of a cancelled one, and the `clock` record of a reading.
 - In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
@@ -391,7 +464,7 @@ presentation state, not scientific state.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
-reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headless runs and frame export.
+reference CPU world; offscreen, any thread of a process on a host with a Metal device. Linux has no native Studio (§13.6). Linux guarantees headless runs and frame export.
 
 **Known gaps.**
 - Moving the window to a screen of another density changes the backing scale; the next frame then takes the new
@@ -405,9 +478,10 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   seen when epochs arrive slower than frames, and for steps.
 - FL-021's inspector panel is the overlay's last lines: what the last answer read (its tick, lineage, generation,
   energy and its change, age, speed and heading, hidden widths and parameter count, and the held output's
-  reproduction probability and emission gate). The host's send on a click, `Studio::inspect_selected`'s refresh
-  once a second while the world runs, the panel's drawing and the record's printing run only in a window, which no
-  test here opened; `overlay_text` and the session thread's answers are tested without one. While the world runs,
+  reproduction probability and emission gate). The host's send on a click runs offscreen in `tests/offscreen.rs`,
+  where a posted click's inspection answers. The binary's refresh once a second while the world runs
+  (`Studio::inspect_selected`), the panel's drawing and the record's printing run only in a window, which no test
+  here opened; `overlay_text` and the session thread's answers are tested without one. While the world runs,
   the snapshot is read at the session's committed boundary when the inspection is answered, usually later than the
   epoch the click selected on; the record carries both ticks and the panel names the tick it was read at, so it is
   up to about a second old. The panel shows none of the snapshot's genome, parent, position, phase, cooldown,
@@ -430,14 +504,18 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     command's watcher keeps asking every 20 ms.
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush
     does survives the process (recording is FL-023).
-- FL-024: the `clock` records and the overlay are printed and drawn only in a window, which no test here opened.
-  The meter, the record's JSON, the overlay's text and its glyphs are tested without one; `flife-manim`'s
-  `tests/hud.rs` renders the overlay through the CPU route. The overlay's tick is the shown tick when the session
+- FL-024: the binary's `clock` records and overlay run offscreen in `tests/offscreen_binary.rs`, which checks the
+  records' frames but neither their rates nor the overlay's pixels, and in a window, which no test here opened.
+  `tests/offscreen.rs` draws the colour key through the Metal route; the meter, the record's JSON, the overlay's
+  text and its glyphs are tested on their own; `flife-manim`'s `tests/hud.rs` renders the overlay through the CPU
+  route. The overlay's tick is the shown tick when the session
   last reported a status or the clocks last read, so while running it is up to a second old. A window shorter than the summary interval, or one in which the feed published no newer epoch,
   reads what the feed shows: the session may have stepped further than it has published.
 - FL-043: `Studio::open` admits the world and its observers before installing the backend
-  (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so, installs the
-  bounded backend and reports `memory` in its `open` record runs only in a window, which no test here opened.
+  (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so and reports
+  `memory` in its `open` record runs offscreen in `tests/offscreen_binary.rs`: on the CPU reference the terms sum
+  to the peak, within the budget, with no backend term, and the observers are charged for the drawable in pixels.
+  That it installs the bounded Metal backend runs only in a window, which no test here opened.
   - A resize past the opening size, in pixels and density bins, is not admitted again.
   - The device terms (`DEVICE_BYTES_PER_PIXEL`: the Metal route's RGBA16F and RGBA8 surfaces and three window
     drawables; and the bloom's row sums) come from FrankenManim's and AppKit's buffers as declared, not from a measurement: device memory is
@@ -469,12 +547,35 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
     alone, both took 11.9 ms end to end (median). The Studio's `frame` and `end` records carry `MetalReport`'s
     copies, counted per presented or occluded frame. The tally is tested on real reports without a window, but
     no window was run here, so no session's records were read.
-- Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
-  one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
-  synchronous present path is an integration starting point, not latency evidence.
-- The colour key is drawn only in a window, which no test here opened: the host's choice of the shown mapping's key
-  each frame and its swatches' colours on screen. `overlay_text`, `legends` and the key's colours are tested
-  without one, and `flife-manim`'s `tests/hud.rs` draws coloured swatches through the CPU route. The key shows
+- G6 (§13.7) is measured offscreen, not in a window. The runs are the release `flife-studio --offscreen 20
+  --offscreen-zooms` on the preset (4,096 founders, 1920 x 1080 points, 30 frames a second), its controllers on
+  the CPU reference with 16 workers, on an Apple M5 Ultra (36 cores) shared with other work (load average 22 to
+  34), three interleaved rounds a scale:
+  - At 1 pixel a point (1920 x 1080) it drew 30.00 frames a second (30.00, 29.99, 30.02; cv 0.04 %). Frame work
+    p95 was 27.4 ms. A camera move's time from its arrival to the end of the frame that drew it was 32.7 ms at the
+    median, 51.6 ms at p95 and 62.7 ms at most.
+  - At 2 pixels a point (3840 x 2160) it drew 29.79 (29.42, 29.79, 29.80; cv 0.7 %). Frame work p95 was 33.2 ms,
+    and the latency was 39.6, 59.9 and 87.5 ms.
+  - Every move moved the view.
+  - The fixed schedule is the lever (`next_slot`). In the same invocation the incumbent pacing drew 27.87
+    (cv 3.6 %) and 28.32 (cv 0.3 %). It waits a period from each frame's start, so every oversleep delays every
+    later frame. Paired, the schedule drew 1.074 to 1.145 times as many frames at 1x and 1.045 to 1.052 at 2x.
+  - The simulation kept its pace. In an earlier study with the incumbent pacing, each Studio run closed on the
+    world `flife run` reaches at the same tick, digest for digest. Its ticks a second were 0.97 to 1.08 (1x) and
+    0.94 to 1.03 (2x) of `flife run`'s. Both pacings ran 114.5 to 118.5 ticks a second.
+
+  What this does not show:
+  - It includes neither AppKit's event delivery nor the window's present and vsync.
+  - The offscreen frame adds a readback that a window does not do (33 MB a frame at 4K).
+  - The 4K frame's work p95 sits at the 33.3 ms budget, so a heavier 4K frame misses its slot.
+  - The controllers ran on the CPU reference, not on Metal.
+  - The host was not quiet.
+  - The windowed G6 run is `flife-studio presets/reference-small-world.toml` on a 2x screen, which no test here
+    opens.
+- The colour key's swatches are their colours on the Metal route only without a bloom: the preset's bloom (0.15),
+  which blurs the overlay with everything else, moved their interiors by up to 8 levels (the generation key) and
+  16 (the affinity key). The binary's choice of the shown mapping's key each frame runs offscreen in
+  `tests/offscreen_binary.rs`, where nothing restyles, and in a window, which no test here opened. The key shows
   sample values, not a continuous ramp; the lineage key cannot say which lineage a colour is. The presenter has no
   window-title setter. The style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed.

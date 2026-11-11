@@ -26,7 +26,7 @@ use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ColorMapping, ControllerChoice, End, Frame, KEY_D, KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F,
     KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, MOTION_MAX, Motion,
-    PICK_RADIUS_POINTS, Particles, Status, Studio, StudioOptions, Style,
+    PICK_RADIUS_POINTS, Particles, Status, Studio, StudioOptions, Style, Surface,
 };
 use fmn_render::metal::{
     LogicalPoint, Modifiers, PixelDensity, PointerButton, PresentOutcome, SurfaceMetrics,
@@ -207,6 +207,7 @@ fn live() -> Result<Vec<String>, String> {
         // shows the GPU-evaluated world is the directly stepped one.
         controllers: ControllerChoice::Auto,
         style: Style::default(),
+        surface: Surface::Window,
     };
     let studio = Studio::open(&config, &options).map_err(|error| format!("opening: {error}"))?;
     let mut live = Live {

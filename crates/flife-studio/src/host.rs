@@ -49,7 +49,7 @@ use fmn_render::metal::{
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
-use crate::{CameraMove, Controls, Intent, Pacer, SessionThread, Status};
+use crate::{Brush, CameraMove, Controls, Intent, Pacer, SessionThread, Status, brush};
 
 /// The session a Studio opens.
 pub const STUDIO_SESSION: SessionId = SessionId::new(1);
@@ -123,6 +123,8 @@ pub struct Frame {
     pub selected: Option<OrganismId>,
     /// The world point under the pointer.
     pub hover: Option<[f64; 2]>,
+    /// The armed brush, if any (FL-022).
+    pub brush: Option<Brush>,
     /// The presentation outcome; `None` when the window was occluded or
     /// closed and nothing was rendered.
     pub outcome: Option<PresentOutcome>,
@@ -147,6 +149,8 @@ pub struct FrameTally {
     pub camera_moves: u64,
     /// Clicks picked (an organism, or nothing).
     pub selections: u64,
+    /// Brush clicks offered to the session as strokes (FL-022).
+    pub strokes: u64,
     /// Intents accepted.
     pub intents: u64,
     /// Intents refused.
@@ -401,6 +405,7 @@ impl Studio {
             .map(|metrics| [metrics.logical_width, metrics.logical_height]);
         let mut viewport = *self.view.viewport();
         let mut picked = None;
+        let mut strokes = Vec::new();
         for change in self.controls.take_moves() {
             match change {
                 CameraMove::Zoom { anchor, factor } => {
@@ -430,6 +435,20 @@ impl Studio {
                         picked = Some(self.view.pick_in(&viewport, point, radius));
                     }
                 }
+                // Through the view as it was at the click, as a selection.
+                CameraMove::Brush { at, brush } => {
+                    if let Some(size) = logical
+                        && let Some(stroke) = brush::stroke(
+                            brush,
+                            &viewport,
+                            size,
+                            self.current.field().cells(),
+                            [at.x, at.y],
+                        )
+                    {
+                        strokes.push(stroke);
+                    }
+                }
             }
         }
         let moved = self.view.set_view(viewport)?;
@@ -454,6 +473,22 @@ impl Studio {
                     self.tally.refused += 1;
                     self.controls.refused(intent);
                 }
+            }
+        }
+        for stroke in strokes {
+            let seen = self
+                .view
+                .shown()
+                .map_or_else(|| self.current.tick(), |shown| shown.tick);
+            let intent = Intent::Intervene { stroke, seen };
+            self.tally.strokes += 1;
+            if self.session.send(intent).is_ok() {
+                intents += 1;
+                self.tally.intents += 1;
+            } else {
+                refused += 1;
+                self.tally.refused += 1;
+                self.controls.refused(intent);
             }
         }
 
@@ -528,6 +563,7 @@ impl Studio {
             motion: self.view.motion(),
             selected: self.view.selected(),
             hover: self.controls.hover(self.view.viewport()),
+            brush: self.controls.brush(),
             outcome,
         })
     }

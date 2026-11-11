@@ -5,9 +5,13 @@
 //! a `selection` each time the selected organism changes (a click, or the
 //! selected organism gone from a newer epoch), an `inspected` record for
 //! each organism a click selects (FL-021: it at the session's committed
-//! boundary `tick`, selected on the epoch of `seen_tick`), and a `frame`
-//! summary about once a second, then an `end` with the committed world's
-//! digest. An error
+//! boundary `tick`, selected on the epoch of `seen_tick`), a `brush` each
+//! time the armed brush changes, a `submitted` record for each brush click
+//! the session accepted as a command (FL-022: the boundary of
+//! `effective_tick` it applies at) and a `finished` record when it applied
+//! (the tick, the published tick and the energy it moved) or was cancelled,
+//! and a `frame` summary about once a second, then an `end` with the
+//! committed world's digest. An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -25,8 +29,10 @@ use flife_backend_metal::ControllerChoice;
 use flife_core::ValidatedConfig;
 use flife_core::memory::MemoryAdmission;
 use flife_engine::OrganismSnapshot;
+use flife_runtime::Outcome;
 use flife_studio::{
-    ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status, Studio, StudioOptions, Style,
+    Brush, ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status, Stroke, Studio,
+    StudioOptions, Style,
 };
 use serde::Serialize;
 
@@ -134,6 +140,34 @@ enum Record<'a> {
         position: Option<[f64; 2]>,
         shown_tick: Option<u64>,
     },
+    /// The armed brush changed (FL-022); `None` when disarmed.
+    Brush {
+        schema: &'static str,
+        brush: Option<&'static str>,
+    },
+    /// A brush's command was accepted for the boundary of `effective_tick`.
+    Submitted {
+        schema: &'static str,
+        command: u64,
+        brush: &'static str,
+        cell: Option<[u32; 2]>,
+        center: Option<[f64; 2]>,
+        radius: Option<f64>,
+        amount: Option<f64>,
+        seen_tick: u64,
+        effective_tick: u64,
+    },
+    /// A command finished: `applied` at the boundary of `tick`, published
+    /// as `published_tick`, moving `energy`; or `cancelled` or `failed`.
+    Finished {
+        schema: &'static str,
+        command: u64,
+        outcome: &'static str,
+        tick: Option<u64>,
+        published_tick: Option<u64>,
+        energy: Option<f64>,
+        detail: Option<String>,
+    },
     Status {
         schema: &'static str,
         status: &'static str,
@@ -174,6 +208,7 @@ enum Record<'a> {
         presented: u64,
         epochs: u64,
         refits: u64,
+        strokes: u64,
         intents: u64,
         refused: u64,
         keys: u64,
@@ -294,6 +329,7 @@ fn main() -> ExitCode {
     let period = Duration::from_secs(1) / fps;
     let mut summary = Instant::now();
     let mut selected = None;
+    let mut armed = None;
     while !studio.should_close() {
         let started = Instant::now();
         let frame = match studio.frame() {
@@ -317,6 +353,13 @@ fn main() -> ExitCode {
                 particles: style.particles.name(),
                 field: style.field,
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
+            });
+        }
+        if frame.brush != armed {
+            armed = frame.brush;
+            print(&Record::Brush {
+                schema: STUDIO_SCHEMA,
+                brush: armed.map(Brush::name),
             });
         }
         if frame.selected != selected {
@@ -363,6 +406,7 @@ fn main() -> ExitCode {
                 presented: closed.frames.presented,
                 epochs: closed.frames.epochs,
                 refits: closed.frames.refits,
+                strokes: closed.frames.strokes,
                 intents: closed.frames.intents,
                 refused: closed.frames.refused,
                 keys: closed.input.keys,
@@ -410,6 +454,65 @@ fn status_record(status: &Status) -> Record<'static> {
             record("refused", None, None, Some(kind), Some(detail.clone()))
         }
         Status::Closed { at } => record("closed", None, Some(at.get()), None, None),
+        Status::Submitted {
+            command,
+            stroke,
+            seen,
+            effective,
+        } => {
+            let (cell, amount, center, radius) = match *stroke {
+                Stroke::Energy { cell, amount } => (Some(cell), Some(amount), None, None),
+                Stroke::Removal { center, radius } => (None, None, Some(center), Some(radius)),
+            };
+            Record::Submitted {
+                schema: STUDIO_SCHEMA,
+                command: command.get(),
+                brush: stroke.brush().name(),
+                cell,
+                center,
+                radius,
+                amount,
+                seen_tick: seen.get(),
+                effective_tick: effective.get(),
+            }
+        }
+        Status::Finished { command, outcome } => {
+            let finished = |outcome, tick, published_tick, energy, detail| Record::Finished {
+                schema: STUDIO_SCHEMA,
+                command: command.get(),
+                outcome,
+                tick,
+                published_tick,
+                energy,
+                detail,
+            };
+            match outcome {
+                Outcome::Applied {
+                    tick,
+                    published,
+                    applied,
+                    ..
+                } => finished(
+                    "applied",
+                    Some(tick.get()),
+                    Some(published.get()),
+                    Some(*applied),
+                    None,
+                ),
+                Outcome::Cancelled {
+                    boundary, reason, ..
+                } => finished(
+                    "cancelled",
+                    Some(boundary.get()),
+                    None,
+                    None,
+                    Some(format!("{reason:?}")),
+                ),
+                Outcome::Failed { detail, .. } => {
+                    finished("failed", None, None, None, Some(detail.clone()))
+                }
+            }
+        }
         Status::Inspected {
             organism,
             seen,

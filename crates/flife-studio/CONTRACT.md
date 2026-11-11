@@ -5,7 +5,9 @@
 rendering (§13.4), and the configured bloom on glowing frames (§2.3). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
-bounded snapshot at its committed boundary (§14.2). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
+bounded snapshot at its committed boundary (§14.2). FL-022 (`flife-2jj`, part) adds two brushes: a click becomes a
+world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
+at and the energy it moved (§14.3, §12.3). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
@@ -38,15 +40,18 @@ adapter.
     | R | switch the glow and raw looks |
     | D | switch dots and density |
     | F | show or hide the field |
-
     | 0 | the whole torus again (a `CameraMove::Reset`) |
+    | E | arm the energy brush, or disarm it (FL-022) |
+    | X | arm the removal brush, or disarm it (FL-022) |
 
-    The style keys and 0 ignore auto-repeat and ⌘, and produce no intent.
+    The style keys, 0, E and X ignore auto-repeat and ⌘, and produce no intent. E or X with the other brush armed
+    switches to it. `brush()` is the armed brush.
   - Pointer gestures become `CameraMove`s, in logical points, kept in order until `take_moves()` (reserved once
     for a poll's events):
     - a primary press that moves more than `CLICK_SLOP_POINTS = 4` is a drag: `Pan` by the whole motion since the
       press, then by each move, so the pans sum to the pointer's motion;
-    - a primary press released within the slop is a click: `Select { at }` at the press;
+    - a primary press released within the slop is a click: `Select { at }` at the press, or with a brush armed at
+      the release, `Brush { at, brush }` (FL-022);
     - capture loss ends a press: no click, no more panning;
     - a vertical scroll is `Zoom { anchor, factor }` about the pointer, `factor = scroll_zoom(dy, unit) =
       exp(rate · dy)` with `ZOOM_PER_POINT = 0.01` (trackpad points) or `ZOOM_PER_LINE = 0.1` (wheel lines), the
@@ -66,6 +71,24 @@ adapter.
     `Inspected { organism, seen, snapshot }`: `seen` is the source tick of the epoch it was selected on, unchanged,
     and the snapshot is the organism at the session's committed boundary, which its `tick` names, or `None` when
     the committed world no longer holds it.
+  - FL-022: `Intent::Intervene { stroke, seen }` submits the stroke's intervention as a `Command` for
+    `Target::NextAdmissible`, stating the session's configuration hash, with identities counting from 1 (the
+    Studio opens fresh sessions only). An acceptance reports `Submitted { command, stroke, seen, effective }`,
+    `effective` being the committed tick whose boundary it applies at; a rejection reports `Refused` with the
+    engine's error class for an invalid payload, or `wrong-session`, `revision-mismatch`, `late`, `queue-full`,
+    `conflicting-reuse`, `stopped` or `closed`, and takes no identity. A watcher task, owned by the controller and
+    joined at close, asks `SessionHandle::status` every `OUTCOME_POLL` = 20 ms and reports
+    `Finished { command, outcome }` once the command is terminal: for `Applied`, the tick it applied at, the tick
+    that published it and the energy it moved. A paused session holds the command until a step or a run reaches
+    its boundary. At close, a pending command's watcher stops when the session refuses its status.
+- `brush` (FL-022): `Brush::{Energy, Removal}` and `Stroke`, a click's world-space payload.
+  `stroke(brush, viewport, logical, cells, at)` maps the logical point `at` through the viewport to the world point
+  under it, `None` in the letterbox margin or while the content area is empty:
+  - energy: `Stroke::Energy { cell, amount: BRUSH_ENERGY }` (64, 32 founders' endowments), the field cell whose
+    square holds the world point, `⌊x / (L / cells)⌋` on each axis; `Intervention::InjectEnergy`;
+  - removal: `Stroke::Removal { center, radius }`, centred on the world point, `BRUSH_RADIUS_POINTS` = 12 points on
+    screen at the drawable's density and the view's zoom, at most half the shorter world side;
+    `Intervention::RemoveOrganisms` with `Disposition::Recycle`, so removed energy goes where a death's does.
 - `Studio` is the main-thread host. It opens the window at `PixelDensity::Backing`: the window keeps its size in
   points, and each frame fills its device pixels (FL-020). Each `frame()`:
   1. drains typed input through `Controls` and offers the resulting intents;
@@ -79,7 +102,9 @@ adapter.
      epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
      (scaled to drawable pixels); then takes the view and the selection. A click that selects an organism offers
      `Intent::Inspect` for it with the shown epoch's tick as `seen` (FL-021), counted with the frame's intents or
-     refusals;
+     refusals. A brush click makes its stroke through the view as it stood at that click, over the shown epoch's
+     field grid, and is offered as `Intent::Intervene` with the shown epoch's tick as `seen` (FL-022), counted in
+     `FrameTally::strokes` and with the intents or refusals;
   6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
      makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
      fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
@@ -88,7 +113,7 @@ adapter.
   7. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
 
   It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
-  `Prior`, the `Motion` or `None` at rest, selected organism, hover, outcome). `display_pair()` is the epochs it
+  `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, outcome). `display_pair()` is the epochs it
   holds and `pacer()` the pacer.
 - `Pacer` times the display's motion (§13.5, one-state display latency): `arrive(now)` for an epoch of a running
   stream moves the smoothed interval between arrivals by `ARRIVAL_SMOOTHING = 0.25` of the difference, and a wait
@@ -117,11 +142,15 @@ adapter.
     age, position, velocity, energy and its change rate, phase, cooldown, topology, hidden widths, parameter count,
     sensing scale, motion response, affinity, and the decoded held output (attempt rate and probability, child
     fraction, emission gate, emission direction and spend fraction) or null;
+  - FL-022: one `brush` each time the armed brush changes (`energy`, `removal` or null); one `submitted` per
+    accepted stroke: its `command`, `brush`, the `cell` and `amount` or the `center` and `radius`, `seen_tick` and
+    `effective_tick`; and one `finished` per command: `outcome` `applied` with its `tick`, `published_tick` and
+    `energy`, or `cancelled` or `failed` with a `detail`;
   - a `frame` summary about once a second, with the camera's center and zoom, and the bytes the Metal route has
     copied so far: to the device (`upload_bytes`, and the most in one frame, `peak_upload_bytes`) and back to the
     host (`readback_bytes`, none for frames presented to the window);
-  - `end`, with the committed tick, the world digest, the controller evaluations the backend returned and
-    deferred, and its failure if it failed, and the same copy totals.
+  - `end`, with the committed tick, the world digest, the strokes offered, the controller evaluations the backend
+    returned and deferred, and its failure if it failed, and the same copy totals.
 
   Errors are `frankenlife.error.v1` on standard error. The exit code is 0 after a clean close, 2 when the
   configuration or window fails, and 1 after a later failure.
@@ -132,7 +161,8 @@ adapter.
   use `try_iter`, and epochs come from the lock-free feed.
 - *Observation neutrality.* The main thread reads the world only through render epochs. It holds at most
   `DISPLAY_PAIR` = 2 leases: the shown epoch, and while the display moves, its prior; at rest, one. Input reaches the
-  world only as session intents: camera moves, selection and the display's motion never do.
+  world only as session intents: camera moves, selection and the display's motion never do, and a brush click
+  reaches it only as a command the session admits and applies at a committed boundary (FL-022).
 - *Committed states only (§13.5).* The display is drawn only between two committed epochs of one world, by
   identity: a birth appears with the first epoch that has it, a death fades and is never picked, an ambiguous gap
   snaps, and a prior that is not an earlier state of the same world is not drawn between.
@@ -145,7 +175,8 @@ adapter.
   is full is counted, and a refused resume leaves the controls paused.
 - *Capture safety.* Losing focus with buttons held delivers `PointerCaptureLost` before `FocusLost`, and the controls
   clear the held buttons.
-- *Same science.* A live session's committed world equals the same configuration stepped directly to the same tick.
+- *Same science.* A live session's committed world equals the same configuration stepped directly to the same tick,
+  with the same interventions at the same ticks.
 - *No unsafe.* The crate is `forbid(unsafe_code)`. All AppKit and Core Graphics FFI is in frankentorch's reviewed
   presenter.
 
@@ -155,14 +186,16 @@ adapter.
   `flife_runtime::open`.
 - A window that cannot be polled, rendered, presented or closed: `StateConflict`, carrying the presenter's error.
 - `SessionThread::send` on a full lane: `BudgetExhausted`. On a gone thread: `QueueClosed`.
-- The session's own refusals arrive as `Status::Refused` with their error class.
+- The session's own refusals arrive as `Status::Refused` with their error class, a rejected stroke's included.
+  The Studio does not check a stroke itself: the engine's validation refuses a cell off the grid or a disk wider
+  than half the world (`numerical-invalid`).
 
 **Determinism.** The session's science is the owner's (FL-014): deterministic for its configuration and the ticks it
 commits, whatever the frame rate, focus or window size. Frame timing, coalescing and pointer positions are
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (13 tests):
+- `tests/controls.rs` (15 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
@@ -175,13 +208,16 @@ presentation state, not scientific state.
     lost to capture loss pans no further; scrolls zoom by `exp(rate · dy)` in both units, limited, with no move for
     a zero or non-finite delta; 0 resets once (not on repeat or with ⌘) and is no style key; 256 moves wait in
     order until taken.
+  - FL-022: E and X arm, switch and disarm the brushes (their codes pinned to `kVK_ANSI_E` and `kVK_ANSI_X`), not
+    on repeat or with ⌘, with no move, intent or style change; an armed click brushes at the press with the brush
+    armed at the release, a drag still pans, and once disarmed a click selects.
 - `tests/pacing.rs` (5 tests, FL-020): at rest before an interval is known; the display moves over the interval
   between arrivals (worked fractions, capped at 1, a frame before the arrival at 0) and later intervals smooth by a
   quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
   too; a step alone moves over `MOTION_MAX` whatever came before and smooths down once epochs flow; arrivals with
   no time between leave the display at rest.
-- `tests/live.rs` (harness-free, 31 checks, `--features synthetic-input`): the real 4,096-organism reference preset
-  in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
+- `tests/live.rs` (harness-free, 31 checks when last run, before FL-022 added three; `--features synthetic-input`):
+  the real 4,096-organism reference preset in a real 640 × 400 window. Every input is a real NSEvent or Core Graphics event posted to the application queue
   and delivered through the presenter's typed bridge:
   - the first poll's real `Resized` (640 × 400 points), and a real `FocusGained` (made key by a real key-window
     change if another application holds the keyboard);
@@ -214,8 +250,13 @@ presentation state, not scientific state.
     ring as the last draw; a step keeps the selection exactly when the new epoch has the organism; a click on an
     empty spot deselects; 0 restores the fitted viewport bit for bit;
   - no intent refused and no input dropped;
-  - Esc closes at the last stepped tick (three steps after the pause);
-  - the committed world's digest equals the directly stepped world's.
+  - FL-022 (added with the brushes, compiled but not run here, so not yet evidence): E arms the energy brush; a
+    real click is `Submitted` as command 1 with the stroke `brush::stroke` makes for that point through the fitted
+    view, for the boundary of the paused tick, and selects nothing; a step reports it `Applied` there, published at
+    the next tick; E disarms;
+  - Esc closes at the last stepped tick (four steps after the pause);
+  - the committed world's digest equals the directly stepped world's, given the stroke at its tick, which moves
+    the same energy bit for bit.
   - Off macOS it reports itself skipped.
 - In `flife-runtime`, `tests/session.rs` checks `SessionHandle::start` across six Lab seeds: the start comes back at
   once, and the end comes back for a pause, a reached tick and a close.
@@ -227,6 +268,26 @@ presentation state, not scientific state.
   - while running: 48 inspections, then a pause; every snapshot the direct world's at its own tick, every
     organism answered with none dead at the close, and the closed world the direct one. Which ticks the answers
     land on depends on thread timing; the Lab test in `flife-runtime` is the one that requires answers mid-run.
+- `tests/brush.rs` (6 tests, FL-022, no window):
+  - an energy click names the cell whose square holds the world point under it (the oracle is the cell's bounds,
+    on a 64 x 16 grid of non-square cells over a lattice of clicks), at fit, zoomed 2.75 and centred on the seams
+    at zoom 2; both ends of both axes are reached, either side of the seams gives the last cells and the first,
+    and the margin, an empty content area and an empty grid make none;
+  - a removal click is centred on the world point under it with the world distance to the point 12 points to its
+    right as its radius (within 1e-12) at zooms 1, 4 and 13.5, a quarter at zoom 4 of zoom 1's, held to 16 in a
+    16-point window over 32 world units, and none in the margin;
+  - the payloads are exactly `InjectEnergy` and `RemoveOrganisms` with `Disposition::Recycle`;
+  - a `SessionThread` over a 32 x 32 preset world paused at tick 2: an energy stroke (seen at 1) and a removal
+    about a living organism are `Submitted` as commands 1 and 2 for the boundary of tick 2 and wait there through
+    ten polls; the next step reports both `Applied` at tick 2, published at 3, with the energy a direct world
+    stepped with both interventions at tick 2 reports, bit for bit; the organism is gone, and the closed world is
+    the direct one;
+  - while running: 16 strokes, then a pause; every stroke applied at the tick it was submitted for and published
+    at the next, over more than one boundary; a direct world stepped with each tick's strokes in command order
+    reports every energy bit for bit and ends on the closed world's digest. Which ticks they land on depends on
+    thread timing;
+  - a cell off the grid and a disk wider than half the world are refused as `numerical-invalid` and take no
+    identity; a stroke still pending at close never applies, and the close returns with the founding world.
 - In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
   backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
@@ -265,7 +326,7 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   real-window test, and frankentorch's planted bug for `contentsScale` following a screen change survives for the
   same reason.
 - Camera smoothing, trails and a pinch-zoom gesture are not implemented (§13.5 allows smoothing and trails; G6's
-  100 ms budget argues against smoothing the camera). Brushes as `CommandPort` commands are FL-022's.
+  100 ms budget argues against smoothing the camera).
 - While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
@@ -275,6 +336,20 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   boundary when the inspection is answered, usually later than the epoch the click selected on; the record carries
   both ticks. §14.2's sampled activations, inputs, transactions, descendants, local efficiency and weight dumps are
   not implemented.
+- FL-022's brushes:
+  - The host's brush path (the click through the frame's view to `Intent::Intervene`), the `brush`, `submitted`
+    and `finished` records and the `end` record's `strokes` run only in a window, which no test here opened. The
+    controls, the payload mapping and the session thread are tested headlessly. `tests/live.rs` has a brush case
+    that was compiled and not run.
+  - There is no brush cursor or disk preview on screen and no applied-energy readout: the Metal 3D route has no
+    text, so the armed brush and each command's outcome are records.
+  - A stroke is one click. Painting by drag, the material brush (`InjectMaterial`), seeded introduction
+    (`IntroduceOrganisms`), a choice of removal disposition, source edits and parameter edits have no Studio
+    brush; the engine's interventions for the first two exist (FL-022's earlier parts, run and branch flags).
+  - A finished command is reported up to `OUTCOME_POLL` after its publication; while paused, a pending
+    command's watcher keeps asking every 20 ms.
+  - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush
+    does survives the process (recording is FL-023).
 - FL-043: `Studio::open` admits the world and its observers before installing the backend
   (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so, installs the
   bounded backend and reports `memory` in its `open` record runs only in a window, which no test here opened.

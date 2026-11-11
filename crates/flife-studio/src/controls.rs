@@ -5,16 +5,18 @@
 //! what the presentation owner needs itself: the pointer, held buttons,
 //! focus and the surface geometry. It turns pointer gestures into
 //! [`CameraMove`]s, in logical points, which the presentation owner applies
-//! to its viewport and hit tests (FL-020). Nothing here reaches the world; a
-//! completed brush would become a canonical command through the session
-//! (FL-022).
+//! to its viewport and hit tests (FL-020). Nothing here reaches the world: a
+//! click of an armed [`Brush`] is a [`CameraMove::Brush`], which the
+//! presentation owner maps through its viewport to a world-space
+//! [`Stroke`](crate::Stroke) and offers the session as
+//! [`Intent::Intervene`] (FL-022).
 //!
 //! Pointer gestures:
 //!
 //! | Gesture | Move |
 //! |---|---|
 //! | primary drag (beyond [`CLICK_SLOP_POINTS`]) | pan: the world follows the pointer |
-//! | primary click (press and release within the slop) | select what is drawn under the press |
+//! | primary click (press and release within the slop) | select what is drawn under the press, or with a brush armed, brush there |
 //! | vertical scroll | zoom about the pointer by [`scroll_zoom`]; up zooms in |
 //!
 //! Keys, by virtual key code (`kVK_*`), so they do not depend on layout:
@@ -25,6 +27,8 @@
 //! | → or `.` (held: repeats) | step one tick while paused |
 //! | Esc, or ⌘W | close |
 //! | 0 | the whole torus again (zoom 1, centred) |
+//! | E | arm the energy brush, or disarm it (FL-022) |
+//! | X | arm the removal brush, or disarm it (FL-022) |
 //!
 //! and, for the presentation owner alone (FL-019's [`Style`]):
 //!
@@ -42,7 +46,7 @@ use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, PointerButton, ScrollUnit, SurfaceMetrics,
 };
 
-use crate::Status;
+use crate::{Brush, Status, Stroke};
 
 /// `kVK_Space`.
 pub const KEY_SPACE: u16 = 49;
@@ -64,6 +68,10 @@ pub const KEY_D: u16 = 2;
 pub const KEY_F: u16 = 3;
 /// `kVK_ANSI_0`.
 pub const KEY_ZERO: u16 = 29;
+/// `kVK_ANSI_E`.
+pub const KEY_E: u16 = 14;
+/// `kVK_ANSI_X`.
+pub const KEY_X: u16 = 7;
 
 /// How far, in logical points, a primary press may move and still be a
 /// click; beyond it the press is a drag.
@@ -120,10 +128,17 @@ pub enum CameraMove {
         /// Where the click pressed.
         at: LogicalPoint,
     },
+    /// Apply `brush` under the logical point `at` (FL-022).
+    Brush {
+        /// Where the click pressed.
+        at: LogicalPoint,
+        /// The brush armed then.
+        brush: Brush,
+    },
 }
 
 /// What the presentation owner asks of the session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Intent {
     /// Run until paused.
     Resume,
@@ -139,6 +154,15 @@ pub enum Intent {
         organism: OrganismId,
         /// The source tick of the epoch it was selected on. A running
         /// session's committed boundary can be past it.
+        seen: Tick,
+    },
+    /// Apply a brush's stroke (FL-022): submitted as a command for the next
+    /// boundary not yet sealed. The presentation owner sends this on a
+    /// brush click, not on a key.
+    Intervene {
+        /// The world-space stroke.
+        stroke: Stroke,
+        /// The source tick of the epoch it was made on.
         seen: Tick,
     },
     /// Close the session.
@@ -187,6 +211,8 @@ pub struct Controls {
     /// Whether the held press has moved beyond the click slop.
     dragging: bool,
     moves: Vec<CameraMove>,
+    /// The armed brush: a click brushes instead of selecting.
+    brush: Option<Brush>,
 }
 
 impl Controls {
@@ -270,6 +296,14 @@ impl Controls {
                         self.push(CameraMove::Reset);
                         None
                     }
+                    KEY_E => {
+                        self.arm(Brush::Energy);
+                        None
+                    }
+                    KEY_X => {
+                        self.arm(Brush::Removal);
+                        None
+                    }
                     code => {
                         self.restyle(code);
                         None
@@ -322,9 +356,27 @@ impl Controls {
         if let Some(at) = self.press.take()
             && !self.dragging
         {
-            self.push(CameraMove::Select { at });
+            self.push(match self.brush {
+                Some(brush) => CameraMove::Brush { at, brush },
+                None => CameraMove::Select { at },
+            });
         }
         self.dragging = false;
+    }
+
+    /// Arm `brush`, or disarm it if it is the one armed.
+    fn arm(&mut self, brush: Brush) {
+        self.brush = if self.brush == Some(brush) {
+            None
+        } else {
+            Some(brush)
+        };
+    }
+
+    /// The armed brush, if any.
+    #[must_use]
+    pub const fn brush(&self) -> Option<Brush> {
+        self.brush
     }
 
     /// Pointer motion while the primary press is held: once beyond the

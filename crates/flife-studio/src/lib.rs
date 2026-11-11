@@ -14,7 +14,10 @@
 //! The pointer reports the world point under it. Scrolling zooms about the
 //! pointer, a primary drag pans across the torus's seams, a click selects
 //! the organism drawn under it by identity, and 0 shows the whole torus
-//! again (FL-020).
+//! again (FL-020). E arms the energy brush and X the removal brush; with
+//! one armed, a click becomes a world-space command the session applies at
+//! its next open boundary, and the Studio reports the tick it applied at
+//! and the energy it moved ([`brush`], FL-022).
 //!
 //! The display runs one committed state behind the world: each new epoch's
 //! organisms move from where the previous epoch had them, matched by
@@ -23,16 +26,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod brush;
 mod controls;
 mod host;
 pub mod memory;
 mod pacing;
 mod session;
 
+pub use brush::{BRUSH_ENERGY, BRUSH_RADIUS_POINTS, Brush, Stroke, stroke};
 pub use controls::{
-    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_D, KEY_DIGITS, KEY_ESCAPE,
-    KEY_F, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT,
-    ZOOM_STEP_LIMIT, scroll_zoom,
+    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_D, KEY_DIGITS, KEY_E,
+    KEY_ESCAPE, KEY_F, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X, KEY_ZERO,
+    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
@@ -40,7 +45,7 @@ pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
-pub use session::{End, INTENT_CAPACITY, SessionThread, Status};
+pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 
 /// The schema of the Studio's NDJSON records.
 pub const STUDIO_SCHEMA: &str = "frankenlife.studio.v1";

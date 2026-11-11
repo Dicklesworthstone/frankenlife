@@ -22,10 +22,11 @@ use flife_core::ids::OrganismId;
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_render::{Interpolation, interpolate};
+use flife_runtime::Outcome;
 use flife_studio::{
-    ColorMapping, ControllerChoice, End, Frame, KEY_D, KEY_DIGITS, KEY_ESCAPE, KEY_F, KEY_PERIOD,
-    KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, MOTION_MAX, Motion, PICK_RADIUS_POINTS, Particles,
-    Status, Studio, StudioOptions, Style,
+    Brush, ColorMapping, ControllerChoice, End, Frame, KEY_D, KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F,
+    KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_ZERO, Look, MOTION_MAX, Motion,
+    PICK_RADIUS_POINTS, Particles, Status, Studio, StudioOptions, Style,
 };
 use fmn_render::metal::{
     LogicalPoint, Modifiers, PixelDensity, PointerButton, PresentOutcome, SurfaceMetrics,
@@ -823,6 +824,86 @@ fn live() -> Result<Vec<String>, String> {
         "0 shows the whole torus again: the fitted viewport, bit for bit",
     )?;
 
+    // FL-022: E arms the energy brush, and a real click becomes a command
+    // for the next boundary, its cell the one under the click through the
+    // view as it stood; the next step applies it.
+    live.key(KEY_E, "e")?;
+    live.until("the energy brush", |_, frame, _| {
+        frame.brush == Some(Brush::Energy)
+    })?;
+    let metrics = live.studio.controls().metrics().ok_or("no metrics")?;
+    let logical = [metrics.logical_width, metrics.logical_height];
+    let grid = [
+        config.config().world.grid_width,
+        config.config().world.grid_height,
+    ];
+    let at = fitted.world_to_drawable([70.3, 41.6]);
+    let expected = flife_studio::stroke(
+        Brush::Energy,
+        &fitted,
+        logical,
+        grid,
+        [at[0] / density, at[1] / density],
+    )
+    .ok_or("no stroke under the click")?;
+    let selections = live.studio.tally().selections;
+    click(&mut live, at)?;
+    live.until("the stroke's acceptance", |_, _, statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Submitted { .. }))
+    })?;
+    let submitted = live.statuses.iter().find_map(|status| match status {
+        Status::Submitted {
+            command,
+            stroke,
+            seen,
+            effective,
+        } => Some((command.get(), *stroke, seen.get(), effective.get())),
+        _ => None,
+    });
+    live.check(
+        submitted == Some((1, expected, paused + 3, paused + 3))
+            && live.studio.tally().selections == selections
+            && live.studio.tally().strokes == 1,
+        format!(
+            "a real click with the energy brush armed is command 1, {expected:?}, for the \
+             boundary of tick {}, and selects nothing",
+            paused + 3
+        ),
+    )?;
+    live.key(KEY_RIGHT, "\u{f703}")?;
+    live.until("the stroke applied", |_, _, statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Finished { .. }))
+    })?;
+    let applied = live.statuses.iter().find_map(|status| match status {
+        Status::Finished {
+            outcome:
+                Outcome::Applied {
+                    tick,
+                    published,
+                    applied,
+                    ..
+                },
+            ..
+        } => Some((tick.get(), published.get(), *applied)),
+        _ => None,
+    });
+    let Some((applied_tick, published_tick, applied_energy)) = applied else {
+        return Err(format!("the stroke did not apply: {:?}", live.statuses));
+    };
+    live.check(
+        (applied_tick, published_tick) == (paused + 3, paused + 4),
+        format!(
+            "the next step applies it at tick {applied_tick}, published at {published_tick}, \
+             moving {applied_energy} energy"
+        ),
+    )?;
+    live.key(KEY_E, "e")?;
+    live.until("the brush disarmed", |_, frame, _| frame.brush.is_none())?;
+
     // Esc closes.
     live.key(KEY_ESCAPE, "\u{1b}")?;
     live.until("the close request", |studio, _, _| studio.should_close())?;
@@ -837,7 +918,7 @@ fn live() -> Result<Vec<String>, String> {
         .studio
         .close()
         .map_err(|error| format!("closing: {error}"))?;
-    let final_tick = paused + 3;
+    let final_tick = paused + 4;
     if closed.session.boundary.tick.get() != final_tick {
         return Err(format!(
             "closed at tick {}, expected {final_tick}",
@@ -853,14 +934,36 @@ fn live() -> Result<Vec<String>, String> {
         NumericalProfile::reference_f32().map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    for _ in 0..final_tick {
-        match direct.step().map_err(|error| error.to_string())? {
-            Stepped::Published(_) => {}
+    // The brush's stroke at its tick, as the session applied it.
+    for tick in 0..final_tick {
+        let interventions = if tick == applied_tick {
+            vec![expected.intervention()]
+        } else {
+            Vec::new()
+        };
+        match direct
+            .step_with(&interventions)
+            .map_err(|error| error.to_string())?
+        {
+            Stepped::Published(report) => {
+                if let Some(applied) = report.interventions.first()
+                    && applied.applied.to_bits() != applied_energy.to_bits()
+                {
+                    return Err(format!(
+                        "the direct world's stroke moved {}, the session's {applied_energy}",
+                        applied.applied
+                    ));
+                }
+            }
             Stepped::Paused(shortfall) => {
                 return Err(format!("the direct world paused: {shortfall:?}"));
             }
         }
     }
+    checks.push(format!(
+        "the direct world given the stroke at tick {applied_tick} moves the same {applied_energy}, \
+         bit for bit"
+    ));
     let live_digest = closed.session.world.digest();
     let direct_digest = direct.digest();
     if live_digest != direct_digest {

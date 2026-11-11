@@ -124,7 +124,9 @@ selection rule sees only the discovery runs. The report is the same bytes at any
 a continuation.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
-printed as an `inspected` record; there is no on-screen inspector panel yet.**
+printed as an `inspected` record; there is no on-screen inspector panel yet. FL-022 gives it an energy brush and a
+removal brush: a click becomes a world-space command the session applies at its next open boundary, reported with
+the tick it applied at and the energy it moved; the host's brush path has not been run in a window here.**
 
 | Question | Answer |
 |---|---|
@@ -410,6 +412,11 @@ while running or paused, and change only the picture:
 | R | the raw look: no halos, linear grey field |
 | D | density per screen bin instead of dots |
 | F | show or hide the field |
+
+E arms the energy brush and X the removal brush (the same key again disarms). With one armed, a click adds 64
+units of declared energy to the field cell under it, or removes the organisms within 12 points of it on screen,
+their energy recycled as a death's. Each click is a command: a `submitted` record names the boundary it will apply
+at, and a `finished` record the tick it applied at and the energy it moved.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density` and `--no-field`.
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.

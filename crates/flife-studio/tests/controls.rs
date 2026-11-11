@@ -3,9 +3,9 @@
 
 use flife_manim::Viewport;
 use flife_studio::{
-    CameraMove, ColorMapping, Controls, Intent, KEY_D, KEY_DIGITS, KEY_ESCAPE, KEY_F, KEY_PERIOD,
-    KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_ZERO, Look, Particles, Style, ZOOM_PER_LINE,
-    ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+    Brush, CameraMove, ColorMapping, Controls, Intent, KEY_D, KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F,
+    KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X, KEY_ZERO, Look, Particles, Style,
+    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -364,6 +364,84 @@ fn a_click_selects_where_it_pressed_and_lost_presses_select_nothing() {
     assert_eq!(
         moves(&mut controls),
         [CameraMove::Pan { delta: [20.0, 0.0] }]
+    );
+}
+
+/// FL-022: E arms the energy brush and X the removal brush; the armed key
+/// again disarms, the other switches. Held (auto-repeat) or with ⌘ they do
+/// nothing, and neither is an intent or a style key.
+#[test]
+fn e_and_x_arm_switch_and_disarm_the_brushes() {
+    // `kVK_ANSI_E` is 0x0E and `kVK_ANSI_X` 0x07 (Carbon's `Events.h`).
+    assert_eq!([KEY_E, KEY_X], [0x0E, 0x07]);
+    let mut controls = Controls::new();
+    let style = controls.style();
+    assert_eq!(controls.brush(), None);
+    assert!(tap(&mut controls, KEY_E).is_empty());
+    assert_eq!(controls.brush(), Some(Brush::Energy));
+    assert!(tap(&mut controls, KEY_X).is_empty());
+    assert_eq!(controls.brush(), Some(Brush::Removal));
+    assert!(tap(&mut controls, KEY_X).is_empty());
+    assert_eq!(controls.brush(), None);
+    tap(&mut controls, KEY_X);
+    tap(&mut controls, KEY_E);
+    assert_eq!(controls.brush(), Some(Brush::Energy));
+    tap(&mut controls, KEY_E);
+    assert_eq!(controls.brush(), None);
+
+    controls.apply(&key(KEY_E, true, true, Modifiers::NONE));
+    controls.apply(&key(
+        KEY_X,
+        true,
+        false,
+        Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        },
+    ));
+    assert_eq!(controls.brush(), None);
+    assert!(moves(&mut controls).is_empty());
+    assert_eq!(controls.style(), style);
+    assert_eq!(Brush::Energy.name(), "energy");
+    assert_eq!(Brush::Removal.name(), "removal");
+}
+
+/// FL-022: with a brush armed a click brushes where it pressed instead of
+/// selecting, with the brush armed at the release; a drag still pans; once
+/// disarmed a click selects again.
+#[test]
+fn an_armed_click_brushes_and_a_drag_still_pans() {
+    let mut controls = Controls::new();
+    tap(&mut controls, KEY_X);
+    controls.apply(&button(true, point(40.0, 50.0)));
+    controls.apply(&drag_to(point(41.0, 51.0)));
+    controls.apply(&button(false, point(41.0, 51.0)));
+    controls.apply(&button(true, point(10.0, 10.0)));
+    controls.apply(&drag_to(point(30.0, 10.0)));
+    controls.apply(&button(false, point(30.0, 10.0)));
+    // Switched while held: the release brushes with the brush armed then.
+    controls.apply(&button(true, point(7.0, 8.0)));
+    tap(&mut controls, KEY_E);
+    controls.apply(&button(false, point(7.0, 8.0)));
+    tap(&mut controls, KEY_E);
+    controls.apply(&button(true, point(3.0, 4.0)));
+    controls.apply(&button(false, point(3.0, 4.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [
+            CameraMove::Brush {
+                at: point(40.0, 50.0),
+                brush: Brush::Removal
+            },
+            CameraMove::Pan { delta: [20.0, 0.0] },
+            CameraMove::Brush {
+                at: point(7.0, 8.0),
+                brush: Brush::Energy
+            },
+            CameraMove::Select {
+                at: point(3.0, 4.0)
+            },
+        ]
     );
 }
 

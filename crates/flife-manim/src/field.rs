@@ -11,6 +11,12 @@
 //! interpolates them bilinearly, wrapping, so the torus shows no seam. Its
 //! CPU and Metal 3D routes both sample textures. The layer is one scene
 //! object and one draw of two triangles, whatever the field's size.
+//!
+//! The texture depends only on the field's values and texels, the display
+//! scale and the look; the viewport moves only the quad. The layer keeps a
+//! copy of the values its texture was built from, and a placement of
+//! bitwise the same values, scale and look keeps the texture and rebuilds
+//! only the quad (FL-033): a pan or zoom of one epoch.
 
 use flife_core::CoreError;
 use flife_render::FieldTexture;
@@ -81,6 +87,22 @@ pub struct FieldLayer {
     texture: Option<Texture>,
     quad: Option<SurfaceMesh>,
     scale: f64,
+    /// What the texture was built from, apart from the values: the look,
+    /// the display scale's bits and the texels.
+    built: Option<(Look, u64, [u32; 2])>,
+    /// The field values the texture was built from, one `f32` a texel.
+    built_values: Vec<f32>,
+}
+
+/// Whether `a` and `b` hold the same values bit for bit.
+fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len()
+        && a.chunks(64).zip(b.chunks(64)).all(|(a, b)| {
+            a.iter()
+                .zip(b)
+                .fold(0, |differ, (x, y)| differ | (x.to_bits() ^ y.to_bits()))
+                == 0
+        })
 }
 
 impl FieldLayer {
@@ -92,6 +114,8 @@ impl FieldLayer {
             texture: None,
             quad: None,
             scale: 0.0,
+            built: None,
+            built_values: Vec::new(),
         }
     }
 
@@ -138,7 +162,9 @@ impl FieldLayer {
     }
 
     /// Place `field` in the layer at the current viewport and display
-    /// scale, which does not move: what a pan or zoom redraws.
+    /// scale, which does not move: what a pan or zoom redraws. A texture
+    /// built from bitwise the same values, at this scale and in this look,
+    /// is kept, and only the quad is rebuilt.
     ///
     /// # Errors
     /// As [`FieldLayer::update_look`].
@@ -159,6 +185,25 @@ impl FieldLayer {
         let [columns, rows] = cells.map(|n| n as usize);
         let values = field.values();
         let scale = self.scale;
+        let key = (look, scale.to_bits(), cells);
+        if self.built == Some(key) && same_bits(&self.built_values, values) {
+            self.quad = Some(self.viewport.periodic_quad(cells)?);
+            return Ok(());
+        }
+        // The copy is reserved before the texture is built, at exactly the
+        // field's size, so the layer never holds two.
+        self.built = None;
+        self.built_values.clear();
+        if self.built_values.capacity() != values.len() {
+            self.built_values = Vec::new();
+        }
+        self.built_values
+            .try_reserve_exact(values.len())
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "field layer values",
+                bytes: u64::try_from(values.len().saturating_mul(size_of::<f32>()))
+                    .unwrap_or(u64::MAX),
+            })?;
         let texel = |column: usize, row: usize| values[(row % rows) * columns + column % columns];
         let mut texels = Vec::new();
         texels
@@ -206,6 +251,8 @@ impl FieldLayer {
         let quad = self.viewport.periodic_quad(cells)?;
         self.texture = Some(texture);
         self.quad = Some(quad);
+        self.built_values.extend_from_slice(values);
+        self.built = Some(key);
         Ok(())
     }
 

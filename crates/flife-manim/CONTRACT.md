@@ -120,8 +120,11 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - drawn on the viewport's `periodic_quad` as FrankenManim's `SurfaceDraw::image`: unlit, without depth test,
     repeating both ways, which its CPU and Metal 3D routes both sample. FrankenManim interpolates the corners
     bilinearly, of premultiplied colour (Gouraud shading of a vertex grid before FL-033);
-  - `place(field, look)` rebuilds the texture and the quad in a new view at the current display scale, and
-    `refit(viewport)` takes the new view.
+  - `place(field, look)` places the field in a new view at the current display scale (`refit(viewport)` takes the
+    new view). The texture depends only on the field's values and texels, the scale and the look, so the layer
+    keeps a copy of the values it was built from (4 bytes a texel): a placement of bitwise the same values and
+    texels at the same scale in the same look keeps the texture and rebuilds only the quad (FL-033), and any other
+    rebuilds both. Epoch identities, unique only within a feed, are not the key.
   - `update_look(field, Look::Raw)` draws linear grey `raw_value = clamp(value / scale, 0, 1)` instead: no square
     root, no palette.
 - `DensityLayer::update(epoch, style)`:
@@ -168,8 +171,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
     draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
     density's textures, their quads and the ring's mesh, twice, since one is built before the one it replaces is
-    dropped). `texel_bytes()` (FL-033) is the layers' textures, 16 bytes a texel: the field's once the view knows
-    it and the density's at the viewport's bins, whatever the style; FrankenManim's CPU route samples them in place
+    dropped; and once, the copy of the field's values its texture was built from). `texel_bytes()` (FL-033) is the
+    layers' textures, 16 bytes a texel: the field's once the view knows it and the density's at the viewport's bins,
+    whatever the style; FrankenManim's CPU route samples them in place
     and its Metal route uploads those a frame draws. `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536)
     for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads' and
     the ring's triangles, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
@@ -288,7 +292,7 @@ route.
   - FL-020 density: a 128-pixel view at 2 pixels per point draws what a 64-pixel view at 1 draws (the floored and the
     capped dots, halos, the selection ring and the density bins); the change refits the shown epoch without a new
     show, an unchanged density is no change, and NaN is refused.
-- `tests/mapping.rs` (15 tests), on real render epochs where they matter:
+- `tests/mapping.rs` (16 tests), on real render epochs where they matter:
   - The energy and generation ramps rise monotonically in CIE L*, from above 15 with a range above 50.
   - Energy maps through the fixed saturating `e / (e + 2)`, generations logarithmically to a fixed 256.
   - The motion hue is the heading (y flipped to screen), its strength `√(speed / limit)`.
@@ -307,13 +311,20 @@ route.
   - A pan or zoom of a density view (a zoom of 3, a pan, a zoom of 16, in both looks) draws what a view built from
     scratch at that viewport draws, bit for bit: the same bins, scale and texels, on a quad that moved. Placed in
     the other look without a show, the texture is rebuilt for it, again equal to a fresh build.
-- `tests/field.rs` (5 tests):
+  - The same three moves of a points view, in both looks, draw the field texture a view built from scratch draws,
+    bit for bit (scale, texels, quad), the texels still and the quad moving; a later epoch of the world, shown and
+    panned, rebuilds it, again equal to a fresh build, though two standalone epochs share identity 1.
+- `tests/field.rs` (6 tests):
   - The palette is monotone dark to bright; the display value is a clamped square root, zero for NaN, negatives and
     a zero scale.
   - A ramp field's texture has a texel per corner, each the palette colour of its wrapped mean, so the seam corner
     is 3.5, not the interior 0.5; it is drawn as a repeating, unlit image without depth test on the view's periodic
     quad, and a placement in a panned view moves only the quad, keeping the scale.
   - The display scale rises at once and falls by `SCALE_DECAY` per update.
+  - A placement keeps the texture only for bitwise the same values, texels, scale and look: against an oracle of
+    corner colours, the same values from another texture at a pan, one texel brightened, the other look, the same
+    values on other texels, the same values re-shown as the scale falls (raw, so every lit texel shows it) and a
+    16 x 8 field changed past its first 64 values are each drawn as given.
   - Every dot of a real epoch has one halo at its centre, sized by its energy, in the lineage colour at
     `HALO_ALPHA`; a resize keeps halos proportional.
   - A real frame rendered offline is opaque and lit by the field beyond the black background.
@@ -330,18 +341,20 @@ route.
   (the fullest at 75.6%, and 27.3% at the ceiling of 64), so the limit leaves nothing out of them, and the job
   compiled within it holds the same bytes. The limit is the ceiling's dots, the quads' and ring's triangles and the
   fixed part exactly, whatever the field or the bins; `texel_bytes` is the field's texture once known and the
-  density's at the viewport's bins, each reserved twice, and follows a new pixel density.
+  density's at the viewport's bins, each reserved twice, the field's values once, and follows a new pixel density.
   In `flife-cli`, `tests/memory_admission.rs` measures the view's own heap and a CPU frame against these terms, and
+  that a pan or zoom allocates no layer texture (at most 440 bytes, against the field's 256 KiB texture), and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
 
 **Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `5d08cba2`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**
-- Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The field's
-  texture is rebuilt on the CPU on every show and placement, the density's on every show (a placement keeps it),
-  and both are uploaded with every Metal frame; resident device textures and buffers and the shared-device resource
-  bridge are still FL-033's (and FL-028's typed Metal buffers).
+- Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The layers'
+  textures are rebuilt on the CPU when what they show changes (a show of a new epoch, a restyle; a placement keeps
+  the density's, and the field's for bitwise the same values), and both are uploaded with every Metal frame;
+  resident device textures and buffers and the shared-device resource bridge are still FL-033's (and FL-028's typed
+  Metal buffers).
 - There is no chemical-affinity mapping (§13.4 lists one): epochs do not carry affinities.
 - There is no on-screen legend: FrankenManim's Metal 3D route has no text, so the meaning is in the Studio's and
   `flife render`'s records.
@@ -360,9 +373,13 @@ route.
 - Density bins do not refine with the zoom (they keep the fit's), so a deep zoom shows wide bins.
 - FrankenManim's frame is a perspective one; there is no orthographic camera, so dots are capped on screen rather
   than drawn at world size at deep zoom.
-- The field's texture covers the whole torus and is rebuilt on every pan, at a cost linear in its texels, though
-  a pan changes only the quad. Epoch identities are unique only within a feed (every standalone epoch is 1), so
-  the view cannot yet tell that a placed epoch's field is the one it mapped. The density's texture, which shows the
+- The field's texture covers the whole torus. A pan keeps it by comparing the placed values with a copy of those it
+  was built from (64 KiB for the reference world's 128 x 128 texels), not by epoch identity, which is unique only
+  within a feed. Its speed is not qualified: on the 4K points view (16,384 organisms, two pixels per point) two
+  interleaved runs gave a paired ratio of 0.65 to 0.66 for a pan's `place` at zoom 1 and 16, but at load averages
+  of 48 to 78 the block medians of both sides moved together between two levels, with coefficients of variation
+  of 8.1% to 15.1%, above the 5% an admissible run needs. A new epoch's show, which compares and copies, was
+  unchanged (ratio 1.001, coefficients 1.3% or less). The density's texture, which shows the
   last binned epoch whatever epoch is placed, is kept: a pan of the 4K density view (16,384 organisms, two pixels
   per point) placed in 0.71 ms instead of 2.73, at zoom 1 and 16 alike (one interleaved invocation, ten blocks a
   side, coefficients of variation at most 3.7%). At a deep zoom the Metal route uploads the whole textures, where

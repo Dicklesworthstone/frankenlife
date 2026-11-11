@@ -627,6 +627,49 @@ fn a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes() {
     }
 }
 
+/// FL-033: a pan or zoom of the shown epoch keeps the field's and the
+/// density's textures and moves only their quads, so a placement allocates
+/// less than the smaller texture, the field's. A full world at 3840 x 2160,
+/// in points and in density, through a zoom of 3, a pan and a zoom of 16.
+#[test]
+fn a_pan_or_zoom_allocates_no_layer_texture() {
+    let _serial = serial();
+    let epoch = full_epoch();
+    let [x, y] = epoch.field().texels().map(u64::from);
+    let field_texture = x * y * 16;
+    for particles in [flife_cli::Particles::Points, flife_cli::Particles::Density] {
+        let mut view =
+            flife_manim::WorldView::for_epoch(&epoch, [3840, 2160], [0, 0, 0]).expect("a view");
+        view.set_style(Style {
+            particles,
+            ..Style::default()
+        });
+        view.show(&epoch).expect("shows");
+        for step in 0..3 {
+            let viewport = view.viewport();
+            let moved = match step {
+                0 => viewport.zoomed_about([1500.0, 900.0], 3.0),
+                1 => viewport.panned([17.0, -9.0]),
+                _ => viewport.zoomed_about([900.0, 400.0], 16.0),
+            }
+            .expect("moves");
+            view.set_view(moved).expect("looks");
+            let base = ALLOC.current_usage();
+            ALLOC.reset_peak_usage();
+            view.place(&epoch).expect("places");
+            let grew = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+            println!(
+                "{particles:?}, move {step}: the placement allocated at most {grew} bytes \
+                 (the field's texture is {field_texture})"
+            );
+            assert!(
+                grew < field_texture,
+                "{particles:?}, move {step}: {grew} bytes, a texture rebuilt"
+            );
+        }
+    }
+}
+
 /// One frame on the CPU route, measured: a full world at 3840 x 2160 in
 /// points and in density, on four threads, holds no more heap above the
 /// view than the view's frame and offline bytes.

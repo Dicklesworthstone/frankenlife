@@ -738,7 +738,7 @@ refused. `a_directory_without_a_run_is_refused_untouched`. Six planted mutants (
 position, the field plane reversed, affinity left out, a founder its own parent, organism energy doubled) were each
 caught.
 
-`tests/memory_admission.rs` (10 tests, FL-043, about 15 s; a counting global allocator, `peak_alloc`, test only):
+`tests/memory_admission.rs` (11 tests, FL-043, about 15 s; a counting global allocator, `peak_alloc`, test only):
 - `the_preset_is_admitted_term_by_term`: on the preset each term is its source (the configuration's quotas, the
   world's footprint, `RESERVE_BYTES`) and the peak is their sum: 1,375.7 MiB on the reference (genomes 1,152.0,
   state 19.63, field 6.95, scratch 79.25, births 53.88, reserve 64.0). With `torch` the scratch adds the batched
@@ -767,8 +767,12 @@ caught.
   at 96 x 64 to 1920 x 1080 holds, with the frame, at most 47.8 bytes a pixel (noise at 640 x 360), within the
   allowance.
 - `a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes`: a view of the preset at its 16,384 ceiling, shown
-  twice in points and twice in density, holds 9.37 of its 9.61 MiB at 1280 x 720 and 15.93 of 16.20 at 4K (FL-033's
-  textures; the vertex grids held 14.49 of 16.41 and 45.56 of 47.82).
+  twice in points and twice in density, holds 9.40 of its 9.68 MiB at 1280 x 720 and 16.00 of 16.27 at 4K (FL-033's
+  textures and the field's values copy; the vertex grids held 14.49 of 16.41 and 45.56 of 47.82).
+- `a_pan_or_zoom_allocates_no_layer_texture` (FL-033): that world's 4K view, in points and in density, through a zoom
+  of 3, a pan and a zoom of 16, allocates at most 440 bytes a placement (the quads), less than the field's 256 KiB
+  texture: both layers keep their textures. A layer that rebuilds on a pan fails it (the field's 262,584 bytes, the
+  density's 2,074,040).
 - `a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms`: a 4K CPU frame of that world holds its draw list
   within what `frame_bytes` adds to the preparation limit (7.75 MiB in points), its job within `frame_bytes`
   (72.1 MiB of 88.8 in points, 0.01 in density) and, above the job, within `offline_bytes` (55.6 of 95.5 MiB).

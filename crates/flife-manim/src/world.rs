@@ -639,14 +639,20 @@ impl WorldView {
     /// at the viewport's count; and the field's and the density's textures
     /// ([`WorldView::texel_bytes`]) and quads and the selection ring's
     /// mesh, each twice, since one is built before the one it replaces is
-    /// dropped. The field's texture counts once the view knows the field:
-    /// from [`WorldView::for_epoch`] or the first shown epoch. A resize or
-    /// a new pixel density changes the density's bins and so these bytes.
+    /// dropped; and once, the copy of the field's values its texture was
+    /// built from, one `f32` a texel (FL-033). The field's texture and
+    /// values count once the view knows the field: from
+    /// [`WorldView::for_epoch`] or the first shown epoch. A resize or a new
+    /// pixel density changes the density's bins and so these bytes.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
         let [columns, rows] = density_bins(&self.viewport).map(u64::from);
         let bins = columns.saturating_mul(rows);
         let ring = SELECTION_RING_SEGMENTS as u64;
+        let [columns, rows] = self.field_texels.map(u64::from);
+        let field_values = columns
+            .saturating_mul(rows)
+            .saturating_mul(bytes_for::<f32>(1));
         let grids = total([
             self.texel_bytes(),
             mesh_bytes(QUAD).saturating_mul(2),
@@ -660,6 +666,7 @@ impl WorldView {
             self.cloud.reserved_bytes(),
             bins.saturating_mul(bytes_for::<u32>(1) + bytes_for::<[f64; 3]>(1)),
             grids.saturating_mul(2),
+            field_values,
         ])
     }
 

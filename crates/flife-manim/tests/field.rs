@@ -5,9 +5,10 @@ mod common;
 
 use flife_manim::{
     FIELD_PALETTE, FieldLayer, HALO_ALPHA, Look, ParticleCloud, SCALE_DECAY, Viewport, WorldView,
-    display_value, halo_factor, lineage_color, palette,
+    display_value, halo_factor, lineage_color, palette, raw_value,
 };
 use flife_render::FieldTexture;
+use fmn_core::color::{LinearRgba, Srgb};
 use fmn_render::{SurfaceMaterial, TextureWrap, ThreeDDraw};
 
 #[expect(
@@ -135,6 +136,144 @@ fn the_display_scale_follows_the_field_down_slowly() {
         .update(&texture([4, 4], &[20.0; 16]))
         .expect("brighter");
     assert_eq!(layer.scale(), 20.0);
+}
+
+/// The colours a field layer draws for `plane` on `cells` at `scale` in
+/// `look`, rows top to bottom: each corner's colour from the mean of the
+/// four field texels around it, wrapping.
+fn corner_colours(cells: [u32; 2], plane: &[f32], scale: f64, look: Look) -> Vec<[f64; 3]> {
+    let [columns, rows] = cells.map(|n| n as usize);
+    let at =
+        |column: usize, row: usize| f64::from(plane[(row % rows) * columns + column % columns]);
+    let mut colours = Vec::new();
+    for row in 0..rows {
+        for column in 0..columns {
+            let (left, up) = (column + columns - 1, row + rows - 1);
+            let mean = (at(left, up) + at(column, up) + at(left, row) + at(column, row)) / 4.0;
+            let linear = match look {
+                Look::Glow => {
+                    let [r, g, b] = palette(display_value(mean as f32, scale));
+                    Srgb::from_rgb8(r, g, b).to_linear(1.0)
+                }
+                Look::Raw => {
+                    let grey = raw_value(mean as f32, scale);
+                    LinearRgba {
+                        r: grey,
+                        g: grey,
+                        b: grey,
+                        a: 1.0,
+                    }
+                }
+            };
+            colours.push([linear.r, linear.g, linear.b].map(|channel| f64::from(channel as f32)));
+        }
+    }
+    colours
+}
+
+/// The layer's texture as colours, rows top to bottom, and its size.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn drawn(layer: &FieldLayer) -> (Vec<[f64; 3]>, [u32; 2]) {
+    let texture = layer.texture().expect("a texture");
+    let colours = (0..texture.height())
+        .flat_map(|row| {
+            (0..texture.width()).map(move |column| {
+                let texel = texture.texel(column, row).expect("a texel");
+                [texel.r, texel.g, texel.b]
+            })
+        })
+        .collect();
+    (colours, [texture.width(), texture.height()])
+}
+
+/// FL-033: a placement keeps the layer's texture only when it would build
+/// the same one, from bitwise the same values on the same texels at the same
+/// display scale in the same look. Whatever the layer built before, every
+/// placement draws the colours of what it was given, on the viewport's quad.
+#[test]
+fn a_placement_keeps_the_texture_only_for_the_same_values_scale_and_look() {
+    let viewport = fit([8.0, 4.0], [160, 80]);
+    let mut layer = FieldLayer::new(&viewport);
+    let plane: Vec<f32> = (0..32).map(|cell| (cell % 8) as f32).collect();
+    layer.update(&texture([8, 4], &plane)).expect("update");
+    assert_eq!(layer.scale(), 7.0);
+    let glow = corner_colours([8, 4], &plane, 7.0, Look::Glow);
+    assert_eq!(drawn(&layer), (glow.clone(), [8, 4]));
+
+    // The same values from another texture, panned: the colours do not
+    // move, the quad does.
+    let panned = viewport.with_view([1.0, 2.0], 2.0).expect("a view");
+    layer.refit(&panned);
+    layer
+        .place(&texture([8, 4], &plane), Look::Glow)
+        .expect("placed");
+    assert_eq!(drawn(&layer), (glow.clone(), [8, 4]));
+    let Some(ThreeDDraw::Surface(draw)) = layer.draw() else {
+        panic!("the layer draws one surface");
+    };
+    assert_eq!(draw.mesh, &panned.periodic_quad([8, 4]).expect("a quad"));
+
+    // Other values: one texel brighter.
+    let mut other = plane.clone();
+    other[9] = 6.0;
+    let other_glow = corner_colours([8, 4], &other, 7.0, Look::Glow);
+    assert_ne!(other_glow, glow, "the brighter texel shows");
+    layer
+        .place(&texture([8, 4], &other), Look::Glow)
+        .expect("placed");
+    assert_eq!(drawn(&layer), (other_glow.clone(), [8, 4]));
+
+    // The other look.
+    let other_raw = corner_colours([8, 4], &other, 7.0, Look::Raw);
+    assert_ne!(other_raw, other_glow);
+    layer
+        .place(&texture([8, 4], &other), Look::Raw)
+        .expect("placed");
+    assert_eq!(drawn(&layer), (other_raw, [8, 4]));
+
+    // The same values on other texels.
+    layer
+        .place(&texture([4, 8], &other), Look::Raw)
+        .expect("placed");
+    assert_eq!(
+        drawn(&layer),
+        (corner_colours([4, 8], &other, 7.0, Look::Raw), [4, 8])
+    );
+
+    // The same values at another scale: a paused world shown again while the
+    // display scale falls. Raw is linear, so every lit texel shows the fall.
+    layer
+        .update_look(&texture([8, 4], &[20.0; 32]), Look::Raw)
+        .expect("bright");
+    for _ in 0..2 {
+        layer
+            .update_look(&texture([8, 4], &plane), Look::Raw)
+            .expect("dim");
+    }
+    let scale = 20.0 * SCALE_DECAY * SCALE_DECAY;
+    assert_eq!(layer.scale(), scale);
+    let fallen = corner_colours([8, 4], &plane, scale, Look::Raw);
+    assert_ne!(
+        fallen,
+        corner_colours([8, 4], &plane, 20.0 * SCALE_DECAY, Look::Raw)
+    );
+    assert_eq!(drawn(&layer), (fallen, [8, 4]));
+
+    // A larger field, one texel changed near its end.
+    let ramp: Vec<f32> = (0..128).map(|cell| (cell % 16) as f32).collect();
+    layer.update(&texture([16, 8], &ramp)).expect("update");
+    let scale = layer.scale();
+    let mut late = ramp.clone();
+    late[100] = 0.5;
+    let late_glow = corner_colours([16, 8], &late, scale, Look::Glow);
+    assert_ne!(late_glow, corner_colours([16, 8], &ramp, scale, Look::Glow));
+    layer
+        .place(&texture([16, 8], &late), Look::Glow)
+        .expect("placed");
+    assert_eq!(drawn(&layer), (late_glow, [16, 8]));
 }
 
 #[test]

@@ -16,7 +16,7 @@
 use std::time::{Duration, Instant};
 
 use flife_core::ids::{OrganismId, SessionId};
-use flife_core::{Tick, ValidatedConfig};
+use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, OrganismSnapshot, Stepped, World};
 use flife_studio::{Intent, SessionThread, Status};
 
@@ -179,7 +179,19 @@ fn a_running_studio_session_answers_inspections_between_ticks() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    session.send(Intent::Pause).expect("offered");
+    // The lane is bounded: on a loaded machine the inspections can still
+    // fill it, and a full lane refuses the pause as it refuses them. Offer
+    // it again until the session has drained room for it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match session.send(Intent::Pause) {
+            Ok(()) => break,
+            Err(CoreError::BudgetExhausted { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("the pause was refused: {error:?}"),
+        }
+    }
     let statuses = gather(&session, |statuses| {
         inspections(statuses).len() == offered
             && statuses

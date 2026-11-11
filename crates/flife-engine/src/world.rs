@@ -102,6 +102,7 @@ use flife_neural::{
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
+use crate::inspect::OrganismSnapshot;
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
@@ -1233,6 +1234,51 @@ impl World {
         self.fault.as_ref()
     }
 
+    /// One organism at this committed tick (FL-021, plan §14.2), or `None`
+    /// for an identity the population does not hold. It reads the
+    /// organism's row and its own genome and changes nothing; see
+    /// [`OrganismSnapshot`].
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] for a live organism whose genome or
+    /// topology is missing; as [`decode`] for its held output.
+    pub fn organism_snapshot(&self, id: OrganismId) -> Result<Option<OrganismSnapshot>, CoreError> {
+        let Some(organism) = self.population.get(id) else {
+            return Ok(None);
+        };
+        let missing = |what: &str| CoreError::StateConflict {
+            operation: "inspect organism",
+            detail: format!("{id} has no {what}"),
+        };
+        let genome = self
+            .population
+            .genome(id)
+            .ok_or_else(|| missing("genome"))?;
+        let topology = self
+            .rules
+            .catalog
+            .topology(genome.topology())
+            .ok_or_else(|| missing("topology in the catalog"))?;
+        let decoded = match organism.held.outputs() {
+            Some(outputs) => Some(decode(
+                &raw_outputs(&self.rules, outputs),
+                self.rules.step,
+                &self.rules.decoding,
+            )?),
+            None => None,
+        };
+        Ok(Some(OrganismSnapshot {
+            tick: self.tick,
+            organism,
+            age_ticks: self.tick.get().saturating_sub(organism.birth_tick.get()),
+            topology: genome.topology().index(),
+            hidden_widths: topology.hidden_widths().to_vec(),
+            parameters: genome.parameters().len(),
+            traits: *genome.traits(),
+            decoded,
+        }))
+    }
+
     /// The committed scientific state: tick, field, population, identity
     /// sequences, genome quota, source paths and ledger holdings. Slots,
     /// the epoch and the event cursor are excluded.
@@ -2161,6 +2207,15 @@ fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
     !organism.held.is_valid() || to.get() % u64::from(rules.interval) == u64::from(organism.phase)
 }
 
+/// The raw outputs a held output decodes from: the controller's, widened,
+/// or none under the chemistry-only variant.
+fn raw_outputs(rules: &Rules, outputs: &[f32; ACTION_WIDTH]) -> [f64; ACTION_WIDTH] {
+    match rules.variant {
+        ModelVariant::ChemistryOnly => [0.0; ACTION_WIDTH],
+        ModelVariant::Baseline | ModelVariant::FreshOffspring => widen(outputs),
+    }
+}
+
 /// The rest of phase 4: the held output, newly evaluated or not, decoded.
 fn finish(
     rules: &Rules,
@@ -2173,14 +2228,10 @@ fn finish(
         operation: "decode held output",
         detail: format!("{} holds no valid output", organism.id),
     })?;
-    let raw = match rules.variant {
-        ModelVariant::ChemistryOnly => [0.0; ACTION_WIDTH],
-        ModelVariant::Baseline | ModelVariant::FreshOffspring => widen(outputs),
-    };
     Ok(Decision {
         held,
         evaluated,
-        actions: decode(&raw, rules.step, &rules.decoding)?,
+        actions: decode(&raw_outputs(rules, outputs), rules.step, &rules.decoding)?,
         gradients: observation.gradients,
     })
 }

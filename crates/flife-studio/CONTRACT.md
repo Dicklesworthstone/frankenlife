@@ -4,7 +4,8 @@
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
 rendering (§13.4), and the configured bloom on glowing frames (§2.3). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
-between epochs by identity (§13.5). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
+between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
+bounded snapshot at its committed boundary (§14.2). It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter.
 
@@ -61,6 +62,10 @@ adapter.
     why }`, and run numbers keep a late end from touching a newer run.
   - A pause reports `Paused { at }`. A step reports `Stepped { tick }` or `StepHeld { at, why }`. A refusal reports
     `Refused`, and close reports `Closed { at }`.
+  - FL-021: `Intent::Inspect { organism, seen }` asks `SessionHandle::inspect_organism` and reports
+    `Inspected { organism, seen, snapshot }`: `seen` is the source tick of the epoch it was selected on, unchanged,
+    and the snapshot is the organism at the session's committed boundary, which its `tick` names, or `None` when
+    the committed world no longer holds it.
 - `Studio` is the main-thread host. It opens the window at `PixelDensity::Backing`: the window keeps its size in
   points, and each frame fills its device pixels (FL-020). Each `frame()`:
   1. drains typed input through `Controls` and offers the resulting intents;
@@ -72,7 +77,9 @@ adapter.
   5. applies the frame's camera moves in order to a copy of the viewport: a zoom about the pointer's drawable
      position, a pan by the drag times drawable pixels per point, a reset to the fit; a click picks among the shown
      epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
-     (scaled to drawable pixels); then takes the view and the selection;
+     (scaled to drawable pixels); then takes the view and the selection. A click that selects an organism offers
+     `Intent::Inspect` for it with the shown epoch's tick as `seen` (FL-021), counted with the frame's intents or
+     refusals;
   6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
      makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
      fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
@@ -105,6 +112,11 @@ adapter.
   - one `view` per style change, with the same style fields;
   - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
     its identity or null, its position and the shown tick;
+  - one `inspected` per inspection answered (FL-021): the organism, `seen_tick`, the committed `tick` it was read
+    at (null when the world no longer holds it) and a `snapshot`: genome, parent, lineage, generation, birth tick,
+    age, position, velocity, energy and its change rate, phase, cooldown, topology, hidden widths, parameter count,
+    sensing scale, motion response, affinity, and the decoded held output (attempt rate and probability, child
+    fraction, emission gate, emission direction and spend fraction) or null;
   - a `frame` summary about once a second, with the camera's center and zoom, and the bytes the Metal route has
     copied so far: to the device (`upload_bytes`, and the most in one frame, `peak_upload_bytes`) and back to the
     host (`readback_bytes`, none for frames presented to the window);
@@ -205,6 +217,14 @@ presentation state, not scientific state.
   - Off macOS it reports itself skipped.
 - In `flife-runtime`, `tests/session.rs` checks `SessionHandle::start` across six Lab seeds: the start comes back at
   once, and the end comes back for a pause, a reached tick and a close.
+- `tests/inspect.rs` (2 tests, FL-021, no window): a `SessionThread` over a 32 x 32 preset world, driven through
+  its intent lane on the native runtime:
+  - paused after four steps: eight organisms and an unknown identity inspected, each answer in order, `seen`
+    unchanged (3), the snapshots the direct world's at tick 4, none for the unknown one; the closed world the
+    direct one;
+  - while running: 48 inspections, then a pause; every snapshot the direct world's at its own tick, every
+    organism answered with none dead at the close, and the closed world the direct one. Which ticks the answers
+    land on depends on thread timing; the Lab test in `flife-runtime` is the one that requires answers mid-run.
 - In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
   backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
@@ -247,7 +267,12 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
 - While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
-- A selection shows only as the ring and the `selection` record: there is no inspector (FL-021).
+- FL-021's inspector is a record, not a panel: the Metal 3D route has no text, so a selected organism's snapshot is
+  printed as the `inspected` record and not drawn. The host's send on a click and the record's printing run only in
+  a window, which no test here opened. While the world runs, the snapshot is read at the session's committed
+  boundary when the inspection is answered, usually later than the epoch the click selected on; the record carries
+  both ticks. §14.2's sampled activations, inputs, transactions, descendants, local efficiency and weight dumps are
+  not implemented.
 - FL-043: `Studio::open` admits the world and its observers before installing the backend
   (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so, installs the
   bounded backend and reports `memory` in its `open` record runs only in a window, which no test here opened.

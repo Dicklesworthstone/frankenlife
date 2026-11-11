@@ -122,7 +122,9 @@ reached its tick, died out, paused or was refused, keeps each run's records and 
 each condition against the control as an effect over k of n paired seeds with an exact sign-flip p-value. A
 selection rule sees only the discovery runs. The report is the same bytes at any worker count, and after a kill and
 a continuation.
-Camera, zoom and selection come next.**
+FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
+identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
+printed as an `inspected` record; there is no on-screen inspector panel yet.**
 
 | Question | Answer |
 |---|---|
@@ -133,7 +135,7 @@ Camera, zoom and selection come next.**
 - When every slot is busy the boundary is skipped and the last displayable epoch stays.
 - Viewers hold a bounded number of leases each and read the feed directly, never through the session's lanes.
 
-Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. `crates/flife-manim` (FL-018) is the FrankenManim adapter: an exact viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from each epoch onto FrankenManim's 3D camera route (checked against FrankenManim's own CPU renderer to 0.05 px). `crates/flife-studio` (FL-018) is the native host. The window, typed input and Metal presentation stay on the main thread, and the session owner runs on its own Asupersync thread behind a bounded intent lane. A harness-free live test drives the real preset entirely with real AppKit events. The view draws the energy field under glowing lineage-coloured organisms, and `flife render` writes the same view to PNG frames and MP4. No checkpoints, camera control or selection exist yet |
+Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. `crates/flife-manim` (FL-018) is the FrankenManim adapter: an exact viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from each epoch onto FrankenManim's 3D camera route (checked against FrankenManim's own CPU renderer to 0.05 px). `crates/flife-studio` (FL-018) is the native host. The window, typed input and Metal presentation stay on the main thread, and the session owner runs on its own Asupersync thread behind a bounded intent lane. A harness-free live test drives the real preset entirely with real AppKit events. The view draws the energy field under glowing lineage-coloured organisms, and `flife render` writes the same view to PNG frames and MP4. FL-020 adds camera control and selection, and FL-021 a bounded organism snapshot on selection (a record, not yet a panel) |
 | Does the stack compose? | **Yes (FL-001, FL-018).** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter now delivers typed pointer, button, scroll, key, modifier, focus, capture-loss and resize events (FL-018 added the bridge upstream in FrankenTorch), and a real window probe qualifies it. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |

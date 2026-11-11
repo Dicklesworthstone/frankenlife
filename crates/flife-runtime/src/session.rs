@@ -72,9 +72,9 @@ use asupersync::Cx;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::yield_now;
 use flife_core::canonical::Sha256Digest;
-use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
+use flife_core::ids::{CommandId, OrganismId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Advance, CapacityShortfall, Intervention, TickReport, World};
+use flife_engine::{Advance, CapacityShortfall, Intervention, OrganismSnapshot, TickReport, World};
 use flife_field::FieldGrid;
 use flife_render::{Feed, Publisher, RenderStats};
 
@@ -317,6 +317,10 @@ enum Control {
         reply: oneshot::Sender<Result<Option<Outcome>, CoreError>>,
     },
     Inspect(oneshot::Sender<Snapshot>),
+    InspectOrganism {
+        id: OrganismId,
+        reply: oneshot::Sender<Result<Option<OrganismSnapshot>, CoreError>>,
+    },
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
     Take(Take),
     Close(oneshot::Sender<Boundary>),
@@ -360,6 +364,7 @@ impl std::fmt::Debug for Control {
             Self::Status { .. } => "Status",
             Self::DurableOutcome { .. } => "DurableOutcome",
             Self::Inspect(_) => "Inspect",
+            Self::InspectOrganism { .. } => "InspectOrganism",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Take(_) => "Take",
             Self::Close(_) => "Close",
@@ -602,6 +607,24 @@ impl SessionHandle {
     /// As [`SessionHandle::submit`].
     pub async fn inspect(&self, cx: &Cx) -> Result<Snapshot, CoreError> {
         self.control(cx, Control::Inspect).await
+    }
+
+    /// One organism at the owner's committed boundary (FL-021, plan §14.2),
+    /// or `None` for an identity the world does not hold there: its row,
+    /// its own genome's traits and shape, and its held output decoded
+    /// ([`World::organism_snapshot`]). A running owner answers between
+    /// ticks, so the snapshot is of one whole committed tick, named by its
+    /// `tick`; nothing else of the world is copied and nothing changes.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`] and [`World::organism_snapshot`].
+    pub async fn inspect_organism(
+        &self,
+        cx: &Cx,
+        id: OrganismId,
+    ) -> Result<Option<OrganismSnapshot>, CoreError> {
+        self.control(cx, |reply| Control::InspectOrganism { id, reply })
+            .await?
     }
 
     /// Close the session, returning the committed boundary it closed at.
@@ -1492,6 +1515,9 @@ impl SessionOwner {
             Control::Inspect(reply) => {
                 let _ = reply.send_blocking(self.snapshot());
             }
+            Control::InspectOrganism { id, reply } => {
+                let _ = reply.send_blocking(self.world.organism_snapshot(id));
+            }
             Control::Checkpoint(reply) => {
                 self.settle_receipts();
                 if self
@@ -1886,6 +1912,9 @@ impl SessionOwner {
                 Control::DurableOutcome { id, reply } => durable.push((id, reply)),
                 Control::Inspect(reply) => {
                     let _ = reply.send_blocking(snapshot.clone());
+                }
+                Control::InspectOrganism { id, reply } => {
+                    let _ = reply.send_blocking(self.world.organism_snapshot(id));
                 }
             }
         }

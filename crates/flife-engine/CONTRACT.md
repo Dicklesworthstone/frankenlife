@@ -170,6 +170,17 @@ each runs and owns the field.
   field, scratch (plus `batched_bytes()` when `batched`) and staging, the host's `render` and `checkpoint` bytes,
   and `RESERVE_BYTES`, against `maximum_total_bytes`. Over it: `BudgetExhausted` ("peak memory
   (maximum_total_bytes)"). Otherwise the backend is granted the rest when `batched`, or nothing.
+- FL-021 (`flife-zyc`, plan §14.2): `World::organism_snapshot(id)`, `Ok(None)` for an identity the population does
+  not hold, or an `OrganismSnapshot`:
+  - `tick`, the world's committed tick;
+  - `organism`, its row: identity, genome, parent, lineage, generation, birth tick, position, velocity, energy and
+    its change rate over the last committed tick, held output, phase and reproduction cooldown;
+  - `age_ticks`, from its birth tick to `tick`;
+  - `topology`, its catalog index, and `hidden_widths`, that topology's;
+  - `parameters`, its controller's parameter count;
+  - `traits`: its affinity direction, motion response and sensing scale;
+  - `decoded`, its held output decoded as the world decodes it for the next tick unless it is evaluated again
+    (from zero under `field-ecology-v1-chemistry-only`), or `None` while it holds no output.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -421,7 +432,18 @@ each runs and owns the field.
   this build. Each of those lists is reserved for its count before it is filled, so none grows past it.
 - `footprint()` does not change as the world steps. No result depends on any of this.
 
+**Invariants — inspection (FL-021; §14.2, §21.2 INV-09).**
+- A snapshot reads one row through the identity index, that organism's own genome and the topology catalog. It
+  copies no controller parameter and nothing of another organism or genome, so its cost does not grow with the
+  population or the genome bank.
+- It takes `&self` and changes nothing: a world inspected in full before every tick commits the digests of one
+  never inspected.
+- The held output is decoded by the function the tick uses (`raw_outputs` then `decode`), so the snapshot and the
+  tick cannot disagree on the variant's raw outputs.
+
 **Refusal cases.**
+- FL-021: a live organism whose genome or topology is missing (`StateConflict`, "inspect organism"); a held output
+  that does not decode (as `decode`).
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
 - A negative or nonfinite grant, an efficiency outside `[−1, 1]`, or a nonfinite composition.
@@ -666,6 +688,18 @@ Twenty planted mutants for the introduction (with `flife-runtime`'s and `flife-c
 adds exactly `batched_bytes()` to the scratch and nothing to the state or fields, 60 ticks grow nothing, and
 removing it returns the scratch to its bytes before.
 
+`tests/inspect.rs` (3 tests, FL-021), on the 32 x 32 Appendix A world with FL-013's small ecology, which breeds.
+The oracle reads the same world through `Population::get`, `Population::genome`, the configuration's topology
+catalog and action decoding:
+- `an_organism_snapshot_is_its_committed_row_and_genome`: three ticks after children of two birth ticks live
+  beside the founders, every live organism against the oracle (row, age, topology and widths, parameter count,
+  traits, decoded output, with some organism holding one); each child's age is from its own birth tick, a
+  founder's is the tick; an unknown identity gives `None`.
+- `a_chemistry_only_snapshot_decodes_from_zero`: under the chemistry-only ablation every held output decodes from
+  zero, as the world decodes it.
+- `inspecting_changes_nothing`: every organism and an unknown identity inspected before each of 20 ticks; the
+  digest is unchanged by it, and equal to an uninspected world's after every tick.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
 `pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`; FL-013 at
@@ -675,6 +709,10 @@ velocity, first-order splitting at the configured fixed timestep.
 **Known gaps.**
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
+- FL-021's snapshot covers §14.2's identity, state, chemistry and brain architecture. It has no sampled
+  activations (the controller's hidden values are not kept), no inputs (the observation it decided from is not
+  kept), no local efficiency at its cell, and no transactions or descendants, which need an event index the
+  world does not keep. Weight dumps on demand are not implemented.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

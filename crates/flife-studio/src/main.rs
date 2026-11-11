@@ -3,8 +3,11 @@
 //! Every line on standard output is one `frankenlife.studio.v1` record: an
 //! `open`, then a `status` per session status, a `view` per style change,
 //! a `selection` each time the selected organism changes (a click, or the
-//! selected organism gone from a newer epoch) and a `frame` summary about
-//! once a second, then an `end` with the committed world's digest. An error
+//! selected organism gone from a newer epoch), an `inspected` record for
+//! each organism a click selects (FL-021: it at the session's committed
+//! boundary `tick`, selected on the epoch of `seen_tick`), and a `frame`
+//! summary about once a second, then an `end` with the committed world's
+//! digest. An error
 //! is one `frankenlife.error.v1` record on standard error. Exit status: 0
 //! after a clean close, 2 for an unreadable or invalid configuration or a
 //! window that cannot open, 1 for any later failure.
@@ -21,6 +24,7 @@ use clap::Parser;
 use flife_backend_metal::ControllerChoice;
 use flife_core::ValidatedConfig;
 use flife_core::memory::MemoryAdmission;
+use flife_engine::OrganismSnapshot;
 use flife_studio::{
     ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status, Studio, StudioOptions, Style,
 };
@@ -138,6 +142,15 @@ enum Record<'a> {
         why: Option<&'static str>,
         detail: Option<String>,
     },
+    Inspected {
+        schema: &'static str,
+        organism: u64,
+        seen_tick: u64,
+        /// The committed boundary it was read at; absent when the committed
+        /// world no longer holds it.
+        tick: Option<u64>,
+        snapshot: Option<Inspection>,
+    },
     Frame {
         schema: &'static str,
         frames: u64,
@@ -175,6 +188,41 @@ enum Record<'a> {
         readback_bytes: u64,
         wall_seconds: f64,
     },
+}
+
+/// One organism at a committed tick: its row, age, controller shape and
+/// heritable traits, and its held output as the world decodes it.
+#[derive(Serialize)]
+struct Inspection {
+    genome: u64,
+    parent: Option<u64>,
+    lineage: u64,
+    generation: u32,
+    birth_tick: u64,
+    age_ticks: u64,
+    position: [f64; 2],
+    velocity: [f64; 2],
+    energy: f64,
+    energy_change_rate: f64,
+    phase: u32,
+    cooldown_until_tick: u64,
+    topology: usize,
+    hidden_widths: Vec<u32>,
+    parameters: usize,
+    sensing_scale: f64,
+    motion_response: Vec<f64>,
+    affinity: Vec<f64>,
+    decoded: Option<Decoded>,
+}
+
+#[derive(Serialize)]
+struct Decoded {
+    attempt_rate: f64,
+    attempt_probability: f64,
+    child_fraction: f64,
+    emission_gate: f64,
+    emission_direction: Option<Vec<f64>>,
+    emission_spend_fraction: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -362,6 +410,49 @@ fn status_record(status: &Status) -> Record<'static> {
             record("refused", None, None, Some(kind), Some(detail.clone()))
         }
         Status::Closed { at } => record("closed", None, Some(at.get()), None, None),
+        Status::Inspected {
+            organism,
+            seen,
+            snapshot,
+        } => Record::Inspected {
+            schema: STUDIO_SCHEMA,
+            organism: organism.get(),
+            seen_tick: seen.get(),
+            tick: snapshot.as_ref().map(|snapshot| snapshot.tick.get()),
+            snapshot: snapshot.as_deref().map(inspection),
+        },
+    }
+}
+
+fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
+    let organism = &snapshot.organism;
+    Inspection {
+        genome: organism.genome.get(),
+        parent: organism.parent.map(|parent| parent.get()),
+        lineage: organism.lineage.get(),
+        generation: organism.generation.get(),
+        birth_tick: organism.birth_tick.get(),
+        age_ticks: snapshot.age_ticks,
+        position: organism.position,
+        velocity: organism.velocity,
+        energy: organism.energy,
+        energy_change_rate: organism.energy_change_rate,
+        phase: organism.phase,
+        cooldown_until_tick: organism.cooldown_deadline.get(),
+        topology: snapshot.topology,
+        hidden_widths: snapshot.hidden_widths.clone(),
+        parameters: snapshot.parameters,
+        sensing_scale: snapshot.traits.sensing_scale(),
+        motion_response: snapshot.traits.motion_response().to_vec(),
+        affinity: snapshot.traits.affinity().to_vec(),
+        decoded: snapshot.decoded.map(|decoded| Decoded {
+            attempt_rate: decoded.attempt_rate,
+            attempt_probability: decoded.attempt_probability,
+            child_fraction: decoded.child_fraction,
+            emission_gate: decoded.emission_gate,
+            emission_direction: decoded.emission.map(|emission| emission.direction.to_vec()),
+            emission_spend_fraction: decoded.emission.map(|emission| emission.spend_fraction),
+        }),
     }
 }
 

@@ -29,7 +29,7 @@ inherits every command and outcome, records the fork, and from then on admits on
   order after the amount; an introduction carries the cell, the count (`u32`) and the energy's bits. An energy
   injection's record is byte for byte FL-014's, and every earlier record decodes unchanged.
 - Control requests: pause, resume, run until a tick, step, cancel, status, inspect, close and suspend (FL-037);
-  checkpoint and durable outcome (FL-036).
+  checkpoint and durable outcome (FL-036); inspect one organism (FL-021).
 - For `open_journaled` (FL-036): a `JournalWriter` started over a `Journal` implementation, and the
   `JournalContents` it read back when it opened the session's run.
 
@@ -56,6 +56,9 @@ inherits every command and outcome, records the fork, and from then on admits on
 - `RunEnd` for a bounded run: `Reached`, `Paused`, `CapacityPaused`, `Failed` or `Closed`, each with its boundary.
 - `Snapshot`: the committed boundary and world digest, live count, running state, unfinished, admitted and outcome
   counts, whether the run stopped, and the render publisher's `RenderStats` (FL-017).
+- FL-021: `SessionHandle::inspect_organism(id)`: the committed world's `World::organism_snapshot(id)`, an
+  `OrganismSnapshot` whose `tick` is the boundary it was read at, or `None` when the committed world does not hold
+  the organism.
 - `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
   still pending), the final boundary and the render counters.
 - FL-036, for a journaled session:
@@ -136,6 +139,9 @@ inherits every command and outcome, records the fork, and from then on admits on
 - `open_restored` (FL-037) opens a `volatile-in-memory` session on a restored world and book, refusing a book of
   another session or revision as `open_journaled` does.
 - Scientific ticks are never skipped and the timestep never changes. A run to tick `t` stops exactly at `t`.
+- An organism inspection (FL-021), like `inspect`, is answered at a committed boundary: at once while paused; while
+  running, deferred from the cancellation boundary to the next committed one; while closing, at the closed
+  boundary. It reads only the committed world, so a session commits the same states whether or not it is inspected.
 
 **Invariants — render epochs and observer pressure (FL-017; §7.5, §9.5, §12.4, INV-09).**
 - The founding state is render epoch 1. Every published tick is offered to the feed before anyone hears of the
@@ -284,6 +290,15 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - dropping every handle, while paused and while running (the latter within a 2,000-step Lab bound, so an owner
     that ignores the dropped handles fails quickly instead of hanging);
   - the same protocol on the native current-thread runtime.
+- `tests/inspect.rs` (3 tests, FL-021), Lab seeds, each answer compared with the snapshot of a world stepped
+  directly to the answer's tick:
+  - paused at tick 6, over four seeds: every live organism's answer, at tick 6; an unknown identity, none; the
+    boundary unmoved, and the closed world the direct one;
+  - during a run to tick 24, over four seeds: founders inspected one after another, each answer the direct
+    snapshot at its own tick, some answered strictly between the run's start and end; an organism answered with
+    none is dead at tick 24; the run reaches 24 at the direct digest;
+  - an inspection sent in the same poll as a close while running, over six seeds: answered at the closed boundary
+    with the direct snapshot of an organism alive throughout; the next inspection is refused.
 - `tests/observation.rs` (3 tests, FL-017), each world compared with one stepped directly with no session and no
   feed:
   - G3 over three Lab seeds. A viewer retaining two epochs makes boundaries 3–48 busy while the feed keeps tick 2

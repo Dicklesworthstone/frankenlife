@@ -40,6 +40,7 @@
 pub mod chemistry;
 pub mod costs;
 pub mod emission;
+pub mod inspect;
 pub mod intervention;
 pub mod lifecycle;
 pub mod motion;
@@ -52,6 +53,7 @@ pub use chemistry::{
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
+pub use inspect::OrganismSnapshot;
 pub use intervention::{
     AppliedIntervention, Intervention, MATERIAL_CHANNELS, MAXIMUM_INTRODUCTION,
 };

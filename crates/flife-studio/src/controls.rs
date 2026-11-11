@@ -35,6 +35,8 @@
 //! | D | points or density |
 //! | F | field on or off |
 
+use flife_core::Tick;
+use flife_core::ids::OrganismId;
 use flife_manim::{ColorMapping, Look, Particles, Style, Viewport};
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -129,6 +131,16 @@ pub enum Intent {
     Pause,
     /// Advance one tick while paused.
     Step,
+    /// Inspect an organism selected on screen (FL-021): a bounded snapshot
+    /// of it at the session's committed boundary. The presentation owner
+    /// sends this on a selection, not on a key.
+    Inspect {
+        /// The selected organism.
+        organism: OrganismId,
+        /// The source tick of the epoch it was selected on. A running
+        /// session's committed boundary can be past it.
+        seen: Tick,
+    },
     /// Close the session.
     Close,
 }

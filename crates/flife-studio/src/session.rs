@@ -16,14 +16,18 @@
 //! watcher task the client owns, so a run that stops on its own (a capacity
 //! shortfall, a failed tick) still comes back, as [`Status::Ended`]. A
 //! paused run reports both [`Status::Paused`] (the intent) and
-//! [`Status::Ended`] (the run).
+//! [`Status::Ended`] (the run). An inspection is answered with
+//! [`Status::Inspected`]: the organism read at the session's committed
+//! boundary, whose tick the snapshot carries.
 
 use std::sync::mpsc;
 
 use asupersync::Cx;
 use asupersync::channel::mpsc as lane;
 use asupersync::runtime::{JoinHandle, RuntimeBuilder, RuntimeHandle};
+use flife_core::ids::OrganismId;
 use flife_core::{CoreError, Tick};
+use flife_engine::OrganismSnapshot;
 use flife_render::Feed;
 use flife_runtime::{RunEnd, SessionClosed, SessionHandle, SessionOwner, StepOutcome};
 
@@ -56,7 +60,7 @@ pub enum End {
 }
 
 /// What an intent or a run did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Status {
     /// A run started from this boundary.
     Running {
@@ -92,6 +96,16 @@ pub enum Status {
         at: Tick,
         /// Why.
         why: End,
+    },
+    /// An inspection's answer (FL-021).
+    Inspected {
+        /// The organism asked about.
+        organism: OrganismId,
+        /// The source tick of the epoch it was selected on.
+        seen: Tick,
+        /// It at the session's committed boundary, which its `tick` names;
+        /// `None` when the committed world no longer holds it.
+        snapshot: Option<Box<OrganismSnapshot>>,
     },
     /// The session refused an intent.
     Refused {
@@ -323,6 +337,14 @@ async fn act(
                     kind: error.kind(),
                     detail: error.to_string(),
                 },
+            },
+            Err(error) => refused(error),
+        },
+        Intent::Inspect { organism, seen } => match handle.inspect_organism(cx, organism).await {
+            Ok(snapshot) => Status::Inspected {
+                organism,
+                seen,
+                snapshot: snapshot.map(Box::new),
             },
             Err(error) => refused(error),
         },

@@ -10,7 +10,10 @@
 //! 3. refits the viewport and camera when the content area changed;
 //! 4. applies the camera moves the input made, in order (zoom about the
 //!    pointer, pan, reset), and picks under a click through the view as it
-//!    was at that click, among the shown epoch's organisms (FL-020);
+//!    was at that click, among the shown epoch's organisms (FL-020); a
+//!    pick that selects an organism offers the session an
+//!    [`Intent::Inspect`] for it (FL-021), answered later as a
+//!    [`Status::Inspected`];
 //! 5. leases the newest render epoch, if newer than the one shown, and
 //!    shows it one committed state late: its organisms move from where the
 //!    previous epoch had them, over about the interval at which epochs
@@ -434,8 +437,24 @@ impl Studio {
             self.tally.camera_moves += 1;
         }
         if let Some(choice) = picked {
-            self.view.select(choice)?;
+            let selected = self.view.select(choice)?;
             self.tally.selections += 1;
+            if let Some(organism) = selected
+                && let Some(shown) = self.view.shown()
+            {
+                let intent = Intent::Inspect {
+                    organism,
+                    seen: shown.tick,
+                };
+                if self.session.send(intent).is_ok() {
+                    intents += 1;
+                    self.tally.intents += 1;
+                } else {
+                    refused += 1;
+                    self.tally.refused += 1;
+                    self.controls.refused(intent);
+                }
+            }
         }
 
         let now = Instant::now();

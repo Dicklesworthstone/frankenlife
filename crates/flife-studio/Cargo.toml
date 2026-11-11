@@ -27,6 +27,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 fmn-render = { workspace = true, features = ["metal"] }
+# The frame-upload measurement counts the heap a Metal frame holds (FL-043).
+peak_alloc.workspace = true
 
 [features]
 # Test seam: `Studio::post` posts real AppKit events into the application

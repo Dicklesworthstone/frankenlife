@@ -9,14 +9,16 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use flife_backend_metal::ControllerChoice;
+use flife_core::memory::total;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::Stepped;
+use flife_engine::{Stepped, World};
 use flife_manim::{Style, WorldView, hex_rgb};
 use flife_render::Publisher;
 use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
 use crate::found;
+use crate::memory::MemoryAdmission;
 use crate::run::{ControllerSummary, install};
 
 /// The schema of `flife render`'s NDJSON records.
@@ -52,6 +54,16 @@ pub struct RenderOptions {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "record")]
 pub enum RenderRecord {
+    /// The run was admitted (FL-043): emitted once, before any frame.
+    Start {
+        /// [`RENDER_SCHEMA`].
+        schema: &'static str,
+        /// The peak-memory admission, its observers' term included.
+        memory: MemoryAdmission,
+        /// Frames encoded at once: [`ENCODERS`], or fewer when the budget
+        /// is short.
+        encoders: usize,
+    },
     /// A frame written.
     Frame {
         /// [`RENDER_SCHEMA`].
@@ -123,29 +135,24 @@ pub fn render(
         world.set_cpu_workers(workers)?;
     }
     let mut publisher = Publisher::new(&world, 3, || {})?;
-    // The observer's term (FL-043): the feed's epoch slots as reserved, and
-    // the frames in flight, each held raw and encoded. The view's own
-    // drawing buffers are not counted.
-    let [width, height] = options.size;
-    let frame = u64::from(width)
-        .saturating_mul(u64::from(height))
-        .saturating_mul(4);
-    let observer = publisher
-        .reserved_bytes()
-        .saturating_add(frame.saturating_mul(2 * (ENCODERS as u64 + 1)));
-    let memory = crate::memory::admit(config, &world, options.controllers, None, observer)?;
-    install(&mut world, options.controllers, memory.backend)?;
-    std::fs::create_dir_all(&options.out)
-        .map_err(|error| io("create the frame directory", &options.out, &error))?;
     let viewer = publisher.feed().viewer(1)?;
     let founding = viewer.latest()?;
     let mut view = WorldView::for_epoch(&founding, options.size, background)?;
     view.set_style(options.style);
     drop(founding);
+    let (memory, encoders) = admit(&world, options, &publisher, &view)?;
+    install(&mut world, options.controllers, memory.backend)?;
+    emit(&RenderRecord::Start {
+        schema: RENDER_SCHEMA,
+        memory,
+        encoders,
+    });
+    std::fs::create_dir_all(&options.out)
+        .map_err(|error| io("create the frame directory", &options.out, &error))?;
     let every = options.every.max(1);
     let mut frames = 0;
     // PNG encoding is the largest part of a frame and independent of every
-    // other frame, so up to `ENCODERS` frames encode on their own threads
+    // other frame, so up to `encoders` frames encode on their own threads
     // while the world steps and the next frame renders. The bytes written
     // are the same; only when they are written changes.
     std::thread::scope(|scope| -> Result<(), CoreError> {
@@ -161,7 +168,7 @@ pub fn render(
                 drop(lease);
                 let rgba = view.render_rgba8(options.render_threads.get())?;
                 let path = options.out.join(format!("frame-{frames:06}.png"));
-                if encoding.len() >= ENCODERS {
+                if encoding.len() >= encoders {
                     finish(encoding.pop_front())?;
                 }
                 let [width, height] = options.size;
@@ -228,9 +235,63 @@ pub fn render(
     Ok(())
 }
 
-/// Frames encoding at once: enough to keep pace with rendering, and a
-/// bound on the frames held in memory.
-const ENCODERS: usize = 4;
+/// The most frames encoding at once: enough to keep pace with rendering,
+/// and a bound on the frames held in memory.
+pub const ENCODERS: usize = 4;
+
+/// The most one frame being encoded holds per pixel (FL-043): its RGBA8
+/// pixels, 4 bytes, and the PNG encoder's working set, which holds the
+/// filtered rows, the compressor's copy of them, its match chains and
+/// tokens, and the stream and file it writes. Measured on the pinned
+/// FrankenManim encoder: at most 44 bytes a pixel on incompressible noise
+/// from 640 x 360 to 1920 x 1080, and 24 on a flat frame.
+pub const ENCODING_BYTES_PER_PIXEL: u64 = 4 + 48;
+
+/// What one frame being encoded holds whatever its size: the compressor's
+/// hash table and its thread. Measured at under 1 MiB.
+pub const ENCODING_BYTES_FIXED: u64 = 2 << 20;
+
+/// What `encoders` frames being encoded at once hold at `size`.
+#[must_use]
+pub fn encoding_bytes(size: [u32; 2], encoders: usize) -> u64 {
+    let [width, height] = size.map(u64::from);
+    width
+        .saturating_mul(height)
+        .saturating_mul(ENCODING_BYTES_PER_PIXEL)
+        .saturating_add(ENCODING_BYTES_FIXED)
+        .saturating_mul(encoders as u64)
+}
+
+/// Admit `world`'s render (FL-043). The observers' term is the feed's epoch
+/// slots as reserved; the view's own buffers, one frame's job and the CPU
+/// route's frame buffers ([`WorldView::reserved_bytes`],
+/// [`WorldView::frame_bytes`], [`WorldView::offline_bytes`]); and the
+/// frames being encoded ([`encoding_bytes`]). [`ENCODERS`] frames encode at
+/// once, or as many as the budget leaves room for, one at least, so a
+/// small budget slows a render before it refuses one. The backend gets
+/// what remains.
+fn admit(
+    world: &World,
+    options: &RenderOptions,
+    publisher: &Publisher,
+    view: &WorldView,
+) -> Result<(MemoryAdmission, usize), CoreError> {
+    let drawing = total([
+        publisher.reserved_bytes(),
+        view.reserved_bytes(),
+        view.frame_bytes(),
+        view.offline_bytes(options.render_threads.get()),
+    ]);
+    let observers = |encoders| drawing.saturating_add(encoding_bytes(options.size, encoders));
+    for encoders in (2..=ENCODERS).rev() {
+        if let Ok(memory) =
+            crate::memory::admit(world, options.controllers, None, observers(encoders))
+        {
+            return Ok((memory, encoders));
+        }
+    }
+    crate::memory::admit(world, options.controllers, None, observers(1)).map(|memory| (memory, 1))
+}
 
 /// Wait for one frame's encoder and pass on its result.
 fn finish(

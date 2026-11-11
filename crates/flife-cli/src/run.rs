@@ -548,8 +548,7 @@ pub fn configure(
     if let Some(workers) = cpu_workers {
         world.set_cpu_workers(workers)?;
     }
-    let config = world.config().clone();
-    let memory = crate::memory::admit(&config, world, choice, checkpoint, 0)?;
+    let memory = crate::memory::admit(world, choice, checkpoint, 0)?;
     install(world, choice, memory.backend)?;
     Ok(memory)
 }

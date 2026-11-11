@@ -33,6 +33,7 @@
 
 use flife_backend_metal::{BackendBudget, ControllerChoice};
 use flife_core::ids::{OrganismId, SessionId};
+use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
 use flife_manim::{Motion, Style, Viewport, WorldView, hex_rgb};
@@ -182,6 +183,8 @@ pub struct Studio {
     window_closed: bool,
     /// Where due controllers are evaluated.
     controllers: String,
+    /// The peak-memory admission it opened under (FL-043).
+    memory: MemoryAdmission,
 }
 
 impl Studio {
@@ -194,6 +197,8 @@ impl Studio {
     ///   cannot start.
     /// - The founding, session and view errors of [`World::found`],
     ///   [`flife_runtime::open`] and [`WorldView::new`].
+    /// - [`CoreError::BudgetExhausted`] when the world and its observers do
+    ///   not fit `maximum_total_bytes` ([`crate::memory::admit`]).
     pub fn open(config: &ValidatedConfig, options: &StudioOptions) -> Result<Self, CoreError> {
         let model = config.config();
         let background =
@@ -223,13 +228,26 @@ impl Studio {
         if let Some(workers) = options.cpu_workers {
             world.set_cpu_workers(workers)?;
         }
-        // The Studio's observers are not yet admitted against the memory
-        // budget (FL-043), so its backend is not bounded by it.
-        world.set_controller_backend(
-            options
-                .controllers
-                .backend(world.cpu_workers(), BackendBudget::UNBOUNDED)?,
-        );
+        // The observers are admitted before the backend (FL-043): the view
+        // is made now, for the founding state, and the backend holds what
+        // the budget leaves. Frames are drawn at the window's drawable.
+        let founding = Epoch::standalone(&world)?;
+        let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
+        view.set_style(options.style);
+        let drawable = preview
+            .surface_metrics()
+            .ok()
+            .filter(|metrics| metrics.drawable_width > 0 && metrics.drawable_height > 0)
+            .map_or([width, height], |metrics| {
+                [metrics.drawable_width, metrics.drawable_height]
+            });
+        let memory = crate::memory::admit(&world, options.controllers, &founding, &view, drawable)?;
+        drop(founding);
+        let budget = BackendBudget {
+            bytes: memory.backend,
+            organisms: world.population().capacity() as u64,
+        };
+        world.set_controller_backend(options.controllers.backend(world.cpu_workers(), budget)?);
         let controllers = world
             .controller_report()
             .backend
@@ -240,8 +258,6 @@ impl Studio {
         // The shown epoch and, while the display moves, its prior.
         let viewer = feed.viewer(DISPLAY_PAIR)?;
         let founding = viewer.latest()?;
-        let mut view = WorldView::for_epoch(&founding, [width, height], background)?;
-        view.set_style(options.style);
         view.show(&founding)?;
         let mut pacer = Pacer::new();
         pacer.arrive(Instant::now());
@@ -275,6 +291,7 @@ impl Studio {
             tally: FrameTally::default(),
             window_closed: false,
             controllers,
+            memory,
         })
     }
 
@@ -283,6 +300,12 @@ impl Studio {
     #[must_use]
     pub fn controllers(&self) -> &str {
         &self.controllers
+    }
+
+    /// The peak-memory admission the Studio opened under (FL-043).
+    #[must_use]
+    pub const fn memory(&self) -> &MemoryAdmission {
+        &self.memory
     }
 
     /// Run one frame.

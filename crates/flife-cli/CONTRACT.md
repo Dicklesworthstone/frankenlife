@@ -36,6 +36,14 @@ the controller backend as its `BackendBudget`. A backend never holds more than i
 would not fit is not made, and its jobs go to the reference, which gives the same bits. So a small budget slows a
 run and never changes it.
 
+The second slice moves the sum into `flife_engine::World::admit_memory` (`memory::admit` wraps it) and charges
+observers. `flife render` builds its view before admission and charges its feed's slots, the view's own buffers,
+one frame's FrankenManim job, the CPU route's frame buffers (`WorldView::{reserved_bytes, frame_bytes,
+offline_bytes}`) and its frames being encoded, `encoding_bytes(size, encoders)`: per pixel
+`ENCODING_BYTES_PER_PIXEL` (the frame's 4 bytes and 48 for the PNG encoder's working set) and
+`ENCODING_BYTES_FIXED` (2 MiB) per frame. `ENCODERS` (4) frames encode at once, or as many as the budget has room
+for, one at least, before a render is refused. Its first record is `start`, with `memory` and `encoders`.
+
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.
 - `flife validate <config>`.
@@ -265,8 +273,7 @@ run and never changes it.
     plus `World::batched_bytes` for a run with a controller backend. The engine reserves the fields and the tick's
     scratch for `population.maximum_count` when the world is founded, its workers are set or a backend is
     installed, so they do not grow while the run steps.
-  - `render` is what an observer reserves (`flife render`: the publisher's slots and its frames in flight); a
-    headless run has none. `checkpoint` is FL-038's admitted peak, or 0 without a run directory. `reserve` is
+  - `render` is what the observers hold (`flife render`: as above; a headless run has none). `checkpoint` is FL-038's admitted peak, or 0 without a run directory. `reserve` is
     `RESERVE_BYTES` (64 MiB), a declared allowance for the runtime, the session, the store and the device driver.
   - `backend` is `budget_bytes` minus the other terms, or 0 for `--controllers cpu`.
 - FL-043: the admission comes before anything is created. A refused run makes no run directory and prints nothing.
@@ -731,7 +738,7 @@ refused. `a_directory_without_a_run_is_refused_untouched`. Six planted mutants (
 position, the field plane reversed, affinity left out, a founder its own parent, organism energy doubled) were each
 caught.
 
-`tests/memory_admission.rs` (5 tests, FL-043, about 7 s; a counting global allocator, `peak_alloc`, test only):
+`tests/memory_admission.rs` (10 tests, FL-043, about 15 s; a counting global allocator, `peak_alloc`, test only):
 - `the_preset_is_admitted_term_by_term`: on the preset each term is its source (the configuration's quotas, the
   world's footprint, `RESERVE_BYTES`) and the peak is their sum: 1,375.7 MiB on the reference (genomes 1,152.0,
   state 19.63, field 6.95, scratch 79.25, births 53.88, reserve 64.0). With `torch` the scratch adds the batched
@@ -749,6 +756,21 @@ caught.
 - `a_filling_introduction_stays_within_the_staging_term`: 512 founders of a capacity of 4,096, and at tick 0 an
   introduction of the other 3,584. The step holds 142.60 MiB above the world before it: within the staging term
   (13.47 MiB), the introduced genomes' parameters (136.55 MiB) and the state's room to its bound (1.34 MiB).
+- `a_render_holds_no_more_heap_than_a_plain_run_and_its_render_term`: the preset rendered at 1280 x 720 for 8 ticks
+  every 2, in points and in density, holds at most the heap of the same world stepped without observers plus the
+  admitted render term (observers held 57.3 MiB above the plain run, against a term of 315.4 MiB, which charges
+  incompressible frames and the full ceiling).
+- `a_renders_term_is_its_observers_and_a_short_budget_encodes_fewer_frames`: at 320 x 180 the term is exactly the
+  feed, the view's buffers, the frame's job, the CPU route's buffers and four encodings. A budget with room for two
+  encodings gets two; one byte short of room for one is refused.
+- `a_frames_encoding_holds_no_more_than_its_allowance`: one PNG encoding of noise (no matches) and of a flat frame
+  at 96 x 64 to 1920 x 1080 holds, with the frame, at most 47.8 bytes a pixel (noise at 640 x 360), within the
+  allowance.
+- `a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes`: a view of the preset at its 16,384 ceiling, shown
+  twice in points and twice in density, holds 14.49 of its 16.41 MiB at 1280 x 720 and 45.56 of 47.82 at 4K.
+- `a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms`: a 4K CPU frame of that world holds its draw list
+  within what `frame_bytes` adds to the preparation limit (7.75 MiB in points), its job within `frame_bytes`
+  (86.5 MiB of 236.2 in points, 178.8 in density) and, above the job, within `offline_bytes` (55.6 of 95.5 MiB).
 
 Eleven planted mutants were run against these tests and `flife-engine`'s, `flife-backend-cpu`'s and
 `flife-backend-metal`'s FL-043 tests, and every one was caught: the source supports, the lanes at a new worker
@@ -759,15 +781,27 @@ admission (the tests here); and the staging term set to zero (the filling introd
 the unbounded owner, until the Metal test asserted the owner's limit, and the zero staging term, until the
 filling introduction was added. The full-population heap test alone has too little margin to see it.
 
+Second slice: 24 planted bugs, 22 caught. Caught: the admission's render term, batched lists, backend grant and
+refusal; render's view buffers, frame job, CPU frame buffers, fewer encoders and `start` record; the view's dot
+and triangle charges, its field once shown and once made, the grid's quad count, the grids counted once, the float
+frame, the density bins and the draw list; the Studio's upload, device and feed-slot terms; and an unprojected
+standalone epoch. The triangle charge (640 cut to 400) and the draw list survived the first run and were caught
+after a grid-dominated world (a ceiling of 64) joined the frame sweep and the draw list was measured on its own.
+Two survive. The encoding loop ignoring the admitted count (`>= ENCODERS`) is unseen: the number of frames
+encoding at once is not observable from outside, and the render term's slack hides it on the heap. A job compiled
+without the limit is unseen because a correct limit is never reached; FrankenManim's refusal past it was seen only
+when the triangle charge was planted short.
+
 **Validity domain.** The `reference-small-world` preset and the configurations `flife-engine` founds, at
 `volatile-in-memory`, on the native current-thread runtime with one owner and one client. FL-037's run directories
 also at `write-ahead-before-apply`, one process per run directory, on local file systems (APFS tested here).
 
 **Known gaps.**
 - FL-043 gaps (first slice):
-  - `flife-studio`'s backends are unbounded (`BackendBudget::UNBOUNDED`), and its observers and windows are not
-    admitted.
-  - `flife render` admits the publisher and its frames in flight, not the view's own drawing buffers.
+  - The Studio is admitted (second slice), but only `flife-studio`'s headless tests check it: see its contract.
+  - The encoding allowance and the preparation coefficients are measured on the pinned FrankenManim, not derived
+    from it. The preparation limit is enforced by FrankenManim; the encoder's working set is not, and is charged
+    at its worst measured case (noise).
   - `reserve` is a declared allowance, not a measurement of the runtime's, the store's or the driver's heap.
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
     in which every organism reproduces, which would test its birth part, is not made.

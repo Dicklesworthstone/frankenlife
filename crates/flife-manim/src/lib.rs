@@ -52,4 +52,7 @@ pub use selection::{
     SELECTION_RING_WIDTH_POINTS, pick, selection_ring,
 };
 pub use viewport::{MAXIMUM_ZOOM, Viewport};
-pub use world::{Motion, WorldView, hex_rgb};
+pub use world::{
+    Motion, PREPARATION_BYTES_FIXED, PREPARATION_BYTES_PER_DOT, PREPARATION_BYTES_PER_TRIANGLE,
+    WorldView, hex_rgb,
+};

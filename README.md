@@ -96,7 +96,10 @@ grow while it steps), a step's births, observers, checkpoints and a declared res
 `maximum_total_bytes`, and refuse the run before creating anything if those do not fit. The preset admits at
 1,375.7 MiB of its 2,048. What is left is the controller backend's budget: a parameter shard that would not fit is
 not made and its organisms are evaluated on the reference, so a small budget slows a run and never changes its
-digest. Studio is not admitted yet.
+digest. The second slice admits observers: `flife render` charges its feed, its view's buffers, one frame's
+FrankenManim job (compiled within a preparation limit) and the frames being encoded, and encodes fewer frames at
+once before it refuses a render. The Studio is admitted before its controller backend is installed, with its feed,
+view, frame upload and device surfaces, and its backend gets the bounded remainder instead of an unbounded budget.
 FL-039 branches a run: `flife branch PARENT DIR --at T` starts a new session from the parent's checkpoint at
 tick T, a control branch, or an intervention branch with `--inject` brushes or `--remove` removals of its own
 (`--remove TICK:X,Y:RADIUS:DISPOSITION` takes out every organism in a disk, its energy removed, dissipated or

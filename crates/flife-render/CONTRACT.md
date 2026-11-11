@@ -55,6 +55,9 @@ A slow consumer can therefore cost display freshness, never the world.
   - busy boundaries, each counted once however often it was retried;
   - the pending tick;
   - the first projection failure.
+- FL-043: `Epoch::standalone(world)`, the world's committed state as one slot outside any feed (identity 1, no
+  prior, never published), so a host can size its observers before its feed exists. The Studio sizes its feed by
+  it: `render_queue_capacity` slots of its `reserved_bytes()`.
 - `pairing`:
   - `pairs(prior, current)`: a merge by identity, yielding `Continuing`, `Born` or `Died` rows;
   - `Gap::between`: the tick gap, the travel bound `ticks · Δt · maximum speed`, and whether twice that bound, with

@@ -112,6 +112,7 @@ use crate::reproduction::{
     resolve_births,
 };
 
+mod admission;
 mod checkpoint;
 
 pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION};

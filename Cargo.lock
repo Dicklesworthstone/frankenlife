@@ -958,6 +958,7 @@ dependencies = [
  "flife-render",
  "flife-runtime",
  "fmn-render",
+ "peak_alloc",
  "serde",
  "serde_json",
 ]

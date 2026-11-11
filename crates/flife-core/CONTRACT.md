@@ -50,7 +50,9 @@ are no hidden defaults.
   its sink a page at a time and keeps only the manifest; `seal` returns the prefix the in-memory container would
   start with. `finish` (in memory) now reserves the container's exact length once.
 - FL-043: `memory::{capacity_bytes, bytes_for, total}`, the one rule every footprint term is counted by: a buffer is
-  charged its capacity times its element size, saturating.
+  charged its capacity times its element size, saturating. `memory::MemoryAdmission` (serializable, with
+  `fixed_bytes()`, every term but the backend's) and `memory::RESERVE_BYTES` (64 MiB) are the preflight's decision
+  and declared reserve, shared by the command line and the Studio; the engine's `World::admit_memory` makes it.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.

@@ -83,7 +83,10 @@ pub use persist::{
     CATALOG_FILE, CONFIG_FILE, Injection, Introduction, Material, Persistence, Removal,
     ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability, resume,
 };
-pub use render::{RENDER_SCHEMA, RenderOptions, RenderRecord, render};
+pub use render::{
+    ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, RENDER_SCHEMA, RenderOptions,
+    RenderRecord, encoding_bytes, render,
+};
 pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,
     Record, RunOptions, SkippedCheckpoint, Stop, auto_workers, configure, found, run, run_with,

@@ -25,6 +25,7 @@
 
 mod controls;
 mod host;
+pub mod memory;
 mod pacing;
 mod session;
 

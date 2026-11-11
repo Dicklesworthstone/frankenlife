@@ -204,6 +204,15 @@ presentation state, not scientific state.
   backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
   --window`) are qualified.
+- `tests/admission.rs` (FL-043, no window): the Studio's observer bytes are its feed (`render_queue_capacity`
+  slots of the founding epoch), its view's buffers, one frame's job, the frame's upload (host staging and device
+  copy, each at the preparation limit), `DEVICE_BYTES_PER_PIXEL` (24) per drawable pixel and a status word per
+  16 x 16 tile. With `torch` the backend gets the budget's remainder (97.2 MiB of 2,048 on the preset at a
+  3840 x 2160 drawable), with `cpu` nothing, and a budget one byte short of the observers is refused.
+- `tests/frame_upload.rs` (FL-043, Metal compute, no window): on a `MetalRenderer`, 48 frames of the preset at
+  4,096 and 16,384 organisms, 1280 x 720 and 3840 x 2160, one and two pixels per point, zooms 1 and 16, in points,
+  density and raw density: the host heap the route holds to upload a frame, above the frame it returns, is within
+  the view's preparation limit (at most 70.7%).
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -220,8 +229,19 @@ reference CPU world. Linux has no native Studio (§13.6). Linux guarantees headl
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
 - A selection shows only as the ring and the `selection` record: there is no inspector (FL-021).
-- FL-043: Studio's controller backends are unbounded (`BackendBudget::UNBOUNDED`), and its world, view and window
-  are not admitted against `maximum_total_bytes`. Only `flife run`, `resume` and `render` admit their peak memory.
+- FL-043: `Studio::open` admits the world and its observers before installing the backend
+  (`memory::admit`), which `tests/admission.rs` checks without a window. That `open` itself does so, installs the
+  bounded backend and reports `memory` in its `open` record runs only in a window, which no test here opened.
+  - A resize past the opening size, in pixels and density bins, is not admitted again.
+  - The device terms (`DEVICE_BYTES_PER_PIXEL`: the Metal route's RGBA16F and RGBA8 surfaces and three window
+    drawables) come from FrankenManim's and AppKit's buffers as declared, not from a measurement: device memory is
+    outside the heap the tests count.
+  - FrankenManim bounds neither the Metal route's host staging of a frame nor its device copy. Both are charged at
+    the view's preparation limit, which the host staging stayed within on 48 measured frames (at most 70.7%); a
+    frame beyond them is not refused.
+  - On the preset at 1920 x 1080 points with a 2x display, the observers take 549.3 MiB and the backend gets
+    97.2 MiB of the 2,048, where it was unbounded: parameter shards that do not fit are evaluated on the reference
+    (the same bits, slower). The Studio's frame and inference rates under that budget are not measured here.
 - Input latency and frame-time percentiles under simulation load (§13.6, §13.7, G6) are not measured here, at
   one pixel per point or at backing density, where a 2× screen has four times the pixels per frame. The
   synchronous present path is an integration starting point, not latency evidence.

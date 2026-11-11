@@ -158,6 +158,16 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
     grid, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
   - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
+  - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
+    draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's, the
+    density's and the ring's grids at the most vertices and indices their cells make, twice, since a grid is built
+    before the one it replaces is dropped). `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536) for a dot
+    and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for every triangle the three
+    grids can make, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
+    (FrankenManim's `max_working_bytes`): a tile bin past it is left out, which only slows the frame, and rows past
+    it refuse the frame. `frame_bytes()` is the draw list and that limit. `offline_bytes(threads)` is what
+    `render_rgba8` adds: the RGBA16F and RGBA8 frames and each thread's tile scratch at the finest sampling. A view
+    made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
   - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
 
 **Invariants.**
@@ -292,6 +302,14 @@ route.
   binary takes its colour from the configuration unless `--color` overrides it.
 - Planted bugs in this crate were each caught (FL-018's listed in its commit; FL-019's 14 in its commit; FL-020's
   camera, picking and world-view mutants, with `flife-render`'s interpolation ones, in its commit).
+- `tests/frame_bytes.rs` (2 tests, FL-043): over Appendix A worlds at 1,024 and 16,384 organisms (a ceiling of
+  16,384) and at a ceiling of 64, where the grids' triangles dominate, every style, 640 x 360 to 3840 x 2160, one
+  and two pixels per point and zooms of 1, 8 and 64, 216 frames: FrankenManim's own accounting of an unlimited
+  preparation is within the view's limit (the fullest at 71.9%, and 69.4% at the ceiling of 64), so the limit
+  leaves nothing out of them, and the job compiled within it holds the same bytes. The limit is
+  the ceiling's dots, the grids' triangles and the fixed part exactly; a view made for an epoch counts the field.
+  In `flife-cli`, `tests/memory_admission.rs` measures the view's own heap and a CPU frame against these terms, and
+  in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
 
 **Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `721b04b9`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.

@@ -21,13 +21,15 @@
 )]
 
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flife_cli::memory::admit;
 use flife_cli::{
     CheckpointMode, ControllerChoice, MemoryAdmission, Persistence, RESERVE_BYTES, Record,
-    RunOptions, configure, found, run_with,
+    RenderOptions, RenderRecord, RunOptions, Style, configure, encoding_bytes, found, render,
+    run_with,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Intervention, Stepped};
@@ -156,7 +158,7 @@ fn the_preset_is_admitted_term_by_term() {
     let mut world = found(&config).expect("the preset founds");
     let footprint = world.footprint();
     let batched = world.batched_bytes();
-    let reference = admit(&config, &world, ControllerChoice::Cpu, None, 0).expect("admitted");
+    let reference = admit(&world, ControllerChoice::Cpu, None, 0).expect("admitted");
     print(&reference);
     assert_eq!(reference.budget_bytes, execution.maximum_total_bytes);
     assert_eq!(reference.genomes, execution.maximum_allocated_genome_bytes);
@@ -195,7 +197,7 @@ fn the_preset_is_admitted_term_by_term() {
         + reference.reserve;
     assert_eq!(reference.peak_bytes, fixed);
 
-    let torch = admit(&config, &world, ControllerChoice::Torch, None, 0).expect("admitted");
+    let torch = admit(&world, ControllerChoice::Torch, None, 0).expect("admitted");
     print(&torch);
     assert!(batched > 0);
     assert_eq!(torch.scratch, footprint.scratch + batched);
@@ -386,4 +388,302 @@ fn a_filling_introduction_stays_within_the_staging_term() {
         "the step held {held} > staging {} + genomes {introduced} + state room {room}",
         footprint.staging
     );
+}
+
+/// What `flife render`'s observers hold: the most heap a render of the
+/// preset holds is at most what the same world, stepped the same ticks
+/// without observers, holds plus the admitted render term.
+#[test]
+fn a_render_holds_no_more_heap_than_a_plain_run_and_its_render_term() {
+    let _serial = serial();
+    let config = preset();
+    let ticks = 8;
+    let workers = NonZeroUsize::new(4);
+
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    {
+        let mut world = found(&config).expect("founds");
+        configure(&mut world, workers, ControllerChoice::Cpu, None).expect("admitted");
+        for _ in 0..ticks {
+            assert!(matches!(
+                world.step().expect("steps"),
+                Stepped::Published(_)
+            ));
+        }
+    }
+    let plain = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+
+    for (size, style) in [
+        ([1280, 720], Style::default()),
+        (
+            [1280, 720],
+            Style {
+                particles: flife_cli::Particles::Density,
+                field: true,
+                ..Style::default()
+            },
+        ),
+    ] {
+        let options = RenderOptions {
+            ticks,
+            every: 2,
+            size,
+            out: fresh("render-frames"),
+            cpu_workers: workers,
+            controllers: ControllerChoice::Cpu,
+            render_threads: NonZeroUsize::new(4).expect("four"),
+            video: None,
+            fps: 30,
+            style,
+        };
+        let mut admitted = None;
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        render(&config, &options, |record| {
+            if let RenderRecord::Start { memory, .. } = record {
+                admitted = Some(memory.render);
+            }
+        })
+        .expect("renders");
+        let peak = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        let term = admitted.expect("a start record");
+        println!(
+            "{size:?} {}: render heap peak {:.2} MiB; plain run {:.2} MiB + render term {:.2} MiB \
+             = {:.2} MiB; observers held {:.2} MiB above the plain run",
+            style.particles.name(),
+            mib(peak),
+            mib(plain),
+            mib(term),
+            mib(plain + term),
+            mib(peak.saturating_sub(plain)),
+        );
+        assert!(
+            peak <= plain + term,
+            "render held {peak} > plain run {plain} + render term {term}"
+        );
+    }
+}
+
+/// One frame being encoded holds no more than its allowance: on noise,
+/// which leaves the compressor no match and so the most tokens and the
+/// longest stream, and on a flat frame, from 96 x 64 to 1920 x 1080. The
+/// frame's own pixels are counted with the encoder's working set.
+#[test]
+fn a_frames_encoding_holds_no_more_than_its_allowance() {
+    let _serial = serial();
+    for size in [[96_u32, 64_u32], [640, 360], [1280, 720], [1920, 1080]] {
+        let [width, height] = size;
+        let pixels = u64::from(width) * u64::from(height);
+        let mut noise = vec![0_u8; usize::try_from(pixels * 4).expect("fits")];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for byte in &mut noise {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state.to_le_bytes()[3];
+        }
+        let flat = vec![7_u8; noise.len()];
+        for (name, rgba) in [("noise", &noise), ("flat", &flat)] {
+            let base = ALLOC.current_usage();
+            ALLOC.reset_peak_usage();
+            let png = fmn_codec::png::encode_rgba8(
+                width,
+                height,
+                rgba,
+                fmn_codec::CompressionLevel::Fast,
+            );
+            let held =
+                u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits") + pixels * 4;
+            let allowance = encoding_bytes(size, 1);
+            println!(
+                "{width}x{height} {name}: held {held} B ({:.1} B/px), allowance {allowance} B, png {} B",
+                held as f64 / pixels as f64,
+                png.len()
+            );
+            assert!(
+                held <= allowance,
+                "{width}x{height} {name}: {held} > {allowance}"
+            );
+        }
+    }
+}
+
+/// Render's observer term is its feed's slots, its view's buffers, one
+/// frame's job, the CPU route's frame buffers and the frames being encoded.
+/// A budget with room for only two encoders gets two, and one short of
+/// room for one is refused.
+#[test]
+fn a_renders_term_is_its_observers_and_a_short_budget_encodes_fewer_frames() {
+    let _serial = serial();
+    let size = [320, 180];
+    let threads = NonZeroUsize::new(2).expect("two");
+    // The observers render makes, made the same way.
+    let world = found(&preset()).expect("founds");
+    let publisher = flife_render::Publisher::new(&world, 3, || {}).expect("a publisher");
+    let lease = publisher
+        .feed()
+        .viewer(1)
+        .expect("a viewer")
+        .latest()
+        .expect("the founding epoch");
+    let view = flife_manim::WorldView::for_epoch(&lease, size, [0, 0, 0]).expect("a view");
+    let drawing = publisher.reserved_bytes()
+        + view.reserved_bytes()
+        + view.frame_bytes()
+        + view.offline_bytes(threads.get());
+    drop(lease);
+
+    let start = |config: &ValidatedConfig| {
+        let options = RenderOptions {
+            ticks: 0,
+            every: 1,
+            size,
+            out: fresh("render-term"),
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+            render_threads: threads,
+            video: None,
+            fps: 30,
+            style: Style::default(),
+        };
+        let mut admitted = None;
+        render(config, &options, |record| {
+            if let RenderRecord::Start {
+                memory, encoders, ..
+            } = record
+            {
+                admitted = Some((memory.clone(), *encoders));
+            }
+        })
+        .map(|()| admitted.expect("a start record"))
+    };
+    let (memory, encoders) = start(&preset()).expect("admitted");
+    print(&memory);
+    assert_eq!(encoders, flife_cli::ENCODERS);
+    assert_eq!(memory.render, drawing + encoding_bytes(size, encoders));
+    let others = memory.fixed_bytes() - memory.render;
+
+    let two = preset_with(&[(
+        "maximum_total_bytes",
+        others + drawing + encoding_bytes(size, 2),
+    )]);
+    let (memory, encoders) = start(&two).expect("admitted with fewer encoders");
+    assert_eq!(encoders, 2);
+    assert_eq!(memory.render, drawing + encoding_bytes(size, 2));
+    assert_eq!(memory.peak_bytes, memory.budget_bytes);
+
+    let short = preset_with(&[(
+        "maximum_total_bytes",
+        others + drawing + encoding_bytes(size, 1) - 1,
+    )]);
+    match start(&short) {
+        Err(CoreError::BudgetExhausted { budget, .. }) => {
+            assert!(budget.starts_with("peak memory"), "{budget}");
+        }
+        other => panic!("expected a peak-memory refusal, got {other:?}"),
+    }
+}
+
+/// The preset at its population ceiling (16,384), as the view sees it.
+fn full_epoch() -> flife_render::Epoch {
+    let config = preset_with(&[("initial_count", 16_384), ("maximum_count", 16_384)]);
+    let world = found(&config).expect("founds");
+    let epoch = flife_render::Epoch::standalone(&world).expect("an epoch");
+    assert_eq!(epoch.len(), 16_384);
+    epoch
+}
+
+/// The view's own buffers, measured: made for a full world, shown in
+/// points and then in density (so each grid is built while the last one
+/// is held), a view holds no more heap than its reserved bytes.
+#[test]
+fn a_views_own_buffers_hold_no_more_heap_than_its_reserved_bytes() {
+    let _serial = serial();
+    let epoch = full_epoch();
+    for size in [[1280, 720], [3840, 2160]] {
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        let mut view = flife_manim::WorldView::for_epoch(&epoch, size, [0, 0, 0]).expect("a view");
+        view.show(&epoch).expect("shows");
+        view.show(&epoch).expect("shows again");
+        view.set_style(Style {
+            particles: flife_cli::Particles::Density,
+            ..Style::default()
+        });
+        view.show(&epoch).expect("shows the density");
+        view.show(&epoch).expect("shows the density again");
+        let held = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        let reserved = view.reserved_bytes();
+        println!(
+            "{size:?}: the view held {:.2} MiB of its {:.2} MiB",
+            mib(held),
+            mib(reserved)
+        );
+        assert!(
+            held <= reserved,
+            "{size:?}: the view held {held} > {reserved}"
+        );
+    }
+}
+
+/// One frame on the CPU route, measured: a full world at 3840 x 2160 in
+/// points and in density, on four threads, holds no more heap above the
+/// view than the view's frame and offline bytes.
+#[test]
+fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
+    let _serial = serial();
+    let epoch = full_epoch();
+    for particles in [flife_cli::Particles::Points, flife_cli::Particles::Density] {
+        let mut view =
+            flife_manim::WorldView::for_epoch(&epoch, [3840, 2160], [0, 0, 0]).expect("a view");
+        view.set_style(Style {
+            particles,
+            ..Style::default()
+        });
+        view.show(&epoch).expect("shows");
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        let draws = view.draws().expect("draws");
+        let listed = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        drop(draws);
+        assert!(
+            listed <= view.frame_bytes() - view.preparation_limit(),
+            "{}: the draw list held {listed} beyond the preparation's limit",
+            particles.name()
+        );
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        let job = view.job().expect("a job");
+        let compiled = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        drop(job);
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        let rgba = view.render_rgba8(4).expect("renders");
+        let held = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        drop(rgba);
+        let offline = view.offline_bytes(4);
+        println!(
+            "{}: a 4K frame's draw list held {:.2} MiB; the frame {:.2} MiB, its job {:.2} of {:.2} MiB, \
+             the rest {:.2} of {:.2} MiB",
+            particles.name(),
+            mib(listed),
+            mib(held),
+            mib(compiled),
+            mib(view.frame_bytes()),
+            mib(held - compiled),
+            mib(offline),
+        );
+        assert!(
+            compiled <= view.frame_bytes(),
+            "{}: the job held {compiled}",
+            particles.name()
+        );
+        assert!(
+            held - compiled <= offline,
+            "{}: rendering held {} above its job > {offline}",
+            particles.name(),
+            held - compiled
+        );
+    }
 }

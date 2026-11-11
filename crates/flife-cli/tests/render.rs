@@ -42,7 +42,7 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
                 path,
                 ..
             } => Some((*schema, *frame, *tick, path.clone())),
-            RenderRecord::End { .. } => None,
+            RenderRecord::Start { .. } | RenderRecord::End { .. } => None,
         })
         .collect();
     assert_eq!(

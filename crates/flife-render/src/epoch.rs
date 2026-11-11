@@ -369,6 +369,19 @@ fn fold(coordinate: f64, length: f32) -> f32 {
 }
 
 impl Epoch {
+    /// `world`'s committed state as an epoch outside any feed: what one of
+    /// a publisher's slots holds, so a host can size its observers before
+    /// its feed exists (FL-043). Its identity is 1 and it has no prior; it
+    /// is never published.
+    ///
+    /// # Errors
+    /// As a slot's allocation and projection.
+    pub fn standalone(world: &World) -> Result<Self, CoreError> {
+        let mut epoch = Self::allocate(world)?;
+        epoch.project(world, RenderEpoch::new(1), None)?;
+        Ok(epoch)
+    }
+
     /// A slot for `world`'s epochs: every buffer allocated once, at its
     /// population ceiling and texture size. It holds `world`'s founding
     /// metadata until its first projection.

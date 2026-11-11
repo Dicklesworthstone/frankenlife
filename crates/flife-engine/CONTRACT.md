@@ -165,6 +165,11 @@ each runs and owns the field.
   installing a controller backend adds). `Population::allocated_bytes()`, `Population::bound_bytes(topologies)`
   and `PER_ORGANISM_BYTES` (an organism's index, free-list and genome-header entries). `ControllerReport` gains
   `resident_peak_bytes`, the most `ControllerBackend::resident_bytes` reported after any batch.
+- FL-043, second slice: `World::admit_memory(batched, checkpoint, render)`, the peak-memory preflight every host
+  calls (moved here from `flife-cli` so the Studio can call it): the allocated genome quota, the footprint's state,
+  field, scratch (plus `batched_bytes()` when `batched`) and staging, the host's `render` and `checkpoint` bytes,
+  and `RESERVE_BYTES`, against `maximum_total_bytes`. Over it: `BudgetExhausted` ("peak memory
+  (maximum_total_bytes)"). Otherwise the backend is granted the rest when `batched`, or nothing.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).

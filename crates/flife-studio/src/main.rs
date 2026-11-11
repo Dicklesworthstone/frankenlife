@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use flife_backend_metal::ControllerChoice;
 use flife_core::ValidatedConfig;
+use flife_core::memory::MemoryAdmission;
 use flife_studio::{
     ColorMapping, End, Look, Particles, STUDIO_SCHEMA, Status, Studio, StudioOptions, Style,
 };
@@ -107,6 +108,7 @@ enum Record<'a> {
         frames_per_second: u32,
         cpu_workers: usize,
         controllers: &'a str,
+        memory: &'a MemoryAdmission,
         mapping: &'static str,
         meaning: &'static str,
         look: &'static str,
@@ -227,6 +229,7 @@ fn main() -> ExitCode {
         frames_per_second: fps,
         cpu_workers: cli.cpu_workers.get(),
         controllers: studio.controllers(),
+        memory: studio.memory(),
         mapping: options.style.mapping.name(),
         meaning: options.style.mapping.meaning(),
         look: options.style.look.name(),

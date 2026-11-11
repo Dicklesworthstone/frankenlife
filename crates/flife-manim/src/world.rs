@@ -3,12 +3,64 @@
 
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
+use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_render::{Epoch, Gap, Interpolation, Prior, interpolate};
-use fmn_core::color::{LinearRgba, Srgb};
-use fmn_render::{SurfaceDraw, SurfaceMesh, ThreeDCamera, ThreeDDraw, ThreeDJob, Tiling};
+use fmn_core::color::{LinearRgba, PremulRgba, Srgb};
+use fmn_render::{
+    SurfaceDraw, SurfaceMesh, SurfaceVertex, ThreeDCamera, ThreeDDraw, ThreeDJob,
+    ThreeDPreparationLimits, Tiling,
+};
 
 use crate::mapping::{Look, Particles, Style};
-use crate::{DensityLayer, FieldLayer, ParticleCloud, Viewport, pick, selection_ring};
+use crate::{
+    DensityLayer, FieldLayer, ParticleCloud, SELECTION_RING_SEGMENTS, Viewport, density_bins, pick,
+    selection_ring,
+};
+
+/// The most FrankenManim's preparation of a frame charges for one true dot
+/// (`ThreeDJob::preparation_bytes`, FL-043): its draw row, its two raster
+/// triangles and its places in the tile bins. Measured on the pinned
+/// FrankenManim with 1,024 and 16,384 organisms at 640 x 360 to 3840 x 2160:
+/// at most 1,197 bytes. A dot's radius has a ceiling in points, so a zoom
+/// does not widen it past a few tiles.
+pub const PREPARATION_BYTES_PER_DOT: u64 = 1_536;
+
+/// The most FrankenManim's preparation of a frame charges for one surface
+/// triangle, its share of the grid's vertices and its places in the
+/// triangle bins included (FL-043). Measured on the pinned FrankenManim
+/// over density grids of 60 x 60 to 360 x 360 bins and a 128 x 128 field:
+/// at most 476 bytes.
+pub const PREPARATION_BYTES_PER_TRIANGLE: u64 = 640;
+
+/// FrankenManim's preparation apart from its rows: the job, and the tile
+/// tables of its bins.
+pub const PREPARATION_BYTES_FIXED: u64 = 1 << 20;
+
+/// The finest edge sampling FrankenManim's 3D route takes per pixel: a
+/// 4 x 4 grid.
+const MAXIMUM_SAMPLES_PER_PIXEL: u64 = 16;
+
+/// The most vertices and triangles a periodic grid of `cells` makes
+/// ([`Viewport::periodic_grid`]): `cells + 2` lines a side when the window
+/// cuts a cell, two triangles a quad.
+fn grid_bound(cells: [u32; 2]) -> (u64, u64) {
+    if cells.contains(&0) {
+        return (0, 0);
+    }
+    let [columns, rows] = cells.map(u64::from);
+    (
+        (columns + 2).saturating_mul(rows + 2),
+        (columns + 1).saturating_mul(rows + 1).saturating_mul(2),
+    )
+}
+
+/// The bytes of a grid of `vertices` and `triangles`.
+fn grid_bytes((vertices, triangles): (u64, u64)) -> u64 {
+    total([
+        vertices.saturating_mul(bytes_for::<SurfaceVertex>(1)),
+        triangles.saturating_mul(bytes_for::<u32>(3)),
+    ])
+}
 
 /// A `#rrggbb` colour, as `[presentation] background` spells it.
 #[must_use]
@@ -55,6 +107,8 @@ pub struct WorldView {
     motion: Option<Motion>,
     selected: Option<OrganismId>,
     ring: Option<SurfaceMesh>,
+    /// The texels of the field last shown; none before the first epoch.
+    field_texels: [u32; 2],
 }
 
 /// Where the display is between two committed epochs (FL-020, plan §13.5).
@@ -122,10 +176,11 @@ impl WorldView {
             motion: None,
             selected: None,
             ring: None,
+            field_texels: [0; 2],
         })
     }
 
-    /// A view sized for `epoch`'s world and population ceiling.
+    /// A view sized for `epoch`'s world, field and population ceiling.
     ///
     /// # Errors
     /// As [`WorldView::new`].
@@ -134,7 +189,9 @@ impl WorldView {
         drawable: [u32; 2],
         background: [u8; 3],
     ) -> Result<Self, CoreError> {
-        Self::new(epoch.extent(), epoch.capacity(), drawable, background)
+        let mut view = Self::new(epoch.extent(), epoch.capacity(), drawable, background)?;
+        view.field_texels = epoch.field().texels();
+        Ok(view)
     }
 
     /// Refit the viewport, camera and dot radius to a new drawable size,
@@ -421,6 +478,7 @@ impl WorldView {
         // for, so it does not grow.
         self.ids.clear();
         self.ids.extend_from_slice(epoch.ids());
+        self.field_texels = epoch.field().texels();
         self.reselect(self.selected)
     }
 
@@ -545,19 +603,112 @@ impl WorldView {
         Ok(draws)
     }
 
-    /// The 3D job for the current frame, over [`WorldView::draws`].
+    /// The 3D job for the current frame, over [`WorldView::draws`],
+    /// compiled within [`WorldView::preparation_limit`] (FL-043).
+    /// FrankenManim leaves out a tile bin that would pass it, which only
+    /// slows the frame; rows that would pass it refuse the frame.
     ///
     /// # Errors
     /// As [`WorldView::draws`]; [`CoreError::NumericalInvalid`] when
     /// FrankenManim refuses to compile the draws.
     pub fn job(&self) -> Result<ThreeDJob<'_>, CoreError> {
         let draws = self.draws()?;
-        ThreeDJob::new(self.camera.camera(), &draws, Tiling::default()).map_err(|error| {
-            CoreError::NumericalInvalid {
+        let limits = ThreeDPreparationLimits {
+            max_working_bytes: self.preparation_limit(),
+            ..ThreeDPreparationLimits::default()
+        };
+        ThreeDJob::new_with_limits(self.camera.camera(), &draws, Tiling::default(), limits).map_err(
+            |error| CoreError::NumericalInvalid {
                 quantity: "world view frame",
                 detail: error.to_string(),
-            }
-        })
+            },
+        )
+    }
+
+    /// The most bytes the view's own buffers hold (FL-043): the shown
+    /// rows' identities and drawn positions and the cloud's draws and
+    /// halos, each reserved for the population ceiling; the density bins
+    /// at the viewport's count; and the field's, the density's and the
+    /// selection ring's grids at the most vertices and indices their cells
+    /// make, each twice, since a grid is built before the one it replaces
+    /// is dropped. The field's grid counts once the view knows the field:
+    /// from [`WorldView::for_epoch`] or the first shown epoch. A resize or
+    /// a new pixel density changes the density's bins and so these bytes.
+    #[must_use]
+    pub fn reserved_bytes(&self) -> u64 {
+        let [columns, rows] = density_bins(&self.viewport).map(u64::from);
+        let bins = columns.saturating_mul(rows);
+        let ring = SELECTION_RING_SEGMENTS as u64;
+        let grids = total([
+            grid_bytes(grid_bound(self.field_texels)),
+            grid_bytes(grid_bound(density_bins(&self.viewport))),
+            grid_bytes((2 * ring, 2 * ring)),
+        ]);
+        total([
+            capacity_bytes(&self.ids),
+            capacity_bytes(&self.between.positions),
+            capacity_bytes(&self.between.shown),
+            capacity_bytes(&self.between.fading),
+            self.cloud.reserved_bytes(),
+            bins.saturating_mul(bytes_for::<u32>(1) + bytes_for::<[f64; 3]>(1)),
+            grids.saturating_mul(2),
+        ])
+    }
+
+    /// The preparation bytes a frame's job is compiled within (FL-043):
+    /// [`PREPARATION_BYTES_PER_DOT`] for a dot and a halo per organism the
+    /// view can hold, [`PREPARATION_BYTES_PER_TRIANGLE`] for every triangle
+    /// the field's, the density's and the ring's grids can make, and
+    /// [`PREPARATION_BYTES_FIXED`], whatever the style, which a host may
+    /// change from frame to frame.
+    #[must_use]
+    pub fn preparation_limit(&self) -> u64 {
+        let dots = (self.cloud.capacity() as u64).saturating_mul(2);
+        let ring = 2 * SELECTION_RING_SEGMENTS as u64;
+        let triangles = total([
+            grid_bound(self.field_texels).1,
+            grid_bound(density_bins(&self.viewport)).1,
+            ring,
+        ]);
+        total([
+            dots.saturating_mul(PREPARATION_BYTES_PER_DOT),
+            triangles.saturating_mul(PREPARATION_BYTES_PER_TRIANGLE),
+            PREPARATION_BYTES_FIXED,
+        ])
+    }
+
+    /// The most one frame's [`WorldView::job`] holds (FL-043): its draw
+    /// list, a field, a density and a ring draw and a dot and a halo per
+    /// organism the view can hold, and FrankenManim's preparation, within
+    /// [`WorldView::preparation_limit`].
+    #[must_use]
+    pub fn frame_bytes(&self) -> u64 {
+        let draws = self.cloud.capacity().saturating_mul(2).saturating_add(3);
+        total([
+            bytes_for::<ThreeDDraw<'static>>(draws),
+            self.preparation_limit(),
+        ])
+    }
+
+    /// What [`WorldView::render_rgba8`] holds on `threads` threads on top
+    /// of [`WorldView::frame_bytes`] (FL-043): the RGBA16F frame
+    /// FrankenManim renders, the RGBA8 frame returned, and each thread's
+    /// tile scratch, a premultiplied colour and a depth for every sample of
+    /// a tile at the finest edge sampling and a flag for every pixel.
+    #[must_use]
+    pub fn offline_bytes(&self, threads: usize) -> u64 {
+        let [width, height] = self.viewport.drawable().map(u64::from);
+        let pixels = width.saturating_mul(height);
+        let tile = u64::from(Tiling::default().fine_tile).pow(2);
+        let scratch = tile.saturating_mul(
+            MAXIMUM_SAMPLES_PER_PIXEL
+                .saturating_mul(bytes_for::<PremulRgba>(1) + bytes_for::<f32>(1))
+                .saturating_add(1),
+        );
+        total([
+            pixels.saturating_mul(8 + 4),
+            scratch.saturating_mul(threads.max(1) as u64),
+        ])
     }
 
     /// Render the current frame on the CPU with up to `threads` threads, as

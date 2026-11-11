@@ -330,7 +330,7 @@ route.
   In `flife-cli`, `tests/memory_admission.rs` measures the view's own heap and a CPU frame against these terms, and
   in `flife-studio`, `tests/frame_upload.rs` the Metal route's upload.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `8ccb702e`, CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `5d08cba2`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**

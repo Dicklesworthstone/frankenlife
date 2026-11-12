@@ -385,40 +385,34 @@ fn serve(
                 let kept = checkpoints.is_some();
                 let stop = Arc::new(AtomicBool::new(false));
                 let mut keeper = None;
-                let mut unheld = None;
+                let mut shared = None;
                 if let Some(checkpoints) = checkpoints
-                    && let Some((checkpoints, holding)) =
+                    && let Some((chain, holding)) =
                         keep::found(&cx, &handle, checkpoints, &report).await
                 {
-                    match holding {
-                        // Interval zero: only the closing checkpoint.
-                        None => unheld = Some(checkpoints),
-                        Some(holding) => {
-                            let (session, kept_report, kept_stop) =
-                                (handle.clone(), report.clone(), Arc::clone(&stop));
-                            let spawned = watchers.try_spawn(async move {
-                                let cx = Cx::current()?;
-                                keep::keep(
-                                    &cx,
-                                    &session,
-                                    checkpoints,
-                                    holding,
-                                    &kept_report,
-                                    &kept_stop,
-                                )
-                                .await
-                            });
-                            match spawned {
-                                Ok(task) => keeper = Some(task),
-                                Err(error) => {
-                                    let _ = report.send(Status::Unkept {
-                                        kind: "missing-capability",
-                                        detail: format!("the checkpointer: {error}"),
-                                    });
-                                    // Nothing waits at the hold: let the
-                                    // session run past it.
-                                    let _ = handle.release(&cx).await;
-                                }
+                    shared = Some(Arc::clone(&chain));
+                    // Interval zero holds nothing: only the strokes' and
+                    // the closing checkpoints.
+                    if let Some(holding) = holding {
+                        let (session, kept_report, kept_stop) =
+                            (handle.clone(), report.clone(), Arc::clone(&stop));
+                        let spawned = watchers.try_spawn(async move {
+                            let Some(cx) = Cx::current() else {
+                                return;
+                            };
+                            keep::keep(&cx, &session, &chain, holding, &kept_report, &kept_stop)
+                                .await;
+                        });
+                        match spawned {
+                            Ok(task) => keeper = Some(task),
+                            Err(error) => {
+                                let _ = report.send(Status::Unkept {
+                                    kind: "missing-capability",
+                                    detail: format!("the checkpointer: {error}"),
+                                });
+                                // Nothing waits at the hold: let the
+                                // session run past it.
+                                let _ = handle.release(&cx).await;
                             }
                         }
                     }
@@ -430,6 +424,11 @@ fn serve(
                         break;
                     }
                     client.watchers.retain(|watcher| !watcher.is_finished());
+                    // A stroke while paused: the exact pre-intervention
+                    // checkpoint first.
+                    if let (Intent::Intervene { .. }, Some(shared)) = (intent, &shared) {
+                        keep::before_stroke(&cx, &handle, shared, &report).await;
+                    }
                     let status = act(&cx, &handle, &watchers, &report, &mut client, intent).await;
                     let _ = report.send(status);
                 }
@@ -440,11 +439,10 @@ fn serve(
                     let paused = handle.pause(&cx).await;
                     stop.store(true, Ordering::Release);
                     let _ = handle.release(&cx).await;
-                    let checkpoints = match keeper {
-                        Some(task) => task.await,
-                        None => unheld,
-                    };
-                    keep::close(&cx, &handle, checkpoints, paused, &report).await
+                    if let Some(task) = keeper {
+                        task.await;
+                    }
+                    keep::close(&cx, &handle, shared.as_ref(), paused, &report).await
                 } else {
                     handle.close(&cx).await
                 };

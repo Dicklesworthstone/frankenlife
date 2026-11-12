@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use flife_cli::{
-    CHECKPOINT_FIXED_BYTES, CheckpointAt, ControllerChoice, InspectOptions, ResumeOptions,
-    StoreDurability,
+    BranchOptions, CHECKPOINT_FIXED_BYTES, CheckpointAt, ControllerChoice, InspectOptions,
+    ResumeOptions, StoreDurability,
 };
 use flife_core::ids::CommandId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
@@ -299,13 +299,19 @@ fn kept_session_resumes(durability: &str) {
     let applied_strokes = [(strokes[0].0, strokes[0].1, applied[0].1)];
 
     // The checkpoints: tick 0 and every multiple of the interval the
-    // session reached, each exactly there, as `flife run`'s are, then the
-    // closing boundary unless a multiple's holds it; numbered in order, all
-    // pause-and-stream.
+    // session reached, each exactly there, as `flife run`'s are; the
+    // closing boundary, where the stroke offered while paused took its
+    // pre-intervention checkpoint (unless a multiple's holds it); and, with
+    // no journal to replay it, the closing boundary again, now holding that
+    // stroke pending. Numbered in order, all pause-and-stream.
     let kept = checkpoints(&statuses);
     assert!(kept.len() >= 3, "{kept:?}");
     let ticks: Vec<u64> = kept.iter().map(|(tick, ..)| tick.get()).collect();
-    assert_eq!(ticks, chain(0, closed_at.get(), every), "{durability}");
+    let mut expected = chain(0, closed_at.get(), every);
+    if durability == "volatile-in-memory" {
+        expected.push(closed_at.get());
+    }
+    assert_eq!(ticks, expected, "{durability}");
     assert!(ticks.contains(&(2 * every)), "{ticks:?}");
     for pair in kept.windows(2) {
         assert!(pair[1].1 > pair[0].1, "{kept:?}");
@@ -313,9 +319,14 @@ fn kept_session_resumes(durability: &str) {
     assert!(kept.iter().all(|(.., mode)| *mode == "pause-and-stream"));
 
     // Every checkpoint restores to the directly stepped world, and the last
-    // is the world the session closed on.
+    // is the world the session closed on. `--at` takes the newest at a
+    // tick: the closing one at the closing boundary.
     let (_, digests) = direct(&config, &applied_strokes, closed_at);
-    for (tick, sequence, sha256, _) in &kept {
+    let newest = kept
+        .iter()
+        .enumerate()
+        .filter(|&(at, (tick, ..))| kept[at + 1..].iter().all(|(later, ..)| later != tick));
+    for (_, (tick, sequence, sha256, _)) in newest {
         let inspection = flife_cli::inspect(
             &dir,
             InspectOptions {
@@ -373,6 +384,230 @@ fn kept_session_resumes(durability: &str) {
         .accepted(strokes[1].0)
         .map(|accepted| accepted.effective);
     assert_eq!(pending_applied, Some(closed_at));
+}
+
+/// Plan §2.2's journey: pause, stroke, resume, and compare the result with
+/// a control branch from the exact pre-intervention checkpoint. A stroke
+/// offered while a kept session is paused first publishes a checkpoint of
+/// the boundary it will apply at; another stroke there shares it, as one at
+/// a multiple shares the checkpointer's own, and a stroke while running
+/// takes none. `flife branch --at` such a tick makes a control that
+/// inherits every command applied before it and none of the strokes made
+/// there: resumed, it is the world stepped directly without them, bit for
+/// bit, while the session closes on the world with all of them.
+#[test]
+fn a_stroke_while_paused_keeps_the_exact_pre_intervention_checkpoint() {
+    for durability in ["volatile-in-memory", "write-ahead-before-apply"] {
+        pre_intervention(durability);
+    }
+}
+
+fn pre_intervention(durability: &str) {
+    // A checkpoint every 4 ticks.
+    let config = configured(
+        durability,
+        &[(
+            "persistence",
+            "checkpoint_interval_simulation_seconds",
+            "0.03125",
+        )],
+    );
+    let every = config.report().checkpoint_interval_ticks.get();
+    assert_eq!(every, 4);
+
+    // Closed at once, the founding checkpoint holds the closing boundary
+    // and every command (none): it is the only one.
+    let dir = fresh(&format!("pre-{durability}-at-once"));
+    let keeping = Keeping::new(&dir, &config).expect("kept");
+    let (owner, handle, kept) = keeping
+        .open(found(&config), &config, STUDIO_SESSION)
+        .expect("the kept session opens");
+    let session =
+        SessionThread::spawn_kept(owner, handle, Some(kept)).expect("the session thread starts");
+    let (closed, closing) = session.close_reporting().expect("closes");
+    let ticks: Vec<u64> = checkpoints(&closing)
+        .iter()
+        .map(|(tick, ..)| tick.get())
+        .collect();
+    assert_eq!(
+        (closed.boundary.tick, ticks),
+        (Tick::ZERO, vec![0]),
+        "{durability}"
+    );
+
+    let dir = fresh(&format!("pre-{durability}"));
+    let keeping = Keeping::new(&dir, &config).expect("kept");
+    let (owner, handle, kept) = keeping
+        .open(found(&config), &config, STUDIO_SESSION)
+        .expect("the kept session opens");
+    let session =
+        SessionThread::spawn_kept(owner, handle, Some(kept)).expect("the session thread starts");
+    let stroke = |cell, seen| Intent::Intervene {
+        stroke: Stroke::Energy {
+            cell,
+            amount: BRUSH_ENERGY,
+        },
+        seen: Tick::new(seen),
+    };
+    let checkpointed_at = |statuses: &[Status], tick: u64| {
+        statuses.iter().position(
+            |status| matches!(status, Status::Checkpointed { tick: at, .. } if at.get() == tick),
+        )
+    };
+    let submitting = |statuses: &[Status], nth: usize| {
+        statuses
+            .iter()
+            .enumerate()
+            .filter(|(_, status)| matches!(status, Status::Submitted { .. }))
+            .nth(nth)
+            .map(|(at, _)| at)
+    };
+
+    // Paused at tick 1: stroke A, then its step.
+    session.send(Intent::Step).expect("offered");
+    let statuses = gather(&session, Vec::new(), |statuses| stepped(statuses) == 1);
+    session.send(stroke([5, 9], 1)).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        submitted(statuses).len() == 1
+    });
+    session.send(Intent::Step).expect("offered");
+    session.send(Intent::Step).expect("offered");
+    // Paused at tick 3: strokes B and C share one checkpoint.
+    let statuses = gather(&session, statuses, |statuses| stepped(statuses) == 3);
+    session.send(stroke([20, 6], 3)).expect("offered");
+    session.send(stroke([12, 12], 3)).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        submitted(statuses).len() == 3
+    });
+    // Stepped to the multiple 4: the checkpointer's checkpoint there is
+    // stroke E's too.
+    session.send(Intent::Step).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        stepped(statuses) == 4 && checkpointed_at(statuses, 4).is_some()
+    });
+    session.send(stroke([7, 25], 4)).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        submitted(statuses).len() == 4
+    });
+    // Running: stroke D takes no checkpoint of its own.
+    session.send(Intent::Resume).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Running { .. }))
+    });
+    session.send(stroke([28, 2], 4)).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        finished(statuses) == 5
+            && checkpoints(statuses)
+                .last()
+                .is_some_and(|(tick, ..)| tick.get() >= 3 * every)
+    });
+    session.send(Intent::Pause).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Paused { .. }))
+    });
+    let (closed, closing) = session.close_reporting().expect("closes");
+    let statuses: Vec<Status> = statuses.into_iter().chain(closing).collect();
+    let closed_at = closed.boundary.tick;
+
+    let strokes = submitted(&statuses);
+    let effective: Vec<u64> = strokes.iter().map(|(.., tick)| tick.get()).collect();
+    assert_eq!(effective[..4], [1, 3, 3, 4], "{durability}");
+    assert!(effective[4] >= 4, "{effective:?}");
+    let mut applied = applied(&statuses);
+    applied.sort();
+    assert_eq!(
+        applied,
+        strokes
+            .iter()
+            .map(|(command, _, tick)| (*command, *tick))
+            .collect::<Vec<_>>(),
+        "every stroke applied where it was accepted"
+    );
+
+    // Each paused stroke's checkpoint came before it was offered; the
+    // checkpoints are tick 0, the two strokes' boundaries, then the
+    // multiples and the closing boundary.
+    for (tick, nth) in [(1, 0), (3, 1)] {
+        let (Some(before), Some(offered)) =
+            (checkpointed_at(&statuses, tick), submitting(&statuses, nth))
+        else {
+            panic!("{durability}: tick {tick}: {statuses:?}");
+        };
+        assert!(before < offered, "{durability}: tick {tick}");
+    }
+    let ticks: Vec<u64> = checkpoints(&statuses)
+        .iter()
+        .map(|(tick, ..)| tick.get())
+        .collect();
+    let mut expected = vec![0, 1, 3];
+    expected.extend(chain(4, closed_at.get(), every));
+    assert_eq!(ticks, expected, "{durability}");
+
+    // The session closed on the world with every stroke.
+    let (_, digests) = direct(&config, &strokes, closed_at);
+    assert_eq!(
+        closed.world.digest().to_hex(),
+        *digests.last().expect("digests")
+    );
+
+    // Controls from tick 3 and tick 4: each inherits the strokes applied
+    // before its tick and none made there, and resumed to tick 11 is the
+    // world stepped directly with only those, while the session's world
+    // there differs.
+    let until = 11;
+    for (at, inherited) in [(3, 1), (4, 3)] {
+        let control = fresh(&format!("pre-{durability}-control-{at}"));
+        flife_cli::branch(
+            &dir,
+            &control,
+            &BranchOptions {
+                at: Some(at),
+                name: Some(format!("control-{at}")),
+                commands: Vec::new(),
+                durability: StoreDurability::PowerLoss,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{durability}: branch at {at}: {error}"));
+        let resumed = flife_cli::resume(
+            &control,
+            &ResumeOptions {
+                until,
+                every: 0,
+                cpu_workers: None,
+                controllers: ControllerChoice::Cpu,
+                checkpoint_every: None,
+                durability: StoreDurability::PowerLoss,
+                checkpoint_mode: None,
+                retained_bytes: None,
+                metrics_every: 0,
+            },
+            |_| {},
+        )
+        .unwrap_or_else(|error| panic!("{durability}: resume the control at {at}: {error}"));
+        let (without, _) = direct(&config, &strokes[..inherited], Tick::new(until));
+        assert_eq!(
+            resumed.closed.world.digest(),
+            without.digest(),
+            "{durability}: the control from {at}"
+        );
+        let usize_until = usize::try_from(until).expect("a small tick");
+        assert_ne!(
+            without.digest().to_hex(),
+            digests[usize_until],
+            "{durability}: the strokes at {at} change the world"
+        );
+        for (nth, (command, ..)) in strokes.iter().enumerate() {
+            assert_eq!(
+                resumed.closed.book.accepted(*command).is_some(),
+                nth < inherited,
+                "{durability}: the control from {at}, stroke {nth}"
+            );
+        }
+    }
 }
 
 /// An offscreen Studio: 320 x 200 points at one pixel a point, paused, CPU

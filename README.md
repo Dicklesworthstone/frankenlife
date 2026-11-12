@@ -471,12 +471,15 @@ checkpoint-replay export (plan §13.8) and Cinema qualification (FL-050) are lat
 
 `--run DIR` keeps the Studio's session in a new run directory (FL-024), as `flife run --run-dir` keeps a run: the
 configuration, the command journal (every brush applied is a journaled command under `write-ahead-before-apply`)
-and checkpoints at the configured interval. The founding one comes first; while the world runs, each is taken at the
-first committed boundary the Studio reads (every 50 ms) at or past the next multiple; and closing publishes the
-closing boundary and suspends the session, so a stroke still pending applies when the run is resumed. The window's
-telemetry names the newest checkpoint's tick, and the NDJSON carries a `checkpoint` record each. `flife resume`,
-`flife branch` and `flife inspect` (`--weights` included) take the directory: resuming it reaches exactly the world
-an uninterrupted session would.
+and checkpoints at the configured interval. The founding one comes first; while the world runs, the Studio holds
+the session at each multiple of the interval, takes the checkpoint there and lets it run on, so its checkpoints land
+on exactly the ticks `flife run`'s would. A brush stroke made while the world is paused first checkpoints the
+boundary it will apply at, unless that boundary already has one, so `flife branch DIR CONTROL --at T` makes a
+control from the exact pre-intervention world, holding every command before the stroke and none made at T.
+Closing publishes the closing boundary and suspends the session, so a stroke still pending applies when the run is
+resumed. The window's telemetry names the newest checkpoint's tick, and the NDJSON carries a `checkpoint` record
+each. `flife resume`, `flife branch` and `flife inspect` (`--weights` included) take the directory: resuming it
+reaches exactly the world an uninterrupted session would.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density`, `--no-field` and
 `--field-mapping energy|composition|component-C` (C from 0 to 31).

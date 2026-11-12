@@ -153,9 +153,18 @@ directory, with its pending commands and its checkpoint chain.
     reached, takes a checkpoint there (`flife_cli::Checkpoints::take`) and moves the hold to the next multiple, so
     every checkpoint a running session takes is at a multiple and each multiple it reaches has one, as `flife
     run`'s do. A run waits at a multiple only while its checkpoint is taken, a step there waits with it, and the
-    session commits the same worlds. Closing pauses the session, releases the hold (which ends the checkpointer's
-    wait), publishes the closing boundary unless the newest holds it or a fault stopped the world, publishes a
-    background checkpoint in flight, and suspends the session rather than closing it. Each checkpoint reports
+    session commits the same worlds. Plan §2.2's pre-intervention checkpoint: an `Intervene` intent while the
+    session is paused (`inspect` says not running) first publishes a checkpoint of the committed boundary, where
+    the stroke will apply, unless the chain's newest is already at that tick (another stroke's there, or the
+    checkpointer's at a multiple), so `flife branch --at` that tick makes a control holding every command before
+    the stroke and none made there. A stroke while running takes none. The checkpointer and the session thread
+    share the chain behind an `asupersync` mutex (`OwnedMutexGuard`, so the checkpointer's future is `Send`),
+    and the chain remembers the tick and the newest command its newest checkpoint holds. Closing pauses the
+    session, releases the hold (which ends the checkpointer's wait), publishes the closing boundary unless a fault
+    stopped the world or the newest is at that tick and holds every command the session does (always, under
+    `write-ahead-before-apply`, whose journal replays them; under `volatile-in-memory`, only when no command was
+    accepted after it), publishes a background checkpoint in flight, and suspends the session rather than closing
+    it. Each checkpoint reports
     `Checkpointed { tick, epoch, sequence, sha256, bytes, retired, mode, paused_seconds }`; a failed one, or a hold
     refused, reports `Unkept { kind, detail }`: the hold is released and no more are taken while the session runs
     on.
@@ -849,16 +858,29 @@ presentation state, not scientific state.
     resizes not followed, an odd drawable not withheld, the timeline's hash of nothing; the binary writing no
     frame's records, no end or no timeline at all, and finding an existing timeline only after the Studio
     opens. All but one were caught. The binary dropping the session's statuses survives (see the gaps).
-- `tests/kept.rs` (5 tests, FL-024, no window; the Studio offscreen on headless Metal), a
+- `tests/kept.rs` (6 tests, FL-024, no window; the Studio offscreen on headless Metal), a
   `SessionThread::spawn_kept` over a 32 x 32 preset world with a checkpoint every 256 ticks, all retained:
   - `a_kept_studio_session_is_a_run_the_command_line_resumes`, under `volatile-in-memory` and
     `write-ahead-before-apply`: running, an energy stroke applies; paused, two steps, then a stroke accepted for
     the closing boundary is left pending at the close (`close_reporting`). The checkpoints reported hold tick 0,
-    then exactly each multiple of 256 the session reached, 512 among them, then the closing boundary unless a
-    multiple's holds it, their sequences rising, all `pause-and-stream`. Each one `flife_cli::inspect` restores
-    has the reported sequence and SHA-256 and the digest of the world stepped directly with the applied stroke
-    at its tick; the last is the world the session closed on; and `flife_cli::resume` six ticks on reaches
-    exactly the uninterrupted world, the pending stroke applied at the closing boundary.
+    then exactly each multiple of 256 the session reached, 512 among them, then the closing boundary (the
+    paused stroke's pre-intervention checkpoint) unless a multiple's holds it, and, under `volatile-in-memory`
+    only, the closing boundary again, holding the stroke pending; their sequences rising, all
+    `pause-and-stream`. The newest at each tick, which `flife_cli::inspect` restores, has the reported sequence
+    and SHA-256 and the digest of the world stepped directly with the applied stroke at its tick; the last is
+    the world the session closed on; and `flife_cli::resume` six ticks on reaches exactly the uninterrupted
+    world, the pending stroke applied at the closing boundary.
+  - `a_stroke_while_paused_keeps_the_exact_pre_intervention_checkpoint`, under both durabilities, a checkpoint
+    every 4 ticks. A session closed at once has one checkpoint, the founding one. Then, paused: at tick 1 stroke
+    A, whose checkpoint at 1 is reported before its `Submitted`; two steps; at 3 strokes B and C, sharing one
+    checkpoint at 3 reported before B's `Submitted`; a step to 4, where the checkpointer's checkpoint is awaited
+    and stroke E shares it; then running, stroke D takes none. After a checkpoint at 12 or later it is paused and
+    closed. A, B, C and E apply
+    at 1, 3, 3 and 4, D at 4 or later; the ticks checkpointed are exactly 0, 1, 3 and each multiple of 4 to the
+    closing boundary; and the closed world is the world stepped directly with every stroke where it applied.
+    `flife_cli::branch` at 3 and at 4 makes controls that hold A, and A, B and C, as accepted, and none of the
+    later strokes; resumed to 11, each is bit for bit the world stepped directly with only those strokes, and
+    differs from the session's world at 11.
   - `a_studio_resumes_its_kept_run_where_it_closed`, under both durabilities: a kept session, paused, steps
     twice, applies a stroke at tick 2, steps, and closes with a second stroke pending at tick 3. `Studio::resume`
     on the directory reports the closing checkpoint (its sequence, tick 3), nothing skipped, and tick 3, keeps the
@@ -903,6 +925,12 @@ presentation state, not scientific state.
   it only by not finishing). Two survive: the checkpointer not checking for the close after a new hold (it
   guards a race between the close and a checkpoint being taken that no test forces), and an interval of zero
   dropping the closing checkpoint (unreachable: the schema requires a positive interval).
+- §2.2's pre-intervention checkpoints, planted bugs in `keep.rs` and `session.rs`, 9: no checkpoint before a
+  paused stroke; a running stroke checkpointing too; strokes at one boundary not sharing; the close ignoring the
+  commands the newest holds; the close ignoring the journal; the newest's commands never recorded; a failed
+  checkpoint keeping the chain; the close taking no checkpoint: each caught. One survives: the checkpointer not
+  sharing a stroke's checkpoint at a multiple (a race guard: a stroke must win the lock at the multiple before the
+  checkpointer, and the test waits for the checkpointer's).
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -1000,6 +1028,15 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     keeps the world and commands, not the view.
   - Closing a kept session pauses it before the closing checkpoint, so a running session's last run ends as
     `paused`, not `closed`.
+  - A pre-intervention checkpoint is the control's only while it is the newest at its tick, since `flife branch
+    --at T` takes the newest. Under `volatile-in-memory`, a session closed at a stroke's own boundary with the
+    stroke still pending publishes a second checkpoint there holding it (with no journal, that is the only
+    record of the stroke), so `--at` that tick then branches with the stroke pending. Resuming before closing,
+    as §2.2's journey does, avoids it; under `write-ahead-before-apply` the close takes no second checkpoint.
+    Before this, the volatile close took none either, and a stroke submitted after the newest checkpoint at the
+    closing tick was in no checkpoint and was lost on resumption.
+  - The checkpointer sharing a paused stroke's checkpoint at a multiple guards a race no test forces (a planted
+    bug there survives).
   - `pause-before-commit` is the only capacity policy, so a capacity rejection pauses the run; the binary counts
     the capacity pauses its session reports (a run's end, or a held step, for a shortfall) and marks the world
     paused when the current run ends. The crowded offscreen run exercises a run's end; a held step's shortfall

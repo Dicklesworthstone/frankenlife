@@ -180,7 +180,9 @@ for, one at least, before a render is refused. Its first record is `start`, with
   `particles`, `field` and `field_mapping`). FL-019's style flags choose what is drawn: `--color M` (`lineage`,
   `energy`, `generation`, `motion`, `topology` or `affinity`, or a registered name such as `founder-lineage-v1`; by
   default the configuration's `[presentation] color_mapping`), `--look glow|raw`, `--density`, `--no-field` and
-  `--field-mapping energy|composition` (the field's energy, or its chemical composition lit by its energy). No style
+  `--field-mapping energy|composition|component-C` (the field's energy, its chemical composition lit by its
+  energy, or moment channel C, 0 to 31, per unit energy from blue at −1 to red at +1, lit the same way; a channel
+  past 31 is a usage error, exit 2). No style
   changes the world. Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
   route, with the configuration's bloom (`[presentation] bloom_enabled`, `bloom_strength`) on glowing frames and
   none on raw ones (FL-019); `tests/render.rs` renders the preset with `bloom_enabled = false` too: the glow frame
@@ -516,12 +518,15 @@ test.
 `tests/render.rs` (2 tests):
 - `rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it`. Six ticks at three world threads
   write PNG frames at ticks 0, 3 and 6 with the requested size in their headers, and the end digest is a plain
-  one-thread run's. The same run rendered by energy, raw, as density and with the field's composition ends at the
-  same digest, names that style in its `end`, and writes a different frame.
+  one-thread run's. The same run rendered by energy, raw, as density, with the field's composition and with
+  components 0 and 13 ends at the same digest, names that style in its `end`, and writes a different frame; the
+  two components' frames differ from each other too.
 - `the_render_colour_is_the_configured_mapping_unless_the_flag_overrides_it`. The `flife` binary renders a preset
   configured for `energy-lightness-v1` by energy; `--color motion` and `--color motion-heading-v1` both override it;
-  its field shows energy, and `--field-mapping composition` its composition (FL-019), each named in the `end`
-  record; a configuration naming an unregistered mapping is refused as `invalid-config` before anything renders.
+  its field shows energy, `--field-mapping composition` its composition and `--field-mapping component-31` that
+  channel (FL-019), each named in the `end` record; `component-32` exits 2 with clap's usage error naming it and
+  prints nothing; a configuration naming an unregistered mapping is refused as `invalid-config` before anything
+  renders.
 
 The test profile is optimized (`[profile.test] opt-level = 3`, with debug assertions and overflow checks on), so
 the smoke run takes about 30 s. Rust floating point has no fast-math and no implicit contraction, so optimization

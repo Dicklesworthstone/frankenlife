@@ -4,8 +4,8 @@
 use std::num::NonZeroUsize;
 
 use flife_cli::{
-    ColorMapping, ControllerChoice, FieldMapping, Look, Particles, RENDER_SCHEMA, RenderOptions,
-    RenderRecord, Style, render,
+    ColorMapping, ControllerChoice, FieldComponent, FieldMapping, Look, Particles, RENDER_SCHEMA,
+    RenderOptions, RenderRecord, Style, render,
 };
 use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -166,6 +166,36 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
     assert_eq!(field_of(&records), (plain.digest().to_hex(), "energy"));
     assert_ne!(frame(&records, 2), frame(&composed_records, 2));
 
+    // A chosen component (plan §13.4, "Local field") draws other pixels
+    // again, of the same world, and each channel its own.
+    let mut channel_frames = Vec::new();
+    for channel in [0, 13] {
+        let channel_out = out.with_file_name(format!("flife-render-test-component-{channel}"));
+        std::fs::create_dir_all(&channel_out).expect("a scratch directory");
+        let component = FieldComponent::new(channel).expect("a channel");
+        let options = RenderOptions {
+            out: channel_out,
+            style: Style {
+                field_mapping: FieldMapping::Component(component),
+                ..Style::default()
+            },
+            ..styled.clone()
+        };
+        let mut channel_records = Vec::new();
+        render(&config, &options, |record| {
+            channel_records.push(record.clone())
+        })
+        .expect("renders");
+        let (digest, name) = field_of(&channel_records);
+        assert_eq!(digest, plain.digest().to_hex());
+        assert_eq!(name, format!("component-{channel}"));
+        let drawn = frame(&channel_records, 2);
+        assert_ne!(drawn, frame(&records, 2));
+        assert_ne!(drawn, frame(&composed_records, 2));
+        channel_frames.push(drawn);
+    }
+    assert_ne!(channel_frames[0], channel_frames[1], "each channel its own");
+
     // The preset blooms glowing frames (FL-019): with `bloom_enabled =
     // false` the glow frame differs, and the raw frame, never bloomed, is
     // the same.
@@ -300,6 +330,28 @@ fn the_render_colour_is_the_configured_mapping_unless_the_flag_overrides_it() {
         end.expect("an end record")["field_mapping"],
         "composition",
         "--field-mapping composition"
+    );
+    let (status, end, err) = render(&energy, &["--field-mapping", "component-31"]);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(
+        end.expect("an end record")["field_mapping"],
+        "component-31",
+        "--field-mapping component-31"
+    );
+    // A channel past the last is a usage error, which clap reports in text.
+    let refused = std::process::Command::new(env!("CARGO_BIN_EXE_flife"))
+        .arg("render")
+        .arg(&energy)
+        .args(["--ticks", "1", "--field-mapping", "component-32", "--out"])
+        .arg(scratch.join("fl019-render-refused"))
+        .output()
+        .expect("flife runs");
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(refused.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("`component-32` is not a field mapping"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
     );
 
     for flag in ["motion", "motion-heading-v1"] {

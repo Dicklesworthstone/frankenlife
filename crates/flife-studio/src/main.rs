@@ -141,10 +141,11 @@ struct Cli {
     /// Hide the energy field. F switches.
     #[arg(long)]
     no_field: bool,
-    /// What the field's colour means: `energy` (the default) or
+    /// What the field's colour means: `energy` (the default),
     /// `composition`, its mean chemical composition coloured as the
-    /// affinity mapping colours organisms, as bright as its energy. C
-    /// switches.
+    /// affinity mapping colours organisms, or `component-C`, moment channel
+    /// C (0 to 31) per unit energy from blue (-1) to red (+1); the last two
+    /// as bright as its energy. C switches, `[` and `]` choose the channel.
     #[arg(long, default_value = "energy")]
     field_mapping: FieldMapping,
     /// Run for SECONDS wall seconds with no window, then close: each frame

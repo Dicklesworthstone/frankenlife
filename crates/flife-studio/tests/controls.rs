@@ -3,10 +3,10 @@
 
 use flife_manim::Viewport;
 use flife_studio::{
-    Brush, CameraMove, ColorMapping, Controls, FieldMapping, Intent, KEY_C, KEY_D, KEY_DIGITS,
-    KEY_E, KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_T, KEY_W,
-    KEY_X, KEY_ZERO, Look, Particles, Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT,
-    scroll_zoom,
+    Brush, CameraMove, ColorMapping, Controls, FieldComponent, FieldMapping, Intent, KEY_C, KEY_D,
+    KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R,
+    KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, Look, Particles, Style,
+    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -576,9 +576,9 @@ fn t_asks_to_track_the_selection() {
 
 /// FL-019: the digit keys 1 to 6 (`kVK_ANSI_1` … `kVK_ANSI_6`, whose codes
 /// are not in order) choose the six mappings in order, R, D and F switch the
-/// look, the particles and the field, C the field's mapping (energy or
-/// composition), none of them makes an intent, and auto-repeat and ⌘ change
-/// nothing.
+/// look, the particles and the field, C the field's mapping (energy,
+/// composition, then the chosen component), none of them makes an intent,
+/// and auto-repeat and ⌘ change nothing.
 #[test]
 fn style_keys_choose_the_mapping_look_particles_and_field() {
     assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22]);
@@ -650,13 +650,85 @@ fn style_keys_choose_the_mapping_look_particles_and_field() {
         tap(&mut controls, code);
     }
     assert_eq!(
+        controls.style().field_mapping,
+        FieldMapping::Component(FieldComponent::default())
+    );
+    tap(&mut controls, KEY_C);
+    assert_eq!(
         controls.style(),
         Style {
             mapping: ColorMapping::Affinity,
             ..Style::default()
         }
     );
-    assert_eq!(controls.tally().keys, 2 * 15 + 2);
+    assert_eq!(controls.tally().keys, 2 * 16 + 2);
+}
+
+/// Plan §13.4's chosen components: `[` and `]` (`kVK_ANSI_LeftBracket`,
+/// `kVK_ANSI_RightBracket`) first show the chosen field component, then
+/// step to the previous or next channel, wrapping; C cycles energy,
+/// composition and the component last chosen; a style the Studio opens in
+/// that shows a component chooses it; no intent, and auto-repeat and ⌘
+/// change nothing.
+#[test]
+fn bracket_keys_choose_the_field_component() {
+    assert_eq!((KEY_LEFT_BRACKET, KEY_RIGHT_BRACKET), (33, 30));
+    let component =
+        |channel| FieldMapping::Component(FieldComponent::new(channel).expect("a channel"));
+    let mut controls = Controls::new();
+    for (code, shown) in [
+        (KEY_RIGHT_BRACKET, component(0)),
+        (KEY_RIGHT_BRACKET, component(1)),
+        (KEY_RIGHT_BRACKET, component(2)),
+        (KEY_LEFT_BRACKET, component(1)),
+        (KEY_LEFT_BRACKET, component(0)),
+        (KEY_LEFT_BRACKET, component(31)),
+        (KEY_C, FieldMapping::Energy),
+        (KEY_C, FieldMapping::Composition),
+        (KEY_C, component(31)),
+        (KEY_C, FieldMapping::Energy),
+        (KEY_LEFT_BRACKET, component(31)),
+        (KEY_RIGHT_BRACKET, component(0)),
+    ] {
+        assert!(tap(&mut controls, code).is_empty());
+        assert_eq!(controls.style().field_mapping, shown, "key {code}");
+    }
+    // Repeat and ⌘ step nothing.
+    controls.apply(&key(KEY_RIGHT_BRACKET, true, true, Modifiers::NONE));
+    controls.apply(&key(
+        KEY_LEFT_BRACKET,
+        true,
+        false,
+        Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        },
+    ));
+    assert_eq!(controls.style().field_mapping, component(0));
+    assert_eq!(
+        controls.style(),
+        Style {
+            field_mapping: component(0),
+            ..Style::default()
+        },
+        "only the field's mapping changed"
+    );
+
+    let mut opened = Controls::new();
+    opened.set_style(Style {
+        field_mapping: component(9),
+        ..Style::default()
+    });
+    for shown in [
+        FieldMapping::Energy,
+        FieldMapping::Composition,
+        component(9),
+    ] {
+        tap(&mut opened, KEY_C);
+        assert_eq!(opened.style().field_mapping, shown);
+    }
+    tap(&mut opened, KEY_RIGHT_BRACKET);
+    assert_eq!(opened.style().field_mapping, component(10));
 }
 
 /// Moves wait, in order, until taken; reserving room for one poll's events

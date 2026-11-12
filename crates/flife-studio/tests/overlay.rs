@@ -19,8 +19,9 @@ use flife_engine::{
     Unviable, World,
 };
 use flife_manim::{
-    FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH,
-    HUD_TEXT_POINTS, HudFont, Legend, affinity_rgb8, legend_affinities, linear,
+    COMPONENT_PALETTE, FieldComponent, FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES,
+    HUD_MAX_VERTICES, HUD_SWATCH, HUD_TEXT_POINTS, HudFont, Legend, affinity_rgb8,
+    legend_affinities, linear,
 };
 use flife_render::{Metrics, Tally};
 use flife_studio::{
@@ -717,6 +718,47 @@ fn the_field_key_goes_with_a_drawn_composed_field() {
         None
     );
     assert_eq!(field_key(Style::default()), None);
+    // A chosen component's key, under the same rules.
+    for channel in [0, 17, 31] {
+        let mapping = FieldMapping::Component(FieldComponent::new(channel).expect("a channel"));
+        let shown = Style {
+            field_mapping: mapping,
+            ..Style::default()
+        };
+        assert!(mapping.legend().is_some());
+        assert_eq!(field_key(shown), mapping.legend());
+        assert_eq!(
+            field_key(Style {
+                field: false,
+                ..shown
+            }),
+            None
+        );
+    }
+}
+
+/// Plan §13.4's chosen components: a component's key names its channel and
+/// shows the component palette at -1, -0.5, 0, 0.5 and 1, its labels at
+/// the ends and the middle.
+#[test]
+fn a_component_key_names_its_channel_and_the_palette() {
+    let seven = FieldMapping::Component(FieldComponent::new(7).expect("a channel"))
+        .legend()
+        .expect("a key");
+    assert_eq!(
+        seven.text,
+        "field channel 7 / energy ■ -1 ■ ■ 0 ■ ■ +1, darker is less energy"
+    );
+    assert_eq!(seven.swatches, COMPONENT_PALETTE.to_vec());
+    assert_eq!(
+        seven.text.chars().filter(|&c| c == HUD_SWATCH).count(),
+        seven.swatches.len()
+    );
+    let last = FieldMapping::Component(FieldComponent::new(31).expect("a channel"))
+        .legend()
+        .expect("a key");
+    assert!(last.text.starts_with("field channel 31 / energy "));
+    assert_eq!(last.swatches, seven.swatches);
 }
 
 /// Plan §13.4's "Local field": the composition mapping's key follows the
@@ -1155,7 +1197,19 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         ..reading
     };
     let keys = legends(&config()).expect("the keys");
-    let field = FieldMapping::Composition.legend().expect("the field's key");
+    // The field key that lays out the most, of every field mapping's.
+    let field = FieldMapping::ALL
+        .into_iter()
+        .filter_map(FieldMapping::legend)
+        .max_by_key(|key| {
+            let colors: Vec<_> = key.swatches.iter().map(|&rgb| linear(rgb)).collect();
+            let laid = font
+                .text_with_swatches(&key.text, HUD_TEXT_POINTS * 2.0, &colors)
+                .unwrap_or_else(|error| panic!("{:?}: {error}", key.text));
+            (laid.triangles().len(), laid.vertices().len())
+        })
+        .expect("a field key");
+    println!("the widest field key: {}", field.text);
     let brushes = [
         Brush::Energy,
         Brush::Removal,

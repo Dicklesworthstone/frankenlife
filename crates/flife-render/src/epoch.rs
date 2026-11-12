@@ -4,7 +4,8 @@
 //! - its source tick and resource epoch;
 //! - one row per live organism, in stable identity order;
 //! - a bounded field texture derived from the energy plane, with each
-//!   texel's mean chemical composition through a fixed projection;
+//!   texel's mean chemical composition through a fixed projection and each
+//!   of its moment channels per unit energy, quantized for display;
 //! - a small metric summary.
 //!
 //! Every view declares its [`Layout`]: element type, components, count and
@@ -88,6 +89,27 @@ fn coordinates(dots: [f64; 3], channels: usize, limit: f64) -> [f32; 3] {
 /// Moment channels per cell, as an array length.
 const CHANNELS: usize = MOMENT_CHANNELS as usize;
 
+/// A field component's display step: a texel's moment channel per unit
+/// energy, in `[−1, 1]`, is held as the nearest multiple of `1 / 127`, an
+/// [`i8`] in `[−127, 127]` ([`FieldTexture::components`]).
+pub const COMPONENT_STEPS: i8 = 127;
+
+/// A block's moment channel sum `moment` per unit of its energy sum
+/// `energy` as [`FieldTexture::components`] holds it: `moment / energy`
+/// clamped to `[−1, 1]`, times [`COMPONENT_STEPS`], rounded half away from
+/// zero; `0` for a block with no energy (`energy` not finite and positive)
+/// and for a ratio that is not finite.
+fn component_step(moment: f64, energy: f64) -> i8 {
+    if !(energy.is_finite() && energy > 0.0) {
+        return 0;
+    }
+    let ratio = moment / energy;
+    if !ratio.is_finite() {
+        return 0;
+    }
+    (ratio.clamp(-1.0, 1.0) * f64::from(COMPONENT_STEPS)).round() as i8
+}
+
 /// [`AFFINITY_AXES`] as signs, channel by channel: `H[k][c]`. Adding
 /// `±1 × v` is exactly adding or subtracting `v`, so a sum over them is the
 /// sum [`affinity_projection`]'s fold makes, bit for bit.
@@ -122,6 +144,8 @@ const ROW: usize = FIELD_TEXELS_MAX as usize;
 pub enum Dtype {
     /// Unsigned 8-bit.
     U8,
+    /// Signed 8-bit.
+    I8,
     /// Unsigned 32-bit.
     U32,
     /// Unsigned 64-bit.
@@ -135,7 +159,7 @@ impl Dtype {
     #[must_use]
     pub const fn bytes(self) -> usize {
         match self {
-            Self::U8 => 1,
+            Self::U8 | Self::I8 => 1,
             Self::U32 | Self::F32 => 4,
             Self::U64 => 8,
         }
@@ -167,11 +191,14 @@ pub enum View {
     /// projection as the affinity ([`FieldTexture::composition`]),
     /// row-major.
     FieldComposition,
+    /// Each field texel's moment channels per unit energy, quantized for
+    /// display ([`FieldTexture::components`]), row-major.
+    FieldComponents,
 }
 
 impl View {
     /// Every view, in declaration order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Identity,
         Self::Position,
         Self::Velocity,
@@ -182,6 +209,7 @@ impl View {
         Self::Affinity,
         Self::Field,
         Self::FieldComposition,
+        Self::FieldComponents,
     ];
 
     /// The view's name.
@@ -198,6 +226,7 @@ impl View {
             Self::Affinity => "affinity",
             Self::Field => "field",
             Self::FieldComposition => "field-composition",
+            Self::FieldComponents => "field-components",
         }
     }
 }
@@ -261,8 +290,8 @@ pub enum FieldChannel {
 
 /// A bounded field texture derived from the committed field (§9.5, B.3:
 /// an explicit channel projection and source scale): each texel's mean
-/// energy density, and its mean composition through a fixed projection
-/// (plan §13.4, "Local field").
+/// energy density, and its mean composition through a fixed projection and
+/// as chosen components (plan §13.4, "Local field").
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldTexture {
     channel: FieldChannel,
@@ -272,6 +301,7 @@ pub struct FieldTexture {
     texel_size: [f64; 2],
     values: Vec<f32>,
     composition: Vec<[f32; 3]>,
+    components: Vec<[i8; CHANNELS]>,
 }
 
 impl FieldTexture {
@@ -349,6 +379,7 @@ impl FieldTexture {
             ],
             values: reserved(count, "render field texture")?,
             composition: reserved(count, "render field composition")?,
+            components: reserved(count, "render field components")?,
         })
     }
 
@@ -429,11 +460,39 @@ impl FieldTexture {
         }
     }
 
+    /// Each texel's moment channels per unit energy, row-major, channel `c`
+    /// at index `c` (plan §13.4, "Local field": chosen components): the
+    /// block's moment channel `c` summed, `Σm_c`, over its energy summed,
+    /// `Σe`, both as [`FieldTexture::composition`] sums them, held as the
+    /// nearest multiple of `1 / `[`COMPONENT_STEPS`]: `round(127 Σm_c /
+    /// Σe)`, clamped to `[−127, 127]`, rounded half away from zero. Every
+    /// cell holds `|m_c| ≤ ‖m‖₂ ≤ e` (§4.2), so the ratio is in `[−1, 1]`
+    /// and the clamp guards only rounding. A block with no energy, and a
+    /// texture made from an energy plane alone, have none: zeros. For
+    /// display only, as every view is: nothing scientific reads it.
+    #[must_use]
+    pub fn components(&self) -> &[[i8; CHANNELS]] {
+        &self.components
+    }
+
+    /// The components' layout.
+    #[must_use]
+    pub fn components_layout(&self) -> Layout {
+        Layout {
+            view: View::FieldComponents,
+            dtype: Dtype::I8,
+            components: CHANNELS,
+            count: self.components.len(),
+            bounds: Bounds::Magnitude(f32::from(COMPONENT_STEPS)),
+        }
+    }
+
     /// Refill from row-major `planes` of `cell_area` cells: an energy plane
     /// alone, or the field's 33 planes in their planar order. Each texel
     /// sums its block's energy in F64, rows then columns, and divides it by
-    /// the block's area; with moments, it sums each channel the same way and
-    /// projects the sums over the energy's ([`FieldTexture::composition`]).
+    /// the block's area; with moments, it sums each channel the same way,
+    /// projects the sums over the energy's ([`FieldTexture::composition`])
+    /// and holds each over the energy's ([`FieldTexture::components`]).
     fn project(&mut self, planes: &[f32], cell_area: f64) -> Result<(), CoreError> {
         let [cells_x, cells_y] = self.cells.map(|n| n as usize);
         let cells = cells_x * cells_y;
@@ -464,6 +523,7 @@ impl FieldTexture {
         };
         self.values.clear();
         self.composition.clear();
+        self.components.clear();
         // A texel row at a time: each texel's energy sum, then its three
         // dot products channel by channel, so each plane is read in one run
         // per row. Per texel these are the same sums in the same order as
@@ -483,12 +543,18 @@ impl FieldTexture {
             if !with_moments {
                 for _ in 0..width {
                     self.composition.push([0.0; 3]);
+                    self.components.push([0; CHANNELS]);
                 }
                 continue;
             }
             for axis in &mut dots {
                 axis[..width].fill(0.0);
             }
+            // The row's components, filled channel by channel below; the
+            // buffer's capacity is the texture's, so this never allocates.
+            let first = self.components.len();
+            self.components.resize(first + width, [0; CHANNELS]);
+            let row_components = &mut self.components[first..];
             for (channel, plane) in moments.chunks_exact(cells).enumerate() {
                 let signs = [0, 1, 2].map(|axis| AXIS_SIGNS[axis][channel]);
                 if whole {
@@ -498,6 +564,11 @@ impl FieldTexture {
                         for (dot, &value) in axis.iter_mut().zip(run) {
                             *dot += sign * f64::from(value);
                         }
+                    }
+                    for ((texel, &value), &energy) in
+                        row_components.iter_mut().zip(run).zip(&energies[..width])
+                    {
+                        texel[channel] = component_step(f64::from(value), energy);
                     }
                 } else {
                     // Each block's sum, rows then columns as `block_sum`
@@ -516,6 +587,13 @@ impl FieldTexture {
                         for (dot, &sum) in axis.iter_mut().zip(sums.iter()) {
                             *dot += sign * sum;
                         }
+                    }
+                    for ((texel, &sum), &energy) in row_components
+                        .iter_mut()
+                        .zip(sums.iter())
+                        .zip(&energies[..width])
+                    {
+                        texel[channel] = component_step(sum, energy);
                     }
                 }
             }
@@ -970,7 +1048,7 @@ impl Epoch {
 
     /// Every view's declared layout, in [`View::ALL`] order.
     #[must_use]
-    pub fn layouts(&self) -> [Layout; 10] {
+    pub fn layouts(&self) -> [Layout; 11] {
         let rows = |view, dtype, components, bounds| Layout {
             view,
             dtype,
@@ -995,11 +1073,12 @@ impl Epoch {
             rows(View::Affinity, Dtype::F32, 3, Bounds::Magnitude(1.0)),
             self.field.layout(),
             self.field.composition_layout(),
+            self.field.components_layout(),
         ]
     }
 
     /// The bytes this slot's buffers have actually reserved. Allocated
-    /// once, it is the population ceiling times 53 bytes a row plus 16 a
+    /// once, it is the population ceiling times 53 bytes a row plus 48 a
     /// texel, and a projection never changes it.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
@@ -1017,6 +1096,7 @@ impl Epoch {
             bytes(&self.affinities),
             bytes(&self.field.values),
             bytes(&self.field.composition),
+            bytes(&self.field.components),
         ]
         .into_iter()
         .fold(0, u64::saturating_add)
@@ -1072,6 +1152,12 @@ impl Epoch {
                 format!("{} texels for {texels:?}", self.field.composition.len()),
             );
         }
+        if self.field.components.len() != texels[0] * texels[1] {
+            return refuse(
+                View::FieldComponents,
+                format!("{} texels for {texels:?}", self.field.components.len()),
+            );
+        }
         for layout in self.layouts() {
             match layout.bounds {
                 Bounds::Wrapped(extent) => {
@@ -1083,7 +1169,13 @@ impl Epoch {
                 }
                 Bounds::Magnitude(limit) => {
                     let exceeds = |c: &f32| c.is_nan() || c.abs() > limit;
-                    let found = if layout.view == View::Affinity {
+                    let found = if layout.view == View::FieldComponents {
+                        self.field
+                            .components
+                            .iter()
+                            .find(|q| q.iter().any(|&c| f32::from(c).abs() > limit))
+                            .map(|q| format!("{q:?}"))
+                    } else if layout.view == View::Affinity {
                         self.affinities
                             .iter()
                             .find(|a| a.iter().any(exceeds))

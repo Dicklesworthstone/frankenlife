@@ -18,8 +18,10 @@
 //!
 //! The field under the organisms has its own mapping ([`FieldMapping`],
 //! plan §13.4's "Local field"): its energy density through the look's
-//! palette, or its mean chemical composition by the affinity mapping's
-//! colours, as bright as its energy.
+//! palette; its mean chemical composition by the affinity mapping's
+//! colours (the fixed projection); or one chosen moment channel per unit
+//! energy through the diverging [`COMPONENT_PALETTE`](crate::COMPONENT_PALETTE) (chosen components);
+//! the last two as bright as its energy.
 
 use std::fmt;
 use std::str::FromStr;
@@ -333,6 +335,81 @@ impl Particles {
     }
 }
 
+/// The moment channels a field component can name:
+/// [`flife_core::model::MOMENT_CHANNELS`].
+pub const FIELD_COMPONENTS: u8 = 32;
+
+/// The component mappings' names, as flags and records spell them.
+const COMPONENT_NAMES: [&str; FIELD_COMPONENTS as usize] = [
+    "component-0",
+    "component-1",
+    "component-2",
+    "component-3",
+    "component-4",
+    "component-5",
+    "component-6",
+    "component-7",
+    "component-8",
+    "component-9",
+    "component-10",
+    "component-11",
+    "component-12",
+    "component-13",
+    "component-14",
+    "component-15",
+    "component-16",
+    "component-17",
+    "component-18",
+    "component-19",
+    "component-20",
+    "component-21",
+    "component-22",
+    "component-23",
+    "component-24",
+    "component-25",
+    "component-26",
+    "component-27",
+    "component-28",
+    "component-29",
+    "component-30",
+    "component-31",
+];
+
+/// One of the field's moment channels, `0` to `31` (plan §13.4, "Local
+/// field": chosen components).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FieldComponent(u8);
+
+impl FieldComponent {
+    /// Channel `channel`, or `None` past the last.
+    #[must_use]
+    pub const fn new(channel: u8) -> Option<Self> {
+        if channel < FIELD_COMPONENTS {
+            Some(Self(channel))
+        } else {
+            None
+        }
+    }
+
+    /// The channel's index.
+    #[must_use]
+    pub const fn channel(self) -> u8 {
+        self.0
+    }
+
+    /// The next channel, the first after the last.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        Self((self.0 + 1) % FIELD_COMPONENTS)
+    }
+
+    /// The previous channel, the last before the first.
+    #[must_use]
+    pub const fn previous(self) -> Self {
+        Self((self.0 + FIELD_COMPONENTS - 1) % FIELD_COMPONENTS)
+    }
+}
+
 /// What the field's colour means (plan §13.4, "Local field").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FieldMapping {
@@ -347,35 +424,67 @@ pub enum FieldMapping {
     /// organism at its norm limit shares the hue of the material it
     /// converts best.
     Composition,
+    /// One moment channel per unit energy
+    /// ([`flife_render::FieldTexture::components`]): a corner the
+    /// [`COMPONENT_PALETTE`](crate::COMPONENT_PALETTE) colour of its texels' density-weighted mean,
+    /// from −1 (the channel wholly against the energy) through 0 to +1
+    /// (wholly along it), and as bright as the energy density shows.
+    Component(FieldComponent),
 }
 
 impl FieldMapping {
-    /// Every field mapping, in the order the Studio's C key steps through.
-    pub const ALL: [Self; 2] = [Self::Energy, Self::Composition];
+    /// Every field mapping: energy, composition, then each component in
+    /// channel order.
+    pub const ALL: [Self; 2 + FIELD_COMPONENTS as usize] = {
+        let mut all = [Self::Energy; 2 + FIELD_COMPONENTS as usize];
+        all[1] = Self::Composition;
+        let mut channel = 0;
+        while channel < FIELD_COMPONENTS {
+            all[2 + channel as usize] = Self::Component(FieldComponent(channel));
+            channel += 1;
+        }
+        all
+    };
 
-    /// The mapping's name, as flags and records spell it.
+    /// The mapping's name, as flags and records spell it: `energy`,
+    /// `composition` or `component-C` for channel `C`.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Energy => "energy",
             Self::Composition => "composition",
+            Self::Component(component) => {
+                COMPONENT_NAMES[(component.0 % FIELD_COMPONENTS) as usize]
+            }
         }
     }
 
-    /// The other mapping: what the Studio's C key switches to.
+    /// What the Studio's C key switches to: energy, composition, then
+    /// `component`, then energy again.
     #[must_use]
-    pub const fn next(self) -> Self {
+    pub const fn next(self, component: FieldComponent) -> Self {
         match self {
             Self::Energy => Self::Composition,
-            Self::Composition => Self::Energy,
+            Self::Composition => Self::Component(component),
+            Self::Component(_) => Self::Energy,
+        }
+    }
+
+    /// The component shown, in a component mapping.
+    #[must_use]
+    pub const fn component(self) -> Option<FieldComponent> {
+        match self {
+            Self::Component(component) => Some(component),
+            Self::Energy | Self::Composition => None,
         }
     }
 
     /// The mapping's key, for a mapping the energy palette does not
     /// explain: the composition's is the affinity key's colours
     /// ([`legend_affinities`]), `none` and then the six directions, at full
-    /// brightness; a texel shows its colour darkened as its energy is
-    /// lower. `None` for energy.
+    /// brightness; a component's is [`COMPONENT_PALETTE`](crate::COMPONENT_PALETTE) at −1, −½, 0, ½
+    /// and 1; a texel shows its colour darkened as its energy is lower.
+    /// `None` for energy.
     #[must_use]
     pub fn legend(self) -> Option<Legend> {
         match self {
@@ -390,6 +499,18 @@ impl FieldMapping {
                     swatches.push(affinity_rgb8(q));
                 }
                 text.push_str(" as affinity, darker is less energy");
+                Some(Legend { text, swatches })
+            }
+            Self::Component(component) => {
+                let swatch = crate::HUD_SWATCH;
+                let text = format!(
+                    "field channel {} / energy {swatch} -1 {swatch} {swatch} 0 {swatch} \
+                     {swatch} +1, darker is less energy",
+                    component.0
+                );
+                let swatches = [-1.0, -0.5, 0.0, 0.5, 1.0]
+                    .map(crate::component_rgb8)
+                    .to_vec();
                 Some(Legend { text, swatches })
             }
         }
@@ -409,7 +530,13 @@ impl FromStr for FieldMapping {
         Self::ALL
             .into_iter()
             .find(|mapping| mapping.name() == text)
-            .ok_or_else(|| format!("`{text}` is not a field mapping: energy or composition"))
+            .ok_or_else(|| {
+                format!(
+                    "`{text}` is not a field mapping: energy, composition or component-C for a \
+                     channel C from 0 to {}",
+                    FIELD_COMPONENTS - 1
+                )
+            })
     }
 }
 

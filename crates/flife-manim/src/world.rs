@@ -926,7 +926,8 @@ impl WorldView {
     /// and the brush region's at its most (a disc), each twice, since one is
     /// built before the one it replaces is dropped; and once, the copy of the field's values its texture was
     /// built from, one `f32` a texel (FL-033), and of its compositions in
-    /// the composition mapping, three more. The field's texture and
+    /// the composition mapping, three more (a component mapping's copy of
+    /// its channel, a byte a texel, is within them). The field's texture and
     /// values count once the view knows the field: from
     /// [`WorldView::for_epoch`] or the first shown epoch. A resize or a new
     /// pixel density changes the density's bins and so these bytes.

@@ -45,7 +45,8 @@ pub use density::{
     DENSITY_BIN_POINTS, DENSITY_BINS_MAX, DensityLayer, density_bins, density_level,
 };
 pub use field::{
-    FIELD_PALETTE, FieldLayer, SCALE_DECAY, corner_composition, display_value, palette, raw_value,
+    COMPONENT_PALETTE, FIELD_PALETTE, FieldLayer, SCALE_DECAY, component_rgb8, corner_component,
+    corner_composition, display_value, palette, raw_value,
 };
 pub use hud::{
     HUD_FLATNESS_PIXELS, HUD_MARGIN_POINTS, HUD_MAX_CURVE_SEGMENTS, HUD_MAX_RINGS,
@@ -55,11 +56,11 @@ pub use hud::{
 };
 pub use mapping::{
     AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, ColorMapping, ENERGY_HALF, ENERGY_RAMP,
-    FieldMapping, GENERATION_RAMP, GENERATION_SCALE, LEGEND_ENERGIES, LEGEND_GENERATIONS,
-    LEGEND_HEADINGS, LINEAGE_PALETTE, Legend, Look, MOTION_STILL, MOTION_WHEEL, Particles, Style,
-    TOPOLOGY_PALETTE, Traits, affinity_rgb8, energy_level, generation_level, heading,
-    legend_affinities, lineage_color, lineage_slot, linear, mapped_color, mapped_rgb8, mix, ramp,
-    speed_level, traits, wheel,
+    FIELD_COMPONENTS, FieldComponent, FieldMapping, GENERATION_RAMP, GENERATION_SCALE,
+    LEGEND_ENERGIES, LEGEND_GENERATIONS, LEGEND_HEADINGS, LINEAGE_PALETTE, Legend, Look,
+    MOTION_STILL, MOTION_WHEEL, Particles, Style, TOPOLOGY_PALETTE, Traits, affinity_rgb8,
+    energy_level, generation_level, heading, legend_affinities, lineage_color, lineage_slot,
+    linear, mapped_color, mapped_rgb8, mix, ramp, speed_level, traits, wheel,
 };
 pub use region::{
     REGION_ADDS_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS, REGION_WIDTH_POINTS, Region,

@@ -46,6 +46,7 @@ A slow consumer can therefore cost display freshness, never the world.
   | affinity | f32 × 3 | each component in `[−1, 1]` |
   | field | f32 × 1 per texel | finite, ≥ 0 |
   | field-composition | f32 × 3 per texel | each component in `[−1, 1]` |
+  | field-components | i8 × 32 per texel | each in `[−127, 127]` |
 
   These are the inputs of §13.4's mappings. Turning them into sizes and colours is FL-019's.
 - The affinity view (FL-019, `affinity_projection`) is a fixed projection of each organism's 32 affinity terms
@@ -65,11 +66,20 @@ A slow consumer can therefore cost display freshness, never the world.
   at its norm limit takes, so an organism and the material it converts best (`a / ‖a‖`) share them. Every cell
   holds `‖m‖₂ ≤ e` (§4.2), so the composition lies in the unit ball. A block with no energy has none, `[0; 3]`, as
   does every texel of `FieldTexture::from_plane` (an energy plane alone); `from_planes` takes the 33 planes.
+- The field's components (FL-019, plan §13.4's "Local field: chosen components", `FieldTexture::components`): per
+  texel, each moment channel `c` per unit energy, `Σm_c / Σe` with the same F64 sums as the composition, clamped to
+  `[−1, 1]` and held in `COMPONENT_STEPS` = 127ths, `round(127 Σm_c / Σe)` rounded half away from zero, an `i8`
+  in `[−127, 127]`. Every cell holds `|m_c| ≤ ‖m‖₂ ≤ e`, so the clamp guards only rounding. A block with no
+  energy, and every texel of `from_plane`, holds zeros. All 32 channels ride on every epoch, so a consumer can show
+  any channel at once, even of a paused world, and a replay shows the same; the quantization is a display step
+  (1/127 of the energy), and nothing scientific reads it. The projection fills them in the same pass, channel by
+  channel, from the sums it already takes for the composition.
   The projection runs a texel row at a time through each moment plane with the axes as a sign table, which gives
   the same sums in the same order, bit for bit, as `affinity_projection` of the block's channel sums. Measured
   (scratch, release, load average about 44, cv up to 20%): on the preset's 128 × 128 field the texture from 33
   planes took 0.29 ms against 0.05 ms from energy alone, and a whole epoch 0.57 ms against a 39.5 ms tick; a
-  512 × 512 field 6.3 ms, a 1024 × 1024 field (2 × 2 blocks) 26 ms.
+  512 × 512 field 6.3 ms, a 1024 × 1024 field (2 × 2 blocks) 26 ms. These were measured before the components
+  were added, which store one byte per channel per texel in the same pass; not measured since.
 - `Metrics`: source tick, live count, organism energy (F64 in identity order), field energy (F64 in cell order),
   highest generation and event cursor. FL-024 adds:
   - `parameters`: the live organisms' logical neural parameters, summed;
@@ -110,7 +120,8 @@ A slow consumer can therefore cost display freshness, never the world.
   displayable slot therefore cannot be written; the type system refuses it. A consumer only sees an epoch after it
   is complete.
 - *Bounded memory (§9.5).* Every slot is allocated once, with fallible reservation, at the population ceiling
-  (53 bytes a row) and the texture size (16 bytes a texel: 4 of energy, 12 of composition). No projection
+  (53 bytes a row) and the texture size (48 bytes a texel: 4 of energy, 12 of composition, 32 of components;
+  1.5 MiB more over the preset's three 128 × 128 slots, 24 MiB at the 512 × 512 cap). No projection
   reallocates. `Publisher::reserved_bytes`
   is the render budget.
 - *Busy feeds skip.* When no slot is free, nothing is written or allocated. The latest epoch stays, and the boundary
@@ -143,16 +154,23 @@ conversions of the F64 state, and its sums are F64 in a fixed order. Slot choice
 identities are sequential, so a deterministic sequence of offers and lease drops gives the same publications.
 
 **Independent tests.**
-- `tests/epochs.rs` (9 tests):
+- `tests/epochs.rs` (10 tests):
   - Every view, metric and texel, at founding and over 288 ticks with births and deaths, matches the world's own
     rows and an independent block-mean oracle. Every declared layout holds. Each texel's composition equals, bit
     for bit, an oracle that sums the world's moment planes per block and projects them with the Hadamard matrix
-    built by its recursion; the run's sources and emissions give texels a composition.
+    built by its recursion; the run's sources and emissions give texels a composition. Each texel's components
+    equal an oracle that sums the planes the same way and rounds each channel's ratio half away from zero by its
+    whole and fractional parts.
   - The composition (FL-019), by hand: a composition along an axis lands on it, its opposite on the opposite end;
     cancelled moments and a cell without energy have none; one channel lands at `±1/√32` by its column's signs. In
     blocks of two, three units along an axis and one against it land half way: weighted by energy. A 521 × 515
     grid in 2 × 2 blocks with partial edges equals the oracle and stays in the unit ball. An energy plane alone has
     no composition; planes of the wrong length are refused.
+  - The components (FL-019), by hand: half the energy in one channel is 64 (63.5 rounded away from zero) and its
+    opposite −64; a moment at the norm limit is 127; a third in two channels is 42 and −42; no energy, or energy
+    without moment, holds zeros. In blocks of two, three units at +1 and one at −1 are 64: weighted by energy. A
+    521 × 515 grid in 2 × 2 blocks with partial edges equals the oracle; an energy plane alone holds zeros. The
+    layout is `i8` × 32 within ±127.
   - A 1,030 × 515 plane gives a 344 × 258 texture of 3 × 2 blocks with partial edges, equal to the oracle. Bad
     planes are refused.
   - C.7: Compact and FreeList worlds publish identical epochs and identical matches at every tick of 288, while
@@ -229,9 +247,10 @@ identities are sequential, so a deterministic sequence of offers and lease drops
   resource bridge (§13.6: device context, layout, completion fence, read lease, release notification) is FL-033's;
   FL-018's adapter (`flife-manim`) copies each epoch into its draw buffer on the CPU and returns the lease before
   rendering. Device reads that must finish before release do not exist yet.
-- The field texture carries energy and the composition's fixed projection. Single moment channels ("chosen
-  components") and an admitted full-field diagnostic lease do not exist. The composition is projected with every
-  epoch, whether or not a consumer draws it.
+- The field texture carries energy, the composition's fixed projection and every moment channel per unit energy
+  at a display step of 1/127. An admitted full-field diagnostic lease (the moments themselves, at full precision)
+  does not exist. The composition and the components are projected with every epoch, whether or not a consumer
+  draws them.
 - Epochs carry no birth ticks, so a birth appears with the first epoch that shows it rather than at its exact
   birth tick within a skipped gap. Recorded winding or displacement (the alternative to snapping) does not exist.
 - Trails, and drawing interpolated epochs in the Studio, are FL-020's remaining parts.

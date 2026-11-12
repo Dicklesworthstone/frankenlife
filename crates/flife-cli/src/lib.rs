@@ -71,7 +71,7 @@ pub use experiment::{
     REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, experiment,
 };
 pub use flife_backend_metal::{BackendBudget, ControllerChoice};
-pub use flife_manim::{ColorMapping, FieldMapping, Look, Particles, Style};
+pub use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Particles, Style};
 pub use inspect::{
     INSPECT_SCHEMA, InspectOptions, Inspected, InspectedCheckpoint, InspectedExtent,
     InspectedField, InspectedLayer, InspectedOrganism, InspectedWeights, Inspection, inspect,

@@ -2,8 +2,9 @@
 //! render epochs are exactly one committed world, in stable identity order,
 //! independent of storage arrangement, preallocated and bounded.
 //!
-//! Every view is compared with the world's own rows. The field texture and
-//! its composition are compared with independent block oracles.
+//! Every view is compared with the world's own rows. The field texture, its
+//! composition and its components are compared with independent block
+//! oracles.
 
 mod common;
 
@@ -12,8 +13,9 @@ use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_engine::{Arrangement, World};
 use flife_render::{
-    AFFINITY_AXES, Bounds, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel, FieldTexture, Gap, Lease,
-    Match, Publication, Publisher, ROUNDING_MARGIN, View, affinity_projection, pairs,
+    AFFINITY_AXES, Bounds, COMPONENT_STEPS, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel,
+    FieldTexture, Gap, Lease, Match, Publication, Publisher, ROUNDING_MARGIN, View,
+    affinity_projection, pairs,
 };
 
 #[expect(
@@ -177,7 +179,64 @@ fn assert_shows(epoch: &Epoch, world: &World) {
         "the field's composition at tick {}",
         world.tick().get()
     );
+    let components = components_oracle(texture.cells(), world.field().energy(), |channel| {
+        world.field().moment(channel).expect("a moment plane")
+    });
+    assert!(
+        texture.components() == components.as_slice(),
+        "the field's components at tick {}",
+        world.tick().get()
+    );
     epoch.check().expect("every declared bound holds");
+}
+
+/// The components oracle: each texel's moments and energy summed in F64
+/// over its block in row-major order, channel by channel, as
+/// [`composition_oracle`] sums them; then each channel's sum over the
+/// energy's, clamped to `[−1, 1]`, in 127ths, rounded half away from zero
+/// by its magnitude's whole and fractional parts; zeros for a block with no
+/// energy.
+fn components_oracle<'a>(
+    cells: [u32; 2],
+    energy: &[f32],
+    moment: impl Fn(u32) -> &'a [f32],
+) -> Vec<[i8; 32]> {
+    let block = cells.map(|n| n.div_ceil(FIELD_TEXELS_MAX));
+    let texels = [cells[0].div_ceil(block[0]), cells[1].div_ceil(block[1])];
+    let planes: Vec<&[f32]> = (0..32).map(&moment).collect();
+    let mut components = Vec::new();
+    for ty in 0..texels[1] {
+        for tx in 0..texels[0] {
+            let (mut e, mut m) = (0.0_f64, [0.0_f64; 32]);
+            let ys = ty * block[1]..((ty + 1) * block[1]).min(cells[1]);
+            let xs = tx * block[0]..((tx + 1) * block[0]).min(cells[0]);
+            for y in ys.clone() {
+                for x in xs.clone() {
+                    e += f64::from(energy[(y * cells[0] + x) as usize]);
+                }
+            }
+            for (channel, plane) in planes.iter().enumerate() {
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        m[channel] += f64::from(plane[(y * cells[0] + x) as usize]);
+                    }
+                }
+            }
+            components.push(if e > 0.0 && e.is_finite() {
+                m.map(|sum| {
+                    let scaled = (sum / e).clamp(-1.0, 1.0) * 127.0;
+                    let magnitude = scaled.abs();
+                    let whole =
+                        magnitude.trunc() + if magnitude.fract() >= 0.5 { 1.0 } else { 0.0 };
+                    let stepped = whole as i8;
+                    if scaled < 0.0 { -stepped } else { stepped }
+                })
+            } else {
+                [0; 32]
+            });
+        }
+    }
+    components
 }
 
 /// The composition oracle: each texel's moments and energy summed in F64
@@ -311,6 +370,7 @@ fn an_epoch_shows_exactly_one_committed_world() {
             (View::Affinity, Dtype::F32, 3),
             (View::Field, Dtype::F32, 1),
             (View::FieldComposition, Dtype::F32, 3),
+            (View::FieldComponents, Dtype::I8, 32),
         ]
     );
     assert_eq!(
@@ -326,6 +386,8 @@ fn an_epoch_shows_exactly_one_committed_world() {
     assert_eq!(layouts[8].count, 32 * 32);
     assert_eq!(layouts[9].count, 32 * 32);
     assert_eq!(layouts[9].bounds, Bounds::Magnitude(1.0));
+    assert_eq!(layouts[10].count, 32 * 32);
+    assert_eq!(layouts[10].bounds, Bounds::Magnitude(127.0));
     // The world's sources and emissions carry chemistry, so the composition
     // the oracle matched is not all none.
     assert!(
@@ -520,6 +582,120 @@ fn the_field_composition_is_the_energy_weighted_mean_composition_projected() {
     }
 }
 
+/// Plan §13.4's chosen components: each texel holds each moment channel per
+/// unit energy, `Σm_c / Σe`, in 127ths. Hand-computed cells: half the
+/// energy in one channel is 64 (63.5, rounded away from zero), its opposite
+/// −64; a moment at the norm limit is 127; one third in two channels is 42
+/// each; a cell with no energy, or with energy but no moment, has zeros.
+/// Across a block the sums are energy-weighted: three units at +1 and one
+/// at −1 in a channel are +0.5, 64. On a grid with partial blocks the
+/// oracle's values hold. An energy plane alone has zeros.
+#[test]
+fn the_field_components_are_each_channel_per_unit_energy() {
+    const CHANNELS: usize = 32;
+    let planes = |cells: &[(f32, [f32; CHANNELS])]| -> Vec<f32> {
+        let mut planes: Vec<f32> = cells.iter().map(|(e, _)| *e).collect();
+        for channel in 0..CHANNELS {
+            planes.extend(cells.iter().map(|(_, m)| m[channel]));
+        }
+        planes
+    };
+    let with = |pairs: &[(usize, f32)]| -> [f32; CHANNELS] {
+        let mut m = [0.0; CHANNELS];
+        for &(channel, value) in pairs {
+            m[channel] = value;
+        }
+        m
+    };
+    let cells: [(f32, [f32; CHANNELS]); 6] = [
+        (2.0, with(&[(5, 1.0)])),
+        (2.0, with(&[(5, -1.0)])),
+        (4.0, with(&[(31, 4.0)])),
+        (3.0, with(&[(0, 1.0), (9, -1.0)])),
+        (0.0, [0.0; CHANNELS]),
+        (5.0, [0.0; CHANNELS]),
+    ];
+    let texture = FieldTexture::from_planes([6, 1], [1.0, 1.0], &planes(&cells)).expect("texture");
+    let q = texture.components();
+    assert_eq!(q.len(), 6);
+    assert_eq!(q[0], with_steps(&[(5, 64)]));
+    assert_eq!(q[1], with_steps(&[(5, -64)]));
+    assert_eq!(q[2], with_steps(&[(31, 127)]));
+    assert_eq!(q[3], with_steps(&[(0, 42), (9, -42)]));
+    assert_eq!(q[4], [0; CHANNELS]);
+    assert_eq!(q[5], [0; CHANNELS]);
+    assert_eq!(COMPONENT_STEPS, 127);
+    let layout = texture.components_layout();
+    assert_eq!(
+        (layout.view, layout.dtype, layout.components, layout.count),
+        (View::FieldComponents, Dtype::I8, 32, 6)
+    );
+    assert_eq!(layout.bounds, Bounds::Magnitude(127.0));
+
+    // 1024 cells in blocks of two: three units at +1 in channel 3 with one
+    // unit at -1, then a cell at +1 in channel 7 with an empty one.
+    let mut wide = Vec::new();
+    for pair in 0..512 {
+        if pair % 2 == 0 {
+            wide.push((3.0_f32, with(&[(3, 3.0)])));
+            wide.push((1.0_f32, with(&[(3, -1.0)])));
+        } else {
+            wide.push((1.0_f32, with(&[(7, 1.0)])));
+            wide.push((0.0_f32, [0.0; CHANNELS]));
+        }
+    }
+    let planar = planes(&wide);
+    let blocked = FieldTexture::from_planes([1024, 1], [1.0, 1.0], &planar).expect("texture");
+    assert_eq!(blocked.block(), [2, 1]);
+    assert_eq!(blocked.components()[0], with_steps(&[(3, 64)]));
+    assert_eq!(blocked.components()[1], with_steps(&[(7, 127)]));
+    let expected = components_oracle([1024, 1], &planar[..1024], |channel| {
+        let start = 1024 * (1 + channel as usize);
+        &planar[start..start + 1024]
+    });
+    assert!(blocked.components() == expected.as_slice());
+
+    // Blocks of 2 x 2 with a partial last column and row, each cell's
+    // moment within its energy: the oracle's values, not all zero.
+    let grid = [521_u32, 515];
+    let count = (grid[0] * grid[1]) as usize;
+    let energy = |i: usize| ((i * 7919) % 1013) as f32 * 0.01;
+    let mut planar: Vec<f32> = (0..count).map(energy).collect();
+    for channel in 0..CHANNELS {
+        planar.extend((0..count).map(|i| {
+            let unit = (((i * 31 + channel * 17) % 101) as f32 / 101.0 - 0.5) * 2.0;
+            energy(i) * unit / 32.0_f32.sqrt()
+        }));
+    }
+    let partial = FieldTexture::from_planes(grid, [0.5, 0.25], &planar).expect("texture");
+    assert_eq!((partial.block(), partial.texels()), ([2, 2], [261, 258]));
+    let expected = components_oracle(grid, &planar[..count], |channel| {
+        let start = count * (1 + channel as usize);
+        &planar[start..start + count]
+    });
+    assert!(partial.components() == expected.as_slice());
+    assert!(
+        partial
+            .components()
+            .iter()
+            .any(|q| q.iter().any(|&c| c.unsigned_abs() > 10)),
+        "the partial grid's components are not all near zero"
+    );
+
+    let energy_only =
+        FieldTexture::from_plane([6, 1], [1.0, 1.0], &planes(&cells)[..6]).expect("texture");
+    assert_eq!(energy_only.components(), &[[0; CHANNELS]; 6]);
+}
+
+/// Steps `pairs` of channel and value, zero elsewhere.
+fn with_steps(pairs: &[(usize, i8)]) -> [i8; 32] {
+    let mut steps = [0; 32];
+    for &(channel, value) in pairs {
+        steps[channel] = value;
+    }
+    steps
+}
+
 /// C.7: two storage arrangements of one stable-identity world occupy
 /// different slots yet publish identical epochs at every tick, and the
 /// identity matching between consecutive epochs is identical too.
@@ -637,7 +813,7 @@ fn slots_are_allocated_once_and_never_grow() {
     let mut world = found(&config, Arrangement::FreeList);
     let mut publisher = publisher(&world);
     let row = 8 + 8 + 8 + 4 + 8 + 4 + 1 + 12;
-    let slot = 72 * row + 32 * 32 * (4 + 12);
+    let slot = 72 * row + 32 * 32 * (4 + 12 + 32);
     assert_eq!(publisher.reserved_bytes(), 3 * slot);
     let viewer = publisher.feed().viewer(1).expect("viewer");
     let (mut peak, mut ceiling) = (0, false);

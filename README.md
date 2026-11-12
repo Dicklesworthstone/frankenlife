@@ -431,7 +431,8 @@ while running or paused, and change only the picture:
 | R | the raw look: no halos, linear grey field |
 | D | density per screen bin instead of dots |
 | F | show or hide the field |
-| C | the field's chemical composition instead of its energy: hue for chemistry, in the affinity mapping's colours, brightness for energy |
+| C | the field's chemical composition instead of its energy (hue for chemistry, in the affinity mapping's colours, brightness for energy), then its chosen component, then its energy again |
+| `[` or `]` | the field's chosen component: one moment channel per unit energy, blue (against) through pale to red (along), brightness for energy; again, the previous or next of its 32 channels |
 
 E arms the energy brush, X the removal brush, M the material brush and I the introduction brush (the same key
 again disarms). With one armed, a click adds 64 units of declared energy to the field cell under it; removes the
@@ -476,7 +477,7 @@ telemetry names the newest checkpoint's tick, and the NDJSON carries a `checkpoi
 an uninterrupted session would.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density`, `--no-field` and
-`--field-mapping energy|composition`.
+`--field-mapping energy|composition|component-C` (C from 0 to 31).
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.
 
 `--controllers metal` evaluates the organisms' controllers on the Mac's GPU, `torch` on FrankenTorch's serial CPU

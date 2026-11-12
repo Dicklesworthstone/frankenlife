@@ -42,11 +42,12 @@
 //! | R | glow or raw |
 //! | D | points or density |
 //! | F | field on or off |
-//! | C | the field's energy or its chemical composition ([`FieldMapping`](flife_manim::FieldMapping)) |
+//! | C | the field's energy, its chemical composition, or its chosen component, in turn ([`FieldMapping`](flife_manim::FieldMapping)) |
+//! | `[` or `]` | the field's chosen component: shown, then the previous or next channel ([`FieldComponent`](flife_manim::FieldComponent)) |
 
 use flife_core::Tick;
 use flife_core::ids::OrganismId;
-use flife_manim::{ColorMapping, Look, Particles, Style, Viewport};
+use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Particles, Style, Viewport};
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, PointerButton, ScrollUnit, SurfaceMetrics,
 };
@@ -85,6 +86,10 @@ pub const KEY_M: u16 = 46;
 pub const KEY_I: u16 = 34;
 /// `kVK_ANSI_T`.
 pub const KEY_T: u16 = 17;
+/// `kVK_ANSI_LeftBracket`.
+pub const KEY_LEFT_BRACKET: u16 = 33;
+/// `kVK_ANSI_RightBracket`.
+pub const KEY_RIGHT_BRACKET: u16 = 30;
 
 /// How far, in logical points, a primary press may move and still be a
 /// click; beyond it the press is a drag.
@@ -249,6 +254,8 @@ pub struct Controls {
     moves: Vec<CameraMove>,
     /// The armed brush: a click brushes instead of selecting.
     brush: Option<Brush>,
+    /// The field component C and the bracket keys show: the last chosen.
+    component: FieldComponent,
 }
 
 impl Controls {
@@ -509,7 +516,19 @@ impl Controls {
                 };
             }
             KEY_F => self.style.field = !self.style.field,
-            KEY_C => self.style.field_mapping = self.style.field_mapping.next(),
+            KEY_C => self.style.field_mapping = self.style.field_mapping.next(self.component),
+            KEY_LEFT_BRACKET | KEY_RIGHT_BRACKET => {
+                // The first press shows the chosen component; later ones
+                // step through the channels.
+                if self.style.field_mapping.component().is_some() {
+                    self.component = if code == KEY_RIGHT_BRACKET {
+                        self.component.next()
+                    } else {
+                        self.component.previous()
+                    };
+                }
+                self.style.field_mapping = FieldMapping::Component(self.component);
+            }
             _ => {}
         }
     }
@@ -520,9 +539,13 @@ impl Controls {
         self.style
     }
 
-    /// Start from `style`, as the Studio opens.
+    /// Start from `style`, as the Studio opens; a component it shows is
+    /// the chosen one.
     pub const fn set_style(&mut self, style: Style) {
         self.style = style;
+        if let Some(component) = style.field_mapping.component() {
+            self.component = component;
+        }
     }
 
     fn request_close(&mut self) -> Option<Intent> {

@@ -3,8 +3,9 @@
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
 rendering (§13.4), the configured bloom on glowing frames (§2.3), the shown mapping's colour key in the overlay
-(§13.4's legend: `legends`, `flife_manim::ColorMapping::legend`), and the field's chemical composition beside its
-energy (§13.4's "Local field": key C, `--field-mapping`, `flife_manim::FieldMapping`), keyed after the colour key. FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
+(§13.4's legend: `legends`, `flife_manim::ColorMapping::legend`), and the field's chemical composition and its
+chosen moment channel beside its energy (§13.4's "Local field": keys C, `[` and `]`, `--field-mapping`,
+`flife_manim::FieldMapping`), keyed after the colour key. FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
 bounded snapshot at its committed boundary (§14.2), with what the committed field offers it where it stands, its
@@ -88,7 +89,8 @@ directory, with its pending commands and its checkpoint chain.
     | R | switch the glow and raw looks |
     | D | switch dots and density |
     | F | show or hide the field |
-    | C | show the field's energy or its chemical composition (FL-019) |
+    | C | show the field's energy, its chemical composition or its chosen component, in turn (FL-019) |
+    | `[` or `]` | show the field's chosen component, then choose the previous or next of its 32 channels, wrapping (FL-019) |
     | 0 | the whole torus again (a `CameraMove::Reset`) |
     | E | arm the energy brush, or disarm it (FL-022) |
     | X | arm the removal brush, or disarm it (FL-022) |
@@ -251,7 +253,7 @@ directory, with its pending commands and its checkpoint chain.
   arrival over the interval, at most 1, and 1 before an interval is known. So a running world is drawn about one
   arrival interval late, and a step is seen moving within 100 ms. `close()` closes the window and the session and returns the committed world (`StudioClosed`).
 - `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
-  [--look glow|raw] [--density] [--no-field] [--field-mapping energy|composition] [--offscreen SECONDS [--scale N]
+  [--look glow|raw] [--density] [--no-field] [--field-mapping energy|composition|component-C] [--offscreen SECONDS [--scale N]
   [--offscreen-zooms]] [--run DIR]`, or `flife-studio --resume DIR [those options but --run]`: the
   binary. `--resume` takes the run's own configuration from DIR, so it takes no `<config>`, and it conflicts with
   `--run`, `--export` and `--timeline`; a configuration given with it exits 2 (usage) and prints nothing. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
@@ -390,13 +392,17 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (17 tests):
+- `tests/controls.rs` (18 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
   - The style keys (FL-019): 1 to 6 choose the six mappings in order, R, D and F switch the look, particles and
-    field, C the field's mapping (energy or composition, its code pinned to `kVK_ANSI_C`), and auto-repeat or ⌘
-    with a digit chooses nothing.
+    field, C the field's mapping (energy, composition, then the chosen component, its code pinned to
+    `kVK_ANSI_C`), and auto-repeat or ⌘ with a digit chooses nothing.
+  - The bracket keys (FL-019, codes pinned to `kVK_ANSI_LeftBracket` and `kVK_ANSI_RightBracket`): `]` first shows
+    component 0, then steps to 1 and 2, `[` back through 0 to 31; C cycles energy, composition and component 31;
+    from energy `[` shows 31 again without stepping; repeat and ⌘ step nothing; only the field's mapping changed;
+    a Studio opened showing component 9 cycles back to it with C, and `]` steps to 10.
   - Following the session: a late end of run 1 does not stop run 2, and run 2 stopping on its own does.
   - A resume refused at the lane or by the session leaves the controls paused.
   - FL-020: a drag pans by the pointer's whole motion (worked deltas) and selects nothing; a click within the slop
@@ -543,7 +549,10 @@ presentation state, not scientific state.
     composition ■ none ■■■■■■ as affinity, darker is less energy`, its swatches the affinity key's colours; in
     `overlay_text` it is the line after the colour key's, before the brush, and at 2x it is set whole with its
     swatches coloured after the colour key's; `field_key` (the binary's choice) gives it for a drawn, composed
-    field in either look and either particles, and nothing while the field is hidden or under raw density;
+    field in either look and either particles, and nothing while the field is hidden or under raw density; a
+    chosen component's key likewise, for channels 0, 17 and 31;
+  - a component's key (FL-019) is exactly `field channel 7 / energy ■ -1 ■ ■ 0 ■ ■ +1, darker is less energy`,
+    its swatches `COMPONENT_PALETTE`, one per `■`; channel 31's names it;
   - the inspector panel exactly, from a real snapshot of the preset three ticks in, its organism watched from the
     start, with every printed value set: its thirteen lines under the selection's, `not in the committed world` for
     a gone organism, nothing without a selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen
@@ -601,7 +610,7 @@ presentation state, not scientific state.
     and the pair not placed again once centred, the tracked move or its placing not recorded, and no tracked
     frame counted (`tests/timeline.rs`, whose replay then draws other pixels or counts). 12 of 12.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 139.4 MiB at 3840 x 2160, which leaves the backend 114.3 MiB of the 2 GiB budget (95.5
+  terms to the observers: 139.4 MiB at 3840 x 2160, which leaves the backend 112.8 MiB of the 2 GiB budget (94.0
   with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
   telemetry, 82.6 MiB (172.1) at 39,936 vertices and 38,912 triangles with the brush preview, 86.9 MiB (166.8) at
@@ -610,7 +619,9 @@ presentation state, not scientific state.
   57,344 and 55,296 with the line for what the field offers the organism where it stands, and is 139.4 MiB at
   68,608 and 65,536 with its two lines of descendants and ancestors (FL-021). Each line the HUD can show costs
   the backend about 11 MiB. The field's compositions (12 bytes a texel in the feed's slots and the
-  view's copy, FL-019) add 0.8 MiB to the rest of the observers.
+  view's copy, FL-019) add 0.8 MiB to the rest of the observers, and its components (32 bytes a texel in each of
+  the feed's three slots, FL-019's chosen components) 1.5 MiB more (backend 114.3 MiB before them, 95.5 with
+  bloom).
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
@@ -749,13 +760,13 @@ presentation state, not scientific state.
   its own binary because `frame_upload.rs` counts every thread's heap.
 - `tests/timeline.rs` (3 tests, FL-023, FL-019, Metal compute, no window):
   - G10. An offscreen Studio on the preset at 320 x 200 points and 2x records its timeline while posted input
-    sets an overlay, restyles (key 3, then C, the field's composition), zooms, selects the shown organism nearest
+    sets an overlay, restyles (key 3, then C, the field's composition, then `]` twice, components 0 and 1), zooms,
+    selects the shown organism nearest
     the centre, has the camera track it (T, which centres the view at once), arms the energy brush and clicks,
     runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
-    Every kind of record is made (in one run: 268 records, 73 frames, 2 restyles, 65 view records, most of them
-    tracking's, 4 brush regions, 51 shows, 56 placements and 9 advances, one between epochs at a fraction
-    strictly inside (0, 1)), a
-    style record names the composition, and the stroke applies. The replay outlines each region as recorded. Written
+    Every kind of record is made (in one run: 275 records, 76 frames, 4 restyles, 65 view records, most of them
+    tracking's, 4 brush regions, 47 shows, 58 placements and 13 advances, one between epochs at a fraction
+    strictly inside (0, 1)), style records name the composition and components 0 and 1, and the stroke applies. The replay outlines each region as recorded. Written
     as NDJSON and read back, the records are equal. The replay redraws every frame in order at the tick the
     Studio showed it, its RGBA8 bytes hashing equal, and closes on the Studio's tick and digest with the one
     command. It refuses, with a `StateConflict`, a timeline whose end names another world, one with its
@@ -1016,9 +1027,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   window-title setter. The style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed.
 - The field's composition (FL-019) is a fixed projection of 32 channels on the affinity view's three axes: two
-  materials that differ only off them show the same hue, and no single moment channel can be chosen (plan
-  §13.4's "chosen components"). C and `--field-mapping` run offscreen and in the timeline; no test opened a
-  window with them, and no human has reviewed the picture (G5).
+  materials that differ only off them show the same hue. A chosen component (plan §13.4's "chosen components")
+  shows one channel at a time, in 127ths of its energy; nothing combines several chosen channels in one picture.
+  C, `[`, `]` and `--field-mapping` run offscreen and in the timeline; no test opened a window with them, and no
+  human has reviewed the picture (G5).
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit is later work; checkpoints are
   `--run`'s (FL-024).
 - FL-023's timeline and export:

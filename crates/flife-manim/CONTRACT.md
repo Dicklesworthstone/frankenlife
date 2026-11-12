@@ -15,11 +15,11 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `region_outline` outlines the region a brush would act on (FL-022, plan §14.3).
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
-- `FieldLayer` draws the epoch's field under the organisms as one texture on one quad (FL-033): its energy, or its
-  chemical composition (FL-019, plan §13.4's "Local field").
+- `FieldLayer` draws the epoch's field under the organisms as one texture on one quad (FL-033): its energy, its
+  chemical composition, or one chosen moment channel (FL-019, plan §13.4's "Local field").
 - `DensityLayer` counts organisms per screen bin, for worlds denser than their pixels.
 - `Style` holds a frame's drawing choices: the `ColorMapping`, the `Look` (glow or raw), the `Particles` (points or
-  density), whether the field is drawn and its `FieldMapping` (energy or composition). `field_drawn()` is whether a
+  density), whether the field is drawn and its `FieldMapping` (energy, composition or a component). `field_drawn()` is whether a
   frame draws the field: when it is on, except under raw density, which is opaque.
 - `WorldView` holds all of them, and builds each frame's `ThreeDJob`.
 
@@ -118,10 +118,15 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     colour, labelled `64, 32`;
   - affinity: `none`, then six directions 60 degrees apart in the first two coordinates at a founder's typical
     radius (`legend_affinities`), then `like hue, like chemistry`.
-- `FieldMapping` (FL-019, plan §13.4's "Local field"): `energy` (the default) or `composition`, by `name()` and
-  `FromStr`; `next()` is the other. `FieldMapping::legend()` is the composition's key, `field composition ■ none
-  ■■■■■■ as affinity, darker is less energy`, its swatches the affinity key's colours at full brightness; the
-  energy field, which the palette explains, has none.
+- `FieldMapping` (FL-019, plan §13.4's "Local field"): `energy` (the default), `composition` (the fixed
+  projection), or `component-C` (`Component(FieldComponent)`, chosen components: moment channel C, 0 to
+  `FIELD_COMPONENTS` − 1 = 31), by `name()` and `FromStr` (exactly those names: `component-07` and `component-32`
+  are refused). `ALL` is energy, composition, then the 32 components in channel order. `next(component)` is what
+  the Studio's C key switches to: energy, composition, `component`, energy. `FieldComponent::new(c)` is `None`
+  past 31; `next` and `previous` wrap. `FieldMapping::legend()` is the composition's key, `field composition ■ none
+  ■■■■■■ as affinity, darker is less energy`, its swatches the affinity key's colours at full brightness, or a
+  component's, `field channel C / energy ■ -1 ■ ■ 0 ■ ■ +1, darker is less energy`, its swatches
+  `COMPONENT_PALETTE`; the energy field, which the palette explains, has none.
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
@@ -174,6 +179,14 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     follows the energy as in the energy mapping. `place_mapped` keeps the texture only for bitwise the same values
     and compositions, scale, look and mapping; the layer then also keeps a copy of the compositions (12 bytes a
     texel).
+  - `update_mapped(field, look, FieldMapping::Component(c))` (FL-019, chosen components) does the same with channel
+    `c` of `FieldTexture::components`: a corner's value is its four texels' steps averaged with their densities as
+    weights, over 127 (`corner_component`: in `[−1, 1]`, 0 without density), coloured by `component_rgb8`, the
+    diverging `COMPONENT_PALETTE` (ColorBrewer's five-class RdYlBu: blue at −1, pale at 0, red at +1, interpolated
+    in sRGB bytes, clamped, 0 for what is not finite), then scaled by what the energy shows. A corner with energy
+    but none of the channel is pale; one with no energy is black. `place_mapped` keeps the texture only for bitwise
+    the same values and the same channel's steps, scale, look and mapping; the layer then keeps a copy of that
+    channel's steps (a byte a texel, within the composition's 12).
 - `DensityLayer::update(epoch, style)`:
   - bins of about `DENSITY_BIN_POINTS = 6` points at the fit, aligned to the world so the torus wraps exactly:
     `ceil(extent · fit_scale / (6 · pixels per point))` per axis, in `1..=DENSITY_BINS_MAX = 512`; the zoom does not change them;
@@ -240,7 +253,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
     density's textures, their quads, the ring's mesh and a region's at its most (a disc), twice, since one is built
     before the one it replaces is dropped; and once, the copy of the field's values its texture was built from, and of its compositions, 16 bytes
-    a texel in all). `texel_bytes()` (FL-033) is the
+    a texel in all, a component's one-byte copy within them). `texel_bytes()` (FL-033) is the
     layers' textures, 16 bytes a texel: the field's once the view knows it and the density's at the viewport's bins,
     whatever the style; FrankenManim's CPU route samples them in place
     and its Metal route uploads those a frame draws. `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536)
@@ -465,9 +478,18 @@ route.
     full brightness; the hole's middle is black; a corner shared by bright and dim texels takes their
     density-weighted composition (0.8 and 0.2, not half each); energy alone is grey everywhere; raw is linear; the
     same energy with other chemistry, then the energy mapping, in either look, are each drawn as given.
-  - A real epoch of the small world holds chemistry; the view draws its field in each mapping as computed, and the
-    two frames differ; the field is drawn exactly when `field_drawn()`, never under raw density.
-  - Field mappings' names parse and print, `next` alternates, and an unknown name is refused.
+  - The field is drawn exactly when `field_drawn()`, never under raw density.
+  - A component mapping (FL-019), against corner colours computed in the test: a field wholly along channel 3 on
+    the left (density 4), wholly against it on the right (density 1), with a hole and a cell holding only channel
+    5. Inside the left a corner is red at full brightness, inside the right blue at half; the hole's middle is
+    black; a corner shared by bright and dim texels takes their density-weighted value (0.6, not 0); channel 5
+    draws its own colours; raw is linear; channel 3 reversed with the same energy is drawn anew, and channel 5's
+    unchanged values as before; energy alone is pale everywhere. The palette's stops, a mix between two, the clamp
+    and a non-finite value are checked by hand.
+  - A real epoch of the small world holds chemistry and components; the view draws its field in all 34 mappings
+    as computed, each component's frame differing from the energy's and the channels' frames not all alike.
+  - Field mappings' names parse and print, `next` cycles energy, composition and the chosen component, channels
+    wrap, and unknown names (`chemistry`, `component-32`, `component-07`, `component-`, `component`) are refused.
 - In `flife-studio`, `tests/live.rs` shows real epochs of the 4,096-organism reference world through this adapter in
   a real window.
 - In `flife-studio`, `tests/live.rs` restyles a paused real window with keys 2, R, D and F and restores it with 1,
@@ -561,8 +583,10 @@ route.
   (`BLOOM_SIGMA_POINTS`), not a configuration key; the plan names none. The bloom runs on the raw frame before
   the RGBA8 table: there is no separate tone-mapping step (§13.3 step 8) before or after it.
 - Human review of the mappings against the plan's reference images (G5) has not been done, nor of the field's
-  composition. The composition is a fixed three-axis projection of 32 channels: two materials that differ only off
-  the three axes show the same hue. No single moment channel ("chosen components") can be shown.
+  composition or its components. The composition is a fixed three-axis projection of 32 channels: two materials
+  that differ only off the three axes show the same hue, which a component mapping then tells apart, one channel
+  at a time. A component is shown in 127ths of its energy, and one channel at a time: no mapping combines chosen
+  channels.
   There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). The validator refuses
   `[presentation] trails_enabled = true` rather than ignoring it. A dot per kept position and organism is not
   affordable on this route: the Studio charges each dot `PREPARATION_BYTES_PER_DOT` three times (in the frame and

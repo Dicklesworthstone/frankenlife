@@ -39,9 +39,9 @@ use std::time::{Duration, Instant, SystemTime};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_studio::{
     ColorMapping, ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
-    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_PERIOD, KEY_SPACE, KEY_T, KEY_ZERO, Look,
-    MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface, TimelineRecord, TimelineStyle,
-    VIDEO_FILE, export, read_timeline, replay, write_timeline_record,
+    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_PERIOD, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T,
+    KEY_ZERO, Look, MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface, TimelineRecord,
+    TimelineStyle, VIDEO_FILE, export, read_timeline, replay, write_timeline_record,
 };
 use fmn_codec::{
     PngLimits, Y4mColorspace, append_y4m_frame_nv12, decode_png, decode_y4m, y4m_header,
@@ -173,6 +173,11 @@ fn a_recorded_session_replays_frame_for_frame() {
     // C: the field's composition (FL-019, plan §13.4).
     recording.post(key(KEY_C, "c"));
     recording.frame();
+    // ] twice: the field's chosen component, channel 0, then channel 1.
+    for _ in 0..2 {
+        recording.post(key(KEY_RIGHT_BRACKET, "]"));
+        recording.frame();
+    }
     recording.post([scroll([100.0, 60.0], 40.0)]);
     recording.frame();
     // A click on the shown organism nearest the centre selects it.
@@ -317,6 +322,15 @@ fn a_recorded_session_replays_frame_for_frame() {
         )),
         "the C key's field mapping was recorded"
     );
+    for name in ["component-0", "component-1"] {
+        assert!(
+            records.iter().any(|record| matches!(
+                record,
+                TimelineRecord::Style { style } if style.field_mapping == name
+            )),
+            "the ] key's {name} was recorded"
+        );
+    }
     assert_eq!(
         count(|r| matches!(r, TimelineRecord::Draw { .. })),
         drawn.len()

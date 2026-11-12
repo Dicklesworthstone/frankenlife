@@ -236,6 +236,26 @@ impl FieldState {
         Some(cell)
     }
 
+    /// Cell `index`, row-major as [`FieldGrid::cell_index`] numbers cells,
+    /// or `None` outside the grid: [`FieldState::cell`] by index, each
+    /// plane read once at its offset in the planar data (plane `p` holds
+    /// `p × cells .. (p + 1) × cells`) rather than looked up per channel.
+    #[must_use]
+    pub fn cell_at(&self, index: usize) -> Option<Cell> {
+        let cells = usize::try_from(self.grid().cell_count()).ok()?;
+        if index >= cells {
+            return None;
+        }
+        let mut cell = Cell::EMPTY;
+        cell.energy = *self.data.get(index)?;
+        let mut at = index;
+        for value in &mut cell.moments {
+            at = at.checked_add(cells)?;
+            *value = *self.data.get(at)?;
+        }
+        Some(cell)
+    }
+
     /// Overwrite cell `(x, y)`; `None` outside the grid, leaving the field
     /// unchanged.
     #[must_use]

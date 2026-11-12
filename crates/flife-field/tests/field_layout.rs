@@ -321,6 +321,28 @@ fn out_of_range_coordinates_are_refused() {
     }
 }
 
+/// `cell_at` reads each cell's own value in every plane, as `cell` and
+/// `moment` do, and refuses an index past the grid.
+#[test]
+fn a_cell_by_index_is_the_cell_by_coordinates() {
+    let grid = small();
+    let state = labelled(grid);
+    for y in 0..grid.cells_y() {
+        for x in 0..grid.cells_x() {
+            let index = grid.cell_index(x, y).expect("cell");
+            let cell = state.cell_at(index).expect("in the grid");
+            assert_eq!(Some(cell), state.cell(x, y));
+            assert_eq!(cell.energy, label(0, x, y));
+            for (channel, &value) in (0_u32..).zip(cell.moments.iter()) {
+                assert_eq!(value, label(channel + 1, x, y));
+            }
+        }
+    }
+    let cells = usize::try_from(grid.cell_count()).expect("fits");
+    assert_eq!(state.cell_at(cells), None);
+    assert_eq!(state.cell_at(usize::MAX), None);
+}
+
 // ----------------------------------------------------- incompatible layouts
 
 #[test]

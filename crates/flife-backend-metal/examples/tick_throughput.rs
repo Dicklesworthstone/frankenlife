@@ -1,9 +1,10 @@
-//! Whole-tick throughput of the reference small-world preset under each
-//! `--controllers` choice, the worlds stepped in rotating blocks in one
-//! process (the reference live in the same invocation), every world's digest
-//! compared with the first's after every block.
+//! Whole-tick throughput of the reference small-world preset, or of the
+//! configuration a sixth argument names, under each `--controllers` choice,
+//! the worlds stepped in rotating blocks in one process (the reference live
+//! in the same invocation), every world's digest compared with the first's
+//! after every block.
 //!
-//! `cargo run --release -p flife-backend-metal --example tick_throughput -- [workers] [ticks per block] [blocks] [warm-up ticks] [choices]`,
+//! `cargo run --release -p flife-backend-metal --example tick_throughput -- [workers] [ticks per block] [blocks] [warm-up ticks] [choices] [config]`,
 //! for example `-- 1 20 8 40 cpu,torch,metal`. A choice may add phases on
 //! Metal after a `+`: `cpu+sensors` samples phase 3 on `MetalSensors`, and
 //! `cpu+field` steps phase 2 on `MetalField`, and `cpu+uptake` computes
@@ -24,16 +25,15 @@ use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
-fn found(workers: NonZeroUsize, name: &str) -> Result<World, CoreError> {
+fn found(workers: NonZeroUsize, name: &str, config: &ValidatedConfig) -> Result<World, CoreError> {
     let refused = |detail: String| CoreError::StateConflict {
         operation: "tick_throughput",
         detail,
     };
     let mut parts = name.split('+');
     let choice: ControllerChoice = parts.next().unwrap_or_default().parse().map_err(refused)?;
-    let config = ValidatedConfig::from_toml(PRESET)?;
     let mut world = World::found(
-        &config,
+        config,
         Arrangement::FreeList,
         NumericalProfile::reference_f32()?,
     )?;
@@ -113,10 +113,21 @@ fn main() -> Result<(), CoreError> {
     let choices = std::env::args()
         .nth(5)
         .unwrap_or_else(|| "cpu,torch,metal".to_owned());
+    let config = match std::env::args().nth(6) {
+        Some(path) => {
+            let text =
+                std::fs::read_to_string(&path).map_err(|error| CoreError::StateConflict {
+                    operation: "tick_throughput",
+                    detail: format!("read {path}: {error}"),
+                })?;
+            ValidatedConfig::from_toml(&text)?
+        }
+        None => ValidatedConfig::from_toml(PRESET)?,
+    };
 
     let mut entries = Vec::new();
     for name in choices.split(',') {
-        match found(workers, name) {
+        match found(workers, name, &config) {
             Ok(mut world) => {
                 block(&mut world, warm)?;
                 entries.push(Entry {
@@ -177,9 +188,12 @@ fn main() -> Result<(), CoreError> {
             )
         })
         .collect();
+    let digest = entries
+        .first()
+        .map_or_else(String::new, |entry| entry.world.digest().to_hex());
     println!(
         "{{\"workers\":{workers},\"ticks_per_block\":{ticks},\"blocks\":{blocks},\"warm_up\":{warm},\
-         \"live\":{live},\"digests_equal\":{equal},\"choices\":[{}]}}",
+         \"live\":{live},\"digests_equal\":{equal},\"digest\":\"{digest}\",\"choices\":[{}]}}",
         rows.join(",")
     );
     Ok(())

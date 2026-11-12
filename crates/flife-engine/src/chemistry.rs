@@ -246,7 +246,9 @@ pub struct ChemicalPacket {
 }
 
 /// The composition `z_c = m_c / e_c` of `cell` in `field`, in F64 from the
-/// exact F32 values. An empty cell is neutral.
+/// exact F32 values. An empty cell is neutral. The moments are read in one
+/// pass ([`FieldState::cell_at`]): phases 6 and 7 compute one composition
+/// per granted packet.
 ///
 /// # Errors
 /// [`CoreError::LayoutMismatch`] when `cell` is not in `field`.
@@ -258,9 +260,9 @@ pub fn composition(field: &FieldState, cell: usize) -> Result<[f64; CHANNELS], C
     let energy = f64::from(*field.energy().get(cell).ok_or_else(missing)?);
     let mut z = [0.0; CHANNELS];
     if energy > 0.0 {
-        for (channel, slot) in (0_u32..).zip(z.iter_mut()) {
-            let plane = field.moment(channel).ok_or_else(missing)?;
-            *slot = f64::from(*plane.get(cell).ok_or_else(missing)?) / energy;
+        let values = field.cell_at(cell).ok_or_else(missing)?;
+        for (slot, &moment) in z.iter_mut().zip(&values.moments) {
+            *slot = f64::from(moment) / energy;
         }
     }
     Ok(z)

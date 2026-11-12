@@ -771,6 +771,8 @@ impl World {
             uptake: Uptake::default(),
             // A checkpoint holds no watch: a restored world watches nothing.
             watch: Watch::default(),
+            // Nor any ancestry: a restored world traces none until told to.
+            ancestry: None,
         })
     }
 }

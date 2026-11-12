@@ -28,6 +28,9 @@
 //! - [`intervention`]: the canonical scientific interventions a session
 //!   seals at a tick boundary, applied with phase 2's external sources and
 //!   recorded in the ledger (FL-014).
+//! - [`ancestry`]: the live population's ancestry, folded from every
+//!   published tick by a world that traces it, for the inspector's
+//!   descendants and ancestry path (FL-021).
 //!
 //! Each organism spends through a `flife_core::EnergyBudget` in the order of
 //! §8.2: it absorbs its gain, pays toxicity and maintenance, then pays for
@@ -37,6 +40,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ancestry;
 pub mod chemistry;
 pub mod costs;
 pub mod emission;
@@ -48,6 +52,7 @@ pub mod population;
 pub mod reproduction;
 pub mod world;
 
+pub use ancestry::{ANCESTRY_PATH, Ancestor, AncestryHeld, Descendants, ROOM_PER_ORGANISM};
 pub use chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, settle_efficiencies,
 };

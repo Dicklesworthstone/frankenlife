@@ -36,6 +36,13 @@
 //! dumped on demand ([`World::organism_weights`](crate::World::organism_weights)):
 //! [`ControllerWeights`] copies that one organism's parameters, and nothing
 //! of any other genome.
+//!
+//! While the world traces its ancestry
+//! ([`World::trace_ancestry`](crate::World::trace_ancestry)), a snapshot
+//! carries the organism's [`Descendants`]: its children and descendants,
+//! born and alive, and the ancestors its line passes through, read from
+//! the world's ancestry index ([`crate::ancestry`]) in one step for each
+//! such ancestor, never from the population or the genome bank.
 
 use flife_core::clock::Tick;
 use flife_core::ids::{GenomeId, OrganismId};
@@ -44,8 +51,8 @@ use flife_genome::Traits;
 use flife_neural::{DecodedActions, LayerShape, Observation};
 
 use crate::{
-    EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism, Split, Unviable,
-    UptakeSettlement,
+    Descendants, EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism, Split,
+    Unviable, UptakeSettlement,
 };
 
 /// How many published steps of a watched organism's [`Transactions`] the
@@ -89,6 +96,10 @@ pub struct OrganismSnapshot {
     /// recorded while watching it, oldest first: at most [`RECENT_STEPS`],
     /// the newest the step to `tick`. Empty before its first watched step.
     pub transactions: Vec<Transactions>,
+    /// Its descendants and the ancestors its line passes through, while the
+    /// world traces its ancestry ([`crate::World::trace_ancestry`]); `None`
+    /// otherwise.
+    pub descendants: Option<Descendants>,
 }
 
 /// What the committed field offers one organism where it stands (plan

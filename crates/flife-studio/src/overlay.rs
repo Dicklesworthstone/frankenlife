@@ -12,7 +12,8 @@ use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
-    Activations, LocalChemistry, OrganismSnapshot, ReproductionOutcome, Sensed, Transactions,
+    Activations, Descendants, LocalChemistry, OrganismSnapshot, ReproductionOutcome, Sensed,
+    Transactions,
 };
 use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend, Style};
@@ -449,7 +450,17 @@ fn places(scale: f64) -> usize {
 /// - `activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.31, 0.44`:
 ///   each hidden layer's largest and mean activation magnitude, in
 ///   evaluation order, of the evaluation its held output came from
-///   ([`Activations`]); or `activations at its next evaluation`.
+///   ([`Activations`]); or `activations at its next evaluation`;
+/// - the transactions' lines ([`Recent`]);
+/// - `children 3 born, 2 alive · descendants 41 born, 17 alive` and
+///   `ancestors 455 (gen 41, 204 alive) ← 301 (gen 38, dead, 1,022 alive) ←
+///   2 more`: its [`Descendants`], births counted from the tick the world
+///   began tracing its ancestry (` since tick 1,024` follows when that is
+///   not its founding), and the [`PANEL_ANCESTORS`] nearest ancestors its
+///   line passes through, each with its generation and live descendants and
+///   marked when dead, then how many more; or `ancestors: none alive or
+///   where lines meet`; or `descendants not traced` when the world does not
+///   trace its ancestry.
 ///
 /// Or `not in the committed world` when it is gone. A magnitude of 100,000
 /// or more is written in scientific notation, so no line grows without
@@ -500,6 +511,10 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
         || "transactions from its next tick".to_owned(),
         |recent| transaction_lines(&recent),
     );
+    let descendants = snapshot
+        .descendants
+        .as_ref()
+        .map_or_else(|| "descendants not traced".to_owned(), descendant_lines);
     format!(
         "read at tick {} · lineage {} · generation {}\n\
          energy {} · {}/s · age {} ticks\n\
@@ -509,7 +524,8 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
          {actions}\n\
          {sensed}\n\
          {activations}\n\
-         {transactions}",
+         {transactions}\n\
+         {descendants}",
         grouped(snapshot.tick.get()),
         grouped(organism.lineage.get()),
         grouped(u64::from(organism.generation.get())),
@@ -517,6 +533,51 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
         signed(organism.energy_change_rate, 3),
         grouped(snapshot.age_ticks),
         grouped(u64::try_from(snapshot.parameters).unwrap_or(u64::MAX)),
+    )
+}
+
+/// The most ancestors the inspector panel names; the Studio's record names
+/// every one a [`Descendants`] path holds.
+pub const PANEL_ANCESTORS: usize = 2;
+
+/// [`inspector_lines`]' two lines for an organism's descendants and the
+/// ancestors its line passes through.
+fn descendant_lines(descendants: &Descendants) -> String {
+    let since = if descendants.since == Tick::ZERO {
+        String::new()
+    } else {
+        format!(" since tick {}", grouped(descendants.since.get()))
+    };
+    let mut ancestors: Vec<String> = descendants
+        .path
+        .iter()
+        .take(PANEL_ANCESTORS)
+        .map(|ancestor| {
+            format!(
+                "{} (gen {}, {}{} alive)",
+                grouped(ancestor.organism.get()),
+                grouped(u64::from(ancestor.generation.get())),
+                if ancestor.alive { "" } else { "dead, " },
+                grouped(ancestor.living)
+            )
+        })
+        .collect();
+    let more = (descendants.path.len().saturating_sub(PANEL_ANCESTORS) as u64)
+        .saturating_add(descendants.beyond);
+    if more > 0 {
+        ancestors.push(format!("{} more", grouped(more)));
+    }
+    let line = if ancestors.is_empty() {
+        "ancestors: none alive or where lines meet".to_owned()
+    } else {
+        format!("ancestors {}", ancestors.join(" ← "))
+    };
+    format!(
+        "children {} born, {} alive · descendants {} born, {} alive{since}\n{line}",
+        grouped(descendants.children_born),
+        grouped(descendants.children_living),
+        grouped(descendants.born),
+        grouped(descendants.living),
     )
 }
 

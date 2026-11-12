@@ -83,8 +83,8 @@ pub use host::{
 };
 pub use keep::{CHECKPOINT_POLL, Keeping};
 pub use overlay::{
-    BrushPreview, Inspected, OverlayState, Recent, Telemetry, field_key, inspector_lines, legends,
-    overlay_text, preview_line, recent, telemetry_lines,
+    BrushPreview, Inspected, OverlayState, PANEL_ANCESTORS, Recent, Telemetry, field_key,
+    inspector_lines, legends, overlay_text, preview_line, recent, telemetry_lines,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};

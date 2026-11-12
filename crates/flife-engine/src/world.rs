@@ -100,6 +100,7 @@ use flife_neural::{
     DecodedActions, Intrinsic, Observation, SensorScales, decode, observe, widen,
 };
 
+use crate::ancestry::{Ancestry, AncestryHeld};
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
@@ -325,11 +326,17 @@ impl Candidate<'_> {
     /// commit first, then everything else together.
     ///
     /// # Errors
-    /// As [`Population::commit_tick`], which the candidate already passed.
-    /// On error nothing is published and the committed world is unchanged.
+    /// As [`Population::commit_tick`], which the candidate already passed;
+    /// [`CoreError::StateConflict`] when the world traces its ancestry and
+    /// the report names an organism its index does not hold as it must
+    /// (FL-021). On error nothing is published and the committed world is
+    /// unchanged.
     pub fn publish(self) -> Result<TickReport, CoreError> {
         let Self { world, staged } = self;
         let mut staged = *staged;
+        if let Some(ancestry) = &world.ancestry {
+            ancestry.admits(&staged.report)?;
+        }
         world.population.commit_tick(
             staged.tick,
             &world.scratch.survivors,
@@ -357,6 +364,9 @@ impl Candidate<'_> {
                 recent.pop_front();
             }
             recent.push_back(transactions);
+        }
+        if let Some(ancestry) = &mut world.ancestry {
+            ancestry.fold(&staged.report);
         }
         Ok(staged.report)
     }
@@ -766,6 +776,9 @@ pub struct World {
     sensors: Sensors,
     uptake: Uptake,
     watch: Watch,
+    /// The live population's ancestry while the world traces it (FL-021):
+    /// not scientific state, like the watch.
+    ancestry: Option<Ancestry>,
 }
 
 impl World {
@@ -883,6 +896,7 @@ impl World {
             sensors: Sensors::default(),
             uptake: Uptake::default(),
             watch: Watch::default(),
+            ancestry: None,
         })
     }
 
@@ -1199,6 +1213,8 @@ impl World {
             population,
             capacity_bytes(&self.sources),
             capacity_bytes(&self.paths),
+            // Reserved whole when tracing begins (FL-021).
+            self.ancestry.as_ref().map_or(0, Ancestry::bytes),
         ])
     }
 
@@ -1294,6 +1310,36 @@ impl World {
     #[must_use]
     pub const fn watched(&self) -> Option<OrganismId> {
         self.watch.organism
+    }
+
+    /// Trace the live population's ancestry from this committed tick on
+    /// (FL-021, plan §14.2's Descendants), so that
+    /// [`World::organism_snapshot`] carries [`Descendants`]: see
+    /// [`crate::ancestry`]. A world traced from its founding counts every
+    /// birth; one traced later starts from its live population. Tracing a
+    /// world that already traces its ancestry keeps what it has. It changes
+    /// no result of a run: no digest, checkpoint or report holds the index,
+    /// and a step reads nothing from it. Its room, reserved now, is part of
+    /// [`World::footprint`]'s state, so call it before
+    /// [`World::admit_memory`].
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the index's room cannot be
+    /// reserved; the world then traces nothing.
+    ///
+    /// [`Descendants`]: crate::Descendants
+    pub fn trace_ancestry(&mut self) -> Result<(), CoreError> {
+        if self.ancestry.is_none() {
+            self.ancestry = Some(Ancestry::begin(&self.population, self.tick)?);
+        }
+        Ok(())
+    }
+
+    /// How much of its room the ancestry index holds, while the world
+    /// traces its ancestry.
+    #[must_use]
+    pub fn ancestry_held(&self) -> Option<AncestryHeld> {
+        self.ancestry.as_ref().map(Ancestry::held)
     }
 
     /// The watched organism's transactions in its last [`RECENT_STEPS`]
@@ -1403,6 +1449,10 @@ impl World {
             sensed,
             activations,
             transactions,
+            descendants: self
+                .ancestry
+                .as_ref()
+                .and_then(|ancestry| ancestry.descendants(id)),
         }))
     }
 

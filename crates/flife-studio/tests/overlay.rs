@@ -14,8 +14,9 @@ use flife_core::ids::{Generation, LineageId, OrganismId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{LedgerReport, Tick, ValidatedConfig};
 use flife_engine::{
-    Arrangement, ExchangeCell, LocalChemistry, MATERIAL_CHANNELS, NumericalProfile,
-    OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Split, Stepped, Unviable, World,
+    Ancestor, Arrangement, Descendants, ExchangeCell, LocalChemistry, MATERIAL_CHANNELS,
+    NumericalProfile, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Split, Stepped,
+    Unviable, World,
 };
 use flife_manim::{
     FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH,
@@ -344,7 +345,36 @@ fn known() -> OrganismSnapshot {
     records[2].reproduction = Some(ReproductionOutcome::CoolingDown {
         deadline: Tick::new(5_200),
     });
+    // Traced from the founding: three children, two alive, 41 descendants,
+    // 17 alive; four ancestors on its line, the nearest alive, the next
+    // dead where lines meet, and three more past the path.
+    known.descendants = Some(Descendants {
+        since: Tick::ZERO,
+        children_born: 3,
+        children_living: 2,
+        born: 41,
+        living: 17,
+        path: vec![
+            ancestor(455, 41, true, 204),
+            ancestor(301, 38, false, 1_022),
+            ancestor(120, 20, false, 2_000),
+            ancestor(12, 0, false, 3_900),
+        ],
+        beyond: 3,
+    });
     known
+}
+
+/// An ancestor on a [`Descendants`] path.
+fn ancestor(organism: u64, generation: u32, alive: bool, living: u64) -> Ancestor {
+    Ancestor {
+        organism: OrganismId::new(organism),
+        generation: Generation::new(generation),
+        birth_tick: Tick::new(organism * 10),
+        alive,
+        born: living * 3,
+        living,
+    }
 }
 
 #[test]
@@ -761,7 +791,9 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
                  gradient 0.031 toward 45° · affinity·Z +0.112\n\
                  activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.40, 0.53\n\
                  last 3 steps: uptake +0.570 · maintenance -0.012 · motion -0.003\n\
-                 emission -0.120 · 1 birth -1.050 · net +1.214 · cooling to tick 5,200";
+                 emission -0.120 · 1 birth -1.050 · net +1.214 · cooling to tick 5,200\n\
+                 children 3 born, 2 alive · descendants 41 born, 17 alive\n\
+                 ancestors 455 (gen 41, 204 alive) ← 301 (gen 38, dead, 1,022 alive) ← 5 more";
     assert_eq!(inspector_lines(Inspected::Read(&known)), panel);
     // Under the line naming the selection.
     assert_eq!(
@@ -872,6 +904,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         inspector_lines(Inspected::Read(&edited))
             .lines()
             .skip(9)
+            .take(2)
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
@@ -918,17 +951,56 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         );
     }
 
+    // Descendants: births counted since a later tick; no ancestor more than
+    // the panel names; none at all; and a world that does not trace them.
+    let descendants = |edit: &dyn Fn(&mut Descendants)| {
+        let mut edited = known.clone();
+        edit(edited.descendants.as_mut().expect("traced"));
+        inspector_lines(Inspected::Read(&edited))
+            .lines()
+            .skip(11)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        descendants(&|descendants| {
+            descendants.since = Tick::new(1_024);
+            descendants.path.truncate(2);
+            descendants.beyond = 0;
+        }),
+        [
+            "children 3 born, 2 alive · descendants 41 born, 17 alive since tick 1,024",
+            "ancestors 455 (gen 41, 204 alive) ← 301 (gen 38, dead, 1,022 alive)"
+        ]
+    );
+    assert_eq!(
+        descendants(&|descendants| {
+            descendants.path.truncate(1);
+            descendants.beyond = 0;
+        })[1],
+        "ancestors 455 (gen 41, 204 alive)"
+    );
+    assert_eq!(
+        descendants(&|descendants| {
+            descendants.path.clear();
+            descendants.beyond = 0;
+        })[1],
+        "ancestors: none alive or where lines meet"
+    );
+
     let mut unrecorded = known;
     unrecorded.sensed = None;
     unrecorded.activations = None;
     unrecorded.transactions.clear();
+    unrecorded.descendants = None;
     let lines = inspector_lines(Inspected::Read(&unrecorded));
     assert_eq!(
         lines.lines().skip(6).collect::<Vec<_>>(),
         [
             "sensed from its next tick",
             "activations at its next evaluation",
-            "transactions from its next tick"
+            "transactions from its next tick",
+            "descendants not traced"
         ]
     );
 }
@@ -1015,6 +1087,26 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
     longest.local.gain = 0.999_6;
     longest.local.toxicity = 99_999.999_4;
     longest.local.request = 99_999.999_94;
+    // Its descendants at their widest: every count and identity the
+    // largest written in full, births counted from a later tick, two dead
+    // ancestors at the largest generation, and more past them.
+    let widest = |alive| Ancestor {
+        organism: OrganismId::new(999_999_999_999),
+        generation: Generation::new(u32::MAX),
+        birth_tick: Tick::new(999_999_999_999),
+        alive,
+        born: 999_999_999_999,
+        living: 999_999_999_999,
+    };
+    longest.descendants = Some(Descendants {
+        since: Tick::new(999_999_999_999),
+        children_born: 999_999_999_999,
+        children_living: 999_999_999_999,
+        born: 999_999_999_999,
+        living: 999_999_999_999,
+        path: vec![widest(false), widest(false)],
+        beyond: 999_999_999_999,
+    });
     let panel = inspector_lines(Inspected::Read(&longest));
     assert_eq!(
         panel.lines().nth(3),
@@ -1028,7 +1120,12 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         [
             "last 128 steps: uptake -99999.999 · maintenance -99999.999 · motion -99999.999",
             "emission -99999.999 · 127 births -99999.999 · net -99999.999 · cooling to tick \
-             999,999,999,999"
+             999,999,999,999",
+            "children 999,999,999,999 born, 999,999,999,999 alive · descendants \
+             999,999,999,999 born, 999,999,999,999 alive since tick 999,999,999,999",
+            "ancestors 999,999,999,999 (gen 4,294,967,295, dead, 999,999,999,999 alive) ← \
+             999,999,999,999 (gen 4,294,967,295, dead, 999,999,999,999 alive) ← 999,999,999,999 \
+             more"
         ]
     );
     // The telemetry at its widest: each count at the largest written in
@@ -1091,7 +1188,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 23, "{text}");
+        assert_eq!(text.lines().count(), 25, "{text}");
         let colors: Vec<_> = legend
             .swatches
             .iter()

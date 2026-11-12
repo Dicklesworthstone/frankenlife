@@ -604,6 +604,35 @@ struct Inspection {
     /// What its budget stages added up to over the steps the world
     /// recorded for it.
     transactions: Option<TransactionsRecord>,
+    /// Its descendants and the ancestors its line passes through.
+    descendants: Option<DescendantsRecord>,
+}
+
+/// An organism's descendants (FL-021, plan §14.2's Descendants): births
+/// counted from `since`, the tick the world began tracing its ancestry,
+/// and the ancestors its line passes through, nearest first, those past
+/// the path counted in `beyond`.
+#[derive(Serialize)]
+struct DescendantsRecord {
+    since: u64,
+    children_born: u64,
+    children_living: u64,
+    born: u64,
+    living: u64,
+    ancestors: Vec<AncestorRecord>,
+    beyond: u64,
+}
+
+/// One ancestor an organism's line passes through: alive, or dead where
+/// two or more of its lines with live members meet.
+#[derive(Serialize)]
+struct AncestorRecord {
+    organism: u64,
+    generation: u32,
+    birth_tick: u64,
+    alive: bool,
+    born: u64,
+    living: u64,
 }
 
 /// What the committed field offers an organism where it stands (FL-021,
@@ -1398,6 +1427,29 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
                 }),
             }
         }),
+        descendants: snapshot
+            .descendants
+            .as_ref()
+            .map(|descendants| DescendantsRecord {
+                since: descendants.since.get(),
+                children_born: descendants.children_born,
+                children_living: descendants.children_living,
+                born: descendants.born,
+                living: descendants.living,
+                ancestors: descendants
+                    .path
+                    .iter()
+                    .map(|ancestor| AncestorRecord {
+                        organism: ancestor.organism.get(),
+                        generation: ancestor.generation.get(),
+                        birth_tick: ancestor.birth_tick.get(),
+                        alive: ancestor.alive,
+                        born: ancestor.born,
+                        living: ancestor.living,
+                    })
+                    .collect(),
+                beyond: descendants.beyond,
+            }),
     }
 }
 
@@ -1881,5 +1933,81 @@ mod tests {
                 "{name}"
             );
         }
+        // An untraced world's snapshot carries no descendants.
+        assert_eq!(record["snapshot"]["descendants"], Value::Null);
+    }
+
+    /// FL-021's Descendants: the record names every count, every ancestor
+    /// the path holds, nearest first, and how many more lie beyond it.
+    #[test]
+    fn inspected_records_carry_descendants_and_every_ancestor() {
+        use flife_core::ids::{Generation, OrganismId};
+        use flife_engine::{Ancestor, Descendants};
+        let config = flife_core::ValidatedConfig::from_toml(include_str!(
+            "../../../presets/reference-small-world.toml"
+        ))
+        .expect("the preset");
+        let mut world = flife_engine::World::found(
+            &config,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("the profile"),
+        )
+        .expect("founds");
+        world.trace_ancestry().expect("traces");
+        let id = world.population().ids().next().expect("a founder");
+        let mut snapshot = world
+            .organism_snapshot(id)
+            .expect("inspects")
+            .expect("it lives");
+        // A founder traced from its founding: nothing born, no ancestors.
+        let founded = snapshot.descendants.clone().expect("traced");
+        assert_eq!(founded.since, Tick::ZERO);
+        assert_eq!(
+            (founded.born, founded.living, founded.path.len()),
+            (0, 0, 0)
+        );
+        let ancestor = |organism, generation, alive, living| Ancestor {
+            organism: OrganismId::new(organism),
+            generation: Generation::new(generation),
+            birth_tick: Tick::new(organism * 10),
+            alive,
+            born: living * 3,
+            living,
+        };
+        snapshot.descendants = Some(Descendants {
+            since: Tick::new(1_024),
+            children_born: 3,
+            children_living: 2,
+            born: 41,
+            living: 17,
+            path: vec![
+                ancestor(455, 41, true, 204),
+                ancestor(301, 38, false, 1_022),
+            ],
+            beyond: 5,
+        });
+        let record = serde_json::to_value(super::status_record(&Status::Inspected {
+            organism: id,
+            seen: Tick::ZERO,
+            snapshot: Some(Box::new(snapshot)),
+        }))
+        .unwrap_or(Value::Null);
+        assert_eq!(
+            record["snapshot"]["descendants"],
+            serde_json::json!({
+                "since": 1_024,
+                "children_born": 3,
+                "children_living": 2,
+                "born": 41,
+                "living": 17,
+                "ancestors": [
+                    {"organism": 455, "generation": 41, "birth_tick": 4_550, "alive": true,
+                     "born": 612, "living": 204},
+                    {"organism": 301, "generation": 38, "birth_tick": 3_010, "alive": false,
+                     "born": 3_066, "living": 1_022},
+                ],
+                "beyond": 5,
+            })
+        );
     }
 }

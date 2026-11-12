@@ -232,11 +232,16 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
     );
     assert_eq!(expected, Some(OrganismId::new(target)));
     click(&mut studio, [spot[0] / density, spot[1] / density]);
+    // The Studio traces its world's ancestry from the founding, so the
+    // inspection carries descendants counted from tick 0 (FL-021).
     until(&mut studio, "the inspection", |studio, statuses| {
         studio.view().selected() == expected
             && statuses.iter().any(|status| {
-                matches!(status, Status::Inspected { organism, snapshot: Some(_), .. }
-                    if Some(*organism) == expected)
+                matches!(status, Status::Inspected { organism, snapshot: Some(snapshot), .. }
+                if Some(*organism) == expected
+                    && snapshot.descendants.as_ref().is_some_and(|descendants| {
+                        descendants.since == Tick::ZERO
+                    }))
             })
     });
 
@@ -291,6 +296,11 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
                 && snapshot.transactions.last().is_some_and(|newest| {
                     newest.tick.next().ok() == Some(snapshot.tick)
                         && newest.closing.to_bits() == snapshot.organism.energy.to_bits()
+                })
+                && snapshot.descendants.as_ref().is_some_and(|descendants| {
+                    descendants.since == Tick::ZERO
+                        && descendants.living <= descendants.born
+                        && descendants.children_living <= descendants.children_born
                 }))
         })
     });

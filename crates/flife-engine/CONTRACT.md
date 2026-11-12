@@ -205,7 +205,14 @@ each runs and owns the field.
     motion's `MotionSettlement` (proposed and applied velocity, cost, whether scaled), emission's
     `EmissionSettlement` (budget, cost, offered) and a `ReproductionOutcome` (`CoolingDown { deadline }`,
     `NoAttempt`, `Unviable`, `Born { child, split }` or `Rejected { split, candidates }`); then what the tiny
-    reservoir took and its closing energy (zero if the step exhausted it).
+    reservoir took and its closing energy (zero if the step exhausted it);
+  - `descendants` (plan §14.2's Descendants), while the world traces its ancestry: a `Descendants` with the tick
+    its counts run from (`since`), the children it bore and how many of them live, the descendants born below it
+    and how many of them live, and its `path`: the ancestors its line passes through that are alive or where two
+    or more lines with live members meet, nearest first, at most `ANCESTRY_PATH` (8), each an `Ancestor` with its
+    identity, generation, birth tick, whether it lives, and its descendants born and living; and how many more
+    lie `beyond` them. A dead ancestor through which only one line with live members passes is not on the path;
+    a founder's or an introduced organism's path ends with it. `None` while the world traces nothing.
 - `World::organism_weights(id)` (plan §14.2's on-demand weight dump): `Ok(None)` for an identity the population does
   not hold, or a `ControllerWeights`: the tick, the organism, its genome and topology index, its topology's
   `LayerShape`s in evaluation order (fan-in, fan-out, and where the weights and biases sit), and its genome's
@@ -219,6 +226,13 @@ each runs and owns the field.
   whether or not it still lives (the newest of an organism that died is the step that exhausted it). Each step's
   preparation reserves the records' room, so publishing allocates nothing; a cancelled or paused candidate records
   nothing.
+- `World::trace_ancestry()` (FL-021, plan §14.2's Descendants) begins the world's ancestry index (the `ancestry`
+  module) at its committed tick: from the founding every birth counts; later, it starts from the live population,
+  each organism under its parent when that parent lives too. It reserves the index's room, `ROOM_PER_ORGANISM`
+  (3) entries for each organism `population.maximum_count` allows, so call it before `admit_memory`; tracing again
+  keeps what the index holds. `World::ancestry_held()` gives an `AncestryHeld`: `since`, the `members` (live
+  organisms and dead ancestors where lines meet), how many are `dead`, the `entries` held (members and leavers
+  not yet cleared out), the `room` and the index's `bytes`. A restored world traces nothing until told to.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -487,12 +501,24 @@ each runs and owns the field.
   backend's samples. The record becomes visible when the step publishes, so a cancelled or paused candidate
   records nothing. A step costs one binary search of its identity-ordered rows and one sample more; the
   activations are evaluated at inspection, once, from the recorded inputs and the organism's own genome.
+- The ancestry index is not scientific state either. No digest, checkpoint or report holds it, and no step reads
+  it. Publishing a tick first checks that the index can take its report (`admits`: each birth's parent a live
+  member, newcomers' identities above every one it holds and ascending, each death a live member or one of the
+  tick's births), then commits the tick, then folds the report into the index, which cannot fail and allocates
+  nothing: the tick's births, deaths and introductions in the report's order. It holds at most `2n − 1` members
+  for `n` live organisms, and clears out leavers before adding newcomers when its room would not hold them. A
+  birth or death costs a step for each index member between it and its line's first ancestor; a `Descendants`
+  costs a step for each ancestor above the organism in the index, at most the path's eight named. Its bytes are
+  part of `footprint()`'s and `allocated()`'s state, so `admit_memory` charges them, and they do not change as
+  the world steps.
 
 **Refusal cases.**
 - FL-021: a live organism whose genome or topology is missing (`StateConflict`, "inspect organism"); a held output
   that does not decode (as `decode`); a watched organism whose held output the reference does not reproduce from
   the inputs recorded for it (`StateConflict`, "inspect organism"), which only a controller backend that broke its
-  bit-for-bit contract can cause.
+  bit-for-bit contract can cause. The ancestry index's room not reserved (`AllocationFailed`, "ancestry index"),
+  after which the world traces nothing; a tick report the index cannot take (`StateConflict`, "ancestry index"),
+  refused before the tick commits, which the world's own reports never cause.
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
 - A negative or nonfinite grant, an efficiency outside `[−1, 1]`, or a nonfinite composition.
@@ -826,6 +852,42 @@ row, the report's births, rejections and deaths, and the tick's ledger closure:
   reading the candidate's field; and the harm counting gain. The density without the area survived the first run,
   whose cells were 1 x 1; the 2 x 2 grid catches it.
 
+`src/ancestry.rs` unit tests (3, FL-021, plan §14.2's Descendants), the index against a whole genealogy that
+forgets nothing, in random ticks of at most three births (half of them to one of the three newest organisms, so
+lines grow deep), deaths and introductions in a population of at most 24:
+- `the_index_says_what_the_whole_genealogy_says`: for four seeds, 3,000 ticks from six founders; after every tick
+  every live organism's `Descendants` (counts, path and `beyond`) equals the genealogy's, a dead one has none, the
+  members less their dead are the live, the dead fewer than the live, and the room never grows. Each seed cleared
+  out leavers more than 20 times, named a path past eight ancestors, and put a dead ancestor on a path.
+- `an_index_begun_later_starts_from_the_live_population`: for two seeds, an index begun at tick 400 from the live
+  population, with at least one organism whose parent died, equals a genealogy rebased there over 1,500 ticks.
+- `events_the_index_cannot_hold_are_refused`: a birth to a parent unknown or dead, a child or introduction at or
+  below an identity taken, and a death unknown, already dead, or above every identity and not born that tick;
+  a birth whose child dies in the same tick, another death and an introduction above them are taken.
+
+`tests/ancestry.rs` (3 tests, FL-021), the 32 x 32 Appendix A world at a population of 512 with 48 founders and
+eight 240-power sources, a removal brush (radius 5, at one of four places in turn) at tick 50 of every hundred and
+six organisms introduced at tick 150; the genealogy is built from the reports alone, each birth's row checked for
+its parent, generation and birth tick:
+- `a_snapshot_says_what_the_whole_genealogy_says`: traced from the founding, every 25 ticks to 1,200 each live
+  organism's snapshot `descendants` equals the genealogy's (6,592 organisms checked); 262 births, 97 deaths, at
+  most 38 living below one organism, a path of 6, and dead ancestors on paths.
+- `a_world_traced_later_starts_from_its_live_population`: untraced, a snapshot has no descendants and the world
+  holds no index; traced at the first tick from 300 on at which a live organism's parent is dead (300), it equals
+  the genealogy begun there, every 25 ticks for 500, with `since` kept when traced again.
+- `tracing_changes_nothing_and_stays_in_its_room`: the room is 512 x 3 and the founders its 48 members, and the
+  footprint's and the admission's state are an untraced world's plus the index's bytes; for 1,200 ticks with the
+  brushes, every tick's report and digest equal an untraced world's, the members less their dead are the live,
+  fewer than twice them, the index's bytes do not change, and a dead ancestor is held.
+- Planted bugs in the ancestry index, each run against the tests that should catch it, all caught (with the
+  Studio's host, panel and record, 23 of 23): a dead organism with one line kept on the path; a dropped line not
+  taken from its ancestor; a birth counted born for its parent alone; a child's death leaving its parent's living
+  children; a death not taken from its ancestors' living; clearing out without carrying links past leavers;
+  leavers never cleared out; a child at its parent's generation; an introduction born a tick late; no ancestor
+  past the path counted `beyond`; every ancestor named alive; a later trace counting no living above a seed; a
+  birth to a parent not held alive, and a death above every identity not born that tick, admitted; the index
+  never folding a tick; a later trace counted from the founding; and the footprint not charging the index.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
 `pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`; FL-013 at
@@ -839,9 +901,13 @@ velocity, first-order splitting at the configured fixed timestep.
   organism, its inputs, sampled activations and the transactions of its last 128 steps. A snapshot taken right
   after the watch is set, or in a world not stepped since, has none of them: they exist only inside a step. The
   transactions are the watched organism's alone, from when it was watched; an organism's earlier history is not
-  kept. Its local chemistry is the committed field's, not the next step's settlement. It has no descendants, which
-  need an event index the world does not keep. A weight dump is on demand (`World::organism_weights`, through
-  `flife inspect --weights`); the session and the Studio do not ask for one yet.
+  kept. Its local chemistry is the committed field's, not the next step's settlement. Its descendants exist only
+  while the world traces its ancestry, and count from when tracing began: a checkpoint holds no ancestry, so a
+  resumed or branched world traced again starts from its live population, and an organism whose parent died
+  before then starts a line of its own. Only the Studio traces; `flife run` and `flife inspect` do not. The path
+  leaves out dead ancestors through which a single living line passes, and names no ancestor's identity once it
+  is dropped. A weight dump is on demand (`World::organism_weights`, through `flife inspect --weights`); the
+  session and the Studio do not ask for one yet.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

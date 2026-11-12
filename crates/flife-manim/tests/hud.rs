@@ -232,9 +232,9 @@ fn a_long_text_stops_at_its_budget() {
     for (glyphs, vertices_bind) in [("@%&$#8BgQ", false), ("SCWMJsczr", true)] {
         let line = glyphs.repeat(12);
         let text = font
-            .text(&[line.as_str(); 20].join("\n"), 26.0)
+            .text(&[line.as_str(); 30].join("\n"), 26.0)
             .expect("a long text");
-        let count = 20 * line.chars().count();
+        let count = 30 * line.chars().count();
         let (vertices, triangles) = (text.vertices().len(), text.triangles().len());
         assert!(text.left_out() > 0, "{glyphs}: the budget never bound");
         assert_eq!(text.glyphs() + text.left_out() + text.refused(), count);

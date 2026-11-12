@@ -366,6 +366,10 @@ impl Studio {
         if let Some(workers) = options.cpu_workers {
             world.set_cpu_workers(workers)?;
         }
+        // The inspector's descendants (FL-021): traced from the founding, so
+        // every birth counts, and its room is reserved before the memory
+        // admission charges the world's state.
+        world.trace_ancestry()?;
         // The observers are admitted before the backend (FL-043): the view
         // is made now, for the founding state, and the backend holds what
         // the budget leaves. Frames are drawn at the window's drawable.

@@ -7,9 +7,10 @@ rendering (§13.4), the configured bloom on glowing frames (§2.3), the shown ma
 energy (§13.4's "Local field": key C, `--field-mapping`, `flife_manim::FieldMapping`), keyed after the colour key. FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
-bounded snapshot at its committed boundary (§14.2), with what the committed field offers it where it stands, and
-what it sensed, its controller's activations and what its budget stages paid and received once the session has
-stepped while watching it, and draws it as a panel in the
+bounded snapshot at its committed boundary (§14.2), with what the committed field offers it where it stands, its
+children's and descendants' counts and the ancestors its line passes through (the world traces its ancestry from
+the founding), and what it sensed, its controller's activations and what its budget stages paid and received once
+the session has stepped while watching it, and draws it as a panel in the
 overlay, read again once a second while the world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, the region a click would act on is outlined on the world, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
@@ -259,7 +260,11 @@ telemetry line names the newest checkpoint's tick.
     `transactions`, what its recorded steps add up to as the panel sums them (`flife_studio::recent`): `steps`, the
     first and newest steps' `ticks`, chemistry's net `uptake`, the `maintenance`, `motion` and `emission` paid,
     `births` and what their splits debited (`endowed`), the `net` change, and the newest step's `reproduction`
-    (`cooling-down`, `no-attempt`, `unviable`, `born` or `rejected`), or null;
+    (`cooling-down`, `no-attempt`, `unviable`, `born` or `rejected`), or null; and `descendants`: the tick its
+    counts run `since`, its `children_born` and `children_living`, its descendants `born` and `living`, the
+    `ancestors` its line passes through, nearest first and at most `flife_engine::ANCESTRY_PATH` (8), each with
+    its `organism`, `generation`, `birth_tick`, whether it is `alive`, and its descendants `born` and `living`, and
+    how many more lie `beyond` them, or null when the world traces no ancestry;
   - FL-022: one `brush` each time the armed brush changes (`energy`, `removal` or null); one `submitted` per
     accepted stroke: its `command`, `brush`, its payload (the `cell` and `amount`, with the material's 32-component
     `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
@@ -493,7 +498,7 @@ presentation state, not scientific state.
     swatches coloured after the colour key's; `field_key` (the binary's choice) gives it for a drawn, composed
     field in either look and either particles, and nothing while the field is hidden or under raw density;
   - the inspector panel exactly, from a real snapshot of the preset three ticks in, its organism watched from the
-    start, with every printed value set: its eleven lines under the selection's, `not in the committed world` for
+    start, with every printed value set: its thirteen lines under the selection's, `not in the committed world` for
     a gone organism, nothing without a selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen
     from east (a heading a hair below east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest;
     scientific notation from 100,000 with a sign on every rate; what the field offers it where it stands (`here:
@@ -506,8 +511,12 @@ presentation state, not scientific state.
     -0.120 · 1 birth -1.050 · net +1.214 · cooling to tick 5,200`: each stage's sum, signed by whether it adds or
     removes energy); a gradient toward 180° with a negative alignment, `no gradient`; one step (`last step`, `no
     births`), two births, and each other reproduction outcome (`bore organism 4,321`, `attempt unviable`, `3
-    candidates rejected`, `no reproduction stage`); and `sensed from its next tick`, `activations at its next
-    evaluation` and `transactions from its next tick` before anything is recorded;
+    candidates rejected`, `no reproduction stage`); `sensed from its next tick`, `activations at its next
+    evaluation` and `transactions from its next tick` before anything is recorded; and its descendants (`children
+    3 born, 2 alive · descendants 41 born, 17 alive`, then `ancestors 455 (gen 41, 204 alive) ← 301 (gen 38,
+    dead, 1,022 alive) ← 5 more`: the panel's two nearest, each with how many of its descendants live, and the
+    path's other two with the three beyond it), counted `since tick 1,024` with two ancestors and nothing more,
+    one ancestor, `ancestors: none alive or where lines meet`, and `descendants not traced`;
   - the longest overlay (every key with every brush, every count one short of a trillion, the panel with every
     value one short of scientific notation and the catalog's largest controller, and the telemetry at its widest:
     four-digit byte counts, energies one short of scientific notation, the widest residual, a tally from a later
@@ -517,10 +526,12 @@ presentation state, not scientific state.
     efficiencies at the width of their bounds and its toxicity and request one short of scientific notation, what
     it sensed and its activations, each decimal one short of scientific notation and negative, a three-digit
     direction and two layers at the largest magnitude, and 128 steps' transactions, each sum one short of
-    scientific notation and negative, 127 births and the newest cooling down to the largest tick written in full),
-    23 lines laid out with its keys' swatches, at 2x: every glyph is drawn, none refused or left out, within four
-    fifths of the overlay's budget (the motion key's with the introduction brush, 45,148 vertices and 43,656
-    triangles, is the longest); at 3x, all of it is still drawn.
+    scientific notation and negative, 127 births and the newest cooling down to the largest tick written in full,
+    and its descendants: every count one short of a trillion, counted since the largest tick written in full,
+    two dead ancestors at the largest generation, and one short of a trillion more past them), 25 lines laid out
+    with its keys' swatches, at 2x: every glyph is drawn, none refused or left out, within four fifths of the
+    overlay's budget (the motion key's with the introduction brush, 54,110 vertices and 52,402 triangles, is the
+    longest); at 3x, all of it is still drawn.
   - Planted bugs in the transactions' panel and record (FL-021), each caught: the uptake summing the gain alone,
     births charging only the child's endowment, the net change the newest step's, the first step's reproduction
     shown, maintenance shown as a gain, the record's uptake including maintenance, and its ticks one late.
@@ -528,14 +539,20 @@ presentation state, not scientific state.
     low, a range for agreeing cells, the request at three places, the gain shown as the toxicity, the line after
     the controller's, the record's gain the toxicity, a cell's weight recorded as its efficiency, the record's
     request the density, and one cell recorded.
+  - Planted bugs in the descendants (FL-021), each caught: the host tracing no ancestry (`tests/offscreen.rs`); a
+    dead ancestor not written dead, the panel's count of more leaving out those beyond the path, and three
+    ancestors named (`tests/overlay.rs`); and the record dropping `beyond` or naming the path farthest first
+    (`src/main.rs`). With the engine's, 23 of 23.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 117.5 MiB at 3840 x 2160, which leaves the backend 136.2 MiB of the 2 GiB budget (117.5
+  terms to the observers: 139.4 MiB at 3840 x 2160, which leaves the backend 114.3 MiB of the 2 GiB budget (95.5
   with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
   telemetry, 82.6 MiB (172.1) at 39,936 vertices and 38,912 triangles with the brush preview, 86.9 MiB (166.8) at
   41,984 and 40,960 with the field's key, 99.9 MiB (153.8) at 48,128 and 47,104 with the inspector's sensed and
-  activation lines, 111.0 MiB (142.7) at 54,272 and 52,224 with its two transaction lines, and is 117.5 MiB at
-  57,344 and 55,296 with the line for what the field offers the organism where it stands (FL-021). The field's compositions (12 bytes a texel in the feed's slots and the
+  activation lines, 111.0 MiB (142.7) at 54,272 and 52,224 with its two transaction lines, 117.5 MiB (136.2) at
+  57,344 and 55,296 with the line for what the field offers the organism where it stands, and is 139.4 MiB at
+  68,608 and 65,536 with its two lines of descendants and ancestors (FL-021). Each line the HUD can show costs
+  the backend about 11 MiB. The field's compositions (12 bytes a texel in the feed's slots and the
   view's copy, FL-019) add 0.8 MiB to the rest of the observers.
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
@@ -616,10 +633,13 @@ presentation state, not scientific state.
     evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
     a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
     was added, the first run's one survivor).
-- `src/main.rs` unit tests (7, FL-022, FL-024, FL-023, FL-021): an `inspected` record of a watched organism of
+- `src/main.rs` unit tests (8, FL-022, FL-024, FL-023, FL-021): an `inspected` record of a watched organism of
   the preset two ticks in carries its sensed tick, scale and evaluation, its 104 inputs, three raw planes and 33
   gradients, and its activations' tick and layers, each value bit for bit, and its two steps' transactions: their
-  ticks, each sum as written out over the two records, bit for bit, and the newest step's reproduction outcome; the parser takes `--timeline FILE` (offscreen too) and
+  ticks, each sum as written out over the two records, bit for bit, and the newest step's reproduction outcome,
+  and null `descendants` in a world that traces none; in a traced world a founder's record counts from tick 0
+  with nothing born, and a record of descendants with three ancestors on the path and two beyond is exactly its
+  counts and every ancestor in path order, dead or alive, with `beyond`; the parser takes `--timeline FILE` (offscreen too) and
   `--export FILE --out DIR` with or without `--export-fps`, and refuses `--export` without `--out`, `--out` or
   `--export-fps` alone, `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never
   opens a Studio; it takes `--offscreen 2.5` (2 pixels a point by default),
@@ -749,9 +769,11 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   footprint's lowest and highest efficiency for its affinity, the gain and toxicity per unit taken in the
   footprint's proportions, and A.1's request there), hidden widths and parameter count, the held output's
   reproduction probability and emission gate, what it sensed, its activations, and what its budget stages
-  added up to over its recorded steps). The host's send on a click runs offscreen in `tests/offscreen.rs`, where
-  a posted click's inspection answers, and an inspection refreshed while the world runs carries what it sensed,
-  its activations and its transactions up to the answer's tick, the newest closing at its energy. The binary's own refresh once a second
+  added up to over its recorded steps, and its children's and descendants' counts and nearest ancestors). The
+  host's send on a click runs offscreen in `tests/offscreen.rs`, where a posted click's inspection answers with
+  descendants counted from tick 0, and an inspection refreshed while the world runs carries what it sensed, its
+  activations and its transactions up to the answer's tick, the newest closing at its energy, and its descendants
+  still counted from tick 0, none more alive than born. The binary's own refresh once a second
   (`Studio::inspect_selected`), the panel's drawing and the record's printing run only in a window, which no test
   here opened; `overlay_text` and the session thread's answers are tested without one. While the world runs,
   the snapshot is read at the session's committed boundary when the inspection is answered, usually later than the
@@ -763,8 +785,18 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   watching it, at most 128 (a second at the reference tick), so a selection's first panel after a pause or a
   newly watched organism covers fewer; no single step's settlement is shown or recorded. What the field offers it
   is read from the committed field the Studio draws, not the field the next step's uptake reads after transport,
-  and is a rate per unit taken, not a forecast of its grants. §14.2's descendants are not implemented, and a
-  weight dump is `flife inspect --weights` on a run directory: the Studio has no key for one.
+  and is a rate per unit taken, not a forecast of its grants. The descendants are the world's ancestry index's
+  (`World::trace_ancestry`, which `Studio::open` calls before its memory admission, so the index's room, three
+  entries for each organism the population can hold, is charged to the world's state): counts of the children
+  and descendants born since the trace began and of those alive at the snapshot's tick, and the ancestors its line
+  passes through that are alive or where two or more living lines meet. A dead ancestor through which only one
+  living line passes is left out of the path, as is everything above a founder or an organism introduced by a
+  brush. The panel names the two nearest and counts the rest; the record names up to eight. The Studio founds
+  its world, so it traces from tick 0; a world traced later (`since`) is the engine's case, tested in
+  `flife-engine`'s `tests/ancestry.rs`, and the panel's `since tick` line in `tests/overlay.rs`. Ancestry is
+  observer state: no digest, checkpoint or report carries it, and the engine's tests show a traced world's reports
+  and digests equal an untraced one's. A weight dump is `flife inspect --weights` on a run directory: the Studio
+  has no key for one.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
     `tests/offscreen.rs` for all four brushes as far as the submitted stroke, and for the energy and material

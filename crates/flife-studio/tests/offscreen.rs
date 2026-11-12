@@ -26,9 +26,9 @@ use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, hud_origin, linear};
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_M, KEY_PERIOD,
-    KEY_SPACE, PICK_RADIUS_POINTS, Status, Studio, StudioOptions, Supplies, Surface, legends,
-    material_for, scroll_zoom, stroke,
+    Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_I, KEY_M, KEY_PERIOD,
+    KEY_SPACE, KEY_X, PICK_RADIUS_POINTS, Preview, Status, Studio, StudioOptions, Supplies,
+    Surface, cell_region, legends, material_for, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -84,6 +84,22 @@ fn click(studio: &mut Studio, at: [f64; 2]) {
             })
             .expect("posts");
     }
+}
+
+fn hover(studio: &mut Studio, at: [f64; 2]) {
+    studio
+        .post_input(InputEvent::PointerMoved {
+            position: point(at),
+            buttons: ButtonSet::EMPTY,
+            modifiers: Modifiers::NONE,
+        })
+        .expect("posts");
+}
+
+/// Press and release a key.
+fn tap(studio: &mut Studio, code: u16, text: &str) {
+    studio.post_input(key(code, text, true)).expect("posts");
+    studio.post_input(key(code, text, false)).expect("posts");
 }
 
 /// Frames until `done` holds, for at most 30 s of wall time.
@@ -260,7 +276,10 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
     let tally = studio.tally();
     assert_eq!(tally.rendered, tally.frames, "every frame was drawn");
     assert_eq!((tally.restyles, tally.selections), (1, 1));
-    assert!(tally.epochs >= 8);
+    // A newer epoch was lowered as the world ran. Not one per tick: the
+    // feed publishes the latest value, so a frame that comes late lowers
+    // only the newest epoch, and a loaded machine skips some.
+    assert!(tally.epochs >= 1, "{tally:?}");
     let closed = studio.close().expect("closes");
     assert!(closed.session.boundary.tick.get() >= 8);
     assert_eq!(closed.input_dropped, 0);
@@ -512,8 +531,16 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
             material,
             founder_energy: config.config().population.initial_energy,
         };
-        strokes
-            .push(stroke(brush, &viewport, logical, cells, at, &supplies).expect("a stroke there"));
+        let made = stroke(brush, &viewport, logical, cells, at, &supplies).expect("a stroke there");
+        // Its preview there is that stroke, the selected organism's
+        // material included.
+        hover(&mut studio, at);
+        let previewed = studio.frame().expect("a frame").preview;
+        assert!(
+            matches!(previewed, Some(Preview::Stroke { stroke, .. }) if stroke == made),
+            "{previewed:?}"
+        );
+        strokes.push(made);
         click(&mut studio, at);
     }
     let mut submitted = Vec::new();
@@ -595,4 +622,105 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
     let closed = studio.close().expect("closes");
     assert_eq!(closed.session.boundary.tick, Tick::new(1));
     assert_eq!(closed.session.world.digest(), direct.digest());
+}
+
+/// FL-022's preview (plan §14.3): while a brush is armed, each frame says
+/// what a click at the pointer would do, and a click there then submits
+/// exactly that stroke.
+#[test]
+fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let config = config();
+    let mut studio = Studio::open(&config, &options(false)).expect("opens offscreen");
+    assert_eq!(studio.frame().expect("the first frame").preview, None);
+    let logical = SIZE.map(f64::from);
+    let world = &config.config().world;
+    let cells = [world.grid_width, world.grid_height];
+    let viewport = *studio.view().viewport();
+    let supplies = Supplies {
+        material: None,
+        founder_energy: config.config().population.initial_energy,
+    };
+
+    // Armed before the pointer has been anywhere: off the world.
+    tap(&mut studio, KEY_E, "e");
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(
+        (frame.brush, frame.preview),
+        (Some(Brush::Energy), Some(Preview::OffWorld))
+    );
+    let mut shown = Vec::new();
+    for (code, text, brush, at) in [
+        (KEY_E, "e", Brush::Energy, [110.0, 70.0]),
+        (KEY_X, "x", Brush::Removal, [160.0, 100.0]),
+        (KEY_I, "i", Brush::Introduction, [205.0, 150.0]),
+    ] {
+        if brush != Brush::Energy {
+            tap(&mut studio, code, text);
+        }
+        hover(&mut studio, at);
+        let frame = studio.frame().expect("a frame");
+        assert_eq!(frame.brush, Some(brush));
+        let expected = stroke(brush, &viewport, logical, cells, at, &supplies).expect("a stroke");
+        let Some(Preview::Stroke {
+            stroke: made,
+            region,
+        }) = frame.preview
+        else {
+            panic!("{brush:?} at {at:?}: {:?}", frame.preview);
+        };
+        assert_eq!(made, expected, "{brush:?}");
+        assert_eq!(
+            region,
+            expected
+                .cell()
+                .map(|cell| cell_region(viewport.extent(), cells, cell))
+        );
+        // The world point under the pointer is in the cell it names.
+        if let Some([[x0, x1], [y0, y1]]) = region {
+            let [x, y] = frame.hover.expect("over the world");
+            assert!(
+                x0 <= x && x < x1 && y0 <= y && y < y1,
+                "{x}, {y} in {region:?}"
+            );
+        }
+        click(&mut studio, at);
+        shown.push(made);
+    }
+
+    // The material brush with no organism selected has no material; in the
+    // letterbox margin it is off the world, as every brush is.
+    tap(&mut studio, KEY_M, "m");
+    hover(&mut studio, [160.0, 100.0]);
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(
+        (frame.brush, frame.preview),
+        (Some(Brush::Material), Some(Preview::NoMaterial))
+    );
+    hover(&mut studio, [5.0, 100.0]);
+    assert_eq!(
+        studio.frame().expect("a frame").preview,
+        Some(Preview::OffWorld)
+    );
+    // Disarmed: no preview.
+    tap(&mut studio, KEY_M, "m");
+    let frame = studio.frame().expect("a frame");
+    assert_eq!((frame.brush, frame.preview), (None, None));
+
+    let mut submitted = Vec::new();
+    until(&mut studio, "the submissions", |_, statuses| {
+        submitted = statuses
+            .iter()
+            .filter_map(|status| match status {
+                Status::Submitted { stroke, .. } => Some(*stroke),
+                _ => None,
+            })
+            .collect();
+        submitted.len() == 3
+    });
+    assert_eq!(submitted, shown);
+    studio.close().expect("closes");
 }

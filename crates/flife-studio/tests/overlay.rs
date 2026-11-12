@@ -13,15 +13,18 @@
 use flife_core::ids::{Generation, LineageId, OrganismId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{LedgerReport, Tick, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, OrganismSnapshot, Stepped, World};
+use flife_engine::{
+    Arrangement, MATERIAL_CHANNELS, NumericalProfile, OrganismSnapshot, Stepped, World,
+};
 use flife_manim::{
     HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH, HUD_TEXT_POINTS, HudFont,
     Legend, linear,
 };
 use flife_render::{Metrics, Tally};
 use flife_studio::{
-    Brush, ClockReading, ColorMapping, Inspected, OverlayState, Telemetry, inspector_lines,
-    legends, overlay_text, telemetry_lines,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, Brush, BrushPreview, ClockReading, ColorMapping, Inspected,
+    OverlayState, Preview, Stroke, Telemetry, inspector_lines, legends, overlay_text, preview_line,
+    telemetry_lines,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -130,9 +133,47 @@ fn state(legend: &Legend) -> OverlayState<'_> {
         clock: None,
         legend,
         brush: None,
+        preview: None,
         selected: None,
         inspected: None,
         telemetry: None,
+    }
+}
+
+/// The widest preview of `brush` the Studio can write: its brushes' own
+/// amount and count, the largest cell indices, bounds and a founder's
+/// endowment one short of scientific notation at the finest places, and
+/// the finest radius.
+fn widest_preview(brush: Brush) -> BrushPreview {
+    let cell = [u32::MAX, u32::MAX];
+    let stroke = match brush {
+        Brush::Energy => Stroke::Energy {
+            cell,
+            amount: BRUSH_ENERGY,
+        },
+        Brush::Material => Stroke::Material {
+            cell,
+            amount: BRUSH_ENERGY,
+            direction: [0.0; MATERIAL_CHANNELS],
+        },
+        Brush::Introduction => Stroke::Introduction {
+            cell,
+            count: BRUSH_INTRODUCTION,
+            energy: 99_999.994,
+        },
+        Brush::Removal => Stroke::Removal {
+            center: [0.0; 2],
+            radius: 1.0e-7,
+        },
+    };
+    BrushPreview {
+        preview: Preview::Stroke {
+            stroke,
+            region: stroke
+                .cell()
+                .map(|_| [[99_999.999_999_8, 99_999.999_999_9]; 2]),
+        },
+        recycle_fraction: 0.999,
     }
 }
 
@@ -247,6 +288,7 @@ fn the_overlay_says_what_the_session_is_doing() {
             clock: Some(&slow),
             legend: &energy,
             brush: Some(Brush::Material),
+            preview: None,
             selected: Some(OrganismId::new(1_234_567)),
             inspected: None,
             telemetry: None,
@@ -656,6 +698,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
             clock: Some(&reading),
             legend,
             brush: Some(brush),
+            preview: Some(widest_preview(brush)),
             selected: Some(OrganismId::new(999_999_999_999)),
             inspected: Some(Inspected::Read(&longest)),
             telemetry: Some(Telemetry {
@@ -668,7 +711,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 15, "{text}");
+        assert_eq!(text.lines().count(), 16, "{text}");
         let colors: Vec<_> = legend.swatches.iter().map(|&rgb| linear(rgb)).collect();
         // At two drawable pixels a point, where the most vertices are.
         let laid = font
@@ -706,4 +749,113 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         assert_eq!(dense.left_out(), 0, "{text:?}");
     }
     println!("the longest: {} vertices, {} triangles", most.0, most.1);
+}
+
+/// A brush's preview (plan §14.3): what a click adds or removes, in the
+/// model's energy units, and the region it affects, in world units, with
+/// figures to the scale of the cell or the radius.
+#[test]
+fn a_preview_says_what_a_click_does() {
+    let preview = |preview| BrushPreview {
+        preview,
+        recycle_fraction: 0.5,
+    };
+    let at = |stroke, region| preview(Preview::Stroke { stroke, region });
+    let cell = [12, 30];
+    let region = Some([[12.0, 13.0], [30.0, 31.0]]);
+    assert_eq!(
+        preview_line(&at(Stroke::Energy { cell, amount: 64.0 }, region)),
+        "a click adds 64.0 energy to cell 12, 30 (x 12.00 to 13.00, y 30.00 to 31.00 world units)"
+    );
+    assert_eq!(
+        preview_line(&at(
+            Stroke::Material {
+                cell,
+                amount: 64.0,
+                direction: [0.0; MATERIAL_CHANNELS]
+            },
+            region
+        )),
+        "a click adds 64.0 energy of the selected organism's material to cell 12, 30 \
+         (x 12.00 to 13.00, y 30.00 to 31.00 world units)"
+    );
+    assert_eq!(
+        preview_line(&at(
+            Stroke::Introduction {
+                cell,
+                count: 8,
+                energy: 2.0
+            },
+            region
+        )),
+        "a click adds 8 organisms of 2.00 energy, 16.0 in all, to cell 12, 30 \
+         (x 12.00 to 13.00, y 30.00 to 31.00 world units)"
+    );
+    assert_eq!(
+        preview_line(&at(
+            Stroke::Removal {
+                center: [16.4, 12.0],
+                radius: 1.234_5
+            },
+            None
+        )),
+        "a click removes the organisms within 1.23 world units of the pointer: 50% of their \
+         energy to the field, the rest dissipated, none out of the world"
+    );
+    // A finer grid's bounds, a deeper zoom's radius and a wider one keep
+    // three significant figures of their scale; a large count is grouped.
+    assert_eq!(
+        preview_line(&at(
+            Stroke::Energy {
+                cell: [1_000, 3],
+                amount: 0.5
+            },
+            Some([[250.0, 250.25], [0.75, 1.0]])
+        )),
+        "a click adds 0.5 energy to cell 1,000, 3 (x 250.000 to 250.250, y 0.750 to 1.000 world units)"
+    );
+    let removal = |radius, recycle_fraction| {
+        preview_line(&BrushPreview {
+            preview: Preview::Stroke {
+                stroke: Stroke::Removal {
+                    center: [0.0; 2],
+                    radius,
+                },
+                region: None,
+            },
+            recycle_fraction,
+        })
+    };
+    assert_eq!(
+        removal(0.000_123_4, 1.0),
+        "a click removes the organisms within 0.000123 world units of the pointer: 100% of \
+         their energy to the field, the rest dissipated, none out of the world"
+    );
+    assert_eq!(
+        removal(123_456.0, 0.0),
+        "a click removes the organisms within 1.23e5 world units of the pointer: 0% of their \
+         energy to the field, the rest dissipated, none out of the world"
+    );
+    assert_eq!(
+        preview_line(&preview(Preview::OffWorld)),
+        "a click does nothing: the pointer is off the world"
+    );
+    assert_eq!(
+        preview_line(&preview(Preview::NoMaterial)),
+        "a click does nothing: select an organism for its material"
+    );
+    // In the overlay: after the brush and the selection.
+    let energy = key(ColorMapping::Energy);
+    assert_eq!(
+        overlay_text(&OverlayState {
+            paused: Some(true),
+            shown: Some(Tick::new(7)),
+            brush: Some(Brush::Material),
+            preview: Some(preview(Preview::NoMaterial)),
+            selected: Some(OrganismId::new(42)),
+            ..state(&energy)
+        }),
+        "paused · tick 7\nenergy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16\nmaterial brush · organism 42\n\
+         a click does nothing: select an organism for its material"
+    );
 }

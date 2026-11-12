@@ -60,8 +60,8 @@ mod session;
 mod timeline;
 
 pub use brush::{
-    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Stroke, Supplies, material_for,
-    stroke,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Preview, Stroke, Supplies,
+    cell_region, material_for, preview, stroke,
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
@@ -81,7 +81,8 @@ pub use host::{
     Surface,
 };
 pub use overlay::{
-    Inspected, OverlayState, Telemetry, inspector_lines, legends, overlay_text, telemetry_lines,
+    BrushPreview, Inspected, OverlayState, Telemetry, inspector_lines, legends, overlay_text,
+    preview_line, telemetry_lines,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};

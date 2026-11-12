@@ -59,10 +59,10 @@ use flife_engine::OrganismSnapshot;
 use flife_render::Metrics;
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ClockMeter, ClockReading, ColorMapping, End, ExportManifest, ExportOptions,
-    FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState, Particles, STUDIO_SCHEMA, Status,
-    Stroke, Studio, StudioOptions, Style, Surface, Telemetry, TimelineRecord, legends,
-    overlay_text, write_timeline_record,
+    Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
+    ExportOptions, FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState, Particles,
+    STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, Surface, Telemetry,
+    TimelineRecord, legends, overlay_text, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -875,6 +875,10 @@ fn main() -> ExitCode {
             clock: last_clock.as_ref(),
             legend,
             brush: armed,
+            preview: frame.preview.map(|preview| BrushPreview {
+                preview,
+                recycle_fraction: model.death.residual_energy_recycle_fraction,
+            }),
             selected,
             inspected: inspected
                 .as_ref()

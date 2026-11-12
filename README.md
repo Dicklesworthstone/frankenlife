@@ -410,8 +410,12 @@ and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the
 preset, a per-second `clock` record gives the honest clocks: the ticks committed per wall second, simulated seconds
 per wall second and frames drawn per second (FL-024). The window draws the same in its top-left corner, as
-text over a dark plate: running or paused at the shown tick, those clocks, the colour mapping's key (such as `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8
-■ 16`, each square in its colour), the armed brush and the selected organism. Drawn offscreen through the Metal
+text over a dark plate: running or paused at the shown tick, those clocks, plan §14.1's persistent telemetry (the
+live population and its parameters, the controller cadence and full evaluations a second, genome memory and
+headroom, births, deaths, capacity pauses and faults, the energy injected, taken up and dissipated with the
+ledger's residual, the model, seed and checkpoint; a `telemetry` record a second carries the same), the colour
+mapping's key (such as `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16`, each square in its colour), the armed brush and the
+selected organism. Drawn offscreen through the Metal
 route, the key's squares are their colours exactly without the bloom; the preset's bloom moves them by up to 16
 levels. The organisms glow over the energy field they feed on, in
 the configuration's colour mapping (`[presentation] color_mapping`, lineage in the preset). The style keys work
@@ -428,8 +432,11 @@ E arms the energy brush, X the removal brush, M the material brush and I the int
 again disarms). With one armed, a click adds 64 units of declared energy to the field cell under it; removes the
 organisms within 12 points of it on screen, their energy recycled as a death's; adds 64 units of material whose
 composition is the selected organism's affinity direction, the material it converts best; or introduces 8
-founder-drawn organisms there. Each click is a command: a `submitted` record names the boundary it will apply
-at, and a `finished` record the tick it applied at and the energy it moved.
+founder-drawn organisms there. While one is armed, the overlay says what a click at the pointer would do: the
+energy it adds, in the model's units, and the cell it lands in, in world units; or for removal, the radius about
+the pointer and the share of the removed energy recycled to the field, none leaving the world. Each click is a
+command: a `submitted` record names the boundary it will apply at, and a `finished` record the tick it applied at
+and the energy it moved.
 
 `--offscreen SECONDS` runs the same Studio for that long with no window (FL-024). It renders each frame through
 the same Metal route at `--scale` pixels a point (2 by default), reads it back and closes. Its `end` record gives

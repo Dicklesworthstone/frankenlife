@@ -27,8 +27,8 @@ use flife_engine::{
 use flife_manim::Viewport;
 use flife_runtime::Outcome;
 use flife_studio::{
-    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL,
-    SessionThread, Status, Stroke, Supplies, material_for, stroke,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL, Preview,
+    SessionThread, Status, Stroke, Supplies, cell_region, material_for, preview, stroke,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -239,6 +239,88 @@ fn an_energy_click_names_the_cell_under_it() {
     assert_eq!(
         stroke(Brush::Energy, &fit, logical, [0, 16], [400.0, 300.0], &NONE),
         None
+    );
+}
+
+/// A brush's preview at a pointer (plan §14.3) is the stroke a click there
+/// makes, for every brush, at fit, zoomed and across the seams: for a cell,
+/// with that cell's world rectangle, which holds the world point under the
+/// pointer. Without a pointer or a content area, and in the letterbox
+/// margin, it is off the world; the material brush over the world with no
+/// material says so.
+#[test]
+fn a_preview_is_the_stroke_a_click_there_makes() {
+    let extent = [32.0, 32.0];
+    let cells = [64, 16];
+    let logical = [800.0, 600.0];
+    let fit = Viewport::fit(extent, [1600, 1200]).expect("fits");
+    let zoomed = fit.with_view([3.3, 30.1], 2.75).expect("views");
+    let seam = fit.with_view([0.0, 0.0], 2.0).expect("views");
+    let material = material_for(&[0.5; flife_engine::MATERIAL_CHANNELS]);
+    let supplied = Supplies { material, ..NONE };
+    let brushes = [
+        Brush::Energy,
+        Brush::Removal,
+        Brush::Material,
+        Brush::Introduction,
+    ];
+    let (mut strokes, mut off, mut unsupplied) = (0, 0, 0);
+    for viewport in [fit, zoomed, seam] {
+        for (at, world, _) in lattice(&viewport, logical, cells) {
+            for brush in brushes {
+                for supplies in [supplied, NONE] {
+                    let shown =
+                        preview(brush, &viewport, Some(logical), cells, Some(at), &supplies);
+                    match stroke(brush, &viewport, logical, cells, at, &supplies) {
+                        Some(made) => {
+                            let region = made.cell().map(|cell| cell_region(extent, cells, cell));
+                            assert_eq!(
+                                shown,
+                                Preview::Stroke {
+                                    stroke: made,
+                                    region
+                                }
+                            );
+                            if let (Some([[x0, x1], [y0, y1]]), Some([x, y])) = (region, world) {
+                                assert!(
+                                    x0 <= x && x < x1 && y0 <= y && y < y1,
+                                    "{at:?}: {world:?} outside {region:?}"
+                                );
+                            }
+                            strokes += 1;
+                        }
+                        None if world.is_some() => {
+                            assert_eq!((brush, supplies.material), (Brush::Material, None));
+                            assert_eq!(shown, Preview::NoMaterial, "{at:?}");
+                            unsupplied += 1;
+                        }
+                        None => {
+                            assert_eq!(shown, Preview::OffWorld, "{brush:?} at {at:?}");
+                            off += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        strokes > 0 && off > 0 && unsupplied > 0,
+        "{strokes} {off} {unsupplied}"
+    );
+    for brush in brushes {
+        let at = Some([400.0, 300.0]);
+        assert_eq!(
+            preview(brush, &fit, Some(logical), cells, None, &supplied),
+            Preview::OffWorld
+        );
+        assert_eq!(
+            preview(brush, &fit, None, cells, at, &supplied),
+            Preview::OffWorld
+        );
+    }
+    assert_eq!(
+        cell_region(extent, cells, [63, 15]),
+        [[31.5, 32.0], [30.0, 32.0]]
     );
 }
 

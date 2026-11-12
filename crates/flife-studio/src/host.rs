@@ -60,7 +60,7 @@ use std::time::Instant;
 
 use crate::timeline::{Exact, TimelineRecord};
 use crate::{
-    Brush, CameraMove, Controls, Intent, Pacer, SessionThread, Status, Supplies, brush,
+    Brush, CameraMove, Controls, Intent, Pacer, Preview, SessionThread, Status, Supplies, brush,
     material_for,
 };
 
@@ -164,6 +164,10 @@ pub struct Frame {
     pub hover: Option<[f64; 2]>,
     /// The armed brush, if any (FL-022).
     pub brush: Option<Brush>,
+    /// While a brush is armed, what a click at the pointer would do now
+    /// (plan §14.3): the stroke the click would make through the view as
+    /// this frame left it ([`brush::preview`]).
+    pub preview: Option<Preview>,
     /// The presentation outcome; `None` when the window was occluded or
     /// closed and nothing was rendered, and offscreen.
     pub outcome: Option<PresentOutcome>,
@@ -514,6 +518,18 @@ impl Studio {
         &self.memory
     }
 
+    /// What the brushes draw on now: the selected organism's material,
+    /// once its inspection has answered, and a founder's endowment.
+    fn supplies(&self) -> Supplies {
+        Supplies {
+            material: self
+                .material
+                .filter(|(organism, _)| self.view.selected() == Some(*organism))
+                .and_then(|(_, material)| material),
+            founder_energy: self.founder_energy,
+        }
+    }
+
     /// Run one frame.
     ///
     /// # Errors
@@ -610,13 +626,7 @@ impl Studio {
         let mut viewport = *self.view.viewport();
         let mut picked = None;
         let mut strokes = Vec::new();
-        let supplies = Supplies {
-            material: self
-                .material
-                .filter(|(organism, _)| self.view.selected() == Some(*organism))
-                .and_then(|(_, material)| material),
-            founder_energy: self.founder_energy,
-        };
+        let supplies = self.supplies();
         for change in self.controls.take_moves() {
             match change {
                 CameraMove::Zoom { anchor, factor } => {
@@ -839,6 +849,18 @@ impl Studio {
             selected: self.view.selected(),
             hover: self.controls.hover(self.view.viewport()),
             brush: self.controls.brush(),
+            preview: self.controls.brush().map(|brush| {
+                brush::preview(
+                    brush,
+                    self.view.viewport(),
+                    logical,
+                    self.current.field().cells(),
+                    self.controls
+                        .pointer()
+                        .map(|pointer| [pointer.x, pointer.y]),
+                    &self.supplies(),
+                )
+            }),
             outcome,
             drawn,
         })

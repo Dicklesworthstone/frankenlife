@@ -5,6 +5,8 @@
 //! follows the clocks, from the shown epoch. The colour mapping's key is
 //! one of the lines (FL-019's legend, plan §13.4), and while an organism is
 //! selected its last inspection follows (FL-021's panel, plan §14.2).
+//! While a brush is armed, a line says what a click at the pointer would
+//! do (FL-022's preview, plan §14.3).
 
 use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
@@ -14,7 +16,7 @@ use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend};
 use flife_render::Metrics;
 
-use crate::{Brush, ClockReading};
+use crate::{Brush, ClockReading, Preview, Stroke};
 
 /// Every colour mapping's key for the run `config` configures, in
 /// [`ColorMapping::ALL`]'s order: the topology key labels the run's catalog
@@ -52,6 +54,8 @@ pub struct OverlayState<'a> {
     pub legend: &'a Legend,
     /// The armed brush.
     pub brush: Option<Brush>,
+    /// What a click of the armed brush at the pointer would do.
+    pub preview: Option<BrushPreview>,
     /// The selected organism.
     pub selected: Option<OrganismId>,
     /// The selected organism's last inspection; `None` until one answers.
@@ -84,6 +88,18 @@ pub struct Telemetry<'a> {
     pub checkpoint: Option<Tick>,
 }
 
+/// What a click of the armed brush at the pointer would do, as the overlay
+/// says it (FL-022, plan §14.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BrushPreview {
+    /// The host's preview ([`crate::preview`]).
+    pub preview: Preview,
+    /// `[death] residual_energy_recycle_fraction`: the share of a removed
+    /// organism's residual energy the removal brush, which recycles as a
+    /// death does, returns to the field; the rest dissipates.
+    pub recycle_fraction: f64,
+}
+
 /// An inspection's answer, as the overlay shows it (FL-021).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Inspected<'a> {
@@ -105,6 +121,7 @@ pub enum Inspected<'a> {
 /// - with telemetry, its lines ([`telemetry_lines`]);
 /// - `energy brush` while a brush is armed and `organism 42` while one is
 ///   selected, joined by ` · `;
+/// - with a brush's preview, what a click would do ([`preview_line`]);
 /// - while one is selected and an inspection has answered, the panel
 ///   ([`inspector_lines`]).
 ///
@@ -150,6 +167,10 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
     if !doing.is_empty() {
         text.push('\n');
         text.push_str(&doing.join(" · "));
+    }
+    if let Some(preview) = &state.preview {
+        text.push('\n');
+        text.push_str(&preview_line(preview));
     }
     if state.selected.is_some()
         && let Some(inspected) = state.inspected
@@ -285,6 +306,93 @@ fn bytes(value: u64) -> String {
         2
     };
     format!("{scaled:.places$} {}", UNITS[unit])
+}
+
+/// What a click would do (plan §14.3): the energy it adds or removes, in
+/// the model's energy units, and the region it affects, in world units.
+///
+/// - `a click adds 64.0 energy to cell 12, 30 (x 12.00 to 13.00, y 30.00
+///   to 31.00 world units)`;
+/// - `a click adds 64.0 energy of the selected organism's material to cell
+///   12, 30 (…)`;
+/// - `a click adds 8 organisms of 2.00 energy, 16.0 in all, to cell 12, 30
+///   (…)`;
+/// - `a click removes the organisms within 1.23 world units of the
+///   pointer: 50% of their energy to the field, the rest dissipated, none
+///   out of the world`;
+/// - `a click does nothing: the pointer is off the world`, or `…: select
+///   an organism for its material`.
+///
+/// A cell's bounds have three significant figures of its width, and a
+/// radius three of its own; from 100,000 a figure is in scientific
+/// notation.
+#[must_use]
+pub fn preview_line(preview: &BrushPreview) -> String {
+    let place = |cell: [u32; 2], region: Option<[[f64; 2]; 2]>| {
+        let at = format!(
+            "cell {}, {}",
+            grouped(u64::from(cell[0])),
+            grouped(u64::from(cell[1]))
+        );
+        match region {
+            Some([[x0, x1], [y0, y1]]) => {
+                let [x, y] = [x1 - x0, y1 - y0].map(places);
+                format!(
+                    "{at} (x {} to {}, y {} to {} world units)",
+                    decimal(x0, x),
+                    decimal(x1, x),
+                    decimal(y0, y),
+                    decimal(y1, y)
+                )
+            }
+            None => at,
+        }
+    };
+    match preview.preview {
+        Preview::Stroke { stroke, region } => match stroke {
+            Stroke::Energy { cell, amount } => format!(
+                "a click adds {} energy to {}",
+                decimal(amount, 1),
+                place(cell, region)
+            ),
+            Stroke::Material { cell, amount, .. } => format!(
+                "a click adds {} energy of the selected organism's material to {}",
+                decimal(amount, 1),
+                place(cell, region)
+            ),
+            Stroke::Introduction {
+                cell,
+                count,
+                energy,
+            } => format!(
+                "a click adds {} organisms of {} energy, {} in all, to {}",
+                grouped(u64::from(count)),
+                decimal(energy, 2),
+                decimal(f64::from(count) * energy, 1),
+                place(cell, region)
+            ),
+            Stroke::Removal { radius, .. } => format!(
+                "a click removes the organisms within {} world units of the pointer: {}% of \
+                 their energy to the field, the rest dissipated, none out of the world",
+                decimal(radius, places(radius)),
+                decimal(preview.recycle_fraction * 100.0, 0)
+            ),
+        },
+        Preview::OffWorld => "a click does nothing: the pointer is off the world".to_owned(),
+        Preview::NoMaterial => {
+            "a click does nothing: select an organism for its material".to_owned()
+        }
+    }
+}
+
+/// The decimal places that give `scale` three significant figures, from 0
+/// to 9; 2 for a scale that is not positive and finite.
+fn places(scale: f64) -> usize {
+    if !(scale.is_finite() && scale > 0.0) {
+        return 2;
+    }
+    // A finite positive scale's floor(log10) is within ±400.
+    (2.0 - scale.log10().floor()).clamp(0.0, 9.0) as usize
 }
 
 /// The inspector panel's lines for an answer:

@@ -14,8 +14,8 @@ scientific ticks committed per wall second and the simulation-time to wall-time 
 They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
 The overlay's lines are `overlay_text`'s: the run and its tick, the clocks, plan §14.1's persistent telemetry
 (`telemetry_lines`), the shown mapping's key (each swatch in the colour that mapping gives its label; the topology
-key labels the run's catalog members by their hidden widths), the armed brush and the selection, then the
-inspector panel. A count of a trillion or more, and a magnitude of 100,000 or more, is written in scientific
+key labels the run's catalog members by their hidden widths), the armed brush and the selection, the armed
+brush's preview (`preview_line`, §14.3), then the inspector panel. A count of a trillion or more, and a magnitude of 100,000 or more, is written in scientific
 notation, so no line grows without bound. The telemetry is the shown epoch's (`flife_render::Metrics`): the live
 population and its logical parameters; the neural cadence and the full-population evaluations a wall second; the
 genomes' allocated bytes against their quota and the memory budget's headroom above the admitted peak; the
@@ -110,6 +110,16 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
     that published it and the energy it moved. A paused session holds the command until a step or a run reaches
     its boundary. At close, a pending command's watcher stops when the session refuses its status.
 - `brush` (FL-022): `Brush::{Energy, Removal, Material, Introduction}` and `Stroke`, a click's world-space payload.
+  `preview(brush, viewport, logical, cells, pointer, supplies)` is plan §14.3's preview: `Preview::Stroke` with
+  exactly the stroke `stroke` makes for a click at the pointer and, for a cell, that cell's world rectangle
+  (`cell_region`), or `OffWorld` (no pointer or content area, or the margin), or `NoMaterial` (the material brush
+  over the world with no material). `overlay::preview_line` says it: what a click adds or removes, in the model's
+  energy units, and its region in world units, such as `a click adds 64.0 energy to cell 12, 30 (x 12.00 to
+  13.00, y 30.00 to 31.00 world units)`, or for a removal `a click removes the organisms within 1.23 world units
+  of the pointer: 50% of their energy to the field, the rest dissipated, none out of the world`
+  (`[death] residual_energy_recycle_fraction`); figures carry three significant digits of the cell width or the
+  radius. The removal preview names the pointer, not its coordinates, so moving within a cell, or with the removal
+  brush, does not change the overlay's text and lay it out again.
   `stroke(brush, viewport, logical, cells, at, supplies)` maps the logical point `at` through the viewport to the
   world point under it, `None` in the letterbox margin or while the content area is empty:
   - energy: `Stroke::Energy { cell, amount: BRUSH_ENERGY }` (64, 32 founders' endowments), the field cell whose
@@ -161,7 +171,9 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
   `StateConflict`.
 
   It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
-  `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, outcome, and `drawn`: presented
+  `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, the armed brush's `preview`
+  (`brush::preview` at the pointer through the view as the frame left it, with the supplies a click there would
+  use), outcome, and `drawn`: presented
   or rendered offscreen; the outcome is `None` offscreen). `FrameTally::drawn()` is the frames presented or
   rendered. `display_pair()` is the epochs it
   holds and `pacer()` the pacer.
@@ -357,7 +369,11 @@ presentation state, not scientific state.
   - while running: 48 inspections, then a pause; every snapshot the direct world's at its own tick, every
     organism answered with none dead at the close, and the closed world the direct one. Which ticks the answers
     land on depends on thread timing; the Lab test in `flife-runtime` is the one that requires answers mid-run.
-- `tests/brush.rs` (9 tests, FL-022, no window):
+- `tests/brush.rs` (10 tests, FL-022, no window):
+  - the preview at every point of the lattice, for every brush with and without a material, at fit, zoomed 2.75
+    and across the seams, is `Preview::Stroke` of exactly `stroke`'s stroke there, a cell's region holding the
+    world point; the material brush over the world without a material is `NoMaterial`, and the margin, a missing
+    pointer and a missing content area are `OffWorld`;
   - an energy click names the cell whose square holds the world point under it (the oracle is the cell's bounds,
     on a 64 x 16 grid of non-square cells over a lattice of clicks), at fit, zoomed 2.75 and centred on the seams
     at zoom 2; both ends of both axes are reached, either side of the seams gives the last cells and the first,
@@ -398,7 +414,11 @@ presentation state, not scientific state.
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and the evaluations what its tally
     advanced (at least one a tick, as the preset evaluates every organism every tick); once paused a window reads
     0 ticks and 0 evaluations.
-- `tests/overlay.rs` (5 tests, FL-024, FL-021 and FL-019, no window):
+- `tests/overlay.rs` (6 tests, FL-024, FL-022, FL-021 and FL-019, no window):
+  - each preview's line exactly: the energy, material and introduction brushes' cell and bounds, the removal's
+    radius and recycled share, three significant digits of a fine grid's cell (`250.000 to 250.250`) and of a deep
+    zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, off the world and no material; in
+    `overlay_text`, after the brush and the selection;
   - plan §14.1's telemetry exactly, for chosen metrics: `4,608 live · 9,124,000 parameters`, `controllers every
     tick · 128.0 full evaluations/s`, `genomes 38.2 MiB of 1.00 GiB · 412 MiB headroom`, `18,586 births · 18,255
     deaths · no capacity pause · no fault`, `injected 1234.5 · uptake 456.7 · dissipated 789.1 · residual
@@ -424,19 +444,22 @@ presentation state, not scientific state.
   - the longest overlay (every key with every brush, every count one short of a trillion, the panel with every
     value one short of scientific notation and the catalog's largest controller, and the telemetry at its widest:
     four-digit byte counts, energies one short of scientific notation, the widest residual, a tally from a later
-    tick, a fault, the largest seed and cadence), 15 lines laid out with its key's swatches, at 2x: every glyph is
-    drawn, none refused or left out, within four fifths of the overlay's budget (the motion key's with the
-    introduction brush, 26,371 vertices and 25,501 triangles, is the longest); at 3x, all of it is still drawn.
+    tick, a fault, the largest seed and cadence, and each brush's widest preview: its own amount and count, the
+    largest cell indices, bounds and a founder's endowment one short of scientific notation at nine places, and
+    the finest radius), 16 lines laid out with its key's swatches, at 2x: every glyph is drawn, none refused or
+    left out, within four fifths of the overlay's budget (the motion key's with the introduction brush, 31,734
+    vertices and 30,742 triangles, is the longest); at 3x, all of it is still drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 71.5 MiB at 3840 x 2160, which leaves the backend 183.1 MiB of the 2 GiB budget (164.4
-  with the preset's bloom). The overlay was 32.5 MiB (backend 222.1 MiB) before the persistent telemetry raised
-  the HUD's caps from 15,360 to 33,792: most of it is the frame preparation each triangle is charged, twice.
+  terms to the observers: 82.6 MiB at 3840 x 2160, which leaves the backend 172.1 MiB of the 2 GiB budget (153.3
+  with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
+  overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
+  telemetry, and is 82.6 MiB at 39,936 vertices and 38,912 triangles with the brush preview.
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
-- `tests/offscreen.rs` (6 tests, FL-024, Metal compute, no window), `Studio::open` offscreen on the preset at
+- `tests/offscreen.rs` (7 tests, FL-024, FL-022, Metal compute, no window), `Studio::open` offscreen on the preset at
   320 x 200 points and 2 pixels a point:
   - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
     the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
@@ -444,8 +467,9 @@ presentation state, not scientific state.
   - posted input as a window's: key 2 restyles to the energy mapping; a scroll zooms by exactly `scroll_zoom`'s
     factor about the pointer, its world point held within 1e-9; a click on the shown organism nearest the
     centre selects it (`flife_manim::pick`'s choice) and its inspection answers; a posted `Resized` becomes the
-    surface's geometry and refits the view to 800 x 500, its frame that size; Space runs the world on; every
-    frame was rendered;
+    surface's geometry and refits the view to 800 x 500, its frame that size; Space runs the world on to a shown
+    tick of 8, lowering newer epochs (latest-value publication: under load a late frame lowers only the newest,
+    so not one a tick); every frame was rendered;
   - FL-019's key on the Metal route: the generation and affinity keys' swatch interiors (2 px inside each square,
     over 1,100 pixels a key) are their sRGB colours exactly with the bloom off; with the preset's bloom (0.15)
     they were within 8 and 16 levels (printed);
@@ -457,7 +481,21 @@ presentation state, not scientific state.
     `stroke` makes at that point through the frame's view, the material one of the selected organism's affinity
     direction; both are submitted as commands 1 and 2 for tick 0, seen at tick 0; a step applies both at tick 0,
     published at 1, each moving the energy, bit for bit, that a world stepped directly with the same two strokes
-    reports; and the Studio closes on that world's digest, with two strokes and none unstroked.
+    reports; and the Studio closes on that world's digest, with two strokes and none unstroked. Before each click,
+    with the pointer there, the frame's preview is that stroke, the material one's composition included;
+  - FL-022's preview through the host: none before a brush is armed; off the world when armed before the pointer
+    has moved; with the energy, removal and introduction brushes armed by key and the pointer moved over the
+    world, the frame's preview is exactly the stroke `stroke` makes there through the view, a cell's region
+    holding the world point under the pointer; a click there then submits that stroke (all three, in order); the
+    material brush with no organism selected is `NoMaterial`, the margin `OffWorld`, and disarmed there is no
+    preview.
+  - Planted bugs in the preview, each run against the tests that should catch it: the preview made with another
+    brush, a cell's region one cell on, no-material never said, the region left out (`tests/brush.rs`); the host
+    previewing without the pointer, while disarmed, or without the selected organism's material (this file);
+    the line left out of the overlay, the recycled share not a percentage, the introduction's total one
+    organism's, figures one short of their scale (`tests/overlay.rs`): eleven caught, each by its own assertion.
+    The binary's recycled share set to zero survives: no offscreen binary run arms a brush (its run failed once,
+    on `tests/offscreen_binary.rs`'s floor of 10 frames in 2.5 s at a load average of 86, not on the mutant).
 - `tests/offscreen_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5
   --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen` and carries
   its admission, whose terms sum to its peak within the budget, with no backend term on the CPU reference, and
@@ -594,14 +632,17 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   transactions, descendants, local efficiency and weight dumps are not implemented.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
-    `tests/offscreen.rs` for the energy and material brushes; the removal and introduction brushes take the same
-    path, through `stroke`, only in `tests/brush.rs` without the host. The printing of the `brush`, `submitted` and
+    `tests/offscreen.rs` for all four brushes as far as the submitted stroke, and for the energy and material
+    brushes through to the applied energy; the removal and introduction brushes' applied energy is checked in
+    `tests/brush.rs` through the session thread, without the host. The printing of the `brush`, `submitted` and
     `finished` records and the `end` record's `strokes` and `unstroked` are the binary's and run only in a
     window, which no test here opened. The controls, the payload mapping, the session thread and the `submitted`
     and `finished` records' serialization are tested headlessly. `tests/live.rs` has a brush case
     that was compiled and not run.
-  - There is no brush cursor or disk preview on screen and no applied-energy readout: the Metal 3D route has no
-    text, so the armed brush and each command's outcome are records.
+  - The preview is text in the overlay: the region is named in world units, not drawn as a cursor, square or disk
+    on the world, and a removal's disk is about the pointer. A command's applied energy is in its `finished`
+    record, not the overlay. The binary's filling of the preview (the recycled share from the configuration) runs
+    only in a window: no offscreen binary run arms a brush.
   - A stroke is one click of fixed size. Painting by drag, a choice of amount, count or removal disposition, a
     material other than the selected organism's, source edits and parameter edits have no Studio brush.
   - The material brush takes the selected organism's composition from its `inspected` snapshot, which arrives

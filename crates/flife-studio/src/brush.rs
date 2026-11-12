@@ -14,6 +14,11 @@
 //! the introduction's endowment fixed when the click is made. It does not
 //! depend on the window once made, so it is what the session records and
 //! replays.
+//!
+//! While a brush is armed, its [`preview`] is the stroke a click at the
+//! pointer would make there now, by the same mapping, with the world
+//! rectangle of its cell: what the overlay says a click will do (plan
+//! §14.3).
 
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS};
 use flife_field::sources::unit_direction;
@@ -101,6 +106,18 @@ pub enum Stroke {
 }
 
 impl Stroke {
+    /// The field cell it applies to; `None` for a removal, which covers a
+    /// disk.
+    #[must_use]
+    pub const fn cell(self) -> Option<[u32; 2]> {
+        match self {
+            Self::Energy { cell, .. }
+            | Self::Material { cell, .. }
+            | Self::Introduction { cell, .. } => Some(cell),
+            Self::Removal { .. } => None,
+        }
+    }
+
     /// The brush that made it.
     #[must_use]
     pub const fn brush(self) -> Brush {
@@ -230,4 +247,74 @@ pub fn stroke(
             })
         }
     }
+}
+
+/// What a click of an armed brush at the pointer would do (plan §14.3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "it holds a `Stroke`, kept `Copy` and unboxed as the stroke is, made once a frame"
+)]
+pub enum Preview {
+    /// The stroke a click at the pointer makes, and for a brush that
+    /// applies to a cell, that cell's world rectangle ([`cell_region`]).
+    Stroke {
+        /// Exactly what [`stroke`] makes for a click there.
+        stroke: Stroke,
+        /// `[[x₀, x₁], [y₀, y₁]]` in world units; `None` for a removal.
+        region: Option<[[f64; 2]; 2]>,
+    },
+    /// The pointer is not over the world: it is outside the window or in
+    /// the letterbox margin, or the content area has no size yet.
+    OffWorld,
+    /// The material brush over the world with no material: no organism is
+    /// selected, or its affinity has not been read yet.
+    NoMaterial,
+}
+
+/// The preview of `brush` with the pointer at the logical window point
+/// `pointer`: [`Preview::Stroke`] with the stroke [`stroke`] makes for a
+/// click there through `viewport`, with the same `logical`, `cells` and
+/// `supplies`; otherwise why there is none.
+#[must_use]
+pub fn preview(
+    brush: Brush,
+    viewport: &Viewport,
+    logical: Option<[f64; 2]>,
+    cells: [u32; 2],
+    pointer: Option<[f64; 2]>,
+    supplies: &Supplies,
+) -> Preview {
+    let (Some(logical), Some(at)) = (logical, pointer) else {
+        return Preview::OffWorld;
+    };
+    match stroke(brush, viewport, logical, cells, at, supplies) {
+        Some(made) => Preview::Stroke {
+            stroke: made,
+            region: made
+                .cell()
+                .map(|cell| cell_region(viewport.extent(), cells, cell)),
+        },
+        None if brush == Brush::Material
+            && supplies.material.is_none()
+            && viewport.logical_to_world(at, logical).is_some() =>
+        {
+            Preview::NoMaterial
+        }
+        None => Preview::OffWorld,
+    }
+}
+
+/// The world rectangle of field cell `cell` on a grid of `cells` over a
+/// world of `extent`, `[[x₀, x₁], [y₀, y₁]]`: the square whose points
+/// [`stroke`]'s `⌊x / (L / cells)⌋` maps to `cell`.
+#[must_use]
+pub fn cell_region(extent: [f64; 2], cells: [u32; 2], cell: [u32; 2]) -> [[f64; 2]; 2] {
+    [0, 1].map(|axis| {
+        let width = extent[axis] / f64::from(cells[axis]);
+        [
+            f64::from(cell[axis]) * width,
+            (f64::from(cell[axis]) + 1.0) * width,
+        ]
+    })
 }

@@ -13,7 +13,8 @@ the founding), and what it sensed, its controller's activations and what its bud
 the session has stepped while watching it, and draws it as a panel in the
 overlay, read again once a second while the world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, the region a click would act on is outlined on the world, and the Studio reports the tick it applied
-at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
+at and the energy it moved (§14.3, §12.3); T has the camera track the selected organism (§14.3's camera-follow
+target). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
 They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
 The overlay's lines are `overlay_text`'s: the run and its tick, the clocks, plan §14.1's persistent telemetry
@@ -85,8 +86,9 @@ telemetry line names the newest checkpoint's tick.
     | M | arm the material brush, or disarm it (FL-022) |
     | I | arm the introduction brush, or disarm it (FL-022) |
     | W (without ⌘) | dump the selected organism's whole controller (a `CameraMove::Weights`, FL-021) |
+    | T | track the selected organism, or stop (a `CameraMove::Track`, plan §14.3) |
 
-    The style keys, 0, W and the brush keys ignore auto-repeat and ⌘ (⌘W closes), and produce no intent. A brush key with another
+    The style keys, 0, W, T and the brush keys ignore auto-repeat and ⌘ (⌘W closes), and produce no intent. A brush key with another
     brush armed switches to its brush. `brush()` is the armed brush.
   - Pointer gestures become `CameraMove`s, in logical points, kept in order until `take_moves()` (reserved once
     for a poll's events):
@@ -193,12 +195,18 @@ telemetry line names the newest checkpoint's tick.
      field grid, and is offered as `Intent::Intervene` with the shown epoch's tick as `seen` (FL-022), counted in
      `FrameTally::strokes` and with the intents or refusals. A brush click that makes no stroke (the margin, or the
      material brush with no material) is counted in `FrameTally::unstroked`. The material is the one the last
-     `Inspected` snapshot gives, while that organism is still selected;
+     `Inspected` snapshot gives, while that organism is still selected. A `CameraMove::Track` starts tracking or
+     stops it; a pan or a reset stops it;
   6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
      makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
      fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
      style change it shows the pair again, after a camera move it places it, and otherwise, while the display
-     moves, it advances it; once the display rests the prior lease is released;
+     moves, it advances it. While tracking (plan §14.3's camera-follow target), it then centres the view on where
+     this frame draws the selected organism (`WorldView::selected_position`), at the zoom it has, and places the
+     pair again there (`place_between`; the timeline records a `View` and a `Place`), counted in
+     `FrameTally::tracked`: a tracked frame lowers its organisms twice. Nothing selected (a click on nothing, or
+     an epoch that no longer draws the organism) stops tracking. Once the display rests the prior lease is
+     released;
   7. renders one `ThreeDJob` with `render_three_d` straight into the window's drawable, with no pixel readback.
      Offscreen, it renders the job with `MetalRenderer::render_three_d_rgba8`, which runs the same dispatch to
      the route's RGBA8 surface and reads it back (`Studio::last_frame`, tight RGBA8 at the drawable's size; the
@@ -210,7 +218,8 @@ telemetry line names the newest checkpoint's tick.
   the native queue drops events. `post_input` on a window, and `post` (AppKit's synthetic input) offscreen, are
   `StateConflict`.
 
-  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
+  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, tracked, tracking, new
+  epoch, shown
   `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, the armed brush's `preview`
   (`brush::preview` at the pointer through the view as the frame left it, with the supplies a click there would
   use, its `preview_region` outlined in that frame's drawing), outcome, and `drawn`: presented
@@ -361,7 +370,7 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (16 tests):
+- `tests/controls.rs` (17 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
@@ -380,6 +389,8 @@ presentation state, not scientific state.
     brushes at the press with the brush armed at the release, a drag still pans, and once disarmed a click selects.
   - FL-021: W makes one `CameraMove::Weights` and no intent, not on repeat; ⌘W closes and makes no move; it is no
     style key.
+  - Plan §14.3: each press of T makes one `CameraMove::Track` and no intent (its code pinned to `kVK_ANSI_T`), not
+    on repeat or with ⌘; it is no style key.
 - `tests/pacing.rs` (5 tests, FL-020): at rest before an interval is known; the display moves over the interval
   between arrivals (worked fractions, capped at 1, a frame before the arrival at 0) and later intervals smooth by a
   quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
@@ -563,7 +574,13 @@ presentation state, not scientific state.
     `tests/offscreen.rs`), the host never offering the dump (`tests/offscreen.rs`), the session thread answering
     no controller or dropping the shown tick (`tests/inspect.rs`), the record's tick the shown one and its layers
     reversed (`src/main.rs`), and the CLI's layout naming fan-in as fan-out (`flife-cli`'s `tests/inspect.rs` and
-    `src/main.rs`). With the runtime's, 10 of 10.- `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
+    `src/main.rs`). With the runtime's, 10 of 10.
+  - Planted bugs in camera tracking (plan §14.3), each caught: T making no move (`tests/controls.rs`); T never
+    stopping it, a pan, a reset or losing the selection not stopping it, tracking at zoom 1, the frame never
+    reporting a tracked move, and centring on where the previous frame drew the organism (`tests/offscreen.rs`);
+    and the pair not placed again once centred, the tracked move or its placing not recorded, and no tracked
+    frame counted (`tests/timeline.rs`, whose replay then draws other pixels or counts). 12 of 12.
+- `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
   terms to the observers: 139.4 MiB at 3840 x 2160, which leaves the backend 114.3 MiB of the 2 GiB budget (95.5
   with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
@@ -579,7 +596,7 @@ presentation state, not scientific state.
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
-- `tests/offscreen.rs` (7 tests, FL-024, FL-022, Metal compute, no window), `Studio::open` offscreen on the preset at
+- `tests/offscreen.rs` (8 tests, FL-024, FL-022, Metal compute, no window), `Studio::open` offscreen on the preset at
   320 x 200 points and 2 pixels a point:
   - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
     the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
@@ -610,6 +627,15 @@ presentation state, not scientific state.
     the pixel just outside the energy brush's cell is amber; a click there then submits that stroke (all three,
     in order); the material brush with no organism selected is `NoMaterial`, the margin `OffWorld`, and disarmed
     there is no preview; none of the three is outlined.
+  - Plan §14.3's camera tracking: T with nothing selected tracks nothing; zoomed in, a click on an organism away
+    from the centre with T centres the view on it at once at the same zoom (bit for bit), and at rest the view
+    stays. While the world runs, every frame draws the tracked organism at the drawable's centre (within 1e-6 px)
+    at that zoom, and only losing the selection stops tracking (the test then tracks the organism nearest the
+    centre); 40 frames move the view, those between epochs among them (in one run, 40 of 40, none lost). Paused:
+    a zoom about another point keeps it centred, at exactly the scroll's factor; T stops and starts it again; a
+    drag stops it and leaves the organism where the pan took it (the drag's offset from the centre, in drawable
+    pixels); T centres it again; 0 refits to zoom 1 and stops it; and a click where nothing is picked selects
+    nothing and stops it.
   - Planted bugs in the region outline (FL-022), each caught: the host outlining nothing or not recording the
     region (this file, `tests/timeline.rs`), a removal outlined as adding energy or with half its radius
     (`tests/brush.rs`), the replay outlining nothing, and a recorded rectangle doubled (`tests/timeline.rs`).
@@ -703,10 +729,12 @@ presentation state, not scientific state.
   its own binary because `frame_upload.rs` counts every thread's heap.
 - `tests/timeline.rs` (3 tests, FL-023, FL-019, Metal compute, no window):
   - G10. An offscreen Studio on the preset at 320 x 200 points and 2x records its timeline while posted input
-    sets an overlay, restyles (key 3, then C, the field's composition), zooms, selects the shown organism nearest the centre, arms the energy
-    brush and clicks, runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
-    Every kind of record is made (in one run: 161 records, 73 frames, 2 restyles, 12 camera moves, 4 brush
-    regions, 50 shows, 3 placements and 9 advances, one between epochs at a fraction strictly inside (0, 1)), a
+    sets an overlay, restyles (key 3, then C, the field's composition), zooms, selects the shown organism nearest
+    the centre, has the camera track it (T, which centres the view at once), arms the energy brush and clicks,
+    runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
+    Every kind of record is made (in one run: 268 records, 73 frames, 2 restyles, 65 view records, most of them
+    tracking's, 4 brush regions, 51 shows, 56 placements and 9 advances, one between epochs at a fraction
+    strictly inside (0, 1)), a
     style record names the composition, and the stroke applies. The replay outlines each region as recorded. Written
     as NDJSON and read back, the records are equal. The replay redraws every frame in order at the tick the
     Studio showed it, its RGBA8 bytes hashing equal, and closes on the Studio's tick and digest with the one
@@ -782,6 +810,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   drawable size and the view its new pixels per point. Only one 2× display is exercised here, so that path has no
   real-window test, and frankentorch's planted bug for `contentsScale` following a screen change survives for the
   same reason.
+- Tracking (T) follows one organism. When it dies the selection goes and tracking stops where it was: the camera
+  does not move on to a descendant (plan §2.2's "Follow descendants of a selected organism" is not done), and
+  §14.3's temporary measurement regions are not implemented. The window shows tracking only by the camera
+  itself; no overlay line says so. Tracking has run offscreen only: no window test here pressed T.
 - Camera smoothing, trails and a pinch-zoom gesture are not implemented (§13.5 allows smoothing and trails; G6's
   100 ms budget argues against smoothing the camera).
 - While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the

@@ -23,7 +23,9 @@
 //!    paused ([`Pacer`]), and the selection stays only if that epoch still
 //!    has its identity; after a style key or a camera move it lowers the
 //!    pair again, so the change shows while paused too, and otherwise
-//!    advances the motion;
+//!    advances the motion; while the T key has the camera track the
+//!    selected organism (plan §14.3), it then centres the view on where
+//!    this frame draws that organism and places the pair again there;
 //! 6. renders the cloud with FrankenManim's Metal 3D route straight into
 //!    the window's drawable, with no pixel readback.
 //!
@@ -168,6 +170,11 @@ pub struct Frame {
     pub restyled: bool,
     /// Whether a camera move changed the view this frame.
     pub moved: bool,
+    /// Whether the view moved to keep the tracked organism centred this
+    /// frame (plan §14.3).
+    pub tracked: bool,
+    /// Whether the camera tracks the selected organism after this frame.
+    pub tracking: bool,
     /// The epoch shown: the newest lowered, which the display has reached
     /// unless it is still moving towards it.
     pub shown: Option<Prior>,
@@ -210,6 +217,8 @@ pub struct FrameTally {
     pub restyles: u64,
     /// Frames whose camera moves changed the view.
     pub camera_moves: u64,
+    /// Frames whose view moved to keep the tracked organism centred.
+    pub tracked: u64,
     /// Clicks picked (an organism, or nothing).
     pub selections: u64,
     /// Brush clicks offered to the session as strokes (FL-022).
@@ -304,6 +313,8 @@ pub struct Studio {
     recorded: Option<Vec<TimelineRecord>>,
     /// When it opened: the timeline's presentation clock.
     opened: Instant,
+    /// Whether the camera tracks the selected organism (plan §14.3).
+    tracking: bool,
 }
 
 impl Studio {
@@ -472,6 +483,7 @@ impl Studio {
                 )]
             }),
             opened: Instant::now(),
+            tracking: false,
         })
     }
 
@@ -696,6 +708,8 @@ impl Studio {
                     }
                 }
                 CameraMove::Pan { delta } => {
+                    // The hand takes the camera back.
+                    self.tracking = false;
                     if let Some(size) = logical
                         && let Some(per_point) = drawable_per_point(&viewport, size)
                     {
@@ -704,6 +718,7 @@ impl Studio {
                     }
                 }
                 CameraMove::Reset => {
+                    self.tracking = false;
                     viewport = viewport.refit();
                 }
                 CameraMove::Select { at } => {
@@ -732,6 +747,7 @@ impl Studio {
                     }
                 }
                 CameraMove::Weights => weights = true,
+                CameraMove::Track => self.tracking = !self.tracking,
             }
         }
         let moved = self.view.set_view(viewport)?;
@@ -857,6 +873,38 @@ impl Studio {
         if let Some(display) = display {
             self.note(|| display);
         }
+        // Tracking (plan §14.3's camera-follow target): the view centred on
+        // the selected organism where this frame draws it, at the zoom it
+        // has, and the pair placed there again. Losing the selection (a
+        // click on nothing, or an epoch that no longer draws it) stops it.
+        if self.view.selected().is_none() {
+            self.tracking = false;
+        }
+        let mut tracked = false;
+        if self.tracking
+            && let Some(position) = self.view.selected_position()
+        {
+            let viewport = *self.view.viewport();
+            if self
+                .view
+                .set_view(viewport.with_view(position, viewport.zoom())?)?
+            {
+                self.view
+                    .place_between(self.prior.as_deref(), &self.current, fraction)?;
+                tracked = true;
+                self.tally.tracked += 1;
+                let taken = *self.view.viewport();
+                self.note(|| TimelineRecord::View {
+                    center: taken.center().map(Exact),
+                    zoom: Exact(taken.zoom()),
+                });
+                self.note(|| TimelineRecord::Place {
+                    prior: ticks.0,
+                    current: ticks.1,
+                    fraction: Exact(fraction),
+                });
+            }
+        }
         let shown_tick = ticks.1;
         if self.view.motion().is_none() {
             // At rest: the publisher may have the prior's slot back.
@@ -943,6 +991,8 @@ impl Studio {
             new_epoch,
             restyled,
             moved,
+            tracked,
+            tracking: self.tracking,
             shown: self.view.shown(),
             motion: self.view.motion(),
             selected: self.view.selected(),

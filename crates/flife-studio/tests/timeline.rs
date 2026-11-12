@@ -2,7 +2,8 @@
 //! frame for frame. An offscreen Studio records its timeline while posted
 //! input does the following:
 //! - sets an overlay and restyles the view, its colours and its field's;
-//! - zooms and resets the camera, and selects an organism;
+//! - zooms and resets the camera, selects an organism and has the camera
+//!   track it (plan §14.3);
 //! - makes a brush command;
 //! - runs the world with the camera moving and the display between epochs;
 //! - pauses and steps it.
@@ -38,9 +39,9 @@ use std::time::{Duration, Instant, SystemTime};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_studio::{
     ColorMapping, ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
-    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_PERIOD, KEY_SPACE, KEY_ZERO, Look, MANIFEST_FILE,
-    Status, Studio, StudioOptions, Style, Surface, TimelineRecord, TimelineStyle, VIDEO_FILE,
-    export, read_timeline, replay, write_timeline_record,
+    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_PERIOD, KEY_SPACE, KEY_T, KEY_ZERO, Look,
+    MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface, TimelineRecord, TimelineStyle,
+    VIDEO_FILE, export, read_timeline, replay, write_timeline_record,
 };
 use fmn_codec::{
     PngLimits, Y4mColorspace, append_y4m_frame_nv12, decode_png, decode_y4m, y4m_header,
@@ -197,6 +198,11 @@ fn a_recorded_session_replays_frame_for_frame() {
         );
         recording.frame();
     }
+    // T: the camera tracks the selection from here, through the run, until
+    // the reset (or until an epoch no longer draws it).
+    recording.post(key(KEY_T, "t"));
+    recording.frame();
+    assert_eq!(recording.studio.tally().tracked, 1, "T centred the view");
     recording.post(key(KEY_E, "e"));
     recording.frame();
     recording.post(click([110.0, 70.0]));

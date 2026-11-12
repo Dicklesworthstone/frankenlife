@@ -27,8 +27,9 @@ use flife_manim::{HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionShape, hu
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_I, KEY_M, KEY_PERIOD,
-    KEY_SPACE, KEY_W, KEY_X, PICK_RADIUS_POINTS, Preview, Status, Studio, StudioOptions, Supplies,
-    Surface, cell_region, legends, material_for, preview_region, scroll_zoom, stroke,
+    KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, PICK_RADIUS_POINTS, Preview, Status, Studio,
+    StudioOptions, Supplies, Surface, cell_region, legends, material_for, preview_region,
+    scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -416,6 +417,214 @@ fn the_colour_key_is_drawn_in_its_colours_offscreen() {
 /// its post to the end of the frame that drew it. AppKit's delivery and the
 /// display's presentation are not in it. Printed, not asserted: the test
 /// asserts only that every move reached the next frame.
+/// Click the shown organism drawn nearest the drawable point `aim`, press T
+/// after it, and run the frame that takes both: whether the camera now
+/// tracks that organism.
+fn track_nearest(studio: &mut Studio, aim: [f64; 2]) -> bool {
+    let density = f64::from(SCALE);
+    let viewport = *studio.view().viewport();
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let (target, spot) = studio
+        .view()
+        .shown_rows()
+        .map(|(id, position)| (id, viewport.world_to_drawable(position)))
+        .min_by(|a, b| distance(a.1, aim).total_cmp(&distance(b.1, aim)))
+        .expect("organisms are shown");
+    click(studio, [spot[0] / density, spot[1] / density]);
+    tap(studio, KEY_T, "t");
+    let frame = studio.frame().expect("a frame");
+    let _ = studio.take_statuses();
+    frame.tracking && frame.selected == Some(OrganismId::new(target))
+}
+
+/// Plan §14.3's camera-follow target: T tracks the selected organism. While
+/// the world runs, every frame draws it at the drawable's centre, where that
+/// frame draws it (between epochs too), at the zoom it had, and the camera
+/// moves with it; only losing the selection stops it then. A zoom keeps
+/// tracking; T again, a pan, a reset and a click on nothing each stop it,
+/// and T with nothing selected tracks nothing.
+#[test]
+fn t_keeps_the_selected_organism_centred_while_the_world_runs() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let mut studio = Studio::open(&config(), &options(false)).expect("opens offscreen");
+    studio.frame().expect("the first frame");
+    let density = f64::from(SCALE);
+    let middle = SIZE.map(|points| f64::from(points) * density / 2.0);
+    let spot = |studio: &Studio| {
+        let position = studio
+            .view()
+            .selected_position()
+            .expect("the selection is drawn");
+        studio.view().viewport().world_to_drawable(position)
+    };
+    let off = |at: [f64; 2], to: [f64; 2]| (at[0] - to[0]).hypot(at[1] - to[1]);
+    let scroll = |studio: &mut Studio, at: [f64; 2], delta: f64| {
+        studio
+            .post_input(InputEvent::Scroll {
+                delta: [0.0, delta],
+                unit: ScrollUnit::Points,
+                position: point(at),
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    };
+
+    tap(&mut studio, KEY_T, "t");
+    let frame = studio.frame().expect("a frame");
+    assert!(!frame.tracking && !frame.tracked, "nothing is selected");
+
+    // Zoomed in, an organism away from the centre: tracking it moves the
+    // view at once and keeps the zoom.
+    scroll(&mut studio, [160.0, 100.0], 80.0);
+    studio.frame().expect("a frame");
+    let zoom = studio.view().viewport().zoom();
+    assert!(zoom > 1.5, "{zoom}");
+    assert!(track_nearest(
+        &mut studio,
+        [middle[0] * 0.5, middle[1] * 0.6]
+    ));
+    assert!(off(spot(&studio), middle) < 1e-6, "{:?}", spot(&studio));
+    assert_eq!(studio.view().viewport().zoom().to_bits(), zoom.to_bits());
+    assert_eq!(studio.tally().tracked, 1);
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.tracking && !frame.tracked, "at rest the view stays");
+
+    // Space runs the world: every frame draws the organism at the centre.
+    tap(&mut studio, KEY_SPACE, " ");
+    let (mut tracked, mut between, mut losses) = (0, 0, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while tracked < 40 {
+        assert!(Instant::now() < deadline, "{tracked} tracked frames");
+        let frame = studio.frame().expect("a frame");
+        let _ = studio.take_statuses();
+        if frame.tracking {
+            assert!(off(spot(&studio), middle) < 1e-6, "{:?}", spot(&studio));
+            assert_eq!(studio.view().viewport().zoom().to_bits(), zoom.to_bits());
+            if frame.tracked {
+                tracked += 1;
+                between += usize::from(frame.motion.is_some_and(|motion| motion.fraction < 1.0));
+            }
+        } else {
+            assert_eq!(frame.selected, None, "only losing the selection stops it");
+            losses += 1;
+            assert!(losses < 50, "{losses} selections lost");
+            while !track_nearest(&mut studio, middle) {
+                assert!(Instant::now() < deadline, "no organism to track");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(between > 0, "no tracked frame was drawn between epochs");
+    println!("{tracked} tracked frames, {between} between epochs, {losses} selections lost");
+
+    tap(&mut studio, KEY_SPACE, " ");
+    until(&mut studio, "the pause", |_, statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Paused { .. }))
+    });
+    // Until the display comes to rest.
+    while studio.frame().expect("a frame").motion.is_some() {
+        assert!(Instant::now() < deadline, "the display never came to rest");
+    }
+    if !studio.frame().expect("a frame").tracking {
+        assert!(track_nearest(&mut studio, middle));
+    }
+
+    // A zoom about another point keeps tracking: about the organism.
+    let before = studio.view().viewport().zoom();
+    scroll(&mut studio, [60.0, 50.0], 40.0);
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.moved && frame.tracked && frame.tracking, "{frame:?}");
+    assert!(off(spot(&studio), middle) < 1e-6);
+    let factor = scroll_zoom(40.0, ScrollUnit::Points).expect("a factor");
+    assert!((studio.view().viewport().zoom() / before - factor).abs() < 1e-12);
+
+    // T again stops it; T once more tracks again.
+    tap(&mut studio, KEY_T, "t");
+    assert!(!studio.frame().expect("a frame").tracking);
+    tap(&mut studio, KEY_T, "t");
+    assert!(studio.frame().expect("a frame").tracking);
+
+    // A drag pans the view off the organism and stops tracking.
+    let (from, to) = ([100.0, 80.0], [130.0, 95.0]);
+    for event in [
+        InputEvent::Button {
+            button: PointerButton::Primary,
+            pressed: true,
+            position: point(from),
+            clicks: 1,
+            modifiers: Modifiers::NONE,
+        },
+        InputEvent::PointerMoved {
+            position: point(to),
+            buttons: ButtonSet::EMPTY.with(PointerButton::Primary),
+            modifiers: Modifiers::NONE,
+        },
+        InputEvent::Button {
+            button: PointerButton::Primary,
+            pressed: false,
+            position: point(to),
+            clicks: 1,
+            modifiers: Modifiers::NONE,
+        },
+    ] {
+        studio.post_input(event).expect("posts");
+    }
+    let frame = studio.frame().expect("a frame");
+    assert!(
+        frame.moved && !frame.tracked && !frame.tracking,
+        "{frame:?}"
+    );
+    let panned = [
+        middle[0] + (to[0] - from[0]) * density,
+        middle[1] + (to[1] - from[1]) * density,
+    ];
+    assert!(off(spot(&studio), panned) < 1e-6, "{:?}", spot(&studio));
+
+    // T centres it again; 0 shows the whole torus and stops tracking.
+    tap(&mut studio, KEY_T, "t");
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.tracked && frame.tracking);
+    assert!(off(spot(&studio), middle) < 1e-6);
+    tap(&mut studio, KEY_ZERO, "0");
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.moved && !frame.tracking);
+    assert_eq!(studio.view().viewport().zoom(), 1.0);
+
+    // A click on nothing selects nothing and stops tracking.
+    tap(&mut studio, KEY_T, "t");
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.tracked && frame.tracking);
+    let viewport = *studio.view().viewport();
+    let rows: Vec<(u64, [f64; 2])> = studio.view().shown_rows().collect();
+    let empty = (0..40)
+        .flat_map(|i| (0..25).map(move |j| [f64::from(i) * 8.0 + 4.0, f64::from(j) * 8.0 + 4.0]))
+        .find(|at| {
+            flife_manim::pick(
+                &viewport,
+                rows.iter().copied(),
+                at.map(|x| x * density),
+                PICK_RADIUS_POINTS * density,
+            )
+            .is_none()
+        })
+        .expect("somewhere picks nothing");
+    click(&mut studio, empty);
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.selected, None);
+    assert!(!frame.tracking && !frame.tracked);
+
+    let tally = studio.tally();
+    assert!(tally.tracked >= 40, "{tally:?}");
+    assert_eq!(tally.rendered, tally.frames, "every frame was drawn");
+    let closed = studio.close().expect("closes");
+    assert_eq!(closed.input_dropped, 0);
+}
+
 #[test]
 fn camera_moves_reach_the_next_frame_while_the_world_runs() {
     if !MetalRenderer::is_available() {

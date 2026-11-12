@@ -4,8 +4,9 @@
 use flife_manim::Viewport;
 use flife_studio::{
     Brush, CameraMove, ColorMapping, Controls, FieldMapping, Intent, KEY_C, KEY_D, KEY_DIGITS,
-    KEY_E, KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X,
-    KEY_ZERO, Look, Particles, Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+    KEY_E, KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_T, KEY_W,
+    KEY_X, KEY_ZERO, Look, Particles, Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT,
+    scroll_zoom,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -543,6 +544,33 @@ fn w_asks_for_a_weight_dump() {
         Some(Intent::Close)
     );
     assert!(moves(&mut controls).is_empty());
+    assert_eq!(controls.style(), style);
+}
+
+/// Plan §14.3: T asks the host to track the selected organism, or to stop,
+/// as a move with no intent (the host knows the selection); each press is
+/// one move, auto-repeat and ⌘T ask nothing, and it is no style key.
+#[test]
+fn t_asks_to_track_the_selection() {
+    assert_eq!(KEY_T, 17);
+    let mut controls = Controls::new();
+    let style = controls.style();
+    assert!(tap(&mut controls, KEY_T).is_empty());
+    assert!(tap(&mut controls, KEY_T).is_empty());
+    controls.apply(&key(KEY_T, true, true, Modifiers::NONE));
+    assert_eq!(
+        controls.apply(&key(
+            KEY_T,
+            true,
+            false,
+            Modifiers {
+                command: true,
+                ..Modifiers::NONE
+            },
+        )),
+        None
+    );
+    assert_eq!(moves(&mut controls), [CameraMove::Track, CameraMove::Track]);
     assert_eq!(controls.style(), style);
 }
 

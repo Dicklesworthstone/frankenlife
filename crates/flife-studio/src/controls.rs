@@ -31,6 +31,8 @@
 //! | X | arm the removal brush, or disarm it (FL-022) |
 //! | M | arm the material brush, or disarm it (FL-022) |
 //! | I | arm the introduction brush, or disarm it (FL-022) |
+//! | W | dump the selected organism's whole controller (FL-021) |
+//! | T | track the selected organism, the camera keeping it centred, or stop (plan §14.3) |
 //!
 //! and, for the presentation owner alone (FL-019's [`Style`]):
 //!
@@ -81,6 +83,8 @@ pub const KEY_X: u16 = 7;
 pub const KEY_M: u16 = 46;
 /// `kVK_ANSI_I`.
 pub const KEY_I: u16 = 34;
+/// `kVK_ANSI_T`.
+pub const KEY_T: u16 = 17;
 
 /// How far, in logical points, a primary press may move and still be a
 /// click; beyond it the press is a drag.
@@ -148,6 +152,11 @@ pub enum CameraMove {
     /// on-demand weight dump): the presentation owner asks the session for
     /// whatever is selected when it takes the move.
     Weights,
+    /// Track the selected organism, or stop tracking (plan §14.3's
+    /// camera-follow target): while tracking, the presentation owner centres
+    /// its view on the selected organism where each frame draws it, at the
+    /// zoom it has. A pan, a reset or losing the selection stops it.
+    Track,
 }
 
 /// What the presentation owner asks of the session.
@@ -341,6 +350,10 @@ impl Controls {
                     }
                     KEY_W => {
                         self.push(CameraMove::Weights);
+                        None
+                    }
+                    KEY_T => {
+                        self.push(CameraMove::Track);
                         None
                     }
                     code => {

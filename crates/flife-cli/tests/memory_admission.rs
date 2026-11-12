@@ -61,6 +61,19 @@ fn preset_with(pairs: &[(&str, u64)]) -> ValidatedConfig {
     ValidatedConfig::from_toml(&lines.join("\n")).expect("still valid")
 }
 
+/// The preset with each `key = value` replaced, the values as written.
+fn preset_with_values(pairs: &[(&str, &str)]) -> ValidatedConfig {
+    let mut lines: Vec<String> = PRESET.lines().map(str::to_owned).collect();
+    for &(key, value) in pairs {
+        let line = lines
+            .iter()
+            .position(|line| line.split('=').next().map(str::trim) == Some(key))
+            .expect("the key is in the preset");
+        lines[line] = format!("{key} = {value}");
+    }
+    ValidatedConfig::from_toml(&lines.join("\n")).expect("still valid")
+}
+
 fn preset() -> ValidatedConfig {
     preset_with(&[])
 }
@@ -388,6 +401,102 @@ fn a_filling_introduction_stays_within_the_staging_term() {
         "the step held {held} > staging {} + genomes {introduced} + state room {room}",
         footprint.staging
     );
+}
+
+/// The staging term against the heaviest ticks of births a test can make:
+/// 2,048 founders of a capacity of 4,096, each with 64 energy, no cooldown
+/// and an attempt rate so high that an attempt's probability rounds to
+/// one, so every founder attempts in the first tick with attempts. Each
+/// attempt stages its request, its mutation candidates and its records at
+/// once. With the preset's mutation every attempt is a birth; with
+/// mutation all but off every candidate is an effective no-op, so every
+/// attempt tries all its candidates and is rejected. What that step holds above
+/// what the world held before it is at most the staging term, the
+/// children's genomes' parameters (charged to the genome quota) and the
+/// state's room to grow to its bound.
+#[test]
+fn a_tick_of_births_stays_within_the_staging_term() {
+    let _serial = serial();
+    let crowded = [
+        ("initial_count", "2048"),
+        ("maximum_count", "4096"),
+        ("initial_energy", "64.0"),
+        ("maximum_attempt_rate_per_second", "1.0e9"),
+        ("cooldown_seconds", "0.0"),
+    ];
+    // Validation refuses a mutation no operator can change a genome with,
+    // so one is left on at a rate no draw reaches.
+    let unmutated = [
+        ("probability_per_birth", "0.0"),
+        ("weight_probability", "0.0"),
+        ("replacement_probability", "1.0e-300"),
+        ("chemistry_standard_deviation", "0.0"),
+        ("sensing_log_scale_standard_deviation", "0.0"),
+    ];
+    for rejecting in [false, true] {
+        let mut pairs = crowded.to_vec();
+        if rejecting {
+            pairs.extend(unmutated);
+        }
+        let config = preset_with_values(&pairs);
+        let candidates = config
+            .config()
+            .mutation
+            .maximum_candidate_proposals_per_birth;
+        let mut world = found(&config).expect("founds");
+        configure(&mut world, None, ControllerChoice::Cpu, None).expect("admitted");
+        let footprint = world.footprint();
+        let mut stepped = false;
+        for _ in 0..16 {
+            let state = world.allocated().state;
+            let genomes = world.quota().allocated_bytes();
+            let live = world.population().len();
+            let base = ALLOC.current_usage();
+            ALLOC.reset_peak_usage();
+            let report = match world.step().expect("steps") {
+                Stepped::Published(report) => report,
+                Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+            };
+            let held = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+            if report.attempted == 0 {
+                continue;
+            }
+            assert!(report.deaths.is_empty(), "no founder dies with 64 energy");
+            let born = world.quota().allocated_bytes() - genomes;
+            let room = footprint.state - state;
+            println!(
+                "{} births and {} rejected of {live} live ({} attempted, up to {candidates} \
+                 candidates each) held {:.2} MiB above the world: staging {:.2}, children's \
+                 genomes {:.2}, state room {:.2}",
+                report.births.len(),
+                report.rejected.len(),
+                report.attempted,
+                mib(held),
+                mib(footprint.staging),
+                mib(born),
+                mib(room),
+            );
+            let (made, unmade) = if rejecting {
+                (report.rejected.len(), report.births.len())
+            } else {
+                (report.births.len(), report.rejected.len())
+            };
+            assert!(
+                made == live && unmade == 0,
+                "{} births and {} rejected of {live}: not the heaviest tick",
+                report.births.len(),
+                report.rejected.len()
+            );
+            assert!(
+                held <= footprint.staging + born + room,
+                "the step held {held} > staging {} + genomes {born} + state room {room}",
+                footprint.staging
+            );
+            stepped = true;
+            break;
+        }
+        assert!(stepped, "no attempts in 16 ticks");
+    }
 }
 
 /// What `flife render`'s observers hold: the most heap a render of the

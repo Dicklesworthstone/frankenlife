@@ -267,7 +267,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     (`ThreeDJob::preparation_threads`), and the Metal route flattens and checks its triangle rows, and builds its
     per-tile triangle lists, on as many. One, the default, does all three on the calling thread, and no row, refusal or byte of the accounting depends on it. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
     make (FL-033: what FrankenManim's job holds beyond its preparation accounting, measured at 865 to 872 bytes a
-    dot and 1,180 a quad), and that limit. `offline_bytes(threads)` is what
+    dot and 1,180 a quad; dots compiled on threads share row blocks since FrankenManim `d670e74e` and hold less),
+    and that limit. `offline_bytes(threads)` is what
     `render_rgba8` adds: the RGBA16F and RGBA8 frames, each thread's tile scratch at the finest sampling, and
     `bloom_bytes` at the drawable. A view
     made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
@@ -570,7 +571,7 @@ route.
   overlay, the motion key's swatches and the inspector panel included, laid out twice and shown, and two zooms. Its
   peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `9b116eee`, CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `d670e74e`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**

@@ -59,7 +59,8 @@ directory, with its pending commands and its checkpoint chain.
   `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
   The Studio's view compiles a frame's dots on up to 8 threads, or this host's cores when fewer
   (`WorldView::set_preparation_threads`, FL-033; 8 measured 0.742x the time of one on a 25,000-organism-sized job).
-  The Metal route flattens and checks the frame's triangle rows on as many (FrankenManim `d87fd3f3`; no speed
+  The dots compiled on those threads keep their rows in shared blocks, one allocation for about 128 dots
+  (FrankenManim `d670e74e`; no speed is claimed for that step). The Metal route flattens and checks the frame's triangle rows on as many (FrankenManim `d87fd3f3`; no speed
   is claimed for that step), and builds its per-tile triangle lists on as many (`3a8d8de8`; 8 measured 0.506x
   the time of one on a 25,000-organism-sized frame). It keeps the frame's tables in device buffers between
   frames, writing each over the last frame's when it fits (`9b116eee`; no speed is claimed for that step). No
@@ -78,7 +79,7 @@ directory, with its pending commands and its checkpoint chain.
   (`StudioOptions::surface = Surface::Offscreen { scale }`): any thread and a Metal device; the content area is
   `size` points at `scale` pixels a point, and `title` and `resizable` are unused.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
-  `0ae728fe`, through FrankenManim `fmn-render` at rev `9b116eee`.
+  `0ae728fe`, through FrankenManim `fmn-render` at rev `d670e74e`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and

@@ -275,8 +275,9 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
     });
     // The selection's organism is watched: an inspection refreshed while the
     // world runs, as the Studio's binary refreshes it each second, carries
-    // what it sensed in a tick before the answer's, and the activations of
-    // the output it holds (FL-021, plan §14.2).
+    // what it sensed in a tick before the answer's, the activations of the
+    // output it holds, and its transactions up to the answer's tick (FL-021,
+    // plan §14.2).
     assert!(studio.inspect_selected(), "the refresh is offered");
     until(&mut studio, "a watched inspection", |_, statuses| {
         statuses.iter().any(|status| {
@@ -286,6 +287,10 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
                 && snapshot.activations.as_ref().is_some_and(|activations| {
                     Some(activations.tick) == snapshot.organism.held.evaluated_at()
                         && activations.hidden.len() == snapshot.hidden_widths.len()
+                })
+                && snapshot.transactions.last().is_some_and(|newest| {
+                    newest.tick.next().ok() == Some(snapshot.tick)
+                        && newest.closing.to_bits() == snapshot.organism.energy.to_bits()
                 }))
         })
     });

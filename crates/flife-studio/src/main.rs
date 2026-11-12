@@ -55,7 +55,7 @@ use clap::Parser;
 use flife_backend_metal::ControllerChoice;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::OrganismSnapshot;
+use flife_engine::{OrganismSnapshot, ReproductionOutcome};
 use flife_render::Metrics;
 use flife_runtime::Outcome;
 use flife_studio::{
@@ -563,6 +563,9 @@ struct Inspection {
     sensed: Option<SensedRecord>,
     /// The hidden activations its held output came from.
     activations: Option<ActivationsRecord>,
+    /// What its budget stages added up to over the steps the world
+    /// recorded for it.
+    transactions: Option<TransactionsRecord>,
 }
 
 /// An organism's recorded observation (FL-021, plan §14.2's Inputs), every
@@ -579,6 +582,27 @@ struct SensedRecord {
     inputs: Vec<f64>,
     /// `[∂q, ∂Z_0, …, ∂Z_31]`, each `[∂/∂x, ∂/∂y]`, unsaturated.
     gradients: Vec<[f64; 2]>,
+}
+
+/// What an organism's recorded steps add up to (plan §14.2's
+/// Transactions), as the inspector panel sums them: chemistry's net gain,
+/// then what maintenance, motion, emission and births paid, each a
+/// nonnegative amount, and the net change.
+#[derive(Serialize)]
+struct TransactionsRecord {
+    steps: usize,
+    /// The first and the newest recorded steps' start ticks.
+    ticks: [u64; 2],
+    uptake: f64,
+    maintenance: f64,
+    motion: f64,
+    emission: f64,
+    births: usize,
+    endowed: f64,
+    net: f64,
+    /// What the newest step's reproduction stage came to:
+    /// `cooling-down`, `no-attempt`, `unviable`, `born` or `rejected`.
+    reproduction: Option<&'static str>,
 }
 
 /// One evaluation's hidden activations (plan §14.2's Brain).
@@ -1236,6 +1260,26 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
                 tick: activations.tick.get(),
                 hidden: activations.hidden.clone(),
             }),
+        transactions: flife_studio::recent(&snapshot.transactions).map(|recent| {
+            TransactionsRecord {
+                steps: recent.steps,
+                ticks: recent.ticks.map(Tick::get),
+                uptake: recent.uptake,
+                maintenance: recent.maintenance,
+                motion: recent.motion,
+                emission: recent.emission,
+                births: recent.births,
+                endowed: recent.endowed,
+                net: recent.net,
+                reproduction: recent.reproduction.map(|outcome| match outcome {
+                    ReproductionOutcome::CoolingDown { .. } => "cooling-down",
+                    ReproductionOutcome::NoAttempt => "no-attempt",
+                    ReproductionOutcome::Unviable(_) => "unviable",
+                    ReproductionOutcome::Born { .. } => "born",
+                    ReproductionOutcome::Rejected { .. } => "rejected",
+                }),
+            }
+        }),
     }
 }
 
@@ -1539,7 +1583,7 @@ mod tests {
         clippy::cast_possible_truncation,
         reason = "an F32 written out reads back as itself"
     )]
-    fn inspected_records_carry_what_it_sensed_and_its_activations() {
+    fn inspected_records_carry_what_it_sensed_its_activations_and_transactions() {
         let config = flife_core::ValidatedConfig::from_toml(include_str!(
             "../../../presets/reference-small-world.toml"
         ))
@@ -1561,6 +1605,7 @@ mod tests {
             .expect("it lives");
         let sensed = snapshot.sensed.clone().expect("sensed");
         let activations = snapshot.activations.clone().expect("activations");
+        let transactions = snapshot.transactions.clone();
         let record = serde_json::to_value(super::status_record(&Status::Inspected {
             organism: id,
             seen: Tick::new(2),
@@ -1631,5 +1676,50 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+        // The two steps' transactions, summed here in step order.
+        assert_eq!(transactions.len(), 2);
+        let sum = |part: &dyn Fn(&flife_engine::Transactions) -> f64| {
+            transactions
+                .iter()
+                .fold(0.0, |total, step| total + part(step))
+        };
+        let ledger = &record["snapshot"]["transactions"];
+        assert_eq!(ledger["steps"], 2);
+        assert_eq!(ledger["ticks"], serde_json::json!([0, 1]));
+        for (name, expected) in [
+            (
+                "uptake",
+                sum(&|step| step.uptake.gain - step.uptake.toxicity.paid),
+            ),
+            (
+                "maintenance",
+                sum(&|step| step.maintenance.map_or(0.0, |paid| paid.cost.paid)),
+            ),
+            (
+                "motion",
+                sum(&|step| step.motion.map_or(0.0, |paid| paid.cost.paid)),
+            ),
+            (
+                "emission",
+                sum(&|step| step.emission.map_or(0.0, |paid| paid.cost.paid)),
+            ),
+            ("net", transactions[1].closing - transactions[0].opening),
+        ] {
+            assert_eq!(
+                ledger[name].as_f64().map(f64::to_bits),
+                Some(expected.to_bits()),
+                "{name}"
+            );
+        }
+        assert!(ledger["maintenance"].as_f64() > Some(0.0), "it paid upkeep");
+        let reproduction = match transactions[1].reproduction {
+            Some(super::ReproductionOutcome::CoolingDown { .. }) => "cooling-down",
+            Some(super::ReproductionOutcome::NoAttempt) => "no-attempt",
+            Some(super::ReproductionOutcome::Unviable(_)) => "unviable",
+            Some(super::ReproductionOutcome::Born { .. }) => "born",
+            Some(super::ReproductionOutcome::Rejected { .. }) => "rejected",
+            None => "none",
+        };
+        assert_eq!(ledger["reproduction"], reproduction);
     }
 }

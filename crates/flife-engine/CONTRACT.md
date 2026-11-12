@@ -188,10 +188,22 @@ each runs and owns the field.
   - `activations` (plan §14.2's Brain), when the world recorded the observation of the evaluation its held output
     came from (that step started one tick before `held.evaluated_at()`): the hidden activations
     `ReferenceController::trace` gives on those inputs, with the output's tick. The trace must reproduce the held
-    output bit for bit.
-- `World::watch(Some(id) | None)` names the one organism whose observation each step records, from the next step
-  on. Watching another organism drops the records of the one before; watching the same one again keeps them.
-  `World::watched()` names it.
+    output bit for bit;
+  - `transactions` (plan §14.2's Transactions), while the world watches it: one `Transactions` per step the world
+    recorded, oldest first, at most `RECENT_STEPS` (128, a second at the reference 1/128 s tick), the newest the
+    step to `tick`. Each holds the step's start tick, its opening energy, and the settlements its stages returned
+    as the ledger was given them, in §8.2's order: chemistry's `UptakeSettlement` (absorbed, gain, toxicity
+    requested and paid), then, unless an earlier stage exhausted it, maintenance's `MaintenanceSettlement`,
+    motion's `MotionSettlement` (proposed and applied velocity, cost, whether scaled), emission's
+    `EmissionSettlement` (budget, cost, offered) and a `ReproductionOutcome` (`CoolingDown { deadline }`,
+    `NoAttempt`, `Unviable`, `Born { child, split }` or `Rejected { split, candidates }`); then what the tiny
+    reservoir took and its closing energy (zero if the step exhausted it).
+- `World::watch(Some(id) | None)` names the one organism whose observation and transactions each step records, from
+  the next step on. Watching another organism drops the records of the one before; watching the same one again
+  keeps them. `World::watched()` names it, and `World::watched_transactions()` gives its records, oldest first,
+  whether or not it still lives (the newest of an organism that died is the step that exhausted it). Each step's
+  preparation reserves the records' room, so publishing allocates nothing; a cancelled or paused candidate records
+  nothing.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -719,18 +731,21 @@ catalog and action decoding:
 - `inspecting_changes_nothing`: every organism and an unknown identity inspected before each of 20 ticks; the
   digest is unchanged by it, and equal to an uninspected world's after every tick.
 
-`tests/watch.rs` (5 tests, FL-021, plan §14.2's Inputs and Brain), on the same small world. Its oracles are not the
-snapshot's path: a controller backend that records every job's inputs and defers each to the reference; `observe`
-of the recorded raw sample and the organism's row at the step's start; and the declared F32 arithmetic (the bias,
-then each input's product in ascending index, `tanh` in F64 rounded once) written out over the genome's parameters:
+`tests/watch.rs` (7 tests, FL-021, plan §14.2's Inputs, Brain and Transactions), on the same small world. Its
+oracles are not the snapshot's path: a controller backend that records every job's inputs and defers each to the
+reference; `observe` of the recorded raw sample and the organism's row at the step's start; the declared F32
+arithmetic (the bias, then each input's product in ascending index, `tanh` in F64 rounded once) written out over the
+genome's parameters; and, for the transactions, a fresh `EnergyBudget` replaying each record, the organism's next
+row, the report's births, rejections and deaths, and the tick's ledger closure:
 - `a_watched_snapshot_holds_what_its_controller_read_and_its_activations`: nothing recorded before the first
   watched step; then for 48 ticks, through births, the record's tick is the step's start, it evaluated, its scale
   is its trait's, its inputs are its job's bit for bit, `observe` of its raw sample and its row gives them and its
   gradients, and the written-out arithmetic on them gives its activations and its held output bit for bit; no
   other organism's snapshot records anything.
-- `the_records_follow_the_watch`: kept when the same organism is watched again, unchanged by a cancelled
-  candidate, dropped for both organisms when the watch moves, made for the new one at its next step, and none
-  once nothing is watched.
+- `the_records_follow_the_watch`: kept when the same organism is watched again (two steps' transactions, ticks 0
+  and 1, the snapshot's and `watched_transactions()` alike), unchanged by a cancelled candidate, dropped for both
+  organisms when the watch moves, made for the new one at its next step (one transaction), and none once nothing
+  is watched.
 - `at_a_slower_cadence_the_activations_are_the_held_outputs`: at an evaluation every three ticks, nine steps give
   three records that evaluated, each its job's inputs, and six that held, with no job; the activations are those
   of the newest evaluation, checked as above, and none before the first watched one.
@@ -739,10 +754,39 @@ then each input's product in ascending index, `tanh` in F64 rounded once) writte
   and both breed.
 - `the_inspector_refuses_an_output_the_reference_does_not_reproduce`: under a backend that flips one bit of every
   output, the watched organism's snapshot is `StateConflict`; an unwatched one's is answered.
+- `every_organisms_transactions_replay_on_its_budget_and_add_up_to_the_ledger`: one world watching each live
+  organism, in lockstep with an unwatched reference for 40 ticks (a world whose organism died watches a newborn;
+  a newborn with no free world gets one stepped to the tick), on the small world, a starving variant (basal upkeep
+  30/s, motion 10^8 per speed² second, a tiny reservoir below 0.2) and a rejecting one (no weight or architecture
+  mutation, trait steps of 10^-30, so most candidates are effective no-ops). Each world's reports are the
+  reference's. Each step, every organism's newest record has the step's tick and opens at its row's energy;
+  replayed on a fresh budget (the gain credited, the toxicity paid, then maintenance, motion, the scaled motion's
+  whole balance, emission, the parent's share kept, the tiny reservoir), every payment pays what the record says,
+  each stage is recorded exactly when the budget reached it alive, a scaled motion's velocity is its proposal
+  times `sqrt(E_available / cost)` (Appendix A), emission offers `ρ` times its cost, and the balance left is its
+  closing energy; a survivor's next row has that energy and the recorded velocity, an
+  organism that died has a death and closes at zero; a birth is the report's (its child, whose energy is the
+  split's), a rejection is the report's with its candidate count, and any other outcome has neither. The records
+  of every organism, summed in the ledger's order (the tiny reservoir's non-parents before the parents), are the
+  closure's toxicity, maintenance, sensor and controller costs, motion and tiny-reservoir flows and its uptake,
+  child-endowment and emission transfers, bit for bit. The small world bred 8 times, with cooling down and
+  emissions; the starving one had 48 deaths, 39 tiny-reservoir clears and 5 scaled motions; the rejecting one
+  rejected 6 births and bred 2.
+- `the_watch_keeps_its_last_steps`: over 131 steps, the snapshot carries one record a step up to 128, oldest first
+  and consecutive, the newest the step just published.
 - Planted bugs, each run against the tests that should catch it, all caught (with the trace's, the session's, the
   panel's and the record's, 18 of 18): every record marked evaluated, the record named by the step's end tick or
   encoded at its age then, no evaluated or no observed record kept on publish, the records kept when the watch
   moves or carried by every organism's snapshot, no reproduction check, and the next row's organism recorded.
+- Planted bugs in the transactions, each run against the tests that should catch it, all caught (with the panel's
+  and the record's, 22 of 22): the record opened after chemistry; maintenance not recorded; motion recorded at its
+  proposed velocity; emission recorded only when it emitted; cooling down recorded as no attempt; a birth naming
+  its parent as the child; a non-parent's tiny reservoir not recorded; the closing energy the opening; one step
+  more than the bound kept; the old transactions kept when the watch moves, or carried by every organism's
+  snapshot; every organism but the watched one recorded; recording that changes the step; a rejected birth's
+  candidate count off by one; and the step's transactions dropped on publish. The proposed velocity and the
+  rejected count survived the first run: no scaled motion leaves a survivor whose next row could show its
+  velocity, and no step had rejected a birth. The scaled-motion check and the rejecting variant catch them.
 
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
@@ -754,10 +798,11 @@ velocity, first-order splitting at the configured fixed timestep.
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
 - FL-021's snapshot covers §14.2's identity, state, chemistry and brain architecture, and, for the watched
-  organism, its inputs and sampled activations. A snapshot taken right after the watch is set, or in a world not
-  stepped since, has neither: the observation exists only inside a step. It has no local efficiency at its cell
-  and no transactions or descendants, which need an event index the world does not keep. Weight dumps on demand
-  are not implemented.
+  organism, its inputs, sampled activations and the transactions of its last 128 steps. A snapshot taken right
+  after the watch is set, or in a world not stepped since, has none of them: they exist only inside a step. The
+  transactions are the watched organism's alone, from when it was watched; an organism's earlier history is not
+  kept. It has no local efficiency at its cell and no descendants, which need an event index the world does not
+  keep. Weight dumps on demand are not implemented.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

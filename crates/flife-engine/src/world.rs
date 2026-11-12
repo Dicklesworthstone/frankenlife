@@ -64,6 +64,7 @@
 //! organism's ordered stages. Fixed-step reproducibility is not a claim of
 //! continuum accuracy.
 
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
@@ -102,15 +103,17 @@ use flife_neural::{
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
-use crate::inspect::{Activations, OrganismSnapshot, Sensed};
+use crate::inspect::{
+    Activations, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Sensed, Transactions,
+};
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
-    Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, CapacityShortfall, Identities,
-    Offspring, ParentState, PopulationQuota, RejectedBirth, Reproduction, ReproductionProposal,
-    resolve_births,
+    Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityShortfall,
+    Identities, Offspring, ParentState, PopulationQuota, RejectedBirth, Reproduction,
+    ReproductionProposal, resolve_births,
 };
 
 mod admission;
@@ -285,6 +288,8 @@ struct Staged {
     paths: Vec<SeededPath>,
     /// The watched organism's observation in this step, if it observed.
     sensed: Option<Sensed>,
+    /// The watched organism's transactions in this step, if it settled.
+    transactions: Option<Transactions>,
     report: TickReport,
 }
 
@@ -344,6 +349,13 @@ impl Candidate<'_> {
                 world.watch.evaluated = Some(sensed.clone());
             }
             world.watch.observed = Some(sensed);
+        }
+        if let Some(transactions) = staged.transactions {
+            let recent = &mut world.watch.recent;
+            if recent.len() >= RECENT_STEPS {
+                recent.pop_front();
+            }
+            recent.push_back(transactions);
         }
         Ok(staged.report)
     }
@@ -692,10 +704,10 @@ struct Controllers {
     by_row: Vec<Option<[f32; ACTION_WIDTH]>>,
 }
 
-/// The one organism the world records observations for (FL-021, plan
-/// §14.2) and its newest records. It is not scientific state: no digest,
-/// checkpoint or report holds it, and every record in it belongs to
-/// `organism`.
+/// The one organism the world records observations and transactions for
+/// (FL-021, plan §14.2) and its newest records. It is not scientific
+/// state: no digest, checkpoint or report holds it, and every record in it
+/// belongs to `organism`.
 #[derive(Debug, Default)]
 struct Watch {
     organism: Option<OrganismId>,
@@ -703,6 +715,10 @@ struct Watch {
     observed: Option<Sensed>,
     /// Its observation in the newest published step it evaluated in.
     evaluated: Option<Sensed>,
+    /// Its transactions in its last [`RECENT_STEPS`] published steps,
+    /// oldest first. Each step's preparation reserves the room, so
+    /// publishing never allocates.
+    recent: VecDeque<Transactions>,
 }
 
 /// The fewest organisms worth handing to another thread.
@@ -1257,10 +1273,10 @@ impl World {
         self.fault.as_ref()
     }
 
-    /// Record `organism`'s observation in every step from the next one on,
-    /// or no organism's (FL-021, plan §14.2): what
-    /// [`World::organism_snapshot`] reports as [`Sensed`] and
-    /// [`Activations`]. Watching another organism drops the records of the
+    /// Record `organism`'s observation and transactions in every step from
+    /// the next one on, or no organism's (FL-021, plan §14.2): what
+    /// [`World::organism_snapshot`] reports as [`Sensed`], [`Activations`]
+    /// and [`Transactions`]. Watching another organism drops the records of the
     /// one before; watching the same one again keeps them. It changes no
     /// result of a run: no digest, checkpoint or report holds the records,
     /// and a step reads them from nothing.
@@ -1277,6 +1293,16 @@ impl World {
     #[must_use]
     pub const fn watched(&self) -> Option<OrganismId> {
         self.watch.organism
+    }
+
+    /// The watched organism's transactions in its last [`RECENT_STEPS`]
+    /// published steps, oldest first, whether or not it still lives: an
+    /// organism that died has the step that exhausted it last. A snapshot
+    /// of a live watched organism carries the same records.
+    pub fn watched_transactions(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &Transactions> + ExactSizeIterator {
+        self.watch.recent.iter()
     }
 
     /// One organism at this committed tick (FL-021, plan §14.2), or `None`
@@ -1352,6 +1378,11 @@ impl World {
             }
             _ => None,
         };
+        let transactions = if watched {
+            self.watch.recent.iter().copied().collect()
+        } else {
+            Vec::new()
+        };
         Ok(Some(OrganismSnapshot {
             tick: self.tick,
             organism,
@@ -1363,6 +1394,7 @@ impl World {
             decoded,
             sensed,
             activations,
+            transactions,
         }))
     }
 
@@ -1650,6 +1682,21 @@ impl World {
             granted.get(at).map_or(usize::MAX, |packet| packet.demand)
         })?;
 
+        // Room for the watched organism's transactions, so that publishing
+        // them never allocates.
+        if watch.organism.is_some() && watch.recent.capacity() < RECENT_STEPS {
+            let more = RECENT_STEPS.saturating_sub(watch.recent.len());
+            watch
+                .recent
+                .try_reserve_exact(more)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "watched transactions",
+                    bytes: u64::try_from(more.saturating_mul(size_of::<Transactions>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+        }
+        let mut transactions = None;
+
         // Phases 6 and 7: each organism's ordered budget stages.
         for (index, organism) in working.iter_mut().enumerate() {
             packets.clear();
@@ -1665,6 +1712,8 @@ impl World {
             }
             let genome = genome_of(population, organism.committed.id)?;
             let parameters = parameter_count(&rules.catalog, genome)?;
+            let record =
+                (watch.organism == Some(organism.committed.id)).then_some(&mut transactions);
             settle_stages(
                 rules,
                 organism,
@@ -1674,6 +1723,7 @@ impl World {
                 from,
                 &mut tick_ledger,
                 emissions,
+                record,
             )?;
         }
 
@@ -1687,7 +1737,13 @@ impl World {
                 organism
                     .vitality
                     .check(BudgetStage::Split, &organism.budget)?;
-                clear_tiny(&rules.tiny, organism, &mut tick_ledger)?;
+                let cleared = clear_tiny(&rules.tiny, organism, &mut tick_ledger)?;
+                if let Some(record) = transactions
+                    .as_mut()
+                    .filter(|_| watch.organism == Some(organism.committed.id))
+                {
+                    record.tiny = cleared;
+                }
                 live += u64::from(organism.vitality.is_alive());
             }
         }
@@ -1750,6 +1806,15 @@ impl World {
                 organism.cooldown_deadline = birth.parent_cooldown_deadline;
             }
         }
+        if let (Some(record), Some(intent)) = (
+            transactions.as_mut(),
+            watch
+                .organism
+                .and_then(|id| find(working, id))
+                .and_then(|organism| organism.intent),
+        ) {
+            record.reproduction = Some(attempted(&births, &intent)?);
+        }
         for organism in working
             .iter_mut()
             .filter(|organism| organism.intent.is_some())
@@ -1757,7 +1822,19 @@ impl World {
             organism
                 .vitality
                 .check(BudgetStage::Split, &organism.budget)?;
-            clear_tiny(&rules.tiny, organism, &mut tick_ledger)?;
+            let cleared = clear_tiny(&rules.tiny, organism, &mut tick_ledger)?;
+            if let Some(record) = transactions
+                .as_mut()
+                .filter(|_| watch.organism == Some(organism.committed.id))
+            {
+                record.tiny = cleared;
+            }
+        }
+        if let Some(record) = transactions.as_mut() {
+            record.closing = watch
+                .organism
+                .and_then(|id| find(working, id))
+                .map_or(0.0, |organism| organism.budget.remaining());
         }
 
         // Every fate, in identity order; the deaths' residuals are settled.
@@ -1909,6 +1986,7 @@ impl World {
             identities: next_identities,
             paths: next_paths,
             sensed,
+            transactions,
             report,
         })))
     }
@@ -2711,12 +2789,12 @@ fn find(working: &[Working], id: OrganismId) -> Option<&Working> {
         .and_then(|index| working.get(index))
 }
 
-/// The tiny-reservoir stage: the last of §8.2.
+/// The tiny-reservoir stage, the last of §8.2. Returns what it took.
 fn clear_tiny(
     tiny: &TinyEnergyPolicy,
     organism: &mut Working,
     ledger: &mut TickLedger,
-) -> Result<(), CoreError> {
+) -> Result<f64, CoreError> {
     let cleared = tiny.clear(&mut organism.budget)?;
     if cleared > 0.0 {
         ledger.record(Flow::TinyReservoir, cleared)?;
@@ -2724,12 +2802,44 @@ fn clear_tiny(
     organism
         .vitality
         .check(BudgetStage::TinyReservoir, &organism.budget)?;
-    Ok(())
+    Ok(cleared)
+}
+
+/// What a viable attempt by the watched organism came to in phase 8.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] if its birth was neither staged nor
+/// rejected.
+fn attempted(births: &Births, intent: &BirthIntent) -> Result<ReproductionOutcome, CoreError> {
+    if let Some(birth) = births
+        .born()
+        .iter()
+        .find(|birth| birth.parent == intent.parent)
+    {
+        return Ok(ReproductionOutcome::Born {
+            child: birth.newborn.id,
+            split: birth.split,
+        });
+    }
+    births
+        .rejected()
+        .iter()
+        .find(|rejected| rejected.parent == intent.parent)
+        .map(|rejected| ReproductionOutcome::Rejected {
+            split: intent.split,
+            candidates: rejected.candidates.len(),
+        })
+        .ok_or_else(|| CoreError::StateConflict {
+            operation: "record transactions",
+            detail: format!("{}'s birth was neither staged nor rejected", intent.parent),
+        })
 }
 
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,
 /// emission and the reproduction proposal, rechecking exhaustion after
 /// each. Once a stage exhausts the organism nothing later pays or acts.
+/// For the watched organism, `record` is filled with each stage's
+/// settlement as the ledger is given it.
 #[expect(
     clippy::too_many_arguments,
     reason = "private stage runner of World::prepare; the arguments are the tick's working state"
@@ -2743,20 +2853,35 @@ fn settle_stages(
     from: Tick,
     ledger: &mut TickLedger,
     emissions: &mut Deposits,
+    record: Option<&mut Option<Transactions>>,
 ) -> Result<(), CoreError> {
     let affinity = Affinity::new(*traits.affinity(), &rules.chemistry)?;
+    let opening = organism.budget.remaining();
     let uptake = rules
         .chemistry
         .settle(&affinity, packets, &mut organism.budget)?;
     uptake.record(ledger)?;
     organism.absorbed = uptake.absorbed;
+    let mut record = record.map(|slot| {
+        slot.insert(Transactions {
+            tick: from,
+            opening,
+            uptake,
+            maintenance: None,
+            motion: None,
+            emission: None,
+            reproduction: None,
+            tiny: 0.0,
+            closing: 0.0,
+        })
+    });
     if !organism
         .vitality
         .check(BudgetStage::Chemistry, &organism.budget)?
     {
         return Ok(());
     }
-    rules
+    let maintenance = rules
         .costs
         .bill(
             rules.step,
@@ -2764,8 +2889,11 @@ fn settle_stages(
             parameters,
             organism.evaluated,
         )?
-        .settle(&mut organism.budget)?
-        .record(ledger)?;
+        .settle(&mut organism.budget)?;
+    maintenance.record(ledger)?;
+    if let Some(record) = record.as_deref_mut() {
+        record.maintenance = Some(maintenance);
+    }
     if !organism
         .vitality
         .check(BudgetStage::Maintenance, &organism.budget)?
@@ -2781,6 +2909,9 @@ fn settle_stages(
     let proposed = rules.motion.propose(organism.velocity, acceleration)?;
     let moved = rules.motion.settle(proposed, &mut organism.budget)?;
     ledger.record(Flow::MotionCost, moved.cost.paid)?;
+    if let Some(record) = record.as_deref_mut() {
+        record.motion = Some(moved);
+    }
     organism.velocity = moved.velocity;
     organism.position = rules
         .motion
@@ -2801,6 +2932,9 @@ fn settle_stages(
         emissions,
     )?;
     organism.emitted = emission.emitted();
+    if let Some(record) = record.as_deref_mut() {
+        record.emission = Some(emission);
+    }
     if !organism
         .vitality
         .check(BudgetStage::Emission, &organism.budget)?
@@ -2815,13 +2949,25 @@ fn settle_stages(
         position: organism.position,
         cooldown_deadline: organism.cooldown_deadline,
     };
-    if let ReproductionProposal::Intent(intent) = rules.reproduction.propose(
+    let proposal = rules.reproduction.propose(
         &rules.rng,
         &parent,
         from,
         &organism.actions,
         &organism.budget,
-    )? {
+    )?;
+    if let Some(record) = record {
+        // A viable attempt's outcome is phase 8's.
+        record.reproduction = match proposal {
+            ReproductionProposal::CoolingDown { deadline } => {
+                Some(ReproductionOutcome::CoolingDown { deadline })
+            }
+            ReproductionProposal::NoAttempt => Some(ReproductionOutcome::NoAttempt),
+            ReproductionProposal::Unviable(why) => Some(ReproductionOutcome::Unviable(why)),
+            ReproductionProposal::Exhausted | ReproductionProposal::Intent(_) => None,
+        };
+    }
+    if let ReproductionProposal::Intent(intent) = proposal {
         organism.intent = Some(intent);
     }
     Ok(())

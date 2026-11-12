@@ -49,17 +49,17 @@ pub const HUD_MAX_CURVE_SEGMENTS: usize = 64;
 /// The most vertices a [`HudText`] holds: a quarter as many again as the
 /// Studio's longest overlay, its persistent telemetry (plan §14.1), colour
 /// key, field key (plan §13.4), brush preview (plan §14.3) and inspector
-/// panel with what the organism sensed and its activations included, takes
-/// at two pixels a point (38,270, the motion key, the composition field's
-/// key and the introduction brush with every count at the largest written
-/// in full), rounded up to a multiple of 1,024. A
-/// denser screen's finer flattening grows a curve's segments by the square
-/// root of its density, so three pixels a point fits too.
-pub const HUD_MAX_VERTICES: usize = 48_128;
+/// panel with what the organism sensed, its activations and its recent
+/// transactions included, takes at two pixels a point (43,036, the motion
+/// key, the composition field's key and the introduction brush with every
+/// count at the largest written in full), rounded up to a multiple of
+/// 1,024. A denser screen's finer flattening grows a curve's segments by
+/// the square root of its density, so three pixels a point fits too.
+pub const HUD_MAX_VERTICES: usize = 54_272;
 
 /// The most triangles a [`HudText`] holds: a quarter as many again as the
-/// longest overlay takes (37,012), rounded up to a multiple of 1,024.
-pub const HUD_MAX_TRIANGLES: usize = 47_104;
+/// longest overlay takes (41,630), rounded up to a multiple of 1,024.
+pub const HUD_MAX_TRIANGLES: usize = 52_224;
 
 /// The most contours a [`HudText`] holds: each has at least three vertices.
 pub const HUD_MAX_RINGS: usize = HUD_MAX_VERTICES / 3;

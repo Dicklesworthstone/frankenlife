@@ -648,7 +648,8 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
     let font = flife_manim::HudFont::bundled().expect("the bundled fonts");
     // The Studio's longest overlay: the motion key (FL-019), and the
     // inspector panel (FL-021) with every count the largest written in full,
-    // what the organism sensed and its activations included.
+    // what the organism sensed, its activations and its recent transactions
+    // included.
     let longest = concat!(
         "running · tick 999,999,999,999\n",
         "99999 ticks/s · 99999.99× real time · 99999 fps\n",
@@ -661,7 +662,12 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
         "reproduction 100.0% a tick · emission gate 1.00\n",
         "sensed at tick 999,999,999,999 · scale 99999.99 · field -99999.999\n",
         "gradient 99999.050 toward 315° · affinity·Z -99999.999\n",
-        "activations at tick 999,999,999,999 · max |a| 1.00, 1.00 · mean |a| 1.00, 1.00"
+        "activations at tick 999,999,999,999 · max |a| 1.00, 1.00 · mean |a| 1.00, 1.00
+",
+        "last 128 steps: uptake -99999.999 · maintenance -99999.999 · motion -99999.999
+",
+        "emission -99999.999 · 127 births -99999.999 · net -99999.999 · cooling to tick ",
+        "999,999,999,999"
     );
     let swatches: Vec<_> = flife_manim::ColorMapping::Motion
         .legend(&[])

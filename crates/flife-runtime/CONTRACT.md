@@ -59,7 +59,8 @@ inherits every command and outcome, records the fork, and from then on admits on
 - FL-021: `SessionHandle::inspect_organism(id)`: the committed world's `World::organism_snapshot(id)`, an
   `OrganismSnapshot` whose `tick` is the boundary it was read at, or `None` when the committed world does not hold
   the organism. The owner's world then watches that organism (`World::watch`), so a later inspection of it carries
-  what it sensed and its newest evaluation's activations; a world watches the organism most recently inspected.
+  what it sensed, its newest evaluation's activations and the transactions of its steps since; a world watches the
+  organism most recently inspected.
   A closing owner answers without moving the watch.
 - `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
   still pending), the final boundary and the render counters.

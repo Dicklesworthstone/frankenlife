@@ -14,7 +14,8 @@ use flife_core::ids::{Generation, LineageId, OrganismId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{LedgerReport, Tick, ValidatedConfig};
 use flife_engine::{
-    Arrangement, MATERIAL_CHANNELS, NumericalProfile, OrganismSnapshot, Stepped, World,
+    Arrangement, MATERIAL_CHANNELS, NumericalProfile, OrganismSnapshot, RECENT_STEPS,
+    ReproductionOutcome, Split, Stepped, Unviable, World,
 };
 use flife_manim::{
     FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH,
@@ -215,8 +216,8 @@ fn config() -> ValidatedConfig {
 }
 
 /// A real snapshot: an organism of [`config`]'s world three ticks in,
-/// watched from the start, so it holds a controller output, an observation
-/// and that output's activations.
+/// watched from the start, so it holds a controller output, an observation,
+/// that output's activations and three steps' transactions.
 fn snapshot() -> OrganismSnapshot {
     let config = config();
     let mut world = World::found(
@@ -240,6 +241,7 @@ fn snapshot() -> OrganismSnapshot {
     assert!(snapshot.decoded.is_some(), "it holds an output");
     assert!(snapshot.sensed.is_some(), "it was watched");
     assert!(snapshot.activations.is_some(), "it evaluated while watched");
+    assert_eq!(snapshot.transactions.len(), 3, "three steps watched");
     snapshot
 }
 
@@ -283,6 +285,43 @@ fn known() -> OrganismSnapshot {
     let activations = known.activations.as_mut().expect("activations");
     activations.tick = Tick::new(5_120);
     activations.hidden = vec![vec![0.5, -0.98, 0.1, 0.02], vec![-0.31, 0.31, 0.97]];
+    // Three steps: each gains 0.2 less 0.01 of toxicity and pays 0.004 of
+    // maintenance and 0.001 of motion; the second emits 0.12 and bears a
+    // child for 1.05; the newest is cooling down. It opened the first at
+    // 2.0 and closed the newest at 3.214.
+    let records = &mut known.transactions;
+    for record in records.iter_mut() {
+        record.uptake.gain = 0.2;
+        record.uptake.toxicity.paid = 0.01;
+        record.maintenance.as_mut().expect("maintained").cost.paid = 0.004;
+        record.motion.as_mut().expect("moved").cost.paid = 0.001;
+        record
+            .emission
+            .as_mut()
+            .expect("reached emission")
+            .cost
+            .paid = 0.0;
+        record.reproduction = Some(ReproductionOutcome::NoAttempt);
+    }
+    records[0].opening = 2.0;
+    records[1]
+        .emission
+        .as_mut()
+        .expect("reached emission")
+        .cost
+        .paid = 0.12;
+    records[1].reproduction = Some(ReproductionOutcome::Born {
+        child: OrganismId::new(4_321),
+        split: Split {
+            available: 2.6,
+            child: 1.0,
+            parent: 1.55,
+        },
+    });
+    records[2].closing = 3.214;
+    records[2].reproduction = Some(ReproductionOutcome::CoolingDown {
+        deadline: Tick::new(5_200),
+    });
     known
 }
 
@@ -697,7 +736,9 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
                  reproduction 3.1% a tick · emission gate 0.72\n\
                  sensed at tick 5,119 · scale 1.50 · field 0.412\n\
                  gradient 0.031 toward 45° · affinity·Z +0.112\n\
-                 activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.40, 0.53";
+                 activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.40, 0.53\n\
+                 last 3 steps: uptake +0.570 · maintenance -0.012 · motion -0.003\n\
+                 emission -0.120 · 1 birth -1.050 · net +1.214 · cooling to tick 5,200";
     assert_eq!(inspector_lines(Inspected::Read(&known)), panel);
     // Under the line naming the selection.
     assert_eq!(
@@ -789,15 +830,71 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         lines.lines().nth(6),
         Some("no gradient · affinity·Z -0.050")
     );
+
+    // One step; no births, and two; each reproduction outcome.
+    let transactions = |edit: &dyn Fn(&mut OrganismSnapshot)| {
+        let mut edited = known.clone();
+        edit(&mut edited);
+        inspector_lines(Inspected::Read(&edited))
+            .lines()
+            .skip(8)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        transactions(&|snapshot| {
+            snapshot.transactions.truncate(1);
+            snapshot.transactions[0].closing = 3.0;
+        }),
+        [
+            "last step: uptake +0.190 · maintenance -0.004 · motion -0.001",
+            "emission -0.000 · no births · net +1.000 · no attempt"
+        ]
+    );
+    let born = known.transactions[1].reproduction;
+    let outcomes = [
+        (born, "2 births -2.100 · net +1.214 · bore organism 4,321"),
+        (
+            Some(ReproductionOutcome::Unviable(
+                Unviable::BelowAttemptEnergy {
+                    available: 1.0,
+                    minimum: 2.0,
+                },
+            )),
+            "1 birth -1.050 · net +1.214 · attempt unviable",
+        ),
+        (
+            Some(ReproductionOutcome::Rejected {
+                split: Split {
+                    available: 2.6,
+                    child: 1.0,
+                    parent: 1.55,
+                },
+                candidates: 3,
+            }),
+            "1 birth -1.050 · net +1.214 · 3 candidates rejected",
+        ),
+        (None, "1 birth -1.050 · net +1.214 · no reproduction stage"),
+    ];
+    for (outcome, line) in outcomes {
+        assert_eq!(
+            transactions(&|snapshot| snapshot.transactions[2].reproduction = outcome)[1],
+            format!("emission -0.120 · {line}"),
+            "{outcome:?}"
+        );
+    }
+
     let mut unrecorded = known;
     unrecorded.sensed = None;
     unrecorded.activations = None;
+    unrecorded.transactions.clear();
     let lines = inspector_lines(Inspected::Read(&unrecorded));
     assert_eq!(
         lines.lines().skip(5).collect::<Vec<_>>(),
         [
             "sensed from its next tick",
-            "activations at its next evaluation"
+            "activations at its next evaluation",
+            "transactions from its next tick"
         ]
     );
 }
@@ -839,6 +936,52 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
     let activations = longest.activations.as_mut().expect("activations");
     activations.tick = Tick::new(999_999_999_999);
     activations.hidden = vec![vec![-1.0; 128], vec![-1.0; 96]];
+    // Every step the watch keeps, each sum one short of scientific notation
+    // and negative, a birth in every step but the newest, and the newest
+    // cooling down to the largest tick written in full.
+    let template = longest.transactions[0];
+    let mut records = vec![template; RECENT_STEPS];
+    for record in &mut records {
+        record.uptake.gain = 0.0;
+        record.uptake.toxicity.paid = 0.0;
+        record.maintenance.as_mut().expect("maintained").cost.paid = 0.0;
+        record.motion.as_mut().expect("moved").cost.paid = 0.0;
+        record
+            .emission
+            .as_mut()
+            .expect("reached emission")
+            .cost
+            .paid = 0.0;
+        record.reproduction = Some(ReproductionOutcome::Born {
+            child: OrganismId::new(999_999_999_999),
+            split: Split {
+                available: 99_999.999_4 / 127.0,
+                child: 0.0,
+                parent: 0.0,
+            },
+        });
+    }
+    let first = &mut records[0];
+    first.uptake.toxicity.paid = 99_999.999_4;
+    first.maintenance.as_mut().expect("maintained").cost.paid = 99_999.999_4;
+    first.motion.as_mut().expect("moved").cost.paid = 99_999.999_4;
+    first.emission.as_mut().expect("reached emission").cost.paid = 99_999.999_4;
+    first.opening = 99_999.999_4;
+    let newest = &mut records[RECENT_STEPS - 1];
+    newest.closing = 0.0;
+    newest.reproduction = Some(ReproductionOutcome::CoolingDown {
+        deadline: Tick::new(999_999_999_999),
+    });
+    longest.transactions = records;
+    let panel = inspector_lines(Inspected::Read(&longest));
+    assert_eq!(
+        panel.lines().skip(8).collect::<Vec<_>>(),
+        [
+            "last 128 steps: uptake -99999.999 · maintenance -99999.999 · motion -99999.999",
+            "emission -99999.999 · 127 births -99999.999 · net -99999.999 · cooling to tick \
+             999,999,999,999"
+        ]
+    );
     // The telemetry at its widest: each count at the largest written in
     // full, each byte count four digits wide, each energy one short of
     // scientific notation, the widest residual, a tally from a later tick,
@@ -899,7 +1042,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 20, "{text}");
+        assert_eq!(text.lines().count(), 22, "{text}");
         let colors: Vec<_> = legend
             .swatches
             .iter()

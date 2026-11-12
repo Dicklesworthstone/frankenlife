@@ -11,7 +11,7 @@
 use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Activations, OrganismSnapshot, Sensed};
+use flife_engine::{Activations, OrganismSnapshot, ReproductionOutcome, Sensed, Transactions};
 use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend, Style};
 use flife_render::Metrics;
@@ -487,6 +487,10 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
         || "activations at its next evaluation".to_owned(),
         activation_line,
     );
+    let transactions = recent(&snapshot.transactions).map_or_else(
+        || "transactions from its next tick".to_owned(),
+        |recent| transaction_lines(&recent),
+    );
     format!(
         "read at tick {} · lineage {} · generation {}\n\
          energy {} · {}/s · age {} ticks\n\
@@ -494,7 +498,8 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
          hidden {hidden} · {} parameters\n\
          {actions}\n\
          {sensed}\n\
-         {activations}",
+         {activations}\n\
+         {transactions}",
         grouped(snapshot.tick.get()),
         grouped(organism.lineage.get()),
         grouped(u64::from(organism.generation.get())),
@@ -572,6 +577,106 @@ fn activation_line(activations: &Activations) -> String {
     format!(
         "activations at tick {} · max |a| {largest} · mean |a| {mean}",
         grouped(activations.tick.get())
+    )
+}
+
+/// What a watched organism's recorded steps add up to: plan §14.2's
+/// Transactions, as the inspector panel and the Studio's record show them.
+/// Each sum runs in step order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Recent {
+    /// How many steps were recorded.
+    pub steps: usize,
+    /// The first recorded step's start tick, and the newest's.
+    pub ticks: [Tick; 2],
+    /// `Σ (gain − toxicity paid)`: chemistry's net change.
+    pub uptake: f64,
+    /// `Σ` maintenance paid: basal, sensor and controller.
+    pub maintenance: f64,
+    /// `Σ` motion paid.
+    pub motion: f64,
+    /// `Σ` emission paid.
+    pub emission: f64,
+    /// Children born.
+    pub births: usize,
+    /// `Σ` what their splits debited: the endowments and the birth costs.
+    pub endowed: f64,
+    /// The newest step's closing energy minus the first's opening energy.
+    pub net: f64,
+    /// What the newest step's reproduction stage came to.
+    pub reproduction: Option<ReproductionOutcome>,
+}
+
+/// What `transactions`, oldest first, add up to; `None` if there are none.
+#[must_use]
+pub fn recent(transactions: &[Transactions]) -> Option<Recent> {
+    let (first, newest) = (transactions.first()?, transactions.last()?);
+    let mut recent = Recent {
+        steps: transactions.len(),
+        ticks: [first.tick, newest.tick],
+        uptake: 0.0,
+        maintenance: 0.0,
+        motion: 0.0,
+        emission: 0.0,
+        births: 0,
+        endowed: 0.0,
+        net: newest.closing - first.opening,
+        reproduction: newest.reproduction,
+    };
+    for step in transactions {
+        recent.uptake += step.uptake.net();
+        recent.maintenance += step
+            .maintenance
+            .map_or(0.0, |maintenance| maintenance.cost.paid);
+        recent.motion += step.motion.map_or(0.0, |motion| motion.cost.paid);
+        recent.emission += step.emission.map_or(0.0, |emission| emission.cost.paid);
+        if let Some(ReproductionOutcome::Born { split, .. }) = step.reproduction {
+            recent.births += 1;
+            recent.endowed += split.debited();
+        }
+    }
+    Some(recent)
+}
+
+/// [`inspector_lines`]' two lines for an organism's recent transactions:
+/// what each stage added (+) or removed (-) over the recorded steps, the
+/// net change, and what its newest reproduction stage came to.
+fn transaction_lines(recent: &Recent) -> String {
+    let births = match recent.births {
+        0 => "no births".to_owned(),
+        1 => format!("1 birth {}", signed(-recent.endowed, 3)),
+        count => format!("{count} births {}", signed(-recent.endowed, 3)),
+    };
+    let reproduction = match recent.reproduction {
+        Some(ReproductionOutcome::CoolingDown { deadline }) => {
+            format!("cooling to tick {}", grouped(deadline.get()))
+        }
+        Some(ReproductionOutcome::NoAttempt) => "no attempt".to_owned(),
+        Some(ReproductionOutcome::Unviable(_)) => "attempt unviable".to_owned(),
+        Some(ReproductionOutcome::Born { child, .. }) => {
+            format!("bore organism {}", grouped(child.get()))
+        }
+        Some(ReproductionOutcome::Rejected { candidates, .. }) => {
+            format!("{candidates} candidates rejected")
+        }
+        None => "no reproduction stage".to_owned(),
+    };
+    let steps = if recent.steps == 1 {
+        "last step".to_owned()
+    } else {
+        format!(
+            "last {} steps",
+            grouped(u64::try_from(recent.steps).unwrap_or(u64::MAX))
+        )
+    };
+    format!(
+        "{steps}: uptake {} · maintenance {} · motion {}\n\
+         emission {} · {births} · net {} · {reproduction}",
+        signed(recent.uptake, 3),
+        signed(-recent.maintenance, 3),
+        signed(-recent.motion, 3),
+        signed(-recent.emission, 3),
+        signed(recent.net, 3),
     )
 }
 

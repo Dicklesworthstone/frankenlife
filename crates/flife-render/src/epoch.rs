@@ -134,6 +134,42 @@ const AXIS_SIGNS: [[f64; CHANNELS]; 3] = {
     signs
 };
 
+/// The projection the affinity view and the field's composition take, as a
+/// record carries it (plan §13.4: "A fixed high-dimensional projection has a
+/// recorded matrix and scaling"). Display axis `k` of a vector `v` of 32
+/// channels is `(Σ_c matrix[k][c] v_c) / (divisor × unit)`, clamped to
+/// `[−1, 1]`: the unit is the affinity norm limit for an organism's
+/// affinity ([`affinity_projection`]) and a block's energy for the field's
+/// composition ([`FieldTexture::composition`]). No entry is fitted to a
+/// population, so the same record means the same colours in every world.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AffinityProjection {
+    /// The rows of the 32 × 32 Sylvester Hadamard matrix it takes, one per
+    /// display axis ([`AFFINITY_AXES`]).
+    pub rows: [usize; 3],
+    /// The matrix, a row per display axis and a column per channel:
+    /// `(−1)^popcount(row & channel)`, each `1` or `−1`.
+    pub matrix: [[i8; CHANNELS]; 3],
+    /// What each sum is divided by besides its unit: `√32`, the norm of a
+    /// row, so the rows are orthonormal after it.
+    pub divisor: f64,
+}
+
+impl AffinityProjection {
+    /// The fixed projection every epoch takes (FL-019): the rows
+    /// [`AFFINITY_AXES`] of the Sylvester Hadamard matrix, over `√32`. The
+    /// matrix is the one the field's composition sums with, and the one the
+    /// affinity view's signs follow, so the record says what is computed.
+    #[must_use]
+    pub fn fixed() -> Self {
+        Self {
+            rows: AFFINITY_AXES,
+            matrix: AXIS_SIGNS.map(|signs| signs.map(|sign| if sign > 0.0 { 1 } else { -1 })),
+            divisor: (CHANNELS as f64).sqrt(),
+        }
+    }
+}
+
 /// The most texels in a field texture's row: a projection carries one row
 /// through the moment planes at once, its F64 sums on the stack, reading
 /// each plane in one run per row.

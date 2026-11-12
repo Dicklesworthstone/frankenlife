@@ -177,7 +177,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
   the video path if encoded, the controller summary, wall seconds, and the style: `mapping`, its `meaning`, `look`,
-  `particles`, `field` and `field_mapping`). FL-019's style flags choose what is drawn: `--color M` (`lineage`,
+  `particles`, `field` and `field_mapping`; and the `projection` the affinity and composition colours are drawn
+  through, plan §13.4's recorded matrix and scaling, `RenderProjection`: `flife-render`'s
+  `AffinityProjection::fixed()` rows, its 3 × 32 `matrix` of ±1 and its `divisor` √32, with the configuration's
+  `affinity_limit`). FL-019's style flags choose what is drawn: `--color M` (`lineage`,
   `energy`, `generation`, `motion`, `topology` or `affinity`, or a registered name such as `founder-lineage-v1`; by
   default the configuration's `[presentation] color_mapping`), `--look glow|raw`, `--density`, `--no-field` and
   `--field-mapping energy|composition|component-C` (the field's energy, its chemical composition lit by its
@@ -520,7 +523,8 @@ test.
   write PNG frames at ticks 0, 3 and 6 with the requested size in their headers, and the end digest is a plain
   one-thread run's. The same run rendered by energy, raw, as density, with the field's composition and with
   components 0 and 13 ends at the same digest, names that style in its `end`, and writes a different frame; the
-  two components' frames differ from each other too.
+  two components' frames differ from each other too. The `end` record's projection is rows 7, 14 and 25, the
+  epochs' own matrix, √32 and the preset's limit 1; `RenderProjection::of` a world at half the limit records 0.5.
 - `the_render_colour_is_the_configured_mapping_unless_the_flag_overrides_it`. The `flife` binary renders a preset
   configured for `energy-lightness-v1` by energy; `--color motion` and `--color motion-heading-v1` both override it;
   its field shows energy, `--field-mapping composition` its composition and `--field-mapping component-31` that

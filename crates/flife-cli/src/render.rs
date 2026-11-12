@@ -13,7 +13,7 @@ use flife_core::memory::total;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Stepped, World};
 use flife_manim::{Style, WorldView, hex_rgb};
-use flife_render::Publisher;
+use flife_render::{AffinityProjection, Publisher};
 use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
@@ -48,6 +48,38 @@ pub struct RenderOptions {
     /// How the frames are drawn: colour mapping, look, points or density,
     /// and the field.
     pub style: Style,
+}
+
+/// Plan §13.4: "A fixed high-dimensional projection has a recorded matrix
+/// and scaling." The projection the frames' affinity and composition
+/// colours are drawn through ([`AffinityProjection`]): display axis `k` of a
+/// 32-channel vector is the sum of `matrix[k]` times it over `divisor`
+/// times its unit, `affinity_limit` for an organism's affinity and a
+/// block's energy for the field's composition.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RenderProjection {
+    /// The rows of the 32 × 32 Sylvester Hadamard matrix taken.
+    pub rows: [usize; 3],
+    /// The matrix, a row per display axis and a column per channel.
+    pub matrix: [[i8; 32]; 3],
+    /// `√32`.
+    pub divisor: f64,
+    /// `chemistry.affinity_norm_limit`.
+    pub affinity_limit: f64,
+}
+
+impl RenderProjection {
+    /// [`AffinityProjection::fixed`] for `config`'s world.
+    #[must_use]
+    pub fn of(config: &ValidatedConfig) -> Self {
+        let projection = AffinityProjection::fixed();
+        Self {
+            rows: projection.rows,
+            matrix: projection.matrix,
+            divisor: projection.divisor,
+            affinity_limit: config.config().chemistry.affinity_norm_limit,
+        }
+    }
 }
 
 /// One `flife render` record.
@@ -107,6 +139,9 @@ pub enum RenderRecord {
         field: bool,
         /// What the field's colour means: `energy` or `composition`.
         field_mapping: &'static str,
+        /// The fixed projection the affinity and composition colours take
+        /// (boxed: its matrix is most of the record).
+        projection: Box<RenderProjection>,
         /// What the controller backend did. Not scientific state.
         controllers: ControllerSummary,
         /// Wall seconds for the whole run.
@@ -239,6 +274,7 @@ pub fn render(
         particles: options.style.particles.name(),
         field: options.style.field,
         field_mapping: options.style.field_mapping.name(),
+        projection: Box::new(RenderProjection::of(config)),
         controllers: ControllerSummary::of(&world),
         wall_seconds: clock.elapsed().as_secs_f64(),
     });

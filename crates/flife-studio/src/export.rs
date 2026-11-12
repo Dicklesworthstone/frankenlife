@@ -27,12 +27,13 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
 use flife_core::{CoreError, Sha256Digest, Sha256Stream, ValidatedConfig};
+use flife_render::AffinityProjection;
 use fmn_codec::{CompressionLevel, PngEncoder, Y4mColorspace, append_y4m_frame_nv12, y4m_header};
 use fmn_frame::convert::rgba_to_nv12;
 use fmn_frame::{ChromaSiting, ColorRange, FrameBuffer, FrameLayout, PixelFormat};
 use serde::{Deserialize, Serialize};
 
-use crate::timeline::{TIMELINE_SCHEMA, TimelineRecord, read_timeline, replay};
+use crate::timeline::{TIMELINE_SCHEMA, TimelineProjection, TimelineRecord, read_timeline, replay};
 
 /// The schema of an export's manifest.
 pub const EXPORT_SCHEMA: &str = "frankenlife.export.v1";
@@ -130,6 +131,9 @@ pub struct ExportManifest {
     pub renderer: String,
     /// How the renderer's linear colour became the frames' bytes.
     pub tone_mapping: String,
+    /// The fixed projection the frames' affinity and composition colours
+    /// were drawn through (plan §13.4's recorded matrix and scaling).
+    pub projection: TimelineProjection,
     /// What wrote the frames.
     pub frame_encoder: String,
     /// Wall seconds from the first frame to the last.
@@ -309,6 +313,7 @@ pub fn export(
         tone_mapping: "linear Rgba16F, clamped and sRGB-encoded to RGBA8 on the device \
                        (fmn-render srgb8_from_f16)"
             .to_owned(),
+        projection: AffinityProjection::fixed().into(),
         frame_encoder: "fmn-codec png, fast".to_owned(),
         wall_seconds,
         ticks_per_wall_second: (wall_seconds > 0.0).then(|| shown / wall_seconds),

@@ -13,8 +13,8 @@ use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_engine::{Arrangement, World};
 use flife_render::{
-    AFFINITY_AXES, Bounds, COMPONENT_STEPS, Dtype, Epoch, FIELD_TEXELS_MAX, FieldChannel,
-    FieldTexture, Gap, Lease, Match, Publication, Publisher, ROUNDING_MARGIN, View,
+    AFFINITY_AXES, AffinityProjection, Bounds, COMPONENT_STEPS, Dtype, Epoch, FIELD_TEXELS_MAX,
+    FieldChannel, FieldTexture, Gap, Lease, Match, Publication, Publisher, ROUNDING_MARGIN, View,
     affinity_projection, pairs,
 };
 
@@ -1036,4 +1036,72 @@ fn the_affinity_view_is_a_fixed_orthonormal_projection() {
     let lease = offer_and_lease(&mut publisher, &world);
     assert_eq!(lease.affinity_limit(), 0.5);
     assert_shows(&lease, &world);
+}
+
+/// Plan §13.4: "A fixed high-dimensional projection has a recorded matrix
+/// and scaling." The record a run prints is the Hadamard construction's
+/// rows 7, 14 and 25 over √32. A reader holding only the record, its
+/// matrix summed in channel order over its divisor times the limit,
+/// computes every affinity coordinate an epoch shows, bit for bit (the
+/// field's composition is `affinity_projection` of a block's sums, checked
+/// above, so the record covers it too).
+#[test]
+fn the_recorded_projection_is_the_one_every_epoch_takes() {
+    let record = AffinityProjection::fixed();
+    assert_eq!(record.rows, AFFINITY_AXES);
+    let matrix = hadamard();
+    for (axis, &row) in record.rows.iter().enumerate() {
+        for channel in 0..32 {
+            assert_eq!(
+                f64::from(record.matrix[axis][channel]),
+                matrix[row][channel],
+                "axis {axis} channel {channel}"
+            );
+        }
+    }
+    assert_eq!(record.divisor.to_bits(), 32.0_f64.sqrt().to_bits());
+    let by_record = |affinity: &[f64], limit: f64| -> [f32; 3] {
+        record.matrix.map(|signs| {
+            let dot = signs
+                .iter()
+                .zip(affinity)
+                .fold(
+                    0.0_f64,
+                    |sum, (&sign, &value)| {
+                        if sign > 0 { sum + value } else { sum - value }
+                    },
+                );
+            (dot / (record.divisor * limit)).clamp(-1.0, 1.0) as f32
+        })
+    };
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5
+    };
+    for limit in [0.25, 0.8, 1.0, 1.5] {
+        for _ in 0..200 {
+            let affinity: Vec<f64> = (0..32).map(|_| next() * 2.0 * limit).collect();
+            assert_eq!(
+                affinity_projection(&affinity, limit).map(f32::to_bits),
+                by_record(&affinity, limit).map(f32::to_bits),
+                "{affinity:?} at {limit}"
+            );
+        }
+    }
+    // An epoch's affinity view, by the record, at the world's own limit.
+    let world = found(&ecology(&[]), Arrangement::FreeList);
+    let lease = publisher_lease(&world);
+    let population = world.population();
+    assert_eq!(lease.affinities().len(), population.len());
+    for (row, id) in population.ids().enumerate() {
+        let genome = population.genome(id).expect("a genome");
+        assert_eq!(
+            lease.affinities()[row].map(f32::to_bits),
+            by_record(genome.traits().affinity(), lease.affinity_limit()).map(f32::to_bits),
+            "{id}"
+        );
+    }
 }

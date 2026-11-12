@@ -33,7 +33,7 @@ use flife_manim::{
     ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionEffect, RegionShape, Style,
     hex_rgb,
 };
-use flife_render::{Lease, Publication, Publisher};
+use flife_render::{AffinityProjection, Lease, Publication, Publisher};
 use flife_runtime::{CommandStatus, Outcome, SessionClosed};
 use fmn_frame::FrameBuffer;
 use fmn_render::metal::MetalRenderer;
@@ -75,6 +75,31 @@ impl<'de> Deserialize<'de> for Exact {
         u64::from_str_radix(&text, 16)
             .map(|bits| Self(f64::from_bits(bits)))
             .map_err(D::Error::custom)
+    }
+}
+
+/// The fixed projection the affinity view and the field's composition take
+/// ([`AffinityProjection`], plan §13.4's "recorded matrix and scaling"), as
+/// a timeline records it: what the colours of the frames it holds meant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineProjection {
+    /// The rows of the 32 × 32 Sylvester Hadamard matrix taken.
+    pub rows: [usize; 3],
+    /// The matrix, a row per display axis and a column per channel, each
+    /// `1` or `−1`.
+    pub matrix: [[i8; 32]; 3],
+    /// What each sum is divided by besides its unit (the affinity norm
+    /// limit, or a block's energy): `√32`.
+    pub divisor: Exact,
+}
+
+impl From<AffinityProjection> for TimelineProjection {
+    fn from(projection: AffinityProjection) -> Self {
+        Self {
+            rows: projection.rows,
+            matrix: projection.matrix,
+            divisor: Exact(projection.divisor),
+        }
     }
 }
 
@@ -418,6 +443,11 @@ pub enum TimelineRecord {
         size: [u32; 2],
         /// The style it opened with.
         style: TimelineStyle,
+        /// The projection its affinity and composition colours were drawn
+        /// through. A timeline recorded before it was recorded has none.
+        /// Boxed: its matrix is most of the record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projection: Option<Box<TimelineProjection>>,
     },
     /// The view took a drawable of `drawable` pixels.
     Resize {
@@ -538,6 +568,7 @@ impl TimelineRecord {
             seed: model.seed,
             size,
             style: style.into(),
+            projection: Some(Box::new(AffinityProjection::fixed().into())),
         }
     }
 
@@ -674,7 +705,10 @@ fn conflict(detail: String) -> CoreError {
 ///
 /// # Errors
 /// - [`CoreError::StateConflict`] for a timeline without its header or its
-///   end, of another schema or configuration; a status that disagrees with
+///   end, of another schema or configuration, or whose colours were drawn
+///   through another affinity projection than [`AffinityProjection::fixed`]
+///   (one recorded before projections were has none, and is taken); a
+///   status that disagrees with
 ///   the book's record; an epoch shown before one already passed; a camera
 ///   the view does not take exactly; a frame recorded at another tick than
 ///   the epoch the view was given; or a replay that closes on another
@@ -692,6 +726,7 @@ pub fn replay(
         config_hash,
         size,
         style,
+        projection,
         ..
     }) = records.first()
     else {
@@ -704,6 +739,16 @@ pub fn replay(
         return Err(conflict(format!(
             "the timeline ran configuration {config_hash}, not {}",
             config.config_hash().to_hex()
+        )));
+    }
+    let fixed = TimelineProjection::from(AffinityProjection::fixed());
+    if let Some(recorded) = projection
+        && **recorded != fixed
+    {
+        return Err(conflict(format!(
+            "the timeline drew affinity through rows {:?} of the Hadamard matrix over {}, not \
+             rows {:?} over {}",
+            recorded.rows, recorded.divisor.0, fixed.rows, fixed.divisor.0
         )));
     }
     let Some(TimelineRecord::End {

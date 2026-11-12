@@ -38,9 +38,12 @@ FL-023 (`flife-w5q`, part) records the Studio's presentation timeline (§13.8, l
 (`StudioOptions::record`, the binary's `--timeline FILE`) notes every change a frame makes to its view, every
 frame drawn with the tick shown and its wall time, and the commands the session applied. `replay` founds the
 world again and steps it with those commands at their ticks, and redraws each frame through the same Metal route,
-byte for byte, closing on the Studio's world or refusing. `export` (the binary's `--export FILE --out DIR`)
+byte for byte, closing on the Studio's world or refusing. The timeline's header records the fixed projection the
+affinity and composition colours were drawn through (`TimelineProjection`, plan §13.4's recorded matrix and
+scaling: its rows, its matrix and its divisor's bits), and `replay` refuses one drawn through another (a header
+from before projections were recorded has none and is taken). `export` (the binary's `--export FILE --out DIR`)
 writes that replay through FrankenManim's frame and encoding paths: a PNG a frame, a y4m video on a constant
-clock with its repeats and drops declared, and a manifest of the provenance (G10).
+clock with its repeats and drops declared, and a manifest of the provenance (G10), the projection among it.
 FL-024 (`flife-xut`, part) keeps a session in a run directory (`StudioOptions::run`, the binary's `--run DIR`;
 `Keeping`, §14.1's durable checkpoint tick, §16.3): the configuration, the command journal and checkpoints, kept by
 `flife-cli`'s own run-directory library, so `flife resume`, `flife branch` and `flife inspect` take it, and the
@@ -354,8 +357,11 @@ directory, with its pending commands and its checkpoint chain.
   with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
   1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
   - `open`, naming the window, the CPU workers, the controller backend, the style (`mapping`, its `meaning`,
-    `look`, `particles`, `field` and `field_mapping`), `clock_telemetry`, the configuration's `[presentation]
-    show_clock_telemetry`, the `surface`, `window` or `offscreen`, and with `--run` the `run_dir` and its
+    `look`, `particles`, `field` and `field_mapping`), the `projection` its affinity and composition colours are
+    drawn through (plan §13.4's recorded matrix and scaling: `rows`, the 3 × 32 `matrix` of ±1, the `divisor`
+    √32 and the `affinity_limit`, display axis `k` of a 32-channel vector being `matrix[k]` dotted with it over
+    the divisor times its unit, the limit for an organism's affinity and a block's energy for the field's
+    composition), `clock_telemetry`, the configuration's `[presentation] show_clock_telemetry`, the `surface`, `window` or `offscreen`, and with `--run` the `run_dir` and its
     `checkpoints` admission (declared and admitted mode, retained bytes, peak, headroom, fallback), the peak
     charged as the memory admission's `checkpoint`; with `--resume` the same, and `resumed` (`checkpoint` with its
     `sequence` and `tick`, or null; `skipped`; the `tick` it opened at), null otherwise;
@@ -865,7 +871,8 @@ presentation state, not scientific state.
     the drawing flag survives, as an equivalent: `drawing()` reads the press, which capture loss clears, and every
     press and release resets the flag.
 - `tests/offscreen_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5
-  --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen` and carries
+  --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen`, records the
+  projection (`AffinityProjection::fixed()`'s rows, matrix and divisor, and the preset's limit 1) and carries
   its admission, whose terms sum to its peak within the budget, with no backend term on the CPU reference, and
   whose observers are charged at least the device bytes of the 640 x 400 drawable's extra pixels more than a
   0.1 s run at one pixel a point; the world runs; every `frame` summary counts each frame rendered, none presented, and at least a 640 x 400 frame's bytes
@@ -897,8 +904,10 @@ presentation state, not scientific state.
     evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
     a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
     was added, the first run's one survivor).
-- `src/main.rs` unit tests (11, FL-022, FL-024, FL-023, FL-021, plan §14.3 and §2.2): a `measured` record carries the
-  seen and read ticks, the disk and everything it holds, each figure the measurement's own; a `following` record
+- `src/main.rs` unit tests (12, FL-022, FL-024, FL-023, FL-021, plan §14.3, §2.2 and §13.4): a `measured` record
+  carries the seen and read ticks, the disk and everything it holds, each figure the measurement's own; the `open`
+  record's projection is rows 7, 14 and 25 with every matrix entry `(−1)^popcount(row & channel)`, the divisor
+  √32 and the configuration's limit (1, and 0.5 in a world at half the limit); a `following` record
   carries the line's origin, the seen tick and the tick it was begun at, and a `handed` record the origin, the
   heir, the tick it has the line since, the hand-offs and the shown tick, each exactly; an `inspected` record of a watched organism of
   the preset two ticks in carries its sensed tick, scale and evaluation, its 104 inputs, three raw planes and 33
@@ -963,7 +972,10 @@ presentation state, not scientific state.
     Studio showed it, its RGBA8 bytes hashing equal, and closes on the Studio's tick and digest with the one
     command. It refuses, with a `StateConflict`, a timeline whose end names another world, one with its
     command a tick late, one with a frame dated to an epoch the view was not given, and another seed's
-    configuration.
+    configuration. Plan §13.4: the header records `AffinityProjection::fixed()`'s rows, matrix and divisor; the
+    replay refuses the timeline with its header's projection changed in a row, in one matrix entry or in its
+    divisor (each naming the projection), and takes a header without one, which writes no `projection` field and
+    reads back as itself (refused there only for its closing world).
   - A style record names its field mapping, and one written before FL-019's composition mapping, without one,
     reads as the energy field; each mapping is written and read back to the same style, and an unknown name is
     refused.
@@ -978,7 +990,7 @@ presentation state, not scientific state.
     7 repeated, 6 dropped). The video is byte for byte the header at 30/1 and each slot's frame through
     `rgba_to_nv12` (limited, left), it decodes at 192 x 120 with as many frames as slots, and its SHA-256 is the
     manifest's. The manifest names the timeline's SHA-256, the configuration's hash, the closing digest and
-    tick, and parses back from disk. A second export into the directory is refused (`StorageFailed`) with the
+    tick, and the fixed projection, and parses back from disk. A second export into the directory is refused (`StorageFailed`) with the
     manifest unchanged. The same timeline with a 191 x 120 drawable exports its frames at that size and no
     video, with the reason (`not even, as 4:2:0 needs`), and leaves no partial video.
 - `tests/timeline_binary.rs` (1 test, FL-023, Metal compute, no window): `flife-studio --offscreen 1.5 --scale 1
@@ -1095,6 +1107,13 @@ presentation state, not scientific state.
   count off by one (`src/main.rs`): 24 caught. The hand-off missing from the timeline survived the first run
   and was caught once the offscreen test recorded its timeline. The binary printing no `handed` record
   survives: a hand-off needs a click, which only a window gives the binary.
+- §13.4's recorded projection, planted bugs, 14, each run against the tests that should catch it: in
+  `flife-render`, the divisor the root of half the channels, the matrix's signs flipped, a row misnamed
+  (`tests/epochs.rs`); a replay blind to the projection, the header recording none, a header without one
+  refused, the export manifest recording another divisor (`tests/timeline.rs`); the `open` record's limit fixed
+  at 1, its divisor rounded, its matrix one row thrice (`src/main.rs`); and in `flife render`'s `end` record the
+  limit fixed at 1, the matrix one row thrice, the rows zero and the divisor rounded (`flife-cli`'s
+  `tests/render.rs`): all 14 caught.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the

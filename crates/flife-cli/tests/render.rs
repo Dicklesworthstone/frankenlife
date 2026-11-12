@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 
 use flife_cli::{
     ColorMapping, ControllerChoice, FieldComponent, FieldMapping, Look, Particles, RENDER_SCHEMA,
-    RenderOptions, RenderRecord, Style, render,
+    RenderOptions, RenderProjection, RenderRecord, Style, render,
 };
 use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -78,6 +78,7 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
         tick,
         digest,
         video,
+        projection,
         ..
     }) = records.last()
     else {
@@ -85,6 +86,25 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
     };
     assert_eq!((*count, *tick, video.as_deref()), (3, 6, None));
     assert_eq!(*digest, plain.digest().to_hex());
+    // Plan §13.4: the projection's matrix and scaling are recorded, every
+    // entry the epochs' own.
+    let fixed = flife_render::AffinityProjection::fixed();
+    assert_eq!(
+        **projection,
+        RenderProjection {
+            rows: [7, 14, 25],
+            matrix: fixed.matrix,
+            divisor: 32.0_f64.sqrt(),
+            affinity_limit: 1.0,
+        }
+    );
+    let halved = ValidatedConfig::from_toml(&PRESET.replacen(
+        "affinity_norm_limit = 1.0",
+        "affinity_norm_limit = 0.5",
+        1,
+    ))
+    .expect("a world at half the limit");
+    assert_eq!(RenderProjection::of(&halved).affinity_limit, 0.5);
 
     // Another style draws other pixels of the same world: FL-019's
     // mappings only read epochs.

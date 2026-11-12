@@ -77,7 +77,7 @@ use flife_cli::{CheckpointAdmission, InspectedLayer, InspectedWeights};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Followed, OrganismSnapshot, ReproductionOutcome};
-use flife_render::Metrics;
+use flife_render::{AffinityProjection, Metrics};
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
@@ -331,6 +331,33 @@ const AUTO_WORKER_CEILING: NonZeroUsize = match NonZeroUsize::new(16) {
     None => NonZeroUsize::MIN,
 };
 
+/// Plan §13.4: "A fixed high-dimensional projection has a recorded matrix
+/// and scaling." The projection the affinity mapping's and the field
+/// composition's colours are drawn through, as the `open` record carries it:
+/// display axis `k` of a 32-channel vector is the sum of `matrix[k]` times
+/// it over `divisor` times its unit, `affinity_limit` for an organism's
+/// affinity and a block's energy for the field's composition.
+#[derive(Debug, Serialize)]
+struct ProjectionRecord {
+    rows: [usize; 3],
+    matrix: [[i8; 32]; 3],
+    divisor: f64,
+    affinity_limit: f64,
+}
+
+impl ProjectionRecord {
+    /// [`AffinityProjection::fixed`] for `config`'s world.
+    fn of(config: &ValidatedConfig) -> Self {
+        let projection = AffinityProjection::fixed();
+        Self {
+            rows: projection.rows,
+            matrix: projection.matrix,
+            divisor: projection.divisor,
+            affinity_limit: config.config().chemistry.affinity_norm_limit,
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case", tag = "record")]
 enum Record<'a> {
@@ -351,6 +378,8 @@ enum Record<'a> {
         particles: &'static str,
         field: bool,
         field_mapping: &'static str,
+        /// The fixed projection the affinity and composition colours take.
+        projection: ProjectionRecord,
         clock_telemetry: bool,
         /// `window` or `offscreen`.
         surface: &'static str,
@@ -910,6 +939,7 @@ fn main() -> ExitCode {
         particles: options.style.particles.name(),
         field: options.style.field,
         field_mapping: options.style.field_mapping.name(),
+        projection: ProjectionRecord::of(&config),
         clock_telemetry: model.presentation.show_clock_telemetry,
         surface: if studio.is_offscreen() {
             "offscreen"
@@ -1967,6 +1997,52 @@ mod tests {
                 "field_energy": 812.46
             })
         );
+    }
+
+    /// Plan §13.4: the `open` record carries the affinity projection's
+    /// matrix and scaling: rows 7, 14 and 25 of the Sylvester Hadamard
+    /// matrix, every entry `(−1)^popcount(row & channel)` written out, the
+    /// divisor √32 and the preset's affinity norm limit.
+    #[test]
+    fn the_open_record_carries_the_projections_matrix_and_scaling() {
+        let config = flife_core::ValidatedConfig::from_toml(include_str!(
+            "../../../presets/reference-small-world.toml"
+        ))
+        .expect("the preset");
+        let rows = [7_usize, 14, 25];
+        let matrix: Vec<Vec<i64>> = rows
+            .iter()
+            .map(|row| {
+                (0..32_usize)
+                    .map(|channel| {
+                        if (row & channel).count_ones() % 2 == 0 {
+                            1
+                        } else {
+                            -1
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let halved = flife_core::ValidatedConfig::from_toml(
+            &include_str!("../../../presets/reference-small-world.toml").replacen(
+                "affinity_norm_limit = 1.0",
+                "affinity_norm_limit = 0.5",
+                1,
+            ),
+        )
+        .expect("a world at half the limit");
+        for (config, limit) in [(config, 1.0), (halved, 0.5)] {
+            assert_eq!(
+                serde_json::to_value(super::ProjectionRecord::of(&config)).expect("serializes"),
+                json!({
+                    "rows": rows,
+                    "matrix": matrix,
+                    "divisor": 32.0_f64.sqrt(),
+                    "affinity_limit": limit
+                })
+            );
+        }
     }
 
     /// Plan §2.2: a follow's record names the line's origin and the

@@ -96,7 +96,8 @@ pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{
     AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineIntervention,
-    TimelineRecord, TimelineRegion, TimelineStyle, read_timeline, replay, write_timeline_record,
+    TimelineProjection, TimelineRecord, TimelineRegion, TimelineStyle, read_timeline, replay,
+    write_timeline_record,
 };
 
 /// The schema of the Studio's NDJSON records.

@@ -86,7 +86,7 @@ pub use persist::{
 };
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, RENDER_SCHEMA, RenderOptions,
-    RenderRecord, encoding_bytes, render,
+    RenderProjection, RenderRecord, encoding_bytes, render,
 };
 pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,

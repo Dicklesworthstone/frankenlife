@@ -81,6 +81,17 @@ fn an_offscreen_run_reports_its_frames_and_closes_on_the_direct_world() {
     let open = &records[0];
     assert_eq!(kind(open), "open");
     assert_eq!(open["surface"], "offscreen");
+    // Plan §13.4: the affinity projection's matrix and scaling, recorded.
+    let fixed = flife_render::AffinityProjection::fixed();
+    assert_eq!(
+        open["projection"],
+        serde_json::json!({
+            "rows": fixed.rows,
+            "matrix": fixed.matrix,
+            "divisor": fixed.divisor,
+            "affinity_limit": 1.0
+        })
+    );
     // As a window's: the view at the content's size in points, before the
     // first frame refits it to the drawable.
     assert_eq!(open["window"], serde_json::json!([320, 200]));

@@ -38,12 +38,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_manim::{Region, RegionEffect, RegionShape};
+use flife_render::AffinityProjection;
 use flife_studio::{
     ColorMapping, ControllerChoice, Disk, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
     FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_G, KEY_PERIOD, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T,
-    KEY_ZERO, Look, MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface, TimelineRecord,
-    TimelineRegion, TimelineStyle, VIDEO_FILE, export, read_timeline, replay,
-    write_timeline_record,
+    KEY_ZERO, Look, MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface,
+    TimelineProjection, TimelineRecord, TimelineRegion, TimelineStyle, VIDEO_FILE, export,
+    read_timeline, replay, write_timeline_record,
 };
 use fmn_codec::{
     PngLimits, Y4mColorspace, append_y4m_frame_nv12, decode_png, decode_y4m, y4m_header,
@@ -455,6 +456,54 @@ fn a_recorded_session_replays_frame_for_frame() {
     let other = ValidatedConfig::from_toml(&PRESET.replacen("seed = 42", "seed = 43", 1))
         .expect("another seed");
     println!("{}", refused(&read, &other));
+
+    // Plan §13.4: the header records the projection the affinity and
+    // composition colours were drawn through. A replay refuses another (a
+    // row, one entry of the matrix, the divisor), and takes a header from
+    // before projections were recorded: refused here only for its world.
+    let TimelineRecord::Header { projection, .. } = &header else {
+        panic!("the header: {header:?}");
+    };
+    let fixed = TimelineProjection::from(AffinityProjection::fixed());
+    assert_eq!(projection.as_deref(), Some(&fixed));
+    let with_header = |header: TimelineRecord| -> Vec<TimelineRecord> {
+        std::iter::once(header)
+            .chain(read[1..].iter().cloned())
+            .collect()
+    };
+    let changes: [fn(&mut TimelineProjection); 3] = [
+        |projection| projection.rows[2] = 26,
+        |projection| projection.matrix[1][5] = -projection.matrix[1][5],
+        |projection| projection.divisor = Exact(4.0),
+    ];
+    for change in changes {
+        let mut changed = header.clone();
+        if let TimelineRecord::Header {
+            projection: Some(projection),
+            ..
+        } = &mut changed
+        {
+            change(projection);
+        }
+        let detail = refused(&with_header(changed), &config);
+        assert!(detail.contains("drew affinity through"), "{detail}");
+    }
+    let mut old = header.clone();
+    if let TimelineRecord::Header { projection, .. } = &mut old {
+        *projection = None;
+    }
+    let line = serde_json::to_string(&old).expect("a record");
+    assert!(!line.contains("projection"), "{line}");
+    assert_eq!(
+        read_timeline(&format!("{line}\n")).expect("reads"),
+        [old.clone()]
+    );
+    let mut closed_elsewhere = read.last().expect("the end").clone();
+    if let TimelineRecord::End { digest, .. } = &mut closed_elsewhere {
+        digest.replace_range(0..1, if digest.starts_with('0') { "1" } else { "0" });
+    }
+    let detail = refused(&[old, closed_elsewhere], &config);
+    assert!(!detail.contains("drew affinity"), "{detail}");
 }
 
 /// A new directory's path under the target's temporary directory.
@@ -671,6 +720,11 @@ fn a_recorded_interval_exports_its_frames_and_video() {
     assert_eq!(manifest.end_tick, closed.session.boundary.tick.get());
     assert!(manifest.ticks[1] > manifest.ticks[0], "the world ran");
     assert_eq!(manifest.frames.len(), drawn.len());
+    assert_eq!(
+        manifest.projection,
+        TimelineProjection::from(AffinityProjection::fixed()),
+        "plan §13.4: the frames' projection, recorded"
+    );
 
     // Each frame: a PNG of the replay's bytes, as the manifest hashes it.
     for (index, (frame, (tick, wall, pixels))) in manifest.frames.iter().zip(&drawn).enumerate() {

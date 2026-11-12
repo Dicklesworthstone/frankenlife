@@ -59,6 +59,12 @@ A slow consumer can therefore cost display freshness, never the world.
   units of the limit, and its length is at most 1. Each component is summed in F64 in channel order, clamped to
   `[−1, 1]` and rounded to F32; a non-finite one, or a limit that is not finite and positive, gives 0. No row of
   the matrix is fitted to a population, so a vector keeps its projection in every world with the same limit.
+  Plan §13.4's "recorded matrix and scaling": `AffinityProjection::fixed()` is that projection as data, its
+  `rows` (`AFFINITY_AXES`), its `matrix` (the 3 × 32 entries, each ±1, the very signs the field's composition
+  sums with) and its `divisor` (`√32`, computed as the projection computes it), the unit being the limit for an
+  organism's affinity and a block's energy for the field's composition. The Studio's `open` record, its
+  timelines and export manifests, and `flife render`'s `end` record carry it, and a Studio replay refuses a
+  timeline drawn through another.
 - `FieldTexture`: channel `EnergyDensity`, the source grid, the block of cells per texel, the texel count and the
   texel size in world units. Each texel is the mean energy density of its block, summed in F64, rows then columns.
   Texels per axis are at most `FIELD_TEXELS_MAX` = 512. A grid that does not divide evenly ends in a partial block.
@@ -157,7 +163,7 @@ conversions of the F64 state, and its sums are F64 in a fixed order. Slot choice
 identities are sequential, so a deterministic sequence of offers and lease drops gives the same publications.
 
 **Independent tests.**
-- `tests/epochs.rs` (10 tests):
+- `tests/epochs.rs` (11 tests):
   - Every view, metric and texel, at founding and over 288 ticks with births and deaths, matches the world's own
     rows and an independent block-mean oracle. Every declared layout holds. Each texel's composition equals, bit
     for bit, an oracle that sums the world's moment planes per block and projects them with the Hadamard matrix
@@ -186,7 +192,12 @@ identities are sequential, so a deterministic sequence of offers and lease drops
     clamped end; 200 pseudo-random vectors project bit for
     bit as that oracle does, inside the unit ball; a zero, NaN or negative limit and an infinite term give the
     origin. A world at `affinity_norm_limit = 0.5` publishes its own limit and projects its founders as spread as at
-    1, not halved, and a publisher made for a limit-1 world states and scales by the 0.5 world it is offered. Every view check above includes the affinity view against the oracle.
+    1, not halved, and a publisher made for a limit-1 world states and scales by the 0.5 world it is offered.
+    Every view check above includes the affinity view against the oracle.
+  - Plan §13.4's recorded projection: `AffinityProjection::fixed()` names rows 7, 14 and 25, every matrix entry
+    that row of the recursion-built Hadamard matrix's, and a divisor of `√32` bit for bit. A reader holding only
+    the record (its matrix summed in channel order over its divisor times the limit) computes `affinity_projection`
+    bit for bit for 800 pseudo-random vectors at four limits, and every founder's affinity view in an epoch.
   - C.15: a one-tick gap is unambiguous. A 600-tick skipped gap on the 32-unit world (18.75 units of reach) is not.
     Epochs out of order or from another world are refused.
   - Selection by identity.

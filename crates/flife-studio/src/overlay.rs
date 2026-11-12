@@ -1,15 +1,18 @@
 //! The Studio's on-screen text (FL-024's metric overlay, plan §12.2): what
 //! the session is doing, the honest clocks and what a click will do, as
 //! lines the view draws in the drawable's top-left corner
-//! ([`flife_manim::HudText`]). The colour mapping's key is one of them
-//! (FL-019's legend, plan §13.4), and while an organism is selected its
-//! last inspection follows (FL-021's panel, plan §14.2).
+//! ([`flife_manim::HudText`]). The persistent telemetry of plan §14.1
+//! follows the clocks, from the shown epoch. The colour mapping's key is
+//! one of the lines (FL-019's legend, plan §13.4), and while an organism is
+//! selected its last inspection follows (FL-021's panel, plan §14.2).
 
 use flife_core::ids::OrganismId;
+use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend};
+use flife_render::Metrics;
 
 use crate::{Brush, ClockReading};
 
@@ -53,6 +56,32 @@ pub struct OverlayState<'a> {
     pub selected: Option<OrganismId>,
     /// The selected organism's last inspection; `None` until one answers.
     pub inspected: Option<Inspected<'a>>,
+    /// The persistent telemetry (plan §14.1); `None` shows none.
+    pub telemetry: Option<Telemetry<'a>>,
+}
+
+/// What the persistent telemetry shows (FL-024, plan §14.1), besides the
+/// tick and the clocks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Telemetry<'a> {
+    /// The shown epoch's summary of its world.
+    pub metrics: &'a Metrics,
+    /// The run's model identity.
+    pub model: &'a str,
+    /// The run's seed.
+    pub seed: u64,
+    /// The configured neural cadence: `[controller]
+    /// evaluation_interval_ticks`.
+    pub evaluation_interval_ticks: u32,
+    /// The peak-memory admission the Studio opened under (FL-043): the
+    /// genome quota and the budget's headroom.
+    pub memory: &'a MemoryAdmission,
+    /// Capacity shortfalls the session reported: under
+    /// `pause-before-commit`, the only capacity policy, a birth the quotas
+    /// cannot cover pauses the run, so these are its capacity rejections.
+    pub capacity_pauses: u64,
+    /// The newest durable checkpoint's tick, if the session has one.
+    pub checkpoint: Option<Tick>,
 }
 
 /// An inspection's answer, as the overlay shows it (FL-021).
@@ -73,6 +102,7 @@ pub enum Inspected<'a> {
 ///   seconds per wall second and frames presented per second;
 /// - the colour mapping's key ([`ColorMapping::legend`]), such as
 ///   `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16`;
+/// - with telemetry, its lines ([`telemetry_lines`]);
 /// - `energy brush` while a brush is armed and `organism 42` while one is
 ///   selected, joined by ` · `;
 /// - while one is selected and an inspection has answered, the panel
@@ -104,6 +134,10 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
             decimal(clock.frames_per_second, 0)
         ));
     }
+    if let Some(telemetry) = &state.telemetry {
+        text.push('\n');
+        text.push_str(&telemetry_lines(telemetry, state.clock));
+    }
     text.push('\n');
     text.push_str(&state.legend.text);
     let mut doing = Vec::new();
@@ -124,6 +158,133 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
         text.push_str(&inspector_lines(inspected));
     }
     text
+}
+
+/// The persistent telemetry's lines (plan §14.1), from the shown epoch's
+/// [`Metrics`]:
+///
+/// - `4,612 live · 9,124,000 parameters`: the live population and its
+///   logical neural parameters;
+/// - `controllers every tick · 127.5 full evaluations/s`: the configured
+///   neural cadence and, with a clock reading that counted evaluations, the
+///   controller evaluations per wall second over the live population;
+/// - `genomes 38.2 MiB of 1.13 GiB · 412 MiB headroom`: the bytes allocated
+///   to live genomes' parameters, the allocated genome quota, and what the
+///   memory budget leaves above the Studio's admitted peak;
+/// - `18,586 births · 3 introduced · 18,255 deaths · no capacity pause · no
+///   fault`, from the epoch's tally (the introductions only when there are
+///   any); a tally from a later tick than the founding says
+///   `from tick 512:` first, and without one the counts read `births and
+///   deaths not counted`;
+/// - `injected 1234.5 · uptake 456.7 · dissipated 789.1 · residual
+///   1.2e-12`: the run ledger's cumulative injection (and `removed`, when
+///   any was), the energy organisms gained by uptake from the tally
+///   (`from tick 512` likewise, and left out without a tally), its
+///   dissipation and its residual `Σ ε`;
+/// - `field-ecology-v1 · seed 42 · no checkpoint`, or `checkpoint at tick
+///   3,840`.
+#[must_use]
+pub fn telemetry_lines(telemetry: &Telemetry<'_>, clock: Option<&ClockReading>) -> String {
+    let metrics = telemetry.metrics;
+    let mut neural = match telemetry.evaluation_interval_ticks {
+        1 => "controllers every tick".to_owned(),
+        ticks => format!("controllers every {} ticks", grouped(u64::from(ticks))),
+    };
+    if let Some(rate) = clock.and_then(|clock| clock.evaluations_per_second)
+        && metrics.live > 0
+    {
+        neural.push_str(&format!(
+            " · {} full evaluations/s",
+            decimal(rate / metrics.live as f64, 1)
+        ));
+    }
+    let memory = telemetry.memory;
+    let headroom = memory.budget_bytes.saturating_sub(memory.peak_bytes);
+    let pauses = match telemetry.capacity_pauses {
+        0 => "no capacity pause".to_owned(),
+        1 => "1 capacity pause".to_owned(),
+        pauses => format!("{} capacity pauses", grouped(pauses)),
+    };
+    let fault = if metrics.faulted {
+        "a numerical fault stopped the run"
+    } else {
+        "no fault"
+    };
+    let from = |tally: &flife_render::Tally| {
+        (tally.since != Tick::ZERO).then(|| format!("from tick {}", grouped(tally.since.get())))
+    };
+    let lifecycle = metrics.tally.as_ref().map_or_else(
+        || "births and deaths not counted".to_owned(),
+        |tally| {
+            let mut counts = vec![format!("{} births", grouped(tally.births))];
+            if tally.introductions > 0 {
+                counts.push(format!("{} introduced", grouped(tally.introductions)));
+            }
+            counts.push(format!("{} deaths", grouped(tally.deaths)));
+            let counts = counts.join(" · ");
+            match from(tally) {
+                Some(from) => format!("{from}: {counts}"),
+                None => counts,
+            }
+        },
+    );
+    let ledger = &metrics.ledger;
+    let mut energy = vec![format!("injected {}", decimal(ledger.injected, 1))];
+    if ledger.removed > 0.0 {
+        energy.push(format!("removed {}", decimal(ledger.removed, 1)));
+    }
+    if let Some(tally) = &metrics.tally {
+        let uptake = format!("uptake {}", decimal(tally.uptake, 1));
+        energy.push(match from(tally) {
+            Some(from) => format!("{uptake} {from}"),
+            None => uptake,
+        });
+    }
+    energy.push(format!("dissipated {}", decimal(ledger.dissipated, 1)));
+    energy.push(format!("residual {:.1e}", ledger.residual));
+    let checkpoint = telemetry.checkpoint.map_or_else(
+        || "no checkpoint".to_owned(),
+        |tick| format!("checkpoint at tick {}", grouped(tick.get())),
+    );
+    format!(
+        "{} live · {} parameters\n\
+         {neural}\n\
+         genomes {} of {} · {} headroom\n\
+         {lifecycle} · {pauses} · {fault}\n\
+         {}\n\
+         {} · seed {} · {checkpoint}",
+        grouped(metrics.live),
+        grouped(metrics.parameters),
+        bytes(metrics.genome_allocated_bytes),
+        bytes(memory.genomes),
+        bytes(headroom),
+        energy.join(" · "),
+        telemetry.model,
+        telemetry.seed,
+    )
+}
+
+/// `value` bytes in binary units to three significant figures: `512 B`,
+/// `38.2 MiB`, `1.13 GiB`.
+fn bytes(value: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    let mut scaled = value as f64;
+    let mut unit = 0;
+    while scaled >= 1024.0 && unit + 1 < UNITS.len() {
+        scaled /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{value} B");
+    }
+    let places = if scaled >= 100.0 {
+        0
+    } else if scaled >= 10.0 {
+        1
+    } else {
+        2
+    };
+    format!("{scaled:.places$} {}", UNITS[unit])
 }
 
 /// The inspector panel's lines for an answer:

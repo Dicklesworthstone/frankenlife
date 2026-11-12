@@ -1,7 +1,8 @@
 //! Plan §12.2 evidence: the Studio's clocks report the scientific ticks
 //! committed per wall second and the simulation-time to wall-time ratio
 //! the session achieved, beside the frames presented, and the display's
-//! backlog. A slow world reads slow and a paused one reads zero.
+//! backlog, and the controller evaluations the shown epoch's tally gained
+//! (plan §14.1). A slow world reads slow and a paused one reads zero.
 //!
 //! No window opens: the meter is read with chosen instants, and against
 //! the render feed of a session thread driven through its intent lane.
@@ -33,7 +34,13 @@ fn read(
     presented: u64,
     shown: Option<u64>,
 ) -> Option<ClockReading> {
-    meter.read(at, Tick::new(committed), presented, shown.map(Tick::new))
+    meter.read(
+        at,
+        Tick::new(committed),
+        presented,
+        shown.map(Tick::new),
+        None,
+    )
 }
 
 #[test]
@@ -67,8 +74,42 @@ fn a_second_of_128_ticks_at_one_128th_is_real_time() {
             committed: Tick::new(1_128),
             shown: Some(Tick::new(1_120)),
             behind: Some(8),
+            evaluations: None,
+            evaluations_per_second: None,
         }
     );
+}
+
+#[test]
+fn evaluations_are_read_between_two_counts() {
+    let mut meter = ClockMeter::new(reference_step());
+    let start = Instant::now();
+    let at = |seconds| start + Duration::from_secs(seconds);
+    assert_eq!(meter.read(start, Tick::new(0), 0, None, Some(1_000)), None);
+    let reading = meter
+        .read(at(2), Tick::new(256), 0, None, Some(5_096))
+        .expect("a window");
+    assert_eq!(reading.evaluations, Some(4_096));
+    assert_eq!(reading.evaluations_per_second, Some(2_048.0));
+    // Without a count at either end there is no reading of them.
+    let reading = meter
+        .read(at(3), Tick::new(384), 0, None, None)
+        .expect("a window");
+    assert_eq!(
+        (reading.evaluations, reading.evaluations_per_second),
+        (None, None)
+    );
+    let reading = meter
+        .read(at(4), Tick::new(512), 0, None, Some(9_000))
+        .expect("a window");
+    assert_eq!(
+        (reading.evaluations, reading.evaluations_per_second),
+        (None, None)
+    );
+    let reading = meter
+        .read(at(5), Tick::new(512), 0, None, Some(9_000))
+        .expect("a window");
+    assert_eq!(reading.evaluations, Some(0));
 }
 
 #[test]
@@ -175,11 +216,19 @@ fn small() -> ValidatedConfig {
     ValidatedConfig::from_toml(&lines.join("\n")).expect("a valid configuration")
 }
 
-fn committed(session: &SessionThread) -> Tick {
-    session
+/// The newest epoch's tick and its tally's controller evaluations, from one
+/// lease.
+fn latest(session: &SessionThread) -> (Tick, Option<u64>) {
+    let lease = session
         .feed()
+        .viewer(1)
+        .expect("a viewer")
         .latest()
-        .map_or(Tick::ZERO, |epoch| epoch.tick)
+        .expect("an epoch");
+    (
+        lease.tick(),
+        lease.metrics().tally.map(|tally| tally.evaluations),
+    )
 }
 
 /// Statuses until one satisfies `done`, within 60 seconds.
@@ -211,14 +260,28 @@ fn a_running_session_reads_the_ticks_its_feed_committed() {
 
     session.send(Intent::Resume).expect("offered");
     until(&session, |status| matches!(status, Status::Running { .. }));
-    let opened = committed(&session);
-    assert_eq!(meter.read(Instant::now(), opened, 0, None), None);
+    let (opened, opened_evaluations) = latest(&session);
+    assert_eq!(
+        meter.read(Instant::now(), opened, 0, None, opened_evaluations),
+        None
+    );
     std::thread::sleep(Duration::from_millis(300));
-    let now = committed(&session);
+    let (now, now_evaluations) = latest(&session);
     let reading = meter
-        .read(Instant::now(), now, 0, Some(opened))
+        .read(Instant::now(), now, 0, Some(opened), now_evaluations)
         .expect("a window");
     let ticks = now.get() - opened.get();
+    // The preset evaluates every live organism every tick.
+    let evaluations = now_evaluations
+        .zip(opened_evaluations)
+        .map(|(now, then)| now - then)
+        .expect("the session's epochs carry tallies");
+    assert!(evaluations >= ticks, "{evaluations} in {ticks} ticks");
+    assert_eq!(reading.evaluations, Some(evaluations));
+    assert_eq!(
+        reading.evaluations_per_second,
+        Some(evaluations as f64 / reading.wall_seconds)
+    );
     assert!(ticks > 0, "the running world committed nothing in 300 ms");
     assert_eq!(reading.ticks, ticks);
     assert_eq!(reading.committed, now);
@@ -236,13 +299,15 @@ fn a_running_session_reads_the_ticks_its_feed_committed() {
     session.send(Intent::Pause).expect("offered");
     until(&session, |status| matches!(status, Status::Paused { .. }));
     std::thread::sleep(Duration::from_millis(50));
-    let held = committed(&session);
-    let _ = meter.read(Instant::now(), held, 0, Some(held));
+    let (held, held_evaluations) = latest(&session);
+    let _ = meter.read(Instant::now(), held, 0, Some(held), held_evaluations);
     std::thread::sleep(Duration::from_millis(100));
+    let (still, still_evaluations) = latest(&session);
     let paused = meter
-        .read(Instant::now(), committed(&session), 0, Some(held))
+        .read(Instant::now(), still, 0, Some(held), still_evaluations)
         .expect("a window");
     assert_eq!(paused.ticks, 0, "{paused:?}");
+    assert_eq!(paused.evaluations, Some(0));
     assert_eq!(paused.simulation_rate, 0.0);
     assert_eq!(paused.behind, Some(0));
     session.close().expect("closes");

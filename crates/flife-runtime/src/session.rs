@@ -1676,7 +1676,9 @@ impl SessionOwner {
                 journal.outcomes(book, from);
             }
             // Before anyone hears of the boundary: a viewer that is told of
-            // a published tick finds its epoch unless every slot is busy.
+            // a published tick finds its epoch unless every slot is busy,
+            // and every epoch carries the tally through its tick.
+            render.count(&report);
             let _ = render.offer(world);
             if !pause.is_empty() {
                 let boundary = Boundary {

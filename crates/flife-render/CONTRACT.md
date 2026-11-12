@@ -2,7 +2,8 @@
 
 **Purpose.** FL-017 (`flife-0cg`) covers immutable compact render epochs (plan §9.5, §12.4, §13.2–§13.5,
 Appendix B.3, C.7, C.15, INV-09, INV-10). FL-020 (`flife-err`, part) adds interpolation between two epochs (§13.5,
-C.15).
+C.15). FL-024 (`flife-xut`, part) adds what plan §14.1's persistent telemetry reads to each epoch's metrics: the
+world's own quantities at its tick, and a tally of the committed ticks the publisher was given.
 
 - An `Epoch` is a compact projection of exactly one committed world, with every row in stable identity order.
 - A `Publisher` owned by the world's owner fills preallocated slots and publishes the latest one.
@@ -15,7 +16,10 @@ A slow consumer can therefore cost display freshness, never the world.
 **Inputs.**
 - `&World`, read only: the committed tick and resource epoch, the population rows, each genome's topology and
   affinity vector and the world's `affinity_norm_limit` (FL-019), the field's energy plane and grid, the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
-  event cursor.
+  event cursor. FL-024: each genome's parameter count, the genome quota's logical and allocated bytes, the run
+  ledger's report and whether a numerical fault stopped the run.
+- FL-024: `Publisher::count(&TickReport)`. The owner gives every report it publishes, in order, before offering the
+  world.
 - The slot count: `execution.render_queue_capacity`, at least 2. The validator refuses 1 (`IntBound::AtLeastTwo`),
   because one displayable epoch and one being written need two slots.
 - A release hook, run after every lease drops, so an owner can retry a pending boundary.
@@ -53,7 +57,15 @@ A slow consumer can therefore cost display freshness, never the world.
   texel size in world units. Each texel is the mean energy density of its block, summed in F64, rows then columns.
   Texels per axis are at most `FIELD_TEXELS_MAX` = 512. A grid that does not divide evenly ends in a partial block.
 - `Metrics`: source tick, live count, organism energy (F64 in identity order), field energy (F64 in cell order),
-  highest generation and event cursor.
+  highest generation and event cursor. FL-024 adds:
+  - `parameters`: the live organisms' logical neural parameters, summed;
+  - `genome_logical_bytes` and `genome_allocated_bytes`: the genome quota's;
+  - `ledger`: the run ledger's `LedgerReport` (cumulative injection, removal, dissipation, turnover and residual);
+  - `faulted`: whether a numerical fault stopped the run;
+  - `tally: Option<Tally>`: from the tick the publisher opened at (`since`), the births, introductions and deaths,
+    controller evaluations (regular and forced), birth attempts whose every candidate was rejected, and the energy
+    organisms gained by uptake (the uptake transfer's credit), each summed in tick order. An epoch carries it only
+    when the publisher counted every tick from `since` through the epoch's own; `Epoch::standalone` carries none.
 - `Publication`:
   - `Published { epoch, replaced }`;
   - `Current`: the latest epoch already shows this state;
@@ -96,6 +108,10 @@ A slow consumer can therefore cost display freshness, never the world.
   identical epochs, and matching never links a reused slot's dead occupant to its newborn.
 - *Observation neutrality (INV-09).* Nothing reaches the world mutably. A projection failure is recorded and
   returned and leaves the last epoch displayable.
+- *A whole tally or none (FL-024).* `count` adds a report only when it follows the last tick counted
+  (`report.from` is that tick). A report that does not, a tick missed or given twice, ends the count, and no later
+  epoch carries a tally. A busy boundary is counted though not published, so the next epoch published carries
+  every tick between.
 
 **Refusal cases.**
 - Fewer than two slots: `InvalidConfig`, at `execution.render_queue_capacity`.
@@ -156,9 +172,32 @@ identities are sequential, so a deterministic sequence of offers and lease drops
     the 48 dead fade from their prior rows, and the five new identities are drawn only at fraction 1, at their own
     positions.
   - Refusals: fractions outside `[0, 1]`, and epochs out of order.
-- In `flife-runtime`, `tests/observation.rs` (3 tests) checks that the session stays state-neutral under pressure.
+- `tests/telemetry.rs` (3 tests, FL-024):
+  - Over 160 ticks of the ecology, with five organisms introduced at tick 40 and a disk removed at tick 90, while a
+    second viewer holds two epochs for six ticks in every sixteen (in one run: 130 published, 30 skipped), every
+    epoch published, the founding one included, carries the world's parameter sum, quota bytes, ledger report and
+    fault flag, and a tally equal to an independent sum over the reports through its tick (uptake bit for bit). The
+    counts are nonzero (in one run: 37 births, 5 introductions, 10 deaths, 11,112 evaluations). The world's own
+    counters agree: its event cursor equals deaths + births + introductions, and its next organism identity equals
+    the live count plus deaths. The uptake is what organisms gained: within 1e-9 of the grants less uptake's
+    dissipated inefficiency, and below the grants.
+  - A publisher opened three ticks in counts from tick 3. A tick offered before it is counted carries no tally, and
+    counted afterwards the tally goes on whole into the next epoch. A tick not counted leaves this epoch and every
+    later one without a tally; so does a tick counted twice. `Epoch::standalone` has the world's quantities and no
+    tally.
+  - A world with one source at power 1e40 faults within 200 ticks; its epoch before says no fault and its epoch
+    after says a fault stopped the run, with every other quantity the world's.
+- In `flife-runtime`, `tests/observation.rs` (3 tests) checks that the session stays state-neutral under pressure,
+  and `tests/telemetry.rs` (FL-024) that a session's epochs carry the tally through their ticks.
 - Twenty-five planted bugs in this crate, the session's feed, the validator and `World::maximum_speed` were each
   caught by at least one of these tests or `flife-runtime`'s (listed in the FL-017 commit).
+- FL-024's telemetry, nine planted bugs here, run against `tests/telemetry.rs` alone: births counted from deaths,
+  evaluations not added, uptake taken as the grant (`debited`), a count that ignores the report's `from`, an offer
+  that attaches the tally to any tick, parameters not summed, a slot's stale ledger and a fault never shown were
+  caught (the last two after the offer-before-count and faulted-world cases were added; the first run's survivors).
+  Allocated genome bytes taken as the logical survives, and is equivalent today: with no deduplicating store the
+  quota allocates exactly `P x 4` bytes a genome, so the two are equal in every world (15,341,568 both in the
+  Studio's crowded run).
 
 **Validity domain.** CPU host memory; one publisher per world; any number of consumers on any threads; the
 `field-ecology-v1` energy plane.

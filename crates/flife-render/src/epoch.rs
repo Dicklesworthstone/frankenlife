@@ -22,8 +22,8 @@
 //! Scientific code never reads an epoch back.
 
 use flife_core::ids::{OrganismId, RenderEpoch, ResourceEpoch};
-use flife_core::{CoreError, Tick, TimeStep};
-use flife_engine::World;
+use flife_core::{CoreError, LedgerReport, Tick, TimeStep, Transfer};
+use flife_engine::{TickReport, World};
 
 /// The most texels a field texture has along either axis. A larger grid is
 /// averaged over blocks of whole cells (§9.5: a bounded derived texture,
@@ -363,6 +363,71 @@ pub struct Metrics {
     pub max_generation: u32,
     /// Births and deaths published so far.
     pub events: u64,
+    /// The live organisms' logical neural parameters, summed (§14.1).
+    pub parameters: u64,
+    /// The logical bytes the genome quota charges the live genomes.
+    pub genome_logical_bytes: u64,
+    /// The bytes allocated to the live genomes' parameters.
+    pub genome_allocated_bytes: u64,
+    /// The run's ledger after the source tick: its cumulative injection,
+    /// removal, dissipation and residual since the run was founded.
+    pub ledger: LedgerReport,
+    /// Whether a numerical fault has stopped the run.
+    pub faulted: bool,
+    /// What the publisher counted from the committed ticks its owner gave
+    /// it ([`crate::Publisher::count`]), through the source tick; `None`
+    /// for an epoch outside a feed, or when the publisher was not given
+    /// every tick up to the source tick.
+    pub tally: Option<Tally>,
+}
+
+/// Counts over the committed ticks a publisher was given, from the tick it
+/// opened at (plan §14.1): what a tick's report says and the world keeps no
+/// running total of. Each is summed in tick order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tally {
+    /// The world's tick when the publisher opened. For a founded run that is
+    /// 0, and the counts are the run's.
+    pub since: Tick,
+    /// Births.
+    pub births: u64,
+    /// Organisms introduced by commands.
+    pub introductions: u64,
+    /// Deaths.
+    pub deaths: u64,
+    /// Controller evaluations, regular and forced.
+    pub evaluations: u64,
+    /// Birth attempts whose every mutation candidate was rejected.
+    pub rejected_births: u64,
+    /// The energy organisms gained by uptake: the uptake transfer's credit,
+    /// what granted uptake left after each organism's efficiency.
+    pub uptake: f64,
+}
+
+impl Tally {
+    /// Nothing counted yet, from `since`.
+    #[must_use]
+    pub const fn from(since: Tick) -> Self {
+        Self {
+            since,
+            births: 0,
+            introductions: 0,
+            deaths: 0,
+            evaluations: 0,
+            rejected_births: 0,
+            uptake: 0.0,
+        }
+    }
+
+    /// Add one committed tick's report.
+    pub fn add(&mut self, report: &TickReport) {
+        self.births += report.births.len() as u64;
+        self.introductions += report.introductions.len() as u64;
+        self.deaths += report.deaths.len() as u64;
+        self.evaluations += report.evaluated as u64;
+        self.rejected_births += report.rejected.len() as u64;
+        self.uptake += report.closure.credited(Transfer::Uptake);
+    }
 }
 
 /// An immutable compact render epoch: exactly one committed world (B.3).
@@ -427,7 +492,7 @@ impl Epoch {
     /// As a slot's allocation and projection.
     pub fn standalone(world: &World) -> Result<Self, CoreError> {
         let mut epoch = Self::allocate(world)?;
-        epoch.project(world, RenderEpoch::new(1), None)?;
+        epoch.project(world, RenderEpoch::new(1), None, None)?;
         Ok(epoch)
     }
 
@@ -466,18 +531,25 @@ impl Epoch {
                 field_energy: 0.0,
                 max_generation: 0,
                 events: 0,
+                parameters: 0,
+                genome_logical_bytes: 0,
+                genome_allocated_bytes: 0,
+                ledger: world.ledger().report(),
+                faulted: false,
+                tally: None,
             },
         })
     }
 
-    /// Refill this slot from `world`'s committed state as epoch `id`. On an
-    /// error the slot holds nothing publishable; the caller does not
-    /// publish it.
+    /// Refill this slot from `world`'s committed state as epoch `id`, with
+    /// the publisher's `tally` through its tick. On an error the slot holds
+    /// nothing publishable; the caller does not publish it.
     pub(crate) fn project(
         &mut self,
         world: &World,
         id: RenderEpoch,
         prior: Option<Prior>,
+        tally: Option<Tally>,
     ) -> Result<(), CoreError> {
         let population = world.population();
         let live = population.len();
@@ -511,6 +583,7 @@ impl Epoch {
         let affinity_limit = world.trait_limits().affinity_norm();
         let mut organism_energy = 0.0_f64;
         let mut max_generation = 0_u32;
+        let mut parameters = 0_u64;
         for organism in population.iter() {
             let genome =
                 population
@@ -543,6 +616,7 @@ impl Epoch {
             ));
             organism_energy += organism.energy;
             max_generation = max_generation.max(organism.generation.get());
+            parameters += genome.parameters().len() as u64;
         }
         self.field
             .project(world.field().energy(), grid.cell_area())?;
@@ -559,6 +633,12 @@ impl Epoch {
             field_energy: world.field().energy_total(),
             max_generation,
             events: world.events(),
+            parameters,
+            genome_logical_bytes: world.quota().logical_bytes(),
+            genome_allocated_bytes: world.quota().allocated_bytes(),
+            ledger: world.ledger().report(),
+            faulted: world.fault().is_some(),
+            tally,
         };
         Ok(())
     }

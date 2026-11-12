@@ -22,6 +22,11 @@
 //!   display consumer that retains its leases only loses freshness.
 //! - Each viewer holds at most its limit of leases, and a limit is below
 //!   the slot count, so no single consumer can hold every slot.
+//! - The owner hands the publisher every tick's report through
+//!   [`Publisher::count`], published or skipped, and each epoch carries the
+//!   running [`Tally`] through its own tick (plan §14.1). A tick missed or
+//!   counted twice ends the tally: no later epoch carries one, rather than
+//!   a total that is short or doubled.
 //!
 //! Nothing here can reach the world mutably: the publisher reads it through
 //! `&World`. Observation cannot change the science (INV-09).
@@ -34,9 +39,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use flife_core::error::ConfigIssue;
 use flife_core::ids::{IdSequence, RenderEpoch, ResourceEpoch};
 use flife_core::{CoreError, Tick};
-use flife_engine::World;
+use flife_engine::{TickReport, World};
 
-use crate::epoch::{Epoch, Prior, reserved};
+use crate::epoch::{Epoch, Prior, Tally, reserved};
 
 /// The default lease limit: the current epoch and its prior, for display
 /// one committed state late (§13.5, `committed-states-one-epoch-late`).
@@ -127,6 +132,9 @@ pub struct Publisher {
     latest: Prior,
     resource: ResourceEpoch,
     stats: RenderStats,
+    tally: Tally,
+    /// The tick the tally runs through; `None` once a tick was missed.
+    counted: Option<Tick>,
 }
 
 impl Publisher {
@@ -186,7 +194,8 @@ impl Publisher {
                     operation: "found render publisher",
                     detail: "a new slot is already shared".into(),
                 })?;
-        first.project(world, id, None)?;
+        let tally = Tally::from(world.tick());
+        first.project(world, id, None, Some(tally))?;
         let shared = Arc::new(Shared {
             latest: Mutex::new(slots.first().map(Arc::clone)),
             capacity,
@@ -203,7 +212,30 @@ impl Publisher {
                 published: 1,
                 ..RenderStats::default()
             },
+            tally,
+            counted: Some(world.tick()),
         })
+    }
+
+    /// Count a committed tick's report into the tally its epochs carry
+    /// ([`crate::Metrics::tally`]). The owner gives it every report it
+    /// publishes, in order, before offering the world. A report that does
+    /// not follow the last one counted, a tick missed or given twice, ends
+    /// the count: no later epoch carries a tally.
+    pub fn count(&mut self, report: &TickReport) {
+        if self.counted == Some(report.from) {
+            self.tally.add(report);
+            self.counted = Some(report.tick);
+        } else {
+            self.counted = None;
+        }
+    }
+
+    /// The tally through the last tick counted, or `None` once a tick was
+    /// missed.
+    #[must_use]
+    pub fn tally(&self) -> Option<Tally> {
+        self.counted.map(|_| self.tally)
     }
 
     /// Offer `world`'s committed state. It is published into the lowest
@@ -233,9 +265,13 @@ impl Publisher {
                 kept: self.latest,
             });
         };
+        // The tally rides only on the tick it was counted through.
+        let tally = (self.counted == Some(world.tick())).then_some(self.tally);
         let projected = match self.ids.issue() {
             Ok(id) => match Arc::get_mut(slot) {
-                Some(epoch) => epoch.project(world, id, Some(self.latest)).map(|()| id),
+                Some(epoch) => epoch
+                    .project(world, id, Some(self.latest), tally)
+                    .map(|()| id),
                 None => Err(CoreError::StateConflict {
                     operation: "publish render epoch",
                     detail: "a free slot became shared".into(),

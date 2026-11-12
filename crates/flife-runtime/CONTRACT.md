@@ -154,6 +154,11 @@ inherits every command and outcome, records the fork, and from then on admits on
   wall time only, never a tick, a command, an admission decision or a birth. A render failure is recorded in the
   counters and never stops the run.
 - At close the owner offers the final boundary once more and marks the feed closed. The last epoch stays readable.
+- FL-024 (plan §14.1): before offering a published tick, stepped or run, the owner counts its report into the
+  publisher's tally (`Publisher::count`), so every epoch the feed publishes carries the births, introductions,
+  deaths, controller evaluations, rejected births and uptake since the publisher opened, through its own tick. A
+  journal's replay runs before the publisher opens, so a recovered session counts from the recovered tick (the
+  tally's `since`).
 
 **Invariants — checkpoints (FL-016; §16.3, C.14, B.2).**
 - FL-038: `checkpoint_into(world, book, sink)` writes the same container through a `flife_core::checkpoint::ChunkSink`
@@ -312,6 +317,13 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     world, and only complete epochs in increasing order.
 - Twenty-nine planted bugs were each caught by at least one of these tests (listed in the FL-014 commit). FL-017's
   twenty-five, three of them in the session's feed, are listed in its commit.
+- `tests/telemetry.rs` (1 test, FL-024), over two Lab seeds: a session submits an introduction (4 organisms at
+  tick 30) and a removal (a disk of radius 12 at tick 40), steps 48 ticks while a viewer holds two epochs from step
+  10 to 20, runs to tick 60 holding one, then to 96 holding two. Every epoch the feed shows, the founding one, the
+  stale one kept while every slot is held and the pending one published on release included, carries a tally
+  equal to a sum over a world stepped directly with the same commands at the shown tick (uptake bit for bit), with
+  births, deaths and the four introductions counted. Two planted bugs in the owner were caught by it: the tick not
+  counted, and counted after it is offered (each epoch then carries no tally).
 
 - `tests/checkpoint.rs` (FL-016):
   - A 48-founder ecology with a four-tick controller cadence, checkpointed at founding, off phase (tick 5), with

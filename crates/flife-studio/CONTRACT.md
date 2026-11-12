@@ -12,10 +12,16 @@ seeded-introduction brushes: a click becomes a world-space command that the sess
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
 They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
-The overlay's lines are `overlay_text`'s: the run and its tick, the clocks, the shown mapping's key (each swatch
-in the colour that mapping gives its label; the topology key labels the run's catalog members by their hidden
-widths), the armed brush and the selection, then the inspector panel. A count of a trillion or more, and a
-magnitude of 100,000 or more, is written in scientific notation, so no line grows without bound.
+The overlay's lines are `overlay_text`'s: the run and its tick, the clocks, plan §14.1's persistent telemetry
+(`telemetry_lines`), the shown mapping's key (each swatch in the colour that mapping gives its label; the topology
+key labels the run's catalog members by their hidden widths), the armed brush and the selection, then the
+inspector panel. A count of a trillion or more, and a magnitude of 100,000 or more, is written in scientific
+notation, so no line grows without bound. The telemetry is the shown epoch's (`flife_render::Metrics`): the live
+population and its logical parameters; the neural cadence and the full-population evaluations a wall second; the
+genomes' allocated bytes against their quota and the memory budget's headroom above the admitted peak; the
+births, introductions and deaths since founding, the capacity pauses and whether a fault stopped the run; the
+ledger's injection, removal and dissipation, the organisms' uptake and the residual; and the model, seed and
+durable checkpoint. The binary prints the same quantities as a `telemetry` record a second.
 It closes the G0 native-input gap: the presenter's real AppKit events reach FrankenLife as typed
 input. The live world is shown in a native window, through FrankenManim's Metal 3D route and the `flife-manim`
 adapter. For FL-024's frame study (G6, §13.7) the same Studio runs with no window (`Surface::Offscreen`): typed
@@ -210,7 +216,14 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
     time, 0 while paused); the `frames` drawn (presented, or rendered offscreen) and `frames_per_second`; and the
     newest `committed_tick`, the
     `shown_tick` and how far the shown epoch is behind it (`behind_ticks`). The committed tick is the newest epoch
-    in the render feed (`Studio::committed`), so a slow world reads slow;
+    in the render feed (`Studio::committed`), so a slow world reads slow. It also carries the controller
+    `evaluations` the shown epoch's tally gained over the window and `evaluations_per_second`;
+  - FL-024, plan §14.1: a `telemetry` record after each `frame` summary (and its `clock`), from the shown epoch:
+    `shown_tick`, `live`, `parameters`, `genome_logical_bytes`, `genome_allocated_bytes`, `headroom_bytes` (the
+    budget less the admitted peak), the tally's `counted_from_tick`, `births`, `introductions`, `deaths`,
+    `evaluations`, `rejected_births` and `uptake` (null without a tally), the ledger's `injected`, `removed`,
+    `dissipated` and `residual`, `faulted`, the `capacity_pauses` reported, and `full_evaluations_per_second`, the
+    clock's evaluations a second over the live population (null without a counted clock or a live population);
   - `end`, with the committed tick, the world digest, the strokes offered and the brush clicks that made none
     (`unstroked`), the controller evaluations the backend
     returned and deferred, and its failure if it failed, and the same copy totals; `frame_times` (FL-024's G6
@@ -373,15 +386,28 @@ presentation state, not scientific state.
   - paused at tick 3: a material stroke of a living organism's affinity direction and an introduction apply at the
     next step, each moving what the direct world stepped with both reports, bit for bit (the introduction 8 organisms
     at 2 energy each, 16), and the closed world is the direct one.
-- `tests/clock.rs` (7 tests, FL-024, no window), the `ClockMeter` the binary reads:
+- `tests/clock.rs` (8 tests, FL-024, no window), the `ClockMeter` the binary reads:
+  - evaluations (plan §14.1): from 1,000 to 5,096 over 2 s read 4,096 and 2,048 a second; a window with no count at
+    either end reads none; a still count reads 0;
   - the first read opens a window and gives nothing; 128 ticks in one second at `Δt = 1/128` read 128 ticks/s,
     rate 1 and the frames' 60 fps, 8 ticks behind;
   - each window starts where the last ended (64 ticks/s and rate 0.5, then 1,024 and 8); the ratio uses the world's
     own timestep (40 ticks of 3/40 s in 2 s are 1.5); a paused world reads 0 ticks and rate 0 with its frames
     still counted; a window of no wall time, or a read before it opened, gives nothing and keeps its start;
   - against a running `SessionThread`'s render feed: over 300 ms the ticks read are exactly what the feed's newest
-    epoch advanced, at that over the window's wall seconds and `Δt` times it, and once paused a window reads 0.
-- `tests/overlay.rs` (4 tests, FL-024, FL-021 and FL-019, no window):
+    epoch advanced, at that over the window's wall seconds and `Δt` times it, and the evaluations what its tally
+    advanced (at least one a tick, as the preset evaluates every organism every tick); once paused a window reads
+    0 ticks and 0 evaluations.
+- `tests/overlay.rs` (5 tests, FL-024, FL-021 and FL-019, no window):
+  - plan §14.1's telemetry exactly, for chosen metrics: `4,608 live · 9,124,000 parameters`, `controllers every
+    tick · 128.0 full evaluations/s`, `genomes 38.2 MiB of 1.00 GiB · 412 MiB headroom`, `18,586 births · 18,255
+    deaths · no capacity pause · no fault`, `injected 1234.5 · uptake 456.7 · dissipated 789.1 · residual
+    1.2e-12`, `field-ecology-v1 · seed 42 · no checkpoint`, between the clocks and the key in `overlay_text`; a
+    cadence of 4 ticks, no rate without a counted clock or a live population; bytes from `512 B` to `16.0 EiB`
+    and no headroom below `0 B`; introductions and removal shown only when present, a negative residual; a tally
+    from tick 512 says so on both its lines, and none says `births and deaths not counted` and leaves uptake out;
+    one and 2,345 capacity pauses, a fault, scientific notation from 100,000 and a zero residual; a checkpoint's
+    tick;
   - `overlay_text` exactly: `opening` before the session reports; `running · tick 1,024`, then `128 ticks/s ·
     1.00× real time · 60 fps`, then the key; one decimal below 100 ticks/s; the brush and the organism on one line,
     grouped in thousands; `999,999,999,999`, then `1.00e12` and `1.84e19` from a trillion, and a clock of
@@ -396,12 +422,15 @@ presentation state, not scientific state.
     east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest; scientific notation from 100,000 with a
     sign on every rate; `no controller output held`;
   - the longest overlay (every key with every brush, every count one short of a trillion, the panel with every
-    value one short of scientific notation and the catalog's largest controller), laid out with its key's swatches,
-    at 2x: every glyph is drawn, none refused or left out, within four fifths of the overlay's budget (the motion
-    key's, 11,832 vertices and 11,434 triangles, is the longest); at 3x, all of it is still drawn.
+    value one short of scientific notation and the catalog's largest controller, and the telemetry at its widest:
+    four-digit byte counts, energies one short of scientific notation, the widest residual, a tally from a later
+    tick, a fault, the largest seed and cadence), 15 lines laid out with its key's swatches, at 2x: every glyph is
+    drawn, none refused or left out, within four fifths of the overlay's budget (the motion key's with the
+    introduction brush, 26,371 vertices and 25,501 triangles, is the longest); at 3x, all of it is still drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 32.5 MiB at 3840 x 2160, which leaves the backend 222.1 MiB of the 2 GiB budget (203.4
-  with the preset's bloom).
+  terms to the observers: 71.5 MiB at 3840 x 2160, which leaves the backend 183.1 MiB of the 2 GiB budget (164.4
+  with the preset's bloom). The overlay was 32.5 MiB (backend 222.1 MiB) before the persistent telemetry raised
+  the HUD's caps from 15,360 to 33,792: most of it is the frame preparation each triangle is charged, twice.
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
@@ -438,6 +467,27 @@ presentation state, not scientific state.
   dropped input, a move in every third frame interval with none unmoved and every move but perhaps the last
   drawn, and ordered percentiles; and the world it closed on is the configuration stepped directly to its tick,
   digest for digest.
+- `tests/telemetry_binary.rs` (2 tests, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5 --timeline
+  T` on the preset at 32 x 32 with 384 founders that start above the birth threshold and pay 1.5 a second to live
+  (in one run: through tick 763, 24 births, 361 deaths and 127,235 evaluations, the population alive). Each
+  `telemetry` record equals the world stepped directly to its shown tick: the live count, parameters, quota bytes,
+  every tally count, the uptake and the ledger's terms bit for bit, the headroom by the `open` record's admission,
+  no fault and no capacity pause. Each `clock` record before one counts exactly the evaluations the telemetry
+  gained since the last, and the record's full evaluations a second are the clock's rate over the live count.
+  Every overlay T recorded has the telemetry lines of the direct world at its tick (the cadence line up to its
+  rate, which depends on the clock's window). The records' shown ticks never go back, and advance over the run.
+  - The same world with room for its 384 founders and no one more: its first birth pauses the run before it commits
+    (in one run at tick 74, with no birth before). The binary's one `ended` status says `capacity-paused` at the
+    tick the direct world pauses at; every `telemetry` record before it counts no capacity pause and every one
+    after it one (in that run, none before and two after), the last shows the paused tick with no births; every
+    overlay says `no capacity pause` or `1 capacity pause`, and the last says `1 capacity pause` and `paused`.
+  - Planted bugs, FL-024's telemetry, each run against the tests that should catch it (`tests/overlay.rs`,
+    `tests/clock.rs`, this file): the telemetry left out of the overlay, births written from deaths, headroom from
+    the genome share, full evaluations not divided by the live count, the clock's evaluations not differenced, the
+    summary's telemetry stale, the record's uptake taken from the injected energy, the binary reading no
+    evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
+    a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
+    was added, the first run's one survivor).
 - `src/main.rs` unit tests (6, FL-022, FL-024, FL-023): the parser takes `--timeline FILE` (offscreen too) and
   `--export FILE --out DIR` with or without `--export-fps`, and refuses `--export` without `--out`, `--out` or
   `--export-fps` alone, `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never
@@ -449,7 +499,7 @@ presentation state, not scientific state.
   with its last slot, not the frame's start, is shown by the pacing A/B below, not by a test); and
   the `submitted` record of each brush's stroke as JSON, exactly (the
   material's 32-component `direction`; absent fields null), the `finished` record of an applied command (tick,
-  published tick, energy) and of a cancelled one, and the `clock` record of a reading.
+  published tick, energy) and of a cancelled one, and the `clock` record of a reading, its evaluations included.
 - In frankentorch, `ft-kernel-metal`'s `tests/native_input.rs` (13 real-window cases) qualifies the bridge itself,
   backing density included.
 - In `flife-probes`, `native_input` (static, every host) and `native_window` (a real window, `flife-probe
@@ -562,6 +612,20 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   - The Studio's session is volatile (`flife_runtime::open`): its commands are not journaled, so nothing a brush
     does survives the process. FL-023's timeline records what was presented and the commands applied, so a
     replay reaches the same world; it is not a journal, and no session resumes from it.
+- FL-024, plan §14.1's telemetry:
+  - The v1 schema configures no scientific rate (the Studio runs as fast as it can), so the telemetry shows the
+    achieved ticks a second and no configured one.
+  - The Studio's session is volatile and keeps no run directory, so its checkpoint line always reads `no
+    checkpoint`; the line takes a durable checkpoint's tick when one exists (FL-038).
+  - `pause-before-commit` is the only capacity policy, so a capacity rejection pauses the run; the binary counts
+    the capacity pauses its session reports (a run's end, or a held step, for a shortfall) and marks the world
+    paused when the current run ends. The crowded offscreen run exercises a run's end; a held step's shortfall
+    (a step taken while paused) is not exercised through the binary.
+  - Full evaluations a second are the evaluations over the clock's window divided by the shown epoch's live count
+    at its end, not a sum of each tick's evaluations over that tick's population.
+  - Rejected births (every mutation candidate rejected) are in the record, not the overlay.
+  - The telemetry is the shown epoch's when the overlay last changed, up to a second old while running, as the
+    tick is. In a window it is unrun: no test here opened one.
 - FL-024: the binary's `clock` records and overlay run offscreen in `tests/offscreen_binary.rs`, which checks the
   records' frames but neither their rates nor the overlay's pixels, and in a window, which no test here opened.
   `tests/offscreen.rs` draws the colour key through the Metal route; the meter, the record's JSON, the overlay's

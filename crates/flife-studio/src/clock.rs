@@ -6,8 +6,9 @@
 //! display draws the latest committed world at its own rate, and a slow
 //! world is reported slow, never stretched. A [`ClockMeter`] reads them
 //! over windows of wall time: how far the session's committed tick (the
-//! newest epoch in the render feed) and the presented frames advanced, and
-//! how far the shown epoch lags the committed one.
+//! newest epoch in the render feed) and the presented frames advanced, how
+//! far the shown epoch lags the committed one, and how many controller
+//! evaluations the shown epoch's tally gained (plan §14.1).
 
 use std::time::Instant;
 
@@ -36,6 +37,12 @@ pub struct ClockReading {
     /// How many ticks the shown epoch is behind the committed one: the
     /// display's backlog.
     pub behind: Option<u64>,
+    /// Controller evaluations in it: how far the shown epoch's count
+    /// ([`flife_render::Tally::evaluations`]) advanced; `None` unless both
+    /// ends had one.
+    pub evaluations: Option<u64>,
+    /// Controller evaluations per wall second.
+    pub evaluations_per_second: Option<f64>,
 }
 
 /// Where a window opened.
@@ -44,6 +51,7 @@ struct Mark {
     at: Instant,
     committed: Tick,
     presented: u64,
+    evaluated: Option<u64>,
 }
 
 /// Reads the clocks over successive windows.
@@ -61,22 +69,25 @@ impl ClockMeter {
     }
 
     /// Read at `now`, with the session's newest committed tick
-    /// `committed`, `presented` frames presented so far and the shown
-    /// epoch's tick. The first read opens a window and returns `None`;
-    /// each later one closes the window since the previous read into a
-    /// reading and opens the next. A read no later than the window's start
-    /// returns `None` and keeps the window open.
+    /// `committed`, `presented` frames presented so far, the shown epoch's
+    /// tick and the controller evaluations its tally counts, if it has one.
+    /// The first read opens a window and returns `None`; each later one
+    /// closes the window since the previous read into a reading and opens
+    /// the next. A read no later than the window's start returns `None` and
+    /// keeps the window open.
     pub fn read(
         &mut self,
         now: Instant,
         committed: Tick,
         presented: u64,
         shown: Option<Tick>,
+        evaluated: Option<u64>,
     ) -> Option<ClockReading> {
         let mark = Mark {
             at: now,
             committed,
             presented,
+            evaluated,
         };
         let Some(opened) = self.opened else {
             self.opened = Some(mark);
@@ -90,6 +101,9 @@ impl ClockMeter {
         // Both counters only advance; a counter that went back reads zero.
         let ticks = committed.get().saturating_sub(opened.committed.get());
         let frames = presented.saturating_sub(opened.presented);
+        let evaluations = evaluated
+            .zip(opened.evaluated)
+            .map(|(now, then)| now.saturating_sub(then));
         Some(ClockReading {
             wall_seconds,
             ticks,
@@ -100,6 +114,8 @@ impl ClockMeter {
             committed,
             shown,
             behind: shown.map(|shown| committed.get().saturating_sub(shown.get())),
+            evaluations,
+            evaluations_per_second: evaluations.map(|count| count as f64 / wall_seconds),
         })
     }
 }

@@ -80,7 +80,9 @@ pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
     Surface,
 };
-pub use overlay::{Inspected, OverlayState, inspector_lines, legends, overlay_text};
+pub use overlay::{
+    Inspected, OverlayState, Telemetry, inspector_lines, legends, overlay_text, telemetry_lines,
+};
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{

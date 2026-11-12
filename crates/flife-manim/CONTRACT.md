@@ -236,8 +236,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     refusal). The result is a `HudText`: vertices in drawable pixels from the block's top-left, y down, each
     contour's range, and triangles.
   - A glyph whose outline cannot be read or triangulated is left out and counted (`refused`). The text stops at
-    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (15,360 each, a quarter as much again as the Studio's longest
-    overlay, its colour key and inspector panel included, at 2x: 11,832 and 11,434; at 3x it is still set whole),
+    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (33,792 each, a quarter as much again as the Studio's longest
+    overlay, its persistent telemetry (FL-024, plan §14.1), colour key and inspector panel included, at 2x, rounded
+    up to a multiple of 1,024: 26,371 and 25,501; at 3x it is still set whole),
     counting the glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
     (`HudText::reserved_bytes`).
   - `hud_scene_point(viewport, position)` is the camera's own map from a drawable position to the scene: the frame

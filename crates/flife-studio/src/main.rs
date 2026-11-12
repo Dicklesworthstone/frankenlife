@@ -56,12 +56,13 @@ use flife_backend_metal::ControllerChoice;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
+use flife_render::Metrics;
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ClockMeter, ClockReading, ColorMapping, End, ExportManifest, ExportOptions,
     FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState, Particles, STUDIO_SCHEMA, Status,
-    Stroke, Studio, StudioOptions, Style, Surface, TimelineRecord, legends, overlay_text,
-    write_timeline_record,
+    Stroke, Studio, StudioOptions, Style, Surface, Telemetry, TimelineRecord, legends,
+    overlay_text, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -381,6 +382,32 @@ enum Record<'a> {
         committed_tick: u64,
         shown_tick: Option<u64>,
         behind_ticks: Option<u64>,
+        evaluations: Option<u64>,
+        evaluations_per_second: Option<f64>,
+    },
+    /// Plan §14.1's persistent telemetry, from the shown epoch.
+    Telemetry {
+        schema: &'static str,
+        shown_tick: u64,
+        live: u64,
+        parameters: u64,
+        genome_logical_bytes: u64,
+        genome_allocated_bytes: u64,
+        headroom_bytes: u64,
+        counted_from_tick: Option<u64>,
+        births: Option<u64>,
+        introductions: Option<u64>,
+        deaths: Option<u64>,
+        evaluations: Option<u64>,
+        rejected_births: Option<u64>,
+        uptake: Option<f64>,
+        injected: f64,
+        removed: f64,
+        dissipated: f64,
+        residual: f64,
+        faulted: bool,
+        capacity_pauses: u64,
+        full_evaluations_per_second: Option<f64>,
     },
     Frame {
         schema: &'static str,
@@ -656,6 +683,7 @@ fn main() -> ExitCode {
             studio.committed().map_or(Tick::ZERO, |epoch| epoch.tick),
             studio.tally().drawn(),
             None,
+            evaluated(&studio),
         );
     }
     let mut selected = None;
@@ -665,6 +693,12 @@ fn main() -> ExitCode {
     let mut paused = None;
     let mut overlay_tick = None;
     let mut last_clock = None;
+    // The shown epoch's metrics when the overlay last changed (plan §14.1's
+    // telemetry), the current run, whose end leaves the world paused, and
+    // the capacity shortfalls reported.
+    let mut telemetry_metrics: Option<Metrics> = None;
+    let mut current_run = None;
+    let mut capacity_pauses = 0_u64;
     // The last inspection's answer and whom it was about (FL-021's panel).
     let mut inspected = None;
     // Every colour mapping's key (FL-019's legend).
@@ -707,20 +741,43 @@ fn main() -> ExitCode {
                 unmoved += 1;
             }
         }
+        let mut reported = false;
         for status in studio.take_statuses() {
             if timeline.is_some() {
                 noted.extend(TimelineRecord::status(&status));
             }
             match &status {
-                Status::Running { .. } => paused = Some(false),
+                Status::Running { run, .. } => {
+                    paused = Some(false);
+                    current_run = Some(*run);
+                }
                 Status::Paused { .. } => paused = Some(true),
+                // The current run's end leaves the world paused, however it
+                // ended; an earlier run's end can arrive after a later run
+                // started.
+                Status::Ended { run, why, .. } => {
+                    if current_run == Some(*run) {
+                        paused = Some(true);
+                    }
+                    if matches!(why, End::CapacityPaused { .. }) {
+                        capacity_pauses += 1;
+                    }
+                }
+                Status::StepHeld {
+                    why: End::CapacityPaused { .. },
+                    ..
+                } => capacity_pauses += 1,
                 Status::Inspected {
                     organism, snapshot, ..
                 } => inspected = Some((*organism, snapshot.clone())),
                 _ => {}
             }
             overlay_tick = frame.shown.map(|shown| shown.tick);
+            reported = true;
             print(&status_record(&status));
+        }
+        if reported {
+            telemetry_metrics = Some(*studio.display_pair().1.metrics());
         }
         if frame.restyled {
             let style = studio.view().style();
@@ -753,6 +810,7 @@ fn main() -> ExitCode {
         if summary.elapsed() >= Duration::from_secs(1) {
             summary = Instant::now();
             overlay_tick = frame.shown.map(|shown| shown.tick);
+            telemetry_metrics = Some(*studio.display_pair().1.metrics());
             let tally = studio.tally();
             let viewport = studio.view().viewport();
             print(&Record::Frame {
@@ -777,10 +835,19 @@ fn main() -> ExitCode {
                     studio.committed().map_or(Tick::ZERO, |epoch| epoch.tick),
                     tally.drawn(),
                     frame.shown.map(|shown| shown.tick),
+                    evaluated(&studio),
                 )
             {
                 print(&clock_record(&reading));
                 last_clock = Some(reading);
+            }
+            if let Some(metrics) = &telemetry_metrics {
+                print(&telemetry_record(
+                    metrics,
+                    last_clock.as_ref(),
+                    studio.memory(),
+                    capacity_pauses,
+                ));
             }
             // A running world moves on: read the selected organism again.
             if selected.is_some() && paused == Some(false) {
@@ -789,6 +856,9 @@ fn main() -> ExitCode {
         }
         if overlay_tick.is_none() {
             overlay_tick = frame.shown.map(|shown| shown.tick);
+        }
+        if telemetry_metrics.is_none() {
+            telemetry_metrics = Some(*studio.display_pair().1.metrics());
         }
         let mapping = studio.view().style().mapping;
         let Some(legend) = keys
@@ -810,6 +880,15 @@ fn main() -> ExitCode {
                 .as_ref()
                 .filter(|(organism, _)| selected == Some(*organism))
                 .map(|(_, snapshot)| snapshot.as_deref().map_or(Inspected::Gone, Inspected::Read)),
+            telemetry: telemetry_metrics.as_ref().map(|metrics| Telemetry {
+                metrics,
+                model: &model.model,
+                seed: model.seed,
+                evaluation_interval_ticks: model.controller.evaluation_interval_ticks,
+                memory: studio.memory(),
+                capacity_pauses,
+                checkpoint: None,
+            }),
         });
         if let Err(error) = studio.set_overlay(&text, &legend.swatches) {
             let code = fail(error.kind(), error.to_string(), 1);
@@ -1007,6 +1086,53 @@ fn clock_record(reading: &ClockReading) -> Record<'static> {
         committed_tick: reading.committed.get(),
         shown_tick: reading.shown.map(Tick::get),
         behind_ticks: reading.behind,
+        evaluations: reading.evaluations,
+        evaluations_per_second: reading.evaluations_per_second,
+    }
+}
+
+/// The shown epoch's controller evaluations, if its tally has them.
+fn evaluated(studio: &Studio) -> Option<u64> {
+    studio
+        .display_pair()
+        .1
+        .metrics()
+        .tally
+        .map(|tally| tally.evaluations)
+}
+
+fn telemetry_record(
+    metrics: &Metrics,
+    clock: Option<&ClockReading>,
+    memory: &MemoryAdmission,
+    capacity_pauses: u64,
+) -> Record<'static> {
+    let tally = metrics.tally;
+    Record::Telemetry {
+        schema: STUDIO_SCHEMA,
+        shown_tick: metrics.tick.get(),
+        live: metrics.live,
+        parameters: metrics.parameters,
+        genome_logical_bytes: metrics.genome_logical_bytes,
+        genome_allocated_bytes: metrics.genome_allocated_bytes,
+        headroom_bytes: memory.budget_bytes.saturating_sub(memory.peak_bytes),
+        counted_from_tick: tally.map(|tally| tally.since.get()),
+        births: tally.map(|tally| tally.births),
+        introductions: tally.map(|tally| tally.introductions),
+        deaths: tally.map(|tally| tally.deaths),
+        evaluations: tally.map(|tally| tally.evaluations),
+        rejected_births: tally.map(|tally| tally.rejected_births),
+        uptake: tally.map(|tally| tally.uptake),
+        injected: metrics.ledger.injected,
+        removed: metrics.ledger.removed,
+        dissipated: metrics.ledger.dissipated,
+        residual: metrics.ledger.residual,
+        faulted: metrics.faulted,
+        capacity_pauses,
+        full_evaluations_per_second: clock
+            .and_then(|clock| clock.evaluations_per_second)
+            .filter(|_| metrics.live > 0)
+            .map(|rate| rate / metrics.live as f64),
     }
 }
 
@@ -1271,6 +1397,8 @@ mod tests {
             committed: Tick::new(1_000),
             shown: Some(Tick::new(999)),
             behind: Some(1),
+            evaluations: Some(4_096),
+            evaluations_per_second: Some(3_276.8),
         };
         let record = serde_json::to_value(super::clock_record(&reading)).unwrap_or(Value::Null);
         assert_eq!(
@@ -1286,7 +1414,9 @@ mod tests {
                 "frames_per_second": 60.0,
                 "committed_tick": 1000,
                 "shown_tick": 999,
-                "behind_ticks": 1
+                "behind_ticks": 1,
+                "evaluations": 4096,
+                "evaluations_per_second": 3276.8
             })
         );
     }

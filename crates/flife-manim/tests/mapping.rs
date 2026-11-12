@@ -1230,3 +1230,30 @@ fn every_key_swatch_is_the_colour_its_mapping_gives_its_label() {
     assert_eq!(legend.swatches.len(), 9);
     assert_eq!(legend.swatches[8], legend.swatches[0]);
 }
+
+#[test]
+fn linear_bytes_are_the_srgb_transfer_bit_for_bit() {
+    // `linear` looks each byte up in a table decoded once. Every byte, in
+    // each channel beside other bytes, is the transfer's own value, and
+    // alpha is one.
+    let bits = |color: LinearRgba| [color.r, color.g, color.b, color.a].map(f64::to_bits);
+    let mut compared = 0;
+    for byte in 0..=u8::MAX {
+        for other in (0..=u8::MAX).step_by(5) {
+            for rgb in [
+                [byte, other, u8::MAX - other],
+                [other, byte, other / 2],
+                [u8::MAX - other, other / 3, byte],
+            ] {
+                let [r, g, b] = rgb;
+                assert_eq!(
+                    bits(linear(rgb)),
+                    bits(Srgb::from_rgb8(r, g, b).to_linear(1.0)),
+                    "{rgb:?}"
+                );
+                compared += 1;
+            }
+        }
+    }
+    assert_eq!(compared, 256 * 52 * 3);
+}

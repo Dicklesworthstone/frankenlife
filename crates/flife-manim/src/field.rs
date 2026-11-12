@@ -29,11 +29,11 @@
 
 use flife_core::CoreError;
 use flife_render::{COMPONENT_STEPS, FieldTexture};
-use fmn_core::color::{LinearRgba, Srgb};
+use fmn_core::color::LinearRgba;
 use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
 use crate::Viewport;
-use crate::mapping::{FieldMapping, Look, affinity_rgb8};
+use crate::mapping::{FieldMapping, Look, affinity_rgb8, linear};
 
 /// The field palette, dark to bright, as sRGB stops evenly spaced in the
 /// mapped value.
@@ -418,8 +418,7 @@ impl FieldLayer {
                     / 4.0;
                 let color = match (mapping, look) {
                     (FieldMapping::Energy, Look::Glow) => {
-                        let [r, g, b] = palette(display_value(mean as f32, scale));
-                        Srgb::from_rgb8(r, g, b).to_linear(1.0)
+                        linear(palette(display_value(mean as f32, scale)))
                     }
                     (FieldMapping::Energy, Look::Raw) => {
                         let grey = raw_value(mean as f32, scale);
@@ -437,10 +436,9 @@ impl FieldLayer {
                             Look::Glow => display_value(mean as f32, scale),
                             Look::Raw => raw_value(mean as f32, scale),
                         };
-                        let [r, g, b] = affinity_rgb8(corner_composition(
+                        let hue = linear(affinity_rgb8(corner_composition(
                             corners.map(|at| (values[at], composition[at])),
-                        ));
-                        let hue = Srgb::from_rgb8(r, g, b).to_linear(1.0);
+                        )));
                         LinearRgba {
                             r: hue.r * level,
                             g: hue.g * level,
@@ -456,10 +454,9 @@ impl FieldLayer {
                             Look::Raw => raw_value(mean as f32, scale),
                         };
                         let components = field.components();
-                        let [r, g, b] = component_rgb8(corner_component(
+                        let hue = linear(component_rgb8(corner_component(
                             corners.map(|at| (values[at], steps(&components[at]))),
-                        ));
-                        let hue = Srgb::from_rgb8(r, g, b).to_linear(1.0);
+                        )));
                         LinearRgba {
                             r: hue.r * level,
                             g: hue.g * level,

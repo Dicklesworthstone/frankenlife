@@ -25,6 +25,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use flife_core::registry::{self, Role};
 use flife_core::{CoreError, ValidatedConfig};
@@ -889,8 +890,29 @@ pub fn mapped_color(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) 
     linear(mapped_rgb8(mapping, traits, maximum_speed))
 }
 
-/// Opaque linear light from sRGB bytes.
+/// Opaque linear light from sRGB bytes: exactly
+/// `Srgb::from_rgb8(r, g, b).to_linear(1.0)`.
+///
+/// The transfer acts on each channel alone, so each byte's linear value is
+/// decoded once for the process and looked up, instead of a power per
+/// channel per call (a frame decodes a colour for every
+/// organism, and a field update one for every texel).
 #[must_use]
 pub fn linear([r, g, b]: [u8; 3]) -> LinearRgba {
-    Srgb::from_rgb8(r, g, b).to_linear(1.0)
+    let table = &*LINEAR_BYTES;
+    LinearRgba {
+        r: table[usize::from(r)],
+        g: table[usize::from(g)],
+        b: table[usize::from(b)],
+        a: 1.0,
+    }
 }
+
+/// Each sRGB byte's linear value, as [`Srgb::to_linear`] decodes it.
+static LINEAR_BYTES: LazyLock<[f64; 256]> = LazyLock::new(|| {
+    let mut table = [0.0; 256];
+    for byte in 0..=u8::MAX {
+        table[usize::from(byte)] = Srgb::from_rgb8(byte, 0, 0).to_linear(1.0).r;
+    }
+    table
+});

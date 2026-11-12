@@ -1509,7 +1509,24 @@ pub(crate) fn studio_view(
             .then_some(presentation.bloom_strength),
     )?;
     view.set_point_radius(presentation.point_radius_pixels)?;
+    view.set_preparation_threads(frame_preparation_threads());
     Ok(view)
+}
+
+/// The most threads the Studio compiles a frame's dots on (FL-033): the
+/// count measured against one, a 25,000-organism-sized job taking 0.742x
+/// the time on 8. The world steps on its own threads meanwhile.
+const FRAME_PREPARATION_THREADS: NonZeroUsize = match NonZeroUsize::new(8) {
+    Some(threads) => threads,
+    None => NonZeroUsize::MIN,
+};
+
+/// [`FRAME_PREPARATION_THREADS`], or this host's cores when fewer. No
+/// frame depends on it.
+fn frame_preparation_threads() -> NonZeroUsize {
+    std::thread::available_parallelism().map_or(NonZeroUsize::MIN, |cores| {
+        cores.min(FRAME_PREPARATION_THREADS)
+    })
 }
 
 /// Lay `text` out over `view` in `font` at [`HUD_TEXT_POINTS`] on its

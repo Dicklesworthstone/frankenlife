@@ -262,7 +262,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads', the
     ring's and a disc region's triangles, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
     (FrankenManim's `max_working_bytes`): a tile bin past it is left out, which only slows the frame, and rows past
-    it refuse the frame. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
+    it refuse the frame. `set_preparation_threads(threads)` (FL-033) has `job()` compile the frame's dots on up to
+    that many threads (FrankenManim's `ThreeDJob::new_with_threads`); one, the default, compiles them on the
+    calling thread, and no row, refusal or byte of the accounting depends on it. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
     make (FL-033: what FrankenManim's job holds beyond its preparation accounting, measured at 865 to 872 bytes a
     dot and 1,180 a quad), and that limit. `offline_bytes(threads)` is what
     `render_rgba8` adds: the RGBA16F and RGBA8 frames, each thread's tile scratch at the finest sampling, and
@@ -505,7 +507,10 @@ route.
   The outline mirrored top to bottom survives: it is equivalent, since a rectangle and a disc are symmetric about
   their centre and only the winding differs, which FrankenManim draws either way. The reserved bytes without the
   region's mesh survive: no test pins the reservation's total, and the measured heap stays well within it.
-- `tests/frame_bytes.rs` (2 tests, FL-043): over Appendix A worlds at 1,024 and 16,384 organisms (a ceiling of
+- `tests/frame_bytes.rs` (3 tests, FL-043 and FL-033): FL-033's compares a view of 4,096 organisms, every style, at
+  the fit and at 8x, with a selection's ring and a removal's disc: the job on 8 preparation threads equals the job on
+  one, every draw, bin and count as FrankenManim prints them and the preparation bytes, and in the points style
+  the rendered frame bit for bit. FL-043's run over Appendix A worlds at 1,024 and 16,384 organisms (a ceiling of
   16,384) and at a ceiling of 64, every style, 640 x 360 to 3840 x 2160, one and two pixels per point and zooms of
   1, 8 and 64, each with a selection's ring and a removal's disc, 216 frames: FrankenManim's own accounting of an unlimited preparation is within the view's limit
   (the fullest at 75.7%, and 32.6% at the ceiling of 64), so the limit leaves nothing out of them, and the job
@@ -564,7 +569,7 @@ route.
   overlay, the motion key's swatches and the inspector panel included, laid out twice and shown, and two zooms. Its
   peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `54b804dc`, CPU and Metal. A view shows one image of the torus at zoom 1 to
+**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `293d7fcd`, CPU and Metal. A view shows one image of the torus at zoom 1 to
 4,096.
 
 **Known gaps.**

@@ -205,3 +205,69 @@ fn the_limit_counts_the_ceiling_and_the_quads_and_the_texels_the_textures() {
             + limit
     );
 }
+
+/// FL-033: a frame whose dots are compiled on threads is the frame compiled
+/// on one. A view of 4,096 organisms draws a run of 8,192 halos and dots,
+/// long enough for FrankenManim to compile on worker threads. In every
+/// style, at the fit and at 8x, with a selection's ring and a removal's
+/// disc, the job on 8 threads must equal the job on the default one: every
+/// draw, bin and count as FrankenManim prints them, and the preparation
+/// bytes. In the points style the rendered frames must match bit for bit.
+#[test]
+fn a_frame_prepared_on_threads_is_the_frame_prepared_on_one() {
+    let config = common::config(&[
+        ("population", "initial_count", "4096"),
+        ("population", "maximum_count", "4096"),
+    ]);
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    let eight = std::num::NonZeroUsize::new(8).expect("eight");
+    let mut compared = 0;
+    for zoom in [1.0, 8.0] {
+        for (name, style) in styles() {
+            let mut view = WorldView::for_epoch(&epoch, [640, 360], [0, 0, 0]).expect("a view");
+            assert_eq!(view.preparation_threads(), std::num::NonZeroUsize::MIN);
+            view.set_style(style);
+            view.show(&epoch).expect("shows");
+            let first = flife_core::ids::OrganismId::new(epoch.ids()[0]);
+            assert_eq!(view.select(Some(first)).expect("selects"), Some(first));
+            let extent = epoch.extent();
+            let disc = flife_manim::Region {
+                shape: flife_manim::RegionShape::Disc {
+                    center: [extent[0] / 2.0, extent[1] / 2.0],
+                    radius: extent[0] / 16.0,
+                },
+                effect: flife_manim::RegionEffect::Removes,
+            };
+            assert!(view.set_region(Some(disc)).expect("a region"));
+            if zoom > 1.0 {
+                let viewport = view
+                    .viewport()
+                    .zoomed_about([0.37, 0.61], zoom)
+                    .expect("zooms");
+                view.set_view(viewport).expect("looks");
+                view.place(&epoch).expect("places");
+            }
+            // A job's record: everything it prints before it renders (its
+            // tile scratch then depends on the render's threads), its
+            // preparation bytes and, in the points style, its frame.
+            let record = |view: &WorldView| {
+                let job = view.job().expect("a job");
+                let printed = format!("{job:?}");
+                let frame =
+                    (name == "points").then(|| job.render(2).expect("a frame").as_bytes().to_vec());
+                (printed, job.preparation_bytes(), frame)
+            };
+            let one = record(&view);
+            view.set_preparation_threads(eight);
+            assert_eq!(view.preparation_threads(), eight);
+            let many = record(&view);
+            assert!(many.0 == one.0, "{name} at zoom {zoom}: the jobs differ");
+            assert_eq!(many.1, one.1, "{name} at zoom {zoom}");
+            assert_eq!(many.2.is_some(), name == "points");
+            assert!(many.2 == one.2, "{name} at zoom {zoom}: the frames differ");
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 2 * 4);
+}

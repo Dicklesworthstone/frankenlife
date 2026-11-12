@@ -1,6 +1,8 @@
 //! The live world as a FrankenManim view: one viewport, one camera, the
 //! field, one particle cloud and its density layer, drawn in one [`Style`].
 
+use std::num::NonZeroUsize;
+
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
@@ -155,6 +157,8 @@ pub struct WorldView {
     overlay: bool,
     /// The text drawn, with its meshes at the viewport.
     hud: Option<Hud>,
+    /// The threads [`WorldView::job`] compiles the frame's dots on (FL-033).
+    preparation_threads: NonZeroUsize,
 }
 
 /// Text over the world and its meshes at the view's viewport (FL-024).
@@ -244,6 +248,7 @@ impl WorldView {
             bloom: None,
             overlay: false,
             hud: None,
+            preparation_threads: NonZeroUsize::MIN,
         })
     }
 
@@ -387,6 +392,21 @@ impl WorldView {
             .transpose()?;
         self.bloom_strength = strength;
         Ok(())
+    }
+
+    /// Compile the frame's dots on up to `threads` threads from the next
+    /// [`WorldView::job`] (FL-033); one, the default, compiles them on the
+    /// calling thread. No row depends on it: FrankenManim's
+    /// `ThreeDJob::new_with_threads` gives the rows, any refusal and the
+    /// preparation accounting of its one-thread compile.
+    pub fn set_preparation_threads(&mut self, threads: NonZeroUsize) {
+        self.preparation_threads = threads;
+    }
+
+    /// The threads [`WorldView::job`] compiles the frame's dots on.
+    #[must_use]
+    pub const fn preparation_threads(&self) -> NonZeroUsize {
+        self.preparation_threads
     }
 
     /// Draw each dot at least `points` in radius on screen, in points like
@@ -871,7 +891,8 @@ impl WorldView {
     }
 
     /// The 3D job for the current frame, over [`WorldView::draws`],
-    /// compiled within [`WorldView::preparation_limit`] (FL-043), with
+    /// compiled within [`WorldView::preparation_limit`] (FL-043) on
+    /// [`WorldView::preparation_threads`] (FL-033), with
     /// [`WorldView::frame_bloom`] (FL-019).
     /// FrankenManim leaves out a tile bin that would pass it, which only
     /// slows the frame; rows that would pass it refuse the frame.
@@ -885,12 +906,17 @@ impl WorldView {
             max_working_bytes: self.preparation_limit(),
             ..ThreeDPreparationLimits::default()
         };
-        let job =
-            ThreeDJob::new_with_limits(self.camera.camera(), &draws, Tiling::default(), limits)
-                .map_err(|error| CoreError::NumericalInvalid {
-                    quantity: "world view frame",
-                    detail: error.to_string(),
-                })?;
+        let job = ThreeDJob::new_with_threads(
+            self.camera.camera(),
+            &draws,
+            Tiling::default(),
+            limits,
+            self.preparation_threads.get(),
+        )
+        .map_err(|error| CoreError::NumericalInvalid {
+            quantity: "world view frame",
+            detail: error.to_string(),
+        })?;
         Ok(match self.frame_bloom() {
             Some(bloom) => job.with_bloom(bloom.clone()),
             None => job,

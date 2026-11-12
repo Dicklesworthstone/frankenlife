@@ -62,7 +62,7 @@ mod timeline;
 
 pub use brush::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Preview, Stroke, Supplies,
-    cell_region, material_for, preview, preview_region, stroke,
+    cell_region, drawing, drawn, material_for, preview, preview_region, stroke,
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{

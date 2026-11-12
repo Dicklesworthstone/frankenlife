@@ -27,8 +27,8 @@ use flife_manim::{HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionShape, hu
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_I, KEY_M, KEY_PERIOD,
-    KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, PICK_RADIUS_POINTS, Preview, Status, Studio,
-    StudioOptions, Supplies, Surface, cell_region, legends, material_for, preview_region,
+    KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, PICK_RADIUS_POINTS, Preview, Status, Stroke, Studio,
+    StudioOptions, Supplies, Surface, cell_region, drawn, legends, material_for, preview_region,
     scroll_zoom, stroke,
 };
 use fmn_render::metal::{
@@ -872,6 +872,193 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
     }
     let tally = studio.tally();
     assert_eq!((tally.strokes, tally.unstroked), (2, 0));
+    let closed = studio.close().expect("closes");
+    assert_eq!(closed.session.boundary.tick, Tick::new(1));
+    assert_eq!(closed.session.world.digest(), direct.digest());
+}
+
+/// FL-022 (plan §2.2: "draw an intervention region, remove part of a
+/// colony"): with the removal brush armed, a drag draws its disk and pans
+/// nothing. Each frame's preview and outlined region are the disk a
+/// release there would apply, centred where the press went down, and the
+/// release submits exactly that disk. Paused at tick 0, it applies at the
+/// next step: the world stepped directly with the same removal removes
+/// the same energy, bit for bit, and organisms the frame showed inside the
+/// disk, and the Studio closes on that world. A drag pressed off the world
+/// draws and submits nothing.
+#[test]
+fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let config = config();
+    let mut studio = Studio::open(&config, &options(false)).expect("opens offscreen");
+    studio.frame().expect("the first frame");
+    let density = f64::from(SCALE);
+    let logical = SIZE.map(f64::from);
+    let viewport = *studio.view().viewport();
+    let extent = viewport.extent();
+    let button = |studio: &mut Studio, pressed: bool, at: [f64; 2]| {
+        studio
+            .post_input(InputEvent::Button {
+                button: PointerButton::Primary,
+                pressed,
+                position: point(at),
+                clicks: 1,
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    };
+    let drag = |studio: &mut Studio, at: [f64; 2]| {
+        studio
+            .post_input(InputEvent::PointerMoved {
+                position: point(at),
+                buttons: ButtonSet::EMPTY.with(PointerButton::Primary),
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    };
+    tap(&mut studio, KEY_X, "x");
+
+    // Pressed in the letterbox margin: no disk, nothing outlined, and the
+    // release makes no stroke.
+    button(&mut studio, true, [5.0, 100.0]);
+    drag(&mut studio, [40.0, 100.0]);
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.preview, Some(Preview::Drawn { stroke: None }));
+    assert_eq!(studio.view().region(), None);
+    button(&mut studio, false, [40.0, 100.0]);
+    studio.frame().expect("a frame");
+    assert_eq!(studio.tally().unstroked, 1);
+
+    // Drawn out from the shown organism nearest the centre.
+    let rows: Vec<(u64, [f64; 2])> = studio.view().shown_rows().collect();
+    let middle = [logical[0] * density / 2.0, logical[1] * density / 2.0];
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let spot = rows
+        .iter()
+        .map(|&(_, position)| viewport.world_to_drawable(position))
+        .min_by(|a, b| distance(*a, middle).total_cmp(&distance(*b, middle)))
+        .expect("organisms are shown");
+    let centre = [spot[0] / density, spot[1] / density];
+    button(&mut studio, true, centre);
+    let edges = [
+        [centre[0] + 9.0, centre[1]],
+        [centre[0] + 18.0, centre[1] + 12.0],
+    ];
+    for edge in edges {
+        drag(&mut studio, edge);
+        let frame = studio.frame().expect("a frame");
+        let expected = drawn(&viewport, logical, centre, edge).expect("a disk");
+        assert_eq!(
+            frame.preview,
+            Some(Preview::Drawn {
+                stroke: Some(expected)
+            })
+        );
+        let outlined = studio.view().region().expect("an outlined disk");
+        assert_eq!(
+            Some(outlined),
+            preview_region(frame.preview.as_ref().expect("a preview"))
+        );
+        assert!(outlined.removes);
+        assert_eq!(
+            *studio.view().viewport(),
+            viewport,
+            "a drawing pans nothing"
+        );
+    }
+    let made = drawn(&viewport, logical, centre, edges[1]).expect("a disk");
+    let Stroke::Removal { center, radius } = made else {
+        panic!("{made:?}");
+    };
+    button(&mut studio, false, edges[1]);
+
+    // The organisms the frame showed inside the disk, and on its edge, on
+    // the torus.
+    let apart = |a: [f64; 2]| {
+        let [dx, dy] = [0, 1].map(|axis| {
+            let d = (a[axis] - center[axis]).abs() % extent[axis];
+            d.min(extent[axis] - d)
+        });
+        dx.hypot(dy)
+    };
+    let inside = rows
+        .iter()
+        .filter(|&&(_, at)| apart(at) < radius * (1.0 - 1e-4))
+        .count();
+    let reached = rows
+        .iter()
+        .filter(|&&(_, at)| apart(at) <= radius * (1.0 + 1e-4))
+        .count();
+    assert!(inside >= 1, "the organism pressed on is inside");
+
+    let mut submitted = None;
+    until(&mut studio, "the submission", |_, statuses| {
+        submitted = statuses.iter().find_map(|status| match status {
+            Status::Submitted {
+                command,
+                stroke,
+                seen,
+                effective,
+            } => Some((*command, *stroke, *seen, *effective)),
+            _ => None,
+        });
+        submitted.is_some()
+    });
+    assert_eq!(
+        submitted,
+        Some((CommandId::new(1), made, Tick::ZERO, Tick::ZERO))
+    );
+
+    // One step: it applies at the boundary of tick 0.
+    tap(&mut studio, KEY_PERIOD, ".");
+    let mut applied = None;
+    until(&mut studio, "the outcome", |_, statuses| {
+        applied = statuses.iter().find_map(|status| match status {
+            Status::Finished {
+                outcome:
+                    Outcome::Applied {
+                        tick,
+                        published,
+                        applied,
+                        ..
+                    },
+                ..
+            } => Some((*tick, *published, *applied)),
+            _ => None,
+        });
+        applied.is_some()
+    });
+    let mut direct = World::found(
+        &config,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("founds");
+    let report = match direct.step_with(&[made.intervention()]).expect("steps") {
+        Stepped::Published(report) => report,
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    };
+    let [removal] = report.interventions.as_slice() else {
+        panic!("{:?}", report.interventions);
+    };
+    let (tick, published, energy) = applied.expect("applied");
+    assert_eq!((tick, published), (Tick::ZERO, Tick::new(1)));
+    assert_eq!(energy.to_bits(), removal.applied.to_bits());
+    assert!(energy > 0.0);
+    let removed = usize::try_from(removal.removed).expect("a count");
+    println!(
+        "a disk of {radius} world units removed {removed} organisms ({inside} to {reached} shown \
+         in it), {energy} energy"
+    );
+    assert!(
+        (inside..=reached).contains(&removed),
+        "{removed} removed, {inside} to {reached} shown in the disk"
+    );
+    let tally = studio.tally();
+    assert_eq!((tally.strokes, tally.unstroked), (1, 1));
     let closed = studio.close().expect("closes");
     assert_eq!(closed.session.boundary.tick, Tick::new(1));
     assert_eq!(closed.session.world.digest(), direct.digest());

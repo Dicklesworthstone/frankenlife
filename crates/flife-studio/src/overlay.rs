@@ -107,8 +107,9 @@ pub struct Telemetry<'a> {
     pub checkpoint: Option<Tick>,
 }
 
-/// What a click of the armed brush at the pointer would do, as the overlay
-/// says it (FL-022, plan §14.3).
+/// What a click of the armed brush at the pointer would do, or a release
+/// of the removal disk being drawn, as the overlay says it (FL-022, plan
+/// §14.3).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BrushPreview {
     /// The host's preview ([`crate::preview`]).
@@ -346,7 +347,11 @@ fn bytes(value: u64) -> String {
 ///   pointer: 50% of their energy to the field, the rest dissipated, none
 ///   out of the world`;
 /// - `a click does nothing: the pointer is off the world`, or `…: select
-///   an organism for its material`.
+///   an organism for its material`;
+/// - while the removal brush's disk is being drawn, what its release
+///   would do: `a release removes the organisms within 4.56 world units of
+///   the press: …`, or `a release does nothing: the press was off the
+///   world`.
 ///
 /// A cell's bounds have three significant figures of its width, and a
 /// radius three of its own; from 100,000 a figure is in scientific
@@ -373,40 +378,50 @@ pub fn preview_line(preview: &BrushPreview) -> String {
             None => at,
         }
     };
-    match preview.preview {
-        Preview::Stroke { stroke, region } => match stroke {
-            Stroke::Energy { cell, amount } => format!(
-                "a click adds {} energy to {}",
-                decimal(amount, 1),
-                place(cell, region)
-            ),
-            Stroke::Material { cell, amount, .. } => format!(
-                "a click adds {} energy of the selected organism's material to {}",
-                decimal(amount, 1),
-                place(cell, region)
-            ),
-            Stroke::Introduction {
-                cell,
-                count,
-                energy,
-            } => format!(
-                "a click adds {} organisms of {} energy, {} in all, to {}",
-                grouped(u64::from(count)),
-                decimal(energy, 2),
-                decimal(f64::from(count) * energy, 1),
-                place(cell, region)
-            ),
-            Stroke::Removal { radius, .. } => format!(
-                "a click removes the organisms within {} world units of the pointer: {}% of \
-                 their energy to the field, the rest dissipated, none out of the world",
-                decimal(radius, places(radius)),
-                decimal(preview.recycle_fraction * 100.0, 0)
-            ),
-        },
-        Preview::OffWorld => "a click does nothing: the pointer is off the world".to_owned(),
-        Preview::NoMaterial => {
-            "a click does nothing: select an organism for its material".to_owned()
+    // A click acts at the pointer; a drawn disk's release, about the press.
+    let (stroke, region, gesture, about) = match preview.preview {
+        Preview::Stroke { stroke, region } => (stroke, region, "a click", "the pointer"),
+        Preview::Drawn {
+            stroke: Some(stroke),
+        } => (stroke, None, "a release", "the press"),
+        Preview::Drawn { stroke: None } => {
+            return "a release does nothing: the press was off the world".to_owned();
         }
+        Preview::OffWorld => {
+            return "a click does nothing: the pointer is off the world".to_owned();
+        }
+        Preview::NoMaterial => {
+            return "a click does nothing: select an organism for its material".to_owned();
+        }
+    };
+    match stroke {
+        Stroke::Energy { cell, amount } => format!(
+            "{gesture} adds {} energy to {}",
+            decimal(amount, 1),
+            place(cell, region)
+        ),
+        Stroke::Material { cell, amount, .. } => format!(
+            "{gesture} adds {} energy of the selected organism's material to {}",
+            decimal(amount, 1),
+            place(cell, region)
+        ),
+        Stroke::Introduction {
+            cell,
+            count,
+            energy,
+        } => format!(
+            "{gesture} adds {} organisms of {} energy, {} in all, to {}",
+            grouped(u64::from(count)),
+            decimal(energy, 2),
+            decimal(f64::from(count) * energy, 1),
+            place(cell, region)
+        ),
+        Stroke::Removal { radius, .. } => format!(
+            "{gesture} removes the organisms within {} world units of {about}: {}% of their \
+             energy to the field, the rest dissipated, none out of the world",
+            decimal(radius, places(radius)),
+            decimal(preview.recycle_fraction * 100.0, 0)
+        ),
     }
 }
 

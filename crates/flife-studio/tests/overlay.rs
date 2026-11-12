@@ -181,6 +181,20 @@ fn widest_preview(brush: Brush) -> BrushPreview {
     }
 }
 
+/// The widest preview of the removal brush's disk being drawn: the finest
+/// radius.
+fn widest_drawing() -> BrushPreview {
+    BrushPreview {
+        preview: Preview::Drawn {
+            stroke: Some(Stroke::Removal {
+                center: [0.0; 2],
+                radius: 1.0e-7,
+            }),
+        },
+        recycle_fraction: 0.999,
+    }
+}
+
 /// The run's key for `mapping`.
 fn key(mapping: ColorMapping) -> Legend {
     legends(&config())
@@ -1210,16 +1224,21 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         })
         .expect("a field key");
     println!("the widest field key: {}", field.text);
-    let brushes = [
+    // Each brush's widest click, and the widest removal disk being drawn.
+    let previews: Vec<(Brush, BrushPreview)> = [
         Brush::Energy,
         Brush::Removal,
         Brush::Material,
         Brush::Introduction,
-    ];
+    ]
+    .into_iter()
+    .map(|brush| (brush, widest_preview(brush)))
+    .chain([(Brush::Removal, widest_drawing())])
+    .collect();
     let mut most = (0, 0);
-    for ((mapping, legend), brush) in keys
+    for ((mapping, legend), (brush, preview)) in keys
         .iter()
-        .flat_map(|key| brushes.iter().map(move |brush| (key, *brush)))
+        .flat_map(|key| previews.iter().map(move |pair| (key, *pair)))
     {
         let text = overlay_text(&OverlayState {
             paused: Some(false),
@@ -1229,7 +1248,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
             legend,
             field_key: Some(&field),
             brush: Some(brush),
-            preview: Some(widest_preview(brush)),
+            preview: Some(preview),
             selected: Some(OrganismId::new(999_999_999_999)),
             inspected: Some(Inspected::Read(&longest)),
             telemetry: Some(Telemetry {
@@ -1287,9 +1306,10 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
     println!("the longest: {} vertices, {} triangles", most.0, most.1);
 }
 
-/// A brush's preview (plan §14.3): what a click adds or removes, in the
-/// model's energy units, and the region it affects, in world units, with
-/// figures to the scale of the cell or the radius.
+/// A brush's preview (plan §14.3): what a click adds or removes, or the
+/// release of a removal disk being drawn, in the model's energy units, and
+/// the region it affects, in world units, with figures to the scale of the
+/// cell or the radius.
 #[test]
 fn a_preview_says_what_a_click_does() {
     let preview = |preview| BrushPreview {
@@ -1379,6 +1399,21 @@ fn a_preview_says_what_a_click_does() {
     assert_eq!(
         preview_line(&preview(Preview::NoMaterial)),
         "a click does nothing: select an organism for its material"
+    );
+    // A removal disk being drawn: what its release does, about the press.
+    assert_eq!(
+        preview_line(&preview(Preview::Drawn {
+            stroke: Some(Stroke::Removal {
+                center: [16.4, 12.0],
+                radius: 4.567_8
+            })
+        })),
+        "a release removes the organisms within 4.57 world units of the press: 50% of their \
+         energy to the field, the rest dissipated, none out of the world"
+    );
+    assert_eq!(
+        preview_line(&preview(Preview::Drawn { stroke: None })),
+        "a release does nothing: the press was off the world"
     );
     // In the overlay: after the brush and the selection.
     let energy = key(ColorMapping::Energy);

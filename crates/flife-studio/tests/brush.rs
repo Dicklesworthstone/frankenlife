@@ -28,8 +28,8 @@ use flife_manim::{Region, RegionShape, Viewport};
 use flife_runtime::Outcome;
 use flife_studio::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL, Preview,
-    SessionThread, Status, Stroke, Supplies, cell_region, material_for, preview, preview_region,
-    stroke,
+    SessionThread, Status, Stroke, Supplies, cell_region, drawing, drawn, material_for, preview,
+    preview_region, stroke,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -407,6 +407,96 @@ fn a_removal_click_is_a_disk_of_fixed_screen_radius() {
         None,
         "the margin"
     );
+}
+
+/// A drag of the removal brush draws a disk about the world point under its
+/// press whose radius is the drag's length on screen, in any direction:
+/// the world distance from the press to the point that far to its right,
+/// at any zoom, and for a drag of [`BRUSH_RADIUS_POINTS`] exactly a
+/// click's disk there. It is at most half the shorter world side, and the
+/// release may be anywhere; a press in the margin, a drag of no length and
+/// a nonfinite one draw nothing. While drawn, its preview is that disk,
+/// outlined as a click's is.
+#[test]
+fn a_removal_drag_draws_a_disk_of_its_length() {
+    let extent = [32.0, 32.0];
+    let logical = [800.0, 600.0];
+    let fit = Viewport::fit(extent, [1600, 1200]).expect("fits");
+    let at = [380.0, 290.0];
+    for zoom in [1.0, 4.0, 13.5] {
+        let viewport = fit.with_view([12.0, 9.0], zoom).expect("views");
+        let world = viewport.logical_to_world(at, logical).expect("inside");
+        for (length, [dx, dy]) in [(30.0, [0.6, 0.8]), (57.5, [-1.0, 0.0]), (5.0, [0.0, -1.0])] {
+            let edge = [at[0] + length * dx, at[1] + length * dy];
+            let Some(Stroke::Removal { center, radius }) = drawn(&viewport, logical, at, edge)
+            else {
+                panic!("no disk at zoom {zoom}, length {length}");
+            };
+            assert_eq!(center, world);
+            let right = viewport
+                .logical_to_world([at[0] + length, at[1]], logical)
+                .expect("inside");
+            assert!(right[0] > world[0], "no seam between them");
+            let screen = right[0] - world[0];
+            assert!(
+                (radius - screen).abs() <= 1e-12 * screen,
+                "zoom {zoom}, length {length}: {radius} vs {screen}"
+            );
+            // Its preview while drawn, and the region outlined.
+            let shown = drawing(&viewport, Some(logical), at, Some(edge));
+            assert_eq!(
+                shown,
+                Preview::Drawn {
+                    stroke: Some(Stroke::Removal { center, radius })
+                }
+            );
+            assert_eq!(
+                preview_region(&shown),
+                Some(Region {
+                    shape: RegionShape::Disc { center, radius },
+                    removes: true
+                })
+            );
+        }
+        assert_eq!(
+            drawn(&viewport, logical, at, [at[0], at[1] + BRUSH_RADIUS_POINTS]),
+            stroke(Brush::Removal, &viewport, logical, [32, 32], at, &NONE),
+            "zoom {zoom}"
+        );
+    }
+
+    // A 16-point window shows 32 world units: a 12-point drag is 24 units,
+    // held to 16, released off the window.
+    let tiny = Viewport::fit(extent, [32, 32]).expect("fits");
+    assert_eq!(
+        drawn(&tiny, [16.0, 16.0], [8.0, 8.0], [8.0, 20.0]),
+        Some(Stroke::Removal {
+            center: tiny
+                .logical_to_world([8.0, 8.0], [16.0, 16.0])
+                .expect("inside"),
+            radius: 16.0
+        })
+    );
+    let margin = [10.0, 300.0];
+    assert_eq!(
+        drawn(&fit, logical, margin, [60.0, 300.0]),
+        None,
+        "the margin"
+    );
+    assert_eq!(drawn(&fit, logical, at, at), None, "no length");
+    for edge in [[f64::NAN, at[1]], [f64::INFINITY, at[1]]] {
+        assert_eq!(drawn(&fit, logical, at, edge), None, "{edge:?}");
+    }
+    // Pressed in the margin, or with no content area or pointer, the
+    // preview names no disk and outlines nothing.
+    for shown in [
+        drawing(&fit, Some(logical), margin, Some([60.0, 300.0])),
+        drawing(&fit, None, at, Some([400.0, 300.0])),
+        drawing(&fit, Some(logical), at, None),
+    ] {
+        assert_eq!(shown, Preview::Drawn { stroke: None });
+        assert_eq!(preview_region(&shown), None);
+    }
 }
 
 /// The material and introduction brushes name the cell the energy brush

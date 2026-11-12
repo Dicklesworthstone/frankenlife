@@ -9,13 +9,14 @@
 //! click of an armed [`Brush`] is a [`CameraMove::Brush`], which the
 //! presentation owner maps through its viewport to a world-space
 //! [`Stroke`](crate::Stroke) and offers the session as
-//! [`Intent::Intervene`] (FL-022).
+//! [`Intent::Intervene`] (FL-022). A drag of the armed removal brush is a
+//! [`CameraMove::Drawn`], the disk it drew, mapped the same way.
 //!
 //! Pointer gestures:
 //!
 //! | Gesture | Move |
 //! |---|---|
-//! | primary drag (beyond [`CLICK_SLOP_POINTS`]) | pan: the world follows the pointer |
+//! | primary drag (beyond [`CLICK_SLOP_POINTS`]) | pan: the world follows the pointer; with the removal brush armed, draw its disk instead, centred where the press went down, out to where it is released |
 //! | primary click (press and release within the slop) | select what is drawn under the press, or with a brush armed, brush there |
 //! | vertical scroll | zoom about the pointer by [`scroll_zoom`]; up zooms in |
 //!
@@ -153,6 +154,15 @@ pub enum CameraMove {
         /// The brush armed then.
         brush: Brush,
     },
+    /// Apply the removal brush's disk drawn by a drag (FL-022, plan §2.2's
+    /// "draw an intervention region"): centred under the logical point
+    /// `center`, its radius on screen the drag's length.
+    Drawn {
+        /// Where the drag pressed.
+        center: LogicalPoint,
+        /// Where it was released: on the disk's edge.
+        edge: LogicalPoint,
+    },
     /// Dump the selected organism's whole controller (FL-021, plan §14.2's
     /// on-demand weight dump): the presentation owner asks the session for
     /// whatever is selected when it takes the move.
@@ -251,6 +261,9 @@ pub struct Controls {
     press: Option<LogicalPoint>,
     /// Whether the held press has moved beyond the click slop.
     dragging: bool,
+    /// Whether that drag draws the removal brush's disk rather than
+    /// panning: the brush was armed when it left the slop.
+    drawing: bool,
     moves: Vec<CameraMove>,
     /// The armed brush: a click brushes instead of selecting.
     brush: Option<Brush>,
@@ -389,6 +402,7 @@ impl Controls {
                 // A lost press is neither a click nor the rest of a drag.
                 self.press = None;
                 self.dragging = false;
+                self.drawing = false;
                 None
             }
             InputEvent::Resized(metrics) => {
@@ -405,20 +419,27 @@ impl Controls {
     }
 
     /// The primary button went down (start a press) or up (a press that
-    /// never left the slop is a click).
+    /// never left the slop is a click; a drag drawing the removal brush's
+    /// disk applies it, if that brush is still armed).
     fn press_or_release(&mut self, pressed: bool, position: LogicalPoint) {
+        let drawing = std::mem::take(&mut self.drawing);
         if pressed {
             self.press = Some(position);
             self.dragging = false;
             return;
         }
-        if let Some(at) = self.press.take()
-            && !self.dragging
-        {
-            self.push(match self.brush {
-                Some(brush) => CameraMove::Brush { at, brush },
-                None => CameraMove::Select { at },
-            });
+        if let Some(at) = self.press.take() {
+            if !self.dragging {
+                self.push(match self.brush {
+                    Some(brush) => CameraMove::Brush { at, brush },
+                    None => CameraMove::Select { at },
+                });
+            } else if drawing && self.brush == Some(Brush::Removal) {
+                self.push(CameraMove::Drawn {
+                    center: at,
+                    edge: position,
+                });
+            }
         }
         self.dragging = false;
     }
@@ -440,12 +461,13 @@ impl Controls {
 
     /// Pointer motion while the primary press is held: once beyond the
     /// slop it is a drag, panning by the whole motion since the press and
-    /// then by each move.
+    /// then by each move. With the removal brush armed as it leaves the
+    /// slop, it draws that brush's disk instead and pans nothing.
     fn drag(&mut self, position: LogicalPoint, last: Option<LogicalPoint>) {
         let Some(press) = self.press else {
             return;
         };
-        if !self.buttons.contains(PointerButton::Primary) {
+        if !self.buttons.contains(PointerButton::Primary) || self.drawing {
             return;
         }
         let from = if self.dragging {
@@ -459,6 +481,10 @@ impl Controls {
                 return;
             }
             self.dragging = true;
+            if self.brush == Some(Brush::Removal) {
+                self.drawing = true;
+                return;
+            }
             press
         };
         let delta = [position.x - from.x, position.y - from.y];
@@ -494,6 +520,17 @@ impl Controls {
     #[must_use]
     pub const fn dragging(&self) -> bool {
         self.dragging
+    }
+
+    /// Where the drag drawing the removal brush's disk pressed, its
+    /// centre, while it is held and the brush is still armed: a release
+    /// then applies it ([`CameraMove::Drawn`]).
+    #[must_use]
+    pub const fn drawing(&self) -> Option<LogicalPoint> {
+        match (self.drawing, self.brush) {
+            (true, Some(Brush::Removal)) => self.press,
+            _ => None,
+        }
     }
 
     /// A style key's change, if `code` is one.

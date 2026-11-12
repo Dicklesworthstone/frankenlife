@@ -105,6 +105,10 @@ directory, with its pending commands and its checkpoint chain.
     for a poll's events):
     - a primary press that moves more than `CLICK_SLOP_POINTS = 4` is a drag: `Pan` by the whole motion since the
       press, then by each move, so the pans sum to the pointer's motion;
+    - with the removal brush armed as the press leaves the slop, the drag draws that brush's disk instead and pans
+      nothing (FL-022, plan §2.2's "draw an intervention region"): `drawing()` is its centre, the press, while it is
+      held and the brush still armed, and the release is `Drawn { center, edge }`, the press and the release. A
+      release with the brush disarmed or switched makes no move; a drag that left the slop panning keeps panning;
     - a primary press released within the slop is a click: `Select { at }` at the press, or with a brush armed at
       the release, `Brush { at, brush }` (FL-022);
     - capture loss ends a press: no click, no more panning;
@@ -183,7 +187,15 @@ directory, with its pending commands and its checkpoint chain.
   brush, does not change the overlay's text and lay it out again. `preview_region(preview)` is the region the
   frame outlines on the world (`flife_manim::Region`): the cell's rectangle, or the removal's disc, and whether
   the stroke removes energy (a removal does: the share not recycled to the field is dissipated); none without a
-  stroke.
+  stroke. `drawn(viewport, logical, center, edge)` is the removal a drag draws: centred on the world point under
+  the press `center`, its radius the drag's length on screen at the drawable's density and the view's zoom, at
+  most half the shorter world side (a drag of 12 points is a click's disk exactly); `None` with the press in the
+  margin, an empty content area, or a drag of no length or a nonfinite one (`min` would otherwise take a NaN
+  radius to the cap); the release may be anywhere. While a disk is drawn the preview is `drawing(viewport,
+  logical, center, pointer)`: `Preview::Drawn { stroke }`, exactly what `drawn` makes for a release at the
+  pointer, `None` when the press was off the world; `preview_region` outlines it as a click's disc, and the line
+  is `a release removes the organisms within 4.57 world units of the press: …`, or `a release does nothing: the
+  press was off the world`.
   `stroke(brush, viewport, logical, cells, at, supplies)` maps the logical point `at` through the viewport to the
   world point under it, `None` in the letterbox margin or while the content area is empty:
   - energy: `Stroke::Energy { cell, amount: BRUSH_ENERGY }` (64, 32 founders' endowments), the field cell whose
@@ -217,8 +229,10 @@ directory, with its pending commands and its checkpoint chain.
      whatever is then selected, with the shown epoch's tick as `seen` (FL-021), and nothing when nothing is
      selected. A brush click makes its stroke through the view as it stood at that click, over the shown epoch's
      field grid, and is offered as `Intent::Intervene` with the shown epoch's tick as `seen` (FL-022), counted in
-     `FrameTally::strokes` and with the intents or refusals. A brush click that makes no stroke (the margin, or the
-     material brush with no material) is counted in `FrameTally::unstroked`. The material is the one the last
+     `FrameTally::strokes` and with the intents or refusals; a drawn disk (`CameraMove::Drawn`) likewise, as
+     `drawn` makes it through the view as it stood at the release. A brush click or drawn disk that makes no
+     stroke (the margin, or the material brush with no material) is counted in `FrameTally::unstroked`. While a
+     disk is drawn, the frame's preview is `drawing`'s, centred on the press. The material is the one the last
      `Inspected` snapshot gives, while that organism is still selected. A `CameraMove::Track` starts tracking or
      stops it; a pan or a reset stops it;
   6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
@@ -396,7 +410,7 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (18 tests):
+- `tests/controls.rs` (19 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
@@ -416,7 +430,11 @@ presentation state, not scientific state.
     order until taken.
   - FL-022: E, X, M and I arm, switch and disarm the brushes (their codes pinned to `kVK_ANSI_E`, `kVK_ANSI_X`,
     `kVK_ANSI_M` and `kVK_ANSI_I`), not on repeat or with ⌘, with no move, intent or style change; an armed click
-    brushes at the press with the brush armed at the release, a drag still pans, and once disarmed a click selects.
+    brushes at the press with the brush armed at the release, a drag with the energy brush armed still pans, and
+    once disarmed a click selects. With the removal brush armed a drag draws its disk: no pan, `drawing()` the
+    press once beyond the slop (none within it), and one `Drawn` of the press and the release; disarming or
+    switching the brush while held, or capture loss, applies nothing; a pan the brush is armed during keeps
+    panning; a click with it armed is still a `Brush` move.
   - FL-021: W makes one `CameraMove::Weights` and no intent, not on repeat; ⌘W closes and makes no move; it is no
     style key.
   - Plan §14.3: each press of T makes one `CameraMove::Track` and no intent (its code pinned to `kVK_ANSI_T`), not
@@ -481,7 +499,7 @@ presentation state, not scientific state.
   - paused after four steps: six organisms' and an unknown identity's weight dumps, each answer in order, `seen`
     unchanged (3), each the direct world's dump at tick 4, none for the unknown one; the closed world the direct
     one.
-- `tests/brush.rs` (10 tests, FL-022, no window):
+- `tests/brush.rs` (11 tests, FL-022, no window):
   - the preview at every point of the lattice, for every brush with and without a material, at fit, zoomed 2.75
     and across the seams, is `Preview::Stroke` of exactly `stroke`'s stroke there, a cell's region holding the
     world point, outlined (`preview_region`) as that cell, or the removal's disc, adding energy except for a
@@ -494,6 +512,12 @@ presentation state, not scientific state.
   - a removal click is centred on the world point under it with the world distance to the point 12 points to its
     right as its radius (within 1e-12) at zooms 1, 4 and 13.5, a quarter at zoom 4 of zoom 1's, held to 16 in a
     16-point window over 32 world units, and none in the margin;
+  - a drawn removal is centred on the world point under the press with the world distance to the point the drag's
+    length to its right as its radius (within 1e-12), for drags of 30, 57.5 and 5 points in three directions at
+    zooms 1, 4 and 13.5, and a 12-point drag is a click's disk exactly; its `drawing` preview is `Drawn` of it,
+    outlined as its disc, removing energy; a 12-point drag in a 16-point window over 32 world units, released off
+    the window, is held to 16; a press in the margin, a drag of no length and a NaN or infinite one draw nothing,
+    and the margin, a missing content area or pointer preview `Drawn { stroke: None }`, outlined as nothing;
   - the material and introduction brushes name the energy brush's cell under every click of a lattice at zoom 1.7;
     the material brush carries the supplied composition and makes nothing without one, and the introduction brush 8
     organisms at the supplied endowment;
@@ -527,11 +551,12 @@ presentation state, not scientific state.
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and the evaluations what its tally
     advanced (at least one a tick, as the preset evaluates every organism every tick); once paused a window reads
     0 ticks and 0 evaluations.
-- `tests/overlay.rs` (8 tests, FL-024, FL-022, FL-021 and FL-019, no window):
+- `tests/overlay.rs` (9 tests, FL-024, FL-022, FL-021 and FL-019, no window):
   - each preview's line exactly: the energy, material and introduction brushes' cell and bounds, the removal's
     radius and recycled share, three significant digits of a fine grid's cell (`250.000 to 250.250`) and of a deep
-    zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, off the world and no material; in
-    `overlay_text`, after the brush and the selection;
+    zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, off the world and no material; a
+    drawn disk's release about the press, and one pressed off the world; in `overlay_text`, after the brush and
+    the selection; the longest overlay's layout also takes the widest drawn disk's line;
   - plan §14.1's telemetry exactly, for chosen metrics: `4,608 live · 9,124,000 parameters`, `controllers every
     tick · 128.0 full evaluations/s`, `genomes 38.2 MiB of 1.00 GiB · 412 MiB headroom`, `18,586 births · 18,255
     deaths · no capacity pause · no fault`, `injected 1234.5 · uptake 456.7 · dissipated 789.1 · residual
@@ -631,7 +656,7 @@ presentation state, not scientific state.
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
-- `tests/offscreen.rs` (8 tests, FL-024, FL-022, Metal compute, no window), `Studio::open` offscreen on the preset at
+- `tests/offscreen.rs` (9 tests, FL-024, FL-022, Metal compute, no window), `Studio::open` offscreen on the preset at
   320 x 200 points and 2 pixels a point:
   - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
     the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
@@ -662,6 +687,15 @@ presentation state, not scientific state.
     the pixel just outside the energy brush's cell is amber; a click there then submits that stroke (all three,
     in order); the material brush with no organism selected is `NoMaterial`, the margin `OffWorld`, and disarmed
     there is no preview; none of the three is outlined.
+  - FL-022's drawn removal disk (plan §2.2: "draw an intervention region, remove part of a colony"): with X armed, a
+    drag pressed in the margin previews `Drawn { stroke: None }`, outlines nothing and its release makes no stroke
+    (one unstroked); a drag pressed on the shown organism nearest the centre previews, at each of two edges,
+    exactly `drawn`'s disk through the frame's view, outlined as it, removing energy, with the view unpanned; the
+    release submits that disk as command 1 for tick 0, seen at 0; a step applies it at tick 0, published at 1,
+    removing the energy, bit for bit, that a world stepped directly with the same removal reports, and a number
+    of organisms between the shown organisms strictly inside the disk and those within it or on its edge (radius
+    ± 1e-4 relative, on the torus); in one run a disk of 13.8 world units removed 152 organisms, 152 shown in it,
+    304 energy; the Studio closes on that world's digest, with one stroke and one unstroked.
   - Plan §14.3's camera tracking: T with nothing selected tracks nothing; zoomed in, a click on an organism away
     from the centre with T centres the view on it at once at the same zoom (bit for bit), and at rest the view
     stays. While the world runs, every frame draws the tracked organism at the drawable's centre (within 1e-6 px)
@@ -681,6 +715,14 @@ presentation state, not scientific state.
     organism's, figures one short of their scale (`tests/overlay.rs`): eleven caught, each by its own assertion.
     The binary's recycled share set to zero survives: no offscreen binary run arms a brush (its run failed once,
     on `tests/offscreen_binary.rs`'s floor of 10 frames in 2.5 s at a load average of 86, not on the mutant).
+  - Planted bugs in drawn removal disks, 14, each run against the tests that should catch it: a removal drag
+    panning, a disarmed drawing still applying, a press keeping an old drawing, `drawing()` ignoring the brush, a
+    drawing panning as it goes (`tests/controls.rs`); the disk a click's radius, centred on the release, and a
+    nonfinite drag drawing the widest disk, a drawn disk outlined as nothing (`tests/brush.rs`); the host applying
+    a fixed disk for a drawing, previewing as if nothing were drawn, and centring the preview on the pointer (this
+    file); the line saying a click about the pointer (`tests/overlay.rs`): thirteen caught. Capture loss keeping
+    the drawing flag survives, as an equivalent: `drawing()` reads the press, which capture loss clears, and every
+    press and release resets the flag.
 - `tests/offscreen_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5
   --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen` and carries
   its admission, whose terms sum to its peak within the budget, with no backend term on the CPU reference, and

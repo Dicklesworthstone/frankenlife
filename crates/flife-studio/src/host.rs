@@ -192,7 +192,9 @@ pub struct Frame {
     pub brush: Option<Brush>,
     /// While a brush is armed, what a click at the pointer would do now
     /// (plan §14.3): the stroke the click would make through the view as
-    /// this frame left it ([`brush::preview`]).
+    /// this frame left it ([`brush::preview`]); while the removal brush's
+    /// disk is being drawn, what a release there would apply
+    /// ([`brush::drawing`]).
     pub preview: Option<Preview>,
     /// The presentation outcome; `None` when the window was occluded or
     /// closed and nothing was rendered, and offscreen.
@@ -883,6 +885,14 @@ impl Studio {
                         None => self.tally.unstroked += 1,
                     }
                 }
+                CameraMove::Drawn { center, edge } => {
+                    match logical.and_then(|size| {
+                        brush::drawn(&viewport, size, [center.x, center.y], [edge.x, edge.y])
+                    }) {
+                        Some(stroke) => strokes.push(stroke),
+                        None => self.tally.unstroked += 1,
+                    }
+                }
                 CameraMove::Weights => weights = true,
                 CameraMove::Track => self.tracking = !self.tracking,
             }
@@ -1048,21 +1058,29 @@ impl Studio {
             self.prior = None;
         }
 
-        // What a click at the pointer would do, through the view as this
-        // frame leaves it, and its region outlined on the world (FL-022,
-        // plan §14.3).
-        let preview = self.controls.brush().map(|brush| {
-            brush::preview(
-                brush,
-                self.view.viewport(),
-                logical,
-                self.current.field().cells(),
-                self.controls
-                    .pointer()
-                    .map(|pointer| [pointer.x, pointer.y]),
-                &self.supplies(),
-            )
-        });
+        // What a click at the pointer would do, or a release of the disk
+        // being drawn, through the view as this frame leaves it, and its
+        // region outlined on the world (FL-022, plan §14.3).
+        let pointer = self
+            .controls
+            .pointer()
+            .map(|pointer| [pointer.x, pointer.y]);
+        let preview = self
+            .controls
+            .brush()
+            .map(|brush| match self.controls.drawing() {
+                Some(center) => {
+                    brush::drawing(self.view.viewport(), logical, [center.x, center.y], pointer)
+                }
+                None => brush::preview(
+                    brush,
+                    self.view.viewport(),
+                    logical,
+                    self.current.field().cells(),
+                    pointer,
+                    &self.supplies(),
+                ),
+            });
         let region = preview.as_ref().and_then(brush::preview_region);
         if self.view.set_region(region)? {
             self.note(|| TimelineRecord::Region {

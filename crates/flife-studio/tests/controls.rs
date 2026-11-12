@@ -417,8 +417,9 @@ fn e_and_x_arm_switch_and_disarm_the_brushes() {
 }
 
 /// FL-022: with a brush armed a click brushes where it pressed instead of
-/// selecting, with the brush armed at the release; a drag still pans; once
-/// disarmed a click selects again.
+/// selecting, with the brush armed at the release; with any brush but the
+/// removal brush armed a drag still pans; once disarmed a click selects
+/// again.
 #[test]
 fn an_armed_click_brushes_and_a_drag_still_pans() {
     let mut controls = Controls::new();
@@ -426,14 +427,15 @@ fn an_armed_click_brushes_and_a_drag_still_pans() {
     controls.apply(&button(true, point(40.0, 50.0)));
     controls.apply(&drag_to(point(41.0, 51.0)));
     controls.apply(&button(false, point(41.0, 51.0)));
+    tap(&mut controls, KEY_E);
     controls.apply(&button(true, point(10.0, 10.0)));
     controls.apply(&drag_to(point(30.0, 10.0)));
     controls.apply(&button(false, point(30.0, 10.0)));
     // Switched while held: the release brushes with the brush armed then.
     controls.apply(&button(true, point(7.0, 8.0)));
-    tap(&mut controls, KEY_E);
+    tap(&mut controls, KEY_X);
     controls.apply(&button(false, point(7.0, 8.0)));
-    tap(&mut controls, KEY_E);
+    tap(&mut controls, KEY_X);
     controls.apply(&button(true, point(3.0, 4.0)));
     controls.apply(&button(false, point(3.0, 4.0)));
     assert_eq!(
@@ -446,13 +448,95 @@ fn an_armed_click_brushes_and_a_drag_still_pans() {
             CameraMove::Pan { delta: [20.0, 0.0] },
             CameraMove::Brush {
                 at: point(7.0, 8.0),
-                brush: Brush::Energy
+                brush: Brush::Removal
             },
             CameraMove::Select {
                 at: point(3.0, 4.0)
             },
         ]
     );
+}
+
+/// FL-022 (plan §2.2's "draw an intervention region"): with the removal
+/// brush armed, a drag draws its disk instead of panning, centred where it
+/// pressed; the release applies it out to where it was released. While it
+/// is drawn, `drawing` names its centre. Disarming the brush while held,
+/// or losing the press, applies nothing; a drag that left the slop panning
+/// keeps panning when the brush is armed during it.
+#[test]
+fn an_armed_removal_drag_draws_its_disk() {
+    let mut controls = Controls::new();
+    tap(&mut controls, KEY_X);
+    controls.apply(&button(true, point(100.0, 100.0)));
+    controls.apply(&drag_to(point(102.0, 103.0)));
+    // Within the slop: still a click candidate.
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&drag_to(point(110.0, 96.0)));
+    assert_eq!(controls.drawing(), Some(point(100.0, 100.0)));
+    assert!(controls.dragging());
+    controls.apply(&drag_to(point(130.0, 60.0)));
+    assert!(moves(&mut controls).is_empty(), "a drawing pans nothing");
+    controls.apply(&button(false, point(124.0, 132.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [CameraMove::Drawn {
+            center: point(100.0, 100.0),
+            edge: point(124.0, 132.0)
+        }]
+    );
+    assert_eq!(controls.drawing(), None);
+    assert!(!controls.dragging());
+
+    // Disarmed while held: nothing is drawn, and the release applies
+    // nothing.
+    controls.apply(&button(true, point(50.0, 50.0)));
+    controls.apply(&drag_to(point(70.0, 50.0)));
+    assert_eq!(controls.drawing(), Some(point(50.0, 50.0)));
+    tap(&mut controls, KEY_X);
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&drag_to(point(80.0, 50.0)));
+    controls.apply(&button(false, point(80.0, 50.0)));
+    // Switched to another brush while held: the same.
+    tap(&mut controls, KEY_X);
+    controls.apply(&button(true, point(50.0, 50.0)));
+    controls.apply(&drag_to(point(70.0, 50.0)));
+    tap(&mut controls, KEY_E);
+    controls.apply(&button(false, point(70.0, 50.0)));
+    // Lost to capture loss: the same.
+    tap(&mut controls, KEY_X);
+    controls.apply(&button(true, point(20.0, 20.0)));
+    controls.apply(&drag_to(point(40.0, 40.0)));
+    controls.apply(&InputEvent::PointerCaptureLost {
+        released: ButtonSet::EMPTY.with(PointerButton::Primary),
+    });
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(40.0, 40.0)));
+    assert!(moves(&mut controls).is_empty());
+
+    // Disarmed, a drag pans; arming the brush during it keeps it panning,
+    // and draws nothing.
+    tap(&mut controls, KEY_X);
+    controls.apply(&button(true, point(10.0, 10.0)));
+    controls.apply(&drag_to(point(30.0, 10.0)));
+    tap(&mut controls, KEY_X);
+    controls.apply(&drag_to(point(40.0, 10.0)));
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(40.0, 10.0)));
+    // A click with it armed still brushes its default disk.
+    controls.apply(&button(true, point(5.0, 5.0)));
+    controls.apply(&button(false, point(5.0, 5.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [
+            CameraMove::Pan { delta: [20.0, 0.0] },
+            CameraMove::Pan { delta: [10.0, 0.0] },
+            CameraMove::Brush {
+                at: point(5.0, 5.0),
+                brush: Brush::Removal
+            },
+        ]
+    );
+    assert_eq!(controls.tally().moves, 4);
 }
 
 /// A vertical scroll zooms about the pointer by `exp(rate · dy)`: up in,

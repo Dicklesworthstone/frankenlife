@@ -5,7 +5,7 @@
 //! | Brush | Key | A click makes |
 //! |---|---|---|
 //! | energy | E | `InjectEnergy` of [`BRUSH_ENERGY`] declared energy into the field cell under the click |
-//! | removal | X | `RemoveOrganisms` in a disk [`BRUSH_RADIUS_POINTS`] in radius on screen about the click, `recycle`d as deaths are |
+//! | removal | X | `RemoveOrganisms` in a disk [`BRUSH_RADIUS_POINTS`] in radius on screen about the click, `recycle`d as deaths are; a drag draws the disk instead ([`drawn`]) |
 //! | material | M | `InjectMaterial` of [`BRUSH_ENERGY`] into the cell under the click, its composition the selected organism's affinity direction ([`material_for`]) |
 //! | introduction | I | `IntroduceOrganisms`: [`BRUSH_INTRODUCTION`] founder-drawn organisms in the cell under the click, each with a founder's endowment |
 //!
@@ -18,9 +18,10 @@
 //! While a brush is armed, its [`preview`] is the stroke a click at the
 //! pointer would make there now, by the same mapping, with the world
 //! rectangle of its cell: what the overlay says a click will do (plan
-//! §14.3). [`preview_region`] is the region it outlines on the world: the
-//! cell, or the removal's disc, coloured by whether the stroke adds energy
-//! or removes it.
+//! §14.3). While a removal's disk is being drawn, it is [`drawing`]'s:
+//! the disk a release would apply. [`preview_region`] is the region it
+//! outlines on the world: the cell, or the removal's disc, coloured by
+//! whether the stroke adds energy or removes it.
 
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS};
 use flife_field::sources::unit_direction;
@@ -238,25 +239,55 @@ pub fn stroke(
             count: BRUSH_INTRODUCTION,
             energy: supplies.founder_energy,
         }),
-        Brush::Removal => {
-            let [width, height] = viewport.drawable().map(f64::from);
-            let per_point = (width / logical[0]).min(height / logical[1]);
-            let radius = (BRUSH_RADIUS_POINTS * per_point / viewport.scale())
-                .min(extent[0].min(extent[1]) / 2.0);
-            (radius.is_finite() && radius > 0.0).then_some(Stroke::Removal {
-                center: world,
-                radius,
-            })
-        }
+        Brush::Removal => removal(viewport, logical, world, BRUSH_RADIUS_POINTS),
     }
 }
 
-/// What a click of an armed brush at the pointer would do (plan §14.3).
+/// The removal a drag of the removal brush draws from the logical window
+/// point `center` out to `edge`, through `viewport`, with a content area of
+/// `logical` points (plan §2.2's "draw an intervention region"): centred
+/// on the world point under `center`, its radius the drag's length on
+/// screen at the drawable's density and the view's zoom, in world units,
+/// and at most half the shorter world side, as a click's
+/// [`BRUSH_RADIUS_POINTS`] is. `None` with `center` in the letterbox
+/// margin, while the content area is empty, and for a drag of no length or
+/// a nonfinite one; `edge` may be anywhere.
+#[must_use]
+pub fn drawn(
+    viewport: &Viewport,
+    logical: [f64; 2],
+    center: [f64; 2],
+    edge: [f64; 2],
+) -> Option<Stroke> {
+    let world = viewport.logical_to_world(center, logical)?;
+    removal(
+        viewport,
+        logical,
+        world,
+        (edge[0] - center[0]).hypot(edge[1] - center[1]),
+    )
+}
+
+/// The removal centred on the world point `center`, `points` logical
+/// points in radius on screen.
+fn removal(
+    viewport: &Viewport,
+    logical: [f64; 2],
+    center: [f64; 2],
+    points: f64,
+) -> Option<Stroke> {
+    let extent = viewport.extent();
+    let [width, height] = viewport.drawable().map(f64::from);
+    let per_point = (width / logical[0]).min(height / logical[1]);
+    let radius = (points * per_point / viewport.scale()).min(extent[0].min(extent[1]) / 2.0);
+    // `min` would take a NaN radius to the cap.
+    (points.is_finite() && radius.is_finite() && radius > 0.0)
+        .then_some(Stroke::Removal { center, radius })
+}
+
+/// What a click of an armed brush at the pointer would do, or a release
+/// of the removal disk being drawn (plan §14.3).
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "it holds a `Stroke`, kept `Copy` and unboxed as the stroke is, made once a frame"
-)]
 pub enum Preview {
     /// The stroke a click at the pointer makes, and for a brush that
     /// applies to a cell, that cell's world rectangle ([`cell_region`]).
@@ -272,6 +303,13 @@ pub enum Preview {
     /// The material brush over the world with no material: no organism is
     /// selected, or its affinity has not been read yet.
     NoMaterial,
+    /// The removal brush's disk being drawn by a drag: what a release with
+    /// the pointer where it is applies.
+    Drawn {
+        /// Exactly what [`drawn`] makes for that release; `None` when the
+        /// drag pressed off the world.
+        stroke: Option<Stroke>,
+    },
 }
 
 /// The preview of `brush` with the pointer at the logical window point
@@ -307,16 +345,38 @@ pub fn preview(
     }
 }
 
+/// The preview of the removal brush's disk being drawn by a drag that
+/// pressed at the logical window point `center`, with the pointer at
+/// `pointer`: [`Preview::Drawn`] with what [`drawn`] makes for a release
+/// there through `viewport`, with a content area of `logical` points.
+#[must_use]
+pub fn drawing(
+    viewport: &Viewport,
+    logical: Option<[f64; 2]>,
+    center: [f64; 2],
+    pointer: Option<[f64; 2]>,
+) -> Preview {
+    Preview::Drawn {
+        stroke: logical
+            .zip(pointer)
+            .and_then(|(logical, edge)| drawn(viewport, logical, center, edge)),
+    }
+}
+
 /// The region `preview` outlines on the world (plan §14.3: the preview
 /// shows its "affected region, and whether it adds/removes energy"): its
 /// cell's rectangle for a brush that applies to a cell, the disc a removal
-/// takes, and whether the stroke removes energy from the world (a removal
-/// does: the share of the removed organisms' energy not recycled to the
-/// field is dissipated). `None` without a stroke.
+/// takes, clicked or drawn, and whether the stroke removes energy from the
+/// world (a removal does: the share of the removed organisms' energy not
+/// recycled to the field is dissipated). `None` without a stroke.
 #[must_use]
 pub fn preview_region(preview: &Preview) -> Option<Region> {
-    let Preview::Stroke { stroke, region } = preview else {
-        return None;
+    let (stroke, region) = match preview {
+        Preview::Stroke { stroke, region } => (stroke, region),
+        Preview::Drawn {
+            stroke: Some(stroke),
+        } => (stroke, &None),
+        _ => return None,
     };
     let shape = match (stroke, region) {
         (_, Some(bounds)) => RegionShape::Rectangle(*bounds),

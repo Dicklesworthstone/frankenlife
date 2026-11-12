@@ -64,15 +64,16 @@ mod session;
 mod timeline;
 
 pub use brush::{
-    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Preview, Stroke, Supplies,
-    cell_region, clicked, drawing, drawn, material_for, preview, preview_region, stroke,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, BrushSettings, ENERGY_STEPS,
+    INTRODUCTION_STEPS, Preview, Stroke, Supplies, cell_region, clicked, drawing, drawn,
+    material_for, preview, preview_region, stroke,
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
     CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_C, KEY_D, KEY_DIGITS, KEY_E,
-    KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT,
-    KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT,
-    ZOOM_STEP_LIMIT, scroll_zoom,
+    KEY_EQUAL, KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_MINUS, KEY_PERIOD,
+    KEY_R, KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SLASH, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO,
+    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 pub use export::{
     EXPORT_SCHEMA, ExportManifest, ExportOptions, ExportedFrame, ExportedVideo, MANIFEST_FILE,

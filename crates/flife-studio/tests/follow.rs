@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::{Tick, ValidatedConfig};
-use flife_engine::{Arrangement, Followed, NumericalProfile, Stepped, TickReport, World};
+use flife_engine::{
+    Arrangement, Disposition, Followed, NumericalProfile, Stepped, TickReport, World,
+};
 use flife_studio::{Intent, SessionThread, Status, Stroke};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -150,6 +152,7 @@ fn removal(world: &World, organism: OrganismId, radius: f64) -> Stroke {
     Stroke::Removal {
         center: world.population().get(organism).expect("alive").position,
         radius,
+        disposition: Disposition::Recycle,
     }
 }
 

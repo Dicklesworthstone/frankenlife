@@ -24,8 +24,8 @@ use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, RegionMeasurement, Stepped, World};
 use flife_manim::{Region, RegionEffect, RegionShape, Viewport};
 use flife_studio::{
-    BRUSH_ENERGY, Brush, Disk, Intent, MeasurePreview, SessionThread, Status, Stroke, Supplies,
-    clicked, drawn, measure, stroke,
+    BRUSH_ENERGY, Brush, BrushSettings, Disk, Intent, MeasurePreview, SessionThread, Status,
+    Stroke, Supplies, clicked, drawn, measure, stroke,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -33,6 +33,7 @@ const PRESET: &str = include_str!("../../../presets/reference-small-world.toml")
 const NONE: Supplies = Supplies {
     material: None,
     founder_energy: 2.0,
+    settings: BrushSettings::DEFAULT,
 };
 
 fn config() -> ValidatedConfig {
@@ -119,7 +120,7 @@ fn a_measured_disk_is_the_removal_brushs() {
         let removal =
             stroke(Brush::Removal, &viewport, logical, [32, 32], at, &NONE).expect("a removal");
         assert_eq!(clicked(&viewport, logical, at), Some(removal));
-        let Stroke::Removal { center, radius } = removal else {
+        let Stroke::Removal { center, radius, .. } = removal else {
             panic!("{removal:?}");
         };
         let disk = measure::clicked(&viewport, logical, at).expect("a disk");

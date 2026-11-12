@@ -36,6 +36,8 @@
 //! | X | arm the removal brush, or disarm it (FL-022) |
 //! | M | arm the material brush, or disarm it (FL-022) |
 //! | I | arm the introduction brush, or disarm it (FL-022) |
+//! | `-` or `=` | halve or double the armed energy or material brush's amount, or the introduction brush's count, within [`ENERGY_STEPS`](crate::brush::ENERGY_STEPS) or [`INTRODUCTION_STEPS`](crate::brush::INTRODUCTION_STEPS) of its default (FL-022) |
+//! | `/` | with the removal brush armed, send what it removes to the next disposition: recycled as a death's, dissipated, or taken out of the world ([`BrushSettings::next_disposition`]) (FL-022) |
 //! | G | arm the measuring tool, or put it and its disk away (plan §14.3) |
 //! | W | dump the selected organism's whole controller (FL-021) |
 //! | T | track the selected organism, the camera keeping it centred, or stop (plan §14.3) |
@@ -58,7 +60,9 @@ use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, PointerButton, ScrollUnit, SurfaceMetrics,
 };
 
-use crate::{Brush, Status, Stroke};
+use flife_engine::Disposition;
+
+use crate::{Brush, BrushSettings, Status, Stroke};
 
 /// `kVK_Space`.
 pub const KEY_SPACE: u16 = 49;
@@ -98,6 +102,12 @@ pub const KEY_G: u16 = 5;
 pub const KEY_LEFT_BRACKET: u16 = 33;
 /// `kVK_ANSI_RightBracket`.
 pub const KEY_RIGHT_BRACKET: u16 = 30;
+/// `kVK_ANSI_Minus`.
+pub const KEY_MINUS: u16 = 27;
+/// `kVK_ANSI_Equal`.
+pub const KEY_EQUAL: u16 = 24;
+/// `kVK_ANSI_Slash`.
+pub const KEY_SLASH: u16 = 44;
 
 /// How far, in logical points, a primary press may move and still be a
 /// click; beyond it the press is a drag.
@@ -160,6 +170,9 @@ pub enum CameraMove {
         at: LogicalPoint,
         /// The brush armed then.
         brush: Brush,
+        /// The brushes' amounts and disposition then: a key pressed after
+        /// the click, in the same poll, does not change what it applies.
+        settings: BrushSettings,
     },
     /// Measure a disk (plan §14.3's temporary measurement region): the
     /// removal brush's click disk under the logical point `center`, or with
@@ -179,6 +192,8 @@ pub enum CameraMove {
         center: LogicalPoint,
         /// Where it was released: on the disk's edge.
         edge: LogicalPoint,
+        /// Where the removal brush sent what it removes at the release.
+        disposition: Disposition,
     },
     /// Dump the selected organism's whole controller (FL-021, plan §14.2's
     /// on-demand weight dump): the presentation owner asks the session for
@@ -322,6 +337,9 @@ pub struct Controls {
     /// Whether the measuring tool is armed: a click or a drag measures
     /// instead of selecting. Never with a brush armed.
     measuring: bool,
+    /// The brushes' amounts and the removal's disposition, which `-`, `=`
+    /// and `/` change; kept while a brush is disarmed.
+    settings: BrushSettings,
     /// The field component C and the bracket keys show: the last chosen.
     component: FieldComponent,
 }
@@ -423,6 +441,18 @@ impl Controls {
                         self.arm(Brush::Introduction);
                         None
                     }
+                    KEY_MINUS | KEY_EQUAL => {
+                        if let Some(brush) = self.brush {
+                            self.settings = self.settings.scaled(brush, *code == KEY_EQUAL);
+                        }
+                        None
+                    }
+                    KEY_SLASH => {
+                        if self.brush == Some(Brush::Removal) {
+                            self.settings = self.settings.next_disposition();
+                        }
+                        None
+                    }
                     KEY_G => {
                         self.measuring = !self.measuring;
                         if self.measuring {
@@ -495,7 +525,11 @@ impl Controls {
         if let Some(at) = self.press.take() {
             if !self.dragging {
                 self.push(match (self.brush, self.measuring) {
-                    (Some(brush), _) => CameraMove::Brush { at, brush },
+                    (Some(brush), _) => CameraMove::Brush {
+                        at,
+                        brush,
+                        settings: self.settings,
+                    },
                     (None, true) => CameraMove::Measure {
                         center: at,
                         edge: None,
@@ -506,6 +540,7 @@ impl Controls {
                 self.push(CameraMove::Drawn {
                     center: at,
                     edge: position,
+                    disposition: self.settings.disposition(),
                 });
             } else if drawing == Some(Drawer::Measuring) && self.measuring {
                 self.push(CameraMove::Measure {
@@ -538,6 +573,13 @@ impl Controls {
     #[must_use]
     pub const fn brush(&self) -> Option<Brush> {
         self.brush
+    }
+
+    /// The brushes' amounts and the removal's disposition now: what a click
+    /// or a release would apply.
+    #[must_use]
+    pub const fn settings(&self) -> BrushSettings {
+        self.settings
     }
 
     /// Pointer motion while the primary press is held: once beyond the

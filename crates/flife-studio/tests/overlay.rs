@@ -14,9 +14,9 @@ use flife_core::ids::{Generation, LineageId, OrganismId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{LedgerReport, Tick, ValidatedConfig};
 use flife_engine::{
-    Ancestor, Arrangement, Descendants, ExchangeCell, LocalChemistry, MATERIAL_CHANNELS,
-    NumericalProfile, OrganismSnapshot, RECENT_STEPS, RegionMeasurement, ReproductionOutcome,
-    Split, Stepped, Unviable, World,
+    Ancestor, Arrangement, Descendants, Disposition, ExchangeCell, LocalChemistry,
+    MATERIAL_CHANNELS, NumericalProfile, OrganismSnapshot, RECENT_STEPS, RegionMeasurement,
+    ReproductionOutcome, Split, Stepped, Unviable, World,
 };
 use flife_manim::{
     COMPONENT_PALETTE, FieldComponent, FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES,
@@ -25,8 +25,8 @@ use flife_manim::{
 };
 use flife_render::{Metrics, Tally};
 use flife_studio::{
-    BRUSH_ENERGY, BRUSH_INTRODUCTION, Brush, BrushPreview, ClockReading, ColorMapping, Disk,
-    Inspected, MeasurePreview, Measuring, OverlayState, Preview, Stroke, Telemetry, field_key,
+    Brush, BrushPreview, BrushSettings, ClockReading, ColorMapping, Disk, Inspected,
+    MeasurePreview, Measuring, OverlayState, Preview, Stroke, Telemetry, field_key,
     inspector_lines, legends, measuring_lines, overlay_text, preview_line, telemetry_lines,
 };
 
@@ -145,30 +145,58 @@ fn state(legend: &Legend) -> OverlayState<'_> {
     }
 }
 
-/// The widest preview of `brush` the Studio can write: its brushes' own
-/// amount and count, the largest cell indices, bounds and a founder's
-/// endowment one short of scientific notation at the finest places, and
-/// the finest radius.
-fn widest_preview(brush: Brush) -> BrushPreview {
+/// Every setting the keys can give `brush` (FL-022): from the default,
+/// each amount or count down to the end of its range and up to the other,
+/// or each disposition of the removal's. Each differs from the others in
+/// what the brush applies.
+fn every_setting(brush: Brush) -> Vec<BrushSettings> {
+    if brush == Brush::Removal {
+        let mut settings = vec![BrushSettings::default()];
+        for _ in 1..3 {
+            let next = settings[settings.len() - 1].next_disposition();
+            settings.push(next);
+        }
+        return settings;
+    }
+    let mut lowest = BrushSettings::default();
+    while lowest.scaled(brush, false) != lowest {
+        lowest = lowest.scaled(brush, false);
+    }
+    let mut settings = vec![lowest];
+    loop {
+        let next = settings[settings.len() - 1].scaled(brush, true);
+        if next == settings[settings.len() - 1] {
+            return settings;
+        }
+        settings.push(next);
+    }
+}
+
+/// The widest preview of `brush` the Studio can write with `settings`:
+/// their amount and count, the largest cell indices, bounds and a
+/// founder's endowment one short of scientific notation at the finest
+/// places, and the finest radius.
+fn widest_preview(brush: Brush, settings: BrushSettings) -> BrushPreview {
     let cell = [u32::MAX, u32::MAX];
     let stroke = match brush {
         Brush::Energy => Stroke::Energy {
             cell,
-            amount: BRUSH_ENERGY,
+            amount: settings.amount(brush).expect("an amount"),
         },
         Brush::Material => Stroke::Material {
             cell,
-            amount: BRUSH_ENERGY,
+            amount: settings.amount(brush).expect("an amount"),
             direction: [0.0; MATERIAL_CHANNELS],
         },
         Brush::Introduction => Stroke::Introduction {
             cell,
-            count: BRUSH_INTRODUCTION,
+            count: settings.count(),
             energy: 99_999.994,
         },
         Brush::Removal => Stroke::Removal {
             center: [0.0; 2],
             radius: 1.0e-7,
+            disposition: settings.disposition(),
         },
     };
     BrushPreview {
@@ -182,14 +210,15 @@ fn widest_preview(brush: Brush) -> BrushPreview {
     }
 }
 
-/// The widest preview of the removal brush's disk being drawn: the finest
-/// radius.
-fn widest_drawing() -> BrushPreview {
+/// The widest preview of the removal brush's disk being drawn, its energy
+/// sent to `disposition`: the finest radius.
+fn widest_drawing(disposition: Disposition) -> BrushPreview {
     BrushPreview {
         preview: Preview::Drawn {
             stroke: Some(Stroke::Removal {
                 center: [0.0; 2],
                 radius: 1.0e-7,
+                disposition,
             }),
         },
         recycle_fraction: 0.999,
@@ -1255,10 +1284,11 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         preview: MeasurePreview::Click(Some(disk)),
         measurement: None,
     };
-    // Each brush's widest click, the widest removal disk being drawn, and
-    // the measuring tool's widest click and placed disk, which says a line
-    // more: the brushes and the tool are never armed together. Each with
-    // the lines the overlay then has.
+    // Each brush's widest click at every amount, count and disposition its
+    // keys set, the widest removal disk being drawn at each disposition,
+    // and the measuring tool's widest click and placed disk, which says a
+    // line more: the brushes and the tool are never armed together. Each
+    // with the lines the overlay then has.
     type Tool<'a> = (
         Option<Brush>,
         Option<BrushPreview>,
@@ -1272,13 +1302,27 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         Brush::Introduction,
     ]
     .into_iter()
-    .map(|brush| (Some(brush), Some(widest_preview(brush)), None, 25))
+    .flat_map(|brush| {
+        every_setting(brush)
+            .into_iter()
+            .map(move |settings| (Some(brush), Some(widest_preview(brush, settings)), None, 25))
+    })
+    .chain(Disposition::ALL.map(|disposition| {
+        (
+            Some(Brush::Removal),
+            Some(widest_drawing(disposition)),
+            None,
+            25,
+        )
+    }))
     .chain([
-        (Some(Brush::Removal), Some(widest_drawing()), None, 25),
         (None, None, Some(clicked), 25),
         (None, None, Some(placed), 26),
     ])
     .collect();
+    // 13 amounts of each energy brush, 7 counts, 3 dispositions clicked and
+    // 3 drawn, and the measuring tool's 2.
+    assert_eq!(tools.len(), 13 + 3 + 13 + 7 + 3 + 2);
     let mut most = (0, 0);
     for ((mapping, legend), (brush, preview, measuring, lines)) in keys
         .iter()
@@ -1393,16 +1437,32 @@ fn a_preview_says_what_a_click_does() {
         "a click adds 8 organisms of 2.00 energy, 16.0 in all, to cell 12, 30 \
          (x 12.00 to 13.00, y 30.00 to 31.00 world units)"
     );
-    assert_eq!(
+    let removed = |disposition| {
         preview_line(&at(
             Stroke::Removal {
                 center: [16.4, 12.0],
-                radius: 1.234_5
+                radius: 1.234_5,
+                disposition,
             },
-            None
-        )),
+            None,
+        ))
+    };
+    assert_eq!(
+        removed(Disposition::Recycle),
         "a click removes the organisms within 1.23 world units of the pointer: 50% of their \
          energy to the field, the rest dissipated, none out of the world"
+    );
+    // Dissipated, or taken out of the modeled world (FL-022's disposition):
+    // none of it to the field, whatever the recycled share.
+    assert_eq!(
+        removed(Disposition::Dissipate),
+        "a click removes the organisms within 1.23 world units of the pointer: all their \
+         energy dissipated, none to the field, none out of the world"
+    );
+    assert_eq!(
+        removed(Disposition::Remove),
+        "a click removes the organisms within 1.23 world units of the pointer: all their \
+         energy out of the world, none to the field, none dissipated"
     );
     // A finer grid's bounds, a deeper zoom's radius and a wider one keep
     // three significant figures of their scale; a large count is grouped.
@@ -1422,6 +1482,7 @@ fn a_preview_says_what_a_click_does() {
                 stroke: Stroke::Removal {
                     center: [0.0; 2],
                     radius,
+                    disposition: Disposition::Recycle,
                 },
                 region: None,
             },
@@ -1451,11 +1512,23 @@ fn a_preview_says_what_a_click_does() {
         preview_line(&preview(Preview::Drawn {
             stroke: Some(Stroke::Removal {
                 center: [16.4, 12.0],
-                radius: 4.567_8
+                radius: 4.567_8,
+                disposition: Disposition::Recycle,
             })
         })),
         "a release removes the organisms within 4.57 world units of the press: 50% of their \
          energy to the field, the rest dissipated, none out of the world"
+    );
+    assert_eq!(
+        preview_line(&preview(Preview::Drawn {
+            stroke: Some(Stroke::Removal {
+                center: [16.4, 12.0],
+                radius: 4.567_8,
+                disposition: Disposition::Remove,
+            })
+        })),
+        "a release removes the organisms within 4.57 world units of the press: all their \
+         energy out of the world, none to the field, none dissipated"
     );
     assert_eq!(
         preview_line(&preview(Preview::Drawn { stroke: None })),

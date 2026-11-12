@@ -230,25 +230,41 @@ directory, with its pending commands and its checkpoint chain.
   margin, an empty content area, or a drag of no length or a nonfinite one (`min` would otherwise take a NaN
   radius to the cap); the release may be anywhere. While a disk is drawn the preview is `drawing(viewport,
   logical, center, pointer)`: `Preview::Drawn { stroke }`, exactly what `drawn` makes for a release at the
-  pointer, `None` when the press was off the world; `preview_region` outlines it as a click's disc, and the line
-  is `a release removes the organisms within 4.57 world units of the press: …`, or `a release does nothing: the
-  press was off the world`.
+  pointer, `None` when the press was off the world, sent to the disposition the keys set (`drawing(viewport,
+  logical, center, pointer, disposition)`); `preview_region` outlines it as a click's disc, and the line is `a
+  release removes the organisms within 4.57 world units of the press: …`, or `a release does nothing: the press
+  was off the world`.
   `stroke(brush, viewport, logical, cells, at, supplies)` maps the logical point `at` through the viewport to the
-  world point under it, `None` in the letterbox margin or while the content area is empty:
-  - energy: `Stroke::Energy { cell, amount: BRUSH_ENERGY }` (64, 32 founders' endowments), the field cell whose
-    square holds the world point, `⌊x / (L / cells)⌋` on each axis; `Intervention::InjectEnergy`;
-  - removal: `Stroke::Removal { center, radius }`, centred on the world point, `BRUSH_RADIUS_POINTS` = 12 points on
-    screen at the drawable's density and the view's zoom, at most half the shorter world side;
-    `Intervention::RemoveOrganisms` with `Disposition::Recycle`, so removed energy goes where a death's does;
-  - material: `Stroke::Material { cell, amount: BRUSH_ENERGY, direction }` in the same cell, `direction` being
+  world point under it, `None` in the letterbox margin or while the content area is empty. `Supplies::settings`
+  is a `BrushSettings` (FL-022's amount, count and disposition): each energy brush's amount and the introduction's
+  count as a power of two of its default, `BRUSH_ENERGY × 2^k` for `k` in `ENERGY_STEPS` = −6 to 6 (1 to 4,096
+  energy) and `BRUSH_INTRODUCTION × 2^k` for `k` in `INTRODUCTION_STEPS` = −3 to 3 (1 to 64 organisms), and the
+  removal's `Disposition`; `BrushSettings::DEFAULT` is 64, 8 and `Recycle`. `scaled(brush, up)` doubles or halves
+  that brush's own amount or count, unchanged at the end of its range and for the removal;
+  `next_disposition()` goes `recycle`, `dissipate`, `remove`, then `recycle` again:
+  - energy: `Stroke::Energy { cell, amount }` (by default `BRUSH_ENERGY`, 64, 32 founders' endowments), the field
+    cell whose square holds the world point, `⌊x / (L / cells)⌋` on each axis; `Intervention::InjectEnergy`;
+  - removal: `Stroke::Removal { center, radius, disposition }`, centred on the world point,
+    `BRUSH_RADIUS_POINTS` = 12 points on screen at the drawable's density and the view's zoom, at most half the
+    shorter world side; `Intervention::RemoveOrganisms` with that disposition: by default `Disposition::Recycle`,
+    so removed energy goes where a death's does; `Dissipate` (`unrecycled-death`, none to the field) or `Remove`
+    (`command-removal`, out of the modeled world, the ledger's removed term). `Stroke::disposed(disposition)` sends
+    a removal elsewhere and leaves any other stroke; `clicked` and `drawn` make the disk recycled, the geometry
+    the measuring tool shares, and the host disposes it as the keys set;
+  - material: `Stroke::Material { cell, amount, direction }` in the same cell, `direction` being
     `Supplies::material`, or no stroke without one; `Intervention::InjectMaterial`. The Studio supplies the selected
     organism's `material_for(affinity)`: the unit direction `a / ‖a‖₂`, shrunk as source directions are until
     `‖·‖₂² ≤ 1` holds as the engine sums it (`flife_field::sources::unit_direction`). Under `bounded-affinity-v1` a
     packet of composition `z` converts at `η_max tanh(k a·z − b)`, which over `‖z‖₂ ≤ 1` is largest along `a`, so
     the brush adds the material that organism converts best; the cell's composition moves towards it;
-  - introduction: `Stroke::Introduction { cell, count: BRUSH_INTRODUCTION, energy }` in the same cell, 8 organisms
-    drawn as founders, each with `Supplies::founder_energy` (`population.initial_energy`);
+  - introduction: `Stroke::Introduction { cell, count, energy }` in the same cell, `count` organisms (by default
+    `BRUSH_INTRODUCTION`, 8) drawn as founders, each with `Supplies::founder_energy` (`population.initial_energy`);
     `Intervention::IntroduceOrganisms`.
+
+  The removal's preview line says where its energy goes: recycled, `…: 50% of their energy to the field, the rest
+  dissipated, none out of the world`; dissipated, `…: all their energy dissipated, none to the field, none out of
+  the world`; taken out, `…: all their energy out of the world, none to the field, none dissipated`. `drawing`
+  takes the disposition too, so a drawn disk's preview is what its release applies.
 - `measure` (plan §14.3's temporary measurement region): `Disk { center, radius }` in world units, `Disk::of`
   the disk of a removal (none for another stroke) and `Disk::region()` its disc outlined in the measurement
   colour (`flife_manim::RegionEffect::Measures`). `measure::clicked(viewport, logical, at)` is the disk a click
@@ -398,7 +414,8 @@ directory, with its pending commands and its checkpoint chain.
     stored. The preset's largest controller writes out as a few hundred kilobytes on one line;
   - FL-022: one `brush` each time the armed brush changes (`energy`, `removal` or null); one `submitted` per
     accepted stroke: its `command`, `brush`, its payload (the `cell` and `amount`, with the material's 32-component
-    `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
+    `direction`; the `center`, `radius` and `disposition`, `recycle`, `dissipate` or `remove`; or the `cell`,
+    `count` and each one's `endowment`; the fields a brush has not, null), `seen_tick` and
     `effective_tick`; and one `finished` per command: `outcome` `applied` with its `tick`, `published_tick` and
     `energy`, or `cancelled` or `failed` with a `detail`;
   - plan §14.3: one `measured` per measurement answered, on a disk's placing, about once a second while it stays
@@ -491,7 +508,7 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (21 tests):
+- `tests/controls.rs` (22 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
@@ -516,6 +533,14 @@ presentation state, not scientific state.
     press once beyond the slop (none within it), and one `Drawn` of the press and the release; disarming or
     switching the brush while held, or capture loss, applies nothing; a pan the brush is armed during keeps
     panning; a click with it armed is still a `Brush` move.
+  - FL-022's amount, count and disposition: `-` and `=` (pinned to `kVK_ANSI_Minus` and `kVK_ANSI_Equal`) halve
+    and double the armed brush's own amount or count: the energy brush to 128 and back, 1 and 4,096 at the ends
+    of its range, the material brush's apart from it, the introduction's count 16, then 64 and 1 at its ends; the
+    removal has none. `/` (`kVK_ANSI_Slash`) with the removal armed goes recycle, dissipate, remove and round
+    again; with another brush armed it does nothing. None of them does anything with no brush armed, on repeat or
+    with ⌘, and none is an intent or a style key; the settings are kept while disarmed. A click's `Brush` move
+    carries the settings in force at its click (a key after it, in the same poll, changes nothing), and a drawn
+    disk's `Drawn` the disposition at its release, not at its press.
   - FL-021: W makes one `CameraMove::Weights` and no intent, not on repeat; ⌘W closes and makes no move; it is no
     style key.
   - Plan §14.3: each press of T makes one `CameraMove::Track` and no intent (its code pinned to `kVK_ANSI_T`), not
@@ -587,7 +612,7 @@ presentation state, not scientific state.
   - paused after four steps: six organisms' and an unknown identity's weight dumps, each answer in order, `seen`
     unchanged (3), each the direct world's dump at tick 4, none for the unknown one; the closed world the direct
     one.
-- `tests/brush.rs` (11 tests, FL-022, no window):
+- `tests/brush.rs` (12 tests, FL-022, no window):
   - the preview at every point of the lattice, for every brush with and without a material, at fit, zoomed 2.75
     and across the seams, is `Preview::Stroke` of exactly `stroke`'s stroke there, a cell's region holding the
     world point, outlined (`preview_region`) as that cell, or the removal's disc, adding energy except for a
@@ -602,27 +627,37 @@ presentation state, not scientific state.
     16-point window over 32 world units, and none in the margin;
   - a drawn removal is centred on the world point under the press with the world distance to the point the drag's
     length to its right as its radius (within 1e-12), for drags of 30, 57.5 and 5 points in three directions at
-    zooms 1, 4 and 13.5, and a 12-point drag is a click's disk exactly; its `drawing` preview is `Drawn` of it,
-    outlined as its disc, removing energy; a 12-point drag in a 16-point window over 32 world units, released off
+    zooms 1, 4 and 13.5, and a 12-point drag is a click's disk exactly, both recycled; its `drawing` preview with
+    each disposition is `Drawn` of it sent there, outlined as its disc, removing energy; a 12-point drag in a
+    16-point window over 32 world units, released off
     the window, is held to 16; a press in the margin, a drag of no length and a NaN or infinite one draw nothing,
     and the margin, a missing content area or pointer preview `Drawn { stroke: None }`, outlined as nothing;
   - the material and introduction brushes name the energy brush's cell under every click of a lattice at zoom 1.7;
     the material brush carries the supplied composition and makes nothing without one, and the introduction brush 8
     organisms at the supplied endowment;
+  - FL-022's settings: the energy and material brushes' amounts are exactly 64 × 2^k for k from −6 to 6 (1 to
+    4,096), the introduction's counts 1, 2, 4, 8, 16, 32 and 64, the removal has no amount, and the dispositions
+    go recycle, dissipate, remove and round again; doubling one brush moves no other. Under every seventh click of
+    the lattice (thousands of cells, both seams), each of those settings makes the default stroke's cell, material
+    and endowment at its own amount or count, and each disposition the default click's disk sent there, its payload
+    `RemoveOrganisms` with that disposition;
   - 24 founders' materials are within the unit ball as the engine checks it, unit to within 1e-14, parallel to
     their affinities (so the unit composition with the largest `a·z`); a zero or nonfinite affinity has none;
-  - the payloads are exactly `InjectEnergy`, `RemoveOrganisms` with `Disposition::Recycle`, `InjectMaterial` and
+  - the payloads are exactly `InjectEnergy`, `RemoveOrganisms` with the stroke's disposition (`Recycle` by
+    default; `disposed` sends a removal to each and leaves an energy stroke), `InjectMaterial` and
     `IntroduceOrganisms`;
   - a `SessionThread` over a 32 x 32 preset world paused at tick 2: an energy stroke (seen at 1) and a removal
     about a living organism are `Submitted` as commands 1 and 2 for the boundary of tick 2 and wait there through
     ten polls; the next step reports both `Applied` at tick 2, published at 3, with the energy a direct world
     stepped with both interventions at tick 2 reports, bit for bit; the organism is gone, and the closed world is
     the direct one;
-  - while running: 16 strokes, then a pause; every stroke applied at the tick it was submitted for and published
+  - while running: 16 strokes (energy of 16 to 512, removals sent to each disposition), then a pause; every stroke
+    applied at the tick it was submitted for and published
     at the next, over more than one boundary; a direct world stepped with each tick's strokes in command order
     reports every energy bit for bit and ends on the closed world's digest. Which ticks they land on depends on
     thread timing;
-  - a cell off the grid and a disk wider than half the world are refused as `numerical-invalid` and take no
+  - a cell off the grid and a disk wider than half the world (taken out of the world) are refused as
+    `numerical-invalid` and take no
     identity; a stroke still pending at close never applies, and the close returns with the founding world;
   - paused at tick 3: a material stroke of a living organism's affinity direction and an introduction apply at the
     next step, each moving what the direct world stepped with both reports, bit for bit (the introduction 8 organisms
@@ -667,9 +702,10 @@ presentation state, not scientific state.
 - `tests/overlay.rs` (10 tests, FL-024, FL-022, FL-021, FL-019 and plan §14.3, no window):
   - each preview's line exactly: the energy, material and introduction brushes' cell and bounds, the removal's
     radius and recycled share, three significant digits of a fine grid's cell (`250.000 to 250.250`) and of a deep
-    zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, off the world and no material; a
-    drawn disk's release about the press, and one pressed off the world; in `overlay_text`, after the brush and
-    the selection; the longest overlay's layout also takes the widest drawn disk's line;
+    zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, a removal dissipated and one taken
+    out of the world (FL-022), off the world and no material; a drawn disk's release about the press, recycled and
+    taken out, and one pressed off the world; in `overlay_text`, after the brush and the selection; the longest
+    overlay's layout also takes the widest drawn disk's line at each disposition;
   - the measuring tool's lines exactly: a click's and a release's disk, each off the world, the placed disk
     `measuring` until its measurement is in, and then what it holds; a measurement of another centre or radius
     is not shown, nor one while a disk is drawn; three significant figures of a fine radius, `1.23e5` from
@@ -735,8 +771,11 @@ presentation state, not scientific state.
     and its descendants: every count one short of a trillion, counted since the largest tick written in full,
     two dead ancestors at the largest generation, and one short of a trillion more past them), 25 lines laid out
     with its keys' swatches, at 2x: every glyph is drawn, none refused or left out, within four fifths of the
-    overlay's budget (the motion key's with the introduction brush, 54,110 vertices and 52,402 triangles, is the
-    longest); at 3x, all of it is still drawn.
+    overlay's budget; at 3x, all of it is still drawn. Each brush's preview is laid out at every amount, count
+    and disposition its keys set (FL-022: 13 amounts of each energy brush, 7 counts, 3 dispositions clicked and 3
+    drawn), with the measuring tool's two, 41 tools under each of the six keys, 246 layouts: the most triangles
+    are the motion key's with the introduction brush at its default count, 52,402, and the most vertices the same
+    at 64 organisms, 54,113.
   - Planted bugs in the transactions' panel and record (FL-021), each caught: the uptake summing the gain alone,
     births charging only the child's endowment, the net change the newest step's, the first step's reproduction
     shown, maintenance shown as a gain, the record's uptake including maintenance, and its ticks one late.
@@ -795,8 +834,9 @@ presentation state, not scientific state.
     loop: every move reaches the next frame; frame work and arrival-to-drawn latency are printed, not asserted;
   - the queue keeps at most `INPUT_QUEUE_CAPACITY` events between frames and counts the rest as dropped;
   - FL-022's host brush path: a click selects the organism nearest the centre and its inspection answers; E and M
-    arm the energy and material brushes (the frame names the armed one), and a click with each is the stroke
-    `stroke` makes at that point through the frame's view, the material one of the selected organism's affinity
+    arm the energy and material brushes (the frame names the armed one), `=` twice doubles the energy brush's
+    amount to 256 and `-` twice halves the material's to 16, and a click with each is the stroke `stroke` makes at
+    that point through the frame's view with those settings, the material one of the selected organism's affinity
     direction; both are submitted as commands 1 and 2 for tick 0, seen at tick 0; a step applies both at tick 0,
     published at 1, each moving the energy, bit for bit, that a world stepped directly with the same two strokes
     reports; and the Studio closes on that world's digest, with two strokes and none unstroked. Before each click,
@@ -808,15 +848,17 @@ presentation state, not scientific state.
     the pixel just outside the energy brush's cell is amber; a click there then submits that stroke (all three,
     in order); the material brush with no organism selected is `NoMaterial`, the margin `OffWorld`, and disarmed
     there is no preview; none of the three is outlined.
-  - FL-022's drawn removal disk (plan §2.2: "draw an intervention region, remove part of a colony"): with X armed, a
-    drag pressed in the margin previews `Drawn { stroke: None }`, outlines nothing and its release makes no stroke
-    (one unstroked); a drag pressed on the shown organism nearest the centre previews, at each of two edges,
-    exactly `drawn`'s disk through the frame's view, outlined as it, removing energy, with the view unpanned; the
-    release submits that disk as command 1 for tick 0, seen at 0; a step applies it at tick 0, published at 1,
-    removing the energy, bit for bit, that a world stepped directly with the same removal reports, and a number
-    of organisms between the shown organisms strictly inside the disk and those within it or on its edge (radius
-    ± 1e-4 relative, on the torus); in one run a disk of 13.8 world units removed 152 organisms, 152 shown in it,
-    304 energy; the Studio closes on that world's digest, with one stroke and one unstroked.
+  - FL-022's drawn removal disk (plan §2.2: "draw an intervention region, remove part of a colony"): with X armed
+    and `/` pressed twice, sending it out of the world (`remove`), a drag pressed in the margin previews `Drawn {
+    stroke: None }`, outlines nothing and its release makes no stroke (one unstroked); a drag pressed on the shown
+    organism nearest the centre previews, at each of two edges, exactly `drawn`'s disk through the frame's view,
+    taken out of the world, outlined as it, removing energy, with the view unpanned; the release submits that disk
+    with that disposition as command 1 for tick 0, seen at 0; a step applies it at tick 0, published at 1,
+    removing the energy, bit for bit, that a world stepped directly with the same removal reports, all of it the
+    direct world's ledger's removed term (bit for bit), and a number of organisms between the shown organisms
+    strictly inside the disk and those within it or on its edge (radius ± 1e-4 relative, on the torus); in one
+    run a disk of 13.8 world units removed 152 organisms, 152 shown in it, 304 energy; the Studio closes on that
+    world's digest, with one stroke and one unstroked.
   - Plan §14.3's temporary measurement region: four steps in, with G armed and no brush, the pointer in the margin
     previews `Click(None)` and outlines nothing, and a click there places nothing (one unmeasured); over the shown
     organism nearest the centre the frame previews exactly `measure::clicked`'s disk, outlined in the measurement
@@ -870,6 +912,16 @@ presentation state, not scientific state.
     file); the line saying a click about the pointer (`tests/overlay.rs`): thirteen caught. Capture loss keeping
     the drawing flag survives, as an equivalent: `drawing()` reads the press, which capture loss clears, and every
     press and release resets the flag.
+  - Planted bugs in FL-022's amounts, counts and dispositions, 22, each run against the tests that should catch
+    it, all caught: an amount ignoring its step, the material's amount the energy brush's, a count ignoring
+    doubling, the count's range the amounts', the dispositions skipping `remove` (`tests/controls.rs`); a clicked
+    removal not disposed, the payload always recycling, `disposed` a no-op, the drawing preview not disposed
+    (`tests/brush.rs`); a click carrying the defaults, a drawn disk recycling, `/` with any brush, `-` and `=`
+    swapped, `-` and `=` scaling the energy brush with none armed (`tests/controls.rs`; this last survived a test
+    that pressed `-` then `=` unarmed, which undo each other, and was caught once each key was checked alone); the
+    host ignoring a click's settings, recycling a drawn removal, previewing at the defaults, and previewing a
+    drawn disk recycled (this file); the line saying dissipated as taken out, and taken out as recycled
+    (`tests/overlay.rs`); the `submitted` record's disposition absent, and always `recycle` (`src/main.rs`).
 - `tests/offscreen_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5
   --offscreen-zooms` at 320 x 200 points, 2x, CPU controllers on 2 workers: `open` says `offscreen`, records the
   projection (`AffinityProjection::fixed()`'s rows, matrix and divisor, and the preset's limit 1) and carries
@@ -1201,8 +1253,12 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     pointer. The outline in a window is unrun here: offscreen frames and the replay draw it. A command's applied energy is in its `finished`
     record, not the overlay. The binary's filling of the preview (the recycled share from the configuration) runs
     only in a window: no offscreen binary run arms a brush.
-  - A stroke is one click of fixed size. Painting by drag, a choice of amount, count or removal disposition, a
-    material other than the selected organism's, source edits and parameter edits have no Studio brush.
+  - A stroke is one click, or one drawn removal disk. Its amount, count and removal disposition are chosen by key
+    (`-`, `=` and `/`), in powers of two of the defaults: 1 to 4,096 energy and 1 to 64 organisms; there is no
+    typed amount. The overlay's preview says the armed brush's amount, count or disposition only once the pointer
+    is over the world. Painting by drag with the other brushes, a material other than the selected organism's,
+    source edits and parameter edits have no Studio brush. The keys run offscreen (`tests/offscreen.rs` posts
+    them as a window's events) and in `tests/controls.rs`; in a window they are unrun here.
   - The material brush takes the selected organism's composition from its `inspected` snapshot, which arrives
     after the click that selected it; a material click before then makes no stroke and is counted as
     `unstroked`. The host's tracking of that snapshot runs offscreen in `tests/offscreen.rs`.

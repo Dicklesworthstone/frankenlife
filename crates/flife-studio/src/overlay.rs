@@ -13,7 +13,7 @@ use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
-    Activations, Descendants, LocalChemistry, OrganismSnapshot, RegionMeasurement,
+    Activations, Descendants, Disposition, LocalChemistry, OrganismSnapshot, RegionMeasurement,
     ReproductionOutcome, Sensed, Transactions,
 };
 use flife_genome::TopologyCatalog;
@@ -118,8 +118,8 @@ pub struct BrushPreview {
     /// The host's preview ([`crate::preview`]).
     pub preview: Preview,
     /// `[death] residual_energy_recycle_fraction`: the share of a removed
-    /// organism's residual energy the removal brush, which recycles as a
-    /// death does, returns to the field; the rest dissipates.
+    /// organism's residual energy the removal brush, recycling as a death
+    /// does, returns to the field; the rest dissipates.
     pub recycle_fraction: f64,
 }
 
@@ -368,7 +368,10 @@ fn bytes(value: u64) -> String {
 ///   (…)`;
 /// - `a click removes the organisms within 1.23 world units of the
 ///   pointer: 50% of their energy to the field, the rest dissipated, none
-///   out of the world`;
+///   out of the world`, recycled as deaths are; dissipated, `…: all their
+///   energy dissipated, none to the field, none out of the world`; taken
+///   out of the modeled world, `…: all their energy out of the world, none
+///   to the field, none dissipated`;
 /// - `a click does nothing: the pointer is off the world`, or `…: select
 ///   an organism for its material`;
 /// - while the removal brush's disk is being drawn, what its release
@@ -439,12 +442,31 @@ pub fn preview_line(preview: &BrushPreview) -> String {
             decimal(f64::from(count) * energy, 1),
             place(cell, region)
         ),
-        Stroke::Removal { radius, .. } => format!(
-            "{gesture} removes the organisms within {} world units of {about}: {}% of their \
-             energy to the field, the rest dissipated, none out of the world",
-            decimal(radius, places(radius)),
-            decimal(preview.recycle_fraction * 100.0, 0)
-        ),
+        Stroke::Removal {
+            radius,
+            disposition,
+            ..
+        } => {
+            let within = format!(
+                "{gesture} removes the organisms within {} world units of {about}",
+                decimal(radius, places(radius))
+            );
+            match disposition {
+                Disposition::Recycle => format!(
+                    "{within}: {}% of their energy to the field, the rest dissipated, none out \
+                     of the world",
+                    decimal(preview.recycle_fraction * 100.0, 0)
+                ),
+                Disposition::Dissipate => format!(
+                    "{within}: all their energy dissipated, none to the field, none out of the \
+                     world"
+                ),
+                Disposition::Remove => format!(
+                    "{within}: all their energy out of the world, none to the field, none \
+                     dissipated"
+                ),
+            }
+        }
     }
 }
 

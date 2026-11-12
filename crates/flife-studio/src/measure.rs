@@ -39,7 +39,7 @@ impl Disk {
     #[must_use]
     pub const fn of(stroke: Stroke) -> Option<Self> {
         match stroke {
-            Stroke::Removal { center, radius } => Some(Self { center, radius }),
+            Stroke::Removal { center, radius, .. } => Some(Self { center, radius }),
             _ => None,
         }
     }

@@ -439,12 +439,14 @@ again disarms). With one armed, a click adds 64 units of declared energy to the 
 organisms within 12 points of it on screen, their energy recycled as a death's; adds 64 units of material whose
 composition is the selected organism's affinity direction, the material it converts best; or introduces 8
 founder-drawn organisms there. With the removal brush armed, a drag draws the disk instead of panning: press at
-its centre, drag out its radius, release to remove the organisms in it. While one is armed, the overlay says what
-a click at the pointer would do, or the release of the disk being drawn: the
+its centre, drag out its radius, release to remove the organisms in it. `-` and `=` halve and double the armed
+brush's amount (1 to 4,096 energy) or count (1 to 64 organisms), and with the removal brush armed `/` sends the
+removed energy elsewhere in turn: recycled as a death's, dissipated, or taken out of the modeled world. While one
+is armed, the overlay says what a click at the pointer would do, or the release of the disk being drawn: the
 energy it adds, in the model's units, and the cell it lands in, in world units; or for removal, the radius about
-the pointer (or the press) and the share of the removed energy recycled to the field, none leaving the world. The
-world shows where: the cell is outlined in amber, or the removal's disc in red. Each click or drawn disk is a
-command: a `submitted` record names the boundary it will apply at, and a `finished` record the tick it applied at
+the pointer (or the press) and where the removed energy goes. The world shows where: the cell is outlined in
+amber, or the removal's disc in red. Each click or drawn disk is a command: a `submitted` record names the
+boundary it will apply at, with its amount, count or disposition, and a `finished` record the tick it applied at
 and the energy it moved.
 
 G arms the measuring tool instead (plan §14.3's temporary measurement region; G again, or a brush key, puts it

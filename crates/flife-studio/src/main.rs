@@ -630,6 +630,9 @@ struct Payload {
     direction: Option<[f64; 32]>,
     center: Option<[f64; 2]>,
     radius: Option<f64>,
+    /// Where a removal sends the removed organisms' energy: `recycle`,
+    /// `dissipate` or `remove`.
+    disposition: Option<&'static str>,
     /// The organisms introduced, each with `endowment`.
     count: Option<u32>,
     endowment: Option<f64>,
@@ -643,9 +646,14 @@ impl Payload {
                 amount: Some(amount),
                 ..Self::default()
             },
-            Stroke::Removal { center, radius } => Self {
+            Stroke::Removal {
+                center,
+                radius,
+                disposition,
+            } => Self {
                 center: Some(center),
                 radius: Some(radius),
+                disposition: Some(disposition.name()),
                 ..Self::default()
             },
             Stroke::Material {
@@ -1728,6 +1736,7 @@ mod tests {
     use clap::Parser;
     use flife_core::Tick;
     use flife_core::ids::{CommandId, ResourceEpoch};
+    use flife_engine::Disposition;
     use flife_runtime::{CancelReason, Outcome};
     use flife_studio::{Status, Stroke};
     use serde_json::{Value, json};
@@ -1845,27 +1854,36 @@ mod tests {
             "direction": direction.to_vec(),
             "center": null,
             "radius": null,
+            "disposition": null,
             "count": null,
             "endowment": null,
             "seen_tick": 40,
             "effective_tick": 41
         });
         assert_eq!(material, expected);
-        let removal = line(&submitted(Stroke::Removal {
-            center: [1.5, 2.5],
-            radius: 3.0,
-        }));
-        for (key, value) in [
-            ("brush", json!("removal")),
-            ("cell", Value::Null),
-            ("amount", Value::Null),
-            ("direction", Value::Null),
-            ("center", json!([1.5, 2.5])),
-            ("radius", json!(3.0)),
+        for (disposition, name) in [
+            (Disposition::Recycle, "recycle"),
+            (Disposition::Dissipate, "dissipate"),
+            (Disposition::Remove, "remove"),
         ] {
-            expected[key] = value;
+            let removal = line(&submitted(Stroke::Removal {
+                center: [1.5, 2.5],
+                radius: 3.0,
+                disposition,
+            }));
+            for (key, value) in [
+                ("brush", json!("removal")),
+                ("cell", Value::Null),
+                ("amount", Value::Null),
+                ("direction", Value::Null),
+                ("center", json!([1.5, 2.5])),
+                ("radius", json!(3.0)),
+                ("disposition", json!(name)),
+            ] {
+                expected[key] = value;
+            }
+            assert_eq!(removal, expected);
         }
-        assert_eq!(removal, expected);
         let introduction = line(&submitted(Stroke::Introduction {
             cell: [9, 1],
             count: 8,

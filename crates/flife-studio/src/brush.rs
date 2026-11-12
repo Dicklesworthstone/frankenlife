@@ -9,6 +9,11 @@
 //! | material | M | `InjectMaterial` of [`BRUSH_ENERGY`] into the cell under the click, its composition the selected organism's affinity direction ([`material_for`]) |
 //! | introduction | I | `IntroduceOrganisms`: [`BRUSH_INTRODUCTION`] founder-drawn organisms in the cell under the click, each with a founder's endowment |
 //!
+//! Those are the defaults. [`BrushSettings`] holds each brush's amount or
+//! count as a power of two of its default and the removal's disposition
+//! (`recycle`, `dissipate` or `remove`), which the Studio's `-`, `=` and
+//! `/` keys change; a stroke carries what they were at its click.
+//!
 //! The payload is world-space: a cell index on the field grid, or a world
 //! centre and a radius in world units, with the material's composition and
 //! the introduction's endowment fixed when the click is made. It does not
@@ -87,6 +92,9 @@ pub enum Stroke {
         center: [f64; 2],
         /// In world units.
         radius: f64,
+        /// Where their energy goes: recycled as a death's, dissipated, or
+        /// taken out of the modeled world.
+        disposition: Disposition,
     },
     /// Declared energy with a chemical composition into one field cell.
     Material {
@@ -132,19 +140,36 @@ impl Stroke {
         }
     }
 
+    /// This stroke with a removal's energy going to `disposition`; any other
+    /// stroke unchanged.
+    #[must_use]
+    pub const fn disposed(self, disposition: Disposition) -> Self {
+        match self {
+            Self::Removal { center, radius, .. } => Self::Removal {
+                center,
+                radius,
+                disposition,
+            },
+            other => other,
+        }
+    }
+
     /// The canonical payload: [`Intervention::InjectEnergy`],
-    /// [`Intervention::RemoveOrganisms`] with [`Disposition::Recycle`], so
-    /// a removed organism's energy goes where a death's does,
+    /// [`Intervention::RemoveOrganisms`] with its disposition,
     /// [`Intervention::InjectMaterial`] or
     /// [`Intervention::IntroduceOrganisms`].
     #[must_use]
     pub const fn intervention(self) -> Intervention {
         match self {
             Self::Energy { cell, amount } => Intervention::InjectEnergy { cell, amount },
-            Self::Removal { center, radius } => Intervention::RemoveOrganisms {
+            Self::Removal {
                 center,
                 radius,
-                disposition: Disposition::Recycle,
+                disposition,
+            } => Intervention::RemoveOrganisms {
+                center,
+                radius,
+                disposition,
             },
             Self::Material {
                 cell,
@@ -168,7 +193,8 @@ impl Stroke {
     }
 }
 
-/// What the brushes draw on besides the click.
+/// What the brushes draw on besides the click, and how much they put in or
+/// take out.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Supplies {
     /// The material brush's composition per unit energy: the selected
@@ -177,6 +203,119 @@ pub struct Supplies {
     pub material: Option<[f64; MATERIAL_CHANNELS]>,
     /// Each introduced organism's endowment: `population.initial_energy`.
     pub founder_energy: f64,
+    /// The brushes' amounts and the removal's disposition.
+    pub settings: BrushSettings,
+}
+
+/// The steps of a power of two an energy or material brush's amount takes
+/// about [`BRUSH_ENERGY`]: from 1 to 4,096 units.
+pub const ENERGY_STEPS: [i8; 2] = [-6, 6];
+
+/// The steps of a power of two the introduction brush's count takes about
+/// [`BRUSH_INTRODUCTION`]: from 1 to 64 organisms.
+pub const INTRODUCTION_STEPS: [i8; 2] = [-3, 3];
+
+/// How much each brush puts in or takes out (plan §14.3's intervention
+/// tools; FL-022's amount, count and disposition): the energy and material
+/// brushes' amounts and the introduction brush's count, each a power of two
+/// of its default, and where the removal brush sends the energy of the
+/// organisms it removes. The default is [`BRUSH_ENERGY`],
+/// [`BRUSH_INTRODUCTION`] and [`Disposition::Recycle`], a death's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrushSettings {
+    energy: i8,
+    material: i8,
+    introduction: i8,
+    disposition: Disposition,
+}
+
+impl Default for BrushSettings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl BrushSettings {
+    /// The defaults: [`BRUSH_ENERGY`], [`BRUSH_INTRODUCTION`] and
+    /// [`Disposition::Recycle`].
+    pub const DEFAULT: Self = Self {
+        energy: 0,
+        material: 0,
+        introduction: 0,
+        disposition: Disposition::Recycle,
+    };
+
+    /// The energy a click of `brush` adds: [`BRUSH_ENERGY`] times two to
+    /// its step for the energy and material brushes; `None` for the others.
+    #[must_use]
+    pub fn amount(self, brush: Brush) -> Option<f64> {
+        let step = match brush {
+            Brush::Energy => self.energy,
+            Brush::Material => self.material,
+            Brush::Removal | Brush::Introduction => return None,
+        };
+        Some(BRUSH_ENERGY * 2.0_f64.powi(i32::from(step)))
+    }
+
+    /// The organisms a click of the introduction brush introduces:
+    /// [`BRUSH_INTRODUCTION`] times two to its step.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        if self.introduction >= 0 {
+            BRUSH_INTRODUCTION << self.introduction.unsigned_abs()
+        } else {
+            BRUSH_INTRODUCTION >> self.introduction.unsigned_abs()
+        }
+    }
+
+    /// Where the removal brush sends the energy of what it removes.
+    #[must_use]
+    pub const fn disposition(self) -> Disposition {
+        self.disposition
+    }
+
+    /// `brush`'s amount or count doubled (`up`) or halved, within
+    /// [`ENERGY_STEPS`] or [`INTRODUCTION_STEPS`]; unchanged at the end of
+    /// its range and for the removal brush, which has none.
+    #[must_use]
+    pub fn scaled(self, brush: Brush, up: bool) -> Self {
+        let step = |step: i8, [low, high]: [i8; 2]| {
+            if up {
+                (step + 1).min(high)
+            } else {
+                (step - 1).max(low)
+            }
+        };
+        match brush {
+            Brush::Energy => Self {
+                energy: step(self.energy, ENERGY_STEPS),
+                ..self
+            },
+            Brush::Material => Self {
+                material: step(self.material, ENERGY_STEPS),
+                ..self
+            },
+            Brush::Introduction => Self {
+                introduction: step(self.introduction, INTRODUCTION_STEPS),
+                ..self
+            },
+            Brush::Removal => self,
+        }
+    }
+
+    /// The removal's next disposition: recycled as a death's, then
+    /// dissipated, then taken out of the modeled world, then recycled again.
+    #[must_use]
+    pub const fn next_disposition(self) -> Self {
+        Self {
+            disposition: match self.disposition {
+                Disposition::Recycle => Disposition::Dissipate,
+                Disposition::Dissipate => Disposition::Remove,
+                Disposition::Remove => Disposition::Recycle,
+            },
+            ..self
+        }
+    }
 }
 
 /// The material an organism of affinity `a` converts best: the unit
@@ -224,30 +363,33 @@ pub fn stroke(
             ((world[axis] / width).floor() as u32).min(cells[axis] - 1)
         }))
     };
+    let settings = supplies.settings;
     match brush {
         Brush::Energy => Some(Stroke::Energy {
             cell: cell()?,
-            amount: BRUSH_ENERGY,
+            amount: settings.amount(Brush::Energy)?,
         }),
         Brush::Material => Some(Stroke::Material {
             cell: cell()?,
-            amount: BRUSH_ENERGY,
+            amount: settings.amount(Brush::Material)?,
             direction: supplies.material?,
         }),
         Brush::Introduction => Some(Stroke::Introduction {
             cell: cell()?,
-            count: BRUSH_INTRODUCTION,
+            count: settings.count(),
             energy: supplies.founder_energy,
         }),
-        Brush::Removal => removal(viewport, logical, world, BRUSH_RADIUS_POINTS),
+        Brush::Removal => removal(viewport, logical, world, BRUSH_RADIUS_POINTS)
+            .map(|made| made.disposed(settings.disposition())),
     }
 }
 
 /// The removal a click of the removal brush at the logical window point
 /// `at` makes, through `viewport` with a content area of `logical` points:
-/// exactly [`stroke`]'s for [`Brush::Removal`], whatever the field's cells
-/// or the supplies. `None` in the letterbox margin and while the content
-/// area is empty. The measuring tool's click measures this disk
+/// exactly [`stroke`]'s disk for [`Brush::Removal`], whatever the field's
+/// cells or the supplies, recycled ([`Stroke::disposed`] sends it
+/// elsewhere). `None` in the letterbox margin and while the content area
+/// is empty. The measuring tool's click measures this disk
 /// ([`crate::measure::clicked`]).
 #[must_use]
 pub fn clicked(viewport: &Viewport, logical: [f64; 2], at: [f64; 2]) -> Option<Stroke> {
@@ -265,9 +407,10 @@ pub fn clicked(viewport: &Viewport, logical: [f64; 2], at: [f64; 2]) -> Option<S
 /// on the world point under `center`, its radius the drag's length on
 /// screen at the drawable's density and the view's zoom, in world units,
 /// and at most half the shorter world side, as a click's
-/// [`BRUSH_RADIUS_POINTS`] is. `None` with `center` in the letterbox
-/// margin, while the content area is empty, and for a drag of no length or
-/// a nonfinite one; `edge` may be anywhere.
+/// [`BRUSH_RADIUS_POINTS`] is, recycled ([`Stroke::disposed`] sends it
+/// elsewhere). `None` with `center` in the letterbox margin, while the
+/// content area is empty, and for a drag of no length or a nonfinite one;
+/// `edge` may be anywhere.
 #[must_use]
 pub fn drawn(
     viewport: &Viewport,
@@ -297,8 +440,11 @@ fn removal(
     let per_point = (width / logical[0]).min(height / logical[1]);
     let radius = (points * per_point / viewport.scale()).min(extent[0].min(extent[1]) / 2.0);
     // `min` would take a NaN radius to the cap.
-    (points.is_finite() && radius.is_finite() && radius > 0.0)
-        .then_some(Stroke::Removal { center, radius })
+    (points.is_finite() && radius.is_finite() && radius > 0.0).then_some(Stroke::Removal {
+        center,
+        radius,
+        disposition: Disposition::Recycle,
+    })
 }
 
 /// What a click of an armed brush at the pointer would do, or a release
@@ -364,18 +510,21 @@ pub fn preview(
 /// The preview of the removal brush's disk being drawn by a drag that
 /// pressed at the logical window point `center`, with the pointer at
 /// `pointer`: [`Preview::Drawn`] with what [`drawn`] makes for a release
-/// there through `viewport`, with a content area of `logical` points.
+/// there through `viewport`, with a content area of `logical` points, its
+/// energy sent to `disposition`.
 #[must_use]
 pub fn drawing(
     viewport: &Viewport,
     logical: Option<[f64; 2]>,
     center: [f64; 2],
     pointer: Option<[f64; 2]>,
+    disposition: Disposition,
 ) -> Preview {
     Preview::Drawn {
         stroke: logical
             .zip(pointer)
-            .and_then(|(logical, edge)| drawn(viewport, logical, center, edge)),
+            .and_then(|(logical, edge)| drawn(viewport, logical, center, edge))
+            .map(|made| made.disposed(disposition)),
     }
 }
 
@@ -396,7 +545,7 @@ pub fn preview_region(preview: &Preview) -> Option<Region> {
     };
     let shape = match (stroke, region) {
         (_, Some(bounds)) => RegionShape::Rectangle(*bounds),
-        (Stroke::Removal { center, radius }, None) => RegionShape::Disc {
+        (Stroke::Removal { center, radius, .. }, None) => RegionShape::Disc {
             center: *center,
             radius: *radius,
         },

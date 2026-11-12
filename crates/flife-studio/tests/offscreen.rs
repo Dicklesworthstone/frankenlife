@@ -22,16 +22,17 @@ use std::time::{Duration, Instant};
 
 use flife_core::ids::{CommandId, OrganismId};
 use flife_core::{Tick, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, RegionMeasurement, Stepped, World};
+use flife_engine::{Arrangement, Disposition, NumericalProfile, RegionMeasurement, Stepped, World};
 use flife_manim::{
     HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionEffect, RegionShape, hud_origin, linear,
 };
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_G, KEY_I, KEY_M,
-    KEY_PERIOD, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, MeasurePreview, PICK_RADIUS_POINTS,
-    Preview, Status, Stroke, Studio, StudioOptions, Supplies, Surface, TimelineRecord, cell_region,
-    drawn, legends, material_for, measure, preview_region, scroll_zoom, stroke,
+    Brush, BrushSettings, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_EQUAL,
+    KEY_G, KEY_I, KEY_M, KEY_MINUS, KEY_PERIOD, KEY_SLASH, KEY_SPACE, KEY_T, KEY_W, KEY_X,
+    KEY_ZERO, MeasurePreview, PICK_RADIUS_POINTS, Preview, Status, Stroke, Studio, StudioOptions,
+    Supplies, Surface, TimelineRecord, cell_region, drawn, legends, material_for, measure,
+    preview_region, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -792,7 +793,7 @@ fn tracking_passes_the_selection_to_the_heir_of_the_organism_it_followed() {
             hover(studio, at);
             let frame = studio.frame().expect("a frame");
             let Some(Preview::Stroke {
-                stroke: stroke @ Stroke::Removal { center, radius },
+                stroke: stroke @ Stroke::Removal { center, radius, .. },
                 ..
             }) = frame.preview
             else {
@@ -1030,13 +1031,13 @@ fn an_offscreen_queue_keeps_a_native_queues_capacity() {
     studio.close().expect("closes");
 }
 
-/// FL-022's host brush path, as a window's: keys arm the brushes, and a
-/// click becomes a stroke through the frame's view and is sent as a
-/// command; the material brush takes the selected organism's affinity from
-/// its inspection. Paused at tick 0, both apply at the next step, each
-/// moving the energy that the world stepped directly with the same two
-/// strokes at tick 0 reports, bit for bit, and the Studio closes on that
-/// world.
+/// FL-022's host brush path, as a window's: keys arm the brushes and set
+/// their amounts, and a click becomes a stroke through the frame's view at
+/// that amount and is sent as a command; the material brush takes the
+/// selected organism's affinity from its inspection. Paused at tick 0, both
+/// apply at the next step, each moving the energy that the world stepped
+/// directly with the same two strokes at tick 0 reports, bit for bit, and
+/// the Studio closes on that world.
 #[test]
 fn brush_clicks_offscreen_apply_where_they_were_made() {
     if !MetalRenderer::is_available() {
@@ -1078,18 +1079,37 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
     let material = material_for(&affinity.expect("inspected"));
     assert!(material.is_some(), "the organism has an affinity direction");
 
-    // Arm each brush by its key and click with it, away from the organism.
+    // Arm each brush by its key, set its amount (FL-022: `=` doubles, `-`
+    // halves), and click with it, away from the organism.
     let mut strokes = Vec::new();
-    for (code, text, brush, at) in [
-        (KEY_E, "e", Brush::Energy, [110.0, 70.0]),
-        (KEY_M, "m", Brush::Material, [210.0, 130.0]),
+    let mut settings = BrushSettings::DEFAULT;
+    for (code, text, brush, scale, at) in [
+        (
+            KEY_E,
+            "e",
+            Brush::Energy,
+            [(KEY_EQUAL, "="); 2],
+            [110.0, 70.0],
+        ),
+        (
+            KEY_M,
+            "m",
+            Brush::Material,
+            [(KEY_MINUS, "-"); 2],
+            [210.0, 130.0],
+        ),
     ] {
         studio.post_input(key(code, text, true)).expect("posts");
         studio.post_input(key(code, text, false)).expect("posts");
         assert_eq!(studio.frame().expect("a frame").brush, Some(brush));
+        for (code, text) in scale {
+            tap(&mut studio, code, text);
+            settings = settings.scaled(brush, code == KEY_EQUAL);
+        }
         let supplies = Supplies {
             material,
             founder_energy: config.config().population.initial_energy,
+            settings,
         };
         let made = stroke(brush, &viewport, logical, cells, at, &supplies).expect("a stroke there");
         // Its preview there is that stroke, the selected organism's
@@ -1103,6 +1123,17 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
         strokes.push(made);
         click(&mut studio, at);
     }
+    // 64 doubled twice and halved twice.
+    assert!(
+        matches!(strokes[0], Stroke::Energy { amount, .. } if amount == 256.0),
+        "{:?}",
+        strokes[0]
+    );
+    assert!(
+        matches!(strokes[1], Stroke::Material { amount, .. } if amount == 16.0),
+        "{:?}",
+        strokes[1]
+    );
     let mut submitted = Vec::new();
     until(&mut studio, "the submissions", |_, statuses| {
         submitted = statuses
@@ -1185,14 +1216,15 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
 }
 
 /// FL-022 (plan §2.2: "draw an intervention region, remove part of a
-/// colony"): with the removal brush armed, a drag draws its disk and pans
-/// nothing. Each frame's preview and outlined region are the disk a
-/// release there would apply, centred where the press went down, and the
-/// release submits exactly that disk. Paused at tick 0, it applies at the
-/// next step: the world stepped directly with the same removal removes
-/// the same energy, bit for bit, and organisms the frame showed inside the
-/// disk, and the Studio closes on that world. A drag pressed off the world
-/// draws and submits nothing.
+/// colony"): with the removal brush armed and sent out of the world by
+/// `/`, a drag draws its disk and pans nothing. Each frame's preview and
+/// outlined region are the disk a release there would apply, centred where
+/// the press went down, and the release submits exactly that disk with
+/// that disposition. Paused at tick 0, it applies at the next step: the
+/// world stepped directly with the same removal removes the same energy,
+/// bit for bit, all of it to the ledger's removed term, and organisms the
+/// frame showed inside the disk, and the Studio closes on that world. A
+/// drag pressed off the world draws and submits nothing.
 #[test]
 fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
     if !MetalRenderer::is_available() {
@@ -1227,6 +1259,15 @@ fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
             .expect("posts");
     };
     tap(&mut studio, KEY_X, "x");
+    // Sent out of the modeled world (FL-022's disposition): `/` twice, past
+    // dissipated.
+    tap(&mut studio, KEY_SLASH, "/");
+    tap(&mut studio, KEY_SLASH, "/");
+    studio.frame().expect("a frame");
+    assert_eq!(
+        studio.controls().settings().disposition(),
+        Disposition::Remove
+    );
 
     // Pressed in the letterbox margin: no disk, nothing outlined, and the
     // release makes no stroke.
@@ -1257,7 +1298,9 @@ fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
     for edge in edges {
         drag(&mut studio, edge);
         let frame = studio.frame().expect("a frame");
-        let expected = drawn(&viewport, logical, centre, edge).expect("a disk");
+        let expected = drawn(&viewport, logical, centre, edge)
+            .expect("a disk")
+            .disposed(Disposition::Remove);
         assert_eq!(
             frame.preview,
             Some(Preview::Drawn {
@@ -1276,8 +1319,15 @@ fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
             "a drawing pans nothing"
         );
     }
-    let made = drawn(&viewport, logical, centre, edges[1]).expect("a disk");
-    let Stroke::Removal { center, radius } = made else {
+    let made = drawn(&viewport, logical, centre, edges[1])
+        .expect("a disk")
+        .disposed(Disposition::Remove);
+    let Stroke::Removal {
+        center,
+        radius,
+        disposition: Disposition::Remove,
+    } = made
+    else {
         panic!("{made:?}");
     };
     button(&mut studio, false, edges[1]);
@@ -1355,6 +1405,9 @@ fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
     assert_eq!((tick, published), (Tick::ZERO, Tick::new(1)));
     assert_eq!(energy.to_bits(), removal.applied.to_bits());
     assert!(energy > 0.0);
+    // Out of the world: the ledger's removed term is that energy, and none
+    // of it reached the field.
+    assert_eq!(report.ledger.removed.to_bits(), energy.to_bits());
     let removed = usize::try_from(removal.removed).expect("a count");
     println!(
         "a disk of {radius} world units removed {removed} organisms ({inside} to {reached} shown \
@@ -1568,7 +1621,8 @@ fn the_measuring_tool_measures_what_a_removal_of_its_disk_takes() {
         made,
         Stroke::Removal {
             center: disk.center,
-            radius: disk.radius
+            radius: disk.radius,
+            disposition: Disposition::Recycle,
         }
     );
     let mut submitted = false;
@@ -1641,6 +1695,7 @@ fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
     let supplies = Supplies {
         material: None,
         founder_energy: config.config().population.initial_energy,
+        settings: BrushSettings::DEFAULT,
     };
 
     // Armed before the pointer has been anywhere: off the world.

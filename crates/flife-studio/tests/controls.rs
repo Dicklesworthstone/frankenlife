@@ -1,12 +1,15 @@
 //! The Studio's controls: typed native input to intents and presentation
 //! state, as a pure state machine (no window).
 
+use flife_engine::Disposition;
 use flife_manim::Viewport;
 use flife_studio::{
-    Brush, CameraMove, ColorMapping, Controls, FieldComponent, FieldMapping, Intent, KEY_C, KEY_D,
-    KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R,
-    KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, Look, Particles, Style,
-    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, Brush, BrushSettings, CameraMove, ColorMapping, Controls,
+    ENERGY_STEPS, FieldComponent, FieldMapping, INTRODUCTION_STEPS, Intent, KEY_C, KEY_D,
+    KEY_DIGITS, KEY_E, KEY_EQUAL, KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M,
+    KEY_MINUS, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SLASH, KEY_SPACE, KEY_T, KEY_W,
+    KEY_X, KEY_ZERO, Look, Particles, Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT,
+    scroll_zoom,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -443,12 +446,14 @@ fn an_armed_click_brushes_and_a_drag_still_pans() {
         [
             CameraMove::Brush {
                 at: point(40.0, 50.0),
-                brush: Brush::Removal
+                brush: Brush::Removal,
+                settings: BrushSettings::default(),
             },
             CameraMove::Pan { delta: [20.0, 0.0] },
             CameraMove::Brush {
                 at: point(7.0, 8.0),
-                brush: Brush::Removal
+                brush: Brush::Removal,
+                settings: BrushSettings::default(),
             },
             CameraMove::Select {
                 at: point(3.0, 4.0)
@@ -481,7 +486,8 @@ fn an_armed_removal_drag_draws_its_disk() {
         moves(&mut controls),
         [CameraMove::Drawn {
             center: point(100.0, 100.0),
-            edge: point(124.0, 132.0)
+            edge: point(124.0, 132.0),
+            disposition: Disposition::Recycle,
         }]
     );
     assert_eq!(controls.drawing(), None);
@@ -532,11 +538,173 @@ fn an_armed_removal_drag_draws_its_disk() {
             CameraMove::Pan { delta: [10.0, 0.0] },
             CameraMove::Brush {
                 at: point(5.0, 5.0),
-                brush: Brush::Removal
+                brush: Brush::Removal,
+                settings: BrushSettings::default(),
             },
         ]
     );
     assert_eq!(controls.tally().moves, 4);
+}
+
+/// FL-022's amount, count and disposition: `-` and `=` halve and double
+/// the armed brush's amount or count, each brush its own, within its range
+/// and kept while disarmed; `/` sends the armed removal's energy to the next
+/// disposition. With no brush armed, or the wrong one, held, or with ⌘,
+/// they change nothing; they are never an intent. A click carries the
+/// settings in force when it was made, and a drawn disk its disposition at
+/// the release.
+#[test]
+fn minus_equal_and_slash_set_the_armed_brushs_amount_and_disposition() {
+    let mut controls = Controls::new();
+    let defaults = BrushSettings::default();
+    assert_eq!(controls.settings(), defaults);
+    assert_eq!(defaults.amount(Brush::Energy), Some(BRUSH_ENERGY));
+    assert_eq!(defaults.amount(Brush::Material), Some(BRUSH_ENERGY));
+    assert_eq!(defaults.amount(Brush::Removal), None);
+    assert_eq!(defaults.amount(Brush::Introduction), None);
+    assert_eq!(defaults.count(), BRUSH_INTRODUCTION);
+    assert_eq!(defaults.disposition(), Disposition::Recycle);
+
+    // Unarmed: nothing changes, and nothing is an intent; each key alone,
+    // so no two undo each other.
+    for code in [KEY_EQUAL, KEY_EQUAL, KEY_MINUS, KEY_SLASH] {
+        assert!(tap(&mut controls, code).is_empty());
+        assert_eq!(controls.settings(), defaults, "{code}");
+    }
+
+    // The energy brush doubles twice and halves once: 128.
+    tap(&mut controls, KEY_E);
+    for code in [KEY_EQUAL, KEY_EQUAL, KEY_MINUS] {
+        assert!(tap(&mut controls, code).is_empty());
+    }
+    assert_eq!(
+        controls.settings().amount(Brush::Energy),
+        Some(BRUSH_ENERGY * 2.0)
+    );
+    // The material brush's is its own; `/` is not the energy brush's.
+    assert_eq!(
+        controls.settings().amount(Brush::Material),
+        Some(BRUSH_ENERGY)
+    );
+    tap(&mut controls, KEY_SLASH);
+    assert_eq!(controls.settings().disposition(), Disposition::Recycle);
+    // Held, or with ⌘: nothing.
+    controls.apply(&key(KEY_EQUAL, true, true, Modifiers::NONE));
+    let command = Modifiers {
+        command: true,
+        ..Modifiers::NONE
+    };
+    controls.apply(&key(KEY_EQUAL, true, false, command));
+    assert_eq!(
+        controls.settings().amount(Brush::Energy),
+        Some(BRUSH_ENERGY * 2.0)
+    );
+
+    // Its range: down to 1 and up to 4,096, and no further.
+    for _ in 0..20 {
+        tap(&mut controls, KEY_MINUS);
+    }
+    assert_eq!(controls.settings().amount(Brush::Energy), Some(1.0));
+    for _ in 0..20 {
+        tap(&mut controls, KEY_EQUAL);
+    }
+    assert_eq!(controls.settings().amount(Brush::Energy), Some(4_096.0));
+    assert_eq!(ENERGY_STEPS, [-6, 6]);
+
+    // The material brush halves alone.
+    tap(&mut controls, KEY_M);
+    tap(&mut controls, KEY_MINUS);
+    assert_eq!(
+        controls.settings().amount(Brush::Material),
+        Some(BRUSH_ENERGY / 2.0)
+    );
+    assert_eq!(controls.settings().amount(Brush::Energy), Some(4_096.0));
+
+    // The introduction brush's count: 1 to 64.
+    tap(&mut controls, KEY_I);
+    tap(&mut controls, KEY_EQUAL);
+    assert_eq!(controls.settings().count(), BRUSH_INTRODUCTION * 2);
+    for _ in 0..10 {
+        tap(&mut controls, KEY_EQUAL);
+    }
+    assert_eq!(controls.settings().count(), 64);
+    for _ in 0..10 {
+        tap(&mut controls, KEY_MINUS);
+    }
+    assert_eq!(controls.settings().count(), 1);
+    assert_eq!(INTRODUCTION_STEPS, [-3, 3]);
+
+    // The removal brush has no amount; `/` cycles its disposition.
+    tap(&mut controls, KEY_X);
+    let before = controls.settings();
+    tap(&mut controls, KEY_EQUAL);
+    tap(&mut controls, KEY_MINUS);
+    assert_eq!(controls.settings(), before);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        assert!(tap(&mut controls, KEY_SLASH).is_empty());
+        seen.push(controls.settings().disposition());
+    }
+    assert_eq!(
+        seen,
+        [
+            Disposition::Dissipate,
+            Disposition::Remove,
+            Disposition::Recycle,
+            Disposition::Dissipate,
+        ]
+    );
+    // Kept while disarmed and rearmed.
+    tap(&mut controls, KEY_X);
+    tap(&mut controls, KEY_X);
+    assert_eq!(controls.settings().disposition(), Disposition::Dissipate);
+    assert_eq!(controls.settings().count(), 1);
+    assert_eq!(controls.settings().amount(Brush::Energy), Some(4_096.0));
+
+    // A click carries the settings then: the key after it does not change
+    // it. A drawn disk carries its disposition at the release.
+    moves(&mut controls);
+    let clicked = controls.settings();
+    controls.apply(&button(true, point(5.0, 5.0)));
+    controls.apply(&button(false, point(5.0, 5.0)));
+    // Pressed sending to `remove`, released sending to `dissipate`.
+    tap(&mut controls, KEY_SLASH);
+    controls.apply(&button(true, point(10.0, 10.0)));
+    controls.apply(&drag_to(point(30.0, 10.0)));
+    tap(&mut controls, KEY_SLASH);
+    tap(&mut controls, KEY_SLASH);
+    controls.apply(&button(false, point(30.0, 10.0)));
+    tap(&mut controls, KEY_E);
+    tap(&mut controls, KEY_MINUS);
+    controls.apply(&button(true, point(6.0, 6.0)));
+    controls.apply(&button(false, point(6.0, 6.0)));
+    let energy = controls.settings();
+    tap(&mut controls, KEY_MINUS);
+    assert_eq!(
+        moves(&mut controls),
+        [
+            CameraMove::Brush {
+                at: point(5.0, 5.0),
+                brush: Brush::Removal,
+                settings: clicked,
+            },
+            CameraMove::Drawn {
+                center: point(10.0, 10.0),
+                edge: point(30.0, 10.0),
+                disposition: Disposition::Dissipate,
+            },
+            CameraMove::Brush {
+                at: point(6.0, 6.0),
+                brush: Brush::Energy,
+                settings: energy,
+            },
+        ]
+    );
+    assert_eq!(clicked.disposition(), Disposition::Dissipate);
+    assert_eq!(energy.amount(Brush::Energy), Some(2_048.0));
+    assert_eq!(controls.settings().amount(Brush::Energy), Some(1_024.0));
+    // No key here is a style key.
+    assert_eq!(controls.style(), Style::default());
 }
 
 /// Plan §14.3's temporary measurement region: G arms the measuring tool,

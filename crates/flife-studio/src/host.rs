@@ -77,8 +77,8 @@ use crate::keep::Keeping;
 
 use crate::timeline::{Exact, TimelineRecord};
 use crate::{
-    Brush, CameraMove, Controls, Disk, Intent, MeasurePreview, Pacer, Preview, SessionThread,
-    Status, Supplies, brush, material_for, measure,
+    Brush, BrushSettings, CameraMove, Controls, Disk, Intent, MeasurePreview, Pacer, Preview,
+    SessionThread, Status, Supplies, brush, material_for, measure,
 };
 
 /// The session a Studio opens.
@@ -753,14 +753,16 @@ impl Studio {
     }
 
     /// What the brushes draw on now: the selected organism's material,
-    /// once its inspection has answered, and a founder's endowment.
-    fn supplies(&self) -> Supplies {
+    /// once its inspection has answered, a founder's endowment, and
+    /// `settings`.
+    fn supplies(&self, settings: BrushSettings) -> Supplies {
         Supplies {
             material: self
                 .material
                 .filter(|(organism, _)| self.view.selected() == Some(*organism))
                 .and_then(|(_, material)| material),
             founder_energy: self.founder_energy,
+            settings,
         }
     }
 
@@ -862,7 +864,7 @@ impl Studio {
         let mut strokes = Vec::new();
         let mut measured = Vec::new();
         let mut weights = false;
-        let supplies = self.supplies();
+        let mut supplies = self.supplies(BrushSettings::default());
         for change in self.controls.take_moves() {
             match change {
                 CameraMove::Zoom { anchor, factor } => {
@@ -895,8 +897,14 @@ impl Studio {
                         picked = Some(self.view.pick_in(&viewport, point, radius));
                     }
                 }
-                // Through the view as it was at the click, as a selection.
-                CameraMove::Brush { at, brush } => {
+                // Through the view as it was at the click, as a selection,
+                // with the amounts set then.
+                CameraMove::Brush {
+                    at,
+                    brush,
+                    settings,
+                } => {
+                    supplies.settings = settings;
                     match logical.and_then(|size| {
                         brush::stroke(
                             brush,
@@ -911,9 +919,14 @@ impl Studio {
                         None => self.tally.unstroked += 1,
                     }
                 }
-                CameraMove::Drawn { center, edge } => {
+                CameraMove::Drawn {
+                    center,
+                    edge,
+                    disposition,
+                } => {
                     match logical.and_then(|size| {
                         brush::drawn(&viewport, size, [center.x, center.y], [edge.x, edge.y])
+                            .map(|made| made.disposed(disposition))
                     }) {
                         Some(stroke) => strokes.push(stroke),
                         None => self.tally.unstroked += 1,
@@ -1158,20 +1171,25 @@ impl Studio {
             .controls
             .pointer()
             .map(|pointer| [pointer.x, pointer.y]);
+        let settings = self.controls.settings();
         let preview = self
             .controls
             .brush()
             .map(|brush| match self.controls.drawing() {
-                Some(center) => {
-                    brush::drawing(self.view.viewport(), logical, [center.x, center.y], pointer)
-                }
+                Some(center) => brush::drawing(
+                    self.view.viewport(),
+                    logical,
+                    [center.x, center.y],
+                    pointer,
+                    settings.disposition(),
+                ),
                 None => brush::preview(
                     brush,
                     self.view.viewport(),
                     logical,
                     self.current.field().cells(),
                     pointer,
-                    &self.supplies(),
+                    &self.supplies(settings),
                 ),
             });
         // The measuring tool's disk, placed or about to be, in the

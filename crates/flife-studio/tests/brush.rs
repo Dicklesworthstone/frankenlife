@@ -27,17 +27,18 @@ use flife_engine::{
 use flife_manim::{Region, RegionEffect, RegionShape, Viewport};
 use flife_runtime::Outcome;
 use flife_studio::{
-    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL, Preview,
-    SessionThread, Status, Stroke, Supplies, cell_region, drawing, drawn, material_for, preview,
-    preview_region, stroke,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, BrushSettings, Intent,
+    OUTCOME_POLL, Preview, SessionThread, Status, Stroke, Supplies, cell_region, drawing, drawn,
+    material_for, preview, preview_region, stroke,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
-/// No material, and the preset's founder endowment.
+/// No material, the preset's founder endowment, and the brushes' defaults.
 const NONE: Supplies = Supplies {
     material: None,
     founder_energy: 2.0,
+    settings: BrushSettings::DEFAULT,
 };
 
 /// The preset at 32 × 32 world units on a 32 × 32 grid with 96 founders.
@@ -292,7 +293,7 @@ fn a_preview_is_the_stroke_a_click_there_makes() {
                             // and whether the stroke removes energy.
                             let shape = match (made, region) {
                                 (_, Some(bounds)) => RegionShape::Rectangle(bounds),
-                                (Stroke::Removal { center, radius }, None) => {
+                                (Stroke::Removal { center, radius, .. }, None) => {
                                     RegionShape::Disc { center, radius }
                                 }
                                 _ => panic!("{made:?} has neither a cell nor a disc"),
@@ -360,10 +361,13 @@ fn a_removal_click_is_a_disk_of_fixed_screen_radius() {
     for zoom in [1.0, 4.0, 13.5] {
         let viewport = fit.with_view([12.0, 9.0], zoom).expect("views");
         let at = [380.0, 290.0];
-        let Some(Stroke::Removal { center, radius }) =
-            stroke(Brush::Removal, &viewport, logical, [32, 32], at, &NONE)
+        let Some(Stroke::Removal {
+            center,
+            radius,
+            disposition: Disposition::Recycle,
+        }) = stroke(Brush::Removal, &viewport, logical, [32, 32], at, &NONE)
         else {
-            panic!("no removal at zoom {zoom}");
+            panic!("no recycled removal at zoom {zoom}");
         };
         let world = viewport.logical_to_world(at, logical).expect("inside");
         assert_eq!(center, world);
@@ -396,7 +400,8 @@ fn a_removal_click_is_a_disk_of_fixed_screen_radius() {
             center: tiny
                 .logical_to_world([8.0, 8.0], [16.0, 16.0])
                 .expect("inside"),
-            radius: 16.0
+            radius: 16.0,
+            disposition: Disposition::Recycle,
         })
     );
     assert_eq!(
@@ -432,9 +437,13 @@ fn a_removal_drag_draws_a_disk_of_its_length() {
         let world = viewport.logical_to_world(at, logical).expect("inside");
         for (length, [dx, dy]) in [(30.0, [0.6, 0.8]), (57.5, [-1.0, 0.0]), (5.0, [0.0, -1.0])] {
             let edge = [at[0] + length * dx, at[1] + length * dy];
-            let Some(Stroke::Removal { center, radius }) = drawn(&viewport, logical, at, edge)
+            let Some(Stroke::Removal {
+                center,
+                radius,
+                disposition: Disposition::Recycle,
+            }) = drawn(&viewport, logical, at, edge)
             else {
-                panic!("no disk at zoom {zoom}, length {length}");
+                panic!("no recycled disk at zoom {zoom}, length {length}");
             };
             assert_eq!(center, world);
             let right = viewport
@@ -446,21 +455,28 @@ fn a_removal_drag_draws_a_disk_of_its_length() {
                 (radius - screen).abs() <= 1e-12 * screen,
                 "zoom {zoom}, length {length}: {radius} vs {screen}"
             );
-            // Its preview while drawn, and the region outlined.
-            let shown = drawing(&viewport, Some(logical), at, Some(edge));
-            assert_eq!(
-                shown,
-                Preview::Drawn {
-                    stroke: Some(Stroke::Removal { center, radius })
-                }
-            );
-            assert_eq!(
-                preview_region(&shown),
-                Some(Region {
-                    shape: RegionShape::Disc { center, radius },
-                    effect: RegionEffect::Removes
-                })
-            );
+            // Its preview while drawn, with each disposition the release
+            // would apply, and the region outlined: the same disc.
+            for disposition in Disposition::ALL {
+                let shown = drawing(&viewport, Some(logical), at, Some(edge), disposition);
+                assert_eq!(
+                    shown,
+                    Preview::Drawn {
+                        stroke: Some(Stroke::Removal {
+                            center,
+                            radius,
+                            disposition
+                        })
+                    }
+                );
+                assert_eq!(
+                    preview_region(&shown),
+                    Some(Region {
+                        shape: RegionShape::Disc { center, radius },
+                        effect: RegionEffect::Removes
+                    })
+                );
+            }
         }
         assert_eq!(
             drawn(&viewport, logical, at, [at[0], at[1] + BRUSH_RADIUS_POINTS]),
@@ -478,7 +494,8 @@ fn a_removal_drag_draws_a_disk_of_its_length() {
             center: tiny
                 .logical_to_world([8.0, 8.0], [16.0, 16.0])
                 .expect("inside"),
-            radius: 16.0
+            radius: 16.0,
+            disposition: Disposition::Recycle,
         })
     );
     let margin = [10.0, 300.0];
@@ -494,9 +511,15 @@ fn a_removal_drag_draws_a_disk_of_its_length() {
     // Pressed in the margin, or with no content area or pointer, the
     // preview names no disk and outlines nothing.
     for shown in [
-        drawing(&fit, Some(logical), margin, Some([60.0, 300.0])),
-        drawing(&fit, None, at, Some([400.0, 300.0])),
-        drawing(&fit, Some(logical), at, None),
+        drawing(
+            &fit,
+            Some(logical),
+            margin,
+            Some([60.0, 300.0]),
+            Disposition::Recycle,
+        ),
+        drawing(&fit, None, at, Some([400.0, 300.0]), Disposition::Remove),
+        drawing(&fit, Some(logical), at, None, Disposition::Dissipate),
     ] {
         assert_eq!(shown, Preview::Drawn { stroke: None });
         assert_eq!(preview_region(&shown), None);
@@ -521,6 +544,7 @@ fn material_and_introduction_clicks_carry_their_supplies() {
     let supplied = Supplies {
         material: Some(direction),
         founder_energy: 2.5,
+        settings: BrushSettings::DEFAULT,
     };
     let mut made = 0;
     for (at, _, energy) in lattice(&viewport, logical, cells) {
@@ -602,8 +626,159 @@ fn an_organisms_material_is_its_affinity_direction() {
     assert_eq!(material_for(&broken), None);
 }
 
+/// FL-022's amount, count and disposition: under every click, each
+/// setting the keys give a brush makes the stroke the defaults make, at
+/// that setting's amount, count or disposition, and nothing else changes:
+/// the cell, the disk, the material and the endowment are the click's.
+/// The amounts are exact powers of two of the defaults: 1 to 4,096 energy
+/// and 1 to 64 organisms.
+#[test]
+fn each_setting_scales_its_brush_and_sends_the_removal() {
+    let logical = [800.0, 600.0];
+    let cells = [64, 16];
+    let viewport = Viewport::fit([32.0, 32.0], [1600, 1200])
+        .expect("fits")
+        .with_view([5.0, 27.0], 1.7)
+        .expect("views");
+    let mut direction = [0.0; 32];
+    direction[3] = 0.6;
+    direction[17] = -0.8;
+    let defaults = Supplies {
+        material: Some(direction),
+        founder_energy: 2.5,
+        settings: BrushSettings::DEFAULT,
+    };
+    // Every setting of each brush, from the lowest up.
+    let every = |brush: Brush| {
+        let mut lowest = BrushSettings::DEFAULT;
+        while lowest.scaled(brush, false) != lowest {
+            lowest = lowest.scaled(brush, false);
+        }
+        let mut all = vec![lowest];
+        while all[all.len() - 1].scaled(brush, true) != all[all.len() - 1] {
+            all.push(all[all.len() - 1].scaled(brush, true));
+        }
+        all
+    };
+    let amounts: Vec<f64> = (-6..=6).map(|step| 64.0 * 2.0_f64.powi(step)).collect();
+    for brush in [Brush::Energy, Brush::Material] {
+        let seen: Vec<_> = every(brush)
+            .iter()
+            .map(|settings| settings.amount(brush).expect("an amount"))
+            .collect();
+        assert_eq!(seen, amounts, "{brush:?}");
+        assert_eq!((seen[0], seen[12]), (1.0, 4_096.0));
+    }
+    let counts: Vec<u32> = every(Brush::Introduction)
+        .iter()
+        .map(|settings| settings.count())
+        .collect();
+    assert_eq!(counts, [1, 2, 4, 8, 16, 32, 64]);
+    assert_eq!(every(Brush::Removal), [BrushSettings::DEFAULT]);
+    let dispositions = [
+        BrushSettings::DEFAULT,
+        BrushSettings::DEFAULT.next_disposition(),
+        BrushSettings::DEFAULT.next_disposition().next_disposition(),
+    ];
+    assert_eq!(
+        dispositions.map(BrushSettings::disposition),
+        [
+            Disposition::Recycle,
+            Disposition::Dissipate,
+            Disposition::Remove
+        ]
+    );
+    assert_eq!(
+        dispositions[2].next_disposition(),
+        BrushSettings::DEFAULT,
+        "round again"
+    );
+    // A brush's settings move only its own amount.
+    let doubled = BrushSettings::DEFAULT.scaled(Brush::Energy, true);
+    assert_eq!(doubled.amount(Brush::Material), Some(BRUSH_ENERGY));
+    assert_eq!(doubled.count(), BRUSH_INTRODUCTION);
+    assert_eq!(doubled.disposition(), Disposition::Recycle);
+
+    let settings = [Brush::Energy, Brush::Material, Brush::Introduction].map(every);
+    let mut made = 0;
+    // Every seventh click of the lattice: thousands of cells, both seams.
+    for (at, _, energy) in lattice(&viewport, logical, cells).into_iter().step_by(7) {
+        let Some(Stroke::Energy { cell, .. }) = energy else {
+            continue;
+        };
+        let click = |brush, settings| {
+            stroke(
+                brush,
+                &viewport,
+                logical,
+                cells,
+                at,
+                &Supplies {
+                    settings,
+                    ..defaults
+                },
+            )
+        };
+        for &set in &settings[0] {
+            let amount = set.amount(Brush::Energy).expect("an amount");
+            assert_eq!(
+                click(Brush::Energy, set),
+                Some(Stroke::Energy { cell, amount })
+            );
+        }
+        for &set in &settings[1] {
+            let amount = set.amount(Brush::Material).expect("an amount");
+            assert_eq!(
+                click(Brush::Material, set),
+                Some(Stroke::Material {
+                    cell,
+                    amount,
+                    direction
+                })
+            );
+        }
+        for &set in &settings[2] {
+            assert_eq!(
+                click(Brush::Introduction, set),
+                Some(Stroke::Introduction {
+                    cell,
+                    count: set.count(),
+                    energy: 2.5
+                })
+            );
+        }
+        let Some(Stroke::Removal { center, radius, .. }) =
+            click(Brush::Removal, BrushSettings::DEFAULT)
+        else {
+            panic!("no removal at {at:?}");
+        };
+        for set in dispositions {
+            let removal = click(Brush::Removal, set).expect("a removal");
+            assert_eq!(
+                removal,
+                Stroke::Removal {
+                    center,
+                    radius,
+                    disposition: set.disposition()
+                }
+            );
+            assert_eq!(
+                removal.intervention(),
+                Intervention::RemoveOrganisms {
+                    center,
+                    radius,
+                    disposition: set.disposition()
+                }
+            );
+        }
+        made += 1;
+    }
+    assert!(made > 100, "{made}");
+}
+
 /// The payloads are the canonical interventions: an injection of the
-/// stroke's energy, or a removal recycled as deaths are.
+/// stroke's energy, or a removal with its disposition, recycled as deaths
+/// are by default.
 #[test]
 fn a_stroke_is_its_canonical_intervention() {
     let energy = Stroke::Energy {
@@ -621,6 +796,7 @@ fn a_stroke_is_its_canonical_intervention() {
     let removal = Stroke::Removal {
         center: [1.5, 30.25],
         radius: 2.5,
+        disposition: Disposition::Recycle,
     };
     assert_eq!(removal.brush(), Brush::Removal);
     assert_eq!(
@@ -631,6 +807,18 @@ fn a_stroke_is_its_canonical_intervention() {
             disposition: Disposition::Recycle,
         }
     );
+    // `disposed` sends a removal elsewhere, and leaves any other stroke.
+    for disposition in Disposition::ALL {
+        assert_eq!(
+            removal.disposed(disposition).intervention(),
+            Intervention::RemoveOrganisms {
+                center: [1.5, 30.25],
+                radius: 2.5,
+                disposition,
+            }
+        );
+        assert_eq!(energy.disposed(disposition), energy);
+    }
     let mut direction = [0.0; 32];
     direction[0] = -1.0;
     let material = Stroke::Material {
@@ -785,6 +973,7 @@ fn a_paused_studio_session_applies_strokes_at_its_next_boundary() {
     let removal = Stroke::Removal {
         center,
         radius: 3.0,
+        disposition: Disposition::Recycle,
     };
     session
         .send(Intent::Intervene {
@@ -844,7 +1033,8 @@ fn a_paused_studio_session_applies_strokes_at_its_next_boundary() {
 /// While the session runs, every stroke applies at the boundary it was
 /// accepted for and is published by the next tick; replaying the applied
 /// strokes at their ticks, in command order, on a direct world reproduces
-/// every reported energy bit for bit and the session's final world.
+/// every reported energy bit for bit and the session's final world. The
+/// strokes take amounts the keys set and each removal disposition.
 #[test]
 fn a_running_studio_session_applies_strokes_where_it_reports() {
     let config = small();
@@ -855,12 +1045,13 @@ fn a_running_studio_session_applies_strokes_where_it_reports() {
         let stroke = if index % 2 == 0 {
             Stroke::Energy {
                 cell: [(index * 7) % 32, (index * 11) % 32],
-                amount: BRUSH_ENERGY,
+                amount: BRUSH_ENERGY * f64::from(1_u32 << (index % 6)) / 4.0,
             }
         } else {
             Stroke::Removal {
                 center: [f64::from(index) * 1.9, 31.0 - f64::from(index) * 1.3],
                 radius: 1.5,
+                disposition: Disposition::ALL[(index as usize / 2) % 3],
             }
         };
         if session
@@ -941,6 +1132,7 @@ fn a_studio_session_refuses_bad_strokes_and_closes_with_one_pending() {
     let wide = Stroke::Removal {
         center: [4.0, 4.0],
         radius: 16.5,
+        disposition: Disposition::Remove,
     };
     let held = Stroke::Energy {
         cell: [31, 31],

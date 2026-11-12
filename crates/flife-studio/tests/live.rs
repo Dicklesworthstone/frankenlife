@@ -850,6 +850,7 @@ fn live() -> Result<Vec<String>, String> {
         &flife_studio::Supplies {
             material: None,
             founder_energy: config.config().population.initial_energy,
+            settings: flife_studio::BrushSettings::default(),
         },
     )
     .ok_or("no stroke under the click")?;

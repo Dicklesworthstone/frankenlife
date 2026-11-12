@@ -13,9 +13,14 @@
 //!   rows and bins and the textures it samples on the host and copies them
 //!   to the device, each charged at the view's
 //!   [`WorldView::preparation_limit`] plus its [`WorldView::texel_bytes`].
-//!   FrankenManim bounds neither; on 48 frames, up to 16,384 organisms at
-//!   4K, two pixels per point and a 16x zoom, the host held at most
-//!   61% and the device copy at most 44% of that sum;
+//!   FrankenManim bounds neither. Since its `9b116eee` the route keeps the
+//!   tables in device buffers between frames, each up to a quarter larger
+//!   than the largest table it has held, and never shrinks them
+//!   (`MetalRenderer::resident_table_bytes`). On 48 frames through one
+//!   renderer, up to 16,384 organisms at 4K, two pixels per point and a
+//!   16x zoom, at FrankenManim `d670e74e`: the host held at most 45.9%
+//!   and copied at most 43.2% of a frame's sum, and the kept buffers were
+//!   at most 51.8% of the largest sum so far;
 //! - per drawable pixel, [`DEVICE_BYTES_PER_PIXEL`]: the route's RGBA16F
 //!   and RGBA8 surfaces and the window's drawables (offscreen, the one
 //!   frame read back to the host instead, 4 of the drawables' 12); and a

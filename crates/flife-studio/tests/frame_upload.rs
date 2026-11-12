@@ -3,7 +3,9 @@
 //! texels), and the bytes it copies to the device, measured headlessly on
 //! a Metal device without a window, are each within the view's preparation
 //! limit plus its texel bytes, the Studio's upload term. The Studio's frame
-//! tally counts the same reports' copies.
+//! tally counts the same reports' copies. The device buffers the one
+//! renderer keeps its tables in between frames (FrankenManim 9b116eee),
+//! which never shrink, stay within the largest term of the frames so far.
 
 #![allow(
     clippy::expect_used,
@@ -48,6 +50,9 @@ fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texel
     let (mut closest, mut copied, mut largest) = (0.0_f64, 0.0_f64, 0);
     let mut tally = FrameTally::default();
     let (mut uploaded, mut read_back) = (0_u64, 0_u64);
+    // The largest upload term so far, and the fullest the kept tables have
+    // been of it.
+    let (mut term, mut kept_most) = (0_u64, 0.0_f64);
     for live in [4_096, 16_384] {
         let config = preset_with(&[("initial_count", live), ("maximum_count", 16_384)]);
         let world = World::found(
@@ -111,6 +116,14 @@ fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texel
                              upload copied {upload} > {limit}"
                         );
                         assert_eq!(report.readback_bytes, frame.as_bytes().len());
+                        term = term.max(limit);
+                        let kept = u64::try_from(renderer.resident_table_bytes()).expect("fits");
+                        assert!(
+                            kept > 0 && kept <= term,
+                            "{live} live, {drawable:?} at {density}x, zoom {zoom}, {name}: \
+                             tables kept {kept} > {term}"
+                        );
+                        kept_most = kept_most.max(kept as f64 / term as f64);
                         tally.count_copies(&report);
                         uploaded += upload;
                         read_back += u64::try_from(report.readback_bytes).expect("fits");
@@ -125,9 +138,12 @@ fn a_frames_metal_upload_holds_and_copies_no_more_than_its_preparation_and_texel
     }
     println!(
         "{frames} frames uploaded; the fullest held {:.1}% and copied {:.1}% of its preparation \
-         limit plus texels; the largest copy {largest} bytes",
+         limit plus texels; the largest copy {largest} bytes; the tables kept on the device at \
+         most {:.1}% of the largest term so far, {} bytes at the end",
         closest * 100.0,
-        copied * 100.0
+        copied * 100.0,
+        kept_most * 100.0,
+        renderer.resident_table_bytes()
     );
     // The Studio's frame records: the copies its tally counts from the same
     // reports.

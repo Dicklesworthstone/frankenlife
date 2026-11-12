@@ -54,6 +54,14 @@
 //! the newest checkpoint's tick. Closing suspends the session: a command
 //! still pending stays pending, to apply when the run is resumed. The
 //! statuses reported while the Studio closes are printed before `end`.
+//!
+//! `--resume DIR` opens such a run again, with the configuration DIR holds
+//! (no configuration is named): the newest checkpoint that restores, the
+//! command journal replayed past it, as `flife resume` recovers it. The
+//! `open` record's `resumed` names that checkpoint (null for the founding
+//! world), those passed over and the tick the session opened at; it is kept
+//! on in DIR, its checkpoints continuing the run's. A resumed run records no
+//! timeline: a timeline replays from the founding world.
 
 #![forbid(unsafe_code)]
 
@@ -74,8 +82,8 @@ use flife_runtime::Outcome;
 use flife_studio::{
     Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
     ExportOptions, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState,
-    Particles, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, Surface, Telemetry,
-    TimelineRecord, legends, overlay_text, write_timeline_record,
+    Particles, Resumed, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, Surface,
+    Telemetry, TimelineRecord, legends, overlay_text, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -89,8 +97,10 @@ const ERROR_SCHEMA: &str = "frankenlife.error.v1";
     about = "FrankenLife's Studio: the live world in a native window"
 )]
 struct Cli {
-    /// The configuration or preset, as TOML.
-    config: PathBuf,
+    /// The configuration or preset, as TOML; with `--resume`, none (the run
+    /// directory holds it).
+    #[arg(required_unless_present = "resume", conflicts_with = "resume")]
+    config: Option<PathBuf>,
     /// Content width in points; `[presentation] width` by default.
     #[arg(long, requires = "height")]
     width: Option<u32>,
@@ -177,6 +187,14 @@ struct Cli {
     /// absent or empty: `flife resume`, `branch` and `inspect` take it.
     #[arg(long, value_name = "DIR", conflicts_with = "export")]
     run: Option<PathBuf>,
+    /// Resume the run kept in run directory DIR, as `flife resume` does,
+    /// and keep it on there (FL-024).
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["run", "export", "timeline"]
+    )]
+    resume: Option<PathBuf>,
 }
 
 /// A timeline file being written (`--timeline`).
@@ -339,6 +357,8 @@ enum Record<'a> {
         /// checkpoint admission.
         run_dir: Option<String>,
         checkpoints: Option<&'a CheckpointAdmission>,
+        /// What `--resume` recovered.
+        resumed: Option<&'a Resumed>,
     },
     /// A checkpoint of the kept session was published (`--run`, FL-024).
     Checkpoint {
@@ -747,7 +767,18 @@ struct ErrorRecord<'a> {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = match load(&cli.config) {
+    let loaded = match (&cli.resume, &cli.config) {
+        (Some(run_dir), _) => flife_cli::persist::read_config(run_dir)
+            .map_err(|error| fail(error.kind(), error.to_string(), 2)),
+        (None, Some(path)) => load(path),
+        // The arguments require one or the other.
+        (None, None) => Err(fail(
+            "internal",
+            "neither a configuration nor --resume DIR was given".to_owned(),
+            2,
+        )),
+    };
+    let config = match loaded {
         Ok(config) => config,
         Err(code) => return code,
     };
@@ -798,7 +829,11 @@ fn main() -> ExitCode {
         return fail(error.kind(), error.to_string(), 2);
     }
     let clock = Instant::now();
-    let mut studio = match Studio::open(&config, &options) {
+    let opened = match &cli.resume {
+        Some(run_dir) => Studio::resume(run_dir, &options),
+        None => Studio::open(&config, &options),
+    };
+    let mut studio = match opened {
         Ok(studio) => studio,
         Err(error) => return fail(error.kind(), error.to_string(), 2),
     };
@@ -846,6 +881,7 @@ fn main() -> ExitCode {
             .kept()
             .map(|(run_dir, _)| run_dir.display().to_string()),
         checkpoints: studio.kept().map(|(_, admission)| admission),
+        resumed: studio.resumed(),
     });
     let deadline = cli
         .offscreen

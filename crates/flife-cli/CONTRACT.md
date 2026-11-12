@@ -312,7 +312,12 @@ for, one at least, before a render is refused. Its first record is `start`, with
   `admission`), with `vacant` (whether a directory can become a run directory: absent or empty; `create` asks it
   first), `create` and `open_session`, so the Studio's `--run` keeps a run directory with this library. A run
   directory the Studio kept is a run: `resume`, `branch` and `inspect` take it (tested in `flife-studio`'s
-  `tests/kept.rs`).
+  `tests/kept.rs`). `recover(dir, adjust)` is the first half of `resume`, public so the Studio's `--resume`
+  opens a run the same way: the configuration `read_config` gives, the session the catalog records, its
+  checkpoints opened under `Persistence::new` as `adjust` leaves it, and the newest that loads and restores (the
+  founding world when none does, refused for a branch), returned unopened as `Recovered` (configuration,
+  limits, checkpoints, world, book, the checkpoint recovered and those passed over). `resume` is `recover`, then
+  configure, `open_session` (which replays the journal) and drive; `tests/resume.rs` runs through it.
 - FL-038 (§16.5, §19.4, A.2), `checkpointing`:
   - `pause-and-stream` (the preset's): `SessionHandle::checkpoint_with` hands the borrowed committed world to
     `flife_runtime::checkpoint_into`, which streams it into a `flife_store::Stream` a 1 MiB page at a time; the
@@ -529,7 +534,10 @@ Twenty-two planted bugs were each caught by at least one of these tests or `flif
 controllers every 4 ticks in per-organism phases, checkpoints every 7 ticks, energy brushes at ticks 3, 66, 150
 and 230 on cells whose X and Y differ, and a 240-tick horizon whose uninterrupted run is the reference (it
 publishes the founding checkpoint, every multiple of 7 and 240, keeps 4, journals 4 acceptances and 4 outcomes,
-and its catalog indexes exactly the checkpoints it published):
+and its catalog indexes exactly the checkpoints it published). Each write-ahead resume (this test's first two,
+and FL-038's after a kill) given `--checkpoint-every 7` publishes nothing before the tick it resumed at and,
+past it, exactly the reference's checkpoints, byte for byte: every multiple of 7, not of the configured 3,840
+ticks (`recover` applies the caller's persistence), and 240:
 - `a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_state`. A run to tick 152 journals 3
   outcomes and no cancellation. Its checkpoint at 147 holds controller outputs evaluated before 147, a cooldown
   running past it, newborn genomes, command 2 applied and commands 3 and 4 pending. With the 152 manifest damaged,

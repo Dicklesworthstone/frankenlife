@@ -8,9 +8,14 @@
 //! the world the session closed on, and `flife resume` continues the run to
 //! exactly the uninterrupted world, applying a stroke still pending at the
 //! close. Under `write-ahead-before-apply` the strokes are journaled too.
+//! `Studio::resume` opens such a run again where it closed: the pending
+//! stroke applies, a new stroke is numbered after the run's commands, the
+//! checkpoints continue the run's, and the world it closes on is the
+//! uninterrupted one.
 //!
 //! No window opens: the session thread is driven through its intent lane,
-//! as the Studio host drives it.
+//! as the Studio host drives it, and the resumed Studio is offscreen on
+//! headless Metal (without a Metal device that test returns early).
 
 #![allow(
     clippy::expect_used,
@@ -18,17 +23,23 @@
     reason = "test helpers: a failure in one is a test failure"
 )]
 
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use flife_cli::{
-    CHECKPOINT_FIXED_BYTES, ControllerChoice, InspectOptions, ResumeOptions, StoreDurability,
+    CHECKPOINT_FIXED_BYTES, CheckpointAt, ControllerChoice, InspectOptions, ResumeOptions,
+    StoreDurability,
 };
 use flife_core::ids::CommandId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Arrangement, Intervention, NumericalProfile, Stepped, World};
 use flife_runtime::Outcome;
-use flife_studio::{BRUSH_ENERGY, Intent, Keeping, STUDIO_SESSION, SessionThread, Status, Stroke};
+use flife_studio::{
+    BRUSH_ENERGY, Intent, KEY_E, KEY_PERIOD, Keeping, Resumed, STUDIO_SESSION, SessionThread,
+    Status, Stroke, Studio, StudioOptions, Surface,
+};
+use fmn_render::metal::{InputEvent, LogicalPoint, MetalRenderer, Modifiers, PointerButton};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -353,6 +364,232 @@ fn kept_session_resumes(durability: &str) {
         .accepted(strokes[1].0)
         .map(|accepted| accepted.effective);
     assert_eq!(pending_applied, Some(closed_at));
+}
+
+/// An offscreen Studio: 320 x 200 points at one pixel a point, paused, CPU
+/// controllers on two workers. No window opens.
+fn offscreen() -> StudioOptions {
+    StudioOptions {
+        size: Some([320, 200]),
+        cpu_workers: NonZeroUsize::new(2),
+        controllers: ControllerChoice::Cpu,
+        surface: Surface::Offscreen {
+            scale: NonZeroU32::MIN,
+        },
+        ..StudioOptions::default()
+    }
+}
+
+/// Press and release a key on `studio`.
+fn tap(studio: &mut Studio, code: u16) {
+    for pressed in [true, false] {
+        studio
+            .post_input(InputEvent::Key {
+                code,
+                text: String::new(),
+                pressed,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    }
+}
+
+/// Frames of `studio` until `done` holds for the statuses gathered, within
+/// 120 seconds.
+fn frames_until(
+    studio: &mut Studio,
+    mut statuses: Vec<Status>,
+    done: impl Fn(&[Status]) -> bool,
+) -> Vec<Status> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !done(&statuses) {
+        assert!(Instant::now() < deadline, "only {statuses:?}");
+        studio.frame().expect("a frame");
+        statuses.extend(studio.take_statuses());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    statuses
+}
+
+fn stepped(statuses: &[Status]) -> usize {
+    statuses
+        .iter()
+        .filter(|status| matches!(status, Status::Stepped { .. }))
+        .count()
+}
+
+#[test]
+fn a_studio_resumes_its_kept_run_where_it_closed() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    for durability in ["volatile-in-memory", "write-ahead-before-apply"] {
+        studio_resumes(durability);
+    }
+}
+
+fn studio_resumes(durability: &str) {
+    let config = configured(durability, &[]);
+    let dir = fresh(&format!("resume-{durability}"));
+
+    // A kept session, paused: two steps, a stroke applied at tick 2, a
+    // step, and a stroke left pending at the closing boundary, tick 3.
+    let keeping = Keeping::new(&dir, &config).expect("kept");
+    let (owner, handle, kept) = keeping
+        .open(found(&config), &config, STUDIO_SESSION)
+        .expect("the kept session opens");
+    let session =
+        SessionThread::spawn_kept(owner, handle, Some(kept)).expect("the session thread starts");
+    let stroke = |cell, seen| Intent::Intervene {
+        stroke: Stroke::Energy {
+            cell,
+            amount: BRUSH_ENERGY,
+        },
+        seen: Tick::new(seen),
+    };
+    session.send(Intent::Step).expect("offered");
+    session.send(Intent::Step).expect("offered");
+    let statuses = gather(&session, Vec::new(), |statuses| stepped(statuses) == 2);
+    session.send(stroke([5, 9], 2)).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        submitted(statuses).len() == 1
+    });
+    session.send(Intent::Step).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        stepped(statuses) == 3 && finished(statuses) == 1
+    });
+    session.send(stroke([20, 6], 3)).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        submitted(statuses).len() == 2
+    });
+    let (closed, closing) = session.close_reporting().expect("closes");
+    let statuses: Vec<Status> = statuses.into_iter().chain(closing).collect();
+    let strokes = submitted(&statuses);
+    assert_eq!(applied(&statuses), [(strokes[0].0, Tick::new(2))]);
+    let closed_at = closed.boundary.tick;
+    assert_eq!(closed_at, Tick::new(3));
+    assert_eq!(strokes[1].2, closed_at, "pending at the closing boundary");
+    let last = checkpoints(&statuses).last().expect("checkpoints").clone();
+    assert_eq!(last.0, closed_at);
+
+    // The Studio resumes it from the closing checkpoint.
+    let mut studio = Studio::resume(&dir, &offscreen()).expect("resumes");
+    assert_eq!(
+        studio.resumed(),
+        Some(&Resumed {
+            checkpoint: Some(CheckpointAt {
+                sequence: last.1,
+                tick: closed_at.get(),
+            }),
+            skipped: Vec::new(),
+            tick: closed_at.get(),
+        })
+    );
+    assert_eq!(
+        studio.kept().map(|(run_dir, _)| run_dir),
+        Some(dir.as_path())
+    );
+    let shown = studio.frame().expect("a frame").shown.expect("an epoch");
+    assert_eq!(shown.tick, closed_at);
+
+    // Stepped, the pending stroke applies at its boundary, and the resumed
+    // session reports it finishing as it reports its own; a new stroke is
+    // numbered after the run's two and applies at the next.
+    tap(&mut studio, KEY_PERIOD);
+    let statuses = frames_until(&mut studio, Vec::new(), |statuses| {
+        stepped(statuses) == 1 && finished(statuses) == 1
+    });
+    assert_eq!(
+        applied(&statuses),
+        [(strokes[1].0, closed_at)],
+        "{statuses:?}"
+    );
+    tap(&mut studio, KEY_E);
+    for pressed in [true, false] {
+        studio
+            .post_input(InputEvent::Button {
+                button: PointerButton::Primary,
+                pressed,
+                position: LogicalPoint { x: 160.0, y: 100.0 },
+                clicks: 1,
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    }
+    let statuses = frames_until(&mut studio, statuses, |statuses| {
+        submitted(statuses).len() == 1
+    });
+    let new = submitted(&statuses)[0];
+    assert_eq!(
+        new.0,
+        CommandId::new(3),
+        "numbered after the run's commands"
+    );
+    for _ in 0..3 {
+        tap(&mut studio, KEY_PERIOD);
+    }
+    let statuses = frames_until(&mut studio, statuses, |statuses| {
+        stepped(statuses) == 4 && finished(statuses) == 2
+    });
+    let after = applied(&statuses);
+    assert_eq!(after.len(), 2, "{statuses:?}");
+    assert_eq!(after[1], (new.0, new.2));
+    let closed = studio.close().expect("closes");
+    let until = closed.session.boundary.tick;
+    assert_eq!(until, Tick::new(closed_at.get() + 4));
+
+    // The world it closed on is the uninterrupted one, bit for bit; its
+    // checkpoints continue the run's, the closing one there.
+    let all = [
+        (strokes[0].0, strokes[0].1, Tick::new(2)),
+        (strokes[1].0, strokes[1].1, closed_at),
+        (new.0, new.1, new.2),
+    ];
+    let (uninterrupted, _) = direct(&config, &all, until);
+    assert_eq!(
+        closed.session.world.digest(),
+        uninterrupted.digest(),
+        "{durability}"
+    );
+    let resumed_kept = checkpoints(&closed.statuses);
+    assert_eq!(resumed_kept.len(), 1, "{resumed_kept:?}");
+    assert_eq!(resumed_kept[0].0, until);
+    assert!(
+        resumed_kept[0].1 > last.1,
+        "{resumed_kept:?} after {last:?}"
+    );
+    let inspection = flife_cli::inspect(&dir, InspectOptions::default()).expect("inspects");
+    assert_eq!(inspection.inspected.checkpoint.tick, until.get());
+    assert_eq!(inspection.inspected.digest, uninterrupted.digest().to_hex());
+}
+
+/// `Studio::resume` refuses, before anything is read or any surface opens,
+/// a run directory to keep it in elsewhere and a timeline to record; and a
+/// directory that holds no run.
+#[test]
+fn what_cannot_be_resumed_is_refused() {
+    let unmade = fresh("unmade");
+    let refused =
+        |options: &StudioOptions, dir: &Path, expected: &str| match Studio::resume(dir, options) {
+            Err(CoreError::StateConflict { detail, .. }) => {
+                assert!(detail.contains(expected), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        };
+    let elsewhere = StudioOptions {
+        run: Some(fresh("elsewhere")),
+        ..offscreen()
+    };
+    refused(&elsewhere, &unmade, "kept where it is");
+    let recorded = StudioOptions {
+        record: true,
+        ..offscreen()
+    };
+    refused(&recorded, &unmade, "replays from the founding world");
+    refused(&offscreen(), &unmade, "is not a run directory");
+    assert!(!unmade.exists());
 }
 
 /// A directory that holds a run, or anything else, and a budget that

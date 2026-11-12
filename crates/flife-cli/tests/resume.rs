@@ -333,6 +333,28 @@ fn uninterrupted() -> &'static Uninterrupted {
     })
 }
 
+/// A resumed run checkpoints as the uninterrupted run did once past the
+/// tick it resumed at: at every multiple of the `--checkpoint-every` it was
+/// given (7, not the configuration's own interval) and at the horizon, each
+/// byte for byte the uninterrupted run's; and never before that tick.
+#[track_caller]
+fn checkpoints_as_uninterrupted(out: &[Value], resumed: &Value, reference: &[(u64, Value)]) {
+    let from = resumed["tick"].as_u64().expect("a tick");
+    let past = |checkpoints: &[(u64, Value)]| -> Vec<(u64, Value)> {
+        checkpoints
+            .iter()
+            .filter(|(tick, _)| *tick > from)
+            .cloned()
+            .collect()
+    };
+    let published = stored(out);
+    assert!(
+        published.iter().all(|(tick, _)| *tick >= from),
+        "{published:?} from {from}"
+    );
+    assert_eq!(past(&published), past(reference));
+}
+
 /// A resumed run reached the uninterrupted run's state at the horizon: the
 /// same digest and a byte-identical final checkpoint.
 #[track_caller]
@@ -461,6 +483,7 @@ fn a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_stat
         resumed["tick"].as_u64().is_some_and(|tick| tick >= 150),
         "replayed past tick 150: {resumed}"
     );
+    checkpoints_as_uninterrupted(&out, resumed, &reference.checkpoints);
     reaches_the_uninterrupted_state(&out, (&reference.digest, &reference.last));
     assert_eq!(
         one(&out, "end")["persisted"]["journal"],
@@ -490,6 +513,7 @@ fn a_killed_write_ahead_run_resumes_to_the_uninterrupted_state() {
     );
     assert_eq!(resumed["journal"]["admitted"], 4);
     publishes_after(&out, resumed);
+    checkpoints_as_uninterrupted(&out, resumed, &reference.checkpoints);
     reaches_the_uninterrupted_state(&out, (&reference.digest, &reference.last));
 }
 
@@ -556,6 +580,7 @@ fn a_bounded_background_run_stores_the_same_checkpoints_and_resumes_after_a_kill
     let resumed = one(&out, "resume");
     eprintln!("killed after {published} background checkpoint records; resumed: {resumed}");
     publishes_after(&out, resumed);
+    checkpoints_as_uninterrupted(&out, resumed, &reference.checkpoints);
     reaches_the_uninterrupted_state(&out, (&reference.digest, &reference.last));
 }
 

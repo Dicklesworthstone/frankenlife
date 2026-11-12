@@ -39,6 +39,15 @@
 //! Each checkpoint is reported as [`Status::Checkpointed`]. A checkpoint
 //! that fails is reported as [`Status::Unkept`], and the session takes no
 //! more of them; it runs on, and its journal is still written.
+//!
+//! `flife-studio --resume DIR` ([`crate::Studio::resume`]) opens a kept run
+//! again, as `flife resume` does, with [`flife_cli::recover`]: the
+//! configuration and session the directory records, the newest checkpoint
+//! that restores (the founding world when none does), and the session
+//! opened through the run's command journal, which replays what it holds
+//! past that checkpoint. Its checkpoints continue the run's, from the next
+//! multiple after the one recovered, and its strokes are numbered after the
+//! commands the session holds.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -103,6 +112,20 @@ impl Keeping {
     #[must_use]
     pub const fn checkpoint_bytes(&self) -> u64 {
         self.admission.peak_bytes
+    }
+
+    /// Keep a run recovered from `run_dir` there again
+    /// ([`flife_cli::recover`]): the configuration's checkpoint settings,
+    /// and the admission its checkpoints were opened under.
+    pub(crate) fn recovered(
+        run_dir: impl Into<PathBuf>,
+        config: &ValidatedConfig,
+        admission: CheckpointAdmission,
+    ) -> Self {
+        Self {
+            persistence: Persistence::new(run_dir, config),
+            admission,
+        }
     }
 
     /// Make the run directory, open its checkpoints, and open `session`'s

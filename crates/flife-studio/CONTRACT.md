@@ -43,7 +43,9 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
 FL-024 (`flife-xut`, part) keeps a session in a run directory (`StudioOptions::run`, the binary's `--run DIR`;
 `Keeping`, §14.1's durable checkpoint tick, §16.3): the configuration, the command journal and checkpoints, kept by
 `flife-cli`'s own run-directory library, so `flife resume`, `flife branch` and `flife inspect` take it, and the
-telemetry line names the newest checkpoint's tick.
+telemetry line names the newest checkpoint's tick. It also reopens such a directory (`Studio::resume`, the
+binary's `--resume DIR`): the run goes on from its newest valid checkpoint and the journal past it, in the same
+directory, with its pending commands and its checkpoint chain.
 
 **Inputs.**
 - A `ValidatedConfig`. `[presentation]` gives the window size, the background, the frame rate, the colour
@@ -54,6 +56,13 @@ telemetry line names the newest checkpoint's tick.
 - With `StudioOptions::run` (`--run DIR`): a directory that is absent or empty, and a configuration whose
   `maximum_total_bytes` less `maximum_allocated_genome_bytes` holds a checkpoint (`flife_cli::admit`). Its
   `[persistence]` gives the interval, mode and retention, and `[execution] command_durability` the journal.
+- With `Studio::resume(dir, options)` (`--resume DIR`, no configuration argument): a run directory `flife run`, the
+  Studio or `flife resume` kept. Its own configuration is the run's; `flife_cli::recover` reads it, checks the
+  run identity, restores the newest checkpoint that verifies (skipping and naming any that do not; with none, the
+  founding world, which a branch does not have, so a branch with none is refused), and `flife_cli::open_session`
+  replays the journal past it. `options.run` (the run stays in its own directory) and `options.record` (a timeline
+  replays from the founding world, where a resumed run does not start) are refused before anything opens, as
+  is a directory that holds no run.
 - For a window: the process main thread, macOS, Metal and a window server. Offscreen
   (`StudioOptions::surface = Surface::Offscreen { scale }`): any thread and a Metal device; the content area is
   `size` points at `scale` pixels a point, and `title` and `resizable` are unused.
@@ -119,8 +128,11 @@ telemetry line names the newest checkpoint's tick.
     organism, seen, weights }`: `seen` unchanged, and the organism's whole controller (`ControllerWeights`) at the
     session's committed boundary, which its `tick` names, or `None` when the committed world no longer holds it.
   - FL-022: `Intent::Intervene { stroke, seen }` submits the stroke's intervention as a `Command` for
-    `Target::NextAdmissible`, stating the session's configuration hash, with identities counting from 1 (the
-    Studio opens fresh sessions only). An acceptance reports `Submitted { command, stroke, seen, effective }`,
+    `Target::NextAdmissible`, stating the session's configuration hash, with identities counting on from the
+    session's last command (`CommandBook::last_command`, read once as the session thread starts: 0 for a fresh
+    session, the earlier sessions' last for a resumed run, so an identity is never reused). Commands a resumed run
+    left unfinished get a watcher each as the thread starts, so their outcomes are reported as the session's own
+    are. An acceptance reports `Submitted { command, stroke, seen, effective }`,
     `effective` being the committed tick whose boundary it applies at; a rejection reports `Refused` with the
     engine's error class for an invalid payload, or `wrong-session`, `revision-mismatch`, `late`, `queue-full`,
     `conflicting-reuse`, `stopped` or `closed`, and takes no identity. A watcher task, owned by the controller and
@@ -145,7 +157,13 @@ telemetry line names the newest checkpoint's tick.
   Studio's memory admission charges (`memory::admit_kept`); `open(world, config, session)` writes the
   configuration, opens the chunk store and catalog, and opens the session through `flife_cli::open_session`
   (journaled under `write-ahead-before-apply`). `Studio::open` asks `Keeping::new` before any surface opens.
-  `Studio::kept()` names the directory and the admission.
+  `Studio::kept()` names the directory and the admission. `Keeping::recovered(dir, config, admission)` keeps a
+  directory `flife_cli::recover` reopened, with the admission its `Checkpoints` made; `Studio::resume` opens the
+  session over the recovered world and command book through `flife_cli::open_session`, charges the same
+  checkpoint term, and keeps the reopened `Checkpoints`, so the chain's sequences go on from the newest.
+  `Studio::resumed()` is `Some(Resumed { checkpoint, skipped, tick })` for a resumed Studio: the checkpoint it
+  restored (`None` when only the founding world and journal were there), the checkpoints skipped as invalid, and
+  the tick it opened at.
 - `brush` (FL-022): `Brush::{Energy, Removal, Material, Introduction}` and `Stroke`, a click's world-space payload.
   `preview(brush, viewport, logical, cells, pointer, supplies)` is plan §14.3's preview: `Preview::Stroke` with
   exactly the stroke `stroke` makes for a click at the pointer and, for a cell, that cell's world rectangle
@@ -234,8 +252,9 @@ telemetry line names the newest checkpoint's tick.
   arrival interval late, and a step is seen moving within 100 ms. `close()` closes the window and the session and returns the committed world (`StudioClosed`).
 - `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
   [--look glow|raw] [--density] [--no-field] [--field-mapping energy|composition] [--offscreen SECONDS [--scale N]
-  [--offscreen-zooms]] [--run DIR]`: the
-  binary. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
+  [--offscreen-zooms]] [--run DIR]`, or `flife-studio --resume DIR [those options but --run]`: the
+  binary. `--resume` takes the run's own configuration from DIR, so it takes no `<config>`, and it conflicts with
+  `--run`, `--export` and `--timeline`; a configuration given with it exits 2 (usage) and prints nothing. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
   a point (2 by default) and closes, and nothing posts input but `--offscreen-zooms`' camera moves: in every
   third frame interval, at a moment drawn uniformly over it (a fixed seed), a 4-point scroll at the content's
   centre, zooming in and out in turn; a move arriving during a frame's work waits for the next frame, as the
@@ -254,8 +273,9 @@ telemetry line names the newest checkpoint's tick.
     `look`, `particles`, `field` and `field_mapping`), `clock_telemetry`, the configuration's `[presentation]
     show_clock_telemetry`, the `surface`, `window` or `offscreen`, and with `--run` the `run_dir` and its
     `checkpoints` admission (declared and admitted mode, retained bytes, peak, headroom, fallback), the peak
-    charged as the memory admission's `checkpoint`;
-  - FL-024, with `--run`: one `checkpoint` per checkpoint published (`tick`, `epoch`, `sequence`, `sha256`,
+    charged as the memory admission's `checkpoint`; with `--resume` the same, and `resumed` (`checkpoint` with its
+    `sequence` and `tick`, or null; `skipped`; the `tick` it opened at), null otherwise;
+  - FL-024, with `--run` or `--resume`: one `checkpoint` per checkpoint published (`tick`, `epoch`, `sequence`, `sha256`,
     `bytes`, `retired`, `mode`, `paused_seconds`), and a `status` `unkept` if one fails;
   - one `status` per status;
   - one `view` per style change, with the same style fields;
@@ -772,8 +792,8 @@ presentation state, not scientific state.
     resizes not followed, an odd drawable not withheld, the timeline's hash of nothing; the binary writing no
     frame's records, no end or no timeline at all, and finding an existing timeline only after the Studio
     opens. All but one were caught. The binary dropping the session's statuses survives (see the gaps).
-- `tests/kept.rs` (2 tests, FL-024, no window), a `SessionThread::spawn_kept` over a 32 x 32 preset world with a
-  checkpoint every 256 ticks, all retained:
+- `tests/kept.rs` (4 tests, FL-024, no window; the Studio offscreen on headless Metal), a
+  `SessionThread::spawn_kept` over a 32 x 32 preset world with a checkpoint every 256 ticks, all retained:
   - `a_kept_studio_session_is_a_run_the_command_line_resumes`, under `volatile-in-memory` and
     `write-ahead-before-apply`: running, an energy stroke applies; paused, two steps, then a stroke accepted for
     the closing boundary is left pending at the close (`close_reporting`). The checkpoints reported hold tick 0,
@@ -782,6 +802,15 @@ presentation state, not scientific state.
     has the reported sequence and SHA-256 and the digest of the world stepped directly with the applied stroke
     at its tick; the last is the world the session closed on; and `flife_cli::resume` six ticks on reaches
     exactly the uninterrupted world, the pending stroke applied at the closing boundary.
+  - `a_studio_resumes_its_kept_run_where_it_closed`, under both durabilities: a kept session, paused, steps
+    twice, applies a stroke at tick 2, steps, and closes with a second stroke pending at tick 3. `Studio::resume`
+    on the directory reports the closing checkpoint (its sequence, tick 3), nothing skipped, and tick 3, keeps the
+    same directory, and shows tick 3. One step applies the pending stroke at 3 and reports it finished; E and a
+    click submit a stroke numbered 3, after the run's two; three more steps apply it. The world it closes on at 7
+    is, bit for bit, the world stepped directly with the three strokes at their ticks; it publishes one closing
+    checkpoint at 7 with a sequence past the earlier session's last, and `flife_cli::inspect` restores that digest.
+  - `what_cannot_be_resumed_is_refused`: `run` set (`kept where it is`), `record` set (`replays from the founding
+    world`) and an absent directory (`is not a run directory`), the directory never made.
   - `what_cannot_be_kept_is_refused_before_anything_is_created`: a directory holding a file (`is not empty`),
     one holding a run the Studio kept (`already holds a run`), both unchanged, and a `maximum_total_bytes` one
     mebibyte past the genome bytes (`budget-exhausted`, `checkpoint memory`), the directory never made.
@@ -791,8 +820,12 @@ presentation state, not scientific state.
   charges. The `checkpoint` records run from tick 0 to the `end`'s tick in order, `end.checkpoint_tick` names
   it, the `closed` status is the record before `end`, and the run's last end is `paused` at that tick. The
   overlays T recorded name only reported checkpoints, never an older one after a newer, and one past tick 0.
-  `flife_cli::inspect(R)` restores the `end`'s digest at its tick.
-- FL-024's kept-run planted bugs, 15: no founding checkpoint; a checkpoint due again at the newest's own multiple;
+  `flife_cli::inspect(R)` restores the `end`'s digest at its tick. Then the configuration beside `--resume R`
+  exits 2 and prints nothing, and `flife-studio --resume R --offscreen 1.5` (CPU controllers): its `open`
+  record names R, `resumed` the closing checkpoint's tick and sequence, nothing skipped, and that tick, the
+  `pause-and-stream` admission and the same `checkpoint` term; it ends past that tick, its `checkpoint` records
+  continue the first run's chain (ticks and sequences rising), the last at its `end`, which `checkpoint_tick`
+  names; and its `end` digest is the world founded from the configuration and stepped directly to that tick. no founding checkpoint; a checkpoint due again at the newest's own multiple;
   a checkpointer that never finds one due; no checkpoint of the closing boundary; a kept session closed rather
   than suspended; no pause before the closing checkpoint; the checkpoint not charged; the overlay never naming a
   checkpoint; the closing statuses not printed; the host keeping no checkpoints; the `open` record naming no
@@ -892,8 +925,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     (`tests/kept.rs` once used an 8-tick interval: its checkpoints were at 0, 49 and the close). In one run of
     `tests/kept_binary.rs` (128 ticks, about 780 ticks a second while rendering) checkpoints landed 3 to 135
     ticks past their multiples, and one (775) covered both 640 and 768.
-  - The Studio opens only a new run directory: it neither continues one (that is `flife resume`) nor branches
-    one. Its command identities count from 1 in each session it opens.
+  - The Studio opens a new run directory or resumes one (`--resume`); it does not branch one (that is `flife
+    branch`). A resumed Studio records no timeline (`--timeline` is refused with `--resume`): a timeline
+    replays from the founding world. A resumed run's selection, camera and style start afresh; the run directory
+    keeps the world and commands, not the view.
   - Closing a kept session pauses it before the closing checkpoint, so a running session's last run ends as
     `paused`, not `closed`.
   - `pause-before-commit` is the only capacity policy, so a capacity rejection pauses the run; the binary counts

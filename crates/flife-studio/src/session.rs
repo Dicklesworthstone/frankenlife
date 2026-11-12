@@ -127,8 +127,8 @@ pub enum Status {
     },
     /// A brush's command was accepted (FL-022).
     Submitted {
-        /// Its identity: the Studio's commands count from 1 in each
-        /// session it opens.
+        /// Its identity: the Studio's commands count on from the
+        /// session's last command, from 1 in a fresh session.
         command: CommandId,
         /// What it asks.
         stroke: Stroke,
@@ -347,7 +347,39 @@ fn serve(
         let client = spawner
             .try_spawn(async move {
                 let cx = Cx::current().ok_or_else(|| missing("a task context".into()))?;
-                let mut client = Client::default();
+                // Read before any intent: the largest command identity the
+                // session holds and its unfinished commands (a resumed run's).
+                // Only a session that has stopped already fails to answer,
+                // and it then admits nothing.
+                let (issued, unfinished) = handle
+                    .checkpoint_with(&cx, |_, book, _| {
+                        (
+                            book.last_command().map_or(0, CommandId::get),
+                            book.schedule().map(|(.., id)| id).collect::<Vec<_>>(),
+                        )
+                    })
+                    .await
+                    .unwrap_or_default();
+                let mut client = Client {
+                    issued,
+                    ..Client::default()
+                };
+                // A resumed run's unfinished commands report how they finish
+                // as the Studio's own strokes do.
+                for command in unfinished {
+                    let (session, report) = (handle.clone(), report.clone());
+                    let watched = watchers.try_spawn(async move {
+                        let Some(cx) = Cx::current() else {
+                            return;
+                        };
+                        if let Ok(status) = finished(&cx, &session, command).await {
+                            let _ = report.send(status);
+                        }
+                    });
+                    if let Ok(watcher) = watched {
+                        client.watchers.push(watcher);
+                    }
+                }
                 // A kept session: its founding checkpoint before any intent,
                 // then the checkpointer.
                 let kept = checkpoints.is_some();
@@ -419,6 +451,9 @@ struct Client {
     started: u64,
     /// Commands submitted.
     submitted: u64,
+    /// The largest command identity the session held when it opened: a
+    /// resumed run's commands keep theirs, and the Studio's follow them.
+    issued: u64,
 }
 
 async fn act(
@@ -468,9 +503,10 @@ async fn act(
             }
         }
         Intent::Intervene { stroke, seen } => {
-            // The Studio opens fresh sessions only, so its identities never
-            // meet an earlier client's.
-            let command = CommandId::new(client.submitted + 1);
+            // After every command the session held when it opened (a
+            // resumed run's), so its identities never meet an earlier
+            // client's.
+            let command = CommandId::new(client.issued + client.submitted + 1);
             let submitted = handle
                 .submit(
                     cx,

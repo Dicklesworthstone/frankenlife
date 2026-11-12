@@ -1153,6 +1153,80 @@ impl Drop for Checkpoints {
     }
 }
 
+/// A run recovered from its run directory, not yet opened: what [`resume`]
+/// continues, and what another client of a session (the Studio's
+/// `--resume`, FL-024) opens with [`open_session`].
+pub struct Recovered {
+    /// The configuration the run directory holds.
+    pub config: ValidatedConfig,
+    /// The session's limits: the session the catalog records, under the
+    /// configuration.
+    pub limits: SessionConfig,
+    /// The run's checkpoints, the one recovered as their newest.
+    pub checkpoints: Checkpoints,
+    /// The committed world the newest checkpoint that restores holds, or
+    /// the founding world when none does (never for a branch). The command
+    /// journal is not yet replayed past it: [`open_session`] does that.
+    pub world: World,
+    /// Its commands.
+    pub book: CommandBook,
+    /// The checkpoint recovered; `None` for the founding world.
+    pub from: Option<CheckpointAt>,
+    /// Newer checkpoints passed over, newest first.
+    pub skipped: Vec<SkippedCheckpoint>,
+}
+
+/// Recover the run in `run_dir`: its configuration, the session its catalog
+/// records, and the newest checkpoint that loads and restores to both (the
+/// founding world if none does), with its checkpoints opened under
+/// [`Persistence::new`]'s settings as `adjust` leaves them.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] when `run_dir` is not a run directory, its
+/// catalog records no run, more than one, or the run under another
+/// configuration, or it is a branch none of whose checkpoints restores;
+/// the store's and catalog's errors.
+pub fn recover(
+    run_dir: &Path,
+    adjust: impl FnOnce(&mut Persistence),
+) -> Result<Recovered, CoreError> {
+    let config = read_config(run_dir)?;
+    let (session, lineage) = run_identity(run_dir, config.config_hash())?;
+    let limits = SessionConfig::from_config(session, &config)?;
+    let mut persistence = Persistence::new(run_dir, &config);
+    adjust(&mut persistence);
+    let mut checkpoints = Checkpoints::open(&persistence, &config, session)?;
+    let (restored, skipped) = checkpoints.recover()?;
+    let (world, book) = match restored {
+        Some(restored) => (restored.world, restored.book),
+        None if !lineage.is_empty() => {
+            return Err(CoreError::StateConflict {
+                operation: "resume run",
+                detail: format!(
+                    "{} is a branch from tick {}, and none of its checkpoints restores; a branch \
+                     has no founding world to fall back to",
+                    run_dir.display(),
+                    crate::branch::fork_tick(&lineage).map_or(0, Tick::get)
+                ),
+            });
+        }
+        None => (
+            found(&config)?,
+            CommandBook::new(limits.session, limits.revision, limits.command_capacity),
+        ),
+    };
+    let from = checkpoints.last();
+    Ok(Recovered {
+        config,
+        limits,
+        checkpoints,
+        world,
+        book,
+        from,
+        skipped,
+    })
+}
+
 /// What to resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeOptions {
@@ -1203,40 +1277,26 @@ pub fn resume(
     options: &ResumeOptions,
     emit: impl FnMut(&Record) + Send + 'static,
 ) -> Result<Finished, CoreError> {
-    let config = read_config(run_dir)?;
-    let (session, lineage) = run_identity(run_dir, config.config_hash())?;
-    let limits = SessionConfig::from_config(session, &config)?;
-    let mut persistence = Persistence::new(run_dir, &config);
-    if let Some(every) = options.checkpoint_every {
-        persistence.checkpoint_every = every;
-    }
-    persistence.durability = options.durability;
-    if let Some(mode) = options.checkpoint_mode {
-        persistence.mode = mode;
-    }
-    if let Some(retained) = options.retained_bytes {
-        persistence.retained_bytes = retained;
-    }
-    let mut checkpoints = Checkpoints::open(&persistence, &config, session)?;
-    let (restored, skipped) = checkpoints.recover()?;
-    let (mut world, book) = match restored {
-        Some(restored) => (restored.world, restored.book),
-        None if !lineage.is_empty() => {
-            return Err(CoreError::StateConflict {
-                operation: "resume run",
-                detail: format!(
-                    "{} is a branch from tick {}, and none of its checkpoints restores; a branch \
-                     has no founding world to fall back to",
-                    run_dir.display(),
-                    crate::branch::fork_tick(&lineage).map_or(0, Tick::get)
-                ),
-            });
+    let Recovered {
+        config,
+        limits,
+        checkpoints,
+        mut world,
+        book,
+        from,
+        skipped,
+    } = recover(run_dir, |persistence| {
+        if let Some(every) = options.checkpoint_every {
+            persistence.checkpoint_every = every;
         }
-        None => (
-            found(&config)?,
-            CommandBook::new(limits.session, limits.revision, limits.command_capacity),
-        ),
-    };
+        persistence.durability = options.durability;
+        if let Some(mode) = options.checkpoint_mode {
+            persistence.mode = mode;
+        }
+        if let Some(retained) = options.retained_bytes {
+            persistence.retained_bytes = retained;
+        }
+    })?;
     let memory = configure(
         &mut world,
         options.cpu_workers,
@@ -1245,7 +1305,6 @@ pub fn resume(
     )?;
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;
-    let from = checkpoints.last();
     let metrics = tracker(&world, options.metrics_every)?;
     let (owner, handle) = open_session(world, book, limits, run_dir)?;
     let clock = Instant::now();

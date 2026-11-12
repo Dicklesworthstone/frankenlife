@@ -81,8 +81,8 @@ pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};
 pub use observe::{Heredity, Survey, Tally};
 pub use persist::{
     CATALOG_FILE, CONFIG_FILE, Checkpoints, Injection, Introduction, Material, Persistence,
-    Removal, ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability, create, open_session,
-    resume, vacant,
+    Recovered, Removal, ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability, create,
+    open_session, recover, resume, vacant,
 };
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, RENDER_SCHEMA, RenderOptions,

@@ -5,8 +5,12 @@
 //! which the `end` record names; the statuses reported while it closes are
 //! printed before `end`; the window's telemetry line names the newest
 //! checkpoint's tick (plan §14.1); and `flife inspect` restores the world
-//! the Studio closed on. Every run passes `--offscreen`, so none opens a
-//! window. Headless Metal: without a Metal device the test returns early.
+//! the Studio closed on. `flife-studio --resume DIR` then runs it on from
+//! there: its `open` record names the checkpoint it resumed from, its
+//! checkpoints follow the run's, and it closes on the world stepped directly
+//! from the founding to its tick. A configuration beside `--resume` is
+//! refused. Every run passes `--offscreen`, so none opens a window.
+//! Headless Metal: without a Metal device the test returns early.
 
 #![allow(
     clippy::expect_used,
@@ -20,6 +24,8 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use flife_cli::{CHECKPOINT_FIXED_BYTES, InspectOptions};
+use flife_core::{Tick, ValidatedConfig};
+use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_studio::{TimelineRecord, read_timeline};
 use fmn_render::metal::MetalRenderer;
 use serde_json::Value;
@@ -208,6 +214,108 @@ fn an_offscreen_studio_keeps_a_run_the_command_line_inspects() {
     assert_eq!(inspection.inspected.checkpoint.tick, closed_at);
     assert_eq!(
         inspection.inspected.digest,
+        end["digest"].as_str().expect("a digest")
+    );
+
+    // A configuration beside `--resume` is refused before anything runs.
+    let both = Command::new(env!("CARGO_BIN_EXE_flife-studio"))
+        .arg(&config)
+        .arg("--resume")
+        .arg(&run)
+        .args(["--offscreen", "0.5"])
+        .output()
+        .expect("the binary runs");
+    assert_eq!(both.status.code(), Some(2));
+    assert!(both.stdout.is_empty());
+
+    // `--resume` runs it on from the closing checkpoint, kept there.
+    let output = Command::new(env!("CARGO_BIN_EXE_flife-studio"))
+        .arg("--resume")
+        .arg(&run)
+        .args([
+            "--offscreen",
+            "1.5",
+            "--scale",
+            "1",
+            "--width",
+            "320",
+            "--height",
+            "200",
+            "--controllers",
+            "cpu",
+            "--cpu-workers",
+            "2",
+        ])
+        .output()
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}: {stderr}",
+        output.status
+    );
+    let records: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON record"))
+        .collect();
+    let open = &records[0];
+    assert_eq!(kind(open), "open");
+    assert_eq!(open["run_dir"], run.display().to_string());
+    let resumed = &open["resumed"];
+    assert_eq!(
+        number(&resumed["checkpoint"], "tick"),
+        closed_at,
+        "{resumed}"
+    );
+    assert_eq!(
+        number(&resumed["checkpoint"], "sequence"),
+        kept.last().expect("kept").1
+    );
+    assert_eq!(resumed["skipped"], Value::Array(Vec::new()));
+    assert_eq!(number(resumed, "tick"), closed_at);
+    assert_eq!(open["checkpoints"]["admitted"], "pause-and-stream");
+    assert_eq!(
+        number(&open["memory"], "checkpoint"),
+        CHECKPOINT_FIXED_BYTES
+    );
+    let end = records.last().expect("records");
+    assert_eq!(kind(end), "end");
+    let until = number(end, "tick");
+    assert!(until > closed_at, "it ran on: {until}");
+    let later: Vec<(u64, u64)> = records
+        .iter()
+        .filter(|record| kind(record) == "checkpoint")
+        .map(|record| (number(record, "tick"), number(record, "sequence")))
+        .collect();
+    println!("resumed at {closed_at}: checkpoints {later:?}, closed at {until}");
+    let mut chain = kept.clone();
+    chain.extend(&later);
+    assert!(
+        chain
+            .windows(2)
+            .all(|pair| pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1),
+        "{chain:?}"
+    );
+    assert_eq!(later.last().expect("a closing checkpoint").0, until);
+    assert_eq!(number(end, "checkpoint_tick"), until);
+
+    // The world it closed on is the one stepped directly from the founding.
+    let configured = ValidatedConfig::from_toml(&configuration()).expect("valid");
+    let mut world = World::found(
+        &configured,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("founds");
+    while world.tick() < Tick::new(until) {
+        match world.step_with(&[]).expect("steps") {
+            Stepped::Published(_) => {}
+            Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+        }
+    }
+    assert_eq!(
+        world.digest().to_hex(),
         end["digest"].as_str().expect("a digest")
     );
 }

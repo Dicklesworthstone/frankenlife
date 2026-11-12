@@ -48,22 +48,26 @@
 //! ([`crate::keep`], FL-024): refused before any surface opens when the
 //! directory holds anything, its checkpoint charged with the observers,
 //! and the session opened through the run's command journal.
+//! [`Studio::resume`] opens a kept run again where it stopped: the newest
+//! checkpoint that restores, the journal replayed past it, kept on in the
+//! same directory.
 
 use flife_backend_metal::{BackendBudget, ControllerChoice};
-use flife_cli::CheckpointAdmission;
+use flife_cli::{CheckpointAdmission, CheckpointAt, Checkpoints, Recovered, SkippedCheckpoint};
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
-use flife_runtime::SessionClosed;
+use flife_runtime::{CommandBook, SessionClosed, SessionConfig};
 use fmn_frame::FrameBuffer;
 use fmn_render::ThreeDJob;
 use fmn_render::metal::{
     INPUT_QUEUE_CAPACITY, InputEvent, MetalRenderer, MetalReport, NativePreviewRenderer,
     PixelDensity, PresentOutcome, PresentationState, SurfaceMetrics,
 };
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -315,6 +319,49 @@ pub struct Studio {
     opened: Instant,
     /// Whether the camera tracks the selected organism (plan §14.3).
     tracking: bool,
+    /// What [`Studio::resume`] recovered.
+    resumed: Option<Resumed>,
+}
+
+/// How a Studio's session is kept (FL-024).
+enum Kept {
+    /// In memory only.
+    Not,
+    /// In a new run directory.
+    New(Keeping),
+    /// In the run directory it was recovered from.
+    Resumed(Box<ResumedKept>),
+}
+
+/// A recovered run, to open where it was kept.
+struct ResumedKept {
+    keeping: Keeping,
+    limits: SessionConfig,
+    book: CommandBook,
+    checkpoints: Checkpoints,
+}
+
+impl Kept {
+    /// The bytes a checkpoint is charged in the memory admission.
+    const fn checkpoint_bytes(&self) -> u64 {
+        match self {
+            Self::Not => 0,
+            Self::New(keeping) => keeping.checkpoint_bytes(),
+            Self::Resumed(resumed) => resumed.keeping.checkpoint_bytes(),
+        }
+    }
+}
+
+/// What [`Studio::resume`] recovered (FL-024).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Resumed {
+    /// The checkpoint the run resumed from; `None` for the founding world.
+    pub checkpoint: Option<CheckpointAt>,
+    /// Newer checkpoints passed over, newest first.
+    pub skipped: Vec<SkippedCheckpoint>,
+    /// The committed tick the session opened at: the checkpoint's, or later
+    /// once the command journal replayed past it.
+    pub tick: u64,
 }
 
 impl Studio {
@@ -335,11 +382,85 @@ impl Studio {
     /// - With [`StudioOptions::run`], before any surface opens:
     ///   [`Keeping::new`]'s refusals; then [`Keeping::open`]'s errors.
     pub fn open(config: &ValidatedConfig, options: &StudioOptions) -> Result<Self, CoreError> {
-        let keeping = options
-            .run
-            .as_ref()
-            .map(|run| Keeping::new(run.clone(), config))
-            .transpose()?;
+        let kept = match &options.run {
+            Some(run) => Kept::New(Keeping::new(run.clone(), config)?),
+            None => Kept::Not,
+        };
+        Self::open_on(config, options, kept, || {
+            World::found(
+                config,
+                Arrangement::FreeList,
+                NumericalProfile::reference_f32()?,
+            )
+        })
+    }
+
+    /// Resume the run kept in `run_dir` (FL-024; `flife-studio --resume`),
+    /// as `flife resume` does: the configuration and session the directory
+    /// records, the newest checkpoint that loads and restores (the founding
+    /// world when none does), and the session opened through the run's
+    /// command journal, which replays what it holds past that checkpoint.
+    /// It is kept on in `run_dir`, its checkpoints continuing the run's,
+    /// and its ancestry traced from the tick it opens at. Otherwise it
+    /// opens as [`Studio::open`] does; [`Studio::resumed`] says what it
+    /// recovered.
+    ///
+    /// # Errors
+    /// - [`CoreError::StateConflict`], before anything is read, with
+    ///   [`StudioOptions::run`] (the run is kept where it is) or
+    ///   [`StudioOptions::record`] (a timeline replays from the founding
+    ///   world, where a resumed run does not start).
+    /// - Before any surface opens, [`flife_cli::recover`]'s: not a run
+    ///   directory, another configuration, a branch none of whose
+    ///   checkpoints restores, the store's and the catalog's errors.
+    /// - Then as [`Studio::open`], and [`flife_cli::open_session`]'s.
+    pub fn resume(run_dir: impl Into<PathBuf>, options: &StudioOptions) -> Result<Self, CoreError> {
+        let refusal = if options.run.is_some() {
+            Some("a resumed run is kept where it is, not in another run directory")
+        } else if options.record {
+            Some("a timeline replays from the founding world, where a resumed run does not start")
+        } else {
+            None
+        };
+        if let Some(detail) = refusal {
+            return Err(CoreError::StateConflict {
+                operation: "resume a studio run",
+                detail: detail.into(),
+            });
+        }
+        let run_dir = run_dir.into();
+        let Recovered {
+            config,
+            limits,
+            checkpoints,
+            world,
+            book,
+            from,
+            skipped,
+        } = flife_cli::recover(&run_dir, |_| {})?;
+        let keeping = Keeping::recovered(run_dir, &config, checkpoints.admission().clone());
+        let kept = Kept::Resumed(Box::new(ResumedKept {
+            keeping,
+            limits,
+            book,
+            checkpoints,
+        }));
+        let mut studio = Self::open_on(&config, options, kept, move || Ok(world))?;
+        studio.resumed = Some(Resumed {
+            checkpoint: from,
+            skipped,
+            tick: studio.current.tick().get(),
+        });
+        Ok(studio)
+    }
+
+    /// Open on the world `found` gives, kept as `kept` says.
+    fn open_on(
+        config: &ValidatedConfig,
+        options: &StudioOptions,
+        kept: Kept,
+        found: impl FnOnce() -> Result<World, CoreError>,
+    ) -> Result<Self, CoreError> {
         let model = config.config();
         let background =
             hex_rgb(&model.presentation.background).ok_or_else(|| CoreError::NumericalInvalid {
@@ -371,17 +492,14 @@ impl Studio {
                 Target::Offscreen(Offscreen::new([width, height], scale)?)
             }
         };
-        let mut world = World::found(
-            config,
-            Arrangement::FreeList,
-            NumericalProfile::reference_f32()?,
-        )?;
+        let mut world = found()?;
         if let Some(workers) = options.cpu_workers {
             world.set_cpu_workers(workers)?;
         }
-        // The inspector's descendants (FL-021): traced from the founding, so
-        // every birth counts, and its room is reserved before the memory
-        // admission charges the world's state.
+        // The inspector's descendants (FL-021): traced from the founding (a
+        // resumed run's from the tick it opens at), so every birth since
+        // counts, and its room is reserved before the memory admission
+        // charges the world's state.
         world.trace_ancestry()?;
         // The observers are admitted before the backend (FL-043): the view
         // is made now, for the founding state, and the backend holds what
@@ -408,7 +526,7 @@ impl Studio {
             &founding,
             &view,
             drawable,
-            keeping.as_ref().map_or(0, Keeping::checkpoint_bytes),
+            kept.checkpoint_bytes(),
         )?;
         drop(founding);
         let budget = BackendBudget {
@@ -421,14 +539,25 @@ impl Studio {
             .backend
             .clone()
             .unwrap_or_else(|| CPU_REFERENCE.to_owned());
-        let (owner, handle, checkpoints) = match &keeping {
-            Some(keeping) => {
-                let (owner, handle, checkpoints) = keeping.open(world, config, STUDIO_SESSION)?;
-                (owner, handle, Some(checkpoints))
-            }
-            None => {
+        let (owner, handle, checkpoints, keeping) = match kept {
+            Kept::Not => {
                 let (owner, handle) = flife_runtime::open(world, config, STUDIO_SESSION)?;
-                (owner, handle, None)
+                (owner, handle, None, None)
+            }
+            Kept::New(keeping) => {
+                let (owner, handle, checkpoints) = keeping.open(world, config, STUDIO_SESSION)?;
+                (owner, handle, Some(checkpoints), Some(keeping))
+            }
+            Kept::Resumed(resumed) => {
+                let ResumedKept {
+                    keeping,
+                    limits,
+                    book,
+                    checkpoints,
+                } = *resumed;
+                let (owner, handle) =
+                    flife_cli::open_session(world, book, limits, keeping.run_dir())?;
+                (owner, handle, Some(checkpoints), Some(keeping))
             }
         };
         let feed = handle.feed();
@@ -484,6 +613,7 @@ impl Studio {
             }),
             opened: Instant::now(),
             tracking: false,
+            resumed: None,
         })
     }
 
@@ -577,6 +707,13 @@ impl Studio {
     #[must_use]
     pub const fn memory(&self) -> &MemoryAdmission {
         &self.memory
+    }
+
+    /// What [`Studio::resume`] recovered; `None` for a Studio that
+    /// [`Studio::open`] founded.
+    #[must_use]
+    pub const fn resumed(&self) -> Option<&Resumed> {
+        self.resumed.as_ref()
     }
 
     /// The run directory the session is kept in and its checkpoint

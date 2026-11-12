@@ -78,8 +78,8 @@ pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, FieldMapping, Look, Motion, Particles, Style};
 pub use frames::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes};
 pub use host::{
-    Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
-    Surface,
+    Frame, FrameTally, PICK_RADIUS_POINTS, Resumed, STUDIO_SESSION, Studio, StudioClosed,
+    StudioOptions, Surface,
 };
 pub use keep::{CHECKPOINT_POLL, Keeping};
 pub use overlay::{

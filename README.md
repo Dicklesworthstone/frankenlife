@@ -126,7 +126,9 @@ a continuation.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
 printed as an `inspected` record and drawn under the overlay's lines (its energy, age, motion, controller and held
-output), read again once a second while the world runs. FL-022 gives it energy, removal, material
+output), read again once a second while the world runs. Once the world has stepped while it is selected, the
+snapshot also carries what the organism sensed, exactly as its controller read it, and the hidden activations
+that produced the output it holds, recomputed on the reference and checked against it bit for bit. FL-022 gives it energy, removal, material
 and introduction brushes: a click becomes a world-space command the session applies at its next open boundary, reported with
 the tick it applied at and the energy it moved; the host's brush path has not been run in a window here.**
 

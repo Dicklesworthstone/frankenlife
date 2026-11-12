@@ -431,6 +431,47 @@ impl<'a> ReferenceController<'a> {
         })?;
         Ok(raw)
     }
+
+    /// [`ReferenceController::evaluate`], keeping each hidden layer's
+    /// activations: the inspector's sampled activations (FL-021, plan
+    /// §14.2). The outputs are `evaluate`'s, bit for bit; the activations
+    /// are the F32 values the next layer read.
+    ///
+    /// # Errors
+    /// As [`ReferenceController::evaluate`], and
+    /// [`CoreError::AllocationFailed`] when the copies cannot be stored.
+    pub fn trace(
+        &self,
+        inputs: &[f64; SENSOR_WIDTH],
+        scratch: &mut ControllerScratch,
+    ) -> Result<Trace, CoreError> {
+        let outputs = self.evaluate(inputs, scratch)?;
+        let layers = self.topology.layers.len().saturating_sub(1);
+        let mut hidden = Vec::new();
+        for activations in [&scratch.first, &scratch.second].into_iter().take(layers) {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(activations.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "traced activations",
+                    bytes: u64::try_from(activations.len().saturating_mul(size_of::<f32>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+            copy.extend_from_slice(activations);
+            hidden.push(copy);
+        }
+        Ok(Trace { hidden, outputs })
+    }
+}
+
+/// One evaluation with its hidden activations
+/// ([`ReferenceController::trace`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trace {
+    /// Each hidden layer's activations, in evaluation order: `tanh` of its
+    /// pre-activations, rounded once to F32.
+    pub hidden: Vec<Vec<f32>>,
+    /// The 36 raw outputs of the linear final layer.
+    pub outputs: [f32; ACTION_WIDTH],
 }
 
 /// The raw outputs as the F64 values [`crate::actions::decode`] reads.

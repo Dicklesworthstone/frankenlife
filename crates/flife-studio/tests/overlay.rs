@@ -214,8 +214,9 @@ fn config() -> ValidatedConfig {
     ValidatedConfig::from_toml(&lines.join("\n")).expect("a valid configuration")
 }
 
-/// A real snapshot: an organism of [`config`]'s world three ticks in, so it
-/// holds a controller output.
+/// A real snapshot: an organism of [`config`]'s world three ticks in,
+/// watched from the start, so it holds a controller output, an observation
+/// and that output's activations.
 fn snapshot() -> OrganismSnapshot {
     let config = config();
     let mut world = World::found(
@@ -224,19 +225,34 @@ fn snapshot() -> OrganismSnapshot {
         NumericalProfile::reference_f32().expect("profile"),
     )
     .expect("founds");
+    let id = world.population().ids().next().expect("an organism");
+    world.watch(Some(id));
     for _ in 0..3 {
         assert!(matches!(
             world.step().expect("steps"),
             Stepped::Published(_)
         ));
     }
-    let id = world.population().ids().next().expect("an organism");
     let snapshot = world
         .organism_snapshot(id)
         .expect("inspects")
         .expect("live");
     assert!(snapshot.decoded.is_some(), "it holds an output");
+    assert!(snapshot.sensed.is_some(), "it was watched");
+    assert!(snapshot.activations.is_some(), "it evaluated while watched");
     snapshot
+}
+
+/// Set the composition inputs `Z` to `along` times the snapshot's own
+/// affinity direction over its squared length, so `affinity·Z` is `along`.
+fn compose(snapshot: &mut OrganismSnapshot, along: f64) {
+    let affinity = *snapshot.traits.affinity();
+    let length: f64 = affinity.iter().map(|a| a * a).sum();
+    assert!(length > 0.0);
+    let sensed = snapshot.sensed.as_mut().expect("sensed");
+    for (z, a) in sensed.observation.inputs[1..=32].iter_mut().zip(affinity) {
+        *z = along * a / length;
+    }
 }
 
 /// [`snapshot`] with every value the panel prints set.
@@ -256,6 +272,17 @@ fn known() -> OrganismSnapshot {
     let decoded = known.decoded.as_mut().expect("an output");
     decoded.attempt_probability = 0.0314;
     decoded.emission_gate = 0.72;
+    let sensed = known.sensed.as_mut().expect("sensed");
+    sensed.tick = Tick::new(5_119);
+    sensed.scale = 1.5;
+    sensed.observation.inputs[0] = 0.412;
+    // Up and to the right on screen.
+    let side = 0.031 / 2.0_f64.sqrt();
+    sensed.observation.gradients[0] = [side, -side];
+    compose(&mut known, 0.112);
+    let activations = known.activations.as_mut().expect("activations");
+    activations.tick = Tick::new(5_120);
+    activations.hidden = vec![vec![0.5, -0.98, 0.1, 0.02], vec![-0.31, 0.31, 0.97]];
     known
 }
 
@@ -667,7 +694,10 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
                  energy 3.21 · +0.012/s · age 1,024 ticks\n\
                  speed 0.85/s · heading 135°\n\
                  hidden 64, 32 · 9,124 parameters\n\
-                 reproduction 3.1% a tick · emission gate 0.72";
+                 reproduction 3.1% a tick · emission gate 0.72\n\
+                 sensed at tick 5,119 · scale 1.50 · field 0.412\n\
+                 gradient 0.031 toward 45° · affinity·Z +0.112\n\
+                 activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.40, 0.53";
     assert_eq!(inspector_lines(Inspected::Read(&known)), panel);
     // Under the line naming the selection.
     assert_eq!(
@@ -728,10 +758,48 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         lines.lines().nth(1),
         Some("energy 1.23e5 · +0.000/s · age 1,024 ticks")
     );
-    let mut quiet = known;
+    let mut quiet = known.clone();
     quiet.decoded = None;
     let lines = inspector_lines(Inspected::Read(&quiet));
     assert_eq!(lines.lines().nth(4), Some("no controller output held"));
+
+    // The gradient's direction as the heading's; a negative alignment; no
+    // gradient; nothing recorded yet.
+    let mut sensing = known.clone();
+    sensing
+        .sensed
+        .as_mut()
+        .expect("sensed")
+        .observation
+        .gradients[0] = [-0.5, 0.0];
+    compose(&mut sensing, -0.05);
+    let lines = inspector_lines(Inspected::Read(&sensing));
+    assert_eq!(
+        lines.lines().nth(6),
+        Some("gradient 0.500 toward 180° · affinity·Z -0.050")
+    );
+    sensing
+        .sensed
+        .as_mut()
+        .expect("sensed")
+        .observation
+        .gradients[0] = [0.0, 0.0];
+    let lines = inspector_lines(Inspected::Read(&sensing));
+    assert_eq!(
+        lines.lines().nth(6),
+        Some("no gradient · affinity·Z -0.050")
+    );
+    let mut unrecorded = known;
+    unrecorded.sensed = None;
+    unrecorded.activations = None;
+    let lines = inspector_lines(Inspected::Read(&unrecorded));
+    assert_eq!(
+        lines.lines().skip(5).collect::<Vec<_>>(),
+        [
+            "sensed from its next tick",
+            "activations at its next evaluation"
+        ]
+    );
 }
 
 #[test]
@@ -759,6 +827,18 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
     let decoded = longest.decoded.as_mut().expect("an output");
     decoded.attempt_probability = 0.999_96;
     decoded.emission_gate = 0.999;
+    // What it sensed and its activations at their widest: every decimal one
+    // short of scientific notation and negative, a three-digit direction,
+    // and two layers each at the largest magnitude.
+    let sensed = longest.sensed.as_mut().expect("sensed");
+    sensed.tick = Tick::new(999_999_999_999);
+    sensed.scale = 99_999.994;
+    sensed.observation.inputs[0] = -99_999.999_4;
+    sensed.observation.gradients[0] = [70_710.0, 70_710.0];
+    compose(&mut longest, -99_999.999_4);
+    let activations = longest.activations.as_mut().expect("activations");
+    activations.tick = Tick::new(999_999_999_999);
+    activations.hidden = vec![vec![-1.0; 128], vec![-1.0; 96]];
     // The telemetry at its widest: each count at the largest written in
     // full, each byte count four digits wide, each energy one short of
     // scientific notation, the widest residual, a tally from a later tick,
@@ -819,7 +899,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 17, "{text}");
+        assert_eq!(text.lines().count(), 20, "{text}");
         let colors: Vec<_> = legend
             .swatches
             .iter()

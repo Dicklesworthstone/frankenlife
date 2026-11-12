@@ -53,7 +53,7 @@ pub use chemistry::{
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
-pub use inspect::OrganismSnapshot;
+pub use inspect::{Activations, OrganismSnapshot, Sensed};
 pub use intervention::{
     AppliedIntervention, Intervention, MATERIAL_CHANNELS, MAXIMUM_INTRODUCTION,
 };

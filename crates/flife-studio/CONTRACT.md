@@ -7,8 +7,9 @@ rendering (§13.4), the configured bloom on glowing frames (§2.3), the shown ma
 energy (§13.4's "Local field": key C, `--field-mapping`, `flife_manim::FieldMapping`), keyed after the colour key. FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
-bounded snapshot at its committed boundary (§14.2), and draws it as a panel in the overlay, read again once a
-second while the world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
+bounded snapshot at its committed boundary (§14.2), with what it sensed and its controller's activations once the
+session has stepped while watching it, and draws it as a panel in the overlay, read again once a second while the
+world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, the region a click would act on is outlined on the world, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
@@ -219,7 +220,9 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
     at (null when the world no longer holds it) and a `snapshot`: genome, parent, lineage, generation, birth tick,
     age, position, velocity, energy and its change rate, phase, cooldown, topology, hidden widths, parameter count,
     sensing scale, motion response, affinity, and the decoded held output (attempt rate and probability, child
-    fraction, emission gate, emission direction and spend fraction) or null;
+    fraction, emission gate, emission direction and spend fraction) or null; `sensed` (its step's start `tick`,
+    `scale`, `evaluated`, `raw` as the three planes `R, M_0, …, M_31`, x and y derivatives, the 104 `inputs` and
+    the 33 `gradients`) and `activations` (the output's `tick` and each `hidden` layer's values) or null;
   - FL-022: one `brush` each time the armed brush changes (`energy`, `removal` or null); one `submitted` per
     accepted stroke: its `command`, `brush`, its payload (the `cell` and `amount`, with the material's 32-component
     `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
@@ -450,26 +453,33 @@ presentation state, not scientific state.
     `overlay_text` it is the line after the colour key's, before the brush, and at 2x it is set whole with its
     swatches coloured after the colour key's; `field_key` (the binary's choice) gives it for a drawn, composed
     field in either look and either particles, and nothing while the field is hidden or under raw density;
-  - the inspector panel exactly, from a real snapshot of the preset three ticks in with every printed value set:
-    its five lines under the selection's, `not in the committed world` for a gone organism, nothing without a
-    selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen from east (a heading a hair below
-    east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest; scientific notation from 100,000 with a
-    sign on every rate; `no controller output held`;
+  - the inspector panel exactly, from a real snapshot of the preset three ticks in, its organism watched from the
+    start, with every printed value set: its eight lines under the selection's, `not in the committed world` for
+    a gone organism, nothing without a selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen
+    from east (a heading a hair below east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest;
+    scientific notation from 100,000 with a sign on every rate; `no controller output held`; what it sensed
+    (`sensed at tick 5,119 · scale 1.50 · field 0.412`, `gradient 0.031 toward 45° · affinity·Z +0.112`, the
+    composition inputs set along its own affinity so the dot product is known) and its activations
+    (`activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.40, 0.53`); a gradient toward 180° with a
+    negative alignment, `no gradient`, and `sensed from its next tick` with `activations at its next evaluation`
+    before anything is recorded;
   - the longest overlay (every key with every brush, every count one short of a trillion, the panel with every
     value one short of scientific notation and the catalog's largest controller, and the telemetry at its widest:
     four-digit byte counts, energies one short of scientific notation, the widest residual, a tally from a later
     tick, a fault, the largest seed and cadence, and each brush's widest preview: its own amount and count, the
     largest cell indices, bounds and a founder's endowment one short of scientific notation at nine places, and
-    the finest radius, and the composition's field key), 17 lines laid out with its keys' swatches, at 2x: every
-    glyph is drawn, none refused or left out, within four fifths of the overlay's budget (the motion key's with
-    the introduction brush, 33,162 vertices and 32,082 triangles, is the longest); at 3x, all of it is still
-    drawn.
+    the finest radius, the composition's field key, and what the organism sensed and its activations, each
+    decimal one short of scientific notation and negative, a three-digit direction and two layers at the largest
+    magnitude), 20 lines laid out with its keys' swatches, at 2x: every glyph is drawn, none refused or left out,
+    within four fifths of the overlay's budget (the motion key's with the introduction brush, 38,270 vertices and
+    37,012 triangles, is the longest); at 3x, all of it is still drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 86.9 MiB at 3840 x 2160, which leaves the backend 166.8 MiB of the 2 GiB budget (148.0
-  with the preset's bloom; 167.0 and 148.2 before the brush region, FL-022). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
-  overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
-  telemetry, 82.6 MiB (172.1) at 39,936 vertices and 38,912 triangles with the brush preview, and is 86.9 MiB at
-  41,984 and 40,960 with the field's key. The field's compositions (12 bytes a texel in the feed's slots and the
+  terms to the observers: 99.9 MiB at 3840 x 2160, which leaves the backend 153.8 MiB of the 2 GiB budget (135.0
+  with the preset's bloom; 166.8 and 148.0 before the inspector's sensed and activation lines, FL-021). Most of it
+  is the frame preparation each of the HUD's triangles is charged, twice: the overlay was 32.5 MiB (backend 222.1
+  MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent telemetry, 82.6 MiB (172.1) at 39,936
+  vertices and 38,912 triangles with the brush preview, 86.9 MiB at 41,984 and 40,960 with the field's key, and
+  is 99.9 MiB at 48,128 and 47,104 with the inspector's three new lines. The field's compositions (12 bytes a texel in the feed's slots and the
   view's copy, FL-019) add 0.8 MiB to the rest of the observers.
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
@@ -550,7 +560,9 @@ presentation state, not scientific state.
     evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
     a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
     was added, the first run's one survivor).
-- `src/main.rs` unit tests (6, FL-022, FL-024, FL-023): the parser takes `--timeline FILE` (offscreen too) and
+- `src/main.rs` unit tests (7, FL-022, FL-024, FL-023, FL-021): an `inspected` record of a watched organism of
+  the preset two ticks in carries its sensed tick, scale and evaluation, its 104 inputs, three raw planes and 33
+  gradients, and its activations' tick and layers, each value bit for bit; the parser takes `--timeline FILE` (offscreen too) and
   `--export FILE --out DIR` with or without `--export-fps`, and refuses `--export` without `--out`, `--out` or
   `--export-fps` alone, `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never
   opens a Studio; it takes `--offscreen 2.5` (2 pixels a point by default),
@@ -648,16 +660,19 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
 - FL-021's inspector panel is the overlay's last lines: what the last answer read (its tick, lineage, generation,
-  energy and its change, age, speed and heading, hidden widths and parameter count, and the held output's
-  reproduction probability and emission gate). The host's send on a click runs offscreen in `tests/offscreen.rs`,
-  where a posted click's inspection answers. The binary's refresh once a second while the world runs
+  energy and its change, age, speed and heading, hidden widths and parameter count, the held output's
+  reproduction probability and emission gate, what it sensed and its activations). The host's send on a click
+  runs offscreen in `tests/offscreen.rs`, where a posted click's inspection answers, and an inspection refreshed
+  while the world runs carries what it sensed and its activations. The binary's own refresh once a second
   (`Studio::inspect_selected`), the panel's drawing and the record's printing run only in a window, which no test
   here opened; `overlay_text` and the session thread's answers are tested without one. While the world runs,
   the snapshot is read at the session's committed boundary when the inspection is answered, usually later than the
   epoch the click selected on; the record carries both ticks and the panel names the tick it was read at, so it is
-  up to about a second old. The panel shows none of the snapshot's genome, parent, position, phase, cooldown,
-  sensing scale, motion response or affinity, which the record carries. §14.2's sampled activations, inputs,
-  transactions, descendants, local efficiency and weight dumps are not implemented.
+  up to about a second old. What it sensed is from the newest tick the session stepped while watching it, so on
+  a selection while paused the panel says `sensed from its next tick` until a step. The panel shows none of the
+  snapshot's genome, parent, position, phase, cooldown, motion response or affinity, nor any single input or
+  activation, which the record carries. §14.2's transactions, descendants, local efficiency and weight dumps are
+  not implemented.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
     `tests/offscreen.rs` for all four brushes as far as the submitted stroke, and for the energy and material

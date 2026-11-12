@@ -44,8 +44,8 @@ use flife_genome::{DENSE_104_36_CATALOG_V1, Genome, GenomeQuota, Traits};
 use flife_neural::ACTION_WIDTH;
 
 use super::{
-    Controllers, Fields, NumericalProfile, Rules, Scratch, Sensors, Uptake, World, initial_sources,
-    organism_total,
+    Controllers, Fields, NumericalProfile, Rules, Scratch, Sensors, Uptake, Watch, World,
+    initial_sources, organism_total,
 };
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
@@ -769,6 +769,8 @@ impl World {
             fields: Fields::default(),
             sensors: Sensors::default(),
             uptake: Uptake::default(),
+            // A checkpoint holds no watch: a restored world watches nothing.
+            watch: Watch::default(),
         })
     }
 }

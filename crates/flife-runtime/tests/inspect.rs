@@ -239,3 +239,47 @@ fn a_closing_session_answers_a_queued_inspection_at_its_boundary() {
         assert!(refused.is_err(), "seed {seed}: {refused:?}");
     }
 }
+
+/// FL-021 (plan §14.2's Inputs and Brain): the organism a session inspects
+/// is watched from the owner's next tick on. Inspected again three steps
+/// later, it carries what it sensed and the activations of its newest
+/// evaluation: exactly what a direct world that watched it from the same
+/// tick gives, and the session commits what that world commits.
+#[test]
+fn a_session_watches_the_organism_it_inspected() {
+    let config = ecology(&[]);
+    let mut direct = reference(&config, 6, &[]);
+    let id = direct.population().ids().next().expect("an organism");
+    direct.watch(Some(id));
+    for _ in 0..3 {
+        publish(&mut direct, &[]);
+    }
+    let expected = snapshot(&direct, id).expect("it lives");
+    assert!(expected.sensed.is_some(), "a recorded observation");
+    assert!(expected.activations.is_some(), "recorded activations");
+    for seed in 0..4 {
+        let expected = expected.clone();
+        let (mut results, closed) = lab(seed, &config, |handle| {
+            vec![Box::pin(async move {
+                let cx = cx();
+                for _ in 0..6 {
+                    handle.step(&cx).await.expect("step");
+                }
+                let first = handle
+                    .inspect_organism(&cx, id)
+                    .await
+                    .expect("inspects")
+                    .expect("it lives");
+                assert_eq!((first.sensed, first.activations), (None, None));
+                for _ in 0..3 {
+                    handle.step(&cx).await.expect("step");
+                }
+                let answer = handle.inspect_organism(&cx, id).await.expect("inspects");
+                handle.close(&cx).await.expect("close");
+                answer
+            }) as Client<Option<OrganismSnapshot>>]
+        });
+        assert_eq!(results.remove(0), Some(expected), "seed {seed}");
+        assert_eq!(closed.world.digest(), direct.digest(), "seed {seed}");
+    }
+}

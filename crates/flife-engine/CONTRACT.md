@@ -180,7 +180,18 @@ each runs and owns the field.
   - `parameters`, its controller's parameter count;
   - `traits`: its affinity direction, motion response and sensing scale;
   - `decoded`, its held output decoded as the world decodes it for the next tick unless it is evaluated again
-    (from zero under `field-ecology-v1-chemistry-only`), or `None` while it holds no output.
+    (from zero under `field-ecology-v1-chemistry-only`), or `None` while it holds no output;
+  - `sensed` (plan §14.2's Inputs), while the world watches it: a `Sensed` with the newest published step's start
+    tick, its sensing scale (the source scale its sample blends at), the raw sample (`R, M_0, …, M_31` and their
+    x and y derivatives), the encoded `Observation` (the 104 inputs in ABI order and the unsaturated gradients
+    motion follows) and whether it evaluated its controller on it; or `None`;
+  - `activations` (plan §14.2's Brain), when the world recorded the observation of the evaluation its held output
+    came from (that step started one tick before `held.evaluated_at()`): the hidden activations
+    `ReferenceController::trace` gives on those inputs, with the output's tick. The trace must reproduce the held
+    output bit for bit.
+- `World::watch(Some(id) | None)` names the one organism whose observation each step records, from the next step
+  on. Watching another organism drops the records of the one before; watching the same one again keeps them.
+  `World::watched()` names it.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -440,10 +451,18 @@ each runs and owns the field.
   never inspected.
 - The held output is decoded by the function the tick uses (`raw_outputs` then `decode`), so the snapshot and the
   tick cannot disagree on the variant's raw outputs.
+- The watch is not scientific state. No digest, checkpoint or report holds it, a restored world watches nothing,
+  and no step reads it. A step records the watched organism's observation after its decisions, by the functions
+  they use (`blended`, then `encode`), from the sensor backend's sample for its row when the decisions used the
+  backend's samples. The record becomes visible when the step publishes, so a cancelled or paused candidate
+  records nothing. A step costs one binary search of its identity-ordered rows and one sample more; the
+  activations are evaluated at inspection, once, from the recorded inputs and the organism's own genome.
 
 **Refusal cases.**
 - FL-021: a live organism whose genome or topology is missing (`StateConflict`, "inspect organism"); a held output
-  that does not decode (as `decode`).
+  that does not decode (as `decode`); a watched organism whose held output the reference does not reproduce from
+  the inputs recorded for it (`StateConflict`, "inspect organism"), which only a controller backend that broke its
+  bit-for-bit contract can cause.
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
 - A negative or nonfinite grant, an efficiency outside `[−1, 1]`, or a nonfinite composition.
@@ -700,6 +719,31 @@ catalog and action decoding:
 - `inspecting_changes_nothing`: every organism and an unknown identity inspected before each of 20 ticks; the
   digest is unchanged by it, and equal to an uninspected world's after every tick.
 
+`tests/watch.rs` (5 tests, FL-021, plan §14.2's Inputs and Brain), on the same small world. Its oracles are not the
+snapshot's path: a controller backend that records every job's inputs and defers each to the reference; `observe`
+of the recorded raw sample and the organism's row at the step's start; and the declared F32 arithmetic (the bias,
+then each input's product in ascending index, `tanh` in F64 rounded once) written out over the genome's parameters:
+- `a_watched_snapshot_holds_what_its_controller_read_and_its_activations`: nothing recorded before the first
+  watched step; then for 48 ticks, through births, the record's tick is the step's start, it evaluated, its scale
+  is its trait's, its inputs are its job's bit for bit, `observe` of its raw sample and its row gives them and its
+  gradients, and the written-out arithmetic on them gives its activations and its held output bit for bit; no
+  other organism's snapshot records anything.
+- `the_records_follow_the_watch`: kept when the same organism is watched again, unchanged by a cancelled
+  candidate, dropped for both organisms when the watch moves, made for the new one at its next step, and none
+  once nothing is watched.
+- `at_a_slower_cadence_the_activations_are_the_held_outputs`: at an evaluation every three ticks, nine steps give
+  three records that evaluated, each its job's inputs, and six that held, with no job; the activations are those
+  of the newest evaluation, checked as above, and none before the first watched one.
+- `watching_changes_nothing_a_run_computes`: at cadences 1 and 3, a world watching a new organism every ten ticks
+  and inspecting it before each of 40 ticks publishes every tick's report and digest as one that watches nothing,
+  and both breed.
+- `the_inspector_refuses_an_output_the_reference_does_not_reproduce`: under a backend that flips one bit of every
+  output, the watched organism's snapshot is `StateConflict`; an unwatched one's is answered.
+- Planted bugs, each run against the tests that should catch it, all caught (with the trace's, the session's, the
+  panel's and the record's, 18 of 18): every record marked evaluated, the record named by the step's end tick or
+  encoded at its age then, no evaluated or no observed record kept on publish, the records kept when the watch
+  moves or carried by every organism's snapshot, no reproduction check, and the next row's organism recorded.
+
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
 `pause-before-commit` at the birth stage; FL-012 at `dissipate-and-record` and `genetic-affinity`; FL-013 at
@@ -709,10 +753,11 @@ velocity, first-order splitting at the configured fixed timestep.
 **Known gaps.**
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
-- FL-021's snapshot covers §14.2's identity, state, chemistry and brain architecture. It has no sampled
-  activations (the controller's hidden values are not kept), no inputs (the observation it decided from is not
-  kept), no local efficiency at its cell, and no transactions or descendants, which need an event index the
-  world does not keep. Weight dumps on demand are not implemented.
+- FL-021's snapshot covers §14.2's identity, state, chemistry and brain architecture, and, for the watched
+  organism, its inputs and sampled activations. A snapshot taken right after the watch is set, or in a world not
+  stepped since, has neither: the observation exists only inside a step. It has no local efficiency at its cell
+  and no transactions or descendants, which need an event index the world does not keep. Weight dumps on demand
+  are not implemented.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

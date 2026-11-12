@@ -11,7 +11,7 @@
 use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::OrganismSnapshot;
+use flife_engine::{Activations, OrganismSnapshot, Sensed};
 use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend, Style};
 use flife_render::Metrics;
@@ -430,7 +430,18 @@ fn places(scale: f64) -> usize {
 /// - `hidden 64, 32 · 9,124 parameters`: its controller's hidden widths, in
 ///   evaluation order, and parameter count;
 /// - `reproduction 3.1% a tick · emission gate 0.72` from the output it
-///   holds, or `no controller output held`.
+///   holds, or `no controller output held`;
+/// - `sensed at tick 5,119 · scale 1.50 · field 0.412` and `gradient 0.031
+///   toward 45° · affinity·Z +0.112`: what it observed in the newest tick
+///   the world recorded for it ([`Sensed`]), at its sensing scale: the
+///   field input `q = R/(R + R_scale)`, the length of its unsaturated
+///   gradient and its direction as the heading's, and its affinity
+///   direction's dot product with the composition inputs `Z`; or `sensed
+///   from its next tick` before the world has recorded one;
+/// - `activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.31, 0.44`:
+///   each hidden layer's largest and mean activation magnitude, in
+///   evaluation order, of the evaluation its held output came from
+///   ([`Activations`]); or `activations at its next evaluation`.
 ///
 /// Or `not in the committed world` when it is gone. A magnitude of 100,000
 /// or more is written in scientific notation, so no line grows without
@@ -444,10 +455,11 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
     let [vx, vy] = organism.velocity;
     let speed = vx.hypot(vy);
     let motion = if speed > 0.0 && speed.is_finite() {
-        // World y points down; the heading turns counter-clockwise on screen.
-        // Adding zero turns a heading of -0 into 0.
-        let degrees = (-vy).atan2(vx).to_degrees().rem_euclid(360.0).round() % 360.0 + 0.0;
-        format!("speed {}/s · heading {degrees:.0}°", decimal(speed, 2))
+        format!(
+            "speed {}/s · heading {:.0}°",
+            decimal(speed, 2),
+            degrees([vx, vy])
+        )
     } else {
         "still".to_owned()
     };
@@ -467,12 +479,22 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
             )
         },
     );
+    let sensed = snapshot.sensed.as_ref().map_or_else(
+        || "sensed from its next tick".to_owned(),
+        |sensed| sensed_lines(sensed, snapshot.traits.affinity()),
+    );
+    let activations = snapshot.activations.as_ref().map_or_else(
+        || "activations at its next evaluation".to_owned(),
+        activation_line,
+    );
     format!(
         "read at tick {} · lineage {} · generation {}\n\
          energy {} · {}/s · age {} ticks\n\
          {motion}\n\
          hidden {hidden} · {} parameters\n\
-         {actions}",
+         {actions}\n\
+         {sensed}\n\
+         {activations}",
         grouped(snapshot.tick.get()),
         grouped(organism.lineage.get()),
         grouped(u64::from(organism.generation.get())),
@@ -480,6 +502,76 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
         signed(organism.energy_change_rate, 3),
         grouped(snapshot.age_ticks),
         grouped(u64::try_from(snapshot.parameters).unwrap_or(u64::MAX)),
+    )
+}
+
+/// A direction in degrees counter-clockwise on screen from east, as a
+/// heading is written; world y points down.
+fn degrees([x, y]: [f64; 2]) -> f64 {
+    // Adding zero turns a direction of -0 into 0.
+    (-y).atan2(x).to_degrees().rem_euclid(360.0).round() % 360.0 + 0.0
+}
+
+/// [`inspector_lines`]' two lines for what an organism sensed.
+fn sensed_lines(sensed: &Sensed, affinity: &[f64]) -> String {
+    let inputs = &sensed.observation.inputs;
+    let field = inputs.first().copied().unwrap_or(0.0);
+    let [gx, gy] = sensed
+        .observation
+        .gradients
+        .first()
+        .copied()
+        .unwrap_or([0.0; 2]);
+    let length = gx.hypot(gy);
+    let gradient = if length > 0.0 && length.is_finite() {
+        format!(
+            "gradient {} toward {:.0}°",
+            decimal(length, 3),
+            degrees([gx, gy])
+        )
+    } else {
+        "no gradient".to_owned()
+    };
+    // The composition inputs Z_0, …, Z_31 follow the field input.
+    let along: f64 = inputs
+        .iter()
+        .skip(1)
+        .zip(affinity)
+        .map(|(z, a)| z * a)
+        .sum();
+    format!(
+        "sensed at tick {} · scale {} · field {}\n{gradient} · affinity·Z {}",
+        grouped(sensed.tick.get()),
+        decimal(sensed.scale, 2),
+        decimal(field, 3),
+        signed(along, 3),
+    )
+}
+
+/// [`inspector_lines`]' line for a held output's hidden activations.
+fn activation_line(activations: &Activations) -> String {
+    let magnitudes = |summary: fn(&[f32]) -> f64| {
+        activations
+            .hidden
+            .iter()
+            .map(|layer| decimal(summary(layer), 2))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let largest = magnitudes(|layer| {
+        layer
+            .iter()
+            .map(|value| f64::from(value.abs()))
+            .fold(0.0, f64::max)
+    });
+    let mean = magnitudes(|layer| {
+        let total: f64 = layer.iter().map(|value| f64::from(value.abs())).sum();
+        // A layer's width is a few hundred at most: the count is exact.
+        total / layer.len().max(1) as f64
+    });
+    format!(
+        "activations at tick {} · max |a| {largest} · mean |a| {mean}",
+        grouped(activations.tick.get())
     )
 }
 

@@ -58,7 +58,9 @@ inherits every command and outcome, records the fork, and from then on admits on
   counts, whether the run stopped, and the render publisher's `RenderStats` (FL-017).
 - FL-021: `SessionHandle::inspect_organism(id)`: the committed world's `World::organism_snapshot(id)`, an
   `OrganismSnapshot` whose `tick` is the boundary it was read at, or `None` when the committed world does not hold
-  the organism.
+  the organism. The owner's world then watches that organism (`World::watch`), so a later inspection of it carries
+  what it sensed and its newest evaluation's activations; a world watches the organism most recently inspected.
+  A closing owner answers without moving the watch.
 - `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
   still pending), the final boundary and the render counters.
 - FL-036, for a journaled session:
@@ -295,7 +297,7 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - dropping every handle, while paused and while running (the latter within a 2,000-step Lab bound, so an owner
     that ignores the dropped handles fails quickly instead of hanging);
   - the same protocol on the native current-thread runtime.
-- `tests/inspect.rs` (3 tests, FL-021), Lab seeds, each answer compared with the snapshot of a world stepped
+- `tests/inspect.rs` (4 tests, FL-021), Lab seeds, each answer compared with the snapshot of a world stepped
   directly to the answer's tick:
   - paused at tick 6, over four seeds: every live organism's answer, at tick 6; an unknown identity, none; the
     boundary unmoved, and the closed world the direct one;
@@ -303,7 +305,10 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     snapshot at its own tick, some answered strictly between the run's start and end; an organism answered with
     none is dead at tick 24; the run reaches 24 at the direct digest;
   - an inspection sent in the same poll as a close while running, over six seeds: answered at the closed boundary
-    with the direct snapshot of an organism alive throughout; the next inspection is refused.
+    with the direct snapshot of an organism alive throughout; the next inspection is refused;
+  - paused at tick 6, over four seeds: an organism's first inspection records nothing, and after three steps its
+    next is exactly the snapshot of a direct world that watched it from tick 6, observation and activations
+    included; the closed world is that world.
 - `tests/observation.rs` (3 tests, FL-017), each world compared with one stepped directly with no session and no
   feed:
   - G3 over three Lab seeds. A viewer retaining two epochs makes boundaries 3–48 busy while the feed keeps tick 2

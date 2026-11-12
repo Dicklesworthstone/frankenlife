@@ -102,7 +102,7 @@ use flife_neural::{
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
-use crate::inspect::OrganismSnapshot;
+use crate::inspect::{Activations, OrganismSnapshot, Sensed};
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
@@ -283,6 +283,8 @@ struct Staged {
     quota: GenomeQuota,
     identities: Identities,
     paths: Vec<SeededPath>,
+    /// The watched organism's observation in this step, if it observed.
+    sensed: Option<Sensed>,
     report: TickReport,
 }
 
@@ -337,6 +339,12 @@ impl Candidate<'_> {
         world.tick = staged.tick;
         world.epoch = staged.epoch;
         world.events = staged.events;
+        if let Some(sensed) = staged.sensed {
+            if sensed.evaluated {
+                world.watch.evaluated = Some(sensed.clone());
+            }
+            world.watch.observed = Some(sensed);
+        }
         Ok(staged.report)
     }
 }
@@ -684,6 +692,19 @@ struct Controllers {
     by_row: Vec<Option<[f32; ACTION_WIDTH]>>,
 }
 
+/// The one organism the world records observations for (FL-021, plan
+/// §14.2) and its newest records. It is not scientific state: no digest,
+/// checkpoint or report holds it, and every record in it belongs to
+/// `organism`.
+#[derive(Debug, Default)]
+struct Watch {
+    organism: Option<OrganismId>,
+    /// Its observation in the newest published step it observed in.
+    observed: Option<Sensed>,
+    /// Its observation in the newest published step it evaluated in.
+    evaluated: Option<Sensed>,
+}
+
 /// The fewest organisms worth handing to another thread.
 const MINIMUM_ROWS_PER_LANE: usize = 128;
 
@@ -727,6 +748,7 @@ pub struct World {
     fields: Fields,
     sensors: Sensors,
     uptake: Uptake,
+    watch: Watch,
 }
 
 impl World {
@@ -843,6 +865,7 @@ impl World {
             fields: Fields::default(),
             sensors: Sensors::default(),
             uptake: Uptake::default(),
+            watch: Watch::default(),
         })
     }
 
@@ -1234,14 +1257,44 @@ impl World {
         self.fault.as_ref()
     }
 
+    /// Record `organism`'s observation in every step from the next one on,
+    /// or no organism's (FL-021, plan §14.2): what
+    /// [`World::organism_snapshot`] reports as [`Sensed`] and
+    /// [`Activations`]. Watching another organism drops the records of the
+    /// one before; watching the same one again keeps them. It changes no
+    /// result of a run: no digest, checkpoint or report holds the records,
+    /// and a step reads them from nothing.
+    pub fn watch(&mut self, organism: Option<OrganismId>) {
+        if self.watch.organism != organism {
+            self.watch = Watch {
+                organism,
+                ..Watch::default()
+            };
+        }
+    }
+
+    /// The organism the world records observations for.
+    #[must_use]
+    pub const fn watched(&self) -> Option<OrganismId> {
+        self.watch.organism
+    }
+
     /// One organism at this committed tick (FL-021, plan §14.2), or `None`
     /// for an identity the population does not hold. It reads the
     /// organism's row and its own genome and changes nothing; see
-    /// [`OrganismSnapshot`].
+    /// [`OrganismSnapshot`]. While the world watches it
+    /// ([`World::watch`]), the snapshot carries its newest recorded
+    /// observation, and the hidden activations of the evaluation its held
+    /// output came from when that evaluation's observation was recorded.
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] for a live organism whose genome or
-    /// topology is missing; as [`decode`] for its held output.
+    /// topology is missing, or whose held output the reference controller
+    /// does not reproduce from the inputs recorded for it; as [`decode`]
+    /// for its held output and as [`ReferenceController::trace`] for the
+    /// activations.
+    ///
+    /// [`ReferenceController::trace`]: flife_neural::ReferenceController::trace
     pub fn organism_snapshot(&self, id: OrganismId) -> Result<Option<OrganismSnapshot>, CoreError> {
         let Some(organism) = self.population.get(id) else {
             return Ok(None);
@@ -1267,6 +1320,38 @@ impl World {
             )?),
             None => None,
         };
+        let watched = self.watch.organism == Some(id);
+        let sensed = self.watch.observed.clone().filter(|_| watched);
+        let recorded = self.watch.evaluated.as_ref().filter(|_| watched);
+        let activations = match (
+            recorded,
+            organism.held.evaluated_at(),
+            organism.held.outputs(),
+        ) {
+            (Some(recorded), Some(at), Some(held)) if recorded.tick.next().ok() == Some(at) => {
+                let trace = genome
+                    .controller(&self.rules.catalog, &self.rules.limits)?
+                    .trace(
+                        &recorded.observation.inputs,
+                        &mut ControllerScratch::default(),
+                    )?;
+                if trace.outputs.map(f32::to_bits) != held.map(f32::to_bits) {
+                    return Err(CoreError::StateConflict {
+                        operation: "inspect organism",
+                        detail: format!(
+                            "{id}'s output held from tick {} is not the reference's on the inputs \
+                             recorded for it",
+                            at.get()
+                        ),
+                    });
+                }
+                Some(Activations {
+                    tick: at,
+                    hidden: trace.hidden,
+                })
+            }
+            _ => None,
+        };
         Ok(Some(OrganismSnapshot {
             tick: self.tick,
             organism,
@@ -1276,6 +1361,8 @@ impl World {
             parameters: genome.parameters().len(),
             traits: *genome.traits(),
             decoded,
+            sensed,
+            activations,
         }))
     }
 
@@ -1422,6 +1509,7 @@ impl World {
             fields,
             sensors,
             uptake: uptake_state,
+            watch,
             ..
         } = self;
         let Scratch {
@@ -1514,6 +1602,10 @@ impl World {
             lanes,
             controllers,
         )?;
+        let sensed = match watch.organism {
+            Some(id) => watched(rules, population, &view, sampled, rows, id, [from, to])?,
+            None => None,
+        };
         // The reference sampled the tick without an error, so a backend that
         // met one failed where the reference does not.
         if let Some(failure) = sensor_failure {
@@ -1816,6 +1908,7 @@ impl World {
             quota: next_quota,
             identities: next_identities,
             paths: next_paths,
+            sensed,
             report,
         })))
     }
@@ -2187,18 +2280,75 @@ fn observation(
     raw: Option<&RawSample>,
     from: Tick,
 ) -> Result<Observation, CoreError> {
-    let genome = genome_of(population, organism.id)?;
-    let raw = match raw {
-        Some(raw) => *raw,
-        None => view.sample(organism.position, genome.traits().sensing_scale())?,
+    let raw = blended(population, view, organism, raw)?;
+    encode(rules, organism, &raw, from)
+}
+
+/// The watched organism's observation in the step from `from` to `to`,
+/// exactly as its decision read it: from the backend's sample for its row
+/// when the decisions used the backend's samples, else from the reference
+/// pyramid. `None` when it is not among `rows`, which are in identity order.
+fn watched(
+    rules: &Rules,
+    population: &Population,
+    view: &PyramidView<'_>,
+    sampled: Option<&[RawSample]>,
+    rows: &[Organism],
+    id: OrganismId,
+    [from, to]: [Tick; 2],
+) -> Result<Option<Sensed>, CoreError> {
+    let Some((row, organism)) = rows
+        .binary_search_by_key(&id, |organism| organism.id)
+        .ok()
+        .and_then(|row| rows.get(row).map(|organism| (row, organism)))
+    else {
+        return Ok(None);
     };
+    let raw = blended(
+        population,
+        view,
+        organism,
+        sampled.and_then(|samples| samples.get(row)),
+    )?;
+    Ok(Some(Sensed {
+        tick: from,
+        scale: genome_of(population, id)?.traits().sensing_scale(),
+        observation: encode(rules, organism, &raw, from)?,
+        raw,
+        evaluated: due(rules, organism, to),
+    }))
+}
+
+/// The organism's raw sample at its sensing scale: the backend's `raw` if
+/// there is one, else the reference pyramid's.
+fn blended(
+    population: &Population,
+    view: &PyramidView<'_>,
+    organism: &Organism,
+    raw: Option<&RawSample>,
+) -> Result<RawSample, CoreError> {
+    let genome = genome_of(population, organism.id)?;
+    match raw {
+        Some(raw) => Ok(*raw),
+        None => view.sample(organism.position, genome.traits().sensing_scale()),
+    }
+}
+
+/// The observation encoded from the organism's raw sample and its own
+/// committed state at `from`.
+fn encode(
+    rules: &Rules,
+    organism: &Organism,
+    raw: &RawSample,
+    from: Tick,
+) -> Result<Observation, CoreError> {
     let intrinsic = Intrinsic {
         energy: organism.energy,
         age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
         velocity: organism.velocity,
         energy_change_per_second: organism.energy_change_rate,
     };
-    observe(&raw, &intrinsic, &rules.scales)
+    observe(raw, &intrinsic, &rules.scales)
 }
 
 /// Whether the organism evaluates its controller for tick `to`: due on its

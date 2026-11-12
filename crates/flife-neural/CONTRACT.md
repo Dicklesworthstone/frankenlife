@@ -47,6 +47,11 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
   each layer's `LayerShape`, which maps `weight[out][in]` and `bias[out]` to packed offsets.
 - `ReferenceController::evaluate` returns the 36 raw F32 outputs of the linear final layer, and `widen` gives the
   exact F64 values `decode` reads. `ControllerScratch` is reusable activation storage.
+- `ReferenceController::trace` (FL-021, plan §14.2's sampled activations) is `evaluate` keeping each hidden layer's
+  activations: a `Trace { hidden, outputs }` whose `outputs` are `evaluate`'s bit for bit and whose `hidden` are the
+  F32 values the next layer read, one vector per hidden layer in evaluation order. It refuses what `evaluate`
+  refuses, and `AllocationFailed` when the copies cannot be stored. `flife-engine`'s `tests/watch.rs` checks its
+  activations against the declared arithmetic written out over real genomes.
 - FL-043: `ControllerBackend::resident_bytes`, required, the host and device bytes a backend holds now;
   `BackendBudget { bytes, organisms }` with `UNBOUNDED`, what a backend may hold and for how many organisms; and
   `ControllerScratch::allocated_bytes`.
@@ -147,6 +152,9 @@ F32, and each lies at least 0.10 F32 ulp from a rounding midpoint.
 - An input-major F64 oracle with `std`'s `tanh` over four topologies and 96 evaluations, under a rigorous running
   error bound (`γ_n Σ|w x|` per dot product, plus propagated and rounding error). The largest observed error is
   5.3e-7, or 0.5% of its bound.
+- FL-021: `trace` over `104 → 8 → 36`, the default and the widest network, each from a scratch the widest net used
+  last: its outputs are `evaluate`'s bit for bit, and each hidden layer, at its width, is the declared arithmetic
+  written out over the layer shapes, bit for bit.
 - INV-13: two genomes of one topology answer differently, and a shared scratch alternating between narrow, wide
   and default topologies gives the same bits as fresh scratch.
 - §6.4's parameter counts (1,164; 4,548; 9,988; 18,628; 29,316) and Appendix A's default layer offsets.

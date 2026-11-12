@@ -559,6 +559,34 @@ struct Inspection {
     motion_response: Vec<f64>,
     affinity: Vec<f64>,
     decoded: Option<Decoded>,
+    /// What it observed in the newest tick the world recorded for it.
+    sensed: Option<SensedRecord>,
+    /// The hidden activations its held output came from.
+    activations: Option<ActivationsRecord>,
+}
+
+/// An organism's recorded observation (FL-021, plan §14.2's Inputs), every
+/// value as the step read it.
+#[derive(Serialize)]
+struct SensedRecord {
+    /// The committed tick its step started from.
+    tick: u64,
+    scale: f64,
+    evaluated: bool,
+    /// The blended `R, M_0, …, M_31`, and their x and y derivatives.
+    raw: [Vec<f64>; 3],
+    /// The 104 controller inputs in ABI order.
+    inputs: Vec<f64>,
+    /// `[∂q, ∂Z_0, …, ∂Z_31]`, each `[∂/∂x, ∂/∂y]`, unsaturated.
+    gradients: Vec<[f64; 2]>,
+}
+
+/// One evaluation's hidden activations (plan §14.2's Brain).
+#[derive(Serialize)]
+struct ActivationsRecord {
+    /// The tick its output is held from.
+    tick: u64,
+    hidden: Vec<Vec<f32>>,
 }
 
 #[derive(Serialize)]
@@ -1189,6 +1217,25 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
             emission_direction: decoded.emission.map(|emission| emission.direction.to_vec()),
             emission_spend_fraction: decoded.emission.map(|emission| emission.spend_fraction),
         }),
+        sensed: snapshot.sensed.as_ref().map(|sensed| SensedRecord {
+            tick: sensed.tick.get(),
+            scale: sensed.scale,
+            evaluated: sensed.evaluated,
+            raw: [
+                sensed.raw.values.to_vec(),
+                sensed.raw.dx.to_vec(),
+                sensed.raw.dy.to_vec(),
+            ],
+            inputs: sensed.observation.inputs.to_vec(),
+            gradients: sensed.observation.gradients.to_vec(),
+        }),
+        activations: snapshot
+            .activations
+            .as_ref()
+            .map(|activations| ActivationsRecord {
+                tick: activations.tick.get(),
+                hidden: activations.hidden.clone(),
+            }),
     }
 }
 
@@ -1482,5 +1529,107 @@ mod tests {
         assert_eq!(cancelled["tick"], 5);
         assert_eq!(cancelled["energy"], Value::Null);
         assert_eq!(cancelled["detail"], "SessionClosed");
+    }
+
+    /// FL-021 (plan §14.2): an inspection's record carries what the watched
+    /// organism sensed and the activations of its held output, every value
+    /// the step's own, bit for bit.
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "an F32 written out reads back as itself"
+    )]
+    fn inspected_records_carry_what_it_sensed_and_its_activations() {
+        let config = flife_core::ValidatedConfig::from_toml(include_str!(
+            "../../../presets/reference-small-world.toml"
+        ))
+        .expect("the preset");
+        let mut world = flife_engine::World::found(
+            &config,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("the profile"),
+        )
+        .expect("founds");
+        let id = world.population().ids().next().expect("a founder");
+        world.watch(Some(id));
+        for _ in 0..2 {
+            world.step().expect("steps");
+        }
+        let snapshot = world
+            .organism_snapshot(id)
+            .expect("inspects")
+            .expect("it lives");
+        let sensed = snapshot.sensed.clone().expect("sensed");
+        let activations = snapshot.activations.clone().expect("activations");
+        let record = serde_json::to_value(super::status_record(&Status::Inspected {
+            organism: id,
+            seen: Tick::new(2),
+            snapshot: Some(Box::new(snapshot)),
+        }))
+        .unwrap_or(Value::Null);
+        let bits = |value: &Value| -> Vec<u64> {
+            value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_f64)
+                .map(f64::to_bits)
+                .collect()
+        };
+        let read = &record["snapshot"]["sensed"];
+        assert_eq!(read["tick"], 1);
+        assert_eq!(
+            read["scale"].as_f64().map(f64::to_bits),
+            Some(sensed.scale.to_bits())
+        );
+        assert_eq!(read["evaluated"], true);
+        assert_eq!(
+            bits(&read["inputs"]),
+            sensed.observation.inputs.map(f64::to_bits).to_vec()
+        );
+        for (plane, values) in [sensed.raw.values, sensed.raw.dx, sensed.raw.dy]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(bits(&read["raw"][plane]), values.map(f64::to_bits).to_vec());
+        }
+        let gradients: Vec<u64> = read["gradients"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(bits)
+            .collect();
+        assert_eq!(
+            gradients,
+            sensed
+                .observation
+                .gradients
+                .iter()
+                .flatten()
+                .map(|gradient| gradient.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let brain = &record["snapshot"]["activations"];
+        assert_eq!(brain["tick"], 2);
+        assert_eq!(
+            brain["hidden"].as_array().map(Vec::len),
+            Some(activations.hidden.len())
+        );
+        for (layer, values) in activations.hidden.iter().enumerate() {
+            let read: Vec<u32> = brain["hidden"][layer]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_f64)
+                .map(|value| (value as f32).to_bits())
+                .collect();
+            assert_eq!(
+                read,
+                values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

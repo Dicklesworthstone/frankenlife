@@ -579,6 +579,62 @@ fn controllers_keep_their_own_weights_and_scratch_carries_nothing() {
     shareable::<DenseTopology>();
 }
 
+/// FL-021 (plan §14.2's sampled activations): a trace's outputs are
+/// `evaluate`'s, bit for bit, and its hidden layers are the declared
+/// arithmetic written out here over the layer shapes (the bias, then each
+/// input's product in ascending index, in F32; `tanh` in F64 rounded once),
+/// one per hidden layer at its width, from a scratch a wider net used last.
+#[test]
+fn a_trace_keeps_each_hidden_layer_and_the_outputs() {
+    let mut shared = ControllerScratch::default();
+    let widest = topology(&[128, 96]);
+    let widest_parameters = random_parameters(&widest, 9);
+    let mut state = 21_u64;
+    for (hidden, seed) in [(&[8][..], 5), (&[64, 32], 6), (&[128, 96], 7)] {
+        let net = topology(hidden);
+        let parameters = random_parameters(&net, seed);
+        let inputs = random_inputs(&mut state);
+        let controller = ReferenceController::new(&net, &parameters, BOUND).expect("controller");
+        ReferenceController::new(&widest, &widest_parameters, BOUND)
+            .expect("the widest")
+            .evaluate(&inputs, &mut shared)
+            .expect("evaluates");
+        let trace = controller.trace(&inputs, &mut shared).expect("traces");
+        assert_eq!(
+            trace.outputs.map(f32::to_bits),
+            evaluate(&net, &parameters, &inputs).map(f32::to_bits),
+            "{hidden:?}"
+        );
+        assert_eq!(trace.hidden.len(), hidden.len(), "{hidden:?}");
+        let mut source: Vec<f32> = inputs.iter().map(|&input| input as f32).collect();
+        for (index, (reported, &width)) in trace.hidden.iter().zip(hidden).enumerate() {
+            let shape = layer(&net, index);
+            let expected: Vec<f32> = (0..shape.outputs)
+                .map(|output| {
+                    let mut z = parameters[shape.bias(output).expect("a bias")];
+                    for (input, value) in source.iter().enumerate() {
+                        z += parameters[shape.weight(output, input).expect("a weight")] * value;
+                    }
+                    flife_core::numerics::tanh(f64::from(z)).expect("finite") as f32
+                })
+                .collect();
+            assert_eq!(reported.len(), width as usize, "{hidden:?} layer {index}");
+            assert_eq!(
+                reported
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{hidden:?} layer {index}"
+            );
+            source = expected;
+        }
+    }
+}
+
 #[test]
 fn catalog_parameter_counts_match_the_plan() {
     // §6.4's table, biases included.

@@ -273,6 +273,22 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
                 .shown()
                 .is_some_and(|shown| shown.tick.get() >= 8)
     });
+    // The selection's organism is watched: an inspection refreshed while the
+    // world runs, as the Studio's binary refreshes it each second, carries
+    // what it sensed in a tick before the answer's, and the activations of
+    // the output it holds (FL-021, plan §14.2).
+    assert!(studio.inspect_selected(), "the refresh is offered");
+    until(&mut studio, "a watched inspection", |_, statuses| {
+        statuses.iter().any(|status| {
+            matches!(status, Status::Inspected { organism, snapshot: Some(snapshot), .. }
+            if Some(*organism) == expected
+                && snapshot.sensed.as_ref().is_some_and(|sensed| sensed.tick < snapshot.tick)
+                && snapshot.activations.as_ref().is_some_and(|activations| {
+                    Some(activations.tick) == snapshot.organism.held.evaluated_at()
+                        && activations.hidden.len() == snapshot.hidden_widths.len()
+                }))
+        })
+    });
     let tally = studio.tally();
     assert_eq!(tally.rendered, tally.frames, "every frame was drawn");
     assert_eq!((tally.restyles, tally.selections), (1, 1));

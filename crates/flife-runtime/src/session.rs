@@ -614,7 +614,12 @@ impl SessionHandle {
     /// its own genome's traits and shape, and its held output decoded
     /// ([`World::organism_snapshot`]). A running owner answers between
     /// ticks, so the snapshot is of one whole committed tick, named by its
-    /// `tick`; nothing else of the world is copied and nothing changes.
+    /// `tick`; nothing else of the world is copied and no result changes.
+    /// The owner's world then watches that organism ([`World::watch`]): its
+    /// observation is recorded in every tick from the next one on, so a
+    /// later inspection of it carries what it sensed and the activations of
+    /// its newest evaluation. A world watches one organism, the one most
+    /// recently inspected.
     ///
     /// # Errors
     /// As [`SessionHandle::submit`] and [`World::organism_snapshot`].
@@ -1516,6 +1521,7 @@ impl SessionOwner {
                 let _ = reply.send_blocking(self.snapshot());
             }
             Control::InspectOrganism { id, reply } => {
+                self.world.watch(Some(id));
                 let _ = reply.send_blocking(self.world.organism_snapshot(id));
             }
             Control::Checkpoint(reply) => {

@@ -39,8 +39,14 @@
 //! committed worlds: a selection is validated against the newest one by
 //! identity, never by storage slot. Nothing on this thread waits for a
 //! tick, a command or the session's lanes.
+//!
+//! With [`StudioOptions::run`] the session is kept in a run directory
+//! ([`crate::keep`], FL-024): refused before any surface opens when the
+//! directory holds anything, its checkpoint charged with the observers,
+//! and the session opened through the run's command journal.
 
 use flife_backend_metal::{BackendBudget, ControllerChoice};
+use flife_cli::CheckpointAdmission;
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
@@ -56,7 +62,10 @@ use fmn_render::metal::{
 };
 use std::collections::VecDeque;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use crate::keep::Keeping;
 
 use crate::timeline::{Exact, TimelineRecord};
 use crate::{
@@ -96,6 +105,9 @@ pub struct StudioOptions {
     /// frame makes to the view and every frame drawn, as
     /// [`TimelineRecord`]s, from [`Studio::take_recorded`].
     pub record: bool,
+    /// A run directory to keep the session in (FL-024, [`crate::Keeping`]):
+    /// absent or empty when the Studio opens. `None` keeps nothing.
+    pub run: Option<PathBuf>,
 }
 
 /// Where a Studio's frames go.
@@ -128,6 +140,7 @@ impl Default for StudioOptions {
             style: Style::default(),
             surface: Surface::Window,
             record: false,
+            run: None,
         }
     }
 }
@@ -243,6 +256,10 @@ pub struct StudioClosed {
     pub input: crate::InputTally,
     /// Input the native queue dropped between polls.
     pub input_dropped: u64,
+    /// The statuses the session reported that no frame took, those
+    /// reported while it closed last: a run's end, a kept session's last
+    /// checkpoints, the close.
+    pub statuses: Vec<Status>,
 }
 
 /// The native Studio host.
@@ -267,6 +284,8 @@ pub struct Studio {
     controllers: String,
     /// The peak-memory admission it opened under (FL-043).
     memory: MemoryAdmission,
+    /// The run directory the session is kept in (FL-024).
+    keeping: Option<Keeping>,
     /// The last inspected organism and the material it converts best
     /// (FL-022): the material brush's composition while it is selected.
     material: Option<(OrganismId, Option<[f64; flife_engine::MATERIAL_CHANNELS]>)>,
@@ -300,7 +319,14 @@ impl Studio {
     ///   [`flife_runtime::open`] and [`WorldView::new`].
     /// - [`CoreError::BudgetExhausted`] when the world and its observers do
     ///   not fit `maximum_total_bytes` ([`crate::memory::admit`]).
+    /// - With [`StudioOptions::run`], before any surface opens:
+    ///   [`Keeping::new`]'s refusals; then [`Keeping::open`]'s errors.
     pub fn open(config: &ValidatedConfig, options: &StudioOptions) -> Result<Self, CoreError> {
+        let keeping = options
+            .run
+            .as_ref()
+            .map(|run| Keeping::new(run.clone(), config))
+            .transpose()?;
         let model = config.config();
         let background =
             hex_rgb(&model.presentation.background).ok_or_else(|| CoreError::NumericalInvalid {
@@ -359,7 +385,14 @@ impl Studio {
             .map_or([width, height], |metrics| {
                 [metrics.drawable_width, metrics.drawable_height]
             });
-        let memory = crate::memory::admit(&world, options.controllers, &founding, &view, drawable)?;
+        let memory = crate::memory::admit_kept(
+            &world,
+            options.controllers,
+            &founding,
+            &view,
+            drawable,
+            keeping.as_ref().map_or(0, Keeping::checkpoint_bytes),
+        )?;
         drop(founding);
         let budget = BackendBudget {
             bytes: memory.backend,
@@ -371,7 +404,16 @@ impl Studio {
             .backend
             .clone()
             .unwrap_or_else(|| CPU_REFERENCE.to_owned());
-        let (owner, handle) = flife_runtime::open(world, config, STUDIO_SESSION)?;
+        let (owner, handle, checkpoints) = match &keeping {
+            Some(keeping) => {
+                let (owner, handle, checkpoints) = keeping.open(world, config, STUDIO_SESSION)?;
+                (owner, handle, Some(checkpoints))
+            }
+            None => {
+                let (owner, handle) = flife_runtime::open(world, config, STUDIO_SESSION)?;
+                (owner, handle, None)
+            }
+        };
         let feed = handle.feed();
         // The shown epoch and, while the display moves, its prior.
         let viewer = feed.viewer(DISPLAY_PAIR)?;
@@ -379,7 +421,7 @@ impl Studio {
         view.show(&founding)?;
         let mut pacer = Pacer::new();
         pacer.arrive(Instant::now());
-        let session = SessionThread::spawn(owner, handle)?;
+        let session = SessionThread::spawn_kept(owner, handle, checkpoints)?;
         let mut events = Vec::new();
         events
             .try_reserve_exact(INPUT_QUEUE_CAPACITY)
@@ -410,6 +452,7 @@ impl Studio {
             window_closed: false,
             controllers,
             memory,
+            keeping,
             material: None,
             founder_energy: model.population.initial_energy,
             font,
@@ -516,6 +559,15 @@ impl Studio {
     #[must_use]
     pub const fn memory(&self) -> &MemoryAdmission {
         &self.memory
+    }
+
+    /// The run directory the session is kept in and its checkpoint
+    /// admission (FL-024); `None` when nothing is kept.
+    #[must_use]
+    pub fn kept(&self) -> Option<(&Path, &CheckpointAdmission)> {
+        self.keeping
+            .as_ref()
+            .map(|keeping| (keeping.run_dir(), keeping.admission()))
     }
 
     /// What the brushes draw on now: the selected organism's material,
@@ -1017,13 +1069,14 @@ impl Studio {
         drop(self.prior.take());
         drop(self.current);
         let input_dropped = self.target.input_dropped();
-        let session = self.session.close()?;
+        let (session, statuses) = self.session.close_reporting()?;
         window?;
         Ok(StudioClosed {
             session,
             frames: self.tally,
             input: self.controls.tally(),
             input_dropped,
+            statuses,
         })
     }
 }

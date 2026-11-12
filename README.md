@@ -405,6 +405,8 @@ cargo run --release -p flife-studio -- presets/reference-small-world.toml --widt
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --offscreen 20 --offscreen-zooms
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --timeline session.ndjson
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --export session.ndjson --out export
+cargo run --release -p flife-studio -- presets/reference-small-world.toml --run studio-run
+cargo run --release -p flife-cli -- resume studio-run --until 20000
 ```
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
@@ -463,6 +465,15 @@ Studio rendered. The frames on a constant clock (`--export-fps`, the preset's 30
 timeline's and configuration's hashes, the ticks shown, the closing digest and each file's SHA-256. An export that
 reaches another world than the Studio's is refused, and neither command writes over a file. Simulation-time and
 checkpoint-replay export (plan §13.8) and Cinema qualification (FL-050) are later work.
+
+`--run DIR` keeps the Studio's session in a new run directory (FL-024), as `flife run --run-dir` keeps a run: the
+configuration, the command journal (every brush applied is a journaled command under `write-ahead-before-apply`)
+and checkpoints at the configured interval. The founding one comes first; while the world runs, each is taken at the
+first committed boundary the Studio reads (every 50 ms) at or past the next multiple; and closing publishes the
+closing boundary and suspends the session, so a stroke still pending applies when the run is resumed. The window's
+telemetry names the newest checkpoint's tick, and the NDJSON carries a `checkpoint` record each. `flife resume`,
+`flife branch` and `flife inspect` (`--weights` included) take the directory: resuming it reaches exactly the world
+an uninterrupted session would.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density`, `--no-field` and
 `--field-mapping energy|composition`.

@@ -23,6 +23,10 @@
 //! - while a bloom is configured, its row sums on the device
 //!   ([`WorldView::bloom_bytes`], FL-019).
 //!
+//! A session kept in a run directory (FL-024) also charges its checkpoint
+//! ([`admit_kept`]): the most heap one holds beyond the live world, as the
+//! command line's runs charge it.
+//!
 //! What a resize past the opening size adds, in pixels and density bins,
 //! is not admitted again.
 
@@ -84,9 +88,25 @@ pub fn admit(
     view: &WorldView,
     drawable: [u32; 2],
 ) -> Result<MemoryAdmission, CoreError> {
+    admit_kept(world, controllers, founding, view, drawable, 0)
+}
+
+/// [`admit`] with a kept session's `checkpoint` bytes (FL-024): the
+/// checkpoint term of [`World::admit_memory`].
+///
+/// # Errors
+/// [`World::admit_memory`]'s refusal.
+pub fn admit_kept(
+    world: &World,
+    controllers: ControllerChoice,
+    founding: &Epoch,
+    view: &WorldView,
+    drawable: [u32; 2],
+    checkpoint: u64,
+) -> Result<MemoryAdmission, CoreError> {
     world.admit_memory(
         controllers != ControllerChoice::Cpu,
-        0,
+        checkpoint,
         observer_bytes(world, founding, view, drawable),
     )
 }

@@ -29,7 +29,16 @@
 //! for an applied command, the tick it applied at, the tick that published
 //! it and the energy it moved. A paused session holds the command until a
 //! step or a run reaches its boundary.
+//!
+//! A session kept in a run directory ([`SessionThread::spawn_kept`],
+//! FL-024's `--run`; [`crate::keep`]) publishes its founding checkpoint
+//! before the client takes any intent, then a checkpointer task the client
+//! owns publishes one as the committed tick passes each due tick, each
+//! reported as [`Status::Checkpointed`]. Closing it pauses it, publishes
+//! the closing boundary and suspends the session instead of closing it.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -37,6 +46,7 @@ use asupersync::Cx;
 use asupersync::channel::mpsc as lane;
 use asupersync::runtime::{JoinHandle, RuntimeBuilder, RuntimeHandle};
 use asupersync::time::{sleep, wall_now};
+use flife_cli::Checkpoints;
 use flife_core::ids::{CommandId, OrganismId};
 use flife_core::{CoreError, Tick};
 use flife_engine::OrganismSnapshot;
@@ -46,7 +56,7 @@ use flife_runtime::{
     SessionOwner, StepOutcome, Target,
 };
 
-use crate::{Intent, Stroke};
+use crate::{Intent, Stroke, keep};
 
 /// Intents the lane holds before refusing more.
 pub const INTENT_CAPACITY: usize = 16;
@@ -145,6 +155,34 @@ pub enum Status {
         /// `None` when the committed world no longer holds it.
         snapshot: Option<Box<OrganismSnapshot>>,
     },
+    /// A checkpoint of a kept session was published to its run directory
+    /// (FL-024): written, verified, indexed in the catalog and retained.
+    Checkpointed {
+        /// The committed tick it holds.
+        tick: Tick,
+        /// The committed epoch it holds.
+        epoch: u64,
+        /// Its chunk-store sequence number.
+        sequence: u64,
+        /// The container's SHA-256, in hex.
+        sha256: String,
+        /// The container's size.
+        bytes: u64,
+        /// Older checkpoints removed under `retain_recent_checkpoints`.
+        retired: Vec<u64>,
+        /// The mode it was taken in (FL-038).
+        mode: &'static str,
+        /// Wall-clock seconds the session took no step for it.
+        paused_seconds: f64,
+    },
+    /// A kept session's checkpoint failed: it takes no more, and runs on
+    /// with its journal.
+    Unkept {
+        /// The error's class.
+        kind: &'static str,
+        /// The error.
+        detail: String,
+    },
     /// The session refused an intent.
     Refused {
         /// The intent.
@@ -176,12 +214,26 @@ impl SessionThread {
     /// # Errors
     /// [`CoreError::MissingCapability`] when the thread cannot be spawned.
     pub fn spawn(owner: SessionOwner, handle: SessionHandle) -> Result<Self, CoreError> {
+        Self::spawn_kept(owner, handle, None)
+    }
+
+    /// Start `owner` and a controller over `handle` on a new thread,
+    /// keeping its run directory through `checkpoints` when given
+    /// ([`crate::Keeping`]; [`crate::Keeping::open`] opens the three).
+    ///
+    /// # Errors
+    /// [`CoreError::MissingCapability`] when the thread cannot be spawned.
+    pub fn spawn_kept(
+        owner: SessionOwner,
+        handle: SessionHandle,
+        checkpoints: Option<Checkpoints>,
+    ) -> Result<Self, CoreError> {
         let (intents, intake) = lane::channel(INTENT_CAPACITY);
         let (report, statuses) = mpsc::channel();
         let feed = handle.feed();
         let thread = std::thread::Builder::new()
             .name("flife-session".into())
-            .spawn(move || serve(owner, handle, intake, report))
+            .spawn(move || serve(owner, handle, intake, report, checkpoints))
             .map_err(|error| missing(format!("the session thread: {error}")))?;
         Ok(Self {
             intents,
@@ -226,13 +278,29 @@ impl SessionThread {
     /// # Errors
     /// The session's closing errors, or [`CoreError::MissingCapability`]
     /// when the thread panicked.
-    pub fn close(mut self) -> Result<SessionClosed, CoreError> {
+    pub fn close(self) -> Result<SessionClosed, CoreError> {
+        self.close_reporting().map(|(closed, _)| closed)
+    }
+
+    /// [`SessionThread::close`], also returning every status not yet taken
+    /// with [`SessionThread::statuses`], those reported while it closed
+    /// last: a run's end, a kept session's last checkpoints, the close.
+    ///
+    /// # Errors
+    /// As [`SessionThread::close`].
+    pub fn close_reporting(self) -> Result<(SessionClosed, Vec<Status>), CoreError> {
+        let Self {
+            intents,
+            statuses,
+            feed,
+            thread,
+        } = self;
         // A full lane still drains: the controller handles intents in turn,
         // and dropping the sender below closes the lane once it is empty.
-        let _ = self.intents.try_send(Intent::Close);
-        let thread = self.thread.take();
-        drop(self);
-        match thread {
+        let _ = intents.try_send(Intent::Close);
+        drop(intents);
+        drop(feed);
+        let closed = match thread {
             Some(thread) => thread
                 .join()
                 .map_err(|_| missing("a session thread that did not panic".into()))?,
@@ -240,7 +308,8 @@ impl SessionThread {
                 operation: "close studio session",
                 detail: "already closed".into(),
             }),
-        }
+        }?;
+        Ok((closed, statuses.try_iter().collect()))
     }
 }
 
@@ -249,6 +318,7 @@ fn serve(
     handle: SessionHandle,
     mut intake: lane::Receiver<Intent>,
     report: mpsc::Sender<Status>,
+    checkpoints: Option<Checkpoints>,
 ) -> Result<SessionClosed, CoreError> {
     let runtime = RuntimeBuilder::current_thread()
         .enable_time()
@@ -267,6 +337,30 @@ fn serve(
             .try_spawn(async move {
                 let cx = Cx::current().ok_or_else(|| missing("a task context".into()))?;
                 let mut client = Client::default();
+                // A kept session: its founding checkpoint before any intent,
+                // then the checkpointer.
+                let kept = checkpoints.is_some();
+                let stop = Arc::new(AtomicBool::new(false));
+                let mut keeper = None;
+                if let Some(checkpoints) = checkpoints
+                    && let Some(checkpoints) = keep::found(&cx, &handle, checkpoints, &report).await
+                {
+                    let (session, kept_report, kept_stop) =
+                        (handle.clone(), report.clone(), Arc::clone(&stop));
+                    let spawned = watchers.try_spawn(async move {
+                        let cx = Cx::current()?;
+                        keep::keep(&cx, &session, checkpoints, &kept_report, &kept_stop).await
+                    });
+                    match spawned {
+                        Ok(task) => keeper = Some(task),
+                        Err(error) => {
+                            let _ = report.send(Status::Unkept {
+                                kind: "missing-capability",
+                                detail: format!("the checkpointer: {error}"),
+                            });
+                        }
+                    }
+                }
                 loop {
                     // A closed lane (the Studio dropped its sender) closes.
                     let intent = intake.recv(&cx).await.unwrap_or(Intent::Close);
@@ -277,7 +371,16 @@ fn serve(
                     let status = act(&cx, &handle, &watchers, &report, &mut client, intent).await;
                     let _ = report.send(status);
                 }
-                let closed = handle.close(&cx).await;
+                let closed = if kept {
+                    stop.store(true, Ordering::Release);
+                    let checkpoints = match keeper {
+                        Some(task) => task.await,
+                        None => None,
+                    };
+                    keep::close(&cx, &handle, checkpoints, &report).await
+                } else {
+                    handle.close(&cx).await
+                };
                 // Closing ends every run and every command's wait (a status
                 // after close is refused), so each watcher reports and
                 // returns.

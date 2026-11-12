@@ -42,6 +42,18 @@
 //! configuration's `[presentation] frames_per_second` by default) as y4m,
 //! and a `frankenlife.export.v1` manifest. Then it prints one `export`
 //! record.
+//!
+//! `--run DIR` keeps the session in run directory DIR (FL-024), which must
+//! be absent or empty: the configuration, the command journal (every brush
+//! applied is a journaled command) and checkpoints, as `flife run
+//! --run-dir` keeps them, so `flife resume`, `flife branch` and `flife
+//! inspect` take it. The `open` record names it and its checkpoint
+//! admission, a `checkpoint` record follows each checkpoint published (the
+//! founding one, one as the committed tick passes each multiple of the
+//! interval, and the closing boundary's), and the window's telemetry names
+//! the newest checkpoint's tick. Closing suspends the session: a command
+//! still pending stays pending, to apply when the run is resumed. The
+//! statuses reported while the Studio closes are printed before `end`.
 
 #![forbid(unsafe_code)]
 
@@ -53,6 +65,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use flife_backend_metal::ControllerChoice;
+use flife_cli::CheckpointAdmission;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{OrganismSnapshot, ReproductionOutcome};
@@ -160,6 +173,10 @@ struct Cli {
     /// `[presentation] frames_per_second` by default.
     #[arg(long, value_name = "FPS", requires = "export")]
     export_fps: Option<NonZeroU32>,
+    /// Keep the session in run directory DIR (FL-024), which must be
+    /// absent or empty: `flife resume`, `branch` and `inspect` take it.
+    #[arg(long, value_name = "DIR", conflicts_with = "export")]
+    run: Option<PathBuf>,
 }
 
 /// A timeline file being written (`--timeline`).
@@ -318,6 +335,22 @@ enum Record<'a> {
         clock_telemetry: bool,
         /// `window` or `offscreen`.
         surface: &'static str,
+        /// The run directory the session is kept in (`--run`), and its
+        /// checkpoint admission.
+        run_dir: Option<String>,
+        checkpoints: Option<&'a CheckpointAdmission>,
+    },
+    /// A checkpoint of the kept session was published (`--run`, FL-024).
+    Checkpoint {
+        schema: &'static str,
+        tick: u64,
+        epoch: u64,
+        sequence: u64,
+        sha256: String,
+        bytes: u64,
+        retired: Vec<u64>,
+        mode: &'static str,
+        paused_seconds: f64,
     },
     View {
         schema: &'static str,
@@ -465,6 +498,8 @@ enum Record<'a> {
         camera_moves: Option<u64>,
         camera_moves_unmoved: Option<u64>,
         camera_latency: Option<FrameTimeSummary>,
+        /// The newest checkpoint's tick (`--run`).
+        checkpoint_tick: Option<u64>,
     },
     /// `--export`'s summary (FL-023); the manifest in `out` has the rest.
     Export {
@@ -696,6 +731,7 @@ fn main() -> ExitCode {
             .offscreen
             .map_or(Surface::Window, |_| Surface::Offscreen { scale: cli.scale }),
         record: cli.timeline.is_some(),
+        run: cli.run.clone(),
         ..StudioOptions::default()
     };
     // Refused before a window opens; creating it refuses a race as well.
@@ -752,6 +788,10 @@ fn main() -> ExitCode {
         } else {
             "window"
         },
+        run_dir: studio
+            .kept()
+            .map(|(run_dir, _)| run_dir.display().to_string()),
+        checkpoints: studio.kept().map(|(_, admission)| admission),
     });
     let deadline = cli
         .offscreen
@@ -787,6 +827,8 @@ fn main() -> ExitCode {
     let mut telemetry_metrics: Option<Metrics> = None;
     let mut current_run = None;
     let mut capacity_pauses = 0_u64;
+    // The newest checkpoint's tick (`--run`).
+    let mut checkpoint = None;
     // The last inspection's answer and whom it was about (FL-021's panel).
     let mut inspected = None;
     // Every colour mapping's key (FL-019's legend).
@@ -858,6 +900,7 @@ fn main() -> ExitCode {
                 Status::Inspected {
                     organism, snapshot, ..
                 } => inspected = Some((*organism, snapshot.clone())),
+                Status::Checkpointed { tick, .. } => checkpoint = Some(*tick),
                 _ => {}
             }
             overlay_tick = frame.shown.map(|shown| shown.tick);
@@ -983,7 +1026,7 @@ fn main() -> ExitCode {
                 evaluation_interval_ticks: model.controller.evaluation_interval_ticks,
                 memory: studio.memory(),
                 capacity_pauses,
-                checkpoint: None,
+                checkpoint,
             }),
         });
         let swatches: Vec<[u8; 3]> = legend
@@ -1050,6 +1093,12 @@ fn main() -> ExitCode {
             {
                 return fail(error.kind(), error.to_string(), 1);
             }
+            for status in &closed.statuses {
+                if let Status::Checkpointed { tick, .. } = status {
+                    checkpoint = Some(*tick);
+                }
+                print(&status_record(status));
+            }
             print(&Record::End {
                 schema: STUDIO_SCHEMA,
                 tick: closed.session.boundary.tick.get(),
@@ -1078,6 +1127,7 @@ fn main() -> ExitCode {
                 camera_moves: cli.offscreen_zooms.then_some(moves),
                 camera_moves_unmoved: cli.offscreen_zooms.then_some(unmoved),
                 camera_latency: latency.summary(),
+                checkpoint_tick: checkpoint.map(Tick::get),
             });
             ExitCode::SUCCESS
         }
@@ -1112,6 +1162,29 @@ fn status_record(status: &Status) -> Record<'static> {
             record("refused", None, None, Some(kind), Some(detail.clone()))
         }
         Status::Closed { at } => record("closed", None, Some(at.get()), None, None),
+        Status::Checkpointed {
+            tick,
+            epoch,
+            sequence,
+            sha256,
+            bytes,
+            retired,
+            mode,
+            paused_seconds,
+        } => Record::Checkpoint {
+            schema: STUDIO_SCHEMA,
+            tick: tick.get(),
+            epoch: *epoch,
+            sequence: *sequence,
+            sha256: sha256.clone(),
+            bytes: *bytes,
+            retired: retired.clone(),
+            mode,
+            paused_seconds: *paused_seconds,
+        },
+        Status::Unkept { kind, detail } => {
+            record("unkept", None, None, Some(kind), Some(detail.clone()))
+        }
         Status::Submitted {
             command,
             stroke,

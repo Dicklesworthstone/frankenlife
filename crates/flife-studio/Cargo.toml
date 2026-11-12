@@ -16,6 +16,10 @@ path = "src/main.rs"
 asupersync.workspace = true
 clap.workspace = true
 flife-backend-metal = { path = "../flife-backend-metal" }
+# A session kept in a run directory (FL-024's `--run`) is kept by the
+# command line's own run-directory library, so `flife resume`, `branch` and
+# `inspect` take it.
+flife-cli = { path = "../flife-cli" }
 flife-core = { path = "../flife-core" }
 flife-engine = { path = "../flife-engine" }
 # The material brush's unit composition is a source direction's (FL-022).

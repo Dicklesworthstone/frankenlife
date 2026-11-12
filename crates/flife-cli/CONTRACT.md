@@ -307,10 +307,18 @@ for, one at least, before a render is refused. Its first record is `start`, with
     lengths and hashes, never decoded); the catalog's index keeps every row, and only a manifest makes a
     checkpoint resumable (§16.6). Resume still restores.
   - A resumed run's tally covers the ticks that call published.
+- FL-024: `persist::Checkpoints` is public (`open`, `take`, `drain`, `every`, `last`, `last_tick`,
+  `admission`), with `vacant` (whether a directory can become a run directory: absent or empty; `create` asks it
+  first), `create` and `open_session`, so the Studio's `--run` keeps a run directory with this library. A run
+  directory the Studio kept is a run: `resume`, `branch` and `inspect` take it (tested in `flife-studio`'s
+  `tests/kept.rs`).
 - FL-038 (§16.5, §19.4, A.2), `checkpointing`:
   - `pause-and-stream` (the preset's): `SessionHandle::checkpoint_with` hands the borrowed committed world to
     `flife_runtime::checkpoint_into`, which streams it into a `flife_store::Stream` a 1 MiB page at a time; the
-    store commits, verifies (the container's SHA-256, read back), and the checkpoint is indexed and retained.
+    store commits, verifies (the container's SHA-256, read back), and the checkpoint is indexed and retained. All
+    of it runs on the session's task, inside the take: the session takes no step and sends its journal nothing
+    until it returns, so a checkpoint may be taken while the session runs (FL-024's Studio). The store passes
+    through a slot, so it comes back whether or not the take ran.
   - `bounded-background`: the encoder's pages go through a `Queue` to a writer thread that stores, commits and
     verifies them. The queue holds at most `[execution] checkpoint_retained_bytes` of pages, counting the one
     being written, and the encoder waits while it is full; the session resumes once the last page is queued.

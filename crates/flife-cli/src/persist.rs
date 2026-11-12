@@ -36,13 +36,19 @@
 //! checkpoint is taken only once every journal record has its receipt.
 //! Retention keeps the newest checkpoints the store verifies (seal, lengths
 //! and hashes, read a buffer at a time); resuming restores them.
+//!
+//! [`Checkpoints`] is public so that another client of a session (the
+//! Studio's `--run`, FL-024) keeps a run directory the same way: a
+//! `pause-and-stream` checkpoint is encoded, committed, verified, indexed
+//! and retained on the session's own task, at its committed boundary, so
+//! it is safe while the session runs.
 
 use std::fs::{self, File};
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -455,15 +461,14 @@ fn storage(operation: &'static str, path: &Path, error: &std::io::Error) -> Core
     }
 }
 
-/// Make `run_dir` a new run directory for `config`: create it, or take an
-/// empty one, and write `config.toml` durably (written, flushed, renamed
-/// into place, and the directory flushed).
+/// Whether `run_dir` can become a new run directory: absent, or an empty
+/// directory. [`create`] asks it first; a client that must refuse before
+/// it opens anything else (the Studio's window) asks it earlier.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] when `run_dir` already holds a run or
-/// other files; [`CoreError::StorageFailed`] when the host refuses an
-/// operation.
-pub fn create(run_dir: &Path, config: &ValidatedConfig) -> Result<(), CoreError> {
+/// other files; [`CoreError::StorageFailed`] when it cannot be read.
+pub fn vacant(run_dir: &Path) -> Result<(), CoreError> {
     if run_dir.join(CONFIG_FILE).exists() {
         return Err(CoreError::StateConflict {
             operation: "create run directory",
@@ -481,13 +486,25 @@ pub fn create(run_dir: &Path, config: &ValidatedConfig) -> Result<(), CoreError>
                     detail: format!("{} is not empty", run_dir.display()),
                 });
             }
+            Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(run_dir)
-                .map_err(|error| storage("create run directory", run_dir, &error))?;
-        }
-        Err(error) => return Err(storage("read run directory", run_dir, &error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(storage("read run directory", run_dir, &error)),
     }
+}
+
+/// Make `run_dir` a new run directory for `config`: create it, or take an
+/// empty one, and write `config.toml` durably (written, flushed, renamed
+/// into place, and the directory flushed).
+///
+/// # Errors
+/// [`CoreError::StateConflict`] when `run_dir` already holds a run or
+/// other files; [`CoreError::StorageFailed`] when the host refuses an
+/// operation.
+pub fn create(run_dir: &Path, config: &ValidatedConfig) -> Result<(), CoreError> {
+    vacant(run_dir)?;
+    fs::create_dir_all(run_dir)
+        .map_err(|error| storage("create run directory", run_dir, &error))?;
     let temporary = run_dir.join(format!("{CONFIG_FILE}.tmp"));
     let path = run_dir.join(CONFIG_FILE);
     let mut file = File::create(&temporary)
@@ -636,7 +653,7 @@ pub(crate) fn run_identity(
 
 /// The run's checkpoints: its chunk store, the catalog that indexes them,
 /// and the mode they are taken in (FL-038).
-pub(crate) struct Checkpoints {
+pub struct Checkpoints {
     /// The store; with the writer while a background checkpoint is in
     /// flight.
     store: Option<ChunkStore>,
@@ -783,7 +800,10 @@ fn unavailable() -> CoreError {
 impl Checkpoints {
     /// Open the run directory's chunk store under `persistence`'s profile,
     /// for `session`'s run of `config`, admitting its checkpoint mode.
-    pub(crate) fn open(
+    ///
+    /// # Errors
+    /// [`admit`]'s refusal; the store's opening errors.
+    pub fn open(
         persistence: &Persistence,
         config: &ValidatedConfig,
         session: SessionId,
@@ -810,7 +830,8 @@ impl Checkpoints {
     }
 
     /// The checkpoint admission the run's start record reports.
-    pub(crate) const fn admission(&self) -> &CheckpointAdmission {
+    #[must_use]
+    pub const fn admission(&self) -> &CheckpointAdmission {
         &self.admission
     }
 
@@ -850,13 +871,21 @@ impl Checkpoints {
         self.every > 0 && tick.is_multiple_of(self.every)
     }
 
+    /// The checkpoint interval in ticks; zero for only the last one.
+    #[must_use]
+    pub const fn every(&self) -> u64 {
+        self.every
+    }
+
     /// The newest checkpoint taken, or the one the run started from.
-    pub(crate) const fn last(&self) -> Option<CheckpointAt> {
+    #[must_use]
+    pub const fn last(&self) -> Option<CheckpointAt> {
         self.last
     }
 
     /// The tick of [`Checkpoints::last`].
-    pub(crate) fn last_tick(&self) -> Option<u64> {
+    #[must_use]
+    pub fn last_tick(&self) -> Option<u64> {
         self.last.map(|last| last.tick)
     }
 
@@ -865,7 +894,18 @@ impl Checkpoints {
     /// background checkpoint still in flight first (this waits for it),
     /// then, for `pause-and-stream`, this one. A background checkpoint's
     /// record follows when it is drained.
-    pub(crate) async fn take(
+    ///
+    /// A `pause-and-stream` checkpoint is encoded, committed, verified,
+    /// indexed and retained on the session's task at its committed
+    /// boundary, which takes no step and sends its journal nothing
+    /// meanwhile; a `bounded-background` one is encoded there and written
+    /// by a writer thread while the session steps, then indexed there when
+    /// drained. Either way it may be taken while the session runs.
+    ///
+    /// # Errors
+    /// [`SessionHandle::checkpoint_with`]'s; the store's and the catalog's;
+    /// [`CoreError::StorageFailed`] when the writer cannot start.
+    pub async fn take(
         &mut self,
         handle: &SessionHandle,
         cx: &Cx,
@@ -874,31 +914,38 @@ impl Checkpoints {
         let started = Instant::now();
         match self.admission.mode() {
             CheckpointMode::PauseAndStream => {
-                let stream = self.store()?.stream()?;
-                let (stream, sealed, boundary) = handle
-                    .checkpoint_with(cx, move |world, book, boundary| {
-                        let mut stream = stream;
-                        let sealed = checkpoint_into(world, book, &mut stream);
-                        (stream, sealed, boundary)
-                    })
-                    .await?;
-                let sealed = sealed?;
-                let store = self.store()?;
-                let publication = store.commit(stream, &sealed)?;
-                let digest = store.verify(publication.sequence)?;
-                let committed = Committed {
-                    boundary,
-                    publication,
-                    digest,
-                    bytes: container_bytes(&sealed)?,
-                };
-                // The session answered the take once every journal record
-                // had its receipt, and the client sends none until this
-                // returns: the journal is idle.
+                // The whole publication runs on the session's task: it
+                // answers the take once every journal record has its
+                // receipt, takes no step and sends its journal nothing
+                // until the take returns, so the committed world cannot
+                // move and the catalog is idle while the checkpoint is
+                // indexed, even in a running session. The store goes
+                // through a slot, so it comes back whether or not the
+                // take ran.
+                let slot = Arc::new(Mutex::new(self.store.take()));
+                let held = Arc::clone(&slot);
                 let filing = self.filing.clone();
-                let filed = filing.file(self.store()?, committed)?;
+                let filed = handle
+                    .checkpoint_with(cx, move |world, book, boundary| {
+                        let mut guard = held.lock().unwrap_or_else(PoisonError::into_inner);
+                        let store = guard.as_mut().ok_or_else(unavailable)?;
+                        let mut stream = store.stream()?;
+                        let sealed = checkpoint_into(world, book, &mut stream)?;
+                        let publication = store.commit(stream, &sealed)?;
+                        let digest = store.verify(publication.sequence)?;
+                        let committed = Committed {
+                            boundary,
+                            publication,
+                            digest,
+                            bytes: container_bytes(&sealed)?,
+                        };
+                        filing.file(store, committed)
+                    })
+                    .await;
+                self.store = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                let filed = filed??;
                 let taken = Taken {
-                    boundary,
+                    boundary: filed.committed.boundary,
                     mode: CheckpointMode::PauseAndStream,
                     retained_peak: 0,
                     paused_seconds: started.elapsed().as_secs_f64(),
@@ -969,7 +1016,11 @@ impl Checkpoints {
     /// `handle`'s session holds its journal idle, retain, and return its
     /// record. The run takes no step meanwhile, and that wait counts in the
     /// record's `paused_seconds`.
-    pub(crate) async fn drain(
+    ///
+    /// # Errors
+    /// The writer's, [`SessionHandle::checkpoint_with`]'s, the catalog's
+    /// and the store's.
+    pub async fn drain(
         &mut self,
         handle: &SessionHandle,
         cx: &Cx,

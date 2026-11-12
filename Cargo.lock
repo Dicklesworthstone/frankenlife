@@ -954,6 +954,7 @@ dependencies = [
  "asupersync",
  "clap",
  "flife-backend-metal",
+ "flife-cli",
  "flife-core",
  "flife-engine",
  "flife-field",

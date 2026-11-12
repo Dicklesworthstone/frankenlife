@@ -53,6 +53,7 @@ mod controls;
 mod export;
 mod frames;
 mod host;
+mod keep;
 pub mod memory;
 mod overlay;
 mod pacing;
@@ -80,6 +81,7 @@ pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
     Surface,
 };
+pub use keep::{CHECKPOINT_POLL, Keeping};
 pub use overlay::{
     BrushPreview, Inspected, OverlayState, Recent, Telemetry, field_key, inspector_lines, legends,
     overlay_text, preview_line, recent, telemetry_lines,

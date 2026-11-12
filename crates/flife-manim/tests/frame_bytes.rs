@@ -249,23 +249,30 @@ fn a_frame_prepared_on_threads_is_the_frame_prepared_on_one() {
                 view.place(&epoch).expect("places");
             }
             // A job's record: everything it prints before it renders (its
-            // tile scratch then depends on the render's threads), its
-            // preparation bytes and, in the points style, its frame.
+            // tile scratch then depends on the render's threads) but the
+            // threads it was prepared on, its last field and the one meant
+            // to differ; those threads; its preparation bytes and, in the
+            // points style, its frame.
             let record = |view: &WorldView| {
                 let job = view.job().expect("a job");
+                let threads = job.preparation_threads();
                 let printed = format!("{job:?}");
+                let field = format!(", threads: {threads} }}");
+                assert!(printed.ends_with(&field), "{name}: {field}");
+                let printed = printed[..printed.len() - field.len()].to_owned();
                 let frame =
                     (name == "points").then(|| job.render(2).expect("a frame").as_bytes().to_vec());
-                (printed, job.preparation_bytes(), frame)
+                (printed, threads, job.preparation_bytes(), frame)
             };
             let one = record(&view);
             view.set_preparation_threads(eight);
             assert_eq!(view.preparation_threads(), eight);
             let many = record(&view);
             assert!(many.0 == one.0, "{name} at zoom {zoom}: the jobs differ");
-            assert_eq!(many.1, one.1, "{name} at zoom {zoom}");
-            assert_eq!(many.2.is_some(), name == "points");
-            assert!(many.2 == one.2, "{name} at zoom {zoom}: the frames differ");
+            assert_eq!((one.1, many.1), (1, 8), "{name} at zoom {zoom}");
+            assert_eq!(many.2, one.2, "{name} at zoom {zoom}");
+            assert_eq!(many.3.is_some(), name == "points");
+            assert!(many.3 == one.3, "{name} at zoom {zoom}: the frames differ");
             compared += 1;
         }
     }

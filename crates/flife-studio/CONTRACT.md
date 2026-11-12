@@ -59,7 +59,8 @@ directory, with its pending commands and its checkpoint chain.
   `StudioOptions` can override the size, make the window fixed and set the starting `Style`.
   The Studio's view compiles a frame's dots on up to 8 threads, or this host's cores when fewer
   (`WorldView::set_preparation_threads`, FL-033; 8 measured 0.742x the time of one on a 25,000-organism-sized job).
-  No frame depends on the count.
+  The Metal route flattens and checks the frame's triangle rows on as many (FrankenManim `d87fd3f3`; no speed
+  is claimed for that step). No frame depends on the count.
 - With `StudioOptions::run` (`--run DIR`): a directory that is absent or empty, and a configuration whose
   `maximum_total_bytes` less `maximum_allocated_genome_bytes` holds a checkpoint (`flife_cli::admit`). Its
   `[persistence]` gives the interval, mode and retention, and `[execution] command_durability` the journal.
@@ -74,7 +75,7 @@ directory, with its pending commands and its checkpoint chain.
   (`StudioOptions::surface = Surface::Offscreen { scale }`): any thread and a Metal device; the content area is
   `size` points at `scale` pixels a point, and `title` and `resizable` are unused.
 - The presenter's typed input and its pixel density. They come from frankentorch `ft-kernel-metal` at rev
-  `0ae728fe`, through FrankenManim `fmn-render` at rev `293d7fcd`.
+  `0ae728fe`, through FrankenManim `fmn-render` at rev `d87fd3f3`.
   - The kinds are pointer moved, button, scroll, key, modifiers changed, focus gained, focus lost, pointer capture
     lost and resized (with logical size, backing scale and drawable size).
   - The presenter queues at most `INPUT_QUEUE_CAPACITY` = 1024 events between polls. It coalesces motion, scroll and

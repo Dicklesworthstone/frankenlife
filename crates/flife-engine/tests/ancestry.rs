@@ -30,8 +30,8 @@ use flife_core::ids::{Generation, OrganismId};
 use flife_core::model::FIELD_ECOLOGY_V1;
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{
-    ANCESTRY_PATH, Ancestor, Arrangement, Descendants, Disposition, Intervention, NumericalProfile,
-    ROOM_PER_ORGANISM, Stepped, TickReport, World,
+    ANCESTRY_PATH, Ancestor, Arrangement, Descendants, Disposition, Followed, Intervention,
+    NumericalProfile, ROOM_PER_ORGANISM, Stepped, TickReport, World,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -229,6 +229,27 @@ impl Genealogy {
                 },
             );
         }
+    }
+
+    /// Whether `organism` descends from `ancestor` along known parents.
+    fn descends(&self, mut organism: OrganismId, ancestor: OrganismId) -> bool {
+        while let Some(parent) = self.known[&organism].parent {
+            if parent == ancestor {
+                return true;
+            }
+            organism = parent;
+        }
+        false
+    }
+
+    /// The heir of `organism`: its descendant alive now, fewest generations
+    /// below it and then the eldest.
+    fn heir(&self, organism: OrganismId) -> Option<OrganismId> {
+        self.known
+            .iter()
+            .filter(|&(&id, known)| known.alive && self.descends(id, organism))
+            .min_by_key(|&(&id, known)| (known.generation, id))
+            .map(|(&id, _)| id)
     }
 
     /// What a snapshot must say of every live organism.
@@ -459,4 +480,127 @@ fn tracing_changes_nothing_and_stays_in_its_room() {
     }
     println!("most dead ancestors held: {most}");
     assert!(most > 0);
+}
+
+/// Plan §2.2, "Follow descendants of a selected organism": a followed line
+/// passes, in the tick its organism dies, to the heir the whole genealogy
+/// names (its descendant alive once that tick is published, fewest
+/// generations below and then the eldest), or ends with none alive. A new
+/// line is followed whenever one ends, from the live organism a first run
+/// saw die soonest among those with a live descendant (or any, with none).
+/// A world that does not trace its ancestry follows nothing. Following
+/// changes nothing a run computes: the followed world publishes a plain
+/// world's reports and digests, tick for tick.
+#[test]
+fn a_followed_line_passes_to_the_heir_the_genealogy_names() {
+    const UNTIL: u64 = 1_200;
+    let config = config();
+    let mut foresight = found(&config);
+    let mut dies = BTreeMap::new();
+    while foresight.tick().get() < UNTIL {
+        let report = step(&mut foresight);
+        for death in &report.deaths {
+            dies.insert(death.id, report.tick);
+        }
+    }
+    let mut plain = found(&config);
+    let first = plain.population().ids().next().expect("an organism");
+    assert!(plain.follow(Some(first)).is_err());
+    assert_eq!(plain.follow(None).expect("follows none"), None);
+    assert_eq!(plain.followed(), None);
+    let mut world = found(&config);
+    world.trace_ancestry().expect("traces");
+    let mut genealogy = Genealogy::begin(&world);
+    let (mut lines, mut handoffs, mut ended, mut deeper) = (0, 0, 0, 0);
+    while world.tick().get() < UNTIL {
+        if world.followed().is_none_or(|line| !line.alive) {
+            let soonest = |with_descendant: bool| {
+                world
+                    .population()
+                    .ids()
+                    .filter_map(|id| dies.get(&id).map(|&tick| (tick, id)))
+                    .filter(|&(_, id)| {
+                        !with_descendant
+                            || genealogy
+                                .known
+                                .iter()
+                                .any(|(&other, known)| known.alive && genealogy.descends(other, id))
+                    })
+                    .min()
+                    .map(|(_, id)| id)
+            };
+            let Some(pick) = soonest(true).or_else(|| soonest(false)) else {
+                break;
+            };
+            let line = world.follow(Some(pick)).expect("follows");
+            assert_eq!(
+                line,
+                Some(Followed {
+                    origin: pick,
+                    organism: pick,
+                    since: world.tick(),
+                    handoffs: 0,
+                    alive: true,
+                })
+            );
+            assert_eq!(world.followed(), line);
+            lines += 1;
+        }
+        let before = world.followed().expect("a line");
+        let expected = step(&mut plain);
+        let report = step(&mut world);
+        let tick = report.tick;
+        assert_eq!(report, expected, "tick {}", tick.get());
+        assert_eq!(world.digest(), plain.digest(), "tick {}", tick.get());
+        genealogy.fold(&report, &world);
+        let line = world.followed().expect("a line");
+        if !report
+            .deaths
+            .iter()
+            .any(|death| death.id == before.organism)
+        {
+            assert_eq!(line, before, "tick {}", tick.get());
+            continue;
+        }
+        match genealogy.heir(before.organism) {
+            Some(heir) => {
+                assert_eq!(
+                    line,
+                    Followed {
+                        organism: heir,
+                        since: tick,
+                        handoffs: before.handoffs + 1,
+                        ..before
+                    },
+                    "tick {}",
+                    tick.get()
+                );
+                assert!(world.population().contains(heir));
+                let dead = genealogy.known[&before.organism].generation;
+                if genealogy.known[&heir].generation > dead.child().expect("a generation") {
+                    deeper += 1;
+                }
+                handoffs += 1;
+            }
+            None => {
+                assert_eq!(
+                    line,
+                    Followed {
+                        alive: false,
+                        ..before
+                    },
+                    "tick {}",
+                    tick.get()
+                );
+                ended += 1;
+            }
+        }
+    }
+    println!("lines {lines}, handoffs {handoffs}, ended {ended}, deeper {deeper}");
+    // What the run exercised: lines passed on and lines ended. (The
+    // index's unit tests pass lines past dead children thousands of times
+    // against the same rule; this world, 97 deaths in 1,200 ticks, rarely
+    // does.)
+    assert!(handoffs >= 3, "handoffs {handoffs}");
+    assert!(ended >= 1, "ended {ended}");
 }

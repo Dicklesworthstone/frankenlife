@@ -74,6 +74,12 @@ inherits every command and outcome, records the fork, and from then on admits on
   committed world's `World::measure_region`, a `RegionMeasurement` whose `tick` is the boundary it was read at,
   or the world's refusal of the disk. It copies no genome, watches nothing and changes no result. A running owner
   answers between ticks, and a closing one at the closed boundary.
+- Plan §2.2: `SessionHandle::follow(organism)` (the Studio's "follow descendants of a selected organism"): the
+  owner's world's `World::follow`, begun at the committed boundary, so the `Followed` line it answers has that
+  tick as its `since`; or the world's refusal (it does not trace its ancestry, or does not hold the organism
+  alive), keeping the line it followed. `None` follows nothing. The line passes to an heir in the tick its
+  organism dies and every rendered epoch carries it; it changes no result. A running owner answers between
+  ticks, and a closing one at the closed boundary. Its test is the Studio's `tests/follow.rs`.
 - `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
   still pending), the final boundary and the render counters.
 - FL-036, for a journaled session:

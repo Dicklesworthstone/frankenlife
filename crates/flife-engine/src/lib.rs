@@ -55,7 +55,9 @@ pub mod population;
 pub mod reproduction;
 pub mod world;
 
-pub use ancestry::{ANCESTRY_PATH, Ancestor, AncestryHeld, Descendants, ROOM_PER_ORGANISM};
+pub use ancestry::{
+    ANCESTRY_PATH, Ancestor, AncestryHeld, Descendants, Followed, ROOM_PER_ORGANISM,
+};
 pub use chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, settle_efficiencies,
 };

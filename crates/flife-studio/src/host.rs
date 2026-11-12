@@ -57,7 +57,7 @@ use flife_cli::{CheckpointAdmission, CheckpointAt, Checkpoints, Recovered, Skipp
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Arrangement, CPU_REFERENCE, NumericalProfile, World};
+use flife_engine::{Arrangement, CPU_REFERENCE, Followed, NumericalProfile, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::{CommandBook, SessionClosed, SessionConfig};
@@ -179,6 +179,11 @@ pub struct Frame {
     pub tracked: bool,
     /// Whether the camera tracks the selected organism after this frame.
     pub tracking: bool,
+    /// The line of descent the selection passed along this frame (plan
+    /// §2.2): while tracking, the shown epoch's line from the organism a
+    /// click selected had passed to an heir it draws, which is now
+    /// selected and tracked.
+    pub handed: Option<Followed>,
     /// The epoch shown: the newest lowered, which the display has reached
     /// unless it is still moving towards it.
     pub shown: Option<Prior>,
@@ -229,6 +234,8 @@ pub struct FrameTally {
     pub camera_moves: u64,
     /// Frames whose view moved to keep the tracked organism centred.
     pub tracked: u64,
+    /// Selections passed to an heir while tracking (plan §2.2).
+    pub handoffs: u64,
     /// Clicks picked (an organism, or nothing).
     pub selections: u64,
     /// Brush clicks offered to the session as strokes (FL-022).
@@ -331,6 +338,10 @@ pub struct Studio {
     opened: Instant,
     /// Whether the camera tracks the selected organism (plan §14.3).
     tracking: bool,
+    /// The organism a click selected, whose line of descent the session
+    /// was asked to follow (plan §2.2): while tracking, an epoch whose line
+    /// from it names an heir passes the selection on.
+    following: Option<OrganismId>,
     /// The disk the measuring tool placed, while it is armed (plan §14.3).
     measure: Option<Disk>,
     /// What [`Studio::resume`] recovered.
@@ -627,6 +638,7 @@ impl Studio {
             }),
             opened: Instant::now(),
             tracking: false,
+            following: None,
             measure: None,
             resumed: None,
         })
@@ -937,6 +949,9 @@ impl Studio {
             self.note(|| TimelineRecord::Select {
                 organism: choice.map(OrganismId::get),
             });
+            // A click's selection is followed (plan §2.2); a click on
+            // nothing follows nothing.
+            self.following = None;
             if let Some(organism) = selected
                 && let Some(shown) = self.view.shown()
             {
@@ -951,6 +966,16 @@ impl Studio {
                     refused += 1;
                     self.tally.refused += 1;
                     self.controls.refused(intent);
+                }
+                let follow = Intent::Follow {
+                    organism,
+                    seen: shown.tick,
+                };
+                if self.offer(follow) {
+                    intents += 1;
+                    self.following = Some(organism);
+                } else {
+                    refused += 1;
                 }
             }
         }
@@ -1059,10 +1084,39 @@ impl Studio {
         if let Some(display) = display {
             self.note(|| display);
         }
+        // Following descendants (plan §2.2): while tracking, when the shown
+        // epoch's line from the organism a click selected has passed to an
+        // heir that epoch draws, the selection passes to the heir, which is
+        // inspected as a click's selection is, and tracking goes on.
+        let mut handed = None;
+        if self.tracking
+            && let Some(origin) = self.following
+            && let Some(line) = self.current.followed()
+            && line.origin == origin
+            && line.alive
+            && self.view.selected() != Some(line.organism)
+            && let Some(heir) = self.view.select(Some(line.organism))?
+        {
+            handed = Some(line);
+            self.tally.handoffs += 1;
+            self.note(|| TimelineRecord::Select {
+                organism: Some(heir.get()),
+            });
+            let inspect = Intent::Inspect {
+                organism: heir,
+                seen: self.current.tick(),
+            };
+            if self.offer(inspect) {
+                intents += 1;
+            } else {
+                refused += 1;
+            }
+        }
         // Tracking (plan §14.3's camera-follow target): the view centred on
         // the selected organism where this frame draws it, at the zoom it
         // has, and the pair placed there again. Losing the selection (a
-        // click on nothing, or an epoch that no longer draws it) stops it.
+        // click on nothing, or an epoch that no longer draws it with no heir
+        // to pass it to) stops it.
         if self.view.selected().is_none() {
             self.tracking = false;
         }
@@ -1201,6 +1255,7 @@ impl Studio {
             moved,
             tracked,
             tracking: self.tracking,
+            handed,
             shown: self.view.shown(),
             motion: self.view.motion(),
             selected: self.view.selected(),
@@ -1227,6 +1282,18 @@ impl Studio {
     /// refused).
     pub fn measure_again(&mut self) -> bool {
         self.measure.is_some_and(|disk| self.send_measure(disk))
+    }
+
+    /// Offer the session `intent`, counted as an intent or as refused.
+    fn offer(&mut self, intent: Intent) -> bool {
+        if self.session.send(intent).is_ok() {
+            self.tally.intents += 1;
+            true
+        } else {
+            self.tally.refused += 1;
+            self.controls.refused(intent);
+            false
+        }
     }
 
     /// Offer the session `disk` to measure, seen on the epoch shown;

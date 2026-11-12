@@ -18,7 +18,9 @@
 //! paused run reports both [`Status::Paused`] (the intent) and
 //! [`Status::Ended`] (the run). An inspection is answered with
 //! [`Status::Inspected`]: the organism read at the session's committed
-//! boundary, whose tick the snapshot carries.
+//! boundary, whose tick the snapshot carries. A follow is answered with
+//! [`Status::Following`]: the line of descent the session's world follows
+//! from then on, which its epochs carry.
 //!
 //! A brush's stroke (FL-022) is submitted as a scientific command for the
 //! next boundary not yet sealed, stating the session's configuration hash.
@@ -49,7 +51,7 @@ use asupersync::time::{sleep, wall_now};
 use flife_cli::Checkpoints;
 use flife_core::ids::{CommandId, OrganismId};
 use flife_core::{CoreError, Tick};
-use flife_engine::{ControllerWeights, OrganismSnapshot, RegionMeasurement};
+use flife_engine::{ControllerWeights, Followed, OrganismSnapshot, RegionMeasurement};
 use flife_render::Feed;
 use flife_runtime::{
     Admission, Command, CommandStatus, Outcome, Rejection, RunEnd, SessionClosed, SessionHandle,
@@ -154,6 +156,14 @@ pub enum Status {
         /// It at the session's committed boundary, which its `tick` names;
         /// `None` when the committed world no longer holds it.
         snapshot: Option<Box<OrganismSnapshot>>,
+    },
+    /// A follow's answer (plan §2.2): the line begun from the organism at
+    /// the session's committed boundary, which its `since` names.
+    Following {
+        /// The source tick of the epoch the organism was selected on.
+        seen: Tick,
+        /// The line.
+        line: Followed,
     },
     /// A weight dump's answer (FL-021).
     Weights {
@@ -625,6 +635,14 @@ async fn act(
                 seen,
                 snapshot: snapshot.map(Box::new),
             },
+            Err(error) => refused(error),
+        },
+        Intent::Follow { organism, seen } => match handle.follow(cx, Some(organism)).await {
+            Ok(Some(line)) => Status::Following { seen, line },
+            Ok(None) => refused(CoreError::StateConflict {
+                operation: "follow a line",
+                detail: format!("following {organism} began no line"),
+            }),
             Err(error) => refused(error),
         },
         Intent::DumpWeights { organism, seen } => {

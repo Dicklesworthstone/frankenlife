@@ -39,6 +39,16 @@
 //! the room, at most once for every [`ROOM_PER_ORGANISM`] − 2 times the
 //! population's capacity newcomers. A [`Descendants`] answer costs one step
 //! for each ancestor above the organism in the index.
+//!
+//! The index can also follow one organism's line of descent (plan §2.2,
+//! "Follow descendants of a selected organism"): a [`Followed`] line. When
+//! the organism that has the line dies, the line passes to its heir, the
+//! descendant that is alive once the tick's deaths are all folded, fewest
+//! generations below it and, among those, the eldest (the lowest
+//! identity). Its descendants are those the index reaches through
+//! organisms alive since `since`, as [`Descendants::living`] counts them.
+//! With none alive, the line ends there. Finding the heir costs one pass
+//! over the entries above the dead organism, with a binary search for each.
 
 use flife_core::CoreError;
 use flife_core::clock::Tick;
@@ -115,6 +125,25 @@ pub struct AncestryHeld {
     pub bytes: u64,
 }
 
+/// A line of descent the index follows ([`crate::World::follow`]; plan
+/// §2.2, "Follow descendants of a selected organism").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Followed {
+    /// The organism the line was followed from.
+    pub origin: OrganismId,
+    /// The organism that has the line: the origin, or the heir of the one
+    /// that had it before.
+    pub organism: OrganismId,
+    /// The committed tick `organism` took the line at: the tick following
+    /// began, or the tick the one before it died.
+    pub since: Tick,
+    /// How many times the line has passed to an heir.
+    pub handoffs: u64,
+    /// Whether `organism` lives. When it died with no descendant alive the
+    /// line ends: it stays, naming it, until another is followed.
+    pub alive: bool,
+}
+
 /// An entry's standing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Standing {
@@ -147,6 +176,10 @@ struct Entry {
     children_living: u64,
     born: u64,
     living: u64,
+    /// Scratch for finding an heir: whether it descends from the organism
+    /// whose heir is sought. Only entries above that organism's are read,
+    /// each after it is written.
+    descends: bool,
 }
 
 impl Entry {
@@ -168,6 +201,7 @@ impl Entry {
             children_living: 0,
             born: 0,
             living: 0,
+            descends: false,
         }
     }
 
@@ -185,6 +219,8 @@ pub(crate) struct Ancestry {
     entries: Vec<Entry>,
     /// The newest identity the index has taken.
     newest: Option<OrganismId>,
+    /// The line it follows, if any.
+    followed: Option<Followed>,
 }
 
 impl Ancestry {
@@ -224,6 +260,7 @@ impl Ancestry {
             since,
             entries,
             newest: None,
+            followed: None,
         })
     }
 
@@ -363,8 +400,25 @@ impl Ancestry {
         for (parent, child) in births {
             self.bear(parent, child, tick);
         }
+        // The followed organism's descendants are marked as it dies, while
+        // every link below it still reaches it: a later death resolves its
+        // own link past a dead ancestor that has passed its place on. Its
+        // heir is chosen once every death is folded, and before clearing
+        // out for the introductions can take its entry.
+        let mut dead_line = None;
         for organism in deaths {
             self.die(organism);
+            if let Some(line) = self.followed
+                && line.alive
+                && line.organism == organism
+                && let Some(at) = self.find(organism)
+            {
+                self.mark_descendants(at);
+                dead_line = Some(at);
+            }
+        }
+        if let Some(at) = dead_line {
+            self.pass_line(at, tick);
         }
         self.make_room(introductions.len());
         for organism in introductions {
@@ -433,6 +487,86 @@ impl Ancestry {
     /// The bytes its room takes.
     pub(crate) fn bytes(&self) -> u64 {
         capacity_bytes(&self.entries)
+    }
+
+    /// Follow live `organism`'s line from committed tick `tick`, or none.
+    /// Following an organism begins a line from it, even the one that has
+    /// the line now.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when the index does not hold `organism`
+    /// alive; the line followed before is kept.
+    pub(crate) fn follow(
+        &mut self,
+        organism: Option<OrganismId>,
+        tick: Tick,
+    ) -> Result<Option<Followed>, CoreError> {
+        let Some(organism) = organism else {
+            self.followed = None;
+            return Ok(None);
+        };
+        if !self
+            .find(organism)
+            .is_some_and(|at| self.entries[at].standing == Standing::Living)
+        {
+            return Err(CoreError::StateConflict {
+                operation: "follow a line",
+                detail: format!("the ancestry index does not hold {organism} alive"),
+            });
+        }
+        let line = Followed {
+            origin: organism,
+            organism,
+            since: tick,
+            handoffs: 0,
+            alive: true,
+        };
+        self.followed = Some(line);
+        Ok(Some(line))
+    }
+
+    /// The line it follows, if any.
+    pub(crate) const fn followed(&self) -> Option<Followed> {
+        self.followed
+    }
+
+    /// Mark each entry above entry `at` that descends from it through the
+    /// index's links. Ascending, so each link, which names an ancestor and
+    /// so a lower identity, is read after it is marked.
+    fn mark_descendants(&mut self, at: usize) {
+        let organism = self.entries[at].organism;
+        for below in at + 1..self.entries.len() {
+            let descends = match self.entries[below].link {
+                Some(link) if link == organism => true,
+                Some(link) if link > organism => self
+                    .find(link)
+                    .is_some_and(|above| self.entries[above].descends),
+                _ => false,
+            };
+            self.entries[below].descends = descends;
+        }
+    }
+
+    /// Pass the line from entry `at`, which died in tick `tick` and whose
+    /// descendants [`Ancestry::mark_descendants`] marked, to its heir: the
+    /// marked entry alive now, fewest generations below and then eldest.
+    /// With none, the line ends.
+    fn pass_line(&mut self, at: usize, tick: Tick) {
+        let heir = self.entries[at + 1..]
+            .iter()
+            .filter(|entry| entry.descends && entry.standing == Standing::Living)
+            .min_by_key(|entry| (entry.generation, entry.organism))
+            .map(|entry| entry.organism);
+        if let Some(line) = &mut self.followed {
+            match heir {
+                Some(heir) => {
+                    line.organism = heir;
+                    line.since = tick;
+                    line.handoffs = line.handoffs.saturating_add(1);
+                }
+                None => line.alive = false,
+            }
+        }
     }
 
     fn find(&self, organism: OrganismId) -> Option<usize> {
@@ -668,6 +802,27 @@ mod tests {
                     },
                 );
             }
+        }
+
+        /// Whether `organism` descends from `ancestor` along known parents.
+        fn descends(&self, mut organism: OrganismId, ancestor: OrganismId) -> bool {
+            while let Some(parent) = self.known[&organism].parent {
+                if parent == ancestor {
+                    return true;
+                }
+                organism = parent;
+            }
+            false
+        }
+
+        /// The heir of `organism`: its descendant alive now, fewest
+        /// generations below it and then the eldest.
+        fn heir(&self, organism: OrganismId) -> Option<OrganismId> {
+            self.known
+                .iter()
+                .filter(|&(&id, known)| known.alive && self.descends(id, organism))
+                .min_by_key(|&(&id, known)| (known.generation, id))
+                .map(|(&id, _)| id)
         }
 
         /// The genealogy an index begun now knows: the live organisms,
@@ -998,5 +1153,291 @@ mod tests {
         // What it can hold: a birth, its child dying in the same tick, a
         // death, an introduction above them.
         assert!(!refused(&[(a, child)], &[child, c], &[OrganismId::new(5)]));
+    }
+
+    /// What a run of followed lines saw.
+    #[derive(Debug, Default)]
+    struct Lines {
+        /// Lines passed to an heir.
+        handoffs: usize,
+        /// Lines ended with no descendant alive.
+        ended: usize,
+        /// Heirs more than one generation below: no child was alive.
+        deeper: usize,
+        /// Heirs with a younger generation's descendant alive and elder
+        /// than them, which the rule passed over.
+        nearer_not_elder: usize,
+    }
+
+    /// Fold `ticks` random ticks into `index` and `genealogy` alike,
+    /// following a live organism's line whenever none is followed alive,
+    /// and check the line after each against the oracle's heir.
+    fn follow_run(
+        index: &mut Ancestry,
+        genealogy: &mut Genealogy,
+        draws: &mut Draws,
+        capacity: usize,
+        ticks: u64,
+    ) -> Lines {
+        let mut lines = Lines::default();
+        let start = genealogy
+            .known
+            .values()
+            .map(|known| known.birth_tick.get())
+            .max()
+            .unwrap_or(0)
+            .max(genealogy.since.get());
+        for tick in start + 1..=start + ticks {
+            let committed = Tick::new(tick - 1);
+            let tick = Tick::new(tick);
+            if index.followed().is_none_or(|line| !line.alive) {
+                let live = genealogy.live();
+                let pick = live[draws.below(live.len() as u64) as usize];
+                let line = index.follow(Some(pick), committed).expect("follows");
+                assert_eq!(
+                    line,
+                    Some(Followed {
+                        origin: pick,
+                        organism: pick,
+                        since: committed,
+                        handoffs: 0,
+                        alive: true,
+                    })
+                );
+            }
+            let before = index.followed().expect("a line");
+            let (births, deaths, introductions) = draw(genealogy, draws, capacity);
+            index
+                .admits_events(
+                    births.iter().copied(),
+                    deaths.iter().copied(),
+                    introductions.iter().copied(),
+                )
+                .unwrap_or_else(|error| panic!("{tick:?}: {error}"));
+            index.fold_events(
+                tick,
+                births.iter().copied(),
+                deaths.iter().copied(),
+                introductions.iter().copied(),
+            );
+            genealogy.fold(tick, &births, &deaths, &introductions);
+            let line = index.followed().expect("a line");
+            if !deaths.contains(&before.organism) {
+                assert_eq!(line, before, "{tick:?}");
+                continue;
+            }
+            match genealogy.heir(before.organism) {
+                Some(heir) => {
+                    assert_eq!(
+                        line,
+                        Followed {
+                            organism: heir,
+                            since: tick,
+                            handoffs: before.handoffs + 1,
+                            ..before
+                        },
+                        "{tick:?}"
+                    );
+                    lines.handoffs += 1;
+                    let generation = genealogy.known[&heir].generation;
+                    let dead = genealogy.known[&before.organism].generation;
+                    if generation > dead.child().expect("a generation") {
+                        lines.deeper += 1;
+                    }
+                    if genealogy.known.iter().any(|(&id, known)| {
+                        known.alive
+                            && id < heir
+                            && known.generation > generation
+                            && genealogy.descends(id, before.organism)
+                    }) {
+                        lines.nearer_not_elder += 1;
+                    }
+                }
+                None => {
+                    assert_eq!(
+                        line,
+                        Followed {
+                            alive: false,
+                            ..before
+                        },
+                        "{tick:?}"
+                    );
+                    lines.ended += 1;
+                }
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn a_followed_line_passes_to_the_nearest_eldest_living_descendant() {
+        for seed in [11_u64, 12, 13, 0xf011] {
+            let capacity = 24;
+            let (mut index, mut genealogy) = founded(6, capacity);
+            let mut draws = Draws(seed);
+            let room = index.entries.capacity();
+            let lines = follow_run(&mut index, &mut genealogy, &mut draws, capacity, 3_000);
+            // Following never allocates either.
+            assert_eq!(index.entries.capacity(), room);
+            // What the runs must have exercised: lines passed on and
+            // ended, an heir past a dead child, and the generation rule
+            // overriding age.
+            assert!(lines.handoffs > 30, "seed {seed}: {lines:?}");
+            assert!(lines.ended > 10, "seed {seed}: {lines:?}");
+            assert!(lines.deeper > 0, "seed {seed}: {lines:?}");
+            assert!(lines.nearer_not_elder > 0, "seed {seed}: {lines:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_followed_in_an_index_begun_later_passes_through_its_lines() {
+        for seed in [17_u64, 18] {
+            let capacity = 24;
+            let (mut first, mut genealogy) = founded(6, capacity);
+            let mut draws = Draws(seed);
+            run(&mut first, &mut genealogy, &mut draws, capacity, 400);
+            let since = Tick::new(400);
+            let mut later = genealogy.rebased(since);
+            let mut index = Ancestry::with_room(capacity * ROOM_PER_ORGANISM, since).expect("room");
+            for &id in later.known.keys() {
+                let row = &genealogy.known[&id];
+                index.seed(id, row.parent, row.generation, row.birth_tick);
+            }
+            let lines = follow_run(&mut index, &mut later, &mut draws, capacity, 1_500);
+            assert!(
+                lines.handoffs >= 10 && lines.ended > 0 && lines.deeper > 0,
+                "seed {seed}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_live_organism_is_followed() {
+        let (mut index, _) = founded(3, 8);
+        let [a, b] = [0, 1].map(OrganismId::new);
+        let line = index.follow(Some(a), Tick::ZERO).expect("follows a");
+        index.fold_events(
+            Tick::new(1),
+            [(a, OrganismId::new(3))].into_iter(),
+            [b].into_iter(),
+            [].into_iter(),
+        );
+        // Dead, unknown: refused, and the line kept.
+        for organism in [b, OrganismId::new(42)] {
+            assert!(index.follow(Some(organism), Tick::new(1)).is_err());
+            assert_eq!(index.followed(), line);
+        }
+        // Following again begins a line, from the organism followed.
+        let child = OrganismId::new(3);
+        let again = index.follow(Some(child), Tick::new(1)).expect("follows");
+        assert_eq!(
+            again,
+            Some(Followed {
+                origin: child,
+                organism: child,
+                since: Tick::new(1),
+                handoffs: 0,
+                alive: true,
+            })
+        );
+        // None follows nothing.
+        assert_eq!(index.follow(None, Tick::new(1)).expect("none"), None);
+        assert_eq!(index.followed(), None);
+    }
+
+    /// The followed organism dies in the same tick as its eldest child,
+    /// with the deaths listed either way round: the heir is its other
+    /// child, alive once every death is folded, not the dead child's own
+    /// child, a generation further below.
+    #[test]
+    fn the_heir_is_chosen_once_the_ticks_deaths_are_folded() {
+        let ids = |raw: [u64; 4]| raw.map(OrganismId::new);
+        for reversed in [false, true] {
+            let (mut index, _) = founded(2, 16);
+            let [a, _, eldest, younger] = ids([0, 1, 2, 3]);
+            let grandchild = OrganismId::new(4);
+            index.fold_events(
+                Tick::new(1),
+                [(a, eldest), (a, younger)].into_iter(),
+                [].into_iter(),
+                [].into_iter(),
+            );
+            index.fold_events(
+                Tick::new(2),
+                [(eldest, grandchild)].into_iter(),
+                [].into_iter(),
+                [].into_iter(),
+            );
+            index.follow(Some(a), Tick::new(2)).expect("follows");
+            let deaths = if reversed { [eldest, a] } else { [a, eldest] };
+            index.fold_events(
+                Tick::new(3),
+                [].into_iter(),
+                deaths.into_iter(),
+                [].into_iter(),
+            );
+            assert_eq!(
+                index.followed(),
+                Some(Followed {
+                    origin: a,
+                    organism: younger,
+                    since: Tick::new(3),
+                    handoffs: 1,
+                    alive: true,
+                }),
+                "reversed {reversed}"
+            );
+        }
+    }
+
+    /// The followed organism bears its only child in the tick it dies:
+    /// that newborn is its heir. Its own line then ends when it dies
+    /// childless.
+    #[test]
+    fn a_child_born_in_the_tick_its_parent_dies_is_its_heir() {
+        let (mut index, _) = founded(2, 16);
+        let [a, newborn] = [0, 2].map(OrganismId::new);
+        index.follow(Some(a), Tick::ZERO).expect("follows");
+        index.fold_events(
+            Tick::new(1),
+            [(a, newborn)].into_iter(),
+            [a].into_iter(),
+            [].into_iter(),
+        );
+        let passed = Followed {
+            origin: a,
+            organism: newborn,
+            since: Tick::new(1),
+            handoffs: 1,
+            alive: true,
+        };
+        assert_eq!(index.followed(), Some(passed));
+        index.fold_events(
+            Tick::new(2),
+            [].into_iter(),
+            [newborn].into_iter(),
+            [].into_iter(),
+        );
+        assert_eq!(
+            index.followed(),
+            Some(Followed {
+                alive: false,
+                ..passed
+            })
+        );
+        // An ended line stays as it ended through later ticks.
+        index.fold_events(
+            Tick::new(3),
+            [].into_iter(),
+            [OrganismId::new(1)].into_iter(),
+            [OrganismId::new(3)].into_iter(),
+        );
+        assert_eq!(
+            index.followed(),
+            Some(Followed {
+                alive: false,
+                ..passed
+            })
+        );
     }
 }

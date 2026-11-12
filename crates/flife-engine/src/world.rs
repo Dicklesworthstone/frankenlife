@@ -100,7 +100,7 @@ use flife_neural::{
     DecodedActions, Intrinsic, Observation, SensorScales, decode, observe, widen,
 };
 
-use crate::ancestry::{Ancestry, AncestryHeld};
+use crate::ancestry::{Ancestry, AncestryHeld, Followed};
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
@@ -1341,6 +1341,40 @@ impl World {
     #[must_use]
     pub fn ancestry_held(&self) -> Option<AncestryHeld> {
         self.ancestry.as_ref().map(Ancestry::held)
+    }
+
+    /// Follow live `organism`'s line of descent from this committed tick
+    /// on, or none (plan §2.2, "Follow descendants of a selected
+    /// organism"): when the organism that has the line dies, the line
+    /// passes to its heir, the descendant alive once that tick's deaths are
+    /// all folded, fewest generations below it and then the eldest; with
+    /// none alive the line ends (see [`crate::ancestry`]). Following an
+    /// organism begins a line from it, even the one that has the line now.
+    /// It needs the ancestry index ([`World::trace_ancestry`]). Like the
+    /// index, the line is not scientific state: no digest, checkpoint or
+    /// report holds it, and a step reads nothing from it.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when the world does not trace its
+    /// ancestry or its index does not hold `organism` alive; the line
+    /// followed before is kept. Following none never fails.
+    pub fn follow(&mut self, organism: Option<OrganismId>) -> Result<Option<Followed>, CoreError> {
+        match (&mut self.ancestry, organism) {
+            (Some(ancestry), _) => ancestry.follow(organism, self.tick),
+            (None, None) => Ok(None),
+            (None, Some(organism)) => Err(CoreError::StateConflict {
+                operation: "follow a line",
+                detail: format!(
+                    "the world does not trace its ancestry, so {organism}'s line has no heirs"
+                ),
+            }),
+        }
+    }
+
+    /// The line of descent the world follows, if any ([`World::follow`]).
+    #[must_use]
+    pub fn followed(&self) -> Option<Followed> {
+        self.ancestry.as_ref().and_then(Ancestry::followed)
     }
 
     /// The watched organism's transactions in its last [`RECENT_STEPS`]

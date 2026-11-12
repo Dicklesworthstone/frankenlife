@@ -76,7 +76,7 @@ use flife_backend_metal::ControllerChoice;
 use flife_cli::{CheckpointAdmission, InspectedLayer, InspectedWeights};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{OrganismSnapshot, ReproductionOutcome};
+use flife_engine::{Followed, OrganismSnapshot, ReproductionOutcome};
 use flife_render::Metrics;
 use flife_runtime::Outcome;
 use flife_studio::{
@@ -461,6 +461,27 @@ enum Record<'a> {
         lineages: u64,
         cells: u64,
         field_energy: f64,
+    },
+    /// A follow's answer (plan §2.2): the session's world follows the line
+    /// of descent from `origin`, selected on the epoch of `seen_tick`, from
+    /// the committed boundary `tick` on.
+    Following {
+        schema: &'static str,
+        origin: u64,
+        seen_tick: u64,
+        tick: u64,
+    },
+    /// While tracking, the selection passed along the line it follows
+    /// (plan §2.2): the organism that had it died in tick `since`, and its
+    /// heir `organism`, now selected, is the line's `handoffs`th from
+    /// `origin`. The `selection` record that follows names it too.
+    Handed {
+        schema: &'static str,
+        origin: u64,
+        organism: u64,
+        since: u64,
+        handoffs: u64,
+        shown_tick: Option<u64>,
     },
     /// The clocks over the last window (plan §12.2).
     Clock {
@@ -1051,6 +1072,9 @@ fn main() -> ExitCode {
                 brush: armed.map(Brush::name),
             });
         }
+        if let Some(line) = &frame.handed {
+            print(&handed_record(line, frame.shown.map(|shown| shown.tick)));
+        }
         if frame.selected != selected {
             selected = frame.selected;
             print(&Record::Selection {
@@ -1421,6 +1445,25 @@ fn status_record(status: &Status) -> Record<'static> {
             cells: measurement.cells,
             field_energy: measurement.field_energy,
         },
+        Status::Following { seen, line } => Record::Following {
+            schema: STUDIO_SCHEMA,
+            origin: line.origin.get(),
+            seen_tick: seen.get(),
+            tick: line.since.get(),
+        },
+    }
+}
+
+/// The record of the selection passing along `line` while tracking (plan
+/// §2.2), on the epoch of `shown`.
+fn handed_record(line: &Followed, shown: Option<Tick>) -> Record<'static> {
+    Record::Handed {
+        schema: STUDIO_SCHEMA,
+        origin: line.origin.get(),
+        organism: line.organism.get(),
+        since: line.since.get(),
+        handoffs: line.handoffs,
+        shown_tick: shown.map(Tick::get),
     }
 }
 
@@ -1922,6 +1965,53 @@ mod tests {
                 "lineages": 3,
                 "cells": 1_064,
                 "field_energy": 812.46
+            })
+        );
+    }
+
+    /// Plan §2.2: a follow's record names the line's origin and the
+    /// boundary it began at; a hand-off's names the heir, the tick the one
+    /// before it died, and how many times the line has passed.
+    #[test]
+    fn following_and_handed_records_carry_the_line() {
+        let begun = flife_engine::Followed {
+            origin: flife_core::ids::OrganismId::new(455),
+            organism: flife_core::ids::OrganismId::new(455),
+            since: Tick::new(5_120),
+            handoffs: 0,
+            alive: true,
+        };
+        assert_eq!(
+            line(&Status::Following {
+                seen: Tick::new(5_118),
+                line: begun,
+            }),
+            json!({
+                "record": "following",
+                "schema": "frankenlife.studio.v1",
+                "origin": 455,
+                "seen_tick": 5_118,
+                "tick": 5_120
+            })
+        );
+        let passed = flife_engine::Followed {
+            organism: flife_core::ids::OrganismId::new(1_234),
+            since: Tick::new(6_001),
+            handoffs: 2,
+            ..begun
+        };
+        let value = serde_json::to_value(super::handed_record(&passed, Some(Tick::new(6_001))))
+            .expect("serializes");
+        assert_eq!(
+            value,
+            json!({
+                "record": "handed",
+                "schema": "frankenlife.studio.v1",
+                "origin": 455,
+                "organism": 1_234,
+                "since": 6_001,
+                "handoffs": 2,
+                "shown_tick": 6_001
             })
         );
     }

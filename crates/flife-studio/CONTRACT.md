@@ -162,6 +162,15 @@ directory, with its pending commands and its checkpoint chain.
     holds and their energy). A disk the world cannot measure (a centre off the world, a radius not finite and
     positive or wider than half the shorter side) reports `Refused` with `numerical-invalid`. Nothing is
     submitted and the world is unchanged.
+  - Plan §2.2's "Follow descendants of a selected organism": `Intent::Follow { organism, seen }` asks
+    `SessionHandle::follow` and reports `Following { seen, line }`: `seen` unchanged, and the line of descent the
+    session's world now follows from that organism, begun at the committed boundary (`line.since`). An organism
+    the world does not hold alive, or a world that does not trace its ancestry, reports `Refused` with
+    `state-conflict`, and the line followed before is kept. From then on every epoch the session publishes
+    carries the line (`Epoch::followed`): in the tick its organism dies the line passes to its heir, the
+    descendant then alive fewest generations below it and then the eldest, or ends with none alive. Following
+    is observer state: nothing the session commits holds it, so it changes no digest, and a checkpoint does not
+    keep it.
   - FL-024: `SessionThread::spawn_kept(owner, handle, Some(checkpoints))` keeps the session's run directory
     (`keep`). It publishes the founding checkpoint before it takes any intent (when the interval is not zero),
     and then, also before any intent, holds the session (`SessionHandle::hold`) at the next multiple of the
@@ -266,7 +275,9 @@ directory, with its pending commands and its checkpoint chain.
      epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
      (scaled to drawable pixels); then takes the view and the selection. A click that selects an organism offers
      `Intent::Inspect` for it with the shown epoch's tick as `seen` (FL-021), counted with the frame's intents or
-     refusals. After the frame's moves and strokes, a `CameraMove::Weights` offers `Intent::DumpWeights` for
+     refusals, and then `Intent::Follow` for it (plan §2.2), likewise counted; the host follows the line from
+     that organism once the offer is taken, and a click that selects nothing, or whose follow is refused,
+     follows none. After the frame's moves and strokes, a `CameraMove::Weights` offers `Intent::DumpWeights` for
      whatever is then selected, with the shown epoch's tick as `seen` (FL-021), and nothing when nothing is
      selected. A brush click makes its stroke through the view as it stood at that click, over the shown epoch's
      field grid, and is offered as `Intent::Intervene` with the shown epoch's tick as `seen` (FL-022), counted in
@@ -285,8 +296,13 @@ directory, with its pending commands and its checkpoint chain.
      makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
      fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
      style change it shows the pair again, after a camera move it places it, and otherwise, while the display
-     moves, it advances it. While tracking (plan §14.3's camera-follow target), it then centres the view on where
-     this frame draws the selected organism (`WorldView::selected_position`), at the zoom it has, and places the
+     moves, it advances it. While tracking, when the newest epoch leased carries the line the host follows
+     (its `origin` the organism last clicked), still alive, and naming an organism other than the selected one
+     (the selected one died and the line passed to its heir), the host selects that heir (plan §2.2's "Follow
+     descendants of a selected organism"; the timeline records a `Select`), offers `Intent::Inspect` for it
+     with the shown epoch's tick as `seen`, names the line in the frame (`Frame::handed`) and counts it in
+     `FrameTally::handoffs`; untracked, the selection goes with the organism, as before. While tracking (plan
+     §14.3's camera-follow target), it then centres the view on where this frame draws the selected organism (`WorldView::selected_position`), at the zoom it has, and places the
      pair again there (`place_between`; the timeline records a `View` and a `Place`), counted in
      `FrameTally::tracked`: a tracked frame lowers its organisms twice. Nothing selected (a click on nothing, or
      an epoch that no longer draws the organism) stops tracking. Once the display rests the prior lease is
@@ -302,8 +318,8 @@ directory, with its pending commands and its checkpoint chain.
   the native queue drops events. `post_input` on a window, and `post` (AppKit's synthetic input) offscreen, are
   `StateConflict`.
 
-  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, tracked, tracking, new
-  epoch, shown
+  It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, tracked, tracking, the
+  line `handed` to an heir in the frame, new epoch, shown
   `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, the armed brush's `preview`
   (`brush::preview` at the pointer through the view as the frame left it, with the supplies a click there would
   use, its `preview_region` outlined in that frame's drawing), while the measuring tool is armed what it shows
@@ -347,7 +363,8 @@ directory, with its pending commands and its checkpoint chain.
     `bytes`, `retired`, `mode`, `paused_seconds`), and a `status` `unkept` if one fails;
   - one `status` per status;
   - one `view` per style change, with the same style fields;
-  - one `selection` each time the selected organism changes (a click, or the organism gone from a newer epoch):
+  - one `selection` each time the selected organism changes (a click, the organism gone from a newer epoch, or a
+    tracked line handed to its heir):
     its identity or null, its position and the shown tick;
   - one `inspected` per inspection answered (FL-021), on a click's selection and about once a second while it
     stays selected and the world runs (`Studio::inspect_selected`): the organism, `seen_tick`, the committed `tick` it was read
@@ -383,6 +400,11 @@ directory, with its pending commands and its checkpoint chain.
     `seen_tick`, the committed `tick` it was read at, the disk's `center` and `radius`, and what it holds:
     `organisms`, `organism_energy`, `lineages`, `cells` and `field_energy`. The overlay shows the newest while it
     is of the disk placed;
+  - plan §2.2: one `following` per follow answered, on a click's selection: the `origin` the line is followed
+    from, the `seen_tick` and the committed `tick` it was begun at; and one `handed` per frame that hands the
+    selection to an heir: the line's `origin`, the `organism` that has it now, the tick it has had it `since`,
+    the line's `handoffs` and the `shown_tick` (null with nothing shown), printed before that frame's
+    `selection` record;
   - a `frame` summary about once a second, with the frames `presented` and `rendered` offscreen, the camera's
     center and zoom, and the bytes the Metal route has copied so far: to the device (`upload_bytes`, and the
     most in one frame, `peak_upload_bytes`) and back to the host (`readback_bytes`, none for frames presented to
@@ -611,6 +633,19 @@ presentation state, not scientific state.
     directly measures there, with the organism counted and field energy in it; refuses a centre off the world on
     each axis, a radius wider than half the world, NaN and 0 as `numerical-invalid`; after a step answers at tick
     4 as the direct world does; and closes on the direct world's digest.
+- `tests/follow.rs` (2 tests, plan §2.2, no window), a `SessionThread` driven through its intent lane as the host
+  drives it after a selection. In the reference world's first 400 ticks no founder dies with a child alive, so the
+  death is a removal brush's:
+  - the preset's traced world, stepped directly to the first tick at which an organism with a child alive stands
+    alone within 0.01 (in one run organism 504 at tick 172), and a session stepped there. Its newest epoch
+    carries no line; a follow of an identity the world does not hold is refused as `state-conflict`, and the
+    organism's is answered `Following` with the line begun there (itself, since that tick, no hand-offs, alive).
+    A removal of that disk, submitted effective at the tick, and the step: the direct world, following the same
+    organism and stepping with the same intervention, removes exactly it, and its line passes to the organism's
+    eldest child alive at the step's tick with one hand-off. The session's newest epoch is of that tick and
+    carries exactly that line; the session closes on the direct world's digest with the same line;
+  - a world that does not trace its ancestry: a follow of a founder is refused as `state-conflict` ("does not
+    trace its ancestry"), and after a step the newest epoch carries no line.
 - `tests/clock.rs` (8 tests, FL-024, no window), the `ClockMeter` the binary reads:
   - evaluations (plan §14.1): from 1,000 to 5,096 over 2 s read 4,096 and 2,048 a second; a window with no count at
     either end reads none; a still count reads 0;
@@ -735,7 +770,8 @@ presentation state, not scientific state.
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
-- `tests/offscreen.rs` (10 tests, FL-024, FL-022, plan §14.3, Metal compute, no window), `Studio::open` offscreen on the preset at
+- `tests/offscreen.rs` (11 tests, FL-024, FL-022, plan §14.3 and §2.2, Metal compute, no window), `Studio::open` offscreen on
+  the preset at
   320 x 200 points and 2 pixels a point:
   - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
     the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
@@ -796,6 +832,20 @@ presentation state, not scientific state.
     drag stops it and leaves the organism where the pan took it (the drag's offset from the centre, in drawable
     pixels); T centres it again; 0 refits to zoom 1 and stops it; and a click where nothing is picked selects
     nothing and stops it.
+  - Plan §2.2's "Follow descendants of a selected organism": a world stepped directly, tracing its ancestry as
+    the Studio's does, to the first tick at which two organisms with a child alive each stand alone within 0.5
+    world units (in one run organisms 504 and 746 at tick 270), and the Studio stepped there. For each, a click
+    selects it (its inspection and its follow answered, the follow with the line begun at that tick), X arms the
+    removal brush, the view zooms about it until the preview's disk measures that organism alone, and a click
+    submits the disk, effective at the tick; a step removes it, the direct world, following the same organism and
+    stepping with the same removal, passing its line to its eldest child alive. The first untracked: the
+    selection goes with the organism, no frame hands it on, no hand-off is counted, and the newest epoch carries
+    the direct world's line. The second tracked (0 then T): exactly one frame hands the selection on, naming
+    exactly the direct world's line; the heir is selected and tracking stays on, the frame shows the removal's
+    tick, draws the heir at the drawable's centre (within 1e-6 px) and counts one hand-off, and the heir's
+    inspection is answered. The Studio records its timeline: that frame's records hold the heir's `Select`, so
+    a replay draws it, and the untracked phase's frames hold no `Select` (a newer epoch ends a selection in the
+    replay's view as in the host's). The Studio closes on the direct world's digest.
   - Planted bugs in the region outline (FL-022), each caught: the host outlining nothing or not recording the
     region (this file, `tests/timeline.rs`), a removal outlined as adding energy or with half its radius
     (`tests/brush.rs`), the replay outlining nothing, and a recorded rectangle doubled (`tests/timeline.rs`).
@@ -847,8 +897,10 @@ presentation state, not scientific state.
     evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
     a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
     was added, the first run's one survivor).
-- `src/main.rs` unit tests (10, FL-022, FL-024, FL-023, FL-021, plan §14.3): a `measured` record carries the
-  seen and read ticks, the disk and everything it holds, each figure the measurement's own; an `inspected` record of a watched organism of
+- `src/main.rs` unit tests (11, FL-022, FL-024, FL-023, FL-021, plan §14.3 and §2.2): a `measured` record carries the
+  seen and read ticks, the disk and everything it holds, each figure the measurement's own; a `following` record
+  carries the line's origin, the seen tick and the tick it was begun at, and a `handed` record the origin, the
+  heir, the tick it has the line since, the hand-offs and the shown tick, each exactly; an `inspected` record of a watched organism of
   the preset two ticks in carries its sensed tick, scale and evaluation, its 104 inputs, three raw planes and 33
   gradients, and its activations' tick and layers, each value bit for bit, and its two steps' transactions: their
   ticks, each sum as written out over the two records, bit for bit, and the newest step's reproduction outcome,
@@ -1031,6 +1083,18 @@ presentation state, not scientific state.
   record read as adding and a measuring region recorded as a stroke's (`tests/timeline.rs`); a measurement
   outlined in amber (`flife-manim`'s `tests/region.rs`): 22 caught. The binary not measuring again after a step
   survives: it runs only in a window, which no test here opens.
+- §2.2's following, planted bugs, 25, each run against the tests that should catch it: in the engine's index,
+  the heir the furthest generation, the youngest of its generation, or the eldest whatever its generation;
+  the heir chosen as the organism's death is folded, or descendants marked after every death; only children
+  marked; a dead descendant made heir; a line that never ends; the heir's tick not kept; hand-offs not
+  counted; a dead organism followed (its unit tests and `tests/ancestry.rs`); an untraced world following
+  silently; the session answering the line without following; an epoch keeping its slot's line; the session
+  thread following nothing (`tests/follow.rs`); in the host, the selection handed on untracked, any line's
+  heir taken, the heir not inspected, a click's line not kept, a click not followed, hand-offs not tallied,
+  the hand-off not in the timeline, the frame naming no hand-off (`tests/offscreen.rs`); the `handed` record's
+  count off by one (`src/main.rs`): 24 caught. The hand-off missing from the timeline survived the first run
+  and was caught once the offscreen test recorded its timeline. The binary printing no `handed` record
+  survives: a hand-off needs a click, which only a window gives the binary.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -1041,10 +1105,17 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   drawable size and the view its new pixels per point. Only one 2× display is exercised here, so that path has no
   real-window test, and frankentorch's planted bug for `contentsScale` following a screen change survives for the
   same reason.
-- Tracking (T) follows one organism. When it dies the selection goes and tracking stops where it was: the camera
-  does not move on to a descendant (plan §2.2's "Follow descendants of a selected organism" is not done). The
-  window shows tracking only by the camera itself; no overlay line says so. Tracking has run offscreen only: no
-  window test here pressed T.
+- Tracking (T) follows one organism, and while tracking, when it dies, its line of descent (plan §2.2's "Follow
+  descendants of a selected organism") passes to one heir by one rule: the descendant alive fewest generations
+  below it, then the eldest. There is no choice of heir, no view of the whole line, and no way to follow a line
+  without tracking (untracked, the selection goes with the organism). A line ends with no descendant alive the
+  index reaches, though one might yet be introduced; the index reaches descendants only through organisms alive
+  since tracing began, which for the Studio's world is tick 0. The line is observer state: a checkpoint does not
+  keep it, so a resumed or branched session follows nothing until clicked. A click on an organism that died at
+  the committed boundary before the follow arrives is refused, and the host then follows nothing. The window
+  shows tracking and a hand-off only by the camera and the selection; no overlay line says so (the overlay's
+  longest is within 26 triangles of its budget). Tracking and hand-offs have run offscreen only: no window test
+  here pressed T.
 - §14.3's temporary measurement region is one disk, the removal brush's shape: no rectangle or lasso, and one at
   a time (a new one replaces it). It measures what a removal there takes and the field under it, not a time
   series: the binary reads it again about once a second while the world runs and after each step or finished

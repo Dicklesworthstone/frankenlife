@@ -456,6 +456,12 @@ cells`), a `measured` record carries it with the disk's centre, and both are rea
 world runs and after each step. Paused, measure a colony before erasing it with the same disk: the removal
 applies at the tick measured, and its `finished` record moves exactly the energy measured.
 
+T tracks the selected organism: the camera keeps it at the centre while the world runs. A click also follows its
+line of descent (plan §2.2), and while tracking, when the organism dies, the selection and the camera move on to
+its heir, the descendant then alive fewest generations below it and then the eldest. A `following` record names
+the line when the click is answered and a `handed` record each hand-off. Following is observer state, outside
+every digest and checkpoint, and so far it has run only offscreen.
+
 `--offscreen SECONDS` runs the same Studio for that long with no window (FL-024). It renders each frame through
 the same Metal route at `--scale` pixels a point (2 by default), reads it back and closes. Its `end` record gives
 the frames' work times and, with `--offscreen-zooms`, a camera move's latency from its arrival at a random moment

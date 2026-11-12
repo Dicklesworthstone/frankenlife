@@ -30,8 +30,8 @@ use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_G, KEY_I, KEY_M,
     KEY_PERIOD, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, MeasurePreview, PICK_RADIUS_POINTS,
-    Preview, Status, Stroke, Studio, StudioOptions, Supplies, Surface, cell_region, drawn, legends,
-    material_for, measure, preview_region, scroll_zoom, stroke,
+    Preview, Status, Stroke, Studio, StudioOptions, Supplies, Surface, TimelineRecord, cell_region,
+    drawn, legends, material_for, measure, preview_region, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -625,6 +625,311 @@ fn t_keeps_the_selected_organism_centred_while_the_world_runs() {
     assert_eq!(tally.rendered, tally.frames, "every frame was drawn");
     let closed = studio.close().expect("closes");
     assert_eq!(closed.input_dropped, 0);
+}
+
+/// What stepping a paused Studio saw.
+#[derive(Default)]
+struct Stepping {
+    /// Steps offered.
+    sent: u64,
+    /// Steps published.
+    stepped: u64,
+    statuses: Vec<Status>,
+    /// The frames that handed the selection on.
+    handed: Vec<flife_studio::Frame>,
+    /// The timeline records of each frame that handed the selection on.
+    handed_records: Vec<Vec<TimelineRecord>>,
+    /// The timeline records of the other frames stepping ran.
+    records: Vec<TimelineRecord>,
+}
+
+/// Step the paused `studio` to committed tick `to`, with at most eight
+/// steps outstanding, and run frames until it shows that tick at rest.
+/// What the timeline recorded before is set aside; each frame's records
+/// are kept with it.
+fn step_to(studio: &mut Studio, to: u64, seen: &mut Stepping) {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    studio.take_recorded();
+    loop {
+        if seen.sent < to && seen.sent < seen.stepped + 8 {
+            tap(studio, KEY_PERIOD, ".");
+            seen.sent += 1;
+        }
+        let frame = studio.frame().expect("a frame");
+        let records = studio.take_recorded();
+        if frame.handed.is_some() {
+            seen.handed.push(frame);
+            seen.handed_records.push(records);
+        } else {
+            seen.records.extend(records);
+        }
+        for status in studio.take_statuses() {
+            match status {
+                Status::Stepped { .. } => seen.stepped += 1,
+                Status::StepHeld { .. } => panic!("a step was held: {status:?}"),
+                _ => {}
+            }
+            seen.statuses.push(status);
+        }
+        if seen.stepped == to
+            && frame.motion.is_none()
+            && frame.shown.is_some_and(|shown| shown.tick == Tick::new(to))
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "stepping to {to}");
+    }
+}
+
+/// Plan §2.2's journey: pause, select an organism, remove it with the
+/// removal brush, and follow its descendants. A direct world finds the
+/// first tick at which two live organisms with a child alive each stand
+/// alone within half a world unit. Selected without tracking, the first is
+/// removed (X, zoomed in about it until the brush's disk there holds it
+/// alone): the session's world follows its line, whose passing to its heir
+/// the epoch of the removal's tick carries, but the selection ends with
+/// it. Selected and tracked (T), the second is removed the same way: the
+/// frame that first shows the removal's tick passes the selection to its
+/// heir, the direct world's line's (its eldest child alive), drawn at the
+/// drawable's centre with tracking going on, inspected, and carried by the
+/// shown epoch; the timeline records that frame's selection of the heir, so
+/// a replay draws it. Following changes nothing the session commits.
+#[test]
+fn tracking_passes_the_selection_to_the_heir_of_the_organism_it_followed() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    const UNTIL: u64 = 400;
+    const ALONE: f64 = 0.5;
+    let config = config();
+    let mut direct = World::found(
+        &config,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("founds");
+    direct.trace_ancestry().expect("traces");
+    let mut parents = std::collections::BTreeSet::new();
+    let alone = loop {
+        let population = direct.population();
+        let alone: Vec<OrganismId> = parents
+            .iter()
+            .copied()
+            .filter(|&parent| {
+                population.get(parent).is_some_and(|organism| {
+                    population.iter().any(|child| child.parent == Some(parent))
+                        && direct
+                            .measure_region(organism.position, ALONE)
+                            .expect("measures")
+                            .organisms
+                            == 1
+                })
+            })
+            .take(2)
+            .collect();
+        if alone.len() == 2 {
+            break alone;
+        }
+        assert!(
+            direct.tick().get() < UNTIL,
+            "no two parents alone by {UNTIL}"
+        );
+        let Stepped::Published(report) = direct.step_with(&[]).expect("steps") else {
+            panic!("paused");
+        };
+        parents.extend(report.births.iter().map(|birth| birth.parent));
+    };
+    let [first, later] = alone[..] else {
+        panic!("{alone:?}");
+    };
+    let at = direct.tick().get();
+    println!("{first} and {later} have a child alive at {at}");
+
+    let recorded = StudioOptions {
+        record: true,
+        ..options(false)
+    };
+    let mut studio = Studio::open(&config, &recorded).expect("opens offscreen");
+    studio.frame().expect("the first frame");
+    let mut seen = Stepping::default();
+    step_to(&mut studio, at, &mut seen);
+    let density = f64::from(SCALE);
+    let middle = SIZE.map(|points| f64::from(points) * density / 2.0);
+    // Where the shown epoch draws `organism`, a logical point.
+    let spot = |studio: &Studio, organism: OrganismId| {
+        let (_, position) = studio
+            .view()
+            .shown_rows()
+            .find(|&(id, _)| id == organism.get())
+            .expect("the organism is drawn");
+        let drawable = studio.view().viewport().world_to_drawable(position);
+        [drawable[0] / density, drawable[1] / density]
+    };
+    let select = |studio: &mut Studio, organism: OrganismId, track: bool| {
+        click(studio, spot(studio, organism));
+        if track {
+            tap(studio, KEY_T, "t");
+        }
+        let frame = studio.frame().expect("a frame");
+        assert_eq!(frame.selected, Some(organism));
+        assert_eq!(frame.tracking, track);
+        until(studio, "the follow's answer", |_, statuses| {
+            statuses.iter().any(|status| {
+                matches!(status, Status::Following { line, .. } if line.origin == organism
+                    && line.organism == organism && line.handoffs == 0 && line.alive)
+            })
+        });
+    };
+    // Zoom in about `organism` until the removal brush's disk there holds it
+    // alone in `direct`, click there and put the brush away: the stroke the
+    // session took.
+    let remove = |studio: &mut Studio, organism: OrganismId, direct: &World| -> Stroke {
+        tap(studio, KEY_X, "x");
+        let mut zooms = 0;
+        let stroke = loop {
+            let at = spot(studio, organism);
+            hover(studio, at);
+            let frame = studio.frame().expect("a frame");
+            let Some(Preview::Stroke {
+                stroke: stroke @ Stroke::Removal { center, radius },
+                ..
+            }) = frame.preview
+            else {
+                panic!("{:?}", frame.preview);
+            };
+            if direct
+                .measure_region(center, radius)
+                .expect("measures")
+                .organisms
+                == 1
+            {
+                break stroke;
+            }
+            zooms += 1;
+            assert!(zooms < 30, "the brush's disk never held {organism} alone");
+            studio
+                .post_input(InputEvent::Scroll {
+                    delta: [0.0, 80.0],
+                    unit: ScrollUnit::Points,
+                    position: point(at),
+                    modifiers: Modifiers::NONE,
+                })
+                .expect("posts");
+        };
+        click(studio, spot(studio, organism));
+        until(studio, "the removal's submission", |_, statuses| {
+            statuses
+                .iter()
+                .any(|status| matches!(status, Status::Submitted { stroke: made, .. } if *made == stroke))
+        });
+        tap(studio, KEY_X, "x");
+        stroke
+    };
+    let apply = |direct: &mut World, organism: OrganismId, stroke: Stroke| {
+        direct.follow(Some(organism)).expect("follows");
+        let Stepped::Published(report) = direct.step_with(&[stroke.intervention()]).expect("steps")
+        else {
+            panic!("paused");
+        };
+        assert_eq!(report.interventions[0].removed, 1);
+        assert!(report.deaths.iter().any(|death| death.id == organism));
+        let line = direct.followed().expect("a line");
+        let eldest = direct
+            .population()
+            .iter()
+            .filter(|child| child.parent == Some(organism))
+            .map(|child| child.id)
+            .min()
+            .expect("a child alive");
+        assert_eq!(
+            line,
+            flife_engine::Followed {
+                origin: organism,
+                organism: eldest,
+                since: report.tick,
+                handoffs: 1,
+                alive: true,
+            }
+        );
+        line
+    };
+
+    // Untracked: the session's world follows the line, the selection ends.
+    select(&mut studio, first, false);
+    let stroke = remove(&mut studio, first, &direct);
+    let line = apply(&mut direct, first, stroke);
+    step_to(&mut studio, at + 1, &mut seen);
+    assert_eq!(studio.view().selected(), None);
+    assert!(seen.handed.is_empty());
+    assert_eq!(studio.tally().handoffs, 0);
+    assert_eq!(studio.display_pair().1.followed(), Some(line));
+    let selection = |organism: Option<OrganismId>| TimelineRecord::Select {
+        organism: organism.map(OrganismId::get),
+    };
+    // A selection a newer epoch ends is not recorded (a replay's view ends
+    // it on the same epoch); nothing selects the heir.
+    assert!(
+        !seen
+            .records
+            .iter()
+            .any(|record| matches!(record, TimelineRecord::Select { .. })),
+        "{:?}",
+        seen.records
+    );
+    assert!(!seen.records.contains(&selection(Some(line.organism))));
+
+    // Tracked: the selection and the camera pass to the heir.
+    tap(&mut studio, KEY_ZERO, "0");
+    studio.frame().expect("a frame");
+    select(&mut studio, later, true);
+    let stroke = remove(&mut studio, later, &direct);
+    let expected = apply(&mut direct, later, stroke);
+    let heir = expected.organism;
+    step_to(&mut studio, at + 2, &mut seen);
+    let [frame] = seen.handed[..] else {
+        panic!("{} frames handed the selection on", seen.handed.len());
+    };
+    assert_eq!(frame.handed, Some(expected));
+    assert_eq!(frame.selected, Some(heir));
+    assert!(frame.tracking);
+    assert!(
+        seen.handed_records[0].contains(&selection(Some(heir))),
+        "{:?}",
+        seen.handed_records[0]
+    );
+    assert_eq!(
+        frame.shown.map(|shown| shown.tick),
+        Some(expected.since),
+        "the first frame showing the removal's tick"
+    );
+    assert_eq!(studio.display_pair().1.followed(), Some(expected));
+    assert_eq!(studio.view().selected(), Some(heir));
+    let frame = studio.frame().expect("a frame");
+    assert!(frame.tracking && frame.handed.is_none());
+    let position = studio
+        .view()
+        .selected_position()
+        .expect("the heir is drawn");
+    let centred = studio.view().viewport().world_to_drawable(position);
+    assert!(
+        (centred[0] - middle[0]).hypot(centred[1] - middle[1]) < 1e-6,
+        "{centred:?}"
+    );
+    assert_eq!(studio.tally().handoffs, 1);
+    let inspected = |statuses: &[Status]| {
+        statuses.iter().any(|status| {
+            matches!(status, Status::Inspected { organism, snapshot: Some(_), .. } if *organism == heir)
+        })
+    };
+    if !inspected(&seen.statuses) {
+        until(&mut studio, "the heir's inspection", |_, statuses| {
+            inspected(statuses)
+        });
+    }
+    let closed = studio.close().expect("closes");
+    assert_eq!(closed.session.boundary.tick, expected.since);
+    assert_eq!(closed.session.world.digest(), direct.digest());
 }
 
 #[test]

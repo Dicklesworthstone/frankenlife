@@ -214,6 +214,19 @@ pub enum Intent {
         /// session's committed boundary can be past it.
         seen: Tick,
     },
+    /// Follow an organism's line of descent (plan §2.2, "Follow
+    /// descendants of a selected organism"): from the session's committed
+    /// boundary on, when the organism that has the line dies the line
+    /// passes to its heir, which the session's epochs then name. The
+    /// presentation owner sends this on a selection, with
+    /// [`Intent::Inspect`], and while it tracks hands its selection to the
+    /// heir as the epoch it shows names one.
+    Follow {
+        /// The selected organism.
+        organism: OrganismId,
+        /// The source tick of the epoch it was selected on.
+        seen: Tick,
+    },
     /// Dump an organism's whole controller (FL-021, plan §14.2): its
     /// genome's parameters at the session's committed boundary. The
     /// presentation owner sends this for the selected organism on a

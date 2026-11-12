@@ -81,7 +81,7 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{CommandId, OrganismId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
-    Advance, CapacityShortfall, ControllerWeights, Intervention, OrganismSnapshot,
+    Advance, CapacityShortfall, ControllerWeights, Followed, Intervention, OrganismSnapshot,
     RegionMeasurement, TickReport, World,
 };
 use flife_field::FieldGrid;
@@ -341,6 +341,10 @@ enum Control {
         radius: f64,
         reply: oneshot::Sender<Result<RegionMeasurement, CoreError>>,
     },
+    Follow {
+        id: Option<OrganismId>,
+        reply: oneshot::Sender<Result<Option<Followed>, CoreError>>,
+    },
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
     Take(Take),
     /// Hold the committed boundary at `tick`, or release the hold (`None`).
@@ -395,6 +399,7 @@ impl std::fmt::Debug for Control {
             Self::InspectOrganism { .. } => "InspectOrganism",
             Self::OrganismWeights { .. } => "OrganismWeights",
             Self::MeasureRegion { .. } => "MeasureRegion",
+            Self::Follow { .. } => "Follow",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Take(_) => "Take",
             Self::Hold { .. } => "Hold",
@@ -703,6 +708,28 @@ impl SessionHandle {
         self.control(cx, |reply| Control::MeasureRegion {
             center,
             radius,
+            reply,
+        })
+        .await?
+    }
+
+    /// Follow live `organism`'s line of descent from the owner's committed
+    /// boundary on, or none (plan §2.2, "Follow descendants of a selected
+    /// organism"; [`World::follow`]): when the organism that has the line
+    /// dies, the line passes to its heir in that same tick. Each epoch the
+    /// owner publishes carries the line as it stands at its tick. It needs
+    /// a world that traces its ancestry, copies nothing, and changes no
+    /// result.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`] and [`World::follow`].
+    pub async fn follow(
+        &self,
+        cx: &Cx,
+        organism: Option<OrganismId>,
+    ) -> Result<Option<Followed>, CoreError> {
+        self.control(cx, |reply| Control::Follow {
+            id: organism,
             reply,
         })
         .await?
@@ -1724,6 +1751,9 @@ impl SessionOwner {
             } => {
                 let _ = reply.send_blocking(self.world.measure_region(center, radius));
             }
+            Control::Follow { id, reply } => {
+                let _ = reply.send_blocking(self.world.follow(id));
+            }
             Control::Checkpoint(reply) => {
                 self.settle_receipts();
                 if self
@@ -2177,6 +2207,9 @@ impl SessionOwner {
                     reply,
                 } => {
                     let _ = reply.send_blocking(self.world.measure_region(center, radius));
+                }
+                Control::Follow { id, reply } => {
+                    let _ = reply.send_blocking(self.world.follow(id));
                 }
             }
         }

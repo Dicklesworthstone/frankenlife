@@ -246,6 +246,15 @@ each runs and owns the field.
   keeps what the index holds. `World::ancestry_held()` gives an `AncestryHeld`: `since`, the `members` (live
   organisms and dead ancestors where lines meet), how many are `dead`, the `entries` held (members and leavers
   not yet cleared out), the `room` and the index's `bytes`. A restored world traces nothing until told to.
+- `World::follow(organism)` (plan §2.2, "Follow descendants of a selected organism") begins a line of descent
+  from a live organism at the committed tick, or with `None` follows nothing; `World::followed()` gives the
+  `Followed` line: its `origin`, the `organism` that has it, the tick `since` which it has had it, its
+  `handoffs` and whether that organism is `alive`. When the organism that has the line dies, the line passes in
+  that tick to its heir: its descendant alive once the tick's deaths are all folded, fewest generations below it
+  and then the eldest (lowest identity), among the descendants the index reaches through organisms alive since
+  tracing began. With none alive the line ends, naming the organism that died, until another is followed.
+  Following an organism always begins a fresh line, even from the one that has the line now. It needs the
+  ancestry index.
 
 **Invariants.**
 - Chemistry runs on each granted packet, never on the request or on the mixture of packets (C.9).
@@ -524,6 +533,13 @@ each runs and owns the field.
   costs a step for each ancestor above the organism in the index, at most the path's eight named. Its bytes are
   part of `footprint()`'s and `allocated()`'s state, so `admit_memory` charges them, and they do not change as
   the world steps.
+- A followed line is the index's, and like it is not scientific state: no digest, checkpoint or report holds it,
+  and no step reads it. Folding a tick in which the line's organism dies marks, as that organism's death is
+  folded and while every link below it still reaches it, each entry above it that descends from it, and chooses
+  the heir among the marked once the tick's deaths are all folded, so the heir does not depend on the order the
+  report lists them in, and before the room is cleared out for the introductions. That costs one pass over the
+  entries above the dead organism, with a binary search each, and allocates nothing: the mark is a field of
+  each entry, within the entry's existing size.
 
 **Refusal cases.**
 - FL-021: a live organism whose genome or topology is missing (`StateConflict`, "inspect organism"); a held output
@@ -531,7 +547,9 @@ each runs and owns the field.
   the inputs recorded for it (`StateConflict`, "inspect organism"), which only a controller backend that broke its
   bit-for-bit contract can cause. The ancestry index's room not reserved (`AllocationFailed`, "ancestry index"),
   after which the world traces nothing; a tick report the index cannot take (`StateConflict`, "ancestry index"),
-  refused before the tick commits, which the world's own reports never cause.
+  refused before the tick commits, which the world's own reports never cause. Following an organism in a world
+  that does not trace its ancestry, or one its index does not hold alive (`StateConflict`, "follow a line"),
+  keeping the line followed before.
 - Chemistry constants outside `η_max ∈ (0, 1]`, `k ≥ 0`, `b > 0`, `κ > 0`, limit `∈ (0, 1]`, or nonfinite.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
 - A negative or nonfinite grant, an efficiency outside `[−1, 1]`, or a nonfinite composition.
@@ -886,7 +904,7 @@ row, the report's births, rejections and deaths, and the tick's ledger closure:
   reading the candidate's field; and the harm counting gain. The density without the area survived the first run,
   whose cells were 1 x 1; the 2 x 2 grid catches it.
 
-`src/ancestry.rs` unit tests (3, FL-021, plan §14.2's Descendants), the index against a whole genealogy that
+`src/ancestry.rs` unit tests (8, FL-021, plan §14.2's Descendants and §2.2's following), the index against a whole genealogy that
 forgets nothing, in random ticks of at most three births (half of them to one of the three newest organisms, so
 lines grow deep), deaths and introductions in a population of at most 24:
 - `the_index_says_what_the_whole_genealogy_says`: for four seeds, 3,000 ticks from six founders; after every tick
@@ -898,8 +916,23 @@ lines grow deep), deaths and introductions in a population of at most 24:
 - `events_the_index_cannot_hold_are_refused`: a birth to a parent unknown or dead, a child or introduction at or
   below an identity taken, and a death unknown, already dead, or above every identity and not born that tick;
   a birth whose child dies in the same tick, another death and an introduction above them are taken.
+- `a_followed_line_passes_to_the_nearest_eldest_living_descendant`: for four seeds, 3,000 ticks, a line followed
+  from a random live organism, and again whenever it ends; after every tick it
+  equals the genealogy's, whose heir is the live descendant, by whole parent chains, fewest generations below
+  the dead organism and then the lowest identity, chosen after the tick's deaths, with the tick it passed and its
+  hand-offs; a line with no live descendant ends naming the organism that died. Over the seeds more than 30
+  hand-offs, more than 10 lines ended, heirs below a dead child, and heirs nearer that were not the eldest
+  descendant alive; the room never grows.
+- `a_line_followed_in_an_index_begun_later_passes_through_its_lines`: for two seeds, an index begun at tick 400,
+  following likewise against the genealogy rebased there: at least 10 hand-offs, a line ended and a deeper heir.
+- `only_a_live_organism_is_followed`: a dead and an unknown organism are refused, keeping the line followed;
+  following the heir that has the line begins a fresh one from it; `None` clears it.
+- `the_heir_is_chosen_once_the_ticks_deaths_are_folded`: a parent and its elder child die in one tick, listed in
+  either order; the line passes to the younger child, not the elder child's child.
+- `a_child_born_in_the_tick_its_parent_dies_is_its_heir`: a parent with one child born in the tick it dies passes
+  the line to it; that child's death later ends the line.
 
-`tests/ancestry.rs` (3 tests, FL-021), the 32 x 32 Appendix A world at a population of 512 with 48 founders and
+`tests/ancestry.rs` (4 tests, FL-021, plan §2.2), the 32 x 32 Appendix A world at a population of 512 with 48 founders and
 eight 240-power sources, a removal brush (radius 5, at one of four places in turn) at tick 50 of every hundred and
 six organisms introduced at tick 150; the genealogy is built from the reports alone, each birth's row checked for
 its parent, generation and birth tick:
@@ -913,6 +946,13 @@ its parent, generation and birth tick:
   footprint's and the admission's state are an untraced world's plus the index's bytes; for 1,200 ticks with the
   brushes, every tick's report and digest equal an untraced world's, the members less their dead are the live,
   fewer than twice them, the index's bytes do not change, and a dead ancestor is held.
+- `a_followed_line_passes_to_the_heir_the_genealogy_names`: an untraced world refuses to follow an organism and
+  follows `None`; a traced world, told by a world stepped ahead which organisms die soonest, follows the live
+  organism with a live descendant that dies soonest (with none, the one that dies soonest), again whenever its
+  line ends, and to 1,200 ticks its line
+  equals the genealogy's heir after every tick, while every tick's report and digest equal an untraced world's.
+  In one run 8 lines, 3 hand-offs and 7 ended; at least 3 hand-offs and one ended are asserted (the brushes'
+  deaths are mostly of organisms with no descendant alive).
 - Planted bugs in the ancestry index, each run against the tests that should catch it, all caught (with the
   Studio's host, panel and record, 23 of 23): a dead organism with one line kept on the path; a dropped line not
   taken from its ancestor; a birth counted born for its parent alone; a child's death leaving its parent's living
@@ -921,6 +961,12 @@ its parent, generation and birth tick:
   past the path counted `beyond`; every ancestor named alive; a later trace counting no living above a seed; a
   birth to a parent not held alive, and a death above every identity not born that tick, admitted; the index
   never folding a tick; a later trace counted from the founding; and the footprint not charging the index.
+- Planted bugs in following (plan §2.2), each run against the unit tests and `tests/ancestry.rs`, all caught:
+  the heir the furthest generation, the youngest of its generation, or the eldest whatever its generation; the
+  heir chosen as the organism's death is folded; descendants marked after every death; only children marked; a
+  dead descendant made heir; a line that never ends; the heir's tick not kept; hand-offs not counted; a dead
+  organism followed; and an untraced world following silently. With the session, epoch and Studio, 24 of 25
+  (the Studio's contract).
 
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and

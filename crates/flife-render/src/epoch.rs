@@ -26,7 +26,7 @@
 use flife_core::ids::{OrganismId, RenderEpoch, ResourceEpoch};
 use flife_core::model::MOMENT_CHANNELS;
 use flife_core::{CoreError, LedgerReport, Tick, TimeStep, Transfer};
-use flife_engine::{TickReport, World};
+use flife_engine::{Followed, TickReport, World};
 
 /// The most texels a field texture has along either axis. A larger grid is
 /// averaged over blocks of whole cells (§9.5: a bounded derived texture,
@@ -716,6 +716,7 @@ pub struct Epoch {
     affinities: Vec<[f32; 3]>,
     field: FieldTexture,
     metrics: Metrics,
+    followed: Option<Followed>,
 }
 
 /// A vector with exactly `count` elements of capacity, or a reported
@@ -799,6 +800,7 @@ impl Epoch {
                 faulted: false,
                 tally: None,
             },
+            followed: world.followed(),
         })
     }
 
@@ -901,6 +903,7 @@ impl Epoch {
             faulted: world.fault().is_some(),
             tally,
         };
+        self.followed = world.followed();
         Ok(())
     }
 
@@ -1046,6 +1049,16 @@ impl Epoch {
         &self.metrics
     }
 
+    /// The line of descent the world follows as of this tick
+    /// ([`World::follow`]; plan §2.2): a host following a selected
+    /// organism's descendants sees here, at the tick it happened, that the
+    /// line has passed to an heir, which a live line's organism names among
+    /// this epoch's rows.
+    #[must_use]
+    pub const fn followed(&self) -> Option<Followed> {
+        self.followed
+    }
+
     /// Every view's declared layout, in [`View::ALL`] order.
     #[must_use]
     pub fn layouts(&self) -> [Layout; 11] {
@@ -1138,6 +1151,15 @@ impl Epoch {
         }
         if let Some(pair) = self.ids.windows(2).find(|pair| pair[0] >= pair[1]) {
             return refuse(View::Identity, format!("{} before {}", pair[0], pair[1]));
+        }
+        if let Some(line) = self.followed
+            && line.alive
+            && self.row(line.organism).is_none()
+        {
+            return refuse(
+                View::Identity,
+                format!("the followed line's {} has no row", line.organism),
+            );
         }
         let texels = self.field.texels.map(|n| n as usize);
         if self.field.values.len() != texels[0] * texels[1] {

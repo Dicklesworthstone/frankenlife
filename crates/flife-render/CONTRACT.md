@@ -31,7 +31,10 @@ A slow consumer can therefore cost display freshness, never the world.
 - `Epoch`, which states:
   - its source: identity (`RenderEpoch`, issued once and strictly increasing), source tick and resource epoch;
   - its `Prior`: the epoch it replaced as latest;
-  - the world's timestep, speed limit and extent, and the affinity norm limit its affinity view is scaled by.
+  - the world's timestep, speed limit and extent, and the affinity norm limit its affinity view is scaled by;
+  - plan §2.2: `followed()`, the line of descent the world follows (`World::followed`), if any. It is observer
+    state, not a view: no digest holds it. An epoch whose line is alive names an organism with a row in it, and
+    `check()` refuses one that does not (`View::Identity`).
 - Its views, each with a declared `Layout` (`View`, `Dtype`, components, count, `Bounds`), in identity order:
 
   | View | Dtype × components | Bounds |

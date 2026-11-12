@@ -16,29 +16,29 @@
 //!   `volatile-in-memory`). Every brush the Studio applies is a journaled
 //!   command, as a scheduled one is for `flife run`.
 //! - The session thread publishes the founding checkpoint before it takes
-//!   any intent, when the interval is not zero. While the Studio runs, a
-//!   checkpointer reads the committed boundary every [`CHECKPOINT_POLL`]
-//!   and, once it is at or past the next multiple of the interval after
-//!   the newest checkpoint, takes one there. A running session's
-//!   checkpoint can therefore hold a later tick than the multiple, and
-//!   multiples a run passes between two reads share one checkpoint
-//!   (`flife run` steps one tick at a time and lands on each). A
-//!   checkpoint lands about the ticks run in one read's interval past its
-//!   multiple, and multiples share one only above 20 intervals a second
-//!   (76,800 ticks a second at the preset's 3,840-tick interval); in a
-//!   debug build the 32 × 32 test world ran about 49 ticks between two
-//!   reads. A world stopped by a numerical fault is not checkpointed
+//!   any intent, when the interval is not zero, and holds the session
+//!   ([`SessionHandle::hold`]) at the next multiple of the interval after
+//!   the committed tick. A checkpointer waits for the committed boundary
+//!   to reach the hold, takes a checkpoint there, and moves the hold to
+//!   the next multiple, so no run or step passes a multiple unkept: every
+//!   checkpoint a running session takes is at a multiple, each multiple
+//!   it reaches has one, as `flife run`'s do, and the world waits at a
+//!   multiple only while its checkpoint is taken. Holding changes no
+//!   result. A world stopped by a numerical fault is not checkpointed
 //!   again.
-//! - Closing pauses the session, publishes a checkpoint of the closing
-//!   boundary unless the newest already holds it or the world is stopped
-//!   by a fault, publishes a background checkpoint still in flight, and
-//!   suspends the session rather than closing it: a command still pending
-//!   stays pending, in the final checkpoint and the journal alike, and
-//!   applies when the run is resumed past its tick.
+//! - Closing pauses the session, then releases the hold, so the
+//!   checkpointer ends (a checkpoint it is taking is of the paused
+//!   boundary). It publishes a checkpoint of the closing boundary unless
+//!   the newest already holds it or the world is stopped by a fault,
+//!   publishes a background checkpoint still in flight, and suspends the
+//!   session rather than closing it: a command still pending stays
+//!   pending, in the final checkpoint and the journal alike, and applies
+//!   when the run is resumed past its tick.
 //!
 //! Each checkpoint is reported as [`Status::Checkpointed`]. A checkpoint
-//! that fails is reported as [`Status::Unkept`], and the session takes no
-//! more of them; it runs on, and its journal is still written.
+//! that fails, or a hold refused, is reported as [`Status::Unkept`], and
+//! the session takes no more checkpoints: the hold is released, the
+//! session runs on, and its journal is still written.
 //!
 //! `flife-studio --resume DIR` ([`crate::Studio::resume`]) opens a kept run
 //! again, as `flife resume` does, with [`flife_cli::recover`]: the
@@ -46,26 +46,21 @@
 //! that restores (the founding world when none does), and the session
 //! opened through the run's command journal, which replays what it holds
 //! past that checkpoint. Its checkpoints continue the run's, from the next
-//! multiple after the one recovered, and its strokes are numbered after the
-//! commands the session holds.
+//! multiple after the tick recovered, and its strokes are numbered after
+//! the commands the session holds.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
 
 use asupersync::Cx;
-use asupersync::time::{sleep, wall_now};
 use flife_cli::{CheckpointAdmission, Checkpoints, Persistence, Record};
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::World;
-use flife_runtime::{Boundary, CommandBook, SessionConfig, SessionHandle, SessionOwner};
+use flife_runtime::{Boundary, CommandBook, Holding, SessionConfig, SessionHandle, SessionOwner};
 
 use crate::Status;
-
-/// How often a running kept session's committed boundary is read.
-pub const CHECKPOINT_POLL: Duration = Duration::from_millis(50);
 
 /// A run directory the Studio will keep its session in.
 #[derive(Debug, Clone)]
@@ -248,55 +243,100 @@ fn unkept(error: &CoreError, report: &mpsc::Sender<Status>) {
     });
 }
 
+/// Hold `handle` at the multiple of the interval after `tick`; `None`,
+/// with the refusal reported, when the session refuses it.
+async fn hold_after(
+    cx: &Cx,
+    handle: &SessionHandle,
+    every: u64,
+    tick: u64,
+    report: &mpsc::Sender<Status>,
+) -> Option<Holding> {
+    let next = (tick / every).saturating_add(1).saturating_mul(every);
+    match handle.hold(cx, Tick::new(next)).await {
+        Ok(holding) => Some(holding),
+        Err(error) => {
+            unkept(&error, report);
+            None
+        }
+    }
+}
+
 /// The founding checkpoint, before the session takes any intent: when the
-/// interval is not zero. `None` once it failed.
+/// interval is not zero. Then the hold at the next multiple after the
+/// committed tick, also before any intent, for the checkpointer
+/// ([`keep`]); none when the interval is zero. `None` once the checkpoint
+/// or the hold failed (reported).
 pub(crate) async fn found(
     cx: &Cx,
     handle: &SessionHandle,
     mut checkpoints: Checkpoints,
     report: &mpsc::Sender<Status>,
-) -> Option<Checkpoints> {
+) -> Option<(Checkpoints, Option<Holding>)> {
     if next_due(&checkpoints) == Some(0) {
         take(cx, handle, &mut checkpoints, report).await.ok()?;
     }
-    Some(checkpoints)
+    let every = checkpoints.every();
+    if every == 0 {
+        return Some((checkpoints, None));
+    }
+    let (tick, _) = match committed(cx, handle).await {
+        Ok(committed) => committed,
+        Err(error) => {
+            unkept(&error, report);
+            return None;
+        }
+    };
+    let holding = hold_after(cx, handle, every, tick.get(), report).await?;
+    Some((checkpoints, Some(holding)))
 }
 
-/// The checkpointer: until `stop`, read the committed boundary every
-/// [`CHECKPOINT_POLL`] and take a checkpoint once it reaches the next due
-/// tick. Returns the checkpoints for the closing one, or `None` once one
-/// failed.
+/// The checkpointer: wait for the committed boundary to reach `holding`'s
+/// multiple, take a checkpoint there, and hold the session at the next,
+/// until the hold's wait ends (the close releases it, or the session
+/// closes) or `stop` is seen after a new hold. Returns the checkpoints for
+/// the closing one, or `None` once a checkpoint or a hold failed
+/// (reported), the hold then released so the session runs on.
 pub(crate) async fn keep(
     cx: &Cx,
     handle: &SessionHandle,
     mut checkpoints: Checkpoints,
+    mut holding: Holding,
     report: &mpsc::Sender<Status>,
     stop: &AtomicBool,
 ) -> Option<Checkpoints> {
-    let Some(mut due) = next_due(&checkpoints) else {
-        return Some(checkpoints);
-    };
-    while !stop.load(Ordering::Acquire) && cx.checkpoint().is_ok() {
-        sleep(wall_now(), CHECKPOINT_POLL).await;
-        if stop.load(Ordering::Acquire) {
-            break;
+    let every = checkpoints.every();
+    loop {
+        let at = holding.tick();
+        if holding.reached(cx).await.is_err() {
+            return Some(checkpoints);
         }
         match committed(cx, handle).await {
             // A stopped world changes no more: nothing more to keep.
-            Ok((_, true)) | Err(_) => break,
-            Ok((tick, false)) if tick.get() < due => {}
-            Ok(_) => {
-                take(cx, handle, &mut checkpoints, report).await.ok()?;
-                due = next_due(&checkpoints)?;
-            }
+            Ok((_, true)) | Err(_) => return Some(checkpoints),
+            Ok(_) => {}
+        }
+        if take(cx, handle, &mut checkpoints, report).await.is_err() {
+            let _ = handle.release(cx).await;
+            return None;
+        }
+        let Some(next) = hold_after(cx, handle, every, at.get(), report).await else {
+            let _ = handle.release(cx).await;
+            return None;
+        };
+        holding = next;
+        // Seen after the new hold was set, so a close that released the
+        // hold before it never leaves this waiting on it.
+        if stop.load(Ordering::Acquire) {
+            return Some(checkpoints);
         }
     }
-    Some(checkpoints)
 }
 
-/// Close a kept session: pause it, publish a checkpoint of the closing
-/// boundary unless the newest holds it or a fault stopped the world, then
-/// any background checkpoint in flight, and suspend it.
+/// Close a kept session whose pause returned `paused`: publish a
+/// checkpoint of the closing boundary unless the newest holds it or a
+/// fault stopped the world, then any background checkpoint in flight, and
+/// suspend it.
 ///
 /// # Errors
 /// [`SessionHandle::suspend`]'s.
@@ -304,10 +344,11 @@ pub(crate) async fn close(
     cx: &Cx,
     handle: &SessionHandle,
     checkpoints: Option<Checkpoints>,
+    paused: Result<Boundary, CoreError>,
     report: &mpsc::Sender<Status>,
 ) -> Result<Boundary, CoreError> {
     if let Some(mut checkpoints) = checkpoints {
-        match handle.pause(cx).await {
+        match paused {
             Ok(_) => {
                 if let Ok((tick, false)) = committed(cx, handle).await
                     && checkpoints.last_tick() != Some(tick.get())

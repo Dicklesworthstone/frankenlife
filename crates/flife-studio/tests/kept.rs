@@ -1,8 +1,8 @@
 //! FL-024 evidence (plan §14.1's durable checkpoint tick, §16.3): a Studio
 //! session kept in a run directory is a run the command line takes. Its
-//! founding checkpoint holds tick 0, one follows as the committed tick
-//! passes each multiple of the interval while it runs, and closing
-//! publishes the closing boundary and suspends the session. Every
+//! founding checkpoint holds tick 0, one is taken at exactly each multiple
+//! of the interval it reaches while it runs, as `flife run`'s are, and
+//! closing publishes the closing boundary and suspends the session. Every
 //! checkpoint `flife inspect` restores is the world stepped directly with
 //! the strokes the Studio applied at their ticks, bit for bit, the last is
 //! the world the session closed on, and `flife resume` continues the run to
@@ -23,7 +23,9 @@
     reason = "test helpers: a failure in one is a test failure"
 )]
 
+use std::fs;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -100,6 +102,18 @@ fn fresh(name: &str) -> PathBuf {
         .as_nanos();
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("fl024-kept-{name}-{}-{nanos}", std::process::id()))
+}
+
+/// The ticks a kept run that runs from `from` to `to` checkpoints at:
+/// every multiple of `every` from `from` on, then `to` unless it is one.
+fn chain(from: u64, to: u64, every: u64) -> Vec<u64> {
+    let mut ticks: Vec<u64> = (from..=to)
+        .filter(|tick| tick.is_multiple_of(every))
+        .collect();
+    if !to.is_multiple_of(every) {
+        ticks.push(to);
+    }
+    ticks
 }
 
 /// Statuses until `done` holds for the ones gathered, within 120 seconds.
@@ -284,23 +298,18 @@ fn kept_session_resumes(durability: &str) {
     assert_eq!(strokes[1].2, closed_at, "pending at the closing boundary");
     let applied_strokes = [(strokes[0].0, strokes[0].1, applied[0].1)];
 
-    // The checkpoints: tick 0, then each at or past the next multiple after
-    // the one before (multiples a run passes between two reads share one),
-    // then the closing boundary; numbered in order, all pause-and-stream.
+    // The checkpoints: tick 0 and every multiple of the interval the
+    // session reached, each exactly there, as `flife run`'s are, then the
+    // closing boundary unless a multiple's holds it; numbered in order, all
+    // pause-and-stream.
     let kept = checkpoints(&statuses);
     assert!(kept.len() >= 3, "{kept:?}");
-    assert!(kept[kept.len() - 2].0.get() >= 2 * every, "{kept:?}");
-    assert_eq!(kept[0].0, Tick::new(0));
+    let ticks: Vec<u64> = kept.iter().map(|(tick, ..)| tick.get()).collect();
+    assert_eq!(ticks, chain(0, closed_at.get(), every), "{durability}");
+    assert!(ticks.contains(&(2 * every)), "{ticks:?}");
     for pair in kept.windows(2) {
-        let ((earlier, first, ..), (later, second, ..)) = (&pair[0], &pair[1]);
-        assert!(second > first, "{kept:?}");
-        assert!(later > earlier, "{kept:?}");
+        assert!(pair[1].1 > pair[0].1, "{kept:?}");
     }
-    for pair in kept[..kept.len() - 1].windows(2) {
-        let (earlier, later) = (pair[0].0.get(), pair[1].0.get());
-        assert!(later >= (earlier / every + 1) * every, "{kept:?}");
-    }
-    assert_eq!(kept.last().expect("kept").0, closed_at, "{kept:?}");
     assert!(kept.iter().all(|(.., mode)| *mode == "pause-and-stream"));
 
     // Every checkpoint restores to the directly stepped world, and the last
@@ -563,6 +572,115 @@ fn studio_resumes(durability: &str) {
     let inspection = flife_cli::inspect(&dir, InspectOptions::default()).expect("inspects");
     assert_eq!(inspection.inspected.checkpoint.tick, until.get());
     assert_eq!(inspection.inspected.digest, uninterrupted.digest().to_hex());
+}
+
+/// The directories under `root`, `root` first.
+fn directories(root: &Path) -> Vec<PathBuf> {
+    let mut found = vec![root.to_path_buf()];
+    let mut at = 0;
+    while at < found.len() {
+        let entries = fs::read_dir(&found[at]).expect("a readable directory");
+        for entry in entries {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                found.push(path);
+            }
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Directories made read-only, made writable again when dropped.
+struct ReadOnly(Vec<PathBuf>);
+
+impl ReadOnly {
+    fn new(directories: Vec<PathBuf>) -> Self {
+        set_mode(&directories, 0o555);
+        Self(directories)
+    }
+}
+
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        set_mode(&self.0, 0o755);
+    }
+}
+
+fn set_mode(directories: &[PathBuf], mode: u32) {
+    for directory in directories {
+        let mut permissions = fs::metadata(directory).expect("metadata").permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(directory, permissions).expect("permissions set");
+    }
+}
+
+/// A checkpoint that fails is reported unkept, and the session is not held
+/// at its multiple: it runs on past it, takes no more checkpoints, and
+/// closes without a closing one.
+#[test]
+fn a_failed_checkpoint_lets_the_session_run_on() {
+    let config = configured("volatile-in-memory", &[]);
+    let every = config.report().checkpoint_interval_ticks.get();
+    let dir = fresh("unkept");
+    let keeping = Keeping::new(&dir, &config).expect("kept");
+    let (owner, handle, kept) = keeping
+        .open(found(&config), &config, STUDIO_SESSION)
+        .expect("the kept session opens");
+    let session =
+        SessionThread::spawn_kept(owner, handle, Some(kept)).expect("the session thread starts");
+    let statuses = gather(&session, Vec::new(), |statuses| {
+        !checkpoints(statuses).is_empty()
+    });
+
+    // The store takes no more chunks, so the checkpoint at the first
+    // multiple fails.
+    let store = ReadOnly::new(directories(&dir.join(flife_cli::STORE_DIR)));
+    session.send(Intent::Resume).expect("offered");
+    let unkept = |statuses: &[Status]| {
+        statuses
+            .iter()
+            .filter(|status| matches!(status, Status::Unkept { .. }))
+            .count()
+    };
+    let mut statuses = gather(&session, statuses, |statuses| unkept(statuses) == 1);
+
+    // Released, the session runs on past the multiple.
+    let paused = |statuses: &[Status]| -> Vec<Tick> {
+        statuses
+            .iter()
+            .filter_map(|status| match status {
+                Status::Paused { at } => Some(*at),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut attempts = 0;
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        session.send(Intent::Pause).expect("offered");
+        let before = paused(&statuses).len();
+        statuses = gather(&session, statuses, |statuses| {
+            paused(statuses).len() > before
+        });
+        let at = *paused(&statuses).last().expect("paused");
+        if at.get() > every {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 25, "held at {at:?}: {statuses:?}");
+        session.send(Intent::Resume).expect("offered");
+    }
+    let (closed, closing) = session.close_reporting().expect("closes");
+    drop(store);
+    let statuses: Vec<Status> = statuses.into_iter().chain(closing).collect();
+    assert!(closed.boundary.tick.get() > every, "{:?}", closed.boundary);
+    assert_eq!(unkept(&statuses), 1, "{statuses:?}");
+    let ticks: Vec<Tick> = checkpoints(&statuses)
+        .iter()
+        .map(|(tick, ..)| *tick)
+        .collect();
+    assert_eq!(ticks, [Tick::new(0)], "only the founding checkpoint");
 }
 
 /// `Studio::resume` refuses, before anything is read or any surface opens,

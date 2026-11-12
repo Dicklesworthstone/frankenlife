@@ -380,27 +380,46 @@ fn serve(
                         client.watchers.push(watcher);
                     }
                 }
-                // A kept session: its founding checkpoint before any intent,
-                // then the checkpointer.
+                // A kept session: its founding checkpoint and its first
+                // hold before any intent, then the checkpointer.
                 let kept = checkpoints.is_some();
                 let stop = Arc::new(AtomicBool::new(false));
                 let mut keeper = None;
+                let mut unheld = None;
                 if let Some(checkpoints) = checkpoints
-                    && let Some(checkpoints) = keep::found(&cx, &handle, checkpoints, &report).await
+                    && let Some((checkpoints, holding)) =
+                        keep::found(&cx, &handle, checkpoints, &report).await
                 {
-                    let (session, kept_report, kept_stop) =
-                        (handle.clone(), report.clone(), Arc::clone(&stop));
-                    let spawned = watchers.try_spawn(async move {
-                        let cx = Cx::current()?;
-                        keep::keep(&cx, &session, checkpoints, &kept_report, &kept_stop).await
-                    });
-                    match spawned {
-                        Ok(task) => keeper = Some(task),
-                        Err(error) => {
-                            let _ = report.send(Status::Unkept {
-                                kind: "missing-capability",
-                                detail: format!("the checkpointer: {error}"),
+                    match holding {
+                        // Interval zero: only the closing checkpoint.
+                        None => unheld = Some(checkpoints),
+                        Some(holding) => {
+                            let (session, kept_report, kept_stop) =
+                                (handle.clone(), report.clone(), Arc::clone(&stop));
+                            let spawned = watchers.try_spawn(async move {
+                                let cx = Cx::current()?;
+                                keep::keep(
+                                    &cx,
+                                    &session,
+                                    checkpoints,
+                                    holding,
+                                    &kept_report,
+                                    &kept_stop,
+                                )
+                                .await
                             });
+                            match spawned {
+                                Ok(task) => keeper = Some(task),
+                                Err(error) => {
+                                    let _ = report.send(Status::Unkept {
+                                        kind: "missing-capability",
+                                        detail: format!("the checkpointer: {error}"),
+                                    });
+                                    // Nothing waits at the hold: let the
+                                    // session run past it.
+                                    let _ = handle.release(&cx).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -415,12 +434,17 @@ fn serve(
                     let _ = report.send(status);
                 }
                 let closed = if kept {
+                    // Paused first, so a checkpoint the checkpointer is
+                    // taking is of the paused boundary; then the hold is
+                    // released, which ends the checkpointer's wait.
+                    let paused = handle.pause(&cx).await;
                     stop.store(true, Ordering::Release);
+                    let _ = handle.release(&cx).await;
                     let checkpoints = match keeper {
                         Some(task) => task.await,
-                        None => None,
+                        None => unheld,
                     };
-                    keep::close(&cx, &handle, checkpoints, &report).await
+                    keep::close(&cx, &handle, checkpoints, paused, &report).await
                 } else {
                     handle.close(&cx).await
                 };

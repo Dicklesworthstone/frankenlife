@@ -24,6 +24,12 @@
 //! - stops running on a capacity pause (the boundary stays sealed for the
 //!   identical retry), and stops the run on a numerical fault under
 //!   `stop-and-preserve`, failing every unfinished command.
+//! - keeps the committed boundary at a client's held tick
+//!   ([`SessionHandle::hold`]): a run stays running and a step waits there,
+//!   with control live, until the hold moves or is released, and the
+//!   hold's wait is answered once the boundary is there. A hold that
+//!   arrives at the cancellation boundary takes effect after that
+//!   candidate is decided.
 //! - offers each committed boundary to its render feed (FL-017) before
 //!   anyone hears of it. Viewers lease epochs from the feed directly,
 //!   never through the lanes. When every slot is busy the boundary stays
@@ -238,6 +244,8 @@ pub struct Snapshot {
     pub running: bool,
     /// The tick a running owner stops at, if any.
     pub until: Option<Tick>,
+    /// The tick no run or step passes ([`SessionHandle::hold`]), if any.
+    pub hold: Option<Tick>,
     /// Unfinished commands.
     pub unfinished: usize,
     /// Commands ever accepted.
@@ -330,9 +338,17 @@ enum Control {
     },
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
     Take(Take),
+    /// Hold the committed boundary at `tick`, or release the hold (`None`).
+    Hold {
+        tick: Option<Tick>,
+        set: oneshot::Sender<Result<Boundary, CoreError>>,
+        reached: Option<HoldReply>,
+    },
     Close(oneshot::Sender<Boundary>),
     Suspend(oneshot::Sender<Boundary>),
 }
+
+type HoldReply = oneshot::Sender<Result<Boundary, CoreError>>;
 
 struct Submission {
     command: Command,
@@ -375,6 +391,7 @@ impl std::fmt::Debug for Control {
             Self::OrganismWeights { .. } => "OrganismWeights",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Take(_) => "Take",
+            Self::Hold { .. } => "Hold",
             Self::Close(_) => "Close",
             Self::Suspend(_) => "Suspend",
         })
@@ -680,6 +697,92 @@ impl SessionHandle {
     /// As [`SessionHandle::submit`].
     pub async fn suspend(&self, cx: &Cx) -> Result<Boundary, CoreError> {
         self.control(cx, Control::Suspend).await
+    }
+
+    /// Hold the session at committed tick `tick` (FL-024: a kept Studio
+    /// session's checkpoints on their multiples): no run and no step takes
+    /// the committed boundary past it until the hold moves or is released.
+    /// A run stays running while held, and ends as it would have; a step
+    /// requested at the hold waits there with it. Control stays live, so a
+    /// checkpoint, an inspection, a pause or a close is answered at the
+    /// held boundary. A hold replaces the session's earlier one, whose
+    /// wait is answered with [`CoreError::StateConflict`]. Holding changes
+    /// no result: the world a held session commits is the world it commits
+    /// unheld.
+    ///
+    /// Returns at once with the committed boundary; the returned
+    /// [`Holding`] waits for the boundary to be at `tick`.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`]; [`CoreError::StateConflict`] when the
+    /// committed tick is already past `tick` (a running session may pass it
+    /// before the request arrives), and the earlier hold stays.
+    pub async fn hold(&self, cx: &Cx, tick: Tick) -> Result<Holding, CoreError> {
+        let (reached, waiting) = oneshot::channel();
+        let set = self
+            .control(cx, |set| Control::Hold {
+                tick: Some(tick),
+                set,
+                reached: Some(reached),
+            })
+            .await??;
+        Ok(Holding { tick, set, waiting })
+    }
+
+    /// Release the session's hold, if any, returning the committed
+    /// boundary. A wait on the hold is answered with
+    /// [`CoreError::StateConflict`].
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`].
+    pub async fn release(&self, cx: &Cx) -> Result<Boundary, CoreError> {
+        self.control(cx, |set| Control::Hold {
+            tick: None,
+            set,
+            reached: None,
+        })
+        .await?
+    }
+}
+
+/// A hold set by [`SessionHandle::hold`].
+pub struct Holding {
+    tick: Tick,
+    set: Boundary,
+    waiting: oneshot::Receiver<Result<Boundary, CoreError>>,
+}
+
+impl std::fmt::Debug for Holding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Holding")
+            .field("tick", &self.tick)
+            .field("set", &self.set)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Holding {
+    /// The tick held.
+    #[must_use]
+    pub const fn tick(&self) -> Tick {
+        self.tick
+    }
+
+    /// The committed boundary when the hold was set.
+    #[must_use]
+    pub const fn set(&self) -> Boundary {
+        self.set
+    }
+
+    /// Wait until the committed boundary is at the held tick, and return
+    /// it; at once when it was there already.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when the hold is moved or released
+    /// first; [`CoreError::QueueClosed`] when the session closes first;
+    /// [`CoreError::Cancelled`] when the wait is cancelled.
+    pub async fn reached(self, cx: &Cx) -> Result<Boundary, CoreError> {
+        answer(cx, self.waiting).await?
     }
 }
 
@@ -1040,6 +1143,9 @@ pub struct SessionOwner {
     deferred: VecDeque<Control>,
     journal: Option<Durable>,
     held: VecDeque<Control>,
+    /// The tick no run or step passes ([`SessionHandle::hold`]), and the
+    /// wait to answer when the committed boundary is there.
+    hold: Option<(Tick, Option<HoldReply>)>,
 }
 
 impl std::fmt::Debug for Durable {
@@ -1337,6 +1443,7 @@ fn build(
         deferred: VecDeque::new(),
         journal,
         held: VecDeque::new(),
+        hold: None,
     };
     let handle = SessionHandle {
         session: limits.session,
@@ -1352,7 +1459,7 @@ enum Ticked {
     Published(Box<TickReport>, Vec<CommandId>),
     Paused(CapacityShortfall),
     Failed(CoreError),
-    /// The boundary waits for a journal receipt; nothing changed.
+    /// The boundary waits for a journal receipt or a hold; nothing changed.
     Held,
     Closing,
 }
@@ -1376,6 +1483,7 @@ impl SessionOwner {
             live: self.world.population().len(),
             running: self.run.is_some(),
             until: self.run.as_ref().and_then(|run| run.until),
+            hold: self.hold.as_ref().map(|&(tick, _)| tick),
             unfinished: self.book.unfinished(),
             admitted: self.book.admitted(),
             outcomes: self.book.outcome_cursor(),
@@ -1385,12 +1493,35 @@ impl SessionOwner {
         }
     }
 
-    /// Whether the committed boundary waits for a journal receipt.
+    /// Whether a hold keeps the committed boundary where it is.
+    fn held_here(&self) -> bool {
+        self.hold
+            .as_ref()
+            .is_some_and(|&(tick, _)| tick == self.world.tick())
+    }
+
+    /// Answer the hold's wait once the committed boundary is at its tick.
+    fn reach_hold(&mut self) {
+        if !self.held_here() {
+            return;
+        }
+        let boundary = self.boundary();
+        if let Some((_, waiting)) = &mut self.hold
+            && let Some(waiting) = waiting.take()
+        {
+            let _ = waiting.send_blocking(Ok(boundary));
+        }
+    }
+
+    /// Whether the committed boundary waits for a journal receipt or is
+    /// held.
     fn holding(&self) -> bool {
         let committed = self.world.tick();
-        self.journal
-            .as_ref()
-            .is_some_and(|journal| journal.holds(committed))
+        self.held_here()
+            || self
+                .journal
+                .as_ref()
+                .is_some_and(|journal| journal.holds(committed))
     }
 
     /// Whether the owner may take another submission now.
@@ -1585,6 +1716,34 @@ impl SessionOwner {
                 }
                 take(Ok((&self.world, &self.book, self.boundary())));
             }
+            Control::Hold { tick, set, reached } => {
+                let boundary = self.boundary();
+                if let Some(tick) = tick
+                    && tick < boundary.tick
+                {
+                    let _ = set.send_blocking(Err(CoreError::StateConflict {
+                        operation: "hold session",
+                        detail: format!(
+                            "the committed tick {} is past {}",
+                            boundary.tick.get(),
+                            tick.get()
+                        ),
+                    }));
+                    return;
+                }
+                if let Some((_, Some(waiting))) = self.hold.take() {
+                    let _ = waiting.send_blocking(Err(CoreError::StateConflict {
+                        operation: "hold session",
+                        detail: match tick {
+                            Some(tick) => format!("the hold moved to tick {}", tick.get()),
+                            None => "the hold was released".into(),
+                        },
+                    }));
+                }
+                self.hold = tick.map(|tick| (tick, reached));
+                let _ = set.send_blocking(Ok(boundary));
+                self.reach_hold();
+            }
             Control::Close(reply) => {
                 self.suspending = false;
                 self.closing.push(reply);
@@ -1603,6 +1762,9 @@ impl SessionOwner {
         loop {
             if cx.checkpoint().is_err() {
                 return Ticked::Closing;
+            }
+            if self.held_here() {
+                return Ticked::Held;
             }
             let committed = self.world.tick();
             if let Some(journal) = &mut self.journal {
@@ -1796,6 +1958,7 @@ impl SessionOwner {
             // that waited for them, deferred control, then both lanes,
             // control first.
             self.offer_render();
+            self.reach_hold();
             self.settle_receipts();
             self.release_held(cx).await;
             while let Some(message) = self.deferred.pop_front() {
@@ -1856,6 +2019,8 @@ impl SessionOwner {
                     continue;
                 }
             }
+            // A step handled above may have reached the hold.
+            self.reach_hold();
             let room = self.room();
             let Self {
                 control,
@@ -1913,6 +2078,10 @@ impl SessionOwner {
         while let Ok(submission) = self.science.try_recv() {
             submissions.push(submission);
         }
+        // A closed session holds nothing: a wait on its hold ends.
+        if let Some((_, Some(waiting))) = self.hold.take() {
+            let _ = waiting.send_blocking(Err(closed()));
+        }
         let snapshot = Snapshot {
             running: false,
             until: None,
@@ -1936,6 +2105,12 @@ impl SessionOwner {
                     let _ = reply.send_blocking(Err(closed()));
                 }
                 Control::Take(take) => take(Err(closed())),
+                Control::Hold { set, reached, .. } => {
+                    let _ = set.send_blocking(Err(closed()));
+                    if let Some(reached) = reached {
+                        let _ = reached.send_blocking(Err(closed()));
+                    }
+                }
                 Control::Cancel { id, reply } => {
                     let decision = match self.book.status(id) {
                         Some(CommandStatus::Terminal(outcome)) => {

@@ -1,13 +1,15 @@
 //! FL-024: `flife-studio --run DIR`, the binary keeping its session in a
 //! run directory. Its `open` record names the directory and the checkpoint
 //! admission, charged in the memory admission; a `checkpoint` record
-//! follows each checkpoint published, from tick 0 to the closing boundary,
-//! which the `end` record names; the statuses reported while it closes are
+//! follows each checkpoint published: tick 0, exactly each multiple of the
+//! interval it reached, and the closing boundary, which the `end` record
+//! names; the statuses reported while it closes are
 //! printed before `end`; the window's telemetry line names the newest
 //! checkpoint's tick (plan §14.1); and `flife inspect` restores the world
 //! the Studio closed on. `flife-studio --resume DIR` then runs it on from
 //! there: its `open` record names the checkpoint it resumed from, its
-//! checkpoints follow the run's, and it closes on the world stepped directly
+//! checkpoints follow the run's at the multiples after it, and it closes on
+//! the world stepped directly
 //! from the founding to its tick. A configuration beside `--resume` is
 //! refused. Every run passes `--offscreen`, so none opens a window.
 //! Headless Metal: without a Metal device the test returns early.
@@ -64,6 +66,21 @@ fn configuration() -> String {
         lines[line] = format!("{key} = {value}");
     }
     lines.join("\n")
+}
+
+/// The configuration's checkpoint interval in ticks.
+const EVERY: u64 = 128;
+
+/// The ticks a kept run that runs from `from` to `to` checkpoints at:
+/// every multiple of [`EVERY`] from `from` on, then `to` unless it is one.
+fn chain(from: u64, to: u64) -> Vec<u64> {
+    let mut ticks: Vec<u64> = (from..=to)
+        .filter(|tick| tick.is_multiple_of(EVERY))
+        .collect();
+    if !to.is_multiple_of(EVERY) {
+        ticks.push(to);
+    }
+    ticks
 }
 
 fn number(record: &Value, key: &str) -> u64 {
@@ -164,12 +181,13 @@ fn an_offscreen_studio_keeps_a_run_the_command_line_inspects() {
         .collect();
     println!("checkpoints {kept:?}, closed at {closed_at}");
     assert!(kept.len() >= 3, "{kept:?}");
-    assert_eq!(kept[0].0, 0);
-    assert!(
-        kept.windows(2)
-            .all(|pair| pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1)
+    // Tick 0, exactly every multiple the run reached, then the closing
+    // boundary unless a multiple's holds it.
+    assert_eq!(
+        kept.iter().map(|&(tick, _)| tick).collect::<Vec<_>>(),
+        chain(0, closed_at)
     );
-    assert_eq!(kept.last().expect("kept").0, closed_at);
+    assert!(kept.windows(2).all(|pair| pair[1].1 > pair[0].1));
     assert_eq!(number(end, "checkpoint_tick"), closed_at);
     let closing = &records[records.len() - 2];
     assert_eq!(
@@ -289,15 +307,21 @@ fn an_offscreen_studio_keeps_a_run_the_command_line_inspects() {
         .map(|record| (number(record, "tick"), number(record, "sequence")))
         .collect();
     println!("resumed at {closed_at}: checkpoints {later:?}, closed at {until}");
-    let mut chain = kept.clone();
-    chain.extend(&later);
+    let mut whole = kept.clone();
+    whole.extend(&later);
     assert!(
-        chain
+        whole
             .windows(2)
             .all(|pair| pair[1].0 > pair[0].0 && pair[1].1 > pair[0].1),
-        "{chain:?}"
+        "{whole:?}"
     );
-    assert_eq!(later.last().expect("a closing checkpoint").0, until);
+    // Resumed, it checkpoints at exactly each multiple after the tick it
+    // resumed at, then at its own closing boundary unless a multiple's
+    // holds it.
+    assert_eq!(
+        later.iter().map(|&(tick, _)| tick).collect::<Vec<_>>(),
+        chain(closed_at + 1, until)
+    );
     assert_eq!(number(end, "checkpoint_tick"), until);
 
     // The world it closed on is the one stepped directly from the founding.

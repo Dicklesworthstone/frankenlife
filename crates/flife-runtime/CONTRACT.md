@@ -29,7 +29,7 @@ inherits every command and outcome, records the fork, and from then on admits on
   order after the amount; an introduction carries the cell, the count (`u32`) and the energy's bits. An energy
   injection's record is byte for byte FL-014's, and every earlier record decodes unchanged.
 - Control requests: pause, resume, run until a tick, step, cancel, status, inspect, close and suspend (FL-037);
-  checkpoint and durable outcome (FL-036); inspect one organism (FL-021).
+  checkpoint and durable outcome (FL-036); inspect one organism (FL-021); hold a tick and release it (FL-024).
 - For `open_journaled` (FL-036): a `JournalWriter` started over a `Journal` implementation, and the
   `JournalContents` it read back when it opened the session's run.
 
@@ -54,8 +54,12 @@ inherits every command and outcome, records the fork, and from then on admits on
   - `Paused`: a capacity shortfall, at an unchanged boundary;
   - `Failed`: the error, and whether the run stopped.
 - `RunEnd` for a bounded run: `Reached`, `Paused`, `CapacityPaused`, `Failed` or `Closed`, each with its boundary.
-- `Snapshot`: the committed boundary and world digest, live count, running state, unfinished, admitted and outcome
-  counts, whether the run stopped, and the render publisher's `RenderStats` (FL-017).
+- `Snapshot`: the committed boundary and world digest, live count, running state, the tick a run stops at and the
+  tick held, unfinished, admitted and outcome counts, whether the run stopped, and the render publisher's
+  `RenderStats` (FL-017).
+- FL-024: `SessionHandle::hold(tick)` returns a `Holding` at once (its `tick` and the boundary it was `set` at), whose
+  `reached()` answers with the boundary once the committed tick is `tick`; `SessionHandle::release()` returns the
+  committed boundary.
 - FL-021: `SessionHandle::inspect_organism(id)`: the committed world's `World::organism_snapshot(id)`, an
   `OrganismSnapshot` whose `tick` is the boundary it was read at, or `None` when the committed world does not hold
   the organism. The owner's world then watches that organism (`World::watch`), so a later inspection of it carries
@@ -146,6 +150,14 @@ inherits every command and outcome, records the fork, and from then on admits on
 - `open_restored` (FL-037) opens a `volatile-in-memory` session on a restored world and book, refusing a book of
   another session or revision as `open_journaled` does.
 - Scientific ticks are never skipped and the timestep never changes. A run to tick `t` stops exactly at `t`.
+- A hold (FL-024, for a kept Studio session's checkpoints on their multiples) keeps the committed boundary at its
+  tick: a run stays running there and ends only as it would have (a pause, its tick, a close), and a step requested
+  there waits with it, as a step waits for a journal receipt. Control stays live, so a checkpoint, an inspection or
+  a pause is answered at the held boundary. A hold's wait is answered when the committed tick reaches it, at once
+  if it is there; with a state conflict when the hold is moved or released first; as closed when the session
+  closes. A hold at a tick the committed one has passed is refused and the earlier hold stays; a hold that arrives
+  at the cancellation boundary is decided after that candidate, so a running session can pass the committed tick
+  it names. Holding changes no result.
 - An organism inspection (FL-021), like `inspect`, is answered at a committed boundary: at once while paused; while
   running, deferred from the cancellation boundary to the next committed one; while closing, at the closed
   boundary. It reads only the committed world, so a session commits the same states whether or not it is inspected.
@@ -281,8 +293,9 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - energy reconciliation: the injection applies at exactly its tick, never above the request, and is recorded as
     `command-injection` and closed by the ledger;
   - every admission refusal, closing, and failing every unfinished command when the run stops.
-- `tests/session.rs` (13 tests), with the owner and clients as separate Asupersync Lab tasks, quiescent and
-  invariant-clean under each seed:
+- `tests/session.rs` (16 tests; until FL-024's hold it had 15, though this list counted 13 and named neither the
+  started run nor `open_restored`'s refusals), with the owner and clients as separate Asupersync Lab tasks,
+  quiescent and invariant-clean under each seed:
   - `volatile-in-memory` admitted, and `write-ahead-before-apply` refused by `open` with a pointer to
     `open_journaled`;
   - C.14's full scientific queue while paused, with inspect, step, run, pause, resume and close still served;
@@ -292,6 +305,14 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     outcomes occur (before sealing, at the cancellation boundary, too late), the world shows exactly the winner,
     and each seed replays;
   - a pause while running, at a reported boundary from which the next step advances one tick;
+  - a started run reports its start at once and its end later: an open run ends on a pause at the pause's
+    boundary, a bounded run at its tick, and a run open at the close ends closed;
+  - FL-024, over six seeds: a hold set at tick 0 is reached by a run at tick 3, which stays running there (the
+    snapshot's boundary and hold, a checkpoint of that boundary); moved to 7, the run reaches it; a hold at 5 is
+    refused and 7 stays; a pause at the hold ends the run there; a step requested there by another client does not
+    pass it (the boundary unmoved 80 yields later) until the hold is released, then publishes 8; a moved and a
+    released hold's waits end in state conflicts and an open one's in the session's close; the closed world is the
+    direct one at 8;
   - a capacity pause that keeps its boundary sealed: the identical retry, a refused late command, and a sealed
     cancellation;
   - a numerical fault that fails every unfinished command, refuses new work, steps and runs, and preserves the
@@ -301,6 +322,8 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     recorded, later requests are refused; with a close sent in the same poll the close wins;
   - dropping every handle, while paused and while running (the latter within a 2,000-step Lab bound, so an owner
     that ignores the dropped handles fails quickly instead of hanging);
+  - `open_restored` refuses a book of another session or another revision (state conflict) and a
+    `write-ahead-before-apply` limit (missing capability), and opens the world's own book;
   - the same protocol on the native current-thread runtime.
 - `tests/inspect.rs` (6 tests, FL-021), Lab seeds, each answer compared with the snapshot or weight dump of a world
   stepped directly to the answer's tick:
@@ -326,6 +349,10 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   a dump that watches its organism (with the CLI's and the Studio's, 10 of 10). The closing owner's answer
   survived until the test sent its dump and close while a run was going: an idle owner answers the dump before
   it shuts down.
+- Planted bugs in the hold (FL-024), each caught by the hold test: a step passing it; a hold that holds neither
+  runs nor steps (caught when the Lab's step bound ran out, about six minutes); a wait never answered; a hold at
+  a passed tick taken; a moved hold's wait dropped unanswered; a release that does nothing; the snapshot naming
+  no hold.
 - `tests/observation.rs` (3 tests, FL-017), each world compared with one stepped directly with no session and no
   feed:
   - G3 over three Lab seeds. A viewer retaining two epochs makes boundaries 3–48 busy while the feed keeps tick 2

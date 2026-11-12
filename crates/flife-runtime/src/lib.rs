@@ -45,7 +45,7 @@ pub use journal::{
     JOURNAL_ATTEMPTS, Journal, JournalContents, JournalRecord, JournalWriter, Watermarks,
 };
 pub use session::{
-    Boundary, JournalState, RunEnd, Running, SessionCheckpoint, SessionClosed, SessionConfig,
-    SessionHandle, SessionOwner, Snapshot, StepOutcome, WRITE_AHEAD_BEFORE_APPLY, open,
-    open_journaled, open_restored, open_with,
+    Boundary, Holding, JournalState, RunEnd, Running, SessionCheckpoint, SessionClosed,
+    SessionConfig, SessionHandle, SessionOwner, Snapshot, StepOutcome, WRITE_AHEAD_BEFORE_APPLY,
+    open, open_journaled, open_restored, open_with,
 };

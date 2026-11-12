@@ -13,6 +13,8 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 
 use asupersync::runtime::{RuntimeBuilder, yield_now};
@@ -859,6 +861,121 @@ fn open_restored_refuses_a_book_that_is_not_the_worlds() {
         matches!(refused, Err(CoreError::MissingCapability { .. })),
         "{refused:?}"
     );
+}
+
+/// FL-024: a hold keeps a run, and a step, at its tick until it moves or is
+/// released, answering its wait there; a checkpoint is of the held
+/// boundary; a hold at a passed tick is refused and the earlier one stays;
+/// a moved, released or closed hold's wait ends with an error; and the
+/// world a held session commits is the directly stepped one.
+#[test]
+fn a_hold_keeps_runs_and_steps_at_its_tick_and_changes_no_result() {
+    let config = ecology(&[]);
+    for seed in 0..6 {
+        let (results, closed) = lab(seed, &config, |handle| {
+            let stepper = handle.clone();
+            let stepping = Arc::new(AtomicBool::new(false));
+            let stepped = Arc::clone(&stepping);
+            vec![
+                Box::pin(async move {
+                    let cx = cx();
+                    // Set while paused at 0; a run reaches it and stays
+                    // running there.
+                    let holding = handle.hold(&cx, Tick::new(3)).await.expect("hold");
+                    assert_eq!(holding.tick(), Tick::new(3));
+                    assert_eq!(holding.set().tick, Tick::new(0));
+                    let running = handle.start(&cx, None).await.expect("start");
+                    let reached = holding.reached(&cx).await.expect("reached");
+                    assert_eq!(reached.tick, Tick::new(3));
+                    for _ in 0..40 {
+                        yield_now().await;
+                    }
+                    let snapshot = handle.inspect(&cx).await.expect("inspect");
+                    assert_eq!(snapshot.boundary, reached);
+                    assert!(snapshot.running);
+                    assert_eq!(snapshot.hold, Some(Tick::new(3)));
+                    let checkpoint = handle.checkpoint(&cx).await.expect("checkpoint");
+                    assert_eq!(checkpoint.boundary, reached);
+
+                    // Moved, the run goes on to the next hold; a hold at a
+                    // passed tick is refused and the hold stays.
+                    let holding = handle.hold(&cx, Tick::new(7)).await.expect("hold");
+                    assert_eq!(holding.set(), reached);
+                    let reached = holding.reached(&cx).await.expect("reached");
+                    assert_eq!(reached.tick, Tick::new(7));
+                    let past = handle.hold(&cx, Tick::new(5)).await.expect_err("past");
+                    assert_eq!(past.kind(), "state-conflict");
+                    assert_eq!(
+                        handle.inspect(&cx).await.expect("inspect").hold,
+                        Some(Tick::new(7))
+                    );
+
+                    // Paused at the hold, the run ends there; a step there
+                    // waits until the hold is released.
+                    let paused = handle.pause(&cx).await.expect("pause");
+                    assert_eq!(paused, reached);
+                    assert_eq!(
+                        running.ended(&cx).await.expect("end"),
+                        RunEnd::Paused(paused)
+                    );
+                    while !stepping.load(Ordering::Acquire) {
+                        yield_now().await;
+                    }
+                    for _ in 0..80 {
+                        yield_now().await;
+                    }
+                    assert_eq!(
+                        handle.inspect(&cx).await.expect("inspect").boundary,
+                        paused,
+                        "a step passed the hold"
+                    );
+                    assert_eq!(handle.release(&cx).await.expect("release"), paused);
+                    while handle.inspect(&cx).await.expect("inspect").boundary.tick < Tick::new(8) {
+                        yield_now().await;
+                    }
+                    assert_eq!(handle.inspect(&cx).await.expect("inspect").hold, None);
+
+                    // A hold's wait ends when it is moved, released, or the
+                    // session closes first.
+                    let moved = handle.hold(&cx, Tick::new(12)).await.expect("hold");
+                    let released = handle.hold(&cx, Tick::new(13)).await.expect("hold");
+                    assert_eq!(
+                        moved.reached(&cx).await.expect_err("moved").kind(),
+                        "state-conflict"
+                    );
+                    handle.release(&cx).await.expect("release");
+                    assert_eq!(
+                        released.reached(&cx).await.expect_err("released").kind(),
+                        "state-conflict"
+                    );
+                    let open = handle.hold(&cx, Tick::new(20)).await.expect("hold");
+                    let boundary = handle.close(&cx).await.expect("close");
+                    assert_eq!(
+                        open.reached(&cx).await.expect_err("closed").kind(),
+                        "queue-closed"
+                    );
+                    Some(boundary)
+                }) as Client<Option<Boundary>>,
+                Box::pin(async move {
+                    let cx = cx();
+                    while stepper.inspect(&cx).await.expect("inspect").boundary.tick < Tick::new(7)
+                        || stepper.inspect(&cx).await.expect("inspect").running
+                    {
+                        yield_now().await;
+                    }
+                    stepped.store(true, Ordering::Release);
+                    let step = stepper.step(&cx).await.expect("step");
+                    assert_eq!(published(&step).0.tick, Tick::new(8));
+                    None
+                }),
+            ]
+        });
+        let boundary = results[0].expect("closed");
+        assert_eq!(boundary.tick, Tick::new(8));
+        assert_eq!(closed.boundary, boundary);
+        let expected = reference(&config, 8, &[]);
+        assert_eq!(closed.world.digest(), expected.digest());
+    }
 }
 
 /// When every handle is dropped the owner closes on its own.

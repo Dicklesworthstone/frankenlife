@@ -82,7 +82,7 @@ pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, Resumed, STUDIO_SESSION, Studio, StudioClosed,
     StudioOptions, Surface,
 };
-pub use keep::{CHECKPOINT_POLL, Keeping};
+pub use keep::Keeping;
 pub use overlay::{
     BrushPreview, Inspected, OverlayState, PANEL_ANCESTORS, Recent, Telemetry, field_key,
     inspector_lines, legends, overlay_text, preview_line, recent, telemetry_lines,

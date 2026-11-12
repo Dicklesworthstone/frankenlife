@@ -143,14 +143,18 @@ directory, with its pending commands and its checkpoint chain.
     that published it and the energy it moved. A paused session holds the command until a step or a run reaches
     its boundary. At close, a pending command's watcher stops when the session refuses its status.
   - FL-024: `SessionThread::spawn_kept(owner, handle, Some(checkpoints))` keeps the session's run directory
-    (`keep`). It publishes the founding checkpoint before it takes any intent (when the interval is not zero).
-    A checkpointer task, owned by the controller, reads the committed boundary every `CHECKPOINT_POLL` = 50 ms
-    through `checkpoint_with` and, once it is at or past the next multiple of the interval after the newest
-    checkpoint, takes one (`flife_cli::Checkpoints::take`) at the boundary the session is at then. Closing stops it,
-    pauses the session, publishes the closing boundary unless the newest holds it or a fault stopped the world,
-    publishes a background checkpoint in flight, and suspends the session rather than closing it. Each
-    checkpoint reports `Checkpointed { tick, epoch, sequence, sha256, bytes, retired, mode, paused_seconds }`; a
-    failed one reports `Unkept { kind, detail }`, and no more are taken while the session runs on.
+    (`keep`). It publishes the founding checkpoint before it takes any intent (when the interval is not zero),
+    and then, also before any intent, holds the session (`SessionHandle::hold`) at the next multiple of the
+    interval after the committed tick. A checkpointer task, owned by the controller, waits for the hold to be
+    reached, takes a checkpoint there (`flife_cli::Checkpoints::take`) and moves the hold to the next multiple, so
+    every checkpoint a running session takes is at a multiple and each multiple it reaches has one, as `flife
+    run`'s do. A run waits at a multiple only while its checkpoint is taken, a step there waits with it, and the
+    session commits the same worlds. Closing pauses the session, releases the hold (which ends the checkpointer's
+    wait), publishes the closing boundary unless the newest holds it or a fault stopped the world, publishes a
+    background checkpoint in flight, and suspends the session rather than closing it. Each checkpoint reports
+    `Checkpointed { tick, epoch, sequence, sha256, bytes, retired, mode, paused_seconds }`; a failed one, or a hold
+    refused, reports `Unkept { kind, detail }`: the hold is released and no more are taken while the session runs
+    on.
   - `close_reporting()` is `close()` that also returns every status not yet taken, those reported while it
     closed last (a run's end, a kept session's last checkpoints, the close); `Studio::close` puts them in
     `StudioClosed::statuses`.
@@ -803,13 +807,13 @@ presentation state, not scientific state.
     resizes not followed, an odd drawable not withheld, the timeline's hash of nothing; the binary writing no
     frame's records, no end or no timeline at all, and finding an existing timeline only after the Studio
     opens. All but one were caught. The binary dropping the session's statuses survives (see the gaps).
-- `tests/kept.rs` (4 tests, FL-024, no window; the Studio offscreen on headless Metal), a
+- `tests/kept.rs` (5 tests, FL-024, no window; the Studio offscreen on headless Metal), a
   `SessionThread::spawn_kept` over a 32 x 32 preset world with a checkpoint every 256 ticks, all retained:
   - `a_kept_studio_session_is_a_run_the_command_line_resumes`, under `volatile-in-memory` and
     `write-ahead-before-apply`: running, an energy stroke applies; paused, two steps, then a stroke accepted for
     the closing boundary is left pending at the close (`close_reporting`). The checkpoints reported hold tick 0,
-    then each tick at or past the next multiple after the one before, past 512 before the pause, then the
-    closing boundary, their sequences rising, all `pause-and-stream`. Each one `flife_cli::inspect` restores
+    then exactly each multiple of 256 the session reached, 512 among them, then the closing boundary unless a
+    multiple's holds it, their sequences rising, all `pause-and-stream`. Each one `flife_cli::inspect` restores
     has the reported sequence and SHA-256 and the digest of the world stepped directly with the applied stroke
     at its tick; the last is the world the session closed on; and `flife_cli::resume` six ticks on reaches
     exactly the uninterrupted world, the pending stroke applied at the closing boundary.
@@ -820,6 +824,9 @@ presentation state, not scientific state.
     click submit a stroke numbered 3, after the run's two; three more steps apply it. The world it closes on at 7
     is, bit for bit, the world stepped directly with the three strokes at their ticks; it publishes one closing
     checkpoint at 7 with a sequence past the earlier session's last, and `flife_cli::inspect` restores that digest.
+  - `a_failed_checkpoint_lets_the_session_run_on`: after the founding checkpoint the run directory's store is
+    made read-only (and writable again after); the checkpoint at the first multiple is reported `Unkept` once,
+    the session runs on past the multiple, and it closes with no checkpoint but the founding one.
   - `what_cannot_be_resumed_is_refused`: `run` set (`kept where it is`), `record` set (`replays from the founding
     world`) and an absent directory (`is not a run directory`), the directory never made.
   - `what_cannot_be_kept_is_refused_before_anything_is_created`: a directory holding a file (`is not empty`),
@@ -828,15 +835,18 @@ presentation state, not scientific state.
 - `tests/kept_binary.rs` (1 test, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5 --run R
   --timeline T` on that world with a checkpoint every 128 ticks. The `open` record names R and the
   `pause-and-stream` admission, whose `CHECKPOINT_FIXED_BYTES` the memory admission's `checkpoint` term
-  charges. The `checkpoint` records run from tick 0 to the `end`'s tick in order, `end.checkpoint_tick` names
-  it, the `closed` status is the record before `end`, and the run's last end is `paused` at that tick. The
+  charges. The `checkpoint` records are tick 0, exactly each multiple of 128 it reached, and the `end`'s tick
+  unless a multiple's holds it, in order; `end.checkpoint_tick` names it, the `closed` status is the record
+  before `end`, and the run's last end is `paused` at that tick. The
   overlays T recorded name only reported checkpoints, never an older one after a newer, and one past tick 0.
   `flife_cli::inspect(R)` restores the `end`'s digest at its tick. Then the configuration beside `--resume R`
   exits 2 and prints nothing, and `flife-studio --resume R --offscreen 1.5` (CPU controllers): its `open`
   record names R, `resumed` the closing checkpoint's tick and sequence, nothing skipped, and that tick, the
   `pause-and-stream` admission and the same `checkpoint` term; it ends past that tick, its `checkpoint` records
-  continue the first run's chain (ticks and sequences rising), the last at its `end`, which `checkpoint_tick`
-  names; and its `end` digest is the world founded from the configuration and stepped directly to that tick. no founding checkpoint; a checkpoint due again at the newest's own multiple;
+  continue the first run's chain (ticks and sequences rising) and are exactly each multiple of 128 after the
+  tick it resumed at, then its `end`'s tick unless a multiple's holds it, which `checkpoint_tick` names (one
+  run: 0, 128, ..., 1,408 and the close at 1,409; resumed, 1,536, ..., 2,176 and the close at 2,177); and its `end` digest is the world founded from the configuration and stepped directly to that tick.
+- FL-024's kept-run planted bugs, 15: no founding checkpoint; a checkpoint due again at the newest's own multiple;
   a checkpointer that never finds one due; no checkpoint of the closing boundary; a kept session closed rather
   than suspended; no pause before the closing checkpoint; the checkpoint not charged; the overlay never naming a
   checkpoint; the closing statuses not printed; the host keeping no checkpoints; the `open` record naming no
@@ -844,6 +854,13 @@ presentation state, not scientific state.
   put back after one, and `vacant` taking a directory that holds files. Each was caught. The missing pause
   survived the first run (the session usually suspends at the boundary the closing checkpoint holds) and is
   caught by the run's `paused` end, checked since.
+- FL-024's checkpoints on multiples, planted bugs in the checkpointer, 9: the hold at the current multiple; a
+  multiple skipped; releasing before pausing at the close (a checkpoint then lands off its multiple in the
+  binary run); a failed checkpoint keeping the hold; no hold set; the first hold ignoring a resumed run's tick:
+  each caught. The close never releasing the hold hangs the close (killed after its timeout: the tests report
+  it only by not finishing). Two survive: the checkpointer not checking for the close after a new hold (it
+  guards a race between the close and a checkpoint being taken that no test forces), and an interval of zero
+  dropping the closing checkpoint (unreachable: the schema requires a positive interval).
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -929,13 +946,12 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
 - FL-024, plan §14.1's telemetry:
   - The v1 schema configures no scientific rate (the Studio runs as fast as it can), so the telemetry shows the
     achieved ticks a second and no configured one.
-  - Without `--run` the session keeps no run directory, so the checkpoint line reads `no checkpoint`. With it, a
-    running session's checkpoint lands at the first boundary the checkpointer reads at or past the next
-    multiple of the interval, and multiples a run passes between two reads share one; `flife run` steps one tick
-    at a time and lands on each. In a debug build the 32 x 32 test world ran 49 ticks before the first read
-    (`tests/kept.rs` once used an 8-tick interval: its checkpoints were at 0, 49 and the close). In one run of
-    `tests/kept_binary.rs` (128 ticks, about 780 ticks a second while rendering) checkpoints landed 3 to 135
-    ticks past their multiples, and one (775) covered both 640 and 768.
+  - Without `--run` the session keeps no run directory, so the checkpoint line reads `no checkpoint`. With it,
+    checkpoints land on the interval's multiples (until FL-024's hold they landed at the first boundary a 50 ms
+    poll read past one, 3 to 135 ticks late in `tests/kept_binary.rs`, and multiples passed between two reads
+    shared one). The run waits at each multiple while its checkpoint is taken; how much that costs the achieved
+    rate has not been measured (the binary test's 2.5 s run and 1.5 s resumption ran 1,409 and 768 ticks with
+    the hold, 1,649 and 721 in one earlier run without it: single runs, not a comparison).
   - The Studio opens a new run directory or resumes one (`--resume`); it does not branch one (that is `flife
     branch`). A resumed Studio records no timeline (`--timeline` is refused with `--resume`): a timeline
     replays from the founding world. A resumed run's selection, camera and style start afresh; the run directory

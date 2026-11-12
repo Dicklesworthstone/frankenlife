@@ -7,8 +7,9 @@ rendering (§13.4), the configured bloom on glowing frames (§2.3), the shown ma
 energy (§13.4's "Local field": key C, `--field-mapping`, `flife_manim::FieldMapping`), keyed after the colour key. FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
-bounded snapshot at its committed boundary (§14.2), with what it sensed, its controller's activations and what its
-budget stages paid and received once the session has stepped while watching it, and draws it as a panel in the
+bounded snapshot at its committed boundary (§14.2), with what the committed field offers it where it stands, and
+what it sensed, its controller's activations and what its budget stages paid and received once the session has
+stepped while watching it, and draws it as a panel in the
 overlay, read again once a second while the world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
 seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, the region a click would act on is outlined on the world, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
@@ -219,7 +220,10 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
     stays selected and the world runs (`Studio::inspect_selected`): the organism, `seen_tick`, the committed `tick` it was read
     at (null when the world no longer holds it) and a `snapshot`: genome, parent, lineage, generation, birth tick,
     age, position, velocity, energy and its change rate, phase, cooldown, topology, hidden widths, parameter count,
-    sensing scale, motion response, affinity, and the decoded held output (attempt rate and probability, child
+    sensing scale, motion response, affinity, `local` (what the committed field offers it where it stands: its
+    exchange footprint's `cells`, each with its `cell` index, `weight`, `energy` and `efficiency`; the footprint's
+    `density`, A.1's `request` there, and the `gain` and `toxicity` per unit taken), and the decoded held output
+    (attempt rate and probability, child
     fraction, emission gate, emission direction and spend fraction) or null; `sensed` (its step's start `tick`,
     `scale`, `evaluated`, `raw` as the three planes `R, M_0, …, M_31`, x and y derivatives, the 104 `inputs` and
     the 33 `gradients`) and `activations` (the output's `tick` and each `hidden` layer's values) or null; and
@@ -458,10 +462,12 @@ presentation state, not scientific state.
     swatches coloured after the colour key's; `field_key` (the binary's choice) gives it for a drawn, composed
     field in either look and either particles, and nothing while the field is hidden or under raw density;
   - the inspector panel exactly, from a real snapshot of the preset three ticks in, its organism watched from the
-    start, with every printed value set: its eight lines under the selection's, `not in the committed world` for
+    start, with every printed value set: its eleven lines under the selection's, `not in the committed world` for
     a gone organism, nothing without a selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen
     from east (a heading a hair below east reads 0°, not 360°, and one of -0 reads 0°), `still` at rest;
-    scientific notation from 100,000 with a sign on every rate; `no controller output held`; what it sensed
+    scientific notation from 100,000 with a sign on every rate; what the field offers it where it stands (`here:
+    η -0.120 to +0.450 · gain 0.225 · toxicity 0.012 a unit · asks 0.0123 a tick`, and `η +0.450` alone when the
+    footprint's cells agree); `no controller output held`; what it sensed
     (`sensed at tick 5,119 · scale 1.50 · field 0.412`, `gradient 0.031 toward 45° · affinity·Z +0.112`, the
     composition inputs set along its own affinity so the dot product is known) and its activations
     (`activations at tick 5,120 · max |a| 0.98, 0.97 · mean |a| 0.40, 0.53`), then its transactions over the
@@ -476,22 +482,29 @@ presentation state, not scientific state.
     four-digit byte counts, energies one short of scientific notation, the widest residual, a tally from a later
     tick, a fault, the largest seed and cadence, and each brush's widest preview: its own amount and count, the
     largest cell indices, bounds and a founder's endowment one short of scientific notation at nine places, and
-    the finest radius, the composition's field key, what the organism sensed and its activations, each decimal one
-    short of scientific notation and negative, a three-digit direction and two layers at the largest magnitude, and
-    128 steps' transactions, each sum one short of scientific notation and negative, 127 births and the newest
-    cooling down to the largest tick written in full), 22 lines laid out with its keys' swatches, at 2x: every
-    glyph is drawn, none refused or left out, within four fifths of the overlay's budget (the motion key's with the
-    introduction brush, 43,036 vertices and 41,630 triangles, is the longest); at 3x, all of it is still drawn.
+    the finest radius, the composition's field key, what the field offers the organism where it stands with its
+    efficiencies at the width of their bounds and its toxicity and request one short of scientific notation, what
+    it sensed and its activations, each decimal one short of scientific notation and negative, a three-digit
+    direction and two layers at the largest magnitude, and 128 steps' transactions, each sum one short of
+    scientific notation and negative, 127 births and the newest cooling down to the largest tick written in full),
+    23 lines laid out with its keys' swatches, at 2x: every glyph is drawn, none refused or left out, within four
+    fifths of the overlay's budget (the motion key's with the introduction brush, 45,148 vertices and 43,656
+    triangles, is the longest); at 3x, all of it is still drawn.
   - Planted bugs in the transactions' panel and record (FL-021), each caught: the uptake summing the gain alone,
     births charging only the child's endowment, the net change the newest step's, the first step's reproduction
     shown, maintenance shown as a gain, the record's uptake including maintenance, and its ticks one late.
+  - Planted bugs in the local chemistry's line and record (FL-021), each caught: the efficiencies written high to
+    low, a range for agreeing cells, the request at three places, the gain shown as the toxicity, the line after
+    the controller's, the record's gain the toxicity, a cell's weight recorded as its efficiency, the record's
+    request the density, and one cell recorded.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 111.0 MiB at 3840 x 2160, which leaves the backend 142.7 MiB of the 2 GiB budget (124.0
+  terms to the observers: 117.5 MiB at 3840 x 2160, which leaves the backend 136.2 MiB of the 2 GiB budget (117.5
   with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
   telemetry, 82.6 MiB (172.1) at 39,936 vertices and 38,912 triangles with the brush preview, 86.9 MiB (166.8) at
   41,984 and 40,960 with the field's key, 99.9 MiB (153.8) at 48,128 and 47,104 with the inspector's sensed and
-  activation lines, and is 111.0 MiB at 54,272 and 52,224 with its two transaction lines (FL-021). The field's compositions (12 bytes a texel in the feed's slots and the
+  activation lines, 111.0 MiB (142.7) at 54,272 and 52,224 with its two transaction lines, and is 117.5 MiB at
+  57,344 and 55,296 with the line for what the field offers the organism where it stands (FL-021). The field's compositions (12 bytes a texel in the feed's slots and the
   view's copy, FL-019) add 0.8 MiB to the rest of the observers.
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
@@ -673,7 +686,9 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   previous committed state each frame: one state late, with no visible in-between motion. Motion between epochs is
   seen when epochs arrive slower than frames, and for steps.
 - FL-021's inspector panel is the overlay's last lines: what the last answer read (its tick, lineage, generation,
-  energy and its change, age, speed and heading, hidden widths and parameter count, the held output's
+  energy and its change, age, speed and heading, what the committed field offers it where it stands (its exchange
+  footprint's lowest and highest efficiency for its affinity, the gain and toxicity per unit taken in the
+  footprint's proportions, and A.1's request there), hidden widths and parameter count, the held output's
   reproduction probability and emission gate, what it sensed, its activations, and what its budget stages
   added up to over its recorded steps). The host's send on a click runs offscreen in `tests/offscreen.rs`, where
   a posted click's inspection answers, and an inspection refreshed while the world runs carries what it sensed,
@@ -687,8 +702,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   snapshot's genome, parent, position, phase, cooldown, motion response or affinity, nor any single input or
   activation, which the record carries. The transactions are sums over the steps the world recorded while
   watching it, at most 128 (a second at the reference tick), so a selection's first panel after a pause or a
-  newly watched organism covers fewer; no single step's settlement is shown or recorded. §14.2's descendants,
-  local efficiency and weight dumps are not implemented.
+  newly watched organism covers fewer; no single step's settlement is shown or recorded. What the field offers it
+  is read from the committed field the Studio draws, not the field the next step's uptake reads after transport,
+  and is a rate per unit taken, not a forecast of its grants. §14.2's descendants and weight dumps are not
+  implemented.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
     `tests/offscreen.rs` for all four brushes as far as the submitted stroke, and for the energy and material

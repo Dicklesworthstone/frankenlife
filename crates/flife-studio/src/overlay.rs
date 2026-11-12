@@ -11,7 +11,9 @@
 use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Activations, OrganismSnapshot, ReproductionOutcome, Sensed, Transactions};
+use flife_engine::{
+    Activations, LocalChemistry, OrganismSnapshot, ReproductionOutcome, Sensed, Transactions,
+};
 use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend, Style};
 use flife_render::Metrics;
@@ -427,6 +429,12 @@ fn places(scale: f64) -> usize {
 /// - `speed 0.84/s · heading 135°` in world units per simulated second, the
 ///   heading counter-clockwise on screen from east as the motion mapping's
 ///   wheel turns, or `still`;
+/// - `here: η -0.120 to +0.450 · gain 0.225 · toxicity 0.012 a unit · asks
+///   0.0123 a tick`: what the committed field offers it where it stands
+///   ([`LocalChemistry`]): the lowest and highest efficiency of its
+///   exchange footprint's cells for its affinity (one value when they
+///   agree), the gain and the toxicity per unit of energy taken in the
+///   footprint's proportions, and what it would request in a tick there;
 /// - `hidden 64, 32 · 9,124 parameters`: its controller's hidden widths, in
 ///   evaluation order, and parameter count;
 /// - `reproduction 3.1% a tick · emission gate 0.72` from the output it
@@ -463,6 +471,7 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
     } else {
         "still".to_owned()
     };
+    let local = local_line(&snapshot.local);
     let hidden = snapshot
         .hidden_widths
         .iter()
@@ -495,6 +504,7 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
         "read at tick {} · lineage {} · generation {}\n\
          energy {} · {}/s · age {} ticks\n\
          {motion}\n\
+         {local}\n\
          hidden {hidden} · {} parameters\n\
          {actions}\n\
          {sensed}\n\
@@ -515,6 +525,27 @@ pub fn inspector_lines(inspected: Inspected<'_>) -> String {
 fn degrees([x, y]: [f64; 2]) -> f64 {
     // Adding zero turns a direction of -0 into 0.
     (-y).atan2(x).to_degrees().rem_euclid(360.0).round() % 360.0 + 0.0
+}
+
+/// [`inspector_lines`]' line for what the committed field offers an
+/// organism where it stands.
+fn local_line(local: &LocalChemistry) -> String {
+    let efficiencies = local.cells.iter().map(|cell| cell.efficiency);
+    let low = signed(efficiencies.clone().fold(f64::INFINITY, f64::min), 3);
+    let high = signed(efficiencies.fold(f64::NEG_INFINITY, f64::max), 3);
+    let range = if local.cells.is_empty() {
+        "no footprint".to_owned()
+    } else if low == high {
+        format!("η {low}")
+    } else {
+        format!("η {low} to {high}")
+    };
+    format!(
+        "here: {range} · gain {} · toxicity {} a unit · asks {} a tick",
+        decimal(local.gain, 3),
+        decimal(local.toxicity, 3),
+        decimal(local.request, 4),
+    )
 }
 
 /// [`inspector_lines`]' two lines for what an organism sensed.

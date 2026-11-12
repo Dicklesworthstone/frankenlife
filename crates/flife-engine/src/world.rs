@@ -83,9 +83,9 @@ use flife_core::{
     Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
-    Bins, BufferLimits, ConeTolerance, Demand, Deposits, FieldBackend, FieldGrid, FieldPair,
-    FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView, RawSample,
-    RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
+    Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
+    FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
+    RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
     SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary,
     UptakeWork, advance_field_on, apply_deposits, apply_grants, demands as reference_demands,
     demands_on, initial_source, resolve_uptake, resolve_uptake_on,
@@ -104,7 +104,8 @@ use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
 use crate::inspect::{
-    Activations, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Sensed, Transactions,
+    Activations, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome,
+    Sensed, Transactions,
 };
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
@@ -1346,6 +1347,12 @@ impl World {
             )?),
             None => None,
         };
+        let local = local_chemistry(
+            &self.rules,
+            self.field.current(),
+            organism.position,
+            genome.traits(),
+        )?;
         let watched = self.watch.organism == Some(id);
         let sensed = self.watch.observed.clone().filter(|_| watched);
         let recorded = self.watch.evaluated.as_ref().filter(|_| watched);
@@ -1391,6 +1398,7 @@ impl World {
             hidden_widths: topology.hidden_widths().to_vec(),
             parameters: genome.parameters().len(),
             traits: *genome.traits(),
+            local,
             decoded,
             sensed,
             activations,
@@ -2803,6 +2811,63 @@ fn clear_tiny(
         .vitality
         .check(BudgetStage::TinyReservoir, &organism.budget)?;
     Ok(cleared)
+}
+
+/// [`OrganismSnapshot::local`]: the exchange footprint at `position` on
+/// `field`, each footprint cell's efficiency for `traits`' affinity, and
+/// A.1's request at the footprint's density, by the functions phase 5 and
+/// chemistry use. It reads at most four cells.
+///
+/// # Errors
+/// As [`ExchangeStencil::at`], [`ExchangeStencil::density`],
+/// [`RequestRule::request`], [`Affinity::new`], [`composition`] and
+/// [`Chemistry::efficiency`].
+fn local_chemistry(
+    rules: &Rules,
+    field: &FieldState,
+    position: [f64; 2],
+    traits: &Traits,
+) -> Result<LocalChemistry, CoreError> {
+    let affinity = Affinity::new(*traits.affinity(), &rules.chemistry)?;
+    let stencil = ExchangeStencil::at(field.grid(), position)?;
+    let density = stencil.density(field)?;
+    let rule = RequestRule {
+        step: rules.step,
+        capacity_per_second: rules.uptake_capacity,
+        half_saturation_density: rules.half_saturation,
+    };
+    let request = rule.request(density)?;
+    let mut cells = Vec::with_capacity(stencil.cells().len());
+    let (mut gain, mut harm) = (0.0, 0.0);
+    for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+        let efficiency = rules
+            .chemistry
+            .efficiency(&affinity, &composition(field, cell)?)?;
+        let energy =
+            field
+                .energy()
+                .get(cell)
+                .copied()
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "field",
+                    detail: format!("exchange cell {cell} is not in this field"),
+                })?;
+        gain += weight * efficiency.max(0.0);
+        harm += weight * (-efficiency).max(0.0);
+        cells.push(ExchangeCell {
+            cell,
+            weight,
+            energy,
+            efficiency,
+        });
+    }
+    Ok(LocalChemistry {
+        cells,
+        density,
+        request,
+        gain,
+        toxicity: rules.chemistry.toxicity_sensitivity() * harm,
+    })
 }
 
 /// What a viable attempt by the watched organism came to in phase 8.

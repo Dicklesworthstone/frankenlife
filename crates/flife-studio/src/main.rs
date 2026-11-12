@@ -376,7 +376,8 @@ enum Record<'a> {
         /// The committed boundary it was read at; absent when the committed
         /// world no longer holds it.
         tick: Option<u64>,
-        snapshot: Option<Inspection>,
+        /// Boxed: an inspection is the largest record by far.
+        snapshot: Option<Box<Inspection>>,
     },
     /// The clocks over the last window (plan §12.2).
     Clock {
@@ -558,6 +559,8 @@ struct Inspection {
     sensing_scale: f64,
     motion_response: Vec<f64>,
     affinity: Vec<f64>,
+    /// What the committed field offers it where it stands.
+    local: LocalRecord,
     decoded: Option<Decoded>,
     /// What it observed in the newest tick the world recorded for it.
     sensed: Option<SensedRecord>,
@@ -566,6 +569,29 @@ struct Inspection {
     /// What its budget stages added up to over the steps the world
     /// recorded for it.
     transactions: Option<TransactionsRecord>,
+}
+
+/// What the committed field offers an organism where it stands (FL-021,
+/// plan §14.2's Chemistry): its exchange footprint's cells, each with its
+/// weight, energy and efficiency for its affinity; the footprint's density
+/// and A.1's request there; and the gain and toxicity per unit taken in the
+/// footprint's proportions.
+#[derive(Serialize)]
+struct LocalRecord {
+    cells: Vec<ExchangeCellRecord>,
+    density: f64,
+    request: f64,
+    gain: f64,
+    toxicity: f64,
+}
+
+/// One cell of an organism's exchange footprint.
+#[derive(Serialize)]
+struct ExchangeCellRecord {
+    cell: usize,
+    weight: f64,
+    energy: f32,
+    efficiency: f64,
 }
 
 /// An organism's recorded observation (FL-021, plan §14.2's Inputs), every
@@ -1145,7 +1171,9 @@ fn status_record(status: &Status) -> Record<'static> {
             organism: organism.get(),
             seen_tick: seen.get(),
             tick: snapshot.as_ref().map(|snapshot| snapshot.tick.get()),
-            snapshot: snapshot.as_deref().map(inspection),
+            snapshot: snapshot
+                .as_deref()
+                .map(|snapshot| Box::new(inspection(snapshot))),
         },
     }
 }
@@ -1233,6 +1261,23 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
         sensing_scale: snapshot.traits.sensing_scale(),
         motion_response: snapshot.traits.motion_response().to_vec(),
         affinity: snapshot.traits.affinity().to_vec(),
+        local: LocalRecord {
+            cells: snapshot
+                .local
+                .cells
+                .iter()
+                .map(|cell| ExchangeCellRecord {
+                    cell: cell.cell,
+                    weight: cell.weight,
+                    energy: cell.energy,
+                    efficiency: cell.efficiency,
+                })
+                .collect(),
+            density: snapshot.local.density,
+            request: snapshot.local.request,
+            gain: snapshot.local.gain,
+            toxicity: snapshot.local.toxicity,
+        },
         decoded: snapshot.decoded.map(|decoded| Decoded {
             attempt_rate: decoded.attempt_rate,
             attempt_probability: decoded.attempt_probability,
@@ -1576,14 +1621,15 @@ mod tests {
     }
 
     /// FL-021 (plan §14.2): an inspection's record carries what the watched
-    /// organism sensed and the activations of its held output, every value
-    /// the step's own, bit for bit.
+    /// organism sensed, the activations of its held output, what its budget
+    /// stages added up to, and what the committed field offers it where it
+    /// stands, every value the snapshot's own, bit for bit.
     #[test]
     #[expect(
         clippy::cast_possible_truncation,
         reason = "an F32 written out reads back as itself"
     )]
-    fn inspected_records_carry_what_it_sensed_its_activations_and_transactions() {
+    fn inspected_records_carry_what_it_sensed_its_activations_transactions_and_surroundings() {
         let config = flife_core::ValidatedConfig::from_toml(include_str!(
             "../../../presets/reference-small-world.toml"
         ))
@@ -1606,6 +1652,7 @@ mod tests {
         let sensed = snapshot.sensed.clone().expect("sensed");
         let activations = snapshot.activations.clone().expect("activations");
         let transactions = snapshot.transactions.clone();
+        let here = snapshot.local.clone();
         let record = serde_json::to_value(super::status_record(&Status::Inspected {
             organism: id,
             seen: Tick::new(2),
@@ -1721,5 +1768,45 @@ mod tests {
             None => "none",
         };
         assert_eq!(ledger["reproduction"], reproduction);
+
+        let local = &record["snapshot"]["local"];
+        assert!(!here.cells.is_empty());
+        assert_eq!(
+            local["cells"].as_array().map(Vec::len),
+            Some(here.cells.len())
+        );
+        for (read, cell) in local["cells"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .zip(&here.cells)
+        {
+            assert_eq!(read["cell"].as_u64(), u64::try_from(cell.cell).ok());
+            assert_eq!(
+                read["energy"]
+                    .as_f64()
+                    .map(|energy| (energy as f32).to_bits()),
+                Some(cell.energy.to_bits())
+            );
+            for (name, expected) in [("weight", cell.weight), ("efficiency", cell.efficiency)] {
+                assert_eq!(
+                    read[name].as_f64().map(f64::to_bits),
+                    Some(expected.to_bits()),
+                    "{name}"
+                );
+            }
+        }
+        for (name, expected) in [
+            ("density", here.density),
+            ("request", here.request),
+            ("gain", here.gain),
+            ("toxicity", here.toxicity),
+        ] {
+            assert_eq!(
+                local[name].as_f64().map(f64::to_bits),
+                Some(expected.to_bits()),
+                "{name}"
+            );
+        }
     }
 }

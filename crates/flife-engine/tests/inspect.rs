@@ -4,7 +4,10 @@
 //!
 //! The oracle reads the same world through its public accessors
 //! (`Population::get`, `Population::genome`, the configuration's topology
-//! catalog and action decoding), not through the snapshot.
+//! catalog and action decoding), not through the snapshot. What the field
+//! offers an organism where it stands is checked against the plan's
+//! footprint, composition, efficiency and request laws written out here
+//! over the committed field's planes.
 
 #![allow(
     clippy::expect_used,
@@ -16,6 +19,7 @@ use flife_core::ValidatedConfig;
 use flife_core::ids::OrganismId;
 use flife_core::model::FIELD_ECOLOGY_V1_CHEMISTRY_ONLY;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
+use flife_field::FieldState;
 use flife_genome::TopologyCatalog;
 use flife_neural::{ACTION_WIDTH, ActionDecoding, decode, widen};
 
@@ -25,6 +29,11 @@ const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_F
 /// ecology (four richer sources, cheaper upkeep, readier reproduction), so
 /// it breeds within tens of ticks, under `model`.
 fn small(model: &str) -> ValidatedConfig {
+    configured(model, &[])
+}
+
+/// [`small`] with `extra` overrides `(section, key, value)`.
+fn configured(model: &str, extra: &[(&str, &str, &str)]) -> ValidatedConfig {
     let appendix = PLAN.find("## Appendix A").map_or("", |at| &PLAN[at..]);
     let start = appendix
         .find("```toml\n")
@@ -55,7 +64,10 @@ fn small(model: &str) -> ValidatedConfig {
         ),
         ("reproduction", "maximum_attempt_rate_per_second", "4.0"),
         ("reproduction", "cooldown_seconds", "0.25"),
-    ] {
+    ]
+    .into_iter()
+    .chain(extra.iter().copied())
+    {
         let header = format!("[{section}]");
         let at = lines
             .iter()
@@ -224,4 +236,169 @@ fn inspecting_changes_nothing() {
         assert_eq!(inspected.digest(), plain.digest());
         assert_eq!(inspected.tick(), plain.tick());
     }
+}
+
+/// The `grid-cic-v1` footprint at `[x, y]` written out from §4.3: the
+/// continuous index `(x/h_x − ½, y/h_y − ½)`; the cell at its floor and the
+/// three to its right and above, wrapped onto the torus and weighted
+/// `(1−f_x)(1−f_y)`, `f_x(1−f_y)`, `(1−f_x)f_y` and `f_x f_y`; a cell named
+/// twice merged and a zero weight dropped; sorted by row-major index. Also
+/// whether it wrapped.
+fn cic(config: &ValidatedConfig, [x, y]: [f64; 2]) -> (Vec<(usize, f64)>, bool) {
+    let world = &config.config().world;
+    let (columns, rows) = (i64::from(world.grid_width), i64::from(world.grid_height));
+    let u = x.rem_euclid(world.width) / (world.width / f64::from(world.grid_width)) - 0.5;
+    let v = y.rem_euclid(world.height) / (world.height / f64::from(world.grid_height)) - 0.5;
+    let (fx, fy) = (u - u.floor(), v - v.floor());
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "a floor of a continuous index on a 32-cell side"
+    )]
+    let (column, row) = (u.floor() as i64, v.floor() as i64);
+    let mut cells: Vec<(usize, f64)> = Vec::new();
+    let mut wrapped = false;
+    for (dx, dy, weight) in [
+        (0, 0, (1.0 - fx) * (1.0 - fy)),
+        (1, 0, fx * (1.0 - fy)),
+        (0, 1, (1.0 - fx) * fy),
+        (1, 1, fx * fy),
+    ] {
+        if weight == 0.0 {
+            continue;
+        }
+        let (cx, cy) = (column + dx, row + dy);
+        wrapped |= !(0..columns).contains(&cx) || !(0..rows).contains(&cy);
+        let index = cy.rem_euclid(rows) * columns + cx.rem_euclid(columns);
+        let index = usize::try_from(index).expect("on the grid");
+        match cells.iter_mut().find(|(cell, _)| *cell == index) {
+            Some((_, merged)) => *merged += weight,
+            None => cells.push((index, weight)),
+        }
+    }
+    cells.sort_by_key(|&(cell, _)| cell);
+    (cells, wrapped)
+}
+
+/// §5.3's `η = η_max tanh(k a·z − b)` at `cell`, with C.3's composition
+/// `z = m/e` from the field's F32 planes (neutral for an empty cell) and
+/// the standard library's `tanh`.
+fn efficiency(
+    config: &ValidatedConfig,
+    affinity: &[f64; 32],
+    field: &FieldState,
+    cell: usize,
+) -> f64 {
+    let chemistry = &config.config().chemistry;
+    let energy = f64::from(field.energy()[cell]);
+    let mut dot = 0.0;
+    if energy > 0.0 {
+        for (channel, a) in (0_u32..).zip(affinity) {
+            let moment = f64::from(field.moment(channel).expect("a moment plane")[cell]);
+            dot += a * (moment / energy);
+        }
+    }
+    chemistry.maximum_efficiency
+        * (chemistry.affinity_gain * dot - chemistry.discrimination_threshold).tanh()
+}
+
+/// Plan §14.2's Chemistry: every organism's snapshot holds its exchange
+/// footprint on the committed field, each footprint cell's energy and
+/// efficiency for its affinity, the gain and toxicity per unit taken in the
+/// footprint's proportions, and A.1's request at the footprint's density.
+/// The oracle is §4.3, C.3, §5.3 and A.1 written out over the field's
+/// planes and the configuration, not the engine's functions. The footprint's
+/// cells, weights and energies are exact; the rest, after `tanh`, within
+/// 1e-12. On the small world's unit cells and on 2 × 2 cells, so a density
+/// is an amount over the cell's area.
+#[test]
+fn a_snapshot_holds_what_the_committed_field_offers_where_it_stands() {
+    for config in [
+        small(flife_core::model::FIELD_ECOLOGY_V1),
+        configured(
+            flife_core::model::FIELD_ECOLOGY_V1,
+            &[
+                ("world", "grid_width", "16"),
+                ("world", "grid_height", "16"),
+                // Sensing no finer than a cell.
+                ("sensors", "minimum_scale_world_units", "2.0"),
+                ("sensors", "initial_scale_world_units", "2.0"),
+            ],
+        ),
+    ] {
+        local_chemistry_against_the_laws(&config);
+    }
+}
+
+/// [`a_snapshot_holds_what_the_committed_field_offers_where_it_stands`] on
+/// `config`.
+fn local_chemistry_against_the_laws(config: &ValidatedConfig) {
+    let chemistry = &config.config().chemistry;
+    let shape = &config.config().world;
+    let area =
+        (shape.width / f64::from(shape.grid_width)) * (shape.height / f64::from(shape.grid_height));
+    let seconds = f64::from(shape.tick_numerator) / f64::from(shape.tick_denominator);
+    let close = |got: f64, want: f64| (got - want).abs() <= 1e-12 * want.abs().max(1.0);
+    let mut world = found(config);
+    let (mut useful, mut harmful, mut wrapped, mut full, mut read) = (0, 0, 0, 0, 0);
+    for _ in 0..12 {
+        step(&mut world);
+        let field = world.field();
+        for organism in world.population().iter() {
+            let snapshot = world
+                .organism_snapshot(organism.id)
+                .expect("inspects")
+                .expect("live");
+            let local = &snapshot.local;
+            let (footprint, wraps) = cic(config, organism.position);
+            assert_eq!(
+                local
+                    .cells
+                    .iter()
+                    .map(|cell| (cell.cell, cell.weight.to_bits()))
+                    .collect::<Vec<_>>(),
+                footprint
+                    .iter()
+                    .map(|&(cell, weight)| (cell, weight.to_bits()))
+                    .collect::<Vec<_>>(),
+                "{} at {:?}",
+                organism.id,
+                organism.position
+            );
+            let (mut density, mut gain, mut harm) = (0.0, 0.0, 0.0);
+            for (cell, &(index, weight)) in local.cells.iter().zip(&footprint) {
+                assert_eq!(cell.energy.to_bits(), field.energy()[index].to_bits());
+                let eta = efficiency(config, snapshot.traits.affinity(), field, index);
+                assert!(
+                    close(cell.efficiency, eta),
+                    "{} at cell {index}: η {} against {eta}",
+                    organism.id,
+                    cell.efficiency
+                );
+                density += weight * f64::from(field.energy()[index]);
+                gain += weight * eta.max(0.0);
+                harm += weight * (-eta).max(0.0);
+                useful += usize::from(eta > 0.0);
+                harmful += usize::from(eta < 0.0);
+            }
+            density /= area;
+            let request = seconds * chemistry.uptake_capacity_per_second * density
+                / (chemistry.uptake_half_saturation_density + density);
+            assert!(close(local.density, density), "{} {density}", local.density);
+            assert!(close(local.request, request), "{} {request}", local.request);
+            assert!(close(local.gain, gain), "{} {gain}", local.gain);
+            assert!(
+                close(local.toxicity, chemistry.toxicity_sensitivity * harm),
+                "{} {harm}",
+                local.toxicity
+            );
+            wrapped += usize::from(wraps);
+            full += usize::from(footprint.len() == 4);
+            read += 1;
+        }
+    }
+    assert!(
+        useful > 0 && harmful > 0 && wrapped > 0 && full > 0,
+        "{area} world-length² cells, {read} footprints: {useful} useful cells, {harmful} harmful, \
+         {wrapped} wrapped, {full} of four cells"
+    );
 }

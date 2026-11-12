@@ -4,7 +4,9 @@
 //! [`World::organism_snapshot`](crate::World::organism_snapshot) reads one
 //! organism's row, its own genome's heritable traits and parameter count and
 //! its topology's shape, and decodes its held controller output as the world
-//! decodes it. It copies no controller parameter and nothing of any other
+//! decodes it. It reads the committed field only at the organism's exchange
+//! footprint, at most four cells, for what chemistry would make of them
+//! ([`LocalChemistry`]). It copies no controller parameter and nothing of any other
 //! organism or genome, so its cost does not grow with the population or the
 //! genome bank, and it changes nothing: the world's digest is the same after
 //! it (plan §21.2, INV-09).
@@ -65,6 +67,8 @@ pub struct OrganismSnapshot {
     pub parameters: usize,
     /// Its heritable affinity direction, motion response and sensing scale.
     pub traits: Traits,
+    /// What the committed field offers it where it stands, for its affinity.
+    pub local: LocalChemistry,
     /// Its held controller output, decoded as the world decodes it for the
     /// tick after `tick` unless it is evaluated again; `None` while it holds
     /// no output.
@@ -80,6 +84,49 @@ pub struct OrganismSnapshot {
     /// recorded while watching it, oldest first: at most [`RECENT_STEPS`],
     /// the newest the step to `tick`. Empty before its first watched step.
     pub transactions: Vec<Transactions>,
+}
+
+/// What the committed field offers one organism where it stands (plan
+/// §14.2's Chemistry): its `grid-cic-v1` exchange footprint on the field at
+/// the snapshot's tick, each footprint cell's efficiency for its affinity,
+/// and A.1's request at the footprint's density.
+///
+/// The field is the committed one, which the Studio draws. A step's uptake
+/// reads the field after that step's transport and sources, and grants less
+/// than the request where organisms contend or quanta round, so this is what
+/// the organism's surroundings hold now, not a forecast of its next
+/// settlement; [`Transactions`] records those.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalChemistry {
+    /// The footprint's cells in ascending index order, each with a positive
+    /// weight; the weights sum to one up to F64 rounding.
+    pub cells: Vec<ExchangeCell>,
+    /// The footprint's energy density `r = Σ_c w_c e_c / (h_x h_y)`.
+    pub density: f64,
+    /// A.1's request at `r`, `d = Δt U_max r/(K + r)`: what it would ask the
+    /// field for in one tick from here.
+    pub request: f64,
+    /// `Σ_c w_c max(η_c, 0)`: the useful gain per unit of energy taken from
+    /// the footprint in proportion to its weights.
+    pub gain: f64,
+    /// `κ Σ_c w_c max(−η_c, 0)`: the toxicity requested per unit taken in
+    /// that proportion.
+    pub toxicity: f64,
+}
+
+/// One cell of an organism's exchange footprint, as [`LocalChemistry`]
+/// reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExchangeCell {
+    /// The cell's index in the field.
+    pub cell: usize,
+    /// Its weight `w_c` in the footprint.
+    pub weight: f64,
+    /// Its energy `e_c`.
+    pub energy: f32,
+    /// `η(z_c) = η_max tanh(k a·z_c − b)` at its composition
+    /// `z_c = m_c / e_c`, which is neutral for an empty cell (C.3).
+    pub efficiency: f64,
 }
 
 /// What one watched organism's budget stages paid and received in one step

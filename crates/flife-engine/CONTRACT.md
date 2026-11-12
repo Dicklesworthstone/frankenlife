@@ -179,6 +179,14 @@ each runs and owns the field.
   - `topology`, its catalog index, and `hidden_widths`, that topology's;
   - `parameters`, its controller's parameter count;
   - `traits`: its affinity direction, motion response and sensing scale;
+  - `local` (plan §14.2's Chemistry): a `LocalChemistry`, what the committed field offers it where it stands. Its
+    `grid-cic-v1` exchange footprint at its position, as `ExchangeCell`s in ascending index order (the cell, its
+    weight, its F32 energy and the efficiency `η(z) = η_max tanh(k a·z − b)` at its composition `z = m/e` for the
+    organism's affinity, neutral for an empty cell); the footprint's density `r` and A.1's request
+    `Δt U_max r/(K + r)` there; and the gain `Σ w_c max(η_c, 0)` and toxicity `κ Σ w_c max(−η_c, 0)` per unit
+    taken in the footprint's proportions. It is the committed field, which the Studio draws, not a forecast: a
+    step's uptake reads the field after its transport and sources, and grants less than the request where
+    organisms contend or quanta round;
   - `decoded`, its held output decoded as the world decodes it for the next tick unless it is evaluated again
     (from zero under `field-ecology-v1-chemistry-only`), or `None` while it holds no output;
   - `sensed` (plan §14.2's Inputs), while the world watches it: a `Sensed` with the newest published step's start
@@ -456,9 +464,12 @@ each runs and owns the field.
 - `footprint()` does not change as the world steps. No result depends on any of this.
 
 **Invariants — inspection (FL-021; §14.2, §21.2 INV-09).**
-- A snapshot reads one row through the identity index, that organism's own genome and the topology catalog. It
-  copies no controller parameter and nothing of another organism or genome, so its cost does not grow with the
-  population or the genome bank.
+- A snapshot reads one row through the identity index, that organism's own genome, the topology catalog and the
+  committed field at its exchange footprint (at most four cells). It copies no controller parameter and nothing of
+  another organism or genome, so its cost does not grow with the population or the genome bank.
+- Its local chemistry is computed by the functions phase 5 and chemistry use (`ExchangeStencil::at`, `density`,
+  `RequestRule::request`, `Affinity::new`, `composition`, `Chemistry::efficiency`), so the panel and the tick
+  cannot disagree on the law.
 - It takes `&self` and changes nothing: a world inspected in full before every tick commits the digests of one
   never inspected.
 - The held output is decoded by the function the tick uses (`raw_outputs` then `decode`), so the snapshot and the
@@ -719,7 +730,7 @@ Twenty planted mutants for the introduction (with `flife-runtime`'s and `flife-c
 adds exactly `batched_bytes()` to the scratch and nothing to the state or fields, 60 ticks grow nothing, and
 removing it returns the scratch to its bytes before.
 
-`tests/inspect.rs` (3 tests, FL-021), on the 32 x 32 Appendix A world with FL-013's small ecology, which breeds.
+`tests/inspect.rs` (4 tests, FL-021), on the 32 x 32 Appendix A world with FL-013's small ecology, which breeds.
 The oracle reads the same world through `Population::get`, `Population::genome`, the configuration's topology
 catalog and action decoding:
 - `an_organism_snapshot_is_its_committed_row_and_genome`: three ticks after children of two birth ticks live
@@ -730,6 +741,12 @@ catalog and action decoding:
   zero, as the world decodes it.
 - `inspecting_changes_nothing`: every organism and an unknown identity inspected before each of 20 ticks; the
   digest is unchanged by it, and equal to an uninspected world's after every tick.
+- `a_snapshot_holds_what_the_committed_field_offers_where_it_stands`: every organism's local chemistry at each of
+  12 ticks against §4.3's footprint, C.3's composition, §5.3's efficiency and A.1's request written out over the
+  committed field's planes and the configuration (the standard library's `tanh`): the footprint's cells, weights
+  and energies exactly, the efficiencies, density, request, gain and toxicity within 1e-12. It runs on the small
+  world's unit cells and on 2 x 2 cells (a 16 x 16 grid), so a density is an amount over the cell's area. On each,
+  the footprints read include useful and harmful cells, wrapped footprints and footprints of four cells.
 
 `tests/watch.rs` (7 tests, FL-021, plan §14.2's Inputs, Brain and Transactions), on the same small world. Its
 oracles are not the snapshot's path: a controller backend that records every job's inputs and defers each to the
@@ -787,6 +804,12 @@ row, the report's births, rejections and deaths, and the tick's ledger closure:
   candidate count off by one; and the step's transactions dropped on publish. The proposed velocity and the
   rejected count survived the first run: no scaled motion leaves a survivor whose next row could show its
   velocity, and no step had rejected a birth. The scaled-motion check and the rejecting variant catch them.
+- Planted bugs in the local chemistry, each run against the tests that should catch it, all caught (with the
+  panel's and the record's, 20 of 20): the footprint taken at the origin; each efficiency the next cell's; the gain
+  counting harm; the toxicity without `κ`; the request at twice the density; the density without the cell's area;
+  a cell's energy its first moment; the footprint's first cell dropped; every cell weighing a quarter; the snapshot
+  reading the candidate's field; and the harm counting gain. The density without the area survived the first run,
+  whose cells were 1 x 1; the 2 x 2 grid catches it.
 
 **Validity domain.** `field-ecology-v1` with `bounded-affinity-v1` and `per-granted-cell-packet`, at sensing-scale
 cost exponent 1; FL-011 at `no-emission-no-charge`, `post-motion`, `next-tick` visibility and activation, and
@@ -801,8 +824,8 @@ velocity, first-order splitting at the configured fixed timestep.
   organism, its inputs, sampled activations and the transactions of its last 128 steps. A snapshot taken right
   after the watch is set, or in a world not stepped since, has none of them: they exist only inside a step. The
   transactions are the watched organism's alone, from when it was watched; an organism's earlier history is not
-  kept. It has no local efficiency at its cell and no descendants, which need an event index the world does not
-  keep. Weight dumps on demand are not implemented.
+  kept. Its local chemistry is the committed field's, not the next step's settlement. It has no descendants, which
+  need an event index the world does not keep. Weight dumps on demand are not implemented.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

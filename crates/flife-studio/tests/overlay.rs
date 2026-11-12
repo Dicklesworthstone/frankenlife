@@ -14,8 +14,8 @@ use flife_core::ids::{Generation, LineageId, OrganismId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{LedgerReport, Tick, ValidatedConfig};
 use flife_engine::{
-    Arrangement, MATERIAL_CHANNELS, NumericalProfile, OrganismSnapshot, RECENT_STEPS,
-    ReproductionOutcome, Split, Stepped, Unviable, World,
+    Arrangement, ExchangeCell, LocalChemistry, MATERIAL_CHANNELS, NumericalProfile,
+    OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Split, Stepped, Unviable, World,
 };
 use flife_manim::{
     FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH,
@@ -271,6 +271,28 @@ fn known() -> OrganismSnapshot {
     organism.energy_change_rate = 0.0123;
     // Up and to the left on screen: world y points down.
     organism.velocity = [-0.6, -0.6];
+    // Two footprint cells, half each: one harmful and one useful, so the
+    // gain is half of 0.45 and the toxicity κ = 0.2 times half of 0.12.
+    known.local = LocalChemistry {
+        cells: vec![
+            ExchangeCell {
+                cell: 33,
+                weight: 0.5,
+                energy: 1.0,
+                efficiency: -0.12,
+            },
+            ExchangeCell {
+                cell: 34,
+                weight: 0.5,
+                energy: 2.0,
+                efficiency: 0.45,
+            },
+        ],
+        density: 1.5,
+        request: 0.0123,
+        gain: 0.225,
+        toxicity: 0.012,
+    };
     let decoded = known.decoded.as_mut().expect("an output");
     decoded.attempt_probability = 0.0314;
     decoded.emission_gate = 0.72;
@@ -732,6 +754,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
     let panel = "read at tick 5,120 · lineage 17 · generation 42\n\
                  energy 3.21 · +0.012/s · age 1,024 ticks\n\
                  speed 0.85/s · heading 135°\n\
+                 here: η -0.120 to +0.450 · gain 0.225 · toxicity 0.012 a unit · asks 0.0123 a tick\n\
                  hidden 64, 32 · 9,124 parameters\n\
                  reproduction 3.1% a tick · emission gate 0.72\n\
                  sensed at tick 5,119 · scale 1.50 · field 0.412\n\
@@ -784,6 +807,17 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         assert_eq!(lines.lines().nth(2), Some(motion), "{velocity:?}");
     }
 
+    // One efficiency when the footprint's cells agree.
+    let mut even = known.clone();
+    for cell in &mut even.local.cells {
+        cell.efficiency = 0.45;
+    }
+    let lines = inspector_lines(Inspected::Read(&even));
+    assert_eq!(
+        lines.lines().nth(3),
+        Some("here: η +0.450 · gain 0.225 · toxicity 0.012 a unit · asks 0.0123 a tick")
+    );
+
     // Large magnitudes in scientific notation; a sign on every rate.
     let mut large = known.clone();
     large.organism.energy = 123_456.7;
@@ -802,7 +836,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
     let mut quiet = known.clone();
     quiet.decoded = None;
     let lines = inspector_lines(Inspected::Read(&quiet));
-    assert_eq!(lines.lines().nth(4), Some("no controller output held"));
+    assert_eq!(lines.lines().nth(5), Some("no controller output held"));
 
     // The gradient's direction as the heading's; a negative alignment; no
     // gradient; nothing recorded yet.
@@ -816,7 +850,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
     compose(&mut sensing, -0.05);
     let lines = inspector_lines(Inspected::Read(&sensing));
     assert_eq!(
-        lines.lines().nth(6),
+        lines.lines().nth(7),
         Some("gradient 0.500 toward 180° · affinity·Z -0.050")
     );
     sensing
@@ -827,7 +861,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         .gradients[0] = [0.0, 0.0];
     let lines = inspector_lines(Inspected::Read(&sensing));
     assert_eq!(
-        lines.lines().nth(6),
+        lines.lines().nth(7),
         Some("no gradient · affinity·Z -0.050")
     );
 
@@ -837,7 +871,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
         edit(&mut edited);
         inspector_lines(Inspected::Read(&edited))
             .lines()
-            .skip(8)
+            .skip(9)
             .map(str::to_owned)
             .collect::<Vec<_>>()
     };
@@ -890,7 +924,7 @@ fn the_inspector_panel_says_what_the_snapshot_holds() {
     unrecorded.transactions.clear();
     let lines = inspector_lines(Inspected::Read(&unrecorded));
     assert_eq!(
-        lines.lines().skip(5).collect::<Vec<_>>(),
+        lines.lines().skip(6).collect::<Vec<_>>(),
         [
             "sensed from its next tick",
             "activations at its next evaluation",
@@ -973,9 +1007,24 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         deadline: Tick::new(999_999_999_999),
     });
     longest.transactions = records;
+    // What the field offers it at its widest: the two efficiencies at the
+    // width of their bounds, and the toxicity and the request one short of
+    // scientific notation.
+    longest.local.cells[0].efficiency = -0.999_6;
+    longest.local.cells[1].efficiency = 0.999_6;
+    longest.local.gain = 0.999_6;
+    longest.local.toxicity = 99_999.999_4;
+    longest.local.request = 99_999.999_94;
     let panel = inspector_lines(Inspected::Read(&longest));
     assert_eq!(
-        panel.lines().skip(8).collect::<Vec<_>>(),
+        panel.lines().nth(3),
+        Some(
+            "here: η -1.000 to +1.000 · gain 1.000 · toxicity 99999.999 a unit · asks 99999.9999 \
+             a tick"
+        )
+    );
+    assert_eq!(
+        panel.lines().skip(9).collect::<Vec<_>>(),
         [
             "last 128 steps: uptake -99999.999 · maintenance -99999.999 · motion -99999.999",
             "emission -99999.999 · 127 births -99999.999 · net -99999.999 · cooling to tick \
@@ -1042,7 +1091,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 22, "{text}");
+        assert_eq!(text.lines().count(), 23, "{text}");
         let colors: Vec<_> = legend
             .swatches
             .iter()

@@ -648,8 +648,8 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
     let font = flife_manim::HudFont::bundled().expect("the bundled fonts");
     // The Studio's longest overlay: the motion key (FL-019), and the
     // inspector panel (FL-021) with every count the largest written in full,
-    // what the organism sensed, its activations and its recent transactions
-    // included.
+    // what the field offers the organism where it stands, what it sensed, its
+    // activations and its recent transactions included.
     let longest = concat!(
         "running · tick 999,999,999,999\n",
         "99999 ticks/s · 99999.99× real time · 99999 fps\n",
@@ -658,6 +658,7 @@ fn a_view_that_draws_text_holds_no_more_heap_than_its_reserved_bytes() {
         "read at tick 999,999,999,999 · lineage 999,999,999,999 · generation 4,294,967,295\n",
         "energy 99999.99 · -99999.999/s · age 999,999,999,999 ticks\n",
         "speed 99999.99/s · heading 315°\n",
+        "here: η -1.000 to +1.000 · gain 1.000 · toxicity 99999.999 a unit · asks 99999.9999 a tick\n",
         "hidden 128, 96 · 29,316 parameters\n",
         "reproduction 100.0% a tick · emission gate 1.00\n",
         "sensed at tick 999,999,999,999 · scale 99999.99 · field -99999.999\n",

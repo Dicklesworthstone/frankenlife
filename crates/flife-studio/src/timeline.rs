@@ -4,8 +4,8 @@
 //! A recording Studio ([`crate::StudioOptions::record`]) notes, as
 //! [`TimelineRecord`]s in the order it makes them, every change a frame
 //! makes to its world view: its drawable and density, the overlay, the
-//! style, the camera, the selection, and the epochs it shows with how far
-//! the display is between them. It also notes every frame it draws, with
+//! style, the camera, the selection, the brush's region outlined (FL-022),
+//! and the epochs it shows with how far the display is between them. It also notes every frame it draws, with
 //! the tick shown and the wall time. The commands are noted as the session
 //! accepts and applies them ([`TimelineRecord::status`]). The timeline
 //! closes with [`TimelineRecord::end`]: the world the session closed on and
@@ -29,7 +29,9 @@ use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
     Arrangement, Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, Stepped, World,
 };
-use flife_manim::{ColorMapping, FieldMapping, HudFont, Look, Particles, Style, hex_rgb};
+use flife_manim::{
+    ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionShape, Style, hex_rgb,
+};
 use flife_render::{Lease, Publication, Publisher};
 use flife_runtime::{CommandStatus, Outcome, SessionClosed};
 use fmn_frame::FrameBuffer;
@@ -298,6 +300,67 @@ pub struct AppliedCommand {
     pub intervention: TimelineIntervention,
 }
 
+/// A brush's region as a record spells it (FL-022): its numbers as their
+/// bits, so a replay outlines exactly what the Studio did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "kebab-case")]
+pub enum TimelineRegion {
+    /// A cell's rectangle.
+    Rectangle {
+        /// `[[x₀, x₁], [y₀, y₁]]` in world units.
+        bounds: [[Exact; 2]; 2],
+        /// Whether the stroke removes energy from the world.
+        removes: bool,
+    },
+    /// A disc.
+    Disc {
+        /// Its centre in world units.
+        center: [Exact; 2],
+        /// Its radius in world units.
+        radius: Exact,
+        /// Whether the stroke removes energy from the world.
+        removes: bool,
+    },
+}
+
+impl From<Region> for TimelineRegion {
+    fn from(region: Region) -> Self {
+        match region.shape {
+            RegionShape::Rectangle(bounds) => Self::Rectangle {
+                bounds: bounds.map(|range| range.map(Exact)),
+                removes: region.removes,
+            },
+            RegionShape::Disc { center, radius } => Self::Disc {
+                center: center.map(Exact),
+                radius: Exact(radius),
+                removes: region.removes,
+            },
+        }
+    }
+}
+
+impl From<TimelineRegion> for Region {
+    fn from(region: TimelineRegion) -> Self {
+        match region {
+            TimelineRegion::Rectangle { bounds, removes } => Self {
+                shape: RegionShape::Rectangle(bounds.map(|range| range.map(|end| end.0))),
+                removes,
+            },
+            TimelineRegion::Disc {
+                center,
+                radius,
+                removes,
+            } => Self {
+                shape: RegionShape::Disc {
+                    center: center.map(|value| value.0),
+                    radius: radius.0,
+                },
+                removes,
+            },
+        }
+    }
+}
+
 /// One record of a Studio timeline, in the order the Studio made it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "kebab-case")]
@@ -350,6 +413,12 @@ pub enum TimelineRecord {
     Select {
         /// The organism's identity.
         organism: Option<u64>,
+    },
+    /// The region an armed brush would act on, outlined on the world, or
+    /// none (FL-022).
+    Region {
+        /// The region.
+        region: Option<TimelineRegion>,
     },
     /// [`flife_manim::WorldView::show_between`]: the epoch at `current`,
     /// `fraction` of the way from the one at `prior`.
@@ -710,6 +779,9 @@ pub fn replay(
             }
             TimelineRecord::Select { organism } => {
                 view.select(organism.map(OrganismId::new))?;
+            }
+            TimelineRecord::Region { region } => {
+                view.set_region(region.map(Region::from))?;
             }
             TimelineRecord::Show {
                 prior,

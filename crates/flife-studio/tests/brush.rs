@@ -24,11 +24,12 @@ use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{
     AppliedIntervention, Arrangement, Disposition, Intervention, NumericalProfile, Stepped, World,
 };
-use flife_manim::Viewport;
+use flife_manim::{Region, RegionShape, Viewport};
 use flife_runtime::Outcome;
 use flife_studio::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL, Preview,
-    SessionThread, Status, Stroke, Supplies, cell_region, material_for, preview, stroke,
+    SessionThread, Status, Stroke, Supplies, cell_region, material_for, preview, preview_region,
+    stroke,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -287,15 +288,33 @@ fn a_preview_is_the_stroke_a_click_there_makes() {
                                     "{at:?}: {world:?} outside {region:?}"
                                 );
                             }
+                            // Outlined: the cell, or the removal's disc,
+                            // and whether the stroke removes energy.
+                            let shape = match (made, region) {
+                                (_, Some(bounds)) => RegionShape::Rectangle(bounds),
+                                (Stroke::Removal { center, radius }, None) => {
+                                    RegionShape::Disc { center, radius }
+                                }
+                                _ => panic!("{made:?} has neither a cell nor a disc"),
+                            };
+                            assert_eq!(
+                                preview_region(&shown),
+                                Some(Region {
+                                    shape,
+                                    removes: brush == Brush::Removal
+                                })
+                            );
                             strokes += 1;
                         }
                         None if world.is_some() => {
                             assert_eq!((brush, supplies.material), (Brush::Material, None));
                             assert_eq!(shown, Preview::NoMaterial, "{at:?}");
+                            assert_eq!(preview_region(&shown), None);
                             unsupplied += 1;
                         }
                         None => {
                             assert_eq!(shown, Preview::OffWorld, "{brush:?} at {at:?}");
+                            assert_eq!(preview_region(&shown), None);
                             off += 1;
                         }
                     }

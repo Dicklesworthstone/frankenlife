@@ -67,6 +67,19 @@ fn a_frames_preparation_is_within_the_views_limit() {
                         view.set_pixels_per_point(density).expect("a density");
                         view.set_style(style);
                         view.show(&epoch).expect("shows");
+                        // The most a frame draws besides: a selection's ring
+                        // and a brush's disc (FL-022).
+                        let first = flife_core::ids::OrganismId::new(epoch.ids()[0]);
+                        assert_eq!(view.select(Some(first)).expect("selects"), Some(first));
+                        let extent = epoch.extent();
+                        let disc = flife_manim::Region {
+                            shape: flife_manim::RegionShape::Disc {
+                                center: [extent[0] / 2.0, extent[1] / 2.0],
+                                radius: extent[0] / 16.0,
+                            },
+                            removes: true,
+                        };
+                        assert!(view.set_region(Some(disc)).expect("a region"));
                         if zoom > 1.0 {
                             let viewport = view
                                 .viewport()
@@ -107,8 +120,9 @@ fn a_frames_preparation_is_within_the_views_limit() {
 }
 
 /// The limit is what the view can draw: a dot and a halo per organism of
-/// its ceiling, the triangles of the field's and the density's quads and
-/// the ring, and the fixed part, whatever the field or the bins. A view of
+/// its ceiling, the triangles of the field's and the density's quads, the
+/// ring and a brush's region, and the fixed part, whatever the field or the
+/// bins. A view of
 /// a world at a quarter of its ceiling is charged the whole ceiling. The
 /// layers' textures are not preparation: `texel_bytes` counts them, the
 /// field's once the view knows it and the density's at the viewport's
@@ -126,8 +140,9 @@ fn the_limit_counts_the_ceiling_and_the_quads_and_the_texels_the_textures() {
     let capacity = epoch.capacity();
     let mut view = WorldView::new(epoch.extent(), capacity, [640, 360], [0, 0, 0]).expect("a view");
     let ring = 2 * flife_manim::SELECTION_RING_SEGMENTS as u64;
+    let region = 2 * flife_manim::REGION_SEGMENTS as u64;
     let limit = 2 * 4096 * PREPARATION_BYTES_PER_DOT
-        + (2 + 2 + ring) * flife_manim::PREPARATION_BYTES_PER_TRIANGLE
+        + (2 + 2 + ring + region) * flife_manim::PREPARATION_BYTES_PER_TRIANGLE
         + PREPARATION_BYTES_FIXED;
     assert_eq!(capacity, 4096);
     assert_eq!(view.preparation_limit(), limit);
@@ -180,8 +195,9 @@ fn the_limit_counts_the_ceiling_and_the_quads_and_the_texels_the_textures() {
     );
     assert!(view.reserved_bytes() > 0);
     // A frame: the draw list and the job's own bytes for every draw the
-    // view can make, and the limit.
-    let draws = 2 * 4096 + 3;
+    // view can make (a dot and a halo each, the field, the density, a
+    // brush's region and the ring), and the limit.
+    let draws = 2 * 4096 + 4;
     assert_eq!(
         view.frame_bytes(),
         draws * size_of::<fmn_render::ThreeDDraw<'static>>() as u64

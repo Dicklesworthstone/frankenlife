@@ -18,11 +18,13 @@
 //! While a brush is armed, its [`preview`] is the stroke a click at the
 //! pointer would make there now, by the same mapping, with the world
 //! rectangle of its cell: what the overlay says a click will do (plan
-//! §14.3).
+//! §14.3). [`preview_region`] is the region it outlines on the world: the
+//! cell, or the removal's disc, coloured by whether the stroke adds energy
+//! or removes it.
 
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS};
 use flife_field::sources::unit_direction;
-use flife_manim::Viewport;
+use flife_manim::{Region, RegionShape, Viewport};
 
 /// The declared energy one click of the energy or material brush adds to
 /// its cell: 32 founders' endowments (`population.initial_energy = 2`),
@@ -303,6 +305,31 @@ pub fn preview(
         }
         None => Preview::OffWorld,
     }
+}
+
+/// The region `preview` outlines on the world (plan §14.3: the preview
+/// shows its "affected region, and whether it adds/removes energy"): its
+/// cell's rectangle for a brush that applies to a cell, the disc a removal
+/// takes, and whether the stroke removes energy from the world (a removal
+/// does: the share of the removed organisms' energy not recycled to the
+/// field is dissipated). `None` without a stroke.
+#[must_use]
+pub fn preview_region(preview: &Preview) -> Option<Region> {
+    let Preview::Stroke { stroke, region } = preview else {
+        return None;
+    };
+    let shape = match (stroke, region) {
+        (_, Some(bounds)) => RegionShape::Rectangle(*bounds),
+        (Stroke::Removal { center, radius }, None) => RegionShape::Disc {
+            center: *center,
+            radius: *radius,
+        },
+        _ => return None,
+    };
+    Some(Region {
+        shape,
+        removes: matches!(stroke, Stroke::Removal { .. }),
+    })
 }
 
 /// The world rectangle of field cell `cell` on a grid of `cells` over a

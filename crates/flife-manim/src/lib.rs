@@ -32,6 +32,7 @@ mod density;
 mod field;
 mod hud;
 mod mapping;
+mod region;
 mod selection;
 mod viewport;
 mod world;
@@ -59,6 +60,10 @@ pub use mapping::{
     TOPOLOGY_PALETTE, Traits, affinity_rgb8, energy_level, generation_level, heading,
     legend_affinities, lineage_color, lineage_slot, linear, mapped_color, mapped_rgb8, mix, ramp,
     speed_level, traits, wheel,
+};
+pub use region::{
+    REGION_ADDS_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS, REGION_WIDTH_POINTS, Region,
+    RegionShape, region_outline,
 };
 pub use selection::{
     PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,

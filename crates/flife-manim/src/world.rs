@@ -16,8 +16,8 @@ use crate::cloud::check_min_radius_points;
 use crate::mapping::{Look, Particles, Style};
 use crate::{
     DensityLayer, FieldLayer, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HudText, ParticleCloud,
-    SELECTION_RING_SEGMENTS, Viewport, density_bins, dot_radius_at_least, hud_glyphs, hud_plate,
-    pick, selection_ring_around,
+    REGION_SEGMENTS, Region, SELECTION_RING_SEGMENTS, Viewport, density_bins, dot_radius_at_least,
+    hud_glyphs, hud_plate, pick, region_outline, selection_ring_around,
 };
 
 /// The most FrankenManim's preparation of a frame charges for one true dot
@@ -33,7 +33,7 @@ pub const PREPARATION_BYTES_PER_DOT: u64 = 1_536;
 /// triangle bins included (FL-043). Measured on FrankenManim at `721b04b9`
 /// over vertex grids of 60 x 60 to 360 x 360 cells: at most 476 bytes. The
 /// field and density layers are now a quad each (FL-033), so this charges
-/// their four triangles and the selection ring's.
+/// their four triangles, the selection ring's and the brush region's.
 pub const PREPARATION_BYTES_PER_TRIANGLE: u64 = 640;
 
 /// FrankenManim's preparation apart from its rows: the job, and the tile
@@ -142,6 +142,9 @@ pub struct WorldView {
     motion: Option<Motion>,
     selected: Option<OrganismId>,
     ring: Option<SurfaceMesh>,
+    /// The region a brush would act on (FL-022), and its outline in the
+    /// viewport.
+    region: Option<(Region, SurfaceMesh)>,
     /// The texels of the field last shown; none before the first epoch.
     field_texels: [u32; 2],
     /// The configured bloom's strength; none when it is off (FL-019).
@@ -235,6 +238,7 @@ impl WorldView {
             motion: None,
             selected: None,
             ring: None,
+            region: None,
             field_texels: [0; 2],
             bloom_strength: None,
             bloom: None,
@@ -337,9 +341,14 @@ impl WorldView {
             Some(hud) => Some(overlay_meshes(&viewport, &hud.text)?),
             None => None,
         };
+        let region = match &self.region {
+            Some((region, _)) => Some((*region, region_outline(&viewport, *region)?)),
+            None => None,
+        };
         self.viewport = viewport;
         self.camera = camera;
         self.ring = ring;
+        self.region = region;
         if let (Some(hud), Some((plate, glyphs))) = (self.hud.as_mut(), hud) {
             hud.plate = plate;
             hud.glyphs = glyphs;
@@ -722,6 +731,43 @@ impl WorldView {
         })
     }
 
+    /// Outline `region` over the organisms from the next frame, or nothing
+    /// for `None` (FL-022, plan §14.3): the region a brush would act on, in
+    /// the colour of whether its stroke adds energy or removes it. The
+    /// outline follows the viewport. Returns whether the region changed.
+    ///
+    /// # Errors
+    /// As [`region_outline`]; the view is unchanged on error.
+    pub fn set_region(&mut self, region: Option<Region>) -> Result<bool, CoreError> {
+        if self.region() == region {
+            return Ok(false);
+        }
+        self.region = match region {
+            Some(region) => Some((region, region_outline(&self.viewport, region)?)),
+            None => None,
+        };
+        Ok(true)
+    }
+
+    /// The region outlined over the organisms.
+    #[must_use]
+    pub fn region(&self) -> Option<Region> {
+        self.region.as_ref().map(|(region, _)| *region)
+    }
+
+    /// The region's outline draw, while there is a region: unlit, over the
+    /// organisms and under the selection ring.
+    #[must_use]
+    pub fn region_draw(&self) -> Option<ThreeDDraw<'_>> {
+        self.region.as_ref().map(|(_, mesh)| {
+            ThreeDDraw::Surface(SurfaceDraw {
+                shading: [0.0; 3],
+                depth_test: false,
+                ..SurfaceDraw::new(mesh)
+            })
+        })
+    }
+
     /// Draw text over the world from now on (FL-024): the view charges a
     /// text's most in [`WorldView::reserved_bytes`],
     /// [`WorldView::preparation_limit`] and [`WorldView::frame_bytes`]
@@ -787,9 +833,9 @@ impl WorldView {
     }
 
     /// The current frame's draws in painter order: the field, then the
-    /// density layer, or every halo and then every dot, then the selection
-    /// ring, then the overlay's plate and text. Raw density is opaque, so
-    /// the field is left out under it.
+    /// density layer, or every halo and then every dot, then the brush's
+    /// region, then the selection ring, then the overlay's plate and text.
+    /// Raw density is opaque, so the field is left out under it.
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the list cannot be reserved.
@@ -799,7 +845,7 @@ impl WorldView {
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
-        let fixed = 3 + OVERLAY_DRAWS;
+        let fixed = 4 + OVERLAY_DRAWS;
         draws
             .try_reserve_exact(fixed + halos.len() + dots.len())
             .map_err(|_| CoreError::AllocationFailed {
@@ -818,6 +864,7 @@ impl WorldView {
             draws.extend_from_slice(halos);
             draws.extend_from_slice(dots);
         }
+        draws.extend(self.region_draw());
         draws.extend(self.selection_draw());
         draws.extend(self.overlay_draws());
         Ok(draws)
@@ -875,9 +922,9 @@ impl WorldView {
     /// rows' identities and drawn positions and the cloud's draws and
     /// halos, each reserved for the population ceiling; the density bins
     /// at the viewport's count; and the field's and the density's textures
-    /// ([`WorldView::texel_bytes`]) and quads and the selection ring's
-    /// mesh, each twice, since one is built before the one it replaces is
-    /// dropped; and once, the copy of the field's values its texture was
+    /// ([`WorldView::texel_bytes`]) and quads, the selection ring's mesh
+    /// and the brush region's at its most (a disc), each twice, since one is
+    /// built before the one it replaces is dropped; and once, the copy of the field's values its texture was
     /// built from, one `f32` a texel (FL-033), and of its compositions in
     /// the composition mapping, three more. The field's texture and
     /// values count once the view knows the field: from
@@ -888,6 +935,7 @@ impl WorldView {
         let [columns, rows] = density_bins(&self.viewport).map(u64::from);
         let bins = columns.saturating_mul(rows);
         let ring = SELECTION_RING_SEGMENTS as u64;
+        let region = REGION_SEGMENTS as u64;
         let [columns, rows] = self.field_texels.map(u64::from);
         let field_values = columns
             .saturating_mul(rows)
@@ -896,6 +944,7 @@ impl WorldView {
             self.texel_bytes(),
             mesh_bytes(QUAD).saturating_mul(2),
             mesh_bytes((2 * ring, 2 * ring)),
+            mesh_bytes((2 * region, 2 * region)),
         ]);
         // A text's buffers and meshes, twice: one is built before the one it
         // replaces is dropped.
@@ -925,7 +974,8 @@ impl WorldView {
     /// The preparation bytes a frame's job is compiled within (FL-043):
     /// [`PREPARATION_BYTES_PER_DOT`] for a dot and a halo per organism the
     /// view can hold, [`PREPARATION_BYTES_PER_TRIANGLE`] for every triangle
-    /// of the field's and the density's quads and the ring, and
+    /// of the field's and the density's quads, the ring and the brush
+    /// region at its most (a disc), and
     /// [`PREPARATION_BYTES_FIXED`], whatever the style, which a host may
     /// change from frame to frame. The layers' texels are not preparation:
     /// a job samples them in place ([`WorldView::texel_bytes`]).
@@ -933,12 +983,13 @@ impl WorldView {
     pub fn preparation_limit(&self) -> u64 {
         let dots = (self.cloud.capacity() as u64).saturating_mul(2);
         let ring = 2 * SELECTION_RING_SEGMENTS as u64;
+        let region = 2 * REGION_SEGMENTS as u64;
         let overlay = if self.overlay {
             QUAD.1 + HUD_MAX_TRIANGLES as u64
         } else {
             0
         };
-        let triangles = total([QUAD.1, QUAD.1, ring, overlay]);
+        let triangles = total([QUAD.1, QUAD.1, ring, region, overlay]);
         total([
             dots.saturating_mul(PREPARATION_BYTES_PER_DOT),
             triangles.saturating_mul(PREPARATION_BYTES_PER_TRIANGLE),
@@ -960,7 +1011,7 @@ impl WorldView {
     }
 
     /// The most one frame's [`WorldView::job`] holds (FL-043): its draw
-    /// list, a field, a density and a ring draw and a dot and a halo per
+    /// list, a field, a density, a region and a ring draw and a dot and a halo per
     /// organism the view can hold, [`JOB_BYTES_PER_DRAW`] for each of those
     /// draws, and FrankenManim's preparation, within
     /// [`WorldView::preparation_limit`].
@@ -971,7 +1022,7 @@ impl WorldView {
             .cloud
             .capacity()
             .saturating_mul(2)
-            .saturating_add(3 + overlay);
+            .saturating_add(4 + overlay);
         total([
             bytes_for::<ThreeDDraw<'static>>(draws),
             (draws as u64).saturating_mul(JOB_BYTES_PER_DRAW),
@@ -1068,11 +1119,11 @@ impl WorldView {
     }
 
     /// Scene objects in the view: the field layer, the one particle cloud
-    /// however many organisms it draws, its density layer, and the
-    /// selection ring.
+    /// however many organisms it draws, its density layer, the brush's
+    /// region and the selection ring.
     #[must_use]
     pub const fn scene_objects(&self) -> usize {
-        4
+        5
     }
 
     /// The density layer.

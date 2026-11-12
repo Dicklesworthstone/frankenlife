@@ -23,12 +23,12 @@ use std::time::{Duration, Instant};
 use flife_core::ids::{CommandId, OrganismId};
 use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_manim::{HUD_TEXT_POINTS, HudFont, hud_origin, linear};
+use flife_manim::{HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionShape, hud_origin, linear};
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_I, KEY_M, KEY_PERIOD,
     KEY_SPACE, KEY_X, PICK_RADIUS_POINTS, Preview, Status, Studio, StudioOptions, Supplies,
-    Surface, cell_region, legends, material_for, scroll_zoom, stroke,
+    Surface, cell_region, legends, material_for, preview_region, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -626,7 +626,9 @@ fn brush_clicks_offscreen_apply_where_they_were_made() {
 
 /// FL-022's preview (plan §14.3): while a brush is armed, each frame says
 /// what a click at the pointer would do, and a click there then submits
-/// exactly that stroke.
+/// exactly that stroke. The frame outlines its region on the world (on the
+/// Metal route, amber just outside the energy brush's cell), and outlines
+/// nothing off the world, without material or disarmed.
 #[test]
 fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
     if !MetalRenderer::is_available() {
@@ -652,6 +654,7 @@ fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
         (frame.brush, frame.preview),
         (Some(Brush::Energy), Some(Preview::OffWorld))
     );
+    assert_eq!(studio.view().region(), None);
     let mut shown = Vec::new();
     for (code, text, brush, at) in [
         (KEY_E, "e", Brush::Energy, [110.0, 70.0]),
@@ -687,6 +690,29 @@ fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
                 "{x}, {y} in {region:?}"
             );
         }
+        // The frame outlined it.
+        let outlined = studio.view().region().expect("an outlined region");
+        assert_eq!(
+            Some(outlined),
+            preview_region(frame.preview.as_ref().expect("a preview"))
+        );
+        assert_eq!(outlined.removes, brush == Brush::Removal);
+        if let RegionShape::Rectangle([[x0, _], [y0, y1]]) = outlined.shape
+            && brush == Brush::Energy
+        {
+            let edge = viewport.world_to_drawable([x0, (y0 + y1) / 2.0]);
+            let band = REGION_WIDTH_POINTS * viewport.pixels_per_point();
+            let rgba = studio.last_frame().expect("the frame").as_bytes();
+            let [width, _] = viewport.drawable();
+            let [px, py] = [edge[0] - band / 2.0, edge[1]].map(|value| value.floor() as usize);
+            let at = 4 * (py * width as usize + px);
+            let [r, g, b] = [rgba[at], rgba[at + 1], rgba[at + 2]];
+            assert!(
+                r > g && g > b && g >= 120,
+                "amber just outside the cell on the Metal route: {:?}",
+                [r, g, b]
+            );
+        }
         click(&mut studio, at);
         shown.push(made);
     }
@@ -700,15 +726,18 @@ fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
         (frame.brush, frame.preview),
         (Some(Brush::Material), Some(Preview::NoMaterial))
     );
+    assert_eq!(studio.view().region(), None);
     hover(&mut studio, [5.0, 100.0]);
     assert_eq!(
         studio.frame().expect("a frame").preview,
         Some(Preview::OffWorld)
     );
-    // Disarmed: no preview.
+    assert_eq!(studio.view().region(), None);
+    // Disarmed: no preview, no region.
     tap(&mut studio, KEY_M, "m");
     let frame = studio.frame().expect("a frame");
     assert_eq!((frame.brush, frame.preview), (None, None));
+    assert_eq!(studio.view().region(), None);
 
     let mut submitted = Vec::new();
     until(&mut studio, "the submissions", |_, statuses| {

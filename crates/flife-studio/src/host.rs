@@ -786,6 +786,28 @@ impl Studio {
             self.prior = None;
         }
 
+        // What a click at the pointer would do, through the view as this
+        // frame leaves it, and its region outlined on the world (FL-022,
+        // plan §14.3).
+        let preview = self.controls.brush().map(|brush| {
+            brush::preview(
+                brush,
+                self.view.viewport(),
+                logical,
+                self.current.field().cells(),
+                self.controls
+                    .pointer()
+                    .map(|pointer| [pointer.x, pointer.y]),
+                &self.supplies(),
+            )
+        });
+        let region = preview.as_ref().and_then(brush::preview_region);
+        if self.view.set_region(region)? {
+            self.note(|| TimelineRecord::Region {
+                region: region.map(Into::into),
+            });
+        }
+
         let mut drawn = false;
         let outcome = if state == PresentationState::Visible {
             let job = self.view.job()?;
@@ -849,18 +871,7 @@ impl Studio {
             selected: self.view.selected(),
             hover: self.controls.hover(self.view.viewport()),
             brush: self.controls.brush(),
-            preview: self.controls.brush().map(|brush| {
-                brush::preview(
-                    brush,
-                    self.view.viewport(),
-                    logical,
-                    self.current.field().cells(),
-                    self.controls
-                        .pointer()
-                        .map(|pointer| [pointer.x, pointer.y]),
-                    &self.supplies(),
-                )
-            }),
+            preview,
             outcome,
             drawn,
         })

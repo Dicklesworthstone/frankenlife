@@ -435,7 +435,8 @@ organisms within 12 points of it on screen, their energy recycled as a death's; 
 composition is the selected organism's affinity direction, the material it converts best; or introduces 8
 founder-drawn organisms there. While one is armed, the overlay says what a click at the pointer would do: the
 energy it adds, in the model's units, and the cell it lands in, in world units; or for removal, the radius about
-the pointer and the share of the removed energy recycled to the field, none leaving the world. Each click is a
+the pointer and the share of the removed energy recycled to the field, none leaving the world. The world shows
+where: the cell is outlined in amber, or the removal's disc in red. Each click is a
 command: a `submitted` record names the boundary it will apply at, and a `finished` record the tick it applied at
 and the energy it moved.
 

@@ -61,7 +61,7 @@ mod timeline;
 
 pub use brush::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Preview, Stroke, Supplies,
-    cell_region, material_for, preview, stroke,
+    cell_region, material_for, preview, preview_region, stroke,
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
@@ -88,7 +88,7 @@ pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{
     AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineIntervention,
-    TimelineRecord, TimelineStyle, read_timeline, replay, write_timeline_record,
+    TimelineRecord, TimelineRegion, TimelineStyle, read_timeline, replay, write_timeline_record,
 };
 
 /// The schema of the Studio's NDJSON records.

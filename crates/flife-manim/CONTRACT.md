@@ -12,6 +12,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   and the 3D camera whose frame it is. A view (center, zoom) shows one image of the torus, wrapping across the
   seams.
 - `pick` finds the organism drawn under the pointer, by stable identity; `selection_ring` marks the selected one.
+- `region_outline` outlines the region a brush would act on (FL-022, plan §14.3).
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
 - `FieldLayer` draws the epoch's field under the organisms as one texture on one quad (FL-033): its energy, or its
@@ -74,6 +75,14 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `selection_ring(viewport, position)`: an annulus of `SELECTION_RING_SEGMENTS = 48` quads around the organism's
   scene point, from `SELECTION_RING_GAP_POINTS = 3` outside its dot to `SELECTION_RING_WIDTH_POINTS = 2` beyond,
   in points at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the quads.
+- `region_outline(viewport, region)` (FL-022, plan §14.3: a preview shows its "affected region, and whether it
+  adds/removes energy"). A `Region` is a `RegionShape`, a cell's `Rectangle` or a removal's `Disc` in world units,
+  and whether its stroke `removes` energy. The outline is a band `REGION_WIDTH_POINTS = 1.5` points wide just
+  outside the region, at any zoom and pixel density, so what is inside stays visible. A rectangle's band is four
+  mitred quads (8 triangles); a disc's is an annulus of `REGION_SEGMENTS = 48` quads from its edge outward. The
+  quads are wound like the ring's, placed where the viewport draws the region's centre, in `REGION_ADDS_COLOR`
+  (amber) or `REGION_REMOVES_COLOR` (red), alpha 0.9. An empty, inverted or non-finite rectangle, or a radius
+  that is not positive, is refused.
 - `Viewport::camera(background)`:
   - a FrankenManim `ThreeDCamera` at the drawable's resolution;
   - its frame is `frame_shape() = (Dw / scale, Dh / scale)`, centred at the origin, at `DEFAULT_FOVY`, `zxz`;
@@ -203,9 +212,13 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     lowering revalidates it and drops an identity the new epoch lacks, whatever now occupies its old slot;
     `selected()`, `selected_position()` (where it is drawn), and `selection_draw()`, the ring, which follows the
     organism as the display moves and is rebuilt for every view change;
+  - `set_region(region)` (FL-022) outlines a region over the organisms and under the ring until it is set to
+    none. It returns whether the region changed, rebuilds the outline for every view change and density, and
+    leaves the view as it was when the region is refused; `region()` and `region_draw()`;
   - `draws()` is the frame in painter order: the field (when `Style::field_drawn`, in the style's field mapping),
     then the density
-    layer, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
+    layer, or every halo and then every dot, then the brush's region, then the selection ring; `job()` wraps it
+    in a `ThreeDJob`;
   - `set_point_radius(points)` (FL-019) sets the dots' smallest radius on screen
     (`ParticleCloud::set_min_radius_points`); the shown dots, their halos and the selection ring change at
     once, and the ring is `selection_ring_around` the view's dot at every refit and reselection;
@@ -225,14 +238,14 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `render_rgba8(threads)` renders it on FrankenManim's CPU 3D route to tight sRGB RGBA8 (for `flife render`);
   - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
     draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
-    density's textures, their quads and the ring's mesh, twice, since one is built before the one it replaces is
-    dropped; and once, the copy of the field's values its texture was built from, and of its compositions, 16 bytes
+    density's textures, their quads, the ring's mesh and a region's at its most (a disc), twice, since one is built
+    before the one it replaces is dropped; and once, the copy of the field's values its texture was built from, and of its compositions, 16 bytes
     a texel in all). `texel_bytes()` (FL-033) is the
     layers' textures, 16 bytes a texel: the field's once the view knows it and the density's at the viewport's bins,
     whatever the style; FrankenManim's CPU route samples them in place
     and its Metal route uploads those a frame draws. `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536)
-    for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads' and
-    the ring's triangles, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
+    for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads', the
+    ring's and a disc region's triangles, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
     (FrankenManim's `max_working_bytes`): a tile bin past it is left out, which only slows the frame, and rows past
     it refuse the frame. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
     make (FL-033: what FrankenManim's job holds beyond its preparation accounting, measured at 865 to 872 bytes a
@@ -240,7 +253,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     `render_rgba8` adds: the RGBA16F and RGBA8 frames, each thread's tile scratch at the finest sampling, and
     `bloom_bytes` at the drawable. A view
     made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
-  - `scene_objects()` is 4: the field, the cloud, the density layer and the selection ring.
+  - `scene_objects()` is 5: the field, the cloud, the density layer, the brush's region and the selection ring.
 - `hud` (FL-024): the 3D route draws triangles, not text.
   - `HudFont::bundled()` loads FrankenManim's bundled font book (`fmn-text`), once.
   - `HudFont::text_with_swatches(text, em_pixels, swatches)` is `text` with each `HUD_SWATCH` in the next of
@@ -278,7 +291,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 
 **Invariants.**
 - *Bounded scene objects (§13.2).* The whole population is one scene object, the field another, the density layer a
-  third, the selection ring a fourth, and a frame one 3D job. There is no mobject or animation handle per organism.
+  third, the selection ring a fourth, the brush's region a fifth, and a frame one 3D job. There is no mobject or animation handle per organism.
 - *Bounded memory.* The draw buffer is reserved once, with fallible reservation, at the population ceiling. No
   update or refit allocates or moves it: `reserved_bytes` and the buffer's address are constant for the cloud's
   life.
@@ -460,13 +473,19 @@ route.
   R, D and F. In `flife-cli`, `tests/render.rs` renders one run in a second style to the same digest, and the
   binary takes its colour from the configuration unless `--color` overrides it.
 - Planted bugs in this crate were each caught (FL-018's listed in its commit; FL-019's 14 in its commit; FL-020's
-  camera, picking and world-view mutants, with `flife-render`'s interpolation ones, in its commit).
+  camera, picking and world-view mutants, with `flife-render`'s interpolation ones, in its commit). FL-022's
+  region outline: 10 of 12 caught (the band inside the region, its width in pixels not points, the colours
+  swapped, a disc's band from inside its edge, the outline not rebuilt for a new view, the same region reported
+  as a change, the region not drawn or drawn over the ring, the limit's and the frame's region terms left out).
+  The outline mirrored top to bottom survives: it is equivalent, since a rectangle and a disc are symmetric about
+  their centre and only the winding differs, which FrankenManim draws either way. The reserved bytes without the
+  region's mesh survive: no test pins the reservation's total, and the measured heap stays well within it.
 - `tests/frame_bytes.rs` (2 tests, FL-043): over Appendix A worlds at 1,024 and 16,384 organisms (a ceiling of
   16,384) and at a ceiling of 64, every style, 640 x 360 to 3840 x 2160, one and two pixels per point and zooms of
-  1, 8 and 64, 216 frames: FrankenManim's own accounting of an unlimited preparation is within the view's limit
-  (the fullest at 75.6%, and 27.3% at the ceiling of 64), so the limit leaves nothing out of them, and the job
-  compiled within it holds the same bytes. The limit is the ceiling's dots, the quads' and ring's triangles and the
-  fixed part exactly, whatever the field or the bins; `texel_bytes` is the field's texture once known and the
+  1, 8 and 64, each with a selection's ring and a removal's disc, 216 frames: FrankenManim's own accounting of an unlimited preparation is within the view's limit
+  (the fullest at 75.7%, and 32.6% at the ceiling of 64), so the limit leaves nothing out of them, and the job
+  compiled within it holds the same bytes. The limit is the ceiling's dots, the quads', ring's and a disc region's
+  triangles and the fixed part exactly, whatever the field or the bins; `texel_bytes` is the field's texture once known and the
   density's at the viewport's bins, each reserved twice, the field's values once, and follows a new pixel density.
   In `flife-cli`, `tests/memory_admission.rs` measures the view's own heap and a CPU frame against these terms, and
   that a pan or zoom allocates no layer texture (at most 440 bytes, against the field's 256 KiB texture); a 4K
@@ -502,6 +521,17 @@ route.
   - `■a■■` with two colours: the first two squares take them in order and the third is text; the triangles are the
     uncoloured text's; the glyph mesh colours exactly the squares' vertices; in a CPU frame every pixel 2 px inside
     a square is its sRGB colour (within 1.5), over 400 a square.
+- `tests/region.rs` (5 tests, FL-022):
+  - A cell's outline at fit, at two pixels a point, and zoomed 16: its inner corners are the cell's where the
+    viewport draws them, each outer corner 1.5 points out on both axes, and its eight triangles, wound alike,
+    cover exactly the band's area. A disc's at fit and zoomed 8: every vertex on its two circles, the radius and
+    1.5 points beyond, in the removal's red, its triangles covering the band between the polygons.
+  - Empty, inverted and non-finite rectangles and zero, negative, NaN and off-world-infinite discs are refused.
+  - The view outlines its region as the last draw, and under the ring when an organism is selected. Setting the
+    same region again changes nothing. Through a zoom and a new density the outline is rebuilt, as computed in
+    the test. A disc replaces the cell; a refused region leaves it; none removes it.
+  - On the CPU route: amber just outside a cell's left edge and red just outside a disc's right edge; inside both,
+    and where an old outline was, the frame is the frame without them.
 - In `flife-cli`, `tests/memory_admission.rs` measures a 4K view at 2x with the overlay: the Studio's longest
   overlay, the motion key's swatches and the inspector panel included, laid out twice and shown, and two zooms. Its
   peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.

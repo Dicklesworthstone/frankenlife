@@ -90,7 +90,7 @@ fn lowering_never_reallocates_and_the_view_is_one_scene_object() -> Result<(), C
     view.resize([640, 360])?;
     assert_eq!(view.cloud().reserved_bytes(), reserved);
     assert_eq!(view.cloud().draws().as_ptr(), storage);
-    assert_eq!(view.scene_objects(), 4);
+    assert_eq!(view.scene_objects(), 5);
     Ok(())
 }
 

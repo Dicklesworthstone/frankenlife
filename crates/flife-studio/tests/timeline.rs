@@ -291,6 +291,10 @@ fn a_recorded_session_replays_frame_for_frame() {
             "applied",
             count(|r| matches!(r, TimelineRecord::Applied { .. })),
         ),
+        (
+            "region",
+            count(|r| matches!(r, TimelineRecord::Region { region: Some(_) })),
+        ),
     ];
     println!(
         "{} records, {} frames drawn: {kinds:?}",

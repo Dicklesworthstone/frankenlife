@@ -9,7 +9,7 @@ reset), selection by displayed stable identity (§13.6), and the display one com
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
 bounded snapshot at its committed boundary (§14.2), and draws it as a panel in the overlay, read again once a
 second while the world runs. FL-022 (`flife-2jj`, part) adds energy, removal, material and
-seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, and the Studio reports the tick it applied
+seeded-introduction brushes: a click becomes a world-space command that the session applies at its next open boundary, the region a click would act on is outlined on the world, and the Studio reports the tick it applied
 at and the energy it moved (§14.3, §12.3). FL-024 (`flife-xut`, part) reports its clocks honestly (§12.2): the
 scientific ticks committed per wall second and the simulation-time to wall-time ratio, beside the frames presented.
 They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
@@ -122,7 +122,10 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
   of the pointer: 50% of their energy to the field, the rest dissipated, none out of the world`
   (`[death] residual_energy_recycle_fraction`); figures carry three significant digits of the cell width or the
   radius. The removal preview names the pointer, not its coordinates, so moving within a cell, or with the removal
-  brush, does not change the overlay's text and lay it out again.
+  brush, does not change the overlay's text and lay it out again. `preview_region(preview)` is the region the
+  frame outlines on the world (`flife_manim::Region`): the cell's rectangle, or the removal's disc, and whether
+  the stroke removes energy (a removal does: the share not recycled to the field is dissipated); none without a
+  stroke.
   `stroke(brush, viewport, logical, cells, at, supplies)` maps the logical point `at` through the viewport to the
   world point under it, `None` in the letterbox margin or while the content area is empty:
   - energy: `Stroke::Energy { cell, amount: BRUSH_ENERGY }` (64, 32 founders' endowments), the field cell whose
@@ -176,7 +179,7 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
   It returns a `Frame` (state, events, intents, refusals, statuses, refit, restyled, moved, new epoch, shown
   `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, the armed brush's `preview`
   (`brush::preview` at the pointer through the view as the frame left it, with the supplies a click there would
-  use), outcome, and `drawn`: presented
+  use, its `preview_region` outlined in that frame's drawing), outcome, and `drawn`: presented
   or rendered offscreen; the outcome is `None` offscreen). `FrameTally::drawn()` is the frames presented or
   rendered. `display_pair()` is the epochs it
   holds and `pacer()` the pacer.
@@ -377,8 +380,9 @@ presentation state, not scientific state.
 - `tests/brush.rs` (10 tests, FL-022, no window):
   - the preview at every point of the lattice, for every brush with and without a material, at fit, zoomed 2.75
     and across the seams, is `Preview::Stroke` of exactly `stroke`'s stroke there, a cell's region holding the
-    world point; the material brush over the world without a material is `NoMaterial`, and the margin, a missing
-    pointer and a missing content area are `OffWorld`;
+    world point, outlined (`preview_region`) as that cell, or the removal's disc, adding energy except for a
+    removal; the material brush over the world without a material is `NoMaterial`, and the margin, a missing
+    pointer and a missing content area are `OffWorld`, neither outlined;
   - an energy click names the cell whose square holds the world point under it (the oracle is the cell's bounds,
     on a 64 x 16 grid of non-square cells over a lattice of clicks), at fit, zoomed 2.75 and centred on the seams
     at zoom 2; both ends of both axes are reached, either side of the seams gives the last cells and the first,
@@ -461,8 +465,8 @@ presentation state, not scientific state.
     the introduction brush, 33,162 vertices and 32,082 triangles, is the longest); at 3x, all of it is still
     drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 86.9 MiB at 3840 x 2160, which leaves the backend 167.0 MiB of the 2 GiB budget (148.2
-  with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
+  terms to the observers: 86.9 MiB at 3840 x 2160, which leaves the backend 166.8 MiB of the 2 GiB budget (148.0
+  with the preset's bloom; 167.0 and 148.2 before the brush region, FL-022). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
   telemetry, 82.6 MiB (172.1) at 39,936 vertices and 38,912 triangles with the brush preview, and is 86.9 MiB at
   41,984 and 40,960 with the field's key. The field's compositions (12 bytes a texel in the feed's slots and the
@@ -499,9 +503,13 @@ presentation state, not scientific state.
   - FL-022's preview through the host: none before a brush is armed; off the world when armed before the pointer
     has moved; with the energy, removal and introduction brushes armed by key and the pointer moved over the
     world, the frame's preview is exactly the stroke `stroke` makes there through the view, a cell's region
-    holding the world point under the pointer; a click there then submits that stroke (all three, in order); the
-    material brush with no organism selected is `NoMaterial`, the margin `OffWorld`, and disarmed there is no
-    preview.
+    holding the world point under the pointer; the view outlines `preview_region` of it, and on the Metal route
+    the pixel just outside the energy brush's cell is amber; a click there then submits that stroke (all three,
+    in order); the material brush with no organism selected is `NoMaterial`, the margin `OffWorld`, and disarmed
+    there is no preview; none of the three is outlined.
+  - Planted bugs in the region outline (FL-022), each caught: the host outlining nothing or not recording the
+    region (this file, `tests/timeline.rs`), a removal outlined as adding energy or with half its radius
+    (`tests/brush.rs`), the replay outlining nothing, and a recorded rectangle doubled (`tests/timeline.rs`).
   - Planted bugs in the preview, each run against the tests that should catch it: the preview made with another
     brush, a cell's region one cell on, no-material never said, the region left out (`tests/brush.rs`); the host
     previewing without the pointer, while disarmed, or without the selected organism's material (this file);
@@ -585,9 +593,9 @@ presentation state, not scientific state.
   - G10. An offscreen Studio on the preset at 320 x 200 points and 2x records its timeline while posted input
     sets an overlay, restyles (key 3, then C, the field's composition), zooms, selects the shown organism nearest the centre, arms the energy
     brush and clicks, runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
-    Every kind of record is made (in one run: 155 records, 72 frames, 2 restyles, 12 camera moves, 49 shows, 3
-    placements and 9 advances, one between epochs at a fraction strictly inside (0, 1)), a style record names the
-    composition, and the stroke applies. Written
+    Every kind of record is made (in one run: 161 records, 73 frames, 2 restyles, 12 camera moves, 4 brush
+    regions, 50 shows, 3 placements and 9 advances, one between epochs at a fraction strictly inside (0, 1)), a
+    style record names the composition, and the stroke applies. The replay outlines each region as recorded. Written
     as NDJSON and read back, the records are equal. The replay redraws every frame in order at the tick the
     Studio showed it, its RGBA8 bytes hashing equal, and closes on the Studio's tick and digest with the one
     command. It refuses, with a `StateConflict`, a timeline whose end names another world, one with its
@@ -659,8 +667,8 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     window, which no test here opened. The controls, the payload mapping, the session thread and the `submitted`
     and `finished` records' serialization are tested headlessly. `tests/live.rs` has a brush case
     that was compiled and not run.
-  - The preview is text in the overlay: the region is named in world units, not drawn as a cursor, square or disk
-    on the world, and a removal's disk is about the pointer. A command's applied energy is in its `finished`
+  - The region is outlined on the world and named in world units in the overlay; a removal's disk is about the
+    pointer. The outline in a window is unrun here: offscreen frames and the replay draw it. A command's applied energy is in its `finished`
     record, not the overlay. The binary's filling of the preview (the recycled share from the configuration) runs
     only in a window: no offscreen binary run arms a brush.
   - A stroke is one click of fixed size. Painting by drag, a choice of amount, count or removal disposition, a

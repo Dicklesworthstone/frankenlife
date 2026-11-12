@@ -24,7 +24,7 @@ use flife_core::{Tick, ValidatedConfig};
 use flife_engine::{
     AppliedIntervention, Arrangement, Disposition, Intervention, NumericalProfile, Stepped, World,
 };
-use flife_manim::{Region, RegionShape, Viewport};
+use flife_manim::{Region, RegionEffect, RegionShape, Viewport};
 use flife_runtime::Outcome;
 use flife_studio::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Intent, OUTCOME_POLL, Preview,
@@ -301,7 +301,11 @@ fn a_preview_is_the_stroke_a_click_there_makes() {
                                 preview_region(&shown),
                                 Some(Region {
                                     shape,
-                                    removes: brush == Brush::Removal
+                                    effect: if brush == Brush::Removal {
+                                        RegionEffect::Removes
+                                    } else {
+                                        RegionEffect::Adds
+                                    }
                                 })
                             );
                             strokes += 1;
@@ -454,7 +458,7 @@ fn a_removal_drag_draws_a_disk_of_its_length() {
                 preview_region(&shown),
                 Some(Region {
                     shape: RegionShape::Disc { center, radius },
-                    removes: true
+                    effect: RegionEffect::Removes
                 })
             );
         }

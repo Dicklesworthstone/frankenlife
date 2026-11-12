@@ -77,8 +77,8 @@ use crate::keep::Keeping;
 
 use crate::timeline::{Exact, TimelineRecord};
 use crate::{
-    Brush, CameraMove, Controls, Intent, Pacer, Preview, SessionThread, Status, Supplies, brush,
-    material_for,
+    Brush, CameraMove, Controls, Disk, Intent, MeasurePreview, Pacer, Preview, SessionThread,
+    Status, Supplies, brush, material_for, measure,
 };
 
 /// The session a Studio opens.
@@ -196,6 +196,10 @@ pub struct Frame {
     /// disk is being drawn, what a release there would apply
     /// ([`brush::drawing`]).
     pub preview: Option<Preview>,
+    /// While the measuring tool is armed, what it shows (plan §14.3's
+    /// temporary measurement region): the disk placed, or what a click or a
+    /// release at the pointer would measure ([`measure::preview`]).
+    pub measuring: Option<MeasurePreview>,
     /// The presentation outcome; `None` when the window was occluded or
     /// closed and nothing was rendered, and offscreen.
     pub outcome: Option<PresentOutcome>,
@@ -232,6 +236,12 @@ pub struct FrameTally {
     /// Brush clicks that made no stroke: in the letterbox margin, or the
     /// material brush with no selected organism's affinity known.
     pub unstroked: u64,
+    /// Disks the measuring tool placed and offered to the session to
+    /// measure (plan §14.3).
+    pub measures: u64,
+    /// Measuring clicks and drags that placed no disk: pressed in the
+    /// letterbox margin, or a drag of no length.
+    pub unmeasured: u64,
     /// Intents accepted.
     pub intents: u64,
     /// Intents refused.
@@ -321,6 +331,8 @@ pub struct Studio {
     opened: Instant,
     /// Whether the camera tracks the selected organism (plan §14.3).
     tracking: bool,
+    /// The disk the measuring tool placed, while it is armed (plan §14.3).
+    measure: Option<Disk>,
     /// What [`Studio::resume`] recovered.
     resumed: Option<Resumed>,
 }
@@ -615,6 +627,7 @@ impl Studio {
             }),
             opened: Instant::now(),
             tracking: false,
+            measure: None,
             resumed: None,
         })
     }
@@ -835,6 +848,7 @@ impl Studio {
         let mut viewport = *self.view.viewport();
         let mut picked = None;
         let mut strokes = Vec::new();
+        let mut measured = Vec::new();
         let mut weights = false;
         let supplies = self.supplies();
         for change in self.controls.take_moves() {
@@ -893,6 +907,17 @@ impl Studio {
                         None => self.tally.unstroked += 1,
                     }
                 }
+                // Through the view as it was at the click or the release.
+                CameraMove::Measure { center, edge } => {
+                    let center = [center.x, center.y];
+                    match logical.and_then(|size| match edge {
+                        Some(edge) => measure::drawn(&viewport, size, center, [edge.x, edge.y]),
+                        None => measure::clicked(&viewport, size, center),
+                    }) {
+                        Some(disk) => measured.push(disk),
+                        None => self.tally.unmeasured += 1,
+                    }
+                }
                 CameraMove::Weights => weights = true,
                 CameraMove::Track => self.tracking = !self.tracking,
             }
@@ -944,6 +969,20 @@ impl Studio {
                 self.tally.refused += 1;
                 self.controls.refused(intent);
             }
+        }
+        // Each disk placed is measured; the last stays placed while the
+        // tool is armed, and putting the tool away takes it away.
+        for disk in measured {
+            self.measure = Some(disk);
+            self.tally.measures += 1;
+            if self.send_measure(disk) {
+                intents += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        if !self.controls.measuring() {
+            self.measure = None;
         }
         // A weight dump (FL-021) of whatever is selected once the frame's
         // moves are taken; with nothing selected, none.
@@ -1081,7 +1120,21 @@ impl Studio {
                     &self.supplies(),
                 ),
             });
-        let region = preview.as_ref().and_then(brush::preview_region);
+        // The measuring tool's disk, placed or about to be, in the
+        // measurement colour (plan §14.3); never with a brush armed.
+        let measuring = self.controls.measuring().then(|| {
+            measure::preview(
+                self.view.viewport(),
+                logical,
+                pointer,
+                self.controls.drawing().map(|center| [center.x, center.y]),
+                self.measure,
+            )
+        });
+        let region = preview
+            .as_ref()
+            .and_then(brush::preview_region)
+            .or_else(|| measuring.and_then(MeasurePreview::disk).map(Disk::region));
         if self.view.set_region(region)? {
             self.note(|| TimelineRecord::Region {
                 region: region.map(Into::into),
@@ -1154,9 +1207,48 @@ impl Studio {
             hover: self.controls.hover(self.view.viewport()),
             brush: self.controls.brush(),
             preview,
+            measuring,
             outcome,
             drawn,
         })
+    }
+
+    /// The disk the measuring tool placed, while it is armed (plan §14.3).
+    #[must_use]
+    pub const fn measured(&self) -> Option<Disk> {
+        self.measure
+    }
+
+    /// Measure the placed disk again (plan §14.3): what it holds at the
+    /// committed boundary arrives as a [`Status::Measured`], as a placing's
+    /// does. The Studio's binary refreshes the overlay's measurement this
+    /// way, once a second while the world runs and after each step. `false`
+    /// when no disk is placed, or when the session refused it (counted as
+    /// refused).
+    pub fn measure_again(&mut self) -> bool {
+        self.measure.is_some_and(|disk| self.send_measure(disk))
+    }
+
+    /// Offer the session `disk` to measure, seen on the epoch shown;
+    /// counted as an intent or as refused.
+    fn send_measure(&mut self, disk: Disk) -> bool {
+        let seen = self
+            .view
+            .shown()
+            .map_or_else(|| self.current.tick(), |shown| shown.tick);
+        let intent = Intent::Measure {
+            center: disk.center,
+            radius: disk.radius,
+            seen,
+        };
+        if self.session.send(intent).is_ok() {
+            self.tally.intents += 1;
+            true
+        } else {
+            self.tally.refused += 1;
+            self.controls.refused(intent);
+            false
+        }
     }
 
     /// The newest epoch the session has published: its committed tick,

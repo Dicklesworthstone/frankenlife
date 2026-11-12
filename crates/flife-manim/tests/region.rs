@@ -9,8 +9,8 @@ mod common;
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_manim::{
-    REGION_ADDS_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS, REGION_WIDTH_POINTS, Region,
-    RegionShape, Viewport, WorldView, region_outline,
+    REGION_ADDS_COLOR, REGION_MEASURES_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS,
+    REGION_WIDTH_POINTS, Region, RegionEffect, RegionShape, Viewport, WorldView, region_outline,
 };
 use fmn_render::{SurfaceMesh, ThreeDDraw};
 
@@ -74,7 +74,7 @@ fn a_cells_outline_is_a_band_just_outside_it_at_a_fixed_width_on_screen() {
     ] {
         let region = Region {
             shape: RegionShape::Rectangle(bounds),
-            removes: false,
+            effect: RegionEffect::Adds,
         };
         let mesh = region_outline(&viewport, region).expect("an outline");
         let w = width(&viewport);
@@ -136,7 +136,7 @@ fn a_discs_outline_is_an_annulus_from_its_edge_in_the_removals_colour() {
     ] {
         let region = Region {
             shape: RegionShape::Disc { center, radius },
-            removes: true,
+            effect: RegionEffect::Removes,
         };
         let mesh = region_outline(&viewport, region).expect("an outline");
         let w = width(&viewport);
@@ -160,6 +160,59 @@ fn a_discs_outline_is_an_annulus_from_its_edge_in_the_removals_colour() {
         assert!(
             close(covered, polygon(radius + w) - polygon(radius)),
             "{covered}"
+        );
+    }
+}
+
+/// A measurement region (plan §14.3) is outlined exactly where a removal's
+/// or an addition's of the same shape is, in its own colour: the three
+/// colours differ, and each outline's every vertex is its region's colour.
+#[test]
+fn a_measurement_is_outlined_where_a_stroke_is_in_its_own_colour() {
+    let viewport = view([64.0, 48.0], [1280, 720], 2.0, [40.0, 10.0], 4.0);
+    let colors = [
+        REGION_ADDS_COLOR,
+        REGION_REMOVES_COLOR,
+        REGION_MEASURES_COLOR,
+    ];
+    for (at, a) in colors.iter().enumerate() {
+        for b in &colors[at + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    for shape in [
+        RegionShape::Rectangle([[12.0, 13.0], [30.0, 31.0]]),
+        RegionShape::Disc {
+            center: [40.25, 10.75],
+            radius: 2.5,
+        },
+    ] {
+        let outlines: Vec<SurfaceMesh> = [
+            RegionEffect::Adds,
+            RegionEffect::Removes,
+            RegionEffect::Measures,
+        ]
+        .into_iter()
+        .map(|effect| region_outline(&viewport, Region { shape, effect }).expect("an outline"))
+        .collect();
+        for (mesh, color) in outlines.iter().zip(colors) {
+            assert!(mesh.vertices().iter().all(|vertex| vertex.color == color));
+            assert_eq!(mesh.indices(), outlines[0].indices());
+            let points = |mesh: &SurfaceMesh| -> Vec<[u64; 3]> {
+                mesh.vertices()
+                    .iter()
+                    .map(|vertex| vertex.point.map(f64::to_bits))
+                    .collect()
+            };
+            assert_eq!(points(mesh), points(&outlines[0]), "{shape:?}");
+        }
+        assert_eq!(
+            Region {
+                shape,
+                effect: RegionEffect::Measures
+            }
+            .color(),
+            REGION_MEASURES_COLOR
         );
     }
 }
@@ -196,7 +249,7 @@ fn a_region_that_is_not_one_is_refused() {
             &viewport,
             Region {
                 shape,
-                removes: false,
+                effect: RegionEffect::Adds,
             },
         );
         assert!(
@@ -223,7 +276,7 @@ fn the_view_outlines_its_region_over_the_organisms_and_under_the_ring() {
 
     let cell = Region {
         shape: RegionShape::Rectangle([[2.0, 3.0], [5.0, 6.0]]),
-        removes: false,
+        effect: RegionEffect::Adds,
     };
     assert!(view_.set_region(Some(cell)).expect("a region"));
     assert!(!view_.set_region(Some(cell)).expect("the same region"));
@@ -286,7 +339,7 @@ fn the_view_outlines_its_region_over_the_organisms_and_under_the_ring() {
             center: [2.5, 5.5],
             radius: 0.75,
         },
-        removes: true,
+        effect: RegionEffect::Removes,
     };
     assert!(view_.set_region(Some(disc)).expect("a disc"));
     assert_eq!(outline(&view_).len(), 2 * REGION_SEGMENTS);
@@ -295,7 +348,7 @@ fn the_view_outlines_its_region_over_the_organisms_and_under_the_ring() {
             center: [2.5, 5.5],
             radius: 0.0,
         },
-        removes: true,
+        effect: RegionEffect::Removes,
     };
     assert!(view_.set_region(Some(refused)).is_err());
     assert_eq!(view_.region(), Some(disc));
@@ -338,7 +391,7 @@ fn a_rendered_frame_outlines_the_region_and_leaves_its_inside() {
 
     let cell = Region {
         shape: RegionShape::Rectangle([[3.0, 4.0], [3.0, 4.0]]),
-        removes: false,
+        effect: RegionEffect::Adds,
     };
     view_.set_region(Some(cell)).expect("a region");
     let outlined = view_.render_rgba8(2).expect("a frame");
@@ -363,7 +416,7 @@ fn a_rendered_frame_outlines_the_region_and_leaves_its_inside() {
             center: [5.0, 5.0],
             radius: 0.5,
         },
-        removes: true,
+        effect: RegionEffect::Removes,
     };
     view_.set_region(Some(disc)).expect("a disc");
     let removing = view_.render_rgba8(2).expect("a frame");

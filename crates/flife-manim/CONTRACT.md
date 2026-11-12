@@ -77,12 +77,14 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   in points at any zoom, in `SELECTION_RING_COLOR` (near-white, alpha 0.95), wound like the quads.
 - `region_outline(viewport, region)` (FL-022, plan §14.3: a preview shows its "affected region, and whether it
   adds/removes energy"). A `Region` is a `RegionShape`, a cell's `Rectangle` or a removal's `Disc` in world units,
-  and whether its stroke `removes` energy. The outline is a band `REGION_WIDTH_POINTS = 1.5` points wide just
-  outside the region, at any zoom and pixel density, so what is inside stays visible. A rectangle's band is four
-  mitred quads (8 triangles); a disc's is an annulus of `REGION_SEGMENTS = 48` quads from its edge outward. The
-  quads are wound like the ring's, placed where the viewport draws the region's centre, in `REGION_ADDS_COLOR`
-  (amber) or `REGION_REMOVES_COLOR` (red), alpha 0.9. An empty, inverted or non-finite rectangle, or a radius
-  that is not positive, is refused.
+  and its `RegionEffect`: a stroke that `Adds` energy, one that `Removes` it, or a measurement region that
+  `Measures` (plan §14.3's temporary measurement region, the Studio's measuring tool), changing nothing. The
+  outline is a band `REGION_WIDTH_POINTS = 1.5` points wide just outside the region, at any zoom and pixel
+  density, so what is inside stays visible. A rectangle's band is four mitred quads (8 triangles); a disc's is an
+  annulus of `REGION_SEGMENTS = 48` quads from its edge outward. The quads are wound like the ring's, placed where
+  the viewport draws the region's centre, in `REGION_ADDS_COLOR` (amber), `REGION_REMOVES_COLOR` (red) or
+  `REGION_MEASURES_COLOR` (cyan, 0.45, 0.9, 1.0), alpha 0.9. An empty, inverted or non-finite rectangle, or a
+  radius that is not positive, is refused.
 - `Viewport::camera(background)`:
   - a FrankenManim `ThreeDCamera` at the drawable's resolution;
   - its frame is `frame_shape() = (Dw / scale, Dh / scale)`, centred at the origin, at `DEFAULT_FOVY`, `zxz`;
@@ -544,7 +546,10 @@ route.
   - `■a■■` with two colours: the first two squares take them in order and the third is text; the triangles are the
     uncoloured text's; the glyph mesh colours exactly the squares' vertices; in a CPU frame every pixel 2 px inside
     a square is its sRGB colour (within 1.5), over 400 a square.
-- `tests/region.rs` (5 tests, FL-022):
+- `tests/region.rs` (6 tests, FL-022, plan §14.3):
+  - A measurement region, a cell's and a disc's, is outlined at the same vertices, bit for bit, and with the same
+    triangles as an addition's or a removal's of the same shape, every vertex in its own colour; the three colours
+    differ.
   - A cell's outline at fit, at two pixels a point, and zoomed 16: its inner corners are the cell's where the
     viewport draws them, each outer corner 1.5 points out on both axes, and its eight triangles, wound alike,
     cover exactly the band's area. A disc's at fit and zoomed 8: every vertex on its two circles, the radius and

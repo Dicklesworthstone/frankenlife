@@ -63,8 +63,8 @@ pub use mapping::{
     linear, mapped_color, mapped_rgb8, mix, ramp, speed_level, traits, wheel,
 };
 pub use region::{
-    REGION_ADDS_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS, REGION_WIDTH_POINTS, Region,
-    RegionShape, region_outline,
+    REGION_ADDS_COLOR, REGION_MEASURES_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS,
+    REGION_WIDTH_POINTS, Region, RegionEffect, RegionShape, region_outline,
 };
 pub use selection::{
     PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,

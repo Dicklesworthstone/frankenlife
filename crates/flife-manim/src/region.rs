@@ -1,12 +1,14 @@
-//! The region a brush would act on, outlined on the world (FL-022, plan
-//! §14.3: "Every intervention preview shows its units, affected region,
-//! and whether it adds/removes energy").
+//! The region a brush would act on, or the measuring tool measures,
+//! outlined on the world (FL-022, plan §14.3: "Every intervention preview
+//! shows its units, affected region, and whether it adds/removes energy";
+//! "temporary measurement regions").
 //!
-//! A region is a cell's rectangle or a disc, in world units, and whether
-//! the stroke on it adds energy to the world or removes it, which is the
-//! outline's colour. The outline lies just outside the region, so what is
-//! inside stays visible, and keeps its width on screen at any zoom or
-//! pixel density.
+//! A region is a cell's rectangle or a disc, in world units, and its
+//! [`RegionEffect`]: whether the stroke on it adds energy to the world or
+//! removes it, or whether it is a measurement, which changes nothing. The
+//! effect is the outline's colour. The outline lies just outside the
+//! region, so what is inside stays visible, and keeps its width on screen
+//! at any zoom or pixel density.
 
 use flife_core::CoreError;
 use fmn_core::color::LinearRgba;
@@ -38,6 +40,15 @@ pub const REGION_REMOVES_COLOR: LinearRgba = LinearRgba {
     a: 0.9,
 };
 
+/// The outline of a measurement region, which changes nothing: pale cyan,
+/// nearly opaque, linear light.
+pub const REGION_MEASURES_COLOR: LinearRgba = LinearRgba {
+    r: 0.45,
+    g: 0.9,
+    b: 1.0,
+    a: 0.9,
+};
+
 /// A corner of an outline's band, as world offsets from the region's
 /// centre: the outer point, then the inner.
 type Corner = ([f64; 2], [f64; 2]);
@@ -56,25 +67,37 @@ pub enum RegionShape {
     },
 }
 
-/// The region a stroke acts on, and whether it adds energy to the world
-/// or removes it.
+/// What a region's stroke does to the world's energy, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionEffect {
+    /// A stroke that adds energy to the world.
+    Adds,
+    /// A stroke that removes energy from the world.
+    Removes,
+    /// No stroke: a measurement region (plan §14.3), which changes nothing.
+    Measures,
+}
+
+/// The region a stroke acts on and what it does to the world's energy, or
+/// a region measured.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Region {
     /// Where.
     pub shape: RegionShape,
-    /// Whether the stroke removes energy from the world.
-    pub removes: bool,
+    /// What the stroke does, or that it is a measurement.
+    pub effect: RegionEffect,
 }
 
 impl Region {
-    /// The outline's colour: [`REGION_REMOVES_COLOR`] for a stroke that
-    /// removes energy, [`REGION_ADDS_COLOR`] for one that adds it.
+    /// The outline's colour: [`REGION_ADDS_COLOR`] for a stroke that adds
+    /// energy, [`REGION_REMOVES_COLOR`] for one that removes it, and
+    /// [`REGION_MEASURES_COLOR`] for a measurement.
     #[must_use]
     pub const fn color(self) -> LinearRgba {
-        if self.removes {
-            REGION_REMOVES_COLOR
-        } else {
-            REGION_ADDS_COLOR
+        match self.effect {
+            RegionEffect::Adds => REGION_ADDS_COLOR,
+            RegionEffect::Removes => REGION_REMOVES_COLOR,
+            RegionEffect::Measures => REGION_MEASURES_COLOR,
         }
     }
 }

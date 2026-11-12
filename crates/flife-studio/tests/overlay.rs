@@ -15,8 +15,8 @@ use flife_core::memory::MemoryAdmission;
 use flife_core::{LedgerReport, Tick, ValidatedConfig};
 use flife_engine::{
     Ancestor, Arrangement, Descendants, ExchangeCell, LocalChemistry, MATERIAL_CHANNELS,
-    NumericalProfile, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Split, Stepped,
-    Unviable, World,
+    NumericalProfile, OrganismSnapshot, RECENT_STEPS, RegionMeasurement, ReproductionOutcome,
+    Split, Stepped, Unviable, World,
 };
 use flife_manim::{
     COMPONENT_PALETTE, FieldComponent, FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES,
@@ -25,9 +25,9 @@ use flife_manim::{
 };
 use flife_render::{Metrics, Tally};
 use flife_studio::{
-    BRUSH_ENERGY, BRUSH_INTRODUCTION, Brush, BrushPreview, ClockReading, ColorMapping, Inspected,
-    OverlayState, Preview, Stroke, Telemetry, field_key, inspector_lines, legends, overlay_text,
-    preview_line, telemetry_lines,
+    BRUSH_ENERGY, BRUSH_INTRODUCTION, Brush, BrushPreview, ClockReading, ColorMapping, Disk,
+    Inspected, MeasurePreview, Measuring, OverlayState, Preview, Stroke, Telemetry, field_key,
+    inspector_lines, legends, measuring_lines, overlay_text, preview_line, telemetry_lines,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -138,6 +138,7 @@ fn state(legend: &Legend) -> OverlayState<'_> {
         field_key: None,
         brush: None,
         preview: None,
+        measuring: None,
         selected: None,
         inspected: None,
         telemetry: None,
@@ -424,6 +425,7 @@ fn the_overlay_says_what_the_session_is_doing() {
             field_key: None,
             brush: Some(Brush::Material),
             preview: None,
+            measuring: None,
             selected: Some(OrganismId::new(1_234_567)),
             inspected: None,
             telemetry: None,
@@ -1224,21 +1226,63 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         })
         .expect("a field key");
     println!("the widest field key: {}", field.text);
-    // Each brush's widest click, and the widest removal disk being drawn.
-    let previews: Vec<(Brush, BrushPreview)> = [
+    // The measuring tool's widest (plan §14.3): the finest radius, and
+    // every count and energy of what it holds at their widest.
+    let disk = Disk {
+        center: [99_999.999_999_999; 2],
+        radius: 1.0e-7,
+    };
+    let held = RegionMeasurement {
+        tick: Tick::new(999_999_999_999),
+        center: disk.center,
+        radius: disk.radius,
+        organisms: 999_999_999_999,
+        organism_energy: 99_999.94,
+        lineages: 999_999_999_999,
+        cells: 999_999_999_999,
+        field_energy: 99_999.94,
+    };
+    let placed = Measuring {
+        preview: MeasurePreview::Placed(disk),
+        measurement: Some(&held),
+    };
+    assert_eq!(
+        measuring_lines(&placed),
+        "radius 0.000000100 world units at tick 999,999,999,999: 999,999,999,999 organisms of \
+         99999.9 energy, 999,999,999,999 lineages\nfield 99999.9 energy in 999,999,999,999 cells"
+    );
+    let clicked = Measuring {
+        preview: MeasurePreview::Click(Some(disk)),
+        measurement: None,
+    };
+    // Each brush's widest click, the widest removal disk being drawn, and
+    // the measuring tool's widest click and placed disk, which says a line
+    // more: the brushes and the tool are never armed together. Each with
+    // the lines the overlay then has.
+    type Tool<'a> = (
+        Option<Brush>,
+        Option<BrushPreview>,
+        Option<Measuring<'a>>,
+        usize,
+    );
+    let tools: Vec<Tool<'_>> = [
         Brush::Energy,
         Brush::Removal,
         Brush::Material,
         Brush::Introduction,
     ]
     .into_iter()
-    .map(|brush| (brush, widest_preview(brush)))
-    .chain([(Brush::Removal, widest_drawing())])
+    .map(|brush| (Some(brush), Some(widest_preview(brush)), None, 25))
+    .chain([
+        (Some(Brush::Removal), Some(widest_drawing()), None, 25),
+        (None, None, Some(clicked), 25),
+        (None, None, Some(placed), 26),
+    ])
     .collect();
     let mut most = (0, 0);
-    for ((mapping, legend), (brush, preview)) in keys
+    for ((mapping, legend), (brush, preview, measuring, lines)) in keys
         .iter()
-        .flat_map(|key| previews.iter().map(move |pair| (key, *pair)))
+        .flat_map(|key| tools.iter().map(move |tool| (key, *tool)))
     {
         let text = overlay_text(&OverlayState {
             paused: Some(false),
@@ -1247,8 +1291,9 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
             clock: Some(&reading),
             legend,
             field_key: Some(&field),
-            brush: Some(brush),
-            preview: Some(preview),
+            brush,
+            preview,
+            measuring,
             selected: Some(OrganismId::new(999_999_999_999)),
             inspected: Some(Inspected::Read(&longest)),
             telemetry: Some(Telemetry {
@@ -1261,7 +1306,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 25, "{text}");
+        assert_eq!(text.lines().count(), lines, "{text}");
         let colors: Vec<_> = legend
             .swatches
             .iter()
@@ -1278,7 +1323,8 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
             most.1.max(laid.triangles().len()),
         );
         println!(
-            "{mapping} {brush:?}: {glyphs} glyphs, {} vertices, {} triangles",
+            "{mapping} {brush:?} {:?}: {glyphs} glyphs, {} vertices, {} triangles",
+            measuring.map(|measuring| measuring.preview),
             laid.vertices().len(),
             laid.triangles().len()
         );
@@ -1428,5 +1474,132 @@ fn a_preview_says_what_a_click_does() {
         }),
         "paused · tick 7\nenergy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16\nmaterial brush · organism 42\n\
          a click does nothing: select an organism for its material"
+    );
+}
+
+/// The measuring tool (plan §14.3's temporary measurement region): what a
+/// click or a release would measure, and what the placed disk holds, only
+/// once the measurement of that disk is in.
+#[test]
+fn a_measurement_says_what_its_disk_holds() {
+    fn lines(preview: MeasurePreview, measurement: Option<&RegionMeasurement>) -> String {
+        measuring_lines(&Measuring {
+            preview,
+            measurement,
+        })
+    }
+    let disk = Disk {
+        center: [12.3, 45.6],
+        radius: 4.56,
+    };
+    assert_eq!(
+        lines(
+            MeasurePreview::Click(Some(Disk {
+                center: [16.4, 12.0],
+                radius: 1.234_5
+            })),
+            None
+        ),
+        "a click measures within 1.23 world units of the pointer; a drag draws the disk"
+    );
+    assert_eq!(
+        lines(MeasurePreview::Click(None), None),
+        "a click measures nothing: the pointer is off the world"
+    );
+    assert_eq!(
+        lines(MeasurePreview::Release(Some(disk)), None),
+        "a release measures within 4.56 world units of the press"
+    );
+    assert_eq!(
+        lines(MeasurePreview::Release(None), None),
+        "a release measures nothing: the press was off the world"
+    );
+    assert_eq!(
+        lines(MeasurePreview::Placed(disk), None),
+        "radius 4.56 world units: measuring"
+    );
+    let held = RegionMeasurement {
+        tick: Tick::new(5_120),
+        center: disk.center,
+        radius: disk.radius,
+        organisms: 17,
+        organism_energy: 41.23,
+        lineages: 3,
+        cells: 1_064,
+        field_energy: 812.46,
+    };
+    let full = "radius 4.56 world units at tick 5,120: 17 organisms of 41.2 energy, 3 \
+                lineages\nfield 812.5 energy in 1,064 cells";
+    assert_eq!(lines(MeasurePreview::Placed(disk), Some(&held)), full);
+    // The measurement of another disk, as a disk placed again has until its
+    // own answers, is not shown: neither another centre nor another radius.
+    for other in [
+        RegionMeasurement {
+            center: [12.3, 45.7],
+            ..held
+        },
+        RegionMeasurement {
+            radius: 4.57,
+            ..held
+        },
+    ] {
+        assert_eq!(
+            lines(MeasurePreview::Placed(disk), Some(&other)),
+            "radius 4.56 world units: measuring"
+        );
+    }
+    // While a disk is drawn or a click is offered, no measurement shows.
+    assert_eq!(
+        lines(MeasurePreview::Release(Some(disk)), Some(&held)),
+        "a release measures within 4.56 world units of the press"
+    );
+    // A finer radius keeps three significant figures; a wide one goes to
+    // scientific notation from 100,000.
+    assert_eq!(
+        lines(
+            MeasurePreview::Placed(Disk {
+                center: [0.25, 1.5],
+                radius: 0.012_34
+            }),
+            None
+        ),
+        "radius 0.0123 world units: measuring"
+    );
+    assert_eq!(
+        lines(
+            MeasurePreview::Click(Some(Disk {
+                center: [123_456.0, 7.0],
+                radius: 123_456.0
+            })),
+            None
+        ),
+        "a click measures within 1.23e5 world units of the pointer; a drag draws the disk"
+    );
+    // In the overlay: `measuring` before the selection, as a brush's name
+    // is, and its lines where a brush's preview would be.
+    let energy = key(ColorMapping::Energy);
+    assert_eq!(
+        overlay_text(&OverlayState {
+            paused: Some(true),
+            shown: Some(Tick::new(7)),
+            measuring: Some(Measuring {
+                preview: MeasurePreview::Placed(disk),
+                measurement: Some(&held),
+            }),
+            selected: Some(OrganismId::new(42)),
+            ..state(&energy)
+        }),
+        format!(
+            "paused · tick 7\nenergy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16\nmeasuring · organism 42\n{full}"
+        )
+    );
+    // Put away, it says nothing.
+    assert_eq!(
+        overlay_text(&OverlayState {
+            paused: Some(true),
+            shown: Some(Tick::new(7)),
+            ..state(&energy)
+        }),
+        "paused · tick 7\nenergy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16"
     );
 }

@@ -4,7 +4,7 @@
 use flife_manim::Viewport;
 use flife_studio::{
     Brush, CameraMove, ColorMapping, Controls, FieldComponent, FieldMapping, Intent, KEY_C, KEY_D,
-    KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R,
+    KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R,
     KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, Look, Particles, Style,
     ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
@@ -537,6 +537,155 @@ fn an_armed_removal_drag_draws_its_disk() {
         ]
     );
     assert_eq!(controls.tally().moves, 4);
+}
+
+/// Plan §14.3's temporary measurement region: G arms the measuring tool,
+/// putting any brush away, and G again puts it away; arming a brush puts it
+/// away too. Held (auto-repeat) or with ⌘, G does nothing, and it is never
+/// an intent or a style key.
+#[test]
+fn g_arms_the_measuring_tool_apart_from_the_brushes() {
+    // `kVK_ANSI_G` is 0x05 (Carbon's `Events.h`).
+    assert_eq!(KEY_G, 0x05);
+    let mut controls = Controls::new();
+    let style = controls.style();
+    assert!(!controls.measuring());
+    assert!(tap(&mut controls, KEY_G).is_empty());
+    assert!(controls.measuring());
+    assert_eq!(controls.brush(), None);
+    assert!(tap(&mut controls, KEY_G).is_empty());
+    assert!(!controls.measuring());
+    // Exclusive with every brush, both ways.
+    for (code, brush) in [
+        (KEY_E, Brush::Energy),
+        (KEY_X, Brush::Removal),
+        (KEY_M, Brush::Material),
+        (KEY_I, Brush::Introduction),
+    ] {
+        tap(&mut controls, code);
+        assert_eq!(controls.brush(), Some(brush));
+        tap(&mut controls, KEY_G);
+        assert!(controls.measuring());
+        assert_eq!(controls.brush(), None, "{brush:?}");
+        tap(&mut controls, code);
+        assert_eq!(controls.brush(), Some(brush));
+        assert!(!controls.measuring(), "{brush:?}");
+        // Disarming that brush leaves the tool put away.
+        tap(&mut controls, code);
+        assert_eq!(controls.brush(), None);
+        assert!(!controls.measuring());
+    }
+    controls.apply(&key(KEY_G, true, true, Modifiers::NONE));
+    controls.apply(&key(
+        KEY_G,
+        true,
+        false,
+        Modifiers {
+            command: true,
+            ..Modifiers::NONE
+        },
+    ));
+    assert!(!controls.measuring());
+    assert!(moves(&mut controls).is_empty());
+    assert_eq!(controls.style(), style);
+}
+
+/// With the measuring tool armed, a click measures where it pressed, and a
+/// drag draws a disk centred where it pressed instead of panning, measured
+/// at its release out to where it was released; `drawing` names its centre
+/// meanwhile. Putting the tool away while a drag is held, or losing the
+/// press, measures nothing; a drag that left the slop panning keeps
+/// panning when the tool is armed during it; once put away a click selects.
+#[test]
+fn an_armed_measuring_click_or_drag_measures() {
+    let mut controls = Controls::new();
+    tap(&mut controls, KEY_G);
+    controls.apply(&button(true, point(40.0, 50.0)));
+    controls.apply(&drag_to(point(41.0, 51.0)));
+    controls.apply(&button(false, point(41.0, 51.0)));
+    controls.apply(&button(true, point(100.0, 100.0)));
+    controls.apply(&drag_to(point(102.0, 103.0)));
+    // Within the slop: still a click candidate.
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&drag_to(point(110.0, 96.0)));
+    assert_eq!(controls.drawing(), Some(point(100.0, 100.0)));
+    controls.apply(&drag_to(point(130.0, 60.0)));
+    controls.apply(&button(false, point(124.0, 132.0)));
+    assert_eq!(controls.drawing(), None);
+    assert_eq!(
+        moves(&mut controls),
+        [
+            CameraMove::Measure {
+                center: point(40.0, 50.0),
+                edge: None
+            },
+            CameraMove::Measure {
+                center: point(100.0, 100.0),
+                edge: Some(point(124.0, 132.0))
+            },
+        ],
+        "a drawing pans nothing"
+    );
+
+    // Put away while held: nothing is drawn, and the release measures
+    // nothing.
+    controls.apply(&button(true, point(50.0, 50.0)));
+    controls.apply(&drag_to(point(70.0, 50.0)));
+    tap(&mut controls, KEY_G);
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(70.0, 50.0)));
+    // The removal brush armed while a measuring drag is held: a drag draws
+    // for the tool armed as it left the slop, and the removal brush's
+    // release removes nothing drawn to be measured.
+    tap(&mut controls, KEY_G);
+    controls.apply(&button(true, point(50.0, 50.0)));
+    controls.apply(&drag_to(point(70.0, 50.0)));
+    tap(&mut controls, KEY_X);
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(70.0, 50.0)));
+    // Nor does the tool measure a removal's disk armed while it is drawn.
+    controls.apply(&button(true, point(50.0, 50.0)));
+    controls.apply(&drag_to(point(70.0, 50.0)));
+    assert_eq!(controls.drawing(), Some(point(50.0, 50.0)));
+    tap(&mut controls, KEY_G);
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(70.0, 50.0)));
+    tap(&mut controls, KEY_G);
+    // Lost to capture loss: the same.
+    tap(&mut controls, KEY_G);
+    controls.apply(&button(true, point(20.0, 20.0)));
+    controls.apply(&drag_to(point(40.0, 40.0)));
+    controls.apply(&InputEvent::PointerCaptureLost {
+        released: ButtonSet::EMPTY.with(PointerButton::Primary),
+    });
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(40.0, 40.0)));
+    assert!(moves(&mut controls).is_empty());
+
+    // Put away, a drag pans; arming the tool during it keeps it panning,
+    // and draws nothing.
+    tap(&mut controls, KEY_G);
+    assert!(!controls.measuring());
+    controls.apply(&button(true, point(10.0, 10.0)));
+    controls.apply(&drag_to(point(30.0, 10.0)));
+    tap(&mut controls, KEY_G);
+    controls.apply(&drag_to(point(40.0, 10.0)));
+    assert_eq!(controls.drawing(), None);
+    controls.apply(&button(false, point(40.0, 10.0)));
+    // Put away again, a click selects.
+    tap(&mut controls, KEY_G);
+    controls.apply(&button(true, point(5.0, 5.0)));
+    controls.apply(&button(false, point(5.0, 5.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [
+            CameraMove::Pan { delta: [20.0, 0.0] },
+            CameraMove::Pan { delta: [10.0, 0.0] },
+            CameraMove::Select {
+                at: point(5.0, 5.0)
+            },
+        ]
+    );
 }
 
 /// A vertical scroll zooms about the pointer by `exp(rate · dy)`: up in,

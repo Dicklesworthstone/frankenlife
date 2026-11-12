@@ -30,7 +30,8 @@ use flife_engine::{
     Arrangement, Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, Stepped, World,
 };
 use flife_manim::{
-    ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionShape, Style, hex_rgb,
+    ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionEffect, RegionShape, Style,
+    hex_rgb,
 };
 use flife_render::{Lease, Publication, Publisher};
 use flife_runtime::{CommandStatus, Outcome, SessionClosed};
@@ -300,8 +301,11 @@ pub struct AppliedCommand {
     pub intervention: TimelineIntervention,
 }
 
-/// A brush's region as a record spells it (FL-022): its numbers as their
-/// bits, so a replay outlines exactly what the Studio did.
+/// A brush's region, or a measured one, as a record spells it (FL-022,
+/// plan §14.3): its numbers as their bits, so a replay outlines exactly
+/// what the Studio did. `measures` is written only when true, so a brush's
+/// region is recorded as it was before measurement regions, and a record
+/// without it is a brush's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "kebab-case")]
 pub enum TimelineRegion {
@@ -311,6 +315,9 @@ pub enum TimelineRegion {
         bounds: [[Exact; 2]; 2],
         /// Whether the stroke removes energy from the world.
         removes: bool,
+        /// Whether it is a measurement region rather than a stroke's.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        measures: bool,
     },
     /// A disc.
     Disc {
@@ -320,44 +327,76 @@ pub enum TimelineRegion {
         radius: Exact,
         /// Whether the stroke removes energy from the world.
         removes: bool,
+        /// Whether it is a measurement region rather than a stroke's.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        measures: bool,
     },
 }
 
 impl From<Region> for TimelineRegion {
     fn from(region: Region) -> Self {
+        let removes = region.effect == RegionEffect::Removes;
+        let measures = region.effect == RegionEffect::Measures;
         match region.shape {
             RegionShape::Rectangle(bounds) => Self::Rectangle {
                 bounds: bounds.map(|range| range.map(Exact)),
-                removes: region.removes,
+                removes,
+                measures,
             },
             RegionShape::Disc { center, radius } => Self::Disc {
                 center: center.map(Exact),
                 radius: Exact(radius),
-                removes: region.removes,
+                removes,
+                measures,
             },
         }
     }
 }
 
-impl From<TimelineRegion> for Region {
-    fn from(region: TimelineRegion) -> Self {
-        match region {
-            TimelineRegion::Rectangle { bounds, removes } => Self {
-                shape: RegionShape::Rectangle(bounds.map(|range| range.map(|end| end.0))),
+impl TryFrom<TimelineRegion> for Region {
+    type Error = CoreError;
+
+    /// The region a record spells.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] for a record that both removes and
+    /// measures.
+    fn try_from(region: TimelineRegion) -> Result<Self, CoreError> {
+        let (shape, removes, measures) = match region {
+            TimelineRegion::Rectangle {
+                bounds,
                 removes,
-            },
+                measures,
+            } => (
+                RegionShape::Rectangle(bounds.map(|range| range.map(|end| end.0))),
+                removes,
+                measures,
+            ),
             TimelineRegion::Disc {
                 center,
                 radius,
                 removes,
-            } => Self {
-                shape: RegionShape::Disc {
+                measures,
+            } => (
+                RegionShape::Disc {
                     center: center.map(|value| value.0),
                     radius: radius.0,
                 },
                 removes,
-            },
-        }
+                measures,
+            ),
+        };
+        let effect = match (removes, measures) {
+            (false, false) => RegionEffect::Adds,
+            (true, false) => RegionEffect::Removes,
+            (false, true) => RegionEffect::Measures,
+            (true, true) => {
+                return Err(conflict(
+                    "a region record both removes and measures".to_owned(),
+                ));
+            }
+        };
+        Ok(Self { shape, effect })
     }
 }
 
@@ -781,7 +820,7 @@ pub fn replay(
                 view.select(organism.map(OrganismId::new))?;
             }
             TimelineRecord::Region { region } => {
-                view.set_region(region.map(Region::from))?;
+                view.set_region(region.map(Region::try_from).transpose()?)?;
             }
             TimelineRecord::Show {
                 prior,

@@ -10,14 +10,18 @@
 //! presentation owner maps through its viewport to a world-space
 //! [`Stroke`](crate::Stroke) and offers the session as
 //! [`Intent::Intervene`] (FL-022). A drag of the armed removal brush is a
-//! [`CameraMove::Drawn`], the disk it drew, mapped the same way.
+//! [`CameraMove::Drawn`], the disk it drew, mapped the same way. With the
+//! measuring tool armed, a click or a drag places a disk to measure
+//! instead, [`CameraMove::Measure`] (plan §14.3's temporary measurement
+//! region), which the presentation owner offers the session as
+//! [`Intent::Measure`].
 //!
 //! Pointer gestures:
 //!
 //! | Gesture | Move |
 //! |---|---|
-//! | primary drag (beyond [`CLICK_SLOP_POINTS`]) | pan: the world follows the pointer; with the removal brush armed, draw its disk instead, centred where the press went down, out to where it is released |
-//! | primary click (press and release within the slop) | select what is drawn under the press, or with a brush armed, brush there |
+//! | primary drag (beyond [`CLICK_SLOP_POINTS`]) | pan: the world follows the pointer; with the removal brush or the measuring tool armed, draw its disk instead, centred where the press went down, out to where it is released |
+//! | primary click (press and release within the slop) | select what is drawn under the press, or with a brush armed, brush there, or with the measuring tool armed, measure there |
 //! | vertical scroll | zoom about the pointer by [`scroll_zoom`]; up zooms in |
 //!
 //! Keys, by virtual key code (`kVK_*`), so they do not depend on layout:
@@ -32,6 +36,7 @@
 //! | X | arm the removal brush, or disarm it (FL-022) |
 //! | M | arm the material brush, or disarm it (FL-022) |
 //! | I | arm the introduction brush, or disarm it (FL-022) |
+//! | G | arm the measuring tool, or put it and its disk away (plan §14.3) |
 //! | W | dump the selected organism's whole controller (FL-021) |
 //! | T | track the selected organism, the camera keeping it centred, or stop (plan §14.3) |
 //!
@@ -87,6 +92,8 @@ pub const KEY_M: u16 = 46;
 pub const KEY_I: u16 = 34;
 /// `kVK_ANSI_T`.
 pub const KEY_T: u16 = 17;
+/// `kVK_ANSI_G`.
+pub const KEY_G: u16 = 5;
 /// `kVK_ANSI_LeftBracket`.
 pub const KEY_LEFT_BRACKET: u16 = 33;
 /// `kVK_ANSI_RightBracket`.
@@ -154,6 +161,16 @@ pub enum CameraMove {
         /// The brush armed then.
         brush: Brush,
     },
+    /// Measure a disk (plan §14.3's temporary measurement region): the
+    /// removal brush's click disk under the logical point `center`, or with
+    /// an `edge`, the disk a drag drew, centred under `center` with its
+    /// radius on screen the drag's length.
+    Measure {
+        /// Where the click or the drag pressed.
+        center: LogicalPoint,
+        /// Where a drag was released; `None` for a click.
+        edge: Option<LogicalPoint>,
+    },
     /// Apply the removal brush's disk drawn by a drag (FL-022, plan §2.2's
     /// "draw an intervention region"): centred under the logical point
     /// `center`, its radius on screen the drag's length.
@@ -207,6 +224,18 @@ pub enum Intent {
         /// The source tick of the epoch it was shown on.
         seen: Tick,
     },
+    /// Measure a disk of the world (plan §14.3's temporary measurement
+    /// region): what it holds at the session's committed boundary. The
+    /// presentation owner sends this when the measuring tool places a disk,
+    /// and again to read it as the world moves on; nothing is submitted.
+    Measure {
+        /// The disk's centre, a world position.
+        center: [f64; 2],
+        /// Its radius in world units.
+        radius: f64,
+        /// The source tick of the epoch it was placed or measured on.
+        seen: Tick,
+    },
     /// Apply a brush's stroke (FL-022): submitted as a command for the next
     /// boundary not yet sealed. The presentation owner sends this on a
     /// brush click, not on a key.
@@ -245,6 +274,15 @@ pub struct InputTally {
     pub moves: u64,
 }
 
+/// What a drag draws a disk for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drawer {
+    /// The removal brush's disk, to remove.
+    Removal,
+    /// The measuring tool's, to measure.
+    Measuring,
+}
+
 /// The presentation owner's input state.
 #[derive(Debug, Clone, Default)]
 pub struct Controls {
@@ -261,12 +299,16 @@ pub struct Controls {
     press: Option<LogicalPoint>,
     /// Whether the held press has moved beyond the click slop.
     dragging: bool,
-    /// Whether that drag draws the removal brush's disk rather than
-    /// panning: the brush was armed when it left the slop.
-    drawing: bool,
+    /// What that drag draws a disk for rather than panning: the removal
+    /// brush or the measuring tool, whichever was armed when it left the
+    /// slop. Only a release with that one still armed takes the disk.
+    drawing: Option<Drawer>,
     moves: Vec<CameraMove>,
     /// The armed brush: a click brushes instead of selecting.
     brush: Option<Brush>,
+    /// Whether the measuring tool is armed: a click or a drag measures
+    /// instead of selecting. Never with a brush armed.
+    measuring: bool,
     /// The field component C and the bracket keys show: the last chosen.
     component: FieldComponent,
 }
@@ -368,6 +410,13 @@ impl Controls {
                         self.arm(Brush::Introduction);
                         None
                     }
+                    KEY_G => {
+                        self.measuring = !self.measuring;
+                        if self.measuring {
+                            self.brush = None;
+                        }
+                        None
+                    }
                     KEY_W => {
                         self.push(CameraMove::Weights);
                         None
@@ -402,7 +451,7 @@ impl Controls {
                 // A lost press is neither a click nor the rest of a drag.
                 self.press = None;
                 self.dragging = false;
-                self.drawing = false;
+                self.drawing = None;
                 None
             }
             InputEvent::Resized(metrics) => {
@@ -420,9 +469,11 @@ impl Controls {
 
     /// The primary button went down (start a press) or up (a press that
     /// never left the slop is a click; a drag drawing the removal brush's
-    /// disk applies it, if that brush is still armed).
+    /// disk applies it, if that brush is still armed, and one drawing the
+    /// measuring tool's measures it, if that tool is still armed: never
+    /// the one's disk by the other).
     fn press_or_release(&mut self, pressed: bool, position: LogicalPoint) {
-        let drawing = std::mem::take(&mut self.drawing);
+        let drawing = self.drawing.take();
         if pressed {
             self.press = Some(position);
             self.dragging = false;
@@ -430,27 +481,44 @@ impl Controls {
         }
         if let Some(at) = self.press.take() {
             if !self.dragging {
-                self.push(match self.brush {
-                    Some(brush) => CameraMove::Brush { at, brush },
-                    None => CameraMove::Select { at },
+                self.push(match (self.brush, self.measuring) {
+                    (Some(brush), _) => CameraMove::Brush { at, brush },
+                    (None, true) => CameraMove::Measure {
+                        center: at,
+                        edge: None,
+                    },
+                    (None, false) => CameraMove::Select { at },
                 });
-            } else if drawing && self.brush == Some(Brush::Removal) {
+            } else if drawing == Some(Drawer::Removal) && self.brush == Some(Brush::Removal) {
                 self.push(CameraMove::Drawn {
                     center: at,
                     edge: position,
+                });
+            } else if drawing == Some(Drawer::Measuring) && self.measuring {
+                self.push(CameraMove::Measure {
+                    center: at,
+                    edge: Some(position),
                 });
             }
         }
         self.dragging = false;
     }
 
-    /// Arm `brush`, or disarm it if it is the one armed.
+    /// Arm `brush`, putting the measuring tool away, or disarm it if it is
+    /// the one armed.
     fn arm(&mut self, brush: Brush) {
+        self.measuring = false;
         self.brush = if self.brush == Some(brush) {
             None
         } else {
             Some(brush)
         };
+    }
+
+    /// Whether the measuring tool is armed (plan §14.3).
+    #[must_use]
+    pub const fn measuring(&self) -> bool {
+        self.measuring
     }
 
     /// The armed brush, if any.
@@ -461,13 +529,14 @@ impl Controls {
 
     /// Pointer motion while the primary press is held: once beyond the
     /// slop it is a drag, panning by the whole motion since the press and
-    /// then by each move. With the removal brush armed as it leaves the
-    /// slop, it draws that brush's disk instead and pans nothing.
+    /// then by each move. With the removal brush or the measuring tool
+    /// armed as it leaves the slop, it draws a disk instead and pans
+    /// nothing.
     fn drag(&mut self, position: LogicalPoint, last: Option<LogicalPoint>) {
         let Some(press) = self.press else {
             return;
         };
-        if !self.buttons.contains(PointerButton::Primary) || self.drawing {
+        if !self.buttons.contains(PointerButton::Primary) || self.drawing.is_some() {
             return;
         }
         let from = if self.dragging {
@@ -481,8 +550,12 @@ impl Controls {
                 return;
             }
             self.dragging = true;
-            if self.brush == Some(Brush::Removal) {
-                self.drawing = true;
+            self.drawing = match (self.brush, self.measuring) {
+                (Some(Brush::Removal), _) => Some(Drawer::Removal),
+                (None, true) => Some(Drawer::Measuring),
+                _ => None,
+            };
+            if self.drawing.is_some() {
                 return;
             }
             press
@@ -522,13 +595,15 @@ impl Controls {
         self.dragging
     }
 
-    /// Where the drag drawing the removal brush's disk pressed, its
-    /// centre, while it is held and the brush is still armed: a release
-    /// then applies it ([`CameraMove::Drawn`]).
+    /// Where the drag drawing a disk pressed, its centre, while it is held
+    /// and the removal brush or the measuring tool that draws it is still
+    /// armed: a release then applies the removal ([`CameraMove::Drawn`])
+    /// or measures the disk ([`CameraMove::Measure`]).
     #[must_use]
     pub const fn drawing(&self) -> Option<LogicalPoint> {
-        match (self.drawing, self.brush) {
-            (true, Some(Brush::Removal)) => self.press,
+        match (self.drawing, self.brush, self.measuring) {
+            (Some(Drawer::Removal), Some(Brush::Removal), _)
+            | (Some(Drawer::Measuring), None, true) => self.press,
             _ => None,
         }
     }

@@ -49,7 +49,7 @@ use asupersync::time::{sleep, wall_now};
 use flife_cli::Checkpoints;
 use flife_core::ids::{CommandId, OrganismId};
 use flife_core::{CoreError, Tick};
-use flife_engine::{ControllerWeights, OrganismSnapshot};
+use flife_engine::{ControllerWeights, OrganismSnapshot, RegionMeasurement};
 use flife_render::Feed;
 use flife_runtime::{
     Admission, Command, CommandStatus, Outcome, Rejection, RunEnd, SessionClosed, SessionHandle,
@@ -165,6 +165,15 @@ pub enum Status {
         /// its `tick` names; `None` when the committed world no longer
         /// holds it.
         weights: Option<Box<ControllerWeights>>,
+    },
+    /// A measurement's answer (plan §14.3's temporary measurement region).
+    Measured {
+        /// The source tick of the epoch the disk was placed or measured
+        /// again on.
+        seen: Tick,
+        /// What the disk holds at the session's committed boundary, which
+        /// its `tick` names.
+        measurement: RegionMeasurement,
     },
     /// A checkpoint of a kept session was published to its run directory
     /// (FL-024): written, verified, indexed in the catalog and retained.
@@ -628,6 +637,14 @@ async fn act(
                 Err(error) => refused(error),
             }
         }
+        Intent::Measure {
+            center,
+            radius,
+            seen,
+        } => match handle.measure_region(cx, center, radius).await {
+            Ok(measurement) => Status::Measured { seen, measurement },
+            Err(error) => refused(error),
+        },
         // The client loop closes before it acts.
         Intent::Close => refused(CoreError::StateConflict {
             operation: "close studio session",

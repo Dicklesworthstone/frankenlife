@@ -77,7 +77,7 @@ fn a_frames_preparation_is_within_the_views_limit() {
                                 center: [extent[0] / 2.0, extent[1] / 2.0],
                                 radius: extent[0] / 16.0,
                             },
-                            removes: true,
+                            effect: flife_manim::RegionEffect::Removes,
                         };
                         assert!(view.set_region(Some(disc)).expect("a region"));
                         if zoom > 1.0 {

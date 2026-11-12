@@ -25,7 +25,7 @@
 
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS};
 use flife_field::sources::unit_direction;
-use flife_manim::{Region, RegionShape, Viewport};
+use flife_manim::{Region, RegionEffect, RegionShape, Viewport};
 
 /// The declared energy one click of the energy or material brush adds to
 /// its cell: 32 founders' endowments (`population.initial_energy = 2`),
@@ -243,6 +243,22 @@ pub fn stroke(
     }
 }
 
+/// The removal a click of the removal brush at the logical window point
+/// `at` makes, through `viewport` with a content area of `logical` points:
+/// exactly [`stroke`]'s for [`Brush::Removal`], whatever the field's cells
+/// or the supplies. `None` in the letterbox margin and while the content
+/// area is empty. The measuring tool's click measures this disk
+/// ([`crate::measure::clicked`]).
+#[must_use]
+pub fn clicked(viewport: &Viewport, logical: [f64; 2], at: [f64; 2]) -> Option<Stroke> {
+    removal(
+        viewport,
+        logical,
+        viewport.logical_to_world(at, logical)?,
+        BRUSH_RADIUS_POINTS,
+    )
+}
+
 /// The removal a drag of the removal brush draws from the logical window
 /// point `center` out to `edge`, through `viewport`, with a content area of
 /// `logical` points (plan §2.2's "draw an intervention region"): centred
@@ -388,7 +404,11 @@ pub fn preview_region(preview: &Preview) -> Option<Region> {
     };
     Some(Region {
         shape,
-        removes: matches!(stroke, Stroke::Removal { .. }),
+        effect: if matches!(stroke, Stroke::Removal { .. }) {
+            RegionEffect::Removes
+        } else {
+            RegionEffect::Adds
+        },
     })
 }
 

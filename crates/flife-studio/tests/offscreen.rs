@@ -22,14 +22,16 @@ use std::time::{Duration, Instant};
 
 use flife_core::ids::{CommandId, OrganismId};
 use flife_core::{Tick, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_manim::{HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionShape, hud_origin, linear};
+use flife_engine::{Arrangement, NumericalProfile, RegionMeasurement, Stepped, World};
+use flife_manim::{
+    HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionEffect, RegionShape, hud_origin, linear,
+};
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_I, KEY_M, KEY_PERIOD,
-    KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, PICK_RADIUS_POINTS, Preview, Status, Stroke, Studio,
-    StudioOptions, Supplies, Surface, cell_region, drawn, legends, material_for, preview_region,
-    scroll_zoom, stroke,
+    Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_G, KEY_I, KEY_M,
+    KEY_PERIOD, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, MeasurePreview, PICK_RADIUS_POINTS,
+    Preview, Status, Stroke, Studio, StudioOptions, Supplies, Surface, cell_region, drawn, legends,
+    material_for, measure, preview_region, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, MetalRenderer, Modifiers, PixelDensity, PointerButton,
@@ -962,7 +964,7 @@ fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
             Some(outlined),
             preview_region(frame.preview.as_ref().expect("a preview"))
         );
-        assert!(outlined.removes);
+        assert_eq!(outlined.effect, RegionEffect::Removes);
         assert_eq!(
             *studio.view().viewport(),
             viewport,
@@ -1064,6 +1066,255 @@ fn a_drawn_removal_disk_applies_where_its_preview_outlined() {
     assert_eq!(closed.session.world.digest(), direct.digest());
 }
 
+/// Plan §14.3's temporary measurement region: with the measuring tool armed
+/// (G), each frame outlines in the measurement colour what a click at the
+/// pointer, or the release of a disk being drawn, would measure; a click or
+/// a drag places that disk, and the session reports what it holds at the
+/// committed boundary: exactly what the same world measured directly
+/// holds, and measured again, the same. A removal drawn the same way then
+/// removes exactly the organisms it counted and moves exactly their
+/// energy, and the measurements changed nothing: the session closes on the
+/// direct world's digest. Putting the tool away takes its disk away.
+#[test]
+fn the_measuring_tool_measures_what_a_removal_of_its_disk_takes() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let config = config();
+    let mut studio = Studio::open(&config, &options(false)).expect("opens offscreen");
+    studio.frame().expect("the first frame");
+    let density = f64::from(SCALE);
+    let logical = SIZE.map(f64::from);
+    let button = |studio: &mut Studio, pressed: bool, at: [f64; 2]| {
+        studio
+            .post_input(InputEvent::Button {
+                button: PointerButton::Primary,
+                pressed,
+                position: point(at),
+                clicks: 1,
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    };
+    let drag = |studio: &mut Studio, at: [f64; 2]| {
+        studio
+            .post_input(InputEvent::PointerMoved {
+                position: point(at),
+                buttons: ButtonSet::EMPTY.with(PointerButton::Primary),
+                modifiers: Modifiers::NONE,
+            })
+            .expect("posts");
+    };
+    let measured = |statuses: &[Status]| -> Vec<(Tick, RegionMeasurement)> {
+        statuses
+            .iter()
+            .filter_map(|status| match status {
+                Status::Measured { seen, measurement } => Some((*seen, *measurement)),
+                _ => None,
+            })
+            .collect()
+    };
+    // A few ticks first, so the sources have put energy in the field.
+    const STEPS: u64 = 4;
+    let mut direct = World::found(
+        &config,
+        Arrangement::FreeList,
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("founds");
+    for _ in 0..STEPS {
+        assert!(matches!(
+            direct.step_with(&[]).expect("steps"),
+            Stepped::Published(_)
+        ));
+        tap(&mut studio, KEY_PERIOD, ".");
+    }
+    until(&mut studio, "the steps", |studio, _| {
+        studio
+            .view()
+            .shown()
+            .is_some_and(|shown| shown.tick == Tick::new(STEPS))
+    });
+    let viewport = *studio.view().viewport();
+    let exactly = |a: &RegionMeasurement, b: &RegionMeasurement| {
+        assert_eq!(
+            (a.tick, a.center, a.radius, a.organisms, a.lineages, a.cells),
+            (b.tick, b.center, b.radius, b.organisms, b.lineages, b.cells)
+        );
+        assert_eq!(a.organism_energy.to_bits(), b.organism_energy.to_bits());
+        assert_eq!(a.field_energy.to_bits(), b.field_energy.to_bits());
+    };
+
+    tap(&mut studio, KEY_G, "g");
+    // Off the world: nothing outlined, and a click there places nothing.
+    let margin = [5.0, 100.0];
+    hover(&mut studio, margin);
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.brush, None);
+    assert_eq!(frame.measuring, Some(MeasurePreview::Click(None)));
+    assert_eq!(studio.view().region(), None);
+    click(&mut studio, margin);
+    studio.frame().expect("a frame");
+    assert_eq!(studio.measured(), None);
+    assert_eq!(studio.tally().unmeasured, 1);
+
+    // Over the shown organism nearest the centre: the click's disk.
+    let rows: Vec<(u64, [f64; 2])> = studio.view().shown_rows().collect();
+    let middle = [logical[0] * density / 2.0, logical[1] * density / 2.0];
+    let distance = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]);
+    let spot = rows
+        .iter()
+        .map(|&(_, position)| viewport.world_to_drawable(position))
+        .min_by(|a, b| distance(*a, middle).total_cmp(&distance(*b, middle)))
+        .expect("organisms are shown");
+    let centre = [spot[0] / density, spot[1] / density];
+    hover(&mut studio, centre);
+    let frame = studio.frame().expect("a frame");
+    let clicked = measure::clicked(&viewport, logical, centre).expect("a disk");
+    assert_eq!(frame.measuring, Some(MeasurePreview::Click(Some(clicked))));
+    let outlined = studio.view().region().expect("an outlined disk");
+    assert_eq!(outlined, clicked.region());
+    assert_eq!(outlined.effect, RegionEffect::Measures);
+    click(&mut studio, centre);
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.measuring, Some(MeasurePreview::Placed(clicked)));
+    assert_eq!(studio.measured(), Some(clicked));
+    let mut answers = Vec::new();
+    until(&mut studio, "the click's measurement", |_, statuses| {
+        answers = measured(statuses);
+        !answers.is_empty()
+    });
+    let &[(seen, first)] = answers.as_slice() else {
+        panic!("{answers:?}");
+    };
+    assert_eq!(seen, Tick::new(STEPS));
+    exactly(
+        &first,
+        &direct
+            .measure_region(clicked.center, clicked.radius)
+            .expect("measures"),
+    );
+    assert!(first.organisms >= 1, "the organism under the click");
+
+    // A drag draws a disk out from the same press, panning nothing.
+    button(&mut studio, true, centre);
+    let edges = [
+        [centre[0] + 9.0, centre[1]],
+        [centre[0] + 18.0, centre[1] + 12.0],
+    ];
+    for edge in edges {
+        drag(&mut studio, edge);
+        let frame = studio.frame().expect("a frame");
+        let disk = measure::drawn(&viewport, logical, centre, edge).expect("a disk");
+        assert_eq!(frame.measuring, Some(MeasurePreview::Release(Some(disk))));
+        assert_eq!(studio.view().region(), Some(disk.region()));
+        assert_eq!(
+            *studio.view().viewport(),
+            viewport,
+            "a drawing pans nothing"
+        );
+        // The click's disk stays placed until the release.
+        assert_eq!(studio.measured(), Some(clicked));
+    }
+    let disk = measure::drawn(&viewport, logical, centre, edges[1]).expect("a disk");
+    assert_ne!(disk, clicked);
+    button(&mut studio, false, edges[1]);
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.measuring, Some(MeasurePreview::Placed(disk)));
+    assert_eq!(studio.view().region(), Some(disk.region()));
+    // Measured again, as the binary does while the world moves on: the
+    // same answer, the world unmoved.
+    assert!(studio.measure_again());
+    until(
+        &mut studio,
+        "the drawn disk's measurements",
+        |_, statuses| {
+            answers = measured(statuses);
+            answers.len() == 2
+        },
+    );
+    let truth = direct
+        .measure_region(disk.center, disk.radius)
+        .expect("measures");
+    for (seen, answer) in &answers {
+        assert_eq!(*seen, Tick::new(STEPS));
+        exactly(answer, &truth);
+    }
+    assert_eq!(truth.tick, Tick::new(STEPS));
+    assert!(truth.field_energy > 0.0, "{truth:?}");
+    // A drag longer than the click's radius holds all the click's disk did.
+    assert!(truth.organisms >= first.organisms, "{truth:?}");
+
+    // The removal brush puts the tool and its disk away.
+    tap(&mut studio, KEY_X, "x");
+    let frame = studio.frame().expect("a frame");
+    assert_eq!(frame.measuring, None);
+    assert_eq!(studio.measured(), None);
+    assert!(!studio.measure_again(), "nothing placed");
+    // The same drag with it removes that disk.
+    button(&mut studio, true, centre);
+    for edge in edges {
+        drag(&mut studio, edge);
+    }
+    button(&mut studio, false, edges[1]);
+    let made = drawn(&viewport, logical, centre, edges[1]).expect("a disk");
+    assert_eq!(
+        made,
+        Stroke::Removal {
+            center: disk.center,
+            radius: disk.radius
+        }
+    );
+    let mut submitted = false;
+    until(&mut studio, "the submission", |_, statuses| {
+        submitted |= statuses
+            .iter()
+            .any(|status| matches!(status, Status::Submitted { stroke, .. } if *stroke == made));
+        submitted
+    });
+    tap(&mut studio, KEY_PERIOD, ".");
+    let mut applied = None;
+    until(&mut studio, "the outcome", |_, statuses| {
+        applied = statuses.iter().find_map(|status| match status {
+            Status::Finished {
+                outcome: Outcome::Applied { applied, .. },
+                ..
+            } => Some(*applied),
+            _ => None,
+        });
+        applied.is_some()
+    });
+    let report = match direct.step_with(&[made.intervention()]).expect("steps") {
+        Stepped::Published(report) => report,
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    };
+    let [removal] = report.interventions.as_slice() else {
+        panic!("{:?}", report.interventions);
+    };
+    let energy = applied.expect("applied");
+    println!(
+        "a measured disk of {} world units held {} organisms of {} energy in {} lineages, and \
+         {} energy in {} cells; its removal took {} organisms, {energy} energy",
+        disk.radius,
+        truth.organisms,
+        truth.organism_energy,
+        truth.lineages,
+        truth.field_energy,
+        truth.cells,
+        removal.removed
+    );
+    assert_eq!(removal.removed, truth.organisms);
+    assert_eq!(energy.to_bits(), truth.organism_energy.to_bits());
+    assert_eq!(removal.applied.to_bits(), truth.organism_energy.to_bits());
+    let tally = studio.tally();
+    assert_eq!((tally.measures, tally.unmeasured), (2, 1));
+    assert_eq!((tally.strokes, tally.unstroked), (1, 0));
+    let closed = studio.close().expect("closes");
+    assert_eq!(closed.session.boundary.tick, Tick::new(STEPS + 1));
+    assert_eq!(closed.session.world.digest(), direct.digest());
+}
+
 /// FL-022's preview (plan §14.3): while a brush is armed, each frame says
 /// what a click at the pointer would do, and a click there then submits
 /// exactly that stroke. The frame outlines its region on the world (on the
@@ -1136,7 +1387,11 @@ fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
             Some(outlined),
             preview_region(frame.preview.as_ref().expect("a preview"))
         );
-        assert_eq!(outlined.removes, brush == Brush::Removal);
+        assert_eq!(
+            outlined.effect == RegionEffect::Removes,
+            brush == Brush::Removal
+        );
+        assert_ne!(outlined.effect, RegionEffect::Measures);
         if let RegionShape::Rectangle([[x0, _], [y0, y1]]) = outlined.shape
             && brush == Brush::Energy
         {

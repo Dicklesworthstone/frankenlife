@@ -447,6 +447,15 @@ world shows where: the cell is outlined in amber, or the removal's disc in red. 
 command: a `submitted` record names the boundary it will apply at, and a `finished` record the tick it applied at
 and the energy it moved.
 
+G arms the measuring tool instead (plan §14.3's temporary measurement region; G again, or a brush key, puts it
+away). A click places the disk a removal click there would take, and a drag draws one, outlined in cyan. Nothing
+changes: the session reports what the disk holds at its committed tick, exactly the organisms a removal of it
+would take, their energy and their lineages, and the field's energy in the cells under it. The overlay says so
+(`radius 4.56 world units at tick 5,120: 17 organisms of 41.2 energy, 3 lineages`, `field 812.5 energy in 1,064
+cells`), a `measured` record carries it with the disk's centre, and both are read again once a second while the
+world runs and after each step. Paused, measure a colony before erasing it with the same disk: the removal
+applies at the tick measured, and its `finished` record moves exactly the energy measured.
+
 `--offscreen SECONDS` runs the same Studio for that long with no window (FL-024). It renders each frame through
 the same Metal route at `--scale` pixels a point (2 by default), reads it back and closes. Its `end` record gives
 the frames' work times and, with `--offscreen-zooms`, a camera move's latency from its arrival at a random moment

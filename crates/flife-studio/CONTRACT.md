@@ -98,9 +98,12 @@ directory, with its pending commands and its checkpoint chain.
     | I | arm the introduction brush, or disarm it (FL-022) |
     | W (without ⌘) | dump the selected organism's whole controller (a `CameraMove::Weights`, FL-021) |
     | T | track the selected organism, or stop (a `CameraMove::Track`, plan §14.3) |
+    | G | arm the measuring tool, or put it and its disk away (plan §14.3's temporary measurement region) |
 
-    The style keys, 0, W, T and the brush keys ignore auto-repeat and ⌘ (⌘W closes), and produce no intent. A brush key with another
-    brush armed switches to its brush. `brush()` is the armed brush.
+    The style keys, 0, W, T, G and the brush keys ignore auto-repeat and ⌘ (⌘W closes), and produce no intent. A
+    brush key with another brush armed switches to its brush. `brush()` is the armed brush. G arms the measuring
+    tool and puts any brush away; a brush key puts the tool away. `measuring()` says whether it is armed: never
+    with a brush.
   - Pointer gestures become `CameraMove`s, in logical points, kept in order until `take_moves()` (reserved once
     for a poll's events):
     - a primary press that moves more than `CLICK_SLOP_POINTS = 4` is a drag: `Pan` by the whole motion since the
@@ -109,8 +112,13 @@ directory, with its pending commands and its checkpoint chain.
       nothing (FL-022, plan §2.2's "draw an intervention region"): `drawing()` is its centre, the press, while it is
       held and the brush still armed, and the release is `Drawn { center, edge }`, the press and the release. A
       release with the brush disarmed or switched makes no move; a drag that left the slop panning keeps panning;
+    - with the measuring tool armed as the press leaves the slop, the drag draws its disk the same way, and the
+      release is `Measure { center, edge: Some(edge) }`. A drag draws for whichever of the two was armed as it
+      left the slop, and only a release with that one still armed takes the disk: the removal brush armed during
+      a measuring drag removes nothing, and the tool armed during a removal's drag measures nothing;
     - a primary press released within the slop is a click: `Select { at }` at the press, or with a brush armed at
-      the release, `Brush { at, brush }` (FL-022);
+      the release, `Brush { at, brush }` (FL-022), or with the measuring tool armed, `Measure { center: at, edge:
+      None }`;
     - capture loss ends a press: no click, no more panning;
     - a vertical scroll is `Zoom { anchor, factor }` about the pointer, `factor = scroll_zoom(dy, unit) =
       exp(rate · dy)` with `ZOOM_PER_POINT = 0.01` (trackpad points) or `ZOOM_PER_LINE = 0.1` (wheel lines), the
@@ -146,6 +154,14 @@ directory, with its pending commands and its checkpoint chain.
     `Finished { command, outcome }` once the command is terminal: for `Applied`, the tick it applied at, the tick
     that published it and the energy it moved. A paused session holds the command until a step or a run reaches
     its boundary. At close, a pending command's watcher stops when the session refuses its status.
+  - Plan §14.3's temporary measurement region: `Intent::Measure { center, radius, seen }` asks
+    `SessionHandle::measure_region` and reports `Measured { seen, measurement }`: `seen` unchanged, and what the
+    disk holds at the session's committed boundary, which the measurement's `tick` names
+    (`flife_engine::RegionMeasurement`: exactly the organisms a removal of that disk there would take, their
+    energy summed as the removal sums it and their distinct lineages, and the field cells whose centres the disk
+    holds and their energy). A disk the world cannot measure (a centre off the world, a radius not finite and
+    positive or wider than half the shorter side) reports `Refused` with `numerical-invalid`. Nothing is
+    submitted and the world is unchanged.
   - FL-024: `SessionThread::spawn_kept(owner, handle, Some(checkpoints))` keeps the session's run directory
     (`keep`). It publishes the founding checkpoint before it takes any intent (when the interval is not zero),
     and then, also before any intent, holds the session (`SessionHandle::hold`) at the next multiple of the
@@ -221,6 +237,22 @@ directory, with its pending commands and its checkpoint chain.
   - introduction: `Stroke::Introduction { cell, count: BRUSH_INTRODUCTION, energy }` in the same cell, 8 organisms
     drawn as founders, each with `Supplies::founder_energy` (`population.initial_energy`);
     `Intervention::IntroduceOrganisms`.
+- `measure` (plan §14.3's temporary measurement region): `Disk { center, radius }` in world units, `Disk::of`
+  the disk of a removal (none for another stroke) and `Disk::region()` its disc outlined in the measurement
+  colour (`flife_manim::RegionEffect::Measures`). `measure::clicked(viewport, logical, at)` is the disk a click
+  measures, exactly the removal brush's click disk there (`brush::clicked`, `stroke`'s for `Brush::Removal`);
+  `measure::drawn(viewport, logical, center, edge)` the disk a drag draws, exactly `brush::drawn`'s; each `None`
+  where those make no stroke. `measure::preview(viewport, logical, pointer, drawing, placed)` is what the armed
+  tool shows: while a drag pressed at `drawing` is held, `MeasurePreview::Release` of what its release at the
+  pointer would measure; otherwise the disk `placed`, `Placed`; or with none, `Click` of what a click at the
+  pointer would measure (`None` off the world). `overlay::measuring_lines` says it: `a click measures within 1.23
+  world units of the pointer; a drag draws the disk`, `a release measures within 4.56 world units of the press`
+  (or that it measures nothing off the world), and for the disk placed, `radius 4.56 world units: measuring`
+  until the measurement of that disk (its centre and radius equal) is in, then `radius 4.56 world units at tick
+  5,120: 17 organisms of 41.2 energy, 3 lineages` and `field 812.5 energy in 1,064 cells`. The lines leave the
+  centre out, as a brush's preview does: the outline shows where, and the `measured` record says it exactly. In
+  the overlay `measuring` joins the line naming the brush and the selection, and the lines follow it where a
+  brush's preview would.
 - `Studio` is the main-thread host. It opens the window at `PixelDensity::Backing`: the window keeps its size in
   points, and each frame fills its device pixels (FL-020). Each `frame()`:
   1. drains typed input through `Controls` and offers the resulting intents;
@@ -243,7 +275,12 @@ directory, with its pending commands and its checkpoint chain.
      stroke (the margin, or the material brush with no material) is counted in `FrameTally::unstroked`. While a
      disk is drawn, the frame's preview is `drawing`'s, centred on the press. The material is the one the last
      `Inspected` snapshot gives, while that organism is still selected. A `CameraMove::Track` starts tracking or
-     stops it; a pan or a reset stops it;
+     stops it; a pan or a reset stops it. A `CameraMove::Measure` makes its disk through the view as it stood at
+     the click or the release (`measure::clicked`, or `measure::drawn` for a drag), places it (`Studio::measured`)
+     and offers `Intent::Measure` for it with the shown epoch's tick as `seen`, counted in
+     `FrameTally::measures` and with the intents or refusals; one that makes no disk is counted in
+     `FrameTally::unmeasured`. With the tool put away the placed disk goes. `Studio::measure_again()` offers the
+     placed disk's measurement again (false with none placed, or refused);
   6. if the feed's latest epoch is newer than the one shown, releases the prior lease, leases the newer epoch and
      makes the shown one its prior: the display then moves from the prior to it (`WorldView::show_between`), at the
      fraction the `Pacer` gives, and the selection stays only if the newer epoch has its identity drawn; after a
@@ -269,7 +306,9 @@ directory, with its pending commands and its checkpoint chain.
   epoch, shown
   `Prior`, the `Motion` or `None` at rest, selected organism, hover, armed brush, the armed brush's `preview`
   (`brush::preview` at the pointer through the view as the frame left it, with the supplies a click there would
-  use, its `preview_region` outlined in that frame's drawing), outcome, and `drawn`: presented
+  use, its `preview_region` outlined in that frame's drawing), while the measuring tool is armed what it shows
+  (`measuring`: `measure::preview` through the view as the frame left it, its disk outlined in the measurement
+  colour; a brush and the tool are never armed together, so one region is outlined), outcome, and `drawn`: presented
   or rendered offscreen; the outcome is `None` offscreen). `FrameTally::drawn()` is the frames presented or
   rendered. `display_pair()` is the epochs it
   holds and `pacer()` the pacer.
@@ -339,6 +378,11 @@ directory, with its pending commands and its checkpoint chain.
     `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
     `effective_tick`; and one `finished` per command: `outcome` `applied` with its `tick`, `published_tick` and
     `energy`, or `cancelled` or `failed` with a `detail`;
+  - plan §14.3: one `measured` per measurement answered, on a disk's placing, about once a second while it stays
+    placed and the world runs, and after each `stepped` or `finished` status (`Studio::measure_again`): the
+    `seen_tick`, the committed `tick` it was read at, the disk's `center` and `radius`, and what it holds:
+    `organisms`, `organism_energy`, `lineages`, `cells` and `field_energy`. The overlay shows the newest while it
+    is of the disk placed;
   - a `frame` summary about once a second, with the frames `presented` and `rendered` offscreen, the camera's
     center and zoom, and the bytes the Metal route has copied so far: to the device (`upload_bytes`, and the
     most in one frame, `peak_upload_bytes`) and back to the host (`readback_bytes`, none for frames presented to
@@ -419,7 +463,7 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (19 tests):
+- `tests/controls.rs` (21 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
@@ -448,6 +492,13 @@ presentation state, not scientific state.
     style key.
   - Plan §14.3: each press of T makes one `CameraMove::Track` and no intent (its code pinned to `kVK_ANSI_T`), not
     on repeat or with ⌘; it is no style key.
+  - Plan §14.3's measurement region: G (its code pinned to `kVK_ANSI_G`) arms the measuring tool and G again puts
+    it away, not on repeat or with ⌘, with no move, intent or style change; with each of the four brushes armed G
+    puts it away, and its key puts the tool away. With the tool armed a click is `Measure { center: press, edge:
+    None }` and a drag, no pan, `drawing()` the press once beyond the slop (none within it), then `Measure` of the
+    press and the release; putting it away while held, the removal brush armed during a measuring drag, the tool
+    armed during a removal's drag, and capture loss each take nothing; a pan the tool is armed during keeps
+    panning; put away, a click selects.
 - `tests/pacing.rs` (5 tests, FL-020): at rest before an interval is known; the display moves over the interval
   between arrivals (worked fractions, capped at 1, a frame before the arrival at 0) and later intervals smooth by a
   quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
@@ -548,6 +599,18 @@ presentation state, not scientific state.
   - paused at tick 3: a material stroke of a living organism's affinity direction and an introduction apply at the
     next step, each moving what the direct world stepped with both reports, bit for bit (the introduction 8 organisms
     at 2 energy each, 16), and the closed world is the direct one.
+- `tests/measure.rs` (3 tests, plan §14.3, no window):
+  - at zooms 1, 4 and 13.5, a click's disk is exactly the removal brush's click stroke there (`brush::clicked`
+    too), and a drag's at two edges exactly `brush::drawn`'s; only a removal is a disk; its outline is the disc
+    in the measurement colour; the margin, a drag pressed there and a drag of no length make none;
+  - the preview: while a drag is held, the release's disk (none without a content area or a pointer) whether or
+    not one is placed; otherwise the placed disk, even off the world; with none placed, the click's disk at the
+    pointer, none off the world;
+  - a `SessionThread` on the preset paused at tick 3 answers three measurements seen at 2 (a 3-unit disk on an
+    organism, one at the corner across the seams, one of 0.001) at tick 3, each bit for bit what the world stepped
+    directly measures there, with the organism counted and field energy in it; refuses a centre off the world on
+    each axis, a radius wider than half the world, NaN and 0 as `numerical-invalid`; after a step answers at tick
+    4 as the direct world does; and closes on the direct world's digest.
 - `tests/clock.rs` (8 tests, FL-024, no window), the `ClockMeter` the binary reads:
   - evaluations (plan §14.1): from 1,000 to 5,096 over 2 s read 4,096 and 2,048 a second; a window with no count at
     either end reads none; a still count reads 0;
@@ -560,12 +623,19 @@ presentation state, not scientific state.
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and the evaluations what its tally
     advanced (at least one a tick, as the preset evaluates every organism every tick); once paused a window reads
     0 ticks and 0 evaluations.
-- `tests/overlay.rs` (9 tests, FL-024, FL-022, FL-021 and FL-019, no window):
+- `tests/overlay.rs` (10 tests, FL-024, FL-022, FL-021, FL-019 and plan §14.3, no window):
   - each preview's line exactly: the energy, material and introduction brushes' cell and bounds, the removal's
     radius and recycled share, three significant digits of a fine grid's cell (`250.000 to 250.250`) and of a deep
     zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, off the world and no material; a
     drawn disk's release about the press, and one pressed off the world; in `overlay_text`, after the brush and
     the selection; the longest overlay's layout also takes the widest drawn disk's line;
+  - the measuring tool's lines exactly: a click's and a release's disk, each off the world, the placed disk
+    `measuring` until its measurement is in, and then what it holds; a measurement of another centre or radius
+    is not shown, nor one while a disk is drawn; three significant figures of a fine radius, `1.23e5` from
+    100,000; in `overlay_text`, `measuring` before the selection and the lines after; put away, nothing. The
+    longest overlay's layout also takes the measuring tool's widest click and its widest placed disk measured,
+    26 lines: the longest overlay now, 52,402 triangles at two pixels a point against the 52,428 the budget's
+    quarter of headroom allows (the centre is left out of the lines to fit it);
   - plan §14.1's telemetry exactly, for chosen metrics: `4,608 live · 9,124,000 parameters`, `controllers every
     tick · 128.0 full evaluations/s`, `genomes 38.2 MiB of 1.00 GiB · 412 MiB headroom`, `18,586 births · 18,255
     deaths · no capacity pause · no fault`, `injected 1234.5 · uptake 456.7 · dissipated 789.1 · residual
@@ -665,7 +735,7 @@ presentation state, not scientific state.
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
-- `tests/offscreen.rs` (9 tests, FL-024, FL-022, Metal compute, no window), `Studio::open` offscreen on the preset at
+- `tests/offscreen.rs` (10 tests, FL-024, FL-022, plan §14.3, Metal compute, no window), `Studio::open` offscreen on the preset at
   320 x 200 points and 2 pixels a point:
   - the first frame drains the geometry and the focus, refits to 640 x 400 and is rendered, not presented, with
     the readback counted; the frame read back is byte for byte what a second `MetalRenderer` renders from the
@@ -705,6 +775,18 @@ presentation state, not scientific state.
     of organisms between the shown organisms strictly inside the disk and those within it or on its edge (radius
     ± 1e-4 relative, on the torus); in one run a disk of 13.8 world units removed 152 organisms, 152 shown in it,
     304 energy; the Studio closes on that world's digest, with one stroke and one unstroked.
+  - Plan §14.3's temporary measurement region: four steps in, with G armed and no brush, the pointer in the margin
+    previews `Click(None)` and outlines nothing, and a click there places nothing (one unmeasured); over the shown
+    organism nearest the centre the frame previews exactly `measure::clicked`'s disk, outlined in the measurement
+    colour, and a click places it and is answered, seen at tick 4, bit for bit as the world stepped directly
+    measures it there. A drag from the same press previews at each of two edges exactly `measure::drawn`'s disk,
+    outlined, with the view unpanned and the click's disk still placed; its release places it, and it and
+    `measure_again` are both answered as the direct world measures it, with energy in the field (in one run: a
+    disk of 13.8 world units, 152 organisms of 299.83 energy in 152 lineages, 16.52 energy in 603 cells). X
+    puts the tool and its disk away (`measure_again` then offers nothing); the same drag with the removal brush
+    submits exactly that disk, and a step removes exactly the organisms it counted, moving exactly its organism
+    energy, bit for bit; two measures, one unmeasured, one stroke, and the Studio closes on the direct world's
+    digest: measuring changed nothing.
   - Plan §14.3's camera tracking: T with nothing selected tracks nothing; zoomed in, a click on an organism away
     from the centre with T centres the view on it at once at the same zoom (bit for bit), and at rest the view
     stays. While the world runs, every frame draws the tracked organism at the drawable's centre (within 1e-6 px)
@@ -765,7 +847,8 @@ presentation state, not scientific state.
     evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
     a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
     was added, the first run's one survivor).
-- `src/main.rs` unit tests (9, FL-022, FL-024, FL-023, FL-021): an `inspected` record of a watched organism of
+- `src/main.rs` unit tests (10, FL-022, FL-024, FL-023, FL-021, plan §14.3): a `measured` record carries the
+  seen and read ticks, the disk and everything it holds, each figure the measurement's own; an `inspected` record of a watched organism of
   the preset two ticks in carries its sensed tick, scale and evaluation, its 104 inputs, three raw planes and 33
   gradients, and its activations' tick and layers, each value bit for bit, and its two steps' transactions: their
   ticks, each sum as written out over the two records, bit for bit, and the newest step's reproduction outcome,
@@ -813,12 +896,14 @@ presentation state, not scientific state.
   the layers drawn (raw density draws no field). An epoch 30 ticks later copies them again. The old pin
   (FrankenManim `5d08cba2`) and a pan that moves the field's or the density's display scale each fail it. It is
   its own binary because `frame_upload.rs` counts every thread's heap.
-- `tests/timeline.rs` (3 tests, FL-023, FL-019, Metal compute, no window):
+- `tests/timeline.rs` (4 tests, FL-023, FL-019, plan §14.3, Metal compute, no window):
   - G10. An offscreen Studio on the preset at 320 x 200 points and 2x records its timeline while posted input
     sets an overlay, restyles (key 3, then C, the field's composition, then `]` twice, components 0 and 1), zooms,
     selects the shown organism nearest
     the centre, has the camera track it (T, which centres the view at once), arms the energy brush and clicks,
-    runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
+    arms the measuring tool (G), clicks to place a disk, waits for its measurement and puts the tool away (G),
+    runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0). Among the regions
+    recorded is the measuring disk's (a disc that measures and does not remove).
     Every kind of record is made (in one run: 275 records, 76 frames, 4 restyles, 65 view records, most of them
     tracking's, 4 brush regions, 47 shows, 58 placements and 13 advances, one between epochs at a fraction
     strictly inside (0, 1)), style records name the composition and components 0 and 1, and the stroke applies. The replay outlines each region as recorded. Written
@@ -830,6 +915,10 @@ presentation state, not scientific state.
   - A style record names its field mapping, and one written before FL-019's composition mapping, without one,
     reads as the energy field; each mapping is written and read back to the same style, and an unknown name is
     refused.
+  - A region record says whether it measures (plan §14.3): the measuring disk's is written exactly, with
+    `measures: true`, and reads back as itself; a removal's disc and a cell's rectangle are written exactly as
+    before the measuring tool, with no `measures` field, and read back as themselves; a record that both removes
+    and measures is refused with a `StateConflict`.
   - Export. A 96 x 60 point Studio at 2x records 24 frames, some closer than a 30 fps slot and some farther, with
     an overlay. `export` at 30 fps writes a PNG a frame. Each decodes to exactly the replay's bytes and hashes as
     the manifest says. Each frame's slot count equals a fresh count in the test (slot k at the first frame's time
@@ -931,6 +1020,17 @@ presentation state, not scientific state.
   checkpoint keeping the chain; the close taking no checkpoint: each caught. One survives: the checkpointer not
   sharing a stroke's checkpoint at a multiple (a race guard: a stroke must win the lock at the multiple before the
   checkpointer, and the test waits for the checkpointer's).
+- §14.3's measuring tool, planted bugs, 23, each run against the tests that should catch it: in the host, a drag
+  measuring the click's disk, the disk never placed, kept with the tool put away, sent at half its radius, the
+  preview blind to a drawing, the disk never outlined (`tests/offscreen.rs`), `measure_again` sending nothing
+  (its wait times out there); in the controls, G leaving the brush armed, a brush leaving the tool armed, a
+  removal's drawing measured, a measuring click selecting, `drawing()` blind to which tool draws
+  (`tests/controls.rs`); a click's disk a point off, a placed disk outranking a drawing, the session thread
+  measuring half the radius (`tests/measure.rs`); another disk's measurement shown, the tool unnamed, organisms
+  and lineages swapped (`tests/overlay.rs`); the record's seen tick the read one (`src/main.rs`); a measuring
+  record read as adding and a measuring region recorded as a stroke's (`tests/timeline.rs`); a measurement
+  outlined in amber (`flife-manim`'s `tests/region.rs`): 22 caught. The binary not measuring again after a step
+  survives: it runs only in a window, which no test here opens.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -942,9 +1042,18 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   real-window test, and frankentorch's planted bug for `contentsScale` following a screen change survives for the
   same reason.
 - Tracking (T) follows one organism. When it dies the selection goes and tracking stops where it was: the camera
-  does not move on to a descendant (plan §2.2's "Follow descendants of a selected organism" is not done), and
-  §14.3's temporary measurement regions are not implemented. The window shows tracking only by the camera
-  itself; no overlay line says so. Tracking has run offscreen only: no window test here pressed T.
+  does not move on to a descendant (plan §2.2's "Follow descendants of a selected organism" is not done). The
+  window shows tracking only by the camera itself; no overlay line says so. Tracking has run offscreen only: no
+  window test here pressed T.
+- §14.3's temporary measurement region is one disk, the removal brush's shape: no rectangle or lasso, and one at
+  a time (a new one replaces it). It measures what a removal there takes and the field under it, not a time
+  series: the binary reads it again about once a second while the world runs and after each step or finished
+  command, and the overlay and the `measured` records show each reading, but nothing keeps them or charts them.
+  It is not kept in the run, as plan §14.3 calls it temporary. The overlay's lines leave the centre out to fit
+  the widest within the HUD's budget, whose headroom it now nearly fills (52,402 of the 52,428 triangles the
+  longest overlay may take). The tool has run offscreen and through the session thread only: no window test here
+  pressed G, and the binary's measuring (its refreshes, its record's printing, its overlay lines) runs only in a
+  window, which no test here opens.
 - Camera smoothing, trails and a pinch-zoom gesture are not implemented (§13.5 allows smoothing and trails; G6's
   100 ms budget argues against smoothing the camera).
 - While the world runs faster than frames, each frame's newest epoch arrives at fraction 0, so the display shows the

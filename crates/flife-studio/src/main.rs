@@ -81,9 +81,9 @@ use flife_render::Metrics;
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
-    ExportOptions, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState,
-    Particles, Resumed, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, Surface,
-    Telemetry, TimelineRecord, legends, overlay_text, write_timeline_record,
+    ExportOptions, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Look, Measuring,
+    OverlayState, Particles, Resumed, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style,
+    Surface, Telemetry, TimelineRecord, legends, overlay_text, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -444,6 +444,23 @@ enum Record<'a> {
         tick: Option<u64>,
         /// Boxed: its parameters, a few hundred kilobytes written out.
         controller: Option<Box<ControllerRecord>>,
+    },
+    /// A measurement's answer (plan §14.3's temporary measurement region):
+    /// what the disk about `center`, `radius` world units across, held at
+    /// the committed boundary `tick`. Its organisms are exactly those a
+    /// removal of that disk there would take, their energy summed as it
+    /// sums them; its cells are those whose centres the disk holds.
+    Measured {
+        schema: &'static str,
+        seen_tick: u64,
+        tick: u64,
+        center: [f64; 2],
+        radius: f64,
+        organisms: u64,
+        organism_energy: f64,
+        lineages: u64,
+        cells: u64,
+        field_energy: f64,
     },
     /// The clocks over the last window (plan §12.2).
     Clock {
@@ -922,6 +939,8 @@ fn main() -> ExitCode {
     let mut checkpoint = None;
     // The last inspection's answer and whom it was about (FL-021's panel).
     let mut inspected = None;
+    // The last measurement's answer (plan §14.3's measurement region).
+    let mut measurement = None;
     // Every colour mapping's key (FL-019's legend).
     let keys = match legends(&config) {
         Ok(keys) => keys,
@@ -963,6 +982,9 @@ fn main() -> ExitCode {
             }
         }
         let mut reported = false;
+        // A step moves the world, and a command finishing may change what
+        // the placed disk holds: measure it again once they are reported.
+        let mut moved_on = false;
         for status in studio.take_statuses() {
             if timeline.is_some() {
                 noted.extend(TimelineRecord::status(&status));
@@ -992,6 +1014,11 @@ fn main() -> ExitCode {
                     organism, snapshot, ..
                 } => inspected = Some((*organism, snapshot.clone())),
                 Status::Checkpointed { tick, .. } => checkpoint = Some(*tick),
+                Status::Measured {
+                    measurement: answer,
+                    ..
+                } => measurement = Some(*answer),
+                Status::Stepped { .. } | Status::Finished { .. } => moved_on = true,
                 _ => {}
             }
             overlay_tick = frame.shown.map(|shown| shown.tick);
@@ -1000,6 +1027,9 @@ fn main() -> ExitCode {
         }
         if reported {
             telemetry_metrics = Some(*studio.display_pair().1.metrics());
+        }
+        if moved_on {
+            studio.measure_again();
         }
         if frame.restyled {
             let style = studio.view().style();
@@ -1072,9 +1102,13 @@ fn main() -> ExitCode {
                     capacity_pauses,
                 ));
             }
-            // A running world moves on: read the selected organism again.
-            if selected.is_some() && paused == Some(false) {
-                studio.inspect_selected();
+            // A running world moves on: read the selected organism, and
+            // the placed disk, again.
+            if paused == Some(false) {
+                if selected.is_some() {
+                    studio.inspect_selected();
+                }
+                studio.measure_again();
             }
         }
         if overlay_tick.is_none() {
@@ -1104,6 +1138,10 @@ fn main() -> ExitCode {
             preview: frame.preview.map(|preview| BrushPreview {
                 preview,
                 recycle_fraction: model.death.residual_energy_recycle_fraction,
+            }),
+            measuring: frame.measuring.map(|preview| Measuring {
+                preview,
+                measurement: measurement.as_ref(),
             }),
             selected,
             inspected: inspected
@@ -1371,6 +1409,18 @@ fn status_record(status: &Status) -> Record<'static> {
                 ),
             }
         }
+        Status::Measured { seen, measurement } => Record::Measured {
+            schema: STUDIO_SCHEMA,
+            seen_tick: seen.get(),
+            tick: measurement.tick.get(),
+            center: measurement.center,
+            radius: measurement.radius,
+            organisms: measurement.organisms,
+            organism_energy: measurement.organism_energy,
+            lineages: measurement.lineages,
+            cells: measurement.cells,
+            field_energy: measurement.field_energy,
+        },
     }
 }
 
@@ -1837,6 +1887,43 @@ mod tests {
         assert_eq!(cancelled["tick"], 5);
         assert_eq!(cancelled["energy"], Value::Null);
         assert_eq!(cancelled["detail"], "SessionClosed");
+    }
+
+    /// Plan §14.3's temporary measurement region: a measurement's record
+    /// carries the disk, the epoch it was seen on, the committed boundary
+    /// it was read at and everything it holds, each figure the
+    /// measurement's own.
+    #[test]
+    fn measured_records_carry_the_disk_and_what_it_holds() {
+        let measurement = flife_engine::RegionMeasurement {
+            tick: Tick::new(5_120),
+            center: [12.3, 45.6],
+            radius: 4.56,
+            organisms: 17,
+            organism_energy: 41.23,
+            lineages: 3,
+            cells: 1_064,
+            field_energy: 812.46,
+        };
+        assert_eq!(
+            line(&Status::Measured {
+                seen: Tick::new(5_118),
+                measurement,
+            }),
+            json!({
+                "record": "measured",
+                "schema": "frankenlife.studio.v1",
+                "seen_tick": 5_118,
+                "tick": 5_120,
+                "center": [12.3, 45.6],
+                "radius": 4.56,
+                "organisms": 17,
+                "organism_energy": 41.23,
+                "lineages": 3,
+                "cells": 1_064,
+                "field_energy": 812.46
+            })
+        );
     }
 
     /// FL-021 (plan §14.2): an inspection's record carries what the watched

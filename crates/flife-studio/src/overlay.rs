@@ -6,20 +6,21 @@
 //! one of the lines (FL-019's legend, plan §13.4), and while an organism is
 //! selected its last inspection follows (FL-021's panel, plan §14.2).
 //! While a brush is armed, a line says what a click at the pointer would
-//! do (FL-022's preview, plan §14.3).
+//! do (FL-022's preview, plan §14.3), and while the measuring tool is, what
+//! its disk holds (plan §14.3's temporary measurement region).
 
 use flife_core::ids::OrganismId;
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
-    Activations, Descendants, LocalChemistry, OrganismSnapshot, ReproductionOutcome, Sensed,
-    Transactions,
+    Activations, Descendants, LocalChemistry, OrganismSnapshot, RegionMeasurement,
+    ReproductionOutcome, Sensed, Transactions,
 };
 use flife_genome::TopologyCatalog;
 use flife_manim::{ColorMapping, Legend, Style};
 use flife_render::Metrics;
 
-use crate::{Brush, ClockReading, Preview, Stroke};
+use crate::{Brush, ClockReading, Disk, MeasurePreview, Preview, Stroke};
 
 /// The field's key for a frame drawn in `style` (FL-019): the field
 /// mapping's legend when the frame draws the field
@@ -75,6 +76,8 @@ pub struct OverlayState<'a> {
     pub brush: Option<Brush>,
     /// What a click of the armed brush at the pointer would do.
     pub preview: Option<BrushPreview>,
+    /// While the measuring tool is armed, its disk and what it holds.
+    pub measuring: Option<Measuring<'a>>,
     /// The selected organism.
     pub selected: Option<OrganismId>,
     /// The selected organism's last inspection; `None` until one answers.
@@ -120,6 +123,17 @@ pub struct BrushPreview {
     pub recycle_fraction: f64,
 }
 
+/// What the armed measuring tool shows, as the overlay says it (plan
+/// §14.3's temporary measurement region).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Measuring<'a> {
+    /// The host's preview ([`crate::measure::preview`]).
+    pub preview: MeasurePreview,
+    /// The session's newest measurement: shown only while it is of the
+    /// disk placed, so a disk placed again reads as awaiting its own.
+    pub measurement: Option<&'a RegionMeasurement>,
+}
+
 /// An inspection's answer, as the overlay shows it (FL-021).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Inspected<'a> {
@@ -141,9 +155,11 @@ pub enum Inspected<'a> {
 /// - with a field key, the field's, such as `field composition ■ none
 ///   ■■■■■■ as affinity, darker is less energy`;
 /// - with telemetry, its lines ([`telemetry_lines`]);
-/// - `energy brush` while a brush is armed and `organism 42` while one is
-///   selected, joined by ` · `;
+/// - `energy brush` while a brush is armed, `measuring` while the measuring
+///   tool is, and `organism 42` while one is selected, joined by ` · `;
 /// - with a brush's preview, what a click would do ([`preview_line`]);
+/// - with the measuring tool armed, its disk and what it holds
+///   ([`measuring_lines`]);
 /// - while one is selected and an inspection has answered, the panel
 ///   ([`inspector_lines`]).
 ///
@@ -187,6 +203,9 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
     if let Some(brush) = state.brush {
         doing.push(format!("{} brush", brush.name()));
     }
+    if state.measuring.is_some() {
+        doing.push("measuring".to_owned());
+    }
     if let Some(organism) = state.selected {
         doing.push(format!("organism {}", grouped(organism.get())));
     }
@@ -197,6 +216,10 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
     if let Some(preview) = &state.preview {
         text.push('\n');
         text.push_str(&preview_line(preview));
+    }
+    if let Some(measuring) = &state.measuring {
+        text.push('\n');
+        text.push_str(&measuring_lines(measuring));
     }
     if state.selected.is_some()
         && let Some(inspected) = state.inspected
@@ -422,6 +445,65 @@ pub fn preview_line(preview: &BrushPreview) -> String {
             decimal(radius, places(radius)),
             decimal(preview.recycle_fraction * 100.0, 0)
         ),
+    }
+}
+
+/// The measuring tool's lines (plan §14.3's temporary measurement region):
+///
+/// - with no disk placed, `a click measures within 1.23 world units of the
+///   pointer; a drag draws the disk`, or `a click measures nothing: the
+///   pointer is off the world`;
+/// - while a disk is being drawn, `a release measures within 4.56 world
+///   units of the press`, or `a release measures nothing: the press was off
+///   the world`;
+/// - with one placed and its measurement in, `radius 4.56 world units at
+///   tick 5,120: 17 organisms of 41.2 energy, 3 lineages` and `field 812.5
+///   energy in 64 cells`: what a removal of that disk at that committed
+///   boundary would take, and the field cells whose centres the disk holds;
+/// - with one placed and its measurement not yet in, `radius 4.56 world
+///   units: measuring`.
+///
+/// The disk's place is its outline on the world, and its centre exactly
+/// the `measured` record's, so the lines leave it out, as a brush's
+/// preview does. A radius has three significant figures; from 100,000 a
+/// figure is in scientific notation.
+#[must_use]
+pub fn measuring_lines(measuring: &Measuring<'_>) -> String {
+    let units = |disk: Disk| format!("{} world units", decimal(disk.radius, places(disk.radius)));
+    let within = |disk: Disk| format!("within {}", units(disk));
+    match measuring.preview {
+        MeasurePreview::Click(Some(disk)) => format!(
+            "a click measures {} of the pointer; a drag draws the disk",
+            within(disk)
+        ),
+        MeasurePreview::Click(None) => {
+            "a click measures nothing: the pointer is off the world".to_owned()
+        }
+        MeasurePreview::Release(Some(disk)) => {
+            format!("a release measures {} of the press", within(disk))
+        }
+        MeasurePreview::Release(None) => {
+            "a release measures nothing: the press was off the world".to_owned()
+        }
+        MeasurePreview::Placed(disk) => {
+            let about = format!("radius {}", units(disk));
+            match measuring
+                .measurement
+                .filter(|measured| measured.center == disk.center && measured.radius == disk.radius)
+            {
+                Some(measured) => format!(
+                    "{about} at tick {}: {} organisms of {} energy, {} lineages\n\
+                     field {} energy in {} cells",
+                    grouped(measured.tick.get()),
+                    grouped(measured.organisms),
+                    decimal(measured.organism_energy, 1),
+                    grouped(measured.lineages),
+                    decimal(measured.field_energy, 1),
+                    grouped(measured.cells)
+                ),
+                None => format!("{about}: measuring"),
+            }
+        }
     }
 }
 

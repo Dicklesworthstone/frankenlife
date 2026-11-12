@@ -37,11 +37,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
+use flife_manim::{Region, RegionEffect, RegionShape};
 use flife_studio::{
-    ColorMapping, ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
-    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_PERIOD, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T,
+    ColorMapping, ControllerChoice, Disk, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
+    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_G, KEY_PERIOD, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T,
     KEY_ZERO, Look, MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface, TimelineRecord,
-    TimelineStyle, VIDEO_FILE, export, read_timeline, replay, write_timeline_record,
+    TimelineRegion, TimelineStyle, VIDEO_FILE, export, read_timeline, replay,
+    write_timeline_record,
 };
 use fmn_codec::{
     PngLimits, Y4mColorspace, append_y4m_frame_nv12, decode_png, decode_y4m, y4m_header,
@@ -216,6 +218,18 @@ fn a_recorded_session_replays_frame_for_frame() {
             .iter()
             .any(|status| matches!(status, Status::Submitted { .. }))
     });
+    // G: the measuring tool (plan §14.3), its disk placed by a click and
+    // outlined in the measurement colour, then put away.
+    recording.post(key(KEY_G, "g"));
+    recording.post(click([150.0, 90.0]));
+    recording.until("the measurement", |statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Measured { .. }))
+    });
+    recording.frame();
+    recording.post(key(KEY_G, "g"));
+    recording.frame();
     // Run, the camera moving every fifth frame, then pause.
     recording.post(key(KEY_SPACE, " "));
     for index in 0..48 {
@@ -305,6 +319,21 @@ fn a_recorded_session_replays_frame_for_frame() {
         (
             "region",
             count(|r| matches!(r, TimelineRecord::Region { region: Some(_) })),
+        ),
+        (
+            "measuring region",
+            count(|r| {
+                matches!(
+                    r,
+                    TimelineRecord::Region {
+                        region: Some(TimelineRegion::Disc {
+                            removes: false,
+                            measures: true,
+                            ..
+                        })
+                    }
+                )
+            }),
         ),
     ];
     println!(
@@ -489,6 +518,64 @@ fn a_style_record_names_its_field_mapping() {
     assert!(matches!(
         wrong.style(),
         Err(CoreError::NumericalInvalid { .. })
+    ));
+}
+
+/// A region record says whether it outlines a measurement (plan §14.3):
+/// the measuring tool's disk reads back as itself, a stroke's record is
+/// written as before the measuring tool, with no `measures` field, and an
+/// older record without one reads as a stroke's. A record that both removes
+/// and measures is refused.
+#[test]
+fn a_region_record_says_whether_it_measures() {
+    let disk = Disk {
+        center: [12.5, 3.25],
+        radius: 1.5,
+    };
+    let measured = disk.region();
+    let line = serde_json::to_string(&TimelineRegion::from(measured)).expect("written");
+    // Exact: each figure its bits in hexadecimal.
+    assert_eq!(
+        line,
+        r#"{"shape":"disc","center":["4029000000000000","400a000000000000"],"radius":"3ff8000000000000","removes":false,"measures":true}"#
+    );
+    let read: TimelineRegion = serde_json::from_str(&line).expect("read");
+    assert_eq!(Region::try_from(read).expect("a region"), measured);
+
+    let removal = Region {
+        shape: RegionShape::Disc {
+            center: disk.center,
+            radius: disk.radius,
+        },
+        effect: RegionEffect::Removes,
+    };
+    let cell = Region {
+        shape: RegionShape::Rectangle([[1.0, 2.0], [3.0, 4.0]]),
+        effect: RegionEffect::Adds,
+    };
+    for (stroke, written) in [
+        (
+            removal,
+            r#"{"shape":"disc","center":["4029000000000000","400a000000000000"],"radius":"3ff8000000000000","removes":true}"#,
+        ),
+        (
+            cell,
+            r#"{"shape":"rectangle","bounds":[["3ff0000000000000","4000000000000000"],["4008000000000000","4010000000000000"]],"removes":false}"#,
+        ),
+    ] {
+        let line = serde_json::to_string(&TimelineRegion::from(stroke)).expect("written");
+        assert_eq!(line, written);
+        let read: TimelineRegion = serde_json::from_str(&line).expect("read");
+        assert_eq!(Region::try_from(read).expect("a region"), stroke);
+    }
+
+    let both: TimelineRegion = serde_json::from_str(
+        r#"{"shape":"disc","center":["4029000000000000","400a000000000000"],"radius":"3ff8000000000000","removes":true,"measures":true}"#,
+    )
+    .expect("a record");
+    assert!(matches!(
+        Region::try_from(both),
+        Err(CoreError::StateConflict { .. })
     ));
 }
 

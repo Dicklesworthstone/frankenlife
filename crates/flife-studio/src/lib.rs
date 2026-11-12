@@ -19,7 +19,9 @@
 //! introduction brush; with one armed, a click becomes a world-space
 //! command the session applies at its next open boundary, and the Studio
 //! reports the tick it applied at and the energy it moved ([`brush`],
-//! FL-022).
+//! FL-022). G arms the measuring tool instead: a click or a drag places a
+//! disk the session measures, changing nothing ([`measure`], plan §14.3's
+//! temporary measurement region).
 //!
 //! The display runs one committed state behind the world: each new epoch's
 //! organisms move from where the previous epoch had them, matched by
@@ -54,6 +56,7 @@ mod export;
 mod frames;
 mod host;
 mod keep;
+pub mod measure;
 pub mod memory;
 mod overlay;
 mod pacing;
@@ -62,12 +65,12 @@ mod timeline;
 
 pub use brush::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, BRUSH_RADIUS_POINTS, Brush, Preview, Stroke, Supplies,
-    cell_region, drawing, drawn, material_for, preview, preview_region, stroke,
+    cell_region, clicked, drawing, drawn, material_for, preview, preview_region, stroke,
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
     CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_C, KEY_D, KEY_DIGITS, KEY_E,
-    KEY_ESCAPE, KEY_F, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT,
+    KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT,
     KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT,
     ZOOM_STEP_LIMIT, scroll_zoom,
 };
@@ -83,9 +86,11 @@ pub use host::{
     StudioOptions, Surface,
 };
 pub use keep::Keeping;
+pub use measure::{Disk, MeasurePreview};
 pub use overlay::{
-    BrushPreview, Inspected, OverlayState, PANEL_ANCESTORS, Recent, Telemetry, field_key,
-    inspector_lines, legends, overlay_text, preview_line, recent, telemetry_lines,
+    BrushPreview, Inspected, Measuring, OverlayState, PANEL_ANCESTORS, Recent, Telemetry,
+    field_key, inspector_lines, legends, measuring_lines, overlay_text, preview_line, recent,
+    telemetry_lines,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};

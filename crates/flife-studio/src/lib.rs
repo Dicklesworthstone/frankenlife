@@ -65,7 +65,7 @@ pub use brush::{
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
-    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_D, KEY_DIGITS, KEY_E,
+    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_C, KEY_D, KEY_DIGITS, KEY_E,
     KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X,
     KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
@@ -74,15 +74,15 @@ pub use export::{
     VIDEO_FILE, export, slot_counts,
 };
 pub use flife_backend_metal::ControllerChoice;
-pub use flife_manim::{ColorMapping, Look, Motion, Particles, Style};
+pub use flife_manim::{ColorMapping, FieldMapping, Look, Motion, Particles, Style};
 pub use frames::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, STUDIO_SESSION, Studio, StudioClosed, StudioOptions,
     Surface,
 };
 pub use overlay::{
-    BrushPreview, Inspected, OverlayState, Telemetry, inspector_lines, legends, overlay_text,
-    preview_line, telemetry_lines,
+    BrushPreview, Inspected, OverlayState, Telemetry, field_key, inspector_lines, legends,
+    overlay_text, preview_line, telemetry_lines,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};

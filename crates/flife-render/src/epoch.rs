@@ -3,7 +3,8 @@
 //! An [`Epoch`] is a compact projection of exactly one committed world:
 //! - its source tick and resource epoch;
 //! - one row per live organism, in stable identity order;
-//! - a bounded field texture derived from the energy plane;
+//! - a bounded field texture derived from the energy plane, with each
+//!   texel's mean chemical composition through a fixed projection;
 //! - a small metric summary.
 //!
 //! Every view declares its [`Layout`]: element type, components, count and
@@ -22,6 +23,7 @@
 //! Scientific code never reads an epoch back.
 
 use flife_core::ids::{OrganismId, RenderEpoch, ResourceEpoch};
+use flife_core::model::MOMENT_CHANNELS;
 use flife_core::{CoreError, LedgerReport, Tick, TimeStep, Transfer};
 use flife_engine::{TickReport, World};
 
@@ -48,12 +50,8 @@ pub const AFFINITY_AXES: [usize; 3] = [7, 14, 25];
 /// a coordinate that is not finite.
 #[must_use]
 pub fn affinity_projection(affinity: &[f64], limit: f64) -> [f32; 3] {
-    let scale = (affinity.len() as f64).sqrt() * limit;
-    if !(scale.is_finite() && scale > 0.0) {
-        return [0.0; 3];
-    }
-    AFFINITY_AXES.map(|row| {
-        let dot = affinity
+    let dots = AFFINITY_AXES.map(|row| {
+        affinity
             .iter()
             .enumerate()
             .fold(0.0_f64, |sum, (channel, &value)| {
@@ -62,7 +60,22 @@ pub fn affinity_projection(affinity: &[f64], limit: f64) -> [f32; 3] {
                 } else {
                     sum - value
                 }
-            });
+            })
+    });
+    coordinates(dots, affinity.len(), limit)
+}
+
+/// The display coordinates of the three dot products `dots` of
+/// [`affinity_projection`] over `channels` channels: each over
+/// `√(channels) × limit`, clamped and rounded to F32; `[0; 3]` for a
+/// nonpositive or non-finite scale and `0` for a coordinate that is not
+/// finite.
+fn coordinates(dots: [f64; 3], channels: usize, limit: f64) -> [f32; 3] {
+    let scale = (channels as f64).sqrt() * limit;
+    if !(scale.is_finite() && scale > 0.0) {
+        return [0.0; 3];
+    }
+    dots.map(|dot| {
         let coordinate = dot / scale;
         if coordinate.is_finite() {
             coordinate.clamp(-1.0, 1.0) as f32
@@ -71,6 +84,38 @@ pub fn affinity_projection(affinity: &[f64], limit: f64) -> [f32; 3] {
         }
     })
 }
+
+/// Moment channels per cell, as an array length.
+const CHANNELS: usize = MOMENT_CHANNELS as usize;
+
+/// [`AFFINITY_AXES`] as signs, channel by channel: `H[k][c]`. Adding
+/// `±1 × v` is exactly adding or subtracting `v`, so a sum over them is the
+/// sum [`affinity_projection`]'s fold makes, bit for bit.
+const AXIS_SIGNS: [[f64; CHANNELS]; 3] = {
+    let mut signs = [[0.0; CHANNELS]; 3];
+    let mut axis = 0;
+    while axis < 3 {
+        let mut channel = 0;
+        while channel < CHANNELS {
+            signs[axis][channel] = if (AFFINITY_AXES[axis] & channel)
+                .count_ones()
+                .is_multiple_of(2)
+            {
+                1.0
+            } else {
+                -1.0
+            };
+            channel += 1;
+        }
+        axis += 1;
+    }
+    signs
+};
+
+/// The most texels in a field texture's row: a projection carries one row
+/// through the moment planes at once, its F64 sums on the stack, reading
+/// each plane in one run per row.
+const ROW: usize = FIELD_TEXELS_MAX as usize;
 
 /// A view's element type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,11 +163,15 @@ pub enum View {
     Affinity,
     /// The field texture, row-major.
     Field,
+    /// Each field texel's mean composition through the same fixed
+    /// projection as the affinity ([`FieldTexture::composition`]),
+    /// row-major.
+    FieldComposition,
 }
 
 impl View {
     /// Every view, in declaration order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Identity,
         Self::Position,
         Self::Velocity,
@@ -132,6 +181,7 @@ impl View {
         Self::Topology,
         Self::Affinity,
         Self::Field,
+        Self::FieldComposition,
     ];
 
     /// The view's name.
@@ -147,6 +197,7 @@ impl View {
             Self::Topology => "topology",
             Self::Affinity => "affinity",
             Self::Field => "field",
+            Self::FieldComposition => "field-composition",
         }
     }
 }
@@ -208,8 +259,10 @@ pub enum FieldChannel {
     EnergyDensity,
 }
 
-/// A bounded field texture derived from the committed energy plane (§9.5,
-/// B.3: an explicit channel projection and source scale).
+/// A bounded field texture derived from the committed field (§9.5, B.3:
+/// an explicit channel projection and source scale): each texel's mean
+/// energy density, and its mean composition through a fixed projection
+/// (plan §13.4, "Local field").
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldTexture {
     channel: FieldChannel,
@@ -218,11 +271,13 @@ pub struct FieldTexture {
     texels: [u32; 2],
     texel_size: [f64; 2],
     values: Vec<f32>,
+    composition: Vec<[f32; 3]>,
 }
 
 impl FieldTexture {
     /// The texture of one row-major energy `plane` on a `cells` grid of
-    /// `cell_size` cells: for previews and checks outside an epoch.
+    /// `cell_size` cells, with no chemical moment: for previews and checks
+    /// outside an epoch.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for an empty grid or a plane of the
@@ -234,6 +289,37 @@ impl FieldTexture {
     ) -> Result<Self, CoreError> {
         let mut texture = Self::sized(cells, cell_size)?;
         texture.project(plane, cell_size[0] * cell_size[1])?;
+        Ok(texture)
+    }
+
+    /// The texture of a whole field's `planes` in the authoritative planar
+    /// layout (plane 0 energy, plane `k + 1` moment channel `k`, each
+    /// row-major) on a `cells` grid of `cell_size` cells: what an epoch
+    /// projects, for previews and checks outside one.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for an empty grid or planes of the
+    /// wrong length; [`CoreError::AllocationFailed`].
+    pub fn from_planes(
+        cells: [u32; 2],
+        cell_size: [f64; 2],
+        planes: &[f32],
+    ) -> Result<Self, CoreError> {
+        let mut texture = Self::sized(cells, cell_size)?;
+        let count = cells.map(|n| n as usize);
+        if planes.len() != count[0] * count[1] * (1 + CHANNELS) {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render field texture",
+                detail: format!(
+                    "{} values are not the {} planes of a {} × {} grid",
+                    planes.len(),
+                    1 + MOMENT_CHANNELS,
+                    count[0],
+                    count[1]
+                ),
+            });
+        }
+        texture.project(planes, cell_size[0] * cell_size[1])?;
         Ok(texture)
     }
 
@@ -262,6 +348,7 @@ impl FieldTexture {
                 f64::from(block[1]) * cell_size[1],
             ],
             values: reserved(count, "render field texture")?,
+            composition: reserved(count, "render field composition")?,
         })
     }
 
@@ -314,34 +401,130 @@ impl FieldTexture {
         }
     }
 
-    /// Refill from a row-major energy plane of `cell_area` cells. Each texel
-    /// sums its block in F64, rows then columns, and divides by the block's
-    /// area.
-    fn project(&mut self, energy: &[f32], cell_area: f64) -> Result<(), CoreError> {
+    /// Each texel's mean chemical composition, row-major, through the
+    /// affinity's fixed projection (plan §13.4, "Local field"): the
+    /// block's moments summed channel by channel, `Σm`, and its energy,
+    /// `Σe`, give [`affinity_projection`]`(Σm, Σe)`, that is row `k` of
+    /// [`AFFINITY_AXES`] dotted with `Σm` over `√32 Σe`. It is the mean
+    /// composition per unit energy `Σm / Σe`, weighted by energy, in the
+    /// coordinates an affinity direction at its norm limit takes, so an
+    /// organism and the material it converts best (`a / ‖a‖`) share them.
+    /// Every cell holds `‖m‖₂ ≤ e` (§4.2), so a block's composition is in
+    /// the unit ball. A block with no energy, and a texture made from an
+    /// energy plane alone, have none: `[0; 3]`.
+    #[must_use]
+    pub fn composition(&self) -> &[[f32; 3]] {
+        &self.composition
+    }
+
+    /// The composition's layout.
+    #[must_use]
+    pub fn composition_layout(&self) -> Layout {
+        Layout {
+            view: View::FieldComposition,
+            dtype: Dtype::F32,
+            components: 3,
+            count: self.composition.len(),
+            bounds: Bounds::Magnitude(1.0),
+        }
+    }
+
+    /// Refill from row-major `planes` of `cell_area` cells: an energy plane
+    /// alone, or the field's 33 planes in their planar order. Each texel
+    /// sums its block's energy in F64, rows then columns, and divides it by
+    /// the block's area; with moments, it sums each channel the same way and
+    /// projects the sums over the energy's ([`FieldTexture::composition`]).
+    fn project(&mut self, planes: &[f32], cell_area: f64) -> Result<(), CoreError> {
         let [cells_x, cells_y] = self.cells.map(|n| n as usize);
-        if energy.len() != cells_x * cells_y {
+        let cells = cells_x * cells_y;
+        let with_moments = planes.len() == cells * (1 + CHANNELS);
+        if planes.len() != cells && !with_moments {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!(
-                    "an energy plane of {} values for a {cells_x} × {cells_y} grid",
-                    energy.len()
+                    "{} values for an energy plane or the {} planes of a {cells_x} × {cells_y} grid",
+                    planes.len(),
+                    1 + CHANNELS
                 ),
             });
         }
+        let (energy, moments) = planes.split_at(cells);
         let [block_x, block_y] = self.block.map(|n| n as usize);
+        let whole = block_x == 1 && block_y == 1;
+        let columns = |texel_x: usize| texel_x * block_x..((texel_x + 1) * block_x).min(cells_x);
+        let block_sum = |plane: &[f32], rows: &std::ops::Range<usize>, texel_x: usize| {
+            let columns = columns(texel_x);
+            let mut sum = 0.0_f64;
+            for y in rows.clone() {
+                for &value in &plane[y * cells_x + columns.start..y * cells_x + columns.end] {
+                    sum += f64::from(value);
+                }
+            }
+            sum
+        };
         self.values.clear();
+        self.composition.clear();
+        // A texel row at a time: each texel's energy sum, then its three
+        // dot products channel by channel, so each plane is read in one run
+        // per row. Per texel these are the same sums in the same order as
+        // `affinity_projection` of the block's channel sums.
+        let width = self.texels[0] as usize;
+        let mut energies = [0.0_f64; ROW];
+        let mut sums = [0.0_f64; ROW];
+        let mut dots = [[0.0_f64; ROW]; 3];
         for texel_y in 0..self.texels[1] as usize {
             let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
-            for texel_x in 0..self.texels[0] as usize {
-                let columns = texel_x * block_x..((texel_x + 1) * block_x).min(cells_x);
-                let mut sum = 0.0_f64;
-                for y in rows.clone() {
-                    for &value in &energy[y * cells_x + columns.start..y * cells_x + columns.end] {
-                        sum += f64::from(value);
+            for (texel_x, total) in energies[..width].iter_mut().enumerate() {
+                let sum = block_sum(energy, &rows, texel_x);
+                let area = (rows.len() * columns(texel_x).len()) as f64 * cell_area;
+                *total = sum;
+                self.values.push(saturate(sum / area));
+            }
+            if !with_moments {
+                for _ in 0..width {
+                    self.composition.push([0.0; 3]);
+                }
+                continue;
+            }
+            for axis in &mut dots {
+                axis[..width].fill(0.0);
+            }
+            for (channel, plane) in moments.chunks_exact(cells).enumerate() {
+                let signs = [0, 1, 2].map(|axis| AXIS_SIGNS[axis][channel]);
+                if whole {
+                    // A texel is a cell: the row's run is the texels'.
+                    let run = &plane[texel_y * cells_x..][..width];
+                    for (axis, sign) in dots.iter_mut().zip(signs) {
+                        for (dot, &value) in axis.iter_mut().zip(run) {
+                            *dot += sign * f64::from(value);
+                        }
+                    }
+                } else {
+                    // Each block's sum, rows then columns as `block_sum`
+                    // makes it, for the whole row of texels.
+                    let sums = &mut sums[..width];
+                    sums.fill(0.0);
+                    for y in rows.clone() {
+                        let line = &plane[y * cells_x..(y + 1) * cells_x];
+                        for (texel_x, sum) in sums.iter_mut().enumerate() {
+                            for &value in &line[columns(texel_x)] {
+                                *sum += f64::from(value);
+                            }
+                        }
+                    }
+                    for (axis, sign) in dots.iter_mut().zip(signs) {
+                        for (dot, &sum) in axis.iter_mut().zip(sums.iter()) {
+                            *dot += sign * sum;
+                        }
                     }
                 }
-                let area = (rows.len() * columns.len()) as f64 * cell_area;
-                self.values.push(saturate(sum / area));
+            }
+            for (texel_x, &sum) in energies[..width].iter().enumerate() {
+                self.composition.push(coordinates(
+                    [0, 1, 2].map(|axis| dots[axis][texel_x]),
+                    CHANNELS,
+                    sum,
+                ));
             }
         }
         Ok(())
@@ -619,7 +802,7 @@ impl Epoch {
             parameters += genome.parameters().len() as u64;
         }
         self.field
-            .project(world.field().energy(), grid.cell_area())?;
+            .project(world.field().as_slice(), grid.cell_area())?;
         self.id = id;
         self.tick = world.tick();
         self.resource = world.epoch();
@@ -787,7 +970,7 @@ impl Epoch {
 
     /// Every view's declared layout, in [`View::ALL`] order.
     #[must_use]
-    pub fn layouts(&self) -> [Layout; 9] {
+    pub fn layouts(&self) -> [Layout; 10] {
         let rows = |view, dtype, components, bounds| Layout {
             view,
             dtype,
@@ -811,11 +994,12 @@ impl Epoch {
             rows(View::Topology, Dtype::U8, 1, Bounds::Any),
             rows(View::Affinity, Dtype::F32, 3, Bounds::Magnitude(1.0)),
             self.field.layout(),
+            self.field.composition_layout(),
         ]
     }
 
     /// The bytes this slot's buffers have actually reserved. Allocated
-    /// once, it is the population ceiling times 53 bytes a row plus 4 a
+    /// once, it is the population ceiling times 53 bytes a row plus 16 a
     /// texel, and a projection never changes it.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
@@ -832,6 +1016,7 @@ impl Epoch {
             bytes(&self.topologies),
             bytes(&self.affinities),
             bytes(&self.field.values),
+            bytes(&self.field.composition),
         ]
         .into_iter()
         .fold(0, u64::saturating_add)
@@ -881,6 +1066,12 @@ impl Epoch {
                 format!("{} texels for {texels:?}", self.field.values.len()),
             );
         }
+        if self.field.composition.len() != texels[0] * texels[1] {
+            return refuse(
+                View::FieldComposition,
+                format!("{} texels for {texels:?}", self.field.composition.len()),
+            );
+        }
         for layout in self.layouts() {
             match layout.bounds {
                 Bounds::Wrapped(extent) => {
@@ -897,6 +1088,12 @@ impl Epoch {
                             .iter()
                             .find(|a| a.iter().any(exceeds))
                             .map(|a| format!("{a:?}"))
+                    } else if layout.view == View::FieldComposition {
+                        self.field
+                            .composition
+                            .iter()
+                            .find(|q| q.iter().any(exceeds))
+                            .map(|q| format!("{q:?}"))
                     } else {
                         self.velocities
                             .iter()

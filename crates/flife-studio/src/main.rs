@@ -60,8 +60,8 @@ use flife_render::Metrics;
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
-    ExportOptions, FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState, Particles,
-    STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, Surface, Telemetry,
+    ExportOptions, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Look, OverlayState,
+    Particles, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style, Surface, Telemetry,
     TimelineRecord, legends, overlay_text, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
@@ -118,6 +118,12 @@ struct Cli {
     /// Hide the energy field. F switches.
     #[arg(long)]
     no_field: bool,
+    /// What the field's colour means: `energy` (the default) or
+    /// `composition`, its mean chemical composition coloured as the
+    /// affinity mapping colours organisms, as bright as its energy. C
+    /// switches.
+    #[arg(long, default_value = "energy")]
+    field_mapping: FieldMapping,
     /// Run for SECONDS wall seconds with no window, then close: each frame
     /// is rendered through the same Metal route and read back, and nothing
     /// posts input (FL-024's frame study).
@@ -308,6 +314,7 @@ enum Record<'a> {
         look: &'static str,
         particles: &'static str,
         field: bool,
+        field_mapping: &'static str,
         clock_telemetry: bool,
         /// `window` or `offscreen`.
         surface: &'static str,
@@ -319,6 +326,7 @@ enum Record<'a> {
         look: &'static str,
         particles: &'static str,
         field: bool,
+        field_mapping: &'static str,
         shown_tick: Option<u64>,
     },
     Selection {
@@ -604,6 +612,7 @@ fn main() -> ExitCode {
                 Particles::Points
             },
             field: !cli.no_field,
+            field_mapping: cli.field_mapping,
         },
         surface: cli
             .offscreen
@@ -658,6 +667,7 @@ fn main() -> ExitCode {
         look: options.style.look.name(),
         particles: options.style.particles.name(),
         field: options.style.field,
+        field_mapping: options.style.field_mapping.name(),
         clock_telemetry: model.presentation.show_clock_telemetry,
         surface: if studio.is_offscreen() {
             "offscreen"
@@ -788,6 +798,7 @@ fn main() -> ExitCode {
                 look: style.look.name(),
                 particles: style.particles.name(),
                 field: style.field,
+                field_mapping: style.field_mapping.name(),
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
             });
         }
@@ -860,7 +871,9 @@ fn main() -> ExitCode {
         if telemetry_metrics.is_none() {
             telemetry_metrics = Some(*studio.display_pair().1.metrics());
         }
-        let mapping = studio.view().style().mapping;
+        let style = studio.view().style();
+        let mapping = style.mapping;
+        let field_key = flife_studio::field_key(style);
         let Some(legend) = keys
             .iter()
             .find_map(|(key, legend)| (*key == mapping).then_some(legend))
@@ -874,6 +887,7 @@ fn main() -> ExitCode {
             shown: overlay_tick,
             clock: last_clock.as_ref(),
             legend,
+            field_key: field_key.as_ref(),
             brush: armed,
             preview: frame.preview.map(|preview| BrushPreview {
                 preview,
@@ -894,7 +908,13 @@ fn main() -> ExitCode {
                 checkpoint: None,
             }),
         });
-        if let Err(error) = studio.set_overlay(&text, &legend.swatches) {
+        let swatches: Vec<[u8; 3]> = legend
+            .swatches
+            .iter()
+            .chain(field_key.iter().flat_map(|key| &key.swatches))
+            .copied()
+            .collect();
+        if let Err(error) = studio.set_overlay(&text, &swatches) {
             let code = fail(error.kind(), error.to_string(), 1);
             let _ = studio.close();
             return code;

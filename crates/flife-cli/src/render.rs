@@ -105,6 +105,8 @@ pub enum RenderRecord {
         particles: &'static str,
         /// Whether the field is drawn.
         field: bool,
+        /// What the field's colour means: `energy` or `composition`.
+        field_mapping: &'static str,
         /// What the controller backend did. Not scientific state.
         controllers: ControllerSummary,
         /// Wall seconds for the whole run.
@@ -236,6 +238,7 @@ pub fn render(
         look: options.style.look.name(),
         particles: options.style.particles.name(),
         field: options.style.field,
+        field_mapping: options.style.field_mapping.name(),
         controllers: ControllerSummary::of(&world),
         wall_seconds: clock.elapsed().as_secs_f64(),
     });

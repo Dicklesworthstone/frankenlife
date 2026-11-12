@@ -15,7 +15,8 @@ A slow consumer can therefore cost display freshness, never the world.
 
 **Inputs.**
 - `&World`, read only: the committed tick and resource epoch, the population rows, each genome's topology and
-  affinity vector and the world's `affinity_norm_limit` (FL-019), the field's energy plane and grid, the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
+  affinity vector and the world's `affinity_norm_limit` (FL-019), the field's 33 planes (energy and the 32 moment
+  channels) and grid, the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
   event cursor. FL-024: each genome's parameter count, the genome quota's logical and allocated bytes, the run
   ledger's report and whether a numerical fault stopped the run.
 - FL-024: `Publisher::count(&TickReport)`. The owner gives every report it publishes, in order, before offering the
@@ -44,6 +45,7 @@ A slow consumer can therefore cost display freshness, never the world.
   | topology | u8 × 1 | — |
   | affinity | f32 × 3 | each component in `[−1, 1]` |
   | field | f32 × 1 per texel | finite, ≥ 0 |
+  | field-composition | f32 × 3 per texel | each component in `[−1, 1]` |
 
   These are the inputs of §13.4's mappings. Turning them into sizes and colours is FL-019's.
 - The affinity view (FL-019, `affinity_projection`) is a fixed projection of each organism's 32 affinity terms
@@ -56,6 +58,18 @@ A slow consumer can therefore cost display freshness, never the world.
 - `FieldTexture`: channel `EnergyDensity`, the source grid, the block of cells per texel, the texel count and the
   texel size in world units. Each texel is the mean energy density of its block, summed in F64, rows then columns.
   Texels per axis are at most `FIELD_TEXELS_MAX` = 512. A grid that does not divide evenly ends in a partial block.
+- The field's composition (FL-019, plan §13.4's "Local field", `FieldTexture::composition`): per texel, the block's
+  moments summed channel by channel, `Σm`, and its energy, `Σe`, in F64, rows then columns, give
+  `affinity_projection(Σm, Σe)`, that is `q_k = (Σ_j H[r_k][j] Σm_j) / (√32 · Σe)` on the affinity view's axes.
+  It is the block's mean composition per unit energy, weighted by energy, in the coordinates an affinity direction
+  at its norm limit takes, so an organism and the material it converts best (`a / ‖a‖`) share them. Every cell
+  holds `‖m‖₂ ≤ e` (§4.2), so the composition lies in the unit ball. A block with no energy has none, `[0; 3]`, as
+  does every texel of `FieldTexture::from_plane` (an energy plane alone); `from_planes` takes the 33 planes.
+  The projection runs a texel row at a time through each moment plane with the axes as a sign table, which gives
+  the same sums in the same order, bit for bit, as `affinity_projection` of the block's channel sums. Measured
+  (scratch, release, load average about 44, cv up to 20%): on the preset's 128 × 128 field the texture from 33
+  planes took 0.29 ms against 0.05 ms from energy alone, and a whole epoch 0.57 ms against a 39.5 ms tick; a
+  512 × 512 field 6.3 ms, a 1024 × 1024 field (2 × 2 blocks) 26 ms.
 - `Metrics`: source tick, live count, organism energy (F64 in identity order), field energy (F64 in cell order),
   highest generation and event cursor. FL-024 adds:
   - `parameters`: the live organisms' logical neural parameters, summed;
@@ -96,7 +110,8 @@ A slow consumer can therefore cost display freshness, never the world.
   displayable slot therefore cannot be written; the type system refuses it. A consumer only sees an epoch after it
   is complete.
 - *Bounded memory (§9.5).* Every slot is allocated once, with fallible reservation, at the population ceiling
-  (53 bytes a row) and the texture size (4 bytes a texel). No projection reallocates. `Publisher::reserved_bytes`
+  (53 bytes a row) and the texture size (16 bytes a texel: 4 of energy, 12 of composition). No projection
+  reallocates. `Publisher::reserved_bytes`
   is the render budget.
 - *Busy feeds skip.* When no slot is free, nothing is written or allocated. The latest epoch stays, and the boundary
   stays pending. The next offer, or one prompted by a released lease, publishes the newest committed state, linked
@@ -128,16 +143,23 @@ conversions of the F64 state, and its sums are F64 in a fixed order. Slot choice
 identities are sequential, so a deterministic sequence of offers and lease drops gives the same publications.
 
 **Independent tests.**
-- `tests/epochs.rs` (8 tests):
+- `tests/epochs.rs` (9 tests):
   - Every view, metric and texel, at founding and over 288 ticks with births and deaths, matches the world's own
-    rows and an independent block-mean oracle. Every declared layout holds.
+    rows and an independent block-mean oracle. Every declared layout holds. Each texel's composition equals, bit
+    for bit, an oracle that sums the world's moment planes per block and projects them with the Hadamard matrix
+    built by its recursion; the run's sources and emissions give texels a composition.
+  - The composition (FL-019), by hand: a composition along an axis lands on it, its opposite on the opposite end;
+    cancelled moments and a cell without energy have none; one channel lands at `±1/√32` by its column's signs. In
+    blocks of two, three units along an axis and one against it land half way: weighted by energy. A 521 × 515
+    grid in 2 × 2 blocks with partial edges equals the oracle and stays in the unit ball. An energy plane alone has
+    no composition; planes of the wrong length are refused.
   - A 1,030 × 515 plane gives a 344 × 258 texture of 3 × 2 blocks with partial edges, equal to the oracle. Bad
     planes are refused.
   - C.7: Compact and FreeList worlds publish identical epochs and identical matches at every tick of 288, while
     their slots differ.
   - Over 1,024 FreeList ticks, matching agrees with every tick's births and deaths, and every reused slot's newborn
     is a birth while its dead occupant is gone.
-  - Slots reserve exactly 72 × 53 + 32 × 32 × 4 bytes, and never more, through a run to the population ceiling.
+  - Slots reserve exactly 72 × 53 + 32 × 32 × 16 bytes, and never more, through a run to the population ceiling.
   - The affinity view (FL-019): the axes are orthonormal rows of a Hadamard matrix built by its recursion, not the
     crate's popcount form; a vector along a row projects onto its axis, and three times past the limit onto its
     clamped end; 200 pseudo-random vectors project bit for
@@ -207,8 +229,9 @@ identities are sequential, so a deterministic sequence of offers and lease drops
   resource bridge (§13.6: device context, layout, completion fence, read lease, release notification) is FL-033's;
   FL-018's adapter (`flife-manim`) copies each epoch into its draw buffer on the CPU and returns the lease before
   rendering. Device reads that must finish before release do not exist yet.
-- The field texture shows energy only. Moment channels, fixed projections and an admitted full-field diagnostic
-  lease are FL-019's raw views.
+- The field texture carries energy and the composition's fixed projection. Single moment channels ("chosen
+  components") and an admitted full-field diagnostic lease do not exist. The composition is projected with every
+  epoch, whether or not a consumer draws it.
 - Epochs carry no birth ticks, so a birth appears with the first epoch that shows it rather than at its exact
   birth tick within a skipped gap. Recorded winding or displacement (the alternative to snapping) does not exist.
 - Trails, and drawing interpolated epochs in the Studio, are FL-020's remaining parts.

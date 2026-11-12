@@ -40,6 +40,7 @@
 //! | R | glow or raw |
 //! | D | points or density |
 //! | F | field on or off |
+//! | C | the field's energy or its chemical composition ([`FieldMapping`](flife_manim::FieldMapping)) |
 
 use flife_core::Tick;
 use flife_core::ids::OrganismId;
@@ -68,6 +69,8 @@ pub const KEY_R: u16 = 15;
 pub const KEY_D: u16 = 2;
 /// `kVK_ANSI_F`.
 pub const KEY_F: u16 = 3;
+/// `kVK_ANSI_C`.
+pub const KEY_C: u16 = 8;
 /// `kVK_ANSI_0`.
 pub const KEY_ZERO: u16 = 29;
 /// `kVK_ANSI_E`.
@@ -475,6 +478,7 @@ impl Controls {
                 };
             }
             KEY_F => self.style.field = !self.style.field,
+            KEY_C => self.style.field_mapping = self.style.field_mapping.next(),
             _ => {}
         }
     }

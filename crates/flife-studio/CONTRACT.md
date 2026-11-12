@@ -2,8 +2,9 @@
 
 **Purpose.** FL-018 (`flife-jdf`) covers FrankenLife's safe native input host and first interactive Studio
 (plan §13.1, §13.6). FL-019 (`flife-g90`) adds live switching between its colour mappings, raw views and density
-rendering (§13.4), the configured bloom on glowing frames (§2.3), and the shown mapping's colour key in the overlay
-(§13.4's legend: `legends`, `flife_manim::ColorMapping::legend`). FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
+rendering (§13.4), the configured bloom on glowing frames (§2.3), the shown mapping's colour key in the overlay
+(§13.4's legend: `legends`, `flife_manim::ColorMapping::legend`), and the field's chemical composition beside its
+energy (§13.4's "Local field": key C, `--field-mapping`, `flife_manim::FieldMapping`), keyed after the colour key. FL-020 (`flife-err`, part) adds the camera (zoom about the pointer, drag pan across the seams,
 reset), selection by displayed stable identity (§13.6), and the display one committed state late, organisms moving
 between epochs by identity (§13.5). FL-021 (`flife-zyc`, part) reads a selected organism back from the session as a
 bounded snapshot at its committed boundary (§14.2), and draws it as a panel in the overlay, read again once a
@@ -14,7 +15,8 @@ scientific ticks committed per wall second and the simulation-time to wall-time 
 They are drawn as text in the window's top-left corner, with what the session is doing and what a click will do.
 The overlay's lines are `overlay_text`'s: the run and its tick, the clocks, plan §14.1's persistent telemetry
 (`telemetry_lines`), the shown mapping's key (each swatch in the colour that mapping gives its label; the topology
-key labels the run's catalog members by their hidden widths), the armed brush and the selection, the armed
+key labels the run's catalog members by their hidden widths), the field's key while the field shows its
+composition, the armed brush and the selection, the armed
 brush's preview (`preview_line`, §14.3), then the inspector panel. A count of a trillion or more, and a magnitude of 100,000 or more, is written in scientific
 notation, so no line grows without bound. The telemetry is the shown epoch's (`flife_render::Metrics`): the live
 population and its logical parameters; the neural cadence and the full-population evaluations a wall second; the
@@ -66,6 +68,7 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
     | R | switch the glow and raw looks |
     | D | switch dots and density |
     | F | show or hide the field |
+    | C | show the field's energy or its chemical composition (FL-019) |
     | 0 | the whole torus again (a `CameraMove::Reset`) |
     | E | arm the energy brush, or disarm it (FL-022) |
     | X | arm the removal brush, or disarm it (FL-022) |
@@ -184,7 +187,8 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
   arrival over the interval, at most 1, and 1 before an interval is known. So a running world is drawn about one
   arrival interval late, and a step is seen moving within 100 ms. `close()` closes the window and the session and returns the committed world (`StudioClosed`).
 - `flife-studio <config> [--width W --height H] [--fixed] [--cpu-workers W] [--controllers C] [--color M]
-  [--look glow|raw] [--density] [--no-field] [--offscreen SECONDS [--scale N] [--offscreen-zooms]]`: the
+  [--look glow|raw] [--density] [--no-field] [--field-mapping energy|composition] [--offscreen SECONDS [--scale N]
+  [--offscreen-zooms]]`: the
   binary. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
   a point (2 by default) and closes, and nothing posts input but `--offscreen-zooms`' camera moves: in every
   third frame interval, at a moment drawn uniformly over it (a fixed seed), a 4-point scroll at the content's
@@ -201,7 +205,7 @@ clock with its repeats and drops declared, and a manifest of the provenance (G10
   with presentation on the same GPU, and level under `f401a947` (132 against 120 at 960×540, 152 against 161 at
   1,920×1,080, four interleaved 10 s runs each). It paces frames to `[presentation] frames_per_second` and prints `frankenlife.studio.v1` NDJSON records:
   - `open`, naming the window, the CPU workers, the controller backend, the style (`mapping`, its `meaning`,
-    `look`, `particles` and `field`), `clock_telemetry`, the configuration's `[presentation]
+    `look`, `particles`, `field` and `field_mapping`), `clock_telemetry`, the configuration's `[presentation]
     show_clock_telemetry`, and the `surface`, `window` or `offscreen`;
   - one `status` per status;
   - one `view` per style change, with the same style fields;
@@ -301,7 +305,8 @@ presentation state, not scientific state.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
   - The style keys (FL-019): 1 to 6 choose the six mappings in order, R, D and F switch the look, particles and
-    field, and auto-repeat or ⌘ with a digit chooses nothing.
+    field, C the field's mapping (energy or composition, its code pinned to `kVK_ANSI_C`), and auto-repeat or ⌘
+    with a digit chooses nothing.
   - Following the session: a late end of run 1 does not stop run 2, and run 2 stopping on its own does.
   - A resume refused at the lane or by the session leaves the controls paused.
   - FL-020: a drag pans by the pointer's whole motion (worked deltas) and selects nothing; a click within the slop
@@ -414,7 +419,7 @@ presentation state, not scientific state.
     epoch advanced, at that over the window's wall seconds and `Δt` times it, and the evaluations what its tally
     advanced (at least one a tick, as the preset evaluates every organism every tick); once paused a window reads
     0 ticks and 0 evaluations.
-- `tests/overlay.rs` (6 tests, FL-024, FL-022, FL-021 and FL-019, no window):
+- `tests/overlay.rs` (8 tests, FL-024, FL-022, FL-021 and FL-019, no window):
   - each preview's line exactly: the energy, material and introduction brushes' cell and bounds, the removal's
     radius and recycled share, three significant digits of a fine grid's cell (`250.000 to 250.250`) and of a deep
     zoom's radius (`0.000123`), `1.23e5` from 100,000, 100% and 0% recycled, off the world and no material; in
@@ -436,6 +441,11 @@ presentation state, not scientific state.
     starts with its mapping's name and has one swatch for each `■`, and at 2x it is set whole, every glyph drawn
     and every `■` coloured by its swatch in order; the topology key names the preset's five members (`8`, `32`,
     `64, 32`, `96, 64`, `128, 96`);
+  - the field's key (plan §13.4's "Local field"): the energy field has none; the composition's is exactly `field
+    composition ■ none ■■■■■■ as affinity, darker is less energy`, its swatches the affinity key's colours; in
+    `overlay_text` it is the line after the colour key's, before the brush, and at 2x it is set whole with its
+    swatches coloured after the colour key's; `field_key` (the binary's choice) gives it for a drawn, composed
+    field in either look and either particles, and nothing while the field is hidden or under raw density;
   - the inspector panel exactly, from a real snapshot of the preset three ticks in with every printed value set:
     its five lines under the selection's, `not in the committed world` for a gone organism, nothing without a
     selection; headings of 0°, 90°, 180° and 270° counter-clockwise on screen from east (a heading a hair below
@@ -446,14 +456,17 @@ presentation state, not scientific state.
     four-digit byte counts, energies one short of scientific notation, the widest residual, a tally from a later
     tick, a fault, the largest seed and cadence, and each brush's widest preview: its own amount and count, the
     largest cell indices, bounds and a founder's endowment one short of scientific notation at nine places, and
-    the finest radius), 16 lines laid out with its key's swatches, at 2x: every glyph is drawn, none refused or
-    left out, within four fifths of the overlay's budget (the motion key's with the introduction brush, 31,734
-    vertices and 30,742 triangles, is the longest); at 3x, all of it is still drawn.
+    the finest radius, and the composition's field key), 17 lines laid out with its keys' swatches, at 2x: every
+    glyph is drawn, none refused or left out, within four fifths of the overlay's budget (the motion key's with
+    the introduction brush, 33,162 vertices and 32,082 triangles, is the longest); at 3x, all of it is still
+    drawn.
 - `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
-  terms to the observers: 82.6 MiB at 3840 x 2160, which leaves the backend 172.1 MiB of the 2 GiB budget (153.3
+  terms to the observers: 86.9 MiB at 3840 x 2160, which leaves the backend 167.0 MiB of the 2 GiB budget (148.2
   with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
-  telemetry, and is 82.6 MiB at 39,936 vertices and 38,912 triangles with the brush preview.
+  telemetry, 82.6 MiB (172.1) at 39,936 vertices and 38,912 triangles with the brush preview, and is 86.9 MiB at
+  41,984 and 40,960 with the field's key. The field's compositions (12 bytes a texel in the feed's slots and the
+  view's copy, FL-019) add 0.8 MiB to the rest of the observers.
 - `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
@@ -505,7 +518,7 @@ presentation state, not scientific state.
   dropped input, a move in every third frame interval with none unmoved and every move but perhaps the last
   drawn, and ordered percentiles; and the world it closed on is the configuration stepped directly to its tick,
   digest for digest.
-- `tests/telemetry_binary.rs` (2 tests, FL-024, Metal compute, no window): `flife-studio --offscreen 2.5 --timeline
+- `tests/telemetry_binary.rs` (3 tests, FL-024, FL-019, Metal compute, no window): `flife-studio --offscreen 2.5 --timeline
   T` on the preset at 32 x 32 with 384 founders that start above the birth threshold and pay 1.5 a second to live
   (in one run: through tick 763, 24 births, 361 deaths and 127,235 evaluations, the population alive). Each
   `telemetry` record equals the world stepped directly to its shown tick: the live count, parameters, quota bytes,
@@ -519,6 +532,9 @@ presentation state, not scientific state.
     tick the direct world pauses at; every `telemetry` record before it counts no capacity pause and every one
     after it one (in that run, none before and two after), the last shows the paused tick with no births; every
     overlay says `no capacity pause` or `1 capacity pause`, and the last says `1 capacity pause` and `paused`.
+  - The field's key (FL-019): the first run's `open` record names `field_mapping` `energy`, and no overlay carries
+    a field key. With `--field-mapping composition` the `open` record names `composition`, and every overlay the
+    timeline recorded has the field's key on the line after the colour key's, its swatches after that key's.
   - Planted bugs, FL-024's telemetry, each run against the tests that should catch it (`tests/overlay.rs`,
     `tests/clock.rs`, this file): the telemetry left out of the overlay, births written from deaths, headroom from
     the genome share, full evaluations not divided by the live count, the clock's evaluations not differenced, the
@@ -565,17 +581,21 @@ presentation state, not scientific state.
   the layers drawn (raw density draws no field). An epoch 30 ticks later copies them again. The old pin
   (FrankenManim `5d08cba2`) and a pan that moves the field's or the density's display scale each fail it. It is
   its own binary because `frame_upload.rs` counts every thread's heap.
-- `tests/timeline.rs` (2 tests, FL-023, Metal compute, no window):
+- `tests/timeline.rs` (3 tests, FL-023, FL-019, Metal compute, no window):
   - G10. An offscreen Studio on the preset at 320 x 200 points and 2x records its timeline while posted input
-    sets an overlay, restyles (key 3), zooms, selects the shown organism nearest the centre, arms the energy
+    sets an overlay, restyles (key 3, then C, the field's composition), zooms, selects the shown organism nearest the centre, arms the energy
     brush and clicks, runs 48 frames with a scroll every fifth, pauses, steps and resets the camera (key 0).
-    Every kind of record is made (in one run: 154 records, 72 frames, 12 camera moves, 41 shows, 3 placements
-    and 17 advances, one between epochs at a fraction strictly inside (0, 1)), and the stroke applies. Written
+    Every kind of record is made (in one run: 155 records, 72 frames, 2 restyles, 12 camera moves, 49 shows, 3
+    placements and 9 advances, one between epochs at a fraction strictly inside (0, 1)), a style record names the
+    composition, and the stroke applies. Written
     as NDJSON and read back, the records are equal. The replay redraws every frame in order at the tick the
     Studio showed it, its RGBA8 bytes hashing equal, and closes on the Studio's tick and digest with the one
     command. It refuses, with a `StateConflict`, a timeline whose end names another world, one with its
     command a tick late, one with a frame dated to an epoch the view was not given, and another seed's
     configuration.
+  - A style record names its field mapping, and one written before FL-019's composition mapping, without one,
+    reads as the energy field; each mapping is written and read back to the same style, and an unknown name is
+    refused.
   - Export. A 96 x 60 point Studio at 2x records 24 frames, some closer than a 30 fps slot and some farther, with
     an overlay. `export` at 30 fps writes a PNG a frame. Each decodes to exactly the replay's bytes and hashes as
     the manifest says. Each frame's slot count equals a fresh count in the test (slot k at the first frame's time
@@ -742,6 +762,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   sample values, not a continuous ramp; the lineage key cannot say which lineage a colour is. The presenter has no
   window-title setter. The style's meaning is in the `open` and `view` records. The field is drawn from the epoch's bounded `FieldTexture`
   at its texel resolution, so the picture is soft rather than detailed.
+- The field's composition (FL-019) is a fixed projection of 32 channels on the affinity view's three axes: two
+  materials that differ only off them show the same hue, and no single moment channel can be chosen (plan
+  §13.4's "chosen components"). C and `--field-mapping` run offscreen and in the timeline; no test opened a
+  window with them, and no human has reviewed the picture (G5).
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit and checkpoints are later work
   (FL-038).
 - FL-023's timeline and export:

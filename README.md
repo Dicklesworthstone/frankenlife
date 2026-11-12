@@ -427,6 +427,7 @@ while running or paused, and change only the picture:
 | R | the raw look: no halos, linear grey field |
 | D | density per screen bin instead of dots |
 | F | show or hide the field |
+| C | the field's chemical composition instead of its energy: hue for chemistry, in the affinity mapping's colours, brightness for energy |
 
 E arms the energy brush, X the removal brush, M the material brush and I the introduction brush (the same key
 again disarms). With one armed, a click adds 64 units of declared energy to the field cell under it; removes the
@@ -460,7 +461,8 @@ timeline's and configuration's hashes, the ticks shown, the closing digest and e
 reaches another world than the Studio's is refused, and neither command writes over a file. Simulation-time and
 checkpoint-replay export (plan §13.8) and Cinema qualification (FL-050) are later work.
 
-`render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density` and `--no-field`.
+`render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density`, `--no-field` and
+`--field-mapping energy|composition`.
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.
 
 `--controllers metal` evaluates the organisms' controllers on the Mac's GPU, `torch` on FrankenTorch's serial CPU

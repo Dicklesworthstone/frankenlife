@@ -2,8 +2,8 @@
 //! render epochs are exactly one committed world, in stable identity order,
 //! independent of storage arrangement, preallocated and bounded.
 //!
-//! Every view is compared with the world's own rows. The field texture is
-//! compared with an independent block-mean oracle.
+//! Every view is compared with the world's own rows. The field texture and
+//! its composition are compared with independent block oracles.
 
 mod common;
 
@@ -160,7 +160,77 @@ fn assert_shows(epoch: &Epoch, world: &World) {
         rows.iter().map(|o| o.generation.get()).max().unwrap_or(0)
     );
     assert_eq!(metrics.events, world.events());
+    let texture = epoch.field();
+    let composition = composition_oracle(texture.cells(), world.field().energy(), |channel| {
+        world.field().moment(channel).expect("a moment plane")
+    });
+    assert_eq!(
+        texture
+            .composition()
+            .iter()
+            .map(|q| q.map(f32::to_bits))
+            .collect::<Vec<_>>(),
+        composition
+            .iter()
+            .map(|q| q.map(f32::to_bits))
+            .collect::<Vec<_>>(),
+        "the field's composition at tick {}",
+        world.tick().get()
+    );
     epoch.check().expect("every declared bound holds");
+}
+
+/// The composition oracle: each texel's moments and energy summed in F64
+/// over its block in row-major order, channel by channel, then rows 7, 14
+/// and 25 of [`hadamard`] dotted with the moment sums in channel order over
+/// `√32 Σe`, clamped and rounded to F32; `[0; 3]` for a block with no
+/// energy. `moment(c)` is channel `c`'s row-major plane.
+fn composition_oracle<'a>(
+    cells: [u32; 2],
+    energy: &[f32],
+    moment: impl Fn(u32) -> &'a [f32],
+) -> Vec<[f32; 3]> {
+    let matrix = hadamard();
+    let block = cells.map(|n| n.div_ceil(FIELD_TEXELS_MAX));
+    let texels = [cells[0].div_ceil(block[0]), cells[1].div_ceil(block[1])];
+    let planes: Vec<&[f32]> = (0..32).map(&moment).collect();
+    let mut composition = Vec::new();
+    for ty in 0..texels[1] {
+        for tx in 0..texels[0] {
+            let (mut e, mut m) = (0.0_f64, [0.0_f64; 32]);
+            let ys = ty * block[1]..((ty + 1) * block[1]).min(cells[1]);
+            let xs = tx * block[0]..((tx + 1) * block[0]).min(cells[0]);
+            for y in ys.clone() {
+                for x in xs.clone() {
+                    e += f64::from(energy[(y * cells[0] + x) as usize]);
+                }
+            }
+            for (channel, plane) in planes.iter().enumerate() {
+                for y in ys.clone() {
+                    for x in xs.clone() {
+                        m[channel] += f64::from(plane[(y * cells[0] + x) as usize]);
+                    }
+                }
+            }
+            composition.push(if e > 0.0 {
+                [7, 14, 25].map(|row: usize| {
+                    let dot = matrix[row]
+                        .iter()
+                        .zip(&m)
+                        .fold(
+                            0.0_f64,
+                            |sum, (&sign, &value)| {
+                                if sign > 0.0 { sum + value } else { sum - value }
+                            },
+                        );
+                    (dot / (32.0_f64.sqrt() * e)).clamp(-1.0, 1.0) as f32
+                })
+            } else {
+                [0.0; 3]
+            });
+        }
+    }
+    composition
 }
 
 /// The block-mean oracle: each texel's mean energy density, summed in F64
@@ -240,6 +310,7 @@ fn an_epoch_shows_exactly_one_committed_world() {
             (View::Topology, Dtype::U8, 1),
             (View::Affinity, Dtype::F32, 3),
             (View::Field, Dtype::F32, 1),
+            (View::FieldComposition, Dtype::F32, 3),
         ]
     );
     assert_eq!(
@@ -253,6 +324,18 @@ fn an_epoch_shows_exactly_one_committed_world() {
     assert_eq!(layouts[2].bounds, Bounds::Magnitude(4.0));
     assert_eq!(layouts[7].bounds, Bounds::Magnitude(1.0));
     assert_eq!(layouts[8].count, 32 * 32);
+    assert_eq!(layouts[9].count, 32 * 32);
+    assert_eq!(layouts[9].bounds, Bounds::Magnitude(1.0));
+    // The world's sources and emissions carry chemistry, so the composition
+    // the oracle matched is not all none.
+    assert!(
+        lease
+            .field()
+            .composition()
+            .iter()
+            .any(|q| q.iter().any(|c| c.abs() > 0.01)),
+        "no texel has a composition"
+    );
 
     let texture = lease.field();
     let grid = world.field().grid();
@@ -306,6 +389,135 @@ fn a_large_field_is_a_bounded_block_mean_texture() {
         FieldTexture::from_plane([0, 4], cell_size, &[]),
         Err(CoreError::LayoutMismatch { .. })
     ));
+}
+
+/// Plan §13.4, "Local field": a texel's composition is its block's
+/// energy-weighted mean composition `Σm / Σe` through the affinity's fixed
+/// projection. Hand-computed cells: a composition along a projection row
+/// lands on its axis and its opposite on the opposite end; opposite
+/// emissions that cancelled leave none; a cell with no energy has none; one
+/// channel lands at `±1/√32` on each axis by the signs of its column.
+/// Across a block the mean is weighted by energy: three units along a row
+/// and one against it are half way, not none. An energy plane alone has no
+/// composition, and planes of the wrong length are refused.
+#[test]
+fn the_field_composition_is_the_energy_weighted_mean_composition_projected() {
+    const CHANNELS: usize = 32;
+    let matrix = hadamard();
+    let along = |row: usize, scale: f64| -> [f64; CHANNELS] {
+        std::array::from_fn(|channel| matrix[row][channel] / 32.0_f64.sqrt() * scale)
+    };
+    let planes = |cells: &[(f32, [f64; CHANNELS])]| -> Vec<f32> {
+        let mut planes: Vec<f32> = cells.iter().map(|(e, _)| *e).collect();
+        for channel in 0..CHANNELS {
+            planes.extend(cells.iter().map(|(_, m)| m[channel] as f32));
+        }
+        planes
+    };
+    let near = |got: [f32; 3], want: [f64; 3]| {
+        got.iter()
+            .zip(want)
+            .all(|(&g, w)| (f64::from(g) - w).abs() < 1e-6)
+    };
+
+    // Cells: (energy, moment) on a 6 x 1 grid.
+    let mut single = [0.0; CHANNELS];
+    single[5] = 4.0;
+    let cells: [(f32, [f64; CHANNELS]); 6] = [
+        (2.0, along(7, 2.0)),
+        (1.0, along(7, -1.0)),
+        (3.0, [0.0; CHANNELS]),
+        (0.0, [0.0; CHANNELS]),
+        (4.0, single),
+        (5.0, along(25, 5.0)),
+    ];
+    let texture = FieldTexture::from_planes([6, 1], [1.0, 1.0], &planes(&cells)).expect("texture");
+    let q = texture.composition();
+    assert!(near(q[0], [1.0, 0.0, 0.0]), "{:?}", q[0]);
+    assert!(near(q[1], [-1.0, 0.0, 0.0]), "{:?}", q[1]);
+    assert_eq!(q[2], [0.0; 3]);
+    assert_eq!(q[3], [0.0; 3]);
+    // Column 5: 7 & 5 = 5 (even), 14 & 5 = 4 (odd), 25 & 5 = 1 (odd).
+    let third = 1.0 / 32.0_f64.sqrt();
+    assert!(near(q[4], [third, -third, -third]), "{:?}", q[4]);
+    assert!(near(q[5], [0.0, 0.0, 1.0]), "{:?}", q[5]);
+    assert_eq!(texture.values(), &[2.0, 1.0, 3.0, 0.0, 4.0, 5.0]);
+    assert_eq!(texture.composition_layout().count, 6);
+    assert_eq!(texture.composition_layout().bounds, Bounds::Magnitude(1.0));
+
+    // 1024 cells in blocks of two: three units along row 7 then one against
+    // it, then two cells of opposite compositions and equal energy.
+    let mut wide = Vec::new();
+    for pair in 0..512 {
+        if pair % 2 == 0 {
+            wide.push((3.0_f32, along(7, 3.0)));
+            wide.push((1.0_f32, along(7, -1.0)));
+        } else {
+            wide.push((1.0_f32, along(14, 1.0)));
+            wide.push((1.0_f32, along(14, -1.0)));
+        }
+    }
+    let planar = planes(&wide);
+    let blocked = FieldTexture::from_planes([1024, 1], [1.0, 1.0], &planar).expect("texture");
+    assert_eq!(blocked.block(), [2, 1]);
+    let blocks = blocked.composition();
+    assert!(near(blocks[0], [0.5, 0.0, 0.0]), "{:?}", blocks[0]);
+    assert!(near(blocks[1], [0.0, 0.0, 0.0]), "{:?}", blocks[1]);
+    assert_eq!(blocked.values()[0], 2.0);
+    let expected = composition_oracle([1024, 1], &planar[..1024], |channel| {
+        let start = 1024 * (1 + channel as usize);
+        &planar[start..start + 1024]
+    });
+    assert_eq!(blocks, expected.as_slice());
+
+    // Blocks of 2 x 2 with a partial last column and row, each cell's
+    // moment within its energy: the oracle's values, in the unit ball.
+    let grid = [521_u32, 515];
+    let count = (grid[0] * grid[1]) as usize;
+    let energy = |i: usize| ((i * 7919) % 1013) as f32 * 0.01;
+    let mut planar: Vec<f32> = (0..count).map(energy).collect();
+    for channel in 0..CHANNELS {
+        planar.extend((0..count).map(|i| {
+            let unit = (((i * 31 + channel * 17) % 101) as f32 / 101.0 - 0.5) * 2.0;
+            energy(i) * unit / 32.0_f32.sqrt()
+        }));
+    }
+    let partial = FieldTexture::from_planes(grid, [0.5, 0.25], &planar).expect("texture");
+    assert_eq!((partial.block(), partial.texels()), ([2, 2], [261, 258]));
+    assert_eq!(
+        partial.values(),
+        oracle(grid, [0.5, 0.25], &planar[..count]).0.as_slice()
+    );
+    let expected = composition_oracle(grid, &planar[..count], |channel| {
+        let start = count * (1 + channel as usize);
+        &planar[start..start + count]
+    });
+    assert_eq!(partial.composition(), expected.as_slice());
+    assert!(
+        partial
+            .composition()
+            .iter()
+            .any(|q| q.iter().any(|c| c.abs() > 0.01))
+    );
+    for q in partial.composition() {
+        let norm = q.iter().map(|&c| f64::from(c).powi(2)).sum::<f64>().sqrt();
+        assert!(norm <= 1.0 + 1e-6, "{q:?}");
+    }
+
+    let energy_only =
+        FieldTexture::from_plane([6, 1], [1.0, 1.0], &planes(&cells)[..6]).expect("texture");
+    assert_eq!(energy_only.composition(), &[[0.0; 3]; 6]);
+    for length in [6, 6 * 33 - 1, 6 * 33 + 1] {
+        let mut planar = planes(&cells);
+        planar.resize(length, 0.0);
+        assert!(
+            matches!(
+                FieldTexture::from_planes([6, 1], [1.0, 1.0], &planar),
+                Err(CoreError::LayoutMismatch { .. })
+            ),
+            "{length} values"
+        );
+    }
 }
 
 /// C.7: two storage arrangements of one stable-identity world occupy
@@ -425,7 +637,7 @@ fn slots_are_allocated_once_and_never_grow() {
     let mut world = found(&config, Arrangement::FreeList);
     let mut publisher = publisher(&world);
     let row = 8 + 8 + 8 + 4 + 8 + 4 + 1 + 12;
-    let slot = 72 * row + 32 * 32 * 4;
+    let slot = 72 * row + 32 * 32 * (4 + 12);
     assert_eq!(publisher.reserved_bytes(), 3 * slot);
     let viewer = publisher.feed().viewer(1).expect("viewer");
     let (mut peak, mut ceiling) = (0, false);

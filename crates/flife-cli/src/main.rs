@@ -16,9 +16,9 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
-    ExperimentOptions, Injection, InspectOptions, Introduction, Look, Material, Particles,
-    Persistence, Removal, ResumeOptions, RunOptions, ScheduledCommand, Stop, StoreDurability,
-    Style, Validation,
+    ExperimentOptions, FieldMapping, Injection, InspectOptions, Introduction, Look, Material,
+    Particles, Persistence, Removal, ResumeOptions, RunOptions, ScheduledCommand, Stop,
+    StoreDurability, Style, Validation,
 };
 use flife_core::ValidatedConfig;
 use serde::Serialize;
@@ -264,6 +264,11 @@ enum Command {
         /// Leave the energy field out.
         #[arg(long)]
         no_field: bool,
+        /// What the field's colour means: `energy` (the default) or
+        /// `composition`, its mean chemical composition coloured as the
+        /// affinity mapping colours organisms, as bright as its energy.
+        #[arg(long, default_value = "energy")]
+        field_mapping: FieldMapping,
     },
 }
 
@@ -325,6 +330,7 @@ fn main() -> ExitCode {
             look,
             density,
             no_field,
+            field_mapping,
         } => render(
             &config,
             ticks,
@@ -345,6 +351,7 @@ fn main() -> ExitCode {
                         Particles::Points
                     },
                     field: !no_field,
+                    field_mapping,
                     ..Style::default()
                 },
             ),

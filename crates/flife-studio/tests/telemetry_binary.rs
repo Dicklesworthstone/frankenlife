@@ -21,6 +21,11 @@
 //! record after it counts one capacity pause and every one before none, and
 //! the overlay says so, and that the world is paused.
 //!
+//! With `--field-mapping composition` (FL-019, plan §13.4's "Local field")
+//! the binary says so in its `open` record, and every overlay carries the
+//! field's key after the colour key, its swatches after that key's; without
+//! it, the field shows energy and no overlay has a field key.
+//!
 //! The run passes `--offscreen`, so no window opens. Headless Metal: without
 //! a Metal device the test returns early. Each run leaves its configuration
 //! and timeline, well under 1 MB, under the target's temporary directory;
@@ -43,7 +48,9 @@ use flife_core::memory::MemoryAdmission;
 use flife_core::{Tick, Transfer, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_render::{Epoch, Metrics, Tally};
-use flife_studio::{Telemetry, TimelineRecord, read_timeline, telemetry_lines};
+use flife_studio::{
+    ColorMapping, FieldMapping, Telemetry, TimelineRecord, legends, read_timeline, telemetry_lines,
+};
 use fmn_render::metal::MetalRenderer;
 use serde_json::Value;
 
@@ -177,6 +184,11 @@ fn kind(record: &Value) -> &str {
 /// The binary run offscreen for 2.5 s on configuration `text`, named
 /// `name`: the records it printed and the timeline it wrote.
 fn run_offscreen(text: &str, name: &str) -> (Vec<Value>, PathBuf) {
+    run_offscreen_with(text, name, &[])
+}
+
+/// [`run_offscreen`] with `extra` arguments.
+fn run_offscreen_with(text: &str, name: &str, extra: &[&str]) -> (Vec<Value>, PathBuf) {
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("after the epoch")
@@ -205,6 +217,7 @@ fn run_offscreen(text: &str, name: &str) -> (Vec<Value>, PathBuf) {
             "--timeline",
         ])
         .arg(&timeline)
+        .args(extra)
         .output()
         .expect("the binary runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -219,6 +232,21 @@ fn run_offscreen(text: &str, name: &str) -> (Vec<Value>, PathBuf) {
         .map(|line| serde_json::from_str(line).expect("a JSON record"))
         .collect();
     (records, timeline)
+}
+
+/// The overlays a timeline recorded, in order, with their swatches.
+fn overlays_with_swatches(timeline: &PathBuf) -> Vec<(String, Vec<[u8; 3]>)> {
+    let text = std::fs::read_to_string(timeline).expect("the timeline");
+    read_timeline(&text)
+        .expect("reads")
+        .into_iter()
+        .filter_map(|record| match record {
+            TimelineRecord::Overlay { text, swatches } if !text.is_empty() => {
+                Some((text, swatches))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// The overlays a timeline recorded, in order.
@@ -246,6 +274,14 @@ fn the_binary_reports_and_draws_the_shown_worlds_telemetry() {
     let open = &records[0];
     assert_eq!(kind(open), "open");
     let memory = admission(&open["memory"]);
+    // The field shows energy, which has no key of its own.
+    assert_eq!(open["field_mapping"], "energy");
+    assert!(
+        overlays(&timeline)
+            .iter()
+            .all(|overlay| !overlay.contains("field composition")),
+        "an energy field has no field key"
+    );
 
     let model = config.config();
     let mut direct = Direct {
@@ -412,6 +448,52 @@ fn the_binary_reports_and_draws_the_shown_worlds_telemetry() {
          world; through tick {}: {last:?}",
         direct.world.tick().get()
     );
+}
+
+/// `--field-mapping composition` opens the field's composition view: the
+/// `open` record says so, and every overlay carries the field's key on the
+/// line after the colour key's, its swatches after that key's.
+#[test]
+fn the_binary_keys_the_fields_composition() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let text = lively();
+    let config = ValidatedConfig::from_toml(&text).expect("valid");
+    let mapping: ColorMapping = config
+        .config()
+        .presentation
+        .color_mapping
+        .parse()
+        .expect("a colour mapping");
+    let keys = legends(&config).expect("the keys");
+    let legend = keys
+        .iter()
+        .find_map(|(key, legend)| (*key == mapping).then_some(legend))
+        .expect("the mapping's key");
+    let field = FieldMapping::Composition.legend().expect("the field's key");
+    let (records, timeline) =
+        run_offscreen_with(&text, "composition", &["--field-mapping", "composition"]);
+    assert_eq!(kind(&records[0]), "open");
+    assert_eq!(records[0]["field_mapping"], "composition");
+    let laid = overlays_with_swatches(&timeline);
+    assert!(!laid.is_empty(), "no overlay was recorded");
+    let swatches: Vec<[u8; 3]> = legend
+        .swatches
+        .iter()
+        .chain(&field.swatches)
+        .copied()
+        .collect();
+    for (text, drawn) in &laid {
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == legend.text)
+            .unwrap_or_else(|| panic!("no colour key in {text:?}"));
+        assert_eq!(lines.get(at + 1), Some(&field.text.as_str()), "{text:?}");
+        assert_eq!(drawn, &swatches, "{text:?}");
+    }
 }
 
 #[test]

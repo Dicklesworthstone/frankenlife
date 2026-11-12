@@ -15,6 +15,11 @@
 //! | motion | velocity | [`MOTION_WHEEL`] hue for the heading, mixed from [`MOTION_STILL`] by `√(speed / speed limit)` |
 //! | topology | catalog index `k` | [`TOPOLOGY_PALETTE`]`[k mod 8]`, catalog members in size order |
 //! | affinity | affinity coordinates `q` ([`flife_render::affinity_projection`]) | [`affinity_rgb8`]: OKLab hue and chroma from `q₁, q₂`, lightness from `q₃` |
+//!
+//! The field under the organisms has its own mapping ([`FieldMapping`],
+//! plan §13.4's "Local field"): its energy density through the look's
+//! palette, or its mean chemical composition by the affinity mapping's
+//! colours, as bright as its energy.
 
 use std::fmt;
 use std::str::FromStr;
@@ -328,6 +333,86 @@ impl Particles {
     }
 }
 
+/// What the field's colour means (plan §13.4, "Local field").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FieldMapping {
+    /// The texels' mean energy density: the glow look's palette, or the
+    /// raw look's linear grey.
+    #[default]
+    Energy,
+    /// The texels' mean chemical composition
+    /// ([`flife_render::FieldTexture::composition`]), coloured as the
+    /// affinity mapping colours an organism ([`affinity_rgb8`]) and as
+    /// bright as the energy density shows: like hue, like chemistry, so an
+    /// organism at its norm limit shares the hue of the material it
+    /// converts best.
+    Composition,
+}
+
+impl FieldMapping {
+    /// Every field mapping, in the order the Studio's C key steps through.
+    pub const ALL: [Self; 2] = [Self::Energy, Self::Composition];
+
+    /// The mapping's name, as flags and records spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Energy => "energy",
+            Self::Composition => "composition",
+        }
+    }
+
+    /// The other mapping: what the Studio's C key switches to.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Energy => Self::Composition,
+            Self::Composition => Self::Energy,
+        }
+    }
+
+    /// The mapping's key, for a mapping the energy palette does not
+    /// explain: the composition's is the affinity key's colours
+    /// ([`legend_affinities`]), `none` and then the six directions, at full
+    /// brightness; a texel shows its colour darkened as its energy is
+    /// lower. `None` for energy.
+    #[must_use]
+    pub fn legend(self) -> Option<Legend> {
+        match self {
+            Self::Energy => None,
+            Self::Composition => {
+                let swatch = crate::HUD_SWATCH;
+                let [none, directions @ ..] = legend_affinities();
+                let mut text = format!("field composition {swatch} none ");
+                let mut swatches = vec![affinity_rgb8(none)];
+                for q in directions {
+                    text.push(swatch);
+                    swatches.push(affinity_rgb8(q));
+                }
+                text.push_str(" as affinity, darker is less energy");
+                Some(Legend { text, swatches })
+            }
+        }
+    }
+}
+
+impl fmt::Display for FieldMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+impl FromStr for FieldMapping {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|mapping| mapping.name() == text)
+            .ok_or_else(|| format!("`{text}` is not a field mapping: energy or composition"))
+    }
+}
+
 /// A whole frame's drawing choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Style {
@@ -337,8 +422,19 @@ pub struct Style {
     pub look: Look,
     /// Points or density.
     pub particles: Particles,
-    /// Whether the energy field is drawn under the organisms.
+    /// Whether the field is drawn under the organisms.
     pub field: bool,
+    /// What the field's colour means.
+    pub field_mapping: FieldMapping,
+}
+
+impl Style {
+    /// Whether a frame in this style draws the field: when it is on, except
+    /// under raw density, which is opaque.
+    #[must_use]
+    pub fn field_drawn(self) -> bool {
+        self.field && !(self.particles == Particles::Density && self.look == Look::Raw)
+    }
 }
 
 impl Default for Style {
@@ -349,6 +445,7 @@ impl Default for Style {
             look: Look::Glow,
             particles: Particles::Points,
             field: true,
+            field_mapping: FieldMapping::Energy,
         }
     }
 }

@@ -3,9 +3,9 @@
 
 use flife_manim::Viewport;
 use flife_studio::{
-    Brush, CameraMove, ColorMapping, Controls, Intent, KEY_D, KEY_DIGITS, KEY_E, KEY_ESCAPE, KEY_F,
-    KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X, KEY_ZERO, Look, Particles,
-    Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+    Brush, CameraMove, ColorMapping, Controls, FieldMapping, Intent, KEY_C, KEY_D, KEY_DIGITS,
+    KEY_E, KEY_ESCAPE, KEY_F, KEY_I, KEY_M, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_SPACE, KEY_W, KEY_X,
+    KEY_ZERO, Look, Particles, Style, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, Modifiers, PointerButton, ScrollUnit, SurfaceMetrics,
@@ -522,8 +522,9 @@ fn zero_resets_the_view() {
 
 /// FL-019: the digit keys 1 to 6 (`kVK_ANSI_1` … `kVK_ANSI_6`, whose codes
 /// are not in order) choose the six mappings in order, R, D and F switch the
-/// look, the particles and the field, none of them makes an intent, and
-/// auto-repeat and ⌘ change nothing.
+/// look, the particles and the field, C the field's mapping (energy or
+/// composition), none of them makes an intent, and auto-repeat and ⌘ change
+/// nothing.
 #[test]
 fn style_keys_choose_the_mapping_look_particles_and_field() {
     assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22]);
@@ -576,11 +577,22 @@ fn style_keys_choose_the_mapping_look_particles_and_field() {
                 ..controls.style()
             },
         ),
+        (
+            KEY_C,
+            Style {
+                look: Look::Raw,
+                particles: Particles::Density,
+                field: false,
+                field_mapping: FieldMapping::Composition,
+                ..controls.style()
+            },
+        ),
     ] {
         assert!(tap(&mut controls, code).is_empty());
         assert_eq!(controls.style(), changed, "key {code}");
     }
-    for code in [KEY_R, KEY_D, KEY_F] {
+    assert_eq!(KEY_C, 8, "kVK_ANSI_C");
+    for code in [KEY_R, KEY_D, KEY_F, KEY_C] {
         tap(&mut controls, code);
     }
     assert_eq!(
@@ -590,7 +602,7 @@ fn style_keys_choose_the_mapping_look_particles_and_field() {
             ..Style::default()
         }
     );
-    assert_eq!(controls.tally().keys, 2 * 13 + 2);
+    assert_eq!(controls.tally().keys, 2 * 15 + 2);
 }
 
 /// Moves wait, in order, until taken; reserving room for one poll's events

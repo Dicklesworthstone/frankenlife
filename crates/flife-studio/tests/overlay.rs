@@ -1,5 +1,5 @@
 //! FL-024's metric overlay (plan §12.2) and persistent telemetry (plan
-//! §14.1), FL-019's colour key in it (plan §13.4) and FL-021's inspector
+//! §14.1), FL-019's colour and field keys in it (plan §13.4) and FL-021's inspector
 //! panel (plan §14.2): the text the Studio draws over the world, exactly,
 //! and that the bundled font sets all of it within the overlay's budget. No
 //! window opens.
@@ -17,14 +17,14 @@ use flife_engine::{
     Arrangement, MATERIAL_CHANNELS, NumericalProfile, OrganismSnapshot, Stepped, World,
 };
 use flife_manim::{
-    HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH, HUD_TEXT_POINTS, HudFont,
-    Legend, linear,
+    FieldMapping, HUD_MAX_SWATCHES, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HUD_SWATCH,
+    HUD_TEXT_POINTS, HudFont, Legend, affinity_rgb8, legend_affinities, linear,
 };
 use flife_render::{Metrics, Tally};
 use flife_studio::{
     BRUSH_ENERGY, BRUSH_INTRODUCTION, Brush, BrushPreview, ClockReading, ColorMapping, Inspected,
-    OverlayState, Preview, Stroke, Telemetry, inspector_lines, legends, overlay_text, preview_line,
-    telemetry_lines,
+    OverlayState, Preview, Stroke, Telemetry, field_key, inspector_lines, legends, overlay_text,
+    preview_line, telemetry_lines,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -132,6 +132,7 @@ fn state(legend: &Legend) -> OverlayState<'_> {
         shown: None,
         clock: None,
         legend,
+        field_key: None,
         brush: None,
         preview: None,
         selected: None,
@@ -287,6 +288,7 @@ fn the_overlay_says_what_the_session_is_doing() {
             shown: Some(Tick::new(7)),
             clock: Some(&slow),
             legend: &energy,
+            field_key: None,
             brush: Some(Brush::Material),
             preview: None,
             selected: Some(OrganismId::new(1_234_567)),
@@ -553,6 +555,110 @@ fn every_key_is_the_runs_and_set_whole() {
     );
 }
 
+/// The field's key goes with a drawn, composed field (FL-019): the
+/// composition's key in either look and either particles, none for the
+/// energy field, none while the field is hidden, and none under raw
+/// density, which draws no field.
+#[test]
+fn the_field_key_goes_with_a_drawn_composed_field() {
+    use flife_manim::{Look, Particles, Style};
+    let composed = Style {
+        field_mapping: FieldMapping::Composition,
+        ..Style::default()
+    };
+    let key = FieldMapping::Composition.legend();
+    assert!(key.is_some());
+    assert_eq!(field_key(composed), key);
+    assert_eq!(
+        field_key(Style {
+            look: Look::Raw,
+            ..composed
+        }),
+        key
+    );
+    assert_eq!(
+        field_key(Style {
+            particles: Particles::Density,
+            ..composed
+        }),
+        key
+    );
+    assert_eq!(
+        field_key(Style {
+            field: false,
+            ..composed
+        }),
+        None
+    );
+    assert_eq!(
+        field_key(Style {
+            look: Look::Raw,
+            particles: Particles::Density,
+            ..composed
+        }),
+        None
+    );
+    assert_eq!(field_key(Style::default()), None);
+}
+
+/// Plan §13.4's "Local field": the composition mapping's key follows the
+/// colour mapping's, a line of its own, its swatches the affinity key's
+/// colours (`none`, then six directions) after the colour key's, set whole.
+/// The energy mapping, which the field palette explains, has none.
+#[test]
+fn the_field_key_follows_the_colour_key() {
+    assert_eq!(FieldMapping::Energy.legend(), None);
+    let field = FieldMapping::Composition.legend().expect("a key");
+    assert_eq!(
+        field.text,
+        "field composition ■ none ■■■■■■ as affinity, darker is less energy"
+    );
+    assert_eq!(
+        field.swatches,
+        legend_affinities().map(affinity_rgb8).to_vec(),
+        "the affinity key's colours"
+    );
+    assert_eq!(
+        field.swatches,
+        key(ColorMapping::Affinity).swatches,
+        "the colours the affinity mapping's key shows"
+    );
+    let lineage = key(ColorMapping::Lineage);
+    let text = overlay_text(&OverlayState {
+        paused: Some(false),
+        shown: Some(Tick::new(1_024)),
+        field_key: Some(&field),
+        brush: Some(Brush::Energy),
+        ..state(&lineage)
+    });
+    assert_eq!(
+        text,
+        "running · tick 1,024\nlineage ■■■■■■■■■■■■ by founder\n\
+         field composition ■ none ■■■■■■ as affinity, darker is less energy\nenergy brush"
+    );
+    let swatches: Vec<_> = lineage.swatches.iter().chain(&field.swatches).collect();
+    assert_eq!(
+        text.chars().filter(|&c| c == HUD_SWATCH).count(),
+        swatches.len()
+    );
+    assert!(swatches.len() <= HUD_MAX_SWATCHES);
+    let colors: Vec<_> = swatches.iter().map(|&&rgb| linear(rgb)).collect();
+    let font = HudFont::bundled().expect("the bundled fonts");
+    let laid = font
+        .text_with_swatches(&text, HUD_TEXT_POINTS * 2.0, &colors)
+        .expect("laid out");
+    assert_eq!(laid.refused(), 0);
+    assert_eq!(laid.left_out(), 0);
+    assert_eq!(
+        laid.swatches()
+            .iter()
+            .map(|(_, color)| *color)
+            .collect::<Vec<_>>(),
+        colors,
+        "the field key's swatches take the colours after the colour key's"
+    );
+}
+
 #[test]
 fn the_inspector_panel_says_what_the_snapshot_holds() {
     let known = known();
@@ -680,6 +786,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
         ..reading
     };
     let keys = legends(&config()).expect("the keys");
+    let field = FieldMapping::Composition.legend().expect("the field's key");
     let brushes = [
         Brush::Energy,
         Brush::Removal,
@@ -697,6 +804,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
             shown: Some(Tick::new(999_999_999_999)),
             clock: Some(&reading),
             legend,
+            field_key: Some(&field),
             brush: Some(brush),
             preview: Some(widest_preview(brush)),
             selected: Some(OrganismId::new(999_999_999_999)),
@@ -711,8 +819,13 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
                 checkpoint: Some(Tick::new(999_999_999_999)),
             }),
         });
-        assert_eq!(text.lines().count(), 16, "{text}");
-        let colors: Vec<_> = legend.swatches.iter().map(|&rgb| linear(rgb)).collect();
+        assert_eq!(text.lines().count(), 17, "{text}");
+        let colors: Vec<_> = legend
+            .swatches
+            .iter()
+            .chain(&field.swatches)
+            .map(|&rgb| linear(rgb))
+            .collect();
         // At two drawable pixels a point, where the most vertices are.
         let laid = font
             .text_with_swatches(&text, HUD_TEXT_POINTS * 2.0, &colors)

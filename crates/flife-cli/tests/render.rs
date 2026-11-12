@@ -4,8 +4,8 @@
 use std::num::NonZeroUsize;
 
 use flife_cli::{
-    ColorMapping, ControllerChoice, Look, Particles, RENDER_SCHEMA, RenderOptions, RenderRecord,
-    Style, render,
+    ColorMapping, ControllerChoice, FieldMapping, Look, Particles, RENDER_SCHEMA, RenderOptions,
+    RenderRecord, Style, render,
 };
 use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -97,6 +97,7 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
             look: Look::Raw,
             particles: Particles::Density,
             field: true,
+            field_mapping: FieldMapping::Energy,
         },
         ..options
     };
@@ -132,6 +133,38 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
         std::fs::read(path).expect("the frame exists")
     };
     assert_ne!(frame(&records, 2), frame(&styled_records, 2));
+
+    // The field's composition (plan §13.4, "Local field") draws other
+    // pixels of the same world, and the end record says which field.
+    let composed_out = out.with_file_name("flife-render-test-composition");
+    std::fs::create_dir_all(&composed_out).expect("a scratch directory");
+    let composed = RenderOptions {
+        out: composed_out,
+        style: Style {
+            field_mapping: FieldMapping::Composition,
+            ..Style::default()
+        },
+        ..styled.clone()
+    };
+    let mut composed_records = Vec::new();
+    render(&config, &composed, |record| {
+        composed_records.push(record.clone())
+    })
+    .expect("renders");
+    let field_of = |records: &[RenderRecord]| match records.last() {
+        Some(RenderRecord::End {
+            digest,
+            field_mapping,
+            ..
+        }) => (digest.clone(), *field_mapping),
+        other => panic!("the last record is the end, not {other:?}"),
+    };
+    assert_eq!(
+        field_of(&composed_records),
+        (plain.digest().to_hex(), "composition")
+    );
+    assert_eq!(field_of(&records), (plain.digest().to_hex(), "energy"));
+    assert_ne!(frame(&records, 2), frame(&composed_records, 2));
 
     // The preset blooms glowing frames (FL-019): with `bloom_enabled =
     // false` the glow frame differs, and the raw frame, never bloomed, is
@@ -255,6 +288,19 @@ fn the_render_colour_is_the_configured_mapping_unless_the_flag_overrides_it() {
     let end = end.expect("an end record");
     assert_eq!(end["record"], "end");
     assert_eq!(end["mapping"], "energy", "the configured mapping");
+    assert_eq!(
+        end["field_mapping"], "energy",
+        "the field's energy by default"
+    );
+
+    // FL-019: the flag draws the field's composition instead.
+    let (status, end, err) = render(&energy, &["--field-mapping", "composition"]);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(
+        end.expect("an end record")["field_mapping"],
+        "composition",
+        "--field-mapping composition"
+    );
 
     for flag in ["motion", "motion-heading-v1"] {
         let (status, end, err) = render(&energy, &["--color", flag]);

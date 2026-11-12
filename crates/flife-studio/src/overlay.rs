@@ -13,10 +13,22 @@ use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::OrganismSnapshot;
 use flife_genome::TopologyCatalog;
-use flife_manim::{ColorMapping, Legend};
+use flife_manim::{ColorMapping, Legend, Style};
 use flife_render::Metrics;
 
 use crate::{Brush, ClockReading, Preview, Stroke};
+
+/// The field's key for a frame drawn in `style` (FL-019): the field
+/// mapping's legend when the frame draws the field
+/// ([`Style::field_drawn`]), none otherwise. The energy field, which the
+/// field palette explains, has none.
+#[must_use]
+pub fn field_key(style: Style) -> Option<Legend> {
+    style
+        .field_drawn()
+        .then(|| style.field_mapping.legend())
+        .flatten()
+}
 
 /// Every colour mapping's key for the run `config` configures, in
 /// [`ColorMapping::ALL`]'s order: the topology key labels the run's catalog
@@ -52,6 +64,10 @@ pub struct OverlayState<'a> {
     /// [`flife_manim::HUD_SWATCH`]es in the text, so its `swatches` colour
     /// them in order.
     pub legend: &'a Legend,
+    /// The field mapping's key ([`flife_manim::FieldMapping::legend`]),
+    /// while the field is drawn in a mapping that has one: the line after
+    /// the colour mapping's, its swatches after that key's.
+    pub field_key: Option<&'a Legend>,
     /// The armed brush.
     pub brush: Option<Brush>,
     /// What a click of the armed brush at the pointer would do.
@@ -118,6 +134,8 @@ pub enum Inspected<'a> {
 ///   seconds per wall second and frames presented per second;
 /// - the colour mapping's key ([`ColorMapping::legend`]), such as
 ///   `energy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16`;
+/// - with a field key, the field's, such as `field composition ■ none
+///   ■■■■■■ as affinity, darker is less energy`;
 /// - with telemetry, its lines ([`telemetry_lines`]);
 /// - `energy brush` while a brush is armed and `organism 42` while one is
 ///   selected, joined by ` · `;
@@ -157,6 +175,10 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
     }
     text.push('\n');
     text.push_str(&state.legend.text);
+    if let Some(key) = state.field_key {
+        text.push('\n');
+        text.push_str(&key.text);
+    }
     let mut doing = Vec::new();
     if let Some(brush) = state.brush {
         doing.push(format!("{} brush", brush.name()));

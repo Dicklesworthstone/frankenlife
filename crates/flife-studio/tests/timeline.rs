@@ -1,7 +1,7 @@
 //! FL-023 (G10, plan §13.8, §21.3): a recorded Studio session replays
 //! frame for frame. An offscreen Studio records its timeline while posted
 //! input does the following:
-//! - sets an overlay and restyles the view;
+//! - sets an overlay and restyles the view, its colours and its field's;
 //! - zooms and resets the camera, and selects an organism;
 //! - makes a brush command;
 //! - runs the world with the camera moving and the display between epochs;
@@ -37,9 +37,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_studio::{
-    ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions, KEY_DIGITS, KEY_E,
-    KEY_PERIOD, KEY_SPACE, KEY_ZERO, MANIFEST_FILE, Status, Studio, StudioOptions, Surface,
-    TimelineRecord, VIDEO_FILE, export, read_timeline, replay, write_timeline_record,
+    ColorMapping, ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
+    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_PERIOD, KEY_SPACE, KEY_ZERO, Look, MANIFEST_FILE,
+    Status, Studio, StudioOptions, Style, Surface, TimelineRecord, TimelineStyle, VIDEO_FILE,
+    export, read_timeline, replay, write_timeline_record,
 };
 use fmn_codec::{
     PngLimits, Y4mColorspace, append_y4m_frame_nv12, decode_png, decode_y4m, y4m_header,
@@ -167,6 +168,9 @@ fn a_recorded_session_replays_frame_for_frame() {
     recording.frame();
     // Key 3: the generation mapping.
     recording.post(key(KEY_DIGITS[2], "3"));
+    recording.frame();
+    // C: the field's composition (FL-019, plan §13.4).
+    recording.post(key(KEY_C, "c"));
     recording.frame();
     recording.post([scroll([100.0, 60.0], 40.0)]);
     recording.frame();
@@ -296,6 +300,13 @@ fn a_recorded_session_replays_frame_for_frame() {
     for (kind, made) in kinds {
         assert!(made > 0, "no {kind} record: {kinds:?}");
     }
+    assert!(
+        records.iter().any(|record| matches!(
+            record,
+            TimelineRecord::Style { style } if style.field_mapping == "composition"
+        )),
+        "the C key's field mapping was recorded"
+    );
     assert_eq!(
         count(|r| matches!(r, TimelineRecord::Draw { .. })),
         drawn.len()
@@ -414,6 +425,47 @@ fn y4m_frame(rgba: &FrameBuffer) -> Vec<u8> {
     let mut record = Vec::new();
     append_y4m_frame_nv12(&mut record, layout.width(), layout.height(), &nv12).expect("a record");
     record
+}
+
+/// A style record names its field mapping; one from before FL-019's
+/// composition mapping has none and means the energy field. A name that is
+/// not a field mapping is refused.
+#[test]
+fn a_style_record_names_its_field_mapping() {
+    let older: TimelineStyle = serde_json::from_str(
+        r#"{"mapping":"generation","look":"glow","particles":"points","field":true}"#,
+    )
+    .expect("an older style record");
+    assert_eq!(older.field_mapping, "energy");
+    assert_eq!(
+        older.style().expect("a style"),
+        Style {
+            mapping: ColorMapping::Generation,
+            ..Style::default()
+        }
+    );
+    for field_mapping in FieldMapping::ALL {
+        let style = Style {
+            look: Look::Raw,
+            field_mapping,
+            ..Style::default()
+        };
+        let line = serde_json::to_string(&TimelineStyle::from(style)).expect("written");
+        assert!(
+            line.contains(&format!("\"field_mapping\":\"{field_mapping}\"")),
+            "{line}"
+        );
+        let read: TimelineStyle = serde_json::from_str(&line).expect("read");
+        assert_eq!(read.style().expect("a style"), style);
+    }
+    let wrong = TimelineStyle {
+        field_mapping: "chemistry".to_owned(),
+        ..TimelineStyle::from(Style::default())
+    };
+    assert!(matches!(
+        wrong.style(),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
 }
 
 #[test]

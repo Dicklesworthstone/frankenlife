@@ -113,7 +113,8 @@ fn a_frames_preparation_is_within_the_views_limit() {
 /// layers' textures are not preparation: `texel_bytes` counts them, the
 /// field's once the view knows it and the density's at the viewport's
 /// bins, and the view reserves each twice, and once the copy of the field's
-/// values its texture was built from (FL-033), four bytes a texel.
+/// values (FL-033) and compositions (FL-019) its texture was built from,
+/// sixteen bytes a texel.
 #[test]
 fn the_limit_counts_the_ceiling_and_the_quads_and_the_texels_the_textures() {
     let config = common::config(&[
@@ -151,8 +152,8 @@ fn the_limit_counts_the_ceiling_and_the_quads_and_the_texels_the_textures() {
     );
     assert_eq!(
         view.reserved_bytes() - reserved,
-        2 * x * y * 16 + x * y * 4,
-        "and is reserved twice, its values once"
+        2 * x * y * 16 + x * y * (4 + 12),
+        "and is reserved twice, its values and compositions once"
     );
     let made = WorldView::for_epoch(&epoch, [640, 360], [0, 0, 0]).expect("a view");
     assert_eq!(

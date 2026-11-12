@@ -29,7 +29,7 @@ use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
     Arrangement, Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, Stepped, World,
 };
-use flife_manim::{ColorMapping, HudFont, Look, Particles, Style, hex_rgb};
+use flife_manim::{ColorMapping, FieldMapping, HudFont, Look, Particles, Style, hex_rgb};
 use flife_render::{Lease, Publication, Publisher};
 use flife_runtime::{CommandStatus, Outcome, SessionClosed};
 use fmn_frame::FrameBuffer;
@@ -86,6 +86,16 @@ pub struct TimelineStyle {
     pub particles: String,
     /// Whether the field is drawn.
     pub field: bool,
+    /// What the field's colour means: `energy` or `composition`. A record
+    /// from before FL-019's composition mapping has none, and means
+    /// `energy`.
+    #[serde(default = "energy_field")]
+    pub field_mapping: String,
+}
+
+/// The field mapping a record without one means.
+fn energy_field() -> String {
+    FieldMapping::Energy.name().to_owned()
 }
 
 impl From<Style> for TimelineStyle {
@@ -95,6 +105,7 @@ impl From<Style> for TimelineStyle {
             look: style.look.name().to_owned(),
             particles: style.particles.name().to_owned(),
             field: style.field,
+            field_mapping: style.field_mapping.name().to_owned(),
         }
     }
 }
@@ -119,6 +130,10 @@ impl TimelineStyle {
             look: self.look.parse::<Look>().map_err(invalid)?,
             particles,
             field: self.field,
+            field_mapping: self
+                .field_mapping
+                .parse::<FieldMapping>()
+                .map_err(invalid)?,
         })
     }
 }

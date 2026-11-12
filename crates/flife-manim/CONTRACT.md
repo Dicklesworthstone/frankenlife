@@ -14,10 +14,12 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `pick` finds the organism drawn under the pointer, by stable identity; `selection_ring` marks the selected one.
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
-- `FieldLayer` draws the epoch's energy field under the organisms as one texture on one quad (FL-033).
+- `FieldLayer` draws the epoch's field under the organisms as one texture on one quad (FL-033): its energy, or its
+  chemical composition (FL-019, plan §13.4's "Local field").
 - `DensityLayer` counts organisms per screen bin, for worlds denser than their pixels.
 - `Style` holds a frame's drawing choices: the `ColorMapping`, the `Look` (glow or raw), the `Particles` (points or
-  density) and whether the field is drawn.
+  density), whether the field is drawn and its `FieldMapping` (energy or composition). `field_drawn()` is whether a
+  frame draws the field: when it is on, except under raw density, which is opaque.
 - `WorldView` holds all of them, and builds each frame's `ThreeDJob`.
 
 **Inputs.**
@@ -107,6 +109,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     colour, labelled `64, 32`;
   - affinity: `none`, then six directions 60 degrees apart in the first two coordinates at a founder's typical
     radius (`legend_affinities`), then `like hue, like chemistry`.
+- `FieldMapping` (FL-019, plan §13.4's "Local field"): `energy` (the default) or `composition`, by `name()` and
+  `FromStr`; `next()` is the other. `FieldMapping::legend()` is the composition's key, `field composition ■ none
+  ■■■■■■ as affinity, darker is less energy`, its swatches the affinity key's colours at full brightness; the
+  energy field, which the palette explains, has none.
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
@@ -149,6 +155,16 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     rebuilds both. Epoch identities, unique only within a feed, are not the key.
   - `update_look(field, Look::Raw)` draws linear grey `raw_value = clamp(value / scale, 0, 1)` instead: no square
     root, no palette.
+  - `update_mapped(field, look, FieldMapping::Composition)` (FL-019) colours each corner by its chemistry: the four
+    texels' compositions (`FieldTexture::composition`) averaged with their densities as weights
+    (`corner_composition`: their energy together, as a texel's composition is its block's; none without density),
+    through `affinity_rgb8`, the affinity mapping's own colour, then scaled in linear light by what the energy
+    shows there (`display_value` for the glow look, `raw_value` for raw). Hue is chemistry and brightness energy:
+    an organism at its norm limit shares the hue of the material it converts best, a corner with no energy is
+    black, and one with energy but no composition is the affinity mapping's neutral grey. The display scale
+    follows the energy as in the energy mapping. `place_mapped` keeps the texture only for bitwise the same values
+    and compositions, scale, look and mapping; the layer then also keeps a copy of the compositions (12 bytes a
+    texel).
 - `DensityLayer::update(epoch, style)`:
   - bins of about `DENSITY_BIN_POINTS = 6` points at the fit, aligned to the world so the torus wraps exactly:
     `ceil(extent · fit_scale / (6 · pixels per point))` per axis, in `1..=DENSITY_BINS_MAX = 512`; the zoom does not change them;
@@ -187,7 +203,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     lowering revalidates it and drops an identity the new epoch lacks, whatever now occupies its old slot;
     `selected()`, `selected_position()` (where it is drawn), and `selection_draw()`, the ring, which follows the
     organism as the display moves and is rebuilt for every view change;
-  - `draws()` is the frame in painter order: the field (unless hidden, or under raw density), then the density
+  - `draws()` is the frame in painter order: the field (when `Style::field_drawn`, in the style's field mapping),
+    then the density
     layer, or every halo and then every dot, then the selection ring; `job()` wraps it in a `ThreeDJob`;
   - `set_point_radius(points)` (FL-019) sets the dots' smallest radius on screen
     (`ParticleCloud::set_min_radius_points`); the shown dots, their halos and the selection ring change at
@@ -209,7 +226,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
     draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
     density's textures, their quads and the ring's mesh, twice, since one is built before the one it replaces is
-    dropped; and once, the copy of the field's values its texture was built from). `texel_bytes()` (FL-033) is the
+    dropped; and once, the copy of the field's values its texture was built from, and of its compositions, 16 bytes
+    a texel in all). `texel_bytes()` (FL-033) is the
     layers' textures, 16 bytes a texel: the field's once the view knows it and the density's at the viewport's bins,
     whatever the style; FrankenManim's CPU route samples them in place
     and its Metal route uploads those a frame draws. `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536)
@@ -236,10 +254,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     refusal). The result is a `HudText`: vertices in drawable pixels from the block's top-left, y down, each
     contour's range, and triangles.
   - A glyph whose outline cannot be read or triangulated is left out and counted (`refused`). The text stops at
-    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (39,936 and 38,912, a quarter as much again as the Studio's longest
-    overlay, its persistent telemetry (FL-024, plan §14.1), colour key, brush preview (FL-022, plan §14.3) and
-    inspector panel included, at 2x, rounded up to a multiple of 1,024: 31,734 and 30,742; at 3x it is still set
-    whole),
+    `HUD_MAX_VERTICES` and `HUD_MAX_TRIANGLES` (41,984 and 40,960, a quarter as much again as the Studio's longest
+    overlay, its persistent telemetry (FL-024, plan §14.1), colour key, field key (FL-019), brush preview (FL-022,
+    plan §14.3) and inspector panel included, at 2x, rounded up to a multiple of 1,024: 33,162 and 32,082; at 3x it
+    is still set whole),
     counting the glyphs beyond them as `left_out`. Its buffers are reserved at those ceilings
     (`HudText::reserved_bytes`).
   - `hud_scene_point(viewport, position)` is the camera's own map from a drawable position to the scene: the frame
@@ -414,7 +432,7 @@ route.
   - The same three moves of a points view, in both looks, draw the field texture a view built from scratch draws,
     bit for bit (scale, texels, quad), the texels still and the quad moving; a later epoch of the world, shown and
     panned, rebuilds it, again equal to a fresh build, though two standalone epochs share identity 1.
-- `tests/field.rs` (6 tests):
+- `tests/field.rs` (9 tests):
   - The palette is monotone dark to bright; the display value is a clamped square root, zero for NaN, negatives and
     a zero scale.
   - A ramp field's texture has a texel per corner, each the palette colour of its wrapped mean, so the seam corner
@@ -428,6 +446,14 @@ route.
   - Every dot of a real epoch has one halo at its centre, sized by its energy, in the lineage colour at
     `HALO_ALPHA`; a resize keeps halos proportional.
   - A real frame rendered offline is opaque and lit by the field beyond the black background.
+  - The composition mapping (FL-019), against corner colours computed in the test: a field of two chemistries and
+    energies with a hole and an uncomposed cell. Inside a region a corner is the affinity colour of its axis at
+    full brightness; the hole's middle is black; a corner shared by bright and dim texels takes their
+    density-weighted composition (0.8 and 0.2, not half each); energy alone is grey everywhere; raw is linear; the
+    same energy with other chemistry, then the energy mapping, in either look, are each drawn as given.
+  - A real epoch of the small world holds chemistry; the view draws its field in each mapping as computed, and the
+    two frames differ; the field is drawn exactly when `field_drawn()`, never under raw density.
+  - Field mappings' names parse and print, `next` alternates, and an unknown name is refused.
 - In `flife-studio`, `tests/live.rs` shows real epochs of the 4,096-organism reference world through this adapter in
   a real window.
 - In `flife-studio`, `tests/live.rs` restyles a paused real window with keys 2, R, D and F and restores it with 1,
@@ -503,7 +529,9 @@ route.
 - Trails are not applied yet. The bloom's width is a constant
   (`BLOOM_SIGMA_POINTS`), not a configuration key; the plan names none. The bloom runs on the raw frame before
   the RGBA8 table: there is no separate tone-mapping step (§13.3 step 8) before or after it.
-- Human review of the mappings against the plan's reference images (G5) has not been done.
+- Human review of the mappings against the plan's reference images (G5) has not been done, nor of the field's
+  composition. The composition is a fixed three-axis projection of 32 channels: two materials that differ only off
+  the three axes show the same hue. No single moment channel ("chosen components") can be shown.
   There are no trails and no camera smoothing (§13.5 allows both; neither is drawn). The validator refuses
   `[presentation] trails_enabled = true` rather than ignoring it. A dot per kept position and organism is not
   affordable on this route: the Studio charges each dot `PREPARATION_BYTES_PER_DOT` three times (in the frame and

@@ -436,7 +436,7 @@ impl WorldView {
     ///
     /// # Errors
     /// As [`ParticleCloud::update_styled`], [`DensityLayer::update`] and
-    /// [`FieldLayer::update_look`].
+    /// [`FieldLayer::update_mapped`].
     pub fn show(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
         self.show_between(None, epoch, 1.0).map(|_| ())
     }
@@ -472,7 +472,8 @@ impl WorldView {
         if style.particles == Particles::Density {
             self.density.update(current, &style)?;
         }
-        self.field.update_look(current.field(), style.look)?;
+        self.field
+            .update_mapped(current.field(), style.look, style.field_mapping)?;
         Ok(motion)
     }
 
@@ -494,7 +495,8 @@ impl WorldView {
         if style.particles == Particles::Density {
             self.density.place(&style)?;
         }
-        self.field.place(current.field(), style.look)?;
+        self.field
+            .place_mapped(current.field(), style.look, style.field_mapping)?;
         Ok(motion)
     }
 
@@ -807,7 +809,7 @@ impl WorldView {
                 )
                 .unwrap_or(u64::MAX),
             })?;
-        if style.field && !(density && style.look == Look::Raw) {
+        if style.field_drawn() {
             draws.extend(self.field.draw());
         }
         if density {
@@ -876,7 +878,8 @@ impl WorldView {
     /// ([`WorldView::texel_bytes`]) and quads and the selection ring's
     /// mesh, each twice, since one is built before the one it replaces is
     /// dropped; and once, the copy of the field's values its texture was
-    /// built from, one `f32` a texel (FL-033). The field's texture and
+    /// built from, one `f32` a texel (FL-033), and of its compositions in
+    /// the composition mapping, three more. The field's texture and
     /// values count once the view knows the field: from
     /// [`WorldView::for_epoch`] or the first shown epoch. A resize or a new
     /// pixel density changes the density's bins and so these bytes.
@@ -888,7 +891,7 @@ impl WorldView {
         let [columns, rows] = self.field_texels.map(u64::from);
         let field_values = columns
             .saturating_mul(rows)
-            .saturating_mul(bytes_for::<f32>(1));
+            .saturating_mul(bytes_for::<f32>(1) + bytes_for::<[f32; 3]>(1));
         let grids = total([
             self.texel_bytes(),
             mesh_bytes(QUAD).saturating_mul(2),

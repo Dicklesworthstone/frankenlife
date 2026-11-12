@@ -104,8 +104,8 @@ use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
 use crate::costs::MaintenanceCosts;
 use crate::emission::EmissionPolicy;
 use crate::inspect::{
-    Activations, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome,
-    Sensed, Transactions,
+    Activations, ControllerWeights, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS,
+    ReproductionOutcome, Sensed, Transactions,
 };
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
@@ -1403,6 +1403,59 @@ impl World {
             sensed,
             activations,
             transactions,
+        }))
+    }
+
+    /// One organism's whole controller at this committed tick (FL-021, plan
+    /// §14.2's on-demand weight dump), or `None` for an identity the
+    /// population does not hold: its own genome's parameters, copied whole,
+    /// and its topology's layer shapes. It copies nothing of any other
+    /// organism or genome and changes nothing; see [`ControllerWeights`].
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] for a live organism whose genome or
+    /// topology is missing, or whose parameters are not its topology's
+    /// count; [`CoreError::AllocationFailed`] when the copy's room cannot be
+    /// reserved.
+    pub fn organism_weights(&self, id: OrganismId) -> Result<Option<ControllerWeights>, CoreError> {
+        let Some(organism) = self.population.get(id) else {
+            return Ok(None);
+        };
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "dump organism weights",
+            detail,
+        };
+        let genome = self
+            .population
+            .genome(id)
+            .ok_or_else(|| conflict(format!("{id} has no genome")))?;
+        let topology = self
+            .rules
+            .catalog
+            .topology(genome.topology())
+            .ok_or_else(|| conflict(format!("{id} has no topology in the catalog")))?;
+        let parameters = genome.parameters();
+        if parameters.len() != topology.parameter_count() {
+            return Err(conflict(format!(
+                "{id} holds {} parameters for a topology of {}",
+                parameters.len(),
+                topology.parameter_count()
+            )));
+        }
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(parameters.len())
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "dumped controller weights",
+                bytes: u64::try_from(size_of_val(parameters)).unwrap_or(u64::MAX),
+            })?;
+        copy.extend_from_slice(parameters);
+        Ok(Some(ControllerWeights {
+            tick: self.tick,
+            organism: id,
+            genome: organism.genome,
+            topology: genome.topology().index(),
+            layers: topology.layers().to_vec(),
+            parameters: copy,
         }))
     }
 

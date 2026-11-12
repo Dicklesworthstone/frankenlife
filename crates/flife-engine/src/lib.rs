@@ -54,8 +54,8 @@ pub use chemistry::{
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
 pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
 pub use inspect::{
-    Activations, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS, ReproductionOutcome,
-    Sensed, Transactions,
+    Activations, ControllerWeights, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS,
+    ReproductionOutcome, Sensed, Transactions,
 };
 pub use intervention::{
     AppliedIntervention, Intervention, MATERIAL_CHANNELS, MAXIMUM_INTRODUCTION,

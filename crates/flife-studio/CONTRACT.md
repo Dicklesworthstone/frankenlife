@@ -704,8 +704,8 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   watching it, at most 128 (a second at the reference tick), so a selection's first panel after a pause or a
   newly watched organism covers fewer; no single step's settlement is shown or recorded. What the field offers it
   is read from the committed field the Studio draws, not the field the next step's uptake reads after transport,
-  and is a rate per unit taken, not a forecast of its grants. §14.2's descendants and weight dumps are not
-  implemented.
+  and is a rate per unit taken, not a forecast of its grants. §14.2's descendants are not implemented, and a
+  weight dump is `flife inspect --weights` on a run directory: the Studio has no key for one.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
     `tests/offscreen.rs` for all four brushes as far as the submitted stroke, and for the energy and material

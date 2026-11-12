@@ -12,7 +12,10 @@
 //!   position, velocity and energy, its topology and parameter count, and
 //!   its genetic affinity direction;
 //! - with `field`, one [`InspectedField`]: the energy plane, row-major
-//!   (`y` outer, `x` inner), each cell's `f32` widened exactly.
+//!   (`y` outer, `x` inner), each cell's `f32` widened exactly;
+//! - with `weights`, one [`InspectedWeights`] per organism named, in the
+//!   order named (plan §14.2's on-demand weight dump): its whole controller,
+//!   each layer's `weights[out][in]` and `biases[out]` as stored.
 //!
 //! Every number is the stored value: nothing is resampled or summarized.
 //! The run directory is checked (its configuration and catalog) before its
@@ -25,6 +28,7 @@ use std::path::Path;
 
 use flife_core::CoreError;
 use flife_core::canonical::Sha256Digest;
+use flife_core::ids::OrganismId;
 use flife_engine::{NumericalProfile, World};
 use flife_store::{ChunkStore, Durability};
 use serde::Serialize;
@@ -35,13 +39,15 @@ use crate::persist::{STORE_DIR, read_config, restorable, run_identity};
 pub const INSPECT_SCHEMA: &str = "frankenlife.inspect.v1";
 
 /// What to inspect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InspectOptions {
     /// The committed tick of the checkpoint; the newest that restores if
     /// `None`.
     pub at: Option<u64>,
     /// Whether to report the field's energy plane.
     pub field: bool,
+    /// The organisms whose whole controller to report, in this order.
+    pub weights: Vec<u64>,
 }
 
 /// The checkpoint an inspection restored.
@@ -133,7 +139,41 @@ pub struct InspectedField {
     pub energy: Vec<f64>,
 }
 
-/// An inspection: the header, the organisms, and the field if asked for.
+/// One organism's whole controller (plan §14.2's on-demand weight dump):
+/// its own genome's parameters as stored, by layer.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InspectedWeights {
+    /// `weights`.
+    pub record: &'static str,
+    /// Its stable identity.
+    pub id: u64,
+    /// Its genome's identity.
+    pub genome: u64,
+    /// Its topology's index in the catalog.
+    pub topology: usize,
+    /// Its controller's parameter count.
+    pub parameters: usize,
+    /// Its layers in evaluation order: the 104 sensor inputs feed the
+    /// first, `tanh` follows each hidden layer, and the last gives the 36
+    /// raw outputs linearly.
+    pub layers: Vec<InspectedLayer>,
+}
+
+/// One dense layer, `z = bias + weights · x`, each `f32` as stored.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InspectedLayer {
+    /// Its fan-in.
+    pub inputs: usize,
+    /// Its fan-out.
+    pub outputs: usize,
+    /// `weights[out][in]`: one row of `inputs` per output.
+    pub weights: Vec<Vec<f32>>,
+    /// `biases[out]`.
+    pub biases: Vec<f32>,
+}
+
+/// An inspection: the header, the organisms, the field and the controllers
+/// asked for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Inspection {
     /// The header.
@@ -142,6 +182,8 @@ pub struct Inspection {
     pub organisms: Vec<InspectedOrganism>,
     /// The field's energy plane, with [`InspectOptions::field`].
     pub field: Option<InspectedField>,
+    /// The controllers [`InspectOptions::weights`] names, in its order.
+    pub weights: Vec<InspectedWeights>,
 }
 
 fn conflict(detail: String) -> CoreError {
@@ -156,7 +198,8 @@ fn conflict(detail: String) -> CoreError {
 /// # Errors
 /// As [`read_config`] and the catalog for a directory that holds no run;
 /// [`CoreError::StateConflict`] when no checkpoint restores (at the
-/// requested tick, if one is given) or another process holds the run; the
+/// requested tick, if one is given), another process holds the run, or an
+/// organism whose weights are asked for is not in the restored world; the
 /// store's errors.
 pub fn inspect(run_dir: &Path, options: InspectOptions) -> Result<Inspection, CoreError> {
     let config = read_config(run_dir)?;
@@ -186,7 +229,48 @@ pub fn inspect(run_dir: &Path, options: InspectOptions) -> Result<Inspection, Co
         tick: world.tick().get(),
         sha256: sha256.to_hex(),
     };
-    of(run_dir, checkpoint, &world, options.field)
+    of(run_dir, checkpoint, &world, &options)
+}
+
+/// `id`'s whole controller in committed `world`.
+fn weights(world: &World, id: u64) -> Result<InspectedWeights, CoreError> {
+    let dump = world
+        .organism_weights(OrganismId::new(id))?
+        .ok_or_else(|| {
+            conflict(format!(
+                "organism {id} is not in the committed world at tick {}",
+                world.tick().get()
+            ))
+        })?;
+    let mut layers = Vec::with_capacity(dump.layers.len());
+    for (index, shape) in dump.layers.iter().enumerate() {
+        let missing = || {
+            conflict(format!(
+                "organism {id}'s layer {index} is not in its parameters"
+            ))
+        };
+        let (weights, biases) = dump.layer(index).ok_or_else(missing)?;
+        if shape.inputs == 0 {
+            return Err(missing());
+        }
+        layers.push(InspectedLayer {
+            inputs: shape.inputs,
+            outputs: shape.outputs,
+            weights: weights
+                .chunks_exact(shape.inputs)
+                .map(<[f32]>::to_vec)
+                .collect(),
+            biases: biases.to_vec(),
+        });
+    }
+    Ok(InspectedWeights {
+        record: "weights",
+        id,
+        genome: dump.genome.get(),
+        topology: dump.topology,
+        parameters: dump.parameters.len(),
+        layers,
+    })
 }
 
 /// The records of committed `world`, restored from `checkpoint`.
@@ -194,7 +278,7 @@ fn of(
     run_dir: &Path,
     checkpoint: InspectedCheckpoint,
     world: &World,
-    field: bool,
+    options: &InspectOptions,
 ) -> Result<Inspection, CoreError> {
     let population = world.population();
     let mut organisms = Vec::new();
@@ -239,14 +323,20 @@ fn of(
         field_energy: state.energy_total(),
         organism_energy,
     };
-    let field = field.then(|| InspectedField {
+    let field = options.field.then(|| InspectedField {
         record: "field",
         cells,
         energy: state.energy().iter().map(|&cell| f64::from(cell)).collect(),
     });
+    let weights = options
+        .weights
+        .iter()
+        .map(|&id| weights(world, id))
+        .collect::<Result<_, _>>()?;
     Ok(Inspection {
         inspected,
         organisms,
         field,
+        weights,
     })
 }

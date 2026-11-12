@@ -112,9 +112,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
     dir, ExperimentOptions { cpu_workers, controllers }, emit)`. `Experiment::configuration(condition, seed)` gives
     any planned run's validated configuration.
 
-- `flife inspect DIR --at T --field` (plan §14.6; FL-048's raw state). `DIR` is a run directory no process holds;
-  `--at` the committed tick of one of its checkpoints, the newest that restores by default. In the library:
-  `inspect(dir, InspectOptions { at, field })` returns an `Inspection`.
+- `flife inspect DIR --at T --field --weights ID…` (plan §14.6; FL-048's raw state; FL-021's on-demand weight
+  dump, §14.2). `DIR` is a run directory no process holds; `--at` the committed tick of one of its checkpoints, the
+  newest that restores by default; `--weights` (repeatable) names organisms whose whole controller to print. In the
+  library: `inspect(dir, InspectOptions { at, field, weights })` returns an `Inspection`.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
@@ -254,8 +255,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
   world's digest, model, size and grid, the live count, and the energy the field and the organisms hold), one
   `organism` record per live organism in identity order (identity, genome, lineage, generation, parent, birth
   tick, position, velocity, energy, topology index, parameter count and affinity), and with `--field` one `field`
-  record: every cell's energy, row-major (`y · cells_x + x`), each `f32` widened exactly. Every number is the stored
-  value. The directory's configuration and catalog are checked before its store is opened, so a directory that
+  record: every cell's energy, row-major (`y · cells_x + x`), each `f32` widened exactly; then one `weights` record
+  per organism `--weights` names, in the order named (its identity, genome, topology index and parameter count, and
+  its `layers` in evaluation order: `inputs`, `outputs`, `weights[out][in]` and `biases[out]`, each `f32` as stored,
+  104 inputs into the first and 36 raw outputs from the last); an organism the restored world does not hold is
+  refused (`state-conflict`). Every number is the stored value. The directory's configuration and catalog are checked before its store is opened, so a directory that
   holds no run is refused untouched; the store is opened as `resume` and `branch` open it.
 
 **Invariants.**
@@ -736,13 +740,23 @@ Eleven planted mutants were run against `tests/experiment.rs` (the two model mut
 - `chemistry-only` decoding the controller's output and `fresh-offspring` inheriting the parent's genome (the
   ablation test here, and each model's own evidence test in `tests/ablation.rs`).
 
-`tests/inspect.rs` (2 tests): `inspection_reports_the_committed_world_as_a_direct_world_holds_it` runs the
+`tests/inspect.rs` (3 tests): `inspection_reports_the_committed_world_as_a_direct_world_holds_it` runs the
 48-founder ecology to tick 30 with checkpoints every 7 ticks; the newest inspection is tick 30 with the run's last
 digest, and inspections at 28 and 21 equal a world founded and stepped directly in the test, organism by organism
 bit for bit, every field cell, the digest and both energy totals; ticks 7 (retired) and 29 (never taken) are
 refused. `a_directory_without_a_run_is_refused_untouched`. Six planted mutants (the tick ignored, velocity for
 position, the field plane reversed, affinity left out, a founder its own parent, organism energy doubled) were each
-caught.
+caught. `a_weight_dump_prints_an_organisms_whole_controller`: a run like the first, inspected at tick 28 with
+`--weights` for its newest and oldest organisms, prints two `weights` records after every other record, in that
+order; each
+one's identity, genome, topology and parameter count, and its layers' rows of weights then biases, read back as
+`f32`, are its genome's parameters in a world stepped directly to tick 28, bit for bit, 104 inputs into the first
+layer, each fan-in the last fan-out and 36 outputs from the last; an organism the world does not hold is refused
+(`state-conflict`, exit 2). Planted bugs, each caught: the rows cut at the fan-out, the dumps in reverse order,
+the biases left out, the parameter count the layer count, an unknown organism skipped, the dumps not printed, and
+the genome's identity off by one. A genome named by the organism's own identity survived, as it must: every
+founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
+every run.
 
 `tests/memory_admission.rs` (11 tests, FL-043, about 15 s; a counting global allocator, `peak_alloc`, test only):
 - `the_preset_is_admitted_term_by_term`: on the preset each term is its source (the configuration's quotas, the
@@ -822,8 +836,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
     in which every organism reproduces, which would test its birth part, is not made.
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
-- Only `validate`, `run`, `resume`, `render`, `branch` and `experiment`. Capabilities, step and inspect, analyze
-  and export are later items (§14.6): FL-021 and FL-023.
+- Only `validate`, `run`, `resume`, `render`, `branch`, `experiment` and `inspect`. Capabilities, step, analyze and
+  export are later items (§14.6).
 - FL-039 gaps:
   - §14.4's synchronized simulation-time views and paired metrics are not here: a branch's paired comparison is two
     `flife resume` runs and their records. Experiment reports (FL-041) compare runs founded afresh per seed, not

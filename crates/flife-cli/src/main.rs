@@ -199,8 +199,9 @@ enum Command {
         controllers: ControllerChoice,
     },
     /// Print a run directory's committed state at one of its checkpoints
-    /// as NDJSON: a header, every live organism in identity order, and with
-    /// `--field` the field's energy plane.
+    /// as NDJSON: a header, every live organism in identity order, with
+    /// `--field` the field's energy plane, and with `--weights` an
+    /// organism's whole controller.
     Inspect {
         /// The run directory.
         run_dir: PathBuf,
@@ -211,6 +212,11 @@ enum Command {
         /// Also print the field's energy plane, row-major.
         #[arg(long)]
         field: bool,
+        /// Also print this organism's whole controller: each layer's
+        /// weights and biases as stored. Repeatable; printed in the order
+        /// given.
+        #[arg(long = "weights", value_name = "ORGANISM")]
+        weights: Vec<u64>,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -433,21 +439,27 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(error.kind(), error.to_string()),
         },
-        Command::Inspect { run_dir, at, field } => {
-            match flife_cli::inspect(&run_dir, InspectOptions { at, field }) {
-                Ok(inspection) => {
-                    print(&inspection.inspected);
-                    for organism in &inspection.organisms {
-                        print(organism);
-                    }
-                    if let Some(field) = &inspection.field {
-                        print(field);
-                    }
-                    ExitCode::SUCCESS
+        Command::Inspect {
+            run_dir,
+            at,
+            field,
+            weights,
+        } => match flife_cli::inspect(&run_dir, InspectOptions { at, field, weights }) {
+            Ok(inspection) => {
+                print(&inspection.inspected);
+                for organism in &inspection.organisms {
+                    print(organism);
                 }
-                Err(error) => fail(error.kind(), error.to_string()),
+                if let Some(field) = &inspection.field {
+                    print(field);
+                }
+                for controller in &inspection.weights {
+                    print(controller);
+                }
+                ExitCode::SUCCESS
             }
-        }
+            Err(error) => fail(error.kind(), error.to_string()),
+        },
         Command::Experiment {
             spec,
             out,

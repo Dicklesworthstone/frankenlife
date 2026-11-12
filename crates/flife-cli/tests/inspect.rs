@@ -1,7 +1,8 @@
 //! `flife inspect` (plan §14.6; FL-048's raw state): a run directory's
 //! committed world at one checkpoint, organism by organism and cell by
-//! cell. The oracle is a world founded and stepped directly in this
-//! process, never the checkpoint the command restores.
+//! cell, and on demand an organism's whole controller (plan §14.2). The
+//! oracle is a world founded and stepped directly in this process, never
+//! the checkpoint the command restores.
 
 #![allow(
     clippy::expect_used,
@@ -286,4 +287,105 @@ fn a_directory_without_a_run_is_refused_untouched() {
     assert_ne!(status, Some(0), "{out:?}");
     assert!(!err.is_empty());
     assert_eq!(fs::read_dir(&empty).expect("lists").count(), 0);
+}
+
+/// Plan §14.2's on-demand weight dump: `--weights` prints each organism it
+/// names after every other record, in the order named: its identity,
+/// genome, topology and parameter count, and its layers (104 inputs into
+/// the first, each fan-in the last fan-out, 36 outputs from the last), whose
+/// rows of weights then biases, read back as `f32`, are its genome's
+/// parameters in a world stepped directly to that tick, bit for bit. An
+/// organism the checkpoint's world does not hold is refused.
+#[test]
+fn a_weight_dump_prints_an_organisms_whole_controller() {
+    let config = config_file();
+    let run_dir = fresh("weights");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&config),
+        "--ticks",
+        "30",
+        "--every",
+        "0",
+        "--run-dir",
+        text(&run_dir),
+        "--checkpoint-every",
+        "7",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let world = direct(28);
+    let population = world.population();
+    let ids: Vec<_> = population.ids().collect();
+    let named = [*ids.last().expect("organisms"), ids[0]];
+    let (status, records, err) = flife(&[
+        "inspect",
+        text(&run_dir),
+        "--at",
+        "28",
+        "--weights",
+        &named[0].get().to_string(),
+        "--weights",
+        &named[1].get().to_string(),
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(
+        records.len(),
+        1 + ids.len() + 2,
+        "header, organisms, two dumps"
+    );
+    let narrow = |value: &Value| {
+        // Each parameter is an f32 written out exactly, so it reads back.
+        #[expect(clippy::cast_possible_truncation, reason = "exact by construction")]
+        let parameter = value.as_f64().expect("a number") as f32;
+        parameter.to_bits()
+    };
+    for (dump, id) in records[1 + ids.len()..].iter().zip(named) {
+        let genome = population.genome(id).expect("its genome");
+        assert_eq!(dump["record"], "weights");
+        assert_eq!(dump["id"], id.get());
+        assert_eq!(
+            dump["genome"],
+            population.get(id).expect("lives").genome.get()
+        );
+        assert_eq!(dump["topology"], genome.topology().index());
+        assert_eq!(dump["parameters"], genome.parameters().len());
+        let mut fan_in = 104;
+        let mut read = Vec::new();
+        for layer in dump["layers"].as_array().expect("layers") {
+            assert_eq!(layer["inputs"], fan_in);
+            let outputs =
+                usize::try_from(layer["outputs"].as_u64().expect("a width")).expect("a width");
+            let rows = layer["weights"].as_array().expect("rows");
+            assert_eq!(rows.len(), outputs);
+            for row in rows {
+                let row = row.as_array().expect("a row");
+                assert_eq!(row.len(), fan_in);
+                read.extend(row.iter().map(narrow));
+            }
+            let biases = layer["biases"].as_array().expect("biases");
+            assert_eq!(biases.len(), outputs);
+            read.extend(biases.iter().map(narrow));
+            fan_in = outputs;
+        }
+        assert_eq!(fan_in, 36, "the raw outputs last");
+        let stored: Vec<u32> = genome
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.to_bits())
+            .collect();
+        assert_eq!(read, stored, "every parameter, in the controller's layout");
+    }
+
+    let (status, out, err) = flife(&[
+        "inspect",
+        text(&run_dir),
+        "--at",
+        "28",
+        "--weights",
+        &(1_u64 << 40).to_string(),
+    ]);
+    assert_eq!(status, Some(2), "{out:?}");
+    assert_eq!(err[0]["kind"], "state-conflict", "{err:?}");
 }

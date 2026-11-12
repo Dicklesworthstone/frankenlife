@@ -7,7 +7,10 @@
 //! catalog and action decoding), not through the snapshot. What the field
 //! offers an organism where it stands is checked against the plan's
 //! footprint, composition, efficiency and request laws written out here
-//! over the committed field's planes.
+//! over the committed field's planes. A weight dump is checked against the
+//! organism's own genome, split by its catalog topology's widths, and its
+//! layers evaluated by the declared arithmetic written out here against the
+//! reference controller.
 
 #![allow(
     clippy::expect_used,
@@ -18,10 +21,14 @@
 use flife_core::ValidatedConfig;
 use flife_core::ids::OrganismId;
 use flife_core::model::FIELD_ECOLOGY_V1_CHEMISTRY_ONLY;
+use flife_core::numerics::tanh;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_field::FieldState;
 use flife_genome::TopologyCatalog;
-use flife_neural::{ACTION_WIDTH, ActionDecoding, decode, widen};
+use flife_neural::{
+    ACTION_WIDTH, ActionDecoding, ControllerScratch, ReferenceController, SENSOR_WIDTH, decode,
+    widen,
+};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
 
@@ -401,4 +408,119 @@ fn local_chemistry_against_the_laws(config: &ValidatedConfig) {
         "{area} world-length² cells, {read} footprints: {useful} useful cells, {harmful} harmful, \
          {wrapped} wrapped, {full} of four cells"
     );
+}
+
+/// The declared F32 arithmetic written out (flife-neural's controller
+/// module) over each `(fan_in, weights, biases)` layer in evaluation order:
+/// each input rounded once to F32; each output the bias, then each input's
+/// product in ascending index, every product and sum in F32; `tanh` in F64
+/// rounded once after each hidden layer; the last layer linear.
+fn forward(layers: &[(usize, &[f32], &[f32])], inputs: &[f64; SENSOR_WIDTH]) -> Vec<f32> {
+    let mut source: Vec<f32> = inputs.iter().map(|&input| input as f32).collect();
+    for (index, &(fan_in, weights, biases)) in layers.iter().enumerate() {
+        assert_eq!(fan_in, source.len());
+        assert_eq!(weights.len(), fan_in * biases.len());
+        let z: Vec<f32> = biases
+            .iter()
+            .zip(weights.chunks_exact(fan_in))
+            .map(|(&bias, row)| {
+                let mut z = bias;
+                for (weight, input) in row.iter().zip(&source) {
+                    z += weight * input;
+                }
+                z
+            })
+            .collect();
+        if index + 1 == layers.len() {
+            return z;
+        }
+        source = z
+            .iter()
+            .map(|&z| tanh(f64::from(z)).expect("finite") as f32)
+            .collect();
+    }
+    panic!("no layers")
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+/// Plan §14.2's on-demand weight dump: every organism's dump, after
+/// children of two birth ticks live beside the founders, is its own genome's
+/// parameters whole and bit for bit, split by its catalog topology's widths
+/// (104 inputs, its hidden widths, 36 outputs) into consecutive layers of
+/// `weight[out][in]` then `bias[out]` covering every parameter. Its layers,
+/// evaluated by the declared arithmetic written out here, give the
+/// reference controller's outputs bit for bit on three input vectors. An
+/// unknown identity gives `None`, and dumping changes nothing (INV-09).
+#[test]
+fn a_weight_dump_is_the_organisms_own_controller() {
+    let config = small(flife_core::model::FIELD_ECOLOGY_V1);
+    let catalog = TopologyCatalog::from_config(&config).expect("catalog");
+    let mut world = found(&config);
+    let births = |world: &World| {
+        world
+            .population()
+            .iter()
+            .filter(|organism| organism.parent.is_some())
+            .map(|organism| organism.birth_tick)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    while births(&world).len() < 2 {
+        assert!(world.tick().get() < 400, "no births by tick 400");
+        step(&mut world);
+    }
+    let before = world.digest();
+    let inputs: [[f64; SENSOR_WIDTH]; 3] = [
+        [0.0; SENSOR_WIDTH],
+        std::array::from_fn(|index| (index as f64 * 0.37).sin()),
+        std::array::from_fn(|index| if index % 2 == 0 { 1.0 } else { -0.5 }),
+    ];
+    let population = world.population();
+    let mut dumped = 0;
+    for organism in population.iter() {
+        let dump = world
+            .organism_weights(organism.id)
+            .expect("dumps")
+            .expect("a live organism");
+        let genome = population.genome(organism.id).expect("its genome");
+        assert_eq!(dump.tick, world.tick());
+        assert_eq!(dump.organism, organism.id);
+        assert_eq!(dump.genome, organism.genome);
+        assert_eq!(dump.topology, genome.topology().index());
+        assert_eq!(bits(&dump.parameters), bits(genome.parameters()));
+        let topology = catalog.topology(genome.topology()).expect("in the catalog");
+        let widths: Vec<usize> = std::iter::once(SENSOR_WIDTH)
+            .chain(topology.hidden_widths().iter().map(|&width| width as usize))
+            .chain(std::iter::once(ACTION_WIDTH))
+            .collect();
+        assert_eq!(dump.layers.len(), widths.len() - 1);
+        let parameters = genome.parameters();
+        let mut at = 0;
+        let mut layers = Vec::new();
+        for (index, (shape, pair)) in dump.layers.iter().zip(widths.windows(2)).enumerate() {
+            let (fan_in, fan_out) = (pair[0], pair[1]);
+            assert_eq!((shape.inputs, shape.outputs), (fan_in, fan_out));
+            let (weights, biases) = dump.layer(index).expect("a layer");
+            assert_eq!(bits(weights), bits(&parameters[at..at + fan_in * fan_out]));
+            at += fan_in * fan_out;
+            assert_eq!(bits(biases), bits(&parameters[at..at + fan_out]));
+            at += fan_out;
+            layers.push((fan_in, weights, biases));
+        }
+        assert_eq!(at, parameters.len(), "every parameter in a layer");
+        assert_eq!(dump.layer(dump.layers.len()), None);
+        let reference =
+            ReferenceController::sealed(topology, genome.parameters()).expect("a controller");
+        let mut scratch = ControllerScratch::default();
+        for inputs in &inputs {
+            let expected = reference.evaluate(inputs, &mut scratch).expect("evaluates");
+            assert_eq!(bits(&forward(&layers, inputs)), bits(&expected));
+        }
+        dumped += 1;
+    }
+    assert!(dumped > 48, "{dumped} organisms, children among them");
+    assert_eq!(world.organism_weights(OrganismId::new(1 << 40)), Ok(None));
+    assert_eq!(world.digest(), before);
 }

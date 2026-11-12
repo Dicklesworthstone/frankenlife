@@ -206,6 +206,13 @@ each runs and owns the field.
     `EmissionSettlement` (budget, cost, offered) and a `ReproductionOutcome` (`CoolingDown { deadline }`,
     `NoAttempt`, `Unviable`, `Born { child, split }` or `Rejected { split, candidates }`); then what the tiny
     reservoir took and its closing energy (zero if the step exhausted it).
+- `World::organism_weights(id)` (plan §14.2's on-demand weight dump): `Ok(None)` for an identity the population does
+  not hold, or a `ControllerWeights`: the tick, the organism, its genome and topology index, its topology's
+  `LayerShape`s in evaluation order (fan-in, fan-out, and where the weights and biases sit), and its genome's
+  parameters copied whole, in the controller's layout (layers in evaluation order, each `weight[out][in]` row-major
+  then `bias[out]`, torch's `parameters_to_vector` order). `ControllerWeights::layer(index)` gives a layer's weights
+  and biases. The copy's room is reserved first (`AllocationFailed`), and a genome whose parameter count is not its
+  topology's is refused (`StateConflict`, "dump organism weights").
 - `World::watch(Some(id) | None)` names the one organism whose observation and transactions each step records, from
   the next step on. Watching another organism drops the records of the one before; watching the same one again
   keeps them. `World::watched()` names it, and `World::watched_transactions()` gives its records, oldest first,
@@ -730,7 +737,7 @@ Twenty planted mutants for the introduction (with `flife-runtime`'s and `flife-c
 adds exactly `batched_bytes()` to the scratch and nothing to the state or fields, 60 ticks grow nothing, and
 removing it returns the scratch to its bytes before.
 
-`tests/inspect.rs` (4 tests, FL-021), on the 32 x 32 Appendix A world with FL-013's small ecology, which breeds.
+`tests/inspect.rs` (5 tests, FL-021), on the 32 x 32 Appendix A world with FL-013's small ecology, which breeds.
 The oracle reads the same world through `Population::get`, `Population::genome`, the configuration's topology
 catalog and action decoding:
 - `an_organism_snapshot_is_its_committed_row_and_genome`: three ticks after children of two birth ticks live
@@ -747,6 +754,14 @@ catalog and action decoding:
   and energies exactly, the efficiencies, density, request, gain and toxicity within 1e-12. It runs on the small
   world's unit cells and on 2 x 2 cells (a 16 x 16 grid), so a density is an amount over the cell's area. On each,
   the footprints read include useful and harmful cells, wrapped footprints and footprints of four cells.
+- `a_weight_dump_is_the_organisms_own_controller`: once children of two birth ticks live beside the founders,
+  every organism's dump is its genome's parameters whole and bit for bit, split by its catalog topology's widths
+  (104, its hidden widths, 36) into consecutive layers of weights then biases covering every parameter; its
+  layers, evaluated by the declared F32 arithmetic written out in the test, give `ReferenceController::sealed`'s
+  outputs bit for bit on three input vectors; an unknown identity gives `None`; the digest is unchanged. Planted
+  bugs, each caught: the copy one parameter short, every dump naming the first organism's genome, the layers in
+  reverse, the tick one late, a layer's weights taking its biases, its biases one along, and an unknown identity
+  refused rather than `None`.
 
 `tests/watch.rs` (7 tests, FL-021, plan §14.2's Inputs, Brain and Transactions), on the same small world. Its
 oracles are not the snapshot's path: a controller backend that records every job's inputs and defers each to the
@@ -825,7 +840,8 @@ velocity, first-order splitting at the configured fixed timestep.
   after the watch is set, or in a world not stepped since, has none of them: they exist only inside a step. The
   transactions are the watched organism's alone, from when it was watched; an organism's earlier history is not
   kept. Its local chemistry is the committed field's, not the next step's settlement. It has no descendants, which
-  need an event index the world does not keep. Weight dumps on demand are not implemented.
+  need an event index the world does not keep. A weight dump is on demand (`World::organism_weights`, through
+  `flife inspect --weights`); the session and the Studio do not ask for one yet.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

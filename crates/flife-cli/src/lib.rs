@@ -74,7 +74,7 @@ pub use flife_backend_metal::{BackendBudget, ControllerChoice};
 pub use flife_manim::{ColorMapping, FieldMapping, Look, Particles, Style};
 pub use inspect::{
     INSPECT_SCHEMA, InspectOptions, Inspected, InspectedCheckpoint, InspectedExtent,
-    InspectedField, InspectedOrganism, Inspection, inspect,
+    InspectedField, InspectedLayer, InspectedOrganism, InspectedWeights, Inspection, inspect,
 };
 pub use memory::{MemoryAdmission, RESERVE_BYTES};
 pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};

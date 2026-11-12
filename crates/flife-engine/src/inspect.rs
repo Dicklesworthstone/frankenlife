@@ -31,12 +31,17 @@
 //! emission stages returned, what its reproduction came to, and what the
 //! tiny reservoir took. They are the values the ledger was given, copied as
 //! they were recorded.
+//!
+//! A snapshot copies no controller parameter. Its whole controller is
+//! dumped on demand ([`World::organism_weights`](crate::World::organism_weights)):
+//! [`ControllerWeights`] copies that one organism's parameters, and nothing
+//! of any other genome.
 
 use flife_core::clock::Tick;
-use flife_core::ids::OrganismId;
+use flife_core::ids::{GenomeId, OrganismId};
 use flife_field::pyramid::RawSample;
 use flife_genome::Traits;
-use flife_neural::{DecodedActions, Observation};
+use flife_neural::{DecodedActions, LayerShape, Observation};
 
 use crate::{
     EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism, Split, Unviable,
@@ -199,6 +204,42 @@ pub struct Sensed {
     pub observation: Observation,
     /// Whether it evaluated its controller on it, or held an earlier output.
     pub evaluated: bool,
+}
+
+/// One organism's whole controller at a committed tick (plan §14.2: "full
+/// weight dumps are on demand"): its own genome's parameters, copied whole,
+/// and the layer shapes that lay them out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControllerWeights {
+    /// The committed tick it was read at: the world's.
+    pub tick: Tick,
+    /// The organism.
+    pub organism: OrganismId,
+    /// Its genome.
+    pub genome: GenomeId,
+    /// Its controller topology's index in the catalog.
+    pub topology: usize,
+    /// Its layers in evaluation order, the sensor inputs first and the raw
+    /// outputs last: each one's fan-in and fan-out, and where its weights
+    /// and biases sit in `parameters`.
+    pub layers: Vec<LayerShape>,
+    /// Every parameter, in the controller's layout: layers in evaluation
+    /// order, each `weight[out][in]` row-major followed by `bias[out]`
+    /// (torch's `parameters_to_vector` order).
+    pub parameters: Vec<f32>,
+}
+
+impl ControllerWeights {
+    /// Layer `index`'s weights, `weight[out][in]` row-major, and its biases;
+    /// `None` past the last layer.
+    #[must_use]
+    pub fn layer(&self, index: usize) -> Option<(&[f32], &[f32])> {
+        let shape = self.layers.get(index)?;
+        Some((
+            self.parameters.get(shape.weights..shape.biases)?,
+            self.parameters.get(shape.biases..shape.end())?,
+        ))
+    }
 }
 
 /// The hidden activations of one evaluation (plan §14.2's Brain).

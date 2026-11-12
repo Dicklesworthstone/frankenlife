@@ -31,6 +31,8 @@
 //! - [`ancestry`]: the live population's ancestry, folded from every
 //!   published tick by a world that traces it, for the inspector's
 //!   descendants and ancestry path (FL-021).
+//! - [`measure`]: what one disk of the committed world holds, read between
+//!   ticks for the Studio's temporary measurement region (plan §14.3).
 //!
 //! Each organism spends through a `flife_core::EnergyBudget` in the order of
 //! §8.2: it absorbs its gain, pays toxicity and maintenance, then pays for
@@ -47,6 +49,7 @@ pub mod emission;
 pub mod inspect;
 pub mod intervention;
 pub mod lifecycle;
+pub mod measure;
 pub mod motion;
 pub mod population;
 pub mod reproduction;
@@ -69,6 +72,7 @@ pub use lifecycle::{
     BudgetStage, DISSIPATE_AND_RECORD, Death, DeathCause, DeathSettlement, Disposition, Fate,
     GENETIC_AFFINITY, Recycling, TinyEnergyPolicy, Vitality,
 };
+pub use measure::RegionMeasurement;
 pub use motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
 pub use population::{
     Arrangement, Collected, Entrant, HeldOutput, Organism, POPULATION_DIGEST_SCHEMA, Population,

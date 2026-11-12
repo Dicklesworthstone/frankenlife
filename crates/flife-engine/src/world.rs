@@ -110,6 +110,7 @@ use crate::inspect::{
 };
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
+use crate::measure::{RegionMeasurement, measure};
 use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
@@ -1507,6 +1508,32 @@ impl World {
             layers: topology.layers().to_vec(),
             parameters: copy,
         }))
+    }
+
+    /// What the disk of `radius` world units about `center` holds in the
+    /// committed world (plan §14.3's temporary measurement region): the
+    /// organisms a removal of that disk at this boundary would take, their
+    /// energy and lineages, and the field cells whose centres lie in it and
+    /// their energy. See [`crate::measure`]. It changes nothing.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a centre or radius a removal
+    /// would refuse (`measurement centre`, `measurement radius`);
+    /// [`CoreError::AllocationFailed`] when the lineages' room cannot be
+    /// reserved.
+    pub fn measure_region(
+        &self,
+        center: [f64; 2],
+        radius: f64,
+    ) -> Result<RegionMeasurement, CoreError> {
+        measure(
+            self.tick,
+            &self.rules.grid,
+            &self.population,
+            self.field.current(),
+            center,
+            radius,
+        )
     }
 
     /// The committed scientific state: tick, field, population, identity

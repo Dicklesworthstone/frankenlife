@@ -70,6 +70,10 @@ inherits every command and outcome, records the fork, and from then on admits on
   `World::organism_weights(id)`, a `ControllerWeights` whose `tick` is the boundary it was read at, or `None` when
   the committed world does not hold the organism. It copies that one genome's parameters, watches nothing and
   changes no result; a running owner answers between ticks, and a closing one at the closed boundary.
+- Plan §14.3: `SessionHandle::measure_region(center, radius)` (the Studio's temporary measurement region): the
+  committed world's `World::measure_region`, a `RegionMeasurement` whose `tick` is the boundary it was read at,
+  or the world's refusal of the disk. It copies no genome, watches nothing and changes no result. A running owner
+  answers between ticks, and a closing one at the closed boundary.
 - `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
   still pending), the final boundary and the render counters.
 - FL-036, for a journaled session:
@@ -325,6 +329,15 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - `open_restored` refuses a book of another session or another revision (state conflict) and a
     `write-ahead-before-apply` limit (missing capability), and opens the world's own book;
   - the same protocol on the native current-thread runtime.
+- `tests/measure.rs` (3 tests, plan §14.3), Lab seeds, each answer compared with the measurement of a world
+  stepped directly to the answer's tick, both energies bit for bit:
+  - paused at tick 6, over four seeds: three disks (across both seams, small, half the world), each answered at
+    tick 6; a disk wider than half the world refused as a `measurement radius`; the boundary unmoved, and the closed
+    world the direct one;
+  - during a run to tick 24, over four seeds: the disks measured one after another, each answer the direct
+    measurement at its own tick, at three or more distinct ticks in all; the run reaches 24 at the direct digest;
+  - a measurement sent in the same poll as a close while running, over six seeds: answered at the closed boundary
+    with the direct measurement there; the next is refused.
 - `tests/inspect.rs` (6 tests, FL-021), Lab seeds, each answer compared with the snapshot or weight dump of a world
   stepped directly to the answer's tick:
   - paused at tick 6, over four seeds: every live organism's answer, at tick 6; an unknown identity, none; the

@@ -220,6 +220,19 @@ each runs and owns the field.
   then `bias[out]`, torch's `parameters_to_vector` order). `ControllerWeights::layer(index)` gives a layer's weights
   and biases. The copy's room is reserved first (`AllocationFailed`), and a genome whose parameter count is not its
   topology's is refused (`StateConflict`, "dump organism weights").
+- `World::measure_region(center, radius)` (plan §14.3's temporary measurement region, `measure`): a
+  `RegionMeasurement` of the committed world, with:
+  - the tick, centre and radius;
+  - the organisms in the disk a removal of that centre and radius would take (`Intervention::removes_at`), so
+    a removal applied alone at this boundary removes exactly `organisms`, holding exactly `organism_energy` bit for
+    bit (summed in identity order, as the removal sums it);
+  - their distinct founder `lineages`;
+  - the field `cells` whose centres lie in the disk by the same minimum-image test, the circle included, and their
+    `field_energy` summed in cell-index order.
+
+  A disk a removal would refuse is refused (`NumericalInvalid`, `measurement centre` or `measurement radius`), and
+  half the shorter world side is admitted. It reads each organism's row and the committed energy plane once, copies
+  no genome and changes nothing.
 - `World::watch(Some(id) | None)` names the one organism whose observation and transactions each step records, from
   the next step on. Watching another organism drops the records of the one before; watching the same one again
   keeps them. `World::watched()` names it, and `World::watched_transactions()` gives its records, oldest first,
@@ -788,6 +801,27 @@ catalog and action decoding:
   bugs, each caught: the copy one parameter short, every dump naming the first organism's genome, the layers in
   reverse, the tick one late, a layer's weights taking its biases, its biases one along, and an unknown identity
   refused rather than `None`.
+
+`tests/measure.rs` (5 tests, plan §14.3), on the removal tests' 32 x 32 ecology. The oracle reads the committed
+population and energy plane directly, tests distance with its own `rem_euclid` minimum image, and sums in identity
+order and cell-index order:
+- `a_measured_disk_holds_what_a_removal_of_it_takes`: at ticks 0, 40 and 75, a disk across the seam, two inside
+  and one half the world wide, each equal to the oracle (both sums bit for bit). A removal of the same disk
+  applied at that boundary to a world founded alike removes exactly the measured count and, bit for bit, the
+  measured energy; the seam disk holds at least two organisms.
+- `the_cells_on_the_circle_count_across_both_seams`: centred on cell (0, 0)'s centre with radius 3, the 29 cells
+  with i² + j² ≤ 9 (18 across a seam), the four on the circle included; a radius 1e-9 smaller holds 25.
+- `measuring_changes_nothing`: two disks measured before each of 30 ticks leave the digest unchanged, and the
+  world is the never-measured world's at tick 30.
+- `a_disk_off_the_world_or_wider_than_half_of_it_is_refused`: the removal's ten refused disks, each refused as a
+  `measurement centre` or `measurement radius`; half the world is admitted and equals the oracle.
+- `an_empty_disk_measures_no_organism`: no organisms, zero energy and no lineage, and the field under it.
+
+Planted bugs, 10 with the runtime's (`flife-runtime`'s `tests/measure.rs`), each caught: the circle's cells left
+out; a cell measured at its corner; lineages not made distinct; a radius refused under a removal's name; no check
+of the disk; the organisms' energy one short; the next field measured instead of the committed one; the cells'
+energy summed in reverse order; a running owner answering for half the radius; and a closing owner dropping the
+measurement.
 
 `tests/watch.rs` (7 tests, FL-021, plan §14.2's Inputs, Brain and Transactions), on the same small world. Its
 oracles are not the snapshot's path: a controller backend that records every job's inputs and defers each to the

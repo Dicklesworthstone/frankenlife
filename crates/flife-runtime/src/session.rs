@@ -81,8 +81,8 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{CommandId, OrganismId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{
-    Advance, CapacityShortfall, ControllerWeights, Intervention, OrganismSnapshot, TickReport,
-    World,
+    Advance, CapacityShortfall, ControllerWeights, Intervention, OrganismSnapshot,
+    RegionMeasurement, TickReport, World,
 };
 use flife_field::FieldGrid;
 use flife_render::{Feed, Publisher, RenderStats};
@@ -336,6 +336,11 @@ enum Control {
         id: OrganismId,
         reply: oneshot::Sender<Result<Option<ControllerWeights>, CoreError>>,
     },
+    MeasureRegion {
+        center: [f64; 2],
+        radius: f64,
+        reply: oneshot::Sender<Result<RegionMeasurement, CoreError>>,
+    },
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
     Take(Take),
     /// Hold the committed boundary at `tick`, or release the hold (`None`).
@@ -389,6 +394,7 @@ impl std::fmt::Debug for Control {
             Self::Inspect(_) => "Inspect",
             Self::InspectOrganism { .. } => "InspectOrganism",
             Self::OrganismWeights { .. } => "OrganismWeights",
+            Self::MeasureRegion { .. } => "MeasureRegion",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Take(_) => "Take",
             Self::Hold { .. } => "Hold",
@@ -675,6 +681,31 @@ impl SessionHandle {
     ) -> Result<Option<ControllerWeights>, CoreError> {
         self.control(cx, |reply| Control::OrganismWeights { id, reply })
             .await?
+    }
+
+    /// What the disk of `radius` world units about `center` holds at the
+    /// owner's committed boundary (plan §14.3's temporary measurement
+    /// region; [`World::measure_region`]): the organisms a removal of that
+    /// disk applied there would take, their energy and lineages, and the
+    /// field cells whose centres lie in it and their energy. A running
+    /// owner answers between ticks, so the measurement is of one whole
+    /// committed tick, named by its `tick`. It copies no genome, watches
+    /// nothing and changes no result.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`] and [`World::measure_region`].
+    pub async fn measure_region(
+        &self,
+        cx: &Cx,
+        center: [f64; 2],
+        radius: f64,
+    ) -> Result<RegionMeasurement, CoreError> {
+        self.control(cx, |reply| Control::MeasureRegion {
+            center,
+            radius,
+            reply,
+        })
+        .await?
     }
 
     /// Close the session, returning the committed boundary it closed at.
@@ -1686,6 +1717,13 @@ impl SessionOwner {
             Control::OrganismWeights { id, reply } => {
                 let _ = reply.send_blocking(self.world.organism_weights(id));
             }
+            Control::MeasureRegion {
+                center,
+                radius,
+                reply,
+            } => {
+                let _ = reply.send_blocking(self.world.measure_region(center, radius));
+            }
             Control::Checkpoint(reply) => {
                 self.settle_receipts();
                 if self
@@ -2132,6 +2170,13 @@ impl SessionOwner {
                 }
                 Control::OrganismWeights { id, reply } => {
                     let _ = reply.send_blocking(self.world.organism_weights(id));
+                }
+                Control::MeasureRegion {
+                    center,
+                    radius,
+                    reply,
+                } => {
+                    let _ = reply.send_blocking(self.world.measure_region(center, radius));
                 }
             }
         }

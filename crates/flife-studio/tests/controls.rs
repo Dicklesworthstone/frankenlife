@@ -520,6 +520,32 @@ fn zero_resets_the_view() {
     assert_eq!(controls.style(), style);
 }
 
+/// FL-021: W asks for the selected organism's weight dump as a move, with
+/// no intent of its own (the host knows the selection); auto-repeat asks
+/// nothing more, ⌘W closes and asks nothing, and it is no style key.
+#[test]
+fn w_asks_for_a_weight_dump() {
+    let mut controls = Controls::new();
+    let style = controls.style();
+    assert!(tap(&mut controls, KEY_W).is_empty());
+    controls.apply(&key(KEY_W, true, true, Modifiers::NONE));
+    assert_eq!(moves(&mut controls), [CameraMove::Weights]);
+    assert_eq!(
+        controls.apply(&key(
+            KEY_W,
+            true,
+            false,
+            Modifiers {
+                command: true,
+                ..Modifiers::NONE
+            },
+        )),
+        Some(Intent::Close)
+    );
+    assert!(moves(&mut controls).is_empty());
+    assert_eq!(controls.style(), style);
+}
+
 /// FL-019: the digit keys 1 to 6 (`kVK_ANSI_1` … `kVK_ANSI_6`, whose codes
 /// are not in order) choose the six mappings in order, R, D and F switch the
 /// look, the particles and the field, C the field's mapping (energy or

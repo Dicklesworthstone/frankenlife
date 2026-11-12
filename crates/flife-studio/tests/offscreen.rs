@@ -27,7 +27,7 @@ use flife_manim::{HUD_TEXT_POINTS, HudFont, REGION_WIDTH_POINTS, RegionShape, hu
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, ColorMapping, ControllerChoice, FrameTimes, KEY_DIGITS, KEY_E, KEY_I, KEY_M, KEY_PERIOD,
-    KEY_SPACE, KEY_X, PICK_RADIUS_POINTS, Preview, Status, Studio, StudioOptions, Supplies,
+    KEY_SPACE, KEY_W, KEY_X, PICK_RADIUS_POINTS, Preview, Status, Studio, StudioOptions, Supplies,
     Surface, cell_region, legends, material_for, preview_region, scroll_zoom, stroke,
 };
 use fmn_render::metal::{
@@ -302,6 +302,19 @@ fn posted_input_drives_an_offscreen_studio_as_a_windows_does() {
                         && descendants.living <= descendants.born
                         && descendants.children_living <= descendants.children_born
                 }))
+        })
+    });
+    // W dumps the selected organism's whole controller (FL-021, plan
+    // §14.2), read at the session's committed boundary while it runs.
+    tap(&mut studio, KEY_W, "w");
+    until(&mut studio, "a weight dump", |_, statuses| {
+        statuses.iter().any(|status| {
+            matches!(status, Status::Weights { organism, weights: Some(weights), .. }
+            if Some(*organism) == expected
+                && weights.organism == *organism
+                && weights.tick.get() >= 8
+                && !weights.parameters.is_empty()
+                && weights.layers.last().is_some_and(|layer| layer.end() == weights.parameters.len()))
         })
     });
     let tally = studio.tally();

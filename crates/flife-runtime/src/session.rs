@@ -74,7 +74,10 @@ use asupersync::runtime::yield_now;
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{CommandId, OrganismId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Advance, CapacityShortfall, Intervention, OrganismSnapshot, TickReport, World};
+use flife_engine::{
+    Advance, CapacityShortfall, ControllerWeights, Intervention, OrganismSnapshot, TickReport,
+    World,
+};
 use flife_field::FieldGrid;
 use flife_render::{Feed, Publisher, RenderStats};
 
@@ -321,6 +324,10 @@ enum Control {
         id: OrganismId,
         reply: oneshot::Sender<Result<Option<OrganismSnapshot>, CoreError>>,
     },
+    OrganismWeights {
+        id: OrganismId,
+        reply: oneshot::Sender<Result<Option<ControllerWeights>, CoreError>>,
+    },
     Checkpoint(oneshot::Sender<Result<SessionCheckpoint, CoreError>>),
     Take(Take),
     Close(oneshot::Sender<Boundary>),
@@ -365,6 +372,7 @@ impl std::fmt::Debug for Control {
             Self::DurableOutcome { .. } => "DurableOutcome",
             Self::Inspect(_) => "Inspect",
             Self::InspectOrganism { .. } => "InspectOrganism",
+            Self::OrganismWeights { .. } => "OrganismWeights",
             Self::Checkpoint(_) => "Checkpoint",
             Self::Take(_) => "Take",
             Self::Close(_) => "Close",
@@ -629,6 +637,26 @@ impl SessionHandle {
         id: OrganismId,
     ) -> Result<Option<OrganismSnapshot>, CoreError> {
         self.control(cx, |reply| Control::InspectOrganism { id, reply })
+            .await?
+    }
+
+    /// One organism's whole controller at the owner's committed boundary
+    /// (FL-021, plan §14.2's on-demand weight dump), or `None` for an
+    /// identity the world does not hold there: its genome's parameters
+    /// copied whole, with the layer shapes that lay them out
+    /// ([`World::organism_weights`]). A running owner answers between
+    /// ticks, so the dump is of one whole committed tick, named by its
+    /// `tick`. It copies that one genome and nothing else, watches nothing,
+    /// and changes no result.
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`] and [`World::organism_weights`].
+    pub async fn organism_weights(
+        &self,
+        cx: &Cx,
+        id: OrganismId,
+    ) -> Result<Option<ControllerWeights>, CoreError> {
+        self.control(cx, |reply| Control::OrganismWeights { id, reply })
             .await?
     }
 
@@ -1524,6 +1552,9 @@ impl SessionOwner {
                 self.world.watch(Some(id));
                 let _ = reply.send_blocking(self.world.organism_snapshot(id));
             }
+            Control::OrganismWeights { id, reply } => {
+                let _ = reply.send_blocking(self.world.organism_weights(id));
+            }
             Control::Checkpoint(reply) => {
                 self.settle_receipts();
                 if self
@@ -1923,6 +1954,9 @@ impl SessionOwner {
                 }
                 Control::InspectOrganism { id, reply } => {
                     let _ = reply.send_blocking(self.world.organism_snapshot(id));
+                }
+                Control::OrganismWeights { id, reply } => {
+                    let _ = reply.send_blocking(self.world.organism_weights(id));
                 }
             }
         }

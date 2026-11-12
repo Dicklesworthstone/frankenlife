@@ -84,8 +84,9 @@ telemetry line names the newest checkpoint's tick.
     | X | arm the removal brush, or disarm it (FL-022) |
     | M | arm the material brush, or disarm it (FL-022) |
     | I | arm the introduction brush, or disarm it (FL-022) |
+    | W (without ⌘) | dump the selected organism's whole controller (a `CameraMove::Weights`, FL-021) |
 
-    The style keys, 0 and the brush keys ignore auto-repeat and ⌘, and produce no intent. A brush key with another
+    The style keys, 0, W and the brush keys ignore auto-repeat and ⌘ (⌘W closes), and produce no intent. A brush key with another
     brush armed switches to its brush. `brush()` is the armed brush.
   - Pointer gestures become `CameraMove`s, in logical points, kept in order until `take_moves()` (reserved once
     for a poll's events):
@@ -112,6 +113,9 @@ telemetry line names the newest checkpoint's tick.
     `Inspected { organism, seen, snapshot }`: `seen` is the source tick of the epoch it was selected on, unchanged,
     and the snapshot is the organism at the session's committed boundary, which its `tick` names, or `None` when
     the committed world no longer holds it.
+  - FL-021: `Intent::DumpWeights { organism, seen }` asks `SessionHandle::organism_weights` and reports `Weights {
+    organism, seen, weights }`: `seen` unchanged, and the organism's whole controller (`ControllerWeights`) at the
+    session's committed boundary, which its `tick` names, or `None` when the committed world no longer holds it.
   - FL-022: `Intent::Intervene { stroke, seen }` submits the stroke's intervention as a `Command` for
     `Target::NextAdmissible`, stating the session's configuration hash, with identities counting from 1 (the
     Studio opens fresh sessions only). An acceptance reports `Submitted { command, stroke, seen, effective }`,
@@ -183,7 +187,9 @@ telemetry line names the newest checkpoint's tick.
      epoch's organisms through the view as it stood at that click, within `PICK_RADIUS_POINTS = 8` logical points
      (scaled to drawable pixels); then takes the view and the selection. A click that selects an organism offers
      `Intent::Inspect` for it with the shown epoch's tick as `seen` (FL-021), counted with the frame's intents or
-     refusals. A brush click makes its stroke through the view as it stood at that click, over the shown epoch's
+     refusals. After the frame's moves and strokes, a `CameraMove::Weights` offers `Intent::DumpWeights` for
+     whatever is then selected, with the shown epoch's tick as `seen` (FL-021), and nothing when nothing is
+     selected. A brush click makes its stroke through the view as it stood at that click, over the shown epoch's
      field grid, and is offered as `Intent::Intervene` with the shown epoch's tick as `seen` (FL-022), counted in
      `FrameTally::strokes` and with the intents or refusals. A brush click that makes no stroke (the margin, or the
      material brush with no material) is counted in `FrameTally::unstroked`. The material is the one the last
@@ -265,6 +271,11 @@ telemetry line names the newest checkpoint's tick.
     `ancestors` its line passes through, nearest first and at most `flife_engine::ANCESTRY_PATH` (8), each with
     its `organism`, `generation`, `birth_tick`, whether it is `alive`, and its descendants `born` and `living`, and
     how many more lie `beyond` them, or null when the world traces no ancestry;
+  - one `weights` per weight dump answered (FL-021, plan §14.2's on-demand weight dump, on W): the `organism`,
+    `seen_tick`, the committed `tick` it was read at and its `controller` (null, with the tick, when the world no
+    longer holds it): `genome`, `topology`, `parameters` and its `layers` as `flife inspect --weights` writes them
+    (`flife_cli::InspectedWeights::of`): `inputs`, `outputs`, `weights[out][in]` and `biases[out]`, each `f32` as
+    stored. The preset's largest controller writes out as a few hundred kilobytes on one line;
   - FL-022: one `brush` each time the armed brush changes (`energy`, `removal` or null); one `submitted` per
     accepted stroke: its `command`, `brush`, its payload (the `cell` and `amount`, with the material's 32-component
     `direction`; the `center` and `radius`; or the `cell`, `count` and each one's `endowment`), `seen_tick` and
@@ -350,7 +361,7 @@ commits, whatever the frame rate, focus or window size. Frame timing, coalescing
 presentation state, not scientific state.
 
 **Independent tests.**
-- `tests/controls.rs` (15 tests):
+- `tests/controls.rs` (16 tests):
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
@@ -367,6 +378,8 @@ presentation state, not scientific state.
   - FL-022: E, X, M and I arm, switch and disarm the brushes (their codes pinned to `kVK_ANSI_E`, `kVK_ANSI_X`,
     `kVK_ANSI_M` and `kVK_ANSI_I`), not on repeat or with ⌘, with no move, intent or style change; an armed click
     brushes at the press with the brush armed at the release, a drag still pans, and once disarmed a click selects.
+  - FL-021: W makes one `CameraMove::Weights` and no intent, not on repeat; ⌘W closes and makes no move; it is no
+    style key.
 - `tests/pacing.rs` (5 tests, FL-020): at rest before an interval is known; the display moves over the interval
   between arrivals (worked fractions, capped at 1, a frame before the arrival at 0) and later intervals smooth by a
   quarter; a five-second wait counts as `MOTION_MAX`, as does a wait of exactly `MOTION_MAX`, after a fast stream
@@ -416,14 +429,17 @@ presentation state, not scientific state.
   - Off macOS it reports itself skipped.
 - In `flife-runtime`, `tests/session.rs` checks `SessionHandle::start` across six Lab seeds: the start comes back at
   once, and the end comes back for a pause, a reached tick and a close.
-- `tests/inspect.rs` (2 tests, FL-021, no window): a `SessionThread` over a 32 x 32 preset world, driven through
+- `tests/inspect.rs` (3 tests, FL-021, no window): a `SessionThread` over a 32 x 32 preset world, driven through
   its intent lane on the native runtime:
   - paused after four steps: eight organisms and an unknown identity inspected, each answer in order, `seen`
     unchanged (3), the snapshots the direct world's at tick 4, none for the unknown one; the closed world the
     direct one;
   - while running: 48 inspections, then a pause; every snapshot the direct world's at its own tick, every
     organism answered with none dead at the close, and the closed world the direct one. Which ticks the answers
-    land on depends on thread timing; the Lab test in `flife-runtime` is the one that requires answers mid-run.
+    land on depends on thread timing; the Lab test in `flife-runtime` is the one that requires answers mid-run;
+  - paused after four steps: six organisms' and an unknown identity's weight dumps, each answer in order, `seen`
+    unchanged (3), each the direct world's dump at tick 4, none for the unknown one; the closed world the direct
+    one.
 - `tests/brush.rs` (10 tests, FL-022, no window):
   - the preview at every point of the lattice, for every brush with and without a material, at fit, zoomed 2.75
     and across the seams, is `Preview::Stroke` of exactly `stroke`'s stroke there, a cell's region holding the
@@ -543,7 +559,11 @@ presentation state, not scientific state.
     dead ancestor not written dead, the panel's count of more leaving out those beyond the path, and three
     ancestors named (`tests/overlay.rs`); and the record dropping `beyond` or naming the path farthest first
     (`src/main.rs`). With the engine's, 23 of 23.
-- `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
+  - Planted bugs in the weight dump (FL-021), each caught: W making no move (`tests/controls.rs`,
+    `tests/offscreen.rs`), the host never offering the dump (`tests/offscreen.rs`), the session thread answering
+    no controller or dropping the shown tick (`tests/inspect.rs`), the record's tick the shown one and its layers
+    reversed (`src/main.rs`), and the CLI's layout naming fan-in as fan-out (`flife-cli`'s `tests/inspect.rs` and
+    `src/main.rs`). With the runtime's, 10 of 10.- `tests/admission.rs` builds its views as `Studio::open` does, with the overlay. The overlay adds exactly its view
   terms to the observers: 139.4 MiB at 3840 x 2160, which leaves the backend 114.3 MiB of the 2 GiB budget (95.5
   with the preset's bloom). Most of it is the frame preparation each of the HUD's triangles is charged, twice: the
   overlay was 32.5 MiB (backend 222.1 MiB) at caps of 15,360, 71.5 MiB (183.1) at 33,792 with the persistent
@@ -633,13 +653,16 @@ presentation state, not scientific state.
     evaluations, a unit stepped only above 1,024, three figures only from 1,000, capacity pauses never counted, and
     a run's end that does not pause the overlay: all twelve caught (the capacity pause count after the crowded run
     was added, the first run's one survivor).
-- `src/main.rs` unit tests (8, FL-022, FL-024, FL-023, FL-021): an `inspected` record of a watched organism of
+- `src/main.rs` unit tests (9, FL-022, FL-024, FL-023, FL-021): an `inspected` record of a watched organism of
   the preset two ticks in carries its sensed tick, scale and evaluation, its 104 inputs, three raw planes and 33
   gradients, and its activations' tick and layers, each value bit for bit, and its two steps' transactions: their
   ticks, each sum as written out over the two records, bit for bit, and the newest step's reproduction outcome,
   and null `descendants` in a world that traces none; in a traced world a founder's record counts from tick 0
   with nothing born, and a record of descendants with three ancestors on the path and two beyond is exactly its
-  counts and every ancestor in path order, dead or alive, with `beyond`; the parser takes `--timeline FILE` (offscreen too) and
+  counts and every ancestor in path order, dead or alive, with `beyond`; a `weights` record of a preset
+  organism names it, the shown and read ticks, its genome, topology and parameter count, and every weight and
+  bias at its place in its layer, bit for bit, and a gone organism's is exactly its identity and ticks with null
+  `tick` and `controller`; the parser takes `--timeline FILE` (offscreen too) and
   `--export FILE --out DIR` with or without `--export-fps`, and refuses `--export` without `--out`, `--out` or
   `--export-fps` alone, `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never
   opens a Studio; it takes `--offscreen 2.5` (2 pixels a point by default),
@@ -773,7 +796,9 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   host's send on a click runs offscreen in `tests/offscreen.rs`, where a posted click's inspection answers with
   descendants counted from tick 0, and an inspection refreshed while the world runs carries what it sensed, its
   activations and its transactions up to the answer's tick, the newest closing at its energy, and its descendants
-  still counted from tick 0, none more alive than born. The binary's own refresh once a second
+  still counted from tick 0, none more alive than born; a posted W then dumps that organism's controller, read
+  while the world runs at a tick of 8 or later, its layers laying out all its parameters. The binary's own
+  refresh once a second
   (`Studio::inspect_selected`), the panel's drawing and the record's printing run only in a window, which no test
   here opened; `overlay_text` and the session thread's answers are tested without one. While the world runs,
   the snapshot is read at the session's committed boundary when the inspection is answered, usually later than the
@@ -795,8 +820,12 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   its world, so it traces from tick 0; a world traced later (`since`) is the engine's case, tested in
   `flife-engine`'s `tests/ancestry.rs`, and the panel's `since tick` line in `tests/overlay.rs`. Ancestry is
   observer state: no digest, checkpoint or report carries it, and the engine's tests show a traced world's reports
-  and digests equal an untraced one's. A weight dump is `flife inspect --weights` on a run directory: the Studio
-  has no key for one.
+  and digests equal an untraced one's. W dumps the selected organism's whole controller at the session's committed
+  boundary as a `weights` record, the layout `flife inspect --weights` writes for a run directory; the window shows
+  no sign of it (only the record does), and with nothing selected W does nothing. The dump's copy (at most the
+  genome catalog's largest controller, 29,316 parameters, about 115 KiB of `f32`) and its written record are not in the memory
+  admission: they fall within its reserve. The record's printing runs only in a window, which no test here
+  opened; the host's offer and the session thread's answer run offscreen and headless.
 - FL-022's brushes:
   - The host's brush path (the click through the frame's view to `Intent::Intervene`) runs offscreen in
     `tests/offscreen.rs` for all four brushes as far as the submitted stroke, and for the energy and material

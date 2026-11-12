@@ -29,7 +29,7 @@ use std::path::Path;
 use flife_core::CoreError;
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::OrganismId;
-use flife_engine::{NumericalProfile, World};
+use flife_engine::{ControllerWeights, NumericalProfile, World};
 use flife_store::{ChunkStore, Durability};
 use serde::Serialize;
 
@@ -242,35 +242,49 @@ fn weights(world: &World, id: u64) -> Result<InspectedWeights, CoreError> {
                 world.tick().get()
             ))
         })?;
-    let mut layers = Vec::with_capacity(dump.layers.len());
-    for (index, shape) in dump.layers.iter().enumerate() {
-        let missing = || {
-            conflict(format!(
-                "organism {id}'s layer {index} is not in its parameters"
-            ))
-        };
-        let (weights, biases) = dump.layer(index).ok_or_else(missing)?;
-        if shape.inputs == 0 {
-            return Err(missing());
+    InspectedWeights::of(&dump)
+}
+
+impl InspectedWeights {
+    /// The record of `dump`, its parameters laid out by layer: what
+    /// `flife inspect --weights` writes, and the Studio's weight dump
+    /// (FL-021) too.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when a layer's shape does not lay out
+    /// the parameters, which a dump from [`World::organism_weights`] never
+    /// has.
+    pub fn of(dump: &ControllerWeights) -> Result<Self, CoreError> {
+        let id = dump.organism.get();
+        let mut layers = Vec::with_capacity(dump.layers.len());
+        for (index, shape) in dump.layers.iter().enumerate() {
+            let missing = || CoreError::StateConflict {
+                operation: "dump organism weights",
+                detail: format!("organism {id}'s layer {index} is not in its parameters"),
+            };
+            let (weights, biases) = dump.layer(index).ok_or_else(missing)?;
+            if shape.inputs == 0 {
+                return Err(missing());
+            }
+            layers.push(InspectedLayer {
+                inputs: shape.inputs,
+                outputs: shape.outputs,
+                weights: weights
+                    .chunks_exact(shape.inputs)
+                    .map(<[f32]>::to_vec)
+                    .collect(),
+                biases: biases.to_vec(),
+            });
         }
-        layers.push(InspectedLayer {
-            inputs: shape.inputs,
-            outputs: shape.outputs,
-            weights: weights
-                .chunks_exact(shape.inputs)
-                .map(<[f32]>::to_vec)
-                .collect(),
-            biases: biases.to_vec(),
-        });
+        Ok(Self {
+            record: "weights",
+            id,
+            genome: dump.genome.get(),
+            topology: dump.topology,
+            parameters: dump.parameters.len(),
+            layers,
+        })
     }
-    Ok(InspectedWeights {
-        record: "weights",
-        id,
-        genome: dump.genome.get(),
-        topology: dump.topology,
-        parameters: dump.parameters.len(),
-        layers,
-    })
 }
 
 /// The records of committed `world`, restored from `checkpoint`.

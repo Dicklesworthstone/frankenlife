@@ -1,8 +1,9 @@
 //! FL-021 evidence (plan §14.2): the Studio's session thread answers an
 //! inspection intent with the organism at the session's committed boundary,
 //! the snapshot a world stepped directly to that tick gives, and keeps the
-//! tick it was selected at beside it. Inspecting changes nothing the session
-//! commits.
+//! tick it was selected at beside it, and a weight dump intent with the
+//! organism's whole controller there. Inspecting and dumping change nothing
+//! the session commits.
 //!
 //! No window opens: the session thread is driven through its intent lane,
 //! as the Studio host drives it after a selection.
@@ -17,7 +18,9 @@ use std::time::{Duration, Instant};
 
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{Arrangement, NumericalProfile, OrganismSnapshot, Stepped, World};
+use flife_engine::{
+    Arrangement, ControllerWeights, NumericalProfile, OrganismSnapshot, Stepped, World,
+};
 use flife_studio::{Intent, SessionThread, Status};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -231,4 +234,65 @@ fn a_running_studio_session_answers_inspections_between_ticks() {
             );
         }
     }
+}
+
+/// FL-021 (plan §14.2's on-demand weight dump): paused at tick 4, every
+/// dump intent is answered with the direct world's whole controller at
+/// tick 4, the shown tick comes back unchanged, an unknown organism has
+/// none, and dumping changes nothing the session commits.
+#[test]
+fn a_paused_studio_session_dumps_weights_at_its_boundary() {
+    let config = small();
+    let mut direct = found(&config);
+    for _ in 0..4 {
+        step(&mut direct);
+    }
+    let session = spawn(&config);
+    for _ in 0..4 {
+        session.send(Intent::Step).expect("offered");
+    }
+    gather(&session, |statuses| {
+        statuses.contains(&Status::Stepped { tick: Tick::new(4) })
+    });
+    let mut asked: Vec<OrganismId> = direct.population().ids().take(6).collect();
+    asked.push(UNKNOWN);
+    let seen = Tick::new(3);
+    for &organism in &asked {
+        session
+            .send(Intent::DumpWeights { organism, seen })
+            .expect("offered");
+    }
+    let dumps = |statuses: &[Status]| -> Vec<(OrganismId, Tick, Option<ControllerWeights>)> {
+        statuses
+            .iter()
+            .filter_map(|status| match status {
+                Status::Weights {
+                    organism,
+                    seen,
+                    weights,
+                } => Some((*organism, *seen, weights.as_deref().cloned())),
+                _ => None,
+            })
+            .collect()
+    };
+    let answered = dumps(&gather(&session, |statuses| {
+        dumps(statuses).len() == asked.len()
+    }));
+    for ((organism, at, dump), asked) in answered.iter().zip(&asked) {
+        assert_eq!(organism, asked);
+        assert_eq!(*at, seen);
+        assert_eq!(
+            *dump,
+            direct.organism_weights(*asked).expect("dumps"),
+            "{asked:?}"
+        );
+    }
+    assert!(answered[..6].iter().all(|(_, _, dump)| {
+        dump.as_ref()
+            .is_some_and(|dump| dump.tick == Tick::new(4) && !dump.parameters.is_empty())
+    }));
+    assert_eq!(answered[6].2, None);
+    let closed = session.close().expect("closes");
+    assert_eq!(closed.boundary.tick, Tick::new(4));
+    assert_eq!(closed.world.digest(), direct.digest());
 }

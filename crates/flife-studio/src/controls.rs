@@ -144,6 +144,10 @@ pub enum CameraMove {
         /// The brush armed then.
         brush: Brush,
     },
+    /// Dump the selected organism's whole controller (FL-021, plan §14.2's
+    /// on-demand weight dump): the presentation owner asks the session for
+    /// whatever is selected when it takes the move.
+    Weights,
 }
 
 /// What the presentation owner asks of the session.
@@ -167,6 +171,16 @@ pub enum Intent {
         organism: OrganismId,
         /// The source tick of the epoch it was selected on. A running
         /// session's committed boundary can be past it.
+        seen: Tick,
+    },
+    /// Dump an organism's whole controller (FL-021, plan §14.2): its
+    /// genome's parameters at the session's committed boundary. The
+    /// presentation owner sends this for the selected organism on a
+    /// [`CameraMove::Weights`].
+    DumpWeights {
+        /// The selected organism.
+        organism: OrganismId,
+        /// The source tick of the epoch it was shown on.
         seen: Tick,
     },
     /// Apply a brush's stroke (FL-022): submitted as a command for the next
@@ -323,6 +337,10 @@ impl Controls {
                     }
                     KEY_I => {
                         self.arm(Brush::Introduction);
+                        None
+                    }
+                    KEY_W => {
+                        self.push(CameraMove::Weights);
                         None
                     }
                     code => {

@@ -906,8 +906,8 @@ velocity, first-order splitting at the configured fixed timestep.
   resumed or branched world traced again starts from its live population, and an organism whose parent died
   before then starts a line of its own. Only the Studio traces; `flife run` and `flife inspect` do not. The path
   leaves out dead ancestors through which a single living line passes, and names no ancestor's identity once it
-  is dropped. A weight dump is on demand (`World::organism_weights`, through `flife inspect --weights`); the
-  session and the Studio do not ask for one yet.
+  is dropped. A weight dump is on demand (`World::organism_weights`), through `flife inspect --weights`, a
+  session's `SessionHandle::organism_weights` and the Studio's W key.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
   disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
   brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a

@@ -1,7 +1,8 @@
 //! FL-021 evidence (plan §14.2, §21.2 INV-09): a session inspects one
 //! organism at its committed boundary, paused, running or closing, and the
-//! answer is the snapshot a world stepped directly to that tick gives.
-//! Inspecting changes nothing the session commits.
+//! answer is the snapshot a world stepped directly to that tick gives; it
+//! dumps one organism's whole controller the same way. Inspecting and
+//! dumping change nothing the session commits.
 //!
 //! The owner and its clients run as separate tasks in Asupersync's Lab, so
 //! each seed is one reproducible interleaving.
@@ -15,7 +16,7 @@ use asupersync::runtime::yield_now;
 use common::{Client, cx, ecology, found, lab, publish, reference};
 use flife_core::ids::OrganismId;
 use flife_core::{CoreError, Tick};
-use flife_engine::{OrganismSnapshot, World};
+use flife_engine::{ControllerWeights, OrganismSnapshot, World};
 use flife_runtime::{Boundary, RunEnd};
 
 /// An identity no world here holds.
@@ -282,4 +283,203 @@ fn a_session_watches_the_organism_it_inspected() {
         assert_eq!(results.remove(0), Some(expected), "seed {seed}");
         assert_eq!(closed.world.digest(), direct.digest(), "seed {seed}");
     }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn weights(world: &World, id: OrganismId) -> Option<ControllerWeights> {
+    world.organism_weights(id).expect("dumps")
+}
+
+/// FL-021 (plan §14.2's on-demand weight dump): paused at tick 6, the
+/// session dumps every live organism's whole controller as the direct
+/// world does at tick 6, and none for an unknown identity. A dump watches
+/// nothing: the organism dumped last, inspected for the first time three
+/// steps later, has neither what it sensed nor activations. The session
+/// commits what a session never asked commits.
+#[test]
+fn a_paused_session_dumps_an_organisms_weights_at_its_boundary() {
+    let config = ecology(&[]);
+    let direct = reference(&config, 6, &[]);
+    let expected: Vec<(OrganismId, ControllerWeights)> = direct
+        .population()
+        .ids()
+        .filter_map(|id| weights(&direct, id).map(|dump| (id, dump)))
+        .collect();
+    assert!(expected.len() >= 40, "{}", expected.len());
+    assert!(expected.iter().all(|(_, dump)| !dump.parameters.is_empty()));
+    let end = reference(&config, 9, &[]);
+    let survivor = expected
+        .iter()
+        .map(|(id, _)| *id)
+        .find(|id| end.population().get(*id).is_some())
+        .expect("an organism lives to tick 9");
+    for seed in 0..4 {
+        let expected = expected.clone();
+        let (mut results, closed) = lab(seed, &config, |handle| {
+            vec![Box::pin(async move {
+                let cx = cx();
+                for _ in 0..6 {
+                    handle.step(&cx).await.expect("step");
+                }
+                for (id, dump) in &expected {
+                    let answer = handle.organism_weights(&cx, *id).await.expect("dumps");
+                    assert_eq!(answer.as_ref(), Some(dump), "organism {id:?}");
+                    assert_eq!(answer.map(|dump| dump.tick), Some(Tick::new(6)));
+                }
+                assert_eq!(
+                    handle.organism_weights(&cx, UNKNOWN).await.expect("dumps"),
+                    None
+                );
+                // The survivor dumped again, last.
+                let again = handle.organism_weights(&cx, survivor).await.expect("dumps");
+                assert_eq!(again.map(|dump| dump.organism), Some(survivor));
+                for _ in 0..3 {
+                    handle.step(&cx).await.expect("step");
+                }
+                let first = handle
+                    .inspect_organism(&cx, survivor)
+                    .await
+                    .expect("inspects");
+                handle.close(&cx).await.expect("close");
+                first
+            }) as Client<Option<OrganismSnapshot>>]
+        });
+        let first = results.remove(0).expect("it lives");
+        assert_eq!(
+            (first.sensed, first.activations),
+            (None, None),
+            "seed {seed}: the dump watched it"
+        );
+        assert_eq!(closed.boundary.tick, Tick::new(9));
+        assert_eq!(closed.world.digest(), end.digest(), "seed {seed}");
+    }
+}
+
+/// While a bounded run is going, every weight dump is answered between
+/// ticks, as the direct world dumps it at the dump's own tick. A dump and a
+/// close that reach a second run together are answered at the closed
+/// boundary, the dump as the session shuts down when the run's step
+/// deferred it, and a closed session refuses the next dump.
+#[test]
+fn a_running_or_closing_session_dumps_weights_between_ticks() {
+    const UNTIL: u64 = 24;
+    const LATER: u64 = 48;
+    let config = ecology(&[]);
+    let founders: Vec<OrganismId> = found(&config).population().ids().collect();
+    // A founder alive at every tick the second run can close at, and the
+    // direct world's digest at each of those ticks.
+    let mut direct = found(&config);
+    let mut alive = founders.clone();
+    let mut digests = vec![direct.digest()];
+    while direct.tick() < Tick::new(LATER) {
+        publish(&mut direct, &[]);
+        alive.retain(|id| direct.population().get(*id).is_some());
+        digests.push(direct.digest());
+    }
+    let survivor = *alive.first().expect("a founder lives through both runs");
+    let mut answered: Vec<ControllerWeights> = Vec::new();
+    for seed in 0..6 {
+        let founders = founders.clone();
+        let (mut results, closed) = lab(seed, &config, |handle| {
+            vec![Box::pin(async move {
+                let cx = cx();
+                let running = handle
+                    .start(&cx, Some(Tick::new(UNTIL)))
+                    .await
+                    .expect("start");
+                let mut dumps = Vec::new();
+                for id in founders.iter().cycle() {
+                    if let Some(dump) = handle.organism_weights(&cx, *id).await.expect("dumps") {
+                        assert_eq!(dump.organism, *id);
+                        dumps.push(dump);
+                    }
+                    if !handle.inspect(&cx).await.expect("inspect").running {
+                        break;
+                    }
+                }
+                let RunEnd::Reached(reached) = running.ended(&cx).await.expect("end") else {
+                    panic!("the run did not reach its tick");
+                };
+                assert_eq!(reached.tick, Tick::new(UNTIL));
+                handle
+                    .start(&cx, Some(Tick::new(LATER)))
+                    .await
+                    .expect("start");
+                while !handle.inspect(&cx).await.expect("inspect").running {
+                    yield_now().await;
+                }
+                for _ in 0..(2 * seed) {
+                    yield_now().await;
+                }
+                // Both requests are queued before the owner runs.
+                let closer = handle.clone();
+                let mut dump = std::pin::pin!(handle.organism_weights(&cx, survivor));
+                let mut close = std::pin::pin!(closer.close(&cx));
+                let (mut dumped, mut boundary) = (None, None);
+                std::future::poll_fn(|context| {
+                    if dumped.is_none()
+                        && let Poll::Ready(answer) = dump.as_mut().poll(context)
+                    {
+                        dumped = Some(answer);
+                    }
+                    if boundary.is_none()
+                        && let Poll::Ready(answer) = close.as_mut().poll(context)
+                    {
+                        boundary = Some(answer);
+                    }
+                    if dumped.is_some() && boundary.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                let refused = handle.organism_weights(&cx, survivor).await;
+                assert!(refused.is_err(), "{refused:?}");
+                let boundary = boundary.expect("answered").expect("closed");
+                let last = dumped
+                    .expect("answered")
+                    .expect("dumps")
+                    .expect("it lives at the close");
+                assert_eq!(last.tick, boundary.tick);
+                dumps.push(last);
+                dumps
+            }) as Client<Vec<ControllerWeights>>]
+        });
+        let tick = closed.boundary.tick;
+        assert!(
+            Tick::new(UNTIL) <= tick && tick <= Tick::new(LATER),
+            "seed {seed}: {tick:?}"
+        );
+        assert_eq!(
+            closed.world.digest(),
+            digests[usize::try_from(tick.get()).expect("small")],
+            "seed {seed}"
+        );
+        answered.extend(results.remove(0));
+    }
+    // Every dump against the direct world at its own tick.
+    answered.sort_by_key(|dump| dump.tick);
+    let mut direct = found(&config);
+    for answer in &answered {
+        while direct.tick() < answer.tick {
+            publish(&mut direct, &[]);
+        }
+        assert_eq!(
+            weights(&direct, answer.organism).as_ref(),
+            Some(answer),
+            "tick {:?}",
+            answer.tick
+        );
+    }
+    let ticks: std::collections::BTreeSet<Tick> = answered.iter().map(|dump| dump.tick).collect();
+    assert!(
+        ticks
+            .iter()
+            .any(|tick| Tick::new(0) < *tick && *tick < Tick::new(UNTIL)),
+        "answered only at {ticks:?}"
+    );
 }

@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use flife_backend_metal::ControllerChoice;
-use flife_cli::CheckpointAdmission;
+use flife_cli::{CheckpointAdmission, InspectedLayer, InspectedWeights};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{OrganismSnapshot, ReproductionOutcome};
@@ -412,6 +412,18 @@ enum Record<'a> {
         /// Boxed: an inspection is the largest record by far.
         snapshot: Option<Box<Inspection>>,
     },
+    /// A weight dump's answer (FL-021, plan §14.2): the organism's whole
+    /// controller, laid out as `flife inspect --weights` writes it.
+    Weights {
+        schema: &'static str,
+        organism: u64,
+        seen_tick: u64,
+        /// The committed boundary it was read at; absent when the committed
+        /// world no longer holds it.
+        tick: Option<u64>,
+        /// Boxed: its parameters, a few hundred kilobytes written out.
+        controller: Option<Box<ControllerRecord>>,
+    },
     /// The clocks over the last window (plan §12.2).
     Clock {
         schema: &'static str,
@@ -606,6 +618,19 @@ struct Inspection {
     transactions: Option<TransactionsRecord>,
     /// Its descendants and the ancestors its line passes through.
     descendants: Option<DescendantsRecord>,
+}
+
+/// An organism's whole controller (FL-021, plan §14.2's on-demand weight
+/// dump): `flife inspect --weights`'s record but for the organism, which
+/// the `weights` record names.
+#[derive(Serialize)]
+struct ControllerRecord {
+    genome: u64,
+    topology: usize,
+    parameters: usize,
+    /// In evaluation order, each `weights[out][in]` and `biases[out]` as
+    /// stored.
+    layers: Vec<InspectedLayer>,
 }
 
 /// An organism's descendants (FL-021, plan §14.2's Descendants): births
@@ -1277,6 +1302,38 @@ fn status_record(status: &Status) -> Record<'static> {
                 .as_deref()
                 .map(|snapshot| Box::new(inspection(snapshot))),
         },
+        Status::Weights {
+            organism,
+            seen,
+            weights,
+        } => {
+            let tick = weights.as_ref().map(|weights| weights.tick.get());
+            match weights.as_deref().map(InspectedWeights::of).transpose() {
+                Ok(controller) => Record::Weights {
+                    schema: STUDIO_SCHEMA,
+                    organism: organism.get(),
+                    seen_tick: seen.get(),
+                    tick,
+                    controller: controller.map(|controller| {
+                        Box::new(ControllerRecord {
+                            genome: controller.genome,
+                            topology: controller.topology,
+                            parameters: controller.parameters,
+                            layers: controller.layers,
+                        })
+                    }),
+                },
+                // Layers that do not lay out the parameters, which a dump
+                // from the world never has.
+                Err(error) => record(
+                    "refused",
+                    None,
+                    tick,
+                    Some(error.kind()),
+                    Some(error.to_string()),
+                ),
+            }
+        }
     }
 }
 
@@ -2007,6 +2064,94 @@ mod tests {
                      "born": 3_066, "living": 1_022},
                 ],
                 "beyond": 5,
+            })
+        );
+    }
+
+    /// FL-021's on-demand weight dump: the `weights` record names the
+    /// organism, the shown and read ticks, and its whole controller laid
+    /// out as `flife inspect --weights` lays it out, every parameter bit for
+    /// bit; a gone organism's has neither a tick nor a controller.
+    #[test]
+    fn weights_records_carry_every_parameter_by_layer() {
+        use flife_core::ids::OrganismId;
+        let config = flife_core::ValidatedConfig::from_toml(include_str!(
+            "../../../presets/reference-small-world.toml"
+        ))
+        .expect("the preset");
+        let world = flife_engine::World::found(
+            &config,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("the profile"),
+        )
+        .expect("founds");
+        let id = world.population().ids().nth(3).expect("an organism");
+        let dump = world
+            .organism_weights(id)
+            .expect("dumps")
+            .expect("it lives");
+        let record = line(&Status::Weights {
+            organism: id,
+            seen: Tick::new(3),
+            weights: Some(Box::new(dump.clone())),
+        });
+        assert_eq!(record["record"], "weights");
+        assert_eq!(record["organism"], id.get());
+        assert_eq!(record["seen_tick"], 3);
+        assert_eq!(record["tick"], dump.tick.get());
+        let controller = &record["controller"];
+        assert_eq!(controller["genome"], dump.genome.get());
+        assert_eq!(controller["topology"], dump.topology);
+        assert_eq!(controller["parameters"], dump.parameters.len());
+        let layers = controller["layers"].as_array().expect("layers");
+        assert_eq!(layers.len(), dump.layers.len());
+        let mut seen = 0;
+        for (layer, shape) in layers.iter().zip(&dump.layers) {
+            assert_eq!(layer["inputs"], shape.inputs);
+            assert_eq!(layer["outputs"], shape.outputs);
+            let value = |value: &Value| value.as_f64().expect("a number") as f32;
+            for output in 0..shape.outputs {
+                for input in 0..shape.inputs {
+                    let at = shape.weight(output, input).expect("in the layer");
+                    assert_eq!(
+                        value(&layer["weights"][output][input]).to_bits(),
+                        dump.parameters[at].to_bits(),
+                        "weight [{output}][{input}]"
+                    );
+                    seen += 1;
+                }
+                let at = shape.bias(output).expect("in the layer");
+                assert_eq!(
+                    value(&layer["biases"][output]).to_bits(),
+                    dump.parameters[at].to_bits(),
+                    "bias [{output}]"
+                );
+                seen += 1;
+            }
+            assert_eq!(
+                layer["weights"].as_array().map(Vec::len),
+                Some(shape.outputs)
+            );
+            assert_eq!(
+                layer["biases"].as_array().map(Vec::len),
+                Some(shape.outputs)
+            );
+        }
+        assert_eq!(seen, dump.parameters.len());
+        let gone = line(&Status::Weights {
+            organism: OrganismId::new(1 << 40),
+            seen: Tick::new(3),
+            weights: None,
+        });
+        assert_eq!(
+            gone,
+            json!({
+                "record": "weights",
+                "schema": super::STUDIO_SCHEMA,
+                "organism": 1_u64 << 40,
+                "seen_tick": 3,
+                "tick": null,
+                "controller": null,
             })
         );
     }

@@ -13,7 +13,9 @@
 //!    was at that click, among the shown epoch's organisms (FL-020); a
 //!    pick that selects an organism offers the session an
 //!    [`Intent::Inspect`] for it (FL-021), answered later as a
-//!    [`Status::Inspected`];
+//!    [`Status::Inspected`], and the W key offers an
+//!    [`Intent::DumpWeights`] for whatever is then selected, answered as a
+//!    [`Status::Weights`];
 //! 5. leases the newest render epoch, if newer than the one shown, and
 //!    shows it one committed state late: its organisms move from where the
 //!    previous epoch had them, over about the interval at which epochs
@@ -682,6 +684,7 @@ impl Studio {
         let mut viewport = *self.view.viewport();
         let mut picked = None;
         let mut strokes = Vec::new();
+        let mut weights = false;
         let supplies = self.supplies();
         for change in self.controls.take_moves() {
             match change {
@@ -728,6 +731,7 @@ impl Studio {
                         None => self.tally.unstroked += 1,
                     }
                 }
+                CameraMove::Weights => weights = true,
             }
         }
         let moved = self.view.set_view(viewport)?;
@@ -769,6 +773,23 @@ impl Studio {
                 .map_or_else(|| self.current.tick(), |shown| shown.tick);
             let intent = Intent::Intervene { stroke, seen };
             self.tally.strokes += 1;
+            if self.session.send(intent).is_ok() {
+                intents += 1;
+                self.tally.intents += 1;
+            } else {
+                refused += 1;
+                self.tally.refused += 1;
+                self.controls.refused(intent);
+            }
+        }
+        // A weight dump (FL-021) of whatever is selected once the frame's
+        // moves are taken; with nothing selected, none.
+        if weights && let (Some(organism), Some(shown)) = (self.view.selected(), self.view.shown())
+        {
+            let intent = Intent::DumpWeights {
+                organism,
+                seen: shown.tick,
+            };
             if self.session.send(intent).is_ok() {
                 intents += 1;
                 self.tally.intents += 1;

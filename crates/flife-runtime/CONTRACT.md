@@ -62,6 +62,10 @@ inherits every command and outcome, records the fork, and from then on admits on
   what it sensed, its newest evaluation's activations and the transactions of its steps since; a world watches the
   organism most recently inspected.
   A closing owner answers without moving the watch.
+- FL-021: `SessionHandle::organism_weights(id)` (plan §14.2's on-demand weight dump): the committed world's
+  `World::organism_weights(id)`, a `ControllerWeights` whose `tick` is the boundary it was read at, or `None` when
+  the committed world does not hold the organism. It copies that one genome's parameters, watches nothing and
+  changes no result; a running owner answers between ticks, and a closing one at the closed boundary.
 - `SessionClosed`: the committed world, the book (closed, or for a suspended session with its unfinished commands
   still pending), the final boundary and the render counters.
 - FL-036, for a journaled session:
@@ -298,8 +302,8 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
   - dropping every handle, while paused and while running (the latter within a 2,000-step Lab bound, so an owner
     that ignores the dropped handles fails quickly instead of hanging);
   - the same protocol on the native current-thread runtime.
-- `tests/inspect.rs` (4 tests, FL-021), Lab seeds, each answer compared with the snapshot of a world stepped
-  directly to the answer's tick:
+- `tests/inspect.rs` (6 tests, FL-021), Lab seeds, each answer compared with the snapshot or weight dump of a world
+  stepped directly to the answer's tick:
   - paused at tick 6, over four seeds: every live organism's answer, at tick 6; an unknown identity, none; the
     boundary unmoved, and the closed world the direct one;
   - during a run to tick 24, over four seeds: founders inspected one after another, each answer the direct
@@ -309,7 +313,19 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     with the direct snapshot of an organism alive throughout; the next inspection is refused;
   - paused at tick 6, over four seeds: an organism's first inspection records nothing, and after three steps its
     next is exactly the snapshot of a direct world that watched it from tick 6, observation and activations
-    included; the closed world is that world.
+    included; the closed world is that world;
+  - weight dumps paused at tick 6, over four seeds: every live organism's dump the direct world's at tick 6, an
+    unknown identity none; a survivor dumped last and first inspected three steps later has neither what it
+    sensed nor activations (a dump watches nothing); the closed world at tick 9 the direct one;
+  - weight dumps during a run to tick 24 and then a second run, over six seeds: founders dumped one after another,
+    each the direct dump at its own tick, some strictly between the run's start and end; a dump and a close sent
+    in the same poll while the second run goes, the dump answered at the closed boundary for a founder alive
+    throughout (when the run's step deferred it, by the closing owner as it shuts down); the next dump refused;
+    the closed world the direct one at its tick.
+- Planted bugs in the weight dumps (FL-021), each caught: a running owner, or a closing one, answering none, and
+  a dump that watches its organism (with the CLI's and the Studio's, 10 of 10). The closing owner's answer
+  survived until the test sent its dump and close while a run was going: an idle owner answers the dump before
+  it shuts down.
 - `tests/observation.rs` (3 tests, FL-017), each world compared with one stepped directly with no session and no
   feed:
   - G3 over three Lab seeds. A viewer retaining two epochs makes boundaries 3–48 busy while the feed keeps tick 2

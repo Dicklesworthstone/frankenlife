@@ -700,6 +700,37 @@ static d64 d_rem_euclid(d64 a, d64 b) {
     return d_lt(r, 0ul) ? d_add(r, b & ~D_SIGN) : r;
 }
 
+// `f64::floor`: integral values (and the zeros) are their own floors; a
+// negative fraction rounds its magnitude up, carrying into the exponent.
+static d64 d_floor(d64 a) {
+    int e = d_exp(a) - 1023;
+    if (e >= 52) {
+        return a;
+    }
+    if (e < 0) {
+        if ((a << 1) == 0ul) {
+            return a;
+        }
+        return d_sign(a) ? (D_SIGN | ONE) : 0ul;
+    }
+    ulong mask = D_FRAC >> uint(e);
+    if ((a & mask) == 0ul) {
+        return a;
+    }
+    return d_sign(a) ? ((a & ~mask) + mask + 1ul) : (a & ~mask);
+}
+
+// `as i64` of an integral value below 2^62 in magnitude.
+static long d_to_long(d64 a) {
+    int e = d_exp(a) - 1023;
+    if (e < 0) {
+        return 0;
+    }
+    ulong m = d_frac(a) | D_HIDDEN;
+    long v = long(e >= 52 ? (m << uint(e - 52)) : (m >> uint(52 - e)));
+    return d_sign(a) ? -v : v;
+}
+
 // flife-field's wrap_coordinate for a finite coordinate and a finite
 // positive length: the Euclidean remainder, and +0 for one that rounds up
 // to the length or is zero.

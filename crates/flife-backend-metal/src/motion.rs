@@ -1,5 +1,5 @@
 //! FL-032 (`flife-kf8`), second stage: phase 6's maintenance and motion on
-//! Metal (plan §5.4, §8.2, §10.7). [`MetalMotion::settle`] runs, one thread
+//! Metal (plan §5.4, §5.6, §8.2, §10.7). [`MetalMotion::settle`] runs, one thread
 //! per organism, the stretch of flife-engine's reference that follows
 //! chemistry:
 //! - the exhaustion check after chemistry;

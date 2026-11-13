@@ -37,6 +37,7 @@ use flife_neural::{
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 pub mod chemistry;
+pub mod emission;
 pub mod field;
 pub mod motion;
 pub mod owner;
@@ -47,6 +48,7 @@ pub use chemistry::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, MetalChemistry,
     SETTLE_OPS_WORDS,
 };
+pub use emission::{EMISSION_OPS_WORDS, EmissionOrganism, EmissionOutcome, MetalEmission};
 pub use field::MetalField;
 /// The memory a controller backend may hold (FL-043), for composition
 /// roots that make one through [`ControllerChoice::backend`].

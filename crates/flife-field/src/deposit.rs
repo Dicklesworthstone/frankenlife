@@ -276,6 +276,26 @@ impl Deposits {
         self.applied
     }
 
+    /// Staged deposit `index`'s organism, payment and offer, in staging
+    /// order. A device's emission is compared with these (FL-032).
+    #[must_use]
+    pub fn entry(&self, index: usize) -> Option<(OrganismId, f64, f64)> {
+        self.entries
+            .get(index)
+            .map(|entry| (entry.organism, entry.paid, entry.offered))
+    }
+
+    /// Staged deposit `index`'s packets, `(cell, amount)`, in staging order;
+    /// none for an index past the staged deposits.
+    pub fn entry_packets(&self, index: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let packets = self
+            .entries
+            .get(index)
+            .and_then(|entry| self.packets.get(entry.first..entry.first + entry.count))
+            .unwrap_or_default();
+        packets.iter().map(|packet| (packet.cell, packet.amount))
+    }
+
     /// Stage `organism`'s deposit. It paid `paid` and offers `offered ≤ paid`
     /// to the cells of its footprint at `position` (wrapped onto the torus),
     /// with chemical `direction`, `||direction||₂ ≤ 1`.

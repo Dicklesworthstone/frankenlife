@@ -49,11 +49,18 @@ each packet's cell and grant), because a backend does not depend on the engine (
 FL-032, second stage: phase 6's maintenance and motion on Metal, in `motion`. `MetalMotion::settle` runs what
 flife-engine's `settle_stages` runs after chemistry, from the exhaustion check after chemistry to the one after
 motion: `MaintenanceCosts::bill`, `MaintenanceBill::settle`, `uptake_ratio`, `MotionResponse::new`, and `Motion`'s
-`acceleration`, `propose`, `settle` and `displace` (plan §5.4, §8.2, §10.7). It takes plain data too: the run's
+`acceleration`, `propose`, `settle` and `displace` (plan §5.4, §5.6, §8.2, §10.7). It takes plain data too: the run's
 constants, and each organism's budget after chemistry, controller evaluation and parameter count, sensing scale,
 absorbed uptake, velocity, position, motion response and sensor gradients.
 
-Neither stage is wired into the engine yet: no port takes them, so no world runs them. The engine port, emission,
+FL-032, third stage: phase 6's emission on Metal, in `emission`. `MetalEmission::settle` runs, for each organism
+alive after motion, `EmissionPolicy::emit` with flife-field's `Deposits::push` (its payment, offer and direction
+checks, `ExchangeStencil::at` and the deposit split) and the budget's payment, then the exhaustion check after
+emission (plan §5.5, §8.2, §10.7). It returns each deposit's packets, cell and amount in stencil order, for the
+caller to stage in identity order. flife-field's `Deposits` gains `entry` and `entry_packets`, read-only, which the
+tests compare the device with.
+
+None of the three stages is wired into the engine yet: no port takes them, so no world runs them. The engine port,
 the reproduction proposal, lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
@@ -293,7 +300,7 @@ deferred, and so is an F16 member with an odd parameter count (none in the catal
 - One command per call. The field's 33 planes, every affinity and every packet go to the device, and the outcomes
   come back.
 
-**Invariants — maintenance and motion (FL-032; §5.4, §8.2, §10.7).**
+**Invariants — maintenance and motion (FL-032; §5.4, §5.6, §8.2, §10.7).**
 - Every organism's maintenance settlement (total requested and paid, and the basal, sensor and controller shares
   paid), motion settlement (proposed and applied velocity, cost requested and paid, whether it was scaled), final
   velocity, position, balance and exhaustion, and the stage that exhausted it, are the reference's, bit for bit.
@@ -324,6 +331,27 @@ deferred, and so is an F16 member with an odd parameter count (none in the catal
   (`NumericalInvalid`).
 - An organism's balance is a budget's, never −0 (`EnergyBudget` adds `+ 0`); the device takes it as given.
 - One command per call. Every organism's state goes to the device (215 words each), and the outcomes come back.
+
+**Invariants — emission (FL-032; §5.5, §8.2, §10.7).**
+- Every organism's settlement (energy available, payment requested and paid, offer), whether it staged a deposit,
+  each packet's cell and amount in order, and its balance and exhaustion after the stage are the reference's, bit
+  for bit.
+- The device computes the reference's expressions operation for operation in software binary64:
+  - `min(f·available, available)`, nothing staged for a zero request, the offer `ρ·requested`;
+  - the direction's squared norm, folded in channel order, at most one;
+  - the stencil: the wrapped position, `x/Δx − ½` split by `floor` (`d_floor`, `d_to_long`), the four bilinear
+    weights in corner order, zero weights skipped, a cell met twice merged by adding, then sorted by cell;
+  - the split: every cell but the first of largest weight takes `offered·w`, summed with `add_up`; that cell takes
+    `max(sub_down(offered, others), 0)`; packets of zero amount are dropped;
+  - the payment through `energy`'s `+ 0`, and exhaustion.
+- Only organisms that reach emission are taken: the host refuses one whose balance is not finite and positive
+  (`StateConflict`), since the reference never calls `emit` for it. What the reference never reads (the direction
+  and position of an organism that does not emit, or whose request is zero) is never checked.
+- Refused after the command (`StateConflict`, so the reference decides): a spend fraction outside [0, 1], a payment
+  or offer the deposit refuses, a direction outside the unit ball, or a position that is not finite. Refused
+  before it: an efficiency outside [0, 1] (`NumericalInvalid`) and a grid of more than `u32::MAX` cells
+  (`Overflow`).
+- One command per call. Every organism's state goes to the device (73 words each), and the outcomes come back.
 
 **Invariants — uptake (FL-031; §5.2, §8.1, §10.7, INV-04).**
 - Every demand's amount is `demands`'s, and every packet's grant, every cell's debit (energy before and after,
@@ -613,6 +641,20 @@ A refusal changes nothing.
     with NaN everything else, and one maintenance exhausts with a NaN response and infinite gradients, whose
     outcomes are the reference's. A huge finite sensor share and a huge finite motion cost settle as the
     reference does. Constants out of range are refused before any command.
+- `tests/emission.rs` (FL-032, 3 tests), every value compared as bits:
+  - `the_emission_arithmetic_is_the_references`: 262,164 operands (random patterns, values near integers and
+    half-integers of either sign, zeros, subnormals, and 20 edges) against `f64::floor`, `as i64`, and
+    `-add_down(-a, -b)`. More than 50,000 fractional floors, 100,000 integers and 200,000 upward sums are checked.
+  - `emission_on_the_device_is_the_references`: 2,048 organisms for each of four grids (the preset's 128 × 128,
+    1 × 1, 1 × 7 and 3 × 2, with non-integer sides) and three efficiencies (the preset's 0.9, 1 and 0) against
+    `EmissionPolicy::emit` and the entry and packets it staged. Positions include zero, the last value below each
+    side, cell centres and cell edges; fractions include 0, 1 and subnormals. The draws are asserted to include
+    deaths at emission, staged deposits, deposits without packets, and deposits of one and of four packets.
+  - `emission_the_reference_refuses_is_refused`: NaN, negative and above-one fractions, a direction past the unit
+    ball, a NaN direction, and NaN and infinite positions, each beside a valid organism. Not refused, and settled
+    as the reference settles them: an organism that does not emit with a NaN position, and one with a zero
+    fraction, NaN direction and infinite position. Refused before any command: zero, negative and NaN balances,
+    and an efficiency of 1.5.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -679,6 +721,19 @@ Planted mutants, each run in a scratch copy.
     unchecked; the acceleration unclamped; the clamp skipping its shrink loop; drag not applied; the motion cost
     missing `Δt`; an unaffordable motion not scaled; the displacement using the proposed velocity; `y` wrapping
     on the width; and a motion death not recorded.
+- FL-032's emission: 16 planted against `tests/emission.rs`, 16 caught, each by a failed assertion:
+  - in `softfloat64.metal`: `floor` truncating a negative fraction, or taking a small negative to zero; the
+    integer dropping its sign;
+  - in `emission.metal`: `add_up` rounding down; a zero request still staging; the offer ignoring the efficiency;
+    a direction outside the unit ball admitted; a cell met twice not merged; the stencil not sorted; the largest
+    weight taken as the last of equals; the remainder rounded to nearest; packets of zero amount kept; the
+    payment never exhausting; the column taking the row's offset; `y` losing the half-cell offset; and the cell
+    index striding by the rows.
+
+  Four candidates were not planted, being equivalent: the request not capped at the balance (`f ≤ 1`), zero
+  weights kept (their shares are zero and dropped), the remainder not clamped at zero (the largest weight is at
+  least ¼), and the payment not capped at the balance (the request never exceeds the energy available, which is
+  the balance).
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -869,8 +924,9 @@ per-pass thread spawning (6%).
 
 **Known gaps.**
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
-  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; chemistry, maintenance and
-  motion have device kernels, `MetalChemistry` and `MetalMotion`, that no world runs yet). On many CPU workers the tick
+  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; chemistry, maintenance, motion
+  and emission have device kernels, `MetalChemistry`, `MetalMotion` and `MetalEmission`, that no world runs yet). On
+  many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype
   parity covers F32 and F16; the quantized I8 profile does not exist. The kernel

@@ -79,7 +79,8 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
   - each F64 input is rounded once to F32;
   - neuron `o` accumulates `((b_o + w_o,0 x_0) + w_o,1 x_1) + …` in F32: the bias first, then the inputs in
     ascending index, every product and sum rounded, no fused multiply-add;
-  - a hidden activation is `flife_core::numerics::tanh` of the F32 pre-activation, in F64, rounded once to F32;
+  - a hidden activation is `flife_core::numerics::tanh` of the F32 pre-activation, in F64, rounded once to F32,
+    computed as `flife_core::numerics::tanh_f32`, which gives those bits for every F32 argument;
   - the output layer is linear, so its `z` is the raw output.
 - Parameter layout: layers in evaluation order, each `weight[out][in]` row-major and then `bias[out]` (torch's
   `parameters_to_vector` order). A neuron is named by layer and index, not by packed offset (A.3 item 5).

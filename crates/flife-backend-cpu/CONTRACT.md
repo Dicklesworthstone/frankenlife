@@ -25,7 +25,8 @@ evaluates on the reference.
 - Each input is rounded once to F32.
 - Each layer is one kernel call. Output `o` is the bias, then each input's product in ascending index, in F32.
   Every product and every sum is rounded, and there is no fused multiply-add: the reference's declared order.
-- The hidden activation is `flife_core::numerics::tanh` of the F32 pre-activation in F64, rounded once to F32.
+- The hidden activation is `flife_core::numerics::tanh` of the F32 pre-activation in F64, rounded once to F32,
+  computed as the reference computes it (`flife_core::numerics::tanh_f32`).
 - The output layer is linear.
 - The CPU keeps subnormal results as the reference does, so, unlike the Metal backend, nothing is deferred for
   being small.

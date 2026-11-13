@@ -2,7 +2,9 @@
 //! distance from correctly rounded values, agreement with the platform
 //! `libm`, and the domain and symmetry each function promises.
 
-use flife_core::numerics::{exp, exp_neg, expm1_neg, ln, log2, sigmoid, sin_cos_turns, tanh};
+use flife_core::numerics::{
+    exp, exp_neg, expm1_neg, ln, log2, sigmoid, sin_cos_turns, tanh, tanh_f32,
+};
 
 /// A total order on finite `f64` in which adjacent values differ by one.
 fn ordinal(value: f64) -> i64 {
@@ -587,4 +589,97 @@ fn turn_angles_are_within_two_ulp_and_exact_at_quarter_turns() {
     for u in [1.0, -1.0e-300, 2.0, f64::NAN, f64::INFINITY] {
         assert_eq!(sin_cos_turns(u), None, "turns({u})");
     }
+}
+
+/// How one F32 argument of `tanh_f32` is reached, by its magnitude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    Zero,
+    Series,
+    Exponential,
+    Saturated,
+    Nonfinite,
+}
+
+fn route(z: f32) -> Route {
+    let a = z.abs();
+    if !a.is_finite() {
+        Route::Nonfinite
+    } else if a == 0.0 {
+        Route::Zero
+    } else if 2.0 * f64::from(a) < 1.0 / 16.0 {
+        Route::Series
+    } else if a < 20.0 {
+        Route::Exponential
+    } else {
+        Route::Saturated
+    }
+}
+
+/// `tanh_f32` is `tanh` in F64 rounded once to F32 for every one of the
+/// 2^32 F32 bit patterns: both signs, both zeros, the subnormals, the
+/// saturated range, the infinities and every NaN. The patterns are split
+/// across all cores.
+#[test]
+fn tanh_f32_is_the_reference_tanh_rounded_to_f32_for_every_f32() {
+    let threads = std::thread::available_parallelism().map_or(8, usize::from);
+    let patterns = 1_u64 << 32;
+    let length = patterns.div_ceil(threads as u64);
+    let results: Vec<([u64; 5], u64, Option<u32>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads as u64)
+            .map(|worker| {
+                scope.spawn(move || {
+                    let mut routes = [0_u64; 5];
+                    let mut wrong = 0_u64;
+                    let mut first = None;
+                    for bits in (worker * length)..((worker + 1) * length).min(patterns) {
+                        let bits = u32::try_from(bits).unwrap();
+                        let z = f32::from_bits(bits);
+                        routes[route(z) as usize] += 1;
+                        let want = tanh(f64::from(z)).map(|t| (t as f32).to_bits());
+                        if tanh_f32(z).map(f32::to_bits) != want {
+                            wrong += 1;
+                            first.get_or_insert(bits);
+                        }
+                    }
+                    (routes, wrong, first)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let mut routes = [0_u64; 5];
+    for (counted, _, _) in &results {
+        for (total, count) in routes.iter_mut().zip(counted) {
+            *total += count;
+        }
+    }
+    let wrong: u64 = results.iter().map(|(_, wrong, _)| wrong).sum();
+    let first = results.iter().find_map(|(_, _, first)| *first);
+    assert_eq!(
+        routes.iter().sum::<u64>(),
+        patterns,
+        "every pattern checked"
+    );
+    // Per sign: one zero; the series below |z| = 2^-5 (bits 0x3d00_0000);
+    // the exponential from there to 20 (bits 0x41a0_0000); the saturated
+    // range up to the infinity (bits 0x7f80_0000); 2^23 - 1 NaN payloads
+    // and the infinity.
+    assert_eq!(
+        routes,
+        [
+            2,
+            2 * (0x3d00_0000 - 1),
+            2 * (0x41a0_0000 - 0x3d00_0000),
+            2 * (0x7f80_0000 - 0x41a0_0000),
+            1 << 24,
+        ],
+        "patterns by route: zero, series, exponential, saturated, nonfinite"
+    );
+    assert_eq!(
+        wrong,
+        0,
+        "{wrong} patterns differ; the first is {:?} ({first:#x?})",
+        first.map(f32::from_bits)
+    );
 }

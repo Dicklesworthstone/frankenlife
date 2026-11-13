@@ -8,7 +8,8 @@
 //! multiply-add: the declared order of
 //! [`flife_neural::ReferenceController::evaluate`]. The hidden activation is
 //! the reference's own `flife_core::numerics::tanh` of the F32
-//! pre-activation, rounded once to F32. So every output is the reference's,
+//! pre-activation, rounded once to F32, computed as the reference computes
+//! it (`flife_core::numerics::tanh_f32`). So every output is the reference's,
 //! bit for bit, and the tests compare bits. The CPU keeps subnormal results,
 //! as the reference does, so nothing is deferred for being small.
 //!
@@ -50,7 +51,7 @@ use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
-use flife_core::numerics::tanh;
+use flife_core::numerics::tanh_f32;
 use flife_neural::{
     ACTION_WIDTH, BackendBudget, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH,
     ShardGeometry, Weight, Weights,
@@ -237,13 +238,14 @@ fn evaluate(
 }
 
 /// The reference's hidden activation in place: `tanh` of each F32
-/// pre-activation in F64, rounded once to F32. False where it refuses one.
+/// pre-activation in F64, rounded once to F32, as `tanh_f32` computes it.
+/// False where it refuses one.
 fn activate(values: &mut [f32]) -> bool {
     for value in values {
-        let Some(activated) = tanh(f64::from(*value)) else {
+        let Some(activated) = tanh_f32(*value) else {
             return false;
         };
-        *value = activated as f32;
+        *value = activated;
     }
     true
 }

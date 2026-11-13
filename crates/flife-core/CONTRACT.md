@@ -40,7 +40,7 @@ are no hidden defaults.
   - The per-organism `EnergyBudget`, with `Payment`, `pay` and (FL-011) `retain`.
   - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.
 - Numerics (FL-006, FL-007, FL-010): `exp_neg`, `expm1_neg`, `tanh`, `sigmoid`, `log2`, `ln`, `exp` and
-  `sin_cos_turns`.
+  `sin_cos_turns`; `tanh_f32` (FL-034), the controllers' activation.
 - Random addressing (FL-010): `SemanticRng`, `Address`, `Stream`, `Lane`, `LaneKind`, `Block`, and the draw
   conventions `half_open_unit`, `open_unit`, `bernoulli`, `choose` and `box_muller`.
 - Checkpoints (FL-016): `checkpoint::{CheckpointWriter, CheckpointReader, Chunk, ChunkFamily, ByteWriter,
@@ -96,6 +96,19 @@ are no hidden defaults.
     series with exact halving and the doubling identity below that, so it does not cancel near zero.
   - Measured against correctly rounded values (Python `Decimal`) over 1,296 arguments from `1e-9` to `745`:
     `exp_neg` within 1 ulp; `expm1_neg`, `tanh` and `sigmoid` within 2 ulp.
+  - `tanh_f32(z)` is `tanh(f64::from(z))` rounded once to F32, bit for bit, for every one of the 2^32 F32 bit
+    patterns: a test checks all of them. It reaches those bits by a cheaper route, a single division where
+    `tanh` takes fourteen to seventeen. For `2|z| < 1/16` it takes `m = 1 − e^(−2|z|)` from Taylor's degree-8
+    polynomial and returns `m/(2 − m)`; otherwise it reduces `2|z|` Cody–Waite style, takes `e^(−r)` from
+    Taylor's degree-11 polynomial and returns `(1 − d)/(1 + d)`. Both polynomials are evaluated by Estrin's
+    scheme. Its F64 value can differ from `tanh`'s in the last bits; the F32 rounding cannot. It is the hidden
+    activation of `flife-neural`'s reference controller and of `flife-backend-cpu`. FL-034: in a 10 s profile
+    of the evolved Interactive world (16 workers, CPU controllers), `tanh`'s calls held about 39% of every
+    thread's busy samples. Measured on that world, resuming from tick 8,192 for 256 ticks (6 alternating
+    pairs, every end digest one value):
+    - on the Apple M5 Ultra, 27.06 → 30.05 ticks/s (paired median 1.104, 6 of 6 faster, cv ≤ 3.5%);
+    - on a two-socket EPYC 7282 host, 10.14 → 10.38 (median 1.012, 4 of 6). There the tick is bound
+      elsewhere.
   - `sigmoid` takes the sign-stable branch: a large negative logit decays to zero instead of dividing by
     infinity.
   - `log2` reads the exponent from the bits (scaling a subnormal by `2^54` first, exactly), reduces the mantissa
@@ -279,6 +292,12 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
     conforming host.
   - Domains, saturation, odd symmetry, `σ(x) + σ(−x) = 1`, and monotonicity.
   - C.11: the drag coefficient, the F32 cancellation, and `sigmoid(8)` against `sigmoid(tanh(8))`.
+  - `tanh_f32` against `tanh` rounded to F32 on all 2^32 F32 bit patterns, split across the cores (about 2 s
+    optimized), with the count of patterns on each route asserted exactly. Planted defects (FL-034): each
+    polynomial without its last term, the series threshold moved to `1/4` and to `2^-10`, the reduction without
+    `ln 2`'s low part, a zero's sign, the negation, and the nonfinite refusal are all caught: 8 of 10. The two
+    survivors are equivalent. One saturates from `> 20` instead of `≥ 20`, where the polynomial also rounds to 1.
+    The other returns `1 − 2d/(1 + d)`, another exact form whose F32 rounding is the same everywhere.
   - `log2`: every power of two exact, seven pinned bit patterns, agreement with `std` over a sweep, and refusal
     of nonpositive and nonfinite arguments.
   - `ln` and `exp`: 19 pinned bit patterns with their correctly rounded values, agreement with `std`, exactness at

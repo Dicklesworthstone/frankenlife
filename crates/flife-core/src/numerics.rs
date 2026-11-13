@@ -163,6 +163,118 @@ pub fn tanh(x: f64) -> Option<f64> {
     Some(if x.is_sign_negative() { -value } else { value })
 }
 
+/// [`tanh`] of an F32 argument, rounded once to F32: for every `f32` `z`,
+/// `tanh_f32(z)` is `tanh(f64::from(z)).map(|t| t as f32)`, bit for bit.
+/// This is the controllers' hidden activation (plan §6.2, C.16).
+///
+/// It reaches those bits by a cheaper route than [`tanh`]'s divided series.
+/// For `s = 2|z|` below `1/16` it takes `m = 1 − e^(−s)` from a degree-8
+/// polynomial in `s` and returns `m/(2 − m)`. Otherwise it reduces
+/// `s = n ln 2 + r` with `|r| ≤ ln 2 / 2` (Cody–Waite, as [`exp_neg`]), takes
+/// `e^(−r)` from a degree-11 polynomial, and returns `(1 − d)/(1 + d)` with
+/// `d = 2^(−n) e^(−r)`. The polynomials are Taylor's, evaluated by Estrin's
+/// scheme, and the only division is the last. Their F64 value can differ
+/// from [`tanh`]'s in its last bits, but rounding to F32 erases the
+/// difference: `crates/flife-core/tests/numerics.rs` checks all 2^32 bit
+/// patterns. Like [`tanh`], it uses only IEEE-754 operations in a fixed
+/// order, so every conforming host computes the same bits. Returns `None`
+/// for a nonfinite argument.
+#[must_use]
+pub fn tanh_f32(z: f32) -> Option<f32> {
+    let x = f64::from(z);
+    if !x.is_finite() {
+        return None;
+    }
+    let magnitude = x.abs();
+    if magnitude == 0.0 {
+        // `tanh(±0) = ±0`.
+        return Some(z);
+    }
+    let value = if magnitude >= TANH_SATURATES {
+        1.0
+    } else {
+        // Rounding once to F32 is the declared arithmetic.
+        tanh_estrin(magnitude) as f32
+    };
+    Some(if z.is_sign_negative() { -value } else { value })
+}
+
+/// Below this `2|x|`, [`tanh_estrin`] takes `1 − e^(−2|x|)` from its own
+/// series, where `1 − d` would cancel.
+const TANH_SERIES_BELOW: f64 = 1.0 / 16.0;
+
+/// `1/k!` for `k = 0..=11`, each a correctly rounded quotient: Taylor's
+/// coefficients of `e^u`.
+const EXP_COEFFICIENTS: [f64; 12] = [
+    1.0,
+    1.0,
+    1.0 / 2.0,
+    1.0 / 6.0,
+    1.0 / 24.0,
+    1.0 / 120.0,
+    1.0 / 720.0,
+    1.0 / 5_040.0,
+    1.0 / 40_320.0,
+    1.0 / 362_880.0,
+    1.0 / 3_628_800.0,
+    1.0 / 39_916_800.0,
+];
+
+/// `1/(k + 1)!` for `k = 0..=7`: Taylor's coefficients of `(e^u − 1)/u`.
+const EXPM1_COEFFICIENTS: [f64; 8] = [
+    1.0,
+    1.0 / 2.0,
+    1.0 / 6.0,
+    1.0 / 24.0,
+    1.0 / 120.0,
+    1.0 / 720.0,
+    1.0 / 5_040.0,
+    1.0 / 40_320.0,
+];
+
+/// `tanh(a)` for `0 < a < 20` in F64, within a few ulp: close enough that
+/// its F32 rounding is [`tanh`]'s (checked for every F32 argument).
+fn tanh_estrin(a: f64) -> f64 {
+    let s = 2.0 * a;
+    if s < TANH_SERIES_BELOW {
+        // `m = 1 − e^(−s) = s Σ (−s)^k/(k + 1)!`; with `s < 1/16` the first
+        // omitted term is below `(1/16)^8/9!`, relative to `m`.
+        let m = s * estrin8(-s, &EXPM1_COEFFICIENTS);
+        m / (2.0 - m)
+    } else {
+        // `s < 40`, so `n ≤ 58` and `n × LN2_HI` is exact.
+        let n = (s * core::f64::consts::LOG2_E).round();
+        let r = (s - n * LN2_HI) - n * LN2_LO;
+        // `|r| ≤ ln 2 / 2` plus rounding: the first omitted term of
+        // `e^(−r)` is below `0.35^12/12! ≈ 6e-15`.
+        let n = n as i32;
+        let d = estrin12(-r, &EXP_COEFFICIENTS) * power_of_two(-n);
+        (1.0 - d) / (1.0 + d)
+    }
+}
+
+/// `Σ_{k<8} c_k u^k` by Estrin's scheme.
+fn estrin8(u: f64, c: &[f64; 8]) -> f64 {
+    let [c0, c1, c2, c3, c4, c5, c6, c7] = *c;
+    let u2 = u * u;
+    let u4 = u2 * u2;
+    let low = (c0 + c1 * u) + (c2 + c3 * u) * u2;
+    let high = (c4 + c5 * u) + (c6 + c7 * u) * u2;
+    low + high * u4
+}
+
+/// `Σ_{k<12} c_k u^k` by Estrin's scheme.
+fn estrin12(u: f64, c: &[f64; 12]) -> f64 {
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11] = *c;
+    let u2 = u * u;
+    let u4 = u2 * u2;
+    let u8 = u4 * u4;
+    let low = (c0 + c1 * u) + (c2 + c3 * u) * u2;
+    let middle = (c4 + c5 * u) + (c6 + c7 * u) * u2;
+    let high = (c8 + c9 * u) + (c10 + c11 * u) * u2;
+    (low + middle * u4) + high * u8
+}
+
 /// The logistic `σ(x) = 1/(1 + e^(−x))` for finite `x`, with a sign-stable
 /// branch (plan A.1): `e^(−|x|)` never overflows, and a large negative
 /// logit decays smoothly to zero instead of dividing by infinity. Within

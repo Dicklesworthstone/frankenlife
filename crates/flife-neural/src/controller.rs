@@ -14,7 +14,9 @@
 //!   bias first, then the inputs in ascending index, with every product
 //!   and every sum rounded to F32. There is no fused multiply-add.
 //! - The hidden activation `tanh` is `flife_core::numerics::tanh` of the F32
-//!   pre-activation, evaluated in F64 and rounded once to F32.
+//!   pre-activation, evaluated in F64 and rounded once to F32. It is
+//!   computed as `flife_core::numerics::tanh_f32`, which gives those bits
+//!   for every F32 argument.
 //! - The output activation is `linear`: the final affine layer's `z` is the
 //!   raw output. Sigmoid and every other decoding happen once, in
 //!   [`crate::actions::decode`].
@@ -31,7 +33,7 @@
 
 use flife_core::memory::capacity_bytes;
 use flife_core::model::{MAXIMUM_HIDDEN_LAYERS, dense_parameter_count};
-use flife_core::numerics::tanh;
+use flife_core::numerics::tanh_f32;
 use flife_core::{CoreError, ValidatedConfig};
 
 use crate::actions::ACTION_WIDTH;
@@ -422,13 +424,14 @@ impl<'a> ReferenceController<'a> {
         let mut source: &[f32] = &rounded;
         for (layer, activations) in hidden_layers.iter().zip([first, second]) {
             affine(parameters, layer, source, |_, z| {
-                let activated = tanh(f64::from(z)).ok_or_else(|| CoreError::NumericalInvalid {
+                // `tanh_f32` is `tanh` in F64 rounded once to F32, the
+                // declared arithmetic, bit for bit.
+                let activated = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
                     quantity: "controller pre-activation",
                     detail: format!("{z} overflowed"),
                 })?;
-                // Rounding the activation once to F32 is the declared
-                // arithmetic. The push never allocates: `reserve` sized it.
-                activations.push(activated as f32);
+                // The push never allocates: `reserve` sized it.
+                activations.push(activated);
                 Ok(())
             })?;
             source = activations.as_slice();

@@ -24,7 +24,8 @@ pub mod pairing;
 
 pub use epoch::{
     AFFINITY_AXES, AffinityProjection, Bounds, COMPONENT_STEPS, Dtype, Epoch, FIELD_TEXELS_MAX,
-    FieldChannel, FieldTexture, Layout, Metrics, Prior, Tally, View, affinity_projection,
+    FieldChannel, FieldTexture, Layout, MINIMUM_TEXEL_ROWS_PER_WORKER, Metrics, Prior, Tally, View,
+    affinity_projection,
 };
 pub use feed::{DISPLAY_PAIR, Feed, Lease, Publication, Publisher, RenderStats, Viewer};
 pub use pairing::{

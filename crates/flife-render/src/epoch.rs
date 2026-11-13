@@ -11,7 +11,9 @@
 //! Every view declares its [`Layout`]: element type, components, count and
 //! bounds. A slot's buffers are allocated once, at the world's population
 //! ceiling and its texture size, and each projection refills them in place.
-//! Publishing therefore never allocates.
+//! Publishing therefore never grows them. The field texture's rows are
+//! projected on the world's CPU workers (scoped threads, as the world's own
+//! phases use), bit for bit as on one.
 //!
 //! Rows follow identity order, never storage-slot order. Two storage
 //! arrangements of one world project the same epoch (C.7), and a consumer
@@ -353,8 +355,23 @@ impl FieldTexture {
         cell_size: [f64; 2],
         plane: &[f32],
     ) -> Result<Self, CoreError> {
+        Self::from_plane_on(cells, cell_size, plane, 1)
+    }
+
+    /// As [`FieldTexture::from_plane`], its texel rows projected on at most
+    /// `workers` threads: the same texture bit for bit.
+    ///
+    /// # Errors
+    /// As [`FieldTexture::from_plane`], and [`CoreError::StateConflict`]
+    /// when a worker panicked.
+    pub fn from_plane_on(
+        cells: [u32; 2],
+        cell_size: [f64; 2],
+        plane: &[f32],
+        workers: usize,
+    ) -> Result<Self, CoreError> {
         let mut texture = Self::sized(cells, cell_size)?;
-        texture.project(plane, cell_size[0] * cell_size[1])?;
+        texture.project_on(plane, cell_size[0] * cell_size[1], workers)?;
         Ok(texture)
     }
 
@@ -371,6 +388,22 @@ impl FieldTexture {
         cell_size: [f64; 2],
         planes: &[f32],
     ) -> Result<Self, CoreError> {
+        Self::from_planes_on(cells, cell_size, planes, 1)
+    }
+
+    /// As [`FieldTexture::from_planes`], its texel rows projected on at
+    /// most `workers` threads, as an epoch projects them on the world's:
+    /// the same texture bit for bit.
+    ///
+    /// # Errors
+    /// As [`FieldTexture::from_planes`], and [`CoreError::StateConflict`]
+    /// when a worker panicked.
+    pub fn from_planes_on(
+        cells: [u32; 2],
+        cell_size: [f64; 2],
+        planes: &[f32],
+        workers: usize,
+    ) -> Result<Self, CoreError> {
         let mut texture = Self::sized(cells, cell_size)?;
         let count = cells.map(|n| n as usize);
         if planes.len() != count[0] * count[1] * (1 + CHANNELS) {
@@ -385,7 +418,7 @@ impl FieldTexture {
                 ),
             });
         }
-        texture.project(planes, cell_size[0] * cell_size[1])?;
+        texture.project_on(planes, cell_size[0] * cell_size[1], workers)?;
         Ok(texture)
     }
 
@@ -529,7 +562,23 @@ impl FieldTexture {
     /// the block's area; with moments, it sums each channel the same way,
     /// projects the sums over the energy's ([`FieldTexture::composition`])
     /// and holds each over the energy's ([`FieldTexture::components`]).
-    fn project(&mut self, planes: &[f32], cell_area: f64) -> Result<(), CoreError> {
+    ///
+    /// The texel rows are split into contiguous runs on at most `workers`
+    /// threads, the calling thread's first, each with at least
+    /// [`MINIMUM_TEXEL_ROWS_PER_WORKER`] rows. A texel is computed from its
+    /// own block alone, in the same order on any thread, so the texture is
+    /// the one-thread texture bit for bit.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for planes of the wrong length, which
+    /// leaves the texture as it was; [`CoreError::StateConflict`] when a
+    /// worker panicked.
+    fn project_on(
+        &mut self,
+        planes: &[f32],
+        cell_area: f64,
+        workers: usize,
+    ) -> Result<(), CoreError> {
         let [cells_x, cells_y] = self.cells.map(|n| n as usize);
         let cells = cells_x * cells_y;
         let with_moments = planes.len() == cells * (1 + CHANNELS);
@@ -544,7 +593,96 @@ impl FieldTexture {
             });
         }
         let (energy, moments) = planes.split_at(cells);
-        let [block_x, block_y] = self.block.map(|n| n as usize);
+        let [width, height] = self.texels.map(|n| n as usize);
+        let count = width * height;
+        // The buffers' capacity is the texture's, so this never allocates.
+        self.values.clear();
+        self.values.resize(count, 0.0);
+        self.composition.clear();
+        self.composition.resize(count, [0.0; 3]);
+        self.components.clear();
+        self.components.resize(count, [0; CHANNELS]);
+        let rows = Rows {
+            energy,
+            moments,
+            cells: [cells_x, cells_y],
+            block: self.block.map(|n| n as usize),
+            width,
+            cell_area,
+        };
+        let used = workers
+            .min(height.div_ceil(MINIMUM_TEXEL_ROWS_PER_WORKER))
+            .max(1);
+        let per = height.div_ceil(used).max(1);
+        let texels = per * width;
+        let mut runs = self
+            .values
+            .chunks_mut(texels)
+            .zip(self.composition.chunks_mut(texels))
+            .zip(self.components.chunks_mut(texels));
+        let Some(((values, composition), components)) = runs.next() else {
+            return Ok(());
+        };
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = runs
+                .enumerate()
+                .map(|(index, ((values, composition), components))| {
+                    scope.spawn(move || {
+                        rows.project((index + 1) * per, values, composition, components)
+                    })
+                })
+                .collect();
+            rows.project(0, values, composition, components);
+            let mut joined = Ok(());
+            for worker in workers {
+                if worker.join().is_err() {
+                    joined = Err(CoreError::StateConflict {
+                        operation: "project render field texture",
+                        detail: "a texture worker panicked".to_owned(),
+                    });
+                }
+            }
+            joined
+        })
+    }
+}
+
+/// The fewest texel rows worth handing to another thread when a texture is
+/// projected on workers.
+pub const MINIMUM_TEXEL_ROWS_PER_WORKER: usize = 8;
+
+/// What a texture's texel rows are projected from: its planes, grid and
+/// blocks. Any run of whole rows projects alone.
+#[derive(Clone, Copy)]
+struct Rows<'a> {
+    /// The energy plane.
+    energy: &'a [f32],
+    /// The moment planes in channel order; empty for an energy plane alone.
+    moments: &'a [f32],
+    /// The grid, `[x, y]` cells.
+    cells: [usize; 2],
+    /// Cells per texel, `[x, y]`.
+    block: [usize; 2],
+    /// Texels per row.
+    width: usize,
+    /// A cell's area.
+    cell_area: f64,
+}
+
+impl Rows<'_> {
+    /// Project texel rows `first..`, as many whole rows as `values` holds,
+    /// into `values`, `composition` and `components`, which hold the same
+    /// count of texels; the last two are zeros on entry.
+    fn project(
+        self,
+        first: usize,
+        values: &mut [f32],
+        composition: &mut [[f32; 3]],
+        components: &mut [[i8; CHANNELS]],
+    ) {
+        let [cells_x, cells_y] = self.cells;
+        let [block_x, block_y] = self.block;
+        let width = self.width;
         let whole = block_x == 1 && block_y == 1;
         let columns = |texel_x: usize| texel_x * block_x..((texel_x + 1) * block_x).min(cells_x);
         let block_sum = |plane: &[f32], rows: &std::ops::Range<usize>, texel_x: usize| {
@@ -557,41 +695,37 @@ impl FieldTexture {
             }
             sum
         };
-        self.values.clear();
-        self.composition.clear();
-        self.components.clear();
         // A texel row at a time: each texel's energy sum, then its three
         // dot products channel by channel, so each plane is read in one run
         // per row. Per texel these are the same sums in the same order as
         // `affinity_projection` of the block's channel sums.
-        let width = self.texels[0] as usize;
         let mut energies = [0.0_f64; ROW];
         let mut sums = [0.0_f64; ROW];
         let mut dots = [[0.0_f64; ROW]; 3];
-        for texel_y in 0..self.texels[1] as usize {
+        let rows_out = values
+            .chunks_exact_mut(width)
+            .zip(composition.chunks_exact_mut(width))
+            .zip(components.chunks_exact_mut(width));
+        for (row, ((row_values, row_composition), row_components)) in rows_out.enumerate() {
+            let texel_y = first + row;
             let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
-            for (texel_x, total) in energies[..width].iter_mut().enumerate() {
-                let sum = block_sum(energy, &rows, texel_x);
-                let area = (rows.len() * columns(texel_x).len()) as f64 * cell_area;
+            for (texel_x, (total, value)) in energies[..width]
+                .iter_mut()
+                .zip(row_values.iter_mut())
+                .enumerate()
+            {
+                let sum = block_sum(self.energy, &rows, texel_x);
+                let area = (rows.len() * columns(texel_x).len()) as f64 * self.cell_area;
                 *total = sum;
-                self.values.push(saturate(sum / area));
+                *value = saturate(sum / area);
             }
-            if !with_moments {
-                for _ in 0..width {
-                    self.composition.push([0.0; 3]);
-                    self.components.push([0; CHANNELS]);
-                }
+            if self.moments.is_empty() {
                 continue;
             }
             for axis in &mut dots {
                 axis[..width].fill(0.0);
             }
-            // The row's components, filled channel by channel below; the
-            // buffer's capacity is the texture's, so this never allocates.
-            let first = self.components.len();
-            self.components.resize(first + width, [0; CHANNELS]);
-            let row_components = &mut self.components[first..];
-            for (channel, plane) in moments.chunks_exact(cells).enumerate() {
+            for (channel, plane) in self.moments.chunks_exact(cells_x * cells_y).enumerate() {
                 let signs = [0, 1, 2].map(|axis| AXIS_SIGNS[axis][channel]);
                 if whole {
                     // A texel is a cell: the row's run is the texels'.
@@ -633,15 +767,14 @@ impl FieldTexture {
                     }
                 }
             }
-            for (texel_x, &sum) in energies[..width].iter().enumerate() {
-                self.composition.push(coordinates(
-                    [0, 1, 2].map(|axis| dots[axis][texel_x]),
-                    CHANNELS,
-                    sum,
-                ));
+            for (texel_x, (out, &sum)) in row_composition
+                .iter_mut()
+                .zip(&energies[..width])
+                .enumerate()
+            {
+                *out = coordinates([0, 1, 2].map(|axis| dots[axis][texel_x]), CHANNELS, sum);
             }
         }
-        Ok(())
     }
 }
 
@@ -917,8 +1050,13 @@ impl Epoch {
             max_generation = max_generation.max(organism.generation.get());
             parameters += genome.parameters().len() as u64;
         }
-        self.field
-            .project(world.field().as_slice(), grid.cell_area())?;
+        // Between ticks the world's workers are idle: the texture's rows
+        // are projected on them.
+        self.field.project_on(
+            world.field().as_slice(),
+            grid.cell_area(),
+            world.cpu_workers(),
+        )?;
         self.id = id;
         self.tick = world.tick();
         self.resource = world.epoch();

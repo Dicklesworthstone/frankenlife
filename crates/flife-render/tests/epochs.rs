@@ -8,6 +8,8 @@
 
 mod common;
 
+use std::num::NonZeroUsize;
+
 use common::{ecology, found, step};
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
@@ -451,6 +453,96 @@ fn a_large_field_is_a_bounded_block_mean_texture() {
         FieldTexture::from_plane([0, 4], cell_size, &[]),
         Err(CoreError::LayoutMismatch { .. })
     ));
+}
+
+/// A texture projected on workers is the one-thread texture bit for bit:
+/// every texel's value, composition and components, at 1 to 64 workers, with
+/// moments and from an energy plane alone. The grids: whole cells (256²,
+/// 16 rows a worker at 16), blocks whose last texel row and column are
+/// partial (1,030 × 517 at 3 × 2), a last run shorter than the others
+/// (700 × 37), and one texel row. Then through an epoch: one committed world
+/// published on 1 worker and on 16 (the 32-row texture in four runs).
+#[test]
+fn a_texture_projected_on_any_number_of_workers_is_the_one_thread_texture() {
+    let bits = |texture: &FieldTexture| {
+        (
+            texture.texels(),
+            texture
+                .values()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            texture
+                .composition()
+                .iter()
+                .map(|c| c.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            texture.components().to_vec(),
+        )
+    };
+    for (cells, cell_size) in [
+        ([256_u32, 256], [1.0, 1.0]),
+        ([1030, 517], [0.5, 0.25]),
+        ([700, 37], [1.0, 2.0]),
+        ([9, 1], [1.0, 1.0]),
+    ] {
+        let count = (cells[0] * cells[1]) as usize;
+        // Energies in [0, 4.05), each moment channel within a sixth of its
+        // cell's energy, so ‖m‖₂ ≤ e.
+        let mut planes = vec![0.0_f32; count * 33];
+        let (energies, moments) = planes.split_at_mut(count);
+        for (cell, energy) in energies.iter_mut().enumerate() {
+            *energy = ((cell * 7919) % 1013) as f32 * 0.004;
+        }
+        for (channel, plane) in moments.chunks_exact_mut(count).enumerate() {
+            for (cell, (moment, &energy)) in plane.iter_mut().zip(energies.iter()).enumerate() {
+                let step = ((cell * 31 + channel * 977) % 201) as f32 - 100.0;
+                *moment = energy * step / 600.0;
+            }
+        }
+        let one = FieldTexture::from_planes(cells, cell_size, &planes).expect("texture");
+        let energy = &planes[..count];
+        let alone = FieldTexture::from_plane(cells, cell_size, energy).expect("texture");
+        assert!(
+            one.components()
+                .iter()
+                .any(|texel| texel.iter().any(|&step| step != 0)),
+            "{cells:?}"
+        );
+        assert!(
+            one.composition().iter().any(|&c| c != [0.0; 3]),
+            "{cells:?}"
+        );
+        for workers in [1, 2, 3, 7, 16, 64] {
+            let on =
+                FieldTexture::from_planes_on(cells, cell_size, &planes, workers).expect("texture");
+            assert_eq!(bits(&on), bits(&one), "{cells:?} on {workers}");
+            let plane_on =
+                FieldTexture::from_plane_on(cells, cell_size, energy, workers).expect("texture");
+            assert_eq!(bits(&plane_on), bits(&alone), "{cells:?} on {workers}");
+        }
+    }
+
+    let config = ecology(&[]);
+    let mut world = found(&config, Arrangement::FreeList);
+    for _ in 0..32 {
+        step(&mut world);
+    }
+    let one = NonZeroUsize::new(1).expect("one");
+    let sixteen = NonZeroUsize::new(16).expect("sixteen");
+    // A publisher projects the committed world when it is made.
+    world.set_cpu_workers(one).expect("one worker");
+    let x = publisher_lease(&world);
+    world.set_cpu_workers(sixteen).expect("sixteen workers");
+    let y = publisher_lease(&world);
+    assert_eq!(x.field().texels(), [32, 32]);
+    assert!(
+        x.field()
+            .components()
+            .iter()
+            .any(|t| t.iter().any(|&s| s != 0))
+    );
+    assert_eq!(*x, *y);
 }
 
 /// Plan §13.4, "Local field": a texel's composition is its block's

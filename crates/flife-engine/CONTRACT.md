@@ -215,9 +215,10 @@ each runs and owns the field.
     a founder's or an introduced organism's path ends with it. `None` while the world traces nothing.
 - `World::organism_weights(id)` (plan §14.2's on-demand weight dump): `Ok(None)` for an identity the population does
   not hold, or a `ControllerWeights`: the tick, the organism, its genome and topology index, its topology's
-  `LayerShape`s in evaluation order (fan-in, fan-out, and where the weights and biases sit), and its genome's
-  parameters copied whole, in the controller's layout (layers in evaluation order, each `weight[out][in]` row-major
-  then `bias[out]`, torch's `parameters_to_vector` order). `ControllerWeights::layer(index)` gives a layer's weights
+  `LayerShape`s in evaluation order (fan-in, fan-out, and where the weights and biases sit), the weight dtype its
+  genome stores, and its genome's parameters copied whole as F32 (a binary16 widened exactly), in the controller's
+  layout (layers in evaluation order, each `weight[out][in]` row-major then `bias[out]`, torch's
+  `parameters_to_vector` order). `ControllerWeights::layer(index)` gives a layer's weights
   and biases. The copy's room is reserved first (`AllocationFailed`), and a genome whose parameter count is not its
   topology's is refused (`StateConflict`, "dump organism weights").
 - `World::measure_region(center, radius)` (plan §14.3's temporary measurement region, `measure`): a
@@ -1057,7 +1058,9 @@ velocity, first-order splitting at the configured fixed timestep.
 - FL-016 encodes the world (INV-14) and restores it to the same trajectory, and FL-035's `flife-store` publishes
   it atomically and recovers the last valid one. Resuming a session from the store is FL-037. Genomes are stored whole, one copy per
   live genome: 1.4–3.6 MB for the 48-founder ecology and 161.3 MiB for the 4,096-organism preset, with no page
-  sharing, deltas or compression. A restored store is compacted in identity order, so `Population::latest`
+  sharing, deltas or compression. Each parameter is its bits in the run's weight dtype: four bytes for `f32`, two
+  for `f16` (FL-030, read back through the configured dtype; an `f32` checkpoint's bytes are unchanged). An F16
+  world resumed mid-run follows its original bit for bit, genomes included (`tests/f16_world.rs`). A restored store is compacted in identity order, so `Population::latest`
   names the highest live identity rather than a since-dead later one; new identities come from the restored
   allocators either way. The checkpoint carries no toolchain or source fingerprint (B.1's run manifest).
 - Explicit removal is carried by `RemoveOrganisms` (FL-022), a disk. Other region shapes and the erase brush's

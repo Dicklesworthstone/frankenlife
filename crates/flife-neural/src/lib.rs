@@ -19,6 +19,9 @@
 //!   packed parameters, and the checked 64-bit geometry of the shards it
 //!   packs them into (FL-026).
 //!
+//! - [`weights`]: the canonical weight dtypes, F32 and compact F16 (plan
+//!   §10.3), and how the evaluator reads each as F32.
+//!
 //! The density pyramid itself is `flife_field::pyramid`. The FrankenTorch
 //! population adapter is FL-025.
 
@@ -29,6 +32,7 @@ pub mod arena;
 pub mod backend;
 pub mod controller;
 pub mod sensors;
+pub mod weights;
 
 pub use actions::{ACTION_WIDTH, ActionDecoding, DecodedActions, Emission, decode};
 pub use arena::{ArenaSlot, Placement, ShardGeometry};
@@ -37,3 +41,4 @@ pub use controller::{
     ControllerScratch, DenseTopology, LayerShape, ReferenceController, Trace, widen,
 };
 pub use sensors::{Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe};
+pub use weights::{Weight, WeightDtype, Weights};

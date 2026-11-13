@@ -50,15 +50,15 @@ use flife_core::rng::{
     Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, box_muller, choose,
 };
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_neural::DenseTopology;
+use flife_neural::{DenseTopology, Weight, Weights};
 
 use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
 use crate::genome::{
     AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, rescale, squared_norm,
 };
-use crate::init::fan_in_weight;
-use crate::quota::{GenomeQuota, ParameterBuffer};
+use crate::init::fan_in_draw;
+use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
 use crate::transition::{Transition, map_parameters};
 
 /// The target selection this module implements.
@@ -286,10 +286,19 @@ pub enum Proposal {
     },
 }
 
-/// A parameter perturbed in F64 and rounded once to canonical F32.
+/// An F32 parameter perturbed in F64 and rounded once to canonical F32
+/// ([`perturb_weight`] in F32).
 #[must_use]
 pub fn perturb(value: f32, delta: f64) -> f32 {
-    (f64::from(value) + delta) as f32
+    perturb_weight(value, delta)
+}
+
+/// A parameter widened exactly, perturbed in F64 and rounded once to its
+/// own dtype: the declared canonical rounding (plan §10.3). In F16 a change
+/// below half a binary16 step rounds away.
+#[must_use]
+pub fn perturb_weight<W: Weight>(value: W, delta: f64) -> W {
+    W::round_from_f64(f64::from(value.widen()) + delta)
 }
 
 /// `exp(ln scale + delta)`, reflected at `ln minimum` and `ln maximum` until
@@ -443,7 +452,7 @@ impl<'a> Mutator<'a> {
         };
         if self.parameters.reject_effective_noop
             && to == from
-            && same_f32(buffer.values(), parent.parameters())
+            && buffer.values().same_bits(&parent.parameters())
             && same_traits(&traits, parent.traits())
         {
             quota.abandon(buffer)?;
@@ -500,29 +509,64 @@ impl<'a> Mutator<'a> {
     ) -> Result<(Option<Transition>, Counts), CoreError> {
         let source = self.member(from)?;
         let target = self.member(to)?;
-        let child = buffer.values_mut();
-        let transition = if from == to {
-            if child.len() != parent.parameters().len() {
+        let same = from == to;
+        match (buffer.values_mut(), parent.parameters()) {
+            (WeightsMut::F32(child), Weights::F32(parent)) => {
+                self.map_and_mutate(source, parent, target, child, same, attempt, candidate)
+            }
+            (WeightsMut::F16(child), Weights::F16(parent)) => {
+                self.map_and_mutate(source, parent, target, child, same, attempt, candidate)
+            }
+            _ => Err(CoreError::LayoutMismatch {
+                buffer: "genome parameters",
+                detail: "the parent's weight dtype is not the child buffer's".into(),
+            }),
+        }
+    }
+
+    /// Step 2 in one weight dtype: `child` is `parent` (the same member) or
+    /// `parent` mapped from `source` onto `target`, then mutated.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the members, both buffers and the candidate's address"
+    )]
+    fn map_and_mutate<W: Weight>(
+        &self,
+        source: &DenseTopology,
+        parent: &[W],
+        target: &DenseTopology,
+        child: &mut [W],
+        same: bool,
+        attempt: BirthAttempt,
+        candidate: u8,
+    ) -> Result<(Option<Transition>, Counts), CoreError> {
+        let transition = if same {
+            if child.len() != parent.len() {
                 return Err(CoreError::LayoutMismatch {
                     buffer: "genome parameters",
                     detail: "the parent does not have its member's length".into(),
                 });
             }
-            child.copy_from_slice(parent.parameters());
+            child.copy_from_slice(parent);
             None
         } else {
             let mut lane_error = None;
-            let transition = map_parameters(source, parent.parameters(), target, child, |at| {
-                match Lane::neuron_index(at.layer, at.output, at.input)
-                    .and_then(|index| Lane::new(candidate, LaneKind::MapWeight, index))
-                {
-                    Ok(lane) => self.block(attempt, lane, 0)[0],
-                    Err(error) => {
-                        lane_error.get_or_insert(error);
-                        0
-                    }
-                }
-            })?;
+            let transition =
+                map_parameters(
+                    source,
+                    parent,
+                    target,
+                    child,
+                    |at| match Lane::neuron_index(at.layer, at.output, at.input)
+                        .and_then(|index| Lane::new(candidate, LaneKind::MapWeight, index))
+                    {
+                        Ok(lane) => self.block(attempt, lane, 0)[0],
+                        Err(error) => {
+                            lane_error.get_or_insert(error);
+                            0
+                        }
+                    },
+                )?;
             if let Some(error) = lane_error {
                 return Err(error);
             }
@@ -536,10 +580,10 @@ impl<'a> Mutator<'a> {
         Ok((transition, counts))
     }
 
-    fn mutate_parameters(
+    fn mutate_parameters<W: Weight>(
         &self,
         topology: &DenseTopology,
-        child: &mut [f32],
+        child: &mut [W],
         attempt: BirthAttempt,
         candidate: u8,
         counts: &mut Counts,
@@ -577,9 +621,9 @@ impl<'a> Mutator<'a> {
         Ok(())
     }
 
-    fn mutate_parameter(
+    fn mutate_parameter<W: Weight>(
         &self,
-        child: &mut [f32],
+        child: &mut [W],
         offset: Option<usize>,
         lane: Lane,
         fan_in: usize,
@@ -594,12 +638,12 @@ impl<'a> Mutator<'a> {
             })?;
         let [replace, replacement, perturbation, _] = self.block(attempt, lane, 0);
         if bernoulli(replace, self.parameters.replacement_probability) {
-            *slot = fan_in_weight(replacement, fan_in)?;
+            *slot = fan_in_draw(replacement, fan_in)?;
             counts.replaced += 1;
         } else if bernoulli(perturbation, self.parameters.weight_probability) {
             let [first, second, ..] = self.block(attempt, lane, 1);
             let [normal, _] = box_muller(first, second)?;
-            *slot = perturb(*slot, self.parameters.weight_standard_deviation * normal);
+            *slot = perturb_weight(*slot, self.parameters.weight_standard_deviation * normal);
             counts.perturbed += 1;
         }
         Ok(())
@@ -686,10 +730,6 @@ fn rejection(error: CoreError) -> Result<Outcome, CoreError> {
         }
         other => Err(other),
     }
-}
-
-fn same_f32(a: &[f32], b: &[f32]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 fn same_f64(a: &[f64], b: &[f64]) -> bool {

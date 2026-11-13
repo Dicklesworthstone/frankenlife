@@ -32,6 +32,7 @@ use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_neural::{
     ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH, ShardGeometry,
+    Weights,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -759,6 +760,7 @@ impl MetalBackend {
         // What the shards hold, written back once the batch is placed. An
         // error drops the backend, so a lost count is never used.
         let (mut held, mut shard_count) = (self.held, self.shard_count);
+        let mut widened: Vec<f32> = Vec::new();
         for &index in &eligible {
             let Some(job) = jobs.get(index) else { continue };
             let Some(bucket) = self.bucket(job)? else {
@@ -828,9 +830,19 @@ impl MetalBackend {
             // The old occupant is gone before the new one is written, so a
             // failure leaves the slot empty, never mixed.
             *occupant = None;
-            owner
-                .write(shard.parameters.buffer())?
-                .write(offset, job.controller.parameters())?;
+            let mut lease = owner.write(shard.parameters.buffer())?;
+            match job.controller.parameters() {
+                Weights::F32(values) => lease.write(offset, values)?,
+                // F16 widens exactly; the shard holds the F32 the
+                // arithmetic reads.
+                Weights::F16(values) => {
+                    widened.clear();
+                    reserve(&mut widened, values.len(), "metal widened parameters")?;
+                    widened.extend(values.iter().map(|value| value.to_f32()));
+                    lease.write(offset, &widened)?;
+                }
+            }
+            drop(lease);
             *occupant = own;
             uploads += 1;
         }

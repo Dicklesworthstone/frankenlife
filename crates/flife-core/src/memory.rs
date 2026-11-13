@@ -19,8 +19,9 @@ pub const RESERVE_BYTES: u64 = 64 << 20;
 pub struct MemoryAdmission {
     /// `[execution] maximum_total_bytes`.
     pub budget_bytes: u64,
-    /// The fixed logical genome quota in F32 parameters:
-    /// `maximum_logical_genome_bytes` over four.
+    /// The fixed logical genome quota in parameters of the run's weight
+    /// dtype: `maximum_logical_genome_bytes` over four for `f32`, over two
+    /// for `f16`.
     pub logical_parameters: u64,
     /// `maximum_logical_genome_bytes`.
     pub logical_genome_bytes: u64,

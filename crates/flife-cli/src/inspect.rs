@@ -153,6 +153,10 @@ pub struct InspectedWeights {
     pub topology: usize,
     /// Its controller's parameter count.
     pub parameters: usize,
+    /// The weight dtype its genome stores (`f32` or `f16`); each value
+    /// below is one of that dtype's, written as the F32 it widens to
+    /// exactly.
+    pub dtype: &'static str,
     /// Its layers in evaluation order: the 104 sensor inputs feed the
     /// first, `tanh` follows each hidden layer, and the last gives the 36
     /// raw outputs linearly.
@@ -282,6 +286,7 @@ impl InspectedWeights {
             genome: dump.genome.get(),
             topology: dump.topology,
             parameters: dump.parameters.len(),
+            dtype: dump.dtype.name(),
             layers,
         })
     }

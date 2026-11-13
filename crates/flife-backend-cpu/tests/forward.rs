@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use flife_backend_cpu::{CpuBackend, MINIMUM_JOBS_PER_LANE};
 use flife_core::CoreError;
+use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
     ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
@@ -276,6 +277,69 @@ fn every_topology_matches_the_reference_bit_for_bit_on_one_lane_and_on_many()
         backend.evaluate(&far, &mut split)?;
         assert_eq!(bits(&split), bits(&outputs), "slots from {first}");
     }
+    Ok(())
+}
+
+/// FL-030: the mixed batch with every parameter rounded once to binary16
+/// (compact F16), binary16 subnormals included: each catalog topology's
+/// outputs are the reference's bit for bit on one lane and on four, and an
+/// input infinite in F32 is still refused. The two regimes whose weights
+/// overflow binary16 are left out.
+#[test]
+fn every_topology_in_f16_matches_the_reference_bit_for_bit() -> Result<(), CoreError> {
+    let topologies = topologies();
+    let cases: Vec<Case> = cases(2_000, 2027)
+        .into_iter()
+        .filter(|case| !matches!(case.regime, Regime::HiddenOverflow | Regime::OutputOverflow))
+        .collect();
+    let halves: Vec<Vec<F16>> = cases
+        .iter()
+        .map(|case| {
+            case.parameters
+                .iter()
+                .map(|&value| F16::from_f64(f64::from(value)))
+                .collect()
+        })
+        .collect();
+    let subnormal = |half: &F16| half.to_bits() & 0x7C00 == 0 && half.to_bits() & 0x03FF != 0;
+    assert!(
+        halves.iter().flatten().any(subnormal),
+        "no binary16 subnormal"
+    );
+    let mut next = [0_u64; TOPOLOGIES.len()];
+    let mut jobs = Vec::with_capacity(cases.len());
+    for (index, (case, half)) in cases.iter().zip(&halves).enumerate() {
+        let slot = next[case.topology];
+        next[case.topology] += 1;
+        jobs.push(ControllerJob {
+            genome: GenomeId::new(index as u64 + 1),
+            slot: ArenaSlot::new(case.topology as u32, slot, 1),
+            controller: ReferenceController::new(&topologies[case.topology], half, BOUND)?,
+            inputs: &case.inputs,
+        });
+    }
+    let mut want = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        let mut scratch = ControllerScratch::new(job.controller.topology())?;
+        want.push(
+            job.controller
+                .evaluate(job.inputs, &mut scratch)
+                .ok()
+                .map(|raw| raw.map(f32::to_bits)),
+        );
+    }
+    for count in [1, 4] {
+        let mut backend = CpuBackend::new(lanes(count));
+        let mut outputs = Vec::new();
+        backend.evaluate(&jobs, &mut outputs)?;
+        assert_eq!(bits(&outputs), want, "{count} lanes");
+    }
+    let mut evaluated = [0_usize; TOPOLOGIES.len()];
+    for (case, want) in cases.iter().zip(&want) {
+        evaluated[case.topology] += usize::from(want.is_some());
+    }
+    assert!(evaluated.iter().all(|&count| count > 0), "{evaluated:?}");
+    assert!(want.iter().any(Option::is_none), "no refusal was exercised");
     Ok(())
 }
 

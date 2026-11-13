@@ -40,14 +40,18 @@ pub use founder::{founder, founder_traits, initial_scale};
 pub use genome::{
     AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, SharedParameters, TraitLimits, Traits, Unsealed,
 };
-pub use init::{FAN_IN_SCALED_SYMMETRIC_V1, WeightAddress, fan_in_weight, initialize};
+pub use init::{FAN_IN_SCALED_SYMMETRIC_V1, WeightAddress, fan_in_draw, fan_in_weight, initialize};
 pub use mutation::{
     BirthAttempt, CandidateRejection, MAXIMUM_CANDIDATES, MutationParameters, MutationRecord,
     Mutator, Proposal, REJECT_BIRTH_NO_CHARGE, RejectionReason, TopologyChange,
-    UNIFORM_OTHER_CATALOG_MEMBER, perturb, reflect_log_scale,
+    UNIFORM_OTHER_CATALOG_MEMBER, perturb, perturb_weight, reflect_log_scale,
 };
 pub use quota::{
-    ALLOCATED_GENOME_BYTES, GenomeQuota, LOGICAL_GENOME_BYTES, ParameterBuffer,
-    allocate_parameters, logical_bytes,
+    ALLOCATED_GENOME_BYTES, GenomeQuota, LOGICAL_GENOME_BYTES, ParameterBuffer, ParameterValues,
+    WeightsMut, allocate_parameters, allocate_values, logical_bytes, logical_bytes_in,
 };
 pub use transition::{Transition, map_parameters};
+
+/// A genome's parameters in its weight dtype, as [`Genome::parameters`]
+/// gives them.
+pub use flife_neural::{WeightDtype, Weights};

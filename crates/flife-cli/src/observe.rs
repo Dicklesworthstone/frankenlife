@@ -24,7 +24,7 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::Transfer;
 use flife_core::numerics;
 use flife_engine::{DeathCause, Population, TickReport, World};
-use flife_genome::{AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits};
+use flife_genome::{AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Weights};
 use serde::Serialize;
 
 /// The published reports of a run, folded.
@@ -318,10 +318,10 @@ fn grandparent(population: &Population, parent: OrganismId) -> Option<&Genome> {
 /// topology.
 fn compare(a: &Genome, b: &Genome) -> (u64, u64) {
     a.parameters()
-        .iter()
-        .zip(b.parameters())
+        .bits()
+        .zip(b.parameters().bits())
         .fold((0, 0), |(total, same), (x, y)| {
-            (total + 1, same + u64::from(x.to_bits() == y.to_bits()))
+            (total + 1, same + u64::from(x == y))
         })
 }
 
@@ -329,15 +329,12 @@ fn compare(a: &Genome, b: &Genome) -> (u64, u64) {
 fn carried(grandparent: &Genome, parent: &Genome, child: &Genome) -> (u64, u64) {
     grandparent
         .parameters()
-        .iter()
-        .zip(parent.parameters())
-        .zip(child.parameters())
-        .filter(|((g, p), _)| g.to_bits() != p.to_bits())
+        .bits()
+        .zip(parent.parameters().bits())
+        .zip(child.parameters().bits())
+        .filter(|((g, p), _)| g != p)
         .fold((0, 0), |(variants, carried), ((_, p), c)| {
-            (
-                variants + 1,
-                carried + u64::from(p.to_bits() == c.to_bits()),
-            )
+            (variants + 1, carried + u64::from(p == c))
         })
 }
 
@@ -382,11 +379,21 @@ fn trait_distance(a: &Genome, b: &Genome, limits: &TraitLimits) -> f64 {
         .sqrt()
 }
 
-/// The SHA-256 of a genome's parameters' bits.
+/// The SHA-256 of a genome's parameters' bits, each little-endian in the
+/// run's weight dtype (four bytes for F32, two for binary16).
 fn parameter_digest(genome: &Genome) -> Sha256Digest {
-    let mut bytes = Vec::with_capacity(4 * genome.parameters().len());
-    for value in genome.parameters() {
-        bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+    let mut bytes = Vec::new();
+    match genome.parameters() {
+        Weights::F32(values) => {
+            for value in values {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        Weights::F16(values) => {
+            for value in values {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
     }
     Sha256Digest::of(&bytes)
 }

@@ -7,6 +7,7 @@
 
 use flife_backend_metal::MetalBackend;
 use flife_core::CoreError;
+use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
     ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
@@ -230,6 +231,55 @@ fn a_genome_is_uploaded_once_and_a_later_occupant_takes_its_place() -> Result<()
         None,
         "a batch of nothing ran no command"
     );
+    Ok(())
+}
+
+/// FL-030: every catalog topology with its parameters rounded once to
+/// binary16 (compact F16), binary16 subnormals included. The backend uploads
+/// each genome widened exactly, and the device's outputs are the
+/// reference's bit for bit; nothing is deferred.
+#[test]
+fn every_topology_in_f16_is_the_reference_bit_for_bit() -> Result<(), CoreError> {
+    let Some(mut backend) = backend(64) else {
+        return Ok(());
+    };
+    let topologies = topologies();
+    let cases = cases(&topologies, 500);
+    let halves: Vec<Vec<F16>> = cases
+        .iter()
+        .map(|case| {
+            case.parameters
+                .iter()
+                .map(|&value| F16::from_f64(f64::from(value)))
+                .collect()
+        })
+        .collect();
+    let subnormal = |half: &F16| half.to_bits() & 0x7C00 == 0 && half.to_bits() & 0x03FF != 0;
+    assert!(
+        halves.iter().flatten().any(subnormal),
+        "no binary16 subnormal"
+    );
+    let mut next = [0_u64; TOPOLOGIES.len()];
+    let mut jobs = Vec::with_capacity(cases.len());
+    for (index, (case, half)) in cases.iter().zip(&halves).enumerate() {
+        let slot = next[case.topology];
+        next[case.topology] += 1;
+        jobs.push(ControllerJob {
+            genome: GenomeId::new(index as u64 + 1),
+            slot: ArenaSlot::new(case.topology as u32, slot, 1),
+            controller: ReferenceController::new(&topologies[case.topology], half, BOUND)?,
+            inputs: &case.inputs,
+        });
+    }
+    let mut outputs = Vec::new();
+    backend.evaluate(&jobs, &mut outputs)?;
+    let want = reference(&jobs);
+    assert!(
+        want.iter().all(Option::is_some),
+        "the reference refused one"
+    );
+    assert_eq!(bits(&outputs), want);
+    assert_eq!(backend.uploads(), jobs.len() as u64);
     Ok(())
 }
 

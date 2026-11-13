@@ -16,7 +16,7 @@
 
 use flife_core::CoreError;
 use flife_core::rng::half_open_unit;
-use flife_neural::DenseTopology;
+use flife_neural::{DenseTopology, Weight};
 
 /// The initializer this module implements.
 pub const FAN_IN_SCALED_SYMMETRIC_V1: &str = "fan-in-scaled-symmetric-v1";
@@ -33,11 +33,22 @@ pub struct WeightAddress {
     pub input: usize,
 }
 
-/// The fan-in-scaled weight a raw word gives a layer of fan-in `fan_in`.
+/// The fan-in-scaled F32 weight a raw word gives a layer of fan-in
+/// `fan_in` ([`fan_in_draw`] in F32).
 ///
 /// # Errors
 /// [`CoreError::NumericalInvalid`] for a zero fan-in.
 pub fn fan_in_weight(word: u64, fan_in: usize) -> Result<f32, CoreError> {
+    fan_in_draw(word, fan_in)
+}
+
+/// The fan-in-scaled weight a raw word gives a layer of fan-in `fan_in`,
+/// computed in F64 and rounded once to `W`, the declared canonical rounding
+/// of its dtype.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a zero fan-in.
+pub fn fan_in_draw<W: Weight>(word: u64, fan_in: usize) -> Result<W, CoreError> {
     if fan_in == 0 {
         return Err(CoreError::NumericalInvalid {
             quantity: "layer fan-in",
@@ -45,21 +56,22 @@ pub fn fan_in_weight(word: u64, fan_in: usize) -> Result<f32, CoreError> {
         });
     }
     let limit = (3.0 / fan_in as f64).sqrt();
-    // Rounding once to F32 is the declared canonical rounding.
-    Ok(((2.0 * half_open_unit(word) - 1.0) * limit) as f32)
+    Ok(W::round_from_f64(
+        (2.0 * half_open_unit(word) - 1.0) * limit,
+    ))
 }
 
 /// Fill `parameters`, laid out as `topology`, with a founder's values:
-/// each weight from `word(address)` and each bias zero. Words are requested
-/// in ascending (layer, output, input) order; each depends only on its
-/// address.
+/// each weight from `word(address)`, rounded once to `W`, and each bias
+/// zero. Words are requested in ascending (layer, output, input) order;
+/// each depends only on its address.
 ///
 /// # Errors
 /// [`CoreError::LayoutMismatch`] when `parameters` does not have the
 /// topology's length.
-pub fn initialize(
+pub fn initialize<W: Weight>(
     topology: &DenseTopology,
-    parameters: &mut [f32],
+    parameters: &mut [W],
     mut word: impl FnMut(WeightAddress) -> u64,
 ) -> Result<(), CoreError> {
     if parameters.len() != topology.parameter_count() {
@@ -88,7 +100,7 @@ pub fn initialize(
             .split_at_mut(shape.biases - shape.weights);
         for (output, row) in weights.chunks_exact_mut(shape.inputs).enumerate() {
             for (input, slot) in row.iter_mut().enumerate() {
-                *slot = fan_in_weight(
+                *slot = fan_in_draw(
                     word(WeightAddress {
                         layer,
                         output,
@@ -98,7 +110,7 @@ pub fn initialize(
                 )?;
             }
         }
-        biases.fill(0.0);
+        biases.fill(W::round_from_f64(0.0));
     }
     Ok(())
 }

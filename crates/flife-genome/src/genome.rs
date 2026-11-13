@@ -17,10 +17,10 @@ use std::sync::Arc;
 
 use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_neural::ReferenceController;
+use flife_neural::{ReferenceController, Weights};
 
 use crate::catalog::{TopologyCatalog, TopologyId};
-use crate::quota::ParameterBuffer;
+use crate::quota::{ParameterBuffer, ParameterValues};
 
 /// Chemical channels, and so affinity components.
 pub const AFFINITY_TERMS: usize = 32;
@@ -253,13 +253,13 @@ fn check_norm(quantity: &'static str, values: &[f64], limit: f64) -> Result<(), 
 
 /// A genome's parameters, shared read-only with its readers.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SharedParameters(Arc<Vec<f32>>);
+pub struct SharedParameters(Arc<ParameterValues>);
 
 impl SharedParameters {
-    /// The parameters.
+    /// The parameters, in their canonical dtype.
     #[must_use]
-    pub fn as_slice(&self) -> &[f32] {
-        &self.0
+    pub fn weights(&self) -> Weights<'_> {
+        self.0.weights()
     }
 
     /// Whether `self` and `other` are the same buffer, not merely equal.
@@ -350,10 +350,11 @@ impl Genome {
         self.topology
     }
 
-    /// The controller parameters, in the layout of `flife_neural::controller`.
+    /// The controller parameters, in the layout of `flife_neural::controller`
+    /// and their canonical dtype.
     #[must_use]
-    pub fn parameters(&self) -> &[f32] {
-        self.parameters.as_slice()
+    pub fn parameters(&self) -> Weights<'_> {
+        self.parameters.weights()
     }
 
     /// A read-only handle to the parameters that outlives the genome.

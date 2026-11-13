@@ -191,6 +191,36 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     );
 }
 
+/// FL-030: the preset in compact F16 on Metal. Each binary16 genome is
+/// uploaded widened exactly to the F32 the reference reads, so the world is
+/// the reference F16 world at every tick, newborns included, and the device
+/// does the work. (The shard still holds F32: halving its resident bytes is
+/// a separate kernel.)
+#[test]
+fn an_f16_world_on_metal_is_the_reference_world_at_every_tick() {
+    let Some(backend) = metal() else { return };
+    let preset = PRESET.replace(
+        "canonical_weight_dtype = \"f32\"",
+        "canonical_weight_dtype = \"f16\"",
+    );
+    assert_ne!(preset, PRESET, "the preset declares its weight dtype");
+    let mut reference = found_from(&preset);
+    let mut metal = found_from(&preset);
+    metal.set_controller_backend(Some(Box::new(backend)));
+    let (difference, evaluated, births, live) = race(&mut reference, &mut metal, 400);
+    let report = metal.controller_report();
+    println!("evaluated {evaluated}, births {births}, live {live}: {report:?}");
+    assert_eq!(difference, None, "the worlds diverged");
+    assert_eq!(report.failure, None);
+    assert_eq!(report.reference_ticks, 0);
+    assert_eq!(report.batched + report.deferred, evaluated);
+    assert!(report.batched > 1_000_000, "{report:?}");
+    assert!(
+        births > 0,
+        "newborn binary16 genomes must be uploaded mid-run"
+    );
+}
+
 /// FL-043: under half of what an unbounded backend holds after 40 ticks,
 /// shards that would not fit are not made and their jobs go to the
 /// reference, so the world is the reference world at every tick while the

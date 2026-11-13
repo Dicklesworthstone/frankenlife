@@ -23,8 +23,10 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
 - `SensorScales` (`[sensors]`): `R_scale`, `L_gradient`, `R_floor`, `E_scale`, the age, velocity and
   energy-change scales, and the admitted sensing-scale range.
 - 36 raw controller outputs, the `TimeStep`, and `ActionDecoding` (`[reproduction]`, `[emission]`).
-- For the controller: a `DenseTopology` (`[controller]`, or hidden widths directly), one organism's own F32
-  parameters in the declared layout, and `maximum_absolute_parameter`.
+- For the controller: a `DenseTopology` (`[controller]`, or hidden widths directly), one organism's own
+  parameters in the declared layout as `Weights` (F32, or binary16 under `f16`, FL-030), and
+  `maximum_absolute_parameter`. A binary16 parameter is widened exactly to F32 where the arithmetic reads it, so
+  the evaluation below is the same for both dtypes.
 
 **Outputs.**
 - `observe` returns an `Observation`:
@@ -164,8 +166,8 @@ F32, and each lies at least 0.10 F32 ulp from a rounding midpoint.
 
 **Validity domain.** `energy-moment-gradient-104-v1` with `fixed-local-scales-v1`, `positive-box-v1`,
 `log-linear-v1` and `no-emission-no-charge`, for the 32-channel field of `field-ecology-v1`. The controller covers
-`independent-dense-mlp-v1` with one or two hidden layers, `tanh`, `linear` and `f32` accumulation over F32
-weights: the reference F32 profile of §10.3.
+`independent-dense-mlp-v1` with one or two hidden layers, `tanh`, `linear` and `f32` accumulation over F32 or
+binary16 weights: the reference F32 and compact F16 profiles of §10.3.
 
 **Known gaps.**
 - Mutation of the heritable sensing scale (A.3 item 4) is FL-010's, so that registry entry stays `Specified`

@@ -917,7 +917,7 @@ fn uniform_parent(
     let mut buffer = quota
         .allocate(catalog, catalog.default_topology())
         .expect("room for the parent");
-    buffer.values_mut().fill(value);
+    buffer.f32_mut().expect("an F32 buffer").fill(value);
     Genome::seal(
         buffer,
         GenomeId::new(organism),

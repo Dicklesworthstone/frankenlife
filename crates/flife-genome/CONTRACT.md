@@ -59,13 +59,18 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
 - Independence (§6.5, INV-13). Every genome has its own buffer, even when two have identical content. Readers hold
   `SharedParameters`, so a retired genome's parameters stay readable without a copy, and they count against
   observer budgets rather than the genome quota (§7.5).
-- Logical quota (§7.5, A.2). Every live genome is charged `P × 4` bytes, its full canonical F32 size.
-  Deduplication never lowers that charge. The allocated quota counts the bytes actually reserved. Both are
+- Weight dtype (§10.3, FL-030). `controller.canonical_weight_dtype` is `f32` (the reference profile) or `f16`
+  (compact F16, "a distinct quantized evolutionary model"). The quota, its buffers and every genome of a run hold
+  that one dtype; `Genome::parameters` gives them as `Weights` (`F32` or `F16` slices of `flife_core::binary16::F16`),
+  and the controller widens each binary16 exactly to F32 and accumulates in F32 as for `f32`.
+- Logical quota (§7.5, A.2). Every live genome is charged `P × b` bytes, its full canonical size at the run's
+  weight dtype (`b` = 4 for `f32`, 2 for `f16`). Deduplication never lowers that charge. The allocated quota counts the bytes actually reserved. Both are
   checked before allocation, and a refusal changes nothing. Logical is at most allocated.
 - Allocation is fallible. An unrepresentable or refused buffer is `AllocationFailed`, never an abort (INV-15).
 - `fan-in-scaled-symmetric-v1`. A weight of fan-in `I` is `(2u − 1) √(3/I)` with `u = k 2^-52`, where `k` is the
   word's leading 52 bits. That is computed in F64 (`2u − 1` exact; `3/I` and `√` correctly rounded) and rounded
-  once to F32. Biases are zero. Each weight depends only on its own address's word.
+  once to the weight dtype (an F16 founder is never its F32 founder rounded again). Biases are zero. Each weight
+  depends only on its own address's word.
 - `overlap-plus-zero-output-v1` (same depth). The leading overlapping subnetwork is copied, biases and output biases
   included. An added neuron gets fan-in-scaled incoming weights from inherited inputs and a zero bias, and its
   outgoing weights are zero, so widening preserves the parent's function exactly. Shrinking keeps the leading
@@ -102,7 +107,8 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
        layer's fan-in;
      - otherwise word 2 against `weight_probability` perturbs it by `weight_standard_deviation` times the
        Box–Muller cosine of draw 1.
-     The arithmetic is F64, rounded once to F32 with ties to even. Biases follow the same rule.
+     The arithmetic is F64 from the parent widened exactly, rounded once to the weight dtype with ties to even.
+     Biases follow the same rule.
   3. Traits.
      - The affinity adds `chemistry_standard_deviation` normals and renormalizes.
      - The motion response adds the same deviation and projects radially into its ball when outside it.
@@ -191,6 +197,11 @@ neurons that keep their outgoing weights. These tests caught each of them.
   - ties to even;
   - a replaced weight `0xbe2c8834`, a replaced bias `0xbd3628c2` and a perturbed weight `0x3e81b044`, all from the
     oracle.
+- Compact F16 (FL-030):
+  - binary16 ties to even at 1 and 1 + 2^-10, and a subnormal result;
+  - the same full paths in F16 give `0xb164`, `0xa9b1` and `0x340e`, `numpy.float16` of the same F64 values;
+  - C.16 in F16: a step of 1e-6 × N changes an F32 parent of 0.5 but rounds back to an F16 one, so all eight
+    F16 candidates are effective no-ops and nothing is charged.
 - Topology targets are uniform among the other admitted members (400 attempts, five standard deviations), with a
   capped member never chosen.
 - Perturbation and replacement counts over 200 children of Appendix A's rates lie within five standard
@@ -206,14 +217,15 @@ Five planted mutation bugs were each caught by these tests:
 - the wrong stream.
 
 **Validity domain.** `dense-104-36-catalog-v1` with `overlap-plus-zero-output-v1`, `prefix-and-identity-bridge-v1`,
-F32 canonical weights and `independent-dense-mlp-v1` controllers, with traits for the 32-channel field of
-`field-ecology-v1`.
+F32 or binary16 canonical weights and `independent-dense-mlp-v1` controllers, with traits for the 32-channel field
+of `field-ecology-v1`.
 
 **Known gaps.**
 - The birth transaction is FL-011. It owns energy and cooldown preservation on a rejected birth, the identity of
   the child, and storing the `MutationRecord` with the child's provenance.
-- Only F32 canonical genomes exist. C.16's F16 rounding case, and the strict-distinct profile's choice of a
-  representable neighbouring value, wait for an F16 weight dtype.
+- The strict-distinct profile's choice of a representable neighbouring value (C.16) is not implemented in either
+  dtype. In F16 it matters more: a step below half a binary16 step is a no-op far more often than in F32, and how
+  often under Appendix A's rates (§24.2's mutation fidelity) is measured by FL-030, not here.
 - A strict globally unique benchmark's content-hash check at birth (§7.3) is not implemented. Parent-relative
   nonidentity is.
 - `MAXIMUM_CANDIDATES` is §7.3's eight. Device paths must reuse the same addresses (FL-032).

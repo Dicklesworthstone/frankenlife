@@ -53,7 +53,7 @@ use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
 use flife_core::numerics::tanh;
 use flife_neural::{
     ACTION_WIDTH, BackendBudget, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH,
-    ShardGeometry,
+    ShardGeometry, Weight, Weights,
 };
 use ft_kernel_cpu::population_affine_f32_into;
 
@@ -133,9 +133,22 @@ fn shape(topology: &DenseTopology, length: usize) -> Option<Vec<Layer>> {
 }
 
 /// Pack `parameters` (`weight[out][in]` then `bias[out]`, layer by layer)
-/// into `out`, in `layers`' order.
+/// into `out`, in `layers`' order, as the F32 the arithmetic reads. An F16
+/// genome widens exactly, so its shard evaluates as the reference does.
 fn pack(
-    parameters: &[f32],
+    parameters: Weights<'_>,
+    topology: &DenseTopology,
+    layers: &[Layer],
+    out: &mut [f32],
+) -> Result<(), CoreError> {
+    match parameters {
+        Weights::F32(values) => pack_as(values, topology, layers, out),
+        Weights::F16(values) => pack_as(values, topology, layers, out),
+    }
+}
+
+fn pack_as<W: Weight>(
+    parameters: &[W],
     topology: &DenseTopology,
     layers: &[Layer],
     out: &mut [f32],
@@ -162,10 +175,12 @@ fn pack(
                 .iter_mut()
                 .zip(weights.iter().skip(input).step_by(layer.inputs))
             {
-                *slot = value;
+                *slot = value.widen();
             }
         }
-        packed_biases.copy_from_slice(biases);
+        for (slot, bias) in packed_biases.iter_mut().zip(biases) {
+            *slot = bias.widen();
+        }
     }
     Ok(())
 }

@@ -22,8 +22,8 @@ use flife_core::{CoreError, ValidatedConfig};
 use crate::catalog::TopologyCatalog;
 use crate::draws::normals;
 use crate::genome::{AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, rescale};
-use crate::init::initialize;
-use crate::quota::GenomeQuota;
+use crate::init::{WeightAddress, initialize};
+use crate::quota::{GenomeQuota, WeightsMut};
 
 /// A founder's genome.
 ///
@@ -51,10 +51,8 @@ pub fn founder(
         })?;
     let mut buffer = quota.allocate(catalog, member)?;
     let mut lane_error = None;
-    let filled = initialize(
-        topology,
-        buffer.values_mut(),
-        |weight| match Lane::neuron_index(weight.layer, weight.output, weight.input)
+    let word =
+        |weight: WeightAddress| match Lane::neuron_index(weight.layer, weight.output, weight.input)
             .and_then(|index| Lane::new(0, LaneKind::Weight, index))
         {
             Ok(lane) => rng.block(address(organism, lane))[0],
@@ -62,8 +60,11 @@ pub fn founder(
                 lane_error.get_or_insert(error);
                 0
             }
-        },
-    );
+        };
+    let filled = match buffer.values_mut() {
+        WeightsMut::F32(values) => initialize(topology, values, word),
+        WeightsMut::F16(values) => initialize(topology, values, word),
+    };
     if let Some(error) = lane_error.or_else(|| filled.err()) {
         quota.abandon(buffer)?;
         return Err(error);

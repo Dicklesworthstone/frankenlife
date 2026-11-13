@@ -296,9 +296,9 @@ fn a_fresh_offspring_child_holds_the_founder_genome_of_its_own_identity() {
                     identical_to_parent += u64::try_from(
                         parent
                             .parameters()
-                            .iter()
-                            .zip(child.parameters())
-                            .filter(|(a, b)| a.to_bits() == b.to_bits())
+                            .bits()
+                            .zip(child.parameters().bits())
+                            .filter(|(a, b)| a == b)
                             .count(),
                     )
                     .expect("a count");

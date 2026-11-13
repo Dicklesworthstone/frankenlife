@@ -30,6 +30,7 @@
 //! holdings must equal the restored field's and organisms' energy in every
 //! bit.
 
+use flife_core::binary16::F16;
 use flife_core::checkpoint::{ByteReader, CheckpointReader, CheckpointWriter, Chunk, ChunkFamily};
 use flife_core::clock::{Tick, stable_phase};
 use flife_core::ids::{
@@ -40,8 +41,8 @@ use flife_core::{
     CompensatedSum, CoreError, EnergyLedger, Holdings, LedgerState, ResidualBudget, ValidatedConfig,
 };
 use flife_field::{ConeTolerance, FIELD_PLANES, FieldPair, SeededPath};
-use flife_genome::{DENSE_104_36_CATALOG_V1, Genome, GenomeQuota, Traits};
-use flife_neural::ACTION_WIDTH;
+use flife_genome::{DENSE_104_36_CATALOG_V1, Genome, GenomeQuota, Traits, WeightsMut};
+use flife_neural::{ACTION_WIDTH, Weights};
 
 use super::{
     Controllers, Fields, NumericalProfile, Rules, Scratch, Sensors, Uptake, Watch, World,
@@ -267,8 +268,13 @@ impl World {
                     }
                     out.f64(traits.sensing_scale());
                     out.u64(items(genome.parameters().len()));
-                    for value in genome.parameters() {
-                        out.f32(*value);
+                    // Each value in the run's weight dtype: an F32's bits,
+                    // or a binary16's.
+                    match genome.parameters() {
+                        Weights::F32(values) => values.iter().for_each(|value| out.f32(*value)),
+                        Weights::F16(values) => {
+                            values.iter().for_each(|value| out.u16(value.to_bits()));
+                        }
                     }
                 }
                 Ok(())
@@ -562,7 +568,8 @@ impl World {
             let sensing = input.f64()?;
             let traits = Traits::new(affinity, motion, sensing, &rules.limits)
                 .map_err(|error| refuse(format!("{id}'s traits: {error}")))?;
-            let count = input.count(parameters_max, 4)?;
+            let width = usize::try_from(quota.dtype().bytes()).unwrap_or(usize::MAX);
+            let count = input.count(parameters_max, width)?;
             let mut buffer = quota.allocate(catalog, topology)?;
             if buffer.values().len() != count {
                 quota.abandon(buffer)?;
@@ -570,8 +577,17 @@ impl World {
                     "{id} has {count} parameters; its topology has a different count"
                 )));
             }
-            for value in buffer.values_mut() {
-                *value = input.f32()?;
+            let read = match buffer.values_mut() {
+                WeightsMut::F32(values) => values
+                    .iter_mut()
+                    .try_for_each(|value| input.f32().map(|read| *value = read)),
+                WeightsMut::F16(values) => values
+                    .iter_mut()
+                    .try_for_each(|value| input.u16().map(|read| *value = F16::from_bits(read))),
+            };
+            if let Err(error) = read {
+                quota.abandon(buffer)?;
+                return Err(error);
             }
             let genome = Genome::seal(buffer, id, catalog, traits, parent, &rules.limits).or_else(
                 |unsealed| {

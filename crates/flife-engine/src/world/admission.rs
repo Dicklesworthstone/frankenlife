@@ -29,7 +29,6 @@
 
 use flife_core::CoreError;
 use flife_core::memory::{MemoryAdmission, RESERVE_BYTES};
-use flife_genome::quota::F32_BYTES;
 
 use super::World;
 
@@ -63,7 +62,8 @@ impl World {
         };
         let mut admission = MemoryAdmission {
             budget_bytes: execution.maximum_total_bytes,
-            logical_parameters: execution.maximum_logical_genome_bytes / F32_BYTES,
+            logical_parameters: execution.maximum_logical_genome_bytes
+                / self.quota().dtype().bytes(),
             logical_genome_bytes: execution.maximum_logical_genome_bytes,
             genomes: execution.maximum_allocated_genome_bytes,
             state: footprint.state,

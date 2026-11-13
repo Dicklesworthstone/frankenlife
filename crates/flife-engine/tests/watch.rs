@@ -321,7 +321,11 @@ fn check_activations(world: &World, id: OrganismId, inputs: &[f64; SENSOR_WIDTH]
         .chain(snapshot.hidden_widths.iter().map(|&width| width as usize))
         .chain(std::iter::once(ACTION_WIDTH))
         .collect();
-    let (hidden, outputs) = forward(genome.parameters(), &widths, inputs);
+    let (hidden, outputs) = forward(
+        genome.parameters().as_f32().expect("an F32 genome"),
+        &widths,
+        inputs,
+    );
     assert_eq!(activations.hidden.len(), snapshot.hidden_widths.len());
     for (reported, expected) in activations.hidden.iter().zip(&hidden) {
         assert_eq!(bits32(reported), bits32(expected));

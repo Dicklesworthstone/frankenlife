@@ -48,7 +48,7 @@ use flife_core::clock::Tick;
 use flife_core::ids::{GenomeId, OrganismId};
 use flife_field::pyramid::RawSample;
 use flife_genome::Traits;
-use flife_neural::{DecodedActions, LayerShape, Observation};
+use flife_neural::{DecodedActions, LayerShape, Observation, WeightDtype};
 
 use crate::{
     Descendants, EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism, Split,
@@ -234,6 +234,9 @@ pub struct ControllerWeights {
     /// outputs last: each one's fan-in and fan-out, and where its weights
     /// and biases sit in `parameters`.
     pub layers: Vec<LayerShape>,
+    /// The dtype its genome stores: every value of `parameters` is one of
+    /// its values, widened exactly to F32.
+    pub dtype: WeightDtype,
     /// Every parameter, in the controller's layout: layers in evaluation
     /// order, each `weight[out][in]` row-major followed by `bias[out]`
     /// (torch's `parameters_to_vector` order).

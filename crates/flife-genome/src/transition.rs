@@ -30,9 +30,9 @@
 //! takes precedence over initializing any connection, the bridge included.
 
 use flife_core::CoreError;
-use flife_neural::{DenseTopology, LayerShape};
+use flife_neural::{DenseTopology, LayerShape, Weight};
 
-use crate::init::{WeightAddress, fan_in_weight};
+use crate::init::{WeightAddress, fan_in_draw};
 
 /// The same-depth map this module implements.
 pub const OVERLAP_PLUS_ZERO_OUTPUT_V1: &str = "overlap-plus-zero-output-v1";
@@ -81,17 +81,18 @@ enum Entry {
 }
 
 /// Map `parent`, laid out as `source`, onto `target`, writing every value of
-/// `child`. Words are requested in ascending (layer, output, input) order,
-/// only for the incoming weights of added neurons.
+/// `child`, both in the weight dtype `W`. Words are requested in ascending
+/// (layer, output, input) order, only for the incoming weights of added
+/// neurons; each such draw is rounded once to `W`.
 ///
 /// # Errors
 /// [`CoreError::LayoutMismatch`] when a buffer does not have its topology's
 /// length; [`CoreError::NumericalInvalid`] for an unsupported depth change.
-pub fn map_parameters(
+pub fn map_parameters<W: Weight>(
     source: &DenseTopology,
-    parent: &[f32],
+    parent: &[W],
     target: &DenseTopology,
-    child: &mut [f32],
+    child: &mut [W],
     mut word: impl FnMut(WeightAddress) -> u64,
 ) -> Result<Transition, CoreError> {
     for (buffer, topology, name) in [(parent, source, "parent"), (&*child, target, "child")] {
@@ -198,12 +199,12 @@ pub fn map_parameters(
     Ok(transition)
 }
 
-fn resolve(
+fn resolve<W: Weight>(
     entry: Entry,
-    parent: &[f32],
+    parent: &[W],
     fan_in: usize,
     word: impl FnOnce() -> u64,
-) -> Result<f32, CoreError> {
+) -> Result<W, CoreError> {
     match entry {
         Entry::Copy(offset) => {
             parent
@@ -214,13 +215,14 @@ fn resolve(
                     detail: format!("parent offset {offset} is out of range"),
                 })
         }
-        Entry::Draw => fan_in_weight(word(), fan_in),
-        Entry::Zero => Ok(0.0),
-        Entry::One => Ok(1.0),
+        Entry::Draw => fan_in_draw(word(), fan_in),
+        // Zero and one are exact in every dtype.
+        Entry::Zero => Ok(W::round_from_f64(0.0)),
+        Entry::One => Ok(W::round_from_f64(1.0)),
     }
 }
 
-fn write(child: &mut [f32], offset: Option<usize>, value: f32) -> Result<(), CoreError> {
+fn write<W: Weight>(child: &mut [W], offset: Option<usize>, value: W) -> Result<(), CoreError> {
     let slot = offset
         .and_then(|offset| child.get_mut(offset))
         .ok_or_else(|| CoreError::LayoutMismatch {

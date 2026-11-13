@@ -261,9 +261,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
   `organism` record per live organism in identity order (identity, genome, lineage, generation, parent, birth
   tick, position, velocity, energy, topology index, parameter count and affinity), and with `--field` one `field`
   record: every cell's energy, row-major (`y · cells_x + x`), each `f32` widened exactly; then one `weights` record
-  per organism `--weights` names, in the order named (its identity, genome, topology index and parameter count, and
-  its `layers` in evaluation order: `inputs`, `outputs`, `weights[out][in]` and `biases[out]`, each `f32` as stored,
-  104 inputs into the first and 36 raw outputs from the last); an organism the restored world does not hold is
+  per organism `--weights` names, in the order named (its identity, genome, topology index, parameter count and
+  weight `dtype` (`f32` or `f16`), and its `layers` in evaluation order: `inputs`, `outputs`, `weights[out][in]`
+  and `biases[out]`, each the stored value as an `f32`, a binary16 widened exactly, 104 inputs into the first and
+  36 raw outputs from the last); an organism the restored world does not hold is
   refused (`state-conflict`). `InspectedWeights::of(dump)` lays a `ControllerWeights` out as that record; the
   Studio's weight dump (FL-021) writes its layers through it. Every number is the stored value. The directory's configuration and catalog are checked before its store is opened, so a directory that
   holds no run is refused untouched; the store is opened as `resume` and `branch` open it.

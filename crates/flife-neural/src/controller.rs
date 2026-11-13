@@ -36,6 +36,7 @@ use flife_core::{CoreError, ValidatedConfig};
 
 use crate::actions::ACTION_WIDTH;
 use crate::sensors::SENSOR_WIDTH;
+use crate::weights::{Weight, WeightDtype, Weights};
 
 /// The controller family this module implements.
 pub const INDEPENDENT_DENSE_MLP_V1: &str = "independent-dense-mlp-v1";
@@ -165,7 +166,8 @@ impl DenseTopology {
         })
     }
 
-    /// The default topology of a validated configuration.
+    /// The default topology of a validated configuration. The topology is
+    /// the same for either weight dtype ([`WeightDtype`]).
     ///
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for another controller family,
@@ -173,6 +175,7 @@ impl DenseTopology {
     /// [`DenseTopology::new`].
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let controller = &config.config().controller;
+        WeightDtype::named(&controller.canonical_weight_dtype)?;
         for (role, name, implemented) in [
             (
                 "controller.family",
@@ -188,11 +191,6 @@ impl DenseTopology {
                 "controller.output_activation",
                 &controller.output_activation,
                 LINEAR,
-            ),
-            (
-                "controller.canonical_weight_dtype",
-                &controller.canonical_weight_dtype,
-                F32,
             ),
             (
                 "controller.accumulation_dtype",
@@ -270,11 +268,12 @@ impl ControllerScratch {
     }
 }
 
-/// One organism's controller: its own parameters, read through a topology.
+/// One organism's controller: its own parameters, read through a topology,
+/// in either weight dtype ([`Weights`]).
 #[derive(Debug, Clone, Copy)]
 pub struct ReferenceController<'a> {
     topology: &'a DenseTopology,
-    parameters: &'a [f32],
+    parameters: Weights<'a>,
 }
 
 impl<'a> ReferenceController<'a> {
@@ -288,9 +287,10 @@ impl<'a> ReferenceController<'a> {
     /// parameter count the topology does not have.
     pub fn new(
         topology: &'a DenseTopology,
-        parameters: &'a [f32],
+        parameters: impl Into<Weights<'a>>,
         maximum_absolute_parameter: f64,
     ) -> Result<Self, CoreError> {
+        let parameters = parameters.into();
         if !maximum_absolute_parameter.is_finite() || maximum_absolute_parameter <= 0.0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "controller.maximum_absolute_parameter",
@@ -307,7 +307,7 @@ impl<'a> ReferenceController<'a> {
                 ),
             });
         }
-        if let Some((index, value)) = parameters.iter().enumerate().find(|&(_, &value)| {
+        if let Some((index, value)) = parameters.iter().enumerate().find(|&(_, value)| {
             !value.is_finite() || f64::from(value.abs()) > maximum_absolute_parameter
         }) {
             return Err(CoreError::NumericalInvalid {
@@ -332,7 +332,11 @@ impl<'a> ReferenceController<'a> {
     /// # Errors
     /// [`CoreError::LayoutMismatch`] for a parameter count the topology does
     /// not have.
-    pub fn sealed(topology: &'a DenseTopology, parameters: &'a [f32]) -> Result<Self, CoreError> {
+    pub fn sealed(
+        topology: &'a DenseTopology,
+        parameters: impl Into<Weights<'a>>,
+    ) -> Result<Self, CoreError> {
+        let parameters = parameters.into();
         if parameters.len() != topology.parameters {
             return Err(CoreError::LayoutMismatch {
                 buffer: "controller parameters",
@@ -355,9 +359,9 @@ impl<'a> ReferenceController<'a> {
         self.topology
     }
 
-    /// The parameters, in the topology's layout.
+    /// The parameters, in the topology's layout and their canonical dtype.
     #[must_use]
-    pub const fn parameters(&self) -> &'a [f32] {
+    pub const fn parameters(&self) -> Weights<'a> {
         self.parameters
     }
 
@@ -370,6 +374,20 @@ impl<'a> ReferenceController<'a> {
     /// [`CoreError::AllocationFailed`] if `scratch` must grow and cannot.
     pub fn evaluate(
         &self,
+        inputs: &[f64; SENSOR_WIDTH],
+        scratch: &mut ControllerScratch,
+    ) -> Result<[f32; ACTION_WIDTH], CoreError> {
+        match self.parameters {
+            Weights::F32(parameters) => self.evaluate_with(parameters, inputs, scratch),
+            Weights::F16(parameters) => self.evaluate_with(parameters, inputs, scratch),
+        }
+    }
+
+    /// [`ReferenceController::evaluate`] over weights of one dtype, each
+    /// read as [`Weight::widen`] gives it.
+    fn evaluate_with<W: Weight>(
+        &self,
+        parameters: &[W],
         inputs: &[f64; SENSOR_WIDTH],
         scratch: &mut ControllerScratch,
     ) -> Result<[f32; ACTION_WIDTH], CoreError> {
@@ -403,7 +421,7 @@ impl<'a> ReferenceController<'a> {
 
         let mut source: &[f32] = &rounded;
         for (layer, activations) in hidden_layers.iter().zip([first, second]) {
-            affine(self.parameters, layer, source, |_, z| {
+            affine(parameters, layer, source, |_, z| {
                 let activated = tanh(f64::from(z)).ok_or_else(|| CoreError::NumericalInvalid {
                     quantity: "controller pre-activation",
                     detail: format!("{z} overflowed"),
@@ -417,7 +435,7 @@ impl<'a> ReferenceController<'a> {
         }
 
         let mut raw = [0.0_f32; ACTION_WIDTH];
-        affine(self.parameters, output_layer, source, |output, z| {
+        affine(parameters, output_layer, source, |output, z| {
             if !z.is_finite() {
                 return Err(CoreError::NumericalInvalid {
                     quantity: "controller output",
@@ -482,10 +500,11 @@ pub fn widen(raw: &[f32; ACTION_WIDTH]) -> [f64; ACTION_WIDTH] {
 }
 
 /// One affine layer in the declared order: for each output neuron, the
-/// bias, then each input's product in ascending index, all in F32. `emit`
-/// receives each neuron's `z` in output order.
-fn affine(
-    parameters: &[f32],
+/// bias, then each input's product in ascending index, all in F32 with each
+/// weight read as [`Weight::widen`] gives it. `emit` receives each neuron's
+/// `z` in output order.
+fn affine<W: Weight>(
+    parameters: &[W],
     layer: &LayerShape,
     input: &[f32],
     mut emit: impl FnMut(usize, f32) -> Result<(), CoreError>,
@@ -508,9 +527,9 @@ fn affine(
         .get(layer.biases..layer.end())
         .ok_or_else(|| mismatch(format!("biases {}..{}", layer.biases, layer.end())))?;
     for (output, (row, &bias)) in weights.chunks_exact(layer.inputs).zip(biases).enumerate() {
-        let mut z = bias;
+        let mut z = bias.widen();
         for (&weight, &value) in row.iter().zip(input) {
-            z += weight * value;
+            z += weight.widen() * value;
         }
         emit(output, z)?;
     }

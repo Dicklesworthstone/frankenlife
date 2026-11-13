@@ -26,8 +26,8 @@ use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 use flife_field::FieldState;
 use flife_genome::TopologyCatalog;
 use flife_neural::{
-    ACTION_WIDTH, ActionDecoding, ControllerScratch, ReferenceController, SENSOR_WIDTH, decode,
-    widen,
+    ACTION_WIDTH, ActionDecoding, ControllerScratch, ReferenceController, SENSOR_WIDTH,
+    WeightDtype, decode, widen,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -489,14 +489,15 @@ fn a_weight_dump_is_the_organisms_own_controller() {
         assert_eq!(dump.organism, organism.id);
         assert_eq!(dump.genome, organism.genome);
         assert_eq!(dump.topology, genome.topology().index());
-        assert_eq!(bits(&dump.parameters), bits(genome.parameters()));
+        let parameters = genome.parameters().as_f32().expect("an F32 genome");
+        assert_eq!(dump.dtype, WeightDtype::F32);
+        assert_eq!(bits(&dump.parameters), bits(parameters));
         let topology = catalog.topology(genome.topology()).expect("in the catalog");
         let widths: Vec<usize> = std::iter::once(SENSOR_WIDTH)
             .chain(topology.hidden_widths().iter().map(|&width| width as usize))
             .chain(std::iter::once(ACTION_WIDTH))
             .collect();
         assert_eq!(dump.layers.len(), widths.len() - 1);
-        let parameters = genome.parameters();
         let mut at = 0;
         let mut layers = Vec::new();
         for (index, (shape, pair)) in dump.layers.iter().zip(widths.windows(2)).enumerate() {

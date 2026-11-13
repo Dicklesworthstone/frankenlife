@@ -1531,15 +1531,18 @@ impl World {
         copy.try_reserve_exact(parameters.len())
             .map_err(|_| CoreError::AllocationFailed {
                 buffer: "dumped controller weights",
-                bytes: u64::try_from(size_of_val(parameters)).unwrap_or(u64::MAX),
+                bytes: bytes_for::<f32>(parameters.len()),
             })?;
-        copy.extend_from_slice(parameters);
+        // Widening a binary16 to F32 is exact, so the copy is the stored
+        // values whatever the dtype.
+        copy.extend(parameters.iter());
         Ok(Some(ControllerWeights {
             tick: self.tick,
             organism: id,
             genome: organism.genome,
             topology: genome.topology().index(),
             layers: topology.layers().to_vec(),
+            dtype: parameters.dtype(),
             parameters: copy,
         }))
     }

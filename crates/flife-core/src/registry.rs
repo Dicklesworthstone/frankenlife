@@ -472,6 +472,12 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     },
     AlgorithmEntry {
         status: Status::Implemented {
+            evidence: "test:flife-engine::tests/f16_world.rs::an_f16_world_is_deterministic_and_resumes_bit_for_bit",
+        },
+        ..entry("f16", Role::WeightDtype, "§10.3", "FL-030")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
             evidence: "test:flife-neural::tests/controller.rs::accumulation_is_f32_bias_first_in_ascending_input_order",
         },
         ..entry("f32", Role::AccumulationDtype, "§10.3", "FL-008")
@@ -798,6 +804,7 @@ pub fn lookup(role: Role, name: &str) -> Result<&'static AlgorithmEntry, CoreErr
 pub fn dtype_bytes(name: &str) -> Option<u64> {
     match name {
         "f32" => Some(4),
+        "f16" => Some(2),
         _ => None,
     }
 }

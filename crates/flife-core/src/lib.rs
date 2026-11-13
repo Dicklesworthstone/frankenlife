@@ -23,9 +23,12 @@
 //!   numerical profile.
 //! - [`rng`]: `fnp-philox-semantic-v1`, semantically addressed Philox words
 //!   and the uniform, choice and Box–Muller conventions (FL-010).
+//! - [`binary16`]: the compact-F16 profile's weights, exact widening and
+//!   the declared rounding from F64 (plan §10.3).
 
 #![forbid(unsafe_code)]
 
+pub mod binary16;
 pub mod canonical;
 pub mod checkpoint;
 pub mod clock;

@@ -9,14 +9,16 @@
 
 use std::collections::BTreeMap;
 
+use flife_core::binary16::F16;
 use flife_core::ids::{GenomeId, OrganismId};
 use flife_core::numerics::exp;
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_genome::{
     BirthAttempt, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters, Mutator, Proposal,
-    RejectionReason, TopologyCatalog, TopologyId, TraitLimits, Traits, Transition, fan_in_weight,
-    founder, initial_scale, map_parameters, perturb, reflect_log_scale,
+    RejectionReason, TopologyCatalog, TopologyId, TraitLimits, Traits, Transition, WeightDtype,
+    WeightsMut, fan_in_weight, founder, initial_scale, map_parameters, perturb, perturb_weight,
+    reflect_log_scale,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -101,7 +103,8 @@ fn founder_of(
     .expect("a founder")
 }
 
-/// A parent of the default member whose every parameter is `value`.
+/// A parent of the default member whose every parameter is `value`, in the
+/// quota's weight dtype (`value` must be exact in it).
 #[expect(
     clippy::expect_used,
     reason = "test helper: a failure here is a test failure"
@@ -112,7 +115,14 @@ fn uniform_parent(value: f32, catalog: &TopologyCatalog, quota: &mut GenomeQuota
     let mut buffer = quota
         .allocate(catalog, catalog.default_topology())
         .expect("room for the parent");
-    buffer.values_mut().fill(value);
+    match buffer.values_mut() {
+        WeightsMut::F32(values) => values.fill(value),
+        WeightsMut::F16(values) => {
+            let half = F16::from_f64(f64::from(value));
+            assert_eq!(half.to_f32(), value, "exact in binary16");
+            values.fill(half);
+        }
+    }
     Genome::seal(
         buffer,
         GenomeId::new(1_000),
@@ -165,6 +175,15 @@ fn content(genome: &Genome) -> (TopologyId, Vec<u32>, Vec<u64>) {
     )
 }
 
+/// An F32 genome's parameters.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn f32s(genome: &Genome) -> &[f32] {
+    genome.parameters().as_f32().expect("an F32 genome")
+}
+
 fn squared(values: &[f64]) -> f64 {
     values
         .iter()
@@ -201,11 +220,11 @@ fn founders_are_functions_of_the_seed_and_their_identity() {
         .expect("default member");
     let layers = topology.layers();
     let offset = layers[0].weight(3, 101).expect("in range");
-    assert_eq!(one.parameters()[offset].to_bits(), 0xbb83_c278);
+    assert_eq!(f32s(&one)[offset].to_bits(), 0xbb83_c278);
     for layer in layers {
         for output in 0..layer.outputs {
             let bias = layer.bias(output).expect("in range");
-            assert_eq!(one.parameters()[bias].to_bits(), 0, "biases start at zero");
+            assert_eq!(f32s(&one)[bias].to_bits(), 0, "biases start at zero");
         }
     }
 
@@ -322,7 +341,7 @@ fn each_operator_changes_only_its_own_heritable_component() {
             draw: 0,
         })[1];
         let expected = fan_in_weight(word, shape.inputs).expect("fan-in");
-        assert_eq!(genome.parameters()[offset.expect("in range")], expected);
+        assert_eq!(f32s(&genome)[offset.expect("in range")], expected);
     }
 
     // Affinity and motion response only.
@@ -375,26 +394,19 @@ fn each_operator_changes_only_its_own_heritable_component() {
         change.transition
     );
     let mut expected = vec![f32::NAN; target.parameter_count()];
-    map_parameters(
-        source,
-        parent.parameters(),
-        target,
-        &mut expected,
-        |weight| {
-            let index =
-                Lane::neuron_index(weight.layer, weight.output, weight.input).expect("neuron");
-            rng.block(Address {
-                stream: Stream::Mutation,
-                entity: 4,
-                ordinal: 77,
-                lane: Lane::new(0, LaneKind::MapWeight, index).expect("lane"),
-                draw: 0,
-            })[0]
-        },
-    )
+    map_parameters(source, f32s(&parent), target, &mut expected, |weight| {
+        let index = Lane::neuron_index(weight.layer, weight.output, weight.input).expect("neuron");
+        rng.block(Address {
+            stream: Stream::Mutation,
+            entity: 4,
+            ordinal: 77,
+            lane: Lane::new(0, LaneKind::MapWeight, index).expect("lane"),
+            draw: 0,
+        })[0]
+    })
     .expect("the map applies");
     let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-    assert_eq!(bits(genome.parameters()), bits(&expected));
+    assert_eq!(bits(f32s(&genome)), bits(&expected));
 }
 
 #[test]
@@ -528,6 +540,46 @@ fn c16_exhausted_no_op_candidates_reject_the_birth_without_charge() {
     assert_eq!(record.perturbed as usize, genome.parameters().len());
 }
 
+/// C.16 in compact F16 (FL-030, §24.2's mutation fidelity): binary16's half
+/// step at 0.5 is 2^-12, so a perturbation of 1e-6 × N, at most about 8.6e-6,
+/// always rounds back to the parent. The same rates change an F32 parent,
+/// whose half-ulp there is 2^-25. Every F16 candidate is an effective no-op
+/// and the birth is rejected without charge.
+#[test]
+fn c16_in_f16_a_step_below_half_a_binary16_step_is_a_no_op() {
+    let catalog = catalog();
+    let rates = MutationParameters {
+        weight_probability: 1.0,
+        weight_standard_deviation: 1.0e-6,
+        reject_effective_noop: true,
+        ..quiet()
+    };
+
+    let mut wide = quota();
+    let parent = uniform_parent(0.5, &catalog, &mut wide);
+    let (genome, record) = child(&mutator(rates, &catalog), &parent, attempt(1, 9), &mut wide);
+    assert_ne!(content(&genome), content(&parent), "F32 resolves the step");
+    assert_eq!(record.perturbed as usize, genome.parameters().len());
+
+    let mut quota = quota().with_dtype(WeightDtype::F16);
+    let parent = uniform_parent(0.5, &catalog, &mut quota);
+    let before = quota.clone();
+    let proposal = mutator(rates, &catalog)
+        .propose(&parent, attempt(1, 9), GenomeId::new(2), &mut quota)
+        .expect("no capacity error");
+    let Proposal::Rejected { candidates } = proposal else {
+        panic!("an effective binary16 no-op was accepted");
+    };
+    assert_eq!(candidates.len(), usize::from(MAXIMUM_CANDIDATES));
+    assert!(
+        candidates
+            .iter()
+            .all(|rejection| rejection.reason == RejectionReason::EffectiveNoop),
+        "{candidates:?}"
+    );
+    assert_eq!(quota, before, "nothing is charged");
+}
+
 #[test]
 fn invalid_candidates_are_rejected_never_reinterpreted() {
     let catalog = catalog();
@@ -560,8 +612,8 @@ fn invalid_candidates_are_rejected_never_reinterpreted() {
     let mut buffer = quota
         .allocate(&catalog, catalog.default_topology())
         .expect("room");
-    buffer.values_mut().fill(0.25);
-    buffer.values_mut()[0] = bound;
+    buffer.f32_mut().expect("an F32 buffer").fill(0.25);
+    buffer.f32_mut().expect("an F32 buffer")[0] = bound;
     let traits = *parent.traits();
     let edge = Genome::seal(buffer, GenomeId::new(3), &catalog, traits, None, &limits())
         .expect("in bound");
@@ -623,8 +675,8 @@ fn canonical_rounding_fixtures() {
         ..quiet()
     };
     let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
-    assert_eq!(genome.parameters()[weight].to_bits(), 0xbe2c_8834);
-    assert_eq!(genome.parameters()[bias].to_bits(), 0xbd36_28c2);
+    assert_eq!(f32s(&genome)[weight].to_bits(), 0xbe2c_8834);
+    assert_eq!(f32s(&genome)[bias].to_bits(), 0xbd36_28c2);
 
     let rates = MutationParameters {
         weight_probability: 1.0,
@@ -632,7 +684,62 @@ fn canonical_rounding_fixtures() {
         ..quiet()
     };
     let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
-    assert_eq!(genome.parameters()[weight].to_bits(), 0x3e81_b044);
+    assert_eq!(f32s(&genome)[weight].to_bits(), 0x3e81_b044);
+}
+
+/// FL-030: the compact-F16 profile's rounding (plan §10.3, "F16 with
+/// declared rounding"). Every value is computed in F64 from the parent
+/// widened exactly and rounded once to binary16, ties to even; the
+/// full-path bits are `numpy.float16` of the F64 values the F32 fixtures
+/// above round to F32 (NumPy 2.5.4, imports no FrankenLife code).
+#[test]
+fn canonical_f16_rounding_fixtures() {
+    let one = F16::from_f64(1.0);
+    let step = 2.0_f64.powi(-10);
+    assert_eq!(perturb_weight(one, step / 4.0), one);
+    assert_eq!(perturb_weight(one, step / 2.0), one, "a tie rounds to even");
+    assert_eq!(perturb_weight(one, 0.75 * step).to_bits(), 0x3c01);
+    assert_eq!(
+        perturb_weight(F16::from_bits(0x3c01), step / 2.0).to_bits(),
+        0x3c02,
+        "a tie rounds to even"
+    );
+    assert_eq!(
+        perturb_weight(F16::ZERO, 1.0e-7).to_bits(),
+        0x0002,
+        "subnormal"
+    );
+
+    let catalog = catalog();
+    let mut quota = quota().with_dtype(WeightDtype::F16);
+    let parent = uniform_parent(0.25, &catalog, &mut quota);
+    assert_eq!(parent.parameters().dtype(), WeightDtype::F16);
+    let shape = catalog
+        .topology(catalog.default_topology())
+        .expect("default member")
+        .layers()[1];
+    let weight = shape.weight(5, 17).expect("in range");
+    let bias = shape.bias(5).expect("in range");
+    let at = attempt(7, 1234);
+    let halves = |genome: &Genome| {
+        let values = genome.parameters().as_f16().expect("an F16 genome");
+        (values[weight].to_bits(), values[bias].to_bits())
+    };
+
+    let rates = MutationParameters {
+        replacement_probability: 1.0,
+        ..quiet()
+    };
+    let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    assert_eq!(halves(&genome), (0xb164, 0xa9b1));
+
+    let rates = MutationParameters {
+        weight_probability: 1.0,
+        weight_standard_deviation: 0.02,
+        ..quiet()
+    };
+    let (genome, _) = child(&mutator(rates, &catalog), &parent, at, &mut quota);
+    assert_eq!(halves(&genome).0, 0x340e);
 }
 
 #[test]
@@ -697,7 +804,7 @@ fn perturbation_and_replacement_counts_follow_their_rates() {
         perturbed += u64::from(record.perturbed);
         replaced += u64::from(record.replaced);
         if record.replaced == 0 {
-            for (&ours, &theirs) in genome.parameters().iter().zip(parent.parameters()) {
+            for (&ours, &theirs) in f32s(&genome).iter().zip(f32s(&parent)) {
                 if ours != theirs {
                     let step = (f64::from(ours) - f64::from(theirs)) / 0.02;
                     sum += step;

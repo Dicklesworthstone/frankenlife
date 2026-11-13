@@ -91,6 +91,35 @@ fn the_preset_on_the_cpu_backend_is_the_reference_world_at_every_tick() {
     assert!(births > 0, "newborn genomes must be packed mid-run");
 }
 
+/// FL-030: the preset in compact F16. The backend packs each binary16
+/// genome widened exactly to the F32 the reference reads, so the world is
+/// the reference F16 world at every tick, newborns included, and nothing is
+/// deferred.
+#[test]
+fn an_f16_world_on_the_cpu_backend_is_the_reference_world_at_every_tick() {
+    let preset = PRESET.replace(
+        "canonical_weight_dtype = \"f32\"",
+        "canonical_weight_dtype = \"f16\"",
+    );
+    assert_ne!(preset, PRESET, "the preset declares its weight dtype");
+    let mut reference = found_from(&preset);
+    let mut batched = found_from(&preset);
+    batched.set_controller_backend(Some(Box::new(CpuBackend::new(workers()))));
+    let (difference, evaluated, births) = race(&mut reference, &mut batched, 400);
+    let report = batched.controller_report();
+    println!("evaluated {evaluated}, births {births}: {report:?}");
+    assert_eq!(difference, None, "the worlds diverged");
+    assert_eq!(report.failure, None);
+    assert_eq!(report.reference_ticks, 0);
+    assert_eq!(report.batched + report.deferred, evaluated);
+    assert_eq!(report.deferred, 0, "{report:?}");
+    assert!(report.batched > 1_000_000, "{report:?}");
+    assert!(
+        births > 0,
+        "newborn binary16 genomes must be packed mid-run"
+    );
+}
+
 /// FL-043: a backend budget below what the preset's genomes take leaves
 /// shards unmade, and their jobs go to the reference, so the world is the
 /// reference world at every tick while the backend holds no more than its

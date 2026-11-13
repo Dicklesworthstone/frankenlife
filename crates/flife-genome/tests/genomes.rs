@@ -707,7 +707,7 @@ fn genomes_are_sealed_once_and_shared_read_only() {
 
     // A parameter outside ±4 is refused, and the charge comes back.
     let mut buffer = quota.allocate(&catalog, default).expect("buffer");
-    buffer.values_mut()[17] = 4.5;
+    buffer.f32_mut().expect("an F32 buffer")[17] = 4.5;
     let unsealed = Genome::seal(buffer, GenomeId::new(1), &catalog, traits, None, &limits)
         .expect_err("out of bound");
     assert!(matches!(unsealed.error, CoreError::NumericalInvalid { .. }));
@@ -719,9 +719,11 @@ fn genomes_are_sealed_once_and_shared_read_only() {
     let mut founders = Vec::new();
     for raw in [2, 3] {
         let mut buffer = quota.allocate(&catalog, default).expect("buffer");
-        initialize(topology, buffer.values_mut(), |address| {
-            address_word(5, address)
-        })
+        initialize(
+            topology,
+            buffer.f32_mut().expect("an F32 buffer"),
+            |address| address_word(5, address),
+        )
         .expect("init");
         founders.push(
             Genome::seal(buffer, GenomeId::new(raw), &catalog, traits, None, &limits)
@@ -742,9 +744,9 @@ fn genomes_are_sealed_once_and_shared_read_only() {
     let mut buffer = quota.allocate(&catalog, wider).expect("buffer");
     map_parameters(
         topology,
-        founders[0].parameters(),
+        founders[0].parameters().as_f32().expect("an F32 genome"),
         member(&catalog, wider),
-        buffer.values_mut(),
+        buffer.f32_mut().expect("an F32 buffer"),
         |address| address_word(9, address),
     )
     .expect("map");
@@ -778,7 +780,7 @@ fn genomes_are_sealed_once_and_shared_read_only() {
     // Readers keep a retired genome's parameters; the quota does not.
     let reader = child.shared_parameters();
     quota.retire(child).expect("retire");
-    assert_eq!(reader.as_slice().len(), 18_628);
+    assert_eq!(reader.weights().len(), 18_628);
     assert_eq!(quota.logical_bytes(), 2 * 39_952);
     for founder in founders {
         quota.retire(founder).expect("retire");
@@ -827,12 +829,14 @@ fn a_sealed_genome_is_rescanned_only_under_a_tighter_bound() {
     let mut quota = GenomeQuota::from_config(&config).expect("quota");
     let traits = Traits::new(unit_affinity(), [0.1; 33], 1.0, &limits).expect("traits");
     let mut buffer = quota.allocate(&catalog, default).expect("buffer");
-    initialize(topology, buffer.values_mut(), |address| {
-        address_word(7, address)
-    })
+    initialize(
+        topology,
+        buffer.f32_mut().expect("an F32 buffer"),
+        |address| address_word(7, address),
+    )
     .expect("init");
     // Inside Appendix A's ±4, outside ±3.
-    buffer.values_mut()[17] = 3.5;
+    buffer.f32_mut().expect("an F32 buffer")[17] = 3.5;
     let genome = Genome::seal(buffer, GenomeId::new(1), &catalog, traits, None, &limits)
         .map_err(|unsealed| unsealed.error)
         .expect("seal");

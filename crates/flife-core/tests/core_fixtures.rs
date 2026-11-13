@@ -51,6 +51,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-engine/tests/ablation.rs"),
     ),
     (
+        "flife-engine::tests/f16_world.rs",
+        include_str!("../../flife-engine/tests/f16_world.rs"),
+    ),
+    (
         "flife-runtime::tests/book.rs",
         include_str!("../../flife-runtime/tests/book.rs"),
     ),

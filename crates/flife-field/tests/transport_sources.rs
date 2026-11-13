@@ -819,3 +819,144 @@ fn the_field_step_on_any_number_of_workers_is_the_serial_step_bit_for_bit() {
         }
     }
 }
+
+/// `count` sources of power 40 with seeded directions, at `center(index)`.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn sources_at(count: u32, mut center: impl FnMut(u32) -> [f64; 2]) -> Vec<Source> {
+    let mut draw = lcg(23);
+    (0..count)
+        .map(|id| {
+            let normals = [(); CHANNELS].map(|()| draw() * 2.0 - 1.0);
+            Source::new(
+                SourceId::new(id),
+                center(id),
+                unit_direction(&normals).expect("direction"),
+                40.0,
+            )
+            .expect("source")
+        })
+        .collect()
+}
+
+#[test]
+fn source_supports_on_any_number_of_workers_are_the_serial_supports() {
+    // 37 sources (prime, so runs are uneven at most counts) on a 48 x 40
+    // torus, some wrapping across both edges; σ 1.5 and cutoff 4 give ~113
+    // cells a support.
+    let world = grid(48, 40, 48.0, 40.0);
+    let limits = BufferLimits::host();
+    let step = tick();
+    let plan = TransportPlan::new(&world, step, 0.4, 0.05).expect("plan");
+    let mut draw = lcg(5);
+    let edges = [[0.2, 0.3], [47.9, 39.8], [0.0, 20.0], [24.0, 39.99]];
+    let sources = sources_at(37, |id| {
+        edges
+            .get(id as usize % 9)
+            .copied()
+            .unwrap_or_else(|| [draw() * 48.0, draw() * 40.0])
+    });
+    let wide = SourceKernel::new(1.5, 4.0).expect("kernel");
+    let bits = |pair: &FieldPair| -> Vec<u32> {
+        pair.current()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    };
+    let mut serial = FieldPair::zeroed(world, &limits).expect("pair");
+    let mut scratch = TransportScratch::new(&world, &limits).expect("scratch");
+    let mut support = SourceSupport::new();
+    let reference: Vec<(String, Vec<u32>)> = (0..3)
+        .map(|_| {
+            let report = advance_field(
+                &mut serial,
+                &plan,
+                &wide,
+                &sources,
+                step,
+                &mut scratch,
+                &mut support,
+            )
+            .expect("tick");
+            serial.commit();
+            (format!("{report:?}"), bits(&serial))
+        })
+        .collect();
+    let workers = [1, 2, 3, 5, 8, 16, 36, 37, 38, 64];
+    for count in workers {
+        let mut pair = FieldPair::zeroed(world, &limits).expect("pair");
+        let mut work = FieldWork::new(
+            &world,
+            &limits,
+            std::num::NonZeroUsize::new(count).expect("nonzero"),
+        )
+        .expect("work");
+        for (tick, expected) in reference.iter().enumerate() {
+            let report =
+                advance_field_on(&mut pair, &plan, &wide, &sources, step, &mut work).expect("tick");
+            pair.commit();
+            let got = (format!("{report:?}"), bits(&pair));
+            assert!(&got == expected, "{count} workers diverge at tick {tick}");
+        }
+    }
+
+    // A radius of 0.1 holds the one cell a center sits on, and no cell from a
+    // corner: sources 9 and 30 are on corners, so the step is refused at 9
+    // with the serial step's error, at every worker count, and the candidate
+    // the refusal leaves (sources 0 to 8's energy; no moments) does not
+    // depend on the count.
+    let narrow = SourceKernel::new(0.1, 1.0).expect("kernel");
+    let refused = sources_at(37, |id| {
+        let column = f64::from(id % 48);
+        if id == 9 || id == 30 {
+            [column, 7.0]
+        } else {
+            [column + 0.5, 7.5]
+        }
+    });
+    let mut serial = FieldPair::zeroed(world, &limits).expect("pair");
+    let error = advance_field(
+        &mut serial,
+        &plan,
+        &narrow,
+        &refused,
+        step,
+        &mut scratch,
+        &mut support,
+    )
+    .expect_err("source 9 has no cell");
+    assert!(
+        format!("{error:?}").contains("[9.0, 7.0]"),
+        "refused at source 9: {error:?}"
+    );
+    let refusal = |count: usize| -> (String, Vec<u32>) {
+        let mut pair = FieldPair::zeroed(world, &limits).expect("pair");
+        let mut work = FieldWork::new(
+            &world,
+            &limits,
+            std::num::NonZeroUsize::new(count).expect("nonzero"),
+        )
+        .expect("work");
+        let error = advance_field_on(&mut pair, &plan, &narrow, &refused, step, &mut work)
+            .expect_err("refused");
+        let candidate = pair.next().as_slice().iter().map(|v| v.to_bits()).collect();
+        (format!("{error:?}"), candidate)
+    };
+    let one = refusal(1);
+    assert_eq!(one.0, format!("{error:?}"), "the serial step's refusal");
+    let cells = usize::try_from(world.cell_count()).expect("cells");
+    let (energy, moments) = one.1.split_at(cells);
+    assert_eq!(
+        energy.iter().filter(|&&value| value != 0).count(),
+        9,
+        "sources 0 to 8 deposit one cell each"
+    );
+    assert!(moments.iter().all(|&value| value == 0), "no moments");
+    for count in workers {
+        let got = refusal(count);
+        assert!(got == one, "{count} workers: {} against {}", got.0, one.0);
+    }
+}

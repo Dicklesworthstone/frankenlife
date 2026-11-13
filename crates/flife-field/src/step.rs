@@ -215,11 +215,14 @@ impl FieldWork {
 
 /// [`advance_field`] on up to [`FieldWork::workers`] threads: this one and
 /// scoped workers it joins before returning (plan §3.4's bounded reference
-/// adapter). Planes are transported independently ([`transport_on`]). Every
-/// source's energy is then deposited in source order on this thread, and
-/// the moment planes are split over the workers, each adding the sources
-/// in the same order. Every value is computed exactly as [`advance_field`]
-/// computes it.
+/// adapter). Planes are transported independently ([`transport_on`]). Each
+/// source's support is computed on the workers, in contiguous runs of
+/// sources: a support depends only on the grid and its source's center.
+/// Every source's energy is then deposited in source order on this thread,
+/// and the moment planes are split over the workers, each adding the
+/// sources in the same order. Every value is computed exactly as
+/// [`advance_field`] computes it, and the error is the first in source
+/// order, returned once the sources before it are deposited.
 ///
 /// # Errors
 /// As [`advance_field`]; [`CoreError::StateConflict`] for a worker that
@@ -244,10 +247,14 @@ pub fn advance_field_on(
     }
     let supports = &mut supports[..sources.len()];
     let grid = *next.grid();
+    let refused = supports_on(kernel, &grid, sources, supports, scratches.len())?;
+    let supported = refused.as_ref().map_or(sources.len(), |(index, _)| *index);
     let mut deposits = Vec::with_capacity(sources.len());
-    for (source, support) in sources.iter().zip(supports.iter_mut()) {
-        kernel.support_into(&grid, source.center(), support)?;
+    for (source, support) in sources.iter().zip(supports.iter_mut()).take(supported) {
         deposits.push(deposit_energy(next, source, step, support)?);
+    }
+    if let Some((_, error)) = refused {
+        return Err(error);
     }
 
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
@@ -292,4 +299,61 @@ pub fn advance_field_on(
         result
     })?;
     Ok(step_report(transported, deposits, next))
+}
+
+/// Each source's support ([`SourceKernel::support_into`]) on up to
+/// `workers` threads (zero is taken as one), the sources split into
+/// contiguous runs, one run per thread. A run stops at its first refusal.
+/// Returns the first refusal in source order with its source's index, or
+/// `None` when every support is made.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] for a worker that panicked, when no run
+/// before its own was refused.
+fn supports_on(
+    kernel: &SourceKernel,
+    grid: &FieldGrid,
+    sources: &[Source],
+    supports: &mut [SourceSupport],
+    workers: usize,
+) -> Result<Option<(usize, CoreError)>, CoreError> {
+    let used = workers.clamp(1, sources.len().max(1));
+    let per = sources.len().div_ceil(used).max(1);
+    let run = |first: usize, sources: &[Source], supports: &mut [SourceSupport]| {
+        sources
+            .iter()
+            .zip(supports)
+            .enumerate()
+            .find_map(|(offset, (source, support))| {
+                kernel
+                    .support_into(grid, source.center(), support)
+                    .err()
+                    .map(|error| (first + offset, error))
+            })
+    };
+    let mut runs = sources.chunks(per).zip(supports.chunks_mut(per));
+    let Some((head_sources, head_supports)) = runs.next() else {
+        return Ok(None);
+    };
+    let run = &run;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = runs
+            .enumerate()
+            .map(|(index, (sources, supports))| {
+                scope.spawn(move || run((index + 1) * per, sources, supports))
+            })
+            .collect();
+        // Runs are in source order, so the first that is not clean decides.
+        let mut first = Ok(run(0, head_sources, head_supports));
+        for worker in workers {
+            let joined = worker.join().map_err(|_| CoreError::StateConflict {
+                operation: "source supports",
+                detail: "a source support worker panicked".to_owned(),
+            });
+            if matches!(first, Ok(None)) {
+                first = joined;
+            }
+        }
+        first
+    })
 }

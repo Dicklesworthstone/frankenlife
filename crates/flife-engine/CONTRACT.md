@@ -1043,7 +1043,8 @@ velocity, first-order splitting at the configured fixed timestep.
   (`the_cpu_worker_count_changes_no_result`: 1, 2, 3, 6 and 64 workers, 96 ticks with births). Decisions read only
   committed state and split into contiguous identity-ordered chunks of at least 128, the first error in identity
   order winning; phases 6 and 7 split the same way and keep the ledger's and the deposits' order (see the scratch
-  section). The field splits transport by plane, and each moment plane keeps its per-source deposit order. The
+  section). The field splits transport by plane and the source supports by source; the energy plane and each
+  moment plane keep their per-source deposit order. The
   threads are scoped `std` threads spawned per tick: a bounded, reported reference adapter (§3.4, §12.5), not
   Asupersync-scheduled work. Phase 5's demands and phase 6's packet compositions run on the lanes too, and phase
   9's grant debit and deposit reductions and phase 10's field check on the field's workers (see phases 9 and 10).

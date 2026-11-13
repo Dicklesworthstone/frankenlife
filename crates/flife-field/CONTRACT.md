@@ -198,6 +198,13 @@
   the Appendix A decay factor and the kernel cutoff. The implementation lives in `flife-core::numerics`.
 - `advance_field` writes only the candidate buffer and reports `ε = (E' − E) − (I − D_decay)`. On error the
   candidate must be discarded; the committed field is untouched.
+- `advance_field_on(pair, plan, kernel, sources, step, work)` is `advance_field` on the `FieldWork`'s workers,
+  with the same report and field bits at any worker count. Planes are transported independently. Each source's
+  support depends only on the grid and its center, so the supports are computed in contiguous runs of sources,
+  one run per worker. The energy is then deposited in source order on the calling thread, and the moment planes
+  are split into runs of whole planes, each adding the sources in order. A refused support is returned once the
+  sources before it have deposited their energy; the first refusal in source order wins. A worker that panics is
+  reported as a state conflict.
 - FL-031 split `support_into`, the transport's energy accounting and the step's report into the pieces above.
   No operation or order changed: every existing test and the world digests are unchanged.
 
@@ -347,6 +354,14 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   - `exp_neg` against `std` and against correctly rounded references.
   - One simulated second (128 ticks) of the Appendix A field with 8 sources. The ledger closes, with a
     cumulative residual of 1.7e-5, which is 2.7e-8 of the transfers; §21.4 proposes 1e-5.
+  - `the_field_step_on_any_number_of_workers_is_the_serial_step_bit_for_bit`: 12 ticks of 8 sources under one
+    plan with a single substep and one with several. On 1, 2, 5, 32, 33 and 40 workers, every report and every
+    plane's bits equal `advance_field`'s.
+  - `source_supports_on_any_number_of_workers_are_the_serial_supports`: 37 sources on a 48×40 torus, some
+    wrapping across both edges. On 1, 2, 3, 5, 8, 16, 36, 37, 38 and 64 workers, 3 ticks give `advance_field`'s
+    reports and bits. A kernel that holds no cell from a corner refuses at source 9 of two corner sources (9 and
+    30) with `advance_field`'s error. At every count it leaves the same candidate: sources 0 to 8's energy, one
+    cell each, and no moments.
 - `tests/uptake_ledger.rs`. Grants are whole quanta, so the oracles are integers.
   - C.1 exactly: grants 4 and 6, the moment removed, 6.5 dissipated, `ε = 0`.
   - The uncontended remainder and its moment.

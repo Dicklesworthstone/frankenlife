@@ -167,7 +167,7 @@ impl FieldState {
 
     /// Every value, writable, in planar order. The length is fixed, so the
     /// layout cannot change through it.
-    pub(crate) fn as_mut_slice(&mut self) -> &mut [f32] {
+    pub fn as_mut_slice(&mut self) -> &mut [f32] {
         &mut self.data
     }
 

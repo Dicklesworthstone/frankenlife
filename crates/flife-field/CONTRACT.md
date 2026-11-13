@@ -64,6 +64,17 @@
   `SeededPath` (source, segment ordinal and current segment). FL-016 adds `SeededPath::resume`, which rebuilds
   a path from its source, ordinal and anchor, `PathSegment::anchor`, and `ConeTolerance::{absolute, relative}`.
 - `advance_field` with its `FieldStepReport`: the field's ledger terms `I`, `D_decay` and `ε` for one tick.
+- FL-032's phase 9 on the same port: `FieldBackend::reduce(field, grants, [emissions, recycling])`, the grants'
+  debit then the two deposit reductions, which must equal `reduce_field_on(field, grants, deposits, workers)`
+  (`apply_grants_on`, then `apply_deposits_on` on each set) and leave the field, the grants and the deposits as
+  they were on any error. A backend gets the reference's checks and grouping without anything being applied:
+  `Grants::debit(field)` makes `apply_grants_on`'s every check and gives a `GrantDebit` (`debits`, and `finish`,
+  which marks the grants applied); `Deposits::reduction(field)` makes `apply_deposits_on`'s every check, groups
+  the packets by (cell, identity) and gives a `DepositReduction` (`offsets`, one more than the cells;
+  `packet(at)`, the grouped packet's amount and deposit; `deposits`; `direction(index)`; `summarize(received)`,
+  the summary from what each occupied cell received, summed in cell order; and `finish`). The two `apply_*_on`
+  functions were factored into those checks (`check_debit`, `prepare`) with their order and arithmetic
+  unchanged. `FieldState::as_mut_slice` is public, for a backend's read-back.
 - FL-031's port for a device phase 2: `FieldBackend` (`describe`, and `advance(pair, plan, kernel, sources,
   step)`, which must equal `advance_field_on`). Alongside it are the reference's own pieces, which a backend
   calls so that its sequential F64 sums stay the reference's:

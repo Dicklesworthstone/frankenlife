@@ -96,7 +96,25 @@ error the values are left as they were. Topology choice, mapping, traits, the se
 host. `MetalSettle` holds a `MetalBirth` on its owner and implements the port's `mutation`: the engine sends
 each tick's births' first candidates in one batch and takes the values and counts as given (flife-engine's
 contract). A later candidate, after the no-op check or the seal rejects the first, is mutated on the host.
-Deaths and recycling, residency and whole-tick parity are FL-032's remaining work.
+
+FL-032, seventh stage: phase 9 on Metal, in `reduce` (`reduce.metal`): the uptake grants' debit and the
+emission and recycling deposits' reductions into the tick's candidate field, bit for bit
+`flife_field::reduce_field_on` (plan §8.1, §11.1). `MetalField` implements the port's `reduce`, and a world
+given it as its field backend runs phase 9 there. flife-field's own `Grants::debit` and `Deposits::reduction`
+make every check and group each set's packets by (cell, identity) before anything is written. The host sends
+each debit that granted energy (cell, energy before and after, strictly ascending cells), each set's grouped
+packets (amount and deposit index) with its cell offsets, and its deposits' directions. One command then runs
+up to three kernels on a device copy of the field. `grants_debit` (a thread per debit) writes the energy and
+scales each moment by `after / before`, or zeroes a drained cell's. `deposits_reduce` (a thread per cell, once
+per set) sums the cell's amounts rounding down, its moment sums `Σ amount · component`, the energy rounded down
+to the F32 at or below `before + total`, what the cell received, and each moment raised by its sum times
+`received / total` when that is not zero, as `apply_deposits_on` does. Every value is binary64 on
+`softfloat64.metal`, and the field crosses as bits. The host reads back what each occupied cell received and
+sums it in cell order (`DepositReduction::summarize`). It then copies the device's field over the host's, and
+only then marks the grants and deposits applied. A non-finite value a kernel meets or would write raises the
+fault word (softfloat64 cannot carry an infinity), and nothing is written or applied (plan §8.3): the engine
+hands the reduction to the reference. Residency (the field kept on the device across phases and ticks), phase
+10's checks on the device and whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -129,8 +147,9 @@ Deaths and recycling, residency and whole-tick parity are FL-032's remaining wor
 
 - FL-031, the field: `MetalField::open()` (or `with_owner(owner)`), given to a world with
   `World::set_field_backend`. Each step receives the field pair, transport plan, source kernel, the tick's
-  sources and the time step, exactly what `advance_field_on` takes. No CLI or Studio choice selects it yet (see
-  the known gaps).
+  sources and the time step, exactly what `advance_field_on` takes. Each phase 9 (FL-032) receives the
+  candidate field, the tick's grants and its emission and recycling deposits, exactly what `reduce_field_on`
+  takes. No CLI or Studio choice selects it yet (see the known gaps).
 - FL-031, the sensors: `MetalSensors::open()` (or `with_owner(owner)`, to share the field's owner), given to a
   world with `World::set_sensor_backend`. Each tick receives the pyramid (its grid and level count), the observed
   field and every live organism's `SensorQuery` (position, sensing scale), in row order. No CLI or Studio choice
@@ -575,16 +594,39 @@ A refusal changes nothing.
   - `random_worlds_step_as_the_reference`: 48 random worlds (grid shapes, cell sizes, kernels from a few cells
     to the whole torus, one to eight sources anywhere, substeps and decay). Any refusal must be the reference's
     too.
-- `tests/field_world.rs` (FL-031, 4 tests), the engine path, on the real preset:
-  - with its field on Metal, the world's digest equals the reference's at every one of 400 ticks; every step came
-    from the device, none failed, and the owner holds exactly the backend's twelve buffers, with no lease, command
-    or retiring buffer left;
+- `tests/field_world.rs` (FL-031 and FL-032, 5 tests), the engine path, on the real preset:
+  - with its field on Metal, the world's digest equals the reference's at every one of 400 ticks; every step and
+    every phase 9 reduction came from the device, none failed, and the owner holds exactly the backend's 26
+    buffers (twelve for phase 2, fourteen for phase 9), with no lease, command or retiring buffer left;
   - with field and controllers both on Metal, 200 ticks, the same;
-  - the planted negative flips one bit of one moment value after the device's seventh step, and the digests must
-    differ at exactly tick 7;
-  - a backend failing at its fifth step (after leaving a damaged value in the candidate) hands that step to the
-    reference and is dropped: the world stays the reference's, with 4 device steps, 1 reference step and the
-    failure recorded.
+  - `recycled_removals_reduce_on_metal_as_on_the_reference`: 60 ticks with every organism within 12 world units
+    of a wandering place removed and recycled every eight ticks (856 recycled), so phase 9 reduces both deposit
+    sets; the digests are equal at every tick and all 60 reductions came from the device;
+  - the planted negatives flip one bit of one moment value after the device's seventh step, and after its
+    seventh reduction, and the digests must differ at exactly tick 7;
+  - a backend failing at its fifth step (after leaving a damaged value in the candidate), or at its fifth
+    reduction, hands that phase to the reference and is dropped: the world stays the reference's, with 4 device
+    steps, 1 reference step and 4 device reductions, or 5 device steps, 4 device reductions and 1 reference
+    reduction, and the failure recorded.
+- `tests/reduce.rs` (FL-032, 2 tests), `MetalField::reduce` against `flife_field::reduce_field_on` from the
+  same field, grants and deposits, every field value and both summaries compared as bits, and the grants and
+  both sets applied:
+  - `the_metal_reduction_is_the_reference_reduction_bit_for_bit`: a `32 × 32` torus with scattered grants,
+    emissions and recycling over energies from subnormal to 1e30 with zeros of both signs, and moments signed,
+    subnormal and to 5e5; oversubscribed cells the grants drain; a hotspot of 4,000 deposits in and around one
+    cell over 500 demands; tiny amounts onto subnormal cells beside amounts to 1e30; three deposits of 1e38
+    into a cell holding the largest F32 (rounded down to it, nothing received); sums on either side of an F32
+    boundary, rounded down and to nearest (`1 − 2⁻⁵³` then `3·2⁻⁵⁵` into an empty cell, and `4 − 2⁻⁵¹` into a
+    cell of 4, which the reference must take to the F32 below 1 and below 8); grants alone, each deposit set
+    alone, and nothing; a stretched `48 × 16` torus; and the first grid again on buffers grown for 6,000
+    deposits. In all, 54,306 packets, 4,529 debits that granted energy (2,663 drained) and 5,844 cells with more
+    than one packet.
+  - `a_reduction_the_device_cannot_finish_leaves_everything_as_it_was`: a NaN moment in a cell that receives a
+    deposit makes the device fault (`NumericalInvalid`) after it has run every kernel; the host's field bits
+    are unchanged and the grants and both sets are not applied, and the reference then reduces them exactly as
+    it reduces the untouched inputs. Infinite moments in cells the grants drain become zero as on the
+    reference. Grants already applied, deposits already applied, deposits staged for another grid and one
+    organism depositing twice are refused with the reference's error, nothing written or applied.
 
 - `tests/sensors.rs` (FL-031, 3 tests), each sample against `PyramidView::sample` on the same pyramid and field,
   every value compared as bits:
@@ -947,6 +989,24 @@ Planted mutants, each run in a scratch copy.
   candidates not sorted by parent survives and is equivalent: rows are in identity order, so a tick's requests
   arrive sorted, and `resolve_births_with`'s binary search could only miss a parent, whose birth the reference
   would then propose bit for bit. The sort is kept because `resolve_births_with` documents sorted input.
+- FL-032's phase 9: 23 planted against `tests/reduce.rs` and `tests/field_world.rs`, 22 caught after one round
+  of fixes:
+  - `reduce.metal` (12, 12 caught): rounding to an F32 never stepping down; an overflow left infinite; a
+    drained cell keeping its moments; the debit's ratio inverted; the debit's energy, or the deposits' energy,
+    or what a cell received, not written; the total, or `before + total`, rounded to nearest; additions of zero
+    applied; the direction stride halved; a packet's deposit index misread;
+  - `reduce.rs` (6, 5 caught): debits that granted nothing sent; the fault word ignored; the grants, or the
+    recycling, left unapplied; the field not read back. Dropping the check that debits arrive in strictly
+    ascending cells survives: flife-field sorts them, so no input reaches it. It stays as the guard that no two
+    threads write one cell;
+  - flife-field (3, 3 caught): empty cells counted in a summary; the debit never marking the grants; the
+    reference reducing the first set twice;
+  - flife-engine (2, 2 caught): a failed reduction keeping the backend; reductions not counted.
+
+  The first round had 23 and 3 survived. Rounding the total, or `before + total`, to nearest instead of down
+  changes an F64 by an ulp, which random cases never carried across an F32; the two boundary sums above now
+  do. The zero-total guard in `deposits_reduce` was not planted, since only positive amounts are staged, so an
+  occupied cell's total is positive.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -1190,4 +1250,14 @@ per-pass thread spawning (6%).
     order, one thread per cell, so a hotspot cell is one thread's work.
   - The world's invariant checks (about 10% of a one-worker tick in a profile) run on the CPU over the read-back
     field.
+- FL-032's phase 9 gaps:
+  - The field is not resident here either: each reduction uploads the whole candidate field and reads it back.
+  - Its packet, direction and debit buffers grow during a tick when a reduction needs more (doubling), rather
+    than being reserved with the population's capacity (FL-043).
+  - The kernels fault on a non-finite value the reference would carry through (a NaN or infinite moment in a
+    cell that is debited without draining, or that receives a deposit), handing that reduction to the
+    reference. Admissible fields hold none, by INV-01.
+  - Two checks cannot be reached through the public API: debits out of ascending cell order (flife-field
+    sorts them; a GPU race if two threads shared a cell) and a cell with packets whose total is zero (only
+    positive amounts are staged). Both are kept as defenses, and their mutants are not planted or survive.
 - No CUDA backend exists: FrankenTorch has no CUDA crate, and no host here has an NVIDIA GPU.

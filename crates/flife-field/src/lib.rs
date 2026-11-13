@@ -60,7 +60,7 @@ pub mod transport;
 pub mod uptake;
 
 pub use bins::Bins;
-pub use deposit::{DepositSummary, Deposits, apply_deposits, apply_deposits_on};
+pub use deposit::{DepositReduction, DepositSummary, Deposits, apply_deposits, apply_deposits_on};
 pub use exchange::{ExchangeStencil, check_request, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
@@ -85,13 +85,14 @@ pub use sources::{
 };
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
 pub use step::{
-    FieldBackend, FieldStepReport, FieldWork, advance_field, advance_field_on, step_report,
+    FieldBackend, FieldStepReport, FieldWork, advance_field, advance_field_on, reduce_field_on,
+    step_report,
 };
 pub use transport::{
     TransportPlan, TransportReport, TransportScratch, energy_report, transport_on,
 };
 pub use uptake::{
-    CellDebit, Demand, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell, UptakeSummary,
-    UptakeWork, apply_grants, apply_grants_on, demand, demands, demands_on, resolve_uptake,
-    resolve_uptake_on,
+    CellDebit, Demand, GrantDebit, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell,
+    UptakeSummary, UptakeWork, apply_grants, apply_grants_on, demand, demands, demands_on,
+    resolve_uptake, resolve_uptake_on,
 };

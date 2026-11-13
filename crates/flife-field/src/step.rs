@@ -9,6 +9,7 @@ use std::num::NonZeroUsize;
 use flife_core::memory::{capacity_bytes, total};
 use flife_core::{CoreError, TimeStep};
 
+use crate::deposit::{DepositSummary, Deposits, apply_deposits_on};
 use crate::footprint::BufferLimits;
 use crate::grid::{FIELD_PLANES, FieldGrid};
 use crate::layout::overflow;
@@ -20,6 +21,7 @@ use crate::state::{FieldPair, FieldState};
 use crate::transport::{
     TransportPlan, TransportReport, TransportScratch, sum, transport, transport_on,
 };
+use crate::uptake::{Grants, apply_grants_on};
 
 /// The field's ledger terms for one tick (§4.4), in F64.
 #[derive(Debug, Clone, PartialEq)]
@@ -120,6 +122,44 @@ pub trait FieldBackend: std::fmt::Debug + Send {
         sources: &[Source],
         step: TimeStep,
     ) -> Result<FieldStepReport, CoreError>;
+
+    /// [`reduce_field_on`]'s phase 9 (FL-032): `grants`' debit, then each
+    /// of `deposits` reduced in turn, into `field`, the tick's candidate,
+    /// bit for bit, with each reduction's summary.
+    ///
+    /// # Errors
+    /// Any. The field, the grants and the deposits are then as they were:
+    /// a backend writes the field once every part has succeeded, and only
+    /// then marks the grants and deposits applied. The world reduces the
+    /// tick on the reference, which reproduces the error or finds none,
+    /// and stops using a backend that failed where the reference did not.
+    fn reduce(
+        &mut self,
+        field: &mut FieldState,
+        grants: &mut Grants,
+        deposits: [&mut Deposits; 2],
+    ) -> Result<[DepositSummary; 2], CoreError>;
+}
+
+/// Phase 9 (plan §8.1): `grants`' debit ([`apply_grants_on`]), then each of
+/// `deposits` reduced in turn ([`apply_deposits_on`]: the emissions, then
+/// the recycling), into `field`, the tick's candidate, on up to `workers`
+/// threads. Returns each reduction's summary.
+///
+/// # Errors
+/// As [`apply_grants_on`] and [`apply_deposits_on`], in that order.
+pub fn reduce_field_on(
+    field: &mut FieldState,
+    grants: &mut Grants,
+    deposits: [&mut Deposits; 2],
+    workers: usize,
+) -> Result<[DepositSummary; 2], CoreError> {
+    apply_grants_on(field, grants, workers)?;
+    let [first, second] = deposits;
+    Ok([
+        apply_deposits_on(field, first, workers)?,
+        apply_deposits_on(field, second, workers)?,
+    ])
 }
 
 /// Reusable scratch for [`advance_field_on`]: one transport scratch per CPU

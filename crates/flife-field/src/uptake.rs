@@ -286,6 +286,61 @@ impl Grants {
         &self.debits
     }
 
+    /// These grants checked against `field` for a debit on another device
+    /// (FL-032), which writes it as [`apply_grants_on`] does: each debited
+    /// cell's energy becomes its debit's `energy_after`, and each of its
+    /// moments is scaled by `energy_after / energy_before` in F64 (exactly
+    /// zero when the cell is drained). Only debits that granted energy
+    /// write anything.
+    ///
+    /// # Errors
+    /// As [`apply_grants_on`]. Nothing is applied either way until
+    /// [`GrantDebit::finish`].
+    pub fn debit(&mut self, field: &FieldState) -> Result<GrantDebit<'_>, CoreError> {
+        self.check_debit(field)?;
+        Ok(GrantDebit { grants: self })
+    }
+
+    /// [`apply_grants_on`]'s checks of these grants against `field`, which
+    /// they would debit: not applied, resolved for its grid, every debited
+    /// cell still holding the energy they were resolved against, and every
+    /// plane whole. Returns the grid's cell count.
+    fn check_debit(&self, field: &FieldState) -> Result<usize, CoreError> {
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "uptake grants",
+            detail,
+        };
+        if self.applied {
+            return Err(conflict("these grants were already applied".into()));
+        }
+        if self.grid != Some(*field.grid()) {
+            return Err(conflict(
+                "these grants were resolved for another grid".into(),
+            ));
+        }
+        let energy = field.energy();
+        for debit in &self.debits {
+            let current = energy.get(debit.cell).copied();
+            if current.map(f32::to_bits) != Some(debit.energy_before.to_bits()) {
+                return Err(conflict(format!(
+                    "cell {} holds {current:?}, but the grants were resolved against {}",
+                    debit.cell, debit.energy_before
+                )));
+            }
+        }
+        if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
+            return Err(conflict("a moment plane is missing".into()));
+        }
+        let cells =
+            usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
+                quantity: "field cells",
+            })?;
+        if field.as_slice().len().checked_sub(cells) != Some(cells.saturating_mul(CHANNELS)) {
+            return Err(conflict("the moment planes are not whole".into()));
+        }
+        Ok(cells)
+    }
+
     /// `U_i = Σ_c u_ic` for each demand, in the order the demands were
     /// given. Each total is summed in cell order and rounded down, so it
     /// never exceeds the energy its cells lost.
@@ -741,37 +796,11 @@ pub fn apply_grants_on(
     grants: &mut Grants,
     workers: usize,
 ) -> Result<f64, CoreError> {
+    let cells = grants.check_debit(field)?;
     let conflict = |detail: String| CoreError::StateConflict {
         operation: "uptake grants",
         detail,
     };
-    if grants.applied {
-        return Err(conflict("these grants were already applied".into()));
-    }
-    if grants.grid != Some(*field.grid()) {
-        return Err(conflict(
-            "these grants were resolved for another grid".into(),
-        ));
-    }
-    let energy = field.energy();
-    for debit in &grants.debits {
-        let current = energy.get(debit.cell).copied();
-        if current.map(f32::to_bits) != Some(debit.energy_before.to_bits()) {
-            return Err(conflict(format!(
-                "cell {} holds {current:?}, but the grants were resolved against {}",
-                debit.cell, debit.energy_before
-            )));
-        }
-    }
-    if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
-        return Err(conflict("a moment plane is missing".into()));
-    }
-    let cells = usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
-        quantity: "field cells",
-    })?;
-    if field.moments_mut().len() != cells.saturating_mul(CHANNELS) {
-        return Err(conflict("the moment planes are not whole".into()));
-    }
     let energy = field.energy_mut();
     for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
         energy[debit.cell] = debit.energy_after;
@@ -813,6 +842,27 @@ pub fn apply_grants_on(
     }
     grants.applied = true;
     Ok(grants.summary.granted)
+}
+
+/// Grants checked for a debit on another device (FL-032); see
+/// [`Grants::debit`].
+#[derive(Debug)]
+pub struct GrantDebit<'a> {
+    grants: &'a mut Grants,
+}
+
+impl GrantDebit<'_> {
+    /// Every cell with demand, in ascending cell order.
+    #[must_use]
+    pub fn debits(&self) -> &[CellDebit] {
+        &self.grants.debits
+    }
+
+    /// Mark the grants applied, once the other device has written their
+    /// debit into the field.
+    pub fn finish(self) {
+        self.grants.applied = true;
+    }
 }
 
 /// A.1's saturating request rule with its run's constants: what phase 5's

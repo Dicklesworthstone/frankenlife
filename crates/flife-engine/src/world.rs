@@ -83,12 +83,13 @@ use flife_core::{
     Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
-    Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
-    FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants,
-    PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath,
-    SensorBackend, SensorPyramid, SensorQuery, SettleBackend, Source, SourceKernel, TransportPlan,
-    UptakeBackend, UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants_on,
-    demand, demands_on, initial_source, resolve_uptake, resolve_uptake_on, state::CHANNELS,
+    Bins, BufferLimits, ConeTolerance, Demand, DepositSummary, Deposits, ExchangeStencil,
+    FieldBackend, FieldGrid, FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork,
+    GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
+    SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
+    Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
+    advance_field_on, demand, demands_on, initial_source, reduce_field_on, resolve_uptake,
+    resolve_uptake_on, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -667,6 +668,11 @@ pub struct FieldReport {
     /// Steps the reference redid because the backend met an error: the
     /// reference reproduces that error exactly, or finds none.
     pub reference_steps: u64,
+    /// Phase 9 reductions the backend computed (FL-032).
+    pub reductions: u64,
+    /// Reductions the reference computed because the backend met an error,
+    /// with the field, grants and deposits as they were.
+    pub reference_reductions: u64,
     /// Why the backend stopped serving the world, if it failed.
     pub failure: Option<String>,
 }
@@ -2209,15 +2215,14 @@ impl World {
         applied.sort_by_key(|intervention| intervention.position);
 
         // Phase 9: the grants' debits, then the paid deposits, then
-        // recycling, reduced into the next field, each on the field's
-        // workers.
+        // recycling, reduced into the next field, on the field backend if
+        // the world has one (FL-032), else on the field's workers.
         let (_, next) = field.stage();
         let workers = field_work.workers();
-        apply_grants_on(next, grants, workers)?;
-        apply_deposits_on(next, emissions, workers)?
-            .record(&mut tick_ledger, Transfer::Emission)?;
-        apply_deposits_on(next, recycling, workers)?
-            .record(&mut tick_ledger, Transfer::Recycling)?;
+        let [emitted_summary, recycled_summary] =
+            reduce_field_with(next, grants, [emissions, recycling], workers, fields)?;
+        emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
+        recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
 
         // Phase 10: invariants, accounting and the population's commit.
         let field_summary = next.check_invariants_on(rules.profile.cone, workers)?;
@@ -2521,6 +2526,39 @@ fn advance_field_with(
         }
     }
     advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
+}
+
+/// Phase 9 on the world's field backend if it has one (FL-032). Any error
+/// there leaves the field, grants and deposits as they were, and hands the
+/// reduction to [`reduce_field_on`], which reproduces the reference's own
+/// error or finds none; with none, the backend failed where the reference
+/// does not, and the world stops using it. Either way the reduction is the
+/// reference's.
+fn reduce_field_with(
+    next: &mut FieldState,
+    grants: &mut Grants,
+    deposits: [&mut Deposits; 2],
+    workers: usize,
+    fields: &mut Fields,
+) -> Result<[DepositSummary; 2], CoreError> {
+    let Fields { backend, report } = fields;
+    let [emissions, recycling] = deposits;
+    if let Some(device) = backend.as_deref_mut() {
+        match device.reduce(next, grants, [&mut *emissions, &mut *recycling]) {
+            Ok(summaries) => {
+                report.reductions = report.reductions.saturating_add(1);
+                return Ok(summaries);
+            }
+            Err(error) => {
+                report.reference_reductions = report.reference_reductions.saturating_add(1);
+                let summaries = reduce_field_on(next, grants, [emissions, recycling], workers)?;
+                report.failure = Some(error.to_string());
+                *backend = None;
+                return Ok(summaries);
+            }
+        }
+    }
+    reduce_field_on(next, grants, [emissions, recycling], workers)
 }
 
 /// Phase 3's raw samples on the world's sensor backend, if it has one and

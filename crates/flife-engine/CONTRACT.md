@@ -370,7 +370,8 @@ each runs and owns the field.
   debit (`flife_field::apply_grants_on`) writes each moment plane as one thread would. Each reduction
   (`flife_field::apply_deposits_on`) reduces and writes every cell as on one thread, and sums what the cells
   received in cell order. The world is therefore bit-identical at any worker count
-  (`the_cpu_worker_count_changes_no_result`, pinned digests).
+  (`the_cpu_worker_count_changes_no_result`, pinned digests). With a field backend, the three go to its
+  `reduce` instead (`reduce_field_with`, below).
 - Phase 10 checks the next field (INV-01, INV-02 at the profile's cone tolerance), closes the tick against holdings
   measured from the next field and the survivors and newborns in identity order (INV-03 per tick), commits the
   closure to a copy of the run's ledger (INV-03 cumulative), and checks the population's whole commit (INV-01,
@@ -1065,8 +1066,13 @@ velocity, first-order splitting at the configured fixed timestep.
   backend writes only the candidate, so nothing it left there survives. The backend is then dropped, and
   `World::field_report` (`FieldReport`: backend, device and reference steps, failure) records why. If the
   reference errs too, its error is the tick's. No result depends on the backend. Like the controller backend,
-  it is not state: a restored world steps on the reference until its owner sets one. The tests are in
-  `flife-backend-metal`'s `tests/field_world.rs`.
+  it is not state: a restored world steps on the reference until its owner sets one. FL-032: the same backend's
+  `reduce` runs phase 9 (the grants' debit, then the emission and recycling deposits) into the candidate, and
+  its two summaries are recorded in the tick's ledger as the reference's are. The port guarantees that a
+  backend that errs has written and applied nothing, so the reference then reduces the same grants and deposits
+  into the same candidate; the backend is dropped and the failure recorded. `FieldReport::reductions` counts
+  the device's reductions and `reference_reductions` the ones handed back. The tests are in
+  `flife-backend-metal`'s `tests/field_world.rs` and `tests/reduce.rs`.
 - `World::set_sensor_backend` (FL-031) hands phase 3's raw sampling to a `flife_field::SensorBackend`, which must
   equal `PyramidView::sample`. The world still builds the reference pyramid. It then gives the backend every live
   organism's query (its position and its genome's sensing scale) in row order, once per tick, before the lanes

@@ -43,6 +43,7 @@ pub mod field;
 pub mod motion;
 pub mod owner;
 pub mod proposal;
+pub mod reduce;
 pub mod sensors;
 pub mod settle;
 pub mod uptake;

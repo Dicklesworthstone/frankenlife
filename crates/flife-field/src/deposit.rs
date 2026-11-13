@@ -656,91 +656,16 @@ pub fn apply_deposits_on(
         operation: "apply deposits",
         detail,
     };
-    if deposits.applied {
-        return Err(conflict("these deposits were already applied".into()));
-    }
-    if deposits.grid.is_some_and(|grid| grid != *field.grid()) {
-        return Err(conflict(
-            "these deposits were staged for another grid".into(),
-        ));
-    }
-    deposits.identities.clear();
-    deposits.identities.extend(
-        deposits
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.organism, index)),
-    );
-    deposits.identities.sort_unstable();
-    if let Some(pair) = deposits
-        .identities
-        .windows(2)
-        .find(|pair| pair[0].0 == pair[1].0)
-    {
-        return Err(conflict(format!(
-            "{} staged two deposits in one reduction",
-            pair[0].0
-        )));
-    }
-    if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
-        return Err(conflict("a moment plane is missing".into()));
-    }
-
-    let mut summary = DepositSummary {
-        organisms: deposits.entries.len(),
-        ..DepositSummary::default()
-    };
-    let mut paid = CompensatedSum::ZERO;
-    let mut offered = CompensatedSum::ZERO;
-    for entry in &deposits.entries {
-        paid.add(entry.paid);
-        offered.add(entry.offered);
-    }
-    summary.paid = paid.value();
-    summary.offered = offered.value();
-
-    // Packets in identity order. An organism's footprint names each cell at
-    // most once, so grouping them by cell gives (cell, identity) order.
+    let (mut summary, buckets) = deposits.prepare(field)?;
     let Deposits {
         entries,
         packets,
         received,
-        identities,
         sequence,
         bins,
         ..
     } = deposits;
-    sequence.clear();
-    for &(_, index) in identities.iter() {
-        if let Some(entry) = entries.get(index) {
-            // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
-            sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
-        }
-    }
-    let buckets = usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
-        quantity: DEPOSIT_PACKETS,
-    })?;
-    bins.group(buckets, sequence.len(), |at| {
-        sequence
-            .get(at)
-            .and_then(|&packet| packets.get(packet as usize))
-            .map_or(usize::MAX, |packet| packet.cell)
-    })?;
-
-    // The grouping refused any cell at or past `buckets`, so a field that
-    // holds `buckets` cells in each of its planes holds every grouped cell.
     let values = field.as_mut_slice();
-    if buckets.checked_mul(CHANNELS + 1) != Some(values.len()) {
-        return Err(CoreError::LayoutMismatch {
-            buffer: crate::layout::BUFFER,
-            detail: format!(
-                "the field holds {} values, not {buckets} cells in {} planes",
-                values.len(),
-                CHANNELS + 1
-            ),
-        });
-    }
     let offsets = bins.offsets();
     let order = bins.order();
     let items = order.len();
@@ -821,6 +746,207 @@ pub fn apply_deposits_on(
     summary.applied = applied.value();
     deposits.applied = true;
     Ok(summary)
+}
+
+impl Deposits {
+    /// [`apply_deposits_on`]'s checks and grouping for a reduction into
+    /// `field`: not applied, staged for its grid, no organism twice, every
+    /// plane whole; then the packets grouped by cell in (cell, identity)
+    /// order. Returns the summary's organisms, paid and offered, and the
+    /// grid's cell count. Nothing is applied.
+    fn prepare(&mut self, field: &FieldState) -> Result<(DepositSummary, usize), CoreError> {
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "apply deposits",
+            detail,
+        };
+        if self.applied {
+            return Err(conflict("these deposits were already applied".into()));
+        }
+        if self.grid.is_some_and(|grid| grid != *field.grid()) {
+            return Err(conflict(
+                "these deposits were staged for another grid".into(),
+            ));
+        }
+        self.identities.clear();
+        self.identities.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.organism, index)),
+        );
+        self.identities.sort_unstable();
+        if let Some(pair) = self
+            .identities
+            .windows(2)
+            .find(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(conflict(format!(
+                "{} staged two deposits in one reduction",
+                pair[0].0
+            )));
+        }
+        if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
+            return Err(conflict("a moment plane is missing".into()));
+        }
+
+        let mut summary = DepositSummary {
+            organisms: self.entries.len(),
+            ..DepositSummary::default()
+        };
+        let mut paid = CompensatedSum::ZERO;
+        let mut offered = CompensatedSum::ZERO;
+        for entry in &self.entries {
+            paid.add(entry.paid);
+            offered.add(entry.offered);
+        }
+        summary.paid = paid.value();
+        summary.offered = offered.value();
+
+        // Packets in identity order. An organism's footprint names each cell
+        // at most once, so grouping them by cell gives (cell, identity) order.
+        let Self {
+            entries,
+            packets,
+            identities,
+            sequence,
+            bins,
+            ..
+        } = self;
+        sequence.clear();
+        for &(_, index) in identities.iter() {
+            if let Some(entry) = entries.get(index) {
+                // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
+                sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
+            }
+        }
+        let buckets =
+            usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
+                quantity: DEPOSIT_PACKETS,
+            })?;
+        bins.group(buckets, sequence.len(), |at| {
+            sequence
+                .get(at)
+                .and_then(|&packet| packets.get(packet as usize))
+                .map_or(usize::MAX, |packet| packet.cell)
+        })?;
+
+        // The grouping refused any cell at or past `buckets`, so a field that
+        // holds `buckets` cells in each of its planes holds every grouped
+        // cell.
+        let values = field.as_slice().len();
+        if buckets.checked_mul(CHANNELS + 1) != Some(values) {
+            return Err(CoreError::LayoutMismatch {
+                buffer: crate::layout::BUFFER,
+                detail: format!(
+                    "the field holds {values} values, not {buckets} cells in {} planes",
+                    CHANNELS + 1
+                ),
+            });
+        }
+        Ok((summary, buckets))
+    }
+
+    /// These deposits checked and grouped for a reduction into `field` on
+    /// another device (FL-032), which reduces each cell as
+    /// [`apply_deposits_on`] does: the cell's packets in
+    /// [`DepositReduction::packet`] order, their amounts summed rounding
+    /// down, each moment the sum of amount times direction component, the
+    /// energy rounded down to F32, and each moment raised by its sum times
+    /// the received fraction.
+    ///
+    /// # Errors
+    /// As [`apply_deposits_on`]. Nothing is applied either way until
+    /// [`DepositReduction::finish`].
+    pub fn reduction(&mut self, field: &FieldState) -> Result<DepositReduction<'_>, CoreError> {
+        let (summary, cells) = self.prepare(field)?;
+        Ok(DepositReduction {
+            deposits: self,
+            summary,
+            cells,
+        })
+    }
+}
+
+/// Deposits checked and grouped by cell for a reduction on another device
+/// (FL-032); see [`Deposits::reduction`].
+#[derive(Debug)]
+pub struct DepositReduction<'a> {
+    deposits: &'a mut Deposits,
+    summary: DepositSummary,
+    cells: usize,
+}
+
+impl DepositReduction<'_> {
+    /// One offset per cell and one more: cell `c`'s packets are
+    /// `offsets()[c]..offsets()[c + 1]` in [`DepositReduction::packet`]'s
+    /// numbering, in identity order.
+    #[must_use]
+    pub fn offsets(&self) -> &[u32] {
+        self.deposits.bins.offsets()
+    }
+
+    /// Grouped packet `at`: its amount and its deposit's index.
+    #[must_use]
+    pub fn packet(&self, at: usize) -> Option<(f64, usize)> {
+        let deposits = &*self.deposits;
+        let &index = deposits.bins.order().get(at)?;
+        let &packet = deposits.sequence.get(index as usize)?;
+        let packet = deposits.packets.get(packet as usize)?;
+        Some((packet.amount, packet.entry))
+    }
+
+    /// How many deposits there are: their indices are below it.
+    #[must_use]
+    pub fn deposits(&self) -> usize {
+        self.deposits.entries.len()
+    }
+
+    /// Deposit `index`'s chemical direction.
+    #[must_use]
+    pub fn direction(&self, index: usize) -> Option<&[f64; CHANNELS]> {
+        self.deposits
+            .entries
+            .get(index)
+            .map(|entry| &entry.direction)
+    }
+
+    /// The reduction's summary, given `received[c]` for every cell `c`, of
+    /// which only the cells with packets are read: the summary's cells and
+    /// its applied energy, summed in cell order as [`apply_deposits_on`]
+    /// sums them. Nothing is applied.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for fewer values than cells.
+    pub fn summarize(&self, received: &[f64]) -> Result<DepositSummary, CoreError> {
+        if received.len() < self.cells {
+            return Err(CoreError::LayoutMismatch {
+                buffer: DEPOSIT_PACKETS,
+                detail: format!(
+                    "{} received values for {} cells",
+                    received.len(),
+                    self.cells
+                ),
+            });
+        }
+        let mut summary = self.summary;
+        let mut applied = CompensatedSum::ZERO;
+        for (cell, pair) in self.offsets().windows(2).enumerate() {
+            if pair[0] < pair[1]
+                && let Some(&value) = received.get(cell)
+            {
+                applied.add(value);
+                summary.cells += 1;
+            }
+        }
+        summary.applied = applied.value();
+        Ok(summary)
+    }
+
+    /// Mark the deposits applied, once the other device has written the
+    /// reduction into the field.
+    pub fn finish(self) {
+        self.deposits.applied = true;
+    }
 }
 
 /// One thread's share of a reduction: a contiguous range of cells, their

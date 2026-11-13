@@ -19,16 +19,20 @@
 //! over the candidates' weights). The field is copied to the
 //! device and back every step; it is not yet resident (see the crate
 //! contract's known gaps).
+//!
+//! Phase 9 (FL-032) is [`crate::reduce`]'s, on the same owner.
 
 use flife_core::{CoreError, TimeStep};
 use flife_field::grid::FIELD_PLANES;
 use flife_field::{
-    FieldBackend, FieldGrid, FieldLayout, FieldPair, FieldStepReport, Source, SourceKernel,
-    SourceSupport, TransportPlan, deposit_energy, energy_report, step_report,
+    DepositSummary, Deposits, FieldBackend, FieldGrid, FieldLayout, FieldPair, FieldState,
+    FieldStepReport, Grants, Source, SourceKernel, SourceSupport, TransportPlan, deposit_energy,
+    energy_report, step_report,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 use crate::owner::{DeviceOwner, Kernel, Limits, Owned, Purpose, metal};
+use crate::reduce::Reduce;
 
 /// The field kernel source, with the software binary64 ahead of it.
 pub const FIELD_MSL: &str = concat!(
@@ -127,6 +131,7 @@ pub struct MetalField {
     moments: Pipeline,
     buffers: Option<Buffers>,
     host: Host,
+    reduce: Reduce,
 }
 
 impl std::fmt::Debug for MetalField {
@@ -160,6 +165,7 @@ impl MetalField {
             stencil: pipeline("field_stencil")?,
             weights: pipeline("source_weights")?,
             moments: pipeline("source_moments")?,
+            reduce: Reduce::new(&owner)?,
             owner,
             buffers: None,
             host: Host::default(),
@@ -275,6 +281,7 @@ impl FieldBackend for MetalField {
             moments: moments_pipeline,
             buffers,
             host,
+            ..
         } = self;
         let buffers = buffers.as_ref().ok_or_else(overflow)?;
 
@@ -506,5 +513,14 @@ impl FieldBackend for MetalField {
             .read(buffers.moments.buffer(), Purpose::Readback)?
             .read(next.moments_mut())?;
         Ok(step_report(transport, deposits, next))
+    }
+
+    fn reduce(
+        &mut self,
+        field: &mut FieldState,
+        grants: &mut Grants,
+        deposits: [&mut Deposits; 2],
+    ) -> Result<[DepositSummary; 2], CoreError> {
+        self.reduce.run(&self.owner, field, grants, deposits)
     }
 }

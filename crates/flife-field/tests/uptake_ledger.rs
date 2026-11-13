@@ -16,8 +16,8 @@ use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
 use flife_field::{
     BufferLimits, Cell, ConeTolerance, Demand, ExchangeStencil, FieldGrid, FieldPair, FieldState,
-    Grants, Source, SourceKernel, SourceSupport, TransportPlan, TransportScratch, advance_field,
-    apply_grants, resolve_uptake, saturating_request,
+    Grants, RequestRule, Source, SourceKernel, SourceSupport, TransportPlan, TransportScratch,
+    advance_field, apply_grants, resolve_uptake, saturating_request,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -562,6 +562,91 @@ fn saturating_requests_follow_appendix_a() {
     assert_eq!(stencil.density(&field).expect("density"), 2.0);
     let halfway = ExchangeStencil::at(&world, [4.0, 3.0]).expect("stencil");
     assert_eq!(halfway.density(&field).expect("density"), 1.0);
+}
+
+/// `demand` is each entry of `demands`, bit for bit, computed in any order,
+/// and refuses what `demands` refuses with the same error: what lets the
+/// engine compute phase 5's demands on its lanes, each into its own slot.
+#[test]
+fn demand_is_each_entry_of_demands() {
+    let world = grid(16, 12, 40.0, 30.0);
+    let mut field = zeroed(world);
+    let mut random = lcg(0x5EED_DE3A);
+    for y in 0..12 {
+        for x in 0..16 {
+            let energy = (random() * 9.0) as f32;
+            put(&mut field, x, y, energy, &axis(((x + y) % 4) as usize), 0.5);
+        }
+    }
+    let rule = RequestRule {
+        step: tick(),
+        capacity_per_second: 0.4,
+        half_saturation_density: 0.1,
+    };
+    let requesters: Vec<(OrganismId, [f64; 2])> = (0..500_u64)
+        .map(|index| {
+            let position = [random() * 40.0, random() * 30.0];
+            (OrganismId::new(1_000 - index), position)
+        })
+        .collect();
+    let mut expected = Vec::new();
+    flife_field::demands(&field, &rule, requesters.iter().copied(), &mut expected)
+        .expect("the demands");
+    assert_eq!(expected.len(), requesters.len());
+    // From the last to the first, as a later lane may finish first.
+    for (index, &(organism, position)) in requesters.iter().enumerate().rev() {
+        let got = flife_field::demand(&field, &rule, organism, position).expect("a demand");
+        let want = expected[index];
+        assert_eq!(got.organism, want.organism, "requester {index}");
+        assert_eq!(got.organism, organism, "requester {index}");
+        assert_eq!(
+            got.position.map(f64::to_bits),
+            position.map(f64::to_bits),
+            "requester {index}"
+        );
+        assert_eq!(
+            got.position.map(f64::to_bits),
+            want.position.map(f64::to_bits),
+            "requester {index}"
+        );
+        assert_eq!(
+            got.amount.to_bits(),
+            want.amount.to_bits(),
+            "requester {index}"
+        );
+    }
+    // The amounts vary, so a slot left at a constant would differ.
+    let mut amounts: Vec<u64> = expected
+        .iter()
+        .map(|demand| demand.amount.to_bits())
+        .collect();
+    amounts.sort_unstable();
+    amounts.dedup();
+    assert!(amounts.len() > 400, "{} distinct amounts", amounts.len());
+
+    // Two refusals: `demands` reports the first in order, which is
+    // `demand`'s refusal of that requester, not of the later one.
+    let mut refused = requesters.clone();
+    refused[321].1 = [f64::NAN, 3.0];
+    refused[400].1 = [3.0, f64::INFINITY];
+    let first = flife_field::demands(&field, &rule, refused.iter().copied(), &mut expected)
+        .expect_err("a nonfinite position is refused");
+    let alone = |at: usize| {
+        flife_field::demand(&field, &rule, refused[at].0, refused[at].1)
+            .expect_err("a nonfinite position is refused")
+    };
+    assert_eq!(first, alone(321));
+    assert_ne!(first, alone(400));
+    // A rule every request refuses: the first requester's refusal.
+    let broken = RequestRule {
+        capacity_per_second: -1.0,
+        ..rule
+    };
+    let first = flife_field::demands(&field, &broken, requesters.iter().copied(), &mut expected)
+        .expect_err("a negative capacity is refused");
+    let alone = flife_field::demand(&field, &broken, requesters[0].0, requesters[0].1)
+        .expect_err("a negative capacity is refused");
+    assert_eq!(first, alone);
 }
 
 #[test]

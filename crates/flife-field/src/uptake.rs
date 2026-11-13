@@ -798,8 +798,7 @@ impl RequestRule {
 }
 
 /// Phase 5's demands on the reference: for each `(organism, position)`, in
-/// order, its [`Demand`] at its footprint's density,
-/// `rule.request(ExchangeStencil::at(grid, position)?.density(field)?)`.
+/// order, its [`demand`].
 ///
 /// # Errors
 /// The first organism's footprint, density or request refusal, in order.
@@ -811,14 +810,30 @@ pub fn demands(
 ) -> Result<(), CoreError> {
     demands.clear();
     for (organism, position) in requesters {
-        let density = ExchangeStencil::at(field.grid(), position)?.density(field)?;
-        demands.push(Demand {
-            organism,
-            position,
-            amount: rule.request(density)?,
-        });
+        demands.push(demand(field, rule, organism, position)?);
     }
     Ok(())
+}
+
+/// One organism's phase 5 [`Demand`] on the reference, at its footprint's
+/// density: `rule.request(ExchangeStencil::at(grid, position)?.density(field)?)`.
+/// It reads only `field`, so callers may compute many at once, each into
+/// its own slot.
+///
+/// # Errors
+/// The footprint's, the density's or the request's refusal.
+pub fn demand(
+    field: &FieldState,
+    rule: &RequestRule,
+    organism: OrganismId,
+    position: [f64; 2],
+) -> Result<Demand, CoreError> {
+    let density = ExchangeStencil::at(field.grid(), position)?.density(field)?;
+    Ok(Demand {
+        organism,
+        position,
+        amount: rule.request(density)?,
+    })
 }
 
 /// One occupied cell for [`UptakeBackend::resolve`].

@@ -87,9 +87,8 @@ use flife_field::{
     FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants,
     PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath,
     SensorBackend, SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend,
-    UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants,
-    demands as reference_demands, demands_on, initial_source, resolve_uptake, resolve_uptake_on,
-    state::CHANNELS,
+    UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants, demand,
+    demands_on, initial_source, resolve_uptake, resolve_uptake_on, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -1871,7 +1870,15 @@ impl World {
 
         // Phase 5: requests from the observation field, resolved per cell,
         // on the uptake backend if the world has one.
-        let uptake = uptake_with(rules, working, observed, demands, grants, uptake_state)?;
+        let uptake = uptake_with(
+            rules,
+            working,
+            observed,
+            demands,
+            grants,
+            uptake_state,
+            lanes,
+        )?;
         // The packets are in (cell, identity) order, so grouping them by
         // demand keeps each organism's in cell order.
         let granted = grants.packets();
@@ -2505,7 +2512,8 @@ fn sample_on(
 /// hands the tick's phase 5 to the reference, which reproduces the
 /// reference's own error or finds none; with none, the backend failed where
 /// the reference does not, and the world stops using it. Either way the
-/// demands and grants are the reference's.
+/// demands and grants are the reference's. The reference's demands are
+/// computed on the lanes ([`demands_on_lanes`]).
 fn uptake_with(
     rules: &Rules,
     working: &[Working],
@@ -2513,6 +2521,7 @@ fn uptake_with(
     demands: &mut Vec<Demand>,
     grants: &mut Grants,
     uptake: &mut Uptake,
+    lanes: &mut [DecisionLane],
 ) -> Result<UptakeSummary, CoreError> {
     let rule = RequestRule {
         step: rules.step,
@@ -2539,7 +2548,7 @@ fn uptake_with(
             }
             Err(error) => {
                 report.reference_ticks = report.reference_ticks.saturating_add(1);
-                reference_demands(field, &rule, requesters(), demands)?;
+                demands_on_lanes(field, &rule, working, demands, lanes)?;
                 let summary = resolve_uptake(field, demands, grants)?;
                 report.failure = Some(error.to_string());
                 *backend = None;
@@ -2547,8 +2556,37 @@ fn uptake_with(
             }
         }
     }
-    reference_demands(field, &rule, requesters(), demands)?;
+    demands_on_lanes(field, &rule, working, demands, lanes)?;
     resolve_uptake(field, demands, grants)
+}
+
+/// Phase 5's demands on the reference, on the lanes: `demands` gets each
+/// working organism's identity and position in identity order, then each
+/// lane computes a contiguous identity-ordered run of them ([`in_runs_mut`])
+/// with [`demand`], the function `flife_field::demands` applies to each in
+/// turn. A demand reads only the observed field, so the demands are the
+/// same at any lane count, and the error returned is the first in identity
+/// order, as one thread would report it.
+fn demands_on_lanes(
+    field: &FieldState,
+    rule: &RequestRule,
+    working: &[Working],
+    demands: &mut Vec<Demand>,
+    lanes: &mut [DecisionLane],
+) -> Result<(), CoreError> {
+    demands.clear();
+    reserve_for(demands, working.len(), "organism demands")?;
+    demands.extend(working.iter().map(|organism| Demand {
+        organism: organism.committed.id,
+        position: organism.position,
+        amount: 0.0,
+    }));
+    in_runs_mut(demands, lanes, "uptake demands", &|_, run, _| {
+        for slot in run.iter_mut() {
+            *slot = demand(field, rule, slot.organism, slot.position)?;
+        }
+        Ok(())
+    })
 }
 
 /// Phase 3 for one organism (§8.1): its observation at its sensing scale,
@@ -2741,8 +2779,14 @@ where
 
 /// [`in_runs`] over rows that `work` changes: the same split into
 /// contiguous identity-ordered runs, one per lane, each with the index of
-/// its first row, and the first error in identity order.
-fn in_runs_mut<T, F>(rows: &mut [T], lanes: &mut [DecisionLane], work: &F) -> Result<(), CoreError>
+/// its first row, and the first error in identity order. `operation` names
+/// the phase in its own refusals.
+fn in_runs_mut<T, F>(
+    rows: &mut [T],
+    lanes: &mut [DecisionLane],
+    operation: &'static str,
+    work: &F,
+) -> Result<(), CoreError>
 where
     T: Send,
     F: Fn(usize, &mut [T], &mut DecisionLane) -> Result<(), CoreError> + Sync,
@@ -2753,7 +2797,7 @@ where
         .max(1);
     let Some((first, others)) = lanes.split_first_mut() else {
         return Err(CoreError::StateConflict {
-            operation: "settle",
+            operation,
             detail: "no lane".to_owned(),
         });
     };
@@ -2773,8 +2817,8 @@ where
         for worker in workers {
             let joined = worker.join().unwrap_or_else(|_| {
                 Err(CoreError::StateConflict {
-                    operation: "settle",
-                    detail: "a settling worker panicked".to_owned(),
+                    operation,
+                    detail: "a lane's worker panicked".to_owned(),
                 })
             });
             if result.is_ok() {
@@ -2807,7 +2851,7 @@ fn settle_all(
         lane.emissions.clear();
         lane.transactions = None;
     }
-    in_runs_mut(working, lanes, &|start, run, lane| {
+    in_runs_mut(working, lanes, "settle", &|start, run, lane| {
         let DecisionLane {
             packets,
             flows,

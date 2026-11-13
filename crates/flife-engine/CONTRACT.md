@@ -1037,14 +1037,16 @@ velocity, first-order splitting at the configured fixed timestep.
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet
   (FL-017), and the reference has no device fences. A candidate is exclusive by borrowing, not by a lease.
-- `execution.cpu_workers` (or `World::set_cpu_workers`) sets the threads for organism decisions, phases 6 and 7,
-  and the field step; no result depends on it (`the_cpu_worker_count_changes_no_result`: 1, 2, 3, 6 and 64
-  workers, 96 ticks with births). Decisions read only committed state and split into contiguous identity-ordered
-  chunks of at least 128, the first error in identity order winning; phases 6 and 7 split the same way and keep
-  the ledger's and the deposits' order (see the scratch section). The field splits transport by plane, and each
-  moment plane keeps its per-source deposit order. The threads are scoped `std` threads spawned per tick: a
-  bounded, reported reference adapter (§3.4, §12.5), not Asupersync-scheduled work. Phase 6's packet compositions
-  run on the lanes too. Invariant checks, uptake, the deposit and grant reductions and the commit stay on one
+- `execution.cpu_workers` (or `World::set_cpu_workers`) sets the threads for organism decisions, phase 5's
+  demands, phases 6 and 7, and the field's step, reductions and check; no result depends on it
+  (`the_cpu_worker_count_changes_no_result`: 1, 2, 3, 6 and 64 workers, 96 ticks with births). Decisions read only
+  committed state and split into contiguous identity-ordered chunks of at least 128, the first error in identity
+  order winning; phases 6 and 7 split the same way and keep the ledger's and the deposits' order (see the scratch
+  section). The field splits transport by plane, and each moment plane keeps its per-source deposit order. The
+  threads are scoped `std` threads spawned per tick: a bounded, reported reference adapter (§3.4, §12.5), not
+  Asupersync-scheduled work. Phase 5's demands and phase 6's packet compositions run on the lanes too, and phase
+  9's deposit reductions and phase 10's field check on the field's workers (see phases 9 and 10). Phase 5's grant
+  resolution, phase 9's grant debit, phase 10's holdings closure and population checks, and the commit stay on one
   thread, and a persistent pool is later work. Parallel phases must keep these reduction orders.
 - `World::set_controller_backend` (FL-030) hands each tick's due evaluations to a `flife_neural::ControllerBackend`
   in one batch, in identity order. Observations are made on the lanes first, then the backend is called once, then
@@ -1072,9 +1074,12 @@ velocity, first-order splitting at the configured fixed timestep.
   reference errs too, its error is the tick's. No result depends on the backend, and it is not state. The tests
   are in `flife-backend-metal`'s `tests/sensor_world.rs`.
 - Phase 5's demands are `flife_field::demands` with the world's `RequestRule`, over the working organisms in
-  identity order: the same expressions as before, in the same order. `World::set_uptake_backend` (FL-031) hands
-  phase 5's densities, requests, cell demands and quanta to a `flife_field::UptakeBackend`, through
-  `demands_on` and `resolve_uptake_on`. If either errs, the tick's phase 5 is redone on the reference from the
+  identity order: the same expressions as before. On the reference they are computed on the lanes, each lane
+  taking a contiguous identity-ordered run of at least 128 organisms and computing each one's `flife_field::demand`
+  into its own slot; a demand reads only the observed field, so the demands are the same at any worker count, and
+  the first refusal in identity order is the tick's. `World::set_uptake_backend` (FL-031) hands phase 5's
+  densities, requests, cell demands and quanta to a `flife_field::UptakeBackend`, through `demands_on` and
+  `resolve_uptake_on`. If either errs, the tick's phase 5 is redone on the reference from the
   same observed field, and the backend is dropped, with `World::uptake_report` (`UptakeReport`: backend, device
   and reference ticks, failure) recording why. If the reference errs too, its error is the tick's. Installing a
   backend reserves its `UptakeWork` for the population's capacity on the grid (FL-043, counted in the footprint's

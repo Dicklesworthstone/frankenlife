@@ -96,7 +96,9 @@
   `CellDebit` per demanded cell, each organism's total `U_i` in input order, and an `UptakeSummary`.
   `apply_grants` debits the field.
 - FL-031's phase 5: `RequestRule` (`Δt`, `U_max`, `K`; `request(density)` is `saturating_request`), and `demands`,
-  each organism's `Demand` at its footprint's density, in order: the reference the engine runs. The port for a
+  each organism's `Demand` at its footprint's density, in order: the reference the engine runs. `demand` is one
+  organism's, the function `demands` applies to each in turn; it reads only the field, so a caller may compute
+  many at once, each into its own slot (the engine does, on its lanes). The port for a
   device is `UptakeBackend` (`describe`; `request(field, rule, stencils, densities, requests)`, each footprint's
   density and request; `resolve(cells, requested, demanded, quanta)`, each `UptakeCell`'s compensated demand and
   each packet's whole quanta), each bit for bit the reference's. `demands_on` and `resolve_uptake_on` run it with
@@ -350,6 +352,8 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   - A 64² field with 100,000 organisms, half in a hotspot, with conservation checked in every cell.
   - Footprint weights, wrapping, combination and locality.
   - A.1's request law.
+  - `demand` equal to each of 500 entries of `demands` bit for bit, taken last to first, and both reporting the
+    same first refusal (a nonfinite position before a later one; a refused rule).
   - Stale and duplicate application refused.
   - A fault-injection lane taken from rust_scriptbots. Credit without debit, debit without credit, double
     credit, an unrecorded loss, a gain above the grant, overspend repaired by clamping, double apply, a stale

@@ -409,6 +409,11 @@ cargo run --release -p flife-studio -- presets/reference-small-world.toml --run 
 cargo run --release -p flife-cli -- resume studio-run --until 20000
 ```
 
+`presets/interactive-world.toml` is the Interactive profile's world (§19.5): 25,000 founders on 256 × 256 × 33,
+its source power chosen by FL-034's declared experiment E1 (`experiments/fl034/README.md`). Its populations
+settle at about 22,000 to 25,000 after an early bottleneck. Open it the same way:
+`cargo run --release -p flife-studio -- presets/interactive-world.toml`.
+
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the

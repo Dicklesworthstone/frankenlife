@@ -1,0 +1,27 @@
+schema = "frankenlife.experiment.v1"
+name = "fl034-e1-interactive-scale-up-pair-12"
+hypothesis = """Which source power makes the Interactive profile's world (256 x 256 x 33, 25,000 founders, \
+plan 19.5) hold an evolving population in the band 20,000 to 30,000 live? The control is the \
+reference-small-world preset scaled to 4x the area with 4x the sources (32 x 960, the reference's energy \
+per area); the sweep raises source power 1.3x and 1.6x. This directory holds one of four seed pairs \
+(discovery 12, held-out 2012); the four together are E1 (experiments/fl034/README.md)."""
+base = "../interactive-base.toml"
+ticks = 8192
+metrics_every = 1024
+control = "control"
+selection = """No selection by the tool: every condition runs on every seed and every run is reported. Rule, \
+declared before any run (TODO 2026-11-13 00:01:52 EST): a condition qualifies on a split when every run of \
+it on that split, over all four seed pairs, reaches tick 8,192 (no extinction, no capacity pause) with \
+final_live in 20,000 to 30,000. The candidate is the lowest source power whose discovery runs qualify; it \
+is adopted for an Interactive preset only if its held-out runs qualify too. If none qualifies, nothing is \
+adopted and the next experiment is declared from these results."""
+
+[seeds]
+discovery = [12]
+held_out = [2012]
+
+[[conditions]]
+name = "control"
+
+[sweep]
+"sources.power_per_source" = [1248.0, 1536.0]

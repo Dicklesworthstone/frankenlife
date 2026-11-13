@@ -84,11 +84,12 @@ use flife_core::{
 };
 use flife_field::{
     Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
-    FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, Grants, PyramidView,
-    RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
-    SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary,
-    UptakeWork, advance_field_on, apply_deposits, apply_grants, demands as reference_demands,
-    demands_on, initial_source, resolve_uptake, resolve_uptake_on,
+    FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants,
+    PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath,
+    SensorBackend, SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend,
+    UptakeSummary, UptakeWork, advance_field_on, apply_deposits, apply_grants,
+    demands as reference_demands, demands_on, initial_source, resolve_uptake, resolve_uptake_on,
+    state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -534,6 +535,9 @@ struct Scratch {
     grants: Grants,
     /// Each organism's grant packets, grouped by demand in cell order.
     by_demand: Bins,
+    /// Each grant packet's composition, in packet order (phase 6): room for
+    /// four a row, and as long as the most packets a tick has had.
+    compositions: Vec<[f64; CHANNELS]>,
     packets: Vec<ChemicalPacket>,
     emissions: Deposits,
     recycling: Deposits,
@@ -1245,6 +1249,7 @@ impl World {
                 capacity_bytes(&scratch.demands),
                 scratch.grants.allocated_bytes(),
                 scratch.by_demand.allocated_bytes(),
+                capacity_bytes(&scratch.compositions),
                 capacity_bytes(&scratch.packets),
                 scratch.emissions.allocated_bytes(),
                 scratch.recycling.allocated_bytes(),
@@ -1729,6 +1734,7 @@ impl World {
             demands,
             grants,
             by_demand,
+            compositions,
             packets,
             emissions,
             recycling,
@@ -1872,17 +1878,18 @@ impl World {
         }
         let mut transactions = None;
 
-        // Phases 6 and 7: each organism's ordered budget stages.
+        // Phases 6 and 7: each organism's ordered budget stages, its packets'
+        // compositions computed first for every packet on the lanes.
+        compositions_into(observed, granted, lanes.len(), compositions)?;
         for (index, organism) in working.iter_mut().enumerate() {
             packets.clear();
-            for packet in by_demand
-                .bucket(index)
-                .iter()
-                .filter_map(|&at| granted.get(at as usize))
-            {
+            for (packet, composition) in by_demand.bucket(index).iter().filter_map(|&at| {
+                let at = at as usize;
+                granted.get(at).zip(compositions.get(at))
+            }) {
                 packets.push(ChemicalPacket {
                     granted: packet.granted,
-                    composition: composition(observed, packet.cell)?,
+                    composition: *composition,
                 });
             }
             let genome = genome_of(population, organism.committed.id)?;
@@ -2264,6 +2271,12 @@ impl Scratch {
             demands: reserved(rows, "organism demands")?,
             grants: Grants::with_capacity(&rules.grid, organisms, &limits)?,
             by_demand: Bins::with_capacity("organism packets", organisms, packets, &limits)?,
+            compositions: reserved(
+                usize::try_from(packets).map_err(|_| CoreError::Overflow {
+                    quantity: "organism packets",
+                })?,
+                "packet compositions",
+            )?,
             packets: reserved(4, "organism packets")?,
             emissions: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
@@ -2701,6 +2714,79 @@ where
                 Err(CoreError::StateConflict {
                     operation: "decide",
                     detail: "a decision worker panicked".to_owned(),
+                })
+            });
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        result
+    })
+}
+
+/// The fewest packets a lane takes in [`compositions_into`].
+const MINIMUM_PACKETS_PER_LANE: usize = 1_024;
+
+/// Phase 6's compositions: `out[at]` becomes [`composition`] of
+/// `granted[at]`'s cell in `observed`, on at most `lanes` threads (this one
+/// and scoped workers joined before returning), each taking a contiguous
+/// run of packets. A composition is a function of the observed field and
+/// the cell alone, so the split changes no value. The packets are in cell
+/// order, so within a run a packet whose cell is the previous packet's
+/// copies its composition. `out` keeps the length of the most packets a tick
+/// has had, within the room reserved for four a row, so a tick writes only
+/// the compositions it reads. The error returned is the first in packet
+/// order.
+fn compositions_into(
+    observed: &FieldState,
+    granted: &[GrantPacket],
+    lanes: usize,
+    out: &mut Vec<[f64; CHANNELS]>,
+) -> Result<(), CoreError> {
+    if out.len() < granted.len() {
+        reserve_for(out, granted.len() - out.len(), "packet compositions")?;
+        out.resize(granted.len(), [0.0; CHANNELS]);
+    }
+    let out = out
+        .get_mut(..granted.len())
+        .ok_or_else(|| CoreError::StateConflict {
+            operation: "compose packets",
+            detail: format!("no room for {} compositions", granted.len()),
+        })?;
+    let run = |packets: &[GrantPacket], slots: &mut [[f64; CHANNELS]]| {
+        let mut previous: Option<(usize, [f64; CHANNELS])> = None;
+        for (packet, slot) in packets.iter().zip(slots) {
+            let value = match previous {
+                Some((cell, value)) if cell == packet.cell => value,
+                _ => composition(observed, packet.cell)?,
+            };
+            *slot = value;
+            previous = Some((packet.cell, value));
+        }
+        Ok(())
+    };
+    let used = lanes
+        .min(granted.len().div_ceil(MINIMUM_PACKETS_PER_LANE))
+        .max(1);
+    if used == 1 {
+        return run(granted, out);
+    }
+    let length = granted.len().div_ceil(used);
+    let mut runs = granted.chunks(length).zip(out.chunks_mut(length));
+    let Some((head, head_slots)) = runs.next() else {
+        return Ok(());
+    };
+    let run = &run;
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = runs
+            .map(|(packets, slots)| scope.spawn(move || run(packets, slots)))
+            .collect();
+        let mut result = run(head, head_slots);
+        for worker in workers {
+            let joined = worker.join().unwrap_or_else(|_| {
+                Err(CoreError::StateConflict {
+                    operation: "compose packets",
+                    detail: "a composition worker panicked".to_owned(),
                 })
             });
             if result.is_ok() {

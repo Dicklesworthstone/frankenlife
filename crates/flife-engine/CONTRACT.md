@@ -493,10 +493,17 @@ each runs and owns the field.
 - `field` is both fields, the field step's per-worker transport scratch and one source support per source, and the
   sensor pyramid. Each support is reserved at founding for its kernel's most candidate cells on the grid (per axis
   at most `⌈2r/h⌉ + 5` cells, and at most the axis), so a step never grows one.
-- `scratch` is the tick's rows, decision lanes, demands, grants, packets, deposits, survivors and deaths, and the
-  sensor backend's queries and samples. They are reserved for the capacity when the world is founded, its workers
-  are set or a sensor backend is installed. Each lane's share of the rows follows the worker count, and lanes
-  removed by a smaller count are released.
+- `scratch` is the tick's rows, decision lanes, demands, grants, packets, each packet's composition, deposits,
+  survivors and deaths, and the sensor backend's queries and samples. They are reserved for the capacity when the
+  world is founded, its workers are set or a sensor backend is installed. Each lane's share of the rows follows
+  the worker count, and lanes removed by a smaller count are released. The compositions take room for four
+  packets a row (256 bytes each), so the footprint grows by 1 KiB per organism of capacity.
+- Phase 6 computes every granted packet's composition before any organism settles. It runs on the world's lanes,
+  each lane taking a contiguous run of at least 1,024 packets in packet order, and a packet whose cell repeats the
+  previous packet's in its run copies that composition. A composition is a function of the observed field and its
+  cell alone, so the result does not depend on the worker count: the world is bit-identical at any worker count
+  (`the_cpu_worker_count_changes_no_result`, pinned digests). The organisms then settle one after another in
+  identity order, as before.
 - Installing a controller backend reserves the batched path's outputs, a slot per row, and each lane's observations
   for the most rows it can take: exactly `batched_bytes()`. Removing it releases them. If the host refuses them,
   no backend is installed and the report says why.
@@ -1016,8 +1023,9 @@ velocity, first-order splitting at the configured fixed timestep.
   births). Decisions read only committed state and split into contiguous identity-ordered chunks of at least 128,
   the first error in identity order winning. The field splits transport by plane, and each moment plane keeps its
   per-source deposit order. The threads are scoped `std` threads spawned per tick: a bounded, reported reference
-  adapter (§3.4, §12.5), not Asupersync-scheduled work. Invariant checks, chemistry composition, uptake and the
-  commit stay on one thread, and a persistent pool is later work. Parallel phases must keep these reduction orders.
+  adapter (§3.4, §12.5), not Asupersync-scheduled work. Phase 6's packet compositions run on the lanes too (see the
+  scratch section). Invariant checks, settlement, uptake and the commit stay on one thread, and a persistent pool
+  is later work. Parallel phases must keep these reduction orders.
 - `World::set_controller_backend` (FL-030) hands each tick's due evaluations to a `flife_neural::ControllerBackend`
   in one batch, in identity order. Observations are made on the lanes first, then the backend is called once, then
   each lane decodes its run, evaluating what the backend deferred on the reference. Any error on that path hands

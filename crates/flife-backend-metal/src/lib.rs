@@ -32,7 +32,7 @@ use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_neural::{
     ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH, ShardGeometry,
-    Weights,
+    WeightDtype, Weights,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -257,6 +257,8 @@ impl std::fmt::Debug for Resident {
 pub struct MetalControllers {
     owner: DeviceOwner,
     forward: Pipeline,
+    /// The forward pass over binary16 shards (FL-030).
+    forward_half: Pipeline,
     activation: Pipeline,
     binary64: Pipeline,
     binary32: Pipeline,
@@ -291,6 +293,7 @@ impl MetalControllers {
         let pipeline = |name: &str| library.pipeline(name).map_err(metal);
         Ok(Self {
             forward: pipeline("controller_forward")?,
+            forward_half: pipeline("controller_forward_half")?,
             activation: pipeline("activation_bits")?,
             binary64: pipeline("binary64_ops")?,
             binary32: pipeline("binary32_ops")?,
@@ -545,10 +548,29 @@ pub const fn staging_bytes(organisms: u64, shards: u64) -> u64 {
     device.saturating_add(host)
 }
 
+/// A shard's parameters on the device, in its bucket's weight dtype.
+enum ShardParameters {
+    F32(Owned<f32>),
+    /// Binary16 values two to a word, the even element in the low half: the
+    /// kernel reads the buffer as `half`. A slot holds an even number of
+    /// elements, so no word is shared by two slots.
+    F16(Owned<u32>),
+}
+
+impl ShardParameters {
+    /// The buffer, bound for a kernel to read.
+    fn reads(&self) -> Binding {
+        match self {
+            Self::F32(values) => values.buffer().reads(),
+            Self::F16(words) => words.buffer().reads(),
+        }
+    }
+}
+
 /// One shard of a topology's slots on the device: a whole shard's buffer,
 /// made when its first slot is needed and never moved or rebuilt.
 struct DeviceShard {
-    parameters: Owned<f32>,
+    parameters: ShardParameters,
     /// Each slot's uploaded occupant, its generation and genome, or `None`
     /// before its first.
     occupants: Vec<Option<(u32, GenomeId)>>,
@@ -561,6 +583,9 @@ struct DeviceShard {
 /// One catalog member, as this backend first saw it.
 struct DeviceBucket {
     topology: DenseTopology,
+    /// The weight dtype of its first genome, which its shards hold; a job of
+    /// another dtype is deferred.
+    dtype: WeightDtype,
     /// `None` when not one slot fits a device shard: its jobs are deferred.
     geometry: Option<ShardGeometry>,
     shards: HashMap<u64, DeviceShard>,
@@ -720,6 +745,7 @@ impl MetalBackend {
         }
         let topology = job.controller.topology();
         let length = job.controller.parameters().len() as u64;
+        let dtype = job.controller.parameters().dtype();
         let (owner, shard_slots) = (&self.controllers.owner, self.shard_slots);
         let share = match self.budget.bytes {
             u64::MAX => u64::MAX,
@@ -730,19 +756,24 @@ impl MetalBackend {
             let limit = (owner.max_buffer_bytes() as u64)
                 .min(SHARD_BYTES)
                 .min(share)
-                / size_of::<f32>() as u64;
+                / dtype.bytes();
+            // Binary16 slots start on a word: an odd parameter count would
+            // share one with the next slot, so such a member is deferred.
+            let packs = dtype == WeightDtype::F32 || length.is_multiple_of(2);
             DeviceBucket {
                 topology: topology.clone(),
-                geometry: ShardGeometry::fitting(
-                    length,
-                    limit.min(u64::from(u32::MAX)),
-                    shard_slots,
-                )
-                .ok(),
+                dtype,
+                geometry: packs
+                    .then(|| {
+                        ShardGeometry::fitting(length, limit.min(u64::from(u32::MAX)), shard_slots)
+                            .ok()
+                    })
+                    .flatten(),
                 shards: HashMap::new(),
             }
         });
         let serves = bucket.topology == *topology
+            && bucket.dtype == dtype
             && bucket
                 .geometry
                 .is_some_and(|geometry| geometry.parameters() == length);
@@ -760,7 +791,7 @@ impl MetalBackend {
         // What the shards hold, written back once the batch is placed. An
         // error drops the backend, so a lost count is never used.
         let (mut held, mut shard_count) = (self.held, self.shard_count);
-        let mut widened: Vec<f32> = Vec::new();
+        let mut packed: Vec<u32> = Vec::new();
         for &index in &eligible {
             let Some(job) = jobs.get(index) else { continue };
             let Some(bucket) = self.bucket(job)? else {
@@ -769,6 +800,7 @@ impl MetalBackend {
             let Some(geometry) = bucket.geometry else {
                 continue;
             };
+            let dtype = bucket.dtype;
             let at = geometry.locate(job.slot.slot());
             let local = usize::try_from(at.slot_in_shard).map_err(|_| CoreError::Overflow {
                 quantity: "arena slot",
@@ -786,14 +818,25 @@ impl MetalBackend {
                             quantity: "arena shard slots",
                         }
                     })?;
-                    let bytes = bytes_for::<f32>(elements)
+                    let bytes = geometry
+                        .shard_elements()
+                        .saturating_mul(dtype.bytes())
                         .saturating_add(bytes_for::<Option<(u32, GenomeId)>>(slots))
                         .saturating_add(SHARD_HOST_BYTES);
                     let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
                     if held.saturating_add(bytes).saturating_add(staging) > budget.bytes {
                         continue;
                     }
-                    let parameters = match owner.zeroed_owned::<f32>(elements) {
+                    let made = match dtype {
+                        WeightDtype::F32 => owner
+                            .zeroed_owned::<f32>(elements)
+                            .map(ShardParameters::F32),
+                        // Slots of an even count fill whole words.
+                        WeightDtype::F16 => owner
+                            .zeroed_owned::<u32>(elements / 2)
+                            .map(ShardParameters::F16),
+                    };
+                    let parameters = match made {
                         Ok(parameters) => parameters,
                         Err(CoreError::BudgetExhausted { .. }) => continue,
                         Err(error) => return Err(error),
@@ -830,19 +873,23 @@ impl MetalBackend {
             // The old occupant is gone before the new one is written, so a
             // failure leaves the slot empty, never mixed.
             *occupant = None;
-            let mut lease = owner.write(shard.parameters.buffer())?;
-            match job.controller.parameters() {
-                Weights::F32(values) => lease.write(offset, values)?,
-                // F16 widens exactly; the shard holds the F32 the
-                // arithmetic reads.
-                Weights::F16(values) => {
-                    widened.clear();
-                    reserve(&mut widened, values.len(), "metal widened parameters")?;
-                    widened.extend(values.iter().map(|value| value.to_f32()));
-                    lease.write(offset, &widened)?;
+            match (&shard.parameters, job.controller.parameters()) {
+                (ShardParameters::F32(buffer), Weights::F32(values)) => {
+                    owner.write(buffer.buffer())?.write(offset, values)?;
                 }
+                // Two binary16 values a word, the even one low; the slot's
+                // first word is its even offset halved.
+                (ShardParameters::F16(words), Weights::F16(values)) => {
+                    packed.clear();
+                    reserve(&mut packed, values.len() / 2, "metal binary16 words")?;
+                    packed.extend(values.as_chunks::<2>().0.iter().map(|[low, high]| {
+                        u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
+                    }));
+                    owner.write(words.buffer())?.write(offset / 2, &packed)?;
+                }
+                // A bucket serves only its own dtype (`bucket`).
+                _ => continue,
             }
-            drop(lease);
             *occupant = own;
             uploads += 1;
         }
@@ -1044,26 +1091,31 @@ impl ControllerBackend for MetalBackend {
             let mut bindings = Vec::new();
             reserve(&mut bindings, touched.len(), "metal controller kernels")?;
             for &(topology, key) in &touched {
-                let shard = self
-                    .buckets
-                    .get(topology)
-                    .and_then(Option::as_ref)
-                    .and_then(|bucket| bucket.shards.get(&key));
-                let Some((parameters, words, staged)) = shard.and_then(|shard| {
-                    Some((
-                        shard.parameters.buffer(),
-                        shard.jobs.as_ref()?.buffer(),
-                        shard.staged.len() / JOB_WORDS,
-                    ))
-                }) else {
+                let bucket = self.buckets.get(topology).and_then(Option::as_ref);
+                let shard = bucket.and_then(|bucket| bucket.shards.get(&key));
+                let Some((dtype, parameters, words, staged)) =
+                    bucket.zip(shard).and_then(|(bucket, shard)| {
+                        Some((
+                            bucket.dtype,
+                            shard.parameters.reads(),
+                            shard.jobs.as_ref()?.buffer(),
+                            shard.staged.len() / JOB_WORDS,
+                        ))
+                    })
+                else {
                     return Err(CoreError::StateConflict {
                         operation: "metal controller residency",
                         detail: format!("shard {key} of member {topology} is missing"),
                     });
                 };
+                let pipeline = match dtype {
+                    WeightDtype::F32 => &self.controllers.forward,
+                    WeightDtype::F16 => &self.controllers.forward_half,
+                };
                 bindings.push((
+                    pipeline,
                     [
-                        parameters.reads(),
+                        parameters,
                         inputs.reads(),
                         words.reads(),
                         raw.writes(),
@@ -1074,8 +1126,8 @@ impl ControllerBackend for MetalBackend {
             }
             let kernels: Vec<Kernel<'_>> = bindings
                 .iter()
-                .map(|(bound, staged)| Kernel {
-                    pipeline: &self.controllers.forward,
+                .map(|(pipeline, bound, staged)| Kernel {
+                    pipeline,
                     bindings: bound,
                     grid: Grid::linear(*staged, FORWARD_THREADS),
                 })

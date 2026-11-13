@@ -5,7 +5,7 @@
 //! outputs are the reference's bits in shards of any size and at slots far
 //! past 32 bits.
 
-use flife_backend_metal::MetalBackend;
+use flife_backend_metal::{BackendBudget, MetalBackend, SHARD_BYTES};
 use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
@@ -234,18 +234,9 @@ fn a_genome_is_uploaded_once_and_a_later_occupant_takes_its_place() -> Result<()
     Ok(())
 }
 
-/// FL-030: every catalog topology with its parameters rounded once to
-/// binary16 (compact F16), binary16 subnormals included. The backend uploads
-/// each genome widened exactly, and the device's outputs are the
-/// reference's bit for bit; nothing is deferred.
-#[test]
-fn every_topology_in_f16_is_the_reference_bit_for_bit() -> Result<(), CoreError> {
-    let Some(mut backend) = backend(64) else {
-        return Ok(());
-    };
-    let topologies = topologies();
-    let cases = cases(&topologies, 500);
-    let halves: Vec<Vec<F16>> = cases
+/// Each case's parameters rounded once to binary16.
+fn halves(cases: &[Case]) -> Vec<Vec<F16>> {
+    cases
         .iter()
         .map(|case| {
             case.parameters
@@ -253,15 +244,18 @@ fn every_topology_in_f16_is_the_reference_bit_for_bit() -> Result<(), CoreError>
                 .map(|&value| F16::from_f64(f64::from(value)))
                 .collect()
         })
-        .collect();
-    let subnormal = |half: &F16| half.to_bits() & 0x7C00 == 0 && half.to_bits() & 0x03FF != 0;
-    assert!(
-        halves.iter().flatten().any(subnormal),
-        "no binary16 subnormal"
-    );
+        .collect()
+}
+
+/// [`jobs`] from `first` with each case's binary16 parameters.
+fn half_jobs<'a>(
+    topologies: &'a [DenseTopology],
+    cases: &'a [Case],
+    halves: &'a [Vec<F16>],
+) -> Result<Vec<ControllerJob<'a>>, CoreError> {
     let mut next = [0_u64; TOPOLOGIES.len()];
     let mut jobs = Vec::with_capacity(cases.len());
-    for (index, (case, half)) in cases.iter().zip(&halves).enumerate() {
+    for (index, (case, half)) in cases.iter().zip(halves).enumerate() {
         let slot = next[case.topology];
         next[case.topology] += 1;
         jobs.push(ControllerJob {
@@ -271,6 +265,28 @@ fn every_topology_in_f16_is_the_reference_bit_for_bit() -> Result<(), CoreError>
             inputs: &case.inputs,
         });
     }
+    Ok(jobs)
+}
+
+/// FL-030: every catalog topology with its parameters rounded once to
+/// binary16 (compact F16), binary16 subnormals included. The backend keeps
+/// each genome as binary16 in its shard and the half kernel widens each
+/// value exactly, so the device's outputs are the reference's bit for bit;
+/// nothing is deferred.
+#[test]
+fn every_topology_in_f16_is_the_reference_bit_for_bit() -> Result<(), CoreError> {
+    let Some(mut backend) = backend(64) else {
+        return Ok(());
+    };
+    let topologies = topologies();
+    let cases = cases(&topologies, 500);
+    let halves = halves(&cases);
+    let subnormal = |half: &F16| half.to_bits() & 0x7C00 == 0 && half.to_bits() & 0x03FF != 0;
+    assert!(
+        halves.iter().flatten().any(subnormal),
+        "no binary16 subnormal"
+    );
+    let jobs = half_jobs(&topologies, &cases, &halves)?;
     let mut outputs = Vec::new();
     backend.evaluate(&jobs, &mut outputs)?;
     let want = reference(&jobs);
@@ -280,6 +296,81 @@ fn every_topology_in_f16_is_the_reference_bit_for_bit() -> Result<(), CoreError>
     );
     assert_eq!(bits(&outputs), want);
     assert_eq!(backend.uploads(), jobs.len() as u64);
+
+    // An F32 genome at a slot of a member whose shards hold binary16 is
+    // deferred, never read as binary16.
+    let wide = self::jobs(&topologies, &cases[..1], 0);
+    backend.evaluate(&wide, &mut outputs)?;
+    assert_eq!(outputs, [None]);
+    assert_eq!(backend.uploads(), jobs.len() as u64);
+    Ok(())
+}
+
+/// FL-030: a binary16 shard holds two bytes a parameter. The same slots in
+/// F32 take exactly two bytes a parameter more on the device, and nothing
+/// else differs; and under a budget of two thirds of what the F32 backend
+/// holds, some F32 jobs are deferred while every F16 job is uploaded and is
+/// the reference's bits, since admission charges a shard at its dtype's
+/// size.
+#[test]
+fn an_f16_shard_holds_half_the_bytes_and_is_admitted_at_that_size() -> Result<(), CoreError> {
+    let (Some(mut wide), Some(mut half)) = (backend(64), backend(64)) else {
+        return Ok(());
+    };
+    let topologies = topologies();
+    let cases = cases(&topologies, 500);
+    let halves = halves(&cases);
+    let wide_jobs = jobs(&topologies, &cases, 0);
+    let half_jobs = half_jobs(&topologies, &cases, &halves)?;
+    let mut outputs = Vec::new();
+    wide.evaluate(&wide_jobs, &mut outputs)?;
+    half.evaluate(&half_jobs, &mut outputs)?;
+    assert_eq!((wide.uploads(), half.uploads()), (500, 500));
+    assert_eq!(wide.shards(), half.shards());
+    // 100 genomes of each topology, 64 to a shard: two whole shards each.
+    let saved: u64 = topologies
+        .iter()
+        .map(|topology| 2 * 64 * topology.parameter_count() as u64 * 2)
+        .sum();
+    let (wide_bytes, half_bytes) = (wide.owner().usage().bytes, half.owner().usage().bytes);
+    assert_eq!(
+        wide_bytes - half_bytes,
+        saved,
+        "{wide_bytes} vs {half_bytes}"
+    );
+
+    let budget = BackendBudget {
+        bytes: wide_bytes * 2 / 3,
+        organisms: 500,
+    };
+    let mut tight = MetalBackend::with_budget(64, budget)?;
+    tight.evaluate(&wide_jobs, &mut outputs)?;
+    let wide_uploads = tight.uploads();
+    assert!(wide_uploads < 500, "{wide_uploads} F32 uploads");
+    let mut tight = MetalBackend::with_budget(64, budget)?;
+    tight.evaluate(&half_jobs, &mut outputs)?;
+    assert_eq!(tight.uploads(), 500);
+    assert_eq!(bits(&outputs), reference(&half_jobs));
+    println!(
+        "F32 {wide_bytes} B, F16 {half_bytes} B; under {} B: {wide_uploads} F32 uploads, 500 F16",
+        budget.bytes
+    );
+
+    // A default shard is `SHARD_BYTES` in either dtype, so it holds twice
+    // the binary16 slots: one genome of the preset's topology allocates a
+    // whole shard of each.
+    let (Some(mut wide), Some(mut half)) = (backend(u64::MAX), backend(u64::MAX)) else {
+        return Ok(());
+    };
+    wide.evaluate(&wide_jobs[2..3], &mut outputs)?;
+    half.evaluate(&half_jobs[2..3], &mut outputs)?;
+    let parameters = topologies[2].parameter_count() as u64;
+    let slots = |bytes: u64| SHARD_BYTES / (bytes * parameters);
+    assert_eq!((slots(4), slots(2)), (6_718, 13_437));
+    assert_eq!(
+        half.owner().usage().bytes as i64 - wide.owner().usage().bytes as i64,
+        (slots(2) * parameters * 2) as i64 - (slots(4) * parameters * 4) as i64
+    );
     Ok(())
 }
 

@@ -192,10 +192,9 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
 }
 
 /// FL-030: the preset in compact F16 on Metal. Each binary16 genome is
-/// uploaded widened exactly to the F32 the reference reads, so the world is
-/// the reference F16 world at every tick, newborns included, and the device
-/// does the work. (The shard still holds F32: halving its resident bytes is
-/// a separate kernel.)
+/// uploaded as binary16 into a half shard and the half kernel widens it
+/// exactly to the F32 the reference reads, so the world is the reference F16
+/// world at every tick, newborns included, and the device does the work.
 #[test]
 fn an_f16_world_on_metal_is_the_reference_world_at_every_tick() {
     let Some(backend) = metal() else { return };

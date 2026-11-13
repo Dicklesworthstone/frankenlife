@@ -9,15 +9,23 @@
 //! both see the same contention; each reports its median and its fastest
 //! round.
 //!
-//! `cargo run --release -p flife-backend-metal --example resident_bandwidth -- [organisms,...] [hidden widths] [rounds]`,
+//! `cargo run --release -p flife-backend-metal --example resident_bandwidth -- [organisms,...] [hidden widths] [rounds] [f32|f16]`,
 //! for example `-- 5000,20000,80000 64,32 21`. Prints one JSON line per
 //! population. `plan_sweeps_per_s` is the measured weight bandwidth over
 //! §19.2's bank of four billion F32 parameters (16 GB a sweep).
+//!
+//! With `f16` (FL-030's compact F16), each parameter is its F64 draw
+//! rounded once to binary16, and two backends hold the same genomes: one as
+//! the binary16 values widened exactly into F32 shards (how F16 genomes ran
+//! before half shards), one in half shards. They alternate round by round,
+//! each first in every other round, beside the plain read, and every output
+//! of both is compared with the reference.
 
 use std::time::Instant;
 
 use flife_backend_metal::{Binding, DeviceOwner, Limits, MetalBackend, Owned};
 use flife_core::CoreError;
+use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
     ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
@@ -201,6 +209,130 @@ fn fastest(samples: &[f64]) -> f64 {
     samples.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
+/// One population of binary16 genomes, widened into F32 shards on one
+/// backend and in half shards on another, alternating round by round with
+/// the plain read; one JSON line.
+fn f16_rounds(
+    topology: &DenseTopology,
+    widths: &[u32],
+    organisms: usize,
+    rounds: usize,
+) -> Result<(), CoreError> {
+    let parameters = topology.parameter_count();
+    let mut draws = Draws(organisms as u64);
+    let halves: Vec<Vec<F16>> = (0..organisms)
+        .map(|_| {
+            let mut values = vec![F16::ZERO; parameters];
+            for layer in topology.layers() {
+                let scale = 1.0 / (layer.inputs as f64).sqrt();
+                for value in &mut values[layer.weights..layer.biases + layer.outputs] {
+                    *value = F16::from_f64(draws.symmetric() * scale);
+                }
+            }
+            values
+        })
+        .collect();
+    let widened: Vec<Vec<f32>> = halves
+        .iter()
+        .map(|genome| genome.iter().map(|value| value.to_f32()).collect())
+        .collect();
+    let observations: Vec<[f64; SENSOR_WIDTH]> = (0..organisms)
+        .map(|_| std::array::from_fn(|_| draws.symmetric() * 2.0))
+        .collect();
+    let mut wide_jobs = Vec::with_capacity(organisms);
+    let mut half_jobs = Vec::with_capacity(organisms);
+    for (index, ((wide, half), inputs)) in
+        widened.iter().zip(&halves).zip(&observations).enumerate()
+    {
+        let genome = GenomeId::new(index as u64 + 1);
+        let slot = ArenaSlot::new(0, index as u64, 1);
+        wide_jobs.push(ControllerJob {
+            genome,
+            slot,
+            controller: ReferenceController::new(topology, wide, BOUND)?,
+            inputs,
+        });
+        half_jobs.push(ControllerJob {
+            genome,
+            slot,
+            controller: ReferenceController::new(topology, half, BOUND)?,
+            inputs,
+        });
+    }
+    let expected = reference(topology, &widened, &observations)?;
+
+    let (mut wide, mut half) = (MetalBackend::open()?, MetalBackend::open()?);
+    let mut outputs = Vec::new();
+    wide.evaluate(&wide_jobs, &mut outputs)?;
+    let mut same = identical(&outputs, &expected);
+    half.evaluate(&half_jobs, &mut outputs)?;
+    same &= identical(&outputs, &expected);
+    let stream = {
+        let flat: Vec<f32> = widened.iter().flatten().copied().collect();
+        Stream::new(&flat)?
+    };
+    stream.run()?;
+    let (mut wide_seconds, mut half_seconds) = (Vec::new(), Vec::new());
+    let mut streamed = Vec::with_capacity(rounds);
+    let (mut kernels, mut deferred) = ([0; 2], 0);
+    for round in 0..rounds {
+        // The F32 shards go first in even rounds, the half shards in odd.
+        for turn in [round % 2, 1 - round % 2] {
+            let (backend, jobs, seconds) = if turn == 0 {
+                (&mut wide, &wide_jobs, &mut wide_seconds)
+            } else {
+                (&mut half, &half_jobs, &mut half_seconds)
+            };
+            backend.evaluate(jobs, &mut outputs)?;
+            let (ran, device) = backend
+                .last_command()
+                .ok_or_else(|| refused("a batch dispatched nothing".to_owned()))?;
+            kernels[turn] = ran;
+            seconds.push(device);
+            same &= identical(&outputs, &expected);
+            deferred += outputs.iter().filter(|output| output.is_none()).count();
+        }
+        streamed.push(stream.run()?);
+    }
+    let paired: Vec<f64> = wide_seconds
+        .iter()
+        .zip(&half_seconds)
+        .map(|(wide, half)| wide / half)
+        .collect();
+    let bytes = (organisms * parameters) as f64;
+    let stream_rate = stream.bytes / median(&streamed);
+    println!(
+        "{{\"device\":{:?},\"dtype\":\"f16\",\"organisms\":{organisms},\"hidden\":{widths:?},\
+         \"parameters\":{parameters},\"shards\":[{},{}],\"kernels\":{kernels:?},\"uploads\":[{},{}],\
+         \"identical\":{same},\"deferred\":{deferred},\"rounds\":{rounds},\
+         \"f32_shard_device_ms\":{:.3},\"f32_shard_cv_percent\":{:.2},\"f32_shard_fastest_ms\":{:.3},\
+         \"half_shard_device_ms\":{:.3},\"half_shard_cv_percent\":{:.2},\"half_shard_fastest_ms\":{:.3},\
+         \"ratio_of_medians\":{:.3},\"paired_ratio_median\":{:.3},\"paired_ratio_cv_percent\":{:.2},\
+         \"f32_shard_weight_gb_per_s\":{:.1},\"half_shard_weight_gb_per_s\":{:.1},\
+         \"stream_gb_per_s\":{:.1},\"stream_cv_percent\":{:.2}}}",
+        stream.owner.device_name(),
+        wide.shards(),
+        half.shards(),
+        wide.uploads(),
+        half.uploads(),
+        median(&wide_seconds) * 1e3,
+        cv_percent(&wide_seconds),
+        fastest(&wide_seconds) * 1e3,
+        median(&half_seconds) * 1e3,
+        cv_percent(&half_seconds),
+        fastest(&half_seconds) * 1e3,
+        median(&wide_seconds) / median(&half_seconds),
+        median(&paired),
+        cv_percent(&paired),
+        bytes * 4.0 / median(&wide_seconds) / 1e9,
+        bytes * 2.0 / median(&half_seconds) / 1e9,
+        stream_rate / 1e9,
+        cv_percent(&streamed),
+    );
+    drop(stream.buffers);
+    Ok(())
+}
+
 fn main() -> Result<(), CoreError> {
     let mut args = std::env::args().skip(1);
     let populations: Vec<usize> = args
@@ -220,7 +352,18 @@ fn main() -> Result<(), CoreError> {
         .and_then(|r| r.parse().ok())
         .unwrap_or(21)
         .max(1);
+    let dtype = args.next().unwrap_or_else(|| "f32".to_owned());
     let topology = DenseTopology::new(&widths)?;
+    match dtype.as_str() {
+        "f32" => {}
+        "f16" => {
+            for &organisms in &populations {
+                f16_rounds(&topology, &widths, organisms, rounds)?;
+            }
+            return Ok(());
+        }
+        other => return Err(refused(format!("weight dtype {other}: f32 or f16"))),
+    }
     let parameters = topology.parameter_count();
     for &organisms in &populations {
         let mut draws = Draws(organisms as u64);

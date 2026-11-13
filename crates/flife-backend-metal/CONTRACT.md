@@ -126,6 +126,14 @@ in what the shards already held leave; the owner refuses any device buffer past 
 evaluates it on the reference, which gives the same bits. `resident_bytes` is the owner's bytes plus the host
 vectors and each shard's host records.
 
+FL-030, compact F16 (plan §10.3): a bucket holds the weight dtype of its first genome. Its F16 shards hold binary16
+values two to a `u32` word, the even element in the low half (the owner keeps only `f32` and `u32` buffers), and
+`controller_forward_half` reads them as `half`. It is the same `forward_pass` template as `controller_forward`,
+instantiated for `half`, and each weight and bias is widened exactly to F32 before the same arithmetic. So a shard
+of `SHARD_BYTES` holds twice the slots (13,437 of the preset's topology), a shard is charged two bytes a parameter
+under a budget, and each warm batch streams half the weight bytes. A job whose dtype is not its bucket's is
+deferred, and so is an F16 member with an odd parameter count (none in the catalog), whose slots would share words.
+
 **Invariants.**
 - Every non-deferred output is the reference controller's, bit for bit:
   - inputs rounded once to F32 on the host, as the reference rounds them;
@@ -310,7 +318,7 @@ A refusal changes nothing.
     1,101,004,800 patterns, zero and subnormals included, in about 3 s each. The fast path must fall back at least
     once and fewer than 1,000,000 times, so the fallback is exercised and the fast path carries the load.
   - Negative inputs (64 random windows of 65,536) and the saturated region equal the reference.
-- `tests/world.rs` (4 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
+- `tests/world.rs` (6 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
   evaluated every tick) runs 400 ticks with its controllers on Metal next to the reference world. The digests
   match at every tick, through the founder crash, 42 births and mutation. All 1,254,756 evaluations came from the
   device (none deferred, no tick redone on the reference). The planted negative flips one output bit of one
@@ -326,13 +334,21 @@ A refusal changes nothing.
     deferred, no tick redone and no failure. The owner holds 96.1 MB and the backend's resident peak is 97.6 MB.
     Planted mutants: dropping the shard check fails it, and so does an unbounded owner (by the limit's
     assertion; with the check in place the owner's limit is never reached, so the run alone would not show it).
-- `tests/residency.rs` (FL-026, 2 tests), in shards of 16:
+  - FL-030, `an_f16_world_on_metal_is_the_reference_world_at_every_tick`: the preset with
+    `canonical_weight_dtype = "f16"` on Metal, in half shards, equals the reference F16 world at every tick for
+    400 ticks, with births, every evaluation on the device and no tick redone.
+- `tests/residency.rs` (FL-026, 4 tests), in shards of 16 and 64:
   - 300 genomes over five topologies are uploaded once into 20 shards. Batches of a few upload and drop nothing.
     A slot at its next generation, holding another genome, is uploaded in its place with that genome's reference
     outputs; in one batch naming a slot at both generations, the last one uploaded is served and the other
     deferred. Another genome at the same slot and generation is another occupant; a job naming another
     topology's bucket is deferred. The owner holds two buffers per shard and three more.
   - Shard sizes 3, 7 and 256, and slots from `u32::MAX - 7` and from `2^40`, give the reference's bits.
+  - FL-030: 500 genomes over every topology, rounded once to binary16 (subnormals included), in half shards of 64,
+    give the reference's bits with nothing deferred. An F32 job at a slot of an F16 member is deferred.
+  - FL-030: the same 500 genomes in F32 take exactly two bytes a parameter more of the owner's bytes (the two whole
+    shards of 64 each topology needs), and under a budget of two thirds of the F32 backend's bytes, some F32 jobs
+    are deferred while every F16 job is uploaded and gives the reference's bits.
 - `tests/forward.rs` (2 tests):
   - 2,000 organisms in one batch, over all five catalog topologies and six regimes: typical, saturating, small,
     subnormal, hidden overflow and output overflow. Every output is bit-identical to the reference, and the batch
@@ -632,6 +648,18 @@ with this kernel; F16 weights would halve it. A batch's wall time is 1.5–2.9 t
 stages inputs and job words and reads the outputs back (160,000 genomes: 30.7 ms wall, 11.2 ms on the device).
 That is the controllers alone; §19.2's sensors, fields, births and deaths are additional.
 
+**F16 shards (FL-030).** `resident_bandwidth -- 20000,80000 64,32 21 f16` holds the same binary16 genomes on two
+backends. One widens them into F32 shards, which is how F16 genomes ran before half shards; the other keeps them in
+half shards. The two alternate round by round, each going first in every other round, beside the plain read. Every
+output of both equalled the reference in every round, and none was deferred. The half shards are half as many (2
+against 3, 6 against 12), so a batch runs half the kernels. The gate, declared before the half kernel was written,
+was a cv of at most 5% on both sides. The device was shared (load average 20–22), and the cv was 41% and 56% at
+20,000 genomes and 17% and 20% at 80,000, so there is NO ADMISSIBLE RATIO (2026-11-12). For orientation only, not a
+claim: the median batches took 1.82 → 1.22 ms and 7.41 → 4.82 ms (1.49× and 1.54×). The medians of the paired
+rounds' ratios were 1.32× and 1.45×, and the fastest rounds 1.31× and 1.41×. The half shards streamed 326–332 GB/s
+of weight bytes, against 431–439 GB/s for F32, so halving the bytes did not halve the time. At these sizes the
+kernel is not bound by its weight bytes alone (see the unexplained remainder under the known gaps).
+
 Negative evidence: storing each layer's weights `[in][out]`, so that a threadgroup's lanes read adjacent words, was
 measured in one process against the kernel's `[out][in]`. One template instantiated both orders; the two backends
 and the stream alternated over 21 paired rounds. Every output was identical. The paired `[out][in]`/`[in][out]`
@@ -722,8 +750,8 @@ per-pass thread spawning (6%).
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them). On many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
-- FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above. Only F32 weights
-  exist, so per-dtype parity covers F32 alone; F16 waits for an F16 weight dtype (`flife-genome`). The kernel
+- FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype
+  parity covers F32 and F16; the quantized I8 profile does not exist. The kernel
   reaches 44–69% of a plain read in its fastest rounds, and nothing measured explains the rest: it is not
   profiled. Each per-product subnormal check is a candidate, as are the 64-lane threadgroup that the 32- and
   36-wide layers half fill, and one barrier per layer.

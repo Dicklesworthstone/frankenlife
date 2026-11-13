@@ -855,6 +855,33 @@ A refusal changes nothing.
     fewer than births, and more counted than a birth has parameters. Each world is the reference world at
     every tick, the backend served the ticks before the first births and is then dropped (one reference tick,
     no births mutated), and its report names the cause.
+- `tests/tick_world.rs` (FL-032, 3 tests), FL-032's closing evidence (plan §23.1: whole-tick parity,
+  affordability, no partial commit after failure). Every stage FL-031 and FL-032 put on Metal runs there at
+  once on one `DeviceOwner`, and the controllers run on `MetalBackend`. The stages are the field step,
+  sampling, uptake's requests and resolution, chemistry and maintenance, motion, emission, proposal,
+  mutation, reduction and field check. Each backend is wrapped so that it can fail at one call. Each race
+  compares, as bits at every tick, the digests, the watched organism's transactions, the births and newborn
+  genomes, and the published field check.
+  - `fertile_worlds_with_every_stage_on_metal_are_the_reference_worlds`: the early-births world (cooldown
+    0.01 s, attempt minimum 1.0) in F32 and F16, 12 ticks each.
+    - 150 births each, all mutated on the device.
+    - Every backend serves every tick: 12 field steps, reductions and checks; 12 sensor, uptake and settle
+      ticks; no reference work.
+    - The owner holds no lease, command or retiring buffer afterwards.
+  - `worlds_whose_organisms_die_at_every_stage_with_every_stage_on_metal_are_the_reference_worlds`:
+    `settle_world`'s two affordability variants (§8.2), 60 ticks each, every backend serving every tick.
+    Deaths: 1,191 at chemistry, 1,154 at maintenance, 935 at motion and 3,356 at emission.
+  - `a_failure_at_any_device_stage_leaves_the_world_the_reference_world`: twelve runs of the F32
+    early-births world, 10 ticks each, each failing one stage. A stage fails at its third call (tick 3), and
+    mutation at its second (tick 4).
+    - Each failing call first runs the device. It leaves its outputs reversed and the step's candidate
+      damaged, except the reduction, whose port allows a failure to change nothing (§8.3).
+    - The world is the reference's at every tick.
+    - The failing backend served the ticks before, the reference did that tick's part, and the backend is
+      then dropped. The field's phases earlier in that tick count as device work. The mutation's tick counts
+      as a device settle tick and a reference tick, since its phases 6 and 7 ran on the device.
+    - Every other backend serves all 10 ticks.
+    - The shared owner is idle afterwards.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -1058,6 +1085,10 @@ Planted mutants, each run in a scratch copy.
     unchecked; the reference's ties going to the later cell; a failing cell outside the grid admitted;
   - flife-engine (3, 3 caught): an accusation the reference refutes keeping the backend; checks not counted;
     a failed check keeping the backend.
+- FL-032's whole tick: 7 planted in the engine's fallbacks against `tests/tick_world.rs` alone, 7 caught: a
+  failed field step, or a failed mutation, keeping its backend; a failed sampling's samples, or a failed
+  mutation's values, used; a failed batch's decisions, a failed uptake's demands, or a failed settlement not
+  redone on the reference. Four diverge or miscount; the batch and settlement mutants make the tick fail.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;

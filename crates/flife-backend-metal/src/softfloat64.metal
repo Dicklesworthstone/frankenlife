@@ -595,3 +595,118 @@ static void csum_add(thread CSum &s, d64 value) {
 static inline d64 csum_value(CSum s) {
     return d_add(s.sum, s.compensation);
 }
+
+// `f64::sqrt`, correctly rounded. With a = m 2^p, m an integer and p made
+// even, q = floor(sqrt(m 2^54)) is found one bit per step (restoring), so q
+// holds the 53 result bits and one rounding bit, and the remainder
+// m 2^54 - q^2 is the sticky bit. Both zeros are their own roots; NaN below
+// zero.
+static d64 d_sqrt(d64 a) {
+    int e = d_exp(a);
+    ulong f = d_frac(a);
+    if (e == 0x7FF) {
+        return (f != 0ul || d_sign(a)) ? D_QNAN : a;
+    }
+    if ((a << 1) == 0ul) {
+        return a;
+    }
+    if (d_sign(a)) {
+        return D_QNAN;
+    }
+    if (e == 0) {
+        norm_subnormal(e, f);
+    }
+    ulong m = f | D_HIDDEN;
+    int power = e - 1075;
+    if ((power & 1) != 0) {
+        m <<= 1;
+        power -= 1;
+    }
+    ulong q = 0ul;
+    ulong r = 0ul;
+    for (int j = 0; j < 54; ++j) {
+        ulong pair = (j <= 26) ? ((m >> uint(52 - 2 * j)) & 3ul) : 0ul;
+        r = (r << 2) | pair;
+        ulong trial = (q << 2) | 1ul;
+        q <<= 1;
+        if (r >= trial) {
+            r -= trial;
+            q |= 1ul;
+        }
+    }
+    ulong sig = q >> 1;
+    if ((q & 1ul) != 0ul && (r != 0ul || (sig & 1ul) != 0ul)) {
+        sig += 1ul;
+    }
+    // sig 2^(p/2 - 26); a carry into bit 53 carries into the exponent.
+    return d_pack(false, power / 2 + 1048, sig);
+}
+
+// `a % b`, C's fmod, which is exact: musl's integer long division. The
+// result has a's sign; NaN for a zero or NaN b or a non-finite a.
+static d64 d_fmod(d64 a, d64 b) {
+    int ea = d_exp(a);
+    int eb = d_exp(b);
+    ulong sign = a & D_SIGN;
+    if ((b << 1) == 0ul || (eb == 0x7FF && d_frac(b) != 0ul) || ea == 0x7FF) {
+        return D_QNAN;
+    }
+    if ((a << 1) <= (b << 1)) {
+        return ((a << 1) == (b << 1)) ? sign : a;
+    }
+    ulong ma = d_frac(a);
+    ulong mb = d_frac(b);
+    if (ea == 0) {
+        norm_subnormal(ea, ma);
+    } else {
+        ma |= D_HIDDEN;
+    }
+    if (eb == 0) {
+        norm_subnormal(eb, mb);
+    } else {
+        mb |= D_HIDDEN;
+    }
+    for (; ea > eb; --ea) {
+        ulong diff = ma - mb;
+        if ((diff >> 63) == 0ul) {
+            if (diff == 0ul) {
+                return sign;
+            }
+            ma = diff;
+        }
+        ma <<= 1;
+    }
+    ulong diff = ma - mb;
+    if ((diff >> 63) == 0ul) {
+        if (diff == 0ul) {
+            return sign;
+        }
+        ma = diff;
+    }
+    for (; (ma >> 52) == 0ul; ma <<= 1) {
+        --ea;
+    }
+    if (ea > 0) {
+        ma = (ma - D_HIDDEN) | (ulong(uint(ea)) << 52);
+    } else {
+        ma >>= uint(1 - ea);
+    }
+    return ma | sign;
+}
+
+// `f64::rem_euclid(a, b)`: `a % b`, plus |b| when that is below zero.
+static d64 d_rem_euclid(d64 a, d64 b) {
+    d64 r = d_fmod(a, b);
+    return d_lt(r, 0ul) ? d_add(r, b & ~D_SIGN) : r;
+}
+
+// flife-field's wrap_coordinate for a finite coordinate and a finite
+// positive length: the Euclidean remainder, and +0 for one that rounds up
+// to the length or is zero.
+static d64 d_wrap(d64 x, d64 length) {
+    d64 wrapped = d_rem_euclid(x, length);
+    if (!d_lt(wrapped, length) || d_eq(wrapped, 0ul)) {
+        return 0ul;
+    }
+    return wrapped;
+}

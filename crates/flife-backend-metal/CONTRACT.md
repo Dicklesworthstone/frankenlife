@@ -44,9 +44,17 @@ flife-field's `demands_on` and `resolve_uptake_on`, and refuses a cell whose qua
 FL-032 (`flife-kf8`), first stage: phase 6's chemistry on Metal, bit-identical to flife-engine's `composition`,
 `Chemistry::settle` and the budget's `credit` and `pay` (plan §5.3, §8.2, §10.7), in `chemistry`.
 `MetalChemistry::settle` takes plain data (the run's constants; each organism's affinity, budget and packet range;
-each packet's cell and grant), because a backend does not depend on the engine (§18.2). It is not wired into the
-engine yet: no port takes it, so no world runs it. The engine port, maintenance, motion, emission, the reproduction
-proposal, lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
+each packet's cell and grant), because a backend does not depend on the engine (§18.2).
+
+FL-032, second stage: phase 6's maintenance and motion on Metal, in `motion`. `MetalMotion::settle` runs what
+flife-engine's `settle_stages` runs after chemistry, from the exhaustion check after chemistry to the one after
+motion: `MaintenanceCosts::bill`, `MaintenanceBill::settle`, `uptake_ratio`, `MotionResponse::new`, and `Motion`'s
+`acceleration`, `propose`, `settle` and `displace` (plan §5.4, §8.2, §10.7). It takes plain data too: the run's
+constants, and each organism's budget after chemistry, controller evaluation and parameter count, sensing scale,
+absorbed uptake, velocity, position, motion response and sensor gradients.
+
+Neither stage is wired into the engine yet: no port takes them, so no world runs them. The engine port, emission,
+the reproduction proposal, lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -284,6 +292,38 @@ deferred, and so is an F16 member with an odd parameter count (none in the catal
   (`LayoutMismatch`).
 - One command per call. The field's 33 planes, every affinity and every packet go to the device, and the outcomes
   come back.
+
+**Invariants — maintenance and motion (FL-032; §5.4, §8.2, §10.7).**
+- Every organism's maintenance settlement (total requested and paid, and the basal, sensor and controller shares
+  paid), motion settlement (proposed and applied velocity, cost requested and paid, whether it was scaled), final
+  velocity, position, balance and exhaustion, and the stage that exhausted it, are the reference's, bit for bit.
+- The stages run in the reference's order, and each runs only for an organism the previous exhaustion check left
+  alive. What the reference never reads (the motion inputs of an organism maintenance exhausts, everything past
+  the budget of one chemistry exhausted) is never checked.
+- The device computes the reference's expressions operation for operation in software binary64, with no fused
+  multiply-add:
+  - the bill `Δt·basal`, `Δt·(sensor·(s/unit))` and `neural·parameters` when evaluated; their total
+    `(basal + sensor) + controller` paid through `energy`'s `+ 0`, then split basal first with `min` and
+    `sub_down`;
+  - `U/(Δt·U_max)`, at most one, zero at zero capacity;
+  - the response's squared norm in term order against the limit's square;
+  - `g_u Σ_j χ_j ∇_j` in term order, `e^(−γΔt) v + c·f`, and both radial clamps: `limit/sqrt(v·v)`, then the shrink
+    by `1 − ε/2` while `v·v` exceeds `limit²`;
+  - `c_v (v·v) Δt`, paid whole when affordable, otherwise the balance paid and the velocity scaled by
+    `sqrt(available/requested)`;
+  - `wrap_coordinate(x + Δt v)`: `rem_euclid`, and `+0` for a remainder that rounds up to the period or is zero.
+- softfloat64 gains a correctly rounded `d_sqrt` (restoring, 54 result bits and a sticky remainder), an exact
+  `d_fmod` (musl's integer long division), `d_rem_euclid` and `d_wrap`.
+- Refused after the command (`StateConflict`, so the reference decides): an organism with a sensing scale that is
+  not a positive length, a bill share that is not a finite nonnegative energy, a negative or non-finite absorbed
+  uptake, a non-finite response or one past the limit, a non-finite gradient, a non-finite velocity, or a
+  non-finite displaced position. Also refused where the reference goes on but the device cannot carry the value:
+  a velocity or acceleration whose square overflows (the reference clamps it to zero), a motion cost that
+  overflows (the reference scales the motion to nothing), a clamp that needs more than 64 shrinks, and a zero
+  `Δt·U_max` from a positive capacity. Refused before it: constants outside the engine's ranges
+  (`NumericalInvalid`).
+- An organism's balance is a budget's, never −0 (`EnergyBudget` adds `+ 0`); the device takes it as given.
+- One command per call. Every organism's state goes to the device (215 words each), and the outcomes come back.
 
 **Invariants — uptake (FL-031; §5.2, §8.1, §10.7, INV-04).**
 - Every demand's amount is `demands`'s, and every packet's grant, every cell's debit (energy before and after,
@@ -552,6 +592,27 @@ A refusal changes nothing.
     an infinite moment, a gain for a zero budget, and a cell outside the field. Each is placed beside a valid
     organism: the reference refuses it, the device refuses the call and leaves no outcomes, and the valid organism
     alone settles as the reference does. Packets past the list and a zero `κ` are refused before any command.
+- `tests/motion.rs` (FL-032, 3 tests), every value compared as bits:
+  - `the_motion_arithmetic_is_the_references`: 262,636 operand pairs: 262,144 random patterns (infinities and
+    NaNs, near pairs, exponents up to 64 apart, subnormals, zeros of both signs), 168 coordinates around six
+    periods, and 324 edge pairs. They are checked against `f64::sqrt`, `%`, `rem_euclid` and flife-field's `wrap_coordinate`. More than
+    100,000 positive square roots, 50,000 dividing remainders, 20,000 Euclidean corrections and 100,000 wraps are
+    checked; NaN results must be NaN on both sides. The one difference is stated: softfloat64 has no infinities,
+    so `rem_euclid` of a negative value on an infinite period is a NaN on the device.
+  - `motion_on_the_device_is_the_references`: 4,096 organisms under each of three rule sets (the preset's, which
+    the test asserts equal to the engine's `from_config`; an expensive, drag-free set on a 3.7 × 1 torus; and a
+    set whose every cost is −0, with no uptake capacity and a drag that underflows the decay) against the
+    reference's calls in `settle_stages`' order. Budgets run from zero and subnormal to 1e4, some drawn between
+    the bill and the bill plus the largest motion cost. The draws are asserted to include deaths at chemistry,
+    maintenance and motion, scaled motion, proposals at the speed limit, wraps across an edge, and both clamps'
+    shrink loops (recomputed on the host).
+  - `motion_the_reference_refuses_is_refused`: zero, negative, NaN and infinite sensing scales, a negative and a NaN
+    absorbed uptake, a NaN response, one past the limit, an infinite gradient, a NaN velocity, an infinite
+    position, and a sensor share that overflows, each beside a valid organism. Also refused: a velocity of 1e200
+    and a motion cost that overflows, which the reference settles. Not refused: an organism chemistry exhausted
+    with NaN everything else, and one maintenance exhausts with a NaN response and infinite gradients, whose
+    outcomes are the reference's. A huge finite sensor share and a huge finite motion cost settle as the
+    reference does. Constants out of range are refused before any command.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -608,6 +669,16 @@ Planted mutants, each run in a scratch copy.
   - in `chemistry.metal`: a zero-energy cell composed as if it held energy, the harm summing positive
     efficiencies, the gain credited rounded to nearest, the affinity check inverted, an exhausted budget credited,
     `a·z` summed from the last channel, the toxicity never exhausting, and a negative grant admitted.
+- FL-032's maintenance and motion: 22 planted against `tests/motion.rs`, 22 caught, each by a failed assertion
+  (none by a shader that does not compile):
+  - in `softfloat64.metal`: `sqrt` dropping its sticky bit or never evening an odd power; `fmod`'s subnormal
+    result shifted one too few, equal magnitudes returning `a`, and the sign dropped; `rem_euclid` adding the signed
+    period; and the wrap keeping a remainder that rounded up to the period, or a −0;
+  - in `motion.metal`: a chemistry death still billed; the controller billed when not evaluated; the bill's total
+    keeping a −0; the controller share rounded to nearest; the uptake ratio not clamped at one; the response norm
+    unchecked; the acceleration unclamped; the clamp skipping its shrink loop; drag not applied; the motion cost
+    missing `Δt`; an unaffordable motion not scaled; the displacement using the proposed velocity; `y` wrapping
+    on the width; and a motion death not recorded.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -798,8 +869,8 @@ per-pass thread spawning (6%).
 
 **Known gaps.**
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
-  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; chemistry has a device kernel,
-  `MetalChemistry`, that no world runs yet). On many CPU workers the tick
+  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; chemistry, maintenance and
+  motion have device kernels, `MetalChemistry` and `MetalMotion`, that no world runs yet). On many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype
   parity covers F32 and F16; the quantized I8 profile does not exist. The kernel

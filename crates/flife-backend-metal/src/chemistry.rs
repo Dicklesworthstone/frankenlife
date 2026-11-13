@@ -14,10 +14,11 @@
 //! caller then settles on the reference, which reports its own error or
 //! finds none.
 //!
-//! Not yet here (FL-032 continues): the engine port, maintenance, motion,
-//! emission and the reproduction proposal, and residency. Each call copies
-//! the field and every organism's affinity and packets to the device and
-//! the outcomes back.
+//! Maintenance and motion, which follow chemistry, are [`crate::motion`]'s.
+//! Not yet here (FL-032 continues): the engine port, emission and the
+//! reproduction proposal, and residency. Each call copies the field and
+//! every organism's affinity and packets to the device and the outcomes
+//! back.
 
 use flife_core::CoreError;
 use flife_field::FieldState;
@@ -108,11 +109,13 @@ fn words(value: f64) -> [u32; 2] {
     [(bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32]
 }
 
-fn put(target: &mut [u32], at: usize, value: f64) {
+/// `value`'s bits as the `(low, high)` word pair at `target[at..at + 2]`.
+pub(crate) fn put(target: &mut [u32], at: usize, value: f64) {
     target[at..at + 2].copy_from_slice(&words(value));
 }
 
-fn value(pair: &[u32]) -> f64 {
+/// The binary64 whose bits are the `(low, high)` word pair `pair[..2]`.
+pub(crate) fn value(pair: &[u32]) -> f64 {
     f64::from_bits(u64::from(pair[0]) | (u64::from(pair[1]) << 32))
 }
 
@@ -122,7 +125,8 @@ fn overflow() -> CoreError {
     }
 }
 
-fn word(value: usize) -> Result<u32, CoreError> {
+/// `value` as a `u32` word, or an overflow for a call too large for one.
+pub(crate) fn word(value: usize) -> Result<u32, CoreError> {
     u32::try_from(value).map_err(|_| overflow())
 }
 
@@ -152,20 +156,24 @@ fn status_name(status: u32) -> &'static str {
 /// A device buffer with room for at least `capacity` elements, replaced by
 /// one of the next power of two when a call outgrows it.
 #[derive(Debug)]
-struct Slot {
+pub(crate) struct Slot {
     owned: Option<Owned<u32>>,
     capacity: usize,
 }
 
 impl Slot {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             owned: None,
             capacity: 0,
         }
     }
 
-    fn ensure(&mut self, owner: &DeviceOwner, len: usize) -> Result<&Owned<u32>, CoreError> {
+    pub(crate) fn ensure(
+        &mut self,
+        owner: &DeviceOwner,
+        len: usize,
+    ) -> Result<&Owned<u32>, CoreError> {
         if self.owned.is_none() || self.capacity < len {
             self.owned = None;
             let capacity = len.max(1).next_power_of_two();

@@ -38,6 +38,7 @@ use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 pub mod chemistry;
 pub mod field;
+pub mod motion;
 pub mod owner;
 pub mod sensors;
 pub mod uptake;
@@ -50,6 +51,10 @@ pub use field::MetalField;
 /// The memory a controller backend may hold (FL-043), for composition
 /// roots that make one through [`ControllerChoice::backend`].
 pub use flife_neural::BackendBudget;
+pub use motion::{
+    ExhaustedAt, MOTION_OPS_WORDS, MOTION_TERMS, MaintenanceOutcome, MetalMotion, MotionConstants,
+    MotionOrganism, MotionOutcome, MovementOutcome,
+};
 use owner::metal;
 pub use owner::{
     Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,

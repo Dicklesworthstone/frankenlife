@@ -373,6 +373,95 @@ impl Deposits {
         });
         Ok(())
     }
+
+    /// Forget every staged deposit and give these deposits room to stage
+    /// exactly `organisms` deposits and their packets, and no more room than
+    /// that: deposits that only stage, and are then appended to deposits
+    /// declared for the whole reduction ([`Deposits::append`]). Their own
+    /// declared limit is unchanged.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] if the room cannot be reserved;
+    /// [`CoreError::Overflow`] if its size overflows.
+    pub fn fit_staging(&mut self, organisms: usize) -> Result<(), CoreError> {
+        self.clear();
+        let packets = usize::try_from(PACKETS_PER_DEPOSIT)
+            .ok()
+            .and_then(|per| organisms.checked_mul(per))
+            .ok_or(CoreError::Overflow {
+                quantity: DEPOSIT_PACKETS,
+            })?;
+        fit(&mut self.entries, organisms)?;
+        fit(&mut self.packets, packets)
+    }
+
+    /// Move `other`'s staged deposits after these, in the order `other`
+    /// staged them: the same entries and packets these deposits would hold
+    /// had each been pushed here instead, so reducing them gives the same
+    /// field and the same summary. `other` is left empty, with its room.
+    ///
+    /// # Errors
+    /// - [`CoreError::StateConflict`] when either was applied, or they were
+    ///   staged for different grids.
+    /// - [`CoreError::BudgetExhausted`] when these deposits were declared for
+    ///   fewer than both hold together, naming the first that does not fit,
+    ///   as [`Deposits::push`] would.
+    ///
+    /// Nothing moves on error.
+    pub fn append(&mut self, other: &mut Self) -> Result<(), CoreError> {
+        if self.applied || other.applied {
+            return Err(CoreError::StateConflict {
+                operation: "append deposits",
+                detail: "these deposits were already applied; clear them first".into(),
+            });
+        }
+        if let (Some(staged), Some(appended)) = (self.grid, other.grid)
+            && staged != appended
+        {
+            return Err(CoreError::StateConflict {
+                operation: "append deposits",
+                detail: "these deposits were staged for another grid".into(),
+            });
+        }
+        if other.entries.len() > self.organisms.saturating_sub(self.entries.len()) {
+            return Err(CoreError::BudgetExhausted {
+                budget: DEPOSIT_PACKETS,
+                required: u64::try_from(self.organisms.saturating_add(1)).unwrap_or(u64::MAX),
+                available: u64::try_from(self.organisms).unwrap_or(u64::MAX),
+            });
+        }
+        let entries = self.entries.len();
+        let packets = self.packets.len();
+        self.packets
+            .extend(other.packets.iter().map(|packet| Packet {
+                entry: packet.entry + entries,
+                ..*packet
+            }));
+        self.entries.extend(other.entries.iter().map(|entry| Entry {
+            first: entry.first + packets,
+            ..*entry
+        }));
+        if other.grid.is_some() {
+            self.grid = other.grid;
+        }
+        other.clear();
+        Ok(())
+    }
+}
+
+/// Empty `vector` and give it room for exactly `count` values.
+fn fit<T>(vector: &mut Vec<T>, count: usize) -> Result<(), CoreError> {
+    vector.clear();
+    if vector.capacity() > count {
+        vector.shrink_to(count);
+    }
+    vector
+        .try_reserve_exact(count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: DEPOSIT_PACKETS,
+            bytes: u64::try_from(count.saturating_mul(std::mem::size_of::<T>()))
+                .unwrap_or(u64::MAX),
+        })
 }
 
 /// `offered` over `stencil`'s cells: every cell but the largest-weight one

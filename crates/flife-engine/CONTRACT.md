@@ -497,13 +497,27 @@ each runs and owns the field.
   survivors and deaths, and the sensor backend's queries and samples. They are reserved for the capacity when the
   world is founded, its workers are set or a sensor backend is installed. Each lane's share of the rows follows
   the worker count, and lanes removed by a smaller count are released. The compositions take room for four
-  packets a row (256 bytes each), so the footprint grows by 1 KiB per organism of capacity.
+  packets a row (256 bytes each), so the footprint grows by 1 KiB per organism of capacity. Each lane also holds
+  room for phases 6 and 7 of the most rows it can take: six 24-byte ledger entries, one 296-byte staged emission
+  and its four 32-byte packets a row, 568 bytes per organism of capacity in all (measured: one worker at 16,384
+  rows adds 9,306,680 bytes), and one organism's grant packets.
 - Phase 6 computes every granted packet's composition before any organism settles. It runs on the world's lanes,
   each lane taking a contiguous run of at least 1,024 packets in packet order, and a packet whose cell repeats the
   previous packet's in its run copies that composition. A composition is a function of the observed field and its
   cell alone, so the result does not depend on the worker count: the world is bit-identical at any worker count
-  (`the_cpu_worker_count_changes_no_result`, pinned digests). The organisms then settle one after another in
-  identity order, as before.
+  (`the_cpu_worker_count_changes_no_result`, pinned digests).
+- Phases 6 and 7 then settle on the lanes, each lane taking a contiguous identity-ordered run of at least 128
+  organisms. A lane records its run's ledger flows in a `flife_core::LedgerLog`, which accepts or refuses each
+  exactly as the tick's ledger would, and stages its run's emissions in deposits of its own. The tick then replays
+  each lane's log into its ledger and appends each lane's deposits to its own (`Deposits::append`), in lane order:
+  the same terms in the same order as one thread settling every organism in identity order, so the ledger's
+  compensated sums and the staged deposits are the same to the bit. The first error in identity order wins, and
+  a lane's buffers are emptied before each tick's settlement. `a_replayed_log_sums_the_same_bits_as_recording_directly`
+  and `appended_deposits_reduce_as_if_pushed_in_order` check the two halves directly. Known gap: compensated sums
+  of nonnegative terms almost never depend on their order, and deposits reduce in identity order, so taking the
+  lanes in the wrong order changes no result the tests can reach (a planted reversal survived); the order is kept
+  by construction, and only the log test's constructed tie sees it. No test reaches an error inside a lane either,
+  so planted defects in the first-error rule and in emptying a lane's buffers survived too.
 - Installing a controller backend reserves the batched path's outputs, a slot per row, and each lane's observations
   for the most rows it can take: exactly `batched_bytes()`. Removing it releases them. If the host refuses them,
   no backend is installed and the report says why.
@@ -1018,14 +1032,15 @@ velocity, first-order splitting at the configured fixed timestep.
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet
   (FL-017), and the reference has no device fences. A candidate is exclusive by borrowing, not by a lease.
-- `execution.cpu_workers` (or `World::set_cpu_workers`) sets the threads for organism decisions and the field step;
-  no result depends on it (`the_cpu_worker_count_changes_no_result`: 1, 2, 3, 6 and 64 workers, 96 ticks with
-  births). Decisions read only committed state and split into contiguous identity-ordered chunks of at least 128,
-  the first error in identity order winning. The field splits transport by plane, and each moment plane keeps its
-  per-source deposit order. The threads are scoped `std` threads spawned per tick: a bounded, reported reference
-  adapter (§3.4, §12.5), not Asupersync-scheduled work. Phase 6's packet compositions run on the lanes too (see the
-  scratch section). Invariant checks, settlement, uptake and the commit stay on one thread, and a persistent pool
-  is later work. Parallel phases must keep these reduction orders.
+- `execution.cpu_workers` (or `World::set_cpu_workers`) sets the threads for organism decisions, phases 6 and 7,
+  and the field step; no result depends on it (`the_cpu_worker_count_changes_no_result`: 1, 2, 3, 6 and 64
+  workers, 96 ticks with births). Decisions read only committed state and split into contiguous identity-ordered
+  chunks of at least 128, the first error in identity order winning; phases 6 and 7 split the same way and keep
+  the ledger's and the deposits' order (see the scratch section). The field splits transport by plane, and each
+  moment plane keeps its per-source deposit order. The threads are scoped `std` threads spawned per tick: a
+  bounded, reported reference adapter (§3.4, §12.5), not Asupersync-scheduled work. Phase 6's packet compositions
+  run on the lanes too. Invariant checks, uptake, the deposit and grant reductions and the commit stay on one
+  thread, and a persistent pool is later work. Parallel phases must keep these reduction orders.
 - `World::set_controller_backend` (FL-030) hands each tick's due evaluations to a `flife_neural::ControllerBackend`
   in one batch, in identity order. Observations are made on the lanes first, then the backend is called once, then
   each lane decodes its run, evaluating what the backend deferred on the reference. Any error on that path hands

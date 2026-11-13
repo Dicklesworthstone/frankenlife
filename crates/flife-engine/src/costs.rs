@@ -20,7 +20,7 @@
 //! recorded flows never exceed the payment. Unpaid maintenance is never
 //! recorded as dissipation.
 
-use flife_core::ledger::{EnergyBudget, Payment, TickLedger, sub_down};
+use flife_core::ledger::{EnergyBudget, Ledger, Payment, sub_down};
 use flife_core::{CoreError, Flow, TimeStep, ValidatedConfig};
 
 /// The cost coefficients of `[costs]` that maintenance uses.
@@ -223,8 +223,8 @@ impl MaintenanceSettlement {
     /// `controller-cost`.
     ///
     /// # Errors
-    /// As [`TickLedger::record`].
-    pub fn record(&self, ledger: &mut TickLedger) -> Result<(), CoreError> {
+    /// As [`Ledger::record`].
+    pub fn record(&self, ledger: &mut impl Ledger) -> Result<(), CoreError> {
         for (flow, amount) in [
             (Flow::Maintenance, self.paid.basal),
             (Flow::SensorCost, self.paid.sensor),

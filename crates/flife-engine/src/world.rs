@@ -72,7 +72,7 @@ use flife_core::clock::{Tick, TimeStep, age_seconds, stable_phase};
 use flife_core::ids::{
     Generation, GenomeId, IdSequence, LineageId, OrganismId, ResourceEpoch, SourceId,
 };
-use flife_core::ledger::CompensatedSum;
+use flife_core::ledger::{CompensatedSum, Ledger, LedgerLog};
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
@@ -538,7 +538,6 @@ struct Scratch {
     /// Each grant packet's composition, in packet order (phase 6): room for
     /// four a row, and as long as the most packets a tick has had.
     compositions: Vec<[f64; CHANNELS]>,
-    packets: Vec<ChemicalPacket>,
     emissions: Deposits,
     recycling: Deposits,
     survivors: Vec<Organism>,
@@ -555,14 +554,30 @@ struct Decision {
     gradients: [[f64; 2]; RESPONSE_TERMS],
 }
 
-/// One CPU worker's scratch for phases 3 and 4.
+/// One CPU worker's scratch for phases 3 and 4, and 6 and 7.
 #[derive(Debug, Default)]
 struct DecisionLane {
     controller: ControllerScratch,
     /// The batched path's observations of this lane's run.
     observed: Vec<Observation>,
     decisions: Vec<Decision>,
+    /// Phases 6 and 7 of this lane's run: one organism's packets at a
+    /// time, the run's ledger flows and staged emissions in identity order,
+    /// which the tick takes in lane order, and the watched organism's
+    /// transactions if the run holds it.
+    packets: Vec<ChemicalPacket>,
+    flows: LedgerLog,
+    emissions: Deposits,
+    transactions: Option<Transactions>,
 }
+
+/// The most packets one organism's demand is granted: one a footprint
+/// cell.
+const PACKETS_PER_ORGANISM: usize = 4;
+
+/// The most ledger entries phases 6 and 7 record for one organism: the
+/// uptake transfer and toxicity, three maintenance terms and motion.
+const FLOWS_PER_ORGANISM: usize = 6;
 
 /// What the world's controller backend did, for run records. Not
 /// scientific state: no result depends on the backend.
@@ -1238,6 +1253,9 @@ impl World {
                 lane.controller.allocated_bytes(),
                 capacity_bytes(&lane.observed),
                 capacity_bytes(&lane.decisions),
+                capacity_bytes(&lane.packets),
+                lane.flows.allocated_bytes(),
+                lane.emissions.allocated_bytes(),
             ])
         });
         total(
@@ -1250,7 +1268,6 @@ impl World {
                 scratch.grants.allocated_bytes(),
                 scratch.by_demand.allocated_bytes(),
                 capacity_bytes(&scratch.compositions),
-                capacity_bytes(&scratch.packets),
                 scratch.emissions.allocated_bytes(),
                 scratch.recycling.allocated_bytes(),
                 capacity_bytes(&scratch.survivors),
@@ -1735,7 +1752,6 @@ impl World {
             grants,
             by_demand,
             compositions,
-            packets,
             emissions,
             recycling,
             survivors,
@@ -1878,35 +1894,27 @@ impl World {
         }
         let mut transactions = None;
 
-        // Phases 6 and 7: each organism's ordered budget stages, its packets'
-        // compositions computed first for every packet on the lanes.
+        // Phases 6 and 7: each organism's ordered budget stages, on the
+        // lanes, its packets' compositions computed first for every packet.
+        // The tick then takes each lane's ledger flows and staged emissions
+        // in lane order: what one thread settling every organism in identity
+        // order would have recorded, in its order.
         compositions_into(observed, granted, lanes.len(), compositions)?;
-        for (index, organism) in working.iter_mut().enumerate() {
-            packets.clear();
-            for (packet, composition) in by_demand.bucket(index).iter().filter_map(|&at| {
-                let at = at as usize;
-                granted.get(at).zip(compositions.get(at))
-            }) {
-                packets.push(ChemicalPacket {
-                    granted: packet.granted,
-                    composition: *composition,
-                });
+        settle_all(
+            rules,
+            population,
+            (by_demand, granted, compositions),
+            from,
+            watch.organism,
+            working,
+            lanes,
+        )?;
+        for lane in lanes.iter_mut() {
+            lane.flows.replay(&mut tick_ledger)?;
+            emissions.append(&mut lane.emissions)?;
+            if let Some(record) = lane.transactions.take() {
+                transactions = Some(record);
             }
-            let genome = genome_of(population, organism.committed.id)?;
-            let parameters = parameter_count(&rules.catalog, genome)?;
-            let record =
-                (watch.organism == Some(organism.committed.id)).then_some(&mut transactions);
-            settle_stages(
-                rules,
-                organism,
-                genome.traits(),
-                parameters,
-                packets,
-                from,
-                &mut tick_ledger,
-                emissions,
-                record,
-            )?;
         }
 
         // Phase 8: the last stages of organisms that do not reproduce, then
@@ -2277,7 +2285,6 @@ impl Scratch {
                 })?,
                 "packet compositions",
             )?,
-            packets: reserved(4, "organism packets")?,
             emissions: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             survivors: reserved(rows, "survivors")?,
@@ -2331,8 +2338,7 @@ fn lane(rules: &Rules) -> Result<DecisionLane, CoreError> {
             Some(topology) => ControllerScratch::new(topology)?,
             None => ControllerScratch::default(),
         },
-        observed: Vec::new(),
-        decisions: Vec::new(),
+        ..DecisionLane::default()
     })
 }
 
@@ -2353,13 +2359,18 @@ fn lane_rows(organisms: usize, lanes: usize) -> usize {
         .min(organisms)
 }
 
-/// Reserve each lane's decisions, and with `batched` its observations, for
-/// the most rows it can take of `organisms`; without `batched`, release its
-/// observations.
+/// Reserve each lane's decisions, ledger flows and staged emissions, and
+/// with `batched` its observations, for the most rows it can take of
+/// `organisms`, and its packets for one organism; without `batched`,
+/// release its observations.
 fn fit_lanes(lanes: &mut [DecisionLane], organisms: usize, batched: bool) -> Result<(), CoreError> {
     let rows = lane_rows(organisms, lanes.len());
     for lane in lanes {
         fit(&mut lane.decisions, rows, "decisions")?;
+        fit(&mut lane.packets, PACKETS_PER_ORGANISM, "organism packets")?;
+        lane.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
+        lane.emissions.fit_staging(rows)?;
+        lane.transactions = None;
         if batched {
             fit(&mut lane.observed, rows, "observations")?;
         } else {
@@ -2724,6 +2735,112 @@ where
     })
 }
 
+/// [`in_runs`] over rows that `work` changes: the same split into
+/// contiguous identity-ordered runs, one per lane, each with the index of
+/// its first row, and the first error in identity order.
+fn in_runs_mut<T, F>(rows: &mut [T], lanes: &mut [DecisionLane], work: &F) -> Result<(), CoreError>
+where
+    T: Send,
+    F: Fn(usize, &mut [T], &mut DecisionLane) -> Result<(), CoreError> + Sync,
+{
+    let used = lanes
+        .len()
+        .min(rows.len().div_ceil(MINIMUM_ROWS_PER_LANE))
+        .max(1);
+    let Some((first, others)) = lanes.split_first_mut() else {
+        return Err(CoreError::StateConflict {
+            operation: "settle",
+            detail: "no lane".to_owned(),
+        });
+    };
+    if used == 1 {
+        return work(0, rows, first);
+    }
+    let length = rows.len().div_ceil(used);
+    let mut runs = rows.chunks_mut(length);
+    let head = runs.next().unwrap_or_default();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = runs
+            .zip(others.iter_mut())
+            .enumerate()
+            .map(|(index, (run, lane))| scope.spawn(move || work((index + 1) * length, run, lane)))
+            .collect();
+        let mut result = work(0, head, first);
+        for worker in workers {
+            let joined = worker.join().unwrap_or_else(|_| {
+                Err(CoreError::StateConflict {
+                    operation: "settle",
+                    detail: "a settling worker panicked".to_owned(),
+                })
+            });
+            if result.is_ok() {
+                result = joined;
+            }
+        }
+        result
+    })
+}
+
+/// Phases 6 and 7 for every working organism, on the lanes: each lane
+/// settles a contiguous identity-ordered run ([`in_runs_mut`]) and keeps,
+/// in identity order, the run's ledger flows, its staged emissions and the
+/// watched organism's transactions, for the tick to take in lane order.
+/// `grants` are the grant packets grouped by demand, the packets and their
+/// compositions ([`compositions_into`]). The error returned is the first in
+/// identity order, as a single thread would report it.
+fn settle_all(
+    rules: &Rules,
+    population: &Population,
+    grants: (&Bins, &[GrantPacket], &[[f64; CHANNELS]]),
+    from: Tick,
+    watched: Option<OrganismId>,
+    working: &mut [Working],
+    lanes: &mut [DecisionLane],
+) -> Result<(), CoreError> {
+    let (by_demand, granted, compositions) = grants;
+    for lane in lanes.iter_mut() {
+        lane.flows.clear();
+        lane.emissions.clear();
+        lane.transactions = None;
+    }
+    in_runs_mut(working, lanes, &|start, run, lane| {
+        let DecisionLane {
+            packets,
+            flows,
+            emissions,
+            transactions,
+            ..
+        } = lane;
+        for (offset, organism) in run.iter_mut().enumerate() {
+            packets.clear();
+            for (packet, composition) in by_demand.bucket(start + offset).iter().filter_map(|&at| {
+                let at = at as usize;
+                granted.get(at).zip(compositions.get(at))
+            }) {
+                packets.push(ChemicalPacket {
+                    granted: packet.granted,
+                    composition: *composition,
+                });
+            }
+            let genome = genome_of(population, organism.committed.id)?;
+            let parameters = parameter_count(&rules.catalog, genome)?;
+            let record = (watched == Some(organism.committed.id)).then_some(&mut *transactions);
+            settle_stages(
+                rules,
+                organism,
+                genome.traits(),
+                parameters,
+                packets,
+                from,
+                flows,
+                emissions,
+                record,
+            )?;
+        }
+        Ok(())
+    })
+}
+
 /// The fewest packets a lane takes in [`compositions_into`].
 const MINIMUM_PACKETS_PER_LANE: usize = 1_024;
 
@@ -2993,6 +3110,7 @@ fn decide_batched(
             controller,
             observed,
             decisions,
+            ..
         } = lane;
         reserve_for(decisions, run.len(), "decisions")?;
         for (index, (organism, observation)) in run.iter().zip(observed.iter()).enumerate() {
@@ -3169,7 +3287,7 @@ fn settle_stages(
     parameters: u32,
     packets: &[ChemicalPacket],
     from: Tick,
-    ledger: &mut TickLedger,
+    ledger: &mut impl Ledger,
     emissions: &mut Deposits,
     record: Option<&mut Option<Transactions>>,
 ) -> Result<(), CoreError> {

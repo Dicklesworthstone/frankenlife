@@ -110,6 +110,11 @@
 - `deposit` (FL-011): reusable `Deposits` (`push`, `clear`, `len`, `is_applied`) and `apply_deposits`, which adds
   them to the field and returns a `DepositSummary` (organisms, cells, paid, offered and applied).
   `DepositSummary::record` books the reduction as one `emission` transfer in a `TickLedger`.
+  `Deposits::fit_staging(organisms)` gives deposits that only stage room for exactly that many deposits and their
+  packets, and `Deposits::append` moves another's staged deposits after these in order, fixing up its entry and
+  packet indices, so the reduction is the one pushing them here would give
+  (`appended_deposits_reduce_as_if_pushed_in_order`: the field's bits, the summary and the bins, no allocation).
+  A refused append (applied, another grid, or more than the declaration) moves nothing.
 - `bins` (FL-027): `Bins::group(buckets, items, bucket_of)`, then `order` (item indices, bucket by bucket),
   `range` and `bucket` (one bucket), `occupied` (nonempty buckets, ascending), `largest` (the hotspot) and
   `allocated`. `Grants::bins` and `Deposits::bins` expose the last reduction's bins, and their `allocated` gives

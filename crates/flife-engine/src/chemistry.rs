@@ -22,7 +22,7 @@
 //! (C.3). The neutral composition is not special-cased beyond that: with
 //! `b > 0` it is mildly harmful.
 
-use flife_core::ledger::{CompensatedSum, EnergyBudget, Payment, TickLedger};
+use flife_core::ledger::{CompensatedSum, EnergyBudget, Ledger, Payment};
 use flife_core::{CoreError, Flow, Transfer, ValidatedConfig};
 use flife_field::FieldState;
 use flife_field::numerics::tanh;
@@ -297,8 +297,8 @@ impl UptakeSettlement {
     /// toxicity `T`.
     ///
     /// # Errors
-    /// As [`TickLedger::transfer`] and [`TickLedger::record`].
-    pub fn record(&self, ledger: &mut TickLedger) -> Result<(), CoreError> {
+    /// As [`Ledger::transfer`] and [`Ledger::record`].
+    pub fn record(&self, ledger: &mut impl Ledger) -> Result<(), CoreError> {
         ledger.transfer(Transfer::Uptake, self.absorbed, self.gain)?;
         ledger.record(Flow::Toxicity, self.toxicity.paid)
     }

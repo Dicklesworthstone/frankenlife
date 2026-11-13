@@ -52,7 +52,7 @@ pub use config::RunConfig;
 pub use descriptor::ModelDescriptor;
 pub use error::{ConfigIssue, CoreError};
 pub use ledger::{
-    CompensatedSum, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, LedgerReport,
-    LedgerState, Payment, ResidualBudget, TickClosure, TickLedger, Transfer,
+    CompensatedSum, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, Ledger, LedgerLog,
+    LedgerReport, LedgerState, Payment, ResidualBudget, TickClosure, TickLedger, Transfer,
 };
 pub use validate::{ValidatedConfig, ValidationReport, validate};

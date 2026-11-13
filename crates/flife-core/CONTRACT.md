@@ -31,6 +31,11 @@ are no hidden defaults.
   - `Flow`: 15 named kinds, each in one `FlowClass`.
   - `Transfer`: uptake, emission, child endowment and recycling, each with a named loss flow.
   - `Holdings`, and `TickLedger` with its `TickClosure`.
+  - The `Ledger` trait (`record`, `transfer`), which `TickLedger` and `LedgerLog` implement. A `LedgerLog` keeps
+    flows and transfers apart, accepting or refusing each exactly as `TickLedger` would, and `replay` records them
+    into a `TickLedger` in order, so split work sums the same terms in the same order
+    (`a_replayed_log_sums_the_same_bits_as_recording_directly`, with a constructed tie whose compensated sum
+    changes when the order does). `fit` reserves its room; `allocated_bytes` reports it.
   - The run's `EnergyLedger` with its `LedgerReport`, and `ResidualBudget`.
   - The per-organism `EnergyBudget`, with `Payment`, `pay` and (FL-011) `retain`.
   - `CompensatedSum`, and the round-down helpers `add_down` and `sub_down`.

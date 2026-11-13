@@ -502,3 +502,145 @@ fn deposits_reduce_the_same_in_any_staging_order_and_any_clustering() {
     }
     assert_eq!(staged.len(), 2);
 }
+
+/// Plan §8.1's phase 7 stages emissions on several threads (C3): each
+/// thread stages its run of organisms into deposits of its own
+/// ([`Deposits::fit_staging`]), and the tick appends them in run order
+/// ([`Deposits::append`]). The tick's deposits must then reduce exactly as
+/// if every deposit had been pushed into them in that order: the same
+/// field to the bit, the same summary and the same bins, with no
+/// allocation on either side. An append that is refused moves nothing.
+#[test]
+fn appended_deposits_reduce_as_if_pushed_in_order() {
+    let grid = grid(32, 24);
+    let base = field(grid, 22);
+    let demands = clustered(&grid, 3_000, 19);
+    let mut next = lcg(5);
+    let deposits: Vec<Staged> = demands
+        .iter()
+        .map(|demand| {
+            let paid = next() * 0.02;
+            let mut direction = [0.0; CHANNELS];
+            direction[(next() * CHANNELS as f64) as usize % CHANNELS] = next() - 0.5;
+            direction[(next() * CHANNELS as f64) as usize % CHANNELS] += next() * 0.4;
+            (
+                demand.organism,
+                demand.position,
+                paid,
+                paid * 0.75,
+                direction,
+            )
+        })
+        .collect();
+    let limits = BufferLimits::host();
+    let push = |staged: &mut Deposits, deposit: &Staged| {
+        let (organism, position, paid, offered, direction) = *deposit;
+        staged.push(&grid, organism, position, paid, offered, &direction)
+    };
+
+    let mut pushed = Deposits::with_capacity(&grid, 3_000, &limits).expect("declare");
+    for deposit in &deposits {
+        push(&mut pushed, deposit).expect("stage");
+    }
+    let mut direct = base.clone();
+    let expected = apply_deposits(&mut direct, &mut pushed).expect("apply");
+    let expected_bins: Vec<_> = pushed.bins().occupied().collect();
+    assert!(planes(&direct) != planes(&base), "nothing was deposited");
+
+    for runs in [1, 2, 7, 16, 3_000] {
+        let length = deposits.len().div_ceil(runs);
+        let mut whole = Deposits::with_capacity(&grid, 3_000, &limits).expect("declare");
+        let allocated = whole.allocated();
+        let mut lane = Deposits::new();
+        lane.fit_staging(length).expect("room for a run");
+        let room = lane.allocated();
+        for run in deposits.chunks(length) {
+            for deposit in run {
+                push(&mut lane, deposit).expect("stage");
+            }
+            assert_eq!(
+                lane.allocated(),
+                room,
+                "{runs} runs: a run outgrew its room"
+            );
+            whole.append(&mut lane).expect("append");
+            assert!(lane.is_empty(), "appending empties the lane");
+            assert_eq!(lane.allocated(), room, "the lane keeps its room");
+        }
+        assert_eq!(
+            whole.allocated(),
+            allocated,
+            "{runs} runs: appending allocated"
+        );
+        assert_eq!(whole.len(), deposits.len());
+        let mut state = base.clone();
+        let summary = apply_deposits(&mut state, &mut whole).expect("apply");
+        assert_eq!(summary, expected, "{runs} runs: summary");
+        assert_eq!(
+            (
+                summary.paid.to_bits(),
+                summary.offered.to_bits(),
+                summary.applied.to_bits()
+            ),
+            (
+                expected.paid.to_bits(),
+                expected.offered.to_bits(),
+                expected.applied.to_bits()
+            ),
+            "{runs} runs: summary bits"
+        );
+        assert!(
+            planes(&state) == planes(&direct),
+            "{runs} runs: the field differs"
+        );
+        assert_eq!(
+            whole.bins().occupied().collect::<Vec<_>>(),
+            expected_bins,
+            "{runs} runs: bins"
+        );
+    }
+
+    // Refusals move nothing.
+    let mut whole = Deposits::with_capacity(&grid, 2, &limits).expect("declare");
+    let mut lane = Deposits::new();
+    for deposit in deposits.iter().take(3) {
+        push(&mut lane, deposit).expect("stage");
+    }
+    match whole.append(&mut lane) {
+        Err(CoreError::BudgetExhausted {
+            budget,
+            required: 3,
+            available: 2,
+        }) => assert_eq!(budget, "deposit packets"),
+        other => panic!("expected the declaration's refusal, got {other:?}"),
+    }
+    assert_eq!(
+        (whole.len(), lane.len()),
+        (0, 3),
+        "a refused append moved deposits"
+    );
+
+    let other = self::grid(16, 12);
+    let mut elsewhere = Deposits::new();
+    let (organism, _, paid, offered, direction) = deposits[0];
+    elsewhere
+        .push(&other, organism, [1.5, 1.5], paid, offered, &direction)
+        .expect("stage on the other grid");
+    let mut whole = Deposits::with_capacity(&grid, 3_000, &limits).expect("declare");
+    push(&mut whole, &deposits[1]).expect("stage");
+    assert!(matches!(
+        whole.append(&mut elsewhere),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert_eq!((whole.len(), elsewhere.len()), (1, 1));
+
+    let mut applied = base.clone();
+    apply_deposits(&mut applied, &mut whole).expect("apply");
+    let mut lane = Deposits::new();
+    push(&mut lane, &deposits[2]).expect("stage");
+    assert!(matches!(
+        whole.append(&mut lane),
+        Err(CoreError::StateConflict { .. })
+    ));
+    assert_eq!(lane.len(), 1, "appending to applied deposits moved one");
+}

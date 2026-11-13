@@ -7,8 +7,8 @@
 
 use flife_core::ledger::{CompensatedSum, FLOW_KINDS, TRANSFER_KINDS, add_down, sub_down};
 use flife_core::{
-    CoreError, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, ResidualBudget, Tick,
-    TickLedger, Transfer,
+    CoreError, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, Ledger, LedgerLog,
+    ResidualBudget, Tick, TickClosure, TickLedger, Transfer,
 };
 
 #[expect(
@@ -454,4 +454,153 @@ fn budgets_retain_exactly_the_share_a_parent_keeps() {
         ));
         assert_eq!(budget.remaining(), 1.0, "a refused retain changes nothing");
     }
+}
+
+/// One flow or transfer, as phases 6 and 7 record them.
+#[derive(Debug, Clone, Copy)]
+enum Entry {
+    Flow(Flow, f64),
+    Transfer(Transfer, f64, f64),
+}
+
+/// Record `entry` into `ledger`: what it returned, as bits, or its error.
+fn enter(ledger: &mut impl Ledger, entry: Entry) -> Result<u64, CoreError> {
+    match entry {
+        Entry::Flow(flow, amount) => ledger.record(flow, amount).map(|()| 0),
+        Entry::Transfer(transfer, debited, credited) => ledger
+            .transfer(transfer, debited, credited)
+            .map(f64::to_bits),
+    }
+}
+
+/// Every sum a closure reports, as bits.
+fn closure_bits(closure: &TickClosure) -> Vec<u64> {
+    let flows = Flow::ALL.iter().map(|&flow| closure.flow(flow));
+    let transfers = Transfer::ALL
+        .iter()
+        .flat_map(|&transfer| [closure.debited(transfer), closure.credited(transfer)]);
+    flows
+        .chain(transfers)
+        .chain([
+            closure.dissipated(),
+            closure.moved(),
+            closure.turnover(),
+            closure.residual(),
+        ])
+        .map(f64::to_bits)
+        .collect()
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn closed(ledger: TickLedger) -> TickClosure {
+    ledger
+        .close(holdings(0.0, 0.0))
+        .expect("a loose budget closes")
+}
+
+/// Plan §8.1's phases 6 and 7 settle on several threads (C3): each logs its
+/// organisms' flows and transfers, and the logs are replayed into the
+/// tick's ledger in the order one thread would have recorded them. The
+/// replay must sum the same terms in the same order, so the compensated
+/// sums agree to the bit with recording directly, however the entries are
+/// split among logs; and a log must refuse exactly what the ledger refuses,
+/// keeping nothing it refused.
+#[test]
+fn a_replayed_log_sums_the_same_bits_as_recording_directly() {
+    let mut next = splitmix(0xc3_1e46e7);
+    let mut entries = Vec::new();
+    while entries.len() < 600 {
+        let pick = usize::try_from(next() % 64).unwrap_or(0);
+        let amount = dyadic(&mut next, -60, 20);
+        let entry = if pick % 3 == 0 {
+            let transfer = Transfer::ALL[pick % TRANSFER_KINDS];
+            Entry::Transfer(transfer, amount, amount * dyadic(&mut next, -3, -1))
+        } else {
+            Entry::Flow(Flow::ALL[pick % FLOW_KINDS], amount)
+        };
+        // Toxicity is kept for the near tie below.
+        if !matches!(entry, Entry::Flow(Flow::Toxicity, _)) {
+            entries.push(entry);
+        }
+    }
+    // Entries the ledger refuses or normalizes, among the accepted ones;
+    // and toxicity terms whose compensated sum is 1 in this order, but
+    // 1 + 2^-52 once the halves are swapped: the compensation's own sum
+    // rounds a tie one way or the other. Compensated sums of nonnegative
+    // terms almost never depend on their order, so without a tie no test
+    // could see the order kept.
+    for (at, entry) in [
+        (17, Entry::Flow(Flow::MotionCost, -1.0e-300)),
+        (40, Entry::Flow(Flow::Toxicity, 1.0)),
+        (90, Entry::Flow(Flow::Toxicity, f64::NAN)),
+        (120, Entry::Flow(Flow::Toxicity, 2.0_f64.powi(-53))),
+        (
+            233,
+            Entry::Transfer(Transfer::Uptake, 1.0, 1.0 + f64::EPSILON),
+        ),
+        (380, Entry::Flow(Flow::Toxicity, 2.0_f64.powi(-106))),
+        (401, Entry::Transfer(Transfer::Emission, f64::INFINITY, 0.0)),
+        (470, Entry::Flow(Flow::Toxicity, 2.0_f64.powi(-150))),
+        (555, Entry::Flow(Flow::Maintenance, -0.0)),
+    ] {
+        entries.insert(at, entry);
+    }
+    let loose = budget(1.0e300, 0.0, 0.0);
+    let open = || TickLedger::open(Tick::new(9), holdings(5.0, 3.0), loose);
+
+    let mut direct = open();
+    let returned: Vec<String> = entries
+        .iter()
+        .map(|&entry| format!("{:?}", enter(&mut direct, entry)))
+        .collect();
+    let expected = closure_bits(&closed(direct));
+
+    for logs in [1, 2, 3, 16, entries.len()] {
+        let length = entries.len().div_ceil(logs);
+        let mut replayed = open();
+        for (run, chunk) in entries.chunks(length).enumerate() {
+            let mut log = LedgerLog::new();
+            log.fit(length).expect("room for the run");
+            for (index, &entry) in chunk.iter().enumerate() {
+                let before = log.len();
+                let outcome = format!("{:?}", enter(&mut log, entry));
+                assert_eq!(
+                    outcome,
+                    returned[run * length + index],
+                    "{entry:?} in {logs} logs returns what the ledger returned"
+                );
+                if outcome.starts_with("Err") {
+                    assert_eq!(log.len(), before, "{entry:?} refused leaves nothing");
+                }
+            }
+            log.replay(&mut replayed)
+                .expect("the log holds only accepted entries");
+            assert!(log.is_empty(), "replaying empties the log");
+        }
+        assert_eq!(
+            closure_bits(&closed(replayed)),
+            expected,
+            "{logs} logs replayed in order sum the same bits"
+        );
+    }
+
+    // The order is the order: replaying the same logs out of order moves
+    // the compensated sums' last bits.
+    let half = entries.len() / 2;
+    let mut swapped = open();
+    for chunk in [&entries[half..], &entries[..half]] {
+        let mut log = LedgerLog::new();
+        for &entry in chunk {
+            let _ = enter(&mut log, entry);
+        }
+        log.replay(&mut swapped).expect("accepted entries");
+    }
+    assert_ne!(
+        closure_bits(&closed(swapped)),
+        expected,
+        "these entries' sums depend on their order, so the test can tell"
+    );
 }

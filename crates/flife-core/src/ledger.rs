@@ -16,6 +16,9 @@
 //!   flows and transfers, and closes against measured holdings. A residual
 //!   outside the budget is an error in every build profile, never a
 //!   warning, and the closure records the budget it was checked against.
+//! - A [`LedgerLog`] keeps flows and transfers for a tick's ledger, refused
+//!   or accepted as the ledger would, and replays them into it in order, so
+//!   that work split across threads sums the same terms in the same order.
 //! - The run's [`EnergyLedger`] requires each tick to open exactly where the
 //!   previous one closed, so a change made between ticks without a flow is
 //!   caught too. It checks the cumulative residual and reports it against
@@ -430,16 +433,7 @@ impl TickLedger {
         debited: f64,
         credited: f64,
     ) -> Result<f64, CoreError> {
-        let debited = energy(transfer.name(), debited)?;
-        let credited = energy(transfer.name(), credited)?;
-        if credited > debited {
-            return Err(CoreError::NumericalInvalid {
-                quantity: transfer.name(),
-                detail: format!(
-                    "credits {credited} but debits only {debited}; an internal transfer cannot create energy"
-                ),
-            });
-        }
+        let (debited, credited) = transfer_terms(transfer, debited, credited)?;
         let loss = debited - credited;
         self.debited[transfer.index()].add(debited);
         self.credited[transfer.index()].add(credited);
@@ -508,6 +502,157 @@ impl TickLedger {
             scale,
             allowance,
         })
+    }
+}
+
+/// Where a tick's flows and transfers are recorded: its [`TickLedger`], or
+/// a [`LedgerLog`] that keeps them for it.
+pub trait Ledger {
+    /// Record `amount` of `flow`, as [`TickLedger::record`].
+    ///
+    /// # Errors
+    /// As [`TickLedger::record`].
+    fn record(&mut self, flow: Flow, amount: f64) -> Result<(), CoreError>;
+
+    /// Record an internal transfer, as [`TickLedger::transfer`], and return
+    /// its loss.
+    ///
+    /// # Errors
+    /// As [`TickLedger::transfer`].
+    fn transfer(
+        &mut self,
+        transfer: Transfer,
+        debited: f64,
+        credited: f64,
+    ) -> Result<f64, CoreError>;
+}
+
+impl Ledger for TickLedger {
+    fn record(&mut self, flow: Flow, amount: f64) -> Result<(), CoreError> {
+        Self::record(self, flow, amount)
+    }
+
+    fn transfer(
+        &mut self,
+        transfer: Transfer,
+        debited: f64,
+        credited: f64,
+    ) -> Result<f64, CoreError> {
+        Self::transfer(self, transfer, debited, credited)
+    }
+}
+
+/// One entry of a [`LedgerLog`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Logged {
+    Flow(Flow, f64),
+    Transfer(Transfer, f64, f64),
+}
+
+/// Flows and transfers kept apart from the tick's ledger, in the order they
+/// were recorded, each refused or accepted exactly as [`TickLedger`] would
+/// refuse or accept it. Replaying the log into the ledger
+/// ([`LedgerLog::replay`]) adds the same terms in the same order as
+/// recording them there directly, so the ledger's compensated sums come out
+/// the same to the bit. Work split across threads records into a log each,
+/// and the logs are replayed in the order the work would have run in.
+#[derive(Debug, Clone, Default)]
+pub struct LedgerLog {
+    entries: Vec<Logged>,
+}
+
+impl LedgerLog {
+    /// An empty log with no room reserved.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Empty the log and give it room for exactly `entries` flows and
+    /// transfers, so that recording that many never allocates.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] if the room cannot be reserved.
+    pub fn fit(&mut self, entries: usize) -> Result<(), CoreError> {
+        self.entries.clear();
+        if self.entries.capacity() > entries {
+            self.entries.shrink_to(entries);
+        }
+        self.entries
+            .try_reserve_exact(entries)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "ledger log",
+                bytes: u64::try_from(entries.saturating_mul(std::mem::size_of::<Logged>()))
+                    .unwrap_or(u64::MAX),
+            })
+    }
+
+    /// The bytes its room takes.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        u64::try_from(
+            self.entries
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Logged>()),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    /// How many flows and transfers it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether it holds none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Forget what it holds, keeping its room.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Record everything it holds into `ledger`, in order, and empty it.
+    ///
+    /// # Errors
+    /// As [`TickLedger::record`] and [`TickLedger::transfer`]; the log
+    /// accepted only what they accept, so neither refuses. The log is
+    /// emptied either way.
+    pub fn replay(&mut self, ledger: &mut TickLedger) -> Result<(), CoreError> {
+        for entry in self.entries.drain(..) {
+            match entry {
+                Logged::Flow(flow, amount) => ledger.record(flow, amount)?,
+                Logged::Transfer(transfer, debited, credited) => {
+                    ledger.transfer(transfer, debited, credited)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Ledger for LedgerLog {
+    fn record(&mut self, flow: Flow, amount: f64) -> Result<(), CoreError> {
+        let amount = energy(flow.name(), amount)?;
+        self.entries.push(Logged::Flow(flow, amount));
+        Ok(())
+    }
+
+    fn transfer(
+        &mut self,
+        transfer: Transfer,
+        debited: f64,
+        credited: f64,
+    ) -> Result<f64, CoreError> {
+        let (debited, credited) = transfer_terms(transfer, debited, credited)?;
+        self.entries
+            .push(Logged::Transfer(transfer, debited, credited));
+        Ok(debited - credited)
     }
 }
 
@@ -1148,4 +1293,24 @@ fn energy(quantity: &'static str, value: f64) -> Result<f64, CoreError> {
             detail: format!("{value} is not a finite nonnegative energy"),
         })
     }
+}
+
+/// A transfer's `debited` and `credited` amounts, if both are finite and
+/// nonnegative and it credits no more than it debits.
+fn transfer_terms(
+    transfer: Transfer,
+    debited: f64,
+    credited: f64,
+) -> Result<(f64, f64), CoreError> {
+    let debited = energy(transfer.name(), debited)?;
+    let credited = energy(transfer.name(), credited)?;
+    if credited > debited {
+        return Err(CoreError::NumericalInvalid {
+            quantity: transfer.name(),
+            detail: format!(
+                "credits {credited} but debits only {debited}; an internal transfer cannot create energy"
+            ),
+        });
+    }
+    Ok((debited, credited))
 }

@@ -202,6 +202,21 @@ neurons that keep their outgoing weights. These tests caught each of them.
   - the same full paths in F16 give `0xb164`, `0xa9b1` and `0x340e`, `numpy.float16` of the same F64 values;
   - C.16 in F16: a step of 1e-6 × N changes an F32 parent of 0.5 but rounds back to an F16 one, so all eight
     F16 candidates are effective no-ops and nothing is charged.
+  - §24.2's mutation fidelity, `f16_mutation_fidelity_under_appendix_a_rates`. Appendix A's rates apply, with
+    topology changes off. 256 founders are each drawn once and rounded to F32 and to binary16, and each has 32
+    children by the same attempts. Both dtypes draw the same selections and steps. The 3,050 children with no
+    replaced parameter carry 61,067 perturbations:
+    - F16 changes no parameter that F32 leaves.
+    - F16 loses 77 of the perturbations (0.126%) whose step rounds back to the binary16 parent. A N(0, 0.02) step
+      within half a binary16 step of each parent value predicts 84.8, and the count must lie within five
+      standard deviations of that.
+    - The kept steps differ from F32's by 1.236e-3 of the deviation (rms), and round-to-nearest predicts 1.232e-3.
+      The test requires agreement within 5%.
+    - Every candidate's traits change (the affinity and motion response are perturbed on every birth), so the
+      strict no-op rule rejects no candidate in either dtype.
+
+    Planted mutants: rounding the steps toward zero (the rms doubles) and a binary16 grid one bit coarser (the
+    losses double) are each caught.
 - Topology targets are uniform among the other admitted members (400 attempts, five standard deviations), with a
   capped member never chosen.
 - Perturbation and replacement counts over 200 children of Appendix A's rates lie within five standard
@@ -224,8 +239,9 @@ of `field-ecology-v1`.
 - The birth transaction is FL-011. It owns energy and cooldown preservation on a rejected birth, the identity of
   the child, and storing the `MutationRecord` with the child's provenance.
 - The strict-distinct profile's choice of a representable neighbouring value (C.16) is not implemented in either
-  dtype. In F16 it matters more: a step below half a binary16 step is a no-op far more often than in F32, and how
-  often under Appendix A's rates (§24.2's mutation fidelity) is measured by FL-030, not here.
+  dtype. In F16 it matters more: a step below half a binary16 step is a no-op far more often than in F32. Under
+  Appendix A's rates that is 0.13% of perturbations, and no whole candidate (see the tests above). §24.2's long-run
+  ecological comparison of F16 and F32 runs is not made.
 - A strict globally unique benchmark's content-hash check at birth (§7.3) is not implemented. Parent-relative
   nonidentity is.
 - `MAXIMUM_CANDIDATES` is §7.3's eight. Device paths must reuse the same addresses (FL-032).

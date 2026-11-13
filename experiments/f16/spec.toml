@@ -1,0 +1,29 @@
+schema = "frankenlife.experiment.v1"
+name = "f16-e1-ecology"
+hypothesis = """Plan 24.2's open decision, F16 canonical-genome suitability: the long-run ecological comparison. \
+The reference-small-world preset with compact F16 genomes (controller.canonical_weight_dtype = "f16", plan 10.3: \
+binary16 parameters rounded once from F64, a distinct quantized evolutionary model) against the same preset in \
+F32, over 8,192 ticks (64 simulated seconds), on FL-048 E1's seeds. \
+Primary measures, declared before any run: final_live, births, lineages_alive, organism_morisita, field_gini and \
+topologies_alive; every other measure is secondary. \
+Rule (FL-048's): F16 differs ecologically on a primary measure when its held-out effect has the direction of its \
+discovery effect, each with p < 0.05. The absence of such a difference does not show equivalence: each effect is \
+reported beside the seeds' spread, and the 24.2 decision stays with the model lane. \
+Cross-check, declared with the rule: the F32 runs repeat FL-048 E1's control runs (same preset, seeds and \
+ticks), so each should reach E1's digest at tick 8,192 unless a later change altered F32 semantics."""
+base = "../fl048/reference-small-world.toml"
+ticks = 8192
+metrics_every = 1024
+control = "f32"
+selection = "No selection: both conditions run on every discovery and held-out seed, and every run, extinct, paused or failed, is reported."
+
+[seeds]
+discovery = [1, 2, 3, 4, 5, 6, 7, 8]
+held_out = [1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]
+
+[[conditions]]
+name = "f32"
+
+[[conditions]]
+name = "f16"
+set = { "controller.canonical_weight_dtype" = "f16" }

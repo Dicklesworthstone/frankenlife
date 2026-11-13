@@ -8,6 +8,7 @@
 //! no FrankenLife or FrankenNumPy code.
 
 use std::collections::BTreeMap;
+use std::f64::consts::PI;
 
 use flife_core::binary16::F16;
 use flife_core::ids::{GenomeId, OrganismId};
@@ -578,6 +579,123 @@ fn c16_in_f16_a_step_below_half_a_binary16_step_is_a_no_op() {
         "{candidates:?}"
     );
     assert_eq!(quota, before, "nothing is charged");
+}
+
+/// An F16 genome's parameters.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn f16s(genome: &Genome) -> &[F16] {
+    genome.parameters().as_f16().expect("an F16 genome")
+}
+
+/// The binary16 steps just below and just above `value`'s magnitude.
+fn binary16_steps(value: F16) -> (f64, f64) {
+    let bits = value.to_bits() & 0x7FFF;
+    let at = F16::from_bits(bits).to_f64();
+    let above = F16::from_bits(bits + 1).to_f64() - at;
+    let below = match bits {
+        0 => above,
+        _ => at - F16::from_bits(bits - 1).to_f64(),
+    };
+    (below, above)
+}
+
+/// Plan §24.2's F16 mutation fidelity under Appendix A's rates, with
+/// topology changes off so that each child's parameters pair with its
+/// parent's. 256 founders, each one F64 draw rounded once to F32 and once to
+/// binary16, have 32 children each by the same attempts, and the operator
+/// draws the same selections and steps in both dtypes. The children without
+/// a replaced parameter (about e^-1 of them) are compared. Every candidate's
+/// traits change, so the strict no-op rule rejects no more in F16 than in
+/// F32. F16 changes no parameter that F32 leaves. It loses the perturbations
+/// whose step rounds back to the binary16 parent, and their count is within
+/// five standard deviations of the sum, over every perturbed parameter, of
+/// the chance that a N(0, 0.02) step lies within half a binary16 step of it.
+#[test]
+fn f16_mutation_fidelity_under_appendix_a_rates() {
+    let catalog = catalog();
+    let rates = MutationParameters::from_config(&appendix_a()).expect("Appendix A rates");
+    let deviation = rates.weight_standard_deviation;
+    let rates = MutationParameters {
+        topology_change_probability: 0.0,
+        ..rates
+    };
+    let mutator = mutator(rates, &catalog);
+    let rng = SemanticRng::new(SEED);
+    let mut wide_quota = quota();
+    let mut half_quota = quota().with_dtype(WeightDtype::F16);
+    let (mut births, mut rejected) = (0_u64, [0_usize; 2]);
+    let (mut kept, mut lost, mut expected) = (0_u64, 0_u64, 0.0_f64);
+    // The squared step errors, and their round-to-nearest expectation: a
+    // twelfth of the squared binary16 step at the child's value.
+    let (mut distortion, mut uniform) = (0.0_f64, 0.0_f64);
+    for organism in 1..=256 {
+        let wide_parent = founder_of(&rng, organism, &catalog, &mut wide_quota);
+        let half_parent = founder_of(&rng, organism, &catalog, &mut half_quota);
+        for tick in 0..32 {
+            let at = attempt(organism, tick);
+            let (wide, wide_record) = child(&mutator, &wide_parent, at, &mut wide_quota.clone());
+            let (half, half_record) = child(&mutator, &half_parent, at, &mut half_quota.clone());
+            rejected[0] += wide_record.rejected.len();
+            rejected[1] += half_record.rejected.len();
+            assert_eq!(
+                (wide_record.candidate, wide_record.perturbed),
+                (half_record.candidate, half_record.perturbed),
+                "the same selections in both dtypes"
+            );
+            if wide_record.replaced + half_record.replaced > 0 {
+                continue;
+            }
+            births += 1;
+            let pairs = f32s(&wide).iter().zip(f32s(&wide_parent));
+            let halves = f16s(&half).iter().zip(f16s(&half_parent));
+            for ((&wide_after, &wide_before), (&half_after, &half_before)) in pairs.zip(halves) {
+                if wide_after == wide_before {
+                    assert_eq!(half_after, half_before, "F16 changed what F32 kept");
+                    continue;
+                }
+                let (below, above) = binary16_steps(half_before);
+                expected += (below + above) / 2.0 / (deviation * (2.0 * PI).sqrt());
+                if half_after == half_before {
+                    lost += 1;
+                } else {
+                    kept += 1;
+                    let wide_step = f64::from(wide_after) - f64::from(wide_before);
+                    let half_step = half_after.to_f64() - half_before.to_f64();
+                    distortion += ((half_step - wide_step) / deviation).powi(2);
+                    let (below, above) = binary16_steps(half_after);
+                    uniform += ((below + above) / 2.0 / deviation).powi(2) / 12.0;
+                }
+            }
+        }
+    }
+    let rms = (distortion / kept as f64).sqrt();
+    let nearest = (uniform / kept as f64).sqrt();
+    println!(
+        "{births} births: {} perturbed, F16 lost {lost} ({:.4}%) against {expected:.1} expected; \
+         rejected candidates F32 {} F16 {}; F16 step error rms {rms:.3e} of the deviation \
+         (round to nearest: {nearest:.3e})",
+        kept + lost,
+        100.0 * lost as f64 / (kept + lost) as f64,
+        rejected[0],
+        rejected[1],
+    );
+    assert!(births > 2_500, "{births}");
+    assert_eq!(rejected[1], rejected[0]);
+    assert!(lost > 0, "F16 lost no perturbation");
+    assert!(
+        (lost as f64 - expected).abs() < 5.0 * expected.sqrt() + 1.0,
+        "{lost} lost against {expected} expected"
+    );
+    assert!(lost * 100 < kept + lost, "F16 lost 1% or more");
+    // The realized steps carry round-to-nearest's error, no more.
+    assert!(
+        (rms / nearest - 1.0).abs() < 0.05,
+        "{rms} against {nearest}"
+    );
+    assert!(rms < 0.01, "{rms}");
 }
 
 #[test]

@@ -76,7 +76,23 @@ shares, their minimums) on software binary64 (plan §7.4, §8.2). The block is P
 one, as NumPy increments it, under the key [world seed, stream code]. `MetalSettle` holds a `MetalProposal` on
 its owner and implements the port's `proposal`; the engine checks the cooldown and the probability and
 recomputes every attempt's split, so it takes from the device only whether the draw made an attempt
-(flife-engine's contract). Lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
+(flife-engine's contract).
+
+FL-032, sixth stage: phase 8's parameter mutation on Metal, in `birth` (`numerics.metal`, `birth.metal`). The
+engine does not call it yet. `MetalBirth::mutate` takes the rates (`MutationConstants`: the world seed, the
+replacement and weight probabilities, the weight's standard deviation) and a batch of births (`MutationBirth`:
+parent, tick, candidate, the child's dense topology), with every child's candidate parameters, copied from the
+parent or mapped onto another member, in the reference layout and the genome's dtype (`ParameterBits`: F32 or
+F16). It mutates each parameter as `Mutator::propose` does (plan §7.3). Word 0 of the block for the mutation
+stream, the parent, the tick and the parameter's lane (candidate; weight or bias; layer, output, input) decides a
+replacement against the replacement probability, and word 2 a perturbation against the weight probability. A
+replacement is the fan-in draw of word 1. A perturbation adds the deviation times component 0 of Box–Muller on
+draw 1's first two words, and rounds once to the dtype. `numerics.metal` holds what that needs of flife-core
+beyond softfloat64: `exp` of either sign, `ln`, `sin_cos_turns`, `open_unit`, `box_muller` and binary16's
+conversions, operation for operation. Each birth's counts of replaced and perturbed parameters come back; on an
+error the values are left as they were. Topology choice, mapping, traits, the seal and the quota stay on the
+host. The engine's wiring (a port, and every birth's candidates batched per tick), deaths and recycling,
+residency and whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -691,6 +707,28 @@ A refusal changes nothing.
     Not refused, and proposed as the reference proposes: a cooling-down or exhausted parent with NaN everything
     else, and a parent that makes no attempt with a NaN fraction. Refused before any command: a NaN or infinite
     constant.
+- `tests/birth.rs` (FL-032, 3 tests), every value compared as bits:
+  - `the_arithmetic_is_flife_cores`: 69,632 rows through `MetalBirth::birth_ops` against flife-core's `exp`,
+    `ln`, `sin_cos_turns`, `open_unit`, `half_open_unit`, `box_muller`, `F16::from_f64`, `F16::to_f32` and
+    flife-genome's `fan_in_draw` (binary64 and F32). Edge rows include ±0, the series' reduction bound and its
+    neighbours, exp's overflow at 710 and its neighbours, the subnormal range, ln at one, √2 and their
+    neighbours, the quarter turns and their neighbours, words whose leading 52 bits are zero or all ones,
+    binary16's largest finite, its overflow tie and its subnormal ties, infinities and NaN, and fan-ins from 1
+    to `u32::MAX`; every binary16 pattern is widened at least once. exp is undefined in 4,921 rows, and 23,002
+    logarithms are of subnormals.
+  - `mutations_on_the_device_are_the_references`: children proposed by `Mutator::propose` from six founders at
+    ticks 0, 7, 1,000 and `u64::MAX - 1`, and a second generation from them, under seven rate sets, in F32 and
+    F16. Each child's parameters before mutation (its parent's, or `map_parameters` onto its member under the
+    map lanes' words) go through `MetalBirth::mutate` and must come back as the reference child's, with its
+    counts. The sets: the preset's; every parameter perturbed; every parameter replaced; topology changes with
+    1.5 standard deviations on 1% of weights (32 children mapped and 34 on a later candidate in each dtype); a
+    replacement probability, and then a weight probability, exactly at a parameter's own uniform; and
+    perturbations below half a binary16 step. 1,008 children in all, 72 per set in each dtype. Each dtype has
+    946,205 replacements and 2,128,621 perturbations.
+  - `rates_the_reference_refuses_are_refused`: replacement probabilities of NaN and one ulp above one, a weight
+    probability of the smallest negative, and deviations of -1, infinity and NaN, each refused with its
+    quantity's name, values unchanged and no counts. So are values one short of the members' parameters and one
+    over. An empty call succeeds.
 - `tests/settle_world.rs` (FL-032, 5 tests): a world with `MetalSettle` raced against the reference world, the
   first organism watched, comparing digests and watched transactions every tick.
   - `the_preset_with_phase_6_on_metal_is_the_reference_world_at_every_tick`: the preset, 300 ticks, every tick
@@ -843,6 +881,32 @@ Planted mutants, each run in a scratch copy.
   the next tick, from half the balance, or with no cooldown. The host's probability check survived: no world
   produces a probability outside [0, 1] (the controller decodes it into that range), and the kernel refuses
   one itself. It is kept because it mirrors the order in which `propose` refuses.
+- FL-032's parameter mutation: 46 planted in `numerics.metal`, `birth.metal` and `birth.rs`, against
+  `tests/birth.rs`, 45 caught:
+  - the arithmetic:
+    - exp: overflowing from 709; +0 negated to -0; the short series of x, not -x; the reduction without ln 2's
+      low part;
+    - ln: a subnormal's exponent off by one; the mantissa folded at √2 itself; the series one term short; the
+      parts summed in another order;
+    - an integer's sign dropped, or its exponent off by one;
+    - the second quadrant's cosine keeping its sign; a half quarter taking the complement; the quarter-turn
+      series one term short;
+    - open_unit keeping 53 bits; Box–Muller's components swapped, or its radius from +2 ln u;
+    - binary16: ties away from zero; the subnormal shift, a subnormal's exponent or the rebias off by one;
+      another NaN pattern;
+  - the kernel: a child's first parameter taken as the previous child's; a weight's output and input swapped;
+    a bias drawn on the weight lane, or with its fan-out as its fan-in; the candidate shifted into the kind;
+    the perturbation from draw 2, decided by word 1, or taking Box–Muller's component 1; the replacement drawn
+    from word 0; a limit of √(2/fan-in); a replacement, or a perturbation, when the uniform equals the
+    probability; the last layer never mutated; the first bias taken as a weight; an F16 read as F32 bits; every
+    result rounded to F32;
+  - the host: the birth stream for the mutation stream; every dtype sent as F32; every child's first parameter
+    at zero; the two probabilities in each other's slots; a negative deviation, or a probability outside
+    [0, 1], admitted; the counts swapped; values longer than the members' parameters admitted.
+
+  binary16 overflowing one binade late survived. It is equivalent: a value of exponent 16 that passes the
+  first check reaches the check after rounding's carry, which also returns infinity. flife-core's
+  `F16::from_f64` makes both checks, and the kernel mirrors it.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -1035,7 +1099,8 @@ per-pass thread spawning (6%).
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; a world given `MetalSettle`
   runs chemistry, maintenance, motion, emission and the reproduction proposal on the device, its host
-  replaying each payment and recomputing each attempt's split). On
+  replaying each payment and recomputing each attempt's split; phase 8's parameter mutation has a kernel,
+  `MetalBirth`, that no world calls yet). On
   many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype

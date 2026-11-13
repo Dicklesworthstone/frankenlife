@@ -36,6 +36,7 @@ use flife_neural::{
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
+pub mod birth;
 pub mod chemistry;
 pub mod emission;
 pub mod field;
@@ -46,6 +47,9 @@ pub mod sensors;
 pub mod settle;
 pub mod uptake;
 
+pub use birth::{
+    BIRTH_OPS_WORDS, MetalBirth, MutationBirth, MutationConstants, MutationCounts, ParameterBits,
+};
 pub use chemistry::{MetalChemistry, SETTLE_OPS_WORDS};
 pub use emission::{EMISSION_OPS_WORDS, MetalEmission};
 pub use field::MetalField;

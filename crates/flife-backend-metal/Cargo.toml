@@ -17,6 +17,8 @@ ft-kernel-metal.workspace = true
 
 [dev-dependencies]
 flife-engine = { path = "../flife-engine" }
+# The reference mutator, the oracle for the device's (tests/birth.rs).
+flife-genome = { path = "../flife-genome" }
 # NumPy-exact Philox4x64-10, the oracle for the device's (tests/proposal.rs).
 fnp-random.workspace = true
 

@@ -116,7 +116,7 @@ use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityShortfall,
     Identities, Offspring, ParentState, PopulationQuota, RejectedBirth, Reproduction,
-    ReproductionProposal, resolve_births,
+    ReproductionProposal, resolve_births_with,
 };
 
 mod admission;
@@ -717,18 +717,21 @@ pub struct UptakeReport {
     pub failure: Option<String>,
 }
 
-/// What the world's phase 6 backend did, for run records (FL-032). Not
+/// What the world's settle backend did, for run records (FL-032). Not
 /// scientific state: no result depends on the backend.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SettleReport {
     /// The backend serving the world, or `None` for the reference alone.
     pub backend: Option<String>,
-    /// Ticks whose phase 6 the backend computed.
+    /// Ticks whose phases 6 and 7 the backend computed.
     pub ticks: u64,
-    /// Ticks the reference computed because the backend met an error, or
-    /// gave a settlement the host's replay refused: the reference
-    /// reproduces any error exactly, or finds none.
+    /// Ticks whose phases 6 and 7, or whose births, the reference computed
+    /// because the backend met an error, or gave a settlement the host's
+    /// replay refused: the reference reproduces any error exactly, or finds
+    /// none.
     pub reference_ticks: u64,
+    /// Births whose first candidate's parameters the backend mutated.
+    pub mutated: u64,
     /// Why the backend stopped serving the world, if it failed.
     pub failure: Option<String>,
 }
@@ -2036,10 +2039,24 @@ impl World {
                 ModelVariant::Baseline | ModelVariant::ChemistryOnly => Offspring::Inherited,
             },
         };
+        // FL-032: each inherited birth's first candidate mutated on the
+        // settle backend, if the world has one.
+        let first = match context.offspring {
+            Offspring::Inherited => settle::mutate_first_candidates(
+                settle_state,
+                rules,
+                &mutator,
+                &requests,
+                quota.dtype(),
+            ),
+            Offspring::Fresh { .. } => settle::FirstCandidates::default(),
+        };
+        let prepared = first.prepared();
         let mut next_identities = identities.clone();
         let mut next_quota = quota.clone();
-        let births = match resolve_births(
+        let births = match resolve_births_with(
             &context,
+            &prepared,
             &requests,
             PopulationQuota::new(rules.maximum_population, live)?,
             &mut next_identities,

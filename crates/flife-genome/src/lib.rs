@@ -43,7 +43,7 @@ pub use genome::{
 pub use init::{FAN_IN_SCALED_SYMMETRIC_V1, WeightAddress, fan_in_draw, fan_in_weight, initialize};
 pub use mutation::{
     BirthAttempt, CandidateRejection, MAXIMUM_CANDIDATES, MutationParameters, MutationRecord,
-    Mutator, Proposal, REJECT_BIRTH_NO_CHARGE, RejectionReason, TopologyChange,
+    Mutator, Prepared, Proposal, REJECT_BIRTH_NO_CHARGE, RejectionReason, TopologyChange,
     UNIFORM_OTHER_CATALOG_MEMBER, perturb, perturb_weight, reflect_log_scale,
 };
 pub use quota::{

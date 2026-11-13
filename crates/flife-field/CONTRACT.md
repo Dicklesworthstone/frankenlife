@@ -145,7 +145,12 @@
   `EmissionAction`, `EmissionOrganism` and `EmissionOutcome` (`packets()`, the staged packets),
   `ProposalConstants` (the world seed and four reproduction rules), `ProposalOrganism` and `ProposalOutcome`
   (`Exhausted`, `CoolingDown`, `NoAttempt`, the four unviable reasons with their value, `Viable` with the
-  split). The phase 6 types moved
+  split). `mutation(constants, births, values, out)` is phase 8's parameter mutation (step 2 of
+  flife-genome's `Mutator::propose`) for each birth's first candidate: `MutationConstants` (the world seed and
+  the replacement probability, weight probability and standard deviation), `MutationBirth` (parent, tick,
+  candidate, up to `MUTATION_LAYERS` = 3 `MutationLayer`s as `LayerShape` gives them, the depth and the
+  parameter count), `MutationValues` (every birth's parameters in turn, F32 or F16, mutated in place) and
+  `MutationCounts` (replaced and perturbed); the last two moved here from `flife-backend-metal`. The phase 6 types moved
   here from `flife-backend-metal` unchanged; `EmissionAction` is the controller's emission (`flife-neural`
   converts its `Emission`). `flife-engine` runs it (`World::set_settle_backend`) and `flife-backend-metal`
   implements it (`MetalSettle`).

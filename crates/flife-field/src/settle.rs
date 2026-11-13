@@ -15,15 +15,22 @@
 //!   payment and offer, and its deposit's footprint split;
 //! - [`SettleBackend::proposal`]: for an organism alive after emission,
 //!   phase 7's reproduction proposal: the cooldown, the attempt's draw and
-//!   the energy split.
+//!   the energy split;
+//! - [`SettleBackend::mutation`]: phase 8's parameter mutation (step 2 of
+//!   flife-genome's `Mutator::propose`) for each birth's first candidate,
+//!   whose member and unmutated parameters the host chose and mapped.
 //!
 //! The engine replays every payment on its own budgets with the reference's
 //! operations and refuses a backend whose amounts or balances differ from
 //! them, records the ledger flows and stages the deposits in identity order,
 //! and builds each birth intent from the proposal's split. Any error hands
-//! the tick's phases 6 and 7 to the reference.
+//! the tick's phases 6 and 7 to the reference. The mutated parameters it
+//! takes as given; the reference's mutator makes the rest of each child
+//! (traits, the no-op check, the seal, any later candidate), and an error
+//! hands the tick's births to the reference.
 
 use flife_core::CoreError;
+use flife_core::binary16::F16;
 
 use crate::grid::FieldGrid;
 use crate::state::{CHANNELS, FieldState};
@@ -329,6 +336,98 @@ pub trait SettleBackend: std::fmt::Debug + Send {
         organisms: &[ProposalOrganism],
         out: &mut Vec<ProposalOutcome>,
     ) -> Result<(), CoreError>;
+
+    /// Phase 8's parameter mutation for each birth's candidate: `values`
+    /// holds every birth's parameters before mutation, the births' in turn,
+    /// and each is mutated in place as flife-genome's `Mutator::propose`
+    /// mutates it; `out` gets each birth's counts.
+    ///
+    /// # Errors
+    /// Any. The world then proposes the tick's births on the reference.
+    fn mutation(
+        &mut self,
+        constants: &MutationConstants,
+        births: &[MutationBirth],
+        values: MutationValues<'_>,
+        out: &mut Vec<MutationCounts>,
+    ) -> Result<(), CoreError>;
+}
+
+/// The seed and rates of phase 8's parameter mutation (flife-genome's
+/// `Mutator`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MutationConstants {
+    /// The world seed, the key of every random block.
+    pub seed: u64,
+    /// `mutation.replacement_probability`.
+    pub replacement_probability: f64,
+    /// `mutation.weight_probability`.
+    pub weight_probability: f64,
+    /// `mutation.weight_standard_deviation`.
+    pub weight_standard_deviation: f64,
+}
+
+/// The most dense layers a member has: two hidden and the output.
+pub const MUTATION_LAYERS: usize = 3;
+
+/// One dense layer of a member, as flife-neural's `LayerShape` gives it:
+/// `weight[o][i]` at `weights + o · inputs + i`, `bias[o]` at
+/// `biases + o`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MutationLayer {
+    /// Fan-in.
+    pub inputs: usize,
+    /// Fan-out.
+    pub outputs: usize,
+    /// The offset of `weight[0][0]`.
+    pub weights: usize,
+    /// The offset of `bias[0]`.
+    pub biases: usize,
+}
+
+/// One birth's candidate: its attempt's address, the candidate, and the
+/// member its parameters are laid out as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MutationBirth {
+    /// The parent's identity, the draws' entity.
+    pub parent: u64,
+    /// The attempt tick, the draws' ordinal.
+    pub tick: u64,
+    /// The candidate, `0..8`.
+    pub candidate: u8,
+    /// The member's layers, the first `depth` in order.
+    pub layers: [MutationLayer; MUTATION_LAYERS],
+    /// How many layers the member has.
+    pub depth: usize,
+    /// How many parameters it has.
+    pub parameters: usize,
+}
+
+impl MutationBirth {
+    /// The member's layers.
+    #[must_use]
+    pub fn layers(&self) -> &[MutationLayer] {
+        self.layers.get(..self.depth).unwrap_or(&self.layers)
+    }
+}
+
+/// The parameters a mutation call takes, every birth's in turn, in the
+/// genomes' dtype.
+#[derive(Debug)]
+pub enum MutationValues<'a> {
+    /// The reference profile's F32 values.
+    F32(&'a mut [f32]),
+    /// The compact-F16 profile's binary16 values.
+    F16(&'a mut [F16]),
+}
+
+/// How many of a birth's parameters were replaced and how many perturbed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MutationCounts {
+    /// Replaced by the fan-in draw.
+    pub replaced: u32,
+    /// Perturbed by a normal.
+    pub perturbed: u32,
 }
 
 /// The constants of phase 7's proposal (flife-engine's `Reproduction`).

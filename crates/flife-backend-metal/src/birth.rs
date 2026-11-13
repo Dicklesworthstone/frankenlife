@@ -9,13 +9,14 @@
 //! Every value is the reference's, bit for bit (`tests/birth.rs`).
 //!
 //! The caller chooses the member, maps the parent onto it, checks and seals
-//! the candidate, and charges the quota; the kernel is not wired into the
-//! engine yet.
+//! the candidate, and charges the quota: in a world, flife-engine's host
+//! through `MetalSettle`'s `SettleBackend::mutation`.
 
 use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::rng::{Lane, Stream};
-use flife_neural::{DenseTopology, Weight, WeightDtype};
+use flife_field::settle::{MUTATION_LAYERS, MutationBirth, MutationConstants, MutationCounts};
+use flife_neural::{Weight, WeightDtype};
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 use crate::chemistry::{Slot, put, word};
@@ -33,7 +34,8 @@ pub const BIRTH_MSL: &str = concat!(
 /// `birth.metal`'s layouts, in words.
 const PARAMS: usize = 13;
 const BIRTH: usize = 20;
-const LAYERS: usize = 3;
+// A birth row holds `M_LAYERS` = 3 layers.
+const _: () = assert!(MUTATION_LAYERS == 3);
 const OPS_IN: usize = 16;
 /// Words per row of [`MetalBirth::birth_ops`]'s results.
 pub const BIRTH_OPS_WORDS: usize = 24;
@@ -53,40 +55,43 @@ fn put_word(target: &mut [u32], at: usize, value: u64) {
     target[at + 1] = (value >> 32) as u32;
 }
 
-/// The seed and rates a call mutates under: `Mutator`'s.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MutationConstants {
-    /// The world seed.
-    pub seed: u64,
-    /// `mutation.replacement_probability`.
-    pub replacement_probability: f64,
-    /// `mutation.weight_probability`.
-    pub weight_probability: f64,
-    /// `mutation.weight_standard_deviation`.
-    pub weight_standard_deviation: f64,
+/// A birth whose layers do not tile its parameters as a dense member's do.
+fn misshapen(detail: String) -> CoreError {
+    CoreError::LayoutMismatch {
+        buffer: "child parameters",
+        detail,
+    }
 }
 
-/// One child in a call: its birth attempt's address, the candidate, and the
-/// member its parameters are laid out as.
-#[derive(Debug, Clone, Copy)]
-pub struct MutationBirth<'t> {
-    /// The parent's identity.
-    pub parent: u64,
-    /// The attempt's tick.
-    pub tick: u64,
-    /// The candidate, `0..8`.
-    pub candidate: u8,
-    /// The candidate's member.
-    pub topology: &'t DenseTopology,
-}
-
-/// How many of a child's parameters were replaced and how many perturbed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MutationCounts {
-    /// Replaced by the fan-in draw.
-    pub replaced: u32,
-    /// Perturbed by a normal.
-    pub perturbed: u32,
+/// Whether `birth`'s layers are a dense member's: at most
+/// [`MUTATION_LAYERS`], each layer's weights then biases following the
+/// last, ending at its parameter count.
+fn check_layers(birth: &MutationBirth) -> Result<(), CoreError> {
+    if birth.depth == 0 || birth.depth > MUTATION_LAYERS {
+        return Err(misshapen(format!("a member of {} layers", birth.depth)));
+    }
+    let mut end = 0_usize;
+    for (layer, shape) in birth.layers().iter().enumerate() {
+        let weights = shape
+            .inputs
+            .checked_mul(shape.outputs)
+            .and_then(|count| count.checked_add(end))
+            .ok_or_else(overflow)?;
+        if shape.weights != end || shape.biases != weights {
+            return Err(misshapen(format!(
+                "layer {layer}'s weights at {} and biases at {}, after {end}",
+                shape.weights, shape.biases
+            )));
+        }
+        end = weights.checked_add(shape.outputs).ok_or_else(overflow)?;
+    }
+    if end != birth.parameters {
+        return Err(misshapen(format!(
+            "layers ending at {end} for {} parameters",
+            birth.parameters
+        )));
+    }
+    Ok(())
 }
 
 /// A parameter dtype the kernel carries as bits.
@@ -188,7 +193,8 @@ impl MetalBirth {
     /// # Errors
     /// - [`CoreError::NumericalInvalid`] for a rate `Mutator` refuses.
     /// - [`CoreError::LayoutMismatch`] when `values` is not the members'
-    ///   parameters, or a member has more than three layers.
+    ///   parameters, or a member's layers are not a dense member's (none,
+    ///   more than [`MUTATION_LAYERS`], or not tiling its parameters).
     /// - [`CoreError::Overflow`] for a member whose neurons have no lane, as
     ///   `Lane::neuron_index` refuses them, or a call too large to describe
     ///   in `u32`.
@@ -198,7 +204,7 @@ impl MetalBirth {
     pub fn mutate<W: ParameterBits>(
         &mut self,
         constants: &MutationConstants,
-        births: &[MutationBirth<'_>],
+        births: &[MutationBirth],
         values: &mut [W],
         counts: &mut Vec<MutationCounts>,
     ) -> Result<(), CoreError> {
@@ -230,19 +236,14 @@ impl MetalBirth {
             .map_err(|_| overflow())?;
         let mut total = 0_usize;
         for birth in births {
-            let layers = birth.topology.layers();
-            if layers.len() > LAYERS {
-                return Err(CoreError::LayoutMismatch {
-                    buffer: "child parameters",
-                    detail: format!("a member of {} layers", layers.len()),
-                });
-            }
+            check_layers(birth)?;
+            let layers = birth.layers();
             let mut row = [0_u32; BIRTH];
             put_word(&mut row, 0, birth.parent);
             put_word(&mut row, 2, birth.tick);
             row[4] = u32::from(birth.candidate);
             row[5] = word(total)?;
-            row[6] = word(birth.topology.parameter_count())?;
+            row[6] = word(birth.parameters)?;
             row[7] = word(layers.len())?;
             for (layer, shape) in layers.iter().enumerate() {
                 // Every neuron's lane, as the reference asks for each.
@@ -258,9 +259,7 @@ impl MetalBirth {
                 row[at + 3] = word(shape.biases)?;
             }
             rows.extend_from_slice(&row);
-            total = total
-                .checked_add(birth.topology.parameter_count())
-                .ok_or_else(overflow)?;
+            total = total.checked_add(birth.parameters).ok_or_else(overflow)?;
         }
         if values.len() != total {
             return Err(CoreError::LayoutMismatch {
@@ -327,7 +326,7 @@ impl MetalBirth {
         tallies.try_reserve(births.len()).map_err(|_| overflow())?;
         let mut start = 0_usize;
         for birth in births {
-            let end = start + birth.topology.parameter_count();
+            let end = start + birth.parameters;
             let mut tally = MutationCounts::default();
             for &code in &rows[start..end] {
                 match code {

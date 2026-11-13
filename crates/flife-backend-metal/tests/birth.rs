@@ -11,7 +11,8 @@
 //! binary16 step. A rate the reference refuses is refused.
 
 use flife_backend_metal::{
-    MetalBirth, MutationBirth, MutationConstants, MutationCounts, ParameterBits,
+    MUTATION_LAYERS, MetalBirth, MutationBirth, MutationConstants, MutationCounts, MutationLayer,
+    ParameterBits,
 };
 use flife_core::binary16::F16;
 use flife_core::ids::{GenomeId, OrganismId};
@@ -24,6 +25,7 @@ use flife_genome::{
     BirthAttempt, Genome, GenomeQuota, MutationParameters, Mutator, Proposal, TopologyCatalog,
     TraitLimits, WeightDtype, fan_in_draw, founder, initial_scale, map_parameters,
 };
+use flife_neural::DenseTopology;
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 const SEED: u64 = 42;
@@ -448,13 +450,15 @@ fn race<W: ParameterBits + Copy>(
     children: &[Child<W>],
     name: &str,
 ) -> [usize; 5] {
-    let births: Vec<MutationBirth<'_>> = children
+    let births: Vec<MutationBirth> = children
         .iter()
-        .map(|child| MutationBirth {
-            parent: child.parent,
-            tick: child.tick,
-            candidate: child.candidate,
-            topology: catalog.topology(child.topology).expect("a member"),
+        .map(|child| {
+            birth_of(
+                child.parent,
+                child.tick,
+                child.candidate,
+                catalog.topology(child.topology).expect("a member"),
+            )
         })
         .collect();
     let mut values: Vec<W> = children
@@ -675,12 +679,7 @@ fn rates_the_reference_refuses_are_refused() {
         weight_probability: 0.5,
         weight_standard_deviation: 0.1,
     };
-    let births = [MutationBirth {
-        parent: 1,
-        tick: 2,
-        candidate: 0,
-        topology,
-    }];
+    let births = [birth_of(1, 2, 0, topology)];
     let original = vec![0.25_f32; topology.parameter_count()];
     for (constants, quantity) in [
         (
@@ -750,9 +749,63 @@ fn rates_the_reference_refuses_are_refused() {
         );
         assert!(wrong.iter().all(|&value| value == 0.25) && counts.is_empty());
     }
+    // Births whose layers are not a dense member's: no layers (and so no
+    // parameters, which the layers' end alone would admit), more than fit,
+    // a layer's weights one past the last layer's end (over its own biases),
+    // biases inside the weights, and a count past the layers' end.
+    let fine = births[0];
+    let mut gap = fine;
+    gap.layers[1].weights += 1;
+    let mut inside = fine;
+    inside.layers[0].biases -= 1;
+    let mut longer = fine;
+    longer.parameters += 1;
+    for misshapen in [
+        MutationBirth {
+            depth: 0,
+            parameters: 0,
+            ..fine
+        },
+        MutationBirth {
+            depth: MUTATION_LAYERS + 1,
+            ..fine
+        },
+        gap,
+        inside,
+        longer,
+    ] {
+        let mut values = vec![0.25_f32; misshapen.parameters];
+        let result = birth.mutate(&valid, &[misshapen], &mut values, &mut counts);
+        assert!(
+            matches!(result, Err(CoreError::LayoutMismatch { .. })),
+            "{misshapen:?}: {result:?}"
+        );
+        assert!(values.iter().all(|&value| value == 0.25) && counts.is_empty());
+    }
     // Nothing to mutate.
     birth
         .mutate(&valid, &[], &mut Vec::<f32>::new(), &mut counts)
         .expect("an empty call");
     assert!(counts.is_empty());
+}
+
+/// A birth of `topology`'s member, as the port names it.
+fn birth_of(parent: u64, tick: u64, candidate: u8, topology: &DenseTopology) -> MutationBirth {
+    let mut layers = [MutationLayer::default(); MUTATION_LAYERS];
+    for (slot, shape) in layers.iter_mut().zip(topology.layers()) {
+        *slot = MutationLayer {
+            inputs: shape.inputs,
+            outputs: shape.outputs,
+            weights: shape.weights,
+            biases: shape.biases,
+        };
+    }
+    MutationBirth {
+        parent,
+        tick,
+        candidate,
+        layers,
+        depth: topology.layers().len(),
+        parameters: topology.parameter_count(),
+    }
 }

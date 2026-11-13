@@ -16,10 +16,10 @@ use flife_core::numerics::exp;
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_genome::{
-    BirthAttempt, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters, Mutator, Proposal,
-    RejectionReason, TopologyCatalog, TopologyId, TraitLimits, Traits, Transition, WeightDtype,
-    WeightsMut, fan_in_weight, founder, initial_scale, map_parameters, perturb, perturb_weight,
-    reflect_log_scale,
+    BirthAttempt, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters, Mutator,
+    ParameterValues, Prepared, Proposal, RejectionReason, TopologyCatalog, TopologyId, TraitLimits,
+    Traits, Transition, WeightDtype, Weights, WeightsMut, fan_in_weight, founder, initial_scale,
+    map_parameters, perturb, perturb_weight, reflect_log_scale,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -1051,4 +1051,277 @@ fn rates_come_from_the_configuration_and_are_validated() {
     assert!(!config.config().architecture_mutation.enabled);
     let rates = MutationParameters::from_config(&config).expect("rates");
     assert_eq!(rates.topology_change_probability, 0.0);
+}
+
+/// Empty values in `dtype`.
+fn empty_values(dtype: WeightDtype) -> ParameterValues {
+    match dtype {
+        WeightDtype::F32 => ParameterValues::F32(Vec::new()),
+        WeightDtype::F16 => ParameterValues::F16(Vec::new()),
+    }
+}
+
+/// Candidate 0 of `at` before mutation: its member and values.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn unmutated(
+    mutator: &Mutator<'_>,
+    parent: &Genome,
+    at: BirthAttempt,
+) -> (TopologyId, ParameterValues) {
+    let mut values = empty_values(parent.parameters().dtype());
+    let member = mutator
+        .unmutated(parent, at, &mut values)
+        .expect("candidate 0 maps");
+    (member, values)
+}
+
+/// The reference child's candidate 0, as `propose_prepared` takes it.
+fn prepared_from<'g>(genome: &'g Genome, record: &flife_genome::MutationRecord) -> Prepared<'g> {
+    Prepared {
+        topology: genome.topology(),
+        values: genome.parameters(),
+        replaced: record.replaced,
+        perturbed: record.perturbed,
+    }
+}
+
+#[test]
+fn unmutated_candidates_are_the_reference_children_before_step_2() {
+    // With every parameter operator off, a child is its candidate 0 before
+    // step 2: the parent copied, or mapped onto another member.
+    let catalog = catalog();
+    let rates = MutationParameters {
+        topology_change_probability: 0.5,
+        ..quiet()
+    };
+    let mutator = mutator(rates, &catalog);
+    for dtype in [WeightDtype::F32, WeightDtype::F16] {
+        let mut quota = quota().with_dtype(dtype);
+        let (mut mapped, mut copied) = (0, 0);
+        for organism in 1..=4 {
+            let parent = founder_of(&SemanticRng::new(SEED), organism, &catalog, &mut quota);
+            for tick in 0..40 {
+                let at = attempt(organism, tick);
+                let (genome, record) = child(&mutator, &parent, at, &mut quota.clone());
+                assert_eq!(record.candidate, 0);
+                let (member, values) = unmutated(&mutator, &parent, at);
+                assert_eq!(member, genome.topology(), "{dtype:?} {organism} {tick}");
+                assert!(values.weights().same_bits(&genome.parameters()));
+                if member == parent.topology() {
+                    copied += 1;
+                } else {
+                    mapped += 1;
+                }
+                // A second candidate is appended after the first.
+                let mut both = values.clone();
+                mutator
+                    .unmutated(&parent, at, &mut both)
+                    .expect("candidate 0 maps again");
+                let length = values.weights().len();
+                assert_eq!(both.weights().len(), 2 * length);
+                let tail: Vec<u32> = both.weights().bits().skip(length).collect();
+                assert!(tail.iter().copied().eq(values.weights().bits()));
+            }
+        }
+        assert!(
+            mapped > 0 && copied > 0,
+            "{dtype:?}: {mapped} mapped, {copied} copied"
+        );
+    }
+}
+
+#[test]
+fn a_prepared_first_candidate_is_proposed_as_the_reference_proposes_it() {
+    // Candidate 0 as the reference mutated it: its traits, seal and record
+    // are the reference's, and so is the quota after it.
+    let catalog = catalog();
+    let rates = MutationParameters {
+        topology_change_probability: 0.3,
+        weight_probability: 0.05,
+        weight_standard_deviation: 0.5,
+        replacement_probability: 0.01,
+        reject_effective_noop: true,
+        ..MutationParameters::from_config(&appendix_a()).expect("Appendix A rates")
+    };
+    let mutator = mutator(rates, &catalog);
+    for dtype in [WeightDtype::F32, WeightDtype::F16] {
+        let mut quota = quota().with_dtype(dtype);
+        let (mut mapped, mut compared) = (0, 0);
+        for organism in 1..=4 {
+            let parent = founder_of(&SemanticRng::new(SEED), organism, &catalog, &mut quota);
+            for tick in 0..25 {
+                let at = attempt(organism, tick);
+                let mut theirs = quota.clone();
+                let (genome, record) = child(&mutator, &parent, at, &mut theirs);
+                if record.candidate != 0 {
+                    continue;
+                }
+                let mut ours = quota.clone();
+                let proposal = mutator
+                    .propose_prepared(
+                        &parent,
+                        at,
+                        GenomeId::new(5_000),
+                        &mut ours,
+                        prepared_from(&genome, &record),
+                    )
+                    .expect("no capacity error");
+                let Proposal::Child {
+                    genome: prepared,
+                    record: prepared_record,
+                } = proposal
+                else {
+                    panic!("{dtype:?} {organism} {tick}: the prepared birth was rejected");
+                };
+                assert_eq!(content(&prepared), content(&genome));
+                assert_eq!(prepared_record, record);
+                assert_eq!(ours, theirs);
+                compared += 1;
+                mapped += usize::from(record.topology.is_some());
+            }
+        }
+        assert!(
+            compared > 90 && mapped > 0,
+            "{dtype:?}: {compared} compared, {mapped} mapped"
+        );
+    }
+}
+
+#[test]
+fn a_prepared_candidates_values_and_counts_are_taken_as_given() {
+    let catalog = catalog();
+    let rates = MutationParameters {
+        topology_change_probability: 0.0,
+        ..MutationParameters::from_config(&appendix_a()).expect("Appendix A rates")
+    };
+    let mutator = mutator(rates, &catalog);
+    let mut quota = quota();
+    let parent = founder_of(&SemanticRng::new(SEED), 7, &catalog, &mut quota);
+    let at = attempt(7, 3);
+    let (genome, _) = child(&mutator, &parent, at, &mut quota.clone());
+    let mut altered = f32s(&genome).to_vec();
+    altered[17] = f32::from_bits(altered[17].to_bits() ^ 1);
+    let proposal = mutator
+        .propose_prepared(
+            &parent,
+            at,
+            GenomeId::new(5_000),
+            &mut quota.clone(),
+            Prepared {
+                topology: genome.topology(),
+                values: Weights::F32(&altered),
+                replaced: 7,
+                perturbed: 9,
+            },
+        )
+        .expect("no capacity error");
+    let Proposal::Child {
+        genome: prepared,
+        record: prepared_record,
+    } = proposal
+    else {
+        panic!("the prepared birth was rejected");
+    };
+    assert_eq!(f32s(&prepared), altered.as_slice());
+    assert_eq!(content(&prepared).2, content(&genome).2, "the traits");
+    assert_eq!(
+        (prepared_record.replaced, prepared_record.perturbed),
+        (7, 9)
+    );
+}
+
+#[test]
+fn a_prepared_candidate_of_another_member_or_layout_is_refused_without_charge() {
+    let catalog = catalog();
+    // Only the weights mutate, so an unmutated candidate is its parent.
+    let rates = MutationParameters {
+        weight_probability: 0.002,
+        weight_standard_deviation: 0.02,
+        reject_effective_noop: true,
+        ..quiet()
+    };
+    let mutator = mutator(rates, &catalog);
+    let mut half_quota = quota().with_dtype(WeightDtype::F16);
+    let mut quota = quota();
+    let parent = founder_of(&SemanticRng::new(SEED), 8, &catalog, &mut quota);
+    let at = attempt(8, 5);
+    let (member, values) = unmutated(&mutator, &parent, at);
+    assert_eq!(member, parent.topology());
+    let other = catalog
+        .transition_targets(member)
+        .next()
+        .expect("another member");
+    let full = values.weights().as_f32().expect("F32 values");
+    let half: Vec<F16> = full.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+    let half_parent = founder_of(&SemanticRng::new(SEED), 8, &catalog, &mut half_quota);
+    assert_eq!(half_parent.topology(), member);
+    let prepared = |topology, values| Prepared {
+        topology,
+        values,
+        replaced: 0,
+        perturbed: 0,
+    };
+    // Another member; then, for each dtype's parent, values one short and
+    // values of the other dtype.
+    let wide = (&parent, &quota);
+    let narrow = (&half_parent, &half_quota);
+    for ((owner, held), first, conflict) in [
+        (wide, prepared(other, Weights::F32(full)), true),
+        (wide, prepared(member, Weights::F32(&full[1..])), false),
+        (wide, prepared(member, Weights::F16(&half)), false),
+        (narrow, prepared(member, Weights::F16(&half[1..])), false),
+        (narrow, prepared(member, Weights::F32(full)), false),
+    ] {
+        let mut charged = held.clone();
+        let result = mutator.propose_prepared(owner, at, GenomeId::new(5_000), &mut charged, first);
+        if conflict {
+            assert!(
+                matches!(result, Err(CoreError::StateConflict { .. })),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(CoreError::LayoutMismatch { .. })),
+                "{result:?}"
+            );
+        }
+        assert_eq!(&charged, held, "nothing charged");
+    }
+    // Values of another dtype are refused, and left as they were.
+    let mut wrong = ParameterValues::F16(vec![F16::ZERO; 3]);
+    assert!(matches!(
+        mutator.unmutated(&parent, at, &mut wrong),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    assert_eq!(wrong, ParameterValues::F16(vec![F16::ZERO; 3]));
+    // An unmutated candidate 0 is its parent: the no-op check rejects it,
+    // and the next candidate is the mutator's own.
+    let proposal = mutator
+        .propose_prepared(
+            &parent,
+            at,
+            GenomeId::new(5_000),
+            &mut quota.clone(),
+            Prepared {
+                topology: member,
+                values: values.weights(),
+                replaced: 0,
+                perturbed: 0,
+            },
+        )
+        .expect("no capacity error");
+    let Proposal::Child { record, .. } = proposal else {
+        panic!("every candidate was rejected");
+    };
+    assert_eq!(record.candidate, 1);
+    assert_eq!(
+        record.rejected,
+        vec![flife_genome::CandidateRejection {
+            candidate: 0,
+            reason: RejectionReason::EffectiveNoop,
+        }]
+    );
 }

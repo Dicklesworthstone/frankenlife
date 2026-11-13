@@ -58,7 +58,7 @@ use crate::genome::{
     AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, rescale, squared_norm,
 };
 use crate::init::fan_in_draw;
-use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
+use crate::quota::{GenomeQuota, ParameterBuffer, ParameterValues, WeightsMut};
 use crate::transition::{Transition, map_parameters};
 
 /// The target selection this module implements.
@@ -286,6 +286,21 @@ pub enum Proposal {
     },
 }
 
+/// A first candidate whose step 2 another engine computed (FL-032), for
+/// [`Mutator::propose_prepared`]: [`Mutator::unmutated`]'s member and
+/// values, mutated.
+#[derive(Debug, Clone, Copy)]
+pub struct Prepared<'p> {
+    /// The member [`Mutator::unmutated`] chose.
+    pub topology: TopologyId,
+    /// The candidate's parameters after mutation, in the parent's dtype.
+    pub values: Weights<'p>,
+    /// Parameters replaced.
+    pub replaced: u32,
+    /// Parameters perturbed.
+    pub perturbed: u32,
+}
+
 /// An F32 parameter perturbed in F64 and rounded once to canonical F32
 /// ([`perturb_weight`] in F32).
 #[must_use]
@@ -401,9 +416,81 @@ impl<'a> Mutator<'a> {
         child: GenomeId,
         quota: &mut GenomeQuota,
     ) -> Result<Proposal, CoreError> {
+        self.propose_from(parent, attempt, child, quota, None)
+    }
+
+    /// The first candidate (candidate 0) of `attempt` from `parent` before
+    /// step 2's mutation, for another engine to mutate (FL-032): its
+    /// member, chosen as step 1 chooses it, with the parent's parameters
+    /// mapped onto it (copied, for the same member) appended to `values`.
+    /// [`Mutator::propose_prepared`] takes it back once mutated.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for a parent whose dtype is not
+    /// `values`' or that does not fit the catalog;
+    /// [`CoreError::NumericalInvalid`] for a change of depth the map does
+    /// not support; [`CoreError::AllocationFailed`] when the host refuses
+    /// the room. `values` is then unchanged.
+    pub fn unmutated(
+        &self,
+        parent: &Genome,
+        attempt: BirthAttempt,
+        values: &mut ParameterValues,
+    ) -> Result<TopologyId, CoreError> {
+        let candidate = 0;
+        let from = parent.topology();
+        let to = self.target(from, attempt, candidate)?;
+        let source = self.member(from)?;
+        let target = self.member(to)?;
+        let same = from == to;
+        match (values, parent.parameters()) {
+            (ParameterValues::F32(values), Weights::F32(parent)) => {
+                self.append_unmutated(source, parent, target, values, same, attempt, candidate)
+            }
+            (ParameterValues::F16(values), Weights::F16(parent)) => {
+                self.append_unmutated(source, parent, target, values, same, attempt, candidate)
+            }
+            _ => Err(CoreError::LayoutMismatch {
+                buffer: "candidate parameters",
+                detail: "the parent's weight dtype is not the values'".into(),
+            }),
+        }?;
+        Ok(to)
+    }
+
+    /// [`Mutator::propose`], with candidate 0's step 2 done elsewhere
+    /// (FL-032): `first` holds its member, its parameters after mutation and
+    /// their counts, which are taken as given. Its traits, the no-op check,
+    /// the seal and every later candidate are this mutator's own.
+    ///
+    /// # Errors
+    /// As [`Mutator::propose`]; [`CoreError::StateConflict`] when `first`
+    /// names another member than step 1 chooses, and
+    /// [`CoreError::LayoutMismatch`] when its values are not that member's
+    /// in the parent's dtype, both with nothing charged.
+    pub fn propose_prepared(
+        &self,
+        parent: &Genome,
+        attempt: BirthAttempt,
+        child: GenomeId,
+        quota: &mut GenomeQuota,
+        first: Prepared<'_>,
+    ) -> Result<Proposal, CoreError> {
+        self.propose_from(parent, attempt, child, quota, Some(first))
+    }
+
+    fn propose_from(
+        &self,
+        parent: &Genome,
+        attempt: BirthAttempt,
+        child: GenomeId,
+        quota: &mut GenomeQuota,
+        first: Option<Prepared<'_>>,
+    ) -> Result<Proposal, CoreError> {
         let mut rejected = Vec::new();
         for candidate in 0..self.parameters.maximum_candidates {
-            match self.candidate(parent, attempt, candidate, child, quota)? {
+            let prepared = first.as_ref().filter(|_| candidate == 0);
+            match self.candidate(parent, attempt, candidate, child, quota, prepared)? {
                 Outcome::Accepted(genome, topology, counts) => {
                     return Ok(Proposal::Child {
                         genome,
@@ -433,16 +520,31 @@ impl<'a> Mutator<'a> {
         candidate: u8,
         child: GenomeId,
         quota: &mut GenomeQuota,
+        prepared: Option<&Prepared<'_>>,
     ) -> Result<Outcome, CoreError> {
         let from = parent.topology();
         let to = self.target(from, attempt, candidate)?;
-        let mut buffer = quota.allocate(self.catalog, to)?;
-        let built = self
-            .parameters_of(parent, from, to, attempt, candidate, &mut buffer)
-            .and_then(|(transition, counts)| {
-                let traits = self.traits_of(parent.traits(), attempt, candidate)?;
-                Ok((transition, counts, traits))
+        if let Some(first) = prepared
+            && first.topology != to
+        {
+            return Err(CoreError::StateConflict {
+                operation: "propose a prepared candidate",
+                detail: format!(
+                    "it is of member {}, step 1 chooses {}",
+                    first.topology.index(),
+                    to.index()
+                ),
             });
+        }
+        let mut buffer = quota.allocate(self.catalog, to)?;
+        let built = match prepared {
+            Some(first) => self.prepared_parameters(from, to, first, &mut buffer),
+            None => self.parameters_of(parent, from, to, attempt, candidate, &mut buffer),
+        }
+        .and_then(|(transition, counts)| {
+            let traits = self.traits_of(parent.traits(), attempt, candidate)?;
+            Ok((transition, counts, traits))
+        });
         let (transition, counts, traits) = match built {
             Ok(built) => built,
             Err(error) => {
@@ -540,7 +642,32 @@ impl<'a> Mutator<'a> {
         attempt: BirthAttempt,
         candidate: u8,
     ) -> Result<(Option<Transition>, Counts), CoreError> {
-        let transition = if same {
+        let transition = self.map_into(source, parent, target, child, same, attempt, candidate)?;
+        let mut counts = Counts::default();
+        if self.parameters.replacement_probability > 0.0 || self.parameters.weight_probability > 0.0
+        {
+            self.mutate_parameters(target, child, attempt, candidate, &mut counts)?;
+        }
+        Ok((transition, counts))
+    }
+
+    /// Step 2's map: `child` is `parent` (the same member) or `parent`
+    /// mapped from `source` onto `target`, before mutation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the members, both buffers and the candidate's address"
+    )]
+    fn map_into<W: Weight>(
+        &self,
+        source: &DenseTopology,
+        parent: &[W],
+        target: &DenseTopology,
+        child: &mut [W],
+        same: bool,
+        attempt: BirthAttempt,
+        candidate: u8,
+    ) -> Result<Option<Transition>, CoreError> {
+        Ok(if same {
             if child.len() != parent.len() {
                 return Err(CoreError::LayoutMismatch {
                     buffer: "genome parameters",
@@ -571,13 +698,89 @@ impl<'a> Mutator<'a> {
                 return Err(error);
             }
             Some(transition)
+        })
+    }
+
+    /// [`Mutator::unmutated`] in one weight dtype.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the members, both buffers and the candidate's address"
+    )]
+    fn append_unmutated<W: Weight>(
+        &self,
+        source: &DenseTopology,
+        parent: &[W],
+        target: &DenseTopology,
+        values: &mut Vec<W>,
+        same: bool,
+        attempt: BirthAttempt,
+        candidate: u8,
+    ) -> Result<(), CoreError> {
+        let start = values.len();
+        let count = target.parameter_count();
+        values
+            .try_reserve(count)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "candidate parameters",
+                bytes: u64::try_from(count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(W::DTYPE.bytes()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        values.resize(start + count, W::round_from_f64(0.0));
+        let mapped = match values.get_mut(start..) {
+            Some(child) => self.map_into(source, parent, target, child, same, attempt, candidate),
+            None => Err(CoreError::LayoutMismatch {
+                buffer: "candidate parameters",
+                detail: "the appended values are out of range".into(),
+            }),
         };
-        let mut counts = Counts::default();
-        if self.parameters.replacement_probability > 0.0 || self.parameters.weight_probability > 0.0
-        {
-            self.mutate_parameters(target, child, attempt, candidate, &mut counts)?;
+        if mapped.is_err() {
+            values.truncate(start);
         }
-        Ok((transition, counts))
+        mapped.map(|_| ())
+    }
+
+    /// The candidate's parameters from `first`, taken in place of step 2:
+    /// see [`Mutator::propose_prepared`].
+    fn prepared_parameters(
+        &self,
+        from: TopologyId,
+        to: TopologyId,
+        first: &Prepared<'_>,
+        buffer: &mut ParameterBuffer,
+    ) -> Result<(Option<Transition>, Counts), CoreError> {
+        match (buffer.values_mut(), first.values) {
+            (WeightsMut::F32(child), Weights::F32(values)) if child.len() == values.len() => {
+                child.copy_from_slice(values);
+            }
+            (WeightsMut::F16(child), Weights::F16(values)) if child.len() == values.len() => {
+                child.copy_from_slice(values);
+            }
+            _ => {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "candidate parameters",
+                    detail: format!(
+                        "{} {} values for member {}",
+                        first.values.len(),
+                        first.values.dtype().name(),
+                        to.index()
+                    ),
+                });
+            }
+        }
+        let transition = if from == to {
+            None
+        } else {
+            Some(Transition::between(self.member(from)?, self.member(to)?)?)
+        };
+        Ok((
+            transition,
+            Counts {
+                replaced: first.replaced,
+                perturbed: first.perturbed,
+            },
+        ))
     }
 
     fn mutate_parameters<W: Weight>(

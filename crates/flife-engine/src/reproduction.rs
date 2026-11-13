@@ -29,7 +29,10 @@
 //! 2. The mutated child is constructed and validated by
 //!    `flife_genome::Mutator::propose` (under
 //!    `field-ecology-v1-fresh-offspring`, FL-041, the child's genome is
-//!    instead a founder's drawn at its own identity, [`Offspring::Fresh`]). The fixed logical genome quota is
+//!    instead a founder's drawn at its own identity, [`Offspring::Fresh`]).
+//!    Through [`resolve_births_with`], a birth's first candidate can come
+//!    with its parameters already mutated elsewhere (FL-032's device), for
+//!    `Mutator::propose_prepared`. The fixed logical genome quota is
 //!    charged before any parameter buffer is allocated. A birth whose
 //!    candidates are all rejected is itself rejected and charges nothing
 //!    (`reject-birth-no-charge`). It takes no slot and no identity.
@@ -74,7 +77,7 @@ use flife_core::{CoreError, ValidatedConfig};
 use flife_field::{FieldGrid, ProposalConstants};
 use flife_genome::{
     BirthAttempt, CandidateRejection, Genome, GenomeQuota, LOGICAL_GENOME_BYTES, MutationRecord,
-    Mutator, Proposal, TopologyCatalog, TraitLimits, founder,
+    Mutator, Prepared, Proposal, TopologyCatalog, TraitLimits, founder,
 };
 use flife_neural::DecodedActions;
 
@@ -802,6 +805,25 @@ pub fn resolve_births(
     identities: &mut Identities,
     quota: &mut GenomeQuota,
 ) -> Result<BirthResolution, CoreError> {
+    resolve_births_with(context, &[], requests, population, identities, quota)
+}
+
+/// [`resolve_births`], where an inherited birth whose parent has an entry
+/// in `first` (sorted by parent) proposes its first candidate from it,
+/// through `Mutator::propose_prepared`: its member and its parameters
+/// already mutated (FL-032).
+///
+/// # Errors
+/// As [`resolve_births`], and as `Mutator::propose_prepared` for a
+/// prepared candidate that is not its birth's.
+pub fn resolve_births_with(
+    context: &BirthContext<'_>,
+    first: &[(OrganismId, Prepared<'_>)],
+    requests: &[BirthRequest<'_>],
+    population: PopulationQuota,
+    identities: &mut Identities,
+    quota: &mut GenomeQuota,
+) -> Result<BirthResolution, CoreError> {
     let mut order: Vec<&BirthRequest<'_>> = requests.iter().collect();
     order.sort_unstable_by_key(|request| request.intent.parent);
     if let Some(pair) = order
@@ -836,8 +858,14 @@ pub fn resolve_births(
     reserve_births(&mut born, order.len(), "births")?;
     reserve_births(&mut rejected, order.len(), "rejected births")?;
     for request in &order {
+        let prepared = first
+            .binary_search_by_key(&request.intent.parent, |(parent, _)| *parent)
+            .ok()
+            .and_then(|at| first.get(at))
+            .map(|(_, prepared)| *prepared);
         match stage(
             context,
+            prepared,
             request,
             birth_tick,
             deadline,
@@ -891,6 +919,7 @@ enum Staged {
 )]
 fn stage(
     context: &BirthContext<'_>,
+    prepared: Option<Prepared<'_>>,
     request: &BirthRequest<'_>,
     birth_tick: Tick,
     deadline: Tick,
@@ -924,9 +953,16 @@ fn stage(
         tick: intent.tick,
     };
     let proposed = match context.offspring {
-        Offspring::Inherited => context
-            .mutator
-            .propose(request.genome, attempt, genome_id, quota),
+        Offspring::Inherited => match prepared {
+            Some(first) => {
+                context
+                    .mutator
+                    .propose_prepared(request.genome, attempt, genome_id, quota, first)
+            }
+            None => context
+                .mutator
+                .propose(request.genome, attempt, genome_id, quota),
+        },
         Offspring::Fresh {
             catalog,
             limits,

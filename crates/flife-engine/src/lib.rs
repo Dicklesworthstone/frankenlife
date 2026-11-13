@@ -83,7 +83,7 @@ pub use reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity,
     CapacityShortfall, Identities, NEXT_TICK_ACTIVATION, Newborn, Offspring, ParentState,
     PopulationQuota, RejectedBirth, Reproduction, ReproductionProposal, ReproductionRules, Split,
-    Unviable, Viability, resolve_births,
+    Unviable, Viability, resolve_births, resolve_births_with,
 };
 pub use world::{
     Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport, Footprint,

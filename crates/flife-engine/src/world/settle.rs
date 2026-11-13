@@ -36,13 +36,18 @@ use flife_core::clock::Tick;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, Payment, sub_down};
 use flife_core::memory::{capacity_bytes, total};
+use std::ops::Range;
+
 use flife_field::settle::{
     ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction, EmissionOrganism,
-    EmissionOutcome, ExhaustedAt, MotionConstants, MotionOrganism, MotionOutcome, ProposalOrganism,
-    ProposalOutcome, SettleBackend,
+    EmissionOutcome, ExhaustedAt, MUTATION_LAYERS, MotionConstants, MotionOrganism, MotionOutcome,
+    MutationBirth, MutationConstants, MutationCounts, MutationLayer, MutationValues,
+    ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 use flife_field::state::CHANNELS;
 use flife_field::{Bins, Deposits, FieldState, GrantPacket};
+use flife_genome::{BirthAttempt, Mutator, ParameterValues, Prepared, TopologyId};
+use flife_neural::{DenseTopology, WeightDtype, Weights};
 
 use super::{
     DecisionLane, PACKETS_PER_ORGANISM, Rules, SettleReport, Settled, Stages, Working,
@@ -54,7 +59,9 @@ use crate::emission::EmissionSettlement;
 use crate::lifecycle::{BudgetStage, Vitality};
 use crate::motion::MotionSettlement;
 use crate::population::Population;
-use crate::reproduction::{ParentState, ReproductionProposal, Unviable, check_probability};
+use crate::reproduction::{
+    BirthRequest, ParentState, ReproductionProposal, Unviable, check_probability,
+};
 
 /// The world's phase 6 backend and the host's lists for it.
 #[derive(Debug, Default)]
@@ -769,6 +776,202 @@ impl Stages for Device<'_> {
             }
         }
     }
+}
+
+/// Phase 8's first candidates, their parameters mutated on the settle
+/// backend: for [`resolve_births_with`](crate::reproduction::resolve_births_with).
+#[derive(Debug, Default)]
+pub(super) struct FirstCandidates {
+    /// Each served birth's parent, member, and its values' range.
+    births: Vec<(OrganismId, TopologyId, Range<usize>, MutationCounts)>,
+    values: Option<ParameterValues>,
+}
+
+impl FirstCandidates {
+    /// Each served birth's first candidate, by parent.
+    pub(super) fn prepared(&self) -> Vec<(OrganismId, Prepared<'_>)> {
+        let Some(values) = &self.values else {
+            return Vec::new();
+        };
+        let weights = values.weights();
+        let mut prepared: Vec<(OrganismId, Prepared<'_>)> = self
+            .births
+            .iter()
+            .filter_map(|(parent, topology, range, counts)| {
+                let values = match weights {
+                    Weights::F32(values) => Weights::F32(values.get(range.clone())?),
+                    Weights::F16(values) => Weights::F16(values.get(range.clone())?),
+                };
+                Some((
+                    *parent,
+                    Prepared {
+                        topology: *topology,
+                        values,
+                        replaced: counts.replaced,
+                        perturbed: counts.perturbed,
+                    },
+                ))
+            })
+            .collect();
+        prepared.sort_unstable_by_key(|(parent, _)| *parent);
+        prepared
+    }
+}
+
+/// Phase 8's parameter mutation on the world's settle backend (FL-032):
+/// each inherited birth's first candidate, its member chosen and its parent
+/// mapped onto it by the reference's `mutator`, mutated in one call. The
+/// host takes the mutated values as given: the rest of each child is the
+/// mutator's own ([`Mutator::propose_prepared`]). A birth the host cannot
+/// prepare is left to the reference; a backend that fails, or does not
+/// count one outcome per birth within its parameters, is dropped, and the
+/// tick's births are the reference's.
+pub(super) fn mutate_first_candidates(
+    settle: &mut Settle,
+    rules: &Rules,
+    mutator: &Mutator<'_>,
+    requests: &[BirthRequest<'_>],
+    dtype: WeightDtype,
+) -> FirstCandidates {
+    let Settle {
+        backend, report, ..
+    } = settle;
+    let Some(device) = backend.as_deref_mut() else {
+        return FirstCandidates::default();
+    };
+    let rates = &rules.mutation;
+    if requests.is_empty()
+        || (rates.replacement_probability <= 0.0 && rates.weight_probability <= 0.0)
+    {
+        return FirstCandidates::default();
+    }
+    let mut values = match dtype {
+        WeightDtype::F32 => ParameterValues::F32(Vec::new()),
+        WeightDtype::F16 => ParameterValues::F16(Vec::new()),
+    };
+    let mut rows = Vec::new();
+    let mut births = Vec::new();
+    for request in requests {
+        let attempt = BirthAttempt {
+            parent: request.intent.parent,
+            tick: request.intent.tick,
+        };
+        let start = values.weights().len();
+        let Ok(member) = mutator.unmutated(request.genome, attempt, &mut values) else {
+            continue;
+        };
+        let end = values.weights().len();
+        match rules
+            .catalog
+            .topology(member)
+            .and_then(|topology| mutation_birth(attempt, topology))
+        {
+            Some(row) => {
+                rows.push(row);
+                births.push((
+                    attempt.parent,
+                    member,
+                    start..end,
+                    MutationCounts::default(),
+                ));
+            }
+            _ => truncate(&mut values, start),
+        }
+    }
+    if rows.is_empty() {
+        return FirstCandidates::default();
+    }
+    let constants = MutationConstants {
+        seed: rules.rng.seed(),
+        replacement_probability: rates.replacement_probability,
+        weight_probability: rates.weight_probability,
+        weight_standard_deviation: rates.weight_standard_deviation,
+    };
+    let mut counts = Vec::new();
+    let served = match &mut values {
+        ParameterValues::F32(values) => {
+            device.mutation(&constants, &rows, MutationValues::F32(values), &mut counts)
+        }
+        ParameterValues::F16(values) => {
+            device.mutation(&constants, &rows, MutationValues::F16(values), &mut counts)
+        }
+    }
+    .and_then(|()| check_counts(&rows, &counts));
+    match served {
+        Ok(()) => {
+            for (birth, served) in births.iter_mut().zip(&counts) {
+                birth.3 = *served;
+            }
+            report.mutated = report
+                .mutated
+                .saturating_add(u64::try_from(births.len()).unwrap_or(u64::MAX));
+            FirstCandidates {
+                births,
+                values: Some(values),
+            }
+        }
+        Err(error) => {
+            report.reference_ticks = report.reference_ticks.saturating_add(1);
+            report.failure = Some(error.to_string());
+            *backend = None;
+            FirstCandidates::default()
+        }
+    }
+}
+
+/// `topology`'s first candidate of `attempt` as the port names it, or
+/// `None` for a member deeper than the port carries.
+fn mutation_birth(attempt: BirthAttempt, topology: &DenseTopology) -> Option<MutationBirth> {
+    let shapes = topology.layers();
+    if shapes.len() > MUTATION_LAYERS {
+        return None;
+    }
+    let mut layers = [MutationLayer::default(); MUTATION_LAYERS];
+    for (slot, shape) in layers.iter_mut().zip(shapes) {
+        *slot = MutationLayer {
+            inputs: shape.inputs,
+            outputs: shape.outputs,
+            weights: shape.weights,
+            biases: shape.biases,
+        };
+    }
+    Some(MutationBirth {
+        parent: attempt.parent.get(),
+        tick: attempt.tick.get(),
+        candidate: 0,
+        layers,
+        depth: shapes.len(),
+        parameters: topology.parameter_count(),
+    })
+}
+
+/// `values` back to its first `length`.
+fn truncate(values: &mut ParameterValues, length: usize) {
+    match values {
+        ParameterValues::F32(values) => values.truncate(length),
+        ParameterValues::F16(values) => values.truncate(length),
+    }
+}
+
+/// One count per birth, none past its parameters.
+fn check_counts(rows: &[MutationBirth], counts: &[MutationCounts]) -> Result<(), CoreError> {
+    if counts.len() != rows.len() {
+        return Err(differ(format!(
+            "the backend counted {} mutations for {} births",
+            counts.len(),
+            rows.len()
+        )));
+    }
+    for (row, count) in rows.iter().zip(counts) {
+        let mutated = u64::from(count.replaced) + u64::from(count.perturbed);
+        if mutated > u64::try_from(row.parameters).unwrap_or(u64::MAX) {
+            return Err(differ(format!(
+                "the backend mutated {mutated} of {}'s {} parameters",
+                row.parent, row.parameters
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Whether the host's proposal for an attempt is the backend's, bit for

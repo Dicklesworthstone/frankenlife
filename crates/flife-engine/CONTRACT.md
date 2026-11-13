@@ -115,7 +115,9 @@ each runs and owns the field.
   each `RejectedBirth`. `Births::settle` returns the budgets the parents keep and records one `child-endowment`
   transfer per birth. `Births::abandon` returns every staged charge. A `CapacityShortfall` names the quota
   (`PopulationSlots` or `LogicalGenomeBytes`), the first parent it could not cover, the required and available
-  amounts, every proposed parent in stable order, and how many births were covered.
+  amounts, every proposed parent in stable order, and how many births were covered. `resolve_births_with`
+  (FL-032) is the same, with some parents' first candidates already mutated elsewhere (`flife_genome::Prepared`,
+  sorted by parent): those births are proposed by `Mutator::propose_prepared`, the rest by `Mutator::propose`.
 - `Vitality` (FL-012): per organism, the first `BudgetStage` that exhausted it, and its `Fate` (`Survives` or
   `Dies(stage)`) once the tiny-reservoir stage has been checked.
 - `TinyEnergyPolicy::clear`: the cleared energy, for the `tiny-reservoir` flow.
@@ -1108,7 +1110,19 @@ velocity, first-order splitting at the configured fixed timestep.
   itself and refuses an outcome that disagrees ("proposed"), checks the probability as `attempts` does, and
   recomputes an attempt's split with `Reproduction::attempted` (`propose`'s tail, factored out with its
   arithmetic unchanged), refusing a split or an unviable reason or value that differs by a bit ("split as").
-  It takes from the backend whether the Bernoulli draw made an attempt. Installing a backend
+  It takes from the backend whether the Bernoulli draw made an attempt. Phase 8's step 2 for each birth's first
+  candidate goes to the same backend, in an inherited world whose replacement or weight rate is above zero: the
+  host has `Mutator::unmutated` choose each first candidate's member and lay the parent's parameters onto it
+  (copied, or mapped for another member) in one buffer of the run's dtype, and hands the backend a row per birth
+  (parent, tick, candidate 0, the member's layers and parameter count) with the world seed and the two rates. It
+  takes back the mutated values and each birth's replaced and perturbed counts, checking only that there is one
+  count per birth and that a birth's replaced and perturbed do not exceed its parameters ("counted",
+  "parameters"); the values and counts are otherwise taken as given, and racing the worlds shows them to be the
+  reference's, F32 and F16. `resolve_births_with` hands them to `Mutator::propose_prepared`, whose traits, no-op
+  check, seal and later candidates are the reference's own. A birth whose candidate the host cannot lay out is
+  proposed by the reference. If the backend errs or a check refuses, the tick's births are all proposed by the
+  reference, the backend is dropped, and the report records why, counting the tick in `reference_ticks`;
+  `SettleReport::mutated` counts the births whose first candidate the backend mutated. Installing a backend
   reserves its lists for the population's capacity (FL-043, counted in the footprint's scratch); if the host
   refuses that, the backend is not installed and the report says why. No result depends on the backend, and it
   is not state. The tests are in `flife-backend-metal`'s `tests/settle_world.rs`.

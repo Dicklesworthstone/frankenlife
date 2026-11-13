@@ -78,12 +78,14 @@ its owner and implements the port's `proposal`; the engine checks the cooldown a
 recomputes every attempt's split, so it takes from the device only whether the draw made an attempt
 (flife-engine's contract).
 
-FL-032, sixth stage: phase 8's parameter mutation on Metal, in `birth` (`numerics.metal`, `birth.metal`). The
-engine does not call it yet. `MetalBirth::mutate` takes the rates (`MutationConstants`: the world seed, the
-replacement and weight probabilities, the weight's standard deviation) and a batch of births (`MutationBirth`:
-parent, tick, candidate, the child's dense topology), with every child's candidate parameters, copied from the
-parent or mapped onto another member, in the reference layout and the genome's dtype (`ParameterBits`: F32 or
-F16). It mutates each parameter as `Mutator::propose` does (plan §7.3). Word 0 of the block for the mutation
+FL-032, sixth stage: phase 8's parameter mutation on Metal, in `birth` (`numerics.metal`, `birth.metal`).
+`MetalBirth::mutate` takes the rates (`MutationConstants`: the world seed, the replacement and weight
+probabilities, the weight's standard deviation) and a batch of births (flife-field's `MutationBirth`: parent,
+tick, candidate, and the child's dense member as its depth, at most three layers' inputs, outputs and weight and
+bias offsets, and its parameter count), with every child's candidate parameters, copied from the parent or
+mapped onto another member, in the reference layout and the genome's dtype (`ParameterBits`: F32 or F16). It
+refuses a birth whose layers are not a dense member's: no layers or more than three, a layer's weights not at
+the last layer's end or its biases not after its weights, or a parameter count past the layers' end. It mutates each parameter as `Mutator::propose` does (plan §7.3). Word 0 of the block for the mutation
 stream, the parent, the tick and the parameter's lane (candidate; weight or bias; layer, output, input) decides a
 replacement against the replacement probability, and word 2 a perturbation against the weight probability. A
 replacement is the fan-in draw of word 1. A perturbation adds the deviation times component 0 of Box–Muller on
@@ -91,8 +93,10 @@ draw 1's first two words, and rounds once to the dtype. `numerics.metal` holds w
 beyond softfloat64: `exp` of either sign, `ln`, `sin_cos_turns`, `open_unit`, `box_muller` and binary16's
 conversions, operation for operation. Each birth's counts of replaced and perturbed parameters come back; on an
 error the values are left as they were. Topology choice, mapping, traits, the seal and the quota stay on the
-host. The engine's wiring (a port, and every birth's candidates batched per tick), deaths and recycling,
-residency and whole-tick parity are FL-032's remaining work.
+host. `MetalSettle` holds a `MetalBirth` on its owner and implements the port's `mutation`: the engine sends
+each tick's births' first candidates in one batch and takes the values and counts as given (flife-engine's
+contract). A later candidate, after the no-op check or the seal rejects the first, is mutated on the host.
+Deaths and recycling, residency and whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -728,12 +732,15 @@ A refusal changes nothing.
   - `rates_the_reference_refuses_are_refused`: replacement probabilities of NaN and one ulp above one, a weight
     probability of the smallest negative, and deviations of -1, infinity and NaN, each refused with its
     quantity's name, values unchanged and no counts. So are values one short of the members' parameters and one
-    over. An empty call succeeds.
-- `tests/settle_world.rs` (FL-032, 5 tests): a world with `MetalSettle` raced against the reference world, the
-  first organism watched, comparing digests and watched transactions every tick.
+    over, and births of no layers (and no parameters), of four, with a layer's weights one past the last
+    layer's end, with biases inside the weights, and with one parameter more than the layers hold. An empty
+    call succeeds.
+- `tests/settle_world.rs` (FL-032, 8 tests): a world with `MetalSettle` raced against the reference world, the
+  first organism watched, comparing digests and watched transactions every tick, and each tick's birth records
+  and newborn genomes (the digest names genomes, not their parameters).
   - `the_preset_with_phase_6_on_metal_is_the_reference_world_at_every_tick`: the preset, 300 ticks, every tick
-    on the device (report 300 and 0), with deposits (552,539), births (22) and deaths at chemistry (146) and
-    maintenance (1,894). Installing the backend reserves its lists (scratch 101,233,808 to 135,050,384 bytes),
+    on the device (report 300 and 0), with deposits (552,539), births (22, each first candidate mutated on the
+    device) and deaths at chemistry (146) and maintenance (1,894). Installing the backend reserves its lists (scratch 101,233,808 to 135,050,384 bytes),
     which the run does not grow; the owner holds no leases or retiring buffers afterwards, and removing the
     backend releases its lists.
   - `worlds_whose_organisms_die_at_every_stage_are_the_reference_worlds`: the preset with motion costing 2.0 and
@@ -757,6 +764,18 @@ A refusal changes nothing.
     kernel itself, which takes only organisms alive after motion. The preset's founders cool down for their
     first 64 ticks, so the proposal's changes are planted in the preset with a cooldown of 0.01 s (two ticks),
     and the viable ones with an attempt minimum of 1.0 too.
+  - `births_mutated_on_metal_are_the_reference_births`: the preset with that cooldown and attempt minimum, an
+    architecture change in half the births, chemistry and sensing that do not mutate, and one weight in 10,000
+    perturbed, so a first candidate often changes member and is often an effective no-op, in F32 and F16,
+    12 ticks on the device: 150 births in each, 86 of them onto another member and 16 from a later candidate,
+    every first candidate mutated on the device.
+  - `a_mutation_the_host_cannot_see_changes_the_world`: the first mutated parameter's last bit flipped, and
+    one replacement more counted for the first birth; the worlds diverge at the first births, and the backend
+    serves every tick.
+  - `a_failing_or_refused_mutation_hands_its_births_to_the_reference_and_is_dropped`: a failure, one count
+    fewer than births, and more counted than a birth has parameters. Each world is the reference world at
+    every tick, the backend served the ticks before the first births and is then dropped (one reference tick,
+    no births mutated), and its report names the cause.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -907,6 +926,27 @@ Planted mutants, each run in a scratch copy.
   binary16 overflowing one binade late survived. It is equivalent: a value of exponent 16 that passes the
   first check reaches the check after rounding's carry, which also returns infinity. flife-core's
   `F16::from_f64` makes both checks, and the kernel mirrors it.
+- FL-032's parameter mutation in a world: 28 planted, against flife-genome's `tests/mutation.rs`, this crate's
+  `tests/birth.rs` and `tests/settle_world.rs`'s mutation tests:
+  - flife-genome's `Mutator` (9, 9 caught): `propose_prepared` proposing as `propose`; a prepared candidate of
+    another member admitted; its counts swapped; a mapped candidate recording no transition; every candidate
+    taken as prepared; `unmutated` laying out candidate 1; values one short admitted in F32, or in F16; values
+    of another dtype admitted;
+  - the port's checks here (6, 6 caught): births of no layers, or of more than fit; a layer's weights, or its
+    biases, not checked; the layers' end not checked; F16 values not mutated;
+  - flife-engine's phase 8 (13, 12 caught): the rates' skip inverted; a count per birth, or the counts' bound,
+    not checked; a failed backend kept; the device's counts not taken; the rows naming candidate 1; the
+    prepared candidates ignored, or the first given to every parent; the mutated births, or a failed
+    mutation's reference tick, not counted; another seed; every world staged as F32.
+
+  The first round had 28 and 5 survived. A prepared candidate's length and dtype were checked twice, before
+  its buffer was allocated and when its values were copied; the copy abandons the buffer on a mismatch, so
+  nothing is charged either way, and each check hid the other's mutants. The first check is gone, and an F16
+  parent's short values and an F32 parent's F16 values are now refused in the test too. A birth of no layers
+  was refused only by the layers' end, as the test's had parameters; the test's now has none. The prepared
+  candidates not sorted by parent survives and is equivalent: rows are in identity order, so a tick's requests
+  arrive sorted, and `resolve_births_with`'s binary search could only miss a parent, whose birth the reference
+  would then propose bit for bit. The sort is kept because `resolve_births_with` documents sorted input.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -1099,8 +1139,8 @@ per-pass thread spawning (6%).
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; a world given `MetalSettle`
   runs chemistry, maintenance, motion, emission and the reproduction proposal on the device, its host
-  replaying each payment and recomputing each attempt's split; phase 8's parameter mutation has a kernel,
-  `MetalBirth`, that no world calls yet). On
+  replaying each payment and recomputing each attempt's split, and phase 8's mutation of each birth's first
+  candidate). On
   many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype

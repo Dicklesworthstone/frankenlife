@@ -46,6 +46,14 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
 - `MutationParameters` (from `[mutation]` and `[architecture_mutation]`) and `Mutator::propose`, which returns
   either `Proposal::Child` with its `MutationRecord` or `Proposal::Rejected` with every candidate's
   `RejectionReason`. Also `perturb` and `reflect_log_scale`.
+- FL-032, mutation on another engine:
+  - `Mutator::unmutated(parent, attempt, values)` appends the first candidate's parameters before step 2 to
+    `values` (`ParameterValues`, the parent's dtype): the parent copied, or mapped onto the member step 1 chooses.
+    It returns that member, and leaves `values` unchanged on an error.
+  - `Mutator::propose_prepared(parent, attempt, child, quota, first)` is `propose`, with candidate 0's step 2
+    taken from `first` (`Prepared`: the member, the mutated values, and the replaced and perturbed counts). The
+    values and counts are taken as given; the traits, the no-op check, the seal and every later candidate are
+    the mutator's own.
 
 **Invariants.**
 - The catalog is exactly §6.4's five rows, in order: `104 → 8 → 36` (1,164 parameters), `104 → 32 → 36` (4,548),
@@ -139,6 +147,9 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
   outside `1..=8`, or a strict no-op rule with no operator able to change a genome. Another target selection or
   exhausted-proposals policy (`UnknownAlgorithm`).
 - A log-scale step that cannot be reflected into range, or a nonpositive scale.
+- A prepared first candidate of another member than step 1 chooses (`StateConflict`), or whose values are not that
+  member's in the parent's dtype (`LayoutMismatch`), with nothing charged. Values of another dtype than the
+  parent's for `unmutated` (`LayoutMismatch`).
 
 **Determinism.** Pure functions of their inputs, in fixed (layer, output, input) order, using only IEEE-754
 arithmetic, the correctly rounded `sqrt` and `flife_core::numerics`. No hash maps. Every draw is a semantic block,
@@ -223,6 +234,15 @@ neurons that keep their outgoing weights. These tests caught each of them.
   deviations of their binomial means, and the perturbations have unit variance in units of 0.02.
 - Log-scale reflection at both bounds, repeated reflection, a one-scale range, and refusals.
 - Rates read from Appendix A, every invalid rate refused, and architecture mutation switched off.
+- FL-032, in F32 and F16:
+  - with every parameter operator off and topology changes at 0.5, `unmutated` is the reference child (member
+    and bits) of 160 attempts per dtype, both copied and mapped, and a second call appends after the first;
+  - `propose_prepared` with the reference's own candidate 0 gives the reference's child, record and quota for
+    every attempt whose candidate 0 was accepted (more than 90 per dtype, some mapped);
+  - a prepared value one ulp off and counts of 7 and 9 are taken as given;
+  - another member, and for an F32 and an F16 parent one value short and the other dtype, are refused with
+    nothing charged;
+  - an unmutated candidate 0 under the strict no-op rule is rejected, and candidate 1 is the mutator's own.
 
 Five planted mutation bugs were each caught by these tests:
 - the candidate index left out of parameter lanes;

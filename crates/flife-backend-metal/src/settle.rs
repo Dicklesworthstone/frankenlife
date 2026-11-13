@@ -1,26 +1,29 @@
-//! FL-032 (`flife-kf8`): phases 6 and 7 on Metal for the engine.
+//! FL-032 (`flife-kf8`): phases 6 to 8 on Metal for the engine.
 //! [`MetalSettle`] serves flife-field's `SettleBackend` with
-//! [`MetalChemistry`], [`MetalMotion`], [`MetalEmission`] and
-//! [`MetalProposal`] on one device owner, so a world installs it with
-//! `World::set_settle_backend`. Each method is one command (four a tick), and
-//! each gives the reference's values bit for bit or refuses, handing the
-//! tick's phases 6 and 7 to the reference.
+//! [`MetalChemistry`], [`MetalMotion`], [`MetalEmission`], [`MetalProposal`]
+//! and [`MetalBirth`] on one device owner, so a world installs it with
+//! `World::set_settle_backend`. Each method is one command (four a tick, and
+//! a fifth in a tick with births), and each gives the reference's values bit
+//! for bit or refuses, handing the tick's phases 6 and 7, or its births, to
+//! the reference.
 
 use flife_core::CoreError;
 use flife_field::settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionOrganism,
-    EmissionOutcome, MotionConstants, MotionOrganism, MotionOutcome, ProposalConstants,
-    ProposalOrganism, ProposalOutcome, SettleBackend,
+    EmissionOutcome, MotionConstants, MotionOrganism, MotionOutcome, MutationBirth,
+    MutationConstants, MutationCounts, MutationValues, ProposalConstants, ProposalOrganism,
+    ProposalOutcome, SettleBackend,
 };
 use flife_field::{FieldGrid, FieldState};
 
+use crate::birth::MetalBirth;
 use crate::chemistry::MetalChemistry;
 use crate::emission::MetalEmission;
 use crate::motion::MetalMotion;
 use crate::owner::{DeviceOwner, Limits};
 use crate::proposal::MetalProposal;
 
-/// Phases 6 and 7's four kernels on one device; see the module
+/// Phases 6 to 8's five kernels on one device; see the module
 /// documentation.
 #[derive(Debug)]
 pub struct MetalSettle {
@@ -28,10 +31,11 @@ pub struct MetalSettle {
     motion: MetalMotion,
     emission: MetalEmission,
     proposal: MetalProposal,
+    birth: MetalBirth,
 }
 
 impl MetalSettle {
-    /// Open the default Metal device and compile phases 6 and 7's kernels.
+    /// Open the default Metal device and compile phases 6 to 8's kernels.
     ///
     /// # Errors
     /// [`CoreError::MissingCapability`] without a Metal device (always, off
@@ -40,7 +44,7 @@ impl MetalSettle {
         Self::with_owner(DeviceOwner::open(Limits::UNBOUNDED)?)
     }
 
-    /// Phases 6 and 7's kernels on `owner`'s device; their buffers are
+    /// Phases 6 to 8's kernels on `owner`'s device; their buffers are
     /// `owner`'s.
     ///
     /// # Errors
@@ -50,7 +54,8 @@ impl MetalSettle {
             chemistry: MetalChemistry::with_owner(owner.clone())?,
             motion: MetalMotion::with_owner(owner.clone())?,
             emission: MetalEmission::with_owner(owner.clone())?,
-            proposal: MetalProposal::with_owner(owner)?,
+            proposal: MetalProposal::with_owner(owner.clone())?,
+            birth: MetalBirth::with_owner(owner)?,
         })
     }
 
@@ -110,5 +115,18 @@ impl SettleBackend for MetalSettle {
         out: &mut Vec<ProposalOutcome>,
     ) -> Result<(), CoreError> {
         self.proposal.settle(constants, organisms, out)
+    }
+
+    fn mutation(
+        &mut self,
+        constants: &MutationConstants,
+        births: &[MutationBirth],
+        values: MutationValues<'_>,
+        out: &mut Vec<MutationCounts>,
+    ) -> Result<(), CoreError> {
+        match values {
+            MutationValues::F32(values) => self.birth.mutate(constants, births, values, out),
+            MutationValues::F16(values) => self.birth.mutate(constants, births, values, out),
+        }
     }
 }

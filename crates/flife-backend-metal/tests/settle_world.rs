@@ -1,24 +1,29 @@
 //! FL-032's engine port: the real small-world preset with phase 6's
-//! chemistry, maintenance, motion and emission and phase 7's reproduction
-//! proposal on Metal is the reference world, digest for digest and the
-//! watched organism's transactions record for record, at every tick, alone
-//! and together with the Metal field, sensors, uptake and controllers.
-//! Changes the host's replay cannot see (one organism moved by one ulp, two
-//! packets of one deposit swapped, a viable attempt reported as none)
-//! change the world (the planted negatives). A backend that fails, or gives
-//! a settlement the replay refuses (one per host check), hands that tick to
-//! the reference and is dropped, leaving the run the reference's: no
-//! organism keeps a stage the refused tick settled.
+//! chemistry, maintenance, motion and emission, phase 7's reproduction
+//! proposal and phase 8's parameter mutation on Metal is the reference
+//! world, digest for digest, the watched organism's transactions record for
+//! record, and each birth's record and newborn genome bit for bit, at every
+//! tick, alone and together with the Metal field, sensors, uptake and
+//! controllers. Changes the host's replay cannot see (one organism moved by
+//! one ulp, two packets of one deposit swapped, a viable attempt reported
+//! as none, one mutated parameter one ulp off, one count off by one) change
+//! the world (the planted negatives). A backend that fails, or gives a
+//! settlement or mutation the host refuses (one per host check), hands that
+//! tick's phases 6 and 7, or its births, to the reference and is dropped,
+//! leaving the run the reference's: no organism keeps a stage the refused
+//! tick settled.
 
 use flife_backend_metal::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionOrganism,
     EmissionOutcome, ExhaustedAt, MetalBackend, MetalField, MetalSensors, MetalSettle, MetalUptake,
-    MotionConstants, MotionOrganism, MotionOutcome, ProposalConstants, ProposalOrganism,
-    ProposalOutcome,
+    MotionConstants, MotionOrganism, MotionOutcome, MutationBirth, MutationConstants,
+    MutationCounts, MutationValues, ProposalConstants, ProposalOrganism, ProposalOutcome,
 };
+use flife_core::binary16::F16;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, BudgetStage, DeathCause, NumericalProfile, Stepped, World};
 use flife_field::{FieldGrid, FieldState, SettleBackend};
+use flife_genome::Genome;
 use std::num::NonZeroUsize;
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -73,15 +78,31 @@ fn settle() -> Option<MetalSettle> {
     }
 }
 
-/// What a race saw: the first tick whose digests or watched transactions
-/// differ, the emitters and births, and the deaths by stage (chemistry,
-/// maintenance, motion, emission).
+/// What a race saw: the first tick whose digests, watched transactions,
+/// birth records or newborn genomes differ, the emitters and births (those
+/// onto another member, and those of a later candidate), the step of the
+/// first births, and the deaths by stage (chemistry, maintenance, motion,
+/// emission).
 #[derive(Debug, Default)]
 struct Raced {
     difference: Option<u64>,
     emitted: usize,
     births: usize,
+    mapped: usize,
+    later: usize,
+    first_births: Option<u64>,
     deaths: [usize; 4],
+}
+
+/// Whether two genomes are the same, bit for bit.
+fn same_genome(a: &Genome, b: &Genome) -> bool {
+    let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let (x, y) = (a.traits(), b.traits());
+    a.topology() == b.topology()
+        && a.parameters().same_bits(&b.parameters())
+        && bits(x.affinity()) == bits(y.affinity())
+        && bits(x.motion_response()) == bits(y.motion_response())
+        && x.sensing_scale().to_bits() == y.sensing_scale().to_bits()
 }
 
 /// Step both worlds, each watching the same organism.
@@ -91,13 +112,36 @@ fn race(reference: &mut World, other: &mut World, ticks: u64) -> Raced {
     reference.watch(watched);
     other.watch(watched);
     let mut raced = Raced::default();
-    for _ in 0..ticks {
+    for step in 1..=ticks {
         let expected = reference.step().expect("the reference steps");
         let got = other.step().expect("the other world steps");
-        match (expected, got) {
-            (Stepped::Published(_), Stepped::Published(report)) => {
+        let births_same = match (expected, got) {
+            (Stepped::Published(expected), Stepped::Published(report)) => {
+                let births_same = expected.births == report.births
+                    && report.births.iter().all(|birth| {
+                        match (
+                            reference.population().genome(birth.child),
+                            other.population().genome(birth.child),
+                        ) {
+                            (Some(a), Some(b)) => same_genome(a, b),
+                            _ => false,
+                        }
+                    });
+                if raced.first_births.is_none() && !report.births.is_empty() {
+                    raced.first_births = Some(step);
+                }
                 raced.emitted += report.emitted;
                 raced.births += report.births.len();
+                raced.mapped += report
+                    .births
+                    .iter()
+                    .filter(|birth| birth.record.topology.is_some())
+                    .count();
+                raced.later += report
+                    .births
+                    .iter()
+                    .filter(|birth| birth.record.candidate > 0)
+                    .count();
                 for death in &report.deaths {
                     let stage = match death.cause {
                         DeathCause::Exhausted(BudgetStage::Chemistry) => 0,
@@ -108,10 +152,12 @@ fn race(reference: &mut World, other: &mut World, ticks: u64) -> Raced {
                     };
                     raced.deaths[stage] += 1;
                 }
+                births_same
             }
             (expected, got) => panic!("unexpected outcomes {expected:?} and {got:?}"),
-        }
-        let same = reference.digest() == other.digest()
+        };
+        let same = births_same
+            && reference.digest() == other.digest()
             && reference
                 .watched_transactions()
                 .eq(other.watched_transactions());
@@ -140,6 +186,8 @@ fn the_preset_with_phase_6_on_metal_is_the_reference_world_at_every_tick() {
     assert_eq!((report.ticks, report.reference_ticks), (300, 0));
     assert_eq!(report.failure, None);
     assert!(raced.emitted > 0 && raced.births > 0, "{raced:?}");
+    // Every birth's first candidate was mutated on the device.
+    assert!(report.mutated >= raced.births as u64, "{report:?}");
     assert!(raced.deaths[0] > 0 && raced.deaths[1] > 0, "{raced:?}");
     // FL-043: installing reserves the host's lists for the capacity, and
     // stepping never grows them.
@@ -292,25 +340,70 @@ enum Change {
     Reason,
     /// Give the first attempt below the attempt energy one ulp less.
     Short,
+    /// Flip the last bit of the first mutated parameter of the first
+    /// mutation.
+    Mutate,
+    /// Count one more replacement for the first birth of the first
+    /// mutation.
+    Recount,
+    /// Fail the first mutation.
+    Barren,
+    /// Give the first mutation one count fewer than its births.
+    Uncounted,
+    /// Count more mutations for the first birth than it has parameters.
+    Overcount,
 }
 
+/// The preset's founders cool down for 64 ticks (0.5 s at Δt = 1/128 s);
+/// with a cooldown of 0.01 s they propose from tick 2, below the attempt
+/// energy, and with an attempt minimum of 1.0 below their 2.0 they can
+/// propose viable births.
+const COOLDOWN: (&str, &str) = ("cooldown_seconds = 0.5", "cooldown_seconds = 0.01");
+const ATTEMPT: (&str, &str) = (
+    "minimum_parent_energy_before_attempt = 3.0",
+    "minimum_parent_energy_before_attempt = 1.0",
+);
+
 /// The world each change is planted in: the preset, unless the change
-/// needs an early death or an early proposal. The preset's founders cool
-/// down for 64 ticks (0.5 s at Δt = 1/128 s); with a cooldown of 0.01 s
-/// they propose from tick 2, below the attempt energy, and with an attempt
-/// minimum of 1.0 below their 2.0 they can propose viable births.
+/// needs an early death, an early proposal or early births.
 fn world_for(change: Change) -> String {
-    const COOLDOWN: (&str, &str) = ("cooldown_seconds = 0.5", "cooldown_seconds = 0.01");
-    const ATTEMPT: (&str, &str) = (
-        "minimum_parent_energy_before_attempt = 3.0",
-        "minimum_parent_energy_before_attempt = 1.0",
-    );
     match change {
         Change::Later => variant("2.0", "1000.0"),
         Change::Cool | Change::Reason | Change::Short => with(&[COOLDOWN]),
-        Change::Abstain | Change::Child => with(&[COOLDOWN, ATTEMPT]),
+        Change::Abstain
+        | Change::Child
+        | Change::Mutate
+        | Change::Recount
+        | Change::Barren
+        | Change::Uncounted
+        | Change::Overcount => with(&[COOLDOWN, ATTEMPT]),
         _ => PRESET.to_owned(),
     }
+}
+
+/// The early-births world in weight dtype `dtype`, whose births change
+/// member half the time, and whose first candidates are often their
+/// parents: only weights mutate, about one in each 10,000.
+fn fertile(dtype: &str) -> String {
+    let dtype = format!("canonical_weight_dtype = \"{dtype}\"");
+    with(&[
+        COOLDOWN,
+        ATTEMPT,
+        (
+            "probability_per_birth = 0.01",
+            "probability_per_birth = 0.5",
+        ),
+        ("weight_probability = 0.002", "weight_probability = 0.0001"),
+        (
+            "chemistry_standard_deviation = 0.01",
+            "chemistry_standard_deviation = 0.0",
+        ),
+        (
+            "sensing_log_scale_standard_deviation = 0.02",
+            "sensing_log_scale_standard_deviation = 0.0",
+        ),
+        ("canonical_weight_dtype = \"f32\"", dtype.as_str()),
+    ])
 }
 
 /// The preset with each line replaced, each found once.
@@ -321,11 +414,13 @@ fn with(lines: &[(&str, &str)]) -> String {
     })
 }
 
-/// The Metal phase 6 with one change at one tick.
+/// The Metal phase 6 with one change at one tick (a mutation's at the
+/// first mutation).
 #[derive(Debug)]
 struct Altered {
     inner: MetalSettle,
     ticks: u64,
+    mutations: u64,
     at: u64,
     change: Change,
 }
@@ -557,15 +652,148 @@ impl SettleBackend for Altered {
         }
         Ok(())
     }
+
+    fn mutation(
+        &mut self,
+        constants: &MutationConstants,
+        births: &[MutationBirth],
+        values: MutationValues<'_>,
+        out: &mut Vec<MutationCounts>,
+    ) -> Result<(), CoreError> {
+        self.mutations += 1;
+        let first = |change| self.mutations == 1 && self.change == change;
+        if first(Change::Barren) {
+            return Err(CoreError::StateConflict {
+                operation: "planted mutation failure",
+                detail: "the test's backend fails here".to_owned(),
+            });
+        }
+        match values {
+            MutationValues::F32(values) => {
+                self.inner
+                    .mutation(constants, births, MutationValues::F32(&mut *values), out)?;
+                if first(Change::Mutate)
+                    && let Some(value) = values.first_mut()
+                {
+                    *value = f32::from_bits(value.to_bits() ^ 1);
+                }
+            }
+            MutationValues::F16(values) => {
+                self.inner
+                    .mutation(constants, births, MutationValues::F16(&mut *values), out)?;
+                if first(Change::Mutate)
+                    && let Some(value) = values.first_mut()
+                {
+                    *value = F16::from_bits(value.to_bits() ^ 1);
+                }
+            }
+        }
+        if first(Change::Recount)
+            && let Some(count) = out.first_mut()
+        {
+            count.replaced += 1;
+        }
+        if first(Change::Uncounted) {
+            out.pop();
+        }
+        if first(Change::Overcount)
+            && let Some(count) = out.first_mut()
+        {
+            count.replaced = u32::MAX;
+        }
+        Ok(())
+    }
 }
 
 fn altered(at: u64, change: Change) -> Option<Altered> {
     settle().map(|inner| Altered {
         inner,
         ticks: 0,
+        mutations: 0,
         at,
         change,
     })
+}
+
+#[test]
+fn births_mutated_on_metal_are_the_reference_births() {
+    for dtype in ["f32", "f16"] {
+        let Some(device) = settle() else { return };
+        let toml = fertile(dtype);
+        let mut reference = found_from(&toml);
+        let mut metal = found_from(&toml);
+        metal.set_settle_backend(Some(Box::new(device)));
+        let raced = race(&mut reference, &mut metal, 12);
+        let report = metal.settle_report().clone();
+        println!("{dtype}: {raced:?}: {report:?}");
+        assert_eq!(raced.difference, None, "{dtype}: the worlds diverged");
+        assert_eq!((report.ticks, report.reference_ticks), (12, 0), "{dtype}");
+        assert_eq!(report.failure, None);
+        assert!(
+            raced.births > 0 && raced.mapped > 0 && raced.later > 0,
+            "{dtype}: {raced:?}"
+        );
+        assert!(report.mutated >= raced.births as u64, "{dtype}: {report:?}");
+    }
+}
+
+#[test]
+fn a_mutation_the_host_cannot_see_changes_the_world() {
+    for change in [Change::Mutate, Change::Recount] {
+        let Some(device) = altered(0, change) else {
+            return;
+        };
+        let toml = world_for(change);
+        let mut reference = found_from(&toml);
+        let mut metal = found_from(&toml);
+        metal.set_settle_backend(Some(Box::new(device)));
+        let raced = race(&mut reference, &mut metal, 12);
+        assert!(raced.first_births.is_some(), "{change:?}: {raced:?}");
+        assert_eq!(raced.difference, raced.first_births, "{change:?}");
+        let report = metal.settle_report();
+        assert_eq!(
+            (report.ticks, report.reference_ticks),
+            (12, 0),
+            "{change:?}: {report:?}"
+        );
+        assert!(report.mutated > 0, "{change:?}: {report:?}");
+    }
+}
+
+#[test]
+fn a_failing_or_refused_mutation_hands_its_births_to_the_reference_and_is_dropped() {
+    for (change, cause) in [
+        (Change::Barren, "planted mutation failure"),
+        (Change::Uncounted, "counted"),
+        (Change::Overcount, "parameters"),
+    ] {
+        let Some(device) = altered(0, change) else {
+            return;
+        };
+        let toml = world_for(change);
+        let mut reference = found_from(&toml);
+        let mut metal = found_from(&toml);
+        metal.set_settle_backend(Some(Box::new(device)));
+        let raced = race(&mut reference, &mut metal, 12);
+        assert_eq!(
+            raced.difference, None,
+            "{change:?}: the fallback must be the reference"
+        );
+        let first = raced.first_births.expect("births");
+        let report = metal.settle_report();
+        assert_eq!(
+            (report.ticks, report.reference_ticks, report.mutated),
+            (first, 1, 0),
+            "{change:?}: {report:?}"
+        );
+        assert!(
+            report
+                .failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains(cause)),
+            "{change:?}: {report:?}"
+        );
+    }
 }
 
 #[test]

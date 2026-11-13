@@ -47,19 +47,19 @@ pub mod sensors;
 pub mod settle;
 pub mod uptake;
 
-pub use birth::{
-    BIRTH_OPS_WORDS, MetalBirth, MutationBirth, MutationConstants, MutationCounts, ParameterBits,
-};
+pub use birth::{BIRTH_OPS_WORDS, MetalBirth, ParameterBits};
 pub use chemistry::{MetalChemistry, SETTLE_OPS_WORDS};
 pub use emission::{EMISSION_OPS_WORDS, MetalEmission};
 pub use field::MetalField;
-/// Phase 6's plain data (FL-032), which [`MetalChemistry`], [`MetalMotion`]
-/// and [`MetalEmission`] take and give: flife-field's port types.
+/// Phases 6 to 8's plain data (FL-032), which [`MetalChemistry`],
+/// [`MetalMotion`], [`MetalEmission`], [`MetalProposal`] and [`MetalBirth`]
+/// take and give: flife-field's port types.
 pub use flife_field::settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
-    EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MaintenanceOutcome,
-    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome, ProposalConstants,
-    ProposalOrganism, ProposalOutcome,
+    EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MUTATION_LAYERS,
+    MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome,
+    MutationBirth, MutationConstants, MutationCounts, MutationLayer, MutationValues,
+    ProposalConstants, ProposalOrganism, ProposalOutcome,
 };
 /// The memory a controller backend may hold (FL-043), for composition
 /// roots that make one through [`ControllerChoice::backend`].

@@ -132,7 +132,8 @@ implements the port's `check`, and a world given it as its field backend checks 
   not finite) is refused (`MissingCapability`), since the software binary64 carries no infinity; the world then
   checks on the reference.
 
-Residency (the field kept on the device across phases and ticks) is FL-032's remaining work.
+Residency (the field kept on the device across phases and ticks) was measured instead of built: its ceiling is
+about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below).
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -1258,6 +1259,39 @@ every packet, as the reference does. Two synchronous commands are added, with th
 and about 16,000 packets uploaded and the results read back. So nothing selects it. Like phases 2 and 3, it pays
 only once the field stays on the device between phases (FL-032).
 
+**The whole tick's frontier and profile (FL-032).** `tick_throughput`'s `+settle` puts phases 6 to 8 on
+`MetalSettle`. `+all` puts the field, sensors, uptake and settlement on one owner. Measured 2026-11-13 on the M5
+Ultra under other load, digests equal after every block.
+
+| preset, 16 workers | Metal controllers | + phases 6–8 on Metal | + every phase on Metal |
+|---|---|---|---|
+| reference (4,096 founders, 128²), load 24 | 123.5 ticks/s (cv 3.1%) | 74.2 (cv 2.7%), 0.60× | 62.7 (cv 2.3%), 0.51× |
+| interactive (25,000 founders, 256²), load 42 | 24.3 (cv 7.3%, inadmissible) | | 15.3 (cv 2.9%) |
+
+The reference row used 20-tick blocks, 8 blocks and 40 warm-up ticks; the interactive row used 10-tick blocks, 6
+blocks and 20 warm-up ticks. The interactive preset has no admissible ratio.
+
+Then `sample` profiled `+all` for 10 s, counting the main thread's samples.
+- **Reference preset (3,884 samples):**
+  - 75.6% waits in `waitUntilCompleted` for the synchronous commands. Settlement's waits alone are 1,091 of
+    its 1,251 samples, and the field step's are 478 of 585.
+  - 3.0% `memmove`, field and organisms together; the field's share is about 2%.
+- **Interactive preset (4,933 samples, a window that may include the end of the warm-up):**
+  - 21.6% GPU waits and 12.8% `memmove`.
+  - The host's own work leads: settlement's staging and replay (772 samples, plus 392 copying organism
+    inputs) and the controllers' (662).
+  - The field's own copies (step, reduction, check, uptake) are about 50 samples, roughly 1%. Sampling's 89
+    mix the field's upload with the samples' readback.
+
+So field residency between phases, which FL-031's closing comment assigned to FL-032, has a measured ceiling of
+about 1–3% of the all-Metal tick on both presets. That is within the rows' noise, so it was not built.
+- The reference preset's measured cost is synchronous command round trips and software-binary64 kernel time.
+  The lever there is fewer, larger commands per tick: a bounded command graph (§11.1), which needs the
+  intermediates on the device.
+- The interactive preset's cost is the host's staging and replay and the organisms' uploads. The lever there
+  is live organism state on the device (§10.5).
+- Both are throughput work for the profiles FL-034 qualifies, not stage semantics.
+
 **The softfloat miscompile.** While building the weights kernel, every in-radius weight came out wrong, always
 the same wrong value. Instrumented variants and a trace kernel computed the right one. `exp_neg`'s series indexed
 a `constant ulong INTEGER[17]` table of binary64 integers inside its loop; computing the divisor with
@@ -1323,7 +1357,8 @@ per-pass thread spawning (6%).
   - The field is not resident: phase 2 uploads and reads it back every step, in two synchronous commands; phase 3
     uploads it again and reads every sample back (3.2 MB on the preset) in a third; and phase 5 uploads the energy
     plane again, with the footprints and packets, in two more. Residency needs the field kept on the device between
-    them, and the observation encoding on the device to keep the samples there (FL-032).
+    them, and the observation encoding on the device to keep the samples there. FL-032 measured that the field's
+copies are about 1–3% of the all-Metal tick, so residency was not built (the whole tick's frontier and profile).
   - Measured slower than the CPU on the preset (above), so nothing selects it by default: no CLI or Studio
     choice exists yet, unlike `ControllerChoice`. The engine ports, these tests and `tick_throughput` are its only
     users.

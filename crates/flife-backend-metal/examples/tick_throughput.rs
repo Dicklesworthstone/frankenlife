@@ -9,7 +9,9 @@
 //! Metal after a `+`: `cpu+sensors` samples phase 3 on `MetalSensors`, and
 //! `cpu+field` steps phase 2 on `MetalField`, and `cpu+uptake` computes
 //! phase 5's demands and grants on `MetalUptake` (FL-031), for example
-//! `cpu,cpu+sensors,metal+sensors+field+uptake`. `+slots=N` puts the controllers on
+//! `cpu,cpu+sensors,metal+sensors+field+uptake`; `+settle` runs phases 6 to 8
+//! on `MetalSettle`, and `+all` puts the field, sensors, uptake and settlement
+//! on one device owner (FL-032). `+slots=N` puts the controllers on
 //! a `MetalBackend` with `N` genomes to a parameter shard (FL-026), for
 //! example `metal,metal+slots=4096`. A choice this host refuses
 //! (`metal` without a device) is reported and left out. Prints one JSON line.
@@ -18,7 +20,8 @@ use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use flife_backend_metal::{
-    BackendBudget, ControllerChoice, MetalBackend, MetalField, MetalSensors, MetalUptake,
+    BackendBudget, ControllerChoice, MetalBackend, MetalField, MetalSensors, MetalSettle,
+    MetalUptake,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -44,13 +47,23 @@ fn found(workers: NonZeroUsize, name: &str, config: &ValidatedConfig) -> Result<
             "sensors" => world.set_sensor_backend(Some(Box::new(MetalSensors::open()?))),
             "field" => world.set_field_backend(Some(Box::new(MetalField::open()?))),
             "uptake" => world.set_uptake_backend(Some(Box::new(MetalUptake::open()?))),
+            "settle" => world.set_settle_backend(Some(Box::new(MetalSettle::open()?))),
+            "all" => {
+                let settle = MetalSettle::open()?;
+                let owner = settle.owner().clone();
+                world.set_field_backend(Some(Box::new(MetalField::with_owner(owner.clone())?)));
+                world.set_sensor_backend(Some(Box::new(MetalSensors::with_owner(owner.clone())?)));
+                world.set_uptake_backend(Some(Box::new(MetalUptake::with_owner(owner)?)));
+                world.set_settle_backend(Some(Box::new(settle)));
+            }
             other => {
                 let slots: u64 = other
                     .strip_prefix("slots=")
                     .and_then(|slots| slots.parse().ok())
                     .ok_or_else(|| {
                         refused(format!(
-                            "`{other}` is not `sensors`, `field`, `uptake` or `slots=N`"
+                            "`{other}` is not `sensors`, `field`, `uptake`, `settle`, `all` or \
+                             `slots=N`"
                         ))
                     })?;
                 world
@@ -166,12 +179,14 @@ fn main() -> Result<(), CoreError> {
             let report = entry.world.controller_report();
             let (sensors, field) = (entry.world.sensor_report(), entry.world.field_report());
             let uptake = entry.world.uptake_report();
+            let settle = entry.world.settle_report();
             let rate = median(&entry.rates);
             format!(
                 "{{\"choice\":\"{}\",\"ticks_per_s\":{rate:.3},\"cv_percent\":{:.2},\
                  \"ratio_to_first\":{:.3},\"samples\":{:?},\"batched\":{},\"deferred\":{},\
                  \"reference_ticks\":{},\"sensor_ticks\":[{},{}],\"field_steps\":[{},{}],\
-                 \"uptake_ticks\":[{},{}]}}",
+                 \"uptake_ticks\":[{},{}],\"field_reductions\":[{},{}],\
+                 \"field_checks\":[{},{}],\"settle_ticks\":[{},{}]}}",
                 entry.name,
                 cv(&entry.rates),
                 rate / baseline,
@@ -184,7 +199,13 @@ fn main() -> Result<(), CoreError> {
                 field.steps,
                 field.reference_steps,
                 uptake.ticks,
-                uptake.reference_ticks
+                uptake.reference_ticks,
+                field.reductions,
+                field.reference_reductions,
+                field.checks,
+                field.reference_checks,
+                settle.ticks,
+                settle.reference_ticks
             )
         })
         .collect();

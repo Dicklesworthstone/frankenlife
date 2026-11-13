@@ -125,9 +125,7 @@ impl FieldState {
         workers: usize,
     ) -> Result<FieldSummary, CoreError> {
         let grid = *self.grid();
-        let planes: Vec<&[f32]> = (0..FIELD_PLANES)
-            .filter_map(|plane| self.plane(plane))
-            .collect();
+        let planes = self.planes();
         let Some((energy, moments)) = planes.split_first() else {
             return Ok(FieldSummary {
                 energy_total: 0.0,
@@ -180,6 +178,176 @@ impl FieldState {
     }
 }
 
+/// What a scan of INV-01 and INV-02 found (FL-032): a backend's phase 10
+/// check of a field, which [`FieldState::scan_invariants`] gives on the host
+/// and [`FieldState::summarize_scan`] turns into the [`FieldSummary`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FieldScan {
+    /// The first cell, in cell-index order, that fails INV-01 or INV-02.
+    pub offending: Option<usize>,
+    /// When no cell fails, the largest cone residual and the first cell
+    /// holding it, if it is positive; `None` when a cell fails.
+    pub largest: Option<(usize, f64)>,
+}
+
+impl FieldState {
+    /// The field's planes: the energy plane first, then the moment planes.
+    fn planes(&self) -> Vec<&[f32]> {
+        (0..FIELD_PLANES)
+            .filter_map(|plane| self.plane(plane))
+            .collect()
+    }
+
+    /// The reference's scan for a backend's phase 10 (FL-032): each cell in
+    /// cell-index order through [`FieldState::check_invariants`]'s
+    /// arithmetic, stopping at the first that fails, else the first cell
+    /// with the largest positive cone residual.
+    #[must_use]
+    pub fn scan_invariants(&self, tolerance: ConeTolerance) -> FieldScan {
+        let planes = self.planes();
+        let mut scan = FieldScan {
+            offending: None,
+            largest: None,
+        };
+        let Some((energy, moments)) = planes.split_first() else {
+            return scan;
+        };
+        let width = u64::from(self.grid().cells_x());
+        for index in 0..energy.len() {
+            match check_cell(energy, moments, index, tolerance, width) {
+                Err(_) => {
+                    return FieldScan {
+                        offending: Some(index),
+                        largest: None,
+                    };
+                }
+                Ok(residual) => {
+                    if residual > scan.largest.map_or(0.0, |(_, largest)| largest) {
+                        scan.largest = Some((index, residual));
+                    }
+                }
+            }
+        }
+        scan
+    }
+
+    /// The [`FieldSummary`] [`FieldState::check_invariants`] gives, from a
+    /// backend's `scan` of this field at `tolerance` (FL-032): its largest
+    /// residual, which the host recomputes for its cell and requires to be
+    /// the same bits, with the energy total summed in cell-index order and
+    /// the empty cells counted on the host. `None` when the scan names a
+    /// failing cell: [`FieldState::check_invariants_on`] then names the
+    /// error.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] when the scan cannot be this field's: a
+    /// cell outside the field, a largest residual that is not positive or
+    /// not the host's own for its cell, or a cell the host finds failing
+    /// (the largest, or any cell's energy).
+    pub fn summarize_scan(
+        &self,
+        tolerance: ConeTolerance,
+        scan: &FieldScan,
+    ) -> Result<Option<FieldSummary>, CoreError> {
+        let conflict = |detail: String| CoreError::StateConflict {
+            operation: "field check backend",
+            detail,
+        };
+        let planes = self.planes();
+        let mut summary = FieldSummary {
+            energy_total: 0.0,
+            max_cone_residual: 0.0,
+            max_cone_residual_cell: None,
+            empty_cells: 0,
+        };
+        let Some((energy, moments)) = planes.split_first() else {
+            return Ok(Some(summary));
+        };
+        let width = u64::from(self.grid().cells_x());
+        if let Some(index) = scan.offending {
+            if index >= energy.len() {
+                return Err(conflict(format!(
+                    "failing cell {index} of {}",
+                    energy.len()
+                )));
+            }
+            return Ok(None);
+        }
+        if let Some((index, residual)) = scan.largest {
+            let own = check_cell(energy, moments, index, tolerance, width)
+                .map_err(|error| conflict(format!("its largest cell {index}: {error}")))?;
+            if own <= 0.0 || own.to_bits() != residual.to_bits() {
+                return Err(conflict(format!(
+                    "cell {index}'s residual is {own:e}, not {residual:e}"
+                )));
+            }
+            summary.max_cone_residual = residual;
+            summary.max_cone_residual_cell = Some(locate(index, width));
+        }
+        for (index, &cell_energy) in energy.iter().enumerate() {
+            let e = f64::from(cell_energy);
+            if !e.is_finite() || e < 0.0 {
+                return Err(conflict(format!("cell {index} holds {cell_energy:?}")));
+            }
+            summary.energy_total += e;
+            if e == 0.0 {
+                summary.empty_cells += 1;
+            }
+        }
+        Ok(Some(summary))
+    }
+}
+
+/// Cell `index`'s coordinates on a grid `width` cells wide.
+fn locate(index: usize, width: u64) -> (u32, u32) {
+    let index = u64::try_from(index).unwrap_or(u64::MAX);
+    let x = u32::try_from(index % width).unwrap_or(u32::MAX);
+    let y = u32::try_from(index / width).unwrap_or(u32::MAX);
+    (x, y)
+}
+
+/// Check cell `index`, INV-01 then INV-02 at `tolerance`, and give its cone
+/// residual: `max(0, ||m||₂ − e)`, the squares summed in channel order.
+fn check_cell(
+    energy: &[f32],
+    moments: &[&[f32]],
+    index: usize,
+    tolerance: ConeTolerance,
+    width: u64,
+) -> Result<f64, CoreError> {
+    let cell_energy = energy.get(index).copied().unwrap_or(f32::NAN);
+    let e = f64::from(cell_energy);
+    if !e.is_finite() || e < 0.0 {
+        let (x, y) = locate(index, width);
+        return Err(CoreError::NumericalInvalid {
+            quantity: "field energy",
+            detail: format!("cell ({x}, {y}) holds {cell_energy:?} (INV-01)"),
+        });
+    }
+    let mut squares = 0.0_f64;
+    for (channel, plane) in moments.iter().enumerate() {
+        let m = plane.get(index).copied().unwrap_or(f32::NAN);
+        if !m.is_finite() {
+            let (x, y) = locate(index, width);
+            return Err(CoreError::NumericalInvalid {
+                quantity: "field moment",
+                detail: format!("cell ({x}, {y}) channel {channel} holds {m:?} (INV-01)"),
+            });
+        }
+        let m = f64::from(m);
+        squares += m * m;
+    }
+    let residual = (squares.sqrt() - e).max(0.0);
+    if !tolerance.allows(residual, e) {
+        let (x, y) = locate(index, width);
+        return Err(CoreError::NumericalInvalid {
+            quantity: "chemical moment cone",
+            detail: format!("cell ({x}, {y}): ||m|| exceeds e = {e:?} by {residual:?} (INV-02)"),
+        });
+    }
+    Ok(residual)
+}
+
 /// Check cells `range` in cell-index order, stopping at the first offending
 /// cell, and measure them.
 fn check_range(
@@ -189,52 +357,16 @@ fn check_range(
     tolerance: ConeTolerance,
     width: u64,
 ) -> Result<RangeSummary, CoreError> {
-    let locate = |index: usize| {
-        let index = u64::try_from(index).unwrap_or(u64::MAX);
-        let x = u32::try_from(index % width).unwrap_or(u32::MAX);
-        let y = u32::try_from(index / width).unwrap_or(u32::MAX);
-        (x, y)
-    };
     let mut summary = RangeSummary::default();
     let first = range.start;
     for (offset, &cell_energy) in energy.get(range).unwrap_or(&[]).iter().enumerate() {
         let index = first + offset;
-        let e = f64::from(cell_energy);
-        if !e.is_finite() || e < 0.0 {
-            let (x, y) = locate(index);
-            return Err(CoreError::NumericalInvalid {
-                quantity: "field energy",
-                detail: format!("cell ({x}, {y}) holds {cell_energy:?} (INV-01)"),
-            });
-        }
-        let mut squares = 0.0_f64;
-        for (channel, plane) in moments.iter().enumerate() {
-            let m = plane.get(index).copied().unwrap_or(f32::NAN);
-            if !m.is_finite() {
-                let (x, y) = locate(index);
-                return Err(CoreError::NumericalInvalid {
-                    quantity: "field moment",
-                    detail: format!("cell ({x}, {y}) channel {channel} holds {m:?} (INV-01)"),
-                });
-            }
-            let m = f64::from(m);
-            squares += m * m;
-        }
-        let residual = (squares.sqrt() - e).max(0.0);
-        if !tolerance.allows(residual, e) {
-            let (x, y) = locate(index);
-            return Err(CoreError::NumericalInvalid {
-                quantity: "chemical moment cone",
-                detail: format!(
-                    "cell ({x}, {y}): ||m|| exceeds e = {e:?} by {residual:?} (INV-02)"
-                ),
-            });
-        }
+        let residual = check_cell(energy, moments, index, tolerance, width)?;
         if residual > summary.max_cone_residual {
             summary.max_cone_residual = residual;
-            summary.max_cone_residual_cell = Some(locate(index));
+            summary.max_cone_residual_cell = Some(locate(index, width));
         }
-        if e == 0.0 {
+        if f64::from(cell_energy) == 0.0 {
             summary.empty_cells += 1;
         }
     }

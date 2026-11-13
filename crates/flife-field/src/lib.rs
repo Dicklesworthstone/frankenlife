@@ -64,7 +64,7 @@ pub use deposit::{DepositReduction, DepositSummary, Deposits, apply_deposits, ap
 pub use exchange::{ExchangeStencil, check_request, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
-pub use invariants::{ConeTolerance, FieldSummary};
+pub use invariants::{ConeTolerance, FieldScan, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
 pub use pyramid::{
     Corners, LevelGrid, PyramidView, RawSample, SensorBackend, SensorPyramid, SensorQuery,

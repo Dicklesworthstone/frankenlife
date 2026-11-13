@@ -887,6 +887,143 @@ fn refusal(result: Result<FieldSummary, CoreError>) -> (&'static str, String) {
 /// include zero (taken as one) and more workers than ranges.
 #[test]
 fn invariants_check_the_same_on_any_number_of_workers() {
+    let state = ranged_field();
+    let tolerant = ConeTolerance::new(1.0e-7, 0.0).expect("tolerance");
+    let one = state.check_invariants(tolerant).expect("within tolerance");
+    assert_eq!(one.max_cone_residual_cell, Some((5, 40)));
+    assert!(one.empty_cells > 0 && one.energy_total > 0.0);
+    let expected = summary_bits(&one);
+    let counts = [0, 1, 2, 3, 4, 5, 6, 16, 64];
+    for workers in counts {
+        let summary = state
+            .check_invariants_on(tolerant, workers)
+            .expect("within tolerance");
+        assert_eq!(summary_bits(&summary), expected, "{workers} workers");
+    }
+
+    // A nonfinite moment in the last range and a negative energy in the
+    // third: within the tolerance the negative energy is first; with no
+    // tolerance the slight cone excess in the first range is.
+    let bad = ranged_failures(&state);
+    for (tolerance, quantity, cell) in [
+        (tolerant, "field energy", "cell (30, 70)"),
+        (ConeTolerance::EXACT, "chemical moment cone", "cell (10, 3)"),
+    ] {
+        let expected = refusal(bad.check_invariants(tolerance));
+        assert_eq!(expected.0, quantity);
+        assert!(expected.1.contains(cell), "{}", expected.1);
+        for workers in counts {
+            assert_eq!(
+                refusal(bad.check_invariants_on(tolerance, workers)),
+                expected,
+                "{workers} workers"
+            );
+        }
+    }
+}
+
+/// FL-032's scan for a device phase 10: `scan_invariants` names the first
+/// failing cell, or the first cell with the largest residual, as
+/// `check_invariants` does, and `summarize_scan` turns a scan into
+/// `check_invariants`'s summary to the bit, refusing one that cannot be the
+/// field's.
+#[test]
+fn a_scan_is_the_check_and_its_summary_the_checks() {
+    let state = ranged_field();
+    let width = 160;
+    let at = |x: usize, y: usize| y * width + x;
+    let tolerant = ConeTolerance::new(1.0e-7, 0.0).expect("tolerance");
+    let one = state.check_invariants(tolerant).expect("within tolerance");
+    let scan = state.scan_invariants(tolerant);
+    assert_eq!(scan.offending, None);
+    let (largest, residual) = scan.largest.expect("a positive residual");
+    assert_eq!(
+        (largest, residual.to_bits()),
+        (at(5, 40), one.max_cone_residual.to_bits())
+    );
+    let summary = state
+        .summarize_scan(tolerant, &scan)
+        .expect("the field's own scan")
+        .expect("no failing cell");
+    assert_eq!(summary_bits(&summary), summary_bits(&one));
+
+    // On the cone everywhere: no largest residual, and the summary still
+    // the check's.
+    let mut exact = FieldState::zeroed(*state.grid(), &BufferLimits::host()).expect("allocate");
+    let mut cell = Cell::EMPTY;
+    cell.energy = 2.0;
+    cell.moments[3] = -2.0;
+    exact.set_cell(7, 9, &cell).expect("in range");
+    let exact_scan = exact.scan_invariants(ConeTolerance::EXACT);
+    assert_eq!(
+        (exact_scan.offending, exact_scan.largest),
+        (None, None),
+        "{exact_scan:?}"
+    );
+    let summary = exact
+        .summarize_scan(ConeTolerance::EXACT, &exact_scan)
+        .expect("the field's own scan")
+        .expect("no failing cell");
+    assert_eq!(
+        summary_bits(&summary),
+        summary_bits(&exact.check_invariants(ConeTolerance::EXACT).expect("on it"))
+    );
+
+    // The first failing cell, whatever fails after it.
+    let bad = ranged_failures(&state);
+    for (tolerance, first) in [(tolerant, at(30, 70)), (ConeTolerance::EXACT, at(10, 3))] {
+        let scan = bad.scan_invariants(tolerance);
+        assert_eq!((scan.offending, scan.largest), (Some(first), None));
+        assert!(matches!(bad.summarize_scan(tolerance, &scan), Ok(None)));
+    }
+
+    // Scans that cannot be this field's.
+    let ulp = f64::from_bits(residual.to_bits() + 1);
+    let cells = 160 * 128;
+    let refused = [
+        ("a residual one ulp off", None, Some((largest, ulp))),
+        ("another cell's residual", None, Some((at(10, 3), residual))),
+        ("a zero residual", None, Some((at(0, 0), 0.0))),
+        ("a largest cell outside", None, Some((cells, residual))),
+        ("a failing cell outside", Some(cells), None),
+    ];
+    for (name, offending, largest) in refused {
+        let scan = flife_field::FieldScan { offending, largest };
+        assert!(
+            matches!(
+                state.summarize_scan(tolerant, &scan),
+                Err(CoreError::StateConflict {
+                    operation: "field check backend",
+                    ..
+                })
+            ),
+            "{name}"
+        );
+    }
+    // A clean scan of a field whose largest cell, or one energy, fails.
+    let mut failing = state.clone();
+    let mut over = Cell::EMPTY;
+    over.energy = 1.0;
+    over.moments[0] = 2.0;
+    failing.set_cell(5, 40, &over).expect("in range");
+    let negative = ranged_failures(&state);
+    for (name, field) in [("its largest cell", &failing), ("an energy", &negative)] {
+        assert!(
+            matches!(
+                field.summarize_scan(tolerant, &scan),
+                Err(CoreError::StateConflict { .. })
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// [`invariants_check_the_same_on_any_number_of_workers`]'s field: 160 ×
+/// 128 cells, most holding energy and one moment inside the cone, two just
+/// outside it with the same residual (cells (5, 40) and (70, 100)), and a
+/// slighter one at (10, 3).
+#[expect(clippy::expect_used, reason = "test helper")]
+fn ranged_field() -> FieldState {
     let grid = grid(160, 128, 160.0, 128.0);
     let mut state = FieldState::zeroed(grid, &BufferLimits::host()).expect("allocate");
     let mut seed = 0x5eed_u64;
@@ -919,23 +1056,13 @@ fn invariants_check_the_same_on_any_number_of_workers() {
     state.set_cell(10, 3, &slight).expect("in range");
     state.set_cell(5, 40, &over).expect("in range");
     state.set_cell(70, 100, &over).expect("in range");
+    state
+}
 
-    let tolerant = ConeTolerance::new(1.0e-7, 0.0).expect("tolerance");
-    let one = state.check_invariants(tolerant).expect("within tolerance");
-    assert_eq!(one.max_cone_residual_cell, Some((5, 40)));
-    assert!(one.empty_cells > 0 && one.energy_total > 0.0);
-    let expected = summary_bits(&one);
-    let counts = [0, 1, 2, 3, 4, 5, 6, 16, 64];
-    for workers in counts {
-        let summary = state
-            .check_invariants_on(tolerant, workers)
-            .expect("within tolerance");
-        assert_eq!(summary_bits(&summary), expected, "{workers} workers");
-    }
-
-    // A nonfinite moment in the last range and a negative energy in the
-    // third: within the tolerance the negative energy is first; with no
-    // tolerance the slight cone excess in the first range is.
+/// `state` with a nonfinite moment in the last range, at (150, 120), and a
+/// negative energy in the third, at (30, 70).
+#[expect(clippy::expect_used, reason = "test helper")]
+fn ranged_failures(state: &FieldState) -> FieldState {
     let mut bad = state.clone();
     let mut nan = Cell::EMPTY;
     nan.energy = 1.0;
@@ -944,19 +1071,5 @@ fn invariants_check_the_same_on_any_number_of_workers() {
     let mut negative = Cell::EMPTY;
     negative.energy = -1.0;
     bad.set_cell(30, 70, &negative).expect("in range");
-    for (tolerance, quantity, cell) in [
-        (tolerant, "field energy", "cell (30, 70)"),
-        (ConeTolerance::EXACT, "chemical moment cone", "cell (10, 3)"),
-    ] {
-        let expected = refusal(bad.check_invariants(tolerance));
-        assert_eq!(expected.0, quantity);
-        assert!(expected.1.contains(cell), "{}", expected.1);
-        for workers in counts {
-            assert_eq!(
-                refusal(bad.check_invariants_on(tolerance, workers)),
-                expected,
-                "{workers} workers"
-            );
-        }
-    }
+    bad
 }

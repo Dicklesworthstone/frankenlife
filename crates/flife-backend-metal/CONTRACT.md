@@ -113,8 +113,26 @@ to the F32 at or below `before + total`, what the cell received, and each moment
 sums it in cell order (`DepositReduction::summarize`). It then copies the device's field over the host's, and
 only then marks the grants and deposits applied. A non-finite value a kernel meets or would write raises the
 fault word (softfloat64 cannot carry an infinity), and nothing is written or applied (plan §8.3): the engine
-hands the reduction to the reference. Residency (the field kept on the device across phases and ticks), phase
-10's checks on the device and whole-tick parity are FL-032's remaining work.
+hands the reduction to the reference.
+
+FL-032, eighth stage: phase 10's field check on Metal, in `check` (`check.metal`): every cell's INV-01 and
+INV-02 check, bit for bit `FieldState::scan_invariants` (plan §4.2, §11.1's validation kernel). `MetalField`
+implements the port's `check`, and a world given it as its field backend checks each candidate field there.
+- The host uploads the field and the tolerance, and one command runs `field_check`.
+- `field_check` uses a thread per cell and 256 per threadgroup. A cell fails when its energy is not finite or is
+  below zero (`-0.0` is zero), when a moment is not finite, or when `max(0, sqrt(Σ m²) − e)` exceeds `absolute +
+  relative · e`; the squares are summed in channel order on `softfloat64.metal`'s binary64.
+- Each threadgroup reduces in a fixed tree to its smallest failing cell and its largest positive residual, ties
+  going to the smaller cell. Both are associative, so the tree's shape changes nothing.
+- The host merges the threadgroups in cell order: the first failing cell, else the first cell with the largest
+  residual.
+- The world builds the summary from the scan (`summarize_scan`), recomputing the largest residual's cell and
+  summing the energy itself.
+- A tolerance whose bound could overflow binary64 at the largest F32 energy (`absolute + relative · f32::MAX`
+  not finite) is refused (`MissingCapability`), since the software binary64 carries no infinity; the world then
+  checks on the reference.
+
+Residency (the field kept on the device across phases and ticks) is FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -149,7 +167,8 @@ hands the reduction to the reference. Residency (the field kept on the device ac
   `World::set_field_backend`. Each step receives the field pair, transport plan, source kernel, the tick's
   sources and the time step, exactly what `advance_field_on` takes. Each phase 9 (FL-032) receives the
   candidate field, the tick's grants and its emission and recycling deposits, exactly what `reduce_field_on`
-  takes. No CLI or Studio choice selects it yet (see the known gaps).
+  takes, and each phase 10 the candidate field and the profile's cone tolerance, what `scan_invariants` takes.
+  No CLI or Studio choice selects it yet (see the known gaps).
 - FL-031, the sensors: `MetalSensors::open()` (or `with_owner(owner)`, to share the field's owner), given to a
   world with `World::set_sensor_backend`. Each tick receives the pyramid (its grid and level count), the observed
   field and every live organism's `SensorQuery` (position, sensing scale), in row order. No CLI or Studio choice
@@ -594,20 +613,36 @@ A refusal changes nothing.
   - `random_worlds_step_as_the_reference`: 48 random worlds (grid shapes, cell sizes, kernels from a few cells
     to the whole torus, one to eight sources anywhere, substeps and decay). Any refusal must be the reference's
     too.
-- `tests/field_world.rs` (FL-031 and FL-032, 5 tests), the engine path, on the real preset:
-  - with its field on Metal, the world's digest equals the reference's at every one of 400 ticks; every step and
-    every phase 9 reduction came from the device, none failed, and the owner holds exactly the backend's 26
-    buffers (twelve for phase 2, fourteen for phase 9), with no lease, command or retiring buffer left;
+- `tests/field_world.rs` (FL-031 and FL-032, 5 tests), the engine path, on the real preset. Each race compares
+  the digests and the published field check (energy total, largest residual, its cell, empty cells) as bits:
+  - with its field on Metal, the two equal at every one of 400 ticks; every step, phase 9 reduction and phase 10
+    check came from the device, none failed, and the owner holds exactly the backend's 29 buffers (twelve for
+    phase 2, fourteen for phase 9, three for phase 10), with no lease, command or retiring buffer left;
   - with field and controllers both on Metal, 200 ticks, the same;
   - `recycled_removals_reduce_on_metal_as_on_the_reference`: 60 ticks with every organism within 12 world units
     of a wandering place removed and recycled every eight ticks (856 recycled), so phase 9 reduces both deposit
-    sets; the digests are equal at every tick and all 60 reductions came from the device;
-  - the planted negatives flip one bit of one moment value after the device's seventh step, and after its
-    seventh reduction, and the digests must differ at exactly tick 7;
-  - a backend failing at its fifth step (after leaving a damaged value in the candidate), or at its fifth
-    reduction, hands that phase to the reference and is dropped: the world stays the reference's, with 4 device
-    steps, 1 reference step and 4 device reductions, or 5 device steps, 4 device reductions and 1 reference
-    reduction, and the failure recorded.
+    sets; the digests are equal at every tick and all 60 reductions and checks came from the device;
+  - `one_flipped_field_bit_or_hidden_residual_changes_the_world`: one bit of one moment value flipped after the
+    device's seventh step, and after its seventh reduction, and the largest residual dropped from the check at
+    the preset's first tick with a positive one (tick 1); the worlds must differ at exactly that tick;
+  - `a_failing_field_backend_hands_its_step_to_the_reference_and_is_dropped`: a backend failing at its fifth
+    step (after leaving a damaged value in the candidate), or at its fifth reduction, a check accusing cell 0 at
+    the fifth tick, and a check reporting its largest residual one ulp high at the fifth tick, each hands that
+    phase to the reference and is dropped. The world stays the reference's; the step, reduction and check counts
+    (device, reference) are `(4, 1)`, `(4, 0)`, `(4, 0)`; `(5, 0)`, `(4, 1)`, `(4, 0)`; and `(5, 0)`, `(5, 0)`,
+    `(4, 1)` for both checks; the failure is recorded.
+- `tests/check.rs` (FL-032, 2 tests), `MetalField::check` against `FieldState::scan_invariants`, the residual
+  compared as bits, and for every field that passes, `summarize_scan` of the device's scan against
+  `check_invariants`:
+  - `the_metal_check_is_the_reference_scan_bit_for_bit`: random fields on `64 × 64`, `37 × 23`, `128 × 128` and
+    `1 × 1` tori (energies from subnormal to 1e6 with zeros of both signs, cells on and off the cone), three
+    rounds under five tolerances; ten kinds of failing cell (NaN, both infinities and a negative energy; a NaN
+    or infinite moment, in the first channel and the next; a residual past the bound) at four positions under
+    the exact tolerance; two failing cells; `-0.0` energies; a residual of exactly the bound (passes) and one ulp
+    of bound short (fails), absolute and relative; equal largest residuals in one threadgroup and in two, which
+    the first cell must win; and the 160 × 128 field of `flife-field`'s layout tests. At least 100 scans, 60
+    with a failing cell and 20 with a largest residual must run (107, 69 and 22 do).
+  - `a_bound_past_binary64_is_refused`: a relative tolerance of 1e300 is refused (`MissingCapability`).
 - `tests/reduce.rs` (FL-032, 2 tests), `MetalField::reduce` against `flife_field::reduce_field_on` from the
   same field, grants and deposits, every field value and both summaries compared as bits, and the grants and
   both sets applied:
@@ -789,7 +824,9 @@ A refusal changes nothing.
     emission capped at 1,000 per second (deaths 1,191, 1,154 and 935 at chemistry, maintenance and motion), and
     with emission capped at 10⁷ (3,356 at emission), 60 ticks each, every tick on the device.
   - `the_preset_with_every_metal_backend_on_one_device_is_the_reference_world`: the field, sensors, uptake and
-    phase 6 on one `DeviceOwner` and the controllers on `MetalBackend`, 120 ticks.
+    phase 6 on one `DeviceOwner` and the controllers on `MetalBackend`, 120 ticks, the published field checks
+    compared as bits too; all 120 field steps, reductions and checks came from the device, none from the
+    reference. Every phase of the tick that FL-032 puts on Metal runs there in this test.
   - `a_change_the_host_cannot_see_changes_the_world`: an organism moved one ulp further, two packets' amounts
     swapped, and a viable attempt reported as none; the worlds diverge at that tick and the backend serves every
     tick.
@@ -1007,6 +1044,20 @@ Planted mutants, each run in a scratch copy.
   changes an F64 by an ulp, which random cases never carried across an F32; the two boundary sums above now
   do. The zero-total guard in `deposits_reduce` was not planted, since only positive amounts are staged, so an
   occupied cell's total is positive.
+- FL-032's phase 10: 22 planted against `tests/check.rs`, `flife-field`'s `tests/field_layout.rs` and
+  `tests/field_world.rs`, 21 caught in one round:
+  - `check.metal` (11, 10 caught): a `-0.0` energy failing; a non-finite energy passing; moments not squared;
+    a residual exactly at the bound failing; the relative part dropped; zero residuals recorded; ties within a
+    threadgroup going to the later cell; the last failing cell kept; the moment planes shifted by one; the last
+    channel skipped. Dropping the moments' finiteness check survives and is equivalent: `softfloat64.metal`
+    turns any non-finite F32 into a positive QNaN, whose residual's bits order above every finite bound, so
+    the cell still fails. The check stays, to mirror INV-01 without relying on that order;
+  - `check.rs` (4, 4 caught): a later group's failing cell kept; ties across groups going to the later; a
+    bound that overflows sent to the device; a failing scan keeping its largest residual;
+  - flife-field (4, 4 caught): the largest residual's bits unchecked by `summarize_scan`; its energies
+    unchecked; the reference's ties going to the later cell; a failing cell outside the grid admitted;
+  - flife-engine (3, 3 caught): an accusation the reference refutes keeping the backend; checks not counted;
+    a failed check keeping the backend.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -1248,8 +1299,15 @@ per-pass thread spawning (6%).
   - The host sums stay serial on the CPU by design. A device reduction would need a fixed tree, which is a
     different numerical profile (§11.3). Phase 5's per-cell compensated sums run on the device in the reference's
     order, one thread per cell, so a hotspot cell is one thread's work.
-  - The world's invariant checks (about 10% of a one-worker tick in a profile) run on the CPU over the read-back
-    field.
+  - The world's invariant checks (about 10% of a one-worker tick in a profile) ran on the CPU over the read-back
+    field. FL-032 moves phase 10's field check to the device (its gaps are below).
+- FL-032's phase 10 gaps:
+  - The field is not resident here either: each check uploads the whole candidate field again (three more
+    buffers, 29 in all).
+  - The host still sums the energy total and counts empty cells in the reference's order, and recomputes the
+    largest residual's cell to check it; per §11.3 a device sum would need a fixed tree, a different profile.
+  - A tolerance whose bound could overflow binary64 is refused, so that world checks on the reference. The
+    profiles' tolerances are far below it.
 - FL-032's phase 9 gaps:
   - The field is not resident here either: each reduction uploads the whole candidate field and reads it back.
   - Its packet, direction and debit buffers grow during a tick when a reduction needs more (doubling), rather

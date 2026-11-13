@@ -673,6 +673,11 @@ pub struct FieldReport {
     /// Reductions the reference computed because the backend met an error,
     /// with the field, grants and deposits as they were.
     pub reference_reductions: u64,
+    /// Phase 10 field checks the backend scanned (FL-032).
+    pub checks: u64,
+    /// Checks the reference made because the backend met an error, gave a
+    /// scan that is not the field's, or failed a cell the reference passes.
+    pub reference_checks: u64,
     /// Why the backend stopped serving the world, if it failed.
     pub failure: Option<String>,
 }
@@ -2224,8 +2229,10 @@ impl World {
         emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
         recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
 
-        // Phase 10: invariants, accounting and the population's commit.
-        let field_summary = next.check_invariants_on(rules.profile.cone, workers)?;
+        // Phase 10: invariants, accounting and the population's commit. The
+        // field's check runs on the field backend if the world has one
+        // (FL-032).
+        let field_summary = check_field_with(next, rules.profile.cone, workers, fields)?;
         let closing = Holdings::new(next.energy_total(), organisms.value())?;
         let closure = tick_ledger.close(closing)?;
         let mut next_ledger = ledger.clone();
@@ -2559,6 +2566,48 @@ fn reduce_field_with(
         }
     }
     reduce_field_on(next, grants, [emissions, recycling], workers)
+}
+
+/// Phase 10's check of the next field (INV-01, INV-02 at `tolerance`), on
+/// the world's field backend if it has one (FL-032), else on the field's
+/// workers. The backend scans the field; the host builds the summary from
+/// the scan, recomputing its largest residual's cell and summing the energy
+/// in cell order. A scan that names a failing cell leaves the error to the
+/// reference. If the backend errs, its scan is not this field's, or it names
+/// a failing cell the reference passes, the reference's check is the tick's,
+/// the backend is dropped and the failure recorded.
+fn check_field_with(
+    next: &FieldState,
+    tolerance: ConeTolerance,
+    workers: usize,
+    fields: &mut Fields,
+) -> Result<FieldSummary, CoreError> {
+    let Fields { backend, report } = fields;
+    if let Some(device) = backend.as_deref_mut() {
+        let failure = match device
+            .check(next, tolerance)
+            .and_then(|scan| next.summarize_scan(tolerance, &scan))
+        {
+            Ok(Some(summary)) => {
+                report.checks = report.checks.saturating_add(1);
+                return Ok(summary);
+            }
+            Ok(None) => match next.check_invariants_on(tolerance, workers) {
+                Err(error) => {
+                    report.checks = report.checks.saturating_add(1);
+                    return Err(error);
+                }
+                Ok(_) => "the backend's check failed a cell the reference passes".to_owned(),
+            },
+            Err(error) => error.to_string(),
+        };
+        report.reference_checks = report.reference_checks.saturating_add(1);
+        let summary = next.check_invariants_on(tolerance, workers)?;
+        report.failure = Some(failure);
+        *backend = None;
+        return Ok(summary);
+    }
+    next.check_invariants_on(tolerance, workers)
 }
 
 /// Phase 3's raw samples on the world's sensor backend, if it has one and

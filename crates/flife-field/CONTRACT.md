@@ -201,7 +201,19 @@
   residual replaces an earlier one only when strictly larger (the first cell on a tie), and the energy total is
   summed on the calling thread in cell-index order. The summary and the error do not depend on the worker count
   (`invariants_check_the_same_on_any_number_of_workers`: 0 to 64 workers, the summary's bits, a residual tied
-  across ranges, and errors in three ranges).
+  across ranges, and errors in three ranges). One cell's check (`check_cell`) is shared by every caller, its
+  arithmetic unchanged.
+- FL-032's phase 10 on a device: `FieldBackend::check(field, tolerance)` returns a `FieldScan`, which must equal
+  `FieldState::scan_invariants(tolerance)`. A scan is the first cell, in cell-index order, that fails INV-01 or
+  INV-02 (`offending`); when none fails, it is the first cell with the largest positive cone residual and that
+  residual (`largest`). `FieldState::summarize_scan(tolerance, scan)` gives `check_invariants`'s summary from a
+  scan. It takes the largest residual after recomputing it for its cell and finding the same bits. It sums the
+  energy in cell-index order and counts the empty cells on the host, checking each energy as it goes. A scan that
+  names a failing cell gives `None`: `check_invariants_on` then names the error. A scan that cannot be the
+  field's is refused (`StateConflict`, "field check backend"): a cell outside the field, a residual that is not
+  positive or not the host's own bits, a largest cell that fails on the host, or an energy that does
+  (`a_scan_is_the_check_and_its_summary_the_checks`: the multi-range field's scan and summary, a field on the
+  cone, the first failing cell under two tolerances, and seven refused scans).
 - Initial field. `energy_per_cell` is rounded once to F32 and the composition is `zero`. The stored value is
   reported, and `injected_total` is exact for grids of at most 2^29 cells.
 

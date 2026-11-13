@@ -1,9 +1,11 @@
 //! FL-031's and FL-032's engine wiring: the real small-world preset with
-//! phases 2 and 9 on the Metal field backend is the reference world, digest
-//! for digest, at every tick, alone, together with the Metal controllers,
-//! and with organisms removed and recycled into the field. A flipped bit in
-//! one field value after either phase changes the world (the planted
-//! negative), and a backend that fails mid-run hands that phase to the
+//! phases 2, 9 and 10's field check on the Metal field backend is the
+//! reference world, digest for digest and published field check for field
+//! check, at every tick, alone, together with the Metal controllers, and
+//! with organisms removed and recycled into the field. A flipped bit in one
+//! field value after phase 2 or 9, or a check that hides its largest
+//! residual, changes the world (the planted negatives), and a backend that
+//! fails mid-run, or whose check the host refuses, hands that phase to the
 //! reference and is dropped, leaving the run the reference's.
 
 use flife_backend_metal::{MetalBackend, MetalField};
@@ -12,8 +14,8 @@ use flife_engine::{
     Arrangement, DeathCause, Disposition, Intervention, NumericalProfile, Stepped, World,
 };
 use flife_field::{
-    DepositSummary, Deposits, FieldBackend, FieldPair, FieldState, FieldStepReport, Grants, Source,
-    SourceKernel, TransportPlan,
+    ConeTolerance, DepositSummary, Deposits, FieldBackend, FieldPair, FieldScan, FieldState,
+    FieldStepReport, FieldSummary, Grants, Source, SourceKernel, TransportPlan,
 };
 use std::num::NonZeroUsize;
 
@@ -48,22 +50,52 @@ fn field() -> Option<MetalField> {
     }
 }
 
-/// Step both worlds; the first tick whose digests differ, and the births.
+/// What a race of two worlds found.
+#[derive(Debug)]
+struct Raced {
+    /// The first tick whose digests, or published field checks, differ.
+    difference: Option<u64>,
+    /// The births.
+    births: usize,
+    /// Ticks whose field check found a positive cone residual.
+    residuals: usize,
+}
+
+/// A field check's summary, its sums as bits.
+fn summary_bits(summary: &FieldSummary) -> (u64, u64, Option<(u32, u32)>, u64) {
+    (
+        summary.energy_total.to_bits(),
+        summary.max_cone_residual.to_bits(),
+        summary.max_cone_residual_cell,
+        summary.empty_cells,
+    )
+}
+
+/// Step both worlds, comparing their digests and the field checks they
+/// publish.
 #[expect(clippy::expect_used, clippy::panic, reason = "test helper")]
-fn race(reference: &mut World, other: &mut World, ticks: u64) -> (Option<u64>, usize) {
-    let (mut difference, mut births) = (None, 0);
+fn race(reference: &mut World, other: &mut World, ticks: u64) -> Raced {
+    let mut raced = Raced {
+        difference: None,
+        births: 0,
+        residuals: 0,
+    };
     for _ in 0..ticks {
         let expected = reference.step().expect("the reference steps");
         let got = other.step().expect("the other world steps");
-        match (expected, got) {
-            (Stepped::Published(_), Stepped::Published(report)) => births += report.births.len(),
-            (expected, got) => panic!("unexpected outcomes {expected:?} and {got:?}"),
-        }
-        if difference.is_none() && reference.digest() != other.digest() {
-            difference = Some(other.tick().get());
+        let (Stepped::Published(expected), Stepped::Published(got)) = (expected, got) else {
+            panic!("a tick did not publish");
+        };
+        raced.births += got.births.len();
+        raced.residuals += usize::from(expected.field.max_cone_residual > 0.0);
+        if raced.difference.is_none()
+            && (reference.digest() != other.digest()
+                || summary_bits(&expected.field) != summary_bits(&got.field))
+        {
+            raced.difference = Some(other.tick().get());
         }
     }
-    (difference, births)
+    raced
 }
 
 #[test]
@@ -74,21 +106,23 @@ fn the_preset_with_its_field_on_metal_is_the_reference_world_at_every_tick() {
     let mut reference = found();
     let mut metal = found();
     metal.set_field_backend(Some(Box::new(device)));
-    let (difference, births) = race(&mut reference, &mut metal, 400);
+    let raced = race(&mut reference, &mut metal, 400);
     let report = metal.field_report().clone();
-    println!("births {births}: {report:?}");
-    assert_eq!(difference, None, "the worlds diverged");
+    println!("{raced:?}: {report:?}");
+    assert_eq!(raced.difference, None, "the worlds diverged");
     assert_eq!(report.backend.as_deref(), Some(description.as_str()));
     assert_eq!((report.steps, report.reference_steps), (400, 0));
     assert_eq!((report.reductions, report.reference_reductions), (400, 0));
+    assert_eq!((report.checks, report.reference_checks), (400, 0));
     assert_eq!(report.failure, None);
-    assert!(births > 0);
+    assert!(raced.births > 0);
     // FL-028: the backend's twelve buffers for phase 2 (three field copies,
     // the moments, weights, fault word and six of parameters and
-    // candidates) and fourteen for phase 9 (the field, debits and their
+    // candidates), fourteen for phase 9 (the field, debits and their
     // parameters, a fault word, and each deposit set's offsets, packets,
-    // directions, parameters and received energy), with no lease, command
-    // or retiring buffer left over.
+    // directions, parameters and received energy) and three for phase 10
+    // (the field, its parameters and the threadgroups' results), with no
+    // lease, command or retiring buffer left over.
     let usage = owner.usage();
     assert_eq!(
         (
@@ -98,7 +132,7 @@ fn the_preset_with_its_field_on_metal_is_the_reference_world_at_every_tick() {
             usage.write_leases,
             usage.running
         ),
-        (26, 0, [0; 3], 0, 0),
+        (29, 0, [0; 3], 0, 0),
         "{usage:?}"
     );
 }
@@ -112,8 +146,8 @@ fn the_preset_with_field_and_controllers_on_metal_is_the_reference_world() {
     metal.set_controller_backend(Some(Box::new(
         MetalBackend::open().expect("a Metal device has the controllers too"),
     )));
-    let (difference, _) = race(&mut reference, &mut metal, 200);
-    assert_eq!(difference, None, "the worlds diverged");
+    let raced = race(&mut reference, &mut metal, 200);
+    assert_eq!(raced.difference, None, "the worlds diverged");
     assert_eq!(metal.field_report().steps, 200);
     assert!(metal.controller_report().batched > 0);
 }
@@ -125,10 +159,22 @@ enum Phase {
     Advance,
     /// Phase 9's reduction.
     Reduce,
+    /// Phase 10's field check, and what its scan says.
+    Check(Lie),
+}
+
+/// A changed field check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lie {
+    /// A largest residual one ulp larger (with `fail`), or no largest
+    /// residual at all.
+    Residual,
+    /// A failing first cell in a field that passes.
+    Accuse,
 }
 
 /// The Metal field with one change at one call of one phase: a bit of one
-/// value flipped, or a failure.
+/// value flipped, a check's scan changed, or a failure.
 #[derive(Debug)]
 struct Altered {
     inner: MetalField,
@@ -149,9 +195,10 @@ impl Altered {
         }
     }
 
-    /// Whether this call of `phase` is the one to change.
-    fn now(&mut self, phase: Phase) -> bool {
-        if self.phase != phase {
+    /// Whether this is the call to change, counting the calls of the
+    /// altered phase (`altered`).
+    fn now(&mut self, altered: bool) -> bool {
+        if !altered {
             return false;
         }
         self.calls += 1;
@@ -173,7 +220,7 @@ impl FieldBackend for Altered {
         step: TimeStep,
     ) -> Result<FieldStepReport, CoreError> {
         let report = self.inner.advance(pair, plan, kernel, sources, step)?;
-        if self.now(Phase::Advance) {
+        if self.now(self.phase == Phase::Advance) {
             if self.fail {
                 // Leave a damaged candidate behind, as a device failing
                 // mid-step could.
@@ -195,7 +242,7 @@ impl FieldBackend for Altered {
         grants: &mut Grants,
         deposits: [&mut Deposits; 2],
     ) -> Result<[DepositSummary; 2], CoreError> {
-        let now = self.now(Phase::Reduce);
+        let now = self.now(self.phase == Phase::Reduce);
         if now && self.fail {
             // A device that fails reduces nothing (plan §8.3).
             return Err(CoreError::StateConflict {
@@ -210,43 +257,114 @@ impl FieldBackend for Altered {
         }
         Ok(summaries)
     }
+
+    fn check(
+        &mut self,
+        field: &FieldState,
+        tolerance: ConeTolerance,
+    ) -> Result<FieldScan, CoreError> {
+        let Phase::Check(lie) = self.phase else {
+            return self.inner.check(field, tolerance);
+        };
+        if !self.now(true) {
+            return self.inner.check(field, tolerance);
+        }
+        let mut scan = self.inner.check(field, tolerance)?;
+        match (lie, self.fail) {
+            (Lie::Residual, false) => scan.largest = None,
+            (Lie::Residual, true) => {
+                scan.largest = scan
+                    .largest
+                    .map(|(cell, residual)| (cell, f64::from_bits(residual.to_bits() + 1)));
+            }
+            (Lie::Accuse, _) => scan.offending = Some(0),
+        }
+        Ok(scan)
+    }
+}
+
+/// The preset's ticks up to the first whose field check finds a positive
+/// cone residual (where hiding it changes the published check).
+#[expect(clippy::expect_used, clippy::panic, reason = "test helper")]
+fn first_residual_tick() -> u64 {
+    let mut world = found();
+    for tick in 1..=400 {
+        let Stepped::Published(report) = world.step().expect("the preset steps") else {
+            panic!("a tick did not publish");
+        };
+        if report.field.max_cone_residual > 0.0 {
+            return tick;
+        }
+    }
+    panic!("no tick of the preset has a positive cone residual");
 }
 
 #[test]
-fn one_flipped_field_bit_changes_the_world() {
-    for phase in [Phase::Advance, Phase::Reduce] {
+fn one_flipped_field_bit_or_hidden_residual_changes_the_world() {
+    let residual = first_residual_tick();
+    println!("first positive residual at tick {residual}");
+    for (phase, at) in [
+        (Phase::Advance, 7),
+        (Phase::Reduce, 7),
+        (Phase::Check(Lie::Residual), residual),
+    ] {
         let Some(inner) = field() else { return };
         let mut reference = found();
         let mut metal = found();
-        metal.set_field_backend(Some(Box::new(Altered::new(inner, phase, 7, false))));
-        let (difference, _) = race(&mut reference, &mut metal, 10);
-        assert_eq!(difference, Some(7), "{phase:?}");
+        metal.set_field_backend(Some(Box::new(Altered::new(inner, phase, at, false))));
+        let raced = race(&mut reference, &mut metal, at + 3);
+        assert_eq!(raced.difference, Some(at), "{phase:?}");
     }
 }
 
 #[test]
 fn a_failing_field_backend_hands_its_step_to_the_reference_and_is_dropped() {
-    for (phase, counts, planted) in [
-        (Phase::Advance, (4, 1, 4, 0), "planted field failure"),
-        (Phase::Reduce, (5, 0, 4, 1), "planted reduction failure"),
+    let residual = first_residual_tick().max(5);
+    for (phase, at, counts, planted) in [
+        (
+            Phase::Advance,
+            5,
+            (4, 1, 4, 0, 4, 0),
+            "planted field failure",
+        ),
+        (
+            Phase::Reduce,
+            5,
+            (5, 0, 4, 1, 4, 0),
+            "planted reduction failure",
+        ),
+        (
+            Phase::Check(Lie::Accuse),
+            5,
+            (5, 0, 5, 0, 4, 1),
+            "failed a cell the reference passes",
+        ),
+        (
+            Phase::Check(Lie::Residual),
+            residual,
+            (residual, 0, residual, 0, residual - 1, 1),
+            "field check backend",
+        ),
     ] {
         let Some(inner) = field() else { return };
         let mut reference = found();
         let mut metal = found();
-        metal.set_field_backend(Some(Box::new(Altered::new(inner, phase, 5, true))));
-        let (difference, _) = race(&mut reference, &mut metal, 12);
+        metal.set_field_backend(Some(Box::new(Altered::new(inner, phase, at, true))));
+        let raced = race(&mut reference, &mut metal, at + 7);
         assert_eq!(
-            difference, None,
+            raced.difference, None,
             "{phase:?}: the fallback must be the reference"
         );
-        // Dropped at tick 5: nothing after it ran on the backend.
+        // Dropped at that tick: nothing after it ran on the backend.
         let report = metal.field_report();
         assert_eq!(
             (
                 report.steps,
                 report.reference_steps,
                 report.reductions,
-                report.reference_reductions
+                report.reference_reductions,
+                report.checks,
+                report.reference_checks,
             ),
             counts,
             "{report:?}"
@@ -305,4 +423,5 @@ fn recycled_removals_reduce_on_metal_as_on_the_reference() {
     println!("recycled {recycled}: {report:?}");
     assert!(recycled > 20, "{recycled}");
     assert_eq!((report.reductions, report.reference_reductions), (60, 0));
+    assert_eq!((report.checks, report.reference_checks), (60, 0));
 }

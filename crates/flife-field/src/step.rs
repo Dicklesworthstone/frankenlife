@@ -12,6 +12,7 @@ use flife_core::{CoreError, TimeStep};
 use crate::deposit::{DepositSummary, Deposits, apply_deposits_on};
 use crate::footprint::BufferLimits;
 use crate::grid::{FIELD_PLANES, FieldGrid};
+use crate::invariants::{ConeTolerance, FieldScan};
 use crate::layout::overflow;
 use crate::sources::{
     DepositReport, Source, SourceKernel, SourceSupport, component, deposit, deposit_energy,
@@ -139,6 +140,21 @@ pub trait FieldBackend: std::fmt::Debug + Send {
         grants: &mut Grants,
         deposits: [&mut Deposits; 2],
     ) -> Result<[DepositSummary; 2], CoreError>;
+
+    /// Phase 10's scan of INV-01 and INV-02 on `field`, the tick's
+    /// candidate, at `tolerance` (FL-032): [`FieldState::scan_invariants`],
+    /// bit for bit. The world builds the tick's summary from it with
+    /// [`FieldState::summarize_scan`], and has the reference name the error
+    /// when the scan finds a failing cell.
+    ///
+    /// # Errors
+    /// Any. The world then checks the field on the reference and stops
+    /// using the backend.
+    fn check(
+        &mut self,
+        field: &FieldState,
+        tolerance: ConeTolerance,
+    ) -> Result<FieldScan, CoreError>;
 }
 
 /// Phase 9 (plan §8.1): `grants`' debit ([`apply_grants_on`]), then each of

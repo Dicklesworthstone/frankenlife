@@ -37,6 +37,7 @@ use flife_neural::{
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 pub mod birth;
+pub mod check;
 pub mod chemistry;
 pub mod emission;
 pub mod field;

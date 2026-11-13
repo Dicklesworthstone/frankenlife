@@ -115,7 +115,7 @@ fn race(reference: &mut World, other: &mut World, ticks: u64) -> Raced {
     for step in 1..=ticks {
         let expected = reference.step().expect("the reference steps");
         let got = other.step().expect("the other world steps");
-        let births_same = match (expected, got) {
+        let reports_same = match (expected, got) {
             (Stepped::Published(expected), Stepped::Published(report)) => {
                 let births_same = expected.births == report.births
                     && report.births.iter().all(|birth| {
@@ -152,11 +152,20 @@ fn race(reference: &mut World, other: &mut World, ticks: u64) -> Raced {
                     };
                     raced.deaths[stage] += 1;
                 }
-                births_same
+                // The published field check (FL-032's phase 10), as bits.
+                let check = |field: &flife_field::FieldSummary| {
+                    (
+                        field.energy_total.to_bits(),
+                        field.max_cone_residual.to_bits(),
+                        field.max_cone_residual_cell,
+                        field.empty_cells,
+                    )
+                };
+                births_same && check(&expected.field) == check(&report.field)
             }
             (expected, got) => panic!("unexpected outcomes {expected:?} and {got:?}"),
         };
-        let same = births_same
+        let same = reports_same
             && reference.digest() == other.digest()
             && reference
                 .watched_transactions()
@@ -266,7 +275,17 @@ fn the_preset_with_every_metal_backend_on_one_device_is_the_reference_world() {
     metal.set_settle_backend(Some(Box::new(device)));
     let raced = race(&mut reference, &mut metal, 120);
     assert_eq!(raced.difference, None, "the worlds diverged");
-    assert_eq!(metal.field_report().steps, 120);
+    let field = metal.field_report();
+    assert_eq!(
+        (
+            field.steps,
+            field.reductions,
+            field.checks,
+            field.reference_steps + field.reference_reductions + field.reference_checks
+        ),
+        (120, 120, 120, 0),
+        "{field:?}"
+    );
     assert_eq!(metal.sensor_report().ticks, 120);
     assert_eq!(metal.uptake_report().ticks, 120);
     assert!(metal.controller_report().batched > 0);

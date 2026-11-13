@@ -20,17 +20,19 @@
 //! device and back every step; it is not yet resident (see the crate
 //! contract's known gaps).
 //!
-//! Phase 9 (FL-032) is [`crate::reduce`]'s, on the same owner.
+//! Phase 9 (FL-032) is [`crate::reduce`]'s, and phase 10's field check
+//! [`crate::check`]'s, on the same owner.
 
 use flife_core::{CoreError, TimeStep};
 use flife_field::grid::FIELD_PLANES;
 use flife_field::{
-    DepositSummary, Deposits, FieldBackend, FieldGrid, FieldLayout, FieldPair, FieldState,
-    FieldStepReport, Grants, Source, SourceKernel, SourceSupport, TransportPlan, deposit_energy,
-    energy_report, step_report,
+    ConeTolerance, DepositSummary, Deposits, FieldBackend, FieldGrid, FieldLayout, FieldPair,
+    FieldScan, FieldState, FieldStepReport, Grants, Source, SourceKernel, SourceSupport,
+    TransportPlan, deposit_energy, energy_report, step_report,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
+use crate::check::Check;
 use crate::owner::{DeviceOwner, Kernel, Limits, Owned, Purpose, metal};
 use crate::reduce::Reduce;
 
@@ -132,6 +134,7 @@ pub struct MetalField {
     buffers: Option<Buffers>,
     host: Host,
     reduce: Reduce,
+    check: Check,
 }
 
 impl std::fmt::Debug for MetalField {
@@ -166,6 +169,7 @@ impl MetalField {
             weights: pipeline("source_weights")?,
             moments: pipeline("source_moments")?,
             reduce: Reduce::new(&owner)?,
+            check: Check::new(&owner)?,
             owner,
             buffers: None,
             host: Host::default(),
@@ -522,5 +526,13 @@ impl FieldBackend for MetalField {
         deposits: [&mut Deposits; 2],
     ) -> Result<[DepositSummary; 2], CoreError> {
         self.reduce.run(&self.owner, field, grants, deposits)
+    }
+
+    fn check(
+        &mut self,
+        field: &FieldState,
+        tolerance: ConeTolerance,
+    ) -> Result<FieldScan, CoreError> {
+        self.check.run(&self.owner, field, tolerance)
     }
 }

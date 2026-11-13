@@ -87,7 +87,7 @@ use flife_field::{
     FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants,
     PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath,
     SensorBackend, SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend,
-    UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants, demand,
+    UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants_on, demand,
     demands_on, initial_source, resolve_uptake, resolve_uptake_on, state::CHANNELS,
 };
 use flife_genome::{
@@ -2132,11 +2132,11 @@ impl World {
         applied.sort_by_key(|intervention| intervention.position);
 
         // Phase 9: the grants' debits, then the paid deposits, then
-        // recycling, reduced into the next field, each reduction on the
-        // field's workers.
+        // recycling, reduced into the next field, each on the field's
+        // workers.
         let (_, next) = field.stage();
-        apply_grants(next, grants)?;
         let workers = field_work.workers();
+        apply_grants_on(next, grants, workers)?;
         apply_deposits_on(next, emissions, workers)?
             .record(&mut tick_ledger, Transfer::Emission)?;
         apply_deposits_on(next, recycling, workers)?

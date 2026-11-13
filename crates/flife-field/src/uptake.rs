@@ -62,7 +62,7 @@ use crate::bins::Bins;
 use crate::exchange::{ExchangeStencil, check_request, saturating_request};
 use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
-use crate::state::FieldState;
+use crate::state::{CHANNELS, FieldState};
 
 /// The most packets one organism's request becomes: its exchange footprint
 /// has at most four cells.
@@ -715,13 +715,32 @@ fn quanta_of(energy: f32) -> (f64, u64) {
 
 /// Debit `field` by `grants`: each cell's energy becomes its debit's
 /// `energy_after`, and its moment is scaled by `e'_c/e_c` (exactly zero when
-/// the cell is drained). Returns the energy debited.
+/// the cell is drained). Returns the energy debited. This is
+/// [`apply_grants_on`] on one thread.
+///
+/// # Errors
+/// As [`apply_grants_on`].
+pub fn apply_grants(field: &mut FieldState, grants: &mut Grants) -> Result<f64, CoreError> {
+    apply_grants_on(field, grants, 1)
+}
+
+/// [`apply_grants`] on at most `workers` threads: this one and scoped
+/// workers it joins before returning. Every check runs first, on this
+/// thread, and the energy plane is written here. The moment planes are then
+/// split into contiguous runs of whole planes, one run per thread, and each
+/// plane is written exactly as one thread writes it. A cell's new values
+/// depend only on its debit and its own old values, so the field is the
+/// same at any worker count.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] when the grants were already applied, were
 /// resolved for another grid, or any debited cell no longer holds the
 /// energy they were resolved against. Nothing is written.
-pub fn apply_grants(field: &mut FieldState, grants: &mut Grants) -> Result<f64, CoreError> {
+pub fn apply_grants_on(
+    field: &mut FieldState,
+    grants: &mut Grants,
+    workers: usize,
+) -> Result<f64, CoreError> {
     let conflict = |detail: String| CoreError::StateConflict {
         operation: "uptake grants",
         detail,
@@ -747,23 +766,50 @@ pub fn apply_grants(field: &mut FieldState, grants: &mut Grants) -> Result<f64, 
     if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
         return Err(conflict("a moment plane is missing".into()));
     }
+    let cells = usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
+        quantity: "field cells",
+    })?;
+    if field.moments_mut().len() != cells.saturating_mul(CHANNELS) {
+        return Err(conflict("the moment planes are not whole".into()));
+    }
     let energy = field.energy_mut();
     for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
         energy[debit.cell] = debit.energy_after;
     }
-    for channel in 0..MOMENT_CHANNELS {
-        let plane = field
-            .moment_mut(channel)
-            .ok_or_else(|| conflict(format!("moment plane {channel} is missing")))?;
-        for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
-            let moment = &mut plane[debit.cell];
-            *moment = if debit.energy_after == 0.0 {
-                0.0
-            } else {
-                let ratio = f64::from(debit.energy_after) / f64::from(debit.energy_before);
-                (f64::from(*moment) * ratio) as f32
-            };
+    let debits: &[CellDebit] = &grants.debits;
+    let scale = |planes: &mut [f32]| {
+        for plane in planes.chunks_exact_mut(cells.max(1)) {
+            for debit in debits.iter().filter(|debit| debit.granted > 0.0) {
+                let moment = &mut plane[debit.cell];
+                *moment = if debit.energy_after == 0.0 {
+                    0.0
+                } else {
+                    let ratio = f64::from(debit.energy_after) / f64::from(debit.energy_before);
+                    (f64::from(*moment) * ratio) as f32
+                };
+            }
         }
+    };
+    let used = workers.clamp(1, CHANNELS);
+    let per = CHANNELS.div_ceil(used);
+    let mut runs = field.moments_mut().chunks_mut(per * cells.max(1));
+    let head = runs.next().unwrap_or_default();
+    let scale = &scale;
+    let panicked = std::thread::scope(|scope| {
+        let workers: Vec<_> = runs
+            .map(|planes| scope.spawn(move || scale(planes)))
+            .collect();
+        scale(head);
+        // Join every worker, so that none is left for the scope to find
+        // panicked.
+        let mut panicked = false;
+        for worker in workers {
+            panicked |= worker.join().is_err();
+        }
+        panicked
+    });
+    if panicked {
+        return Err(conflict("a grant worker panicked".into()));
     }
     grants.applied = true;
     Ok(grants.summary.granted)

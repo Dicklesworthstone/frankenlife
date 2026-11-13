@@ -11,7 +11,8 @@ use flife_core::ids::OrganismId;
 use flife_field::state::CHANNELS;
 use flife_field::{
     Bins, BufferLimits, Cell, Demand, DepositSummary, Deposits, ExchangeStencil, FieldGrid,
-    FieldState, Grants, apply_deposits, apply_deposits_on, apply_grants, resolve_uptake,
+    FieldState, Grants, apply_deposits, apply_deposits_on, apply_grants, apply_grants_on,
+    resolve_uptake,
 };
 
 #[expect(
@@ -733,5 +734,88 @@ fn deposits_reduce_the_same_on_any_number_of_workers() {
             "{workers} workers: the reduction allocated"
         );
         assert!(deposits.is_applied());
+    }
+}
+
+/// The grants' debit on any number of workers writes every plane as one
+/// thread does, drained cells included, and refuses what one thread
+/// refuses without writing anything.
+#[test]
+fn grants_apply_the_same_on_any_number_of_workers() {
+    let grid = grid(32, 24);
+    let mut base = field(grid, 31);
+    // A moment in every channel of every cell, so that every plane has
+    // debited cells to scale.
+    let mut next = lcg(8);
+    for y in 0..grid.cells_y() {
+        for x in 0..grid.cells_x() {
+            let mut cell = base.cell(x, y).expect("a cell inside the grid");
+            for moment in &mut cell.moments {
+                *moment = cell.energy * (next() as f32 - 0.5) * 0.05;
+            }
+            base.set_cell(x, y, &cell).expect("a cell inside the grid");
+        }
+    }
+    let demands = clustered(&grid, 6_000, 37);
+    let resolved = || {
+        let mut grants =
+            Grants::with_capacity(&grid, 6_000, &BufferLimits::host()).expect("declare");
+        resolve_uptake(&base, &demands, &mut grants).expect("resolve");
+        grants
+    };
+
+    let mut one = base.clone();
+    let mut grants = resolved();
+    let granted = apply_grants(&mut one, &mut grants).expect("apply");
+    let expected = planes(&one);
+    let debited = |drained: bool| {
+        grants
+            .debits()
+            .iter()
+            .filter(|debit| debit.granted > 0.0 && (debit.energy_after == 0.0) == drained)
+            .count()
+    };
+    assert!(debited(true) >= 1, "no drained cell");
+    assert!(debited(false) > 300, "{} scaled cells", debited(false));
+    for (plane, (before, after)) in planes(&base).iter().zip(&expected).enumerate() {
+        assert!(before != after, "plane {plane} was not debited");
+    }
+
+    for workers in [0, 1, 2, 3, 5, 16, 31, 32, 33, 64] {
+        let mut state = base.clone();
+        let mut grants = resolved();
+        let got = apply_grants_on(&mut state, &mut grants, workers).expect("apply");
+        assert_eq!(got.to_bits(), granted.to_bits(), "{workers} workers");
+        assert!(
+            planes(&state) == expected,
+            "{workers} workers: the field differs"
+        );
+        // Applied again: refused as on one thread, with nothing written.
+        let refused = apply_grants_on(&mut state, &mut grants, workers).expect_err("twice");
+        let mut again = one.clone();
+        let mut applied = resolved();
+        apply_grants(&mut base.clone(), &mut applied).expect("apply");
+        assert_eq!(
+            refused,
+            apply_grants(&mut again, &mut applied).expect_err("twice"),
+            "{workers} workers"
+        );
+        assert!(planes(&state) == expected, "{workers} workers: written");
+
+        // A debited cell changed since the grants were resolved: refused,
+        // with nothing written.
+        let mut stale = base.clone();
+        let cell = grants.debits()[grants.debits().len() / 2].cell;
+        stale.energy_mut()[cell] += 1.0;
+        let before = planes(&stale);
+        let mut fresh = resolved();
+        let refused = apply_grants_on(&mut stale, &mut fresh, workers).expect_err("stale");
+        let mut fresh_one = resolved();
+        assert_eq!(
+            refused,
+            apply_grants(&mut stale.clone(), &mut fresh_one).expect_err("stale"),
+            "{workers} workers"
+        );
+        assert!(planes(&stale) == before, "{workers} workers: written");
     }
 }

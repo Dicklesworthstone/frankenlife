@@ -94,7 +94,11 @@
   `saturating_request` gives `d = Δt U_max r/(K + r)`.
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
   `CellDebit` per demanded cell, each organism's total `U_i` in input order, and an `UptakeSummary`.
-  `apply_grants` debits the field.
+  `apply_grants` debits the field. `apply_grants_on(field, grants, workers)` is the same debit on up to `workers`
+  threads (zero is taken as one): every check first, the energy plane on the calling thread, then the 32 moment
+  planes in contiguous runs of whole planes, one run per thread, each plane written as on one thread. A cell's
+  new values depend only on its debit and its old values, so the field does not depend on the worker count. A
+  worker that panics is reported as a state conflict, and the field may then be partly written.
 - FL-031's phase 5: `RequestRule` (`Δt`, `U_max`, `K`; `request(density)` is `saturating_request`), and `demands`,
   each organism's `Demand` at its footprint's density, in order: the reference the engine runs. `demand` is one
   organism's, the function `demands` applies to each in turn; it reads only the field, so a caller may compute
@@ -374,8 +378,8 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
     within the speed limit and join continuously.
   - A path unaffected by another source's advances.
   - A moved source keeping its chemistry.
-- `tests/bins.rs` (FL-027, 6 tests). The oracles do not use `Bins`: a stable sort of item indices by bucket, and
-  a sort of every footprint packet by (cell, organism), the rule before FL-027.
+- `tests/bins.rs` (FL-027 and later, 9 tests). The oracles do not use `Bins`: a stable sort of item indices by
+  bucket, and a sort of every footprint packet by (cell, organism), the rule before FL-027.
   - `bins_are_a_stable_sort_by_bucket_whatever_the_clustering`: 50,000 items spread over 1,000 buckets, all in
     one bucket, a third in the last, none, and one bucket. Each matches the oracle, with its bucket counts,
     occupied buckets and hotspot size, and nothing is allocated.
@@ -394,6 +398,12 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   - `deposits_reduce_the_same_in_any_staging_order_and_any_clustering`: 5,000 deposits staged in three orders give
     bit-identical fields (energy and all 32 moment planes) and summaries, with nothing allocated. A third deposit
     against a declaration of two is refused.
+  - `appended_deposits_reduce_as_if_pushed_in_order` and `deposits_reduce_the_same_on_any_number_of_workers`:
+    see `Deposits::append` and `apply_deposits_on` above.
+  - `grants_apply_the_same_on_any_number_of_workers`: the grants of 6,000 clustered demands on 32×24 cells with a
+    moment in every channel of every cell, drained and scaled cells both present, applied on 0 to 64 workers.
+    Every plane's bits and the granted total equal one thread's, and every plane changes. Grants applied twice,
+    and grants for a cell that has changed since, are refused with one thread's error, and nothing is written.
 - FL-027's planted mutants, each run against both crates' suites in a scratch copy: 12 planted, 11 caught.
   - Caught: a bucket scattered in reverse; bucket starts not restored; the item limit unchecked; the hotspot size
     unreported; uptake packets staged in demand order; uptake's or deposits' declaration unchecked; the

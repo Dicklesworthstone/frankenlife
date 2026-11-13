@@ -364,9 +364,10 @@ each runs and owns the field.
   `(E_next − E_previous)/Δt`. A death is collected exhausted at its resulting position at tick `n + 1`, and its
   residual (zero) is settled under the death policy. Newborns join at `n + 1` and are first advanced from it.
 - Phase 9 debits the grants first, then reduces the emission deposits (`emission`), then recycling (`recycling`),
-  all into the next field, so new deposits are first sensed next tick. Each reduction runs on the field's workers
-  (`flife_field::apply_deposits_on`): every cell is reduced and written as on one thread, and what the cells
-  received is summed in cell order, so the world is bit-identical at any worker count
+  all into the next field, so new deposits are first sensed next tick. Each runs on the field's workers. The
+  debit (`flife_field::apply_grants_on`) writes each moment plane as one thread would. Each reduction
+  (`flife_field::apply_deposits_on`) reduces and writes every cell as on one thread, and sums what the cells
+  received in cell order. The world is therefore bit-identical at any worker count
   (`the_cpu_worker_count_changes_no_result`, pinned digests).
 - Phase 10 checks the next field (INV-01, INV-02 at the profile's cone tolerance), closes the tick against holdings
   measured from the next field and the survivors and newborns in identity order (INV-03 per tick), commits the
@@ -1045,8 +1046,8 @@ velocity, first-order splitting at the configured fixed timestep.
   section). The field splits transport by plane, and each moment plane keeps its per-source deposit order. The
   threads are scoped `std` threads spawned per tick: a bounded, reported reference adapter (§3.4, §12.5), not
   Asupersync-scheduled work. Phase 5's demands and phase 6's packet compositions run on the lanes too, and phase
-  9's deposit reductions and phase 10's field check on the field's workers (see phases 9 and 10). Phase 5's grant
-  resolution, phase 9's grant debit, phase 10's holdings closure and population checks, and the commit stay on one
+  9's grant debit and deposit reductions and phase 10's field check on the field's workers (see phases 9 and 10).
+  Phase 5's grant resolution, phase 10's holdings closure and population checks, and the commit stay on one
   thread, and a persistent pool is later work. Parallel phases must keep these reduction orders.
 - `World::set_controller_backend` (FL-030) hands each tick's due evaluations to a `flife_neural::ControllerBackend`
   in one batch, in identity order. Observations are made on the lanes first, then the backend is called once, then

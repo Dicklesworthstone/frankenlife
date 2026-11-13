@@ -41,6 +41,13 @@ demand, quantum, target, floor shares, remainders and largest-remainder deficit,
 `softfloat64.metal`. The host takes the footprints, stages and groups the packets in identity order through
 flife-field's `demands_on` and `resolve_uptake_on`, and refuses a cell whose quanta do not sum to its grant.
 
+FL-032 (`flife-kf8`), first stage: phase 6's chemistry on Metal, bit-identical to flife-engine's `composition`,
+`Chemistry::settle` and the budget's `credit` and `pay` (plan §5.3, §8.2, §10.7), in `chemistry`.
+`MetalChemistry::settle` takes plain data (the run's constants; each organism's affinity, budget and packet range;
+each packet's cell and grant), because a backend does not depend on the engine (§18.2). It is not wired into the
+engine yet: no port takes it, so no world runs it. The engine port, maintenance, motion, emission, the reproduction
+proposal, lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
+
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
@@ -254,6 +261,29 @@ deferred, and so is an F16 member with an odd parameter count (none in the catal
   the coarse levels, four level parameters, the sample parameters, queries and samples.
 - A backend of the engine path: an error from `sample` hands the tick's sampling to the reference and drops the
   backend (`flife-engine`'s `World::sensor_report`).
+
+**Invariants — chemistry (FL-032; §5.3, §8.2, §10.7).**
+- Every organism's absorbed `U`, gain `G`, requested and paid toxicity, and its budget's balance and exhaustion
+  after them are the reference's, bit for bit.
+- The field crosses to the device as F32 bit patterns. Each packet's composition `z = m/e` is computed in binary64
+  from them, and is neutral where `e` is not positive.
+- The device computes the reference's expressions operation for operation in software binary64:
+  - `Affinity::new`'s squared norm, in channel order, against the limit's square;
+  - `a·z` in channel order, then `η_max tanh(k a·z − b)` with `numerics::tanh` (`d_tanh`; `tanh_reference`, the
+    controllers' activation, now calls it);
+  - the three Neumaier sums of `settle_efficiencies` in packet order;
+  - `G` credited with `add_down`, and `κ` times the harm paid with `min`, `sub_down` and the exhaustion rule.
+- `f64::max` and `f64::min` are taken as they run on the reference's host, AArch64's `fmaxnm` and `fminnm`: +0 over
+  −0, and −0 under +0. A zero's sign changes no sum here, since the sums start at +0, but the device follows the host
+  anyway.
+- Refused after the command (`StateConflict`, so the reference decides): an organism with a non-finite or over-limit
+  affinity, a non-finite tanh argument, a negative or non-finite grant, an efficiency outside [−1, 1], a gain for an
+  exhausted budget, a credit that overflows, a non-finite total or toxicity, or a cell outside the field. softfloat64
+  turns infinities into NaNs, so every non-finite intermediate is refused, never carried. Refused before it:
+  constants outside `Chemistry::new`'s ranges (`NumericalInvalid`) and packet ranges past the list
+  (`LayoutMismatch`).
+- One command per call. The field's 33 planes, every affinity and every packet go to the device, and the outcomes
+  come back.
 
 **Invariants — uptake (FL-031; §5.2, §8.1, §10.7, INV-04).**
 - Every demand's amount is `demands`'s, and every packet's grant, every cell's debit (energy before and after,
@@ -508,6 +538,20 @@ A refusal changes nothing.
   - a backend failing at its fifth tick (leaving damaged quanta), and one granting a cell one quantum too many at
     its sixth, each hand that tick to the reference and are dropped: the world stays the reference's, and the
     failure is recorded.
+- `tests/chemistry.rs` (FL-032, 3 tests), every value compared as bits:
+  - `the_settlement_arithmetic_is_the_references`: 262,400 operand pairs (random finite patterns, near pairs,
+    subnormals, zeros of both signs, tanh's active range, and 256 edge pairs) against flife-core's `numerics::tanh`,
+    `add_down`, `sub_down`, `f64::next_down`, `max`, `min` and a `CompensatedSum`. Each operation is checked on more
+    than 200,000 pairs.
+  - `chemistry_on_the_device_is_the_references_settlement`: 4,096 organisms under each of three constant sets (the
+    preset's; saturating, `k = 1e6`; gainless, `k = 0`) against `Chemistry::settle`. The field has zero, subnormal
+    and 1e-30 to 1e30 energies and wide moments. Each organism has 0 to 8 packets, past the reference's stack of
+    four. Budgets run from zero to 1e4. The draws are asserted to include toxicity exhaustion, gains, harms, and
+    empty and long packet lists.
+  - `chemistry_the_reference_refuses_is_refused`: a NaN affinity, one past the limit, a negative grant, a NaN grant,
+    an infinite moment, a gain for a zero budget, and a cell outside the field. Each is placed beside a valid
+    organism: the reference refuses it, the device refuses the call and leaves no outcomes, and the valid organism
+    alone settles as the reference does. Packets past the list and a zero `κ` are refused before any command.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -558,6 +602,12 @@ Planted mutants, each run in a scratch copy.
 
   One survived, and it is equivalent: `A_c > e_c` made `A_c ≥ e_c`. At equality both branches give the target
   `n` and the scale `1/Q` exactly, and the contended flag recorded is the host's.
+- FL-032's chemistry: 14 planted against `tests/chemistry.rs`, 14 caught:
+  - in `softfloat64.metal`: `max` keeping −0, `min` keeping +0, `next_down` of a zero going up, `add_down` stepping
+    down on a positive error, Neumaier's other branch always taken, and `tanh` losing its sign;
+  - in `chemistry.metal`: a zero-energy cell composed as if it held energy, the harm summing positive
+    efficiencies, the gain credited rounded to nearest, the affinity check inverted, an exhausted budget credited,
+    `a·z` summed from the last channel, the toxicity never exhausting, and a negative grant admitted.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -748,7 +798,8 @@ per-pass thread spawning (6%).
 
 **Known gaps.**
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
-  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them). On many CPU workers the tick
+  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; chemistry has a device kernel,
+  `MetalChemistry`, that no world runs yet). On many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype
   parity covers F32 and F16; the quantized I8 profile does not exist. The kernel

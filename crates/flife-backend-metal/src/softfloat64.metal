@@ -480,9 +480,8 @@ static d64 expm1_neg(d64 x) {
     return m;
 }
 
-// `numerics::tanh(f64::from(z)) as f32` for finite z.
-static float tanh_reference(float z) {
-    d64 x = d_from_f32(z);
+// numerics::tanh for finite x.
+static d64 d_tanh(d64 x) {
     d64 magnitude = x & ~D_SIGN;
     d64 value;
     if (magnitude >= TANH_SATURATES) {
@@ -497,5 +496,102 @@ static float tanh_reference(float z) {
     if (d_sign(x)) {
         value ^= D_SIGN;
     }
-    return d_to_f32(value);
+    return value;
+}
+
+// `numerics::tanh(f64::from(z)) as f32` for finite z.
+static float tanh_reference(float z) {
+    return d_to_f32(d_tanh(d_from_f32(z)));
+}
+
+// ---------------------------------------------------------------------------
+// Phases 6 and 7's arithmetic (FL-032): flife-core's ledger helpers and the
+// comparisons Rust makes, for operands that are not NaN.
+
+// `f64::next_down`: the next value toward negative infinity. Both zeros go
+// to the negative smallest subnormal; negative infinity stays.
+static d64 d_next_down(d64 a) {
+    if ((a << 1) == 0ul) {
+        return D_SIGN | 1ul;
+    }
+    if (a == (D_SIGN | 0x7FF0000000000000ul)) {
+        return a;
+    }
+    return d_sign(a) ? a + 1ul : a - 1ul;
+}
+
+// `a == b` as IEEE compares: the zeros are equal.
+static inline bool d_eq(d64 a, d64 b) {
+    return a == b || ((a | b) << 1) == 0ul;
+}
+
+// `|a| >= |b|`: nonnegative magnitudes order as their bit patterns.
+static inline bool d_abs_ge(d64 a, d64 b) {
+    return (a & ~D_SIGN) >= (b & ~D_SIGN);
+}
+
+// `f64::max` as it runs on the reference's host (AArch64 `fmaxnm`): the
+// larger, and +0 over -0.
+static d64 d_max(d64 a, d64 b) {
+    if (d_lt(a, b)) {
+        return b;
+    }
+    if (d_lt(b, a)) {
+        return a;
+    }
+    return a & b;
+}
+
+// `f64::min` as it runs on the reference's host (AArch64 `fminnm`): the
+// smaller, and -0 under +0.
+static d64 d_min(d64 a, d64 b) {
+    if (d_lt(a, b)) {
+        return a;
+    }
+    if (d_lt(b, a)) {
+        return b;
+    }
+    return a | b;
+}
+
+// ledger::add_down: `a + b`, rounded so that it never exceeds the exact sum
+// (TwoSum's error, then one step down when the rounded sum is above).
+static d64 d_add_down(d64 a, d64 b) {
+    d64 sum = d_add(a, b);
+    d64 b_part = d_sub(sum, a);
+    d64 a_part = d_sub(sum, b_part);
+    d64 error = d_add(d_sub(a, a_part), d_sub(b, b_part));
+    return d_lt(error, 0ul) ? d_next_down(sum) : sum;
+}
+
+// ledger::sub_down.
+static inline d64 d_sub_down(d64 a, d64 b) {
+    return d_add_down(a, b ^ D_SIGN);
+}
+
+// ledger::CompensatedSum.
+struct CSum {
+    d64 sum;
+    d64 compensation;
+};
+
+static inline CSum csum_zero() {
+    CSum s;
+    s.sum = 0ul;
+    s.compensation = 0ul;
+    return s;
+}
+
+static void csum_add(thread CSum &s, d64 value) {
+    d64 total = d_add(s.sum, value);
+    if (d_abs_ge(s.sum, value)) {
+        s.compensation = d_add(s.compensation, d_add(d_sub(s.sum, total), value));
+    } else {
+        s.compensation = d_add(s.compensation, d_add(d_sub(value, total), s.sum));
+    }
+    s.sum = total;
+}
+
+static inline d64 csum_value(CSum s) {
+    return d_add(s.sum, s.compensation);
 }

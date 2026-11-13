@@ -115,10 +115,19 @@
   packet indices, so the reduction is the one pushing them here would give
   (`appended_deposits_reduce_as_if_pushed_in_order`: the field's bits, the summary and the bins, no allocation).
   A refused append (applied, another grid, or more than the declaration) moves nothing.
+  `apply_deposits_on(field, deposits, workers)` is the same reduction on up to `workers` threads (zero is taken as
+  one); `apply_deposits` is one thread. The cells are split into contiguous runs of whole cells with about equal
+  packets, at least 1,024 a run, and each run's thread reduces its cells and writes their energy and moments,
+  which no other run touches. The calling thread then sums what the cells received, in cell order. Every value is
+  computed as on one thread, so the field and the summary do not depend on the worker count
+  (`deposits_reduce_the_same_on_any_number_of_workers`: 0 to 64 workers, the field's bits and the summary's, no
+  allocation, with run bounds falling inside a hotspot cell). A worker that panics is reported as a state conflict,
+  and the field may then be partly written. Deposits keep one F64 per packet for what the cells received (eight
+  bytes a packet, declared by `Deposits::with_capacity`), where they kept 272 bytes per cell before.
 - `bins` (FL-027): `Bins::group(buckets, items, bucket_of)`, then `order` (item indices, bucket by bucket),
-  `range` and `bucket` (one bucket), `occupied` (nonempty buckets, ascending), `largest` (the hotspot) and
-  `allocated`. `Grants::bins` and `Deposits::bins` expose the last reduction's bins, and their `allocated` gives
-  every scratch buffer's capacity.
+  `offsets` (each bucket's first position in `order`, then the item count), `range` and `bucket` (one bucket),
+  `occupied` (nonempty buckets, ascending), `largest` (the hotspot) and `allocated`. `Grants::bins` and
+  `Deposits::bins` expose the last reduction's bins, and their `allocated` gives every scratch buffer's capacity.
 - FL-043: `allocated_bytes` on `TransportScratch`, `SourceSupport`, `FieldWork`, `Bins`, `Deposits` and `Grants`,
   each buffer at its capacity. `SourceKernel::candidate_bound(grid)`, the most candidate columns and rows one
   support takes (per axis `⌈2r/h⌉ + 5`, at most the axis); `SourceSupport::for_kernel(kernel, grid)`, a support

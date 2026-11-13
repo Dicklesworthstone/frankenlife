@@ -220,6 +220,14 @@ impl Bins {
         &self.order
     }
 
+    /// Each bucket's first position in [`Bins::order`], then the number of
+    /// items: bucket `b`'s positions are `offsets[b]..offsets[b + 1]`. Empty
+    /// before the first grouping.
+    #[must_use]
+    pub fn offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
     /// Bucket `bucket`'s positions in [`Bins::order`]; empty for an empty
     /// or out-of-range bucket.
     #[must_use]

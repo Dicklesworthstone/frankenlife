@@ -10,8 +10,8 @@ use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_field::state::CHANNELS;
 use flife_field::{
-    Bins, BufferLimits, Cell, Demand, Deposits, ExchangeStencil, FieldGrid, FieldState, Grants,
-    apply_deposits, apply_grants, resolve_uptake,
+    Bins, BufferLimits, Cell, Demand, DepositSummary, Deposits, ExchangeStencil, FieldGrid,
+    FieldState, Grants, apply_deposits, apply_deposits_on, apply_grants, resolve_uptake,
 };
 
 #[expect(
@@ -643,4 +643,95 @@ fn appended_deposits_reduce_as_if_pushed_in_order() {
         Err(CoreError::StateConflict { .. })
     ));
     assert_eq!(lane.len(), 1, "appending to applied deposits moved one");
+}
+
+/// A summary's every field, its sums as bits.
+fn summary_bits(summary: &DepositSummary) -> (usize, usize, u64, u64, u64) {
+    (
+        summary.organisms,
+        summary.cells,
+        summary.paid.to_bits(),
+        summary.offered.to_bits(),
+        summary.applied.to_bits(),
+    )
+}
+
+/// Phase 9 reduces deposits on the field's workers (C4): the cells are
+/// split into contiguous runs, and each run's thread reduces and writes its
+/// own cells. Every worker count must give one thread's field and summary
+/// to the bit, with no allocation of the deposits' scratch. The clustered
+/// population puts a quarter of the organisms in one hotspot cell, so some
+/// runs' bounds fall inside it and those runs are empty; the counts include
+/// zero (taken as one) and more workers than there are runs.
+#[test]
+fn deposits_reduce_the_same_on_any_number_of_workers() {
+    let grid = grid(32, 24);
+    let base = field(grid, 23);
+    let demands = clustered(&grid, 6_000, 29);
+    let mut next = lcg(6);
+    let deposits: Vec<Staged> = demands
+        .iter()
+        .map(|demand| {
+            let paid = next() * 0.02;
+            let mut direction = [0.0; CHANNELS];
+            direction[(next() * CHANNELS as f64) as usize % CHANNELS] = next() - 0.5;
+            direction[(next() * CHANNELS as f64) as usize % CHANNELS] += next() * 0.4;
+            (
+                demand.organism,
+                demand.position,
+                paid,
+                paid * 0.75,
+                direction,
+            )
+        })
+        .collect();
+    let limits = BufferLimits::host();
+    let staged = || {
+        let mut staged = Deposits::with_capacity(&grid, 6_000, &limits).expect("declare");
+        for &(organism, position, paid, offered, direction) in &deposits {
+            staged
+                .push(&grid, organism, position, paid, offered, &direction)
+                .expect("stage");
+        }
+        staged
+    };
+
+    let mut one = base.clone();
+    let mut reference = staged();
+    let expected = summary_bits(&apply_deposits(&mut one, &mut reference).expect("apply"));
+    let expected_planes = planes(&one);
+    assert!(expected_planes != planes(&base), "nothing was deposited");
+    assert_eq!(expected.1, reference.bins().occupied().count());
+    let packets = reference.bins().order().len();
+    assert!(
+        packets >= 16 * 1_024,
+        "{packets} packets: too few for 16 runs"
+    );
+    assert!(
+        reference.bins().largest() > packets / 16,
+        "the hotspot holds {} of {packets}: no run falls inside it",
+        reference.bins().largest()
+    );
+
+    for workers in [0, 1, 2, 3, 5, 8, 13, 16, 17, 64] {
+        let mut state = base.clone();
+        let mut deposits = staged();
+        let allocated = deposits.allocated();
+        let summary = apply_deposits_on(&mut state, &mut deposits, workers).expect("apply");
+        assert_eq!(
+            summary_bits(&summary),
+            expected,
+            "{workers} workers: summary"
+        );
+        assert!(
+            planes(&state) == expected_planes,
+            "{workers} workers: the field differs"
+        );
+        assert_eq!(
+            deposits.allocated(),
+            allocated,
+            "{workers} workers: the reduction allocated"
+        );
+        assert!(deposits.is_applied());
+    }
 }

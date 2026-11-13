@@ -52,6 +52,7 @@ use crate::exchange::ExchangeStencil;
 use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
 use crate::state::{CHANNELS, FieldState};
+use std::ops::Range;
 
 /// The name deposits' scratch refusals carry.
 const DEPOSIT_PACKETS: &str = "deposit packets";
@@ -79,14 +80,6 @@ struct Packet {
     organism: OrganismId,
     entry: usize,
     amount: f64,
-}
-
-/// One cell's reduced deposit, before it is written.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct CellDeposit {
-    cell: usize,
-    after: f32,
-    moment: [f64; CHANNELS],
 }
 
 /// What one reduction paid, offered and applied.
@@ -130,7 +123,9 @@ pub struct Deposits {
     grid: Option<FieldGrid>,
     entries: Vec<Entry>,
     packets: Vec<Packet>,
-    cells: Vec<CellDeposit>,
+    /// What each occupied cell of the last reduction received: a slot a
+    /// packet, so that each run of cells has its own.
+    received: Vec<f64>,
     /// Each entry's organism and index, sorted by organism.
     identities: Vec<(OrganismId, usize)>,
     /// Packet indices in organism identity order, before grouping by cell.
@@ -148,14 +143,14 @@ impl Default for Deposits {
 }
 
 impl Deposits {
-    /// Bytes its entries, packets, cells and reduction scratch hold
+    /// Bytes its entries, packets, received amounts and reduction scratch hold
     /// (FL-043).
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         total([
             capacity_bytes(&self.entries),
             capacity_bytes(&self.packets),
-            capacity_bytes(&self.cells),
+            capacity_bytes(&self.received),
             capacity_bytes(&self.identities),
             capacity_bytes(&self.sequence),
             self.bins.allocated_bytes(),
@@ -170,7 +165,7 @@ impl Deposits {
             grid: None,
             entries: Vec::new(),
             packets: Vec::new(),
-            cells: Vec::new(),
+            received: Vec::new(),
             identities: Vec::new(),
             sequence: Vec::new(),
             bins: Bins::new(DEPOSIT_PACKETS),
@@ -202,19 +197,18 @@ impl Deposits {
         let entry_bytes = organisms
             .checked_mul(std::mem::size_of::<Entry>() as u64)
             .ok_or_else(overflow)?;
-        let cell_bytes = packets
-            .checked_mul(std::mem::size_of::<CellDeposit>() as u64)
+        let received_bytes = packets
+            .checked_mul(std::mem::size_of::<f64>() as u64)
             .ok_or_else(overflow)?;
         limits.admit(DEPOSIT_PACKETS, entry_bytes)?;
-        limits.admit(DEPOSIT_PACKETS, cell_bytes)?;
+        limits.admit(DEPOSIT_PACKETS, received_bytes)?;
         let bins = Bins::with_capacity(DEPOSIT_PACKETS, grid.cell_count(), packets, limits)?;
-        let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
         let organisms = usize::try_from(organisms).map_err(|_| overflow())?;
         let packets = usize::try_from(packets).map_err(|_| overflow())?;
         Ok(Self {
             entries: Vec::with_capacity(organisms),
             packets: Vec::with_capacity(packets),
-            cells: Vec::with_capacity(packets.min(cells)),
+            received: Vec::with_capacity(packets),
             identities: Vec::with_capacity(organisms),
             sequence: Vec::with_capacity(packets),
             bins,
@@ -228,7 +222,7 @@ impl Deposits {
         self.grid = None;
         self.entries.clear();
         self.packets.clear();
-        self.cells.clear();
+        self.received.clear();
         self.identities.clear();
         self.sequence.clear();
         self.bins.clear();
@@ -256,7 +250,7 @@ impl Deposits {
         [
             self.entries.capacity(),
             self.packets.capacity(),
-            self.cells.capacity(),
+            self.received.capacity(),
             self.identities.capacity(),
             self.sequence.capacity(),
             offsets,
@@ -503,17 +497,43 @@ fn round_down_f32(value: f64) -> f32 {
     }
 }
 
+/// The fewest packets one thread of [`apply_deposits_on`] reduces: a smaller
+/// run costs more to hand to a thread than it saves.
+const PACKETS_PER_RUN: usize = 1_024;
+
 /// Reduce `deposits` into `field`, the next state, and return what was paid,
 /// offered and applied. The deposits are marked applied.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] when the deposits were already applied,
 /// were staged for another grid, name one organism twice, or the field
-/// lacks a moment plane; [`CoreError::LayoutMismatch`] if a cell falls
-/// outside `field`. Nothing is written on error.
+/// lacks a moment plane; [`CoreError::LayoutMismatch`] if the field does
+/// not hold every cell of its grid in every plane. Nothing is written on
+/// error.
 pub fn apply_deposits(
     field: &mut FieldState,
     deposits: &mut Deposits,
+) -> Result<DepositSummary, CoreError> {
+    apply_deposits_on(field, deposits, 1)
+}
+
+/// [`apply_deposits`] on up to `workers` threads: this one and scoped
+/// workers it joins before returning. The cells are split into contiguous
+/// runs of whole cells holding about equal numbers of packets, at least
+/// 1,024 a run. Each run's thread reduces its cells exactly as
+/// [`apply_deposits`] does and writes their energy and moments, which no
+/// other run touches. This thread then sums what the cells received, in
+/// cell order. Every value is computed as on one thread, so the field and
+/// the summary are the same for every worker count. Zero workers is taken
+/// as one.
+///
+/// # Errors
+/// As [`apply_deposits`]; [`CoreError::StateConflict`] for a worker that
+/// panicked, after which the field may be partly written.
+pub fn apply_deposits_on(
+    field: &mut FieldState,
+    deposits: &mut Deposits,
+    workers: usize,
 ) -> Result<DepositSummary, CoreError> {
     let conflict = |detail: String| CoreError::StateConflict {
         operation: "apply deposits",
@@ -568,7 +588,7 @@ pub fn apply_deposits(
     let Deposits {
         entries,
         packets,
-        cells,
+        received,
         identities,
         sequence,
         bins,
@@ -590,24 +610,141 @@ pub fn apply_deposits(
             .and_then(|&packet| packets.get(packet as usize))
             .map_or(usize::MAX, |packet| packet.cell)
     })?;
-    cells.clear();
-    let energy = field.energy();
+
+    // The grouping refused any cell at or past `buckets`, so a field that
+    // holds `buckets` cells in each of its planes holds every grouped cell.
+    let values = field.as_mut_slice();
+    if buckets.checked_mul(CHANNELS + 1) != Some(values.len()) {
+        return Err(CoreError::LayoutMismatch {
+            buffer: crate::layout::BUFFER,
+            detail: format!(
+                "the field holds {} values, not {buckets} cells in {} planes",
+                values.len(),
+                CHANNELS + 1
+            ),
+        });
+    }
+    let offsets = bins.offsets();
+    let order = bins.order();
+    let items = order.len();
+    let start = |cell: usize| offsets.get(cell).map_or(items, |&at| at as usize);
+    // Run `k` holds the cells from the first one starting at or after
+    // `k / runs` of the packets up to the next run's first cell.
+    let runs = workers.min(items / PACKETS_PER_RUN).max(1);
+    let bounds: Vec<usize> = (0..=runs)
+        .map(|run| {
+            if run == runs {
+                buckets
+            } else {
+                let target = items / runs * run + items % runs * run / runs;
+                offsets
+                    .partition_point(|&at| (at as usize) < target)
+                    .min(buckets)
+            }
+        })
+        .collect();
+    received.clear();
+    received.resize(items, 0.0);
+    let (mut energy, moments) = values.split_at_mut(buckets);
+    let mut slots: &mut [f64] = received;
+    let mut lanes = Vec::with_capacity(runs);
+    for pair in bounds.windows(2) {
+        let cells = pair[0]..pair[1];
+        let (head, tail) = cut(std::mem::take(&mut energy), cells.len())?;
+        energy = tail;
+        let (owned, rest) = cut(
+            std::mem::take(&mut slots),
+            start(cells.end).saturating_sub(start(cells.start)),
+        )?;
+        slots = rest;
+        lanes.push(Run {
+            cells,
+            energy: head,
+            moments: std::array::from_fn(|_| <&mut [f32]>::default()),
+            received: owned,
+        });
+    }
+    for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
+        let mut plane = plane;
+        for lane in &mut lanes {
+            let (head, tail) = cut(std::mem::take(&mut plane), lane.cells.len())?;
+            plane = tail;
+            if let Some(slot) = lane.moments.get_mut(channel) {
+                *slot = head;
+            }
+        }
+    }
+
+    let (sequence, packets, entries) = (&**sequence, &**packets, &**entries);
+    let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, sequence, packets, entries);
+    let reduce = &reduce;
+    let mut rest = lanes.iter_mut();
+    let first = rest.next();
+    let occupied = std::thread::scope(|scope| {
+        let workers: Vec<_> = rest.map(|run| scope.spawn(move || reduce(run))).collect();
+        let mut occupied = Vec::with_capacity(runs);
+        occupied.push(first.map_or(0, reduce));
+        for worker in workers {
+            occupied.push(
+                worker
+                    .join()
+                    .map_err(|_| conflict("a deposit worker panicked".into()))?,
+            );
+        }
+        Ok::<_, CoreError>(occupied)
+    })?;
+
     let mut applied = CompensatedSum::ZERO;
-    for (cell, range) in bins.occupied() {
-        let group = bins
-            .order()
-            .get(range)
+    for (lane, &count) in lanes.iter().zip(&occupied) {
+        for &value in lane.received.get(..count).unwrap_or(&[]) {
+            applied.add(value);
+        }
+        summary.cells += count;
+    }
+    summary.applied = applied.value();
+    deposits.applied = true;
+    Ok(summary)
+}
+
+/// One thread's share of a reduction: a contiguous range of cells, their
+/// energy and their values in every moment plane, and a slot for what each
+/// of its occupied cells received.
+struct Run<'a> {
+    cells: Range<usize>,
+    energy: &'a mut [f32],
+    moments: [&'a mut [f32]; CHANNELS],
+    received: &'a mut [f64],
+}
+
+/// Reduce and write `run`'s occupied cells in cell order, each as
+/// [`apply_deposits`] reduces it, filling `run.received` in the same order.
+/// Returns how many cells received a packet.
+fn reduce_run(
+    run: &mut Run<'_>,
+    offsets: &[u32],
+    order: &[u32],
+    sequence: &[u32],
+    packets: &[Packet],
+    entries: &[Entry],
+) -> usize {
+    let mut occupied = 0;
+    for (at, cell) in run.cells.clone().enumerate() {
+        let (Some(&first), Some(&end)) = (offsets.get(cell), offsets.get(cell + 1)) else {
+            continue;
+        };
+        if first >= end {
+            continue;
+        }
+        let Some(energy) = run.energy.get_mut(at) else {
+            continue;
+        };
+        let group = order
+            .get(first as usize..end as usize)
             .unwrap_or(&[])
             .iter()
             .filter_map(|&at| sequence.get(at as usize))
             .filter_map(|&packet| packets.get(packet as usize));
-        let before = energy
-            .get(cell)
-            .copied()
-            .ok_or_else(|| CoreError::LayoutMismatch {
-                buffer: crate::layout::BUFFER,
-                detail: format!("deposit cell {cell} is not in this field"),
-            })?;
+        let before = *energy;
         let mut total = 0.0;
         let mut moment = [0.0; CHANNELS];
         for packet in group {
@@ -622,36 +759,29 @@ pub fn apply_deposits(
         let after = round_down_f32(add_down(f64::from(before), total));
         let received = f64::from(after) - f64::from(before);
         let factor = if total > 0.0 { received / total } else { 0.0 };
-        for slot in &mut moment {
-            *slot *= factor;
-        }
-        applied.add(received);
-        cells.push(CellDeposit {
-            cell,
-            after,
-            moment,
-        });
-    }
-    summary.cells = deposits.cells.len();
-    summary.applied = applied.value();
-
-    let energy = field.energy_mut();
-    for deposit in &deposits.cells {
-        energy[deposit.cell] = deposit.after;
-    }
-    for channel in 0..MOMENT_CHANNELS {
-        let plane = field
-            .moment_mut(channel)
-            .ok_or_else(|| conflict(format!("moment plane {channel} is missing")))?;
-        let index = usize::try_from(channel).unwrap_or(usize::MAX);
-        for deposit in &deposits.cells {
-            let added = deposit.moment.get(index).copied().unwrap_or(0.0);
-            if added != 0.0 {
-                let moment = &mut plane[deposit.cell];
-                *moment = (f64::from(*moment) + added) as f32;
+        *energy = after;
+        for (plane, &sum) in run.moments.iter_mut().zip(&moment) {
+            let added = sum * factor;
+            if added != 0.0
+                && let Some(value) = plane.get_mut(at)
+            {
+                *value = (f64::from(*value) + added) as f32;
             }
         }
+        if let Some(slot) = run.received.get_mut(occupied) {
+            *slot = received;
+        }
+        occupied += 1;
     }
-    deposits.applied = true;
-    Ok(summary)
+    occupied
+}
+
+/// `slice` cut after its first `count` values.
+fn cut<T>(slice: &mut [T], count: usize) -> Result<(&mut [T], &mut [T]), CoreError> {
+    slice
+        .split_at_mut_checked(count)
+        .ok_or_else(|| CoreError::LayoutMismatch {
+            buffer: crate::layout::BUFFER,
+            detail: format!("a deposit run of {count} values overruns its buffer"),
+        })
 }

@@ -364,7 +364,10 @@ each runs and owns the field.
   `(E_next − E_previous)/Δt`. A death is collected exhausted at its resulting position at tick `n + 1`, and its
   residual (zero) is settled under the death policy. Newborns join at `n + 1` and are first advanced from it.
 - Phase 9 debits the grants first, then reduces the emission deposits (`emission`), then recycling (`recycling`),
-  all into the next field, so new deposits are first sensed next tick.
+  all into the next field, so new deposits are first sensed next tick. Each reduction runs on the field's workers
+  (`flife_field::apply_deposits_on`): every cell is reduced and written as on one thread, and what the cells
+  received is summed in cell order, so the world is bit-identical at any worker count
+  (`the_cpu_worker_count_changes_no_result`, pinned digests).
 - Phase 10 checks the next field (INV-01, INV-02 at the profile's cone tolerance), closes the tick against holdings
   measured from the next field and the survivors and newborns in identity order (INV-03 per tick), commits the
   closure to a copy of the run's ledger (INV-03 cumulative), and checks the population's whole commit (INV-01,

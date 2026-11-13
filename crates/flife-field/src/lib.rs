@@ -57,7 +57,7 @@ pub mod transport;
 pub mod uptake;
 
 pub use bins::Bins;
-pub use deposit::{DepositSummary, Deposits, apply_deposits};
+pub use deposit::{DepositSummary, Deposits, apply_deposits, apply_deposits_on};
 pub use exchange::{ExchangeStencil, check_request, saturating_request};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};

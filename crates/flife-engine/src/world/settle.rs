@@ -1,29 +1,34 @@
-//! FL-032: phase 6 on a [`SettleBackend`] (plan §5.3–§5.6, §8.2, §10.7).
+//! FL-032: phases 6 and 7 on a [`SettleBackend`] (plan §5.3–§5.6, §7.4,
+//! §8.2, §10.7).
 //!
-//! The backend computes each organism's chemistry, maintenance, motion and
-//! emission (`flife_field::settle`); the host composes them with the
-//! reference's own [`settle_stages`], so the order of stages, the
-//! exhaustion checks, the ledger flows, the watched organism's record and
-//! the reproduction proposal are the reference's code, not a copy. At each
-//! stage the host replays the backend's payment on its own budget with the
-//! reference's operations ([`Device`]) and refuses a settlement whose
-//! amounts or balances differ by a bit; it recomputes emission's request
-//! and offer, and stages each deposit's split through
-//! [`Deposits::push_split`]'s checks. The replay runs on the lanes, each
-//! lane taking the run the reference would, so each lane's ledger flows and
-//! staged emissions are what the reference's lane holds.
+//! The backend computes each organism's chemistry, maintenance, motion,
+//! emission and reproduction proposal (`flife_field::settle`); the host
+//! composes them with the reference's own [`settle_stages`], so the order of
+//! stages, the exhaustion checks, the ledger flows and the watched
+//! organism's record are the reference's code, not a copy. At each stage the
+//! host replays the backend's payment on its own budget with the reference's
+//! operations ([`Device`]) and refuses a settlement whose amounts or
+//! balances differ by a bit; it recomputes emission's request and offer, and
+//! stages each deposit's split through [`Deposits::push_split`]'s checks.
+//! For the proposal it checks the cooldown and the attempt probability, and
+//! for an attempt recomputes the split with the reference's
+//! `Reproduction::attempted`, which also builds the birth intent. The replay
+//! runs on the lanes, each lane taking the run the reference would, so each
+//! lane's ledger flows and staged emissions are what the reference's lane
+//! holds.
 //!
 //! What the host does not recompute it takes from the backend: what
 //! chemistry absorbed and gained, the requested toxicity and maintenance
 //! bill, the motion request, the velocity and position (only checked to lie
-//! on the torus), and each deposit's split within `push_split`'s bounds.
-//! That those are the reference's is shown by racing the worlds, not by
-//! this replay (`flife-backend-metal`'s `tests/settle_world.rs`).
+//! on the torus), each deposit's split within `push_split`'s bounds, and
+//! whether the attempt's draw made an attempt. That those are the
+//! reference's is shown by racing the worlds, not by this replay
+//! (`flife-backend-metal`'s `tests/settle_world.rs`).
 //!
 //! No row is written until every organism has settled: [`settle_stages`]
 //! returns each organism's [`Settled`], and the rows take them only after
 //! the whole replay succeeds. Any error, from the backend or the replay,
-//! leaves the rows as they were, and the tick's phase 6 runs on the
+//! leaves the rows as they were, and the tick's phases 6 and 7 run on the
 //! reference ([`settle_with`]).
 
 use flife_core::CoreError;
@@ -33,7 +38,8 @@ use flife_core::ledger::{EnergyBudget, Payment, sub_down};
 use flife_core::memory::{capacity_bytes, total};
 use flife_field::settle::{
     ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction, EmissionOrganism,
-    EmissionOutcome, ExhaustedAt, MotionConstants, MotionOrganism, MotionOutcome, SettleBackend,
+    EmissionOutcome, ExhaustedAt, MotionConstants, MotionOrganism, MotionOutcome, ProposalOrganism,
+    ProposalOutcome, SettleBackend,
 };
 use flife_field::state::CHANNELS;
 use flife_field::{Bins, Deposits, FieldState, GrantPacket};
@@ -48,6 +54,7 @@ use crate::emission::EmissionSettlement;
 use crate::lifecycle::{BudgetStage, Vitality};
 use crate::motion::MotionSettlement;
 use crate::population::Population;
+use crate::reproduction::{ParentState, ReproductionProposal, Unviable, check_probability};
 
 /// The world's phase 6 backend and the host's lists for it.
 #[derive(Debug, Default)]
@@ -70,6 +77,11 @@ pub(super) struct SettleWork {
     /// For each organism, the index of its emission outcome, or
     /// `usize::MAX` for one that does not reach emission.
     emitters: Vec<usize>,
+    proposal: Vec<ProposalOrganism>,
+    proposal_out: Vec<ProposalOutcome>,
+    /// For each organism, the index of its proposal, or `usize::MAX` for
+    /// one that does not reach phase 7.
+    proposers: Vec<usize>,
     settled: Vec<Settled>,
 }
 
@@ -92,6 +104,9 @@ impl SettleWork {
         fit(&mut self.emission, rows, "phase 6 emission rows")?;
         fit(&mut self.emission_out, rows, "phase 6 emission outcomes")?;
         fit(&mut self.emitters, rows, "phase 6 emitters")?;
+        fit(&mut self.proposal, rows, "phase 7 proposal rows")?;
+        fit(&mut self.proposal_out, rows, "phase 7 proposals")?;
+        fit(&mut self.proposers, rows, "phase 7 proposers")?;
         fit(&mut self.settled, rows, "phase 6 settlements")
     }
 
@@ -106,6 +121,9 @@ impl SettleWork {
             capacity_bytes(&self.emission),
             capacity_bytes(&self.emission_out),
             capacity_bytes(&self.emitters),
+            capacity_bytes(&self.proposal),
+            capacity_bytes(&self.proposal_out),
+            capacity_bytes(&self.proposers),
             capacity_bytes(&self.settled),
         ])
     }
@@ -171,8 +189,8 @@ pub(super) fn settle_with(
     Ok(())
 }
 
-/// Phases 6 and 7 with `device`'s chemistry, maintenance, motion and
-/// emission; see the module documentation. On error no row is written.
+/// Phases 6 and 7 with `device`'s chemistry, maintenance, motion, emission
+/// and proposal; see the module documentation. On error no row is written.
 #[expect(
     clippy::too_many_arguments,
     reason = "private stage runner of World::prepare; the arguments are the tick's working state"
@@ -199,6 +217,9 @@ fn settle_on(
         emission,
         emission_out,
         emitters,
+        proposal,
+        proposal_out,
+        proposers,
         settled,
     } = work;
     chemistry.clear();
@@ -206,6 +227,8 @@ fn settle_on(
     motion.clear();
     emission.clear();
     emitters.clear();
+    proposal.clear();
+    proposers.clear();
     settled.clear();
 
     // Each organism's packets, in cell order as the reference settles them,
@@ -279,6 +302,29 @@ fn settle_on(
         emission_out,
     )?;
     expect_outcomes("emission", emission_out.len(), emission.len())?;
+    for (organism, &at) in working.iter().zip(emitters.iter()) {
+        match emission_out.get(at) {
+            Some(outcome) if !outcome.exhausted => {
+                proposers.push(proposal.len());
+                proposal.push(ProposalOrganism {
+                    entity: organism.committed.id.get(),
+                    tick: from.get(),
+                    cooldown_deadline: organism.cooldown_deadline.get(),
+                    remaining: outcome.remaining,
+                    exhausted: false,
+                    attempt_probability: organism.actions.attempt_probability,
+                    child_fraction: organism.actions.child_fraction,
+                });
+            }
+            _ => proposers.push(usize::MAX),
+        }
+    }
+    device.proposal(
+        &rules.reproduction.proposal_constants(rules.rng.seed()),
+        proposal,
+        proposal_out,
+    )?;
+    expect_outcomes("proposal", proposal_out.len(), proposal.len())?;
 
     // The replay, on the lanes as the reference runs them.
     for lane in lanes.iter_mut() {
@@ -289,8 +335,14 @@ fn settle_on(
     settled.extend(working.iter().map(Settled::of));
     {
         let rows: &[Working] = working;
-        let (chemistry_out, motion_out, emission_out, emitters) =
-            (&*chemistry_out, &*motion_out, &*emission_out, &*emitters);
+        let (chemistry_out, motion_out, emission_out, emitters, proposal_out, proposers) = (
+            &*chemistry_out,
+            &*motion_out,
+            &*emission_out,
+            &*emitters,
+            &*proposal_out,
+            &*proposers,
+        );
         in_runs_mut(
             settled,
             lanes,
@@ -310,6 +362,7 @@ fn settle_on(
                         chemistry: chemistry_out.get(index).ok_or_else(missing)?,
                         motion: motion_out.get(index).ok_or_else(missing)?,
                         emission: emitters.get(index).and_then(|&at| emission_out.get(at)),
+                        proposal: proposers.get(index).and_then(|&at| proposal_out.get(at)),
                     };
                     let record =
                         (watched == Some(organism.committed.id)).then_some(&mut *transactions);
@@ -392,6 +445,8 @@ struct Device<'a> {
     motion: &'a MotionOutcome,
     /// `None` for an organism the backend found dead before emission.
     emission: Option<&'a EmissionOutcome>,
+    /// `None` for an organism the backend found dead before phase 7.
+    proposal: Option<&'a ProposalOutcome>,
 }
 
 impl Device<'_> {
@@ -664,5 +719,94 @@ impl Stages for Device<'_> {
             cost,
             offered,
         })
+    }
+
+    fn propose(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        parent: &ParentState,
+        tick: Tick,
+        budget: &EnergyBudget,
+    ) -> Result<ReproductionProposal, CoreError> {
+        // Reproduction::propose: the cooldown and the probability checked
+        // here, whether the draw made an attempt taken from the backend, and
+        // an attempt's split recomputed. `settle_stages` proposes only for an
+        // organism alive after emission, so the budget is not exhausted and a
+        // backend's `Exhausted` is refused.
+        let outcome = *self
+            .proposal
+            .ok_or_else(|| differ("the backend did not propose".into()))?;
+        let unexpected = || differ(format!("{} proposed {outcome:?} on the backend", parent.id));
+        if tick < parent.cooldown_deadline {
+            return if outcome == ProposalOutcome::CoolingDown {
+                Ok(ReproductionProposal::CoolingDown {
+                    deadline: parent.cooldown_deadline,
+                })
+            } else {
+                Err(unexpected())
+            };
+        }
+        check_probability(organism.actions.attempt_probability)?;
+        match outcome {
+            ProposalOutcome::NoAttempt => Ok(ReproductionProposal::NoAttempt),
+            ProposalOutcome::Exhausted | ProposalOutcome::CoolingDown => Err(unexpected()),
+            attempted => {
+                let proposal = rules.reproduction.attempted(
+                    parent,
+                    tick,
+                    organism.actions.child_fraction,
+                    budget,
+                )?;
+                if agrees(&proposal, attempted) {
+                    Ok(proposal)
+                } else {
+                    Err(differ(format!(
+                        "{} split as {attempted:?} on the backend and {proposal:?} on the host",
+                        parent.id
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Whether the host's proposal for an attempt is the backend's, bit for
+/// bit.
+fn agrees(host: &ReproductionProposal, backend: ProposalOutcome) -> bool {
+    match (host, backend) {
+        (
+            ReproductionProposal::Unviable(Unviable::BelowAttemptEnergy { available, .. }),
+            ProposalOutcome::BelowAttemptEnergy { available: theirs },
+        )
+        | (
+            ReproductionProposal::Unviable(Unviable::BirthCostUnaffordable { available, .. }),
+            ProposalOutcome::BirthCostUnaffordable { available: theirs },
+        )
+        | (
+            ReproductionProposal::Unviable(Unviable::ChildBelowMinimum {
+                child: available, ..
+            }),
+            ProposalOutcome::ChildBelowMinimum { child: theirs },
+        )
+        | (
+            ReproductionProposal::Unviable(Unviable::ParentBelowMinimum {
+                parent: available, ..
+            }),
+            ProposalOutcome::ParentBelowMinimum { parent: theirs },
+        ) => same(*available, theirs),
+        (
+            ReproductionProposal::Intent(intent),
+            ProposalOutcome::Viable {
+                available,
+                child,
+                parent,
+            },
+        ) => {
+            same(intent.split.available, available)
+                && same(intent.split.child, child)
+                && same(intent.split.parent, parent)
+        }
+        _ => false,
     }
 }

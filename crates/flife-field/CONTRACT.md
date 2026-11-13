@@ -138,10 +138,14 @@
   with its arithmetic unchanged.
 - `settle` (FL-032): the port for phase 6 on a device, plain data below the engine. `SettleBackend` (`describe`;
   `chemistry(observed, constants, organisms, packets, out)`, `motion(constants, organisms, out)` for
-  maintenance and motion, `emission(grid, efficiency, organisms, out)`), with `ChemistryConstants`,
+  maintenance and motion, `emission(grid, efficiency, organisms, out)`, `proposal(constants, organisms, out)`
+  for phase 7's reproduction proposal), with `ChemistryConstants`,
   `ChemistryOrganism`, `ChemistryPacket`, `ChemistryOutcome`, `MotionConstants`, `MotionOrganism` (`MOTION_TERMS`
   response terms), `MotionOutcome` (`ExhaustedAt`, `MaintenanceOutcome`, `MovementOutcome`),
-  `EmissionAction`, `EmissionOrganism` and `EmissionOutcome` (`packets()`, the staged packets). The types moved
+  `EmissionAction`, `EmissionOrganism` and `EmissionOutcome` (`packets()`, the staged packets),
+  `ProposalConstants` (the world seed and four reproduction rules), `ProposalOrganism` and `ProposalOutcome`
+  (`Exhausted`, `CoolingDown`, `NoAttempt`, the four unviable reasons with their value, `Viable` with the
+  split). The phase 6 types moved
   here from `flife-backend-metal` unchanged; `EmissionAction` is the controller's emission (`flife-neural`
   converts its `Emission`). `flife-engine` runs it (`World::set_settle_backend`) and `flife-backend-metal`
   implements it (`MetalSettle`).

@@ -65,8 +65,18 @@ port `SettleBackend`, unchanged; this crate re-exports them. `MetalSettle` (`ope
 `owner`) holds `MetalChemistry`, `MetalMotion` and `MetalEmission` on one `DeviceOwner` and implements the port;
 `World::set_settle_backend` runs it. The engine replays each organism's payments on its own budget and refuses a
 settlement that differs by a bit (flife-engine's contract), so a backend that fails or is refused hands its tick
-to the reference and is dropped. The reproduction proposal stays on the host. Lifecycle, mutation, residency and
-whole-tick parity are FL-032's remaining work.
+to the reference and is dropped.
+
+FL-032, fifth stage: phase 7's reproduction proposal on Metal, in `proposal` (`philox.metal`, `proposal.metal`).
+`MetalProposal::settle` runs, for each organism alive after emission, `Reproduction::propose`: the exhaustion and
+cooldown checks, `attempts` (the probability's range, then word 0 of fnp-philox-semantic-v1's block for the birth
+stream, the parent, the tick and the attempt lane, as a half-open uniform against the probability) and `split`
+(the balance and fraction checks, the attempt minimum, the birth cost rounded down, the child's and parent's
+shares, their minimums) on software binary64 (plan §7.4, §8.2). The block is Philox4x64-10 of the counter plus
+one, as NumPy increments it, under the key [world seed, stream code]. `MetalSettle` holds a `MetalProposal` on
+its owner and implements the port's `proposal`; the engine checks the cooldown and the probability and
+recomputes every attempt's split, so it takes from the device only whether the draw made an attempt
+(flife-engine's contract). Lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -660,11 +670,32 @@ A refusal changes nothing.
     as the reference settles them: an organism that does not emit with a NaN position, and one with a zero
     fraction, NaN direction and infinite position. Refused before any command: zero, negative and NaN balances,
     and an efficiency of 1.5.
+- `tests/proposal.rs` (FL-032, 3 tests), every value compared as bits:
+  - `the_random_blocks_are_numpys_and_flife_cores`: the device's Philox4x64-10 blocks against FrankenNumPy's
+    NumPy-exact `PhiloxRng` on random keys and counters and on eight carry counters (each word wrapping in turn,
+    and the whole counter wrapping to zero), and against flife-core's `SemanticRng::block` on semantic addresses
+    of every stream and lane kind; each word's half-open uniform, and that of 58 edge words (zero, the largest,
+    the leading 52 bits' smallest and largest, and each bit alone), against flife-core's.
+  - `proposals_on_the_device_are_the_references`: 4,096 organisms under each of four rule sets (the preset's; no
+    birth cost or attempt minimum with the smallest positive minimums; a birth cost of 60; a child's minimum of
+    0.4 beside a parent's of 0.2), with the constants from `Reproduction::proposal_constants`, against
+    `Reproduction::propose`. Balances run from zero to 1e300, some a few ulps above the birth cost, some at the
+    attempt minimum and one ulp below it; deadlines fall on, before and after the tick; probabilities include
+    ±0, 1, the smallest subnormal, the largest below one, and the attempt's own uniform and one ulp above it;
+    fractions include the smallest subnormal and the largest below one; identities reach `u64::MAX`. Every
+    outcome is seen (exhausted 6,547, cooling down 1,675, no attempt 4,378, the four unviable reasons 784, 401,
+    657 and 213, viable 1,729).
+  - `proposals_the_reference_refuses_are_refused`: probabilities of NaN, the smallest negative, one ulp above one
+    and infinity; balances of -1, NaN and infinity; fractions of zero, one, NaN and -0.5, each beside a valid
+    organism.
+    Not refused, and proposed as the reference proposes: a cooling-down or exhausted parent with NaN everything
+    else, and a parent that makes no attempt with a NaN fraction. Refused before any command: a NaN or infinite
+    constant.
 - `tests/settle_world.rs` (FL-032, 5 tests): a world with `MetalSettle` raced against the reference world, the
   first organism watched, comparing digests and watched transactions every tick.
   - `the_preset_with_phase_6_on_metal_is_the_reference_world_at_every_tick`: the preset, 300 ticks, every tick
     on the device (report 300 and 0), with deposits (552,539), births (22) and deaths at chemistry (146) and
-    maintenance (1,894). Installing the backend reserves its lists (scratch 101,233,808 to 133,477,520 bytes),
+    maintenance (1,894). Installing the backend reserves its lists (scratch 101,233,808 to 135,050,384 bytes),
     which the run does not grow; the owner holds no leases or retiring buffers afterwards, and removing the
     backend releases its lists.
   - `worlds_whose_organisms_die_at_every_stage_are_the_reference_worlds`: the preset with motion costing 2.0 and
@@ -672,17 +703,22 @@ A refusal changes nothing.
     with emission capped at 10⁷ (3,356 at emission), 60 ticks each, every tick on the device.
   - `the_preset_with_every_metal_backend_on_one_device_is_the_reference_world`: the field, sensors, uptake and
     phase 6 on one `DeviceOwner` and the controllers on `MetalBackend`, 120 ticks.
-  - `a_change_the_host_cannot_see_changes_the_world`: an organism moved one ulp further, and two packets'
-    amounts swapped; the worlds diverge at that tick and the backend serves every tick.
-  - `a_failing_or_refused_settle_backend_hands_its_tick_to_the_reference_and_is_dropped`: 19 planted changes,
+  - `a_change_the_host_cannot_see_changes_the_world`: an organism moved one ulp further, two packets' amounts
+    swapped, and a viable attempt reported as none; the worlds diverge at that tick and the backend serves every
+    tick.
+  - `a_failing_or_refused_settle_backend_hands_its_tick_to_the_reference_and_is_dropped`: 24 planted changes,
     one per host check: a failure after emission; one ulp more toxicity paid, or less left after chemistry; a
     gain reported as a loss; a death at motion the host does not see; a death at chemistry reported at
     maintenance; one ulp more of a maintenance bill paid, or paid to the controller; a scaled flag flipped; one
     ulp less paid for motion; a position on the torus's edge; a deposit for an organism that does not emit; one
     ulp less offered or paid for a deposit; a packet twice the offer, or holding nothing; two packets out of
-    order, or in one cell; a cell one past the grid. Each world is the reference world at every tick, the
-    backend served the ticks before and is then dropped, and its report names the cause. A death at chemistry
-    reported as none is refused by the emission kernel itself, which takes only organisms alive after motion.
+    order, or in one cell; a cell one past the grid; no attempt reported as cooling down, and cooling down as no
+    attempt; a viable child one ulp short; an attempt below the attempt energy reported as unaffordable, or one
+    ulp short. Each world is the reference world at every tick, the backend served the ticks before and is then
+    dropped, and its report names the cause. A death at chemistry reported as none is refused by the emission
+    kernel itself, which takes only organisms alive after motion. The preset's founders cool down for their
+    first 64 ticks, so the proposal's changes are planted in the preset with a cooldown of 0.01 s (two ticks),
+    and the viable ones with an attempt minimum of 1.0 too.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -779,6 +815,34 @@ Planted mutants, each run in a scratch copy.
   because `tests/world.rs` tallied the ecology's deaths by stage but asserted nothing about them. Its assertion
   of deaths at maintenance now catches it: without the vitality, each death is recorded at the split, its
   budget's next check. Absorbed was equivalent: nothing read it after phase 6, so the field was removed.
+- FL-032's reproduction proposal: 38 planted in `philox.metal`, `proposal.metal`, `proposal.rs` and
+  `Reproduction::proposal_constants`, against `tests/proposal.rs`, 38 caught:
+  - Philox: a multiplier and a Weyl increment one bit off; no carry into the counter's second or last word, or
+    a carry past a third word that did not wrap; nine rounds; the first new word under the second key; the
+    block's second and fourth words swapped; the counter not incremented;
+  - the uniform: a zero word not special-cased; the exponent off by one; 53 bits kept; the fraction shifted
+    one too few;
+  - the kernel: an exhausted budget not refused; the cooldown including its deadline; a probability above one,
+    or below zero, admitted; an attempt when the uniform equals the probability; the draw from the block's
+    second word, or from draw one; a negative balance, or a fraction of one, admitted; a balance at the attempt
+    minimum below it; the remainder rounded to nearest; a zero remainder affordable; the parent's share taken
+    from the balance; the parent's minimum checked first; a child below its minimum reported as a parent;
+    below the attempt energy reporting the minimum;
+  - the port: the attempt lane's index, or the stream's code, off by one; the child's and parent's minimums in
+    each other's slots, or swapped by the engine; a viable split's shares read swapped; an unknown row read as
+    no attempt; an infinite constant admitted; the exhausted flag not sent; the seed not the world's.
+
+  The uniform equal to the probability and the balance at the attempt minimum survived the first round, as
+  the generator had neither edge; it now proposes at the attempt's own uniform and one ulp above it, and at the
+  attempt minimum and one ulp below it, and the second round caught both. The swapped minimums are caught only
+  under the fourth rule set, whose child's minimum differs from the parent's.
+- FL-032's proposal in a world: 11 planted in flife-engine's `Device::propose` and the rows it sends, against
+  `tests/settle_world.rs`, 10 caught: the cooldown not checked; any outcome passing during a cooldown; a
+  cooldown outside one read as no attempt; the split not compared; a viable child's share not compared; an
+  unviable attempt's value not compared; the host splitting with another fraction; the backend proposing for
+  the next tick, from half the balance, or with no cooldown. The host's probability check survived: no world
+  produces a probability outside [0, 1] (the controller decodes it into that range), and the kernel refuses
+  one itself. It is kept because it mirrors the order in which `propose` refuses.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -970,7 +1034,8 @@ per-pass thread spawning (6%).
 **Known gaps.**
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
   decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; a world given `MetalSettle`
-  runs chemistry, maintenance, motion and emission on the device, its host replaying each payment). On
+  runs chemistry, maintenance, motion, emission and the reproduction proposal on the device, its host
+  replaying each payment and recomputing each attempt's split). On
   many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype

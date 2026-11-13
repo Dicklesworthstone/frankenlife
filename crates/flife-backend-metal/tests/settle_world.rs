@@ -1,20 +1,20 @@
 //! FL-032's engine port: the real small-world preset with phase 6's
-//! chemistry, maintenance, motion and emission on Metal is the reference
-//! world, digest for digest and the watched organism's transactions record
-//! for record, at every tick, alone and together with the Metal field,
-//! sensors, uptake and controllers. Two changes the host's replay cannot
-//! see, one organism moved by one ulp and two packets of one deposit
-//! swapped, change the world (the planted negatives). A backend that fails,
-//! or gives a settlement the replay refuses (a toxicity off by one ulp at
-//! the population's last toxic organism, a death the host does not find, a
-//! packet larger than its offer), hands that tick to the reference and is
-//! dropped, leaving the run the reference's: no organism keeps a stage the
-//! refused tick settled.
+//! chemistry, maintenance, motion and emission and phase 7's reproduction
+//! proposal on Metal is the reference world, digest for digest and the
+//! watched organism's transactions record for record, at every tick, alone
+//! and together with the Metal field, sensors, uptake and controllers.
+//! Changes the host's replay cannot see (one organism moved by one ulp, two
+//! packets of one deposit swapped, a viable attempt reported as none)
+//! change the world (the planted negatives). A backend that fails, or gives
+//! a settlement the replay refuses (one per host check), hands that tick to
+//! the reference and is dropped, leaving the run the reference's: no
+//! organism keeps a stage the refused tick settled.
 
 use flife_backend_metal::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionOrganism,
     EmissionOutcome, ExhaustedAt, MetalBackend, MetalField, MetalSensors, MetalSettle, MetalUptake,
-    MotionConstants, MotionOrganism, MotionOutcome,
+    MotionConstants, MotionOrganism, MotionOutcome, ProposalConstants, ProposalOrganism,
+    ProposalOutcome,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, BudgetStage, DeathCause, NumericalProfile, Stepped, World};
@@ -279,6 +279,46 @@ enum Change {
     Outside,
     /// Give the first deposit's first packet nothing.
     Zero,
+    /// Report the first viable attempt as no attempt.
+    Abstain,
+    /// Report the first organism that made no attempt as cooling down.
+    Cool,
+    /// Report the first organism cooling down as having made no attempt.
+    Warm,
+    /// Give the first viable split one ulp less for the child.
+    Child,
+    /// Report the first attempt below the attempt energy as one that cannot
+    /// afford the birth cost.
+    Reason,
+    /// Give the first attempt below the attempt energy one ulp less.
+    Short,
+}
+
+/// The world each change is planted in: the preset, unless the change
+/// needs an early death or an early proposal. The preset's founders cool
+/// down for 64 ticks (0.5 s at Δt = 1/128 s); with a cooldown of 0.01 s
+/// they propose from tick 2, below the attempt energy, and with an attempt
+/// minimum of 1.0 below their 2.0 they can propose viable births.
+fn world_for(change: Change) -> String {
+    const COOLDOWN: (&str, &str) = ("cooldown_seconds = 0.5", "cooldown_seconds = 0.01");
+    const ATTEMPT: (&str, &str) = (
+        "minimum_parent_energy_before_attempt = 3.0",
+        "minimum_parent_energy_before_attempt = 1.0",
+    );
+    match change {
+        Change::Later => variant("2.0", "1000.0"),
+        Change::Cool | Change::Reason | Change::Short => with(&[COOLDOWN]),
+        Change::Abstain | Change::Child => with(&[COOLDOWN, ATTEMPT]),
+        _ => PRESET.to_owned(),
+    }
+}
+
+/// The preset with each line replaced, each found once.
+fn with(lines: &[(&str, &str)]) -> String {
+    lines.iter().fold(PRESET.to_owned(), |toml, (from, to)| {
+        assert_eq!(toml.matches(from).count(), 1, "{from}");
+        toml.replace(from, to)
+    })
 }
 
 /// The Metal phase 6 with one change at one tick.
@@ -466,6 +506,57 @@ impl SettleBackend for Altered {
         }
         Ok(())
     }
+
+    fn proposal(
+        &mut self,
+        constants: &ProposalConstants,
+        organisms: &[ProposalOrganism],
+        out: &mut Vec<ProposalOutcome>,
+    ) -> Result<(), CoreError> {
+        self.inner.proposal(constants, organisms, out)?;
+        let viable =
+            |outcome: &&mut ProposalOutcome| matches!(outcome, ProposalOutcome::Viable { .. });
+        if self.now(Change::Abstain)
+            && let Some(outcome) = out.iter_mut().find(viable)
+        {
+            *outcome = ProposalOutcome::NoAttempt;
+        }
+        if self.now(Change::Cool)
+            && let Some(outcome) = out
+                .iter_mut()
+                .find(|outcome| **outcome == ProposalOutcome::NoAttempt)
+        {
+            *outcome = ProposalOutcome::CoolingDown;
+        }
+        if self.now(Change::Warm)
+            && let Some(outcome) = out
+                .iter_mut()
+                .find(|outcome| **outcome == ProposalOutcome::CoolingDown)
+        {
+            *outcome = ProposalOutcome::NoAttempt;
+        }
+        if self.now(Change::Child)
+            && let Some(ProposalOutcome::Viable { child, .. }) = out.iter_mut().find(viable)
+        {
+            *child = child.next_down();
+        }
+        if self.now(Change::Reason)
+            && let Some(outcome) = out
+                .iter_mut()
+                .find(|outcome| matches!(outcome, ProposalOutcome::BelowAttemptEnergy { .. }))
+            && let ProposalOutcome::BelowAttemptEnergy { available } = *outcome
+        {
+            *outcome = ProposalOutcome::BirthCostUnaffordable { available };
+        }
+        if self.now(Change::Short)
+            && let Some(ProposalOutcome::BelowAttemptEnergy { available }) = out
+                .iter_mut()
+                .find(|outcome| matches!(outcome, ProposalOutcome::BelowAttemptEnergy { .. }))
+        {
+            *available = available.next_down();
+        }
+        Ok(())
+    }
 }
 
 fn altered(at: u64, change: Change) -> Option<Altered> {
@@ -479,12 +570,13 @@ fn altered(at: u64, change: Change) -> Option<Altered> {
 
 #[test]
 fn a_change_the_host_cannot_see_changes_the_world() {
-    for (change, at) in [(Change::Nudge, 7), (Change::Swap, 9)] {
+    for (change, at) in [(Change::Nudge, 7), (Change::Swap, 9), (Change::Abstain, 3)] {
         let Some(device) = altered(at, change) else {
             return;
         };
-        let mut reference = found();
-        let mut metal = found();
+        let toml = world_for(change);
+        let mut reference = found_from(&toml);
+        let mut metal = found_from(&toml);
         metal.set_settle_backend(Some(Box::new(device)));
         let raced = race(&mut reference, &mut metal, 12);
         assert_eq!(raced.difference, Some(at), "{change:?}");
@@ -520,16 +612,16 @@ fn a_failing_or_refused_settle_backend_hands_its_tick_to_the_reference_and_is_dr
         (Change::Repeat, 3, "out of order"),
         (Change::Outside, 4, "outside the grid"),
         (Change::Zero, 5, "amount 0e0"),
+        (Change::Cool, 4, "proposed CoolingDown"),
+        (Change::Warm, 6, "proposed NoAttempt"),
+        (Change::Child, 3, "split as Viable"),
+        (Change::Reason, 5, "split as BirthCostUnaffordable"),
+        (Change::Short, 6, "split as BelowAttemptEnergy"),
     ] {
         let Some(device) = altered(at, change) else {
             return;
         };
-        // No organism of the preset dies this early.
-        let toml = if change == Change::Later {
-            variant("2.0", "1000.0")
-        } else {
-            PRESET.to_owned()
-        };
+        let toml = world_for(change);
         let mut reference = found_from(&toml);
         let mut metal = found_from(&toml);
         metal.set_settle_backend(Some(Box::new(device)));

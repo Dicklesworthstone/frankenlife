@@ -76,7 +76,8 @@ pub use seeding::{
 pub use settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
     EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MaintenanceOutcome,
-    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome, SettleBackend,
+    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome, ProposalConstants,
+    ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 pub use sources::{
     DepositReport, PathSegment, Source, SourceKernel, SourceSupport, deposit_energy,

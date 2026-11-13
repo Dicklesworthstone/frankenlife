@@ -1089,10 +1089,10 @@ velocity, first-order splitting at the configured fixed timestep.
   the backend, and it is not state. The tests are in `flife-backend-metal`'s `tests/uptake_world.rs`.
 - Phase 6 runs each organism's stages through one function (`settle_stages`) over a `Stages` source: the
   reference's operators, or a backend's outcomes. It returns the organism's settlement (`Settled`: budget,
-  vitality, absorbed, velocity, position, emitted, birth intent), which is written to the row afterwards; the
-  stage order, exhaustion checks, ledger flows, watched record and reproduction proposal are unchanged.
-  `World::set_settle_backend` (FL-032) hands phase 6's chemistry, maintenance, motion and emission to a
-  `flife_field::SettleBackend`. The host replays the backend's settlements on each organism's own budget with
+  vitality, velocity, position, emitted, birth intent), which is written to the row afterwards; the stage
+  order, exhaustion checks, ledger flows, watched record and reproduction proposal are unchanged.
+  `World::set_settle_backend` (FL-032) hands phase 6's chemistry, maintenance, motion and emission, and phase
+  7's reproduction proposal, to a `flife_field::SettleBackend`. The host replays the backend's settlements on each organism's own budget with
   the reference's payments, on the lanes as the reference runs them, and refuses (`StateConflict`, "replay a
   settle backend") a payment, balance, exhaustion flag, maintenance split, scaled flag, emission request or offer
   that differs by a bit, a position off the torus, a deposit for an organism that does not emit or for a zero
@@ -1102,7 +1102,13 @@ velocity, first-order splitting at the configured fixed timestep.
   reference's. No row is written until every organism has settled. If the backend or the replay errs, the
   tick's phase 6 is redone on the reference from the same rows, and the backend is dropped, with
   `World::settle_report` (`SettleReport`: backend, device and reference ticks, failure) recording why; if the
-  reference errs too, its error is the tick's. Reproduction's proposal stays on the host. Installing a backend
+  reference errs too, its error is the tick's. For the proposal, the backend gets every organism alive after
+  emission with its post-emission balance, the attempt probability and child fraction, and the constants of
+  `Reproduction::proposal_constants` (the world seed and the reproduction rules). The host checks the cooldown
+  itself and refuses an outcome that disagrees ("proposed"), checks the probability as `attempts` does, and
+  recomputes an attempt's split with `Reproduction::attempted` (`propose`'s tail, factored out with its
+  arithmetic unchanged), refusing a split or an unviable reason or value that differs by a bit ("split as").
+  It takes from the backend whether the Bernoulli draw made an attempt. Installing a backend
   reserves its lists for the population's capacity (FL-043, counted in the footprint's scratch); if the host
   refuses that, the backend is not installed and the report says why. No result depends on the backend, and it
   is not state. The tests are in `flife-backend-metal`'s `tests/settle_world.rs`.

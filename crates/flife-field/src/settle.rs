@@ -12,13 +12,16 @@
 //!   response, its payment and the displacement, and the check after
 //!   motion;
 //! - [`SettleBackend::emission`]: for an organism alive after motion, its
-//!   payment and offer, and its deposit's footprint split.
+//!   payment and offer, and its deposit's footprint split;
+//! - [`SettleBackend::proposal`]: for an organism alive after emission,
+//!   phase 7's reproduction proposal: the cooldown, the attempt's draw and
+//!   the energy split.
 //!
 //! The engine replays every payment on its own budgets with the reference's
 //! operations and refuses a backend whose amounts or balances differ from
 //! them, records the ledger flows and stages the deposits in identity order,
-//! and proposes reproduction on the host. Any error hands the tick's phase 6
-//! to the reference.
+//! and builds each birth intent from the proposal's split. Any error hands
+//! the tick's phases 6 and 7 to the reference.
 
 use flife_core::CoreError;
 
@@ -314,4 +317,91 @@ pub trait SettleBackend: std::fmt::Debug + Send {
         organisms: &[EmissionOrganism],
         out: &mut Vec<EmissionOutcome>,
     ) -> Result<(), CoreError>;
+
+    /// The reproduction proposal of each organism alive after emission.
+    ///
+    /// # Errors
+    /// Any. The world then computes the tick's phases 6 and 7 on the
+    /// reference.
+    fn proposal(
+        &mut self,
+        constants: &ProposalConstants,
+        organisms: &[ProposalOrganism],
+        out: &mut Vec<ProposalOutcome>,
+    ) -> Result<(), CoreError>;
+}
+
+/// The constants of phase 7's proposal (flife-engine's `Reproduction`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProposalConstants {
+    /// The world seed, the key of every random block.
+    pub seed: u64,
+    /// The minimum post-emission energy for an attempt.
+    pub minimum_attempt_energy: f64,
+    /// `c_b`, the birth cost.
+    pub birth_cost: f64,
+    /// The minimum child endowment.
+    pub minimum_child_energy: f64,
+    /// The minimum energy the parent keeps.
+    pub minimum_parent_energy: f64,
+}
+
+/// One organism's state for its proposal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProposalOrganism {
+    /// Its stable identity, the draw's entity.
+    pub entity: u64,
+    /// The attempt tick, the draw's ordinal.
+    pub tick: u64,
+    /// The first tick at which it may attempt.
+    pub cooldown_deadline: u64,
+    /// Its post-emission balance.
+    pub remaining: f64,
+    /// Whether its budget is exhausted.
+    pub exhausted: bool,
+    /// The decoded probability of one attempt this tick.
+    pub attempt_probability: f64,
+    /// The decoded child share `β`.
+    pub child_fraction: f64,
+}
+
+/// One organism's proposal, as flife-engine's `Reproduction::propose`
+/// gives it, without the parent's identities the host adds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProposalOutcome {
+    /// Its budget is exhausted.
+    Exhausted,
+    /// The attempt tick is before its cooldown deadline.
+    CoolingDown,
+    /// Eligible, and the draw made no attempt.
+    NoAttempt,
+    /// Attempted, with a balance below the attempt minimum.
+    BelowAttemptEnergy {
+        /// The balance.
+        available: f64,
+    },
+    /// Attempted, with nothing left after the birth cost.
+    BirthCostUnaffordable {
+        /// The balance.
+        available: f64,
+    },
+    /// Attempted, and the child's share is below its minimum.
+    ChildBelowMinimum {
+        /// The child's share.
+        child: f64,
+    },
+    /// Attempted, and the parent's share is below its minimum.
+    ParentBelowMinimum {
+        /// The parent's share.
+        parent: f64,
+    },
+    /// A viable split.
+    Viable {
+        /// The balance, `+0` for a zero.
+        available: f64,
+        /// The child's endowment.
+        child: f64,
+        /// What the parent keeps.
+        parent: f64,
+    },
 }

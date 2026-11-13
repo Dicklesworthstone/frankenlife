@@ -41,6 +41,7 @@ pub mod emission;
 pub mod field;
 pub mod motion;
 pub mod owner;
+pub mod proposal;
 pub mod sensors;
 pub mod settle;
 pub mod uptake;
@@ -53,7 +54,8 @@ pub use field::MetalField;
 pub use flife_field::settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
     EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MaintenanceOutcome,
-    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome,
+    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome, ProposalConstants,
+    ProposalOrganism, ProposalOutcome,
 };
 /// The memory a controller backend may hold (FL-043), for composition
 /// roots that make one through [`ControllerChoice::backend`].
@@ -64,6 +66,7 @@ pub use owner::{
     Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
     ResourceState, Usage, WriteLease,
 };
+pub use proposal::{MetalProposal, PROPOSAL_OPS_WORDS};
 pub use sensors::MetalSensors;
 pub use settle::MetalSettle;
 pub use uptake::MetalUptake;

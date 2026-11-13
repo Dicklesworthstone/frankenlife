@@ -3413,10 +3413,10 @@ impl Settled {
     }
 }
 
-/// Where phase 6's settlements come from: the reference's operators
-/// ([`Reference`]), or a backend's outcomes replayed on the host's budget
-/// (`settle::Device`, FL-032). Each stage settles against `budget`, the
-/// organism's balance as the earlier stages left it.
+/// Where phase 6's settlements and phase 7's proposal come from: the
+/// reference's operators ([`Reference`]), or a backend's outcomes replayed on
+/// the host's budget (`settle::Device`, FL-032). Each stage settles against
+/// `budget`, the organism's balance as the earlier stages left it.
 trait Stages {
     /// Chemistry: the gain credited and the toxicity paid.
     fn uptake(
@@ -3460,6 +3460,17 @@ trait Stages {
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
     ) -> Result<EmissionSettlement, CoreError>;
+
+    /// Phase 7: `parent`'s reproduction proposal at attempt tick `tick`,
+    /// from its post-emission `budget`.
+    fn propose(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        parent: &ParentState,
+        tick: Tick,
+        budget: &EnergyBudget,
+    ) -> Result<ReproductionProposal, CoreError>;
 }
 
 /// The reference's stages for one organism with genome `traits`, a
@@ -3540,6 +3551,19 @@ impl Stages for Reference<'_> {
             budget,
             emissions,
         )
+    }
+
+    fn propose(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        parent: &ParentState,
+        tick: Tick,
+        budget: &EnergyBudget,
+    ) -> Result<ReproductionProposal, CoreError> {
+        rules
+            .reproduction
+            .propose(&rules.rng, parent, tick, &organism.actions, budget)
     }
 }
 
@@ -3634,13 +3658,7 @@ fn settle_stages(
         position: settled.position,
         cooldown_deadline: organism.cooldown_deadline,
     };
-    let proposal = rules.reproduction.propose(
-        &rules.rng,
-        &parent,
-        from,
-        &organism.actions,
-        &settled.budget,
-    )?;
+    let proposal = stages.propose(rules, organism, &parent, from, &settled.budget)?;
     if let Some(record) = record {
         // A viable attempt's outcome is phase 8's.
         record.reproduction = match proposal {

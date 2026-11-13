@@ -818,6 +818,7 @@ dependencies = [
  "flife-engine",
  "flife-field",
  "flife-neural",
+ "fnp-random",
  "ft-kernel-metal",
 ]
 

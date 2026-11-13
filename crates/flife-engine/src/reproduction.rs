@@ -71,7 +71,7 @@ use flife_core::rng::{
     Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, half_open_unit,
 };
 use flife_core::{CoreError, ValidatedConfig};
-use flife_field::FieldGrid;
+use flife_field::{FieldGrid, ProposalConstants};
 use flife_genome::{
     BirthAttempt, CandidateRejection, Genome, GenomeQuota, LOGICAL_GENOME_BYTES, MutationRecord,
     Mutator, Proposal, TopologyCatalog, TraitLimits, founder,
@@ -187,6 +187,19 @@ impl Reproduction {
         &self.rules
     }
 
+    /// The constants a settle backend's proposal takes for these rules in a
+    /// world of seed `seed` (FL-032).
+    #[must_use]
+    pub const fn proposal_constants(&self, seed: u64) -> ProposalConstants {
+        ProposalConstants {
+            seed,
+            minimum_attempt_energy: self.rules.minimum_attempt_energy,
+            birth_cost: self.rules.birth_cost,
+            minimum_child_energy: self.rules.minimum_child_energy,
+            minimum_parent_energy: self.rules.minimum_parent_energy,
+        }
+    }
+
     /// Whether `parent` attempts a birth at tick `tick` with probability
     /// `probability`: word 0 of `(birth, parent, tick, lane (attempt, 0),
     /// 0)` against `p`.
@@ -200,12 +213,7 @@ impl Reproduction {
         tick: Tick,
         probability: f64,
     ) -> Result<bool, CoreError> {
-        if !(0.0..=1.0).contains(&probability) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "reproduction attempt probability",
-                detail: format!("{probability} is outside [0, 1]"),
-            });
-        }
+        check_probability(probability)?;
         let [word, ..] = birth_block(rng, parent, tick, LaneKind::Attempt)?;
         Ok(bernoulli(word, probability))
     }
@@ -315,7 +323,24 @@ impl Reproduction {
         if !self.attempts(rng, parent.id, tick, actions.attempt_probability)? {
             return Ok(ReproductionProposal::NoAttempt);
         }
-        match self.split(budget.remaining(), actions.child_fraction)? {
+        self.attempted(parent, tick, actions.child_fraction, budget)
+    }
+
+    /// The proposal of an attempt that the draw made: the split of the
+    /// budget at child share `child_fraction`, and the intent a viable one
+    /// gives.
+    ///
+    /// # Errors
+    /// As [`Self::split`]; [`CoreError::Overflow`] for a child generation
+    /// past `u32::MAX`.
+    pub(crate) fn attempted(
+        &self,
+        parent: &ParentState,
+        tick: Tick,
+        child_fraction: f64,
+        budget: &EnergyBudget,
+    ) -> Result<ReproductionProposal, CoreError> {
+        match self.split(budget.remaining(), child_fraction)? {
             Viability::Unviable(reason) => Ok(ReproductionProposal::Unviable(reason)),
             Viability::Viable(split) => Ok(ReproductionProposal::Intent(BirthIntent {
                 parent: parent.id,
@@ -326,6 +351,21 @@ impl Reproduction {
                 split,
             })),
         }
+    }
+}
+
+/// [`Reproduction::attempts`]' check of an attempt probability.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] unless `0 ≤ p ≤ 1`.
+pub(crate) fn check_probability(probability: f64) -> Result<(), CoreError> {
+    if (0.0..=1.0).contains(&probability) {
+        Ok(())
+    } else {
+        Err(CoreError::NumericalInvalid {
+            quantity: "reproduction attempt probability",
+            detail: format!("{probability} is outside [0, 1]"),
+        })
     }
 }
 

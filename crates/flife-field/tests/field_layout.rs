@@ -9,7 +9,8 @@ use flife_field::grid::{minimum_image, wrap_coordinate};
 use flife_field::layout::{FIELD_LAYOUT_SCHEMA, HOST_ALIGNMENT};
 use flife_field::{
     Arrangement, BufferLimits, Cell, ConeTolerance, DeclaredLayout, FIELD_PLANES, FieldFootprint,
-    FieldGrid, FieldLayout, FieldPair, FieldState, FieldView, InitialEnergy, relayout,
+    FieldGrid, FieldLayout, FieldPair, FieldState, FieldSummary, FieldView, InitialEnergy,
+    relayout,
 };
 use fnp_dtype::{ArrayStorage, DType};
 use fnp_ndarray::{MemoryOrder, NdLayout};
@@ -852,5 +853,110 @@ fn committed_fields_obey_energy_and_cone_invariants() {
 
     for (absolute, relative) in [(-1.0, 0.0), (0.0, f64::NAN), (f64::INFINITY, 0.0)] {
         assert!(ConeTolerance::new(absolute, relative).is_err());
+    }
+}
+
+/// A summary's every field, its sums as bits.
+fn summary_bits(summary: &FieldSummary) -> (u64, u64, Option<(u32, u32)>, u64) {
+    (
+        summary.energy_total.to_bits(),
+        summary.max_cone_residual.to_bits(),
+        summary.max_cone_residual_cell,
+        summary.empty_cells,
+    )
+}
+
+/// The quantity and detail of a numerical refusal.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a failure here is a test failure"
+)]
+fn refusal(result: Result<FieldSummary, CoreError>) -> (&'static str, String) {
+    match result {
+        Err(CoreError::NumericalInvalid { quantity, detail }) => (quantity, detail),
+        other => panic!("expected a numerical refusal, got {other:?}"),
+    }
+}
+
+/// Phase 10 checks the next field on the field's workers (C5): the cells
+/// are split into contiguous ranges, each checked by its own thread. Every
+/// worker count must give one thread's summary to the bit, keep the first
+/// cell of a largest residual tied across ranges, and report the first
+/// offending cell in cell-index order when several ranges hold one. The
+/// 160 × 128 grid's 20,480 cells make at most five ranges; the counts
+/// include zero (taken as one) and more workers than ranges.
+#[test]
+fn invariants_check_the_same_on_any_number_of_workers() {
+    let grid = grid(160, 128, 160.0, 128.0);
+    let mut state = FieldState::zeroed(grid, &BufferLimits::host()).expect("allocate");
+    let mut seed = 0x5eed_u64;
+    let mut next = move || {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        f64::from(u32::try_from(seed >> 40).unwrap_or(0)) / 16_777_216.0
+    };
+    for y in 0..128_u32 {
+        for x in 0..160_u32 {
+            if (x + y) % 7 == 0 {
+                continue;
+            }
+            let mut cell = Cell::EMPTY;
+            cell.energy = (next() * 4.0) as f32;
+            cell.moments[(x as usize * 3 + y as usize) % 32] =
+                cell.energy * 0.5 * (next() as f32 - 0.5);
+            state.set_cell(x, y, &cell).expect("in range");
+        }
+    }
+    // Just outside the cone: two cells with the same residual in the second
+    // and fourth of five ranges, and a smaller one in the first.
+    let mut over = Cell::EMPTY;
+    over.energy = 1.0;
+    over.moments[0] = 1.0;
+    over.moments[1] = 2.0_f32.powi(-12);
+    let mut slight = over;
+    slight.moments[1] = 2.0_f32.powi(-13);
+    state.set_cell(10, 3, &slight).expect("in range");
+    state.set_cell(5, 40, &over).expect("in range");
+    state.set_cell(70, 100, &over).expect("in range");
+
+    let tolerant = ConeTolerance::new(1.0e-7, 0.0).expect("tolerance");
+    let one = state.check_invariants(tolerant).expect("within tolerance");
+    assert_eq!(one.max_cone_residual_cell, Some((5, 40)));
+    assert!(one.empty_cells > 0 && one.energy_total > 0.0);
+    let expected = summary_bits(&one);
+    let counts = [0, 1, 2, 3, 4, 5, 6, 16, 64];
+    for workers in counts {
+        let summary = state
+            .check_invariants_on(tolerant, workers)
+            .expect("within tolerance");
+        assert_eq!(summary_bits(&summary), expected, "{workers} workers");
+    }
+
+    // A nonfinite moment in the last range and a negative energy in the
+    // third: within the tolerance the negative energy is first; with no
+    // tolerance the slight cone excess in the first range is.
+    let mut bad = state.clone();
+    let mut nan = Cell::EMPTY;
+    nan.energy = 1.0;
+    nan.moments[9] = f32::NAN;
+    bad.set_cell(150, 120, &nan).expect("in range");
+    let mut negative = Cell::EMPTY;
+    negative.energy = -1.0;
+    bad.set_cell(30, 70, &negative).expect("in range");
+    for (tolerance, quantity, cell) in [
+        (tolerant, "field energy", "cell (30, 70)"),
+        (ConeTolerance::EXACT, "chemical moment cone", "cell (10, 3)"),
+    ] {
+        let expected = refusal(bad.check_invariants(tolerance));
+        assert_eq!(expected.0, quantity);
+        assert!(expected.1.contains(cell), "{}", expected.1);
+        for workers in counts {
+            assert_eq!(
+                refusal(bad.check_invariants_on(tolerance, workers)),
+                expected,
+                "{workers} workers"
+            );
+        }
     }
 }

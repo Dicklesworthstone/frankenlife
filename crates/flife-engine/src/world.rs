@@ -2136,7 +2136,7 @@ impl World {
             .record(&mut tick_ledger, Transfer::Recycling)?;
 
         // Phase 10: invariants, accounting and the population's commit.
-        let field_summary = next.check_invariants(rules.profile.cone)?;
+        let field_summary = next.check_invariants_on(rules.profile.cone, workers)?;
         let closing = Holdings::new(next.energy_total(), organisms.value())?;
         let closure = tick_ledger.close(closing)?;
         let mut next_ledger = ledger.clone();

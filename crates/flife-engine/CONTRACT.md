@@ -372,6 +372,8 @@ each runs and owns the field.
   measured from the next field and the survivors and newborns in identity order (INV-03 per tick), commits the
   closure to a copy of the run's ledger (INV-03 cumulative), and checks the population's whole commit (INV-01,
   INV-06, INV-07). The next tick opens at exactly those holdings, so energy that moved without a flow is refused.
+  The field check runs on the field's workers (`FieldState::check_invariants_on`), which reports the same summary
+  and the same first offending cell at any worker count.
 - A candidate reads only committed state and writes only the spare field buffer, reusable scratch and its own
   copies of the ledger, quota, identities and paths. Until publication the committed world is authoritative and
   unchanged. Cancelling, dropping, pausing or failing leaves every committed byte as it was. A retry prepares the

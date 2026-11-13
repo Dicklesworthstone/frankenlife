@@ -153,6 +153,14 @@
   correction is exact (Sterbenz).
 - INV-01: every energy is finite and nonnegative (`-0.0` counts as zero), and every moment is finite.
   INV-02: `max(0, ||m||₂ − e) ≤ absolute + relative · e`, checked in F64 over the exact F32 values.
+  `FieldState::check_invariants_on(tolerance, workers)` is the same check on up to `workers` threads (zero is
+  taken as one); `check_invariants` is one thread. The cells are split into contiguous ranges of at least 4,096
+  cells, and each thread checks its range in cell-index order and stops at its first offending cell. The ranges
+  are then taken in order: the first range's error is the first offending cell's, a later range's largest
+  residual replaces an earlier one only when strictly larger (the first cell on a tie), and the energy total is
+  summed on the calling thread in cell-index order. The summary and the error do not depend on the worker count
+  (`invariants_check_the_same_on_any_number_of_workers`: 0 to 64 workers, the summary's bits, a residual tied
+  across ranges, and errors in three ranges).
 - Initial field. `energy_per_cell` is rounded once to F32 and the composition is `zero`. The stored value is
   reported, and `injected_total` is exact for grids of at most 2^29 cells.
 

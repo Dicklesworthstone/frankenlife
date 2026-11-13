@@ -370,6 +370,15 @@ fn a_small_headless_ecology_lives_breeds_mutates_emits_and_dies() {
     eprintln!("{census:?}; live {}", world.population().len());
     assert!(census.births >= 20, "{census:?}");
     assert!(census.deaths >= 20, "{census:?}");
+    // Phase 6's deaths are recorded at the stage that exhausted them, not
+    // at a later check of the same empty budget.
+    assert!(
+        census
+            .stages
+            .get("maintenance")
+            .is_some_and(|&count| count > 0),
+        "{census:?}"
+    );
     assert!(census.emitted > 1_000, "{census:?}");
     assert!(census.perturbed > 0, "mutation changed the children");
     assert!(census.descendant_deaths > 0, "children die too: {census:?}");

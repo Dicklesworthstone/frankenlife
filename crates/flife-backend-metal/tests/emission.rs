@@ -10,7 +10,9 @@
 //! budgets that emission exhausts. Every input the reference refuses is
 //! refused, and what it never reads is not checked.
 
-use flife_backend_metal::{EMISSION_OPS_WORDS, EmissionOrganism, EmissionOutcome, MetalEmission};
+use flife_backend_metal::{
+    EMISSION_OPS_WORDS, EmissionAction, EmissionOrganism, EmissionOutcome, MetalEmission,
+};
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, add_down};
 use flife_core::{CoreError, ValidatedConfig};
@@ -169,11 +171,15 @@ fn reference(
     let mut budget = EnergyBudget::new(organism.remaining)?;
     assert!(!budget.is_exhausted(), "an organism that reaches emission");
     let mut deposits = Deposits::new();
+    let emission = organism.emission.map(|action| Emission {
+        direction: action.direction,
+        spend_fraction: action.spend_fraction,
+    });
     let settlement = policy.emit(
         grid,
         OrganismId::new(7),
         organism.position,
-        organism.emission.as_ref(),
+        emission.as_ref(),
         &mut budget,
         &mut deposits,
     )?;
@@ -251,7 +257,7 @@ fn organism(grid: &FieldGrid, rng: &mut Rng) -> EmissionOrganism {
                 *component *= fraction / norm;
             }
         }
-        Emission {
+        EmissionAction {
             direction,
             spend_fraction,
         }
@@ -370,13 +376,13 @@ fn emission_the_reference_refuses_is_refused() -> Result<(), CoreError> {
     let valid = EmissionOrganism {
         remaining: 1.5,
         position: [10.25, 99.75],
-        emission: Some(Emission {
+        emission: Some(EmissionAction {
             direction,
             spend_fraction: 0.125,
         }),
     };
     assert!(reference(&policy, &grid, &valid)?.staged);
-    let edit = |change: &dyn Fn(&mut EmissionOrganism, &mut Emission)| {
+    let edit = |change: &dyn Fn(&mut EmissionOrganism, &mut EmissionAction)| {
         let mut organism = valid;
         let mut emission = valid.emission.expect("an emission");
         change(&mut organism, &mut emission);

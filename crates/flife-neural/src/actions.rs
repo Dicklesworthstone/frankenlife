@@ -25,6 +25,7 @@
 
 use flife_core::numerics::{expm1_neg, sigmoid};
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
+use flife_field::settle::EmissionAction;
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
 
@@ -155,6 +156,16 @@ pub struct Emission {
     /// `f = 1 − e^(−r_max σ(o) Δt)`: the fraction of the energy available
     /// at the emission stage to spend.
     pub spend_fraction: f64,
+}
+
+impl From<Emission> for EmissionAction {
+    /// The same emission as phase 6's port carries it (FL-032).
+    fn from(emission: Emission) -> Self {
+        Self {
+            direction: emission.direction,
+            spend_fraction: emission.spend_fraction,
+        }
+    }
 }
 
 /// One tick's decoded actions.

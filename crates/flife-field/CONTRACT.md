@@ -130,6 +130,21 @@
   allocation, with run bounds falling inside a hotspot cell). A worker that panics is reported as a state conflict,
   and the field may then be partly written. Deposits keep one F64 per packet for what the cells received (eight
   bytes a packet, declared by `Deposits::with_capacity`), where they kept 272 bytes per cell before.
+- FL-032's phase 6: `Deposits::push_split(grid, organism, paid, offered, direction, packets)` stages a deposit
+  whose split a backend computed: `push`'s checks of everything but the position, then at most 4 packets, each
+  cell inside the grid and strictly after the one before, each amount finite and positive, and the amounts'
+  `add_down` sum at most the offer (`StateConflict`, "stage a backend's deposit split"); then it stages them as
+  `push` stages its own split, keeping the positive shares. `push` was factored into `check_entry` and `stage`
+  with its arithmetic unchanged.
+- `settle` (FL-032): the port for phase 6 on a device, plain data below the engine. `SettleBackend` (`describe`;
+  `chemistry(observed, constants, organisms, packets, out)`, `motion(constants, organisms, out)` for
+  maintenance and motion, `emission(grid, efficiency, organisms, out)`), with `ChemistryConstants`,
+  `ChemistryOrganism`, `ChemistryPacket`, `ChemistryOutcome`, `MotionConstants`, `MotionOrganism` (`MOTION_TERMS`
+  response terms), `MotionOutcome` (`ExhaustedAt`, `MaintenanceOutcome`, `MovementOutcome`),
+  `EmissionAction`, `EmissionOrganism` and `EmissionOutcome` (`packets()`, the staged packets). The types moved
+  here from `flife-backend-metal` unchanged; `EmissionAction` is the controller's emission (`flife-neural`
+  converts its `Emission`). `flife-engine` runs it (`World::set_settle_backend`) and `flife-backend-metal`
+  implements it (`MetalSettle`).
 - `bins` (FL-027): `Bins::group(buckets, items, bucket_of)`, then `order` (item indices, bucket by bucket),
   `offsets` (each bucket's first position in `order`, then the item count), `range` and `bucket` (one bucket),
   `occupied` (nonempty buckets, ascending), `largest` (the hotspot) and `allocated`. `Grants::bins` and
@@ -323,7 +338,9 @@
 - Deposits (FL-011): a negative or nonfinite payment or offer; an offer above its payment; a direction outside
   the unit ball; a nonfinite position; staging on another grid, or after the deposits were applied (until
   `clear`); applying twice, to another grid, with one organism staged twice, or to a field missing a moment
-  plane. Nothing is written on a refusal.
+  plane. A backend's split (`push_split`): more than 4 packets, a cell outside the grid or not after the one
+  before, an amount that is not finite and positive, or amounts summing above the offer. Nothing is written on a
+  refusal.
 - Bins and declared scratch (FL-027): bins, grants or deposits whose index buffers exceed `BufferLimits` or the
   `u32` index range (`BudgetExhausted`); a grouping with more buckets or items than declared
   (`BudgetExhausted`), or an item outside its buckets (`LayoutMismatch`); more demands, or more deposits staged,

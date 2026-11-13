@@ -13,13 +13,13 @@
 //! meets an input the reference would refuse reports a status instead of an
 //! outcome, and the call is refused, so the reference decides.
 //!
-//! Not yet here: the engine port. Each call copies every organism's state
-//! to the device and the outcomes back.
+//! [`crate::settle`] serves this stage to the engine. Each call copies every
+//! organism's state to the device and the outcomes back.
 
 use flife_core::CoreError;
 use flife_field::FieldGrid;
+use flife_field::settle::{EmissionOrganism, EmissionOutcome};
 use flife_field::state::CHANNELS;
-use flife_neural::Emission;
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 use crate::chemistry::{Slot, put, value, word};
@@ -42,53 +42,6 @@ pub const EMISSION_OPS_WORDS: usize = 6;
 
 /// Threads per threadgroup.
 const THREADS: usize = 64;
-
-/// One organism that reaches emission: alive after motion, so its budget
-/// holds energy.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EmissionOrganism {
-    /// The budget's balance after motion, finite and positive.
-    pub remaining: f64,
-    /// Its position after motion.
-    pub position: [f64; 2],
-    /// Its decoded emission, if it emits.
-    pub emission: Option<Emission>,
-}
-
-/// One organism's emission: flife-engine's `EmissionSettlement`, the
-/// deposit it staged, and the budget after it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EmissionOutcome {
-    /// The energy available at the stage.
-    pub available: f64,
-    /// The payment requested.
-    pub requested: f64,
-    /// The payment made.
-    pub paid: f64,
-    /// The offer to the field.
-    pub offered: f64,
-    /// Whether a deposit was staged (a positive request); its offer may
-    /// still be zero.
-    pub staged: bool,
-    /// The deposit's packets, `(cell, amount)`, in stencil order: the
-    /// first [`EmissionOutcome::packet_count`] entries.
-    pub packets: [(usize, f64); 4],
-    /// How many packets the deposit has.
-    pub packet_count: usize,
-    /// The budget's balance after the stage.
-    pub remaining: f64,
-    /// Whether the payment exhausted the budget: the organism dies at
-    /// emission.
-    pub exhausted: bool,
-}
-
-impl EmissionOutcome {
-    /// The deposit's packets.
-    #[must_use]
-    pub fn packets(&self) -> &[(usize, f64)] {
-        &self.packets[..self.packet_count.min(4)]
-    }
-}
 
 fn overflow() -> CoreError {
     CoreError::Overflow {

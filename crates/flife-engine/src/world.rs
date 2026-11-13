@@ -86,9 +86,9 @@ use flife_field::{
     Bins, BufferLimits, ConeTolerance, Demand, Deposits, ExchangeStencil, FieldBackend, FieldGrid,
     FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork, GrantPacket, Grants,
     PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath,
-    SensorBackend, SensorPyramid, SensorQuery, Source, SourceKernel, TransportPlan, UptakeBackend,
-    UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants_on, demand,
-    demands_on, initial_source, resolve_uptake, resolve_uptake_on, state::CHANNELS,
+    SensorBackend, SensorPyramid, SensorQuery, SettleBackend, Source, SourceKernel, TransportPlan,
+    UptakeBackend, UptakeSummary, UptakeWork, advance_field_on, apply_deposits_on, apply_grants_on,
+    demand, demands_on, initial_source, resolve_uptake, resolve_uptake_on, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -101,9 +101,9 @@ use flife_neural::{
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
-use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, composition};
-use crate::costs::MaintenanceCosts;
-use crate::emission::EmissionPolicy;
+use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition};
+use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
+use crate::emission::{EmissionPolicy, EmissionSettlement};
 use crate::inspect::{
     Activations, ControllerWeights, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS,
     ReproductionOutcome, Sensed, Transactions,
@@ -111,7 +111,7 @@ use crate::inspect::{
 use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::measure::{RegionMeasurement, measure};
-use crate::motion::{Motion, MotionResponse, RESPONSE_TERMS, uptake_ratio};
+use crate::motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityShortfall,
@@ -121,8 +121,10 @@ use crate::reproduction::{
 
 mod admission;
 mod checkpoint;
+mod settle;
 
 pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION};
+use settle::{Settle, settle_with};
 
 /// The backend this module implements: the scalar CPU reference.
 pub const CPU_REFERENCE: &str = "cpu-reference";
@@ -715,6 +717,22 @@ pub struct UptakeReport {
     pub failure: Option<String>,
 }
 
+/// What the world's phase 6 backend did, for run records (FL-032). Not
+/// scientific state: no result depends on the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettleReport {
+    /// The backend serving the world, or `None` for the reference alone.
+    pub backend: Option<String>,
+    /// Ticks whose phase 6 the backend computed.
+    pub ticks: u64,
+    /// Ticks the reference computed because the backend met an error, or
+    /// gave a settlement the host's replay refused: the reference
+    /// reproduces any error exactly, or finds none.
+    pub reference_ticks: u64,
+    /// Why the backend stopped serving the world, if it failed.
+    pub failure: Option<String>,
+}
+
 /// The world's uptake backend and the host's lists for it.
 #[derive(Debug, Default)]
 struct Uptake {
@@ -765,7 +783,6 @@ struct Working {
     evaluated: bool,
     actions: DecodedActions,
     gradients: [[f64; 2]; RESPONSE_TERMS],
-    absorbed: f64,
     position: [f64; 2],
     velocity: [f64; 2],
     cooldown_deadline: Tick,
@@ -794,6 +811,7 @@ pub struct World {
     fields: Fields,
     sensors: Sensors,
     uptake: Uptake,
+    settle: Settle,
     watch: Watch,
     /// The live population's ancestry while the world traces it (FL-021):
     /// not scientific state, like the watch.
@@ -914,6 +932,7 @@ impl World {
             fields: Fields::default(),
             sensors: Sensors::default(),
             uptake: Uptake::default(),
+            settle: Settle::default(),
             watch: Watch::default(),
             ancestry: None,
         })
@@ -1141,6 +1160,44 @@ impl World {
         &self.uptake.report
     }
 
+    /// Compute phase 6's chemistry, maintenance, motion and emission on
+    /// `backend` from the next tick, or on the reference alone with `None`
+    /// (FL-032). No result depends on it: the host composes the backend's
+    /// settlements with the reference's own stage order, exhaustion checks,
+    /// ledger flows and reproduction proposal, replays every payment on its
+    /// own budgets and refuses a settlement that differs from them by a
+    /// bit, and stages each deposit's split through its checks
+    /// ([`SettleBackend`]). Any error leaves every organism as it was and
+    /// hands the tick's phase 6 to the reference. A backend that fails
+    /// where the reference does not is dropped, and
+    /// [`World::settle_report`] says why.
+    ///
+    /// Installing a backend reserves the host's lists for the population's
+    /// capacity (FL-043). If the host refuses them, the backend is not
+    /// installed, and the report says why.
+    pub fn set_settle_backend(&mut self, backend: Option<Box<dyn SettleBackend>>) {
+        let settle = &mut self.settle;
+        settle.report.backend = backend.as_ref().map(|backend| backend.describe());
+        settle.report.failure = None;
+        settle.work = settle::SettleWork::default();
+        settle.backend = None;
+        if backend.is_none() {
+            return;
+        }
+        if let Err(error) = capacity_of(&self.rules).and_then(|rows| settle.work.reserve(rows)) {
+            settle.report.failure = Some(error.to_string());
+            settle.work = settle::SettleWork::default();
+            return;
+        }
+        settle.backend = backend;
+    }
+
+    /// What the settle backend has done so far.
+    #[must_use]
+    pub const fn settle_report(&self) -> &SettleReport {
+        &self.settle.report
+    }
+
     /// The event cursor: births and deaths published so far.
     #[must_use]
     pub const fn events(&self) -> u64 {
@@ -1276,6 +1333,7 @@ impl World {
                 capacity_bytes(&self.sensors.queries),
                 capacity_bytes(&self.sensors.samples),
                 self.uptake.work.allocated_bytes(),
+                self.settle.work.allocated_bytes(),
             ]
             .into_iter()
             .chain(lanes),
@@ -1737,6 +1795,7 @@ impl World {
             fields,
             sensors,
             uptake: uptake_state,
+            settle: settle_state,
             watch,
             ..
         } = self;
@@ -1853,7 +1912,6 @@ impl World {
                 evaluated: decision.evaluated,
                 actions: decision.actions,
                 gradients: decision.gradients,
-                absorbed: 0.0,
                 position: organism.position,
                 velocity: organism.velocity,
                 cooldown_deadline: organism.cooldown_deadline,
@@ -1902,19 +1960,21 @@ impl World {
         let mut transactions = None;
 
         // Phases 6 and 7: each organism's ordered budget stages, on the
-        // lanes, its packets' compositions computed first for every packet.
+        // lanes, with phase 6 on the settle backend if the world has one.
         // The tick then takes each lane's ledger flows and staged emissions
         // in lane order: what one thread settling every organism in identity
         // order would have recorded, in its order.
-        compositions_into(observed, granted, lanes.len(), compositions)?;
-        settle_all(
+        settle_with(
             rules,
             population,
-            (by_demand, granted, compositions),
+            observed,
+            (by_demand, granted),
+            compositions,
             from,
             watch.organism,
             working,
             lanes,
+            settle_state,
         )?;
         for lane in lanes.iter_mut() {
             lane.flows.replay(&mut tick_ledger)?;
@@ -2871,19 +2931,14 @@ fn settle_all(
                 });
             }
             let genome = genome_of(population, organism.committed.id)?;
-            let parameters = parameter_count(&rules.catalog, genome)?;
-            let record = (watched == Some(organism.committed.id)).then_some(&mut *transactions);
-            settle_stages(
-                rules,
-                organism,
-                genome.traits(),
-                parameters,
+            let mut stages = Reference {
+                traits: genome.traits(),
+                parameters: parameter_count(&rules.catalog, genome)?,
                 packets,
-                from,
-                flows,
-                emissions,
-                record,
-            )?;
+            };
+            let record = (watched == Some(organism.committed.id)).then_some(&mut *transactions);
+            settle_stages(rules, organism, &mut stages, from, flows, emissions, record)?
+                .apply(organism);
         }
         Ok(())
     })
@@ -3319,33 +3374,196 @@ fn attempted(births: &Births, intent: &BirthIntent) -> Result<ReproductionOutcom
         })
 }
 
+/// What phases 6 and 7 change of one working organism: its budget and
+/// vitality, its velocity and position, whether it emitted, and its birth
+/// intent. [`settle_stages`] computes it without
+/// writing the row, so a backend's phase 6 writes no row until every
+/// organism has settled (FL-032).
+#[derive(Debug, Clone, Copy)]
+struct Settled {
+    budget: EnergyBudget,
+    vitality: Vitality,
+    velocity: [f64; 2],
+    position: [f64; 2],
+    emitted: bool,
+    intent: Option<BirthIntent>,
+}
+
+impl Settled {
+    /// `organism`'s values before phase 6.
+    const fn of(organism: &Working) -> Self {
+        Self {
+            budget: organism.budget,
+            vitality: organism.vitality,
+            velocity: organism.velocity,
+            position: organism.position,
+            emitted: organism.emitted,
+            intent: organism.intent,
+        }
+    }
+
+    /// Write these values to `organism`.
+    const fn apply(self, organism: &mut Working) {
+        organism.budget = self.budget;
+        organism.vitality = self.vitality;
+        organism.velocity = self.velocity;
+        organism.position = self.position;
+        organism.emitted = self.emitted;
+        organism.intent = self.intent;
+    }
+}
+
+/// Where phase 6's settlements come from: the reference's operators
+/// ([`Reference`]), or a backend's outcomes replayed on the host's budget
+/// (`settle::Device`, FL-032). Each stage settles against `budget`, the
+/// organism's balance as the earlier stages left it.
+trait Stages {
+    /// Chemistry: the gain credited and the toxicity paid.
+    fn uptake(
+        &mut self,
+        rules: &Rules,
+        budget: &mut EnergyBudget,
+    ) -> Result<UptakeSettlement, CoreError>;
+
+    /// Maintenance: the bill paid.
+    fn maintenance(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        budget: &mut EnergyBudget,
+    ) -> Result<MaintenanceSettlement, CoreError>;
+
+    /// Motion: the proposal from the uptake `absorbed`, and its payment.
+    fn movement(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        absorbed: f64,
+        budget: &mut EnergyBudget,
+    ) -> Result<MotionSettlement, CoreError>;
+
+    /// The position after `organism` moves at `velocity`.
+    fn displace(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        velocity: [f64; 2],
+    ) -> Result<[f64; 2], CoreError>;
+
+    /// Emission at the post-motion `position`: the payment, and the
+    /// deposit staged in `emissions`.
+    fn emission(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        position: [f64; 2],
+        budget: &mut EnergyBudget,
+        emissions: &mut Deposits,
+    ) -> Result<EmissionSettlement, CoreError>;
+}
+
+/// The reference's stages for one organism with genome `traits`, a
+/// controller of `parameters` weights, and its granted `packets`.
+struct Reference<'a> {
+    traits: &'a Traits,
+    parameters: u32,
+    packets: &'a [ChemicalPacket],
+}
+
+impl Stages for Reference<'_> {
+    fn uptake(
+        &mut self,
+        rules: &Rules,
+        budget: &mut EnergyBudget,
+    ) -> Result<UptakeSettlement, CoreError> {
+        let affinity = Affinity::new(*self.traits.affinity(), &rules.chemistry)?;
+        rules.chemistry.settle(&affinity, self.packets, budget)
+    }
+
+    fn maintenance(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        budget: &mut EnergyBudget,
+    ) -> Result<MaintenanceSettlement, CoreError> {
+        rules
+            .costs
+            .bill(
+                rules.step,
+                self.traits.sensing_scale(),
+                self.parameters,
+                organism.evaluated,
+            )?
+            .settle(budget)
+    }
+
+    fn movement(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        absorbed: f64,
+        budget: &mut EnergyBudget,
+    ) -> Result<MotionSettlement, CoreError> {
+        let ratio = uptake_ratio(absorbed, rules.step, rules.uptake_capacity)?;
+        let response = MotionResponse::new(*self.traits.motion_response(), &rules.motion)?;
+        let acceleration = rules
+            .motion
+            .acceleration(ratio, &response, &organism.gradients)?;
+        let proposed = rules.motion.propose(organism.velocity, acceleration)?;
+        rules.motion.settle(proposed, budget)
+    }
+
+    fn displace(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        velocity: [f64; 2],
+    ) -> Result<[f64; 2], CoreError> {
+        rules
+            .motion
+            .displace(&rules.grid, organism.position, velocity)
+    }
+
+    fn emission(
+        &mut self,
+        rules: &Rules,
+        organism: &Working,
+        position: [f64; 2],
+        budget: &mut EnergyBudget,
+        emissions: &mut Deposits,
+    ) -> Result<EmissionSettlement, CoreError> {
+        rules.emission.emit(
+            &rules.grid,
+            organism.committed.id,
+            position,
+            organism.actions.emission.as_ref(),
+            budget,
+            emissions,
+        )
+    }
+}
+
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,
 /// emission and the reproduction proposal, rechecking exhaustion after
-/// each. Once a stage exhausts the organism nothing later pays or acts.
-/// For the watched organism, `record` is filled with each stage's
-/// settlement as the ledger is given it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "private stage runner of World::prepare; the arguments are the tick's working state"
-)]
+/// each, with each stage's settlement from `stages`. Once a stage exhausts
+/// the organism nothing later pays or acts. For the watched organism,
+/// `record` is filled with each stage's settlement as the ledger is given
+/// it. The organism's row is read, not written: the caller applies the
+/// returned [`Settled`].
 fn settle_stages(
     rules: &Rules,
-    organism: &mut Working,
-    traits: &Traits,
-    parameters: u32,
-    packets: &[ChemicalPacket],
+    organism: &Working,
+    stages: &mut impl Stages,
     from: Tick,
     ledger: &mut impl Ledger,
     emissions: &mut Deposits,
     record: Option<&mut Option<Transactions>>,
-) -> Result<(), CoreError> {
-    let affinity = Affinity::new(*traits.affinity(), &rules.chemistry)?;
-    let opening = organism.budget.remaining();
-    let uptake = rules
-        .chemistry
-        .settle(&affinity, packets, &mut organism.budget)?;
+) -> Result<Settled, CoreError> {
+    let mut settled = Settled::of(organism);
+    let opening = settled.budget.remaining();
+    let uptake = stages.uptake(rules, &mut settled.budget)?;
     uptake.record(ledger)?;
-    organism.absorbed = uptake.absorbed;
+    let absorbed = uptake.absorbed;
     let mut record = record.map(|slot| {
         slot.insert(Transactions {
             tick: from,
@@ -3359,78 +3577,61 @@ fn settle_stages(
             closing: 0.0,
         })
     });
-    if !organism
+    if !settled
         .vitality
-        .check(BudgetStage::Chemistry, &organism.budget)?
+        .check(BudgetStage::Chemistry, &settled.budget)?
     {
-        return Ok(());
+        return Ok(settled);
     }
-    let maintenance = rules
-        .costs
-        .bill(
-            rules.step,
-            traits.sensing_scale(),
-            parameters,
-            organism.evaluated,
-        )?
-        .settle(&mut organism.budget)?;
+    let maintenance = stages.maintenance(rules, organism, &mut settled.budget)?;
     maintenance.record(ledger)?;
     if let Some(record) = record.as_deref_mut() {
         record.maintenance = Some(maintenance);
     }
-    if !organism
+    if !settled
         .vitality
-        .check(BudgetStage::Maintenance, &organism.budget)?
+        .check(BudgetStage::Maintenance, &settled.budget)?
     {
-        return Ok(());
+        return Ok(settled);
     }
 
-    let ratio = uptake_ratio(organism.absorbed, rules.step, rules.uptake_capacity)?;
-    let response = MotionResponse::new(*traits.motion_response(), &rules.motion)?;
-    let acceleration = rules
-        .motion
-        .acceleration(ratio, &response, &organism.gradients)?;
-    let proposed = rules.motion.propose(organism.velocity, acceleration)?;
-    let moved = rules.motion.settle(proposed, &mut organism.budget)?;
+    let moved = stages.movement(rules, organism, absorbed, &mut settled.budget)?;
     ledger.record(Flow::MotionCost, moved.cost.paid)?;
     if let Some(record) = record.as_deref_mut() {
         record.motion = Some(moved);
     }
-    organism.velocity = moved.velocity;
-    organism.position = rules
-        .motion
-        .displace(&rules.grid, organism.position, moved.velocity)?;
-    if !organism
+    settled.velocity = moved.velocity;
+    settled.position = stages.displace(rules, organism, moved.velocity)?;
+    if !settled
         .vitality
-        .check(BudgetStage::Motion, &organism.budget)?
+        .check(BudgetStage::Motion, &settled.budget)?
     {
-        return Ok(());
+        return Ok(settled);
     }
 
-    let emission = rules.emission.emit(
-        &rules.grid,
-        organism.committed.id,
-        organism.position,
-        organism.actions.emission.as_ref(),
-        &mut organism.budget,
+    let emission = stages.emission(
+        rules,
+        organism,
+        settled.position,
+        &mut settled.budget,
         emissions,
     )?;
-    organism.emitted = emission.emitted();
+    settled.emitted = emission.emitted();
     if let Some(record) = record.as_deref_mut() {
         record.emission = Some(emission);
     }
-    if !organism
+    if !settled
         .vitality
-        .check(BudgetStage::Emission, &organism.budget)?
+        .check(BudgetStage::Emission, &settled.budget)?
     {
-        return Ok(());
+        return Ok(settled);
     }
 
     let parent = ParentState {
         id: organism.committed.id,
         lineage: organism.committed.lineage,
         generation: organism.committed.generation,
-        position: organism.position,
+        position: settled.position,
         cooldown_deadline: organism.cooldown_deadline,
     };
     let proposal = rules.reproduction.propose(
@@ -3438,7 +3639,7 @@ fn settle_stages(
         &parent,
         from,
         &organism.actions,
-        &organism.budget,
+        &settled.budget,
     )?;
     if let Some(record) = record {
         // A viable attempt's outcome is phase 8's.
@@ -3452,7 +3653,7 @@ fn settle_stages(
         };
     }
     if let ReproductionProposal::Intent(intent) = proposal {
-        organism.intent = Some(intent);
+        settled.intent = Some(intent);
     }
-    Ok(())
+    Ok(settled)
 }

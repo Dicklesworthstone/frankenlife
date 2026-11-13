@@ -14,14 +14,18 @@
 //! caller then settles on the reference, which reports its own error or
 //! finds none.
 //!
-//! Maintenance and motion, which follow chemistry, are [`crate::motion`]'s.
-//! Not yet here (FL-032 continues): the engine port, emission and the
-//! reproduction proposal, and residency. Each call copies the field and
-//! every organism's affinity and packets to the device and the outcomes
-//! back.
+//! Maintenance and motion, which follow chemistry, are [`crate::motion`]'s;
+//! emission is [`crate::emission`]'s; [`crate::settle`] serves the three to
+//! the engine through flife-field's `SettleBackend`, whose plain data these
+//! take. Not yet here (FL-032 continues): the reproduction proposal, and
+//! residency. Each call copies the field and every organism's affinity and
+//! packets to the device and the outcomes back.
 
 use flife_core::CoreError;
 use flife_field::FieldState;
+use flife_field::settle::{
+    ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket,
+};
 use flife_field::state::CHANNELS;
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -43,66 +47,6 @@ pub const SETTLE_OPS_WORDS: usize = 14;
 
 /// Threads per threadgroup.
 const THREADS: usize = 64;
-
-/// The constants of `bounded-affinity-v1` the settlement uses (flife-engine's
-/// `Chemistry`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChemistryConstants {
-    /// `η_max ∈ (0, 1]`.
-    pub maximum_efficiency: f64,
-    /// The affinity gain `k ≥ 0`.
-    pub gain: f64,
-    /// The discrimination threshold `b > 0`.
-    pub threshold: f64,
-    /// The toxicity sensitivity `κ > 0`.
-    pub toxicity_sensitivity: f64,
-    /// The affinity norm limit, in `(0, 1]`.
-    pub affinity_norm_limit: f64,
-}
-
-/// One organism's chemistry: its affinity, its budget at the start of the
-/// tick, and its granted packets, `packets` of the call's packet list from
-/// `first`, in the order the reference settles them.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChemistryOrganism {
-    /// The heritable affinity direction `a`.
-    pub affinity: [f64; CHANNELS],
-    /// The budget's balance.
-    pub remaining: f64,
-    /// Whether the budget is exhausted.
-    pub exhausted: bool,
-    /// The index of the organism's first packet.
-    pub first: usize,
-    /// How many packets it was granted.
-    pub packets: usize,
-}
-
-/// One granted packet: its cell in the observed field and `u_c`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChemistryPacket {
-    /// The cell, row-major as the field numbers them.
-    pub cell: usize,
-    /// The granted energy.
-    pub granted: f64,
-}
-
-/// One organism's settlement: flife-engine's `UptakeSettlement` and the
-/// budget after it.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ChemistryOutcome {
-    /// `U = Σ_c u_c`.
-    pub absorbed: f64,
-    /// `G = Σ_c max(η_c, 0) u_c`.
-    pub gain: f64,
-    /// The requested toxicity `κ Σ_c max(−η_c, 0) u_c`.
-    pub requested_toxicity: f64,
-    /// The toxicity paid.
-    pub paid_toxicity: f64,
-    /// The budget's balance after the gain and the toxicity.
-    pub remaining: f64,
-    /// Whether the budget is exhausted after them.
-    pub exhausted: bool,
-}
 
 fn words(value: f64) -> [u32; 2] {
     let bits = value.to_bits();

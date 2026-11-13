@@ -106,6 +106,12 @@ impl MaintenanceCosts {
         )
     }
 
+    /// `(c_basal, c_sensor, s_unit, c_neural)`, for a device's phase 6
+    /// (FL-032).
+    pub(crate) const fn coefficients(&self) -> (f64, f64, f64, f64) {
+        (self.basal, self.sensor, self.sensor_unit_scale, self.neural)
+    }
+
     /// The mandatory cost of one tick for an organism with sensing scale
     /// `sensing_scale` (world-length) and a controller of `parameters`
     /// weights and biases, evaluated this tick or not: the

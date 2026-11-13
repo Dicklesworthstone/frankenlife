@@ -157,6 +157,12 @@ impl Motion {
         self.maximum_speed
     }
 
+    /// `Δt`, the acceleration limit and the cost coefficient `c_v`, for a
+    /// device's phase 6 (FL-032).
+    pub(crate) const fn step_limit_and_cost(&self) -> (f64, f64, f64) {
+        (self.step_seconds, self.maximum_acceleration, self.cost)
+    }
+
     /// `f = bound[g_u Σ_j χ_j ∇_j]` for uptake ratio `g_u ∈ [0, 1]`, summed
     /// in coefficient order: energy first, then channels.
     ///

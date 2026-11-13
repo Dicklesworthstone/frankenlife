@@ -320,6 +320,92 @@ impl Deposits {
         offered: f64,
         direction: &[f64; CHANNELS],
     ) -> Result<(), CoreError> {
+        self.check_entry(grid, paid, offered, direction)?;
+        let stencil = ExchangeStencil::at(grid, position)?;
+        let shares = split(&stencil, offered);
+        self.stage(
+            grid,
+            organism,
+            paid,
+            offered,
+            direction,
+            stencil.cells().iter().copied().zip(shares),
+        );
+        Ok(())
+    }
+
+    /// Stage `organism`'s deposit as [`Deposits::push`] would, with the
+    /// footprint split a backend computed: `packets`, `(cell, amount)` in
+    /// increasing cell order, are the cells of the split that receive a
+    /// positive amount (FL-032). The host cannot redo the split without
+    /// the position, so it checks what the split guarantees: at most four
+    /// cells of `grid`, each amount finite and positive, and their sum,
+    /// rounded down, at most the offer.
+    ///
+    /// # Errors
+    /// As [`Deposits::push`], and [`CoreError::StateConflict`] for packets
+    /// the split cannot give.
+    ///
+    /// Nothing is staged on error.
+    pub fn push_split(
+        &mut self,
+        grid: &FieldGrid,
+        organism: OrganismId,
+        paid: f64,
+        offered: f64,
+        direction: &[f64; CHANNELS],
+        packets: &[(usize, f64)],
+    ) -> Result<(), CoreError> {
+        self.check_entry(grid, paid, offered, direction)?;
+        let refuse = |detail: String| CoreError::StateConflict {
+            operation: "stage a backend's deposit split",
+            detail,
+        };
+        if packets.len() > 4 {
+            return Err(refuse(format!("{} packets", packets.len())));
+        }
+        let mut sum = 0.0;
+        let mut previous = None;
+        for &(cell, amount) in packets {
+            if u64::try_from(cell).map_or(true, |cell| cell >= grid.cell_count())
+                || previous.is_some_and(|previous| cell <= previous)
+            {
+                return Err(refuse(format!(
+                    "cell {cell} out of order or outside the grid in {packets:?}"
+                )));
+            }
+            if !(amount.is_finite() && amount > 0.0) {
+                return Err(refuse(format!(
+                    "amount {amount:e} for an offer of {offered:e}"
+                )));
+            }
+            sum = add_down(sum, amount);
+            previous = Some(cell);
+        }
+        if sum > offered {
+            return Err(refuse(format!(
+                "packets summing to {sum:e} for an offer of {offered:e}"
+            )));
+        }
+        self.stage(
+            grid,
+            organism,
+            paid,
+            offered,
+            direction,
+            packets.iter().copied(),
+        );
+        Ok(())
+    }
+
+    /// [`Deposits::push`]'s checks of everything but the position.
+    fn check_entry(
+        &self,
+        grid: &FieldGrid,
+        paid: f64,
+        offered: f64,
+        direction: &[f64; CHANNELS],
+    ) -> Result<(), CoreError> {
         if self.applied {
             return Err(CoreError::StateConflict {
                 operation: "stage deposit",
@@ -362,12 +448,24 @@ impl Deposits {
                 detail: format!("||a||² = {squared} is outside the unit ball"),
             });
         }
-        let stencil = ExchangeStencil::at(grid, position)?;
+        Ok(())
+    }
+
+    /// Stage a checked deposit whose cells receive `shares`, keeping the
+    /// positive ones.
+    fn stage(
+        &mut self,
+        grid: &FieldGrid,
+        organism: OrganismId,
+        paid: f64,
+        offered: f64,
+        direction: &[f64; CHANNELS],
+        shares: impl Iterator<Item = (usize, f64)>,
+    ) {
         let entry = self.entries.len();
-        let shares = split(&stencil, offered);
         self.grid = Some(*grid);
         let first = self.packets.len();
-        for (&cell, &amount) in stencil.cells().iter().zip(&shares) {
+        for (cell, amount) in shares {
             if amount > 0.0 {
                 self.packets.push(Packet {
                     cell,
@@ -385,7 +483,6 @@ impl Deposits {
             first,
             count: self.packets.len() - first,
         });
-        Ok(())
     }
 
     /// Forget every staged deposit and give these deposits room to stage

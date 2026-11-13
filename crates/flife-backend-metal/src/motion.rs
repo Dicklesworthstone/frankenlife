@@ -21,11 +21,14 @@
 //! status instead of an outcome, and the call is refused: the caller then
 //! settles on the reference.
 //!
-//! Not yet here: the engine port. Each call copies every organism's state
-//! to the device and the outcomes back.
+//! [`crate::settle`] serves this stage to the engine. Each call copies every
+//! organism's state to the device and the outcomes back.
 
 use flife_core::CoreError;
-use flife_field::state::CHANNELS;
+use flife_field::settle::{
+    ExhaustedAt, MOTION_TERMS, MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome,
+    MovementOutcome,
+};
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
 use crate::chemistry::{Slot, put, value, word};
@@ -36,10 +39,6 @@ pub const MOTION_MSL: &str = concat!(
     include_str!("softfloat64.metal"),
     include_str!("motion.metal")
 );
-
-/// A motion response's terms: energy first, then the channels
-/// (flife-engine's `RESPONSE_TERMS`).
-pub const MOTION_TERMS: usize = 1 + CHANNELS;
 
 /// `motion.metal`'s layouts, in words.
 const PARAMS: usize = 29;
@@ -52,127 +51,6 @@ pub const MOTION_OPS_WORDS: usize = 8;
 
 /// Threads per threadgroup.
 const THREADS: usize = 64;
-
-/// The run's constants the two stages use: flife-engine's
-/// `MaintenanceCosts`, `Motion` and `uptake_ratio` arguments, and the
-/// torus.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MotionConstants {
-    /// `Δt`, the timestep's seconds per tick.
-    pub step_seconds: f64,
-    /// `costs.basal_energy_per_second`.
-    pub basal: f64,
-    /// `costs.sensor_energy_per_second_at_unit_scale`.
-    pub sensor: f64,
-    /// `costs.sensor_unit_scale_world_units`.
-    pub sensor_unit_scale: f64,
-    /// `costs.neural_energy_per_parameter_evaluation`.
-    pub neural: f64,
-    /// `Motion::decay`, `e^(−γΔt)`.
-    pub decay: f64,
-    /// `Motion::force_coefficient`.
-    pub force_coefficient: f64,
-    /// `chemistry.maximum_speed`.
-    pub maximum_speed: f64,
-    /// `chemistry.maximum_acceleration`.
-    pub maximum_acceleration: f64,
-    /// `costs.motion_energy_per_speed_squared_second`.
-    pub cost: f64,
-    /// `chemistry.motion_response_norm_limit`.
-    pub response_norm_limit: f64,
-    /// `chemistry.uptake_capacity_per_second`.
-    pub uptake_capacity: f64,
-    /// The torus's width.
-    pub world_width: f64,
-    /// The torus's height.
-    pub world_height: f64,
-}
-
-/// One organism as chemistry left it: its budget, what maintenance bills,
-/// and what motion reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MotionOrganism {
-    /// The budget's balance after chemistry.
-    pub remaining: f64,
-    /// Whether the budget is exhausted after chemistry.
-    pub exhausted: bool,
-    /// Whether its controller was evaluated this tick.
-    pub evaluated: bool,
-    /// Its controller's parameter count.
-    pub parameters: u32,
-    /// Its heritable sensing scale.
-    pub sensing_scale: f64,
-    /// The uptake chemistry absorbed, `U`.
-    pub absorbed: f64,
-    /// Its velocity at the start of the tick.
-    pub velocity: [f64; 2],
-    /// Its position at the start of the tick.
-    pub position: [f64; 2],
-    /// Its heritable motion response `(χ_e, χ_1, …, χ_32)`.
-    pub response: [f64; MOTION_TERMS],
-    /// Its sensor gradients, in the response's order.
-    pub gradients: [[f64; 2]; MOTION_TERMS],
-}
-
-/// The stage whose exhaustion check found the budget exhausted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExhaustedAt {
-    /// Chemistry, before either stage here ran.
-    Chemistry,
-    /// Maintenance; motion did not run.
-    Maintenance,
-    /// Motion.
-    Motion,
-}
-
-/// Maintenance's settlement: flife-engine's `MaintenanceSettlement`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MaintenanceOutcome {
-    /// The bill's total, as requested.
-    pub requested: f64,
-    /// The total paid.
-    pub paid: f64,
-    /// The basal share paid.
-    pub basal: f64,
-    /// The sensor share paid.
-    pub sensor: f64,
-    /// The controller share paid.
-    pub controller: f64,
-}
-
-/// Motion's settlement: flife-engine's `MotionSettlement`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MovementOutcome {
-    /// The proposed velocity after the speed limit.
-    pub proposed: [f64; 2],
-    /// The velocity applied.
-    pub velocity: [f64; 2],
-    /// The motion cost requested.
-    pub requested: f64,
-    /// The motion cost paid.
-    pub paid: f64,
-    /// Whether the proposal was unaffordable and scaled down.
-    pub scaled: bool,
-}
-
-/// One organism after the two stages.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MotionOutcome {
-    /// Maintenance's settlement, if it ran.
-    pub maintenance: Option<MaintenanceOutcome>,
-    /// Motion's settlement, if it ran.
-    pub movement: Option<MovementOutcome>,
-    /// The velocity after the stages.
-    pub velocity: [f64; 2],
-    /// The position after the stages.
-    pub position: [f64; 2],
-    /// The budget's balance after the stages.
-    pub remaining: f64,
-    /// Whether the budget is exhausted after the stages.
-    pub exhausted: bool,
-    /// The first exhaustion check that found the budget exhausted.
-    pub died: Option<ExhaustedAt>,
-}
 
 fn overflow() -> CoreError {
     CoreError::Overflow {

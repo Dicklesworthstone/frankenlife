@@ -60,8 +60,13 @@ emission (plan §5.5, §8.2, §10.7). It returns each deposit's packets, cell an
 caller to stage in identity order. flife-field's `Deposits` gains `entry` and `entry_packets`, read-only, which the
 tests compare the device with.
 
-None of the three stages is wired into the engine yet: no port takes them, so no world runs them. The engine port,
-the reproduction proposal, lifecycle, mutation, residency and whole-tick parity are FL-032's remaining work.
+FL-032, fourth stage: the three stages in a world. Their plain-data types moved to flife-field's `settle`, the
+port `SettleBackend`, unchanged; this crate re-exports them. `MetalSettle` (`open`, `with_owner`, `device_name`,
+`owner`) holds `MetalChemistry`, `MetalMotion` and `MetalEmission` on one `DeviceOwner` and implements the port;
+`World::set_settle_backend` runs it. The engine replays each organism's payments on its own budget and refuses a
+settlement that differs by a bit (flife-engine's contract), so a backend that fails or is refused hands its tick
+to the reference and is dropped. The reproduction proposal stays on the host. Lifecycle, mutation, residency and
+whole-tick parity are FL-032's remaining work.
 
 **Inputs.**
 - The engine path: `MetalBackend::open()`, given to a world with `World::set_controller_backend`. It implements
@@ -655,6 +660,29 @@ A refusal changes nothing.
     as the reference settles them: an organism that does not emit with a NaN position, and one with a zero
     fraction, NaN direction and infinite position. Refused before any command: zero, negative and NaN balances,
     and an efficiency of 1.5.
+- `tests/settle_world.rs` (FL-032, 5 tests): a world with `MetalSettle` raced against the reference world, the
+  first organism watched, comparing digests and watched transactions every tick.
+  - `the_preset_with_phase_6_on_metal_is_the_reference_world_at_every_tick`: the preset, 300 ticks, every tick
+    on the device (report 300 and 0), with deposits (552,539), births (22) and deaths at chemistry (146) and
+    maintenance (1,894). Installing the backend reserves its lists (scratch 101,233,808 to 133,477,520 bytes),
+    which the run does not grow; the owner holds no leases or retiring buffers afterwards, and removing the
+    backend releases its lists.
+  - `worlds_whose_organisms_die_at_every_stage_are_the_reference_worlds`: the preset with motion costing 2.0 and
+    emission capped at 1,000 per second (deaths 1,191, 1,154 and 935 at chemistry, maintenance and motion), and
+    with emission capped at 10⁷ (3,356 at emission), 60 ticks each, every tick on the device.
+  - `the_preset_with_every_metal_backend_on_one_device_is_the_reference_world`: the field, sensors, uptake and
+    phase 6 on one `DeviceOwner` and the controllers on `MetalBackend`, 120 ticks.
+  - `a_change_the_host_cannot_see_changes_the_world`: an organism moved one ulp further, and two packets'
+    amounts swapped; the worlds diverge at that tick and the backend serves every tick.
+  - `a_failing_or_refused_settle_backend_hands_its_tick_to_the_reference_and_is_dropped`: 19 planted changes,
+    one per host check: a failure after emission; one ulp more toxicity paid, or less left after chemistry; a
+    gain reported as a loss; a death at motion the host does not see; a death at chemistry reported at
+    maintenance; one ulp more of a maintenance bill paid, or paid to the controller; a scaled flag flipped; one
+    ulp less paid for motion; a position on the torus's edge; a deposit for an organism that does not emit; one
+    ulp less offered or paid for a deposit; a packet twice the offer, or holding nothing; two packets out of
+    order, or in one cell; a cell one past the grid. Each world is the reference world at every tick, the
+    backend served the ticks before and is then dropped, and its report names the cause. A death at chemistry
+    reported as none is refused by the emission kernel itself, which takes only organisms alive after motion.
 
 Planted mutants, each run in a scratch copy.
 - FL-031's field: 14 planted against `tests/field.rs`, 13 caught:
@@ -734,6 +762,23 @@ Planted mutants, each run in a scratch copy.
   weights kept (their shares are zero and dropped), the remainder not clamped at zero (the largest weight is at
   least ¼), and the payment not capped at the balance (the request never exceeds the energy available, which is
   the balance).
+- FL-032's phase 6 in a world: 21 planted in flife-engine's `world/settle.rs` and flife-field's `push_split`,
+  against `tests/settle_world.rs`, 21 caught:
+  - the backend: a failing backend kept; the replay's error ignored; rows written before the replay is known
+    to succeed (the world then refuses its own tick, since the reference settles those rows again); the
+    settlements never written;
+  - the host's checks: chemistry's amounts, payment and balance; maintenance's payment and controller share; a
+    scaled motion; motion's payment; a position on the torus's edge; a deposit for an organism that does not
+    emit; emission's offer, unchecked or ignoring the efficiency; emission's payment; the backend's fate;
+  - the split: cells repeating, a cell at the grid's end, a packet holding nothing, packets above the offer.
+
+  A repeated cell survived the first round, as no planted change gave one; the repeat, the grid's end and the
+  empty packet were planted after it, and the second round caught all three.
+- `Settled::apply`, 7 planted against flife-engine's own tests (the race cannot see them, since both worlds
+  write their rows through it): budget, velocity, position, emitted and birth intent caught. Vitality survived
+  because `tests/world.rs` tallied the ecology's deaths by stage but asserted nothing about them. Its assertion
+  of deaths at maintenance now catches it: without the vitality, each death is recorded at the split, its
+  budget's next check. Absorbed was equivalent: nothing read it after phase 6, so the field was removed.
 - FL-029's owner batch: 14 planted, 14 caught, in the dev profile so the fault-seam test runs:
   - later kernels' bindings unchecked;
   - a later kernel's write forgotten;
@@ -924,8 +969,8 @@ per-pass thread spawning (6%).
 
 **Known gaps.**
 - Only phases 3 and 4's controller evaluation runs on the GPU; observation encoding (about 69 `tanh` per organism),
-  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; chemistry, maintenance, motion
-  and emission have device kernels, `MetalChemistry`, `MetalMotion` and `MetalEmission`, that no world runs yet). On
+  decoding, chemistry, uptake and the field step stay on the CPU (FL-032 moves them; a world given `MetalSettle`
+  runs chemistry, maintenance, motion and emission on the device, its host replaying each payment). On
   many CPU workers the tick
   is bound by those, so Metal does not shorten it there.
 - FL-030: the resident-bandwidth benchmark against §19.2's weight-stream bound is above, for F32 weights. Per-dtype

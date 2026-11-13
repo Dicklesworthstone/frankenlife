@@ -34,6 +34,8 @@
 //!   field: identity-ordered, rounded down per cell so that no deposit
 //!   creates energy, with the composition carried by the energy each cell
 //!   actually received (FL-011).
+//! - [`settle`]: the port for a device phase 6, chemistry through
+//!   emission, as plain data (FL-032).
 //!
 //! The energy ledger itself is `flife_core::ledger`. The sensor encoding
 //! and action decoding are in `flife-neural`.
@@ -50,6 +52,7 @@ pub mod layout;
 pub mod numerics;
 pub mod pyramid;
 pub mod seeding;
+pub mod settle;
 pub mod sources;
 pub mod state;
 pub mod step;
@@ -69,6 +72,11 @@ pub use pyramid::{
 pub use seeding::{
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, chemical_direction, initial_center,
     initial_source, travel_direction,
+};
+pub use settle::{
+    ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
+    EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MaintenanceOutcome,
+    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome, SettleBackend,
 };
 pub use sources::{
     DepositReport, PathSegment, Source, SourceKernel, SourceSupport, deposit_energy,

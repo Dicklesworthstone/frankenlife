@@ -42,27 +42,30 @@ pub mod field;
 pub mod motion;
 pub mod owner;
 pub mod sensors;
+pub mod settle;
 pub mod uptake;
 
-pub use chemistry::{
-    ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, MetalChemistry,
-    SETTLE_OPS_WORDS,
-};
-pub use emission::{EMISSION_OPS_WORDS, EmissionOrganism, EmissionOutcome, MetalEmission};
+pub use chemistry::{MetalChemistry, SETTLE_OPS_WORDS};
+pub use emission::{EMISSION_OPS_WORDS, MetalEmission};
 pub use field::MetalField;
+/// Phase 6's plain data (FL-032), which [`MetalChemistry`], [`MetalMotion`]
+/// and [`MetalEmission`] take and give: flife-field's port types.
+pub use flife_field::settle::{
+    ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
+    EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MaintenanceOutcome,
+    MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome,
+};
 /// The memory a controller backend may hold (FL-043), for composition
 /// roots that make one through [`ControllerChoice::backend`].
 pub use flife_neural::BackendBudget;
-pub use motion::{
-    ExhaustedAt, MOTION_OPS_WORDS, MOTION_TERMS, MaintenanceOutcome, MetalMotion, MotionConstants,
-    MotionOrganism, MotionOutcome, MovementOutcome,
-};
+pub use motion::{MOTION_OPS_WORDS, MetalMotion};
 use owner::metal;
 pub use owner::{
     Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
     ResourceState, Usage, WriteLease,
 };
 pub use sensors::MetalSensors;
+pub use settle::MetalSettle;
 pub use uptake::MetalUptake;
 
 /// The controller kernel source, with the software binary64

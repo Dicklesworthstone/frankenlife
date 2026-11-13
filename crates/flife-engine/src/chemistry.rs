@@ -26,6 +26,7 @@ use flife_core::ledger::{CompensatedSum, EnergyBudget, Ledger, Payment};
 use flife_core::{CoreError, Flow, Transfer, ValidatedConfig};
 use flife_field::FieldState;
 use flife_field::numerics::tanh;
+use flife_field::settle::ChemistryConstants;
 use flife_field::state::CHANNELS;
 
 /// The chemistry family this module implements.
@@ -137,6 +138,17 @@ impl Chemistry {
     #[must_use]
     pub const fn affinity_norm_limit(&self) -> f64 {
         self.affinity_norm_limit
+    }
+
+    /// These constants as a device's phase 6 takes them (FL-032).
+    pub(crate) const fn settle_constants(&self) -> ChemistryConstants {
+        ChemistryConstants {
+            maximum_efficiency: self.maximum_efficiency,
+            gain: self.gain,
+            threshold: self.threshold,
+            toxicity_sensitivity: self.toxicity_sensitivity,
+            affinity_norm_limit: self.affinity_norm_limit,
+        }
     }
 
     /// `η(z) = η_max tanh(k a·z − b)`, with the dot product summed in channel

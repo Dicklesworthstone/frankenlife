@@ -9,6 +9,7 @@
 //! | `lock` | held exclusively by the one writer |
 //! | `chunks/ab/abcd…` | one file per chunk, named by its SHA-256, so equal chunks are stored once |
 //! | `checkpoints/<sequence>.manifest` | a checkpoint's sealed prefix (header, manifest and seal; [`CheckpointManifest`]) |
+//! | `pins/<sequence>.<holder>.pin` | an empty file: the holder (a saved discovery, FL-042) pins that checkpoint |
 //! | `tmp/` | writes in flight; emptied when the store is opened |
 //!
 //! [`ChunkStore::publish`] follows §16.4. It verifies the whole checkpoint,
@@ -37,6 +38,14 @@
 //! each newer one was skipped. [`ChunkStore::retain`] keeps the newest valid
 //! checkpoints and removes older manifests and every chunk no remaining
 //! manifest names.
+//!
+//! [`ChunkStore::pin`] pins a checkpoint for a holder (§16.7: "Garbage
+//! collection traces from committed manifests and pinned discoveries"):
+//! while pins are preserved ([`ChunkStore::set_preserve_pinned`], the
+//! configuration's `preserve_pinned_discoveries`; the default), retention
+//! keeps a pinned manifest however old, and so every chunk it names. A
+//! checkpoint stays pinned until its last holder [unpins](ChunkStore::unpin)
+//! it.
 //!
 //! The store holds checkpoints; it does not decode them. Resuming a session
 //! from one is FL-037.
@@ -80,7 +89,9 @@ const LOCK: &str = "lock";
 const CHUNKS: &str = "chunks";
 const CHECKPOINTS: &str = "checkpoints";
 const TEMPORARY: &str = "tmp";
+const PINS: &str = "pins";
 const MANIFEST_SUFFIX: &str = ".manifest";
+const PIN_SUFFIX: &str = ".pin";
 
 /// What a published checkpoint survives (§16.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +221,9 @@ pub struct Retention {
     pub valid: Vec<u64>,
     /// Manifests removed, oldest first.
     pub removed: Vec<u64>,
+    /// Manifests older than the kept ones that stayed because they are
+    /// pinned and pins are preserved, oldest first.
+    pub pinned: Vec<u64>,
     /// Chunk files removed because no remaining manifest names them.
     pub chunks_removed: usize,
     /// Chunk files kept.
@@ -229,6 +243,7 @@ pub struct ChunkStore {
     durability: Durability,
     next: u64,
     swept: usize,
+    preserve_pinned: bool,
     _lock: File,
 }
 
@@ -349,6 +364,22 @@ fn sequence_of(name: &str) -> Option<u64> {
     .flatten()
 }
 
+/// A pin's file name, `<sequence>.<holder>.pin`: the sequence and holder.
+fn pin_of(name: &str) -> Option<(u64, Sha256Digest)> {
+    let stem = name.strip_suffix(PIN_SUFFIX)?;
+    let (sequence, holder) = stem.split_once('.')?;
+    let sequence = sequence_of(&format!("{sequence}{MANIFEST_SUFFIX}"))?;
+    if !is_digest_name(holder) {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (byte, pair) in bytes.iter_mut().zip(holder.as_bytes().as_chunks::<2>().0) {
+        let pair = std::str::from_utf8(pair.as_slice()).ok()?;
+        *byte = u8::from_str_radix(pair, 16).ok()?;
+    }
+    Some((sequence, Sha256Digest::from_bytes(bytes)))
+}
+
 fn is_digest_name(name: &str) -> bool {
     name.len() == 64
         && name
@@ -430,7 +461,7 @@ impl ChunkStore {
             }
             Err(error) => return Err(storage("read store marker", &marker, &error)),
         }
-        for directory in [CHUNKS, CHECKPOINTS, TEMPORARY] {
+        for directory in [CHUNKS, CHECKPOINTS, PINS, TEMPORARY] {
             create_directory(&root.join(directory))?;
         }
         if durability.flushes() {
@@ -456,6 +487,7 @@ impl ChunkStore {
             durability,
             next: 1,
             swept,
+            preserve_pinned: true,
             _lock: lock,
         };
         store.next = store.sequences()?.last().map_or(Ok(1), |last| {
@@ -521,6 +553,101 @@ impl ChunkStore {
     #[must_use]
     pub fn chunk_path(&self, digest: &Sha256Digest) -> PathBuf {
         chunk_path_in(&self.root, digest)
+    }
+
+    /// Where `holder`'s pin of checkpoint `sequence` is.
+    #[must_use]
+    pub fn pin_path(&self, sequence: u64, holder: &Sha256Digest) -> PathBuf {
+        self.root
+            .join(PINS)
+            .join(format!("{sequence:016x}.{}{PIN_SUFFIX}", holder.to_hex()))
+    }
+
+    /// Pin checkpoint `sequence` for `holder`: while pins are preserved,
+    /// retention keeps it, and every chunk it names, however old it is.
+    /// Returns whether the pin is new (`false` if `holder` already held
+    /// it).
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] if the store holds no manifest
+    /// `sequence`; [`CoreError::StorageFailed`] if the host refuses an
+    /// operation.
+    pub fn pin(&mut self, sequence: u64, holder: &Sha256Digest) -> Result<bool, CoreError> {
+        let manifest = self.manifest_path(sequence);
+        if !fs::symlink_metadata(&manifest).is_ok_and(|metadata| metadata.is_file()) {
+            return Err(CoreError::StateConflict {
+                operation: "pin checkpoint",
+                detail: format!("{} holds no checkpoint {sequence}", self.root.display()),
+            });
+        }
+        let path = self.pin_path(sequence, holder);
+        let created = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                if self.durability.flushes() {
+                    file.sync_all()
+                        .map_err(|error| storage("flush pin", &path, &error))?;
+                }
+                true
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(storage("create pin", &path, &error)),
+        };
+        if created && self.durability.flushes() {
+            flush_directory(&self.root.join(PINS))?;
+        }
+        Ok(created)
+    }
+
+    /// Remove `holder`'s pin of checkpoint `sequence`. Returns whether it
+    /// held one. The checkpoint stays pinned while another holder pins it.
+    ///
+    /// # Errors
+    /// [`CoreError::StorageFailed`] if the host refuses an operation.
+    pub fn unpin(&mut self, sequence: u64, holder: &Sha256Digest) -> Result<bool, CoreError> {
+        let path = self.pin_path(sequence, holder);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if self.durability.flushes() {
+                    flush_directory(&self.root.join(PINS))?;
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(storage("remove pin", &path, &error)),
+        }
+    }
+
+    /// Every pin: checkpoint sequence and holder, ascending. A pin may name
+    /// a checkpoint retention removed while pins were not preserved.
+    ///
+    /// # Errors
+    /// [`CoreError::StorageFailed`] if `pins/` cannot be listed.
+    pub fn pins(&self) -> Result<Vec<(u64, Sha256Digest)>, CoreError> {
+        let directory = self.root.join(PINS);
+        let mut pins = Vec::new();
+        for entry in
+            fs::read_dir(&directory).map_err(|error| storage("list pins", &directory, &error))?
+        {
+            let entry = entry.map_err(|error| storage("list pins", &directory, &error))?;
+            if let Some(pin) = entry.file_name().to_str().and_then(pin_of) {
+                pins.push(pin);
+            }
+        }
+        pins.sort_unstable_by_key(|(sequence, holder)| (*sequence, *holder.as_bytes()));
+        Ok(pins)
+    }
+
+    /// Whether retention keeps pinned checkpoints (the default) or treats
+    /// them as any other: the configuration's
+    /// `persistence.preserve_pinned_discoveries`.
+    pub const fn set_preserve_pinned(&mut self, preserve: bool) {
+        self.preserve_pinned = preserve;
+    }
+
+    /// Whether retention keeps pinned checkpoints.
+    #[must_use]
+    pub const fn preserve_pinned(&self) -> bool {
+        self.preserve_pinned
     }
 
     /// Start publishing a checkpoint as it is encoded ([`Stream`]): pass
@@ -1008,9 +1135,10 @@ impl ChunkStore {
 
     /// Keep the newest `keep` valid checkpoints (`accept` as in
     /// [`ChunkStore::latest_valid`]): remove every manifest older than the
-    /// oldest of them, then every chunk no remaining manifest names. With
-    /// fewer than `keep` valid checkpoints nothing is removed. Invalid
-    /// manifests newer than the oldest kept one stay, for inspection.
+    /// oldest of them, except pinned ones while pins are preserved, then
+    /// every chunk no remaining manifest names. With fewer than `keep`
+    /// valid checkpoints nothing is removed. Invalid manifests newer than
+    /// the oldest kept one stay, for inspection.
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] for `keep == 0`;
@@ -1067,13 +1195,24 @@ impl ChunkStore {
         } else {
             None
         };
-        let removed: Vec<u64> = oldest.map_or_else(Vec::new, |oldest| {
-            sequences
-                .iter()
-                .copied()
-                .filter(|sequence| *sequence < oldest)
+        let held: BTreeSet<u64> = if self.preserve_pinned {
+            self.pins()?
+                .into_iter()
+                .map(|(sequence, _)| sequence)
                 .collect()
-        });
+        } else {
+            BTreeSet::new()
+        };
+        let (pinned, removed): (Vec<u64>, Vec<u64>) = oldest
+            .map_or_else(Vec::new, |oldest| {
+                sequences
+                    .iter()
+                    .copied()
+                    .filter(|sequence| *sequence < oldest)
+                    .collect()
+            })
+            .into_iter()
+            .partition(|sequence| held.contains(sequence));
         for &sequence in &removed {
             let path = self.manifest_path(sequence);
             fs::remove_file(&path).map_err(|error| storage("remove manifest", &path, &error))?;
@@ -1133,6 +1272,7 @@ impl ChunkStore {
         Ok(Retention {
             valid,
             removed,
+            pinned,
             chunks_removed,
             chunks_kept,
         })

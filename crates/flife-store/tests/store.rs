@@ -871,6 +871,111 @@ fn retention_keeps_the_newest_valid_checkpoints_and_the_chunks_they_name() {
     assert_eq!(skipped.len(), 1);
 }
 
+/// §16.7 and FL-042: "Garbage collection traces from committed manifests
+/// and pinned discoveries." While pins are preserved (the default), a
+/// pinned checkpoint outlives retention whole however old it is, and stays
+/// pinned until its last holder unpins it; then it goes like any other,
+/// with exactly the chunks only it named.
+#[test]
+fn retention_keeps_pinned_checkpoints_until_their_last_holder_unpins() {
+    let config = ecology();
+    let published = checkpoints(&config, &[0, 4, 8, 12, 16]);
+    let root = fresh("retain-pinned");
+    let mut store = open_store(&root, Durability::PowerLoss).expect("creates");
+    for (bytes, _) in &published {
+        store.publish(bytes).expect("publishes");
+    }
+    let first = Sha256Digest::of(b"a discovery");
+    let second = Sha256Digest::of(b"another discovery");
+    assert!(store.preserve_pinned(), "pins are preserved by default");
+    assert!(
+        matches!(store.pin(6, &first), Err(CoreError::StateConflict { .. })),
+        "a pin names a checkpoint the store holds"
+    );
+    assert!(store.pins().expect("lists").is_empty());
+    assert!(store.pin(2, &first).expect("pins"));
+    assert!(
+        !store.pin(2, &first).expect("pins again"),
+        "a holder pins once"
+    );
+    assert!(store.pin(2, &second).expect("pins"));
+    let mut both = vec![(2, first), (2, second)];
+    both.sort_unstable_by_key(|(sequence, holder)| (*sequence, *holder.as_bytes()));
+    assert_eq!(store.pins().expect("lists"), both);
+
+    let retention = store.retain(1, valid).expect("retains");
+    assert_eq!(
+        (retention.valid, retention.removed, retention.pinned),
+        (vec![5], vec![1, 3, 4], vec![2])
+    );
+    assert_eq!(store.sequences().expect("lists"), [2, 5]);
+    assert_eq!(store.load(2).expect("loads"), published[1].0);
+    assert_eq!(
+        restored(2, &published[1].0).expect("restores"),
+        published[1].1
+    );
+    store.verify(2).expect("the pinned checkpoint is whole");
+    let kept: BTreeSet<String> = digests(&published[1].0)
+        .union(&digests(&published[4].0))
+        .cloned()
+        .collect();
+    assert_eq!(
+        chunk_files(&root),
+        kept,
+        "the pinned checkpoint's chunks stay"
+    );
+
+    // Pins are files: a reopened store still holds them.
+    drop(store);
+    let mut store = open_store(&root, Durability::PowerLoss).expect("reopens");
+    assert_eq!(store.pins().expect("lists"), both);
+    assert!(store.unpin(2, &first).expect("unpins"));
+    assert!(!store.unpin(2, &first).expect("unpins again"));
+    let retention = store.retain(1, valid).expect("retains");
+    assert_eq!(
+        (retention.removed, retention.pinned),
+        (vec![], vec![2]),
+        "another holder still pins it"
+    );
+    assert!(store.unpin(2, &second).expect("unpins"));
+    assert!(store.pins().expect("lists").is_empty());
+    let retention = store.retain(1, valid).expect("retains");
+    assert_eq!((retention.removed, retention.pinned), (vec![2], vec![]));
+    assert_eq!(store.sequences().expect("lists"), [5]);
+    assert_eq!(chunk_files(&root), digests(&published[4].0));
+}
+
+/// With pins not preserved (`preserve_pinned_discoveries = false`),
+/// retention removes a pinned checkpoint as any other; the pin stays,
+/// naming a checkpoint the store no longer holds, and no new pin can name
+/// it.
+#[test]
+fn retention_removes_pinned_checkpoints_when_pins_are_not_preserved() {
+    let config = ecology();
+    let published = checkpoints(&config, &[0, 4, 8]);
+    let root = fresh("retain-unpreserved");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
+    for (bytes, _) in &published {
+        store.publish(bytes).expect("publishes");
+    }
+    let holder = Sha256Digest::of(b"a discovery");
+    assert!(store.pin(1, &holder).expect("pins"));
+    store.set_preserve_pinned(false);
+    assert!(!store.preserve_pinned());
+    let retention = store.retain_intact(1).expect("retains");
+    assert_eq!(
+        (retention.valid, retention.removed, retention.pinned),
+        (vec![3], vec![1, 2], vec![])
+    );
+    assert_eq!(store.sequences().expect("lists"), [3]);
+    assert_eq!(chunk_files(&root), digests(&published[2].0));
+    assert_eq!(store.pins().expect("lists"), [(1, holder)]);
+    assert!(matches!(
+        store.pin(1, &Sha256Digest::of(b"later")),
+        Err(CoreError::StateConflict { .. })
+    ));
+}
+
 /// The 4,096-organism preset at its scale, under both durability
 /// profiles: publish, share unchanged chunks with the next tick's
 /// checkpoint, and recover.

@@ -809,11 +809,13 @@ impl Checkpoints {
         session: SessionId,
     ) -> Result<Self, CoreError> {
         let admission = admit(config, persistence.mode, persistence.retained_bytes)?;
+        let mut store =
+            ChunkStore::open(persistence.run_dir.join(STORE_DIR), persistence.durability)?;
+        // Retention keeps the checkpoints saved discoveries pin (FL-042,
+        // plan §16.7) unless the configuration says otherwise.
+        store.set_preserve_pinned(config.config().persistence.preserve_pinned_discoveries);
         Ok(Self {
-            store: Some(ChunkStore::open(
-                persistence.run_dir.join(STORE_DIR),
-                persistence.durability,
-            )?),
+            store: Some(store),
             filing: Filing {
                 catalog: persistence.run_dir.join(CATALOG_FILE),
                 session,

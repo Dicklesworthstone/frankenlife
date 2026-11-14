@@ -43,6 +43,8 @@ experiment knows what already ran and a report can list every run.
   - `ChunkStore::publish_sharing` and `publish_sharing_observed`, taking a donor `ChunkStore`;
   - `Step::ChunkLinked`, and `Publication::linked`, a part of `written`;
   - `CommandJournal::open_branch`, `lineage` and `branch_origin`, and `BranchOrigin`.
+- FL-042: `ChunkStore::pin`, `unpin`, `pins`, `pin_path`, `set_preserve_pinned` and `preserve_pinned`, and
+  `Retention::pinned`. A pin is the empty file `pins/<sequence>.<holder SHA-256 hex>.pin`.
 - FL-041: `ExperimentCatalog` with `open`, `path`, `design`, `runs` and `record`; `CatalogedRun`; and
   `EXPERIMENT_CATALOG_FORMAT`.
 
@@ -105,6 +107,12 @@ experiment knows what already ran and a report can list every run.
   the oldest of them, then every chunk file that no remaining parseable manifest names. Invalid manifests newer
   than the oldest kept one stay, for inspection. With fewer than `n` valid checkpoints nothing is removed, and
   `n = 0` is refused. Manifests go before chunks, so a failure part way never breaks a kept checkpoint.
+- Pins (FL-042, §16.7 "Garbage collection traces from committed manifests and pinned discoveries"). While pins are
+  preserved (the default; `flife-cli` sets it from `[persistence] preserve_pinned_discoveries`), `retain` and
+  `retain_intact` keep a pinned manifest however old, and so every chunk it names; `Retention::pinned` lists them.
+  A checkpoint stays pinned until its last holder unpins it. `pin` refuses a sequence with no manifest and is
+  idempotent per holder. When pins are not preserved, a pinned manifest goes as any other and its pin file stays,
+  naming a checkpoint the store no longer holds.
 
 **Invariants — the run catalog and command journal (FL-036; §12.3, §16.6, B.1).**
 - One FrankenSQLite file, opened in WAL mode with `synchronous = FULL` (FrankenSQLite's per-commit sync), so every
@@ -194,6 +202,12 @@ manifests.
   valid checkpoint. So do a directory in the way of a chunk and a directory in the way of the next manifest.
 - Retention of 6 checkpoints to 4 removes the oldest 2 and exactly the chunks only they named. The kept 4 load and
   restore. A damaged newest checkpoint is not counted and stays.
+- FL-042, `retention_keeps_pinned_checkpoints_until_their_last_holder_unpins` (`power-loss`): of 5 checkpoints, the
+  second pinned by two holders survives `retain(1)` with 1, 3 and 4 removed; it loads byte for byte, restores and
+  verifies; the store's chunks are exactly the two kept checkpoints'. Reopened, both pins are there; one holder's
+  unpin keeps it; the last one's lets retention remove it and the chunks only it named.
+  `retention_removes_pinned_checkpoints_when_pins_are_not_preserved` (`retain_intact`): the pinned checkpoint goes,
+  its pin stays, and a new pin of it is refused.
 - At the preset's scale: 161.3 MiB published in 0.08–0.10 s (`process-crash`) or 0.23–0.26 s (`power-loss`), over
   two runs on an Apple-silicon Mac. The next tick's checkpoint shares 6 of its 11 chunks, including the genomes,
   so 3.1 MiB is written. Recovery (load, verify and restore) takes about 0.2 s.
@@ -318,9 +332,9 @@ file-backed engine), one writer thread per session, one session per database at 
   crashes are tested. Two sessions writing one catalog at once, and two processes opening one session's journal,
   are not tested; FrankenSQLite's concurrent writers are not relied on.
 - No journal compaction or bounded idempotency window: every record is kept for the session's life.
-- No readers' leases: retention assumes no other process is reading the store. Pinned discoveries and branch
-  closures (§16.7) are not retained specially. A branch shares its parent's chunks by hard links instead
-  (FL-039), so a parent's retention cannot remove a chunk a branch names. Across file systems a link fails and the
+- No readers' leases: retention assumes no other process is reading the store. Pinned discoveries are retained
+  (FL-042); branch closures (§16.7) are not retained specially. A branch shares its parent's chunks by hard links
+  instead (FL-039), so a parent's retention cannot remove a chunk a branch names. Across file systems a link fails and the
   chunk is written, which is not tested. A linked chunk damaged in place is damaged in every store that names it.
   It is detected on load, as any damage is.
 - Chunks are whole families: a single birth rewrites the full genome chunk. Per-genome pages, deltas and

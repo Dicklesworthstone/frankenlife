@@ -15,11 +15,20 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use flife_cli::{
-    BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, ERROR_SCHEMA, Experiment,
-    ExperimentOptions, FieldMapping, Injection, InspectOptions, Introduction, Look, Material,
-    Particles, Persistence, Removal, ResumeOptions, RunOptions, ScheduledCommand, Stop,
-    StoreDurability, Style, Validation,
+    BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions, Discovery,
+    ERROR_SCHEMA, Experiment, ExperimentOptions, FieldMapping, Injection, InspectOptions,
+    Introduction, Look, Material, Particles, Persistence, Removal, ResumeOptions, RunOptions,
+    ScheduledCommand, Selection, Stop, StoreDurability, Style, Validation,
 };
+
+/// `flife discover`'s one record: the [`Discovery`] its bundle's
+/// `discovery.json` holds, tagged.
+#[derive(Serialize)]
+struct DiscoverRecord<'a> {
+    record: &'static str,
+    #[serde(flatten)]
+    discovery: &'a Discovery,
+}
 use flife_core::ValidatedConfig;
 use serde::Serialize;
 
@@ -217,6 +226,68 @@ enum Command {
         /// given.
         #[arg(long = "weights", value_name = "ORGANISM")]
         weights: Vec<u64>,
+    },
+    /// Save a discovery (plan §14.5) of a run directory's checkpoint into a
+    /// new bundle directory: `discovery.json` (source reference,
+    /// selection, presentation, description), `thumbnail.png`, and the
+    /// full-world export `world/`, a run directory `flife resume`
+    /// continues. The run's store pins the checkpoint against retention.
+    Discover {
+        /// The run directory.
+        run_dir: PathBuf,
+        /// The new (or empty) bundle directory.
+        out: PathBuf,
+        /// The committed tick of the checkpoint; the newest that restores
+        /// if omitted.
+        #[arg(long)]
+        at: Option<u64>,
+        /// The discovery's name, part of its identity; the bundle
+        /// directory's name if omitted.
+        #[arg(long)]
+        name: Option<String>,
+        /// What the discovery is.
+        #[arg(long, default_value = "")]
+        description: String,
+        /// Select the organisms and field cells within RADIUS world units
+        /// of (X, Y); the thumbnail frames them.
+        #[arg(long, value_name = "X,Y,RADIUS", conflicts_with = "lineage")]
+        region: Option<flife_cli::Disk>,
+        /// Select one founder lineage's live organisms.
+        #[arg(long, value_name = "LINEAGE")]
+        lineage: Option<u64>,
+        /// Thumbnail width in pixels.
+        #[arg(long, default_value_t = 640)]
+        width: u32,
+        /// Thumbnail height in pixels.
+        #[arg(long, default_value_t = 360)]
+        height: u32,
+        /// Leave the full-world export out.
+        #[arg(long)]
+        no_world: bool,
+        /// Threads for FrankenManim's CPU renderer: a count or `auto`.
+        #[arg(long, default_value = "auto", value_parser = parse_workers)]
+        render_threads: NonZeroUsize,
+        /// What the organisms' colour means, as for `flife render`; the
+        /// default is the configuration's `[presentation] color_mapping`.
+        #[arg(long)]
+        color: Option<ColorMapping>,
+        /// `glow` (the default) or `raw`.
+        #[arg(long, default_value = "glow")]
+        look: Look,
+        /// Draw organism density per screen bin instead of dots.
+        #[arg(long)]
+        density: bool,
+        /// Leave the energy field out.
+        #[arg(long)]
+        no_field: bool,
+        /// What the field's colour means, as for `flife render`.
+        #[arg(long, default_value = "energy")]
+        field_mapping: FieldMapping,
+        /// `power-loss` (the default) flushes the export, the pin and the
+        /// bundle's files to stable storage; `process-crash` relies on
+        /// atomic renames.
+        #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
+        checkpoint_durability: StoreDurability,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view.
@@ -441,6 +512,70 @@ fn main() -> ExitCode {
             }
             Err(error) => fail(error.kind(), error.to_string()),
         },
+        Command::Discover {
+            run_dir,
+            out,
+            at,
+            name,
+            description,
+            region,
+            lineage,
+            width,
+            height,
+            no_world,
+            render_threads,
+            color,
+            look,
+            density,
+            no_field,
+            field_mapping,
+            checkpoint_durability,
+        } => {
+            let config = match flife_cli::persist::read_config(&run_dir) {
+                Ok(config) => config,
+                Err(error) => return fail(error.kind(), error.to_string()),
+            };
+            let mapping = match color.map_or_else(|| ColorMapping::configured(&config), Ok) {
+                Ok(mapping) => mapping,
+                Err(error) => return fail(error.kind(), error.to_string()),
+            };
+            let selection = match (region, lineage) {
+                (Some(disk), _) => Selection::Region(disk),
+                (None, Some(lineage)) => Selection::Lineage(lineage),
+                (None, None) => Selection::World,
+            };
+            let options = DiscoverOptions {
+                at,
+                name,
+                description,
+                selection,
+                size: [width, height],
+                style: Style {
+                    mapping,
+                    look,
+                    particles: if density {
+                        Particles::Density
+                    } else {
+                        Particles::Points
+                    },
+                    field: !no_field,
+                    field_mapping,
+                },
+                render_threads,
+                full_world: !no_world,
+                durability: checkpoint_durability,
+            };
+            match flife_cli::discover(&run_dir, &out, &options) {
+                Ok(discovery) => {
+                    print(&DiscoverRecord {
+                        record: "discovery",
+                        discovery: &discovery,
+                    });
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error.kind(), error.to_string()),
+            }
+        }
         Command::Inspect {
             run_dir,
             at,

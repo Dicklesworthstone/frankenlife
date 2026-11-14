@@ -29,6 +29,14 @@ seed it plans, catalogs every run however it ended in FrankenSQLite (`flife-stor
 run's records and Appendix B.1 manifest, and writes a report computed from the catalog alone. A report is the same
 bytes at any worker count and backend, and after a kill and a continuation.
 
+FL-042 (`flife-gfl`), first slice, adds `flife discover` (plan §14.5, §16.7), in `discovery`. It saves a discovery of
+a run directory's durable checkpoint into a new bundle directory: the run/checkpoint reference, the selected region
+(measured in the committed world) or lineage, a thumbnail drawn from that checkpoint, the presentation settings and
+a description, in `discovery.json`. It also writes the full-world export, a complete reproducible world checkpoint:
+`world/`, a control branch of the run at that checkpoint that `flife resume` continues. The run's store pins the
+checkpoint for the discovery, so the run's own retention keeps it while `[persistence] preserve_pinned_discoveries`
+holds, which until now nothing read. §14.5's second export, the local transplant package, is not built yet.
+
 FL-043 (`flife-8gy`), first slice, adds the peak-memory preflight (plan §7.5, §19.3, §19.4, INV-12, INV-15), in
 `memory`. Before a run, resume or render steps, `memory::admit` adds up §19.4's terms against `[execution]
 maximum_total_bytes` and refuses the run when the terms other than the backend's do not fit. The remainder goes to
@@ -112,6 +120,18 @@ for, one at least, before a render is refused. Its first record is `start`, with
     dir, ExperimentOptions { cpu_workers, controllers }, emit)`. `Experiment::configuration(condition, seed)` gives
     any planned run's validated configuration.
 
+- FL-042: `flife discover DIR BUNDLE --at T --name NAME --description TEXT (--region X,Y,R | --lineage L) --width W
+  --height H --no-world --render-threads N --color C --look L --density --no-field --field-mapping F
+  --checkpoint-durability D`.
+  - `DIR` is a run directory no process holds. `BUNDLE` is new or empty.
+  - `--at` is the committed tick of one of its checkpoints, the newest that restores by default. `--name` is 1 to
+    256 bytes, `BUNDLE`'s name by default. `--description` is at most 4,096 bytes.
+  - `--region` selects a disk of radius R world units about (X, Y), as a measurement region (§14.3); `--lineage`
+    selects one founder lineage's live organisms; neither selects the whole world.
+  - The thumbnail is W × H pixels (640 × 360 by default, each side 1 to 4,096), drawn with `flife render`'s style
+    flags. `--no-world` leaves the full-world export out.
+  - In the library: `discover(dir, bundle, &DiscoverOptions { at, name, description, selection, size, style,
+    render_threads, full_world, durability })` returns the `Discovery`.
 - `flife inspect DIR --at T --field --weights ID…` (plan §14.6; FL-048's raw state; FL-021's on-demand weight
   dump, §14.2). `DIR` is a run directory no process holds; `--at` the committed tick of one of its checkpoints, the
   newest that restores by default; `--weights` (repeatable) names organisms whose whole controller to print. In the
@@ -143,6 +163,22 @@ for, one at least, before a render is refused. Its first record is `start`, with
     - the branch's own command identities;
     - its founding checkpoint: sequence and tick, SHA-256 and size, and the chunks written and linked;
     - the world's digest, which is the parent's at that tick.
+  - FL-042, `discovery` (the only record of `flife discover`): the bundle's `discovery.json`
+    (`frankenlife.discovery.v1`), tagged. It holds:
+    - `id`, `discovery_id(checkpoint SHA-256, name)`: SHA-256 of `frankenlife.discovery.v1`, a zero byte, the
+      checkpoint container's SHA-256 and the name. It is the pin's holder;
+    - `name` and `description`;
+    - `source`: the run directory, session, checkpoint sequence, tick and container SHA-256, the restored world's
+      digest, the configuration hash, `pinned` and `pins_preserved` (the run's `preserve_pinned_discoveries`);
+    - `selection`: `world` (live organisms), `region` (centre, radius, organisms, their energy summed in identity
+      order, distinct lineages, field cells and their energy: `World::measure_region`), or `lineage` (the lineage,
+      its live organisms and lowest and highest generation);
+    - `presentation`: the colour mapping and its meaning, look, particles, field and field mapping, the fixed
+      projection (as `flife render`'s end record), the camera (centre and zoom), background, bloom and dot radius;
+    - `thumbnail`: path, size and the PNG's SHA-256;
+    - `exports`: `full_world` (path `world`, its session, its founding checkpoint's SHA-256, and the chunks written
+      and linked) or `null` under `--no-world`, and `local_package`, `null`;
+    - `memory`: the thumbnail's FL-043 admission.
   - FL-040, with `--metrics-every M`:
     - `start.metrics` declares `frankenlife.metrics.v1`: M, the complete and sampled rules in words, the bin grid
       (16 a side) and the lineages listed (8);
@@ -365,6 +401,23 @@ for, one at least, before a render is refused. Its first record is `start`, with
     intervention branch matches its control until its first command applies.
   - Resuming a branch takes the newest checkpoint of its own session that restores. Checkpoints of another session
     are passed over, and a branch has no founding world to fall back to.
+- FL-042, discoveries:
+  - A bundle is `thumbnail.png`, `world/` (unless `--no-world`) and `discovery.json`, written in that order.
+    `discovery.json` is written to `discovery.json.partial` and renamed into place: it is the bundle's commit
+    point, and a bundle without it is incomplete. Under `power-loss` each file and the directory are flushed.
+  - Full-world semantics: `world/` is `branch(DIR, BUNDLE/world, at = the checkpoint's tick, name = the
+    discovery's name, no commands)`. It is a complete world: its own session, every inherited command and outcome,
+    its founding checkpoint byte-identical to the source's in every world chunk and linking the source's chunk
+    files. Resumed alone, it reaches the state the source run reaches from that checkpoint. A source checkpoint
+    that changed between the read and the export (another sequence or SHA-256) refuses the discovery.
+  - The thumbnail is drawn as `flife render` draws a frame (CPU reference route, the configuration's background,
+    bloom and dot radius), from a standalone epoch of the restored world. A region is framed: the camera is centred
+    on it and zoomed so its diameter fills `REGION_FILL` (0.75) of the shorter side, within the viewport's zoom
+    range, and its measurement outline is drawn. Its memory is admitted (FL-043) as a render's with one frame
+    encoding.
+  - The pin is made after the export and before `discovery.json`. While the run's configuration preserves pins,
+    the run's retention keeps the checkpoint and every chunk it names (`flife-store`'s pins); `Checkpoints::open`
+    sets the store from `[persistence] preserve_pinned_discoveries`.
 - FL-040:
   - The tracker never reads the world after its start. It starts from the committed population (each organism's
     identity, genome, lineage, generation, birth tick and topology) and then folds each published report: births
@@ -465,6 +518,17 @@ test.
 
   The first four are refused before the branch directory is made. `flife resume` of a branch none of whose
   checkpoints restores is also refused.
+- FL-042, `flife discover`, with nothing printed on standard output and no `discovery.json` written:
+  - `state-conflict`: a name that is empty or longer than 256 bytes, a description longer than 4,096 bytes, a
+    thumbnail side of 0 or above 4,096, a bundle directory that holds anything, a directory that is not a run or
+    that another process holds, no checkpoint that restores (at `--at`, when given), or a lineage with no live
+    organism at the checkpoint;
+  - `numerical-invalid`: a region a measurement refuses (a centre outside the world, a radius that is not finite
+    and positive or is above half the shorter world side);
+  - `budget-exhausted`: a thumbnail that does not fit `maximum_total_bytes`.
+
+  All of these are refused before the bundle directory is made or anything is pinned. `--region` with
+  `--lineage` is a usage error.
 - FL-040: a report or an epoch that disagrees with the tracker stops the run with `state-conflict` (operation
   `track run metrics`), exit status 2. The records before it are still emitted.
 - FL-041, before anything runs: a specification with an unknown key, another schema, an empty name, hypothesis or
@@ -662,6 +726,42 @@ and `tests/resume.rs`: in the book's lineage, its encoding and checks, chunk lin
 admissions, and forks out of order, each accepted on restore, and a restored record's session left unchecked) are
 reachable only through a crafted checkpoint. `flife-runtime`'s `a_crafted_lineage_is_refused_on_restore` now
 catches each of them.
+
+`tests/discovery.rs` (4 tests, FL-042, about 4 s), on FL-037's 32 × 32 ecology run to tick 120 with checkpoints
+every 7 ticks, the newest 4 retained, and two energy brushes (one before and one after the discovered tick):
+- `a_region_discovery_is_a_pinned_reference_and_a_reproducible_world`. A region discovery at tick 112:
+  - the record equals `discovery.json`;
+  - its source equals that checkpoint's record, and its identity is recomputed from its definition;
+  - its organisms, their energy and its lineages equal a count over `flife inspect`'s rows by the minimum-image
+    distance, and its world digest equals `inspect`'s;
+  - the camera is centred on the disk and zoomed in, and the thumbnail's SHA-256 is its bytes';
+  - the outline is drawn: over 150 pale pixels, at a mean distance from the centre within 2 pixels of 0.75 × 90 / 2;
+  - `world/` resumed to tick 161 reaches the digest the source reaches from the same checkpoint;
+  - the source store holds exactly one pin, the discovery's. The run continued to tick 161 still restores tick 112,
+    while its other old checkpoints are gone.
+- `lineage_and_whole_world_discoveries_record_what_the_checkpoint_holds`. A lineage discovery with `--no-world`
+  under `power-loss` has the live count and generations `inspect` shows, and only `discovery.json` and
+  `thumbnail.png`. A whole-world discovery at the newest tick (120) has `inspect`'s live count and digest at zoom 1.
+  Neither thumbnail has an outline, and the store holds both pins.
+- `refused_discoveries_write_nothing`. A tick with no checkpoint, an absent lineage, a region of radius 0 and one
+  above half the world, a thumbnail side of 0, and a non-empty bundle directory: each exits 2 with one error record
+  of its kind, makes no bundle directory, leaves the non-empty one as it was, and pins nothing. `--region` with
+  `--lineage` is clap's usage error. The name, description and held-run refusals are not tested here.
+- `a_thumbnail_over_the_memory_budget_is_refused_before_the_bundle_exists`. A run whose budget is its own fixed
+  terms and 8 MiB refuses a 4,096 × 4,096 thumbnail with `budget-exhausted`, makes no directory and pins nothing,
+  and then admits the usual 160 × 90 one.
+
+Twenty-five planted mutants were run against these tests and `flife-store`'s retention tests, and all were caught:
+eight in the store's pins and retention (pins ignored, preserved whatever the setting, a pin of an absent checkpoint,
+an unpin that removes nothing, a misread sequence, a repeated pin reported new, pins not preserved by default, the
+run ignoring `preserve_pinned_discoveries`) and seventeen in `discover` (nothing pinned, the previous checkpoint
+pinned, the region not framed, not outlined or framed at twice the zoom, a lineage's organisms inverted or its
+generations reversed, the checkpoint's hash as the world digest, the export from the newest checkpoint, a non-empty
+bundle accepted, the description dropped, the region measured at half its radius, the identity without the name,
+the export left out, an absent lineage accepted, the bundle made before the thumbnail's admission, and an admission
+without the thumbnail's bytes). The last two were planted after a reading of `discover` showed that a budget
+refusal made the bundle directory, which no test then checked; `discover` now makes it only after the thumbnail is
+drawn, and the budget test was added for it.
 
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
@@ -863,8 +963,16 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
     in which every organism reproduces, which would test its birth part, is not made.
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
-- Only `validate`, `run`, `resume`, `render`, `branch`, `experiment` and `inspect`. Capabilities, step, analyze and
-  export are later items (§14.6).
+- Only `validate`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect` and `discover`. Capabilities,
+  step, analyze and export are later items (§14.6).
+- FL-042 gaps (first slice):
+  - §14.5's local transplant package (a declared cropped field, boundary conditions and energy endowment) and a
+    transplant into a host are not built, so `exports.local_package` is always `null` and FL-042 stays open.
+  - The Studio has no discover action; a run the Studio (or any process) holds is refused, as for `branch`.
+  - A crash between the pin and the commit point leaves a pin that no `discovery.json` names. It keeps its
+    checkpoint until unpinned; nothing lists or removes such pins yet.
+  - Nothing unpins: deleting a bundle leaves its pin in the source store.
+  - A lineage selection is recorded, not drawn: its thumbnail is the whole world, unframed and unhighlighted.
 - FL-039 gaps:
   - §14.4's synchronized simulation-time views and paired metrics are not here: a branch's paired comparison is two
     `flife resume` runs and their records. Experiment reports (FL-041) compare runs founded afresh per seed, not

@@ -28,6 +28,10 @@
 //!   with its manifest whatever its ending, continues after a kill, and
 //!   writes a [`Report`] of paired comparisons with the control that
 //!   depends only on the catalog.
+//! - [`mod@discovery`]: saved discoveries (FL-042). [`discover()`] saves a
+//!   run checkpoint's discovery (selection, thumbnail, presentation,
+//!   description) into a bundle directory with a full-world export, and
+//!   pins the checkpoint in the run's store against retention.
 //! - [`mod@inspect`]: a run directory's committed state at one checkpoint,
 //!   organism by organism and optionally cell by cell (plan §14.6).
 //! - [`observe`]: what a run did. A [`Tally`] of the published reports, and
@@ -39,7 +43,8 @@
 //! `flife run <config> --ticks N --every K [--run-dir DIR]`,
 //! `flife resume DIR --until T`,
 //! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
-//! `flife inspect DIR [--at T] [--field]` and
+//! `flife inspect DIR [--at T] [--field]`,
+//! `flife discover DIR BUNDLE [--at T] [--region X,Y,R | --lineage L]` and
 //! `flife experiment SPEC --out DIR`. The repository's presets live
 //! in `presets/`.
 
@@ -47,6 +52,7 @@
 
 pub mod branch;
 pub mod checkpointing;
+pub mod discovery;
 pub mod experiment;
 pub mod inspect;
 pub mod memory;
@@ -64,6 +70,11 @@ pub use branch::{
 pub use checkpointing::{
     BOUNDED_BACKGROUND, CHECKPOINT_FIXED_BYTES, CheckpointAdmission, CheckpointMode,
     PAUSE_AND_STREAM, admit,
+};
+pub use discovery::{
+    Camera, DESCRIPTION_MAX_BYTES, DISCOVERY_FILE, DISCOVERY_SCHEMA, DiscoverOptions, Discovery,
+    Disk, Exports, FullWorld, Presentation, REGION_FILL, Selected, Selection, Source,
+    THUMBNAIL_FILE, THUMBNAIL_MAX_PIXELS, Thumbnail, WORLD_DIR, discover, discovery_id,
 };
 pub use experiment::{
     ABLATIONS, Ablation, Condition, EXPERIMENT_CATALOG_FILE, EXPERIMENT_SCHEMA, Experiment,

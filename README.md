@@ -123,6 +123,12 @@ reached its tick, died out, paused or was refused, keeps each run's records and 
 each condition against the control as an effect over k of n paired seeds with an exact sign-flip p-value. A
 selection rule sees only the discovery runs. The report is the same bytes at any worker count, and after a kill and
 a continuation.
+FL-042 saves discoveries: `flife discover DIR BUNDLE --at T --region X,Y,R --description TEXT` (or `--lineage L`)
+writes a bundle with the run/checkpoint reference, the selection measured in the committed world, a thumbnail framed
+on the region, the presentation settings and the description. It also writes the full-world export `world/`, a
+control branch of the checkpoint that `flife resume` continues to exactly the source run's state. The run's store
+pins the checkpoint, so its retention keeps it while `preserve_pinned_discoveries` holds. The local transplant
+package, §14.5's second export, is not built yet.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
 printed as an `inspected` record and drawn under the overlay's lines (its energy, age, motion, controller and held
@@ -571,6 +577,7 @@ flife inspect               # a run directory's committed world at one checkpoin
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
 flife branch                # control and intervention branches from one checkpoint (exists)
 flife experiment            # seed ensembles, sweeps and ablations against a control, every run cataloged (exists)
+flife discover              # a pinned discovery bundle: reference, selection, thumbnail, full-world export (exists)
 flife analyze               # cross-experiment analysis of cataloged metrics
 flife render | export       # simulation-time frames and video through FrankenManim (render exists)
 flife-studio <preset>       # the interactive microscope

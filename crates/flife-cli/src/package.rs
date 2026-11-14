@@ -278,13 +278,30 @@ fn agrees(manifest: f64, restored: f64) -> bool {
 /// restored world; [`CoreError::StorageFailed`] for a file that cannot be
 /// read; and the restore's [`CoreError::IncompatibleCheckpoint`].
 pub fn read_package(dir: &Path, profile: NumericalProfile) -> Result<(Package, World), CoreError> {
-    let manifest = dir.join(PACKAGE_FILE);
-    if !manifest.is_file() || !dir.join(PACKAGE_WORLD_FILE).is_file() {
-        return Err(refuse(format!(
-            "{} is not a package directory (it needs {PACKAGE_FILE} and {PACKAGE_WORLD_FILE})",
-            dir.display()
-        )));
+    for name in [PACKAGE_FILE, PACKAGE_WORLD_FILE] {
+        let path = dir.join(name);
+        // Absent (or under something that is not a directory) means this is
+        // not a package; any other failure is the host's.
+        let present = match fs::metadata(&path) {
+            Ok(metadata) => metadata.is_file(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(error) => return Err(storage("read package file", &path, &error)),
+        };
+        if !present {
+            return Err(refuse(format!(
+                "{} is not a package directory (it needs {PACKAGE_FILE} and {PACKAGE_WORLD_FILE})",
+                dir.display()
+            )));
+        }
     }
+    let manifest = dir.join(PACKAGE_FILE);
     let text = read_bounded(&manifest, MANIFEST_MAX_BYTES)?;
     let package: Package = serde_json::from_slice(&text)
         .map_err(|error| refuse(format!("{}: {error}", manifest.display())))?;

@@ -966,7 +966,10 @@ outside-the-disk and landing checks removed; host founders in the disk kept; a l
 member; the source phase or cooldown kept; the ledger not reopened; the disk moved the wrong way; and the whole
 founding check removed. One survived: removing only the founding check's tick clause, because a stepped host is
 still refused by a remaining clause (its epoch or its event count; which one was not isolated). The whole check
-removed is caught.
+removed is caught. Three more, run with `tests/graft.rs` alone after the oblong and host-limit cases were added,
+were all caught: the target's y moved by the cell width, and a landed cell's row found by the cell width (each
+caught only by `a_crop_of_oblong_cells_grafts_into_an_oblong_host`; the other three tests passed), and `reseal`
+without its trait re-check (caught only by the host-limit case of `a_refused_graft_leaves_the_host_as_it_was`).
 
 `tests/watch.rs` (7 tests, FL-021, plan §14.2's Inputs, Brain and Transactions), on the same small world. Its
 oracles are not the snapshot's path: a controller backend that records every job's inputs and defers each to the

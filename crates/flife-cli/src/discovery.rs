@@ -32,9 +32,10 @@
 //!   choice, after the thumbnail is drawn and before anything is written.
 //! - **Commit point.** `discovery.json` is written to a temporary name and
 //!   renamed into place after everything else. A bundle without it is
-//!   incomplete: a failure after the pin (a file the host cannot write, or
-//!   a full-world export the store refuses) leaves the pin, which names the
-//!   discovery's identity, and the files written so far.
+//!   incomplete: a failure after the pin (a write the host refuses, or the
+//!   package's or the full-world export's refusals) leaves the pin, which
+//!   names the discovery's identity, and whatever of the bundle was
+//!   written.
 //!
 //! The source's store is opened as its writer, so a run another process
 //! holds (a running `flife run` or Studio) is refused, as for a branch.
@@ -381,8 +382,9 @@ fn vacant_bundle(out: &Path) -> Result<(), CoreError> {
 /// checkpoint; [`CoreError::NumericalInvalid`] for a region a measurement
 /// refuses; [`CoreError::BudgetExhausted`] when the thumbnail does not fit
 /// the configuration's memory budget; the store's, branch's and view's
-/// errors. All but the full-world export's (the branch's) and the bundle's
-/// writes come before the pin and before the bundle directory is made.
+/// errors. All but the bundle's writes (the thumbnail, the package and the
+/// full-world export, whose errors include the branch's) come before the
+/// pin and before the bundle directory is made.
 pub fn discover(
     run_dir: &Path,
     out: &Path,

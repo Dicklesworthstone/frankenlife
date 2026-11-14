@@ -604,8 +604,8 @@ test.
   - `budget-exhausted`: a thumbnail that does not fit `maximum_total_bytes`.
 
   All of these are refused before the bundle directory is made or anything is pinned. A failure after the pin (a
-  write the host refuses, the full-world export's refusals, a source checkpoint that changed before the export)
-  leaves the pin and an incomplete bundle without `discovery.json`. `--region` with `--lineage` is a usage error.
+  write the host refuses, the package's or the full-world export's refusals, a source checkpoint that changed
+  before the export) leaves the pin and whatever of the bundle was written, without `discovery.json`. `--region` with `--lineage` is a usage error.
   `read_package` refuses a directory without `package.json` and `world.ckpt` ("not a package directory") and a
   package that disagrees with itself (see the invariants) with `state-conflict` (operation `read package`).
 - FL-042, `flife transplant`, with nothing printed on standard output and nothing written:
@@ -895,7 +895,13 @@ Planted bugs, 11, run with `tests/discovery.rs`, each caught: `read_package` not
 the boundary, the schema, the endowment's total, the source tick or the digest (the last three caught by variants
 added to `a_package_that_disagrees_with_itself_is_refused` for them); the offset floored instead of rounded; the
 session ignoring the name; a position on the host's far edge accepted; the founding checkpoint carrying a founded
-run's command book; and `recover` falling back to a transplant's configuration's founding world.
+run's command book; and `recover` falling back to a transplant's configuration's founding world. Three more, run
+with `tests/transplant.rs`, each caught by `refused_transplants_write_nothing`: the early vacancy check removed (an
+occupied directory is then refused only after the package is read, for the damaged package's SHA-256), the
+not-a-package check removed (a missing manifest is then `storage-failed`), and `reseal` without its trait re-check
+(the motion-response host then takes the package). No test covers, and none was planted for: the pin taken under
+the hold that chose the checkpoint (a pin after the export would need a concurrent retention to tell apart), and
+`transplant.json`'s rename into place (writing it in place would need a crash to tell apart).
 
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at

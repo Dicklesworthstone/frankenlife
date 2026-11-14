@@ -954,7 +954,8 @@ the first failing test binary); the cell-size, parameter-type,
 outside-the-disk and landing checks removed; host founders in the disk kept; a lineage not named by its first
 member; the source phase or cooldown kept; the ledger not reopened; the disk moved the wrong way; and the whole
 founding check removed. One survived: removing only the founding check's tick clause, because a stepped host is
-also refused by its epoch and event clauses (the whole check removed is caught).
+still refused by a remaining clause (its epoch or its event count; which one was not isolated). The whole check
+removed is caught.
 
 `tests/watch.rs` (7 tests, FL-021, plan §14.2's Inputs, Brain and Transactions), on the same small world. Its
 oracles are not the snapshot's path: a controller backend that records every job's inputs and defers each to the

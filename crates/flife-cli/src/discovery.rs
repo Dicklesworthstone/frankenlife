@@ -27,10 +27,14 @@
 //! - **Pin.** The source store pins the checkpoint for the discovery
 //!   ([`flife_store::ChunkStore::pin`]): while the source configuration's
 //!   `preserve_pinned_discoveries` holds, its retention keeps the
-//!   checkpoint and every chunk it names however old it grows (§16.7).
+//!   checkpoint and every chunk it names however old it grows (§16.7). The
+//!   pin is made under the same hold on the store as the checkpoint's
+//!   choice, after the thumbnail is drawn and before anything is written.
 //! - **Commit point.** `discovery.json` is written to a temporary name and
 //!   renamed into place after everything else. A bundle without it is
-//!   incomplete; its pin, if one was made, names the discovery's identity.
+//!   incomplete: a failure after the pin (a file the host cannot write, or
+//!   a full-world export the store refuses) leaves the pin, which names the
+//!   discovery's identity, and the files written so far.
 //!
 //! The source's store is opened as its writer, so a run another process
 //! holds (a running `flife run` or Studio) is refused, as for a branch.
@@ -146,7 +150,8 @@ pub struct DiscoverOptions {
     pub full_world: bool,
     /// Whether to write the local package, for a region selection.
     pub package: bool,
-    /// How the export's founding checkpoint and the pin are made durable.
+    /// How the bundle's files, the export's founding checkpoint and the
+    /// pin are made durable.
     pub durability: StoreDurability,
 }
 
@@ -376,7 +381,8 @@ fn vacant_bundle(out: &Path) -> Result<(), CoreError> {
 /// checkpoint; [`CoreError::NumericalInvalid`] for a region a measurement
 /// refuses; [`CoreError::BudgetExhausted`] when the thumbnail does not fit
 /// the configuration's memory budget; the store's, branch's and view's
-/// errors.
+/// errors. All but the full-world export's (the branch's) and the bundle's
+/// writes come before the pin and before the bundle directory is made.
 pub fn discover(
     run_dir: &Path,
     out: &Path,
@@ -417,26 +423,26 @@ pub fn discover(
     let revision = config.config_hash();
     let (session, _) = run_identity(run_dir, revision)?;
     let profile = NumericalProfile::reference_f32()?;
-    let (sequence, world, checkpoint) = {
-        let store = ChunkStore::open(run_dir.join(STORE_DIR), options.durability)?;
-        let recovered = store.latest_valid(|_, bytes| {
-            let restored = restorable(bytes, profile, revision, session)?;
-            let tick = restored.world.tick().get();
-            if options.at.is_some_and(|at| at != tick) {
-                return Err(conflict(format!("it holds tick {tick}")));
-            }
-            Ok((restored.world, Sha256Digest::of(bytes)))
-        })?;
-        let Some((sequence, (world, checkpoint))) = recovered.latest else {
-            return Err(conflict(format!(
-                "{} holds no checkpoint that restores{}",
-                run_dir.display(),
-                options
-                    .at
-                    .map_or_else(String::new, |at| format!(" at tick {at}"))
-            )));
-        };
-        (sequence, world, checkpoint)
+    // The store stays open, its writer's lock held, from the choice of the
+    // checkpoint to its pin, so no other process's retention can take the
+    // checkpoint between the two.
+    let mut store = ChunkStore::open(run_dir.join(STORE_DIR), options.durability)?;
+    let recovered = store.latest_valid(|_, bytes| {
+        let restored = restorable(bytes, profile, revision, session)?;
+        let tick = restored.world.tick().get();
+        if options.at.is_some_and(|at| at != tick) {
+            return Err(conflict(format!("it holds tick {tick}")));
+        }
+        Ok((restored.world, Sha256Digest::of(bytes)))
+    })?;
+    let Some((sequence, (world, checkpoint))) = recovered.latest else {
+        return Err(conflict(format!(
+            "{} holds no checkpoint that restores{}",
+            run_dir.display(),
+            options
+                .at
+                .map_or_else(String::new, |at| format!(" at tick {at}"))
+        )));
     };
     let tick = world.tick().get();
     let epoch = Epoch::standalone(&world)?;
@@ -446,7 +452,11 @@ pub fn discover(
     let (presentation, thumbnail, memory, png) = draw(&config, &world, &epoch, options)?;
     drop(epoch);
     // Every refusal above, the render's admission among them, leaves no
-    // bundle directory behind.
+    // pin and no bundle directory behind.
+    let pins_preserved = config.config().persistence.preserve_pinned_discoveries;
+    store.pin(sequence, &id)?;
+    // The full-world export opens the store itself.
+    drop(store);
     fs::create_dir_all(out).map_err(|error| storage("create bundle directory", out, &error))?;
     write_new(&out.join(THUMBNAIL_FILE), &png, options.durability)?;
 
@@ -509,9 +519,6 @@ pub fn discover(
     } else {
         None
     };
-
-    let pins_preserved = config.config().persistence.preserve_pinned_discoveries;
-    ChunkStore::open(run_dir.join(STORE_DIR), options.durability)?.pin(sequence, &id)?;
 
     let discovery = Discovery {
         schema: DISCOVERY_SCHEMA,
@@ -719,14 +726,26 @@ fn commit(out: &Path, discovery: &Discovery, durability: StoreDurability) -> Res
             detail: error.to_string(),
         })?;
     text.push('\n');
-    let partial = out.join(format!("{DISCOVERY_FILE}.partial"));
-    write_new(&partial, text.as_bytes(), durability)?;
-    let path = out.join(DISCOVERY_FILE);
-    fs::rename(&partial, &path).map_err(|error| storage("publish discovery", &path, &error))?;
+    publish(out, DISCOVERY_FILE, text.as_bytes(), durability)
+}
+
+/// Write `bytes` as the new file `name` in `dir` all at once: to
+/// `name.partial`, renamed into place, and under `power-loss` the file and
+/// then the directory flushed. A reader finds the whole file or none.
+pub(crate) fn publish(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    durability: StoreDurability,
+) -> Result<(), CoreError> {
+    let partial = dir.join(format!("{name}.partial"));
+    write_new(&partial, bytes, durability)?;
+    let path = dir.join(name);
+    fs::rename(&partial, &path).map_err(|error| storage("publish file", &path, &error))?;
     if durability == StoreDurability::PowerLoss {
-        File::open(out)
+        File::open(dir)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| storage("flush bundle directory", out, &error))?;
+            .map_err(|error| storage("flush directory", dir, &error))?;
     }
     Ok(())
 }

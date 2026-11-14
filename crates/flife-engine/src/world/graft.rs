@@ -22,6 +22,10 @@
 //!   genome topology, traits and parameters, and their kinship: the
 //!   package's organisms of one lineage form one new lineage, named by its
 //!   first member's new identity.
+//! - Every genome, the host survivors' and the newcomers', is rebuilt in a
+//!   fresh quota and sealed again under the host's limits, so a package
+//!   organism whose traits or parameters the host's configuration does not
+//!   allow refuses the graft.
 //! - The ledger opens afresh at the grafted world's holdings.
 //!
 //! A graft is all or none: refused, it leaves the host as it was.
@@ -88,9 +92,11 @@ impl World {
     /// size, topology catalog and parameter type, `package` holds an
     /// organism or a field value outside its disk, or two of its cells land
     /// on one host cell; [`CoreError::NumericalInvalid`] for a disk a
-    /// measurement of either world refuses; [`CoreError::BudgetExhausted`]
-    /// when the host's population or genome quota cannot take the grafted
-    /// organisms; and the identity allocators' and phase's errors.
+    /// measurement of either world refuses, or a package organism whose
+    /// traits or parameters the host's limits refuse;
+    /// [`CoreError::BudgetExhausted`] when the host's population or genome
+    /// quota cannot take the grafted organisms; and the identity
+    /// allocators' and phase's errors.
     #[allow(
         clippy::too_many_lines,
         reason = "one all-or-none transaction: checks, field, organisms, ledger"
@@ -282,6 +288,12 @@ impl World {
         self.quota = quota;
         self.identities = identities;
         self.ledger = EnergyLedger::new(after, self.rules.profile.residual);
+        // The fresh quota's arena slots and generations start again, so an
+        // installed controller backend's resident parameters, kept by slot,
+        // no longer name these genomes.
+        if let Some(backend) = self.controllers.backend.as_mut() {
+            backend.forget();
+        }
         Ok(Graft {
             center: target,
             radius,

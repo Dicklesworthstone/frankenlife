@@ -607,17 +607,22 @@ each runs and owns the field.
   no parent, generation 0, born at tick 0, held output invalid, energy change rate 0, the stable phase of the new
   identity, the founders' cooldown deadline. They keep velocity, energy, topology, traits and parameters, and
   their position's displacement from the disk's centre. Each source lineage becomes one new lineage named by its
-  first member's new identity.
+  first member's new identity. Every genome, survivors' and newcomers', is rebuilt in a fresh quota and sealed
+  again under the host's trait and parameter limits.
 - The ledger reopens at the grafted world's holdings: the host's, less the displaced cells' and organisms' energy,
   plus the package's endowment (to rounding).
 - All or none: the field, population, quota and identity allocators are built aside and assigned only once every
   check and allocation has passed. A refused graft leaves the host's digest, ledger and population as they were.
+  After the assignment an installed controller backend is told to `forget` its resident parameters, since the
+  fresh quota's slots and generations start again (the backends in this workspace also key them by genome
+  identity, so this restores the backend contract's premise rather than fixing an observed fault).
 
 **Refusal cases.**
 - FL-042: `cropped` of a stopped world (`StateConflict`, "crop world"); `graft` into a world that is not
   founding, of another cell size, topology catalog or parameter type, of a package holding matter outside its
-  disk, or landing two cells on one (`StateConflict`, "graft package"); a disk either world's measurement refuses
-  (`NumericalInvalid`); a host whose population or genome quota cannot take the organisms (`BudgetExhausted`).
+  disk, or landing two cells on one (`StateConflict`, "graft package"); a disk either world's measurement refuses,
+  or a package organism whose traits or parameters the host's limits refuse (`NumericalInvalid`); a host whose
+  population or genome quota cannot take the organisms (`BudgetExhausted`).
 - FL-021: a live organism whose genome or topology is missing (`StateConflict`, "inspect organism"); a held output
   that does not decode (as `decode`); a watched organism whose held output the reference does not reproduce from
   the inputs recorded for it (`StateConflict`, "inspect organism"), which only a controller backend that broke its
@@ -923,10 +928,11 @@ of the disk; the organisms' energy one short; the next field measured instead of
 energy summed in reverse order; a running owner answering for half the radius; and a closing owner dropping the
 measurement.
 
-`tests/crop.rs` (3 tests, FL-042) and `tests/graft.rs` (3 tests, FL-042), on the measurement tests' 32 × 32 ecology
+`tests/crop.rs` (3 tests, FL-042) and `tests/graft.rs` (4 tests, FL-042), on the measurement tests' 32 × 32 ecology
 (controllers every 4 ticks in `graft.rs`). The oracles are the files' own: a `rem_euclid` minimum image on each
-torus, positions and cells placed on the host's torus the same way, and the source's and host's populations,
-genomes and fields read directly before the operation:
+torus (in `graft.rs` each axis with its own side and cell size, read from the grid), positions and cells placed on
+the host's torus the same way, and the source's and host's populations, genomes and fields read directly before
+the operation:
 - `a_crop_holds_exactly_the_disk_and_nothing_else`: three disks at tick 75 (one across the seam, one centred, one
   at a corner): the measurement is `measure_region`'s, tick and epoch kept; rows and genomes equal the source's in
   the disk; every cell in it equal plane for plane and every other zero; the holdings are the crop's own (field bit
@@ -934,8 +940,10 @@ genomes and fields read directly before the operation:
 - `a_crop_restores_from_its_checkpoint_and_runs_on`: the crop's checkpoint restores to its digest and holdings, and
   both run 40 ticks with equal digests, its organisms living on.
 - `a_crop_of_a_disk_a_measurement_refuses_is_refused`: three disks, each refused as the measurement refuses it.
-- `a_crop_grafts_into_a_host_of_its_size` (moved 8 cells east and 4 north) and
-  `a_crop_across_the_seams_grafts_into_a_wider_host` (a disk on the source's corner into a 48 × 48 host): each field
+- `a_crop_grafts_into_a_host_of_its_size` (moved 8 cells east and 4 north),
+  `a_crop_across_the_seams_grafts_into_a_wider_host` (a disk on the source's corner into a 48 × 48 host) and
+  `a_crop_of_oblong_cells_grafts_into_an_oblong_host` (cells 0.5 × 1 in both: a disk across both of a 32 × 32
+  source's seams, moved 7 cells in x and 30 in y into a 40 × 48 host): each field
   cell is the package's where the oracle lands it (one per place) and the host's elsewhere, and the displaced energy
   is theirs; the host's founders outside the disk keep their rows and genomes, in order; the grafted organisms have
   the host's next identities, kin as kin, no parent, generation 0, birth tick 0, the founders' cooldown, the stable
@@ -943,8 +951,11 @@ genomes and fields read directly before the operation:
   position, and the package's genomes with no parent; the holdings identity holds; the grafted world's checkpoint
   restores and runs 30 ticks identically.
 - `a_refused_graft_leaves_the_host_as_it_was`: a host stepped once, a host of half-unit cells, an F16 host, the
-  whole source as a "package", a 17-cell disk into a 16-cell host, and a host whose population cap is its founders:
-  each refused for its own reason (the refusal's detail is checked), the host's digest, holdings and rows unchanged.
+  whole source as a "package", a 17-cell disk into a 16-cell host, a host whose motion-response norm limit is a
+  hundredth of the source's (its own founders fit it; the package's do not), and a host whose population cap is
+  its founders: each refused with its own kind and for its own reason (a fragment of the message is checked: the
+  last is the "live population" budget, the one before it "motion response"), the host's digest, holdings and rows
+  unchanged.
 
 Planted bugs, 18, run with `tests/measure.rs`: 17 caught: the crop copying every cell or keeping every organism,
 dropping genome parents, opening its ledger at the source field's energy or resetting the epoch; the rim cells left
@@ -1093,8 +1104,9 @@ velocity, first-order splitting at the configured fixed timestep.
 **Known gaps.**
 - FL-042: a crop is a disk; a graft moves it by whole cells only (no rotation, no sub-cell move) and only into a
   founding world, so a mid-run transplant with ledger flows is not built. Grafted organisms are founders; their
-  ancestry, ages and cooldowns are not carried. `graft`'s `numerical-invalid` and `budget-exhausted` genome-quota
-  paths are not tested (the population's is). The crop's and graft's memory is not charged to `admit_memory`.
+  ancestry, ages and cooldowns are not carried. `graft`'s `budget-exhausted` genome-quota path is not tested (the
+  population's is), nor its measurement's `numerical-invalid` (the crop's is). The backend `forget` after a graft
+  has no test. The crop's and graft's memory is not charged to `admit_memory`.
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
 - FL-021's snapshot covers §14.2's identity, state, chemistry and brain architecture, and, for the watched

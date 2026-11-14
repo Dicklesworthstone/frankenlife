@@ -24,14 +24,20 @@
 //!   another session none of whose checkpoints restores.
 //! - `transplant.json` in the run directory holds the record the command
 //!   emits: the package, the host, what the graft did and the founding
-//!   checkpoint.
+//!   checkpoint. It is written last, to a temporary name renamed into
+//!   place.
 //!
-//! Every refusal (a package that does not verify, a host whose cells,
-//! topology catalog or parameter type differ, a position outside the host,
-//! a disk that wraps onto itself in a narrower host, a population or genome
-//! quota too small) comes before anything is written.
+//! Every refusal (a position outside the host, a run directory that holds
+//! anything, a package that does not verify, a host whose cells, topology
+//! catalog or parameter type differ, a disk that wraps onto itself in a
+//! narrower host, a package organism the host's limits refuse, a
+//! population or genome quota too small) comes before anything is written.
+//! A failure while the run directory is written (the host refusing a write)
+//! leaves no run that silently refounds: before the catalog exists the
+//! directory is not a run directory, and after it, with no checkpoint that
+//! restores, `flife resume` refuses it; once the founding checkpoint is
+//! published it is a run that resumes, missing only `transplant.json`.
 
-use std::fs::File;
 use std::path::Path;
 
 use flife_core::canonical::Sha256Digest;
@@ -45,10 +51,10 @@ use flife_store::CommandJournal;
 use serde::Serialize;
 
 use crate::branch::BRANCH_NAME_MAX_BYTES;
-use crate::discovery::{storage, write_new};
+use crate::discovery::publish;
 use crate::package::{PackageSource, read_package};
 use crate::persist::{
-    CATALOG_FILE, Checkpoints, Persistence, StoreDurability, create, on_plain_thread,
+    CATALOG_FILE, Checkpoints, Persistence, StoreDurability, create, on_plain_thread, vacant,
 };
 use crate::run::{CheckpointAt, RUN_SCHEMA, RUN_SESSION, Record, found};
 
@@ -185,6 +191,8 @@ fn conflict(detail: String) -> CoreError {
 /// [`CoreError::StateConflict`] for a name that is empty or too long, a
 /// position outside the host's world, `run_dir` holding a run or other
 /// files, and [`read_package`]'s and [`World::graft`]'s refusals;
+/// [`CoreError::NumericalInvalid`] for a disk the host's measurement
+/// refuses or a package organism the host's limits refuse;
 /// [`CoreError::BudgetExhausted`] when the host cannot take the grafted
 /// organisms; the store's and catalog's errors.
 ///
@@ -208,10 +216,9 @@ pub fn transplant(
             name.len()
         )));
     }
-    let (package, crop) = read_package(package_dir, NumericalProfile::reference_f32()?)?;
-    let mut world = found(host)?;
-    let grid = *world.field().grid();
-    let side = [grid.world_width(), grid.world_height()];
+    // The cheap refusals first: the host's sides are its configuration's.
+    let world_shape = &host.config().world;
+    let side = [world_shape.width, world_shape.height];
     if !(0..2)
         .all(|axis| options.at[axis].is_finite() && (0.0..side[axis]).contains(&options.at[axis]))
     {
@@ -220,6 +227,10 @@ pub fn transplant(
             options.at, side[0], side[1]
         )));
     }
+    vacant(run_dir)?;
+    let (package, crop) = read_package(package_dir, NumericalProfile::reference_f32()?)?;
+    let mut world = found(host)?;
+    let grid = *world.field().grid();
     let disk = package.crop.disk();
     let cell = [grid.cell_width(), grid.cell_height()];
     // Bounded by the two worlds' sides over a cell: exact as an i64.
@@ -316,15 +327,11 @@ pub fn transplant(
             detail: error.to_string(),
         })?;
     text.push('\n');
-    write_new(
-        &run_dir.join(TRANSPLANT_FILE),
+    publish(
+        run_dir,
+        TRANSPLANT_FILE,
         text.as_bytes(),
         options.durability,
     )?;
-    if options.durability == StoreDurability::PowerLoss {
-        File::open(run_dir)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| storage("flush run directory", run_dir, &error))?;
-    }
     Ok(record)
 }

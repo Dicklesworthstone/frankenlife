@@ -272,13 +272,19 @@ fn agrees(manifest: f64, restored: f64) -> bool {
 /// documentation](self)): its manifest and its restored world.
 ///
 /// # Errors
-/// [`CoreError::StateConflict`] for a manifest that does not parse, has
-/// another schema, boundary or container name, or disagrees with the
-/// container or the restored world; [`CoreError::StorageFailed`] for a file
-/// that cannot be read; and the restore's
-/// [`CoreError::IncompatibleCheckpoint`].
+/// [`CoreError::StateConflict`] for a directory without the manifest and
+/// the container, or a manifest that does not parse, has another schema,
+/// boundary or container name, or disagrees with the container or the
+/// restored world; [`CoreError::StorageFailed`] for a file that cannot be
+/// read; and the restore's [`CoreError::IncompatibleCheckpoint`].
 pub fn read_package(dir: &Path, profile: NumericalProfile) -> Result<(Package, World), CoreError> {
     let manifest = dir.join(PACKAGE_FILE);
+    if !manifest.is_file() || !dir.join(PACKAGE_WORLD_FILE).is_file() {
+        return Err(refuse(format!(
+            "{} is not a package directory (it needs {PACKAGE_FILE} and {PACKAGE_WORLD_FILE})",
+            dir.display()
+        )));
+    }
     let text = read_bounded(&manifest, MANIFEST_MAX_BYTES)?;
     let package: Package = serde_json::from_slice(&text)
         .map_err(|error| refuse(format!("{}: {error}", manifest.display())))?;

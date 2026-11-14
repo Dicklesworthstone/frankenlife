@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 
+use flife_core::ValidatedConfig;
 use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
-use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{
     Arrangement, Graft, HeldOutput, NumericalProfile, Organism, Stepped, WORLD_CHECKPOINT_CHUNKS,
     World,
@@ -126,10 +126,30 @@ fn wrapped(from: f64, to: f64, side: f64) -> f64 {
     (to - from + side / 2.0).rem_euclid(side) - side / 2.0
 }
 
-fn inside(center: [f64; 2], radius: f64, position: [f64; 2], side: f64) -> bool {
-    let dx = wrapped(center[0], position[0], side);
-    let dy = wrapped(center[1], position[1], side);
+/// Whether `position` lies within `radius` of `center` on a torus of
+/// `sides`.
+fn inside(center: [f64; 2], radius: f64, position: [f64; 2], sides: [f64; 2]) -> bool {
+    let dx = wrapped(center[0], position[0], sides[0]);
+    let dy = wrapped(center[1], position[1], sides[1]);
     dx * dx + dy * dy <= radius * radius
+}
+
+/// A world's sides, cells and cell size, read from its grid.
+struct Shape {
+    sides: [f64; 2],
+    cells: [u32; 2],
+    cell: [f64; 2],
+}
+
+impl Shape {
+    fn of(world: &World) -> Self {
+        let grid = world.field().grid();
+        Self {
+            sides: [grid.world_width(), grid.world_height()],
+            cells: [grid.cells_x(), grid.cells_y()],
+            cell: [grid.cell_width(), grid.cell_height()],
+        }
+    }
 }
 
 fn bits(cell: Cell) -> Vec<u32> {
@@ -147,18 +167,19 @@ fn round_trip(world: &World) -> World {
     World::read_checkpoint(&reader, profile()).expect("restores")
 }
 
-/// Graft the crop of `center`/`radius` of the 32 × 32 source at tick 75
+/// Graft the crop of `center`/`radius` of a world of `source` at tick 75
 /// into a founding host of `host` moved by `offset`, and check it against
 /// the oracle: the field, the host's survivors, the grafted founders and
 /// their genomes, the holdings, and a checkpoint that restores and runs on
-/// identically.
+/// identically. Each axis has its own sides and cell size.
 fn grafts_as_the_oracle_says(
+    source: &ValidatedConfig,
     host: &ValidatedConfig,
     center: [f64; 2],
     radius: f64,
     offset: [i64; 2],
 ) {
-    let source = world_at(&ecology(&[]), 75);
+    let source = world_at(source, 75);
     let (package, _) = source.cropped(center, radius).expect("a crop");
     let before = found(host);
     let mut world = found(host);
@@ -166,23 +187,30 @@ fn grafts_as_the_oracle_says(
         .graft(&package, center, radius, offset)
         .expect("grafts");
 
-    let side = world.field().grid().world_width();
-    let cells = world.field().grid().cells_x();
-    let target = [0, 1].map(|axis| (center[axis] + offset[axis] as f64).rem_euclid(side));
+    let (from, to) = (Shape::of(&package), Shape::of(&world));
+    assert_eq!(from.cell, to.cell, "one cell size");
+    let target = [0, 1].map(|axis| {
+        (center[axis] + offset[axis] as f64 * to.cell[axis]).rem_euclid(to.sides[axis])
+    });
     assert_eq!(report.center, target);
     let place = |position: [f64; 2]| {
         [0, 1].map(|axis| {
-            (target[axis] + wrapped(center[axis], position[axis], 32.0)).rem_euclid(side)
+            (target[axis] + wrapped(center[axis], position[axis], from.sides[axis]))
+                .rem_euclid(to.sides[axis])
         })
     };
 
     // The field: package cells to their places, the rest the host's.
     let mut landed = BTreeMap::new();
-    for y in 0..32_u32 {
-        for x in 0..32_u32 {
-            let at = [f64::from(x) + 0.5, f64::from(y) + 0.5];
-            if inside(center, radius, at, 32.0) {
-                let [hx, hy] = place(at).map(|value| value.floor() as u32);
+    for y in 0..from.cells[1] {
+        for x in 0..from.cells[0] {
+            let at = [
+                (f64::from(x) + 0.5) * from.cell[0],
+                (f64::from(y) + 0.5) * from.cell[1],
+            ];
+            if inside(center, radius, at, from.sides) {
+                let placed = place(at);
+                let [hx, hy] = [0, 1].map(|axis| (placed[axis] / to.cell[axis]).floor() as u32);
                 assert!(
                     landed.insert((hx, hy), (x, y)).is_none(),
                     "one cell per place"
@@ -190,10 +218,11 @@ fn grafts_as_the_oracle_says(
             }
         }
     }
+    assert!(!landed.is_empty(), "the disk holds cells");
     assert_eq!(report.cells, landed.len() as u64);
     let mut displaced_field = 0.0;
-    for y in 0..cells {
-        for x in 0..cells {
+    for y in 0..to.cells[1] {
+        for x in 0..to.cells[0] {
             let grafted = bits(world.field().cell(x, y).expect("a cell"));
             let host_cell = before.field().cell(x, y).expect("a cell");
             match landed.get(&(x, y)) {
@@ -211,12 +240,12 @@ fn grafts_as_the_oracle_says(
     let survivors: Vec<Organism> = before
         .population()
         .iter()
-        .filter(|organism| !inside(target, radius, organism.position, side))
+        .filter(|organism| !inside(target, radius, organism.position, to.sides))
         .collect();
     let displaced: Vec<Organism> = before
         .population()
         .iter()
-        .filter(|organism| inside(target, radius, organism.position, side))
+        .filter(|organism| inside(target, radius, organism.position, to.sides))
         .collect();
     assert_eq!(report.displaced_organisms, displaced.len() as u64);
     let rows: Vec<Organism> = world.population().iter().collect();
@@ -307,7 +336,13 @@ fn grafts_as_the_oracle_says(
 /// Into a host of the source's size, moved 8 cells east and 4 north.
 #[test]
 fn a_crop_grafts_into_a_host_of_its_size() {
-    grafts_as_the_oracle_says(&ecology(&[("", "seed", "7")]), [16.0, 16.0], 6.0, [8, -4]);
+    grafts_as_the_oracle_says(
+        &ecology(&[]),
+        &ecology(&[("", "seed", "7")]),
+        [16.0, 16.0],
+        6.0,
+        [8, -4],
+    );
 }
 
 /// Into a wider host, across both of the source's seams: a cell or an
@@ -315,29 +350,49 @@ fn a_crop_grafts_into_a_host_of_its_size() {
 /// not a source-width away.
 #[test]
 fn a_crop_across_the_seams_grafts_into_a_wider_host() {
-    grafts_as_the_oracle_says(&wide(), [0.5, 0.5], 5.0, [20, 30]);
+    grafts_as_the_oracle_says(&ecology(&[]), &wide(), [0.5, 0.5], 5.0, [20, 30]);
 }
 
-/// Refused: a host that has run, cells of another size, a package holding
-/// matter outside its disk, cells that would land twice, and too many
-/// organisms for the host. Each leaves the host as it was.
+/// Cells half a unit wide and a unit tall, from a square source into an
+/// oblong host (40 × 48), across both of the source's seams: each axis
+/// moves by its own cell size and wraps on its own side.
+#[test]
+fn a_crop_of_oblong_cells_grafts_into_an_oblong_host() {
+    let source = ecology(&[("world", "grid_width", "64")]);
+    let host = ecology(&[
+        ("world", "width", "40.0"),
+        ("world", "height", "48.0"),
+        ("world", "grid_width", "80"),
+        ("world", "grid_height", "48"),
+        ("", "seed", "7"),
+    ]);
+    grafts_as_the_oracle_says(&source, &host, [31.75, 0.5], 5.0, [7, 30]);
+}
+
+/// Refused: a host that has run, cells of another size, genomes of another
+/// parameter type, a package holding matter outside its disk, cells that
+/// would land twice, a host whose limits refuse the package's organisms,
+/// and too many organisms for the host. Each leaves the host as it was.
 #[test]
 fn a_refused_graft_leaves_the_host_as_it_was() {
     let source = world_at(&ecology(&[]), 75);
     let (package, _) = source.cropped([16.0, 16.0], 6.0).expect("a crop");
-    // `why` is a fragment of the refusal's detail, so each case is refused
-    // for its own reason and not an earlier one.
-    let refused = |host: &mut World, package: &World, center: [f64; 2], radius: f64, why: &str| {
+    // `kind` is the refusal's kind and `why` a fragment of its message, so
+    // each case is refused for its own reason and not an earlier one.
+    let refused = |host: &mut World,
+                   package: &World,
+                   center: [f64; 2],
+                   radius: f64,
+                   kind: &str,
+                   why: &str| {
         let digest = host.digest();
         let holdings = host.ledger().holdings().total().to_bits();
         let rows: Vec<Organism> = host.population().iter().collect();
-        let result = host.graft(package, center, radius, [0, 0]);
-        let matched = match &result {
-            Err(CoreError::StateConflict { detail, .. }) => detail.contains(why),
-            Err(CoreError::BudgetExhausted { .. }) => why == "budget-exhausted",
-            _ => false,
-        };
-        assert!(matched, "{why}: {:?}", result.as_ref().err());
+        let error = host
+            .graft(package, center, radius, [0, 0])
+            .expect_err("refused");
+        assert_eq!(error.kind(), kind, "{why}: {error}");
+        assert!(error.to_string().contains(why), "{why}: {error}");
         assert_eq!(host.digest(), digest, "the host is unchanged");
         assert_eq!(host.ledger().holdings().total().to_bits(), holdings);
         assert_eq!(host.population().iter().collect::<Vec<_>>(), rows);
@@ -350,6 +405,7 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
         &package,
         [16.0, 16.0],
         6.0,
+        "state-conflict",
         "only a founding world",
     );
 
@@ -362,6 +418,7 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
         &package,
         [16.0, 16.0],
         6.0,
+        "state-conflict",
         "the package's cells are",
     );
 
@@ -370,7 +427,14 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
         "canonical_weight_dtype",
         "\"f16\"",
     )]));
-    refused(&mut halved, &package, [16.0, 16.0], 6.0, "parameter type");
+    refused(
+        &mut halved,
+        &package,
+        [16.0, 16.0],
+        6.0,
+        "state-conflict",
+        "parameter type",
+    );
 
     let mut host = found(&ecology(&[("", "seed", "7")]));
     refused(
@@ -378,7 +442,25 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
         &source,
         [16.0, 16.0],
         6.0,
+        "state-conflict",
         "outside the package's disk",
+    );
+
+    // Founders' motion responses lie on the sphere of the configured norm,
+    // 1 in the source: a host allowing a hundredth of it founds its own
+    // founders and refuses the package's.
+    let mut timid = found(&ecology(&[(
+        "chemistry",
+        "motion_response_norm_limit",
+        "0.01",
+    )]));
+    refused(
+        &mut timid,
+        &package,
+        [16.0, 16.0],
+        6.0,
+        "numerical-invalid",
+        "motion response",
     );
 
     // A disk 17 cells across on a host 16 cells wide: its row through the
@@ -395,6 +477,7 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
         &half,
         [16.5, 16.5],
         8.0,
+        "state-conflict",
         "land on the host's cell",
     );
 
@@ -407,5 +490,12 @@ fn a_refused_graft_leaves_the_host_as_it_was() {
             < package.population().len() as u64,
         "more arrive than leave"
     );
-    refused(&mut full, &package, crowded, 6.0, "budget-exhausted");
+    refused(
+        &mut full,
+        &package,
+        crowded,
+        6.0,
+        "budget-exhausted",
+        "live population budget exhausted",
+    );
 }

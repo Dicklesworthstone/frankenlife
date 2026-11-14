@@ -149,7 +149,8 @@ for, one at least, before a render is refused. Its first record is `start`, with
     returns its manifest and world.
 - FL-042: `flife transplant PACKAGE DIR --config HOST --at X,Y --name NAME --checkpoint-durability D`.
   - `PACKAGE` is a package directory (a bundle's `package/`). `DIR` is new or empty. `HOST` is the host's
-    configuration, the run's: it must have the package's cell size, topology catalog and parameter type.
+    configuration, the run's: it must have the package's cell size, topology catalog and parameter type, and trait
+    and parameter limits that admit the package's organisms.
   - `--at` is where the disk's centre goes, a world position in the host (`0 ≤ X < width`, `0 ≤ Y < height`). The
     disk moves by `offset = round((at − centre) / cell size)` whole cells per axis, so cells land on cells; its
     centre in the host is the package's centre plus `offset` cells, wrapped. `--name` is 1 to 256 bytes, `DIR`'s name
@@ -457,9 +458,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
     on it and zoomed so its diameter fills `REGION_FILL` (0.75) of the shorter side, within the viewport's zoom
     range, and its measurement outline is drawn. Its memory is admitted (FL-043) as a render's with one frame
     encoding.
-  - The pin is made after the export and before `discovery.json`. While the run's configuration preserves pins,
-    the run's retention keeps the checkpoint and every chunk it names (`flife-store`'s pins); `Checkpoints::open`
-    sets the store from `[persistence] preserve_pinned_discoveries`.
+  - The pin is made while the run's store is still held as it was when the checkpoint was chosen, so no other
+    process's retention can take the checkpoint between the choice and the pin. It comes after the thumbnail is drawn
+    and admitted and before anything is written. The full-world export then opens the store again. While the run's
+    configuration preserves pins, the run's retention keeps the checkpoint and every chunk it names (`flife-store`'s
+    pins); `Checkpoints::open` sets the store from `[persistence] preserve_pinned_discoveries`.
   - Local-package semantics: `package/world.ckpt` is `World::cropped(disk)` as a world checkpoint container (world
     chunks, no command chunk). It keeps the source's configuration, tick, epoch and identity allocators; it holds the
     organisms a removal of the disk would take (rows, held state and genomes) and the cells whose centres lie in it,
@@ -484,7 +487,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
     identity. Everything outside the disk is the host's. A graft is all or none.
   - `DIR` is `config.toml` (the host's), `catalog.db` recording the transplant session under the host's
     configuration hash, `store/` holding the founding checkpoint (the grafted world, an empty command book of that
-    session), and `transplant.json`, written in that order. `flife resume DIR` continues it as its own session.
+    session), and `transplant.json`, written in that order; `transplant.json` goes to `transplant.json.partial`
+    and is renamed into place. `flife resume DIR` continues it as its own session. Stopped part way (a write the
+    host refuses), `DIR` never refounds silently: before `catalog.db` it is not a run directory; after it, with no
+    checkpoint, `flife resume` refuses it (below); after the checkpoint it is a run that resumes, lacking only
+    `transplant.json`.
   - Only a run of `RUN_SESSION` falls back to the world its configuration founds. A transplant none of whose
     checkpoints restores is refused (`persist::recover`): its world is not its configuration's.
 - FL-040:
@@ -596,19 +603,23 @@ test.
     and positive or is above half the shorter world side);
   - `budget-exhausted`: a thumbnail that does not fit `maximum_total_bytes`.
 
-  All of these are refused before the bundle directory is made or anything is pinned. `--region` with
-  `--lineage` is a usage error. `read_package` refuses a package that disagrees with itself (see the invariants)
-  with `state-conflict` (operation `read package`).
+  All of these are refused before the bundle directory is made or anything is pinned. A failure after the pin (a
+  write the host refuses, the full-world export's refusals, a source checkpoint that changed before the export)
+  leaves the pin and an incomplete bundle without `discovery.json`. `--region` with `--lineage` is a usage error.
+  `read_package` refuses a directory without `package.json` and `world.ckpt` ("not a package directory") and a
+  package that disagrees with itself (see the invariants) with `state-conflict` (operation `read package`).
 - FL-042, `flife transplant`, with nothing printed on standard output and nothing written:
-  - `state-conflict`: a name that is empty or longer than 256 bytes; a package that does not verify; a position
-    outside the host; a host of another cell size, topology catalog or parameter type; a disk that would land two
-    of its cells on one host cell (a host narrower than the disk); a target directory that holds a run or other
-    files;
-  - `numerical-invalid`: a disk the host's measurement refuses (a radius above half the host's shorter side);
+  - `state-conflict`: a name that is empty or longer than 256 bytes; a position outside the host; a target
+    directory that holds a run or other files; a directory that is not a package, or a package that does not
+    verify; a host of another cell size, topology catalog or parameter type; a disk that would land two of its
+    cells on one host cell (a host narrower than the disk);
+  - `numerical-invalid`: a disk the host's measurement refuses (a radius above half the host's shorter side); a
+    package organism whose traits or parameters the host's limits refuse (each genome is sealed again under them);
   - `budget-exhausted`: a host whose population or genome quota cannot take the organisms that arrive.
 
-  Each is refused before `DIR` is made. A refused graft leaves the host world as it was (`World::graft` assigns
-  nothing until every check and allocation has passed).
+  The name, the position and the target directory are checked first, before the package is read or the host
+  founded. Each is refused before `DIR` is made. A refused graft leaves the host world as it was (`World::graft`
+  assigns nothing until every check and allocation has passed).
 - FL-040: a report or an epoch that disagrees with the tracker stops the run with `state-conflict` (operation
   `track run metrics`), exit status 2. The records before it are still emitted.
 - FL-041, before anything runs: a specification with an unknown key, another schema, an empty name, hypothesis or
@@ -871,9 +882,13 @@ seed 7:
 - `a_transplant_without_a_checkpoint_that_restores_is_refused`: its checkpoint manifest damaged, `flife resume`
   exits 2 with `state-conflict` and "no founding world to fall back to".
 - `refused_transplants_write_nothing`: a position on the host's edge, an empty name, a host of half-unit cells, a
-  host capped at its founders (`budget-exhausted`, more organisms arriving than leaving, checked here) and a package
-  with a flipped container byte each exit 2 and leave no run directory; a second transplant into a run directory
-  is refused and leaves the first's record.
+  host capped at its founders (`budget-exhausted` of the live population, more organisms arriving than leaving,
+  checked here), a host whose motion-response norm limit is a hundredth of the source's (`numerical-invalid`,
+  motion response), a package with a flipped container byte (its SHA-256) and the bundle directory given as the
+  package ("not a package directory") each exit 2 with one error record of its kind whose detail names its reason,
+  and leave no run directory. A second transplant, of the damaged package, into a run directory is refused as one
+  that "already holds a run" (so before the package is read), and leaves the first's `transplant.json` byte for
+  byte, with no `.partial` beside it.
 - `a_transplant_session_names_its_inputs`: changing the package, the host, the offset or the name changes it.
 
 Planted bugs, 11, run with `tests/discovery.rs`, each caught: `read_package` not checking the container's SHA-256,

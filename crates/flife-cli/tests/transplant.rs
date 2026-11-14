@@ -512,18 +512,45 @@ fn a_transplant_without_a_checkpoint_that_restores_is_refused() {
     );
 }
 
+/// The error record of a refused `flife transplant` of `package` into a
+/// host of `config` at `at`, named `name`, into `run_dir`: exit status 2,
+/// nothing on standard output, one error of `kind` whose detail holds
+/// `why`.
+fn refused_with(
+    package: &Path,
+    config: &Path,
+    run_dir: &Path,
+    (at, name): (&str, &str),
+    (kind, why): (&str, &str),
+) {
+    let (status, out, err) = flife(&[
+        "transplant",
+        text(package),
+        text(run_dir),
+        "--config",
+        text(config),
+        "--at",
+        at,
+        "--name",
+        name,
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(2), "{why}: {out:?}");
+    assert!(out.is_empty(), "{why}: {out:?}");
+    assert_eq!(err.len(), 1, "{why}: {err:?}");
+    assert_eq!(err[0]["kind"], kind, "{why}: {err:?}");
+    let detail = err[0]["detail"].as_str().expect("a detail");
+    assert!(detail.contains(why), "{why}: {detail}");
+}
+
 /// Refusals: each before anything is written.
 #[test]
 fn refused_transplants_write_nothing() {
     let (host_path, _) = host();
     let run_dir = fresh("refused");
     let refused = |config: &Path, at: &str, name: &str, kind: &str, why: &str| {
-        let (status, out, err) = transplant(config, &run_dir, at, name);
-        assert_eq!(status, Some(2), "{out:?}");
-        assert!(out.is_empty());
-        assert_eq!(err[0]["kind"], kind, "{err:?}");
-        let detail = err[0]["detail"].as_str().expect("a detail");
-        assert!(detail.contains(why), "{why}: {detail}");
+        refused_with(package(), config, &run_dir, (at, name), (kind, why));
         assert!(!run_dir.exists(), "{why}: nothing is written");
     };
     refused(
@@ -569,9 +596,33 @@ fn refused_transplants_write_nothing() {
         .expect("measures")
         .organisms;
     assert!(leaving < declared.organisms, "more arrive than leave");
-    refused(&full_path, "5,5", "full", "budget-exhausted", "");
+    refused(
+        &full_path,
+        "5,5",
+        "full",
+        "budget-exhausted",
+        "live population budget exhausted",
+    );
 
-    // A package that does not verify.
+    // Founders' motion responses lie on the sphere of the configured norm,
+    // 1 in the source: a host allowing a hundredth of it founds its own
+    // founders and refuses the package's.
+    let (timid, _) = ecology(
+        "timid.toml",
+        &[
+            ("", "seed", "7"),
+            ("chemistry", "motion_response_norm_limit", "0.01"),
+        ],
+    );
+    refused(
+        &timid,
+        "5,5",
+        "timid",
+        "numerical-invalid",
+        "motion response",
+    );
+
+    // A package that does not verify, and a directory that is not one.
     let damaged = scratch().join("damaged-package");
     if damaged.exists() {
         fs::remove_dir_all(&damaged).expect("clears the last copy");
@@ -582,30 +633,41 @@ fn refused_transplants_write_nothing() {
     let middle = bytes.len() / 2;
     bytes[middle] ^= 0x01;
     fs::write(&container, bytes).expect("writes");
-    let (status, out, err) = flife(&[
-        "transplant",
-        text(&damaged),
-        text(&run_dir),
-        "--config",
-        text(&host_path),
-        "--at",
-        "5,5",
-    ]);
-    assert_eq!((status, out.len()), (Some(2), 0), "{err:?}");
-    assert_eq!(err[0]["kind"], "state-conflict", "{err:?}");
+    refused_with(
+        &damaged,
+        &host_path,
+        &run_dir,
+        ("5,5", "damaged"),
+        ("state-conflict", "SHA-256"),
+    );
+    assert!(!run_dir.exists());
+    let bundle = package().parent().expect("the bundle");
+    refused_with(
+        bundle,
+        &host_path,
+        &run_dir,
+        ("5,5", "bundle"),
+        ("state-conflict", "is not a package directory"),
+    );
     assert!(!run_dir.exists());
 
-    // A directory that already holds a run.
+    // A directory that already holds a run: refused before the package is
+    // read, its record left as it was.
     let (status, _, err) = transplant(&host_path, &run_dir, "5,5", "first");
     assert_eq!(status, Some(0), "{err:?}");
-    let (status, out, err) = transplant(&host_path, &run_dir, "6,6", "second");
-    assert_eq!((status, out.len()), (Some(2), 0), "{err:?}");
-    assert_eq!(err[0]["kind"], "state-conflict", "{err:?}");
-    let kept: Value = serde_json::from_str(
-        &fs::read_to_string(run_dir.join("transplant.json")).expect("the first's record"),
-    )
-    .expect("parses");
-    assert_eq!(kept["name"], "first");
+    let first = fs::read(run_dir.join("transplant.json")).expect("the first's record");
+    assert!(!run_dir.join("transplant.json.partial").exists());
+    refused_with(
+        &damaged,
+        &host_path,
+        &run_dir,
+        ("6,6", "second"),
+        ("state-conflict", "already holds a run"),
+    );
+    assert_eq!(
+        fs::read(run_dir.join("transplant.json")).expect("the first's record"),
+        first
+    );
 }
 
 /// The session derives from every input: the package, the host, the

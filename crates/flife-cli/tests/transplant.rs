@@ -14,6 +14,9 @@
 //! - With no checkpoint that restores, it is refused: it has no founding
 //!   world to fall back to.
 //! - Refusals write nothing.
+//! - Its memory is admitted as a run's is, with the package as a term of
+//!   its own (FL-043): a budget of exactly the terms' sum is admitted, and
+//!   one byte fewer refused.
 
 #![cfg(unix)]
 #![allow(
@@ -30,7 +33,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use flife_cli::{found, read_package, transplant_session};
+use flife_cli::{CHECKPOINT_FIXED_BYTES, RESERVE_BYTES, found, read_package, transplant_session};
 use flife_core::ValidatedConfig;
 use flife_core::canonical::Sha256Digest;
 use flife_engine::NumericalProfile;
@@ -668,6 +671,72 @@ fn refused_transplants_write_nothing() {
         fs::read(run_dir.join("transplant.json")).expect("the first's record"),
         first
     );
+}
+
+/// Memory is admitted as a run's is (FL-043): the host's terms, its
+/// streamed founding checkpoint's and the package's restored world with its
+/// container, against the host's `maximum_total_bytes`. A budget of exactly
+/// their sum is admitted; one byte fewer is refused before anything is
+/// written, though it holds the host alone.
+#[test]
+fn a_transplant_is_admitted_with_its_package_or_refused() {
+    // The host's terms, added up here: the allocated genome quota, the
+    // founded world's state, field, scratch and staging, the streamed
+    // checkpoint's fixed heap and the reserve. The package's: its restored
+    // world, its container and the graft's parts. No term depends on the
+    // budget.
+    let (_, probe) = ecology("budget-probe.toml", &[("", "seed", "7")]);
+    let world = found(&probe).expect("founds");
+    let footprint = world.footprint();
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    let (declared, crop) = read_package(package(), profile).expect("verifies");
+    let graft = world.graft_bytes(&crop);
+    assert!(
+        graft > world.quota().allocated_bytes() + crop.quota().allocated_bytes(),
+        "the graft rebuilds both worlds' genomes in a second population"
+    );
+    let package_term = crop.held_bytes() + declared.world.bytes + graft;
+    drop((world, crop));
+    let host_terms = probe.config().execution.maximum_allocated_genome_bytes
+        + footprint.state
+        + footprint.field
+        + footprint.scratch
+        + footprint.staging
+        + CHECKPOINT_FIXED_BYTES
+        + RESERVE_BYTES;
+    let needed = host_terms + package_term;
+
+    let budgeted = |name: &str, budget: u64| {
+        ecology(
+            name,
+            &[
+                ("", "seed", "7"),
+                ("execution", "maximum_total_bytes", &budget.to_string()),
+            ],
+        )
+        .0
+    };
+    let run_dir = fresh("budgeted");
+    refused_with(
+        package(),
+        &budgeted("short.toml", needed - 1),
+        &run_dir,
+        ("5,5", "short"),
+        ("budget-exhausted", "peak memory (maximum_total_bytes)"),
+    );
+    assert!(!run_dir.exists(), "nothing is written");
+
+    let (status, out, err) = transplant(&budgeted("exact.toml", needed), &run_dir, "5,5", "exact");
+    assert_eq!(status, Some(0), "{err:?}");
+    let memory = &one(&out, "transplant")["memory"];
+    let term = |name: &str| memory[name].as_u64().expect("a count");
+    assert_eq!(term("package"), package_term, "{memory}");
+    assert_eq!(term("checkpoint"), CHECKPOINT_FIXED_BYTES, "{memory}");
+    assert_eq!(term("render"), 0, "{memory}");
+    assert_eq!(term("backend"), 0, "{memory}");
+    assert_eq!(term("budget_bytes"), needed, "{memory}");
+    assert_eq!(term("peak_bytes"), needed, "{memory}");
+    assert!(run_dir.join("transplant.json").exists());
 }
 
 /// The session derives from every input: the package, the host, the

@@ -28,12 +28,16 @@
 //!   allow refuses the graft.
 //! - The ledger opens afresh at the grafted world's holdings.
 //!
-//! A graft is all or none: refused, it leaves the host as it was.
+//! A graft is all or none: refused, it leaves the host as it was. So it
+//! makes the grafted world's field, population and genomes before it
+//! releases the host's: while it runs it holds about a second host world
+//! ([`World::graft_bytes`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use flife_core::clock::{Tick, stable_phase};
 use flife_core::ids::{Generation, LineageId, ResourceEpoch};
+use flife_core::memory::{bytes_for, total};
 use flife_core::{CoreError, EnergyLedger, Holdings};
 use flife_field::{BufferLimits, FieldPair};
 use flife_genome::GenomeQuota;
@@ -82,9 +86,35 @@ pub struct Graft {
 }
 
 impl World {
+    /// The most a [`World::graft`] of `package` into this world holds beside
+    /// the two worlds while it runs (FL-043). The graft is all or none, so
+    /// it makes the grafted world's parts before it releases this world's:
+    /// a field pair of this grid; a population of this configuration, at
+    /// most its bound; the genomes it rebuilds, at most this world's
+    /// parameters and the package's; and the entrants' list for both
+    /// populations, grown by doubling.
+    #[must_use]
+    pub fn graft_bytes(&self, package: &Self) -> u64 {
+        let organisms = self
+            .population
+            .len()
+            .saturating_add(package.population.len());
+        total([
+            self.field.allocated_bytes(),
+            self.population.bound_bytes(self.rules.catalog.len()),
+            self.quota.allocated_bytes(),
+            package.quota.allocated_bytes(),
+            bytes_for::<Entrant>(organisms).saturating_mul(2),
+        ])
+    }
+
     /// Graft `package`, a crop of the disk of `radius` about `center`, into
-    /// this founding world, moved by `offset` whole cells (see the [module
-    /// documentation](self)).
+    /// this founding world, moved by `offset` whole cells. The package's
+    /// cells replace the host's under them, every plane; the host's
+    /// organisms in the disk are displaced; the package's enter as founders
+    /// with the host's next identities, kin kept as kin, every genome
+    /// sealed again under the host's limits; the ledger reopens at the
+    /// grafted holdings. It is all or none.
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] when this world is not a founding world

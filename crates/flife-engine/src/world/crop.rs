@@ -84,8 +84,11 @@ pub(super) fn reseal(
 
 impl World {
     /// The committed world with everything outside the disk of `radius`
-    /// world units about `center` emptied (see the [module
-    /// documentation](self)), and that disk's measurement.
+    /// world units about `center` emptied, and that disk's measurement. It
+    /// keeps the organisms a removal of the disk would take, their genomes
+    /// rebuilt through a fresh quota, and every plane of the field cells
+    /// whose centres lie in the disk; every other cell is zero. Its ledger
+    /// opens at those holdings.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a disk a measurement refuses;

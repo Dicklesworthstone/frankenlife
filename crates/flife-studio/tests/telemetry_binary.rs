@@ -127,6 +127,7 @@ fn admission(memory: &Value) -> MemoryAdmission {
         births: number(memory, "births"),
         render: number(memory, "render"),
         checkpoint: number(memory, "checkpoint"),
+        package: number(memory, "package"),
         reserve: number(memory, "reserve"),
         backend: number(memory, "backend"),
         peak_bytes: number(memory, "peak_bytes"),

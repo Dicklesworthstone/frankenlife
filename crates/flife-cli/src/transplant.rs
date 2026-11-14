@@ -23,34 +23,51 @@
 //!   [`RUN_SESSION`], and [`crate::persist::recover`] refuses a run of
 //!   another session none of whose checkpoints restores.
 //! - `transplant.json` in the run directory holds the record the command
-//!   emits: the package, the host, what the graft did and the founding
-//!   checkpoint. It is written last, to a temporary name renamed into
-//!   place.
+//!   emits: the package, the host, what the graft did, the founding
+//!   checkpoint and the memory admission. It is written last, to a
+//!   temporary name renamed into place.
+//! - Memory (FL-043) is admitted as a run's is, against the host's
+//!   `[execution] maximum_total_bytes`: the host world's terms, the
+//!   founding checkpoint's (streamed, `pause-and-stream`, whatever the
+//!   configuration's mode) and, as the package term, the package's restored
+//!   world ([`World::held_bytes`]), the container it was restored from, and
+//!   what the graft makes before it releases the host's parts
+//!   ([`World::graft_bytes`]: about a second host world). Reading holds the
+//!   container and the package's world at once, before the host is
+//!   founded; the graft holds that world, the host's and its own parts.
+//!   The sum bounds both. No controller backend is installed: the
+//!   transplant takes no step.
 //!
 //! Every refusal (a position outside the host, a run directory that holds
-//! anything, a package that does not verify, a host whose cells, topology
-//! catalog or parameter type differ, a disk that wraps onto itself in a
-//! narrower host, a package organism the host's limits refuse, a
-//! population or genome quota too small) comes before anything is written.
-//! A failure while the run directory is written (the host refusing a write)
-//! leaves no run that silently refounds: before the catalog exists the
+//! anything, a checkpoint the host's budget cannot take, a package that
+//! does not verify, a host whose cells, topology catalog or parameter type
+//! differ, a disk that wraps onto itself in a narrower host, a package
+//! organism the host's limits refuse, a population or genome quota too
+//! small, a memory budget too small for the host and the package together)
+//! comes before anything is written. A failure while the run directory is
+//! written (the host refusing a write, or the founding checkpoint's
+//! encoding) leaves no run that silently refounds: before the catalog exists the
 //! directory is not a run directory, and after it, with no checkpoint that
 //! restores, `flife resume` refuses it; once the founding checkpoint is
 //! published it is a run that resumes, missing only `transplant.json`.
+//!
+//! [`World::graft`]: flife_engine::World::graft
+//! [`World::held_bytes`]: flife_engine::World::held_bytes
+//! [`World::graft_bytes`]: flife_engine::World::graft_bytes
 
 use std::path::Path;
 
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::SessionId;
+use flife_core::memory::total;
 use flife_core::{CoreError, Holdings, ValidatedConfig};
 use flife_engine::NumericalProfile;
-use flife_runtime::{
-    Boundary, CommandBook, Journal as _, SessionCheckpoint, SessionConfig, checkpoint,
-};
+use flife_runtime::{CommandBook, Journal as _, SessionConfig};
 use flife_store::CommandJournal;
 use serde::Serialize;
 
 use crate::branch::BRANCH_NAME_MAX_BYTES;
+use crate::checkpointing::{self, CheckpointMode};
 use crate::discovery::publish;
 use crate::package::{PackageSource, read_package};
 use crate::persist::{
@@ -194,7 +211,9 @@ fn conflict(detail: String) -> CoreError {
 /// [`CoreError::NumericalInvalid`] for a disk the host's measurement
 /// refuses or a package organism the host's limits refuse;
 /// [`CoreError::BudgetExhausted`] when the host cannot take the grafted
-/// organisms; the store's and catalog's errors.
+/// organisms, or its memory budget cannot take its founding checkpoint, or
+/// its world and the package's together (FL-043); the store's and
+/// catalog's errors.
 ///
 /// [`World::graft`]: flife_engine::World::graft
 pub fn transplant(
@@ -228,8 +247,28 @@ pub fn transplant(
         )));
     }
     vacant(run_dir)?;
+    // The founding checkpoint is streamed whatever the configuration's
+    // mode. Its term, then the whole peak (FL-043), are admitted before the
+    // run directory is made, as a run's are.
+    let persistence = Persistence {
+        checkpoint_every: 0,
+        durability: options.durability,
+        mode: CheckpointMode::PauseAndStream,
+        ..Persistence::new(run_dir, host)
+    };
+    let checkpointing = checkpointing::admit(host, persistence.mode, persistence.retained_bytes)?;
     let (package, crop) = read_package(package_dir, NumericalProfile::reference_f32()?)?;
     let mut world = found(host)?;
+    let memory = world.admit_memory_beside(
+        false,
+        checkpointing.peak_bytes,
+        0,
+        total([
+            crop.held_bytes(),
+            package.world.bytes,
+            world.graft_bytes(&crop),
+        ]),
+    )?;
     let grid = *world.field().grid();
     let disk = package.crop.disk();
     let cell = [grid.cell_width(), grid.cell_height()];
@@ -251,7 +290,6 @@ pub fn transplant(
     let limits = SessionConfig::from_config(session, host)?;
     let mut book = CommandBook::new(session, revision, limits.command_capacity);
     book.set_durability(limits.durability);
-    let bytes = checkpoint(&world, &book)?;
 
     create(run_dir, host)?;
     let catalog = run_dir.join(CATALOG_FILE);
@@ -260,20 +298,8 @@ pub fn transplant(
             .open_run(session, revision)
             .map(|_| ())
     })?;
-    let persistence = Persistence {
-        checkpoint_every: 0,
-        durability: options.durability,
-        ..Persistence::new(run_dir, host)
-    };
     let mut checkpoints = Checkpoints::open(&persistence, host, session)?;
-    let taken = SessionCheckpoint {
-        boundary: Boundary {
-            tick: world.tick(),
-            epoch: world.epoch(),
-        },
-        bytes,
-    };
-    let (published, _) = checkpoints.publish_from(&taken, None)?;
+    let published = checkpoints.stream_from(&world, &book)?;
     let Record::Checkpoint {
         sequence,
         sha256,
@@ -320,6 +346,7 @@ pub fn transplant(
         sha256,
         bytes,
         digest: world.digest().to_hex(),
+        memory: Box::new(memory),
     };
     let mut text =
         serde_json::to_string_pretty(&record).map_err(|error| CoreError::StateConflict {

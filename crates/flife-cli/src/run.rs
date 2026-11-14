@@ -314,6 +314,9 @@ pub enum Record {
         bytes: u64,
         /// The grafted world's digest.
         digest: String,
+        /// The peak-memory admission (FL-043): the host's terms, the
+        /// founding checkpoint's and the package's.
+        memory: Box<MemoryAdmission>,
     },
     /// Where a resumed run starts (FL-037).
     Resume {

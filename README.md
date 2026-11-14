@@ -133,7 +133,8 @@ nothing else, its declared boundary (`exterior = "host"`) and its energy endowme
 run. `flife transplant PACKAGE DIR --config HOST --at X,Y` grafts it into a host founded from another
 configuration (moved by whole cells; the host's founders under it displaced; the package's organisms entering as
 founders, kin kept as kin) and makes the grafted world a new run's founding checkpoint, which `flife resume`
-continues. Grafting into a running world is not built.
+continues. Its memory is admitted as a run's is, with the package's world and the graft's working copy charged
+beside the host's. Grafting into a running world is not built.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
 printed as an `inspected` record and drawn under the overlay's lines (its energy, age, motion, controller and held

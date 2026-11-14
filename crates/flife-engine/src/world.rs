@@ -1267,6 +1267,18 @@ impl World {
         }
     }
 
+    /// What the world holds on the host now with its genomes' parameters:
+    /// [`World::allocated`]'s terms and what its genome quota has allocated
+    /// (FL-042, FL-043). A world that never steps, such as a transplant's
+    /// restored package, holds no more; it is that world's term in
+    /// [`World::admit_memory_beside`].
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        self.allocated()
+            .total()
+            .saturating_add(self.quota.allocated_bytes())
+    }
+
     /// The most the world holds on the host while its population stays
     /// within its capacity (FL-043, plan §19.4). Its buffers count as they
     /// are reserved: the population's columns, and the tick's per-organism

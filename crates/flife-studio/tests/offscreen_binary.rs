@@ -106,6 +106,7 @@ fn an_offscreen_run_reports_its_frames_and_closes_on_the_direct_world() {
         "births",
         "render",
         "checkpoint",
+        "package",
         "reserve",
         "backend",
     ];

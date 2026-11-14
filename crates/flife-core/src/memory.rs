@@ -39,6 +39,11 @@ pub struct MemoryAdmission {
     pub render: u64,
     /// The checkpoint admission's peak, or zero without a run directory.
     pub checkpoint: u64,
+    /// A transplant's package (FL-042), held beside the host's world: its
+    /// restored world, the container it was read from, and what grafting
+    /// it makes before the host's parts are released. Zero for every other
+    /// host.
+    pub package: u64,
     /// [`RESERVE_BYTES`].
     pub reserve: u64,
     /// The controller backend's budget: what the other terms leave, or zero
@@ -60,6 +65,7 @@ impl MemoryAdmission {
             self.births,
             self.render,
             self.checkpoint,
+            self.package,
             self.reserve,
         ])
     }

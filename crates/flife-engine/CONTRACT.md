@@ -178,6 +178,15 @@ each runs and owns the field.
   field, scratch (plus `batched_bytes()` when `batched`) and staging, the host's `render` and `checkpoint` bytes,
   and `RESERVE_BYTES`, against `maximum_total_bytes`. Over it: `BudgetExhausted` ("peak memory
   (maximum_total_bytes)"). Otherwise the backend is granted the rest when `batched`, or nothing.
+- FL-042/FL-043: `World::admit_memory_beside(batched, checkpoint, render, package)`, the same with a `package`
+  term of its own (`MemoryAdmission::package`, in `fixed_bytes`; `admit_memory` passes 0). It is for what a host
+  holds beside its world for a transplant's package. `World::held_bytes()` is a world's allocation now
+  (`allocated().total()`) with its genomes' parameters (the quota's allocated bytes); a world that never steps
+  holds no more. `World::graft_bytes(package)` is the most a graft makes before it releases the host's parts:
+  - a field pair of the host's grid;
+  - a population at the host's bound;
+  - the host's and the package's genome parameters, rebuilt;
+  - the entrants' list for both populations, at twice its length.
 - FL-021 (`flife-zyc`, plan §14.2): `World::organism_snapshot(id)`, `Ok(None)` for an identity the population does
   not hold, or an `OrganismSnapshot`:
   - `tick`, the world's committed tick;
@@ -616,6 +625,10 @@ each runs and owns the field.
   After the assignment an installed controller backend is told to `forget` its resident parameters, since the
   fresh quota's slots and generations start again (the backends in this workspace also key them by genome
   identity, so this restores the backend contract's premise rather than fixing an observed fault).
+- Because it is all or none, a graft holds about a second host world while it runs. `graft_bytes` bounds that
+  part, and `flife transplant` admits it. `flife-cli`'s `a_transplant_holds_no_more_heap_than_its_terms` measures
+  it under a counting allocator: 591.2 MiB peak against a 779.0 MiB bound on the preset. Without `graft_bytes` the
+  bound was 573.8 MiB, and the heap passed it.
 
 **Refusal cases.**
 - FL-042: `cropped` of a stopped world (`StateConflict`, "crop world"); `graft` into a world that is not
@@ -1109,7 +1122,11 @@ velocity, first-order splitting at the configured fixed timestep.
   founding world, so a mid-run transplant with ledger flows is not built. Grafted organisms are founders; their
   ancestry, ages and cooldowns are not carried. `graft`'s `budget-exhausted` genome-quota path is not tested (the
   population's is), nor its measurement's `numerical-invalid` (the crop's is). The backend `forget` after a graft
-  has no test. The crop's and graft's memory is not charged to `admit_memory`.
+  has no test. A crop's memory is not charged to any admission (`flife discover` holds it beside the source
+  world). A graft's is, through `held_bytes` and `graft_bytes` in `admit_memory_beside`. These have no engine
+  test of their own: `flife-cli`'s transplant tests check them against a counting allocator and an exact budget.
+  The graft's second host world could be avoided by moving the survivors' genomes rather than rebuilding them; it
+  is not.
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011
   settles them, including the exact zero limits.
 - FL-021's snapshot covers §14.2's identity, state, chemistry and brain architecture, and, for the watched

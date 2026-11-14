@@ -246,10 +246,29 @@ pub fn write_package(
     Ok(package)
 }
 
-/// At most `limit` bytes of `path`.
+/// At most `limit` bytes of `path`, in a buffer reserved for the file's
+/// length, so that it holds those bytes and no more: a transplant charges
+/// the container at its length (FL-043), where a buffer grown by doubling
+/// could hold nearly twice it.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, CoreError> {
     let file = File::open(path).map_err(|error| storage("open package file", path, &error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| storage("read package file", path, &error))?
+        .len();
+    if length > limit {
+        return Err(refuse(format!(
+            "{} is longer than {limit} bytes",
+            path.display()
+        )));
+    }
     let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(usize::try_from(length).unwrap_or(usize::MAX))
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "package file",
+            bytes: length,
+        })?;
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| storage("read package file", path, &error))?;

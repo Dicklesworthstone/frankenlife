@@ -220,7 +220,8 @@ for, one at least, before a render is refused. Its first record is `start`, with
     - `graft`: `at`, `center` (where the disk went), `radius`, `offset`, host cells replaced and their energy, host
       founders displaced and their energy, organisms grafted, the new lineages they form, and the holdings
       `before`, `endowment` and `after` (field, organisms, total);
-    - the founding checkpoint (sequence, tick 0), its SHA-256 and size, and the grafted world's digest.
+    - the founding checkpoint (sequence, tick 0), its SHA-256 and size, and the grafted world's digest;
+    - `memory`, its FL-043 admission, as a run's `start.memory`, with `package` set and `backend` 0.
   - FL-040, with `--metrics-every M`:
     - `start.metrics` declares `frankenlife.metrics.v1`: M, the complete and sampled rules in words, the bin grid
       (16 a side) and the lineages listed (8);
@@ -249,7 +250,8 @@ for, one at least, before a render is refused. Its first record is `start`, with
   scientific state either.
 - FL-043: `start.memory` is the admission: `budget_bytes`, the fixed logical quota (`logical_parameters`,
   `logical_genome_bytes`), and the terms in bytes: `genomes` (the allocated genome quota), `state`, `field`,
-  `scratch`, `births`, `render`, `checkpoint`, `reserve` and `backend`, with `peak_bytes` their sum. `end.controllers`
+  `scratch`, `births`, `render`, `checkpoint`, `package` (0 but for a transplant), `reserve` and `backend`, with
+  `peak_bytes` their sum. `end.controllers`
   carries `resident_peak_bytes`, the most the backend held after any batch. A run admitted on the reference alone
   has `backend` 0. None of these is scientific state.
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
@@ -371,7 +373,7 @@ for, one at least, before a render is refused. Its first record is `start`, with
     `RESERVE_BYTES` (64 MiB), a declared allowance for the runtime, the session, the store and the device driver.
   - `backend` is `budget_bytes` minus the other terms, or 0 for `--controllers cpu`.
 - FL-043: the admission comes before anything is created. A refused run makes no run directory and prints nothing.
-  `flife resume` admits the resumed world under the same rule.
+  `flife resume` admits the resumed world under the same rule, and `flife transplant` its host (below).
 - The preset is Appendix A with exactly its declared changes. Its header declares each one, and the smoke test
   refuses any other difference.
 - FL-037:
@@ -494,6 +496,19 @@ for, one at least, before a render is refused. Its first record is `start`, with
     `transplant.json`.
   - Only a run of `RUN_SESSION` falls back to the world its configuration founds. A transplant none of whose
     checkpoints restores is refused (`persist::recover`): its world is not its configuration's.
+  - Memory (FL-043) is admitted as a run's is, against the host's `maximum_total_bytes`, after the host is founded
+    and before the graft and `DIR`. The terms are:
+    - the host's: genomes, state, field, scratch, births, reserve;
+    - the founding checkpoint's, which is streamed `pause-and-stream` whatever the configured mode
+      (`CHECKPOINT_FIXED_BYTES`; `Checkpoints::stream_from`), never encoded whole;
+    - `package`, from `World::admit_memory_beside`. It is the package's restored world (`World::held_bytes`: its
+      allocations now with its genomes' parameters), its container, and the graft's own parts
+      (`World::graft_bytes`). The graft is all or none, so it makes a second field pair, a population at the host's
+      bound and both worlds' genomes before it releases the host's: about a second host world.
+
+    Reading holds the container and the package's world; the graft holds the package's world, the host's and its
+    parts. The sum bounds both phases. `read_package` reads each file into a buffer reserved for the file's length,
+    so the container is held at its size, not the next power of two. No backend is installed: no step is taken.
 - FL-040:
   - The tracker never reads the world after its start. It starts from the committed population (each organism's
     identity, genome, lineage, generation, birth tick and topology) and then folds each published report: births
@@ -615,10 +630,13 @@ test.
     cells on one host cell (a host narrower than the disk);
   - `numerical-invalid`: a disk the host's measurement refuses (a radius above half the host's shorter side); a
     package organism whose traits or parameters the host's limits refuse (each genome is sealed again under them);
-  - `budget-exhausted`: a host whose population or genome quota cannot take the organisms that arrive.
+  - `budget-exhausted`: a host whose population or genome quota cannot take the organisms that arrive; a host whose
+    memory budget cannot take its founding checkpoint, or its terms with the package's (`peak memory
+    (maximum_total_bytes)`).
 
-  The name, the position and the target directory are checked first, before the package is read or the host
-  founded. Each is refused before `DIR` is made. A refused graft leaves the host world as it was (`World::graft`
+  The name, the position and the target directory are checked first, then the founding checkpoint's admission (the
+  configuration alone), before the package is read or the host founded. The memory admission follows the founding
+  and precedes the graft. Each is refused before `DIR` is made. A refused graft leaves the host world as it was (`World::graft`
   assigns nothing until every check and allocation has passed).
 - FL-040: a report or an epoch that disagrees with the tracker stops the run with `state-conflict` (operation
   `track run metrics`), exit status 2. The records before it are still emitted.
@@ -864,7 +882,7 @@ without the thumbnail's bytes). The last two were planted after a reading of `di
 refusal made the bundle directory, which no test then checked; `discover` now makes it only after the thumbnail is
 drawn, and the budget test was added for it.
 
-`tests/transplant.rs` (4 tests, FL-042, about 4 s). A source run of FL-037's 32 × 32 ecology to tick 60 and a
+`tests/transplant.rs` (5 tests, FL-042, about 4 s). A source run of FL-037's 32 × 32 ecology to tick 60 and a
 region discovery of (16, 16) radius 6 there (`--no-world`) make the package; the host is the ecology founded from
 seed 7:
 - `a_transplant_is_a_run_that_resumes_from_the_grafted_world`, at (8.3, 24.6):
@@ -890,6 +908,12 @@ seed 7:
   that "already holds a run" (so before the package is read), and leaves the first's `transplant.json` byte for
   byte, with no `.partial` beside it.
 - `a_transplant_session_names_its_inputs`: changing the package, the host, the offset or the name changes it.
+- `a_transplant_is_admitted_with_its_package_or_refused` (FL-043). The test adds up the host's terms itself:
+  quotas, footprint, `CHECKPOINT_FIXED_BYTES` and `RESERVE_BYTES`. The package's are its restored world, its
+  container and the graft's parts, which exceed both worlds' genomes. A host whose budget is exactly their sum is
+  admitted: `memory.package`, `checkpoint`, `render` 0, `backend` 0, and `peak_bytes` equal to the budget. One
+  byte fewer is refused with `budget-exhausted`, "peak memory (maximum_total_bytes)", and no `DIR`, though that
+  budget holds the host alone.
 
 Planted bugs, 11, run with `tests/discovery.rs`, each caught: `read_package` not checking the container's SHA-256,
 the boundary, the schema, the endowment's total, the source tick or the digest (the last three caught by variants
@@ -902,6 +926,19 @@ not-a-package check removed (a missing manifest is then `storage-failed`), and `
 (the motion-response host then takes the package). No test covers, and none was planted for: the pin taken under
 the hold that chose the checkpoint (a pin after the export would need a concurrent retention to tell apart), and
 `transplant.json`'s rename into place (writing it in place would need a crash to tell apart).
+
+The transplant's memory admission: 9 planted bugs, run with `tests/transplant.rs` and the two transplant tests of
+`tests/memory_admission.rs`; 8 caught:
+- `fixed_bytes` leaving out the package term, `admit_memory_beside` recording none, and the transplant charging no
+  graft, no container or no checkpoint: the exact-budget test;
+- `held_bytes` without the genomes, and the package read into a buffer grown by doubling: the package's heap test;
+- `graft_bytes` without the host's genomes: both.
+
+One survives: the founding checkpoint encoded whole (`flife_runtime::checkpoint` and `publish_from`) instead of
+streamed. It is encoded after the graft has released its parts, so its peak stays within the slack the whole
+transplant's bound keeps (the births term, the container and the reserve, none of them live then). A host whose
+genomes outweigh the package's world and that slack, the preset at its 16,384 ceiling (about 2 GiB in one test),
+would show it; none is run.
 
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
@@ -1025,7 +1062,18 @@ the genome's identity off by one. A genome named by the organism's own identity 
 founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
 every run.
 
-`tests/memory_admission.rs` (11 tests, FL-043, about 15 s; a counting global allocator, `peak_alloc`, test only):
+`tests/memory_admission.rs` (15 tests, FL-043, about 33 s in a workspace run; a counting global allocator,
+`peak_alloc`, test only):
+- `a_package_is_read_within_its_term_and_keeps_its_held_bytes` (FL-042): the preset 8 ticks on, cropped to radius
+  24 about its centre (469 organisms) and written as a package, is read back. The reading's peak, 156.06 MiB, is
+  within its term (155.69: the world's 135.39 and the container's 20.30) and `RESTORE_ALLOWANCE` (1 MiB, for the
+  restore's own configuration parse and entrant lists, 0.39 MiB here). The restored world keeps 135.37 MiB, within
+  1% of its `held_bytes`. Before the read buffer was reserved for the file's length it peaked at 167.76 MiB.
+- `a_transplant_holds_no_more_heap_than_its_terms` (FL-042): that package into the preset's host of 4,096
+  founders. The heap from reading the package to the published record peaks at 591.2 MiB. The bound is 779.0 MiB:
+  the admitted terms, with the host's genome term at its founders' and the package's actual parameters, not the
+  quota. Without the graft's parts (360.9 MiB of package term, 205.2 of it the graft's) the bound was 573.8 MiB,
+  and the heap exceeded it.
 - `the_preset_is_admitted_term_by_term`: on the preset each term is its source (the configuration's quotas, the
   world's footprint, `RESERVE_BYTES`) and the peak is their sum: 1,375.7 MiB on the reference (genomes 1,152.0,
   state 19.63, field 6.95, scratch 79.25, births 53.88, reserve 64.0). With `torch` the scratch adds the batched
@@ -1109,9 +1157,16 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - FL-042 is formally blocked by FL-020 (the Studio window); the bead stays open whatever these slices satisfy.
   - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for
     `branch`.
-  - The crop, its encoding, the package's restored world and the transplant's host and grafted world are not
-    admitted against `maximum_total_bytes` (FL-043): `flife branch`'s restore has no term either. Each is at most a
-    copy of a world the run itself held.
+  - `discover`'s crop and its encoding are not admitted against `maximum_total_bytes` (FL-043), and neither is
+    `flife branch`'s or `flife inspect`'s restore. Each is at most a copy of a world the run itself held, which may
+    take the process past its budget. `flife transplant` is admitted (above).
+  - The transplant's package term over-counts in three ways:
+    - it adds the reading phase (container and package world) to the graft phase, though they are not live at once;
+    - its `births` term is charged, though it takes no step;
+    - a restore's own temporaries (the configuration parse and the entrant lists: 0.39 MiB for 469 organisms) are
+      the reserve's, as they are for every restore.
+  - The graft holds about a second host world because it is all or none and rebuilds the survivors' genomes in a
+    fresh quota. Moving the survivors instead would halve that; it is not done.
   - A package is one disk with one boundary condition, `exterior = "host"`. Other shapes, and other boundary
     conditions (an isolated or periodic exterior), are not built. Nothing outside the disk travels: not the
     surrounding field, the sources or the neighbours, which §14.5 warns a colony may depend on. Whether a

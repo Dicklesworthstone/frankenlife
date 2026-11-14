@@ -83,6 +83,7 @@ const fn admission(genomes: u64, budget_bytes: u64, peak_bytes: u64) -> MemoryAd
         births: 0,
         render: 0,
         checkpoint: 0,
+        package: 0,
         reserve: 0,
         backend: 0,
         peak_bytes,

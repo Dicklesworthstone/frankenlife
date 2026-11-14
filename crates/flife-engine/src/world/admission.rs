@@ -18,6 +18,11 @@
 //!   headless run has none.
 //! - checkpoint: the checkpoint admission's peak (FL-038), or nothing
 //!   without a run directory.
+//! - package: what a host holds beside its world for another
+//!   ([`World::admit_memory_beside`]): a transplant's package (FL-042), its
+//!   restored world ([`World::held_bytes`]), the container it was read from
+//!   and the graft's own parts ([`World::graft_bytes`]). Nothing for every
+//!   other host.
 //! - reserve: [`RESERVE_BYTES`] for the runtime's and libraries' own heap.
 //! - backend: what all that leaves, granted to the controller backend as
 //!   its budget. It holds no more: a parameter shard that does not fit is
@@ -38,7 +43,8 @@ impl World {
     /// admission's `checkpoint` peak bytes and `render` bytes of observers.
     /// The terms are the allocated genome quota; the [`World::footprint`]'s
     /// state, field, scratch (with [`World::batched_bytes`] when `batched`)
-    /// and staging as births; `render`; `checkpoint`; and [`RESERVE_BYTES`].
+    /// and staging as births; `render`; `checkpoint`; and [`RESERVE_BYTES`]
+    /// (its package term is zero: see [`World::admit_memory_beside`]).
     /// The backend is granted what they leave of `maximum_total_bytes`, or
     /// nothing when not `batched`. Call it after the world's workers are set
     /// and before its backend is installed, and give the backend
@@ -52,6 +58,24 @@ impl World {
         batched: bool,
         checkpoint: u64,
         render: u64,
+    ) -> Result<MemoryAdmission, CoreError> {
+        self.admit_memory_beside(batched, checkpoint, render, 0)
+    }
+
+    /// [`World::admit_memory`] with `package` bytes held beside this world
+    /// as a term of their own: a transplant's package (FL-042), which its
+    /// host holds until it has grafted it: the package's world
+    /// ([`World::held_bytes`]), the container it was read from and the
+    /// graft's parts ([`World::graft_bytes`]).
+    ///
+    /// # Errors
+    /// As [`World::admit_memory`].
+    pub fn admit_memory_beside(
+        &self,
+        batched: bool,
+        checkpoint: u64,
+        render: u64,
+        package: u64,
     ) -> Result<MemoryAdmission, CoreError> {
         let execution = &self.config().config().execution;
         let footprint = self.footprint();
@@ -72,6 +96,7 @@ impl World {
             births: footprint.staging,
             render,
             checkpoint,
+            package,
             reserve: RESERVE_BYTES,
             backend: 0,
             peak_bytes: 0,

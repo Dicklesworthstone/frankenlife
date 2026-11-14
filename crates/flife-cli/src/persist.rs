@@ -1146,6 +1146,57 @@ impl Checkpoints {
         );
         Ok((record, linked))
     }
+
+    /// Stream committed `world` and its `book` into the store at the
+    /// world's boundary (a transplant's founding checkpoint), as
+    /// [`Checkpoints::take`]'s `pause-and-stream` does: a page at a time,
+    /// within [`crate::checkpointing::CHECKPOINT_FIXED_BYTES`], never the
+    /// whole container that [`Checkpoints::publish_from`] is given. It is
+    /// then committed, verified, indexed in the catalog and retained.
+    /// Returns its record.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] while a background checkpoint is in
+    /// flight; the encoding's, the store's and the catalog's.
+    pub(crate) fn stream_from(
+        &mut self,
+        world: &World,
+        book: &CommandBook,
+    ) -> Result<Record, CoreError> {
+        if self.in_flight.is_some() {
+            return Err(CoreError::StateConflict {
+                operation: "stream checkpoint",
+                detail: "a background checkpoint is in flight".into(),
+            });
+        }
+        let started = Instant::now();
+        let boundary = Boundary {
+            tick: world.tick(),
+            epoch: world.epoch(),
+        };
+        let filing = self.filing.clone();
+        let store = self.store()?;
+        let mut stream = store.stream()?;
+        let sealed = checkpoint_into(world, book, &mut stream)?;
+        let publication = store.commit(stream, &sealed)?;
+        let digest = store.verify(publication.sequence)?;
+        let committed = Committed {
+            boundary,
+            publication,
+            digest,
+            bytes: container_bytes(&sealed)?,
+        };
+        let filed = filing.file(store, committed)?;
+        Ok(self.record(
+            &filed,
+            &Taken {
+                boundary,
+                mode: CheckpointMode::PauseAndStream,
+                retained_peak: 0,
+                paused_seconds: started.elapsed().as_secs_f64(),
+            },
+        ))
+    }
 }
 
 impl Drop for Checkpoints {

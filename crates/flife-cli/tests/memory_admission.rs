@@ -11,6 +11,10 @@
 //!   defers what does not fit, and the run reaches the reference's digest.
 //! - A full population's run, stepped on the CPU backend, holds no more
 //!   heap than its admitted terms, with its genomes at their actual bytes.
+//! - A transplant's package (FL-042) is read within its term, the restored
+//!   world and its container, and keeps its `held_bytes`; a whole
+//!   transplant holds no more heap than its admitted terms, with the
+//!   host's genomes at their actual bytes.
 
 #![allow(
     clippy::expect_used,
@@ -27,12 +31,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flife_cli::memory::admit;
 use flife_cli::{
-    CheckpointMode, ControllerChoice, MemoryAdmission, Persistence, RESERVE_BYTES, Record,
-    RenderOptions, RenderRecord, RunOptions, Style, configure, encoding_bytes, found, render,
-    run_with,
+    CheckpointMode, ControllerChoice, Disk, MemoryAdmission, PackageSource, Persistence,
+    RESERVE_BYTES, Record, RenderOptions, RenderRecord, RunOptions, StoreDurability, Style,
+    TransplantOptions, configure, encoding_bytes, found, read_package, render, run_with,
+    transplant, write_package,
 };
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Intervention, Stepped};
+use flife_engine::{Intervention, NumericalProfile, Stepped};
 use peak_alloc::PeakAlloc;
 use serde_json::Value;
 
@@ -142,8 +147,8 @@ fn admitted(config: &ValidatedConfig, choice: ControllerChoice) -> MemoryAdmissi
 fn print(admission: &MemoryAdmission) {
     println!(
         "budget {:.1} MiB: genomes {:.1} ({} logical parameters), state {:.2}, field {:.2}, \
-         scratch {:.2}, births {:.2}, render {:.2}, checkpoint {:.2}, reserve {:.1}, backend \
-         {:.1}; peak {:.1} MiB",
+         scratch {:.2}, births {:.2}, render {:.2}, checkpoint {:.2}, package {:.2}, reserve \
+         {:.1}, backend {:.1}; peak {:.1} MiB",
         mib(admission.budget_bytes),
         mib(admission.genomes),
         admission.logical_parameters,
@@ -153,6 +158,7 @@ fn print(admission: &MemoryAdmission) {
         mib(admission.births),
         mib(admission.render),
         mib(admission.checkpoint),
+        mib(admission.package),
         mib(admission.reserve),
         mib(admission.backend),
         mib(admission.peak_bytes),
@@ -352,6 +358,148 @@ fn a_full_population_holds_no_more_heap_than_its_terms() {
         peak <= bound,
         "heap peak {peak} above the admitted terms {bound}"
     );
+}
+
+/// What a restore holds for a moment beyond the world it builds and the
+/// container it reads: the configuration's parse and the restored
+/// organisms' entrant and genome lists. No term counts it; like every
+/// restore's (resume, branch, inspect), it is the reserve's. Declared here
+/// at 1 MiB; 0.39 MiB was measured for the package below.
+const RESTORE_ALLOWANCE: u64 = 1 << 20;
+
+/// A transplant's package term (FL-042): its restored world and the
+/// container it was restored from. The preset's world, 8 ticks on, cropped
+/// to a disk of radius 24 about its centre and written as a package, is
+/// read back. The reading's peak is within the term and the restore's
+/// allowance, the container's buffer holding its bytes and no more. The
+/// restored world keeps its `held_bytes` to within 1%, and the manifest.
+#[test]
+fn a_package_is_read_within_its_term_and_keeps_its_held_bytes() {
+    let _serial = serial();
+    let dir = preset_package();
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let (package, crop) = read_package(&dir, profile).expect("verifies");
+    let reading = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let kept = u64::try_from(ALLOC.current_usage().saturating_sub(base)).expect("fits");
+    let held = crop.held_bytes();
+    let term = held + package.world.bytes;
+    println!(
+        "a package of {} organisms: reading held {:.2} MiB at its peak against a term of {:.2} \
+         (world {:.2}, container {:.2}); the world kept {:.2} MiB",
+        crop.population().len(),
+        mib(reading),
+        mib(term),
+        mib(held),
+        mib(package.world.bytes),
+        mib(kept),
+    );
+    assert!(!crop.population().is_empty(), "the disk holds organisms");
+    assert!(
+        reading <= term + RESTORE_ALLOWANCE,
+        "reading held {reading} > its term {term} and the restore's allowance"
+    );
+    assert!(
+        kept <= held + RESTORE_ALLOWANCE,
+        "the world kept {kept} > its held bytes {held}"
+    );
+    assert!(
+        kept >= held - held / 100,
+        "the world kept {kept}, more than 1% under its held bytes {held}"
+    );
+}
+
+/// A whole transplant (FL-042, FL-043) of [`preset_package`] into the
+/// preset's host of 4,096 founders: the heap from reading the package to
+/// the published record is within its admitted terms. The host's genomes
+/// are counted at their actual bytes, not the quota's ceiling: its
+/// founders' and the package's, which the graft rebuilds. The bound keeps
+/// the reserve, which holds the store's and the catalog's heap and the
+/// restore's temporaries. Its founding checkpoint is streamed: encoded
+/// whole, it would hold the founders' parameters again, about 160 MiB.
+#[test]
+fn a_transplant_holds_no_more_heap_than_its_terms() {
+    let _serial = serial();
+    let dir = preset_package();
+    let host = preset();
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    let packaged = read_package(&dir, profile)
+        .expect("verifies")
+        .1
+        .quota()
+        .allocated_bytes();
+    let founders = found(&host).expect("founds").quota().allocated_bytes();
+    let run_dir = fresh("transplanted");
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let record = transplant(
+        &dir,
+        &host,
+        &run_dir,
+        &TransplantOptions {
+            at: [40.0, 88.0],
+            name: None,
+            durability: StoreDurability::ProcessCrash,
+        },
+    )
+    .expect("transplants");
+    let peak = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let Record::Transplant { memory, .. } = record else {
+        panic!("a transplant record");
+    };
+    print(&memory);
+    let bound = memory.fixed_bytes() - memory.genomes + founders + packaged;
+    println!(
+        "a transplant held {:.1} MiB at its peak; bound {:.1} MiB (package {:.1}, genomes {:.1} of {:.1})",
+        mib(peak),
+        mib(bound),
+        mib(memory.package),
+        mib(founders + packaged),
+        mib(memory.genomes),
+    );
+    assert!(
+        peak <= bound,
+        "heap peak {peak} above the admitted terms {bound}"
+    );
+}
+
+/// The preset's world, 8 ticks on, cropped to a disk of radius 24 about its
+/// centre and written as a package, once.
+fn preset_package() -> PathBuf {
+    static PACKAGE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PACKAGE.get_or_init(write_preset_package).clone()
+}
+
+fn write_preset_package() -> PathBuf {
+    let config = preset();
+    let mut world = found(&config).expect("founds");
+    for _ in 0..8 {
+        match world.step().expect("steps") {
+            Stepped::Published(_) => {}
+            Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+        }
+    }
+    let dir = fresh("package");
+    write_package(
+        &dir,
+        &world,
+        Disk {
+            center: [64.0, 64.0],
+            radius: 24.0,
+        },
+        PackageSource {
+            run_dir: "memory-admission".into(),
+            session: 1,
+            sequence: 1,
+            tick: world.tick().get(),
+            checkpoint_sha256: String::new(),
+            config_sha256: config.config_hash().to_hex(),
+        },
+        StoreDurability::ProcessCrash,
+    )
+    .expect("writes the package");
+    dir
 }
 
 /// The staging term against the heaviest tick a test can make: 512 founders

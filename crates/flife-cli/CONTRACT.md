@@ -165,7 +165,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
   configuration to run instead of the compiled-in reference preset; N (at least 1) the ticks each route runs,
   `PROBE_TICKS` = 8 by default; W the world's workers, the configuration's by default. In the library:
   `capabilities(config, &CapabilitiesOptions { ticks, cpu_workers })` returns the `Capabilities` record, and
-  `video_encoder()` checks `flife render --video`'s encoder.
+  `video_encoder()` checks `flife render --video`'s encoder. `encode_y4m(source, video)` encodes a y4m into a
+  new H.264 MP4 with that encoder (`Y4M_TO_H264`: the frames tagged BT.709 primaries, sRGB transfer, BT.709
+  matrix and limited range, without converting a sample; libx264 CRF 18, 4:2:0, left chroma siting). It is the
+  Studio export's `--export-mp4` (FL-023), whose tests run it.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default

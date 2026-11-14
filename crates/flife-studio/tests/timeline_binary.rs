@@ -7,6 +7,9 @@
 //!   headless into D, and its `export` record and manifest close on that
 //!   world, with a PNG for each frame and the video on the configuration's
 //!   clock.
+//! - `--export-mp4` with no ffmpeg on the `PATH` is refused before anything
+//!   is written; with this machine's, its record and manifest name the MP4
+//!   and its SHA-256, beside the same y4m.
 //! - Neither writes over a file: a second run with the same T or D is
 //!   refused, and what is there is unchanged.
 //!
@@ -27,7 +30,9 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use flife_core::{Sha256Digest, ValidatedConfig};
-use flife_studio::{ExportManifest, MANIFEST_FILE, TimelineRecord, VIDEO_FILE, read_timeline};
+use flife_studio::{
+    ENCODED_FILE, ExportManifest, MANIFEST_FILE, TimelineRecord, VIDEO_FILE, read_timeline,
+};
 use fmn_render::metal::MetalRenderer;
 use serde_json::Value;
 
@@ -178,6 +183,62 @@ fn a_recorded_session_exports_through_the_binary() {
     let video = manifest.video.as_ref().expect("a video at 96 x 60");
     assert_eq!(summary["slots"].as_u64(), Some(video.slots));
     assert_eq!(sha(&out.join(VIDEO_FILE)), video.sha256);
+    assert!(summary["mp4"].is_null() && manifest.encoded.is_none());
+
+    // `--export-mp4`: with no ffmpeg on the PATH, refused before anything is
+    // written; with this machine's, the same video as H.264.
+    let mp4_out = dir.join("export-mp4");
+    let mp4_args = [
+        "--export",
+        path(&timeline),
+        "--out",
+        path(&mp4_out),
+        "--cpu-workers",
+        "2",
+        "--export-mp4",
+    ];
+    let output = Command::new(env!("CARGO_BIN_EXE_flife-studio"))
+        .arg(PRESET)
+        .args(mp4_args)
+        .env("PATH", "")
+        .output()
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("ffmpeg"), "{stderr}");
+    assert!(!mp4_out.exists(), "nothing written");
+    if flife_cli::video_encoder().is_ok() {
+        let output = studio(&mp4_args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "exit {:?}: {stderr}",
+            output.status
+        );
+        let exported = records(&output);
+        let summary = the(&exported, "export");
+        println!("{summary}");
+        assert_eq!(summary["digest"].as_str(), Some(digest.as_str()));
+        assert_eq!(summary["mp4"].as_str(), Some(ENCODED_FILE));
+        let mp4_sha = sha(&mp4_out.join(ENCODED_FILE));
+        assert_eq!(summary["mp4_sha256"].as_str(), Some(mp4_sha.as_str()));
+        let manifest: ExportManifest = serde_json::from_slice(
+            &std::fs::read(mp4_out.join(MANIFEST_FILE)).expect("the manifest"),
+        )
+        .expect("parses");
+        let encoded = manifest.encoded.as_ref().expect("the MP4");
+        assert_eq!(
+            (encoded.sha256.as_str(), encoded.source.as_str()),
+            (mp4_sha.as_str(), VIDEO_FILE)
+        );
+        assert_eq!(
+            manifest.video.as_ref().map(|video| &video.sha256),
+            Some(&video.sha256),
+            "the same y4m"
+        );
+    } else {
+        println!("no H.264 encoder here: only the refusal ran");
+    }
 
     // Neither is written over.
     let (timeline_sha, manifest_sha) = (sha(&timeline), sha(&out.join(MANIFEST_FILE)));

@@ -45,8 +45,9 @@
 //! names and pins, [`TimelineStart`]). It redraws each of those frames,
 //! byte for byte, and closes on the world the Studio closed on. [`export`] writes a replay out through
 //! FrankenManim's frame and encoding paths: each frame as a PNG, the
-//! frames on a constant clock as y4m video, and a manifest of their
-//! provenance (plan §13.8's live capture).
+//! frames on a constant clock as y4m video (and, asked, that video as
+//! H.264 MP4 through ffmpeg), and a manifest of their provenance (plan
+//! §13.8's live capture).
 
 #![forbid(unsafe_code)]
 
@@ -77,8 +78,8 @@ pub use controls::{
     ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
 };
 pub use export::{
-    EXPORT_SCHEMA, ExportManifest, ExportOptions, ExportedFrame, ExportedVideo, MANIFEST_FILE,
-    VIDEO_FILE, export, slot_counts,
+    ENCODED_FILE, EXPORT_SCHEMA, ExportManifest, ExportOptions, ExportedEncoding, ExportedFrame,
+    ExportedVideo, MANIFEST_FILE, VIDEO_FILE, export, slot_counts,
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Motion, Particles, Style};

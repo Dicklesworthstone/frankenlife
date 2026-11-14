@@ -427,7 +427,8 @@ cargo run --release -p flife-cli -- render presets/reference-small-world.toml --
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --offscreen 20 --offscreen-zooms
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --timeline session.ndjson
-cargo run --release -p flife-studio -- presets/reference-small-world.toml --export session.ndjson --out export
+cargo run --release -p flife-studio -- presets/reference-small-world.toml --export session.ndjson --out export \
+    --export-mp4
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --run studio-run
 cargo run --release -p flife-cli -- resume studio-run --until 20000
 cargo run --release -p flife-cli -- render --run-dir studio-run --ticks 1200 --every 4 \
@@ -512,8 +513,11 @@ DIR` opens no Studio and no window. It founds the world again (or restores the c
 from), steps it with those commands at those ticks, and
 redraws every frame through the same Metal route. Each frame lands in DIR as a PNG, byte for byte the frame the
 Studio rendered. The frames on a constant clock (`--export-fps`, the preset's 30 by default) become
-`capture.y4m` (BT.709 limited 4:2:0), its repeated and dropped frames declared. A `manifest.json` gives the
-timeline's and configuration's hashes, the ticks shown, the closing digest and each file's SHA-256. An export that
+`capture.y4m` (BT.709 limited 4:2:0), its repeated and dropped frames declared. With `--export-mp4`, the ffmpeg
+on the `PATH` also encodes that video as H.264 into `capture.mp4`, which plays where y4m does not. The samples are
+tagged with what they hold, not converted, and an ffmpeg without libx264 is refused before anything is written. A
+`manifest.json` gives the timeline's and configuration's hashes, the ticks shown, the closing digest, the ffmpeg
+that encoded the MP4 and each file's SHA-256. An export that
 reaches another world than the Studio's is refused, and neither command writes over a file. Plan §13.8's other
 export modes are the command line's: `flife render` draws a configuration on simulation time, and `flife render
 --run-dir` draws a kept run from where it would resume. Cinema qualification (FL-050) is later work.

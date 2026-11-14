@@ -555,13 +555,59 @@ pub fn video_encoder() -> Result<String, CoreError> {
 
 /// Encode `frames/frame-%06d.png` into an H.264 MP4 with `ffmpeg`.
 fn encode(frames: &Path, video: &Path, fps: u32) -> Result<(), CoreError> {
-    let output = std::process::Command::new("ffmpeg")
+    let mut command = std::process::Command::new("ffmpeg");
+    command
         .args(["-y", "-loglevel", "error", "-framerate"])
         .arg(fps.max(1).to_string())
         .arg("-i")
         .arg(frames.join("frame-%06d.png"))
         .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"])
-        .arg(video)
+        .arg(video);
+    run_encoder(&mut command)
+}
+
+/// What [`encode_y4m`] asks of ffmpeg after its input. The frames are
+/// tagged with what the Studio export's y4m holds and its header cannot
+/// say: BT.709 primaries, sRGB-encoded, BT.709 matrix, limited range (the
+/// header's `C420mpeg2` says left chroma siting). Not a sample is
+/// converted. They are then compressed as H.264 (libx264, CRF 18) 4:2:0,
+/// into an MP4 whose index comes first.
+pub const Y4M_TO_H264: [&str; 12] = [
+    "-vf",
+    "setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-crf",
+    "18",
+    "-chroma_sample_location",
+    "left",
+    "-movflags",
+    "+faststart",
+];
+
+/// Encode the Studio export's y4m video `source` into the new MP4 `video`
+/// with the ffmpeg on the `PATH` ([`Y4M_TO_H264`]). Every frame is kept,
+/// at the y4m's rate.
+///
+/// # Errors
+/// [`CoreError::MissingCapability`] when ffmpeg cannot be run;
+/// [`CoreError::StateConflict`] when it fails, as it does when `video`
+/// exists (ffmpeg's `-n`).
+pub fn encode_y4m(source: &Path, video: &Path) -> Result<(), CoreError> {
+    let mut command = std::process::Command::new("ffmpeg");
+    command
+        .args(["-n", "-loglevel", "error", "-i"])
+        .arg(source)
+        .args(Y4M_TO_H264)
+        .arg(video);
+    run_encoder(&mut command)
+}
+
+/// Run an ffmpeg encode to its end.
+fn run_encoder(command: &mut std::process::Command) -> Result<(), CoreError> {
+    let output = command
         .output()
         .map_err(|error| CoreError::MissingCapability {
             capability: format!("ffmpeg, to encode a video: {error}"),

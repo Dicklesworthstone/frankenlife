@@ -40,8 +40,9 @@
 //! Metal route and writes each frame as a PNG into DIR, which must not
 //! exist. It also writes the frames on a constant `--export-fps` clock (the
 //! configuration's `[presentation] frames_per_second` by default) as y4m,
-//! and a `frankenlife.export.v1` manifest. Then it prints one `export`
-//! record.
+//! with `--export-mp4` that video as H.264 MP4 through the ffmpeg on the
+//! `PATH`, and a `frankenlife.export.v1` manifest. Then it prints one
+//! `export` record.
 //!
 //! `--run DIR` keeps the session in run directory DIR (FL-024), which must
 //! be absent or empty: the configuration, the command journal (every brush
@@ -187,6 +188,11 @@ struct Cli {
     /// `[presentation] frames_per_second` by default.
     #[arg(long, value_name = "FPS", requires = "export")]
     export_fps: Option<NonZeroU32>,
+    /// Also encode the exported video as H.264 into `capture.mp4`, with
+    /// the ffmpeg on the `PATH`, which must list libx264. It is checked
+    /// before anything is written.
+    #[arg(long, requires = "export")]
+    export_mp4: bool,
     /// Keep the session in run directory DIR (FL-024), which must be
     /// absent or empty: `flife resume`, `branch` and `inspect` take it.
     #[arg(long, value_name = "DIR", conflicts_with = "export")]
@@ -267,6 +273,7 @@ fn export_timeline(config: &ValidatedConfig, cli: &Cli, timeline: &Path, out: &P
             .export_fps
             .unwrap_or_else(|| NonZeroU32::new(configured).unwrap_or(NonZeroU32::MIN)),
         cpu_workers: Some(cli.cpu_workers),
+        mp4: cli.export_mp4,
     };
     match flife_studio::export(config, &text, options, out) {
         Ok(manifest) => {
@@ -292,6 +299,14 @@ fn export_record<'a>(manifest: &'a ExportManifest, out: &Path) -> Record<'a> {
         repeated: manifest.video.as_ref().map(|video| video.repeated),
         dropped: manifest.video.as_ref().map(|video| video.dropped),
         video_withheld: manifest.video_withheld.as_deref(),
+        mp4: manifest
+            .encoded
+            .as_ref()
+            .map(|encoded| encoded.file.as_str()),
+        mp4_sha256: manifest
+            .encoded
+            .as_ref()
+            .map(|encoded| encoded.sha256.as_str()),
     }
 }
 
@@ -621,6 +636,9 @@ enum Record<'a> {
         repeated: Option<u64>,
         dropped: Option<u64>,
         video_withheld: Option<&'a str>,
+        /// The H.264 MP4's file and SHA-256 (`--export-mp4`).
+        mp4: Option<&'a str>,
+        mp4_sha256: Option<&'a str>,
     },
 }
 
@@ -1792,11 +1810,17 @@ mod tests {
         let cli = parse(&["--export", "t", "--out", "d", "--export-fps", "60"])
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(cli.export_fps.map(std::num::NonZeroU32::get), Some(60));
+        assert!(!cli.export_mp4, "no MP4 unless asked");
+        let cli = parse(&["--export", "t", "--out", "d", "--export-mp4"])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(cli.export_mp4);
         for args in [
             // An export needs its directory, and the directory its export.
             &["--export", "t"][..],
             &["--out", "d"],
             &["--export-fps", "30"],
+            &["--export-mp4"],
+            &["--offscreen", "1", "--export-mp4"],
             &["--export", "t", "--out", "d", "--export-fps", "0"],
             // An export opens no Studio: it neither records nor runs one.
             &["--export", "t", "--out", "d", "--timeline", "u"],

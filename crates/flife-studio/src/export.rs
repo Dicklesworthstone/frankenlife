@@ -13,6 +13,11 @@
 //!   how many slots each frame fills, the slots that repeat a frame, and the
 //!   frames no slot shows. Encoded video is compared by these settings, and
 //!   is not assumed to be byte-identical across encoders.
+//! - `capture.mp4`, when asked for ([`ExportOptions::mp4`]): that video
+//!   encoded as H.264 by the ffmpeg on the `PATH`
+//!   ([`flife_cli::encode_y4m`]), each slot a frame, its samples tagged
+//!   with what they hold and compressed, not converted. It plays where y4m
+//!   does not. The ffmpeg is checked before anything is written.
 //! - `manifest.json`, written last, so a directory without one holds an
 //!   export that did not finish. It records the timeline's and the
 //!   configuration's hashes, the ticks shown and the tick the session
@@ -22,7 +27,7 @@
 //! The directory must not exist. An export never writes over a file.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +49,9 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// The video's file name in an export's directory.
 pub const VIDEO_FILE: &str = "capture.y4m";
 
+/// The encoded video's file name in an export's directory.
+pub const ENCODED_FILE: &str = "capture.mp4";
+
 /// How a timeline is exported.
 #[derive(Debug, Clone, Copy)]
 pub struct ExportOptions {
@@ -52,6 +60,9 @@ pub struct ExportOptions {
     /// Threads for the replayed world's field and organism phases; no
     /// result depends on it.
     pub cpu_workers: Option<NonZeroUsize>,
+    /// Also encode the video as H.264 into `capture.mp4`, with the ffmpeg
+    /// on the `PATH`, which must list libx264.
+    pub mp4: bool,
 }
 
 /// One frame of an export: a frame the Studio drew.
@@ -96,6 +107,21 @@ pub struct ExportedVideo {
     pub repeated: u64,
     /// The frames drawn that no slot shows.
     pub dropped: u64,
+    /// Its SHA-256.
+    pub sha256: String,
+}
+
+/// An export's video encoded as H.264 ([`ExportOptions::mp4`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedEncoding {
+    /// Its file name.
+    pub file: String,
+    /// The video it encodes.
+    pub source: String,
+    /// The first line of the ffmpeg's `-version`.
+    pub ffmpeg: String,
+    /// ffmpeg's arguments after the source ([`flife_cli::Y4M_TO_H264`]).
+    pub settings: String,
     /// Its SHA-256.
     pub sha256: String,
 }
@@ -146,6 +172,9 @@ pub struct ExportManifest {
     pub video: Option<ExportedVideo>,
     /// Why the video was withheld, if it was.
     pub video_withheld: Option<String>,
+    /// The video encoded as H.264, when asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded: Option<ExportedEncoding>,
 }
 
 /// One frame the timeline draws, as its records declare it.
@@ -164,7 +193,11 @@ struct Planned {
 ///   written.
 /// - [`CoreError::StateConflict`] for frame times that are not finite and
 ///   in order, for more slots than a `u32` counts, or for a frame of
-///   another size than its drawable.
+///   another size than its drawable. Before anything is written, for an
+///   MP4 asked of an export whose video is withheld.
+/// - [`CoreError::MissingCapability`] before anything is written, for an
+///   MP4 asked for without a runnable ffmpeg listing libx264; as
+///   [`flife_cli::encode_y4m`] when its encode fails.
 /// - As [`read_timeline`] and [`replay`].
 pub fn export(
     config: &ValidatedConfig,
@@ -223,6 +256,17 @@ pub fn export(
                     .any(|n| n % 2 == 1)
                     .then(|| format!("{:?} is not even, as 4:2:0 needs", first.drawable))
             }),
+    };
+    // The encoder, before anything is written.
+    let ffmpeg = if options.mp4 {
+        if let Some(why) = &withheld {
+            return Err(conflict(format!(
+                "an MP4 encodes the export's y4m video, which this export withholds: {why}"
+            )));
+        }
+        Some(flife_cli::video_encoder()?)
+    } else {
+        None
     };
 
     std::fs::create_dir(out)
@@ -283,6 +327,20 @@ pub fn export(
     let video = video
         .map(|video| video.finish(options.frames_per_second, &counts))
         .transpose()?;
+    let encoded = match (ffmpeg, &video) {
+        (Some(ffmpeg), Some(_)) => {
+            let path = out.join(ENCODED_FILE);
+            flife_cli::encode_y4m(&video_path, &path)?;
+            Some(ExportedEncoding {
+                file: ENCODED_FILE.to_owned(),
+                source: VIDEO_FILE.to_owned(),
+                ffmpeg,
+                settings: flife_cli::Y4M_TO_H264.join(" "),
+                sha256: file_sha256(&path)?,
+            })
+        }
+        _ => None,
+    };
 
     let first = planned.first();
     let last = planned.last();
@@ -320,6 +378,7 @@ pub fn export(
         frames,
         video,
         video_withheld: withheld,
+        encoded,
     };
     let mut json =
         serde_json::to_vec_pretty(&manifest).map_err(|error| CoreError::StateConflict {
@@ -460,6 +519,23 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
         File::create_new(path).map_err(|error| storage("create an export file", path, &error))?;
     file.write_all(bytes)
         .map_err(|error| storage("write an export file", path, &error))
+}
+
+/// The SHA-256 of the file at `path`, read a block at a time.
+fn file_sha256(path: &Path) -> Result<String, CoreError> {
+    let mut file =
+        File::open(path).map_err(|error| storage("read an export file", path, &error))?;
+    let mut hash = Sha256Stream::new();
+    let mut block = vec![0_u8; 1 << 16];
+    loop {
+        let read = file
+            .read(&mut block)
+            .map_err(|error| storage("read an export file", path, &error))?;
+        if read == 0 {
+            return Ok(hash.finish().to_hex());
+        }
+        hash.update(&block[..read]);
+    }
 }
 
 fn storage(operation: &'static str, path: &Path, error: &std::io::Error) -> CoreError {

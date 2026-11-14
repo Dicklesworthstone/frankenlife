@@ -18,7 +18,12 @@
 //! frames on a 30 fps clock become y4m video, with the repeats and drops
 //! it declares. The manifest names its sources. An export never writes
 //! over a directory. A drawable that 4:2:0 cannot take withholds the video
-//! and says why. Each run leaves its exports, about 1 MB, under the
+//! and says why. Asked for an MP4, an export encodes that y4m as H.264
+//! with this machine's ffmpeg: one frame a slot, tagged BT.709 limited
+//! range, sRGB-encoded, left siting (as ffprobe reads it), and each frame
+//! decodes to its slot's y4m frame within compression. Without an ffmpeg
+//! listing libx264, and for a withheld video, it is refused before
+//! anything is written. Each run leaves its exports, about 1 MB, under the
 //! target's temporary directory; nothing deletes them.
 //!
 //! No window opens: headless Metal. Without a Metal device the tests
@@ -34,15 +39,16 @@
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_manim::{Region, RegionEffect, RegionShape};
 use flife_render::AffinityProjection;
 use flife_studio::{
-    ColorMapping, ControllerChoice, Disk, EXPORT_SCHEMA, Exact, ExportManifest, ExportOptions,
-    FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_G, KEY_PERIOD, KEY_RIGHT_BRACKET, KEY_SPACE, KEY_T,
-    KEY_ZERO, Look, MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface,
+    ColorMapping, ControllerChoice, Disk, ENCODED_FILE, EXPORT_SCHEMA, Exact, ExportManifest,
+    ExportOptions, FieldMapping, KEY_C, KEY_DIGITS, KEY_E, KEY_G, KEY_PERIOD, KEY_RIGHT_BRACKET,
+    KEY_SPACE, KEY_T, KEY_ZERO, Look, MANIFEST_FILE, Status, Studio, StudioOptions, Style, Surface,
     TimelineProjection, TimelineRecord, TimelineRegion, TimelineStyle, VIDEO_FILE, export,
     read_timeline, replay, write_timeline_record,
 };
@@ -688,16 +694,12 @@ fn a_recorded_interval_exports_its_frames_and_video() {
 
     let out = fresh("export");
     let fps = NonZeroU32::new(30).expect("nonzero");
-    let manifest = export(
-        &config,
-        &text,
-        ExportOptions {
-            frames_per_second: fps,
-            cpu_workers: NonZeroUsize::new(2),
-        },
-        &out,
-    )
-    .expect("exports");
+    let options = ExportOptions {
+        frames_per_second: fps,
+        cpu_workers: NonZeroUsize::new(2),
+        mp4: false,
+    };
+    let manifest = export(&config, &text, options, &out).expect("exports");
     println!(
         "{} frames, video {:?}, ticks {:?} to {}, into {}",
         manifest.frames.len(),
@@ -788,6 +790,10 @@ fn a_recorded_interval_exports_its_frames_and_video() {
         }
     }
     assert!(bytes == ours, "the video is the slots' frames");
+    assert!(
+        manifest.encoded.is_none() && !out.join(ENCODED_FILE).exists(),
+        "no MP4 unless asked"
+    );
     let decoded = decode_y4m(&bytes).expect("decodes");
     assert_eq!(
         (
@@ -822,15 +828,7 @@ fn a_recorded_interval_exports_its_frames_and_video() {
 
     // An export never writes over one.
     let before = std::fs::read(out.join(MANIFEST_FILE)).expect("the manifest");
-    match export(
-        &config,
-        &text,
-        ExportOptions {
-            frames_per_second: fps,
-            cpu_workers: NonZeroUsize::new(2),
-        },
-        &out,
-    ) {
+    match export(&config, &text, options, &out) {
         Err(CoreError::StorageFailed { .. }) => {}
         other => panic!("not refused: {other:?}"),
     }
@@ -838,6 +836,158 @@ fn a_recorded_interval_exports_its_frames_and_video() {
         std::fs::read(out.join(MANIFEST_FILE)).expect("the manifest"),
         before
     );
+
+    // The video as H.264, asked for: this machine's ffmpeg encodes the same
+    // y4m. Without one listing libx264, the export is refused before
+    // anything is written.
+    let mp4_out = fresh("mp4");
+    let mp4_options = ExportOptions {
+        mp4: true,
+        ..options
+    };
+    match flife_cli::video_encoder() {
+        Err(error) => {
+            println!("no H.264 encoder: {error}");
+            match export(&config, &text, mp4_options, &mp4_out) {
+                Err(CoreError::MissingCapability { .. }) => {}
+                other => panic!("not refused: {other:?}"),
+            }
+            assert!(!mp4_out.exists(), "nothing written");
+        }
+        Ok(version) => {
+            let encoded_export =
+                export(&config, &text, mp4_options, &mp4_out).expect("exports an MP4");
+            assert_eq!(
+                encoded_export.video.as_ref().map(|video| &video.sha256),
+                Some(&video.sha256),
+                "the same y4m"
+            );
+            let encoded = encoded_export.encoded.as_ref().expect("the MP4");
+            println!("{encoded:?}");
+            assert_eq!(
+                (
+                    encoded.file.as_str(),
+                    encoded.source.as_str(),
+                    encoded.ffmpeg.as_str(),
+                    encoded.settings.clone()
+                ),
+                (
+                    ENCODED_FILE,
+                    VIDEO_FILE,
+                    version.as_str(),
+                    flife_cli::Y4M_TO_H264.join(" ")
+                )
+            );
+            let path = mp4_out.join(ENCODED_FILE);
+            let mp4 = std::fs::read(&path).expect("the MP4");
+            assert_eq!(Sha256Digest::of(&mp4).to_hex(), encoded.sha256);
+            let written: ExportManifest = serde_json::from_slice(
+                &std::fs::read(mp4_out.join(MANIFEST_FILE)).expect("the manifest"),
+            )
+            .expect("parses");
+            assert_eq!(written.encoded.as_ref(), Some(encoded));
+
+            // The stream: H.264 4:2:0 at the clock's rate, one frame a slot,
+            // tagged with what the y4m's samples are.
+            let probe = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,pix_fmt,width,height,r_frame_rate,nb_frames,\
+                     color_range,color_space,color_primaries,color_transfer,chroma_location",
+                    "-of",
+                    "json",
+                ])
+                .arg(&path)
+                .output()
+                .expect("ffprobe runs beside ffmpeg");
+            assert!(probe.status.success(), "{probe:?}");
+            let probed: serde_json::Value =
+                serde_json::from_slice(&probe.stdout).expect("ffprobe's JSON");
+            let stream = &probed["streams"][0];
+            let field = |name: &str| stream[name].as_str().map(str::to_owned);
+            let slots = video.slots.to_string();
+            let mut found = Vec::new();
+            for (name, expected) in [
+                ("codec_name", "h264"),
+                ("pix_fmt", "yuv420p"),
+                ("r_frame_rate", "30/1"),
+                ("nb_frames", slots.as_str()),
+                ("color_range", "tv"),
+                ("color_space", "bt709"),
+                ("color_primaries", "bt709"),
+                ("color_transfer", "iec61966-2-1"),
+                ("chroma_location", "left"),
+            ] {
+                found.push((name, field(name)));
+                assert_eq!(field(name).as_deref(), Some(expected), "{name}: {stream}");
+            }
+            assert_eq!(
+                [stream["width"].as_u64(), stream["height"].as_u64()],
+                [Some(u64::from(width)), Some(u64::from(height))]
+            );
+
+            // Decoded: each slot is the y4m's frame for it, compressed, not
+            // converted. Encoding these frames tagged on the encoder rather
+            // than the frames, ffmpeg 8.1 converted them from BT.601 to
+            // BT.709: luma moved up to 1.6 levels on a slot's mean, at
+            // 36.3 dB. As they are, 41.5 dB and 0.28 here.
+            let decoded = Command::new("ffmpeg")
+                .args(["-loglevel", "error", "-i"])
+                .arg(&path)
+                .args(["-f", "rawvideo", "-"])
+                .output()
+                .expect("ffmpeg decodes");
+            assert!(decoded.status.success(), "{decoded:?}");
+            let luma = width as usize * height as usize;
+            let frame_bytes = luma * 3 / 2;
+            assert_eq!(
+                decoded.stdout.len() as u64,
+                frame_bytes as u64 * video.slots
+            );
+            // Each slot's I420 planes (Y, then Cb and Cr), as the y4m has
+            // them after its `FRAME` line.
+            let truth: Vec<Vec<u8>> = drawn
+                .iter()
+                .zip(&expected)
+                .flat_map(|((_, _, pixels), &count)| {
+                    let record = y4m_frame(pixels);
+                    std::iter::repeat_n(record[6..].to_vec(), count as usize)
+                })
+                .collect();
+            let mut worst = (f64::INFINITY, 0.0_f64, f64::INFINITY);
+            for (slot, (ours, theirs)) in truth
+                .iter()
+                .zip(decoded.stdout.chunks_exact(frame_bytes))
+                .enumerate()
+            {
+                assert_eq!(ours.len(), frame_bytes);
+                let (psnr, shift) = agreement(&ours[..luma], &theirs[..luma]);
+                let (chroma, _) = agreement(&ours[luma..], &theirs[luma..]);
+                worst = (
+                    worst.0.min(psnr),
+                    worst.1.max(shift.abs()),
+                    worst.2.min(chroma),
+                );
+                assert!(
+                    psnr >= 39.0 && shift.abs() <= 0.75 && chroma >= 35.0,
+                    "slot {slot}: luma PSNR {psnr:.1} dB, mean shift {shift:.2}; chroma PSNR \
+                     {chroma:.1} dB"
+                );
+            }
+            println!(
+                "MP4 {} bytes, {found:?}; worst luma PSNR {:.1} dB, mean shift {:.3}; chroma \
+                 {:.1} dB",
+                mp4.len(),
+                worst.0,
+                worst.1,
+                worst.2
+            );
+        }
+    }
 
     // A drawable 4:2:0 cannot take: the frames, and no video, with why.
     let odd: String = records
@@ -851,16 +1001,7 @@ fn a_recorded_interval_exports_its_frames_and_video() {
         .map(|record| serde_json::to_string(&record).expect("a record") + "\n")
         .collect();
     let out = fresh("odd");
-    let manifest = export(
-        &config,
-        &odd,
-        ExportOptions {
-            frames_per_second: fps,
-            cpu_workers: NonZeroUsize::new(2),
-        },
-        &out,
-    )
-    .expect("exports its frames");
+    let manifest = export(&config, &odd, options, &out).expect("exports its frames");
     println!("{:?}", manifest.video_withheld);
     assert!(manifest.video.is_none());
     assert!(
@@ -875,4 +1016,28 @@ fn a_recorded_interval_exports_its_frames_and_video() {
     let png = std::fs::read(out.join(&manifest.frames[0].file)).expect("a frame");
     let decoded = decode_png(&png, &PngLimits::default()).expect("decodes");
     assert_eq!([decoded.width, decoded.height], [191, 120]);
+    // An MP4 of a withheld video is refused before anything is written.
+    let out = fresh("odd-mp4");
+    match export(&config, &odd, mp4_options, &out) {
+        Err(CoreError::StateConflict { detail, .. }) if detail.contains("withholds") => {
+            println!("{detail}");
+        }
+        other => panic!("not refused: {other:?}"),
+    }
+    assert!(!out.exists(), "nothing written");
+}
+
+/// The PSNR of samples `theirs` against `ours` in dB, and how far
+/// `theirs`' mean level sits from `ours`'.
+fn agreement(ours: &[u8], theirs: &[u8]) -> (f64, f64) {
+    assert_eq!(ours.len(), theirs.len());
+    let (mut squared, mut shift) = (0.0, 0.0);
+    for (&a, &b) in ours.iter().zip(theirs) {
+        let difference = f64::from(b) - f64::from(a);
+        squared += difference * difference;
+        shift += difference;
+    }
+    let count = ours.len() as f64;
+    let psnr = 10.0 * (255.0 * 255.0 / (squared / count).max(1e-9)).log10();
+    (psnr, shift / count)
 }

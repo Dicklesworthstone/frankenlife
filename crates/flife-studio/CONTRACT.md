@@ -43,7 +43,10 @@ affinity and composition colours were drawn through (`TimelineProjection`, plan 
 scaling: its rows, its matrix and its divisor's bits), and `replay` refuses one drawn through another (a header
 from before projections were recorded has none and is taken). `export` (the binary's `--export FILE --out DIR`)
 writes that replay through FrankenManim's frame and encoding paths: a PNG a frame, a y4m video on a constant
-clock with its repeats and drops declared, and a manifest of the provenance (G10), the projection among it. A
+clock with its repeats and drops declared, and a manifest of the provenance (G10), the projection among it. Asked
+(`ExportOptions::mp4`, `--export-mp4`), it also encodes that y4m as H.264 MP4 with the ffmpeg on the `PATH`
+(`flife_cli::encode_y4m`): the samples tagged with what they hold, not converted, and the manifest names the
+ffmpeg, its arguments and the MP4's SHA-256. A
 resumed Studio records too: its header names where the session started (`TimelineStart`: the run directory's
 absolute path, the checkpoint restored and the tick opened at), the Studio pins that checkpoint for the timeline,
 and `replay` restores it (`flife_cli::restore_checkpoint`) instead of founding, then steps it to the tick opened
@@ -988,9 +991,9 @@ presentation state, not scientific state.
   organism names it, the shown and read ticks, its genome, topology and parameter count, and every weight and
   bias at its place in its layer, bit for bit, and a gone organism's is exactly its identity and ticks with null
   `tick` and `controller`; the parser takes `--timeline FILE` (offscreen too) and
-  `--export FILE --out DIR` with or without `--export-fps`, and refuses `--export` without `--out`, `--out` or
-  `--export-fps` alone, `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never
-  opens a Studio; it takes `--offscreen 2.5` (2 pixels a point by default),
+  `--export FILE --out DIR` with or without `--export-fps` or `--export-mp4` (no MP4 unless asked), and refuses
+  `--export` without `--out`, `--out`, `--export-fps` or `--export-mp4` alone, `--export-mp4` with `--offscreen`,
+  `--export-fps 0`, and `--export` with `--timeline` or `--offscreen`, so an export never opens a Studio; it takes `--offscreen 2.5` (2 pixels a point by default),
   `--scale 3` and `--offscreen-zooms` with it, and refuses `--offscreen` of 0, -1, NaN, inf or a word,
   `--scale 0`, and `--scale` or `--offscreen-zooms` alone, so no refused run can open a window; `next_slot`
   keeps 300 frames of 15 ms work on their 30 Hz slots, exactly, though every wait overshoots by 6 ms, and after
@@ -1060,13 +1063,26 @@ presentation state, not scientific state.
     `rgba_to_nv12` (limited, left), it decodes at 192 x 120 with as many frames as slots, and its SHA-256 is the
     manifest's. The manifest names the timeline's SHA-256, the configuration's hash, the closing digest and
     tick, and the fixed projection, and parses back from disk. A second export into the directory is refused (`StorageFailed`) with the
-    manifest unchanged. The same timeline with a 191 x 120 drawable exports its frames at that size and no
-    video, with the reason (`not even, as 4:2:0 needs`), and leaves no partial video.
+    manifest unchanged. That export writes no MP4. The same timeline exported again with `mp4` into a new
+    directory (this Mac's ffmpeg 8.1.2, which lists libx264) writes the same y4m, byte for byte, and
+    `capture.mp4`. The manifest names it, the y4m it encodes, the ffmpeg's version line and `Y4M_TO_H264`, and
+    its SHA-256 is the file's. ffprobe reads H.264 `yuv420p` at 192 x 120 and 30/1, one frame a slot, tagged
+    `tv` range, `bt709` matrix and primaries, `iec61966-2-1` transfer and `left` chroma. Decoded by ffmpeg, each
+    slot's I420 planes are the y4m's frame for it within compression: luma at least 39 dB with its mean within
+    0.75 of a level, chroma at least 35 dB (in one run, worst 41.6 dB, 0.30, 42.8 dB). Tagging the encoder
+    instead of the frames, ffmpeg 8.1 converted the samples from BT.601 to BT.709, 36.3 dB with a mean 1.58 off.
+    Without a runnable ffmpeg listing libx264, the test expects that export refused (`MissingCapability`) with
+    nothing written. The same timeline with a 191 x 120 drawable exports its frames at that size and no
+    video, with the reason (`not even, as 4:2:0 needs`), and leaves no partial video. Asked for an MP4, it is
+    refused (`StateConflict`, `withholds`) before anything is written.
 - `tests/timeline_binary.rs` (1 test, FL-023, Metal compute, no window): `flife-studio --offscreen 1.5 --scale 1
   --width 96 --height 60 --timeline T`. T opens with its header, has a draw for each frame the `end` record
   rendered, and closes on the `end`'s tick and digest. `flife-studio --export T --out D` prints one `export`
   record on that digest and tick, with the frame count, T's SHA-256 and the configuration's 30 fps. D's manifest
-  hashes every frame and the video as they are on disk. A second recording onto T exits 2 before a Studio opens,
+  hashes every frame and the video as they are on disk, and names no MP4, nor does the record. With
+  `--export-mp4` and an empty `PATH` the export exits 1 naming ffmpeg, and its directory is not made. With this
+  Mac's ffmpeg, the record names `capture.mp4` and its SHA-256 as on disk, on the same digest, and the manifest
+  names that MP4 beside the same y4m. A second recording onto T exits 2 before a Studio opens,
   saying it is never written over, and a second export into D exits 1, both files unchanged.
 - FL-023's planted bugs, 33 in all:
   - 13 in the recording and the replay: a camera move, the overlay, a selection or a restyle not noted; the
@@ -1222,6 +1238,16 @@ presentation state, not scientific state.
   at 1, its divisor rounded, its matrix one row thrice (`src/main.rs`); and in `flife render`'s `end` record the
   limit fixed at 1, the matrix one row thrice, the rows zero and the divisor rounded (`flife-cli`'s
   `tests/render.rs`): all 14 caught.
+- FL-023's H.264 export (`--export-mp4`), planted bugs, 13, run against `tests/timeline.rs` and
+  `tests/timeline_binary.rs`:
+  - in `flife-cli`'s `Y4M_TO_H264`: the tags on the encoder instead of the frames; a BT.601-to-BT.709
+    conversion with the tags kept; CRF 40; centre chroma siting; 4:4:4; a 25 fps stream; Cb and Cr swapped;
+  - in the export: an MP4 of a withheld video not refused; the encoder not checked before anything is written;
+    the manifest hashing the y4m for the MP4; the settings recorded not those used;
+  - in the binary: `--export-mp4` not passed on; the record naming no MP4.
+
+  All 13 caught. The conversion with its tags kept, CRF 40 and the swapped chroma were caught by the decoded
+  frames' comparison. The encoder tags, the siting, 4:4:4 and the rate were caught by ffprobe's reading.
 - Planted bugs in this crate were each caught (listed in the FL-018 commit).
 
 **Validity domain.** macOS on Apple silicon with a window server, one window and one session per process, the
@@ -1444,8 +1470,13 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     --run-dir` draws a run, branch or transplant on from where `flife resume` would continue it (checkpoint
     replay). Neither carries a Studio timeline's camera, overlay or selection. Cinema export at 1080p and 4K
     (FL-050) is not implemented.
-  - The video is y4m, FrankenManim's raw 4:2:0 path. It is not encoded (H.264, MP4): FrankenManim's negotiated
-    ffmpeg boundary (`fmn-output`) is not wired here.
+  - The video is y4m, FrankenManim's raw 4:2:0 path; `--export-mp4` also encodes it as H.264 MP4. That runs
+    the ffmpeg first on the `PATH`, as `flife render --video` does, not FrankenManim's negotiated ffmpeg boundary
+    (`fmn-output`, which hashes and runs a private copy of the executable). The manifest names that ffmpeg's
+    version line, not its executable's hash, and nothing pins its version. The MP4 is lossy (CRF 18). Only
+    ffmpeg 8.1.2 has run it. Its bytes are not compared across encoders or runs, only its decoded frames
+    against the y4m's. A failed encode leaves the frames and y4m without a manifest, as an unfinished export.
+    The test reads the stream's tags with ffprobe and decodes it with ffmpeg, the tool that wrote it.
   - A timeline holds no audio cues, and no captions beyond the overlay's text.
   - Recording in a window is unrun here: no test opened one. A frame drawn in a window replays as it was
     rendered, before the window composited it. A frame the window did not draw (occluded) has no record, and

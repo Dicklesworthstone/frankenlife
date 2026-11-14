@@ -15,6 +15,8 @@
 //!   world and its container, and keeps its `held_bytes`; a whole
 //!   transplant holds no more heap than its admitted terms, with the
 //!   host's genomes at their actual bytes.
+//! - A branch streams its founding checkpoint: it holds no more heap than
+//!   restoring the parent's checkpoint does, and one stream's fixed bytes.
 
 #![allow(
     clippy::expect_used,
@@ -31,10 +33,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use flife_cli::memory::admit;
 use flife_cli::{
-    CheckpointMode, ControllerChoice, Disk, MemoryAdmission, PackageSource, Persistence,
-    RESERVE_BYTES, Record, RenderOptions, RenderRecord, RunOptions, StoreDurability, Style,
-    TransplantOptions, configure, encoding_bytes, found, read_package, render, run_with,
-    transplant, write_package,
+    BranchOptions, CHECKPOINT_FIXED_BYTES, CheckpointMode, ControllerChoice, Disk, MemoryAdmission,
+    PackageSource, Persistence, RESERVE_BYTES, Record, RenderOptions, RenderRecord, RunOptions,
+    StoreDurability, Style, TransplantOptions, branch, configure, encoding_bytes, found,
+    read_package, render, restore_checkpoint, run_with, transplant, write_package,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Intervention, NumericalProfile, Stepped};
@@ -461,6 +463,97 @@ fn a_transplant_holds_no_more_heap_than_its_terms() {
     assert!(
         peak <= bound,
         "heap peak {peak} above the admitted terms {bound}"
+    );
+}
+
+/// The preset's run directory, 8 ticks on, checkpointed at ticks 0 and 8,
+/// once: the directory and the tick-8 checkpoint's sequence number.
+fn preset_run() -> (PathBuf, u64) {
+    static RUN: std::sync::OnceLock<(PathBuf, u64)> = std::sync::OnceLock::new();
+    RUN.get_or_init(|| {
+        let config = preset();
+        let run_dir = fresh("preset-run");
+        let mut persistence = Persistence::new(&run_dir, &config);
+        persistence.checkpoint_every = 8;
+        persistence.durability = StoreDurability::ProcessCrash;
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&held);
+        run_with(
+            &config,
+            options(8, ControllerChoice::Cpu),
+            &[],
+            Some(&persistence),
+            move |record: &Record| {
+                sink.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(serde_json::to_value(record).expect("a record serializes"));
+            },
+        )
+        .expect("the run ends");
+        let records = held.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let last = records
+            .iter()
+            .rev()
+            .find(|record| record["record"] == "checkpoint")
+            .expect("a checkpoint record");
+        assert_eq!(number(&last["tick"]), 8);
+        (run_dir, number(&last["sequence"]))
+    })
+    .clone()
+}
+
+/// A branch (FL-039) streams its founding checkpoint (FL-043): from opening
+/// the parent to its record, it holds no more heap than restoring the
+/// parent's checkpoint does (the restored world and the container it was
+/// restored from) and one stream's fixed bytes. Encoded whole, the founding
+/// checkpoint held a second container beside the world, and its encoder's
+/// genome chunk buffer grown by doubling: 696.7 MiB against a restore of
+/// 438.6 MiB. The parent's chunks are still linked, not copied.
+#[test]
+fn a_branch_holds_no_more_heap_than_its_restore() {
+    let _serial = serial();
+    let config = preset();
+    let (run_dir, sequence) = preset_run();
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let world = restore_checkpoint(&run_dir, &config, sequence).expect("restores");
+    let restoring = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let held = world.held_bytes();
+    drop(world);
+
+    let out = fresh("branched");
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let record = branch(
+        &run_dir,
+        &out,
+        &BranchOptions {
+            at: Some(8),
+            name: None,
+            commands: Vec::new(),
+            durability: StoreDurability::ProcessCrash,
+        },
+    )
+    .expect("branches");
+    let branching = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let Record::Branch { chunks, bytes, .. } = record else {
+        panic!("a branch record");
+    };
+    println!(
+        "a restore held {:.2} MiB at its peak (the world {:.2}, its container {:.2}); a branch \
+         {:.2} MiB, {} chunks linked and {} written",
+        mib(restoring),
+        mib(held),
+        mib(bytes),
+        mib(branching),
+        chunks.linked,
+        chunks.written,
+    );
+    assert!(chunks.linked > 0, "the parent's chunks are linked");
+    assert!(
+        branching <= restoring + CHECKPOINT_FIXED_BYTES,
+        "a branch's heap peak {branching} above its restore's {restoring} and a stream's fixed \
+         bytes"
     );
 }
 

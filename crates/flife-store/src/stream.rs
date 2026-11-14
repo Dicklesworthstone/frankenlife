@@ -6,7 +6,10 @@
 //! encoded; when the chunk ends, a chunk the store already holds intact is
 //! shared and its temporary removed, and any other is flushed under the
 //! store's [`Durability`] and renamed to its digest's path, exactly as
-//! [`ChunkStore::publish`](super::ChunkStore::publish) stores it.
+//! [`ChunkStore::publish`](super::ChunkStore::publish) stores it. A stream
+//! [sharing](super::ChunkStore::stream_sharing) a donor's chunks first links
+//! the donor's intact copy in place of the pages written, as
+//! [`ChunkStore::publish_sharing`](super::ChunkStore::publish_sharing) does.
 //! [`ChunkStore::commit`](super::ChunkStore::commit) then checks the sealed
 //! prefix names exactly the chunks stored, in order, and publishes the
 //! manifest by the same link. Until that link nothing is published: a
@@ -51,6 +54,9 @@ pub struct Stream {
     /// more is written and [`ChunkStore::commit`](super::ChunkStore::commit)
     /// publishes nothing.
     pub(crate) failed: Option<CoreError>,
+    /// The store whose intact chunks are linked rather than kept as
+    /// written ([`ChunkStore::stream_sharing`](super::ChunkStore::stream_sharing)).
+    donor: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Stream {
@@ -88,7 +94,14 @@ impl Stream {
             },
             observe,
             failed: None,
+            donor: None,
         }
+    }
+
+    /// Link each chunk the store lacks (or holds damaged) from the store at
+    /// `donor` when it holds the chunk intact.
+    pub(crate) fn share_from(&mut self, donor: PathBuf) {
+        self.donor = Some(donor);
     }
 
     /// The sequence number this checkpoint takes when committed.
@@ -211,9 +224,28 @@ impl Stream {
                 ),
             });
         }
-        self.publication.bytes_written = self.publication.bytes_written.saturating_add(length);
-        self.step(Step::ChunkWritten { index })?;
+        // The donor's intact copy replaces the pages written, as
+        // `publish_sharing` links one rather than writing it.
+        let (temporary, file) = match self.linked(index, length, &digest)? {
+            Some(linked) => {
+                drop(file);
+                fs::remove_file(&temporary)
+                    .map_err(|error| storage("remove temporary file", &temporary, &error))?;
+                self.temporaries.retain(|candidate| candidate != &temporary);
+                self.publication.linked += 1;
+                self.step(Step::ChunkLinked { index })?;
+                linked
+            }
+            None => {
+                self.publication.bytes_written =
+                    self.publication.bytes_written.saturating_add(length);
+                self.step(Step::ChunkWritten { index })?;
+                (temporary, file)
+            }
+        };
         if flushes {
+            // Flushing a linked file covers a donor that published without
+            // flushing.
             file.sync_all()
                 .map_err(|error| storage("flush chunk", &temporary, &error))?;
             self.step(Step::ChunkFlushed { index })?;
@@ -233,6 +265,36 @@ impl Stream {
         }
         self.stored.push((family, length, digest));
         self.step(Step::ChunkStored { index })
+    }
+
+    /// The donor's copy of the chunk `digest` names, verified intact (hashed
+    /// a buffer at a time), hard-linked under a temporary name of its own
+    /// and opened; `None` without a donor, an intact copy, or a host that
+    /// links it.
+    fn linked(
+        &mut self,
+        index: usize,
+        length: u64,
+        digest: &Sha256Digest,
+    ) -> Result<Option<(PathBuf, File)>, CoreError> {
+        let Some(donor) = &self.donor else {
+            return Ok(None);
+        };
+        let source = chunk_path_in(donor, digest);
+        if !matches!(stored_as(&source, length, digest)?, Stored::Intact) {
+            return Ok(None);
+        }
+        let linked = self
+            .root
+            .join(TEMPORARY)
+            .join(format!("{:016x}-{index}.linked", self.sequence));
+        if fs::hard_link(&source, &linked).is_err() {
+            return Ok(None);
+        }
+        self.temporaries.push(linked.clone());
+        let file =
+            File::open(&linked).map_err(|error| storage("open linked chunk", &linked, &error))?;
+        Ok(Some((linked, file)))
     }
 }
 

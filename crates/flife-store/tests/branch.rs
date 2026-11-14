@@ -1,9 +1,11 @@
 //! FL-039 evidence in the store (plan §14.4, §16.6, §16.7, Appendix B.1):
 //! a checkpoint published from a donor store links the donor's verified
 //! chunk files instead of writing them, writes any it cannot share, leaves
-//! nothing behind when cancelled, and survives the donor's retention; and a
-//! branch's catalog records its lineage and origin and starts its journal
-//! with exactly the history it inherited.
+//! nothing behind when cancelled, and survives the donor's retention; a
+//! streamed one (FL-043) links them in place of the pages it wrote, with
+//! the same refusals and cancellations; and a branch's catalog records its
+//! lineage and origin and starts its journal with exactly the history it
+//! inherited.
 
 #![cfg(unix)]
 #![allow(
@@ -23,7 +25,8 @@ use flife_core::{CoreError, Sha256Digest, Tick, ValidatedConfig};
 use flife_engine::{Arrangement, Intervention, NumericalProfile, Stepped, World};
 use flife_runtime::{
     Accepted, Command, CommandBook, Durability as CommandDurability, Fork, Journal,
-    JournalContents, JournalRecord, Outcome, Target, Watermarks, checkpoint, restore,
+    JournalContents, JournalRecord, Outcome, Target, Watermarks, checkpoint, checkpoint_into,
+    restore,
 };
 use flife_store::{BranchOrigin, ChunkStore, CommandJournal, Durability, Flow, Step};
 
@@ -240,6 +243,212 @@ fn a_donors_verified_chunks_are_linked_not_written() {
         assert!(restored(&donor, 1).is_err(), "gone from the donor");
         assert_eq!(restored(&store, 1).expect("still whole"), a_world);
         assert_eq!(restored(&store, 2).expect("still whole"), b_world);
+    }
+}
+
+/// Stream the world and book `checkpoint` holds into `store`, sharing
+/// `donor`'s chunks, reporting each step to `observe`; the stream's commit.
+fn stream_sharing(
+    store: &mut ChunkStore,
+    donor: &ChunkStore,
+    checkpoint: &[u8],
+    observe: flife_store::Observer,
+) -> Result<flife_store::Publication, CoreError> {
+    let restored = restore(checkpoint, profile()).expect("restores");
+    let mut stream = store
+        .stream_sharing_observed(donor, observe)
+        .expect("opens a stream");
+    let sealed = checkpoint_into(&restored.world, &restored.book, &mut stream)?;
+    store.commit(stream, &sealed)
+}
+
+/// A streamed checkpoint (a branch's founding one, FL-043) shares a donor's
+/// verified chunks as a whole one does: each chunk the donor holds intact
+/// is the donor's file once the stream ends, counted linked and not
+/// written, and the checkpoint is the whole one byte for byte. A chunk the
+/// donor holds damaged is kept as written. No temporary file is left.
+#[test]
+fn a_streamed_checkpoint_links_a_donors_verified_chunks() {
+    let [(a, a_world), (b, b_world), (c, c_world)] =
+        <[_; 3]>::try_from(checkpoints(&[8, 16, 24])).unwrap_or_else(|_| panic!("three"));
+    for durability in BOTH {
+        let (donor_root, root) = (
+            fresh(&format!("stream-donor-{}", durability.name())),
+            fresh(&format!("stream-recipient-{}", durability.name())),
+        );
+        let mut donor = ChunkStore::open(&donor_root, durability).expect("opens");
+        for bytes in [&a, &b, &c] {
+            donor.publish(bytes).expect("publishes");
+        }
+        let mut store = ChunkStore::open(&root, durability).expect("opens");
+        let steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // What `tmp/` holds as each chunk is stored: one chunk is open at a
+        // time, so nothing of it may be left there, neither the pages
+        // written nor the link.
+        let leftovers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer = |steps: &std::sync::Arc<std::sync::Mutex<Vec<Step>>>| {
+            let steps = std::sync::Arc::clone(steps);
+            let leftovers = std::sync::Arc::clone(&leftovers);
+            let tmp = root.join("tmp");
+            Box::new(move |step| {
+                if matches!(step, Step::ChunkStored { .. }) {
+                    leftovers
+                        .lock()
+                        .expect("unpoisoned")
+                        .push(fs::read_dir(&tmp).map_or(usize::MAX, Iterator::count));
+                }
+                steps.lock().expect("unpoisoned").push(step);
+                Flow::Continue
+            }) as flife_store::Observer
+        };
+
+        let first = stream_sharing(&mut store, &donor, &a, observer(&steps)).expect("streams");
+        let count = digests(&a).len();
+        assert_eq!(
+            (first.written, first.linked, first.shared, first.repaired),
+            (count, count, 0, 0)
+        );
+        assert_eq!(first.bytes_written, 0, "no chunk kept as written");
+        let (theirs, ours) = (files(&donor_root), files(&root));
+        for digest in digests(&a) {
+            assert_eq!(ours[&digest.to_hex()], theirs[&digest.to_hex()], "{digest}");
+        }
+        assert_eq!(store.load(1).expect("loads"), a, "byte for byte");
+        assert_eq!(restored(&store, 1).expect("restores"), a_world);
+        {
+            let steps = steps.lock().expect("unpoisoned");
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|step| matches!(step, Step::ChunkLinked { .. }))
+                    .count(),
+                count
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|step| matches!(step, Step::ChunkWritten { .. }))
+            );
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|step| matches!(step, Step::ChunkFlushed { .. }))
+                    .count(),
+                if durability == Durability::PowerLoss {
+                    count
+                } else {
+                    0
+                },
+                "a linked chunk is flushed as a written one is"
+            );
+        }
+
+        // `b`: chunks already held are shared, the rest linked.
+        let second = stream_sharing(&mut store, &donor, &b, observer(&steps)).expect("streams");
+        assert_eq!(second.written, second.linked);
+        assert!(second.linked > 0 && second.shared > 0, "{second:?}");
+        assert_eq!(store.load(2).expect("loads"), b, "byte for byte");
+        assert_eq!(restored(&store, 2).expect("restores"), b_world);
+
+        // A chunk the donor holds damaged is kept as written.
+        let damaged = digests(&c)
+            .into_iter()
+            .find(|digest| !files(&root).contains_key(&digest.to_hex()))
+            .expect("a chunk only c has");
+        let path = donor.chunk_path(&damaged);
+        let mut bytes = fs::read(&path).expect("reads");
+        bytes[0] ^= 1;
+        fs::write(&path, bytes).expect("damages the donor's chunk");
+        let third = stream_sharing(&mut store, &donor, &c, observer(&steps)).expect("streams");
+        assert_eq!(third.written, third.linked + 1);
+        assert!(third.bytes_written > 0);
+        assert_ne!(
+            files(&root)[&damaged.to_hex()],
+            files(&donor_root)[&damaged.to_hex()],
+            "its own file"
+        );
+        assert_eq!(store.load(3).expect("loads"), c, "byte for byte");
+        assert_eq!(restored(&store, 3).expect("restores"), c_world);
+        assert_eq!(
+            fs::read_dir(root.join("tmp")).expect("tmp").count(),
+            0,
+            "no temporaries left"
+        );
+        let leftovers = leftovers.lock().expect("unpoisoned");
+        assert!(
+            leftovers.len() > count && leftovers.iter().all(|left| *left == 0),
+            "tmp/ holds nothing of a chunk once it is stored: {leftovers:?}"
+        );
+    }
+}
+
+/// A cancellation at any step of a sharing stream before the manifest is
+/// linked leaves the recipient as it was, with no temporary file, and the
+/// donor untouched.
+#[test]
+fn cancelling_a_sharing_stream_at_any_step_leaves_both_stores_as_they_were() {
+    let [(a, a_world), (b, b_world)] =
+        <[_; 2]>::try_from(checkpoints(&[8, 16])).unwrap_or_else(|_| panic!("two"));
+    for durability in BOTH {
+        let donor_root = fresh(&format!("stream-cancel-donor-{}", durability.name()));
+        let mut donor = ChunkStore::open(&donor_root, durability).expect("opens");
+        donor.publish(&b).expect("publishes");
+        let donor_files = files(&donor_root);
+        let mut cancelled = 0;
+        let mut linked = 0;
+        for stop in 0.. {
+            let root = fresh(&format!("stream-cancel-recipient-{}", durability.name()));
+            let mut store = ChunkStore::open(&root, durability).expect("opens");
+            store.publish(&a).expect("publishes");
+            let before = files(&root);
+            let last = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let seen = std::sync::Arc::clone(&last);
+            let mut count = 0;
+            let outcome = stream_sharing(
+                &mut store,
+                &donor,
+                &b,
+                Box::new(move |step| {
+                    let here = count == stop;
+                    count += 1;
+                    if here {
+                        *seen.lock().expect("unpoisoned") = Some(step);
+                        Flow::Cancel
+                    } else {
+                        Flow::Continue
+                    }
+                }),
+            );
+            let Some(step) = last.lock().expect("unpoisoned").take() else {
+                outcome.expect("publishes");
+                break;
+            };
+            if matches!(step, Step::Published | Step::DirectoryFlushed) {
+                outcome.expect("too late to cancel");
+                assert_eq!(restored(&store, 2).expect("published"), b_world);
+                continue;
+            }
+            assert!(
+                matches!(outcome, Err(CoreError::Cancelled { .. })),
+                "{step:?}: {outcome:?}"
+            );
+            cancelled += 1;
+            if matches!(step, Step::ChunkLinked { .. }) {
+                linked += 1;
+            }
+            assert_eq!(
+                fs::read_dir(root.join("tmp")).expect("tmp").count(),
+                0,
+                "{step:?}: no temporaries left"
+            );
+            assert_eq!(store.sequences().expect("lists"), [1]);
+            assert_eq!(restored(&store, 1).expect("restores"), a_world);
+            assert!(before.keys().all(|name| files(&root).contains_key(name)));
+        }
+        assert!(cancelled >= 3, "{cancelled}");
+        assert!(linked >= 1, "a cancellation once a chunk was linked");
+        assert_eq!(files(&donor_root), donor_files, "the donor is untouched");
+        assert_eq!(restored(&donor, 1).expect("restores"), b_world);
     }
 }
 

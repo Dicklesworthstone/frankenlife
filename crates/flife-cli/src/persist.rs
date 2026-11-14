@@ -64,8 +64,8 @@ use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, World};
 use flife_runtime::{
     Boundary, Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored,
-    SessionCheckpoint, SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into,
-    open_journaled, open_restored, restore,
+    SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into, open_journaled,
+    open_restored, restore,
 };
 use flife_store::{ChunkStore, CommandJournal, IndexedCheckpoint, Publication, Stream};
 
@@ -1117,56 +1117,14 @@ impl Checkpoints {
         }
     }
 
-    /// Publish `taken`, a checkpoint encoded in memory (a branch's first),
-    /// to the chunk store, linking the chunks `donor` holds intact rather
-    /// than writing them; index it in the catalog, then keep the newest
-    /// `retain_recent_checkpoints` the store verifies. Returns the record
-    /// and how many chunks were linked.
-    pub(crate) fn publish_from(
-        &mut self,
-        taken: &SessionCheckpoint,
-        donor: Option<&ChunkStore>,
-    ) -> Result<(Record, usize), CoreError> {
-        if self.in_flight.is_some() {
-            return Err(CoreError::StateConflict {
-                operation: "publish checkpoint",
-                detail: "a background checkpoint is in flight".into(),
-            });
-        }
-        let started = Instant::now();
-        let store = self.store()?;
-        let publication = match donor {
-            Some(donor) => store.publish_sharing(&taken.bytes, donor)?,
-            None => store.publish(&taken.bytes)?,
-        };
-        let linked = publication.linked;
-        let committed = Committed {
-            boundary: taken.boundary,
-            publication,
-            digest: Sha256Digest::of(&taken.bytes),
-            bytes: u64::try_from(taken.bytes.len()).unwrap_or(u64::MAX),
-        };
-        let filing = self.filing.clone();
-        let filed = filing.file(self.store()?, committed)?;
-        let record = self.record(
-            &filed,
-            &Taken {
-                boundary: taken.boundary,
-                mode: CheckpointMode::PauseAndStream,
-                retained_peak: 0,
-                paused_seconds: started.elapsed().as_secs_f64(),
-            },
-        );
-        Ok((record, linked))
-    }
-
     /// Stream committed `world` and its `book` into the store at the
-    /// world's boundary (a transplant's founding checkpoint), as
-    /// [`Checkpoints::take`]'s `pause-and-stream` does: a page at a time,
-    /// within [`crate::checkpointing::CHECKPOINT_FIXED_BYTES`], never the
-    /// whole container that [`Checkpoints::publish_from`] is given. It is
-    /// then committed, verified, indexed in the catalog and retained.
-    /// Returns its record.
+    /// world's boundary (a branch's or a transplant's founding checkpoint),
+    /// as [`Checkpoints::take`]'s `pause-and-stream` does: a page at a
+    /// time, within [`crate::checkpointing::CHECKPOINT_FIXED_BYTES`], never
+    /// the whole container. Each chunk `donor` holds intact is linked from
+    /// it rather than kept as written ([`ChunkStore::stream_sharing`]). It
+    /// is then committed, verified, indexed in the catalog and retained.
+    /// Returns its record and how many chunks were linked.
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] while a background checkpoint is in
@@ -1175,7 +1133,8 @@ impl Checkpoints {
         &mut self,
         world: &World,
         book: &CommandBook,
-    ) -> Result<Record, CoreError> {
+        donor: Option<&ChunkStore>,
+    ) -> Result<(Record, usize), CoreError> {
         if self.in_flight.is_some() {
             return Err(CoreError::StateConflict {
                 operation: "stream checkpoint",
@@ -1189,9 +1148,13 @@ impl Checkpoints {
         };
         let filing = self.filing.clone();
         let store = self.store()?;
-        let mut stream = store.stream()?;
+        let mut stream = match donor {
+            Some(donor) => store.stream_sharing(donor)?,
+            None => store.stream()?,
+        };
         let sealed = checkpoint_into(world, book, &mut stream)?;
         let publication = store.commit(stream, &sealed)?;
+        let linked = publication.linked;
         let digest = store.verify(publication.sequence)?;
         let committed = Committed {
             boundary,
@@ -1200,7 +1163,7 @@ impl Checkpoints {
             bytes: container_bytes(&sealed)?,
         };
         let filed = filing.file(store, committed)?;
-        Ok(self.record(
+        let record = self.record(
             &filed,
             &Taken {
                 boundary,
@@ -1208,7 +1171,8 @@ impl Checkpoints {
                 retained_peak: 0,
                 paused_seconds: started.elapsed().as_secs_f64(),
             },
-        ))
+        );
+        Ok((record, linked))
     }
 }
 

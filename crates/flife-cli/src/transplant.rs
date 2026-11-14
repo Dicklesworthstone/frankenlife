@@ -299,7 +299,7 @@ pub fn transplant(
             .map(|_| ())
     })?;
     let mut checkpoints = Checkpoints::open(&persistence, host, session)?;
-    let published = checkpoints.stream_from(&world, &book)?;
+    let (published, _) = checkpoints.stream_from(&world, &book, None)?;
     let Record::Checkpoint {
         sequence,
         sha256,

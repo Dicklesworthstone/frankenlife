@@ -41,6 +41,7 @@ experiment knows what already ran and a report can list every run.
   `flife_core::checkpoint::ChunkSink`) and `Observer`.
 - FL-039:
   - `ChunkStore::publish_sharing` and `publish_sharing_observed`, taking a donor `ChunkStore`;
+  - FL-043: `ChunkStore::stream_sharing` and `stream_sharing_observed`, a `Stream` sharing a donor's chunks;
   - `Step::ChunkLinked`, and `Publication::linked`, a part of `written`;
   - `CommandJournal::open_branch`, `lineage` and `branch_origin`, and `BranchOrigin`.
 - FL-042: `ChunkStore::pin`, `unpin`, `pins`, `pin_path`, `set_preserve_pinned` and `preserve_pinned`, and
@@ -79,6 +80,13 @@ experiment knows what already ran and a report can list every run.
   chunk counts as written, and also as linked, with no bytes written. Under `power-loss` it is flushed like a
   written one, and so is its directory. The donor is only read. It is never written, and its retention removes only
   its own names, so a chunk both stores hold stays whole in the other.
+- FL-043, `stream_sharing(donor)`: a `Stream` that shares the donor's chunks the way `publish_sharing` does (a
+  branch's founding checkpoint, never held whole). A chunk's digest is known only when it ends, so its pages are
+  first written to `tmp/`. Then, for a chunk the store does not hold intact, the donor's verified copy is
+  hard-linked under a temporary name of its own, the written file is removed and the link is stored in its place.
+  The steps and counts are `publish_sharing`'s: `ChunkLinked` rather than `ChunkWritten`, counted linked and
+  written, with no bytes written. So the cost of streaming is the chunk's bytes written once to `tmp/` and
+  removed.
 
 **Invariants — streamed publication (FL-038; §16.4, §16.5).**
 - A `Stream` writes each chunk's pages to `tmp/` as they are encoded. When the chunk ends it is stored exactly as
@@ -280,7 +288,7 @@ manifests.
   until the harness's timeout. A first pass over 31 left 12 surviving and one hanging. Each got a test or an
   assertion; the hang exposed a replay that looped forever on a journaled cancellation of a command that had
   already ended, which now refuses.
-- `tests/branch.rs` (FL-039, 3 tests), over three checkpoints of FL-013's ecology:
+- `tests/branch.rs` (FL-039, 5 tests), over three checkpoints of FL-013's ecology:
   - `a_donors_verified_chunks_are_linked_not_written`, under both durabilities:
     - every chunk of the first checkpoint is linked: the donor's inode under the same name, with no bytes written;
     - the second checkpoint's chunks are shared or linked, with `ChunkLinked` and no `ChunkWritten` steps, and as
@@ -291,6 +299,22 @@ manifests.
   - `cancelling_a_sharing_publication_at_any_step_leaves_both_stores_as_they_were`, under both durabilities. A
     cancellation at every step before the link refuses as `cancelled` and leaves no temporaries and the recipient's
     checkpoints as they were. From the link on, it publishes. The donor's files are unchanged.
+  - FL-043, `a_streamed_checkpoint_links_a_donors_verified_chunks`, under both durabilities: each checkpoint is
+    restored and streamed with `stream_sharing`. The first's chunks are all the donor's inodes, counted linked,
+    with `ChunkLinked` steps, no `ChunkWritten`, no bytes written and, under `power-loss`, a flush per link. The
+    second shares and links. A chunk the donor holds damaged is kept as written, as the recipient's own file. Each
+    loads byte for byte as the whole container and restores to its world. `tmp/` is empty at every `ChunkStored`
+    step, so a linked chunk's written pages are removed as it is stored, not left until the commit.
+  - FL-043, `cancelling_a_sharing_stream_at_any_step_leaves_both_stores_as_they_were`, under both durabilities: as
+    for the whole publication, including a cancellation once a chunk is linked, with no temporary left (the pages
+    written or the link).
+  - 8 planted bugs in the sharing stream and the branch that uses it, run with these tests, `flife-cli`'s
+    `tests/branch.rs` and its branch heap test; all caught. The link made without verifying the donor's copy, the
+    linked temporary left untracked, a link counted as bytes written or reported as written, and the stream
+    forgetting its donor: these tests. The branch streaming without its donor: `flife-cli`'s branch tests and
+    heap test. The founding checkpoint also encoded whole and held: the heap test. The written pages left in
+    `tmp/` after the link survived the first run, because the commit removes every temporary; the per-chunk
+    `tmp/` check catches it.
   - `a_branch_catalog_records_its_lineage_and_starts_with_its_inherited_history`:
     - a branch catalog opens with the inherited watermarks and takes its own acceptance and an inherited command's
       outcome;

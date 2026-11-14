@@ -18,8 +18,10 @@
 //!   branch's book. Its world chunks (configuration, field, genomes,
 //!   particles and the rest) are byte-identical to the parent's, so the
 //!   branch's store links the parent's verified chunk files instead of
-//!   copying them (FL-035's [`ChunkStore::publish_sharing`]). Only the
-//!   command closure is written.
+//!   keeping copies (FL-035's sharing). Only the command closure is kept
+//!   as written. It is streamed a page at a time
+//!   ([`ChunkStore::stream_sharing`]), never held whole: each chunk's pages
+//!   go to a temporary file, which the parent's link then replaces.
 //! - The branch's catalog records its lineage, its name, the parent run,
 //!   the parent checkpoint's sequence and the creation time. For a
 //!   `write-ahead-before-apply` run its journal starts with the history it
@@ -37,9 +39,7 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, Tick};
 use flife_engine::NumericalProfile;
-use flife_runtime::{
-    Admission, Boundary, Durability, JournalContents, SessionCheckpoint, SessionConfig, checkpoint,
-};
+use flife_runtime::{Admission, Durability, JournalContents, SessionConfig};
 use flife_store::{BranchOrigin, ChunkStore, CommandJournal};
 use serde::Serialize;
 
@@ -211,7 +211,6 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
         }
         commands.push(command.id.get());
     }
-    let bytes = checkpoint(&world, &book)?;
 
     create(run_dir, &config)?;
     let history = match limits.durability {
@@ -237,14 +236,7 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
         ..Persistence::new(run_dir, &config)
     };
     let mut checkpoints = Checkpoints::open(&persistence, &config, session)?;
-    let taken = SessionCheckpoint {
-        boundary: Boundary {
-            tick,
-            epoch: world.epoch(),
-        },
-        bytes,
-    };
-    let (published, linked) = checkpoints.publish_from(&taken, Some(&donor))?;
+    let (published, linked) = checkpoints.stream_from(&world, &book, Some(&donor))?;
     let Record::Checkpoint {
         sequence: founding,
         sha256,

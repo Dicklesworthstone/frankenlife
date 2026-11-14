@@ -662,6 +662,36 @@ impl ChunkStore {
         self.stream_observed(Box::new(|_| Flow::Continue))
     }
 
+    /// [`ChunkStore::stream`], linking each chunk this store lacks (or holds
+    /// damaged) from `donor` when the donor holds it intact and the host
+    /// can link it, as [`ChunkStore::publish_sharing`] does: a branch's
+    /// founding checkpoint shares its parent's chunks without being held
+    /// whole. A chunk's digest is known only at its end, so its pages are
+    /// still written to a temporary file as they are encoded; the link then
+    /// replaces it, and the publication counts the chunk linked, not its
+    /// bytes written.
+    ///
+    /// # Errors
+    /// As [`ChunkStore::stream`].
+    pub fn stream_sharing(&mut self, donor: &Self) -> Result<Stream, CoreError> {
+        self.stream_sharing_observed(donor, Box::new(|_| Flow::Continue))
+    }
+
+    /// [`ChunkStore::stream_sharing`], reporting each [`Step`] to `observe`
+    /// as [`ChunkStore::stream_observed`] does.
+    ///
+    /// # Errors
+    /// As [`ChunkStore::stream`].
+    pub fn stream_sharing_observed(
+        &mut self,
+        donor: &Self,
+        observe: Observer,
+    ) -> Result<Stream, CoreError> {
+        let mut stream = self.stream_observed(observe)?;
+        stream.share_from(donor.root.clone());
+        Ok(stream)
+    }
+
     /// [`ChunkStore::stream`], reporting each [`Step`] to `observe`, which
     /// may cancel the publication until the manifest is published, as
     /// [`ChunkStore::publish_observed`] does.

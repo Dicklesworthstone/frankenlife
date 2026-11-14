@@ -493,8 +493,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
     A session already in the lineage is refused.
   - The founding checkpoint is the parent checkpoint's world with the branch's command book: every inherited command
     and outcome, the lineage, and the branch's own commands. Its ten world chunks are byte-identical to the
-    parent's. The branch's store links the parent's verified chunk files instead of writing them (FL-035's
-    `publish_sharing`), and writes only the command closure. A parent chunk that does not verify is written.
+    parent's. It is streamed a page at a time (FL-043, `ChunkStore::stream_sharing`), never held whole, so a
+    branch holds no more heap than its restore of the parent's checkpoint. The branch's store links the parent's
+    verified chunk files in place of the pages written (FL-035's sharing), and keeps only the command closure as
+    written. A parent chunk that does not verify is kept as written. Each chunk's pages are written once to the
+    branch store's `tmp/` before its link replaces them.
   - Command histories are independent. A branch admits only its own session's commands. Its
     `write-ahead-before-apply` journal starts with the history it inherited and then holds its own commands. The
     parent's journal never holds a branch's command, and a branch's never holds a later command of its parent.
@@ -1132,8 +1135,8 @@ The transplant's memory admission: 9 planted bugs, run with `tests/transplant.rs
 - `held_bytes` without the genomes, and the package read into a buffer grown by doubling: the package's heap test;
 - `graft_bytes` without the host's genomes: both.
 
-One survives: the founding checkpoint encoded whole (`flife_runtime::checkpoint` and `publish_from`) instead of
-streamed. It is encoded after the graft has released its parts, so its peak stays within the slack the whole
+One survives: the founding checkpoint encoded whole (`flife_runtime::checkpoint` and `publish_from`, which a
+branch no longer uses and is gone) instead of streamed. It is encoded after the graft has released its parts, so its peak stays within the slack the whole
 transplant's bound keeps (the births term, the container and the reserve, none of them live then). A host whose
 genomes outweigh the package's world and that slack, the preset at its 16,384 ceiling (about 2 GiB in one test),
 would show it; none is run.
@@ -1260,8 +1263,14 @@ the genome's identity off by one. A genome named by the organism's own identity 
 founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
 every run.
 
-`tests/memory_admission.rs` (15 tests, FL-043, about 33 s in a workspace run; a counting global allocator,
+`tests/memory_admission.rs` (16 tests, FL-043, about 33 s in a workspace run; a counting global allocator,
 `peak_alloc`, test only):
+- `a_branch_holds_no_more_heap_than_its_restore` (FL-039): the preset run to tick 8, checkpointed at 0 and 8, is
+  branched at 8. Restoring that checkpoint peaks at 438.58 MiB (the world's 274.05 and its 161.30 MiB
+  container). The branch, from opening the parent to its record, peaks at the same 438.58: at most the restore's
+  peak and `CHECKPOINT_FIXED_BYTES`. 10 chunks are linked and 1 (the command closure) written. Before the founding
+  checkpoint was streamed, the branch peaked at 696.7 MiB: a second container, beside the encoder's genome chunk
+  buffer grown by doubling.
 - `a_package_is_read_within_its_term_and_keeps_its_held_bytes` (FL-042): the preset 8 ticks on, cropped to radius
   24 about its centre (469 organisms) and written as a package, is read back. The reading's peak, 156.06 MiB, is
   within its term (155.69: the world's 135.39 and the container's 20.30) and `RESTORE_ALLOWANCE` (1 MiB, for the

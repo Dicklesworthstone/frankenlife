@@ -256,6 +256,11 @@ inherits every command and outcome, records the fork, and from then on admits on
   the book does not hold is replayed: the world advances through the same boundaries with the same commands, each
   journaled cancellation is applied at its boundary, and every outcome must be reproduced exactly. The session
   then starts at the boundary the replay reached, with every later acceptance pending and nothing journaled twice.
+- `replay_journal(world, book, journal)` is that merge and replay without a session: it brings a restored world
+  and its book to the boundary `open_journaled` would start at, and writes nothing. `open_journaled` calls it.
+  `flife render --run-dir` uses it to read a write-ahead run as its owner would continue it. It refuses
+  (`StateConflict`) a book and world of different configurations, as well as the merge's and replay's own
+  refusals.
 - Closing journals the session-closed cancellations (suspending journals none), answers everything queued, waits
   for every receipt and then stops the writer, so `SessionClosed.journal` reports the final durable watermarks.
 

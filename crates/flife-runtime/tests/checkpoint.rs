@@ -17,8 +17,8 @@ use flife_core::ids::CommandId;
 use flife_core::{CoreError, ResidualBudget, Sha256Digest, Tick, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, TickReport, World};
 use flife_runtime::{
-    Admission, CommandBook, CommandStatus, Outcome, Rejection, Restored, SESSION_CHECKPOINT_CHUNKS,
-    checkpoint, restore,
+    Admission, CommandBook, CommandStatus, JournalContents, Outcome, Rejection, Restored,
+    SESSION_CHECKPOINT_CHUNKS, checkpoint, replay_journal, restore,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -87,6 +87,39 @@ fn round_trip(world: &World, book: &CommandBook) -> (Vec<u8>, Restored) {
 
 fn book_for(config: &ValidatedConfig) -> CommandBook {
     CommandBook::new(SESSION, config.config_hash(), 16)
+}
+
+/// `replay_journal`, the replay a journaled session opens with, run on its
+/// own (as `flife render --run-dir` runs it): a book of another
+/// configuration than the world's is refused, and an empty journal leaves a
+/// founding world where it is.
+#[test]
+fn a_journal_replays_only_onto_a_book_of_the_worlds_configuration() {
+    let config = ecology(&[]);
+    let other = ecology(&[("population", "initial_energy", "3.5")]);
+    let mut world = found(&config);
+    let refused = replay_journal(
+        &mut world,
+        &mut book_for(&other),
+        &JournalContents::default(),
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(CoreError::StateConflict {
+                operation: "replay command journal",
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    replay_journal(
+        &mut world,
+        &mut book_for(&config),
+        &JournalContents::default(),
+    )
+    .expect("nothing to replay");
+    assert_eq!(world.tick(), Tick::new(0));
 }
 
 /// C.13 at the ecology's scale: with a four-tick controller cadence, a

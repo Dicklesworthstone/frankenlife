@@ -3,6 +3,12 @@
 //! view the Studio shows, on FrankenManim's CPU reference 3D route, and
 //! written as a PNG. With `video`, the frames are then encoded by an
 //! external `ffmpeg` (plan §3.4: video uses an external encoder boundary).
+//!
+//! [`render`] founds a configuration's world. [`render_run`] renders a run
+//! directory instead (plan §13.8's checkpoint replay export): a run, a
+//! branch or a transplant continues from the state `flife resume` would
+//! continue it from, its commands applying at their ticks, and nothing is
+//! written to the directory.
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -11,15 +17,18 @@ use std::time::Instant;
 use flife_backend_metal::ControllerChoice;
 use flife_core::memory::total;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Stepped, World};
+use flife_engine::{Intervention, Stepped, World};
 use flife_manim::{Style, WorldView, hex_rgb};
 use flife_render::{AffinityProjection, Publisher};
+use flife_runtime::{CommandBook, Durability, Journal as _, replay_journal};
+use flife_store::CommandJournal;
 use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
 use crate::found;
 use crate::memory::MemoryAdmission;
-use crate::run::{ControllerSummary, install};
+use crate::persist::{CATALOG_FILE, Recovered, on_plain_thread, recover};
+use crate::run::{CheckpointAt, ControllerSummary, JournalMarks, SkippedCheckpoint, install};
 
 /// The schema of `flife render`'s NDJSON records.
 pub const RENDER_SCHEMA: &str = "frankenlife.render.v1";
@@ -82,6 +91,28 @@ impl RenderProjection {
     }
 }
 
+/// Where [`render_run`] starts: the state `flife resume` continues the run
+/// directory from, as its `resume` record reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RenderedRun {
+    /// The run directory.
+    pub run_dir: String,
+    /// The checkpoint restored, or none for a founded run's founding world.
+    pub checkpoint: Option<CheckpointAt>,
+    /// Newer checkpoints passed over, newest first.
+    pub skipped: Vec<SkippedCheckpoint>,
+    /// The command journal's watermarks, for a write-ahead run, whose
+    /// outcomes past the checkpoint are replayed before the first frame.
+    pub journal: Option<JournalMarks>,
+    /// The committed tick the first frame shows.
+    pub tick: u64,
+    /// The committed world's digest there.
+    pub digest: String,
+    /// Commands the run accepted that have not applied: each applies at its
+    /// tick if the render reaches it.
+    pub pending: usize,
+}
+
 /// One `flife render` record.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "record")]
@@ -95,6 +126,9 @@ pub enum RenderRecord {
         /// Frames encoded at once: [`ENCODERS`], or fewer when the budget
         /// is short.
         encoders: usize,
+        /// The run directory rendered ([`render_run`]); `None` for a
+        /// founded configuration.
+        run: Option<Box<RenderedRun>>,
     },
     /// A frame written.
     Frame {
@@ -159,7 +193,7 @@ pub enum RenderRecord {
 pub fn render(
     config: &ValidatedConfig,
     options: &RenderOptions,
-    mut emit: impl FnMut(&RenderRecord),
+    emit: impl FnMut(&RenderRecord),
 ) -> Result<(), CoreError> {
     let clock = Instant::now();
     // A video's encoder runs after every frame is drawn, so it is checked
@@ -167,13 +201,101 @@ pub fn render(
     if options.video.is_some() {
         video_encoder()?;
     }
-    let model = config.config();
-    let background =
-        hex_rgb(&model.presentation.background).ok_or_else(|| CoreError::NumericalInvalid {
-            quantity: "presentation background",
-            detail: format!("`{}` is not #rrggbb", model.presentation.background),
+    background(config)?;
+    let world = found(config)?;
+    draw(config, world, None, options, clock, emit)
+}
+
+/// Render the run in `run_dir` per `options`, passing each record to
+/// `emit`: plan §13.8's checkpoint replay export. The run is recovered as
+/// `flife resume` recovers it, from the newest checkpoint that restores to
+/// its configuration and session (a founded run's founding world if none
+/// does), and a `write-ahead-before-apply` run's journal is replayed past
+/// it; the start record reports where ([`RenderedRun`]). The first frame
+/// shows that committed tick and the render steps `options.ticks` past it,
+/// each command the run accepted applying at its tick, so it ends at the
+/// world `flife resume` reaches at the same tick. Nothing is written to
+/// the run directory: no checkpoint, journal record or catalog row, and its
+/// store is released before the first frame. (Opening its catalog, as every
+/// reader of a run does, lets FrankenSQLite rewrite the log files beside
+/// it; what the catalog holds does not change.)
+///
+/// # Errors
+/// [`video_encoder`]'s, before the run is read, when a video is asked for.
+/// [`recover`]'s: not a run directory, another process holding its store, a
+/// branch or transplant none of whose checkpoints restores. The journal's
+/// errors and [`replay_journal`]'s; then as [`render`].
+pub fn render_run(
+    run_dir: &Path,
+    options: &RenderOptions,
+    emit: impl FnMut(&RenderRecord),
+) -> Result<(), CoreError> {
+    let clock = Instant::now();
+    if options.video.is_some() {
+        video_encoder()?;
+    }
+    let Recovered {
+        config,
+        limits,
+        checkpoints,
+        mut world,
+        mut book,
+        from,
+        skipped,
+    } = recover(run_dir, |_| {})?;
+    // Nothing more is read from the store, and nothing is written to it.
+    drop(checkpoints);
+    background(&config)?;
+    let journal = if limits.durability == Durability::WriteAhead {
+        let catalog = run_dir.join(CATALOG_FILE);
+        let contents = on_plain_thread("read the command journal", || {
+            CommandJournal::open(&catalog)?.open_run(limits.session, limits.revision)
         })?;
-    let mut world = found(config)?;
+        replay_journal(&mut world, &mut book, &contents)?;
+        let marks = contents.watermarks();
+        Some(JournalMarks {
+            admitted: marks.admitted,
+            outcomes: marks.outcomes,
+        })
+    } else {
+        None
+    };
+    let run = RenderedRun {
+        run_dir: run_dir.display().to_string(),
+        checkpoint: from,
+        skipped,
+        journal,
+        tick: world.tick().get(),
+        digest: world.digest().to_hex(),
+        pending: book.unfinished(),
+    };
+    draw(&config, world, Some((book, run)), options, clock, emit)
+}
+
+/// `config`'s `[presentation] background`.
+fn background(config: &ValidatedConfig) -> Result<[u8; 3], CoreError> {
+    let background = &config.config().presentation.background;
+    hex_rgb(background).ok_or_else(|| CoreError::NumericalInvalid {
+        quantity: "presentation background",
+        detail: format!("`{background}` is not #rrggbb"),
+    })
+}
+
+/// Draw `world`, which `config` runs, per `options`: with `run`'s book, the
+/// commands it holds apply at their ticks.
+fn draw(
+    config: &ValidatedConfig,
+    mut world: World,
+    run: Option<(CommandBook, RenderedRun)>,
+    options: &RenderOptions,
+    clock: Instant,
+    mut emit: impl FnMut(&RenderRecord),
+) -> Result<(), CoreError> {
+    let model = config.config();
+    let background = background(config)?;
+    let (mut book, run) = run.map_or((None, None), |(book, run)| {
+        (Some(book), Some(Box::new(run)))
+    });
     if let Some(workers) = options.cpu_workers {
         world.set_cpu_workers(workers)?;
     }
@@ -196,6 +318,7 @@ pub fn render(
         schema: RENDER_SCHEMA,
         memory,
         encoders,
+        run,
     });
     std::fs::create_dir_all(&options.out)
         .map_err(|error| io("create the frame directory", &options.out, &error))?;
@@ -242,18 +365,7 @@ pub fn render(
                 frames += 1;
             }
             if tick < options.ticks {
-                match world.step()? {
-                    Stepped::Published(_) => {}
-                    Stepped::Paused(shortfall) => {
-                        return Err(CoreError::StateConflict {
-                            operation: "render",
-                            detail: format!(
-                                "the world paused at tick {}: {shortfall:?}",
-                                world.tick().get()
-                            ),
-                        });
-                    }
-                }
+                advance(&mut world, book.as_mut())?;
             }
         }
         while let Some(handle) = encoding.pop_front() {
@@ -285,6 +397,31 @@ pub fn render(
         wall_seconds: clock.elapsed().as_secs_f64(),
     });
     Ok(())
+}
+
+/// Publish `world`'s next tick as a session owner does: the commands `book`
+/// holds due at the committed tick are sealed, applied in order and
+/// recorded as applied.
+fn advance(world: &mut World, book: Option<&mut CommandBook>) -> Result<(), CoreError> {
+    let committed = world.tick();
+    let (book, sealed) = match book {
+        Some(book) => {
+            let sealed = book.seal(committed)?;
+            (Some(book), sealed)
+        }
+        None => (None, Vec::new()),
+    };
+    let interventions: Vec<Intervention> = sealed.iter().map(|&(_, i)| i).collect();
+    match world.step_with(&interventions)? {
+        Stepped::Published(report) => book.map_or(Ok(()), |book| book.published(&report, &sealed)),
+        Stepped::Paused(shortfall) => Err(CoreError::StateConflict {
+            operation: "render",
+            detail: format!(
+                "the world paused at tick {}: {shortfall:?}",
+                committed.get()
+            ),
+        }),
+    }
 }
 
 /// The most frames encoding at once: enough to keep pace with rendering,

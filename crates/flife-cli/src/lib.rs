@@ -47,10 +47,17 @@
 //!   §14.6, §20.5). [`capabilities()`] runs every controller route on a
 //!   world and compares it with the reference, and reports the host and
 //!   video encoding, with explicit refusals.
+//! - [`mod@render`]: pre-rendered PNG frames and video through the
+//!   Studio's FrankenManim view. [`render()`] founds a configuration;
+//!   [`render_run`] continues a run directory (a run, branch or transplant)
+//!   from the state `flife resume` would, its commands applying at their
+//!   ticks, and writes nothing to it (plan §13.8's checkpoint replay
+//!   export).
 //!
 //! The `flife` binary wraps these as `flife validate <config>`,
 //! `flife capabilities [--config C]`,
 //! `flife run <config> --ticks N --every K [--run-dir DIR]`,
+//! `flife render (<config> | --run-dir DIR) --ticks N --out FRAMES [--video V]`,
 //! `flife resume DIR --until T`,
 //! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
 //! `flife inspect DIR [--at T] [--field]`,
@@ -119,7 +126,7 @@ pub use persist::{
 };
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, RENDER_SCHEMA, RenderOptions,
-    RenderProjection, RenderRecord, encoding_bytes, render, video_encoder,
+    RenderProjection, RenderRecord, RenderedRun, encoding_bytes, render, render_run, video_encoder,
 };
 pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,

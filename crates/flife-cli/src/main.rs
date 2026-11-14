@@ -340,11 +340,18 @@ enum Command {
         checkpoint_durability: StoreDurability,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
-    /// optionally an MP4) through the Studio's FrankenManim view.
+    /// optionally an MP4) through the Studio's FrankenManim view; or, with
+    /// --run-dir, continue a run directory (a run, branch or transplant)
+    /// from where `flife resume` would, writing nothing to it.
     Render {
         /// The configuration or preset, as TOML.
-        config: PathBuf,
-        /// Ticks to run after the founding frame.
+        #[arg(required_unless_present = "run_dir", conflicts_with = "run_dir")]
+        config: Option<PathBuf>,
+        /// A run directory to render from its newest restorable checkpoint
+        /// (and journal), its commands applying at their ticks.
+        #[arg(long)]
+        run_dir: Option<PathBuf>,
+        /// Ticks to run after the first frame.
         #[arg(long, default_value_t = 1280)]
         ticks: u64,
         /// Draw a frame every this many ticks.
@@ -450,6 +457,7 @@ fn main() -> ExitCode {
         } => capabilities(config.as_ref(), ticks, cpu_workers),
         Command::Render {
             config,
+            run_dir,
             ticks,
             every,
             width,
@@ -466,7 +474,7 @@ fn main() -> ExitCode {
             no_field,
             field_mapping,
         } => render(
-            &config,
+            (config.as_ref(), run_dir.as_ref()),
             ticks,
             every,
             [width, height],
@@ -785,8 +793,11 @@ fn parse_workers(text: &str) -> Result<NonZeroUsize, String> {
 }
 
 #[expect(clippy::too_many_arguments, reason = "one argument per flag")]
+/// Render a configuration, or with a run directory that run (its
+/// configuration read from it for the default colour): 2 when the
+/// configuration cannot be read or is invalid, 1 when the render fails.
 fn render(
-    config: &PathBuf,
+    (config, run_dir): (Option<&PathBuf>, Option<&PathBuf>),
     ticks: u64,
     every: u64,
     size: [u32; 2],
@@ -797,9 +808,16 @@ fn render(
     fps: u32,
     (color, style): (Option<ColorMapping>, Style),
 ) -> ExitCode {
-    let config = match load(config) {
-        Ok(config) => config,
-        Err(code) => return code,
+    let config = match (run_dir, config) {
+        (Some(run_dir), _) => match flife_cli::persist::read_config(run_dir) {
+            Ok(config) => config,
+            Err(error) => return fail(error.kind(), error.to_string()),
+        },
+        (None, Some(config)) => match load(config) {
+            Ok(config) => config,
+            Err(code) => return code,
+        },
+        (None, None) => return fail("usage", "a configuration or --run-dir".to_owned()),
     };
     let style = match color.map_or_else(|| ColorMapping::configured(&config), Ok) {
         Ok(mapping) => Style { mapping, ..style },
@@ -817,7 +835,11 @@ fn render(
         fps,
         style,
     };
-    match flife_cli::render(&config, &options, print) {
+    let rendered = match run_dir {
+        Some(run_dir) => flife_cli::render_run(run_dir, &options, print),
+        None => flife_cli::render(&config, &options, print),
+    };
+    match rendered {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             fail(error.kind(), error.to_string());

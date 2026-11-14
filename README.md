@@ -140,6 +140,10 @@ beside the host's. Grafting into a running world is not built.
 that deferred all its work to the reference is reported idle, not verified. The report also gives the memory
 admission, the host, and whether `flife render --video`'s encoder (ffmpeg with libx264) is there, each with its
 reason when refused. `flife render --video` now checks that encoder before its first frame.
+`flife render --run-dir DIR` renders a run directory (a run, a branch or a transplant) from where `flife resume`
+would continue it: the newest checkpoint that restores, with a write-ahead run's journal replayed past it. The run's
+pending commands apply at their ticks, and nothing is written to the directory. An evolved world can now be watched
+without re-running it from tick 0. A branch rendered this way ends at the world `flife resume` of the branch reaches.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
 printed as an `inspected` record and drawn under the overlay's lines (its energy, age, motion, controller and held
@@ -426,6 +430,8 @@ cargo run --release -p flife-studio -- presets/reference-small-world.toml --time
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --export session.ndjson --out export
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --run studio-run
 cargo run --release -p flife-cli -- resume studio-run --until 20000
+cargo run --release -p flife-cli -- render --run-dir studio-run --ticks 1200 --every 4 \
+    --width 1080 --height 1080 --out frames-run --video run.mp4
 ```
 
 `presets/interactive-world.toml` is the Interactive profile's world (§19.5): 25,000 founders on 256 × 256 × 33,
@@ -593,7 +599,7 @@ flife experiment            # seed ensembles, sweeps and ablations against a con
 flife discover              # a pinned discovery bundle: reference, selection, thumbnail, full-world export, local package (exists)
 flife transplant            # a local package grafted into a founded host, as a run that resumes (exists)
 flife analyze               # cross-experiment analysis of cataloged metrics
-flife render | export       # simulation-time frames and video through FrankenManim (render exists)
+flife render | export       # simulation-time frames and video through FrankenManim; render --run-dir continues a run, branch or transplant from its checkpoint (render exists)
 flife-studio <preset>       # the interactive microscope (exists, macOS)
 ```
 

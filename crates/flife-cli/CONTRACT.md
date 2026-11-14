@@ -279,6 +279,20 @@ for, one at least, before a render is refused. Its first record is `start`, with
   different glow and raw frames and the same density frame. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
   frame draws; the bytes are those of encoding them in order, and a failed encode or write fails the render with
   its error. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg` after the last frame is written.
+- `flife render --run-dir DIR` (`render_run`; plan §13.8's checkpoint replay export, FL-023): the same records and
+  frames, for a run directory instead of a configuration (the two conflict; one is required). The run is recovered
+  as `flife resume` recovers it (`persist::recover`): the newest checkpoint that restores to its configuration and
+  session, or a founded run's founding world if none does; a `write-ahead-before-apply` run's journal is then
+  replayed past it (`flife_runtime::replay_journal`, the replay `open_journaled` runs, now public). The `start`
+  record's `run` says where: `run_dir`, the `checkpoint` (sequence and tick), newer checkpoints `skipped`, the
+  `journal` watermarks (write-ahead only), the committed `tick` and `digest` the first frame shows, and the commands
+  still `pending`. `run` is `null` for a configuration. The render steps `--ticks` past that tick as a session owner
+  does: each tick, the commands due are sealed, applied in order and recorded as applied, so a branch's brush and
+  its inherited injections apply at their ticks. The default colour mapping is the run's configuration's. No
+  session is opened and nothing is written to the run: no checkpoint, journal record or catalog row. The store is
+  locked only while the checkpoint is restored, and released before the first frame. Opening the catalog, as
+  every reader of a run does, lets FrankenSQLite rewrite its log files (`catalog.db-wal`, `-shm`, `-wal-cert`); what
+  the catalog holds does not change.
 - `Tally`:
   - published ticks;
   - births, rejected births, and deaths by the budget stage that exhausted them;
@@ -697,7 +711,13 @@ test.
 - `flife render --video` is refused as `missing-capability` before anything is founded, printed or written (exit
   status 1, as for any render error) in three cases: no `ffmpeg` on the `PATH`; an `ffmpeg` that exits with an
   error; or one that lists no `libx264` encoder. Until this change the frames were drawn and written first, and the
-  refusal came only at the end.
+  refusal came only at the end. With `--run-dir`, the check comes before the run is read.
+- `flife render --run-dir DIR`, before any frame or record:
+  - a directory holding no run: its configuration's read error, exit 2;
+  - a configuration and `--run-dir` together: clap's usage error, exit 2;
+  - a run another process holds (`state-conflict`, "another writer holds"), and recovery's refusals (a branch or
+    transplant none of whose checkpoints restores; a journal that disagrees with the checkpoint), exit 1, as for any
+    render error.
 - `flife capabilities`:
   - `--ticks 0` is a usage error.
   - A route's refusal or absence is reported in its entry, not raised.
@@ -757,6 +777,36 @@ test.
   channel (FL-019), each named in the `end` record; `component-32` exits 2 with clap's usage error naming it and
   prints nothing; a configuration naming an unregistered mapping is refused as `invalid-config` before anything
   renders.
+
+`tests/render_run.rs` (3 tests, about 4 s), on FL-037's 32 × 32 ecology with its four injections (ticks 3, 66, 150
+and 230). "Left as it was" means every file but the catalog's is byte-identical, and the catalog holds the same run,
+journal, lineage and checkpoint index.
+- `a_branch_renders_to_the_world_its_resume_reaches_and_is_left_as_it_was`. A volatile parent is run to tick 120.
+  A control branch and an intervention branch (brush at tick 130) are made at 112. Each is rendered with
+  `flife render --run-dir` to tick 240, 48 × 48 every 32 ticks, and left as it was. Its frames are PNGs at ticks
+  112, 144, 176, 208 and 240. `start.run` names the branch's checkpoint at 112, nothing skipped, no journal, and
+  the same digest for both branches. 2 commands are pending in the control (the parent's injections at 150 and 230)
+  and 3 in the intervention. The two end digests differ. Each equals what `flife resume` of that branch reaches at
+  240, and the control's equals the parent's resumed. After the resume, a render with `--ticks 0` starts at 240
+  with nothing pending, and draws one frame of the same world.
+- `a_write_ahead_run_renders_past_its_checkpoint_through_its_journal`. A write-ahead run to 152 has its newest
+  checkpoint's manifest damaged. `render_run` restores tick 147, skipping that checkpoint, with journal watermarks
+  4 admitted and 3 outcomes. It replays command 3's outcome (tick 150) past it, starting beyond tick 150 with
+  command 4 pending. Rendered to tick 240, it ends at the uninterrupted write-ahead run's digest, and the run is
+  left as it was.
+- `what_cannot_be_rendered_is_refused_before_the_first_frame`. With the run's store held in-process, the binary
+  exits 1, `state-conflict` "another writer holds". With no ffmpeg on the `PATH`, `--video` exits 1,
+  `missing-capability`. An empty directory exits 2. A configuration with `--run-dir` exits 2 with clap's
+  "cannot be used with". None prints a record or makes the frame directory, and the run is left as it was. Once the
+  store is released, the same render draws ticks 10 to 14.
+
+Planted bugs: 13, all caught, by these tests, `flife-runtime`'s
+`a_journal_replays_only_onto_a_book_of_the_worlds_configuration` (in `tests/checkpoint.rs`) and `tests/resume.rs`.
+The bugs: the run's commands never applied; the journal not replayed; the journal read for a volatile run instead;
+the store held through the render; the start record without the run; pending commands not counted; applied commands
+not recorded; due commands sealed but not applied; the run's world refounded; a run's video not checked first; the
+binary ignoring `--run-dir`; `replay_journal` taking a book of any configuration; `open_journaled` no longer
+replaying.
 
 The test profile is optimized (`[profile.test] opt-level = 3`, with debug assertions and overflow checks on), so
 the smoke run takes about 30 s. Rust floating point has no fast-math and no implicit contraction, so optimization
@@ -1261,6 +1311,15 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
 - Only `validate`, `capabilities`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect`, `discover` and
   `transplant`. Step, analyze and export are later items (§14.6).
+- `flife render --run-dir` gaps:
+  - It renders forward from where `flife resume` would continue. It does not re-render an earlier interval from
+    an older checkpoint (no `--at`): commands accepted after that checkpoint would have to be taken from a newer
+    book or the journal, which is not built.
+  - Its restore is not admitted against `maximum_total_bytes` (FL-043), as for `inspect` and `branch`. The render
+    that follows is.
+  - It is the CLI's. The Studio's `--export` still replays a timeline from the founding world (its contract).
+  - The frames show the committed world only: no clock, camera keyframes, captions or provenance overlay
+    (§13.8's timeline).
 - `flife capabilities` gaps:
   - Not probed: the Studio's window, which is its own probe (no window test runs on this Mac), FrankenManim's
     Metal frame route and its CPU renderer.

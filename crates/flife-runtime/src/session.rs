@@ -1342,9 +1342,7 @@ pub fn open_journaled(
         )));
     }
     agree(&world, &book, &limits, "open journaled session")?;
-    book.set_durability(Durability::WriteAhead);
-    let replay = book.recover(journal, world.tick())?;
-    replay_journal(&mut world, &mut book, replay)?;
+    replay_journal(&mut world, &mut book, journal)?;
     let durable = Durable {
         writer,
         waiting: VecDeque::new(),
@@ -1371,9 +1369,40 @@ fn stopped_detail(world: &World) -> Option<String> {
     })
 }
 
+/// Bring committed `world` and its `book` to the boundary a
+/// `write-ahead-before-apply` session opened on them over `journal` starts
+/// at ([`open_journaled`]), without opening one: the journal is merged into
+/// the book and every journaled outcome the book does not hold is
+/// reproduced. Nothing is written. A reader of a run (`flife render` of a
+/// run directory) continues from the state its owner would.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] when the book and the world run different
+/// configurations, the journal disagrees with the book, or the replay does
+/// not reproduce the journal; the world's errors while replaying.
+pub fn replay_journal(
+    world: &mut World,
+    book: &mut CommandBook,
+    journal: &JournalContents,
+) -> Result<(), CoreError> {
+    if book.revision() != world.config().config_hash() {
+        return Err(CoreError::StateConflict {
+            operation: "replay command journal",
+            detail: format!(
+                "the book runs {}, the world {}",
+                book.revision().to_hex(),
+                world.config().config_hash().to_hex()
+            ),
+        });
+    }
+    book.set_durability(Durability::WriteAhead);
+    let outcomes = book.recover(journal, world.tick())?;
+    reproduce(world, book, outcomes)
+}
+
 /// Advance `world` and `book` until they have reproduced `outcomes`, the
 /// journal's outcomes after the book's, in order.
-fn replay_journal(
+fn reproduce(
     world: &mut World,
     book: &mut CommandBook,
     outcomes: Vec<(CommandId, Outcome)>,

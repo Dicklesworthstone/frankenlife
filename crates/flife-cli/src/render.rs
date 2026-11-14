@@ -553,7 +553,8 @@ pub fn video_encoder() -> Result<String, CoreError> {
     Ok(version.lines().next().unwrap_or_default().trim().to_owned())
 }
 
-/// Encode `frames/frame-%06d.png` into an H.264 MP4 with `ffmpeg`.
+/// Encode `frames/frame-%06d.png` into an H.264 MP4 with `ffmpeg`
+/// ([`PNG_TO_H264`]).
 fn encode(frames: &Path, video: &Path, fps: u32) -> Result<(), CoreError> {
     let mut command = std::process::Command::new("ffmpeg");
     command
@@ -561,10 +562,32 @@ fn encode(frames: &Path, video: &Path, fps: u32) -> Result<(), CoreError> {
         .arg(fps.max(1).to_string())
         .arg("-i")
         .arg(frames.join("frame-%06d.png"))
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"])
+        .args(PNG_TO_H264)
         .arg(video);
     run_encoder(&mut command)
 }
+
+/// What `flife render --video` asks of ffmpeg after its PNG frames. The
+/// sRGB frames are converted to BT.709 limited range 4:2:0 with left chroma
+/// siting, as the Studio export's y4m is (fmn-frame's `rgba_to_nv12`), and
+/// tagged as such. They are then compressed as [`Y4M_TO_H264`] compresses.
+/// Left to itself, ffmpeg converted with BT.601 and tagged no matrix, which
+/// players read as BT.709 at HD sizes.
+pub const PNG_TO_H264: [&str; 12] = [
+    "-vf",
+    "scale=out_color_matrix=bt709:out_range=tv:out_chroma_loc=left,format=yuv420p,\
+     setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709",
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-crf",
+    "18",
+    "-chroma_sample_location",
+    "left",
+    "-movflags",
+    "+faststart",
+];
 
 /// What [`encode_y4m`] asks of ffmpeg after its input. The frames are
 /// tagged with what the Studio export's y4m holds and its header cannot

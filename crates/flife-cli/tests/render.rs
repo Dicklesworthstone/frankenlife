@@ -1,5 +1,6 @@
 //! `flife render`: pre-rendered frames of the reference world through the
-//! Studio's FrankenManim view, without perturbing the world.
+//! Studio's FrankenManim view, without perturbing the world, and with
+//! `--video` an H.264 MP4 of them in BT.709 limited range.
 
 use std::num::NonZeroUsize;
 
@@ -9,6 +10,10 @@ use flife_cli::{
 };
 use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
+use fmn_codec::append_y4m_frame_nv12;
+use fmn_codec::png::{PngLimits, decode};
+use fmn_frame::convert::rgba_to_nv12;
+use fmn_frame::{ChromaSiting, ColorRange, FrameBuffer, FrameLayout, PixelFormat};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -395,4 +400,234 @@ fn the_render_colour_is_the_configured_mapping_unless_the_flag_overrides_it() {
             .is_some_and(|detail| detail.contains("glitter-v1")),
         "{err}"
     );
+}
+
+/// `flife render --video` with this machine's ffmpeg: an H.264 MP4 of the
+/// frames, converted as the Studio export's y4m is (fmn-frame's
+/// `rgba_to_nv12`: BT.709, limited range, left siting) and tagged so. Each
+/// frame decodes to that conversion of its PNG within compression. Without
+/// an ffmpeg listing libx264 nothing here runs; `tests/render_run.rs`
+/// refuses a video with no ffmpeg on the `PATH`.
+#[test]
+fn a_video_holds_the_frames_in_bt709_limited_range_and_says_so() {
+    if let Err(error) = flife_cli::video_encoder() {
+        println!("no H.264 encoder ({error}): skipped");
+        return;
+    }
+    let config = ValidatedConfig::from_toml(PRESET).expect("the preset validates");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_nanos();
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flife-render-video-{}-{nanos}", std::process::id()));
+    let out = dir.join("frames");
+    std::fs::create_dir_all(&out).expect("a new directory");
+    let video = dir.join("render.mp4");
+    let [width, height] = [192_u32, 128];
+    let options = RenderOptions {
+        ticks: 6,
+        every: 3,
+        size: [width, height],
+        out,
+        cpu_workers: NonZeroUsize::new(3),
+        controllers: ControllerChoice::Auto,
+        render_threads: NonZeroUsize::MIN,
+        video: Some(video.clone()),
+        fps: 30,
+        style: Style::default(),
+    };
+    let mut records = Vec::new();
+    render(&config, &options, |record| records.push(record.clone())).expect("renders");
+    let paths: Vec<String> = records
+        .iter()
+        .filter_map(|record| match record {
+            RenderRecord::Frame { path, .. } => Some(path.clone()),
+            RenderRecord::Start { .. } | RenderRecord::End { .. } => None,
+        })
+        .collect();
+    assert_eq!(paths.len(), 3);
+
+    // The stream: H.264 4:2:0 at 30/1, a frame a PNG, tagged as converted.
+    let probe = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,pix_fmt,width,height,r_frame_rate,nb_frames,color_range,\
+             color_space,color_primaries,color_transfer,chroma_location",
+            "-of",
+            "json",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffprobe runs beside ffmpeg");
+    assert!(probe.status.success(), "{probe:?}");
+    let probed: serde_json::Value = serde_json::from_slice(&probe.stdout).expect("ffprobe's JSON");
+    let stream = &probed["streams"][0];
+    for (name, expected) in [
+        ("codec_name", "h264"),
+        ("pix_fmt", "yuv420p"),
+        ("r_frame_rate", "30/1"),
+        ("nb_frames", "3"),
+        ("color_range", "tv"),
+        ("color_space", "bt709"),
+        ("color_primaries", "bt709"),
+        ("color_transfer", "iec61966-2-1"),
+        ("chroma_location", "left"),
+    ] {
+        assert_eq!(stream[name].as_str(), Some(expected), "{name}: {stream}");
+    }
+    assert_eq!(
+        [stream["width"].as_u64(), stream["height"].as_u64()],
+        [Some(u64::from(width)), Some(u64::from(height))]
+    );
+
+    // Decoded: each frame is its PNG converted by `rgba_to_nv12`, within
+    // compression. Which matrix and siting converted it are told apart from
+    // the compression's loss by projection. The decoded luma's departure
+    // from that conversion is projected onto how BT.601's luma departs from
+    // BT.709's: about 0 for BT.709, about 1 for BT.601. Left to itself,
+    // ffmpeg 8.1 made it 1.004 on these frames at 34.9 dB; converted as now,
+    // 0.020 at 38.8 dB. The chroma's is projected onto how centre-sited
+    // chroma departs from left-sited.
+    let decoded = std::process::Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i"])
+        .arg(&video)
+        .args(["-f", "rawvideo", "-"])
+        .output()
+        .expect("ffmpeg decodes");
+    assert!(decoded.status.success(), "{decoded:?}");
+    let luma = width as usize * height as usize;
+    let frame_bytes = luma * 3 / 2;
+    assert_eq!(decoded.stdout.len(), frame_bytes * paths.len());
+    let mut worst = (f64::INFINITY, f64::INFINITY);
+    // Departures projected onto BT.601's luma and onto centre-sited chroma.
+    let mut matrix = Leaning::default();
+    let mut siting = Leaning::default();
+    for (index, (path, theirs)) in paths
+        .iter()
+        .zip(decoded.stdout.chunks_exact(frame_bytes))
+        .enumerate()
+    {
+        let png = decode(
+            &std::fs::read(path).expect("the frame"),
+            &PngLimits::default(),
+        )
+        .expect("decodes");
+        let mut rgba = FrameBuffer::new(
+            FrameLayout::tight(PixelFormat::Rgba8, width, height).expect("a layout"),
+        );
+        rgba.as_bytes_mut().copy_from_slice(&png.rgba);
+        let ours = i420(&rgba, ChromaSiting::Left);
+        let centred = i420(&rgba, ChromaSiting::Center);
+        assert_eq!(ours.len(), frame_bytes);
+        let (luma_psnr, chroma_psnr) = (
+            psnr(&ours[..luma], &theirs[..luma]),
+            psnr(&ours[luma..], &theirs[luma..]),
+        );
+        worst = (worst.0.min(luma_psnr), worst.1.min(chroma_psnr));
+        assert!(
+            luma_psnr >= 36.0 && chroma_psnr >= 31.0,
+            "frame {index}: luma PSNR {luma_psnr:.1} dB, chroma {chroma_psnr:.1} dB"
+        );
+        for ((pixel, &converted), &shown) in png
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(&ours[..luma])
+            .zip(&theirs[..luma])
+        {
+            let bt601 = studio_luma(pixel, 0.299, 0.114) - studio_luma(pixel, 0.2126, 0.0722);
+            matrix.add(f64::from(shown) - f64::from(converted), bt601);
+        }
+        for ((&left, &centre), &shown) in ours[luma..]
+            .iter()
+            .zip(&centred[luma..])
+            .zip(&theirs[luma..])
+        {
+            siting.add(
+                f64::from(shown) - f64::from(left),
+                f64::from(centre) - f64::from(left),
+            );
+        }
+    }
+    let (toward_601, toward_centre) = (matrix.leaning(), siting.leaning());
+    println!(
+        "worst luma PSNR {:.1} dB, chroma {:.1} dB; toward BT.601 {toward_601:.3}, toward centre \
+         siting {toward_centre:.3}",
+        worst.0, worst.1
+    );
+    assert!(
+        toward_601.abs() <= 0.25,
+        "the luma leans {toward_601:.3} toward BT.601"
+    );
+    // ffmpeg's left-sited chroma filter is wider than `rgba_to_nv12`'s
+    // two-tap one. Left-sited, it read 0.70 toward the centre-sited box on
+    // the first frame unencoded (0.725 here); centre-sited, 0.999.
+    assert!(
+        toward_centre <= 0.85,
+        "the chroma leans {toward_centre:.3} toward centre siting"
+    );
+}
+
+/// `rgba` converted as the Studio export converts it (`rgba_to_nv12`,
+/// limited range) with chroma `siting`: the I420 planes, Y then Cb and Cr,
+/// of its y4m record.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure is a test failure"
+)]
+fn i420(rgba: &FrameBuffer, siting: ChromaSiting) -> Vec<u8> {
+    let layout = rgba.layout();
+    let (width, height) = (layout.width(), layout.height());
+    let mut nv12 =
+        FrameBuffer::new(FrameLayout::tight(PixelFormat::Nv12, width, height).expect("even"));
+    rgba_to_nv12(rgba, &mut nv12, ColorRange::Limited, siting).expect("converts");
+    let mut record = Vec::new();
+    append_y4m_frame_nv12(&mut record, width, height, &nv12).expect("a record");
+    record.split_off(6)
+}
+
+/// How far a decoded frame's departures from a reference lean toward
+/// another reference: the departures projected onto the other's
+/// difference from the reference, about 0 when it is the reference and 1
+/// when it is the other.
+#[derive(Default)]
+struct Leaning {
+    along: f64,
+    apart: f64,
+}
+
+impl Leaning {
+    fn add(&mut self, departure: f64, toward: f64) {
+        self.along += departure * toward;
+        self.apart += toward * toward;
+    }
+
+    fn leaning(&self) -> f64 {
+        assert!(self.apart > 0.0, "the references differ");
+        self.along / self.apart
+    }
+}
+
+/// The PSNR of samples `theirs` against `ours` in dB.
+fn psnr(ours: &[u8], theirs: &[u8]) -> f64 {
+    assert_eq!(ours.len(), theirs.len());
+    let squared: f64 = ours
+        .iter()
+        .zip(theirs)
+        .map(|(&a, &b)| (f64::from(b) - f64::from(a)).powi(2))
+        .sum();
+    10.0 * (255.0 * 255.0 / (squared / ours.len() as f64).max(1e-9)).log10()
+}
+
+/// The limited-range luma of an sRGB-encoded RGBA pixel under the matrix
+/// with red and blue weights `kr` and `kb`.
+fn studio_luma(pixel: &[u8; 4], kr: f64, kb: f64) -> f64 {
+    let [r, g, b, _] = pixel.map(f64::from);
+    16.0 + 219.0 * (kr * r + (1.0 - kr - kb) * g + kb * b) / 255.0
 }

@@ -139,7 +139,9 @@ beside the host's. Grafting into a running world is not built.
 `torch`, `metal`) steps the reference preset and is compared with the world every qualified host reaches. A route
 that deferred all its work to the reference is reported idle, not verified. The report also gives the memory
 admission, the host, and whether `flife render --video`'s encoder (ffmpeg with libx264) is there, each with its
-reason when refused. `flife render --video` now checks that encoder before its first frame.
+reason when refused. `flife render --video` now checks that encoder before its first frame. Its video is
+converted to BT.709 limited range, as the Studio export's is, and tagged as such. Before, ffmpeg's default
+converted it with BT.601 and tagged no matrix, so players showed it in shifted colours.
 `flife render --run-dir DIR` renders a run directory (a run, a branch or a transplant) from where `flife resume`
 would continue it: the newest checkpoint that restores, with a write-ahead run's journal replayed past it. The run's
 pending commands apply at their ticks, and nothing is written to the directory. An evolved world can now be watched

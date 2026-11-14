@@ -30,6 +30,9 @@ serde_json.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+# `flife render --video`'s frames are compared with fmn-frame's conversion,
+# the one the Studio export's y4m is made by.
+fmn-frame.workspace = true
 peak_alloc.workspace = true
 # The frame-route measurement example renders on FrankenManim's Metal route.
 fmn-render = { workspace = true, features = ["metal"] }

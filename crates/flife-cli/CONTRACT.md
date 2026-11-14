@@ -281,7 +281,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
   (FL-019); at the test's 96 x 64, where that floor binds, the preset's 0.8 and the old fixed 1.5 draw
   different glow and raw frames and the same density frame. Each frame's PNG is encoded on its own thread, at most four at once, while the world steps and the next
   frame draws; the bytes are those of encoding them in order, and a failed encode or write fails the render with
-  its error. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg` after the last frame is written.
+  its error. `--video` encodes `frame-%06d.png` to H.264 with `ffmpeg` after the last frame is written
+  (`PNG_TO_H264`). The sRGB frames are converted to BT.709 limited range 4:2:0 with left chroma siting, as the
+  Studio export's y4m is, and tagged so (BT.709 primaries and matrix, sRGB transfer, limited range, left siting).
+  Before, ffmpeg converted them with its default, BT.601, and tagged no matrix, which players read as BT.709 at HD
+  sizes.
 - `flife render --run-dir DIR` (`render_run`; plan §13.8's checkpoint replay export, FL-023): the same records and
   frames, for a run directory instead of a configuration (the two conflict; one is required). The run is recovered
   as `flife resume` recovers it (`persist::recover`): the newest checkpoint that restores to its configuration and
@@ -774,7 +778,28 @@ test.
   slot. The run ends `capacity-paused` before tick 1,024,
   with no birth published, and `flife` exits with status 1.
 
-`tests/render.rs` (2 tests):
+`tests/render.rs` (3 tests):
+- `a_video_holds_the_frames_in_bt709_limited_range_and_says_so`, where ffmpeg lists libx264 (here 8.1.2; elsewhere
+  it prints that it skipped). `render` of the preset, six ticks every three at 192 x 128 with a video at 30 fps.
+  ffprobe reads H.264 `yuv420p` at 192 x 128 and 30/1, three frames, tagged `tv`, `bt709` matrix and primaries,
+  `iec61966-2-1` and `left`. Each decoded frame is compared with fmn-frame's `rgba_to_nv12` of its PNG (limited,
+  left), the Studio export's conversion: luma at least 36 dB and chroma at least 31 dB (in one run, worst 37.8 and
+  34.1). Compression masks which matrix and siting converted the frames, so departures are projected. The decoded
+  luma's departure from that conversion is projected onto how BT.601's luma departs from BT.709's: within 0.25 of
+  0 (0.016 here). The old command made it 1.004 on these frames. The chroma's is projected onto how
+  `rgba_to_nv12`'s centre-sited chroma departs from its left-sited: at most 0.85 (0.725 here). ffmpeg's left-sited
+  filter is wider than `rgba_to_nv12`'s two-tap one, so it reads 0.70 unencoded, and centre-sited 0.999. The MP4
+  shares the y4m's matrix, range and siting, not its chroma filter.
+  Planted bugs, 7, in `PNG_TO_H264` and `encode`:
+  - Caught by the decoded frames' PSNR: no explicit conversion (ffmpeg's own, the frames tagged), BT.601
+    conversion tagged BT.709, and full range tagged limited.
+  - Caught by the siting projection: centre-sited chroma tagged left. It survived the first version of the test,
+    which compared chroma only by PSNR.
+  - Caught by ffprobe's reading: the encode at twice the rate, and render ignoring `PNG_TO_H264` (the old
+    command).
+  - Survives: the frames' `setparams` tags dropped. Here the conversion sets the matrix and range, and the PNGs'
+    sRGB chunk sets the primaries and transfer, so the stream reads the same. The tags are kept so that it does
+    not depend on either.
 - `rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it`. Six ticks at three world threads
   write PNG frames at ticks 0, 3 and 6 with the requested size in their headers, and the end digest is a plain
   one-thread run's. The same run rendered by energy, raw, as density, with the field's composition and with

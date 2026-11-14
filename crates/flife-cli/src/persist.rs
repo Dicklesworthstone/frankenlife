@@ -24,7 +24,10 @@
 //! A run directory made by [`crate::branch()`] (FL-039) is a branch: its
 //! catalog records a session other than [`RUN_SESSION`] and the fork it
 //! descends from, and it resumes only from a checkpoint of that session.
-//! It has no founding world of its own to fall back to.
+//! It has no founding world of its own to fall back to. Nor has a
+//! transplant ([`crate::transplant()`], FL-042), whose founding checkpoint
+//! holds a host grafted with a package: only a run of [`RUN_SESSION`]
+//! falls back to the world its configuration founds.
 //!
 //! Checkpoints are taken in the configuration's `checkpoint_mode`
 //! ([`crate::checkpointing`], FL-038): `pause-and-stream` encodes the
@@ -1186,7 +1189,8 @@ pub struct Recovered {
 /// # Errors
 /// [`CoreError::StateConflict`] when `run_dir` is not a run directory, its
 /// catalog records no run, more than one, or the run under another
-/// configuration, or it is a branch none of whose checkpoints restores;
+/// configuration, or none of its checkpoints restores and it is a branch or
+/// any other run of a session other than [`RUN_SESSION`] (a transplant);
 /// the store's and catalog's errors.
 pub fn recover(
     run_dir: &Path,
@@ -1209,6 +1213,19 @@ pub fn recover(
                      has no founding world to fall back to",
                     run_dir.display(),
                     crate::branch::fork_tick(&lineage).map_or(0, Tick::get)
+                ),
+            });
+        }
+        // Only a founded run's world is its configuration's: a transplant's
+        // (or any other session's) is not.
+        None if session != RUN_SESSION => {
+            return Err(CoreError::StateConflict {
+                operation: "resume run",
+                detail: format!(
+                    "{} records {session}, not a founded run's {RUN_SESSION}, and none of its \
+                     checkpoints restores; its world is not the one its configuration founds, \
+                     so it has no founding world to fall back to",
+                    run_dir.display()
                 ),
             });
         }

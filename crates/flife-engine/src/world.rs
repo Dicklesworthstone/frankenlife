@@ -122,9 +122,12 @@ use crate::reproduction::{
 
 mod admission;
 mod checkpoint;
+mod crop;
+mod graft;
 mod settle;
 
 pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION};
+pub use graft::Graft;
 use settle::{Settle, settle_with};
 
 /// The backend this module implements: the scalar CPU reference.

@@ -86,7 +86,7 @@ pub use reproduction::{
     Unviable, Viability, resolve_births, resolve_births_with,
 };
 pub use world::{
-    Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport, Footprint,
+    Advance, BirthEvent, CPU_REFERENCE, Candidate, ControllerReport, FieldReport, Footprint, Graft,
     IntroductionEvent, ModelVariant, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT,
     QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SensorReport, SettleReport, Stepped, TickReport,
     UNIFORM_POSITIONS, UptakeReport, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION,

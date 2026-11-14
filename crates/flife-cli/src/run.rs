@@ -291,6 +291,30 @@ pub enum Record {
         /// The committed world's digest, the parent's at the checkpoint.
         digest: String,
     },
+    /// A local package grafted into a founded host, made a run directory
+    /// (FL-042).
+    Transplant {
+        /// [`RUN_SCHEMA`].
+        schema: &'static str,
+        /// The transplant's name.
+        name: String,
+        /// Its session.
+        session: u64,
+        /// The package grafted.
+        package: crate::transplant::TransplantPackage,
+        /// The host grafted into.
+        host: crate::transplant::TransplantHost,
+        /// What the graft did.
+        graft: crate::transplant::GraftRecord,
+        /// The founding checkpoint.
+        checkpoint: CheckpointAt,
+        /// The founding checkpoint container's SHA-256.
+        sha256: String,
+        /// The container's size.
+        bytes: u64,
+        /// The grafted world's digest.
+        digest: String,
+    },
     /// Where a resumed run starts (FL-037).
     Resume {
         /// [`RUN_SCHEMA`].

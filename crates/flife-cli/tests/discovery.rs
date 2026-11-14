@@ -30,6 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flife_core::canonical::Sha256Digest;
+use flife_engine::NumericalProfile;
 use flife_store::Durability;
 use fmn_codec::png::{PngLimits, decode};
 use serde_json::Value;
@@ -437,7 +438,7 @@ fn a_region_discovery_is_a_pinned_reference_and_a_reproducible_world() {
         let delta = delta.rem_euclid(32.0);
         delta.min(32.0 - delta)
     };
-    let inside: Vec<f64> = at
+    let held: Vec<&Value> = at
         .iter()
         .filter(|record| record["record"] == "organism")
         .filter(|organism| {
@@ -445,6 +446,9 @@ fn a_region_discovery_is_a_pinned_reference_and_a_reproducible_world() {
                 .map(|axis| organism["position"][axis].as_f64().expect("a coordinate") - 16.0);
             wrapped(x).hypot(wrapped(y)) <= 6.0
         })
+        .collect();
+    let inside: Vec<f64> = held
+        .iter()
         .map(|organism| organism["energy"].as_f64().expect("an energy"))
         .collect();
     assert!(!inside.is_empty(), "the disk holds organisms at tick {AT}");
@@ -486,11 +490,85 @@ fn a_region_discovery_is_a_pinned_reference_and_a_reproducible_world() {
     // Full-world semantics: the export resumes to the source's own state.
     let world = &record["exports"]["full_world"];
     assert_eq!(world["path"], "world");
-    assert!(record["exports"]["local_package"].is_null());
     assert!(world["chunks"][1].as_u64().expect("linked") > 0, "{world}");
     let exported = resume(&bundle.join("world"), LATER);
     let continued = resume(&run_dir, LATER);
     assert_eq!(exported, continued, "the export reproduces the source");
+
+    // Local-package semantics: only the disk, its boundary declared, its
+    // endowment the energy it carries; not a run.
+    let local = &record["exports"]["local_package"];
+    assert_eq!(local["path"], "package");
+    let manifest = &local["manifest"];
+    let written: Value = serde_json::from_slice(
+        &fs::read(bundle.join("package/package.json")).expect("package.json exists"),
+    )
+    .expect("package.json is JSON");
+    assert_eq!(&written, manifest);
+    assert_eq!(manifest["schema"], "frankenlife.package.v1");
+    assert_eq!(manifest["boundary"]["exterior"], "host");
+    for key in ["tick", "sequence", "checkpoint_sha256", "session"] {
+        assert_eq!(manifest["source"][key], record["source"][key], "{key}");
+    }
+    assert_eq!(manifest["crop"]["center"], selection["center"]);
+    assert_eq!(manifest["crop"]["radius"], selection["radius"]);
+    assert_eq!(
+        manifest["crop"]["center_bits"],
+        serde_json::json!([16.0_f64.to_bits(), 16.0_f64.to_bits()])
+    );
+    assert_eq!(manifest["crop"]["cells"], selection["cells"]);
+    assert_eq!(manifest["organisms"], selection["organisms"]);
+    assert_eq!(manifest["lineages"], selection["lineages"]);
+    let endowment = &manifest["endowment"];
+    let [field, organisms, total] =
+        ["field", "organisms", "total"].map(|key| endowment[key].as_f64().expect("energy"));
+    let carried: f64 = inside.iter().sum();
+    assert!(
+        (organisms - carried).abs() <= 1e-9 * carried,
+        "{organisms} {carried}"
+    );
+    let measured = selection["field_energy"].as_f64().expect("energy");
+    assert!(
+        (field - measured).abs() <= 1e-9 * measured,
+        "{field} {measured}"
+    );
+    assert!((total - (field + organisms)).abs() <= 1e-12 * total);
+    let container = fs::read(bundle.join("package/world.ckpt")).expect("world.ckpt exists");
+    assert_eq!(manifest["world"]["bytes"], container.len() as u64);
+    assert_eq!(
+        manifest["world"]["sha256"],
+        Sha256Digest::of(&container).to_hex()
+    );
+    let (package, cropped) = flife_cli::read_package(
+        &bundle.join("package"),
+        NumericalProfile::reference_f32().expect("profile"),
+    )
+    .expect("the package verifies");
+    assert_eq!(package.organisms, inside.len() as u64);
+    assert_eq!(cropped.tick().get(), AT);
+    assert_eq!(
+        cropped
+            .population()
+            .ids()
+            .map(|id| id.get())
+            .collect::<Vec<_>>(),
+        held.iter()
+            .map(|organism| organism["id"].as_u64().expect("an id"))
+            .collect::<Vec<_>>(),
+        "the package holds exactly the disk's organisms"
+    );
+    assert_eq!(cropped.digest().to_hex(), manifest["world"]["digest"]);
+    assert_ne!(
+        manifest["world"]["digest"], record["source"]["world_digest"],
+        "the package is not the whole world"
+    );
+    let (status, _, err) = flife(&[
+        "resume",
+        text(&bundle.join("package")),
+        "--until",
+        &LATER.to_string(),
+    ]);
+    assert_eq!(status, Some(2), "a package is not a run: {err:?}");
 
     // Pinning: the source's retention, continued to LATER, removed the
     // unpinned checkpoints 105, 119, 120, 126 and 133 and kept AT.
@@ -561,6 +639,10 @@ fn lineage_and_whole_world_discoveries_record_what_the_checkpoint_holds() {
         serde_json::json!([members.iter().min(), members.iter().max()])
     );
     assert!(record["exports"]["full_world"].is_null());
+    assert!(
+        record["exports"]["local_package"].is_null(),
+        "no disk, no package"
+    );
     assert!(!bundle.join("world").exists());
     let mut written: Vec<String> = fs::read_dir(&bundle)
         .expect("lists")
@@ -583,6 +665,8 @@ fn lineage_and_whole_world_discoveries_record_what_the_checkpoint_holds() {
     let record = one(&out, "discovery");
     assert_eq!(record["source"]["tick"], FIRST, "the newest that restores");
     assert_eq!(record["selection"]["kind"], "world");
+    assert!(record["exports"]["local_package"].is_null());
+    assert!(!whole.join("package").exists());
     let (status, newest) = inspect(&run_dir, FIRST);
     assert_eq!(status, Some(0));
     let newest = one(&newest, "inspect");
@@ -605,6 +689,100 @@ fn lineage_and_whole_world_discoveries_record_what_the_checkpoint_holds() {
             .count(),
         2
     );
+}
+
+/// A package is verified before use: a damaged container, a manifest that
+/// declares another boundary, names a field it does not know, or disagrees
+/// with its world about the crop, the organisms, the endowment, the tick,
+/// the configuration or the digest is refused. `--no-package` writes none.
+#[test]
+fn a_package_that_disagrees_with_itself_is_refused() {
+    let run_dir = copy_of_source("package-run");
+    let bundle = fresh("package-bundle");
+    let (status, _, err) = discover(
+        &run_dir,
+        &bundle,
+        &["--at", &AT.to_string(), "--region", "20,11,5", "--no-world"],
+    );
+    assert_eq!(status, Some(0), "{err:?}");
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    let original = bundle.join("package");
+    flife_cli::read_package(&original, profile).expect("the package verifies");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(original.join("package.json")).expect("reads"))
+            .expect("JSON");
+
+    let variant = |name: &str, change: &dyn Fn(&Path, &mut Value)| {
+        let copy = fresh(name);
+        copy_tree(&original, &copy);
+        let mut edited = manifest.clone();
+        change(&copy, &mut edited);
+        fs::write(
+            copy.join("package.json"),
+            serde_json::to_vec_pretty(&edited).expect("encodes"),
+        )
+        .expect("writes");
+        let refused = flife_cli::read_package(&copy, profile);
+        assert!(
+            matches!(refused, Err(flife_core::CoreError::StateConflict { .. })),
+            "{name}: {:?}",
+            refused.map(|(package, _)| package)
+        );
+    };
+    variant("package-flipped", &|copy, _| {
+        let path = copy.join("world.ckpt");
+        let mut bytes = fs::read(&path).expect("reads");
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0x40;
+        fs::write(&path, bytes).expect("writes");
+    });
+    variant("package-isolated", &|_, edited| {
+        edited["boundary"]["exterior"] = "isolated".into();
+    });
+    variant("package-unknown", &|_, edited| {
+        edited["crop"]["shape"] = "square".into();
+    });
+    variant("package-moved", &|_, edited| {
+        edited["crop"]["center_bits"][0] = 21.0_f64.to_bits().into();
+    });
+    variant("package-more", &|_, edited| {
+        let organisms = edited["organisms"].as_u64().expect("a count");
+        edited["organisms"] = (organisms + 1).into();
+    });
+    variant("package-schema", &|_, edited| {
+        edited["schema"] = "frankenlife.package.v2".into();
+    });
+    variant("package-richer", &|_, edited| {
+        let total = edited["endowment"]["total"].as_f64().expect("a total");
+        edited["endowment"]["total"] = (total * 1.01).into();
+    });
+    variant("package-later", &|_, edited| {
+        let tick = edited["source"]["tick"].as_u64().expect("a tick");
+        edited["source"]["tick"] = (tick + 1).into();
+    });
+    variant("package-other-config", &|_, edited| {
+        edited["source"]["config_sha256"] = "00".repeat(32).into();
+    });
+    variant("package-other-digest", &|_, edited| {
+        edited["world"]["digest"] = "00".repeat(32).into();
+    });
+
+    let without = fresh("package-none");
+    let (status, out, err) = discover(
+        &run_dir,
+        &without,
+        &[
+            "--at",
+            &AT.to_string(),
+            "--region",
+            "20,11,5",
+            "--no-world",
+            "--no-package",
+        ],
+    );
+    assert_eq!(status, Some(0), "{err:?}");
+    assert!(one(&out, "discovery")["exports"]["local_package"].is_null());
+    assert!(!without.join("package").exists());
 }
 
 /// Refusals: before anything is written, and never into a directory that

@@ -127,8 +127,13 @@ FL-042 saves discoveries: `flife discover DIR BUNDLE --at T --region X,Y,R --des
 writes a bundle with the run/checkpoint reference, the selection measured in the committed world, a thumbnail framed
 on the region, the presentation settings and the description. It also writes the full-world export `world/`, a
 control branch of the checkpoint that `flife resume` continues to exactly the source run's state. The run's store
-pins the checkpoint, so its retention keeps it while `preserve_pinned_discoveries` holds. The local transplant
-package, §14.5's second export, is not built yet.
+pins the checkpoint, so its retention keeps it while `preserve_pinned_discoveries` holds. A region discovery also
+writes §14.5's second export, the local transplant package `package/`: the disk's organisms and field cells and
+nothing else, its declared boundary (`exterior = "host"`) and its energy endowment, verified before use. It is not a
+run. `flife transplant PACKAGE DIR --config HOST --at X,Y` grafts it into a host founded from another
+configuration (moved by whole cells; the host's founders under it displaced; the package's organisms entering as
+founders, kin kept as kin) and makes the grafted world a new run's founding checkpoint, which `flife resume`
+continues. Grafting into a running world is not built.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
 printed as an `inspected` record and drawn under the overlay's lines (its energy, age, motion, controller and held
@@ -577,7 +582,8 @@ flife inspect               # a run directory's committed world at one checkpoin
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
 flife branch                # control and intervention branches from one checkpoint (exists)
 flife experiment            # seed ensembles, sweeps and ablations against a control, every run cataloged (exists)
-flife discover              # a pinned discovery bundle: reference, selection, thumbnail, full-world export (exists)
+flife discover              # a pinned discovery bundle: reference, selection, thumbnail, full-world export, local package (exists)
+flife transplant            # a local package grafted into a founded host, as a run that resumes (exists)
 flife analyze               # cross-experiment analysis of cataloged metrics
 flife render | export       # simulation-time frames and video through FrankenManim (render exists)
 flife-studio <preset>       # the interactive microscope

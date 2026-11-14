@@ -18,7 +18,7 @@ use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions, Discovery,
     ERROR_SCHEMA, Experiment, ExperimentOptions, FieldMapping, Injection, InspectOptions,
     Introduction, Look, Material, Particles, Persistence, Removal, ResumeOptions, RunOptions,
-    ScheduledCommand, Selection, Stop, StoreDurability, Style, Validation,
+    ScheduledCommand, Selection, Stop, StoreDurability, Style, TransplantOptions, Validation,
 };
 
 /// `flife discover`'s one record: the [`Discovery`] its bundle's
@@ -229,9 +229,11 @@ enum Command {
     },
     /// Save a discovery (plan §14.5) of a run directory's checkpoint into a
     /// new bundle directory: `discovery.json` (source reference,
-    /// selection, presentation, description), `thumbnail.png`, and the
+    /// selection, presentation, description), `thumbnail.png`, the
     /// full-world export `world/`, a run directory `flife resume`
-    /// continues. The run's store pins the checkpoint against retention.
+    /// continues, and for a region the local transplant package `package/`,
+    /// which `flife transplant` grafts. The run's store pins the checkpoint
+    /// against retention.
     Discover {
         /// The run directory.
         run_dir: PathBuf,
@@ -264,6 +266,9 @@ enum Command {
         /// Leave the full-world export out.
         #[arg(long)]
         no_world: bool,
+        /// Leave a region's local transplant package out.
+        #[arg(long)]
+        no_package: bool,
         /// Threads for FrankenManim's CPU renderer: a count or `auto`.
         #[arg(long, default_value = "auto", value_parser = parse_workers)]
         render_threads: NonZeroUsize,
@@ -285,6 +290,31 @@ enum Command {
         field_mapping: FieldMapping,
         /// `power-loss` (the default) flushes the export, the pin and the
         /// bundle's files to stable storage; `process-crash` relies on
+        /// atomic renames.
+        #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
+        checkpoint_durability: StoreDurability,
+    },
+    /// Graft a discovery's local transplant package into a host world as it
+    /// is founded, into a new run directory whose founding checkpoint is the
+    /// grafted world. Continue it with `flife resume`.
+    Transplant {
+        /// The package directory (a discovery bundle's `package/`).
+        package: PathBuf,
+        /// The new (or empty) run directory.
+        run_dir: PathBuf,
+        /// The host's configuration or preset, as TOML: the run's.
+        #[arg(long)]
+        config: PathBuf,
+        /// Where the package's disk centre goes in the host, in world
+        /// units; snapped to the nearest whole-cell move.
+        #[arg(long, value_name = "X,Y", value_parser = parse_position)]
+        at: [f64; 2],
+        /// The transplant's name, part of its identity; the new directory's
+        /// name if omitted.
+        #[arg(long)]
+        name: Option<String>,
+        /// `power-loss` (the default) flushes the founding checkpoint and
+        /// `transplant.json` to stable storage; `process-crash` relies on
         /// atomic renames.
         #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
         checkpoint_durability: StoreDurability,
@@ -523,6 +553,7 @@ fn main() -> ExitCode {
             width,
             height,
             no_world,
+            no_package,
             render_threads,
             color,
             look,
@@ -563,6 +594,7 @@ fn main() -> ExitCode {
                 },
                 render_threads,
                 full_world: !no_world,
+                package: !no_package,
                 durability: checkpoint_durability,
             };
             match flife_cli::discover(&run_dir, &out, &options) {
@@ -571,6 +603,35 @@ fn main() -> ExitCode {
                         record: "discovery",
                         discovery: &discovery,
                     });
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(error.kind(), error.to_string()),
+            }
+        }
+        Command::Transplant {
+            package,
+            run_dir,
+            config,
+            at,
+            name,
+            checkpoint_durability,
+        } => {
+            let host = match load(&config) {
+                Ok(host) => host,
+                Err(code) => return code,
+            };
+            match flife_cli::transplant(
+                &package,
+                &host,
+                &run_dir,
+                &TransplantOptions {
+                    at,
+                    name,
+                    durability: checkpoint_durability,
+                },
+            ) {
+                Ok(record) => {
+                    print(&record);
                     ExitCode::SUCCESS
                 }
                 Err(error) => fail(error.kind(), error.to_string()),
@@ -665,6 +726,21 @@ fn parse_mode(text: &str) -> Result<CheckpointMode, String> {
     .into_iter()
     .find(|mode| mode.name() == text)
     .ok_or_else(|| format!("`{text}` is not `pause-and-stream` or `bounded-background`"))
+}
+
+/// A world position, `X,Y`.
+fn parse_position(text: &str) -> Result<[f64; 2], String> {
+    let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+    let [x, y] = parts.as_slice() else {
+        return Err(format!("`{text}` is not X,Y"));
+    };
+    let value = |part: &str| {
+        part.parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("`{part}` in `{text}` is not a finite number"))
+    };
+    Ok([value(x)?, value(y)?])
 }
 
 fn parse_durability(text: &str) -> Result<StoreDurability, String> {

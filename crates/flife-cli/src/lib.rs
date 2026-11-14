@@ -30,8 +30,13 @@
 //!   depends only on the catalog.
 //! - [`mod@discovery`]: saved discoveries (FL-042). [`discover()`] saves a
 //!   run checkpoint's discovery (selection, thumbnail, presentation,
-//!   description) into a bundle directory with a full-world export, and
-//!   pins the checkpoint in the run's store against retention.
+//!   description) into a bundle directory with a full-world export and,
+//!   for a region, a [`mod@package`] (one disk, its declared boundary and
+//!   its endowment), and pins the checkpoint in the run's store against
+//!   retention.
+//! - [`mod@transplant`]: a package grafted into a host world as it is
+//!   founded (FL-042). [`transplant()`] makes the grafted world a new run
+//!   directory's founding checkpoint, which resumes as its own session.
 //! - [`mod@inspect`]: a run directory's committed state at one checkpoint,
 //!   organism by organism and optionally cell by cell (plan §14.6).
 //! - [`observe`]: what a run did. A [`Tally`] of the published reports, and
@@ -44,7 +49,8 @@
 //! `flife resume DIR --until T`,
 //! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
 //! `flife inspect DIR [--at T] [--field]`,
-//! `flife discover DIR BUNDLE [--at T] [--region X,Y,R | --lineage L]` and
+//! `flife discover DIR BUNDLE [--at T] [--region X,Y,R | --lineage L]`,
+//! `flife transplant PACKAGE DIR --config HOST --at X,Y [--name N]` and
 //! `flife experiment SPEC --out DIR`. The repository's presets live
 //! in `presets/`.
 
@@ -58,9 +64,11 @@ pub mod inspect;
 pub mod memory;
 pub mod metrics;
 pub mod observe;
+pub mod package;
 pub mod persist;
 pub mod render;
 pub mod run;
+pub mod transplant;
 pub mod validate;
 
 pub use branch::{
@@ -73,7 +81,7 @@ pub use checkpointing::{
 };
 pub use discovery::{
     Camera, DESCRIPTION_MAX_BYTES, DISCOVERY_FILE, DISCOVERY_SCHEMA, DiscoverOptions, Discovery,
-    Disk, Exports, FullWorld, Presentation, REGION_FILL, Selected, Selection, Source,
+    Disk, Exports, FullWorld, LocalPackage, Presentation, REGION_FILL, Selected, Selection, Source,
     THUMBNAIL_FILE, THUMBNAIL_MAX_PIXELS, Thumbnail, WORLD_DIR, discover, discovery_id,
 };
 pub use experiment::{
@@ -90,6 +98,10 @@ pub use inspect::{
 pub use memory::{MemoryAdmission, RESERVE_BYTES};
 pub use metrics::{Declaration, METRICS_SCHEMA, Metrics, Tracked, Tracker};
 pub use observe::{Heredity, Survey, Tally};
+pub use package::{
+    Boundary, Crop, Endowment, HOST_EXTERIOR, PACKAGE_DIR, PACKAGE_FILE, PACKAGE_SCHEMA,
+    PACKAGE_WORLD_FILE, Package, PackageSource, PackageWorld, read_package, write_package,
+};
 pub use persist::{
     CATALOG_FILE, CONFIG_FILE, Checkpoints, Injection, Introduction, Material, Persistence,
     Recovered, Removal, ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability, create,
@@ -103,6 +115,10 @@ pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,
     Record, RunOptions, SkippedCheckpoint, Stop, auto_workers, configure, found, run, run_with,
     start,
+};
+pub use transplant::{
+    GraftRecord, HeldEnergy, TRANSPLANT_FILE, TransplantHost, TransplantOptions, TransplantPackage,
+    transplant, transplant_session,
 };
 pub use validate::{VALIDATE_SCHEMA, Validation};
 

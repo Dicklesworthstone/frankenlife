@@ -8,6 +8,7 @@
 //! | Path | Content |
 //! |---|---|
 //! | `thumbnail.png` | the checkpoint's world drawn through the same FrankenManim view as `flife render`, framed on the region when one is selected, with the region's measurement outline |
+//! | `package/` | for a region, the local transplant package ([`crate::package`]): the cropped field and organisms, the declared boundary condition and the energy endowment |
 //! | `world/` | the full-world export: a complete, reproducible world checkpoint, as a run directory that `flife resume` continues |
 //! | `discovery.json` | the [`Discovery`]: identity, source reference, selection, presentation, description, thumbnail and exports; written last |
 //!
@@ -17,9 +18,12 @@
 //!   founding checkpoint byte-identical to the source's in every world
 //!   chunk and linking the source store's verified chunk files. Resumed, it
 //!   reaches exactly the state the source run reaches from that checkpoint.
-//!   The local transplant package (a declared cropped field, boundary
-//!   conditions and energy endowment) is the second export §14.5 names;
-//!   [`Exports::local_package`] is `null` until it is built.
+//! - **Local package.** `package/` holds only the region: the organisms in
+//!   it and the field cells whose centres lie in it, with the declared
+//!   boundary condition `exterior = "host"` (nothing outside the crop
+//!   travels with it) and its energy endowment. It is not a run; a
+//!   transplant grafts it into a host. A lineage or whole-world discovery
+//!   has no disk, so it writes none.
 //! - **Pin.** The source store pins the checkpoint for the discovery
 //!   ([`flife_store::ChunkStore::pin`]): while the source configuration's
 //!   `preserve_pinned_discoveries` holds, its retention keeps the
@@ -50,6 +54,7 @@ use serde::Serialize;
 
 use crate::branch::{BRANCH_NAME_MAX_BYTES, BranchOptions, branch};
 use crate::memory::{MemoryAdmission, admit};
+use crate::package::{PACKAGE_DIR, Package, PackageSource, write_package};
 use crate::persist::{STORE_DIR, StoreDurability, read_config, restorable, run_identity};
 use crate::render::{RenderProjection, encoding_bytes};
 use crate::run::Record;
@@ -139,6 +144,8 @@ pub struct DiscoverOptions {
     pub render_threads: NonZeroUsize,
     /// Whether to write the full-world export.
     pub full_world: bool,
+    /// Whether to write the local package, for a region selection.
+    pub package: bool,
     /// How the export's founding checkpoint and the pin are made durable.
     pub durability: StoreDurability,
 }
@@ -269,14 +276,23 @@ pub struct FullWorld {
     pub chunks: [usize; 2],
 }
 
+/// The local package export.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LocalPackage {
+    /// Its path in the bundle: a package directory.
+    pub path: &'static str,
+    /// Its manifest, `package.json`.
+    pub manifest: Package,
+}
+
 /// The bundle's exports (plan §14.5: "Support two explicit exports").
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Exports {
     /// "a complete reproducible world checkpoint", if written.
     pub full_world: Option<FullWorld>,
     /// "a local transplant package with declared cropped field, boundary
-    /// conditions, and energy endowment": not built yet, so `null`.
-    pub local_package: Option<()>,
+    /// conditions, and energy endowment", if written: for a region only.
+    pub local_package: Option<LocalPackage>,
 }
 
 /// A saved discovery: `discovery.json`, and `flife discover`'s record.
@@ -321,7 +337,7 @@ fn conflict(detail: String) -> CoreError {
     }
 }
 
-fn storage(operation: &'static str, path: &Path, error: &std::io::Error) -> CoreError {
+pub(crate) fn storage(operation: &'static str, path: &Path, error: &std::io::Error) -> CoreError {
     CoreError::StorageFailed {
         operation,
         path: path.display().to_string(),
@@ -429,11 +445,32 @@ pub fn discover(
 
     let (presentation, thumbnail, memory, png) = draw(&config, &world, &epoch, options)?;
     drop(epoch);
-    drop(world);
     // Every refusal above, the render's admission among them, leaves no
     // bundle directory behind.
     fs::create_dir_all(out).map_err(|error| storage("create bundle directory", out, &error))?;
     write_new(&out.join(THUMBNAIL_FILE), &png, options.durability)?;
+
+    let local_package = match options.selection {
+        Selection::Region(disk) if options.package => Some(LocalPackage {
+            path: PACKAGE_DIR,
+            manifest: write_package(
+                &out.join(PACKAGE_DIR),
+                &world,
+                disk,
+                PackageSource {
+                    run_dir: run_dir.display().to_string(),
+                    session: session.get(),
+                    sequence,
+                    tick,
+                    checkpoint_sha256: checkpoint.to_hex(),
+                    config_sha256: revision.to_hex(),
+                },
+                options.durability,
+            )?,
+        }),
+        Selection::Region(_) | Selection::World | Selection::Lineage(_) => None,
+    };
+    drop(world);
 
     let full_world = if options.full_world {
         let record = branch(
@@ -497,7 +534,7 @@ pub fn discover(
         thumbnail,
         exports: Exports {
             full_world,
-            local_package: None,
+            local_package,
         },
         memory,
     };
@@ -654,7 +691,11 @@ fn draw(
 }
 
 /// Write `bytes` to the new file `path`, flushed under `durability`.
-fn write_new(path: &Path, bytes: &[u8], durability: StoreDurability) -> Result<(), CoreError> {
+pub(crate) fn write_new(
+    path: &Path,
+    bytes: &[u8],
+    durability: StoreDurability,
+) -> Result<(), CoreError> {
     let mut file = File::options()
         .write(true)
         .create_new(true)

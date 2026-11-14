@@ -35,7 +35,19 @@ a run directory's durable checkpoint into a new bundle directory: the run/checkp
 a description, in `discovery.json`. It also writes the full-world export, a complete reproducible world checkpoint:
 `world/`, a control branch of the run at that checkpoint that `flife resume` continues. The run's store pins the
 checkpoint for the discovery, so the run's own retention keeps it while `[persistence] preserve_pinned_discoveries`
-holds, which until now nothing read. §14.5's second export, the local transplant package, is not built yet.
+holds, which until now nothing read.
+
+The second slice adds §14.5's second export, the local transplant package, in `package`. A region discovery also
+writes `BUNDLE/package/`: one disk of the checkpoint (`flife_engine::World::cropped`: the organisms in it and the field
+cells whose centres lie in it, every plane; everything else zero), its declared boundary condition (`exterior =
+"host"`: whatever receives it supplies everything outside the crop) and its energy endowment (the crop's holdings), as
+a world-only checkpoint container and a manifest. Full-world and local-package semantics are distinguished: the full
+world resumes as a run; the package is not a run, does not resume alone, and is verified (`read_package`) before
+anything uses it.
+
+The third slice adds `flife transplant`, in `transplant`, which uses a package: it founds a host from its own
+configuration, grafts the package's disk into it at a requested position (`flife_engine::World::graft`, moved by whole
+cells) and writes the grafted world as the founding checkpoint of a new run directory that `flife resume` continues.
 
 FL-043 (`flife-8gy`), first slice, adds the peak-memory preflight (plan §7.5, §19.3, §19.4, INV-12, INV-15), in
 `memory`. Before a run, resume or render steps, `memory::admit` adds up §19.4's terms against `[execution]
@@ -121,7 +133,7 @@ for, one at least, before a render is refused. Its first record is `start`, with
     any planned run's validated configuration.
 
 - FL-042: `flife discover DIR BUNDLE --at T --name NAME --description TEXT (--region X,Y,R | --lineage L) --width W
-  --height H --no-world --render-threads N --color C --look L --density --no-field --field-mapping F
+  --height H --no-world --no-package --render-threads N --color C --look L --density --no-field --field-mapping F
   --checkpoint-durability D`.
   - `DIR` is a run directory no process holds. `BUNDLE` is new or empty.
   - `--at` is the committed tick of one of its checkpoints, the newest that restores by default. `--name` is 1 to
@@ -129,9 +141,21 @@ for, one at least, before a render is refused. Its first record is `start`, with
   - `--region` selects a disk of radius R world units about (X, Y), as a measurement region (§14.3); `--lineage`
     selects one founder lineage's live organisms; neither selects the whole world.
   - The thumbnail is W × H pixels (640 × 360 by default, each side 1 to 4,096), drawn with `flife render`'s style
-    flags. `--no-world` leaves the full-world export out.
+    flags. `--no-world` leaves the full-world export out; `--no-package` leaves a region's package out (a lineage or
+    whole-world discovery has none).
   - In the library: `discover(dir, bundle, &DiscoverOptions { at, name, description, selection, size, style,
-    render_threads, full_world, durability })` returns the `Discovery`.
+    render_threads, full_world, package, durability })` returns the `Discovery`. `write_package(dir, world, disk,
+    source, durability)` cuts a package from any committed world; `read_package(dir, profile)` verifies one and
+    returns its manifest and world.
+- FL-042: `flife transplant PACKAGE DIR --config HOST --at X,Y --name NAME --checkpoint-durability D`.
+  - `PACKAGE` is a package directory (a bundle's `package/`). `DIR` is new or empty. `HOST` is the host's
+    configuration, the run's: it must have the package's cell size, topology catalog and parameter type.
+  - `--at` is where the disk's centre goes, a world position in the host (`0 ≤ X < width`, `0 ≤ Y < height`). The
+    disk moves by `offset = round((at − centre) / cell size)` whole cells per axis, so cells land on cells; its
+    centre in the host is the package's centre plus `offset` cells, wrapped. `--name` is 1 to 256 bytes, `DIR`'s name
+    by default.
+  - In the library: `transplant(package, &host, dir, &TransplantOptions { at, name, durability })` returns the
+    `Record::Transplant`.
 - `flife inspect DIR --at T --field --weights ID…` (plan §14.6; FL-048's raw state; FL-021's on-demand weight
   dump, §14.2). `DIR` is a run directory no process holds; `--at` the committed tick of one of its checkpoints, the
   newest that restores by default; `--weights` (repeatable) names organisms whose whole controller to print. In the
@@ -177,8 +201,25 @@ for, one at least, before a render is refused. Its first record is `start`, with
       projection (as `flife render`'s end record), the camera (centre and zoom), background, bloom and dot radius;
     - `thumbnail`: path, size and the PNG's SHA-256;
     - `exports`: `full_world` (path `world`, its session, its founding checkpoint's SHA-256, and the chunks written
-      and linked) or `null` under `--no-world`, and `local_package`, `null`;
+      and linked) or `null` under `--no-world`, and `local_package` (path `package` and its manifest) for a region,
+      `null` for a lineage, the whole world or `--no-package`;
     - `memory`: the thumbnail's FL-043 admission.
+  - FL-042, the package's manifest `package/package.json` (`frankenlife.package.v1`, unknown keys refused): `source`
+    (run directory, session, checkpoint sequence, tick and container SHA-256, configuration hash), `crop` (centre,
+    radius and their IEEE-754 bits, which are the disk; the field cells in it; the source grid and cell size),
+    `boundary` (`exterior = "host"`), `endowment` (field, organisms, total: the crop's holdings), `organisms`,
+    `lineages`, and `world` (`world.ckpt`, its size, SHA-256 and the cropped world's digest).
+  - FL-042, `transplant` (the only record of `flife transplant`; `DIR/transplant.json` holds the same):
+    - `name` and `session`, `transplant_session(package SHA-256, host configuration hash, offset, name)`: the first
+      eight bytes, little-endian, of SHA-256 of `frankenlife.transplant-session.v1`, a zero byte, the package
+      container's SHA-256 (hex), the configuration hash, the offset's two little-endian `i64`s and the name. It is
+      never `RUN_SESSION`;
+    - `package`: its directory, container SHA-256, the cropped world's digest and its `source`;
+    - `host`: the configuration hash, its founders and the founded host's digest before the graft;
+    - `graft`: `at`, `center` (where the disk went), `radius`, `offset`, host cells replaced and their energy, host
+      founders displaced and their energy, organisms grafted, the new lineages they form, and the holdings
+      `before`, `endowment` and `after` (field, organisms, total);
+    - the founding checkpoint (sequence, tick 0), its SHA-256 and size, and the grafted world's digest.
   - FL-040, with `--metrics-every M`:
     - `start.metrics` declares `frankenlife.metrics.v1`: M, the complete and sampled rules in words, the bin grid
       (16 a side) and the lineages listed (8);
@@ -402,7 +443,8 @@ for, one at least, before a render is refused. Its first record is `start`, with
   - Resuming a branch takes the newest checkpoint of its own session that restores. Checkpoints of another session
     are passed over, and a branch has no founding world to fall back to.
 - FL-042, discoveries:
-  - A bundle is `thumbnail.png`, `world/` (unless `--no-world`) and `discovery.json`, written in that order.
+  - A bundle is `thumbnail.png`, `package/` (a region's, unless `--no-package`), `world/` (unless `--no-world`) and
+    `discovery.json`, written in that order.
     `discovery.json` is written to `discovery.json.partial` and renamed into place: it is the bundle's commit
     point, and a bundle without it is incomplete. Under `power-loss` each file and the directory are flushed.
   - Full-world semantics: `world/` is `branch(DIR, BUNDLE/world, at = the checkpoint's tick, name = the
@@ -418,6 +460,33 @@ for, one at least, before a render is refused. Its first record is `start`, with
   - The pin is made after the export and before `discovery.json`. While the run's configuration preserves pins,
     the run's retention keeps the checkpoint and every chunk it names (`flife-store`'s pins); `Checkpoints::open`
     sets the store from `[persistence] preserve_pinned_discoveries`.
+  - Local-package semantics: `package/world.ckpt` is `World::cropped(disk)` as a world checkpoint container (world
+    chunks, no command chunk). It keeps the source's configuration, tick, epoch and identity allocators; it holds the
+    organisms a removal of the disk would take (rows, held state and genomes) and the cells whose centres lie in it,
+    and nothing else; its ledger opens at exactly its own holdings, the endowment. It is not a run: `flife resume
+    BUNDLE/package` is refused.
+  - `read_package` accepts a package only when the manifest has the schema, `exterior = "host"` and `world.ckpt`;
+    the container has the manifest's size and SHA-256 and restores (its restore checks the ledger against the state
+    bit for bit); and the restored world agrees with the manifest on the crop (decimals and bits, cells,
+    organisms, lineages, grid and cell size, measured again), the digest, the tick, the configuration hash, the
+    organism count and the endowment (to 4 units in the last place: JSON carries it as decimal text).
+- FL-042, transplants:
+  - A transplant is a founding-world operation: the host is founded from its configuration and the graft applies
+    before any tick is published, so everything the run then holds is its founding endowment and no flow accounts
+    for it. The grafted world's ledger opens at its holdings: the host's, less the displaced cells' and founders'
+    energy, plus the package's endowment.
+  - The graft (`World::graft`): each package cell in the disk replaces the host cell at the host centre plus its
+    minimum-image displacement from the package's centre, every plane; the host's founders in the host's disk are
+    displaced; the package's organisms enter after the host's survivors, in identity order, with the host's next
+    organism and genome identities, as founders (no parent, generation 0, born at tick 0, invalid held output, the
+    stable phase of their new identity, the founders' cooldown deadline), keeping velocity, energy, topology, traits
+    and parameters; the package's organisms of one lineage form one new lineage named by its first member's
+    identity. Everything outside the disk is the host's. A graft is all or none.
+  - `DIR` is `config.toml` (the host's), `catalog.db` recording the transplant session under the host's
+    configuration hash, `store/` holding the founding checkpoint (the grafted world, an empty command book of that
+    session), and `transplant.json`, written in that order. `flife resume DIR` continues it as its own session.
+  - Only a run of `RUN_SESSION` falls back to the world its configuration founds. A transplant none of whose
+    checkpoints restores is refused (`persist::recover`): its world is not its configuration's.
 - FL-040:
   - The tracker never reads the world after its start. It starts from the committed population (each organism's
     identity, genome, lineage, generation, birth tick and topology) and then folds each published report: births
@@ -528,7 +597,18 @@ test.
   - `budget-exhausted`: a thumbnail that does not fit `maximum_total_bytes`.
 
   All of these are refused before the bundle directory is made or anything is pinned. `--region` with
-  `--lineage` is a usage error.
+  `--lineage` is a usage error. `read_package` refuses a package that disagrees with itself (see the invariants)
+  with `state-conflict` (operation `read package`).
+- FL-042, `flife transplant`, with nothing printed on standard output and nothing written:
+  - `state-conflict`: a name that is empty or longer than 256 bytes; a package that does not verify; a position
+    outside the host; a host of another cell size, topology catalog or parameter type; a disk that would land two
+    of its cells on one host cell (a host narrower than the disk); a target directory that holds a run or other
+    files;
+  - `numerical-invalid`: a disk the host's measurement refuses (a radius above half the host's shorter side);
+  - `budget-exhausted`: a host whose population or genome quota cannot take the organisms that arrive.
+
+  Each is refused before `DIR` is made. A refused graft leaves the host world as it was (`World::graft` assigns
+  nothing until every check and allocation has passed).
 - FL-040: a report or an epoch that disagrees with the tracker stops the run with `state-conflict` (operation
   `track run metrics`), exit status 2. The records before it are still emitted.
 - FL-041, before anything runs: a specification with an unknown key, another schema, an empty name, hypothesis or
@@ -727,7 +807,7 @@ admissions, and forks out of order, each accepted on restore, and a restored rec
 reachable only through a crafted checkpoint. `flife-runtime`'s `a_crafted_lineage_is_refused_on_restore` now
 catches each of them.
 
-`tests/discovery.rs` (4 tests, FL-042, about 4 s), on FL-037's 32 × 32 ecology run to tick 120 with checkpoints
+`tests/discovery.rs` (5 tests, FL-042, about 4 s), on FL-037's 32 × 32 ecology run to tick 120 with checkpoints
 every 7 ticks, the newest 4 retained, and two energy brushes (one before and one after the discovered tick):
 - `a_region_discovery_is_a_pinned_reference_and_a_reproducible_world`. A region discovery at tick 112:
   - the record equals `discovery.json`;
@@ -738,11 +818,21 @@ every 7 ticks, the newest 4 retained, and two energy brushes (one before and one
   - the outline is drawn: over 150 pale pixels, at a mean distance from the centre within 2 pixels of 0.75 × 90 / 2;
   - `world/` resumed to tick 161 reaches the digest the source reaches from the same checkpoint;
   - the source store holds exactly one pin, the discovery's. The run continued to tick 161 still restores tick 112,
-    while its other old checkpoints are gone.
+    while its other old checkpoints are gone;
+  - the package: its manifest equals the record's and `package.json`; its schema and boundary; its source is the
+    discovery's; its crop (centre, radius, centre bits) and its cells, organisms and lineages are the selection's;
+    its endowment's organism energy equals a sum over `inspect`'s rows in the disk and its field energy the
+    selection's; `world.ckpt` has the manifest's size and SHA-256; `read_package` verifies it; its organisms'
+    identities are exactly `inspect`'s rows in the disk; its digest is the manifest's and not the source world's;
+    and `flife resume BUNDLE/package` exits 2.
 - `lineage_and_whole_world_discoveries_record_what_the_checkpoint_holds`. A lineage discovery with `--no-world`
   under `power-loss` has the live count and generations `inspect` shows, and only `discovery.json` and
   `thumbnail.png`. A whole-world discovery at the newest tick (120) has `inspect`'s live count and digest at zoom 1.
-  Neither thumbnail has an outline, and the store holds both pins.
+  Neither thumbnail has an outline, neither has a package, and the store holds both pins.
+- `a_package_that_disagrees_with_itself_is_refused`. A region package at tick 112, then copies with one change
+  each: a flipped container byte, `exterior = "isolated"`, an unknown crop key, the centre's bits moved, one more
+  organism, schema v2, the endowment's total 1% higher, the tick one later, another configuration hash, another
+  digest. `read_package` refuses each with `state-conflict`. `--no-package` writes none.
 - `refused_discoveries_write_nothing`. A tick with no checkpoint, an absent lineage, a region of radius 0 and one
   above half the world, a thumbnail side of 0, and a non-empty bundle directory: each exits 2 with one error record
   of its kind, makes no bundle directory, leaves the non-empty one as it was, and pins nothing. `--region` with
@@ -762,6 +852,35 @@ the export left out, an absent lineage accepted, the bundle made before the thum
 without the thumbnail's bytes). The last two were planted after a reading of `discover` showed that a budget
 refusal made the bundle directory, which no test then checked; `discover` now makes it only after the thumbnail is
 drawn, and the budget test was added for it.
+
+`tests/transplant.rs` (4 tests, FL-042, about 4 s). A source run of FL-037's 32 × 32 ecology to tick 60 and a
+region discovery of (16, 16) radius 6 there (`--no-world`) make the package; the host is the ecology founded from
+seed 7:
+- `a_transplant_is_a_run_that_resumes_from_the_grafted_world`, at (8.3, 24.6):
+  - the record equals `transplant.json`; its offset is (−8, 9) and its centre (8, 25), recomputed here; its session
+    is `transplant_session` of its inputs and not `RUN_SESSION`; its package, source and host hash are the
+    manifest's and the configuration's; its organisms, lineages and endowment are the manifest's; the holdings
+    identity holds;
+  - the same graft made here from `read_package` and a host founded alike has the record's host digest, founders
+    and grafted digest; the run's store holds exactly one checkpoint, the record's sequence and SHA-256;
+  - `flife inspect --at 0` reads the record's digest and checkpoint, the host's survivors (all outside the disk)
+    then the newcomers with the host's next identities, generation 0, no parent, birth tick 0, the package's
+    energies bit for bit, at the oracle's positions;
+  - resumed to 30 it starts from checkpoint 0 at the record's digest; resumed to 13 and then 30 it reaches the same
+    digest; the host run alone to 30 does not.
+- `a_transplant_without_a_checkpoint_that_restores_is_refused`: its checkpoint manifest damaged, `flife resume`
+  exits 2 with `state-conflict` and "no founding world to fall back to".
+- `refused_transplants_write_nothing`: a position on the host's edge, an empty name, a host of half-unit cells, a
+  host capped at its founders (`budget-exhausted`, more organisms arriving than leaving, checked here) and a package
+  with a flipped container byte each exit 2 and leave no run directory; a second transplant into a run directory
+  is refused and leaves the first's record.
+- `a_transplant_session_names_its_inputs`: changing the package, the host, the offset or the name changes it.
+
+Planted bugs, 11, run with `tests/discovery.rs`, each caught: `read_package` not checking the container's SHA-256,
+the boundary, the schema, the endowment's total, the source tick or the digest (the last three caught by variants
+added to `a_package_that_disagrees_with_itself_is_refused` for them); the offset floored instead of rounded; the
+session ignoring the name; a position on the host's far edge accepted; the founding checkpoint carrying a founded
+run's command book; and `recover` falling back to a transplant's configuration's founding world.
 
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
@@ -963,12 +1082,30 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
     in which every organism reproduces, which would test its birth part, is not made.
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
-- Only `validate`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect` and `discover`. Capabilities,
-  step, analyze and export are later items (§14.6).
-- FL-042 gaps (first slice):
-  - §14.5's local transplant package (a declared cropped field, boundary conditions and energy endowment) and a
-    transplant into a host are not built, so `exports.local_package` is always `null` and FL-042 stays open.
-  - The Studio has no discover action; a run the Studio (or any process) holds is refused, as for `branch`.
+- Only `validate`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect`, `discover` and `transplant`.
+  Capabilities, step, analyze and export are later items (§14.6).
+- FL-042 gaps:
+  - FL-042 is formally blocked by FL-020 (the Studio window); the bead stays open whatever these slices satisfy.
+  - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for
+    `branch`.
+  - The crop, its encoding, the package's restored world and the transplant's host and grafted world are not
+    admitted against `maximum_total_bytes` (FL-043): `flife branch`'s restore has no term either. Each is at most a
+    copy of a world the run itself held.
+  - A package is one disk with one boundary condition, `exterior = "host"`. Other shapes, and other boundary
+    conditions (an isolated or periodic exterior), are not built. Nothing outside the disk travels: not the
+    surrounding field, the sources or the neighbours, which §14.5 warns a colony may depend on. Whether a
+    transplanted colony survives is an experiment's question, not a guarantee.
+  - A transplant is made only at founding. Grafting into a running world (an intervention with ledger flows at a
+    committed boundary) is not built, and neither is a rotation or a move by less than a cell.
+  - The host must share the package's cell size, topology catalog and parameter type. Grafted organisms become
+    founders: their parentage, generation, birth tick, held output and cooldown are reset, and their ancestry is
+    not carried into the host's lineage records.
+  - `read_package` reads the container whole (at most 16 GiB) rather than streaming it, and checks the decimal
+    endowment to 4 units in the last place, not bit for bit (the bits are checked through the restored ledger).
+  - `transplant.json` records provenance; no code reads it. The catalog records only the transplant's session,
+    from which the package and host are not recoverable without it.
+  - `numerical-invalid` for a host disk a measurement refuses is in `World::graft`'s contract but not exercised
+    through `flife transplant`.
   - A crash between the pin and the commit point leaves a pin that no `discovery.json` names. It keeps its
     checkpoint until unpinned; nothing lists or removes such pins yet.
   - Nothing unpins: deleting a bundle leaves its pin in the source store.

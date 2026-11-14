@@ -53,6 +53,24 @@ pub struct RegionMeasurement {
     pub field_energy: f64,
 }
 
+/// Whether cell `(x, y)`'s centre lies within `radius` of `center` by the
+/// minimum-image distance, the circle included: the cell rule a measurement
+/// and a crop ([`crate::World::cropped`]) share.
+pub(crate) fn cell_in_disk(
+    grid: &FieldGrid,
+    center: [f64; 2],
+    radius: f64,
+    x: u32,
+    y: u32,
+) -> Result<bool, CoreError> {
+    let at = [
+        (f64::from(x) + 0.5) * grid.cell_width(),
+        (f64::from(y) + 0.5) * grid.cell_height(),
+    ];
+    let [dx, dy] = grid.displacement(center, at)?;
+    Ok(dx * dx + dy * dy <= radius * radius)
+}
+
 /// Measure the disk of `radius` about `center` in the committed world at
 /// `tick`: `population` and `field` on `grid`.
 pub(crate) fn measure(
@@ -91,15 +109,11 @@ pub(crate) fn measure(
     let lineages = distinct_lineages(grid, population, &disk, organisms)?;
 
     let energy = field.energy();
-    let [width, height] = [grid.cell_width(), grid.cell_height()];
     let mut cells = 0_u64;
     let mut field_energy = 0.0;
     for y in 0..grid.cells_y() {
-        let at_y = (f64::from(y) + 0.5) * height;
         for x in 0..grid.cells_x() {
-            let at = [(f64::from(x) + 0.5) * width, at_y];
-            let [dx, dy] = grid.displacement(center, at)?;
-            if dx * dx + dy * dy > radius * radius {
+            if !cell_in_disk(grid, center, radius, x, y)? {
                 continue;
             }
             let value = grid

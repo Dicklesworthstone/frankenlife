@@ -410,6 +410,59 @@ fn a_branch_renders_to_the_world_its_resume_reaches_and_is_left_as_it_was() {
     assert_eq!(one(&out, "end")["digest"], *treated_digest);
 }
 
+/// A restored world draws the pixels the uninterrupted one does: the frame
+/// of a run's newest checkpoint is byte for byte the frame a render of its
+/// configuration draws at that tick, though that view was built at the
+/// founding and this one at the checkpoint.
+#[test]
+fn a_restored_world_draws_the_frame_its_uninterrupted_render_draws() {
+    let config = ecology("volatile-in-memory");
+    let run_dir = fresh("plain");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&config),
+        "--ticks",
+        "40",
+        "--every",
+        "0",
+        "--run-dir",
+        text(&run_dir),
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let restored = fresh("plain-restored");
+    let (status, from_run, err) = flife(&strs(&render_args(&run_dir, &restored, 0, 1)));
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(frame_ticks(&from_run), [40]);
+    let founded = fresh("plain-founded");
+    let (status, from_config, err) = flife(&[
+        "render",
+        text(&config),
+        "--ticks",
+        "40",
+        "--every",
+        "40",
+        "--width",
+        "48",
+        "--height",
+        "48",
+        "--out",
+        text(&founded),
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    assert_eq!(frame_ticks(&from_config), [0, 40]);
+    assert_eq!(
+        one(&from_run, "end")["digest"],
+        one(&from_config, "end")["digest"]
+    );
+    let frame = |path: PathBuf| fs::read(path).expect("the frame");
+    assert!(
+        frame(restored.join("frame-000000.png")) == frame(founded.join("frame-000001.png")),
+        "the same pixels"
+    );
+}
+
 /// The options [`render_run`] is called with here: 48 × 48 frames every
 /// `every` ticks into `out`, on the CPU controllers.
 fn options(out: PathBuf, ticks: u64, every: u64) -> RenderOptions {

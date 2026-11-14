@@ -778,8 +778,8 @@ test.
   prints nothing; a configuration naming an unregistered mapping is refused as `invalid-config` before anything
   renders.
 
-`tests/render_run.rs` (3 tests, about 4 s), on FL-037's 32 × 32 ecology with its four injections (ticks 3, 66, 150
-and 230). "Left as it was" means every file but the catalog's is byte-identical, and the catalog holds the same run,
+`tests/render_run.rs` (4 tests, about 4 s), on FL-037's 32 × 32 ecology with its four injections (ticks 3, 66, 150
+and 230) but in the last. "Left as it was" means every file but the catalog's is byte-identical, and the catalog holds the same run,
 journal, lineage and checkpoint index.
 - `a_branch_renders_to_the_world_its_resume_reaches_and_is_left_as_it_was`. A volatile parent is run to tick 120.
   A control branch and an intervention branch (brush at tick 130) are made at 112. Each is rendered with
@@ -799,6 +799,11 @@ journal, lineage and checkpoint index.
   `missing-capability`. An empty directory exits 2. A configuration with `--run-dir` exits 2 with clap's
   "cannot be used with". None prints a record or makes the frame directory, and the run is left as it was. Once the
   store is released, the same render draws ticks 10 to 14.
+- `a_restored_world_draws_the_frame_its_uninterrupted_render_draws`. A run of the ecology without commands is taken
+  to tick 40. Rendered from its run directory, its one frame (tick 40) is byte for byte the tick-40 frame of
+  `flife render` of the configuration, whose view was built at the founding. The end digests are equal. Compared
+  with that render's tick-0 frame instead, the test fails (planted). The same holds at the preset's scale, checked
+  once by hand (not a test): 512 × 512 at tick 1,536, digest 47066678….
 
 Planted bugs: 13, all caught, by these tests, `flife-runtime`'s
 `a_journal_replays_only_onto_a_book_of_the_worlds_configuration` (in `tests/checkpoint.rs`) and `tests/resume.rs`.

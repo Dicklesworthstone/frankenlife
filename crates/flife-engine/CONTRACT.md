@@ -947,8 +947,10 @@ genomes and fields read directly before the operation:
   each refused for its own reason (the refusal's detail is checked), the host's digest, holdings and rows unchanged.
 
 Planted bugs, 18, run with `tests/measure.rs`: 17 caught: the crop copying every cell or keeping every organism,
-dropping genome parents, opening its ledger at the source field's energy or resetting the epoch; the rim cell left
-out of a disk (`<` for `≤`: the 17-cell disk then fits the 16-cell host); the cell-size, parameter-type,
+dropping genome parents, opening its ledger at the source field's energy or resetting the epoch; the rim cells left
+out of a disk (`<` for `≤`: caught by the seam graft, whose radius-5 disk has rim cells 3 and 4 cells off its
+centre, and by the 17-cell refusal, whose disk then fits; `tests/measure.rs` did not run for it, as cargo stops at
+the first failing test binary); the cell-size, parameter-type,
 outside-the-disk and landing checks removed; host founders in the disk kept; a lineage not named by its first
 member; the source phase or cooldown kept; the ledger not reopened; the disk moved the wrong way; and the whole
 founding check removed. One survived: removing only the founding check's tick clause, because a stepped host is

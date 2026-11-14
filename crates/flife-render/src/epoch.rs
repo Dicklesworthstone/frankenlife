@@ -1016,14 +1016,11 @@ impl Epoch {
         let mut organism_energy = 0.0_f64;
         let mut max_generation = 0_u32;
         let mut parameters = 0_u64;
-        for organism in population.iter() {
-            let genome =
-                population
-                    .genome(organism.id)
-                    .ok_or_else(|| CoreError::StateConflict {
-                        operation: "project render epoch",
-                        detail: format!("{} has no genome", organism.id),
-                    })?;
+        for (organism, genome) in population.iter_with_genomes() {
+            let genome = genome.ok_or_else(|| CoreError::StateConflict {
+                operation: "project render epoch",
+                detail: format!("{} has no genome", organism.id),
+            })?;
             let topology =
                 u8::try_from(genome.topology().index()).map_err(|_| CoreError::Overflow {
                     quantity: "render topology index",

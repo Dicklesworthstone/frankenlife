@@ -48,7 +48,7 @@
 //! parameters ([`Population::arena_slot`]). Arena slots are physical too.
 //! An organism keeps its arena slot when the compact arrangement moves it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
@@ -301,6 +301,14 @@ pub struct Population {
     latest: Option<OrganismId>,
 }
 
+/// `id`'s slot, from an ascending walk of the index that has not passed
+/// `id`: the entries below `id` are skipped and the one at or after it is
+/// taken. `None` when `id` is not alive.
+fn next_slot(live: &mut btree_map::Iter<'_, OrganismId, usize>, id: OrganismId) -> Option<usize> {
+    live.find(|&(&entry, _)| entry >= id)
+        .and_then(|(&entry, &slot)| (entry == id).then_some(slot))
+}
+
 /// Every birth in `births` is at `tick`.
 fn check_birth_ticks(tick: Tick, births: &[Entrant]) -> Result<(), CoreError> {
     for entrant in births {
@@ -504,6 +512,16 @@ impl Population {
         self.index.values().map(|&slot| self.read(slot))
     }
 
+    /// Every live organism with its genome, in identity order: what
+    /// [`Population::iter`] and [`Population::genome`] give, read from the
+    /// one slot without a second search.
+    pub fn iter_with_genomes(&self) -> impl Iterator<Item = (Organism, Option<&Genome>)> + '_ {
+        self.index.values().map(|&slot| {
+            let genome = self.genomes.get(slot).and_then(Option::as_ref);
+            (self.read(slot), genome)
+        })
+    }
+
     /// `id`'s genome's arena slot.
     #[must_use]
     pub fn arena_slot(&self, id: OrganismId) -> Option<ArenaSlot> {
@@ -656,11 +674,18 @@ impl Population {
     ) -> Result<(), CoreError> {
         let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
         self.reserve_arena(births)?;
+        // Checked above: the survivors ascend and each is alive, so one
+        // ordered walk of the index finds every slot. The index is moved
+        // out for the walk, because writing a slot borrows the population;
+        // `write` does not touch it.
+        let index = core::mem::take(&mut self.index);
+        let mut live = index.iter();
         for organism in survivors {
-            if let Some(&slot) = self.index.get(&organism.id) {
+            if let Some(slot) = next_slot(&mut live, organism.id) {
                 self.write(slot, organism);
             }
         }
+        self.index = index;
         for collected in self.remove(dying) {
             // Checked above: the quota holds every one of these charges.
             quota.retire(collected.genome)?;
@@ -685,6 +710,7 @@ impl Population {
             detail,
         };
         let mut previous: Option<OrganismId> = None;
+        let mut live = self.index.iter();
         for organism in survivors {
             if previous.is_some_and(|previous| organism.id <= previous) {
                 return Err(conflict(format!(
@@ -696,7 +722,11 @@ impl Population {
             if dying.contains_key(&organism.id) {
                 return Err(conflict(format!("{} both survives and dies", organism.id)));
             }
-            let Some(&slot) = self.index.get(&organism.id) else {
+            // The survivors so far ascend and each matched its own entry,
+            // so the walk stands just past the last one's entry and this
+            // one's, if it is alive, lies ahead: one ordered walk of the
+            // index, not a search per survivor.
+            let Some(slot) = next_slot(&mut live, organism.id) else {
                 return Err(conflict(format!("{} is not alive", organism.id)));
             };
             if self.read(slot).lineage_key() != organism.lineage_key() {

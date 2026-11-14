@@ -124,13 +124,19 @@ each runs and owns the field.
 - `Death` (identity, genome, lineage, generation, tick, resulting position, `DeathCause`, residual), and
   `Recycling::settle`'s `DeathSettlement` (removed, dissipated, recycled and offered; `record` books the first two).
 - `Population`: `admit`, `update`, `commit` (the `Collected` deaths, each with its last row and genome, for the
-  caller to retire), `get`, `iter` and `ids` in identity order, `slot` and `slots`, `genome`, `arena_slot` and
+  caller to retire), `get`, `iter` and `ids` in identity order, `iter_with_genomes` (each organism with its
+  genome, read from its one slot), `slot` and `slots`, `genome`, `arena_slot` and
   `arena` (FL-026: each live genome's generation-tagged slot, assigned at admission or birth and released at
   death, kept when the compact arrangement moves the organism, and reassigned in identity order on restore),
   `latest` and
   `digest`, a SHA-256 of the canonical state in identity order without slots (`frankenlife.population-state.v1`).
   `HeldOutput` hides an invalid output entirely. `check_tick` and `commit_tick` (FL-013) check and commit a whole
-  tick: survivors, deaths with their genome charges returned to the quota, and births.
+  tick: survivors, deaths with their genome charges returned to the quota, and births. Each finds the survivors'
+  slots in one ordered walk of the identity index (the survivors are checked ascending first), not a search per
+  survivor (FL-034's C13); the refusals and their order are unchanged. In the 25k evolved world's profile those
+  searches, with the render projection's second search per genome, were about 7.7% of the main thread, which
+  bounds the tick. Measured on csd (2 x EPYC 7282, quiet): 10.36 to 10.86 ticks/s, paired median 1.047, 6 of 6,
+  every digest one value. On the shared Mac both runs were inadmissible (other agents' load), so no claim there.
 - `World` (FL-013): the committed `tick`, `epoch` (a `ResourceEpoch`, zero at founding and one more per
   publication), event cursor `events`, `field`, `population`, source `paths`, `identities`, `quota`, `ledger`,
   `fault`, and `digest`, a SHA-256 of the scientific state (`frankenlife.world-state.v1`: tick, every field value,
@@ -717,6 +723,12 @@ streams. The small ecology pins its world digest, checked on Linux x86_64.
   - INV-08: an organism out of the field's reach evolves bit for bit as if alone.
   - `Population::check_tick` refusals: a forgotten, repeated, reordered, surviving-and-dying, starved or renamed
     organism, and a quota short of the dying genomes' bytes or count, each checked on its own.
+  - `tests/lifecycle.rs::a_whole_tick_commit_finds_survivors_by_identity_across_gaps`: with gaps the dead leave and
+    a reused slot, in both arrangements, `commit_tick` writes each survivor's state on its own identity; a dead
+    identity between live ones is refused as not alive by `check_tick` and `commit_tick`, nothing changed; and
+    `iter_with_genomes` gives `iter`'s organisms with `genome`'s genomes. Of five planted defects in the walk and
+    in `iter_with_genomes`, each was caught; the one that drops the walk's equality check is caught by this test
+    alone.
   - Twenty-two planted bugs were each caught by at least one of these tests: regular evaluation keyed to the input
     tick, newborns not forced, packet scratch leaking between organisms, every demand at one position, identities
     or the quota advanced in place, the field, epoch or event cursor not committed, deposits before the grants'

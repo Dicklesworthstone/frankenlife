@@ -1068,6 +1068,94 @@ fn deaths_are_committed_once_and_only_for_the_living() {
     }
 }
 
+/// The whole-tick commit finds each survivor by identity, whatever slot it
+/// occupies and across the gaps the dead leave, and refuses a dead identity
+/// between live ones as not alive. Organisms read with their genomes are
+/// the organisms and genomes read apart.
+#[test]
+fn a_whole_tick_commit_finds_survivors_by_identity_across_gaps() {
+    let world = World::new();
+    for arrangement in [Arrangement::Compact, Arrangement::FreeList] {
+        let mut genomes = quota();
+        let mut population = population(arrangement, 8);
+        let mut founders: Vec<Entrant> = [1, 3, 5, 6]
+            .into_iter()
+            .map(|id| world.founder(id, 2.0, &mut genomes))
+            .collect();
+        population.admit(&mut founders).expect("founders");
+        // 3 dies and 7 is born: the live identities are 1, 5, 6 and 7, and
+        // a slot is reused or moved.
+        let three = alive(&population, 3);
+        let mut births = vec![world.child(7, &alive(&population, 1), 1, 0.5, &mut genomes)];
+        let collected = population
+            .commit(Tick::new(1), &[exhausted(&three, 1)], &mut births)
+            .expect("commit");
+        for entry in collected {
+            genomes.retire(entry.genome).expect("retire");
+        }
+        let rows: Vec<Organism> = population
+            .iter()
+            .map(|organism| Organism {
+                energy: organism.energy * 0.5,
+                ..organism
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.id.get()).collect::<Vec<_>>(),
+            [1, 5, 6, 7]
+        );
+
+        // Read together, as read apart.
+        let together: Vec<_> = population.iter_with_genomes().collect();
+        assert_eq!(
+            together
+                .iter()
+                .map(|&(organism, _)| organism)
+                .collect::<Vec<_>>(),
+            population.iter().collect::<Vec<_>>()
+        );
+        for (organism, genome) in together {
+            let apart = population.genome(organism.id).expect("a genome");
+            assert!(
+                genome.is_some_and(|genome| std::ptr::eq(genome, apart)),
+                "{}",
+                organism.id
+            );
+        }
+
+        // The dead 3, between live identities, is not alive; nothing changes.
+        let digest = population.digest();
+        let mut stray = rows.clone();
+        stray.insert(1, three);
+        let refused = |error: CoreError| {
+            assert!(
+                matches!(&error, CoreError::StateConflict { detail, .. }
+                    if detail.contains("organism:3 is not alive")),
+                "{error}"
+            );
+        };
+        refused(
+            population
+                .check_tick(Tick::new(2), &stray, &[], &[], &genomes)
+                .expect_err("a dead survivor"),
+        );
+        refused(
+            population
+                .commit_tick(Tick::new(2), &stray, &[], &mut Vec::new(), &mut genomes)
+                .expect_err("a dead survivor"),
+        );
+        assert_eq!(population.digest(), digest);
+
+        // Each survivor's new state lands on its own identity.
+        population
+            .commit_tick(Tick::new(2), &rows, &[], &mut Vec::new(), &mut genomes)
+            .expect("commit tick");
+        for row in &rows {
+            assert_eq!(alive(&population, row.id.get()), *row);
+        }
+    }
+}
+
 #[test]
 fn dead_identities_are_never_readmitted() {
     let world = World::new();

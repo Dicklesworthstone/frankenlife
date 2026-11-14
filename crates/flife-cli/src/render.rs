@@ -152,15 +152,21 @@ pub enum RenderRecord {
 /// Render `config` per `options`, passing each record to `emit`.
 ///
 /// # Errors
-/// The world's founding and stepping errors; [`CoreError::StateConflict`]
-/// for a capacity pause, an unwritable frame or a failed encoder; and the
-/// view's errors.
+/// [`video_encoder`]'s, before anything is founded or written, when a video
+/// is asked for. The world's founding and stepping errors;
+/// [`CoreError::StateConflict`] for a capacity pause, an unwritable frame
+/// or a failed encoder; and the view's errors.
 pub fn render(
     config: &ValidatedConfig,
     options: &RenderOptions,
     mut emit: impl FnMut(&RenderRecord),
 ) -> Result<(), CoreError> {
     let clock = Instant::now();
+    // A video's encoder runs after every frame is drawn, so it is checked
+    // before the first.
+    if options.video.is_some() {
+        video_encoder()?;
+    }
     let model = config.config();
     let background =
         hex_rgb(&model.presentation.background).ok_or_else(|| CoreError::NumericalInvalid {
@@ -368,6 +374,46 @@ fn speeds(velocities: &[[f32; 2]]) -> (f64, f64) {
         sum / velocities.len() as f64
     };
     (mean, top)
+}
+
+/// The external encoder `flife render --video` runs: `ffmpeg` on the
+/// `PATH`, listing a `libx264` encoder. Returns ffmpeg's version line.
+///
+/// # Errors
+/// [`CoreError::MissingCapability`] when ffmpeg cannot be run, exits with
+/// an error, or lists no libx264 encoder.
+pub fn video_encoder() -> Result<String, CoreError> {
+    let ffmpeg = |args: &[&str]| -> Result<String, CoreError> {
+        let output = std::process::Command::new("ffmpeg")
+            .args(args)
+            .output()
+            .map_err(|error| CoreError::MissingCapability {
+                capability: format!("ffmpeg, to encode a video: {error}"),
+            })?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        } else {
+            Err(CoreError::MissingCapability {
+                capability: format!(
+                    "ffmpeg, to encode a video: `ffmpeg {}` exited with {}",
+                    args.join(" "),
+                    output.status
+                ),
+            })
+        }
+    };
+    let encoders = ffmpeg(&["-hide_banner", "-encoders"])?;
+    if !encoders
+        .lines()
+        .any(|line| line.split_whitespace().nth(1) == Some("libx264"))
+    {
+        return Err(CoreError::MissingCapability {
+            capability: "ffmpeg's libx264 encoder, to encode a video: this ffmpeg lists none"
+                .to_owned(),
+        });
+    }
+    let version = ffmpeg(&["-version"])?;
+    Ok(version.lines().next().unwrap_or_default().trim().to_owned())
 }
 
 /// Encode `frames/frame-%06d.png` into an H.264 MP4 with `ffmpeg`.

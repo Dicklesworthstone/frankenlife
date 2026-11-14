@@ -161,6 +161,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
   dump, §14.2). `DIR` is a run directory no process holds; `--at` the committed tick of one of its checkpoints, the
   newest that restores by default; `--weights` (repeatable) names organisms whose whole controller to print. In the
   library: `inspect(dir, InspectOptions { at, field, weights })` returns an `Inspection`.
+- `flife capabilities --config C --ticks N --cpu-workers W` (plan §14.6, §20.5), every flag optional. C is a
+  configuration to run instead of the compiled-in reference preset; N (at least 1) the ticks each route runs,
+  `PROBE_TICKS` = 8 by default; W the world's workers, the configuration's by default. In the library:
+  `capabilities(config, &CapabilitiesOptions { ticks, cpu_workers })` returns the `Capabilities` record, and
+  `video_encoder()` checks `flife render --video`'s encoder.
 
 **Outputs.** Every line on standard output is one JSON record.
 - `frankenlife.validate.v1`: name, model, configuration hash, seed, Δt, grid, founders, population ceiling, default
@@ -348,6 +353,30 @@ for, one at least, before a render is refused. Its first record is `start`, with
   refused (`state-conflict`). `InspectedWeights::of(dump)` lays a `ControllerWeights` out as that record; the
   Studio's weight dump (FL-021) writes its layers through it. Every number is the stored value. The directory's configuration and catalog are checked before its store is opened, so a directory that
   holds no run is refused untouched; the store is opened as `resume` and `branch` open it.
+- `frankenlife.capabilities.v1` (`flife capabilities`), one record:
+  - `build`: version, target OS and architecture, `release` or `debug`.
+  - `host`: `experiment::Host::current`, the CPU, logical cores, physical memory and OS. An entry the host does
+    not give is left out.
+  - `world`: `source` (`preset` or `config`), name, configuration hash, founders, workers and ticks.
+    - `pinned_digest`: `PRESET_DIGEST`, given for the preset at 8 ticks only.
+    - `memory`: `admitted` with the `MemoryAdmission` `flife run` makes with `auto` controllers and no run
+      directory, or `refused` with its kind and detail.
+    - `budget_within_physical_memory`: left out when the host's memory is unknown.
+  - `controllers`: `cpu`, `torch` and `metal`, in that order. Each has a `status`: `reference`, `verified`,
+    `idle`, `unavailable`, `refused`, `disagrees` or `failed`.
+    - A `detail` for every status but `verified` and `reference`.
+    - A `kind` for a refusal or error.
+    - For a route that ran: its `tick`, its `digest`, and `controllers` (the end record's `ControllerSummary`).
+  - `auto`: workers, `metal_device`, and the route `--controllers auto` `takes`. `metal_device` is left out when
+    the Metal route was refused before it was opened.
+  - `video`: `ffmpeg libx264`, either `available` with ffmpeg's version line or `unavailable` with the reason.
+
+  Exit status:
+  - 0 normally;
+  - 1 when a route disagrees or fails;
+  - 2 when the reference is refused, with the record still printed;
+  - 2 for an unreadable or invalid configuration, or a world that cannot be founded: an error record, with
+    nothing on standard output.
 
 **Invariants.**
 - The run is a client of the session. The owner task holds the world and is the only commit authority. The client
@@ -556,6 +585,21 @@ for, one at least, before a render is refused. Its first record is `start`, with
     compared like any other; runs that paused, failed or were refused are counted and named as unpaired seeds.
     Nothing is dropped from the report.
   - Every condition's configuration is validated at the first discovery seed before anything runs.
+- `flife capabilities` reports what a route did when it ran, never what it claims to support:
+  - Each route founds its own world and sets the workers. It is then configured as `flife run` configures it
+    (`configure`: the admission, then the backend within its admitted budget). It steps directly, without a
+    session, until its tick or a pause. It is compared with the reference by committed tick and world digest.
+  - The reference is `verified` only against `PRESET_DIGEST`. That is the preset's world at 8 ticks, which a
+    session run of the preset reaches (tested). For any other world or tick it is `reference`.
+  - Another route is `verified` only when three things hold: its world equals the reference's, its backend
+    evaluated at least one controller itself, and the backend never stopped serving.
+    - A route that deferred every evaluation is `idle`: its agreement shows nothing about it (plan §18.1).
+    - A backend that stopped serving is `failed`, even though the reference, redoing its ticks, reached the same
+      world.
+  - `refused` is a memory admission's refusal (`budget-exhausted`) on that route. `unavailable` is
+    `missing-capability` from opening it. Any other error opening or stepping it is `failed`.
+  - It writes nothing to disk and opens no window.
+  - `flife render --video` runs the same encoder check (`video_encoder`) before founding anything.
 
 **The preset.** `reference-small-world` is a viability-calibrated start with declared parameter tuning (§7.2) at
 the Reference profile's scale (§19.5):
@@ -650,6 +694,14 @@ test.
   `write-ahead-before-apply` without a run directory) is cataloged as an `error` run, not returned.
 - FL-043: a run whose terms other than the backend's exceed `maximum_total_bytes`: `budget-exhausted` (budget
   `peak memory (maximum_total_bytes)`), before a run directory is made or a record is printed.
+- `flife render --video` is refused as `missing-capability` before anything is founded, printed or written (exit
+  status 1, as for any render error) in three cases: no `ffmpeg` on the `PATH`; an `ffmpeg` that exits with an
+  error; or one that lists no `libx264` encoder. Until this change the frames were drawn and written first, and the
+  refusal came only at the end.
+- `flife capabilities`:
+  - `--ticks 0` is a usage error.
+  - A route's refusal or absence is reported in its entry, not raised.
+  - A refused reference prints the report and exits 2.
 - Any other refusal from founding or the session, by its `CoreError` kind.
 - A run that pauses on capacity or fails a tick ends with that `stop` and exit status 1. Its records up to that
   point are still emitted.
@@ -712,6 +764,62 @@ changes no result. FL-013's digest, pinned before the change, still holds under 
 
 Twenty-two planted bugs were each caught by at least one of these tests or `flife-core`'s `errors_name_their_class`
 (listed in the FL-015 commit).
+
+`tests/capabilities.rs` (6 tests, about 10 s), and two unit tests in `capabilities.rs`:
+- `the_preset_reaches_its_pinned_world_on_every_route_this_host_opens`:
+  - A session run of the preset reaches `PRESET_DIGEST` at 8 ticks, and the report's reference is `verified`
+    there.
+  - `torch` is `verified`, with all 4,096 × 8 evaluations batched and none deferred.
+  - `metal` is `verified` where `MetalControllers::open` opens a device, and `unavailable`
+    (`missing-capability`) where it does not.
+  - `auto` takes what `ControllerChoice::auto_for` gives for the device the test opened.
+  - The memory is admitted with a backend, and the video entry agrees with `video_encoder`.
+- `a_route_left_no_budget_defers_everything_and_is_idle_not_verified`: the preset's budget is set to exactly its
+  batched terms, so the backend is granted nothing. `torch` (and `metal`, where there is one) defers all 32,768
+  evaluations, reaches the preset's world, and is `idle`.
+- `a_budget_with_no_room_for_batching_refuses_the_backends_and_auto_but_not_the_reference`: the preset's budget is
+  set to exactly its reference terms.
+  - The reference runs.
+  - `torch`, `metal` and `auto`'s admission are each refused (`budget-exhausted`).
+  - `auto` reports neither a device nor a route.
+- `the_binary_reports_exits_by_what_it_found_and_refuses_explicitly`:
+  - With the preset, exit status 0.
+  - With a budget one byte short of the reference's terms, every route is `refused`, the report is printed, and the
+    exit status is 2.
+  - An unreadable configuration gives an `io` error record and no report.
+  - `--ticks 0` is refused.
+- `video_encoding_is_reported_as_the_path_offers_it` (Unix). Each case runs with an otherwise empty `PATH`:
+  - a stand-in `ffmpeg` listing `libx264` is `available`, with its version line;
+  - one listing only `libx265` is `unavailable`;
+  - one exiting 1 is `unavailable`;
+  - no `ffmpeg` at all is `unavailable`.
+
+  Each `unavailable` entry says why.
+- `a_video_render_is_refused_before_its_first_frame_without_an_encoder`:
+  - With no `ffmpeg` on the `PATH`, `flife render --video` exits 1 with `missing-capability`. Nothing is on
+    standard output, and there is no frame directory and no video.
+  - Where the host has ffmpeg with libx264, the same render writes an MP4, checked by its `ftyp` box. On this Mac
+    (ffmpeg 8.1.2), `ffprobe` found three 32 × 32 H.264 frames. This is the first test of `--video` that encodes.
+- The unit tests classify runs:
+  - a route with batched evaluations and the reference's world is `verified`;
+  - one with no batched evaluations is `idle`;
+  - another digest, or the same digest at another tick, `disagrees`;
+  - a backend failure is `failed`, even when its world agrees;
+  - a route compared with a reference that did not run is `failed`;
+  - the reference is `verified` only against its pinned digest.
+
+Eleven planted bugs were run against these tests, and every one was caught:
+- a disagreeing route not noticed;
+- an idle route counted as verified;
+- a failed backend counted as verified;
+- a disagreement not counted as a defect;
+- the reference never pinned;
+- each route stepped once;
+- the world's memory admitted as the reference's rather than `auto`'s;
+- a refused Metal route read as a device;
+- render's encoder check removed;
+- libx264 not required;
+- a refused reference exiting 0.
 
 `tests/resume.rs` (5 tests, FL-037, about 11 s), each on a 32 × 32 Appendix A ecology of 48 founders that breeds,
 controllers every 4 ticks in per-organism phases, checkpoints every 7 ticks, energy brushes at ticks 3, 66, 150
@@ -1151,8 +1259,21 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
     in which every organism reproduces, which would test its birth part, is not made.
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
-- Only `validate`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect`, `discover` and `transplant`.
-  Capabilities, step, analyze and export are later items (§14.6).
+- Only `validate`, `capabilities`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect`, `discover` and
+  `transplant`. Step, analyze and export are later items (§14.6).
+- `flife capabilities` gaps:
+  - Not probed: the Studio's window, which is its own probe (no window test runs on this Mac), FrankenManim's
+    Metal frame route and its CPU renderer.
+  - No real host has shown a route that disagrees with the reference. The classification is unit-tested, but the
+    binary's exit status 1 is never exercised.
+  - Only the preset at 8 ticks is pinned. With `--config`, or at other ticks, the reference is reported, not
+    verified.
+  - Eight ticks of the preset have no births, so the routes are compared on controller evaluation alone. On every
+    route, births, mutation and the field run on the CPU reference.
+  - No timings: one unrepeated run per route would be noise, not a measurement.
+  - The video check runs `ffmpeg -encoders` and does not encode a test video. An ffmpeg whose libx264 fails when
+    encoding is found only by the render.
+  - It is not FL-051: there is no packaged application and no fresh-install test.
 - FL-042 gaps:
   - FL-042 is formally blocked by FL-020 (the Studio window); the bead stays open whatever these slices satisfy.
   - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for

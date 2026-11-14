@@ -135,6 +135,11 @@ configuration (moved by whole cells; the host's founders under it displaced; the
 founders, kin kept as kin) and makes the grafted world a new run's founding checkpoint, which `flife resume`
 continues. Its memory is admitted as a run's is, with the package's world and the graft's working copy charged
 beside the host's. Grafting into a running world is not built.
+`flife capabilities` reports what this machine and build can run by running it. Each controller route (`cpu`,
+`torch`, `metal`) steps the reference preset and is compared with the world every qualified host reaches. A route
+that deferred all its work to the reference is reported idle, not verified. The report also gives the memory
+admission, the host, and whether `flife render --video`'s encoder (ffmpeg with libx264) is there, each with its
+reason when refused. `flife render --video` now checks that encoder before its first frame.
 FL-020 gives the Studio a camera (zoom about the pointer, pan across the seams, reset) and selection by stable
 identity. FL-021 reads a selected organism back from the session as a bounded snapshot at its committed boundary,
 printed as an `inspected` record and drawn under the overlay's lines (its energy, age, motion, controller and held
@@ -402,10 +407,12 @@ ecology comes before any broad infrastructure.
 
 ## Planned command surface
 
-**Mostly proposed** (§14.6). `flife validate`, `flife run` and `flife render` exist, and so does `flife-studio`
-(FL-018, macOS); the rest are later work items. Try the real preset headlessly, as frames and video, then live:
+**Partly built** (§14.6). The commands marked "(exists)" below exist, as does `flife-studio` (FL-018, macOS); the
+rest are later work items. See what this machine can run, then try the real preset headlessly, as frames and video,
+then live:
 
 ```bash
+cargo run --release -p flife-cli -- capabilities
 cargo run --release -p flife-cli -- validate presets/reference-small-world.toml
 cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128 \
     --metrics-every 128
@@ -575,9 +582,9 @@ at 1,280², 32–34 against 30–41 ms at 2,160²), and its frame differs from t
 bytes, so it would change the written frames (`cargo run --release -p flife-cli --example frame_routes`). The full surface, as planned:
 
 ```bash
-flife validate <config>     # range-check a config; report real memory and the worst admitted allocation
-flife capabilities          # what this machine and build can actually run, with explicit refusals
-flife run <config>          # a headless run
+flife validate <config>     # range-check a config; report real memory and the worst admitted allocation (exists)
+flife capabilities          # what this machine and build can run, each route run against the reference, with explicit refusals (exists)
+flife run <config>          # a headless run (exists)
 flife step                  # advance one tick
 flife inspect               # a run directory's committed world at one checkpoint, every organism and cell (exists)
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
@@ -587,7 +594,7 @@ flife discover              # a pinned discovery bundle: reference, selection, t
 flife transplant            # a local package grafted into a founded host, as a run that resumes (exists)
 flife analyze               # cross-experiment analysis of cataloged metrics
 flife render | export       # simulation-time frames and video through FrankenManim (render exists)
-flife-studio <preset>       # the interactive microscope
+flife-studio <preset>       # the interactive microscope (exists, macOS)
 ```
 
 Machine output is versioned JSON or NDJSON with stable identifiers and typed errors. Missing accelerator capability,

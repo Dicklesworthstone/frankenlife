@@ -46,6 +46,26 @@ enum Command {
         /// The configuration or preset, as TOML.
         config: PathBuf,
     },
+    /// Report what this machine and build can run. Every controller route
+    /// (`cpu`, `torch`, `metal`) runs a world and is compared with the
+    /// reference, and the host, the memory admission and video encoding are
+    /// reported, each with its reason where it is unavailable or refused.
+    /// Exit 1 when a route disagrees with the reference or fails; 2 when
+    /// the reference itself is refused.
+    Capabilities {
+        /// A configuration to run instead of the compiled-in reference
+        /// preset, whose world after 8 ticks is pinned.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Ticks each route runs.
+        #[arg(long, default_value_t = flife_cli::PROBE_TICKS,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        ticks: u64,
+        /// Threads for the world, replacing `[execution] cpu_workers`: a
+        /// count or `auto`. No result depends on it; `auto`'s route does.
+        #[arg(long, value_parser = parse_workers)]
+        cpu_workers: Option<NonZeroUsize>,
+    },
     /// Run a configuration headlessly through the session owner, printing
     /// NDJSON records.
     Run {
@@ -423,6 +443,11 @@ fn main() -> ExitCode {
             }
             Err(code) => code,
         },
+        Command::Capabilities {
+            config,
+            ticks,
+            cpu_workers,
+        } => capabilities(config.as_ref(), ticks, cpu_workers),
         Command::Render {
             config,
             ticks,
@@ -798,6 +823,35 @@ fn render(
             fail(error.kind(), error.to_string());
             ExitCode::from(1)
         }
+    }
+}
+
+/// The capability report: 0 when every route ran as the reference did or
+/// says why it could not, 1 when one disagreed or failed, 2 when the
+/// reference was refused (the report printed) or nothing could be probed
+/// (an error record).
+fn capabilities(
+    config: Option<&PathBuf>,
+    ticks: u64,
+    cpu_workers: Option<NonZeroUsize>,
+) -> ExitCode {
+    let config = match config.map(load).transpose() {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    let options = flife_cli::CapabilitiesOptions { ticks, cpu_workers };
+    match flife_cli::capabilities(config.as_ref(), &options) {
+        Ok(report) => {
+            print(&report);
+            if report.defect() {
+                ExitCode::from(1)
+            } else if report.refused() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => fail(error.kind(), error.to_string()),
     }
 }
 

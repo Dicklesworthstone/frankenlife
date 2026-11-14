@@ -43,8 +43,13 @@
 //!   a [`Survey`] of a committed world's raw state: generations, lineages,
 //!   distinct genomes and position-by-position heredity between live
 //!   relatives.
+//! - [`mod@capabilities`]: what this machine and build can run (plan
+//!   §14.6, §20.5). [`capabilities()`] runs every controller route on a
+//!   world and compares it with the reference, and reports the host and
+//!   video encoding, with explicit refusals.
 //!
 //! The `flife` binary wraps these as `flife validate <config>`,
+//! `flife capabilities [--config C]`,
 //! `flife run <config> --ticks N --every K [--run-dir DIR]`,
 //! `flife resume DIR --until T`,
 //! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
@@ -57,6 +62,7 @@
 #![forbid(unsafe_code)]
 
 pub mod branch;
+pub mod capabilities;
 pub mod checkpointing;
 pub mod discovery;
 pub mod experiment;
@@ -74,6 +80,10 @@ pub mod validate;
 pub use branch::{
     BRANCH_NAME_MAX_BYTES, BranchOptions, BranchParent, ForkRecord, FoundingChunks, Inherited,
     branch, branch_session,
+};
+pub use capabilities::{
+    Admitted, Auto, Build, CAPABILITIES_SCHEMA, Capabilities, CapabilitiesOptions, PRESET_DIGEST,
+    PROBE_TICKS, ProbedWorld, Refusal, Route, RouteStatus, Video, capabilities,
 };
 pub use checkpointing::{
     BOUNDED_BACKGROUND, CHECKPOINT_FIXED_BYTES, CheckpointAdmission, CheckpointMode,
@@ -109,7 +119,7 @@ pub use persist::{
 };
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, RENDER_SCHEMA, RenderOptions,
-    RenderProjection, RenderRecord, encoding_bytes, render,
+    RenderProjection, RenderRecord, encoding_bytes, render, video_encoder,
 };
 pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,

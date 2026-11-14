@@ -40,9 +40,10 @@
 //! A recording Studio ([`StudioOptions::record`]) keeps its presentation
 //! timeline: every change a frame makes to the view, and every frame drawn
 //! ([`TimelineRecord`], FL-023, plan §13.8). [`replay`] steps the
-//! configuration's world again with the session's commands at their ticks.
-//! It redraws each of those frames, byte for byte, and closes on the world
-//! the Studio closed on. [`export`] writes a replay out through
+//! configuration's world again with the session's commands at their ticks
+//! (from the checkpoint a resumed Studio started from, which its timeline
+//! names and pins, [`TimelineStart`]). It redraws each of those frames,
+//! byte for byte, and closes on the world the Studio closed on. [`export`] writes a replay out through
 //! FrankenManim's frame and encoding paths: each frame as a PNG, the
 //! frames on a constant clock as y4m video, and a manifest of their
 //! provenance (plan §13.8's live capture).
@@ -96,9 +97,9 @@ pub use overlay::{
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{
-    AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineIntervention,
-    TimelineProjection, TimelineRecord, TimelineRegion, TimelineStyle, read_timeline, replay,
-    write_timeline_record,
+    AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineCheckpoint,
+    TimelineIntervention, TimelineProjection, TimelineRecord, TimelineRegion, TimelineStart,
+    TimelineStyle, read_timeline, replay, write_timeline_record,
 };
 
 /// The schema of the Studio's NDJSON records.

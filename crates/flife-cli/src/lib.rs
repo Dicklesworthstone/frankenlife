@@ -122,7 +122,7 @@ pub use package::{
 pub use persist::{
     CATALOG_FILE, CONFIG_FILE, Checkpoints, Injection, Introduction, Material, Persistence,
     Recovered, Removal, ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability, create,
-    open_session, recover, resume, vacant,
+    open_session, recover, restore_checkpoint, resume, vacant,
 };
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, RENDER_SCHEMA, RenderOptions,

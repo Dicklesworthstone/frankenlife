@@ -894,6 +894,19 @@ impl Checkpoints {
         self.last.map(|last| last.tick)
     }
 
+    /// Pin checkpoint `sequence` for `holder` ([`ChunkStore::pin`]): while
+    /// the configuration preserves pins, retention keeps it however many
+    /// checkpoints follow. A resumed Studio's timeline replays from the
+    /// checkpoint it pins (FL-023). Returns whether the pin is new.
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] for a checkpoint the store does not
+    /// hold, or a store lost with a failed checkpoint writer; the store's
+    /// errors.
+    pub fn pin(&mut self, sequence: u64, holder: &Sha256Digest) -> Result<bool, CoreError> {
+        self.store()?.pin(sequence, holder)
+    }
+
     /// Take a checkpoint of `handle`'s committed boundary in the admitted
     /// mode. Returns the records of checkpoints published meanwhile: a
     /// background checkpoint still in flight first (this waits for it),
@@ -1295,6 +1308,42 @@ pub fn recover(
         from,
         skipped,
     })
+}
+
+/// The committed world checkpoint `sequence` of the run in `run_dir` holds,
+/// restored as [`recover`] restores one: a world of `config`, the
+/// configuration the run directory holds, with the commands of the session
+/// its catalog records. A resumed Studio's timeline replays from it
+/// (FL-023). Nothing in `run_dir` is written; its store is locked while the
+/// checkpoint is read.
+///
+/// # Errors
+/// [`read_config`]'s and the catalog's, as [`recover`]'s;
+/// [`CoreError::StateConflict`] when the catalog records the run under
+/// another configuration than `config`, another process holds its store, or
+/// the checkpoint holds another configuration's world or another session's
+/// commands; [`CoreError::IncompatibleCheckpoint`] for a checkpoint the
+/// store does not hold whole; the store's errors.
+pub fn restore_checkpoint(
+    run_dir: &Path,
+    config: &ValidatedConfig,
+    sequence: u64,
+) -> Result<World, CoreError> {
+    // A run directory (before the catalog is opened, which would make one),
+    // whose catalog refuses a run recorded under another configuration.
+    read_config(run_dir)?;
+    let revision = config.config_hash();
+    let (session, _) = run_identity(run_dir, revision)?;
+    let store = ChunkStore::open(run_dir.join(STORE_DIR), StoreDurability::ProcessCrash)?;
+    let bytes = store.load(sequence)?;
+    drop(store);
+    let restored = restorable(
+        &bytes,
+        NumericalProfile::reference_f32()?,
+        revision,
+        session,
+    )?;
+    Ok(restored.world)
 }
 
 /// What to resume.

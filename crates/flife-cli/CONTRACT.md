@@ -438,7 +438,7 @@ for, one at least, before a render is refused. Its first record is `start`, with
     checkpoint resumable (§16.6). Resume still restores.
   - A resumed run's tally covers the ticks that call published.
 - FL-024: `persist::Checkpoints` is public (`open`, `take`, `drain`, `every`, `last`, `last_tick`,
-  `admission`), with `vacant` (whether a directory can become a run directory: absent or empty; `create` asks it
+  `admission`, `pin`), with `vacant` (whether a directory can become a run directory: absent or empty; `create` asks it
   first), `create` and `open_session`, so the Studio's `--run` keeps a run directory with this library. A run
   directory the Studio kept is a run: `resume`, `branch` and `inspect` take it (tested in `flife-studio`'s
   `tests/kept.rs`). `recover(dir, adjust)` is the first half of `resume`, public so the Studio's `--resume`
@@ -447,6 +447,13 @@ for, one at least, before a render is refused. Its first record is `start`, with
   founding world when none does, refused for a branch), returned unopened as `Recovered` (configuration,
   limits, checkpoints, world, book, the checkpoint recovered and those passed over). `resume` is `recover`, then
   configure, `open_session` (which replays the journal) and drive; `tests/resume.rs` runs through it.
+- FL-023 with FL-024, for a resumed Studio's timeline: `Checkpoints::pin(sequence, holder)` pins a checkpoint
+  through the store the session holds (`ChunkStore::pin`), so the Studio pins the one it resumed from without
+  opening the store again. `restore_checkpoint(dir, config, sequence)` restores one checkpoint as `recover` would:
+  the directory's configuration must be `config` and the run's catalog its session's; the store is opened
+  (locked), the checkpoint loaded and the store released; `restorable` checks the world's configuration and the
+  book's session. It writes nothing but what opening the catalog rewrites (FrankenSQLite's log files). Tested in
+  `flife-studio`'s `tests/resumed_timeline.rs` and `tests/kept_binary.rs`; no test in this crate.
 - FL-038 (§16.5, §19.4, A.2), `checkpointing`:
   - `pause-and-stream` (the preset's): `SessionHandle::checkpoint_with` hands the borrowed committed world to
     `flife_runtime::checkpoint_into`, which streams it into a `flife_store::Stream` a 1 MiB page at a time; the

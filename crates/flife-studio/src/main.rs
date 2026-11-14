@@ -60,8 +60,11 @@
 //! command journal replayed past it, as `flife resume` recovers it. The
 //! `open` record's `resumed` names that checkpoint (null for the founding
 //! world), those passed over and the tick the session opened at; it is kept
-//! on in DIR, its checkpoints continuing the run's. A resumed run records no
-//! timeline: a timeline replays from the founding world.
+//! on in DIR, its checkpoints continuing the run's. With `--timeline`, the
+//! timeline's header names where the session started: DIR's absolute path,
+//! the checkpoint restored and the tick opened at. The checkpoint is pinned
+//! so retention keeps it, and `--export` (with DIR's `config.toml` as the
+//! configuration) restores it and replays from there.
 
 #![forbid(unsafe_code)]
 
@@ -193,7 +196,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["run", "export", "timeline"]
+        conflicts_with_all = ["run", "export"]
     )]
     resume: Option<PathBuf>,
 }

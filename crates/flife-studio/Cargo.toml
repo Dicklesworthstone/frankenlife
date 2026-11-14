@@ -40,6 +40,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# A resumed Studio's timeline pins its checkpoint (FL-023): the tests read
+# the store's pins and damage a manifest.
+flife-store = { path = "../flife-store" }
 fmn-render = { workspace = true, features = ["metal"] }
 # The frame-upload measurement counts the heap a Metal frame holds (FL-043).
 peak_alloc.workspace = true

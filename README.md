@@ -508,13 +508,15 @@ wait a period from its own start, so every timer oversleep delayed all later fra
 line. That is every change a frame makes to the view (drawable, density, overlay, style, camera, selection, the
 epochs shown and how far the display is between them) and every frame drawn with its tick and wall time, the
 commands as the session accepts and applies them, and on a clean close the world it closed on. `--export FILE --out
-DIR` opens no Studio and no window. It founds the world again, steps it with those commands at those ticks, and
+DIR` opens no Studio and no window. It founds the world again (or restores the checkpoint a resumed Studio started
+from), steps it with those commands at those ticks, and
 redraws every frame through the same Metal route. Each frame lands in DIR as a PNG, byte for byte the frame the
 Studio rendered. The frames on a constant clock (`--export-fps`, the preset's 30 by default) become
 `capture.y4m` (BT.709 limited 4:2:0), its repeated and dropped frames declared. A `manifest.json` gives the
 timeline's and configuration's hashes, the ticks shown, the closing digest and each file's SHA-256. An export that
-reaches another world than the Studio's is refused, and neither command writes over a file. Simulation-time and
-checkpoint-replay export (plan §13.8) and Cinema qualification (FL-050) are later work.
+reaches another world than the Studio's is refused, and neither command writes over a file. Plan §13.8's other
+export modes are the command line's: `flife render` draws a configuration on simulation time, and `flife render
+--run-dir` draws a kept run from where it would resume. Cinema qualification (FL-050) is later work.
 
 `--run DIR` keeps the Studio's session in a new run directory (FL-024), as `flife run --run-dir` keeps a run: the
 configuration, the command journal (every brush applied is a journaled command under `write-ahead-before-apply`)
@@ -526,7 +528,9 @@ control from the exact pre-intervention world, holding every command before the 
 Closing publishes the closing boundary and suspends the session, so a stroke still pending applies when the run is
 resumed. The window's telemetry names the newest checkpoint's tick, and the NDJSON carries a `checkpoint` record
 each. `flife resume`, `flife branch` and `flife inspect` (`--weights` included) take the directory: resuming it
-reaches exactly the world an uninterrupted session would.
+reaches exactly the world an uninterrupted session would. `flife-studio --resume DIR` opens it in the Studio again
+where it closed. With `--timeline`, the timeline names the checkpoint it resumed from, which stays pinned in DIR,
+and `--export` (given `DIR/config.toml`) replays it from there.
 
 `render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density`, `--no-field` and
 `--field-mapping energy|composition|component-C` (C from 0 to 31).

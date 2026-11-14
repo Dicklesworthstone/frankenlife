@@ -12,7 +12,13 @@
 //! every command its book applied, with its payload and tick.
 //!
 //! [`replay`] founds the configuration's world again and steps it with those
-//! commands at those ticks. It makes the same changes to a fresh view in the
+//! commands at those ticks. A resumed Studio's timeline (FL-024's
+//! `--resume`) names where its session started ([`TimelineStart`]): the
+//! checkpoint of its run directory it restored, which the Studio pinned so
+//! retention keeps it, and the tick its session opened at once the command
+//! journal replayed past it. Its replay restores that checkpoint instead
+//! ([`flife_cli::restore_checkpoint`]) and steps it there with the commands
+//! the book applied. It makes the same changes to a fresh view in the
 //! same order and draws each frame the Studio drew through the same Metal
 //! route ([`MetalRenderer::render_three_d_rgba8`]). Every number a frame
 //! depends on is written as its bits ([`Exact`]). So the frames a replay
@@ -23,6 +29,7 @@
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
+use std::path::Path;
 
 use flife_core::ids::OrganismId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
@@ -33,7 +40,7 @@ use flife_manim::{
     ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionEffect, RegionShape, Style,
     hex_rgb,
 };
-use flife_render::{AffinityProjection, Lease, Publication, Publisher};
+use flife_render::{AffinityProjection, Lease, Publication, Publisher, Viewer};
 use flife_runtime::{CommandStatus, Outcome, SessionClosed};
 use fmn_frame::FrameBuffer;
 use fmn_render::metal::MetalRenderer;
@@ -326,6 +333,33 @@ pub struct AppliedCommand {
     pub intervention: TimelineIntervention,
 }
 
+/// Where a resumed Studio's session started (FL-024's `--resume`): its run
+/// directory, the checkpoint it restored, and the tick it opened at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineStart {
+    /// The run directory, as an absolute path.
+    pub run_dir: String,
+    /// The checkpoint restored; none for the founding world, which a run
+    /// without a checkpoint that restores resumes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<TimelineCheckpoint>,
+    /// The committed tick the session opened at: the checkpoint's (or the
+    /// founding's), or later once the command journal replayed past it.
+    pub tick: u64,
+}
+
+/// The checkpoint a resumed Studio restored, which its timeline pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimelineCheckpoint {
+    /// Its chunk-store sequence number.
+    pub sequence: u64,
+    /// The committed tick it holds.
+    pub tick: u64,
+    /// The holder of the pin that keeps it from retention, in hexadecimal:
+    /// the store's `pins/` names it.
+    pub pin: String,
+}
+
 /// A brush's region, or a measured one, as a record spells it (FL-022,
 /// plan §14.3): its numbers as their bits, so a replay outlines exactly
 /// what the Studio did. `measures` is written only when true, so a brush's
@@ -448,6 +482,10 @@ pub enum TimelineRecord {
         /// Boxed: its matrix is most of the record.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         projection: Option<Box<TimelineProjection>>,
+        /// Where a resumed Studio's session started; none for a session
+        /// that founded its world, which a replay founds again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<TimelineStart>,
     },
     /// The view took a drawable of `drawable` pixels.
     Resize {
@@ -569,6 +607,7 @@ impl TimelineRecord {
             size,
             style: style.into(),
             projection: Some(Box::new(AffinityProjection::fixed().into())),
+            from: None,
         }
     }
 
@@ -713,6 +752,11 @@ fn conflict(detail: String) -> CoreError {
 ///   the view does not take exactly; a frame recorded at another tick than
 ///   the epoch the view was given; or a replay that closes on another
 ///   world than the Studio's.
+/// - For a resumed Studio's timeline, [`flife_cli::restore_checkpoint`]'s
+///   refusals: its run directory gone or of another configuration, held
+///   by another process, or no longer holding the checkpoint whole; and
+///   [`CoreError::StateConflict`] for a checkpoint of another tick than
+///   the one restored.
 /// - [`CoreError::MissingCapability`] without a Metal device.
 /// - The world's, the view's and `drawn`'s errors.
 pub fn replay(
@@ -727,6 +771,7 @@ pub fn replay(
         size,
         style,
         projection,
+        from,
         ..
     }) = records.first()
     else {
@@ -812,26 +857,60 @@ pub fn replay(
     let mut renderer = MetalRenderer::new().map_err(|error| CoreError::MissingCapability {
         capability: format!("a Metal renderer to replay a studio timeline: {error}"),
     })?;
-    let mut world = World::found(
-        config,
-        Arrangement::FreeList,
-        NumericalProfile::reference_f32()?,
-    )?;
+    // The world the Studio's session was opened on: its configuration's
+    // founding world, or the checkpoint a resumed run restored.
+    let mut world = match from
+        .as_ref()
+        .and_then(|start| Some((start, start.checkpoint.as_ref()?)))
+    {
+        Some((start, checkpoint)) => {
+            let world = flife_cli::restore_checkpoint(
+                Path::new(&start.run_dir),
+                config,
+                checkpoint.sequence,
+            )?;
+            if world.tick().get() != checkpoint.tick {
+                return Err(conflict(format!(
+                    "checkpoint {} of {} holds tick {}, where the Studio restored tick {}",
+                    checkpoint.sequence,
+                    start.run_dir,
+                    world.tick().get(),
+                    checkpoint.tick
+                )));
+            }
+            world
+        }
+        None => World::found(
+            config,
+            Arrangement::FreeList,
+            NumericalProfile::reference_f32()?,
+        )?,
+    };
     if let Some(workers) = cpu_workers {
         world.set_cpu_workers(workers)?;
     }
     // A prior, a current and one being written, and one to spare.
     let mut publisher = Publisher::new(&world, 4, || {})?;
     let viewer = publisher.feed().viewer(3)?;
-    let founding = viewer.latest()?;
-    // As `Studio::open` makes it.
-    let mut view = crate::host::studio_view(config, &founding, *size, style.style()?, background)?;
-    view.show(&founding)?;
+    let restored = viewer.latest()?;
+    // As `Studio::open` makes it: for the world restored, before a resumed
+    // run's command journal replays past it.
+    let mut view = crate::host::studio_view(config, &restored, *size, style.style()?, background)?;
+    // The epoch the session opened on: the restored world's, or the one the
+    // journal's commands reached, which the book records applied.
+    let opened = from.as_ref().map_or(0, |start| start.tick);
+    let opening = if opened == restored.tick().get() {
+        restored
+    } else {
+        drop(restored);
+        publish_at(&mut world, opened, &at, &mut publisher, &viewer)?
+    };
+    view.show(&opening)?;
     let font = HudFont::bundled()?;
     let mut epochs: BTreeMap<u64, Lease> = BTreeMap::new();
-    epochs.insert(0, founding);
+    epochs.insert(opened, opening);
     // The tick of the epoch the view was last given: each frame's.
-    let mut showing = 0;
+    let mut showing = opened;
     let mut frames = 0;
     for (index, record) in records.iter().enumerate() {
         match record {
@@ -884,19 +963,7 @@ pub fn replay(
             } => {
                 for tick in prior.iter().chain([current]) {
                     if !epochs.contains_key(tick) {
-                        step_to(&mut world, *tick, &at)?;
-                        if let Publication::Busy { .. } = publisher.offer(&world)? {
-                            return Err(conflict(format!(
-                                "no render slot was free for tick {tick}"
-                            )));
-                        }
-                        let lease = viewer.latest()?;
-                        if lease.tick().get() != *tick {
-                            return Err(conflict(format!(
-                                "tick {tick} was published as tick {}",
-                                lease.tick().get()
-                            )));
-                        }
+                        let lease = publish_at(&mut world, *tick, &at, &mut publisher, &viewer)?;
                         epochs.insert(*tick, lease);
                     }
                 }
@@ -953,6 +1020,29 @@ pub fn replay(
         digest: reached,
         commands: applied.len(),
     })
+}
+
+/// Step `world` to committed tick `tick` ([`step_to`]) and publish it: the
+/// epoch a frame there shows.
+fn publish_at(
+    world: &mut World,
+    tick: u64,
+    at: &BTreeMap<u64, Vec<Intervention>>,
+    publisher: &mut Publisher,
+    viewer: &Viewer,
+) -> Result<Lease, CoreError> {
+    step_to(world, tick, at)?;
+    if let Publication::Busy { .. } = publisher.offer(world)? {
+        return Err(conflict(format!("no render slot was free for tick {tick}")));
+    }
+    let lease = viewer.latest()?;
+    if lease.tick().get() != tick {
+        return Err(conflict(format!(
+            "tick {tick} was published as tick {}",
+            lease.tick().get()
+        )));
+    }
+    Ok(lease)
 }
 
 /// Step `world` to committed tick `tick`, applying at each boundary the

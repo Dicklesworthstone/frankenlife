@@ -10,7 +10,9 @@
 //! there: its `open` record names the checkpoint it resumed from, its
 //! checkpoints follow the run's at the multiples after it, and it closes on
 //! the world stepped directly
-//! from the founding to its tick. A configuration beside `--resume` is
+//! from the founding to its tick. Its `--timeline` names that checkpoint,
+//! and `--export` of it, with the run directory's configuration, closes on
+//! the same world. A configuration beside `--resume` is
 //! refused. Every run passes `--offscreen`, so none opens a window.
 //! Headless Metal: without a Metal device the test returns early.
 
@@ -246,7 +248,9 @@ fn an_offscreen_studio_keeps_a_run_the_command_line_inspects() {
     assert_eq!(both.status.code(), Some(2));
     assert!(both.stdout.is_empty());
 
-    // `--resume` runs it on from the closing checkpoint, kept there.
+    // `--resume` runs it on from the closing checkpoint, kept there, and
+    // records its timeline.
+    let resumed_timeline = dir.join("resumed.ndjson");
     let output = Command::new(env!("CARGO_BIN_EXE_flife-studio"))
         .arg("--resume")
         .arg(&run)
@@ -264,6 +268,8 @@ fn an_offscreen_studio_keeps_a_run_the_command_line_inspects() {
             "--cpu-workers",
             "2",
         ])
+        .arg("--timeline")
+        .arg(&resumed_timeline)
         .output()
         .expect("the binary runs");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -342,4 +348,57 @@ fn an_offscreen_studio_keeps_a_run_the_command_line_inspects() {
         world.digest().to_hex(),
         end["digest"].as_str().expect("a digest")
     );
+
+    // Its timeline names where the session started, and `--export`, with
+    // the run directory's configuration, replays it from that checkpoint
+    // to the world it closed on.
+    let text = std::fs::read_to_string(&resumed_timeline).expect("the resumed timeline");
+    let timeline_records = read_timeline(&text).expect("reads");
+    let Some(TimelineRecord::Header {
+        from: Some(start), ..
+    }) = timeline_records.first()
+    else {
+        panic!("{:?}", timeline_records.first());
+    };
+    assert_eq!(
+        start.run_dir,
+        run.canonicalize().expect("the run").display().to_string()
+    );
+    assert_eq!(start.tick, closed_at);
+    assert_eq!(
+        start
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| (checkpoint.sequence, checkpoint.tick)),
+        Some((kept.last().expect("kept").1, closed_at))
+    );
+    let out = dir.join("resumed-export");
+    let output = Command::new(env!("CARGO_BIN_EXE_flife-studio"))
+        .arg(run.join("config.toml"))
+        .arg("--export")
+        .arg(&resumed_timeline)
+        .arg("--out")
+        .arg(&out)
+        .args(["--cpu-workers", "2"])
+        .output()
+        .expect("the binary runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}: {stderr}",
+        output.status
+    );
+    let exported: Vec<Value> = String::from_utf8(output.stdout)
+        .expect("UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON record"))
+        .collect();
+    let [summary] = exported.as_slice() else {
+        panic!("one record: {exported:?}");
+    };
+    println!("{summary}");
+    assert_eq!(kind(summary), "export");
+    assert_eq!(summary["digest"], end["digest"]);
+    assert_eq!(summary["end_tick"].as_u64(), Some(until));
+    assert_eq!(summary["frames"], end["rendered"]);
 }

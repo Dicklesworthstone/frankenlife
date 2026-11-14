@@ -964,6 +964,7 @@ dependencies = [
  "flife-manim",
  "flife-render",
  "flife-runtime",
+ "flife-store",
  "fmn-codec",
  "fmn-frame",
  "fmn-render",

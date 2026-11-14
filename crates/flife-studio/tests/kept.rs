@@ -807,6 +807,13 @@ fn studio_resumes(durability: &str) {
     let inspection = flife_cli::inspect(&dir, InspectOptions::default()).expect("inspects");
     assert_eq!(inspection.inspected.checkpoint.tick, until.get());
     assert_eq!(inspection.inspected.digest, uninterrupted.digest().to_hex());
+    // Not recording, it pinned nothing (FL-023's pin is a timeline's).
+    let store = flife_store::ChunkStore::open(
+        dir.join(flife_cli::STORE_DIR),
+        StoreDurability::ProcessCrash,
+    )
+    .expect("the store opens");
+    assert_eq!(store.pins().expect("pins"), []);
 }
 
 /// The directories under `root`, `root` first.
@@ -919,8 +926,8 @@ fn a_failed_checkpoint_lets_the_session_run_on() {
 }
 
 /// `Studio::resume` refuses, before anything is read or any surface opens,
-/// a run directory to keep it in elsewhere and a timeline to record; and a
-/// directory that holds no run.
+/// a run directory to keep it in elsewhere; and a directory that holds no
+/// run, recording or not.
 #[test]
 fn what_cannot_be_resumed_is_refused() {
     let unmade = fresh("unmade");
@@ -940,7 +947,7 @@ fn what_cannot_be_resumed_is_refused() {
         record: true,
         ..offscreen()
     };
-    refused(&recorded, &unmade, "replays from the founding world");
+    refused(&recorded, &unmade, "is not a run directory");
     refused(&offscreen(), &unmade, "is not a run directory");
     assert!(!unmade.exists());
 }

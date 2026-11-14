@@ -54,6 +54,7 @@
 
 use flife_backend_metal::{BackendBudget, ControllerChoice};
 use flife_cli::{CheckpointAdmission, CheckpointAt, Checkpoints, Recovered, SkippedCheckpoint};
+use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
@@ -75,7 +76,7 @@ use std::time::Instant;
 
 use crate::keep::Keeping;
 
-use crate::timeline::{Exact, TimelineRecord};
+use crate::timeline::{Exact, TIMELINE_SCHEMA, TimelineCheckpoint, TimelineRecord, TimelineStart};
 use crate::{
     Brush, BrushSettings, CameraMove, Controls, Disk, Intent, MeasurePreview, Pacer, Preview,
     SessionThread, Status, Supplies, brush, material_for, measure,
@@ -364,6 +365,26 @@ struct ResumedKept {
     limits: SessionConfig,
     book: CommandBook,
     checkpoints: Checkpoints,
+    /// The checkpoint a recorded timeline replays from, and the pin's
+    /// holder, pinned once the session opens.
+    pin: Option<(u64, Sha256Digest)>,
+}
+
+/// The holder of the pin a resumed Studio's timeline keeps `checkpoint` of
+/// `run_dir` with: its own, as no other timeline's is, so it names the
+/// timeline that holds the checkpoint.
+fn timeline_pin(run_dir: &str, checkpoint: CheckpointAt) -> Sha256Digest {
+    let opened = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    Sha256Digest::of(
+        format!(
+            "{TIMELINE_SCHEMA} pin {run_dir} {} {} {opened}",
+            checkpoint.sequence,
+            std::process::id()
+        )
+        .as_bytes(),
+    )
 }
 
 impl Kept {
@@ -430,27 +451,29 @@ impl Studio {
     /// opens as [`Studio::open`] does; [`Studio::resumed`] says what it
     /// recovered.
     ///
+    /// Recording ([`StudioOptions::record`]), the timeline's header names
+    /// where the session started ([`TimelineStart`]): the run directory,
+    /// the checkpoint restored and the tick opened at, so its replay
+    /// restores that checkpoint (FL-023). The checkpoint is pinned for the
+    /// timeline once the session opens, so retention keeps it while the
+    /// configuration preserves pins (`persistence.preserve_pinned_discoveries`,
+    /// the default); nothing unpins it.
+    ///
     /// # Errors
     /// - [`CoreError::StateConflict`], before anything is read, with
-    ///   [`StudioOptions::run`] (the run is kept where it is) or
-    ///   [`StudioOptions::record`] (a timeline replays from the founding
-    ///   world, where a resumed run does not start).
+    ///   [`StudioOptions::run`] (the run is kept where it is).
     /// - Before any surface opens, [`flife_cli::recover`]'s: not a run
     ///   directory, another configuration, a branch none of whose
-    ///   checkpoints restores, the store's and the catalog's errors.
-    /// - Then as [`Studio::open`], and [`flife_cli::open_session`]'s.
+    ///   checkpoints restores, the store's and the catalog's errors; and,
+    ///   recording, [`CoreError::StorageFailed`] for a run directory whose
+    ///   absolute path cannot be read.
+    /// - Then as [`Studio::open`], and [`flife_cli::open_session`]'s; and,
+    ///   recording, [`Checkpoints::pin`]'s.
     pub fn resume(run_dir: impl Into<PathBuf>, options: &StudioOptions) -> Result<Self, CoreError> {
-        let refusal = if options.run.is_some() {
-            Some("a resumed run is kept where it is, not in another run directory")
-        } else if options.record {
-            Some("a timeline replays from the founding world, where a resumed run does not start")
-        } else {
-            None
-        };
-        if let Some(detail) = refusal {
+        if options.run.is_some() {
             return Err(CoreError::StateConflict {
                 operation: "resume a studio run",
-                detail: detail.into(),
+                detail: "a resumed run is kept where it is, not in another run directory".into(),
             });
         }
         let run_dir = run_dir.into();
@@ -463,18 +486,53 @@ impl Studio {
             from,
             skipped,
         } = flife_cli::recover(&run_dir, |_| {})?;
+        // Recording, the timeline names the run directory absolutely and
+        // the checkpoint by the pin that keeps it.
+        let recording = if options.record {
+            let absolute =
+                std::fs::canonicalize(&run_dir).map_err(|error| CoreError::StorageFailed {
+                    operation: "resolve the run directory",
+                    path: run_dir.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+            let absolute = absolute.display().to_string();
+            let pin = from.map(|checkpoint| (checkpoint, timeline_pin(&absolute, checkpoint)));
+            Some((absolute, pin))
+        } else {
+            None
+        };
         let keeping = Keeping::recovered(run_dir, &config, checkpoints.admission().clone());
         let kept = Kept::Resumed(Box::new(ResumedKept {
             keeping,
             limits,
             book,
             checkpoints,
+            pin: recording
+                .as_ref()
+                .and_then(|(_, pin)| pin.map(|(checkpoint, holder)| (checkpoint.sequence, holder))),
         }));
         let mut studio = Self::open_on(&config, options, kept, move || Ok(world))?;
+        let tick = studio.current.tick().get();
+        if let Some((run_dir, pin)) = recording
+            && let Some(TimelineRecord::Header { from, .. }) = studio
+                .recorded
+                .as_mut()
+                .and_then(|recorded| recorded.first_mut())
+        {
+            *from = Some(TimelineStart {
+                run_dir,
+                checkpoint: pin.map(|(checkpoint, holder)| TimelineCheckpoint {
+                    sequence: checkpoint.sequence,
+                    tick: checkpoint.tick,
+                    pin: holder.to_hex(),
+                }),
+                tick,
+            });
+        }
         studio.resumed = Some(Resumed {
             checkpoint: from,
             skipped,
-            tick: studio.current.tick().get(),
+            tick,
         });
         Ok(studio)
     }
@@ -578,10 +636,14 @@ impl Studio {
                     keeping,
                     limits,
                     book,
-                    checkpoints,
+                    mut checkpoints,
+                    pin,
                 } = *resumed;
                 let (owner, handle) =
                     flife_cli::open_session(world, book, limits, keeping.run_dir())?;
+                if let Some((sequence, holder)) = pin {
+                    checkpoints.pin(sequence, &holder)?;
+                }
                 (owner, handle, Some(checkpoints), Some(keeping))
             }
         };

@@ -43,7 +43,11 @@ affinity and composition colours were drawn through (`TimelineProjection`, plan 
 scaling: its rows, its matrix and its divisor's bits), and `replay` refuses one drawn through another (a header
 from before projections were recorded has none and is taken). `export` (the binary's `--export FILE --out DIR`)
 writes that replay through FrankenManim's frame and encoding paths: a PNG a frame, a y4m video on a constant
-clock with its repeats and drops declared, and a manifest of the provenance (G10), the projection among it.
+clock with its repeats and drops declared, and a manifest of the provenance (G10), the projection among it. A
+resumed Studio records too: its header names where the session started (`TimelineStart`: the run directory's
+absolute path, the checkpoint restored and the tick opened at), the Studio pins that checkpoint for the timeline,
+and `replay` restores it (`flife_cli::restore_checkpoint`) instead of founding, then steps it to the tick opened
+at with the commands the book applied.
 FL-024 (`flife-xut`, part) keeps a session in a run directory (`StudioOptions::run`, the binary's `--run DIR`;
 `Keeping`, §14.1's durable checkpoint tick, §16.3): the configuration, the command journal and checkpoints, kept by
 `flife-cli`'s own run-directory library, so `flife resume`, `flife branch` and `flife inspect` take it, and the
@@ -72,9 +76,12 @@ directory, with its pending commands and its checkpoint chain.
   Studio or `flife resume` kept. Its own configuration is the run's; `flife_cli::recover` reads it, checks the
   run identity, restores the newest checkpoint that verifies (skipping and naming any that do not; with none, the
   founding world, which a branch does not have, so a branch with none is refused), and `flife_cli::open_session`
-  replays the journal past it. `options.run` (the run stays in its own directory) and `options.record` (a timeline
-  replays from the founding world, where a resumed run does not start) are refused before anything opens, as
-  is a directory that holds no run.
+  replays the journal past it. `options.run` (the run stays in its own directory) is refused before anything
+  opens, as is a directory that holds no run. With `options.record`, the timeline's header names the start
+  (`TimelineStart { run_dir, checkpoint, tick }`, `checkpoint` `None` for the founding world), and once the
+  session opens the checkpoint is pinned (`Checkpoints::pin`) under a holder of the timeline's own, which the
+  header names (`TimelineCheckpoint::pin`), so retention keeps it while `persistence.preserve_pinned_discoveries`
+  holds (the default).
 - For a window: the process main thread, macOS, Metal and a window server. Offscreen
   (`StudioOptions::surface = Surface::Offscreen { scale }`): any thread and a Metal device; the content area is
   `size` points at `scale` pixels a point, and `title` and `resizable` are unused.
@@ -365,7 +372,9 @@ directory, with its pending commands and its checkpoint chain.
   [--look glow|raw] [--density] [--no-field] [--field-mapping energy|composition|component-C] [--offscreen SECONDS [--scale N]
   [--offscreen-zooms]] [--run DIR]`, or `flife-studio --resume DIR [those options but --run]`: the
   binary. `--resume` takes the run's own configuration from DIR, so it takes no `<config>`, and it conflicts with
-  `--run`, `--export` and `--timeline`; a configuration given with it exits 2 (usage) and prints nothing. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
+  `--run` and `--export`; a configuration given with it exits 2 (usage) and prints nothing. With `--timeline`
+  it records as above; `flife-studio DIR/config.toml --export T --out D` replays such a timeline from its
+  checkpoint. With `--offscreen` it opens no window: it runs its loop offscreen for SECONDS wall seconds at N pixels
   a point (2 by default) and closes, and nothing posts input but `--offscreen-zooms`' camera moves: in every
   third frame interval, at a moment drawn uniformly over it (a fixed seed), a 4-point scroll at the content's
   centre, zooming in and out in turn; a move arriving during a frame's work waits for the next frame, as the
@@ -1101,11 +1110,12 @@ presentation state, not scientific state.
     click submit a stroke numbered 3, after the run's two; three more steps apply it. The world it closes on at 7
     is, bit for bit, the world stepped directly with the three strokes at their ticks; it publishes one closing
     checkpoint at 7 with a sequence past the earlier session's last, and `flife_cli::inspect` restores that digest.
+    Not recording, it leaves no pin in the store.
   - `a_failed_checkpoint_lets_the_session_run_on`: after the founding checkpoint the run directory's store is
     made read-only (and writable again after); the checkpoint at the first multiple is reported `Unkept` once,
     the session runs on past the multiple, and it closes with no checkpoint but the founding one.
-  - `what_cannot_be_resumed_is_refused`: `run` set (`kept where it is`), `record` set (`replays from the founding
-    world`) and an absent directory (`is not a run directory`), the directory never made.
+  - `what_cannot_be_resumed_is_refused`: `run` set (`kept where it is`) and an absent directory, recording or
+    not (`is not a run directory`), the directory never made.
   - `what_cannot_be_kept_is_refused_before_anything_is_created`: a directory holding a file (`is not empty`),
     one holding a run the Studio kept (`already holds a run`), both unchanged, and a `maximum_total_bytes` one
     mebibyte past the genome bytes (`budget-exhausted`, `checkpoint memory`), the directory never made.
@@ -1123,6 +1133,44 @@ presentation state, not scientific state.
   continue the first run's chain (ticks and sequences rising) and are exactly each multiple of 128 after the
   tick it resumed at, then its `end`'s tick unless a multiple's holds it, which `checkpoint_tick` names (one
   run: 0, 128, ..., 1,408 and the close at 1,409; resumed, 1,536, ..., 2,176 and the close at 2,177); and its `end` digest is the world founded from the configuration and stepped directly to that tick.
+  The resumed run records `--timeline T2`: T2's header names R's absolute path, the closing checkpoint's
+  sequence and tick, and that tick opened at; `flife-studio R/config.toml --export T2 --out D2` prints one
+  `export` record on the resumed `end`'s digest and tick with as many frames as it rendered (one run: 45
+  frames, ticks 1,408 to 2,124, closing at 2,176).
+- `tests/resumed_timeline.rs` (1 test, FL-023 with FL-024, Metal compute, no window), on a 32 x 32 world
+  retaining one checkpoint. A kept run of the Studio's session (two steps, a stroke applied at 2, a step, a
+  stroke pending at 3 where it closes), or a run made from one, is resumed through `R/store/..` by an offscreen
+  recording Studio. The Studio steps once (a pending stroke applies), strokes with E and a click, and steps
+  three more.
+  - A transplant (FL-042: a disk of the world at tick 8, `write_package`, grafted into a host of the
+    configuration), resumed from its founding checkpoint with nothing pending. Its world is not the one its
+    configuration founds, so a replay that founded instead fails its first frame (planted).
+  - A branch made at the kept run's closing tick, resumed from its founding checkpoint: the Studio resumes a
+    branch as `flife resume` does, the inherited pending stroke applying at its first step.
+  - The kept run (`volatile-in-memory`) resumed from its closing checkpoint.
+  - The kept run (`write-ahead-before-apply`), its only checkpoint's manifest damaged: resumed from the founding
+    world with the journal replayed to tick 3. The start names no checkpoint, and nothing is pinned.
+  - Each with a checkpoint: the header's start is the run directory's canonical path, the checkpoint's sequence
+    and tick with a pin, and the tick opened at; the store's one pin is that checkpoint under that holder, and it
+    holds two checkpoints after the resumed session's close, the pinned one first (retention keeps one, so
+    without the pin the replay's checkpoint is gone).
+  - Each: written as NDJSON and read back, the records are equal; the replay draws every frame in order at the
+    tick the Studio showed it, the first at the tick opened at, its RGBA8 bytes hashing equal, and closes on the
+    Studio's tick and digest. Refused with a `StateConflict`: the start's tick moved two later (the first
+    frame's tick is not the view's); with a checkpoint, a store another process holds (`another writer
+    holds`), the run directory moved (`is not a run directory`) and the checkpoint's tick changed (`where the
+    Studio restored tick`). A header with no start writes no `from` and reads back as one.
+  - A run's or a branch's book holds every command applied since the founding, so founding and stepping with
+    them reaches the same world: for those, the checkpoint saves the steps before it, and only the refusals show
+    the replay reads it.
+- Record on resume, planted bugs, 12, run against `tests/resumed_timeline.rs`, `tests/kept.rs` and
+  `tests/kept_binary.rs`, each caught: the resumed Studio never pinning its checkpoint; `Checkpoints::pin`
+  pinning nothing; pinning when not recording; the header naming no start; naming the run directory as given,
+  not canonically; the binary refusing `--timeline` with `--resume` again; replay founding when the header
+  names a checkpoint (caught first by the transplant's first frame, once the transplant case was added: before,
+  only the refusals caught it); replay opening at the restored tick, ignoring the journal's; replay taking a
+  checkpoint of another tick; replay showing the restored epoch as the one opened at; `restore_checkpoint`
+  opening the catalog of what may be no run directory; and a header with no start writing `from: null`.
 - FL-024's kept-run planted bugs, 15: no founding checkpoint; a checkpoint due again at the newest's own multiple;
   a checkpointer that never finds one due; no checkpoint of the closing boundary; a kept session closed rather
   than suspended; no pause before the closing checkpoint; the checkpoint not charged; the overlay never naming a
@@ -1286,9 +1334,8 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     rate has not been measured (the binary test's 2.5 s run and 1.5 s resumption ran 1,409 and 768 ticks with
     the hold, 1,649 and 721 in one earlier run without it: single runs, not a comparison).
   - The Studio opens a new run directory or resumes one (`--resume`); it does not branch one (that is `flife
-    branch`). A resumed Studio records no timeline (`--timeline` is refused with `--resume`): a timeline
-    replays from the founding world. A resumed run's selection, camera and style start afresh; the run directory
-    keeps the world and commands, not the view.
+    branch`), though it resumes a branch's run directory as `flife resume` does. A resumed run's selection,
+    camera and style start afresh; the run directory keeps the world and commands, not the view.
   - Closing a kept session pauses it before the closing checkpoint, so a running session's last run ends as
     `paused`, not `closed`.
   - A pre-intervention checkpoint is the control's only while it is the newest at its tick, since `flife branch
@@ -1392,17 +1439,30 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
 - A run ends only on pause, capacity shortfall, failure or close. A tick limit is later work; checkpoints are
   `--run`'s (FL-024).
 - FL-023's timeline and export:
-  - Only live capture exists. Simulation-time export and checkpoint-replay export (§13.8's other modes) and
-    Cinema export at 1080p and 4K (FL-050) are not implemented.
+  - The Studio's export is live capture: the frames the Studio drew, at its wall times. §13.8's other modes are
+    the command line's: `flife render` draws a configuration's run on simulation time, and `flife render
+    --run-dir` draws a run, branch or transplant on from where `flife resume` would continue it (checkpoint
+    replay). Neither carries a Studio timeline's camera, overlay or selection. Cinema export at 1080p and 4K
+    (FL-050) is not implemented.
   - The video is y4m, FrankenManim's raw 4:2:0 path. It is not encoded (H.264, MP4): FrankenManim's negotiated
     ffmpeg boundary (`fmn-output`) is not wired here.
   - A timeline holds no audio cues, and no captions beyond the overlay's text.
   - Recording in a window is unrun here: no test opened one. A frame drawn in a window replays as it was
     rendered, before the window composited it. A frame the window did not draw (occluded) has no record, and
     the video shows it as repeats.
-  - Replay founds the configuration's world and steps it from tick 0, so its time grows with the session's
-    ticks. The Studio always founds, so a timeline never starts from a checkpoint or a branch. A world that
-    paused for a capacity shortfall cannot be replayed: stepping refuses the pause.
+  - Replay founds the configuration's world, or restores a resumed Studio's checkpoint, and steps it from
+    there, so its time grows with the ticks since. A world that paused for a capacity shortfall cannot be
+    replayed: stepping refuses the pause.
+  - A resumed Studio's timeline depends on its run directory: it names it by absolute path, so a moved directory
+    is refused (`is not a run directory`), and its replay restores the checkpoint through the store's lock, so it
+    is refused while a Studio or `flife resume` holds the run (`another writer holds`). A start from the founding
+    world reads nothing there.
+  - Nothing unpins a timeline's checkpoint: deleting the timeline leaves it pinned, and the store keeps it. With
+    `persistence.preserve_pinned_discoveries = false`, retention removes it like any other, and the replay is
+    refused. The pin is made once the session opens, so a Studio that fails after that (a thread that cannot
+    start, an allocation) leaves a pin with no timeline.
+  - The export's manifest does not name the run directory or checkpoint a resumed timeline started from; the
+    timeline, whose SHA-256 the manifest names, does.
   - The replay's and the export's buffers (a view, a renderer, an RGBA8 frame, an NV12 frame and the encoders'
     scratch, each bounded by one frame) are not admitted against `[resources] memory_budget_bytes` (FL-043).
     The manifest's frame list grows with the frames.

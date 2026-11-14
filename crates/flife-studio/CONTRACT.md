@@ -1127,9 +1127,11 @@ presentation state, not scientific state.
     is, bit for bit, the world stepped directly with the three strokes at their ticks; it publishes one closing
     checkpoint at 7 with a sequence past the earlier session's last, and `flife_cli::inspect` restores that digest.
     Not recording, it leaves no pin in the store.
-  - `a_failed_checkpoint_lets_the_session_run_on`: after the founding checkpoint the run directory's store is
-    made read-only (and writable again after); the checkpoint at the first multiple is reported `Unkept` once,
-    the session runs on past the multiple, and it closes with no checkpoint but the founding one.
+  - `a_failed_checkpoint_lets_the_session_run_on`: after the founding checkpoint the store's `tmp/` is replaced by
+    a file (and is a directory again after), so no checkpoint can make its temporaries, whoever the process runs
+    as; the checkpoint at the first multiple is reported `Unkept` once, the session runs on past the multiple, and
+    it closes with no checkpoint but the founding one. (Read-only directories, the earlier way, do not stop root:
+    on a Linux build host running as root every checkpoint was kept and the test failed.)
   - `what_cannot_be_resumed_is_refused`: `run` set (`kept where it is`) and an absent directory, recording or
     not (`is not a run directory`), the directory never made.
   - `what_cannot_be_kept_is_refused_before_anything_is_created`: a directory holding a file (`is not empty`),

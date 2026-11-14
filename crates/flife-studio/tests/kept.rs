@@ -25,7 +25,6 @@
 
 use std::fs;
 use std::num::{NonZeroU32, NonZeroUsize};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -816,44 +815,26 @@ fn studio_resumes(durability: &str) {
     assert_eq!(store.pins().expect("pins"), []);
 }
 
-/// The directories under `root`, `root` first.
-fn directories(root: &Path) -> Vec<PathBuf> {
-    let mut found = vec![root.to_path_buf()];
-    let mut at = 0;
-    while at < found.len() {
-        let entries = fs::read_dir(&found[at]).expect("a readable directory");
-        for entry in entries {
-            let path = entry.expect("an entry").path();
-            if path.is_dir() {
-                found.push(path);
-            }
-        }
-        at += 1;
-    }
-    found
-}
+/// A store whose `tmp/` is a file, so that no checkpoint can make the
+/// temporary file every chunk and manifest is written to first: each is
+/// refused as not a directory, whoever the process runs as. (Directories
+/// made read-only do not stop root: on a Linux build host running as root
+/// every checkpoint was kept.) `tmp/` is a directory again when dropped.
+struct NoTemporaries(PathBuf);
 
-/// Directories made read-only, made writable again when dropped.
-struct ReadOnly(Vec<PathBuf>);
-
-impl ReadOnly {
-    fn new(directories: Vec<PathBuf>) -> Self {
-        set_mode(&directories, 0o555);
-        Self(directories)
+impl NoTemporaries {
+    fn new(store: &Path) -> Self {
+        let tmp = store.join("tmp");
+        fs::remove_dir(&tmp).expect("the store's tmp/ is an empty directory");
+        fs::write(&tmp, b"").expect("a file in tmp/'s place");
+        Self(tmp)
     }
 }
 
-impl Drop for ReadOnly {
+impl Drop for NoTemporaries {
     fn drop(&mut self) {
-        set_mode(&self.0, 0o755);
-    }
-}
-
-fn set_mode(directories: &[PathBuf], mode: u32) {
-    for directory in directories {
-        let mut permissions = fs::metadata(directory).expect("metadata").permissions();
-        permissions.set_mode(mode);
-        fs::set_permissions(directory, permissions).expect("permissions set");
+        let _ignored = fs::remove_file(&self.0);
+        let _ignored = fs::create_dir(&self.0);
     }
 }
 
@@ -875,9 +856,9 @@ fn a_failed_checkpoint_lets_the_session_run_on() {
         !checkpoints(statuses).is_empty()
     });
 
-    // The store takes no more chunks, so the checkpoint at the first
+    // The store can make no temporary file, so the checkpoint at the first
     // multiple fails.
-    let store = ReadOnly::new(directories(&dir.join(flife_cli::STORE_DIR)));
+    let store = NoTemporaries::new(&dir.join(flife_cli::STORE_DIR));
     session.send(Intent::Resume).expect("offered");
     let unkept = |statuses: &[Status]| {
         statuses

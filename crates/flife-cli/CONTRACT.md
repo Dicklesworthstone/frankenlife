@@ -530,6 +530,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
     organisms a removal of the disk would take (rows, held state and genomes) and the cells whose centres lie in it,
     and nothing else; its ledger opens at exactly its own holdings, the endowment. It is not a run: `flife resume
     BUNDLE/package` is refused.
+  - `write_package` streams the container to `world.ckpt` a page at a time (FL-043), holding the crop and no copy
+    of its encoding. The sealed prefix names every chunk's length and digest and comes first, so the crop is encoded
+    twice: once to learn the prefix, then again behind it into the file, counted and hashed for the manifest as it
+    is written. The second encoding must seal to the same prefix (`state-conflict`, operation `write package`,
+    otherwise). The file is byte for byte the crop's checkpoint encoded whole.
   - `read_package` accepts a package only when the manifest has the schema, `exterior = "host"` and `world.ckpt`;
     the container has the manifest's size and SHA-256 and restores (its restore checks the ledger against the state
     bit for bit); and the restored world agrees with the manifest on the crop (decimals and bits, cells,
@@ -1141,6 +1146,14 @@ transplant's bound keeps (the births term, the container and the reserve, none o
 genomes outweigh the package's world and that slack, the preset at its 16,384 ceiling (about 2 GiB in one test),
 would show it; none is run.
 
+The package's streamed container: 5 planted bugs, run with `tests/discovery.rs` and the two package tests of
+`tests/memory_admission.rs`; all caught. The first encoding held whole: the package's heap test. The prefix, or the
+pages, written but not counted or hashed, and each write counted a byte short: the manifest's size and SHA-256 in
+the heap test, and `read_package` in the discovery tests. The second encoding sent nowhere: the byte-for-byte check
+and `read_package`. None was planted for the check that the second encoding seals to the first's prefix (the
+encoding is deterministic, so no test can make them differ) or for the flush under power loss (a crash would be
+needed to tell it apart).
+
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
   a quarter of births, stepped directly for 1,200 ticks, and the preset's first 320 ticks. The tracker is fed only
@@ -1263,8 +1276,15 @@ the genome's identity off by one. A genome named by the organism's own identity 
 founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
 every run.
 
-`tests/memory_admission.rs` (16 tests, FL-043, about 33 s in a workspace run; a counting global allocator,
+`tests/memory_admission.rs` (17 tests, FL-043, about 33 s in a workspace run; a counting global allocator,
 `peak_alloc`, test only):
+- `a_package_holds_no_more_heap_than_its_crop` (FL-042): the world of the branch test's tick-8 checkpoint (below),
+  cropped to radius 64 about its centre (3,223 organisms), is written as a package. Cropping alone peaks at 243.94 MiB (the crop holds 240.67);
+  `write_package` peaks at the same 243.94, at most cropping's peak and `CHECKPOINT_FIXED_BYTES`, for a container
+  of 127.36 MiB. The file equals the crop's checkpoint encoded whole, and the manifest names its size and SHA-256.
+  Before the container was streamed it was held twice beside the crop (each chunk in its own buffer, then all of
+  them copied into the container): `flife discover` of that disk with its package peaked at 775.26 MiB, and now
+  peaks at 518.01 (the world and the crop).
 - `a_branch_holds_no_more_heap_than_its_restore` (FL-039): the preset run to tick 8, checkpointed at 0 and 8, is
   branched at 8. Restoring that checkpoint peaks at 438.58 MiB (the world's 274.05 and its 161.30 MiB
   container). The branch, from opening the parent to its record, peaks at the same 438.58: at most the restore's

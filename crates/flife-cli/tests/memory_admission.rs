@@ -17,6 +17,9 @@
 //!   host's genomes at their actual bytes.
 //! - A branch streams its founding checkpoint: it holds no more heap than
 //!   restoring the parent's checkpoint does, and one stream's fixed bytes.
+//! - A package streams its container: it holds no more heap than cropping
+//!   its disk does, and one stream's fixed bytes; the file is the crop's
+//!   checkpoint encoded whole.
 
 #![allow(
     clippy::expect_used,
@@ -34,11 +37,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use flife_cli::memory::admit;
 use flife_cli::{
     BranchOptions, CHECKPOINT_FIXED_BYTES, CheckpointMode, ControllerChoice, Disk, MemoryAdmission,
-    PackageSource, Persistence, RESERVE_BYTES, Record, RenderOptions, RenderRecord, RunOptions,
-    StoreDurability, Style, TransplantOptions, branch, configure, encoding_bytes, found,
-    read_package, render, restore_checkpoint, run_with, transplant, write_package,
+    PACKAGE_WORLD_FILE, PackageSource, Persistence, RESERVE_BYTES, Record, RenderOptions,
+    RenderRecord, RunOptions, StoreDurability, Style, TransplantOptions, branch, configure,
+    encoding_bytes, found, read_package, render, restore_checkpoint, run_with, transplant,
+    write_package,
 };
-use flife_core::{CoreError, ValidatedConfig};
+use flife_core::checkpoint::CheckpointWriter;
+use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_engine::{Intervention, NumericalProfile, Stepped};
 use peak_alloc::PeakAlloc;
 use serde_json::Value;
@@ -555,6 +560,74 @@ fn a_branch_holds_no_more_heap_than_its_restore() {
         "a branch's heap peak {branching} above its restore's {restoring} and a stream's fixed \
          bytes"
     );
+}
+
+/// A package (FL-042) streams its container to its file (FL-043): cutting a
+/// disk of radius 64 about the centre of the preset's world, 8 ticks on,
+/// holds no more heap than cropping that disk does, and one stream's fixed
+/// bytes. Encoded whole, the container was held twice beside the crop (each
+/// chunk in its own buffer, then all of them copied into it): `flife
+/// discover` of that disk with its package peaked at 775.3 MiB against a
+/// restore of 438.6 MiB. The file is, byte for byte, the crop's checkpoint
+/// encoded whole, and the manifest names its size and SHA-256.
+#[test]
+fn a_package_holds_no_more_heap_than_its_crop() {
+    let _serial = serial();
+    let config = preset();
+    let (run_dir, sequence) = preset_run();
+    let world = restore_checkpoint(&run_dir, &config, sequence).expect("restores");
+    let disk = Disk {
+        center: [64.0, 64.0],
+        radius: 64.0,
+    };
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let (crop, _) = world.cropped(disk.center, disk.radius).expect("crops");
+    let cropping = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let held = crop.held_bytes();
+    let mut whole = CheckpointWriter::new(&crop.config().config().model);
+    crop.write_checkpoint(&mut whole).expect("encodes");
+    let expected = whole.finish().expect("encodes whole");
+    drop(crop);
+    let dir = fresh("package-r64");
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let package = write_package(
+        &dir,
+        &world,
+        disk,
+        PackageSource {
+            run_dir: "memory-admission".into(),
+            session: 1,
+            sequence,
+            tick: world.tick().get(),
+            checkpoint_sha256: String::new(),
+            config_sha256: config.config_hash().to_hex(),
+        },
+        StoreDurability::ProcessCrash,
+    )
+    .expect("writes the package");
+    let packaging = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    println!(
+        "a package of {} organisms: cropping held {:.2} MiB at its peak (the crop {:.2}); \
+         packaging {:.2} MiB, its container {:.2}",
+        package.organisms,
+        mib(cropping),
+        mib(held),
+        mib(packaging),
+        mib(package.world.bytes),
+    );
+    assert!(
+        packaging <= cropping + CHECKPOINT_FIXED_BYTES,
+        "packaging's heap peak {packaging} above cropping's {cropping} and a stream's fixed bytes"
+    );
+    let written = fs::read(dir.join(PACKAGE_WORLD_FILE)).expect("reads the container");
+    assert!(
+        written == expected,
+        "the container is the crop's checkpoint encoded whole"
+    );
+    assert_eq!(package.world.bytes, written.len() as u64);
+    assert_eq!(package.world.sha256, Sha256Digest::of(&written).to_hex());
 }
 
 /// The preset's world, 8 ticks on, cropped to a disk of radius 24 about its

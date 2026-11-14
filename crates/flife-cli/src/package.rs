@@ -30,12 +30,12 @@
 //! endowment against the restored holdings.
 
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use flife_core::CoreError;
-use flife_core::canonical::Sha256Digest;
-use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
+use flife_core::canonical::{Sha256Digest, Sha256Stream};
+use flife_core::checkpoint::{CheckpointReader, CheckpointWriter, ChunkFamily, ChunkSink};
 use flife_engine::{NumericalProfile, WORLD_CHECKPOINT_CHUNKS, World};
 use serde::{Deserialize, Serialize};
 
@@ -178,14 +178,76 @@ fn refuse(detail: impl Into<String>) -> CoreError {
     }
 }
 
+/// A streamed checkpoint's pages, dropped: the first of a package's two
+/// encodings, which learns each chunk's length and digest, and so the
+/// container's sealed prefix.
+struct Measure;
+
+impl ChunkSink for Measure {
+    fn begin(&mut self, _: usize, _: ChunkFamily) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn page(&mut self, _: &[u8]) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn end(&mut self, _: u64, _: Sha256Digest) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// The container's file, written as it comes (the sealed prefix, then the
+/// second encoding's pages), counted and hashed.
+struct Container<'p> {
+    path: &'p Path,
+    file: File,
+    bytes: u64,
+    sha256: Sha256Stream,
+}
+
+impl Container<'_> {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), CoreError> {
+        self.file
+            .write_all(bytes)
+            .map_err(|error| storage("write bundle file", self.path, &error))?;
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        self.sha256.update(bytes);
+        Ok(())
+    }
+}
+
+impl ChunkSink for Container<'_> {
+    fn begin(&mut self, _: usize, _: ChunkFamily) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    fn page(&mut self, bytes: &[u8]) -> Result<(), CoreError> {
+        self.write(bytes)
+    }
+
+    fn end(&mut self, _: u64, _: Sha256Digest) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
 /// Cut the disk `disk` of committed `world`, which `source` names, into the
 /// new directory `dir` (see the [module documentation](self)), and return
 /// its manifest.
 ///
+/// The container is streamed to its file a page at a time (FL-043), so
+/// that cutting holds the crop and no copy of its encoding. Its sealed
+/// prefix names every chunk's length and digest and comes first, so the
+/// crop is encoded twice: once to learn the prefix, then again behind it
+/// into the file. The second must seal to the same prefix.
+///
 /// # Errors
 /// As [`World::cropped`] and [`World::write_checkpoint`];
 /// [`CoreError::StorageFailed`] when `dir` exists or a file cannot be
-/// written.
+/// written; [`CoreError::StateConflict`] if the crop's second encoding
+/// seals to another prefix than its first.
 pub fn write_package(
     dir: &Path,
     world: &World,
@@ -194,9 +256,43 @@ pub fn write_package(
     durability: StoreDurability,
 ) -> Result<Package, CoreError> {
     let (crop, measurement) = world.cropped(disk.center, disk.radius)?;
-    let mut writer = CheckpointWriter::new(&crop.config().config().model);
+    let model = &crop.config().config().model;
+    let mut measure = Measure;
+    let mut writer = CheckpointWriter::streaming(model, &mut measure);
     crop.write_checkpoint(&mut writer)?;
-    let bytes = writer.finish()?;
+    let prefix = writer.seal()?;
+    drop(writer);
+    fs::create_dir(dir).map_err(|error| storage("create package directory", dir, &error))?;
+    let path = dir.join(PACKAGE_WORLD_FILE);
+    let file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| storage("create bundle file", &path, &error))?;
+    let mut container = Container {
+        path: &path,
+        file,
+        bytes: 0,
+        sha256: Sha256Stream::new(),
+    };
+    container.write(&prefix)?;
+    let mut writer = CheckpointWriter::streaming(model, &mut container);
+    crop.write_checkpoint(&mut writer)?;
+    let sealed = writer.seal()?;
+    drop(writer);
+    if sealed != prefix {
+        return Err(CoreError::StateConflict {
+            operation: "write package",
+            detail: "the crop's second encoding seals to another prefix than its first".into(),
+        });
+    }
+    if durability == StoreDurability::PowerLoss {
+        container
+            .file
+            .sync_all()
+            .map_err(|error| storage("flush bundle file", &path, &error))?;
+    }
+    let Container { bytes, sha256, .. } = container;
     let holdings = crop.ledger().holdings();
     let grid = crop.field().grid();
     let package = Package {
@@ -223,8 +319,8 @@ pub fn write_package(
         lineages: measurement.lineages,
         world: PackageWorld {
             path: PACKAGE_WORLD_FILE.into(),
-            bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            sha256: Sha256Digest::of(&bytes).to_hex(),
+            bytes,
+            sha256: sha256.finish().to_hex(),
             digest: crop.digest().to_hex(),
         },
     };
@@ -235,8 +331,6 @@ pub fn write_package(
             detail: error.to_string(),
         })?;
     text.push('\n');
-    fs::create_dir(dir).map_err(|error| storage("create package directory", dir, &error))?;
-    write_new(&dir.join(PACKAGE_WORLD_FILE), &bytes, durability)?;
     write_new(&dir.join(PACKAGE_FILE), text.as_bytes(), durability)?;
     if durability == StoreDurability::PowerLoss {
         File::open(dir)

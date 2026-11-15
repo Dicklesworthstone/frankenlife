@@ -7,11 +7,12 @@
 //! E1's base with only the selected power; and valid at the profile's
 //! scale.
 
-use std::collections::BTreeMap;
+mod preset_diff;
 
 use flife_cli::{RUN_SESSION, VALIDATE_SCHEMA, Validation};
 use flife_core::ValidatedConfig;
 use flife_runtime::SessionConfig;
+use preset_diff::{assert_exactly_declared, changes, value};
 
 const PRESET: &str = include_str!("../../../presets/interactive-world.toml");
 const REFERENCE: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -42,83 +43,11 @@ const DECLARED: [(&str, &str, &str); 12] = [
     ("execution.maximum_total_bytes", "2147483648", "8589934592"),
 ];
 
-/// Every leaf of a TOML document by its dotted key.
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a failure here is a test failure"
-)]
-fn leaves(text: &str) -> BTreeMap<String, toml::Value> {
-    fn walk(prefix: &str, table: &toml::Table, out: &mut BTreeMap<String, toml::Value>) {
-        for (key, value) in table {
-            let path = if prefix.is_empty() {
-                key.clone()
-            } else {
-                format!("{prefix}.{key}")
-            };
-            match value {
-                toml::Value::Table(inner) => walk(&path, inner, out),
-                leaf => {
-                    out.insert(path, leaf.clone());
-                }
-            }
-        }
-    }
-    let table: toml::Table = toml::from_str(text).expect("TOML");
-    let mut out = BTreeMap::new();
-    walk("", &table, &mut out);
-    out
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "test helper: a failure here is a test failure"
-)]
-fn value(text: &str) -> toml::Value {
-    let table: toml::Table = toml::from_str(&format!("v = {text}")).expect("a TOML value");
-    table.get("v").cloned().expect("v")
-}
-
-/// The keys whose values differ between `from` and `to`, which hold the
-/// same keys, with both values.
-fn changes(from: &str, to: &str) -> Vec<(String, toml::Value, toml::Value)> {
-    let (from, to) = (leaves(from), leaves(to));
-    assert_eq!(
-        from.keys().collect::<Vec<_>>(),
-        to.keys().collect::<Vec<_>>()
-    );
-    from.into_iter()
-        .filter_map(|(key, before)| {
-            let after = to.get(&key)?.clone();
-            (after != before).then_some((key, before, after))
-        })
-        .collect()
-}
-
 /// The preset is the reference preset with exactly its declared changes,
 /// and its header declares each one.
 #[test]
 fn the_preset_is_the_reference_preset_with_exactly_its_declared_changes() {
-    let changed = changes(REFERENCE, PRESET);
-    let mut declared: Vec<(String, toml::Value, toml::Value)> = DECLARED
-        .iter()
-        .map(|&(key, from, to)| (key.to_owned(), value(from), value(to)))
-        .collect();
-    declared.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(changed, declared);
-    let header: Vec<&str> = PRESET
-        .lines()
-        .take_while(|line| line.starts_with('#'))
-        .collect();
-    for (key, from, to) in DECLARED {
-        let (from, to) = (from.trim_matches('"'), to.trim_matches('"'));
-        assert!(
-            header.iter().any(|line| line.contains(key)
-                && line.contains(from)
-                && line.contains(to)
-                && line.contains('→')),
-            "the header does not declare {key}: {from} → {to}"
-        );
-    }
+    assert_exactly_declared(REFERENCE, PRESET, &DECLARED);
 }
 
 /// The preset is E1's base, its control, with only its name and the source

@@ -1,9 +1,10 @@
-# FL-034 E1: the Interactive profile's source power
+# FL-034 E1 and E2: the Interactive and Desktop ecology profiles' source power
 
-This directory records FrankenLife's first scale-up experiment (plan §19.5, FL-034). It covers what was run,
-the rule declared before the runs, every run, and the decision. It holds the base configuration, the four
-specifications verbatim and the experiments' records. The experiment directories (catalogs, per-run logs)
-are kept outside git.
+This directory records FrankenLife's scale-up experiments (plan §19.5, FL-034): E1 for the Interactive profile
+(25,000 organisms) and, [below](#fl-034-e2-the-desktop-ecology-profiles-source-power), E2 for the Desktop
+ecology profile (100,000). Each covers what was run, the rule declared before the runs, every run, and the
+decision. The directory holds each experiment's base configuration, its specifications verbatim and its
+records. The experiment directories (catalogs, per-run logs) are kept outside git.
 
 ## Why
 
@@ -145,3 +146,123 @@ G6 measurement start from.
   within the 40,000 cap.
 - Per-organism throughput is a ratio of totals, and the partition is one window's ledger flows. Neither
   measures what an individual organism takes.
+
+# FL-034 E2: the Desktop ecology profile's source power
+
+## Why
+
+The Desktop ecology profile (§19.5) is 100,000 organisms on 512 × 512 × 33 with F16 canonical weights,
+controllers every tick. No 100,000-organism configuration existed. E2 tests whether the Interactive preset's
+energy per area, which E1 selected at 256 × 256, holds the Desktop profile's population at 4× the area.
+
+## Summary
+
+| Source power | Discovery (seeds 21–24) | Held-out (seeds 2021–2024) | Verdict |
+|---:|---|---|---|
+| **1248 (control)** | **4 of 4: 91,664–96,063** | **4 of 4: 92,381–99,361** | **adopted** |
+| 1435.2 (1.15×) | 4 of 4: 107,253–110,919 | 4 of 4: 106,513–113,532 | qualifies, not the lowest |
+
+By the declared rule, the control's power was adopted: `presets/desktop-world.toml` is this experiment's base
+with only its name changed (`crates/flife-cli/tests/desktop_preset.rs` keeps it so).
+
+## Provenance
+
+- Base: `desktop-base.toml` (SHA-256 `25b83953…40c86`). It is `presets/interactive-world.toml` scaled to the
+  profile, changing only the name, the world and grid to 512 (4× the area at the same cell size), founders
+  25,000 → 100,000, the population cap 40,000 → 160,000, sources 32 → 128 (the Interactive preset's energy per
+  area), the canonical weights F32 → F16, and the genome and total memory budgets (4, 4.5 and 16 GiB). Its
+  header lists each change.
+- Specifications: `e2/spec-21.toml` … `e2/spec-24.toml`, one seed pair each (discovery `d`, held-out `2000 + d`),
+  identical except for their name and seeds. SHA-256: 21 `792a1a5b…25687`, 22 `ec032adc…61f72`, 23
+  `f3153015…295d47`, 24 `b9f5fe13…cdddd0`.
+- Binary: `flife experiment` built at a5e73e3 (SHA-256 `96cc1fa4…4f19`), CPU-reference controllers and 16
+  workers per run, two pairs concurrently per host: pairs 21 and 22 on hz4 (AMD EPYC 7282, Linux 7.0.0
+  x86_64), pairs 23 and 24 on ts1 (AMD Ryzen Threadripper PRO 5975WX, Linux 7.0.0 x86_64). The specifications'
+  amendment (82fd4ba) changed no code. A run's result depends on neither its host nor its worker count, so
+  splitting the seeds across hosts changes no result.
+- Date: 2026-11-15, 00:14 to 04:49 EST. Each run took 3,029–4,449 s of wall time. A first attempt at 00:12 was
+  refused at validation (a specification with no condition beside its control) and ran nothing.
+- Records: `e2/records.ndjson` (SHA-256 `25ad57bc…31e8`), the four experiments' NDJSON output in pair order.
+  Each has a start record, four run records and an end record. Every experiment's stderr was empty.
+
+## Declared before the runs
+
+Written into the specifications at 2026-11-15 00:04:31 EST, and amended at 00:13:31 EST, still before any run,
+to add the 1.15× sweep when `flife experiment` refused a specification with only its control (commit 82fd4ba).
+
+- Conditions: the control (1248 per source) and a sweep of `sources.power_per_source` over 1435.2 (1.15×).
+  8,192 ticks (64 simulated seconds) per run, metrics every 1,024 ticks.
+- Band: 80,000 to 120,000 live.
+- A condition qualifies on a split when every run of it on that split, over all four seed pairs, reaches tick
+  8,192 (no extinction, no capacity pause) with `final_live` in the band. The candidate is the lowest source
+  power whose discovery runs qualify. It is adopted for a Desktop ecology preset only if its held-out runs
+  qualify too. If none qualifies, nothing is adopted and the next experiment is declared from these results.
+- Prediction (from E1's 1.655–1.700 energy/s of source power per organism): the control near 88,000–101,000
+  live at tick 8,192, 1.15× near 101,000–116,000.
+
+## Results
+
+All 16 runs reached tick 8,192. None went extinct, paused at the population cap or failed.
+
+| Power | Split | Seed | Final live | In band | Peak | Least | Births | Deaths | Lineages | Morisita | Moran's I | Digest |
+|---:|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 1248 | discovery | 21 | 94,391 | yes | 119,501 | 15,507 | 379,009 | 384,618 | 907 | 1.82 | 0.18 | `7082822b4b4a` |
+| 1248 | discovery | 22 | 91,664 | yes | 120,993 | 15,442 | 374,991 | 383,327 | 952 | 1.80 | 0.23 | `1f891384b92d` |
+| 1248 | discovery | 23 | 95,172 | yes | 121,867 | 14,906 | 387,466 | 392,294 | 897 | 1.72 | 0.10 | `74bc6e4cb53d` |
+| 1248 | discovery | 24 | 96,063 | yes | 120,342 | 14,805 | 380,744 | 384,681 | 917 | 1.78 | 0.15 | `fc731efe159a` |
+| 1248 | held-out | 2021 | 92,381 | yes | 119,439 | 14,791 | 380,065 | 387,684 | 852 | 1.85 | 0.17 | `89fae6e36480` |
+| 1248 | held-out | 2022 | 99,361 | yes | 119,331 | 15,252 | 389,349 | 389,988 | 884 | 1.61 | 0.20 | `31e5c97f9158` |
+| 1248 | held-out | 2023 | 92,393 | yes | 117,891 | 15,575 | 379,413 | 387,020 | 893 | 1.84 | 0.18 | `03168c22af7b` |
+| 1248 | held-out | 2024 | 94,777 | yes | 119,405 | 15,689 | 390,394 | 395,617 | 928 | 1.76 | 0.26 | `311859ae6ec0` |
+| 1435.2 | discovery | 21 | 110,919 | yes | 138,180 | 17,104 | 436,023 | 425,104 | 978 | 1.83 | 0.19 | `8347a4ec2ec2` |
+| 1435.2 | discovery | 22 | 107,253 | yes | 140,905 | 17,080 | 430,825 | 423,572 | 979 | 1.80 | 0.23 | `038d4b4e6f94` |
+| 1435.2 | discovery | 23 | 110,345 | yes | 140,573 | 16,405 | 444,493 | 434,148 | 981 | 1.69 | 0.11 | `b2109fce1a29` |
+| 1435.2 | discovery | 24 | 110,584 | yes | 138,416 | 16,328 | 435,210 | 424,626 | 955 | 1.80 | 0.16 | `89ec18f0e836` |
+| 1435.2 | held-out | 2021 | 109,117 | yes | 140,051 | 16,292 | 439,388 | 430,271 | 942 | 1.85 | 0.19 | `aee707f62c2c` |
+| 1435.2 | held-out | 2022 | 113,532 | yes | 138,893 | 16,734 | 444,502 | 430,970 | 961 | 1.61 | 0.21 | `9241932b46b7` |
+| 1435.2 | held-out | 2023 | 106,513 | yes | 134,856 | 17,046 | 433,280 | 426,767 | 965 | 1.83 | 0.17 | `9d2e7c780bce` |
+| 1435.2 | held-out | 2024 | 109,079 | yes | 138,317 | 17,410 | 447,139 | 438,060 | 938 | 1.76 | 0.24 | `6497d7a37d33` |
+
+Morisita and Moran's I are the organisms' at the last sample (tick 8,192), and the digest is the committed
+world's at tick 8,192.
+
+- As at both smaller scales, every run first lost most of its 100,000 founders: its least live (14,791–17,410)
+  fell within the first 1,024 ticks, and it then recovered and overshot (peaks 117,891–140,905, below the
+  160,000 cap) before settling. The populations at tick 8,192 descend from the survivors (§21.6).
+- The predictions held: the control ended at 91,664–99,361, 1.15× at 106,513–113,532.
+- Every run kept colonies by FL-048's H1 criterion (organism Morisita > 1 and Moran's I > 0 at the last
+  sample), with 852–981 founder lineages alive and all five catalog topologies alive. The default topology
+  (`[64, 32]`) held 91–94% of the live organisms in the last window.
+- The largest normalized ledger residual of any metrics window in any run was 1.19e-8.
+
+## Energy throughput (§19.5)
+
+| World | Total source power (energy/s) | Per unit area (energy/s) | Per organism (energy/s) |
+|---|---:|---:|---:|
+| Interactive preset: 32 × 1248 on 256² | 39,936 | 0.609 | 1.678 |
+| E2 control: 128 × 1248 on 512² (adopted) | 159,744 | 0.609 | 1.690 |
+| 128 × 1435.2 | 183,706 | 0.701 | 1.675 |
+
+Per organism is total source power over the mean final live of the condition's eight runs (94,525 and
+109,668). The population still tracks source power at about 1.7 energy/s per organism, now at three scales.
+
+Where it went, in each run's last metrics window (ticks 7,168–8,192): uptake inefficiency 48.2–51.5% of the
+source power, maintenance 45.5–49.4%, field decay 0.5–0.7%, and emission loss, birth loss, controllers,
+sensors, motion and toxicity under 0.6% each.
+
+## Decision
+
+The control's power, 1248 per source, is adopted. Its discovery runs qualified (4 of 4 in band at tick
+8,192), it is the lowest power that did, and its held-out runs qualified too (4 of 4). 1435.2 also qualified on
+both splits but is not the lowest.
+
+`presets/desktop-world.toml` is `desktop-base.toml` with the name `desktop-world`. Its header lists its changes
+from the Interactive preset.
+
+## Limits
+
+- Four seed pairs per condition, as in E1. Every control run ended in the lower half of the band.
+- 8,192 ticks is 64 simulated seconds. Nothing here shows the population staying in the band beyond that.
+- The rule tests only `final_live`.
+- These runs say nothing about speed: they ran on the CPU reference on x86-64 hosts, two at a time. The
+  Desktop profile's G4/G6 qualification is FL-034's remaining work.

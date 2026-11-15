@@ -15,6 +15,9 @@
 //! a `MetalBackend` with `N` genomes to a parameter shard (FL-026), for
 //! example `metal,metal+slots=4096`. A choice this host refuses
 //! (`metal` without a device) is reported and left out. Prints one JSON line.
+//! Each choice's `controller_device_nanoseconds` is the device's time on its
+//! controller backend's commands over the world's life, warm-up included
+//! (`ControllerReport::device_nanoseconds`; 0 off the device).
 
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -184,7 +187,8 @@ fn main() -> Result<(), CoreError> {
             format!(
                 "{{\"choice\":\"{}\",\"ticks_per_s\":{rate:.3},\"cv_percent\":{:.2},\
                  \"ratio_to_first\":{:.3},\"samples\":{:?},\"batched\":{},\"deferred\":{},\
-                 \"reference_ticks\":{},\"sensor_ticks\":[{},{}],\"field_steps\":[{},{}],\
+                 \"reference_ticks\":{},\"controller_device_nanoseconds\":{},\
+                 \"sensor_ticks\":[{},{}],\"field_steps\":[{},{}],\
                  \"uptake_ticks\":[{},{}],\"field_reductions\":[{},{}],\
                  \"field_checks\":[{},{}],\"settle_ticks\":[{},{}]}}",
                 entry.name,
@@ -194,6 +198,7 @@ fn main() -> Result<(), CoreError> {
                 report.batched,
                 report.deferred,
                 report.reference_ticks,
+                report.device_nanoseconds,
                 sensors.ticks,
                 sensors.reference_ticks,
                 field.steps,

@@ -1380,7 +1380,9 @@ per-pass thread spawning (6%).
     (submit, then wait or poll for the receipt, with the bindings held meanwhile). No consumer needs it yet.
   - The engine path still submits one kernel per tick (`MetalBackend::evaluate`). Several kernels per command pay
     off once FL-032 moves the CPU phases around the controllers onto the device.
-  - `device_seconds` reaches run records as `controllers.device_nanoseconds`, but not the throughput example.
+  - `device_seconds` reaches run records as `controllers.device_nanoseconds`, and `tick_throughput`'s rows as
+    `controller_device_nanoseconds` (the world's whole life, warm-up included). The other Metal stages' commands
+    (sensors, field, uptake, settlement) report no device time.
   - A failed command buffer is tested through the gateway's seam: a real command buffer, left uncommitted. No
     device fault on this host fails a committed one (see the tests).
 - FL-028 gaps:

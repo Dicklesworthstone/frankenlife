@@ -200,6 +200,9 @@ FL-028's outputs:
   - `written`, the epoch each buffer it wrote now holds, in order of each buffer's first binding;
   - `kernels`, the kernels it ran (FL-029);
   - `device_seconds`, its command buffer's time on the GPU, from start to end (FL-029).
+- `DeviceTime { commands, nanoseconds }` and `DeviceOwner::device_time` (FL-029): every command the owner
+  completed since it opened, and their receipts' device time summed, shared by its clones. A refused or failed
+  command adds nothing. So the Metal phases on one owner (`+all`) are timed together.
 - `ResourceState`: `Available`, `Computing`, `Committed`, `Rendering`, `Checkpointing` or `Retiring` (§9.5).
 - `Usage`: buffers, bytes, retiring, read leases by purpose, write leases and running commands.
 - `MetalBackend::last_command` (FL-030): the last batch's kernels and its command buffer's device seconds.
@@ -606,6 +609,7 @@ A refusal changes nothing.
   - `a_failed_command_buffer_leaves_what_the_batch_writes_undefined`, through FrankenTorch's fault seam. The seam
     leaves the next command buffer uncommitted, and it reports `NotEnqueued`, as one a GPU restart aborted does.
     - Both written buffers become `Available`, undefined at epoch 1, and refuse reads.
+    - The owner's `device_time` is unchanged: a failed command is not counted.
     - The buffer the batch only read stays `Committed` at epoch 1.
     - A batch that reads an undefined buffer first is refused.
     - The same batch again, whose first kernel rewrites `b` before the second reads it, is admitted: epochs
@@ -613,6 +617,12 @@ A refusal changes nothing.
 
     The seam exists only with debug assertions, so this test runs in full under `cargo test` (the dev profile).
     A release build only checks that the seam is absent.
+- `tests/device_time.rs` (FL-029, 1 test in a binary of its own, away from `batch.rs`'s injected fault), on
+  this host's device: compiling and uploading run no command. Eight commands, one and two kernels, half through
+  a clone, give `DeviceTime { commands: 8, .. }` on both handles. Their device time is the receipts' summed, to a
+  nanosecond a command, and within the wall time (75.7 µs of 11.7 ms here). A refused command adds nothing, and
+  another owner starts at zero. Planted bugs, 4 of 4 caught, each by its intended assertion: no command counted;
+  no device time added; a failed command counted (by `batch.rs`); microseconds counted as nanoseconds.
 - `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's buffers (since
   FL-026, two per shard and three more), with no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
   crate, every output still bit-identical.
@@ -1381,8 +1391,9 @@ per-pass thread spawning (6%).
   - The engine path still submits one kernel per tick (`MetalBackend::evaluate`). Several kernels per command pay
     off once FL-032 moves the CPU phases around the controllers onto the device.
   - `device_seconds` reaches run records as `controllers.device_nanoseconds`, and `tick_throughput`'s rows as
-    `controller_device_nanoseconds` (the world's whole life, warm-up included). The other Metal stages' commands
-    (sensors, field, uptake, settlement) report no device time.
+    `controller_device_nanoseconds` (the world's whole life, warm-up included). The other Metal phases' owners
+    count theirs (`DeviceOwner::device_time`), which `tick_throughput` prints as `phase_commands` and
+    `phase_device_nanoseconds`. Neither the engine's phase reports nor run records carry them.
   - A failed command buffer is tested through the gateway's seam: a real command buffer, left uncommitted. No
     device fault on this host fails a committed one (see the tests).
 - FL-028 gaps:

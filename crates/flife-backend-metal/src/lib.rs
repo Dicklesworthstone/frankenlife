@@ -25,7 +25,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZeroUsize;
-use std::time::Duration;
 
 use flife_backend_cpu::CpuBackend;
 use flife_core::CoreError;
@@ -70,8 +69,8 @@ pub use flife_neural::BackendBudget;
 pub use motion::{MOTION_OPS_WORDS, MetalMotion};
 use owner::metal;
 pub use owner::{
-    Binding, Buffer, DeviceOwner, Element, Kernel, Limits, Owned, Purpose, ReadLease, Receipt,
-    ResourceState, Usage, WriteLease,
+    Binding, Buffer, DeviceOwner, DeviceTime, Element, Kernel, Limits, Owned, Purpose, ReadLease,
+    Receipt, ResourceState, Usage, WriteLease,
 };
 pub use proposal::{MetalProposal, PROPOSAL_OPS_WORDS};
 pub use sensors::MetalSensors;
@@ -1044,10 +1043,8 @@ impl ControllerBackend for MetalBackend {
     }
 
     fn last_device_nanoseconds(&self) -> u64 {
-        self.last_command.map_or(0, |(_, seconds)| {
-            Duration::try_from_secs_f64(seconds)
-                .map_or(0, |time| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX))
-        })
+        self.last_command
+            .map_or(0, |(_, seconds)| owner::nanoseconds(seconds))
     }
 
     fn resident_bytes(&self) -> u64 {

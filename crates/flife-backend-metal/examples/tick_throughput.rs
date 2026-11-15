@@ -17,21 +17,30 @@
 //! (`metal` without a device) is reported and left out. Prints one JSON line.
 //! Each choice's `controller_device_nanoseconds` is the device's time on its
 //! controller backend's commands over the world's life, warm-up included
-//! (`ControllerReport::device_nanoseconds`; 0 off the device).
+//! (`ControllerReport::device_nanoseconds`; 0 off the device), and
+//! `phase_commands` and `phase_device_nanoseconds` are the commands and
+//! device time of the Metal phases a `+` adds, from their owners
+//! (`DeviceOwner::device_time`), over the same span.
 
 use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use flife_backend_metal::{
-    BackendBudget, ControllerChoice, MetalBackend, MetalField, MetalSensors, MetalSettle,
-    MetalUptake,
+    BackendBudget, ControllerChoice, DeviceOwner, DeviceTime, MetalBackend, MetalField,
+    MetalSensors, MetalSettle, MetalUptake,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
-fn found(workers: NonZeroUsize, name: &str, config: &ValidatedConfig) -> Result<World, CoreError> {
+/// The world for choice `name`, and the device owners of the Metal phases
+/// it adds (one for `+all`), whose device time its row reports.
+fn found(
+    workers: NonZeroUsize,
+    name: &str,
+    config: &ValidatedConfig,
+) -> Result<(World, Vec<DeviceOwner>), CoreError> {
     let refused = |detail: String| CoreError::StateConflict {
         operation: "tick_throughput",
         detail,
@@ -45,15 +54,33 @@ fn found(workers: NonZeroUsize, name: &str, config: &ValidatedConfig) -> Result<
     )?;
     world.set_cpu_workers(workers)?;
     world.set_controller_backend(choice.backend(workers.get(), BackendBudget::UNBOUNDED)?);
+    let mut owners = Vec::new();
     for phase in parts {
         match phase {
-            "sensors" => world.set_sensor_backend(Some(Box::new(MetalSensors::open()?))),
-            "field" => world.set_field_backend(Some(Box::new(MetalField::open()?))),
-            "uptake" => world.set_uptake_backend(Some(Box::new(MetalUptake::open()?))),
-            "settle" => world.set_settle_backend(Some(Box::new(MetalSettle::open()?))),
+            "sensors" => {
+                let sensors = MetalSensors::open()?;
+                owners.push(sensors.owner().clone());
+                world.set_sensor_backend(Some(Box::new(sensors)));
+            }
+            "field" => {
+                let field = MetalField::open()?;
+                owners.push(field.owner().clone());
+                world.set_field_backend(Some(Box::new(field)));
+            }
+            "uptake" => {
+                let uptake = MetalUptake::open()?;
+                owners.push(uptake.owner().clone());
+                world.set_uptake_backend(Some(Box::new(uptake)));
+            }
+            "settle" => {
+                let settle = MetalSettle::open()?;
+                owners.push(settle.owner().clone());
+                world.set_settle_backend(Some(Box::new(settle)));
+            }
             "all" => {
                 let settle = MetalSettle::open()?;
                 let owner = settle.owner().clone();
+                owners.push(owner.clone());
                 world.set_field_backend(Some(Box::new(MetalField::with_owner(owner.clone())?)));
                 world.set_sensor_backend(Some(Box::new(MetalSensors::with_owner(owner.clone())?)));
                 world.set_uptake_backend(Some(Box::new(MetalUptake::with_owner(owner)?)));
@@ -74,7 +101,7 @@ fn found(workers: NonZeroUsize, name: &str, config: &ValidatedConfig) -> Result<
             }
         }
     }
-    Ok(world)
+    Ok((world, owners))
 }
 
 /// Step `ticks` published ticks; the seconds taken and the last live count.
@@ -112,6 +139,8 @@ fn cv(samples: &[f64]) -> f64 {
 struct Entry {
     name: String,
     world: World,
+    /// The Metal phases' owners, apart from the controllers'.
+    owners: Vec<DeviceOwner>,
     rates: Vec<f64>,
 }
 
@@ -144,11 +173,12 @@ fn main() -> Result<(), CoreError> {
     let mut entries = Vec::new();
     for name in choices.split(',') {
         match found(workers, name, &config) {
-            Ok(mut world) => {
+            Ok((mut world, owners)) => {
                 block(&mut world, warm)?;
                 entries.push(Entry {
                     name: name.to_owned(),
                     world,
+                    owners,
                     rates: Vec::new(),
                 });
             }
@@ -183,11 +213,19 @@ fn main() -> Result<(), CoreError> {
             let (sensors, field) = (entry.world.sensor_report(), entry.world.field_report());
             let uptake = entry.world.uptake_report();
             let settle = entry.world.settle_report();
+            let phases = entry.owners.iter().map(DeviceOwner::device_time).fold(
+                DeviceTime::default(),
+                |sum, time| DeviceTime {
+                    commands: sum.commands + time.commands,
+                    nanoseconds: sum.nanoseconds + time.nanoseconds,
+                },
+            );
             let rate = median(&entry.rates);
             format!(
                 "{{\"choice\":\"{}\",\"ticks_per_s\":{rate:.3},\"cv_percent\":{:.2},\
                  \"ratio_to_first\":{:.3},\"samples\":{:?},\"batched\":{},\"deferred\":{},\
                  \"reference_ticks\":{},\"controller_device_nanoseconds\":{},\
+                 \"phase_commands\":{},\"phase_device_nanoseconds\":{},\
                  \"sensor_ticks\":[{},{}],\"field_steps\":[{},{}],\
                  \"uptake_ticks\":[{},{}],\"field_reductions\":[{},{}],\
                  \"field_checks\":[{},{}],\"settle_ticks\":[{},{}]}}",
@@ -199,6 +237,8 @@ fn main() -> Result<(), CoreError> {
                 report.deferred,
                 report.reference_ticks,
                 report.device_nanoseconds,
+                phases.commands,
+                phases.nanoseconds,
                 sensors.ticks,
                 sensors.reference_ticks,
                 field.steps,

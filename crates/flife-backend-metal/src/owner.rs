@@ -33,6 +33,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use flife_core::CoreError;
 use flife_core::ids::ResourceEpoch;
@@ -285,6 +286,24 @@ pub struct Receipt {
     pub device_seconds: f64,
 }
 
+/// What an owner's commands have taken on the device (FL-029): each
+/// command that completed, and their command buffers' device time summed
+/// ([`DeviceOwner::device_time`]). Clones of an owner share it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceTime {
+    /// Commands that completed.
+    pub commands: u64,
+    /// Their [`Receipt::device_seconds`], summed, in nanoseconds.
+    pub nanoseconds: u64,
+}
+
+/// `seconds` of device time in whole nanoseconds: 0 for a time that is
+/// negative or not a number, `u64::MAX` past it.
+pub(crate) fn nanoseconds(seconds: f64) -> u64 {
+    Duration::try_from_secs_f64(seconds)
+        .map_or(0, |time| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX))
+}
+
 /// One buffer a command binds, after its bindings were checked.
 struct Bound {
     handle: Handle,
@@ -488,6 +507,10 @@ struct Shared {
     gateway: Gateway,
     limits: Limits,
     table: Mutex<Table>,
+    /// [`DeviceTime::commands`].
+    commands: AtomicU64,
+    /// [`DeviceTime::nanoseconds`].
+    device_nanoseconds: AtomicU64,
 }
 
 impl Shared {
@@ -543,6 +566,8 @@ impl DeviceOwner {
                 gateway,
                 limits,
                 table: Mutex::new(Table::default()),
+                commands: AtomicU64::new(0),
+                device_nanoseconds: AtomicU64::new(0),
             }),
         })
     }
@@ -585,6 +610,19 @@ impl DeviceOwner {
     #[must_use]
     pub fn usage(&self) -> Usage {
         self.shared.table().usage()
+    }
+
+    /// What this owner's commands have taken on the device since it
+    /// opened: every command that completed through
+    /// [`DeviceOwner::submit_batch`] or [`DeviceOwner::submit`], whoever
+    /// holds the clone that submitted it. A refused or failed command adds
+    /// nothing.
+    #[must_use]
+    pub fn device_time(&self) -> DeviceTime {
+        DeviceTime {
+            commands: self.shared.commands.load(Ordering::Relaxed),
+            nanoseconds: self.shared.device_nanoseconds.load(Ordering::Relaxed),
+        }
     }
 
     /// Compile Metal Shading Language `source` in `mode`.
@@ -880,10 +918,16 @@ impl DeviceOwner {
             encoded.and_then(|()| batch.submit())
         };
         let written = self.release(&bound, outcome.as_ref().map(|_| ()));
-        outcome.map_err(metal).map(|completed| Receipt {
-            written,
-            kernels: completed.kernels,
-            device_seconds: completed.device_seconds,
+        outcome.map_err(metal).map(|completed| {
+            self.shared.commands.fetch_add(1, Ordering::Relaxed);
+            self.shared
+                .device_nanoseconds
+                .fetch_add(nanoseconds(completed.device_seconds), Ordering::Relaxed);
+            Receipt {
+                written,
+                kernels: completed.kernels,
+                device_seconds: completed.device_seconds,
+            }
         })
     }
 

@@ -321,6 +321,7 @@ fn a_failed_command_buffer_leaves_what_the_batch_writes_undefined() {
     if !armed {
         return;
     }
+    let timed = owner.device_time();
     match owner.submit_batch(&chain) {
         Err(CoreError::StateConflict { operation, detail }) => {
             assert_eq!(operation, "metal dispatch");
@@ -328,6 +329,11 @@ fn a_failed_command_buffer_leaves_what_the_batch_writes_undefined() {
         }
         other => panic!("expected the failed command buffer, got {other:?}"),
     }
+    assert_eq!(
+        owner.device_time(),
+        timed,
+        "a failed command adds no device time"
+    );
     assert_eq!(
         account(&owner, &[a, b, c]),
         [

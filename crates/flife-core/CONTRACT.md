@@ -48,7 +48,10 @@ are no hidden defaults.
   every bit of a ledger; `CompensatedSum::{from_parts, parts}` and `Sha256Digest::from_bytes` support them.
   FL-035 adds `CheckpointManifest` and `ManifestEntry`, which verify a container's sealed prefix without its
   payload, so `flife-store` can keep the prefix as a manifest and the chunks by digest. `CheckpointReader::parse`
-  is that check plus the chunk hashes and the payload's exact coverage.
+  is that check plus the chunk hashes and the payload's exact coverage. `SEALED_PREFIX_MAX_BYTES` (65,843: the
+  header with the longest model identifier and manifest, and the seal) is the longest prefix the format admits, so
+  a single-file container's first that many bytes hold its prefix: `flife-cli`'s `read_package` finds its chunks
+  that way (FL-043).
 - Streamed checkpoints (FL-038): `checkpoint::ChunkSink` (`begin`, `page`, `end`), `CHECKPOINT_PAGE_BYTES` (1 MiB),
   `CheckpointWriter::streaming(model, sink)` with `chunk_with` (a chunk written through a `ChunkWriter`), `seal`
   (the sealed prefix) and `payload_length`, and `canonical::Sha256Stream`. A streaming writer hands each chunk to

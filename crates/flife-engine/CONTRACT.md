@@ -649,8 +649,8 @@ each runs and owns the field.
   identity, so this restores the backend contract's premise rather than fixing an observed fault).
 - Because it is all or none, a graft holds about a second host world while it runs. `graft_bytes` bounds that
   part, and `flife transplant` admits it. `flife-cli`'s `a_transplant_holds_no_more_heap_than_its_terms` measures
-  it under a counting allocator: 591.2 MiB peak against a 779.0 MiB bound on the preset. Without `graft_bytes` the
-  bound was 573.8 MiB, and the heap passed it.
+  it under a counting allocator: 591.2 MiB peak against a 761.9 MiB bound on the preset (779.0 while the package's
+  container was read whole). Without `graft_bytes` the bound was 573.8 MiB, and the heap passed it.
 
 **Refusal cases.**
 - FL-042: `cropped` of a stopped world (`StateConflict`, "crop world"); `graft` into a world that is not

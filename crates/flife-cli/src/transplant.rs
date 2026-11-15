@@ -30,12 +30,13 @@
 //!   `[execution] maximum_total_bytes`: the host world's terms, the
 //!   founding checkpoint's (streamed, `pause-and-stream`, whatever the
 //!   configuration's mode) and, as the package term, the package's restored
-//!   world ([`World::held_bytes`]), the container it was restored from, and
-//!   what the graft makes before it releases the host's parts
-//!   ([`World::graft_bytes`]: about a second host world). Reading holds the
-//!   container and the package's world at once, before the host is
-//!   founded; the graft holds that world, the host's and its own parts.
-//!   The sum bounds both. No controller backend is installed: the
+//!   world ([`World::held_bytes`]), what its restore held beside it
+//!   ([`World::restored_bytes`]: the container but its genome chunk, and
+//!   one window of that), and what the graft makes before it releases the
+//!   host's parts ([`World::graft_bytes`]: about a second host world).
+//!   Reading holds the package's world and its restore's bytes at once,
+//!   before the host is founded; the graft holds that world, the host's and
+//!   its own parts. The sum bounds both. No controller backend is installed: the
 //!   transplant takes no step.
 //!
 //! Every refusal (a position outside the host, a run directory that holds
@@ -53,6 +54,7 @@
 //!
 //! [`World::graft`]: flife_engine::World::graft
 //! [`World::held_bytes`]: flife_engine::World::held_bytes
+//! [`World::restored_bytes`]: flife_engine::World::restored_bytes
 //! [`World::graft_bytes`]: flife_engine::World::graft_bytes
 
 use std::path::Path;
@@ -265,7 +267,7 @@ pub fn transplant(
         0,
         total([
             crop.held_bytes(),
-            package.world.bytes,
+            crop.restored_bytes(),
             world.graft_bytes(&crop),
         ]),
     )?;

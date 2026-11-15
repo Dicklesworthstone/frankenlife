@@ -50,6 +50,13 @@ pub const MANIFEST_MAX_BYTES: u32 = 64 * 1024;
 /// The longest model identifier a checkpoint may declare.
 pub const MODEL_MAX_BYTES: u16 = 256;
 
+/// The longest sealed prefix a checkpoint may have: the magic, format,
+/// hash algorithm, the longest model identifier with its length, the
+/// longest manifest with its length, and the seal. The first this many
+/// bytes of a container hold its whole prefix (or the whole container).
+pub const SEALED_PREFIX_MAX_BYTES: usize =
+    8 + 4 + 1 + 2 + MODEL_MAX_BYTES as usize + 4 + MANIFEST_MAX_BYTES as usize + 32;
+
 /// The most families a chunk may depend on.
 pub const DEPENDENCIES_MAX: u8 = 16;
 

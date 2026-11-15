@@ -674,17 +674,18 @@ fn refused_transplants_write_nothing() {
 }
 
 /// Memory is admitted as a run's is (FL-043): the host's terms, its
-/// streamed founding checkpoint's and the package's restored world with its
-/// container, against the host's `maximum_total_bytes`. A budget of exactly
-/// their sum is admitted; one byte fewer is refused before anything is
-/// written, though it holds the host alone.
+/// streamed founding checkpoint's and the package's restored world with what
+/// its restore held, against the host's `maximum_total_bytes`. A budget of
+/// exactly their sum is admitted; one byte fewer is refused before anything
+/// is written, though it holds the host alone.
 #[test]
 fn a_transplant_is_admitted_with_its_package_or_refused() {
     // The host's terms, added up here: the allocated genome quota, the
     // founded world's state, field, scratch and staging, the streamed
     // checkpoint's fixed heap and the reserve. The package's: its restored
-    // world, its container and the graft's parts. No term depends on the
-    // budget.
+    // world, what its restore held (the container but its genome chunk, and
+    // a window of that chunk: all of this small package's container) and
+    // the graft's parts. No term depends on the budget.
     let (_, probe) = ecology("budget-probe.toml", &[("", "seed", "7")]);
     let world = found(&probe).expect("founds");
     let footprint = world.footprint();
@@ -695,7 +696,12 @@ fn a_transplant_is_admitted_with_its_package_or_refused() {
         graft > world.quota().allocated_bytes() + crop.quota().allocated_bytes(),
         "the graft rebuilds both worlds' genomes in a second population"
     );
-    let package_term = crop.held_bytes() + declared.world.bytes + graft;
+    assert_eq!(
+        crop.restored_bytes(),
+        declared.world.bytes,
+        "a genome chunk under a page is read through a window of its length"
+    );
+    let package_term = crop.held_bytes() + crop.restored_bytes() + graft;
     drop((world, crop));
     let host_terms = probe.config().execution.maximum_allocated_genome_bytes
         + footprint.state

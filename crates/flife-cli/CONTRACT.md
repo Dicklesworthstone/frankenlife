@@ -581,13 +581,18 @@ for, one at least, before a render is refused. Its first record is `start`, with
     - the founding checkpoint's, which is streamed `pause-and-stream` whatever the configured mode
       (`CHECKPOINT_FIXED_BYTES`; `Checkpoints::stream_from`), never encoded whole;
     - `package`, from `World::admit_memory_beside`. It is the package's restored world (`World::held_bytes`: its
-      allocations now with its genomes' parameters), its container, and the graft's own parts
-      (`World::graft_bytes`). The graft is all or none, so it makes a second field pair, a population at the host's
-      bound and both worlds' genomes before it releases the host's: about a second host world.
+      allocations now with its genomes' parameters), what its restore held (`World::restored_bytes`: the container
+      but its genome chunk, and one window), and the graft's own parts (`World::graft_bytes`). The graft is all or
+      none, so it makes a second field pair, a population at the host's bound and both worlds' genomes before it
+      releases the host's: about a second host world.
 
-    Reading holds the container and the package's world; the graft holds the package's world, the host's and its
-    parts. The sum bounds both phases. `read_package` reads each file into a buffer reserved for the file's length,
-    so the container is held at its size, not the next power of two. No backend is installed: no step is taken.
+    Reading holds the package's world and what its restore held; the graft holds the package's world, the host's
+    and its parts. The sum bounds both phases. `read_package` never holds the container whole (FL-043): it hashes
+    `world.ckpt` a page at a time against the manifest's size and SHA-256, then holds the sealed prefix and every
+    chunk but the genomes in one buffer reserved for exactly them (the prefix is found in the file's first
+    `SEALED_PREFIX_MAX_BYTES`), and streams the genome chunk from the file through
+    `CheckpointReader::parse_streamed`, as a run's restore streams it from its store. It reads the file twice. No
+    backend is installed: no step is taken.
 - FL-040:
   - The tracker never reads the world after its start. It starts from the committed population (each organism's
     identity, genome, lineage, generation, birth tick and topology) and then folds each published report: births
@@ -1081,7 +1086,11 @@ every 7 ticks, the newest 4 retained, and two energy brushes (one before and one
 - `a_package_that_disagrees_with_itself_is_refused`. A region package at tick 112, then copies with one change
   each: a flipped container byte, `exterior = "isolated"`, an unknown crop key, the centre's bits moved, one more
   organism, schema v2, the endowment's total 1% higher, the tick one later, another configuration hash, another
-  digest. `read_package` refuses each with `state-conflict`. `--no-package` writes none.
+  digest. `read_package` refuses each with `state-conflict`. Three more damage the container and make the
+  manifest's size and SHA-256 match it, so only the streamed restore can refuse them: the genome chunk's last byte
+  flipped (`incompatible-checkpoint`, "chunk genomes hash mismatch", found at the stream's end), the field chunk's
+  last byte flipped ("chunk field hash mismatch", a held chunk) and a byte appended (`state-conflict`: the prefix
+  declares less). `--no-package` writes none.
 - `refused_discoveries_write_nothing`. A tick with no checkpoint, an absent lineage, a region of radius 0 and one
   above half the world, a thumbnail side of 0, and a non-empty bundle directory: each exits 2 with one error record
   of its kind, makes no bundle directory, leaves the non-empty one as it was, and pins nothing. `--region` with
@@ -1135,8 +1144,9 @@ seed 7:
   byte, with no `.partial` beside it.
 - `a_transplant_session_names_its_inputs`: changing the package, the host, the offset or the name changes it.
 - `a_transplant_is_admitted_with_its_package_or_refused` (FL-043). The test adds up the host's terms itself:
-  quotas, footprint, `CHECKPOINT_FIXED_BYTES` and `RESERVE_BYTES`. The package's are its restored world, its
-  container and the graft's parts, which exceed both worlds' genomes. A host whose budget is exactly their sum is
+  quotas, footprint, `CHECKPOINT_FIXED_BYTES` and `RESERVE_BYTES`. The package's are its restored world, what its
+  restore held (`restored_bytes`: for this small package, whose genome chunk is under a page, its whole container,
+  checked) and the graft's parts, which exceed both worlds' genomes. A host whose budget is exactly their sum is
   admitted: `memory.package`, `checkpoint`, `render` 0, `backend` 0, and `peak_bytes` equal to the budget. One
   byte fewer is refused with `budget-exhausted`, "peak memory (maximum_total_bytes)", and no `DIR`, though that
   budget holds the host alone.
@@ -1330,15 +1340,17 @@ every run.
   checkpoint was streamed, the branch peaked at 696.7 MiB: a second container, beside the encoder's genome chunk
   buffer grown by doubling; before the restore streamed its genome chunk, both peaked at 438.58.
 - `a_package_is_read_within_its_term_and_keeps_its_held_bytes` (FL-042): the preset 8 ticks on, cropped to radius
-  24 about its centre (469 organisms) and written as a package, is read back. The reading's peak, 156.06 MiB, is
-  within its term (155.69: the world's 135.39 and the container's 20.30) and `RESTORE_ALLOWANCE` (1 MiB, for the
-  restore's own configuration parse and entrant lists, 0.39 MiB here). The restored world keeps 135.37 MiB, within
-  1% of its `held_bytes`. Before the read buffer was reserved for the file's length it peaked at 167.76 MiB.
+  24 about its centre (469 organisms) and written as a package, is read back. Its restore held exactly the 20.30
+  MiB container but its genome chunk, and one page-sized window: 3.18 MiB. The reading's peak, 137.94 MiB, is
+  within its term (138.57: the world's 135.39 and the restore's 3.18) and `RESTORE_ALLOWANCE` (1 MiB, for the
+  restore's own configuration parse and entrant lists). The restored world keeps 135.37 MiB, within 1% of its
+  `held_bytes`. Holding the container whole, it peaked at 156.06 MiB (167.76 before that buffer was reserved for
+  the file's length).
 - `a_transplant_holds_no_more_heap_than_its_terms` (FL-042): that package into the preset's host of 4,096
-  founders. The heap from reading the package to the published record peaks at 591.2 MiB. The bound is 779.0 MiB:
-  the admitted terms, with the host's genome term at its founders' and the package's actual parameters, not the
-  quota. Without the graft's parts (360.9 MiB of package term, 205.2 of it the graft's) the bound was 573.8 MiB,
-  and the heap exceeded it.
+  founders. The heap from reading the package to the published record peaks at 591.2 MiB, in the graft. The bound
+  is 761.9 MiB (779.0 while the container was held whole): the admitted terms, with the host's genome term at its
+  founders' and the package's actual parameters, not the quota. Without the graft's parts (205.2 MiB of the
+  package term) the bound was 573.8 MiB with the container held whole, and the heap exceeded it.
 - `the_preset_is_admitted_term_by_term`: on the preset each term is its source (the configuration's quotas, the
   world's footprint, `RESERVE_BYTES`) and the peak is their sum: 1,375.7 MiB on the reference (genomes 1,152.0,
   state 19.63, field 6.95, scratch 79.25, births 53.88, reserve 64.0). With `torch` the scratch adds the batched
@@ -1453,7 +1465,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
     footprint does, though a crop holds only the disk's organisms: 248.54 MiB against the 240.67 the crop holds at
     radius 64 on the preset.
   - The transplant's package term over-counts in three ways:
-    - it adds the reading phase (container and package world) to the graft phase, though they are not live at once;
+    - it adds the reading phase (the package world and what its restore held) to the graft phase, though they are
+      not live at once;
     - its `births` term is charged, though it takes no step;
     - a restore's own temporaries (the configuration parse and the entrant lists: 0.39 MiB for 469 organisms) are
       the reserve's, as they are for every restore.
@@ -1468,8 +1481,9 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The host must share the package's cell size, topology catalog and parameter type. Grafted organisms become
     founders: their parentage, generation, birth tick, held output and cooldown are reset, and their ancestry is
     not carried into the host's lineage records.
-  - `read_package` reads the container whole (at most 16 GiB) rather than streaming it, and checks the decimal
-    endowment to 4 units in the last place, not bit for bit (the bits are checked through the restored ledger).
+  - `read_package` reads the container's file twice (to hash it, then to restore it; at most 16 GiB), and checks
+    the decimal endowment to 4 units in the last place, not bit for bit (the bits are checked through the restored
+    ledger).
   - `transplant.json` records provenance; no code reads it. The catalog records only the transplant's session,
     from which the package and host are not recoverable without it.
   - `numerical-invalid` for a host disk a measurement refuses is in `World::graft`'s contract but not exercised

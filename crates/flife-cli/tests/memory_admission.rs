@@ -47,7 +47,9 @@ use flife_cli::{
     configure, encoding_bytes, found, read_package, render, restore_checkpoint, resume, run_with,
     transplant, write_package,
 };
-use flife_core::checkpoint::{CHECKPOINT_PAGE_BYTES, CheckpointWriter, ChunkFamily};
+use flife_core::checkpoint::{
+    CHECKPOINT_PAGE_BYTES, CheckpointManifest, CheckpointWriter, ChunkFamily,
+};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_engine::{Intervention, NumericalProfile, Stepped};
 use flife_store::ChunkStore;
@@ -390,35 +392,52 @@ const RESTORE_ALLOWANCE: u64 = 1 << 20;
 /// 0.13 MiB besides.
 const RESTORED_ORGANISM_BYTES: u64 = 640;
 
-/// A transplant's package term (FL-042): its restored world and the
-/// container it was restored from. The preset's world, 8 ticks on, cropped
-/// to a disk of radius 24 about its centre and written as a package, is
-/// read back. The reading's peak is within the term and the restore's
-/// allowance, the container's buffer holding its bytes and no more. The
-/// restored world keeps its `held_bytes` to within 1%, and the manifest.
+/// A transplant's package term (FL-042): its restored world and what its
+/// restore held beside it. The preset's world, 8 ticks on, cropped to a
+/// disk of radius 24 about its centre and written as a package, is read
+/// back. The restore holds the container but its genome chunk, and one
+/// window of that (FL-043): never the container whole. The reading's peak
+/// is within the term and the restore's allowance. The restored world keeps
+/// its `held_bytes` to within 1%, and the manifest.
 #[test]
 fn a_package_is_read_within_its_term_and_keeps_its_held_bytes() {
     let _serial = serial();
     let dir = preset_package();
     let profile = NumericalProfile::reference_f32().expect("profile");
+    let container = fs::read(dir.join(PACKAGE_WORLD_FILE)).expect("reads the container");
+    let genomes = CheckpointManifest::parse(&container)
+        .expect("a sealed prefix")
+        .entries()
+        .iter()
+        .find(|entry| entry.family == ChunkFamily::Genomes)
+        .expect("a genome chunk")
+        .length;
+    drop(container);
     let base = ALLOC.current_usage();
     ALLOC.reset_peak_usage();
     let (package, crop) = read_package(&dir, profile).expect("verifies");
     let reading = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
     let kept = u64::try_from(ALLOC.current_usage().saturating_sub(base)).expect("fits");
     let held = crop.held_bytes();
-    let term = held + package.world.bytes;
+    let restored = crop.restored_bytes();
+    let term = held + restored;
     println!(
         "a package of {} organisms: reading held {:.2} MiB at its peak against a term of {:.2} \
-         (world {:.2}, container {:.2}); the world kept {:.2} MiB",
+         (world {:.2}, restore {:.2} of its {:.2} MiB container); the world kept {:.2} MiB",
         crop.population().len(),
         mib(reading),
         mib(term),
         mib(held),
+        mib(restored),
         mib(package.world.bytes),
         mib(kept),
     );
     assert!(!crop.population().is_empty(), "the disk holds organisms");
+    assert_eq!(
+        restored,
+        package.world.bytes - genomes + CHECKPOINT_PAGE_BYTES as u64,
+        "the restore held the container but its genome chunk, and one window"
+    );
     assert!(
         reading <= term + RESTORE_ALLOWANCE,
         "reading held {reading} > its term {term} and the restore's allowance"

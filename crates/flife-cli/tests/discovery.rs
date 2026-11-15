@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use flife_cli::CHECKPOINT_FIXED_BYTES;
 use flife_core::canonical::Sha256Digest;
+use flife_core::checkpoint::{CheckpointManifest, ChunkFamily};
 use flife_engine::NumericalProfile;
 use flife_store::Durability;
 use fmn_codec::png::{PngLimits, decode};
@@ -695,7 +696,10 @@ fn lineage_and_whole_world_discoveries_record_what_the_checkpoint_holds() {
 /// A package is verified before use: a damaged container, a manifest that
 /// declares another boundary, names a field it does not know, or disagrees
 /// with its world about the crop, the organisms, the endowment, the tick,
-/// the configuration or the digest is refused. `--no-package` writes none.
+/// the configuration or the digest is refused. A damaged container whose
+/// size and SHA-256 the manifest was made to match is refused by the
+/// streamed restore, naming the damaged chunk or the length.
+/// `--no-package` writes none.
 #[test]
 fn a_package_that_disagrees_with_itself_is_refused() {
     let run_dir = copy_of_source("package-run");
@@ -767,6 +771,63 @@ fn a_package_that_disagrees_with_itself_is_refused() {
     variant("package-other-digest", &|_, edited| {
         edited["world"]["digest"] = "00".repeat(32).into();
     });
+
+    // A container damaged, and the manifest's size and SHA-256 made to match
+    // it: the streamed restore (FL-043) refuses it by the part it damaged.
+    let resealed = |name: &str, damage: &dyn Fn(&mut Vec<u8>)| {
+        let copy = fresh(name);
+        copy_tree(&original, &copy);
+        let path = copy.join("world.ckpt");
+        let mut bytes = fs::read(&path).expect("reads");
+        damage(&mut bytes);
+        fs::write(&path, &bytes).expect("writes");
+        let mut edited = manifest.clone();
+        edited["world"]["bytes"] = (bytes.len() as u64).into();
+        edited["world"]["sha256"] = Sha256Digest::of(&bytes).to_hex().into();
+        fs::write(
+            copy.join("package.json"),
+            serde_json::to_vec_pretty(&edited).expect("encodes"),
+        )
+        .expect("writes");
+        flife_cli::read_package(&copy, profile)
+            .map(|(package, _)| package)
+            .expect_err(name)
+    };
+    let last_byte_of = |bytes: &[u8], family: ChunkFamily| {
+        let prefix = CheckpointManifest::parse(bytes).expect("a sealed prefix");
+        let entry = prefix
+            .entries()
+            .iter()
+            .find(|entry| entry.family == family)
+            .expect("the chunk");
+        prefix.sealed_length() + usize::try_from(entry.offset + entry.length).expect("fits") - 1
+    };
+    for (name, family) in [
+        ("package-genomes-flipped", ChunkFamily::Genomes),
+        ("package-field-flipped", ChunkFamily::Field),
+    ] {
+        let refused = resealed(name, &|bytes| {
+            let at = last_byte_of(bytes, family);
+            bytes[at] ^= 0x01;
+        });
+        assert!(
+            matches!(
+                &refused,
+                flife_core::CoreError::IncompatibleCheckpoint { reason }
+                    if *reason == format!("chunk {} hash mismatch", family.name())
+            ),
+            "{name}: {refused:?}"
+        );
+    }
+    let refused = resealed("package-longer", &|bytes| bytes.push(0));
+    assert!(
+        matches!(
+            &refused,
+            flife_core::CoreError::StateConflict { detail, .. }
+                if detail.contains("declares") && detail.contains("more")
+        ),
+        "{refused:?}"
+    );
 
     let without = fresh("package-none");
     let (status, out, err) = discover(

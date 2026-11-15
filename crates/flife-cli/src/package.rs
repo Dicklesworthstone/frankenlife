@@ -27,15 +27,22 @@
 //! manifest's schema and boundary, the container's size and SHA-256, the
 //! world's restore (which checks its ledger against its state bit for bit),
 //! its digest, tick, configuration and organism count, and the manifest's
-//! endowment against the restored holdings.
+//! endowment against the restored holdings. It never holds the container
+//! whole (FL-043): the SHA-256 is hashed from the file a buffer at a time,
+//! and the restore holds the sealed prefix and every chunk but the genomes,
+//! which it streams from the file a window at a time, as a run's restore
+//! streams them from its store.
 
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use flife_core::CoreError;
 use flife_core::canonical::{Sha256Digest, Sha256Stream};
-use flife_core::checkpoint::{CheckpointReader, CheckpointWriter, ChunkFamily, ChunkSink};
+use flife_core::checkpoint::{
+    CHECKPOINT_PAGE_BYTES, CheckpointManifest, CheckpointReader, CheckpointWriter, ChunkFamily,
+    ChunkSink, SEALED_PREFIX_MAX_BYTES,
+};
 use flife_engine::{NumericalProfile, WORLD_CHECKPOINT_CHUNKS, World};
 use serde::{Deserialize, Serialize};
 
@@ -341,9 +348,7 @@ pub fn write_package(
 }
 
 /// At most `limit` bytes of `path`, in a buffer reserved for the file's
-/// length, so that it holds those bytes and no more: a transplant charges
-/// the container at its length (FL-043), where a buffer grown by doubling
-/// could hold nearly twice it.
+/// length, so that it holds those bytes and no more.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, CoreError> {
     let file = File::open(path).map_err(|error| storage("open package file", path, &error))?;
     let length = file
@@ -373,6 +378,116 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, CoreError> {
         )));
     }
     Ok(bytes)
+}
+
+/// The length and SHA-256 of `path`, read a page at a time: at most
+/// `limit` bytes, or a refusal naming it.
+fn hash_bounded(path: &Path, limit: u64) -> Result<(u64, Sha256Digest), CoreError> {
+    let file = File::open(path).map_err(|error| storage("open package file", path, &error))?;
+    let length = file
+        .metadata()
+        .map_err(|error| storage("read package file", path, &error))?
+        .len();
+    if length > limit {
+        return Err(refuse(format!(
+            "{} is longer than {limit} bytes",
+            path.display()
+        )));
+    }
+    let mut page = Vec::new();
+    page.try_reserve_exact(CHECKPOINT_PAGE_BYTES)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "package hash page",
+            bytes: u64::try_from(CHECKPOINT_PAGE_BYTES).unwrap_or(u64::MAX),
+        })?;
+    page.resize(CHECKPOINT_PAGE_BYTES, 0);
+    let mut sha256 = Sha256Stream::new();
+    let mut read = 0_u64;
+    let mut file = file.take(limit.saturating_add(1));
+    loop {
+        match file.read(&mut page) {
+            Ok(0) => break,
+            Ok(got) => {
+                let got = got.min(page.len());
+                sha256.update(page.get(..got).unwrap_or_default());
+                read = read.saturating_add(u64::try_from(got).unwrap_or(u64::MAX));
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(storage("read package file", path, &error)),
+        }
+    }
+    Ok((read, sha256.finish()))
+}
+
+/// The container at `path`, of `length` bytes, as a streamed restore reads
+/// it (FL-043): its sealed prefix and every chunk but the genomes, in one
+/// buffer reserved for exactly them, and the file opened again at the
+/// genome chunk and limited to its declared length. Checking the chunks'
+/// hashes is the reader's.
+fn split(path: &Path, length: u64) -> Result<(Vec<u8>, Option<io::Take<File>>), CoreError> {
+    let open = || File::open(path).map_err(|error| storage("open package file", path, &error));
+    let read = |error: io::Error| storage("read package file", path, &error);
+    let mut file = open()?;
+    let head_length = length.min(u64::try_from(SEALED_PREFIX_MAX_BYTES).unwrap_or(u64::MAX));
+    let mut head = Vec::new();
+    head.try_reserve_exact(usize::try_from(head_length).unwrap_or(usize::MAX))
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "package container prefix",
+            bytes: head_length,
+        })?;
+    (&mut file)
+        .take(head_length)
+        .read_to_end(&mut head)
+        .map_err(read)?;
+    let manifest = CheckpointManifest::parse(&head)?;
+    let sealed = manifest.sealed_length();
+    let entries = manifest.entries().to_vec();
+    let payload = manifest.payload_length();
+    let sealed_bytes = u64::try_from(sealed).unwrap_or(u64::MAX);
+    if sealed_bytes.checked_add(payload) != Some(length) {
+        return Err(refuse(format!(
+            "the container holds {length} bytes; its prefix of {sealed} declares {payload} more"
+        )));
+    }
+    let streamed: u64 = entries
+        .iter()
+        .filter(|entry| entry.family == ChunkFamily::Genomes)
+        .map(|entry| entry.length)
+        .sum();
+    let held_length = length.saturating_sub(streamed);
+    let mut held = Vec::new();
+    held.try_reserve_exact(usize::try_from(held_length).unwrap_or(usize::MAX))
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "package container",
+            bytes: held_length,
+        })?;
+    held.extend_from_slice(head.get(..sealed).unwrap_or_default());
+    drop(head);
+    let mut genomes = None;
+    for entry in &entries {
+        // Within the container: the prefix and the payload are its length.
+        let at = sealed_bytes.saturating_add(entry.offset);
+        if entry.family == ChunkFamily::Genomes {
+            let mut chunk = open()?;
+            chunk.seek(SeekFrom::Start(at)).map_err(read)?;
+            genomes = Some(chunk.take(entry.length));
+            continue;
+        }
+        file.seek(SeekFrom::Start(at)).map_err(read)?;
+        let start = held.len();
+        (&mut file)
+            .take(entry.length)
+            .read_to_end(&mut held)
+            .map_err(read)?;
+        if u64::try_from(held.len().saturating_sub(start)).ok() != Some(entry.length) {
+            return Err(refuse(format!(
+                "{} ends inside chunk {}",
+                path.display(),
+                entry.family.name()
+            )));
+        }
+    }
+    Ok((held, genomes))
 }
 
 /// Whether `manifest` agrees with `restored` to within a few units in the
@@ -437,22 +552,25 @@ pub fn read_package(dir: &Path, profile: NumericalProfile) -> Result<(Package, W
         )));
     }
     let path = dir.join(PACKAGE_WORLD_FILE);
-    let bytes = read_bounded(&path, package.world.bytes.min(WORLD_MAX_BYTES))?;
-    let sha256 = Sha256Digest::of(&bytes).to_hex();
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != package.world.bytes
-        || sha256 != package.world.sha256
-    {
+    let (length, sha256) = hash_bounded(&path, package.world.bytes.min(WORLD_MAX_BYTES))?;
+    let sha256 = sha256.to_hex();
+    if length != package.world.bytes || sha256 != package.world.sha256 {
         return Err(refuse(format!(
-            "the container holds {} bytes with SHA-256 {sha256}; the manifest names {} bytes with {}",
-            bytes.len(),
-            package.world.bytes,
-            package.world.sha256
+            "the container holds {length} bytes with SHA-256 {sha256}; the manifest names {} \
+             bytes with {}",
+            package.world.bytes, package.world.sha256
         )));
     }
-    let reader = CheckpointReader::parse(&bytes, &WORLD_CHECKPOINT_CHUNKS)?;
+    let (held, genomes) = split(&path, length)?;
+    let reader = CheckpointReader::parse_streamed(
+        &held,
+        &WORLD_CHECKPOINT_CHUNKS,
+        ChunkFamily::Genomes,
+        genomes.map(|file| Box::new(file) as Box<dyn Read>),
+    )?;
     let world = World::read_checkpoint(&reader, profile)?;
     drop(reader);
-    drop(bytes);
+    drop(held);
     let holdings = world.ledger().holdings();
     let disk = package.crop.disk();
     let measured = world.measure_region(disk.center, disk.radius)?;

@@ -584,7 +584,8 @@ fn a_branch_holds_no_more_heap_than_its_restore() {
 /// A package (FL-042) streams its container to its file (FL-043): cutting a
 /// disk of radius 64 about the centre of the preset's world, 8 ticks on,
 /// holds no more heap than cropping that disk does, and one stream's fixed
-/// bytes. Encoded whole, the container was held twice beside the crop (each
+/// bytes. Cropping, and the crop it makes, hold no more than
+/// `World::crop_bytes`, which discover admits before it crops. Encoded whole, the container was held twice beside the crop (each
 /// chunk in its own buffer, then all of them copied into it): `flife
 /// discover` of that disk with its package peaked at 775.3 MiB against a
 /// restore of 438.6 MiB. The file is, byte for byte, the crop's checkpoint
@@ -599,11 +600,18 @@ fn a_package_holds_no_more_heap_than_its_crop() {
         center: [64.0, 64.0],
         radius: 64.0,
     };
+    let bound = world
+        .crop_bytes(disk.center, disk.radius)
+        .expect("bounds the crop");
     let base = ALLOC.current_usage();
     ALLOC.reset_peak_usage();
     let (crop, _) = world.cropped(disk.center, disk.radius).expect("crops");
     let cropping = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
     let held = crop.held_bytes();
+    assert!(
+        cropping <= bound && held <= bound,
+        "cropping's heap peak {cropping}, or the crop's {held}, above World::crop_bytes's {bound}"
+    );
     let mut whole = CheckpointWriter::new(&crop.config().config().model);
     crop.write_checkpoint(&mut whole).expect("encodes");
     let expected = whole.finish().expect("encodes whole");
@@ -628,11 +636,12 @@ fn a_package_holds_no_more_heap_than_its_crop() {
     .expect("writes the package");
     let packaging = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
     println!(
-        "a package of {} organisms: cropping held {:.2} MiB at its peak (the crop {:.2}); \
-         packaging {:.2} MiB, its container {:.2}",
+        "a package of {} organisms: cropping held {:.2} MiB at its peak (the crop {:.2}, \
+         its bound {:.2}); packaging {:.2} MiB, its container {:.2}",
         package.organisms,
         mib(cropping),
         mib(held),
+        mib(bound),
         mib(packaging),
         mib(package.world.bytes),
     );

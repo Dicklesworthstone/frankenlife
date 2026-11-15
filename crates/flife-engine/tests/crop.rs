@@ -17,7 +17,7 @@ use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
 use flife_core::model::FIELD_ECOLOGY_V1;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{
-    Arrangement, NumericalProfile, Organism, Stepped, WORLD_CHECKPOINT_CHUNKS, World,
+    Arrangement, Entrant, NumericalProfile, Organism, Stepped, WORLD_CHECKPOINT_CHUNKS, World,
 };
 use flife_field::Cell;
 
@@ -217,6 +217,26 @@ fn a_crop_holds_exactly_the_disk_and_nothing_else() {
             [crop.quota().live(), crop.population().len() as u64],
             [measurement.organisms; 2]
         );
+
+        // Known before the crop is made: the source's reserved state, field
+        // and scratch, the disk's genomes as the crop's quota allocated
+        // them, and its organisms as they entered. The crop holds no more.
+        let footprint = world.footprint();
+        let bound = world.crop_bytes(center, radius).expect("bounds the crop");
+        assert_eq!(
+            bound,
+            footprint.state
+                + footprint.field
+                + footprint.scratch
+                + crop.quota().allocated_bytes()
+                + measurement.organisms * size_of::<Entrant>() as u64,
+            "{center:?} r {radius}"
+        );
+        assert!(
+            crop.held_bytes() <= bound,
+            "{center:?} r {radius}: {} > {bound}",
+            crop.held_bytes()
+        );
     }
 }
 
@@ -251,7 +271,7 @@ fn a_crop_restores_from_its_checkpoint_and_runs_on() {
     );
 }
 
-/// A disk a measurement refuses is refused as a crop.
+/// A disk a measurement refuses is refused as a crop, and its bound too.
 #[test]
 fn a_crop_of_a_disk_a_measurement_refuses_is_refused() {
     let config = ecology();
@@ -261,6 +281,14 @@ fn a_crop_of_a_disk_a_measurement_refuses_is_refused() {
         ([5.0, 5.0], 0.0, "measurement radius"),
         ([5.0, 5.0], SIDE / 2.0 + 1.0e-9, "measurement radius"),
     ] {
+        let bound = world.crop_bytes(center, radius);
+        assert!(
+            matches!(
+                &bound,
+                Err(CoreError::NumericalInvalid { quantity: named, .. }) if *named == quantity
+            ),
+            "{center:?} r {radius}: {bound:?}"
+        );
         let refused = world.cropped(center, radius);
         assert!(
             matches!(

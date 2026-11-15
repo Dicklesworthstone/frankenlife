@@ -273,7 +273,13 @@ each runs and owns the field.
   `measure_region` counts, each with its whole row and its genome resealed through a fresh quota (the same identity
   and parent, the traits checked again against the limits), and the cells `measure_region` counts, every plane; the
   rest of the field is zero. Its ledger opens at its own holdings. A fault refuses it (`StateConflict`, "crop
-  world"), and so does any disk a measurement refuses.
+  world"), and so does any disk a measurement refuses. The disk's entrants are reserved once, at the measurement's
+  count.
+- `World::crop_bytes(center, radius)` (FL-042, FL-043): the most `cropped` holds, known before it is made: this
+  world's `footprint()` state, field and scratch (a world of its configuration reserves them whatever it holds), the
+  disk's genomes' `allocated_bytes` and its organisms as `Entrant`s. The measurement's lineages are freed first and
+  are no more than the entrants. A disk a measurement refuses is refused the same way. `flife discover` admits it as
+  a package's term before it crops.
 - `World::graft(package, center, radius, offset)` (FL-042, `world/graft.rs`): put a crop of the disk about
   `center` into this world, moved by `offset` whole cells, and return a `Graft` (where the disk went; host cells
   replaced and their energy; host organisms displaced and their energy; organisms grafted and their new lineages;
@@ -979,8 +985,11 @@ the operation:
   the disk; every cell in it equal plane for plane and every other zero; the holdings are the crop's own (field bit
   for bit); the digest differs from the source's.
 - `a_crop_restores_from_its_checkpoint_and_runs_on`: the crop's checkpoint restores to its digest and holdings, and
-  both run 40 ticks with equal digests, its organisms living on.
-- `a_crop_of_a_disk_a_measurement_refuses_is_refused`: three disks, each refused as the measurement refuses it.
+  both run 40 ticks with equal digests, its organisms living on. For each disk `crop_bytes` is exactly the source's
+  state, field and scratch, the crop's allocated genome quota and its entrants, and the crop's `held_bytes` is no
+  more.
+- `a_crop_of_a_disk_a_measurement_refuses_is_refused`: three disks, each refused as the measurement refuses it, by
+  `cropped` and by `crop_bytes`.
 - `a_crop_grafts_into_a_host_of_its_size` (moved 8 cells east and 4 north),
   `a_crop_across_the_seams_grafts_into_a_wider_host` (a disk on the source's corner into a 48 × 48 host) and
   `a_crop_of_oblong_cells_grafts_into_an_oblong_host` (cells 0.5 × 1 in both: a disk across both of a 32 × 32
@@ -1150,9 +1159,10 @@ velocity, first-order splitting at the configured fixed timestep.
   founding world, so a mid-run transplant with ledger flows is not built. Grafted organisms are founders; their
   ancestry, ages and cooldowns are not carried. `graft`'s `budget-exhausted` genome-quota path is not tested (the
   population's is), nor its measurement's `numerical-invalid` (the crop's is). The backend `forget` after a graft
-  has no test. A crop's memory is not charged to any admission (`flife discover` holds it beside the source
-  world). A graft's is, through `held_bytes` and `graft_bytes` in `admit_memory_beside`. These have no engine
-  test of their own: `flife-cli`'s transplant tests check them against a counting allocator and an exact budget.
+  has no test. A crop's memory is charged as `flife discover`'s package term through `crop_bytes`, and a graft's
+  through `held_bytes` and `graft_bytes`, in `admit_memory_beside`. Only `crop_bytes` has an engine test, and only
+  of its accounting: `flife-cli`'s memory, discovery and transplant tests check them against a counting allocator
+  and an exact budget.
   The graft's second host world could be avoided by moving the survivors' genomes rather than rebuilding them; it
   is not.
 - C.11's near-zero emission fractions and birth hazards are decoded and tested in `flife-neural` (FL-007). FL-011

@@ -210,8 +210,8 @@ for, one at least, before a render is refused. Its first record is `start`, with
       projection (as `flife render`'s end record), the camera (centre and zoom), background, bloom and dot radius;
     - `thumbnail`: path, size and the PNG's SHA-256;
     - `exports`: `full_world` (path `world`, its session, its founding checkpoint's SHA-256, and the chunks written
-      and linked) or `null` under `--no-world`, and `local_package` (path `package` and its manifest) for a region,
-      `null` for a lineage, the whole world or `--no-package`;
+      and linked) or `null` under `--no-world`, and `local_package` (path `package`, its manifest and `memory`, the
+      crop's FL-043 admission) for a region, `null` for a lineage, the whole world or `--no-package`;
     - `memory`: the thumbnail's FL-043 admission.
   - FL-042, the package's manifest `package/package.json` (`frankenlife.package.v1`, unknown keys refused): `source`
     (run directory, session, checkpoint sequence, tick and container SHA-256, configuration hash), `crop` (centre,
@@ -530,6 +530,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
     on it and zoomed so its diameter fills `REGION_FILL` (0.75) of the shorter side, within the viewport's zoom
     range, and its measurement outline is drawn. Its memory is admitted (FL-043) as a render's with one frame
     encoding.
+  - A package's crop is admitted after the thumbnail, as a phase of its own and before the crop is made: the
+    restored world's terms with `package` the crop's bound (`World::crop_bytes`), `checkpoint` a stream's
+    `CHECKPOINT_FIXED_BYTES` and `render` 0. Over the budget it is `budget-exhausted`, "peak memory
+    (maximum_total_bytes)", before the pin and the bundle directory. The admission is `local_package.memory`.
   - The pin is made while the run's store is still held as it was when the checkpoint was chosen, so no other
     process's retention can take the checkpoint between the choice and the pin. It comes after the thumbnail is drawn
     and admitted and before anything is written. The full-world export then opens the store again. While the run's
@@ -1085,6 +1089,12 @@ every 7 ticks, the newest 4 retained, and two energy brushes (one before and one
 - `a_thumbnail_over_the_memory_budget_is_refused_before_the_bundle_exists`. A run whose budget is its own fixed
   terms and 8 MiB refuses a 4,096 × 4,096 thumbnail with `budget-exhausted`, makes no directory and pins nothing,
   and then admits the usual 160 × 90 one.
+- `a_package_over_the_memory_budget_is_refused_before_the_bundle_exists` (FL-043). The crop's phase is read from
+  a region discovery under the run's own budget: its peak is its fixed terms, with the render's restored-world
+  terms, `render` 0 and a package term, and it is larger than the run's and the render's. The same run under a
+  budget one byte below it refuses the package with exactly that phase required, makes no directory and pins
+  nothing, and saves the discovery under `--no-package`. A budget of exactly the phase admits the package with the
+  same package term.
 
 Twenty-five planted mutants were run against these tests and `flife-store`'s retention tests, and all were caught:
 eight in the store's pins and retention (pins ignored, preserved whatever the setting, a pin of an absent checkpoint,
@@ -1306,9 +1316,10 @@ every run.
   4,096 organisms (fitted to this restore and the package's below: about 538 bytes an organism and 0.13 MiB
   besides). Holding its container, it peaked at 438.58 MiB.
 - `a_package_holds_no_more_heap_than_its_crop` (FL-042): the world of the branch test's tick-8 checkpoint (below),
-  cropped to radius 64 about its centre (3,223 organisms), is written as a package. Cropping alone peaks at 243.94 MiB (the crop holds 240.67);
-  `write_package` peaks at the same 243.94, at most cropping's peak and `CHECKPOINT_FIXED_BYTES`, for a container
-  of 127.36 MiB. The file equals the crop's checkpoint encoded whole, and the manifest names its size and SHA-256.
+  cropped to radius 64 about its centre (3,223 organisms), is written as a package. Cropping alone peaks at 243.22
+  MiB (the crop holds 240.67), within `World::crop_bytes`'s 248.54, which bounds the crop too. (Its entrants grew by
+  doubling until they were reserved at the measurement's count: 243.94.) `write_package` peaks at 243.41, at most
+  cropping's peak and `CHECKPOINT_FIXED_BYTES`, for a container of 127.36 MiB. The file equals the crop's checkpoint encoded whole, and the manifest names its size and SHA-256.
   Before the container was streamed it was held twice beside the crop (each chunk in its own buffer, then all of
   them copied into the container): `flife discover` of that disk with its package peaked at 775.26 MiB, and now
   peaks at 518.01 (the world and the crop).
@@ -1433,10 +1444,14 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - FL-042 is formally blocked by FL-020 (the Studio window); the bead stays open whatever these slices satisfy.
   - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for
     `branch`.
-  - `discover`'s crop is not admitted against `maximum_total_bytes` (FL-043), and neither is `flife branch`'s or
-    `flife inspect`'s restore. Each is at most a copy of a world the run itself held and what its restore holds
-    beside it (the checkpoint but its genome chunk, and one window), which may take the process past its budget. `discover`'s own restore is admitted with its thumbnail's render, as a phase
-    of its own, once it has happened. `flife transplant` is admitted (above).
+  - `flife branch`'s and `flife inspect`'s restores are not admitted against `maximum_total_bytes` (FL-043). Each is
+    at most a world the run itself held and what its restore holds beside it (the checkpoint but its genome chunk,
+    and one window), which may take the process past its budget. `discover`'s own restore is admitted with its
+    thumbnail's render, as a phase of its own, once it has happened; its crop is admitted before it is made.
+    `flife transplant` is admitted (above).
+  - `discover`'s crop term counts the population's genome arena and index entries at its capacity, as a world's
+    footprint does, though a crop holds only the disk's organisms: 248.54 MiB against the 240.67 the crop holds at
+    radius 64 on the preset.
   - The transplant's package term over-counts in three ways:
     - it adds the reading phase (container and package world) to the graft phase, though they are not live at once;
     - its `births` term is charged, though it takes no step;

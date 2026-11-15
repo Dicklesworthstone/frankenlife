@@ -29,6 +29,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use flife_cli::CHECKPOINT_FIXED_BYTES;
 use flife_core::canonical::Sha256Digest;
 use flife_engine::NumericalProfile;
 use flife_store::Durability;
@@ -900,4 +901,102 @@ fn a_thumbnail_over_the_memory_budget_is_refused_before_the_bundle_exists() {
         one(&out, "discovery")["memory"]["budget_bytes"],
         fixed + (8 << 20)
     );
+}
+
+/// An admission's terms other than the backend's, as recorded.
+fn fixed_terms(admission: &Value) -> u64 {
+    [
+        "genomes",
+        "state",
+        "field",
+        "scratch",
+        "births",
+        "render",
+        "checkpoint",
+        "package",
+        "reserve",
+    ]
+    .iter()
+    .map(|term| admission[*term].as_u64().expect("a term"))
+    .sum()
+}
+
+/// A package's crop is admitted as a phase of its own (FL-043), beside the
+/// restored world and before the pin, at `World::crop_bytes`, before the
+/// crop is made. The phases are read from a discovery under the run's own
+/// budget; the same run under a budget one byte below the crop's phase, and
+/// above the render's and the run's, refuses the package before the bundle
+/// exists and saves the discovery without it. A budget of exactly the
+/// crop's phase admits the package, its terms as before.
+#[test]
+fn a_package_over_the_memory_budget_is_refused_before_the_bundle_exists() {
+    const REGION: [&str; 3] = ["--region", "16,16,6", "--no-world"];
+    let probe = fresh("crop-budget-probe");
+    let run_out = run(&probe, 7);
+    let (status, out, err) = discover(&probe, &fresh("crop-budget-probe-bundle"), &REGION);
+    assert_eq!(status, Some(0), "{err:?}");
+    let record = one(&out, "discovery");
+    let render = &record["memory"];
+    let crop = &record["exports"]["local_package"]["memory"];
+    let cropping = fixed_terms(crop);
+    assert_eq!(crop["peak_bytes"], cropping, "the crop's phase is its peak");
+    assert_eq!(crop["render"], 0);
+    assert_eq!(crop["checkpoint"], CHECKPOINT_FIXED_BYTES, "its stream's");
+    assert!(crop["package"].as_u64().expect("a term") > 0);
+    for term in ["genomes", "state", "field", "scratch", "births", "restore"] {
+        assert_eq!(crop[term], render[term], "{term}: the same restored world");
+    }
+    let running = fixed_terms(&one(&run_out, "start")["memory"]);
+    let drawing = render["peak_bytes"].as_u64().expect("a peak");
+    assert!(
+        running < cropping && drawing < cropping,
+        "the crop's phase {cropping} is the largest: the run's {running}, the render's {drawing}"
+    );
+
+    let budget = |name: &str, bytes: u64| {
+        let config = ecology_with(
+            &format!("{name}.toml"),
+            &[("execution", "maximum_total_bytes", &bytes.to_string())],
+        );
+        let run_dir = fresh(name);
+        run_with(&config, &run_dir, 7);
+        run_dir
+    };
+    let run_dir = budget("crop-budget-short", cropping - 1);
+    let bundle = fresh("crop-budget-bundle");
+    let (status, out, err) = discover(&run_dir, &bundle, &REGION);
+    assert_eq!(status, Some(2), "{out:?} {err:?}");
+    assert!(out.is_empty());
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert_eq!(err[0]["kind"], "budget-exhausted", "{err:?}");
+    let detail = err[0]["detail"].as_str().expect("a detail");
+    assert!(
+        detail.starts_with(&format!(
+            "peak memory (maximum_total_bytes) budget exhausted: {cropping} required"
+        )),
+        "{detail}"
+    );
+    assert!(!bundle.exists(), "the refused discovery made no directory");
+    assert_eq!(
+        fs::read_dir(run_dir.join("store/pins"))
+            .expect("pins")
+            .count(),
+        0,
+        "the refused discovery pinned nothing"
+    );
+    let (status, out, err) = discover(
+        &run_dir,
+        &bundle,
+        &[&REGION[..], &["--no-package"]].concat(),
+    );
+    assert_eq!(status, Some(0), "without its package: {err:?}");
+    assert!(one(&out, "discovery")["exports"]["local_package"].is_null());
+
+    let run_dir = budget("crop-budget-exact", cropping);
+    let (status, out, err) = discover(&run_dir, &fresh("crop-budget-exact-bundle"), &REGION);
+    assert_eq!(status, Some(0), "{err:?}");
+    let admitted = &one(&out, "discovery")["exports"]["local_package"]["memory"];
+    assert_eq!(admitted["budget_bytes"], cropping);
+    assert_eq!(admitted["package"], crop["package"]);
+    assert_eq!(admitted["peak_bytes"], cropping);
 }

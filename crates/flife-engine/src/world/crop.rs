@@ -17,8 +17,14 @@
 //! for digest, so the checkpoint is the package's verified payload. What the
 //! package declares about its boundary is the command line's: the crop is a
 //! world only so that the checkpoint encoding carries it.
+//!
+//! [`World::crop_bytes`] is the most a crop holds, known before it is made
+//! (FL-043): a crop is a world of this one's configuration, so it reserves
+//! its population, field and scratch as this world does, and beside them
+//! the disk's genomes and its organisms as they enter.
 
 use flife_core::ids::GenomeId;
+use flife_core::memory::{bytes_for, total};
 use flife_core::{CoreError, EnergyLedger, Holdings};
 use flife_field::{BufferLimits, FieldPair};
 use flife_genome::{Genome, GenomeQuota, Traits, WeightsMut};
@@ -83,6 +89,42 @@ pub(super) fn reseal(
 }
 
 impl World {
+    /// The most [`World::cropped`] holds on the host for the disk of
+    /// `radius` about `center` (FL-042, FL-043), worked out before any of it
+    /// is made: this world's [`World::footprint`] state, field and scratch,
+    /// which a world of its configuration reserves whatever it holds; the
+    /// parameters of the disk's genomes, as a fresh quota allocates them
+    /// again; and the disk's organisms as they enter. The measurement's
+    /// lineages are freed before any of that is made and are no more than
+    /// the entrants. A crop, once made, holds no more
+    /// ([`World::held_bytes`]).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a disk a measurement refuses,
+    /// and the measurement's [`CoreError::AllocationFailed`].
+    pub fn crop_bytes(&self, center: [f64; 2], radius: f64) -> Result<u64, CoreError> {
+        let measurement = self.measure_region(center, radius)?;
+        let disk = Intervention::RemoveOrganisms {
+            center,
+            radius,
+            disposition: Disposition::Remove,
+        };
+        let mut genomes = 0_u64;
+        for (organism, genome) in self.population.iter_with_genomes() {
+            if disk.removes_at(&self.rules.grid, organism.position)? {
+                genomes = genomes.saturating_add(genome.map_or(0, Genome::allocated_bytes));
+            }
+        }
+        let footprint = self.footprint();
+        Ok(total([
+            footprint.state,
+            footprint.field,
+            footprint.scratch,
+            genomes,
+            bytes_for::<Entrant>(usize::try_from(measurement.organisms).unwrap_or(usize::MAX)),
+        ]))
+    }
+
     /// The committed world with everything outside the disk of `radius`
     /// world units about `center` emptied, and that disk's measurement. It
     /// keeps the organisms a removal of the disk would take, their genomes
@@ -129,7 +171,16 @@ impl World {
             disposition: Disposition::Remove,
         };
         let mut quota = GenomeQuota::from_config(&self.config)?;
+        // The measurement counted the organisms the disk takes: their room
+        // is reserved once, as `crop_bytes` charges it.
+        let count = usize::try_from(measurement.organisms).unwrap_or(usize::MAX);
         let mut entrants = Vec::new();
+        entrants
+            .try_reserve_exact(count)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "cropped organisms",
+                bytes: bytes_for::<Entrant>(count),
+            })?;
         for (organism, genome) in self.population.iter_with_genomes() {
             if !disk.removes_at(&grid, organism.position)? {
                 continue;

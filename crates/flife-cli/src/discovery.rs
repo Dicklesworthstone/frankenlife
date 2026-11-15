@@ -24,6 +24,11 @@
 //!   travels with it) and its energy endowment. It is not a run; a
 //!   transplant grafts it into a host. A lineage or whole-world discovery
 //!   has no disk, so it writes none.
+//! - **Memory.** The thumbnail's render and the package's crop are each
+//!   admitted under the source configuration's memory budget (FL-043),
+//!   beside the restored world, before the pin: the crop at
+//!   [`World::crop_bytes`], before it is made, and its streamed checkpoint
+//!   at a stream's fixed bytes. Each admission is recorded.
 //! - **Pin.** The source store pins the checkpoint for the discovery
 //!   ([`flife_store::ChunkStore::pin`]): while the source configuration's
 //!   `preserve_pinned_discoveries` holds, its retention keeps the
@@ -59,6 +64,7 @@ use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
 use crate::branch::{BRANCH_NAME_MAX_BYTES, BranchOptions, branch};
+use crate::checkpointing::CHECKPOINT_FIXED_BYTES;
 use crate::memory::{MemoryAdmission, admit};
 use crate::package::{PACKAGE_DIR, Package, PackageSource, write_package};
 use crate::persist::{STORE_DIR, StoreDurability, read_config, restorable, run_identity};
@@ -290,6 +296,10 @@ pub struct LocalPackage {
     pub path: &'static str,
     /// Its manifest, `package.json`.
     pub manifest: Package,
+    /// The crop's peak-memory admission (FL-043): the restored world, the
+    /// crop as its package term and a stream's fixed bytes as its
+    /// checkpoint term.
+    pub memory: MemoryAdmission,
 }
 
 /// The bundle's exports (plan §14.5: "Support two explicit exports").
@@ -381,8 +391,9 @@ fn vacant_bundle(out: &Path) -> Result<(), CoreError> {
 /// that holds no checkpoint that restores (at `options.at`, if given) or is
 /// held by another process, or a lineage with no live organism at the
 /// checkpoint; [`CoreError::NumericalInvalid`] for a region a measurement
-/// refuses; [`CoreError::BudgetExhausted`] when the thumbnail does not fit
-/// the configuration's memory budget; the store's, branch's and view's
+/// refuses; [`CoreError::BudgetExhausted`] when the thumbnail, or a
+/// package's crop, does not fit the configuration's memory budget beside the
+/// restored world; the store's, branch's and view's
 /// errors. All but the bundle's writes (the thumbnail, the package and the
 /// full-world export, whose errors include the branch's) come before the
 /// pin and before the bundle directory is made.
@@ -457,8 +468,22 @@ pub fn discover(
 
     let (presentation, thumbnail, memory, png) = draw(&config, &world, &epoch, options)?;
     drop(epoch);
-    // Every refusal above, the render's admission among them, leaves no
-    // pin and no bundle directory behind.
+    // The package's crop is a phase of its own, after the render's: the
+    // world, the crop and its checkpoint's stream.
+    let packaging = match options.selection {
+        Selection::Region(disk) if options.package => Some((
+            disk,
+            world.admit_memory_beside(
+                false,
+                CHECKPOINT_FIXED_BYTES,
+                0,
+                world.crop_bytes(disk.center, disk.radius)?,
+            )?,
+        )),
+        Selection::Region(_) | Selection::World | Selection::Lineage(_) => None,
+    };
+    // Every refusal above, the render's and the crop's admissions among
+    // them, leaves no pin and no bundle directory behind.
     let pins_preserved = config.config().persistence.preserve_pinned_discoveries;
     store.pin(sequence, &id)?;
     // The full-world export opens the store itself.
@@ -466,8 +491,8 @@ pub fn discover(
     fs::create_dir_all(out).map_err(|error| storage("create bundle directory", out, &error))?;
     write_new(&out.join(THUMBNAIL_FILE), &png, options.durability)?;
 
-    let local_package = match options.selection {
-        Selection::Region(disk) if options.package => Some(LocalPackage {
+    let local_package = match packaging {
+        Some((disk, memory)) => Some(LocalPackage {
             path: PACKAGE_DIR,
             manifest: write_package(
                 &out.join(PACKAGE_DIR),
@@ -483,8 +508,9 @@ pub fn discover(
                 },
                 options.durability,
             )?,
+            memory,
         }),
-        Selection::Region(_) | Selection::World | Selection::Lineage(_) => None,
+        None => None,
     };
     drop(world);
 

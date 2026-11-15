@@ -443,9 +443,10 @@ settle at about 22,000 to 25,000 after an early bottleneck. Open it the same way
 `cargo run --release -p flife-studio -- presets/interactive-world.toml`.
 `presets/desktop-world.toml` is the Desktop ecology profile's: 100,000 founders on 512 × 512 × 33 with F16
 weights, at the Interactive preset's energy per area, which FL-034's experiment E2 tested and adopted. All 8
-of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. It steps at about 8
-ticks per second on 16 workers of an M5 Ultra with all 100,000 founders alive, so it is a world to study, not
-yet one to watch at frame rate.
+of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With all 100,000 founders alive, on
+16 workers of an M5 Ultra, it steps at 9.8–10.2 ticks per second on `torch`, which `auto` takes there, against
+8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
+frame rate.
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
@@ -609,7 +610,7 @@ bytes, so it would change the written frames (`cargo run --release -p flife-cli 
 flife validate <config>     # range-check a config; report real memory and the worst admitted allocation (exists)
 flife capabilities          # what this machine and build can run, each route run against the reference, with explicit refusals (exists)
 flife run <config>          # a headless run (exists)
-flife step                  # advance one tick
+flife step <run-dir>        # advance a run N ticks (default 1) past its newest durable tick, its journal replayed first (exists)
 flife inspect               # a run directory's committed world at one checkpoint, every organism and cell (exists)
 flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
 flife branch                # control and intervention branches from one checkpoint (exists)

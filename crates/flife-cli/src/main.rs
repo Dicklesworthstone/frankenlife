@@ -9,7 +9,7 @@
 #![forbid(unsafe_code)]
 
 use std::io::Write;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -18,7 +18,8 @@ use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions, Discovery,
     ERROR_SCHEMA, Experiment, ExperimentOptions, FieldMapping, Injection, InspectOptions,
     Introduction, Look, Material, Particles, Persistence, Removal, ResumeOptions, RunOptions,
-    ScheduledCommand, Selection, Stop, StoreDurability, Style, TransplantOptions, Validation,
+    ScheduledCommand, Selection, Stop, StoreDurability, Style, TransplantOptions, Until,
+    Validation,
 };
 
 /// `flife discover`'s one record: the [`Discovery`] its bundle's
@@ -155,6 +156,37 @@ enum Command {
         /// Where due controllers are evaluated: `metal`, `cpu`, `torch` or
         /// `auto`.
         /// No result depends on it.
+        #[arg(long, default_value = "auto")]
+        controllers: ControllerChoice,
+        #[command(flatten)]
+        checkpoints: CheckpointFlags,
+    },
+    /// Advance the run in a run directory TICKS committed ticks past its
+    /// newest durable one: `flife resume` from its newest checkpoint that
+    /// restores, its command journal replayed, to that tick plus TICKS. A
+    /// progress record reports each committed tick (`--every 1`), and the
+    /// end record whether the last one committed. Exit 1 when a tick did
+    /// not commit (a capacity pause or a failed tick).
+    Step {
+        /// The run directory `flife run --run-dir` made.
+        run_dir: PathBuf,
+        /// Committed ticks to advance; at least 1.
+        #[arg(long, default_value = "1")]
+        ticks: NonZeroU64,
+        /// Print a progress record at every multiple of this tick; 0 for
+        /// none.
+        #[arg(long, default_value_t = 1)]
+        every: u64,
+        /// Print a metrics record at every multiple of this tick and at the
+        /// end; 0 for none.
+        #[arg(long, default_value_t = 0)]
+        metrics_every: u64,
+        /// Threads for the organism phases: a count or `auto`. No result
+        /// depends on it.
+        #[arg(long, value_parser = parse_workers)]
+        cpu_workers: Option<NonZeroUsize>,
+        /// Where due controllers are evaluated: `metal`, `cpu`, `torch` or
+        /// `auto`. No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
         #[command(flatten)]
@@ -726,7 +758,30 @@ fn main() -> ExitCode {
         } => exit(flife_cli::resume(
             &run_dir,
             &ResumeOptions {
-                until,
+                until: Until::Tick(until),
+                every,
+                cpu_workers,
+                controllers,
+                checkpoint_every: checkpoints.checkpoint_every,
+                durability: checkpoints.checkpoint_durability,
+                checkpoint_mode: checkpoints.checkpoint_mode,
+                retained_bytes: checkpoints.checkpoint_retained_bytes,
+                metrics_every,
+            },
+            print,
+        )),
+        Command::Step {
+            run_dir,
+            ticks,
+            every,
+            metrics_every,
+            cpu_workers,
+            controllers,
+            checkpoints,
+        } => exit(flife_cli::resume(
+            &run_dir,
+            &ResumeOptions {
+                until: Until::Past(ticks),
                 every,
                 cpu_workers,
                 controllers,

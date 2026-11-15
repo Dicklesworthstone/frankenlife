@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use flife_cli::{
     BranchOptions, CHECKPOINT_FIXED_BYTES, CheckpointAt, ControllerChoice, InspectOptions,
-    ResumeOptions, StoreDurability,
+    ResumeOptions, StoreDurability, Until,
 };
 use flife_core::ids::CommandId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
@@ -353,7 +353,7 @@ fn kept_session_resumes(durability: &str) {
     let resumed = flife_cli::resume(
         &dir,
         &ResumeOptions {
-            until,
+            until: Until::Tick(until),
             every: 0,
             cpu_workers: None,
             controllers: ControllerChoice::Cpu,
@@ -574,7 +574,7 @@ fn pre_intervention(durability: &str) {
         let resumed = flife_cli::resume(
             &control,
             &ResumeOptions {
-                until,
+                until: Until::Tick(until),
                 every: 0,
                 cpu_workers: None,
                 controllers: ControllerChoice::Cpu,

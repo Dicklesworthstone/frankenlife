@@ -131,8 +131,8 @@ pub use render::{
 };
 pub use run::{
     AUTO_WORKER_CEILING, CheckpointAt, Finished, JournalMarks, Persisted, RUN_SCHEMA, RUN_SESSION,
-    Record, RunOptions, SkippedCheckpoint, Stop, auto_workers, configure, found, found_on, run,
-    run_with, start,
+    Record, RunOptions, SkippedCheckpoint, Stop, Until, auto_workers, configure, found, found_on,
+    run, run_with, start,
 };
 pub use transplant::{
     GraftRecord, HeldEnergy, TRANSPLANT_FILE, TransplantHost, TransplantOptions, TransplantPackage,

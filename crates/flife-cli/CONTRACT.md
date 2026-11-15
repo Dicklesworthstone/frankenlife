@@ -97,9 +97,14 @@ for, one at least, before a render is refused. Its first record is `start`, with
     commands. A count of 0 or above 4096, or an endowment that is not a finite positive energy at most `f32::MAX`,
     is refused at admission: exit 2 before any tick.
 - `flife resume DIR --until T --every K --cpu-workers W --controllers C`, with the same two checkpoint flags.
+- `flife step DIR --ticks N` (plan §12.3, §14.6; N at least 1, default 1; zero is refused by the argument parser,
+  exit 2) is `flife resume` to N ticks past the tick the run resumes at, once its journal is replayed: the newest
+  durable tick, which only the session knows. Its start record's `ticks` is that resolved tick. `--every`
+  defaults to 1, so a progress record reports each committed tick, and the end record whether the last one did
+  (exit 0 reached, 1 stopped early, 2 refused, as resume). It takes resume's other flags.
 - In the library: `run_with(config, options, scheduled, persistence, emit)` and `resume(dir, ResumeOptions,
-  emit)`, with `Persistence::new(dir, config)` giving the configured defaults. `scheduled` is a list of
-  `ScheduledCommand`s (`Inject(Injection)`, `Material(Material)`, `Remove(Removal)` or
+  emit)`, where `ResumeOptions::until` is an `Until`: `Tick(t)`, or `Past(n)` for `flife step`.
+  `Persistence::new(dir, config)` gives the configured defaults. `scheduled` is a list of `ScheduledCommand`s (`Inject(Injection)`, `Material(Material)`, `Remove(Removal)` or
   `Introduce(Introduction)`, FL-022); `ScheduledCommand::listed(injections, materials, removals, introductions)`
   numbers them as the command line does.
 - FL-040: `--metrics-every M` on `flife run` and `flife resume`, 0 (none) by default; `RunOptions::metrics_every`
@@ -942,7 +947,7 @@ Eleven planted bugs were run against these tests, and every one was caught:
 - libx264 not required;
 - a refused reference exiting 0.
 
-`tests/resume.rs` (5 tests, FL-037, about 11 s), each on a 32 × 32 Appendix A ecology of 48 founders that breeds,
+`tests/resume.rs` (FL-037, about 14 s), each on a 32 × 32 Appendix A ecology of 48 founders that breeds,
 controllers every 4 ticks in per-organism phases, checkpoints every 7 ticks, energy brushes at ticks 3, 66, 150
 and 230 on cells whose X and Y differ, and a 240-tick horizon whose uninterrupted run is the reference (it
 publishes the founding checkpoint, every multiple of 7 and 240, keeps 4, journals 4 acceptances and 4 outcomes,
@@ -965,6 +970,12 @@ ticks (`recover` applies the caller's persistence), and 240:
 - `checkpoints_of_another_configuration_are_passed_over`. With another configuration's store moved in, resume
   passes over all three of its checkpoints by name and replays the journal from the founding world to the digest
   of the same run made directly.
+- `a_step_advances_from_the_newest_durable_tick`. A run to tick 152 with its 152 manifest damaged: `flife step
+  --ticks 2` recovers 147, replays command 3's outcome to tick 150 or later (T), starts with `ticks` T + 2,
+  reports T + 1 and T + 2 in a progress record each, and ends there with its checkpoint. A second step of
+  240 - (T + 2) resumes from that checkpoint, with no replay, and reaches the reference digest and final checkpoint
+  SHA-256. `--ticks 0` exits 2 with nothing on standard output. Three planted defects were all caught: a step
+  target taken as an absolute tick, a start record left without the resolved tick, and `--every` defaulting to 128.
 - `run_directories_refuse_what_they_cannot_continue`: an existing run, a non-empty directory, a non-run
   directory, an edited `config.toml`, a tick already passed, and a run directory another live process holds; and
   the configured interval (3,840 ticks), giving only the founding and final checkpoints of a 10-tick run.

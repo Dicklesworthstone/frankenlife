@@ -47,9 +47,9 @@ use flife_cli::memory::admit;
 use flife_cli::{
     BranchOptions, CHECKPOINT_FIXED_BYTES, CheckpointMode, ControllerChoice, Disk, MemoryAdmission,
     PACKAGE_WORLD_FILE, PackageSource, Persistence, RESERVE_BYTES, Record, RenderOptions,
-    RenderRecord, ResumeOptions, RunOptions, StoreDurability, Style, TransplantOptions, branch,
-    configure, encoding_bytes, found, read_package, render, restore_checkpoint, resume, run_with,
-    transplant, write_package,
+    RenderRecord, ResumeOptions, RunOptions, StoreDurability, Style, TransplantOptions, Until,
+    branch, configure, encoding_bytes, found, read_package, render, restore_checkpoint, resume,
+    run_with, transplant, write_package,
 };
 use flife_core::checkpoint::{
     CHECKPOINT_PAGE_BYTES, CheckpointManifest, CheckpointWriter, ChunkFamily,
@@ -709,7 +709,7 @@ fn resumed(config: &ValidatedConfig, name: &str) -> Resumed {
     let resumed = resume(
         &run_dir,
         &ResumeOptions {
-            until: 9,
+            until: Until::Tick(9),
             every: 0,
             cpu_workers: None,
             controllers: ControllerChoice::Cpu,

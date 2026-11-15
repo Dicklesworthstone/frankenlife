@@ -18,7 +18,7 @@
 //! [`Record::Metrics`] follows at every multiple of it and at the end when
 //! ticks remain ([`crate::metrics`], FL-040).
 
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::time::Instant;
 
@@ -564,7 +564,7 @@ pub fn run_with(
             ),
             memory,
         ),
-        until: options.ticks,
+        until: Until::Tick(options.ticks),
         every: options.every,
         commands,
         resumed: None,
@@ -620,10 +620,11 @@ pub(crate) fn with_memory(mut start: Record, admission: MemoryAdmission) -> Reco
 
 /// What a session is driven to do.
 pub(crate) struct Plan {
-    /// The [`Record::Start`] emitted first.
+    /// The [`Record::Start`] emitted first, its `ticks` set to the tick
+    /// `until` resolves to.
     pub start: Record,
     /// The committed tick to reach.
-    pub until: u64,
+    pub until: Until,
     /// Emit a progress record at every multiple of this tick; zero for
     /// none.
     pub every: u64,
@@ -644,6 +645,27 @@ pub(crate) struct Driven<E> {
     pub closed: SessionClosed,
     pub emit: E,
     pub checkpoints: Option<Checkpoints>,
+}
+
+/// Where a session's stepping stops (plan §12.3, §14.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Until {
+    /// At this committed tick.
+    Tick(u64),
+    /// This many ticks past the committed tick the session opens at, after
+    /// a resumed run has replayed its journal (`flife step`).
+    Past(NonZeroU64),
+}
+
+impl Until {
+    /// The committed tick to reach from a session opened at `committed`.
+    #[must_use]
+    pub const fn from(self, committed: u64) -> u64 {
+        match self {
+            Self::Tick(tick) => tick,
+            Self::Past(ticks) => committed.saturating_add(ticks.get()),
+        }
+    }
 }
 
 /// Drive the session from a client task on Asupersync's native
@@ -690,16 +712,19 @@ where
                 };
                 let snapshot = handle.inspect(&cx).await?;
                 let mut committed = snapshot.boundary.tick.get();
-                if plan.until < committed {
+                let until = plan.until.from(committed);
+                if until < committed {
                     return Err(CoreError::StateConflict {
                         operation: "continue the run",
                         detail: format!(
-                            "the run is already at tick {committed}, past tick {}",
-                            plan.until
+                            "the run is already at tick {committed}, past tick {until}"
                         ),
                     });
                 }
                 let mut start = plan.start;
+                if let Record::Start { ticks, .. } = &mut start {
+                    *ticks = until;
+                }
                 if let (
                     Record::Start {
                         checkpoints: admitted,
@@ -762,7 +787,7 @@ where
                 }
                 let mut tally = Tally::default();
                 let stop = loop {
-                    if committed >= plan.until {
+                    if committed >= until {
                         break Stop::Reached;
                     }
                     match handle.step(&cx).await? {

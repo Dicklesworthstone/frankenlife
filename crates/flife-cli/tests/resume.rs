@@ -491,6 +491,93 @@ fn a_run_resumes_from_its_newest_restorable_checkpoint_to_the_uninterrupted_stat
     );
 }
 
+/// `flife step` of `run_dir` by `ticks`, checkpointing as the run did,
+/// with `--every` if given.
+fn step(run_dir: &Path, ticks: u64, every: Option<u64>) -> (Option<i32>, Vec<Value>, Vec<Value>) {
+    let ticks = ticks.to_string();
+    let mut args = vec![
+        "step",
+        text(run_dir),
+        "--ticks",
+        &ticks,
+        "--checkpoint-every",
+        "7",
+        "--checkpoint-durability",
+        "process-crash",
+    ];
+    let every = every.map(|every| every.to_string());
+    if let Some(every) = &every {
+        args.extend(["--every", every]);
+    }
+    flife(&args)
+}
+
+/// `flife step` advances a run past its newest durable tick, which only the
+/// replay knows (plan §12.3, §14.6): a run stopped at tick 152 whose newest
+/// checkpoint is damaged resumes from 147, replays command 3's outcome
+/// past it, and steps two ticks from where the replay stopped, reporting
+/// each by default. A second step resumes from the first one's final checkpoint and
+/// reaches the uninterrupted run's state at the horizon. Zero ticks is
+/// refused.
+#[test]
+fn a_step_advances_from_the_newest_durable_tick() {
+    let reference = uninterrupted();
+    let config = ecology("write-ahead-before-apply");
+    let run_dir = fresh("stepped");
+    let (status, out, err) = flife(&strs(&run_args(&config, &run_dir, 152, 0)));
+    assert_eq!(status, Some(0), "{err:?}");
+    let newest = checkpoint_at(&out, 152)["sequence"]
+        .as_u64()
+        .expect("a sequence");
+    {
+        let store = common::open_store(run_dir.join("store"), Durability::ProcessCrash)
+            .expect("the store opens");
+        fs::write(store.manifest_path(newest), b"damaged").expect("damages the manifest");
+    }
+
+    let (status, out, err) = step(&run_dir, 2, None);
+    assert_eq!(status, Some(0), "{err:?}");
+    let resumed = one(&out, "resume");
+    assert_eq!(resumed["checkpoint"]["tick"], 147, "{resumed}");
+    let from = resumed["tick"].as_u64().expect("a tick");
+    assert!(from >= 150, "replayed past tick 150: {resumed}");
+    assert_eq!(one(&out, "start")["ticks"], from + 2);
+    let progress: Vec<u64> = all(&out, "progress")
+        .iter()
+        .map(|record| record["tick"].as_u64().expect("a tick"))
+        .collect();
+    assert_eq!(
+        progress,
+        [from + 1, from + 2],
+        "one record per committed tick"
+    );
+    let end = one(&out, "end");
+    assert_eq!(end["stop"]["end"], "reached");
+    assert_eq!(end["tick"], from + 2);
+    let stepped = from + 2;
+    assert_eq!(end["persisted"]["checkpoint"]["tick"], stepped);
+
+    let (status, out, err) = step(&run_dir, HORIZON - stepped, Some(0));
+    assert_eq!(status, Some(0), "{err:?}");
+    let resumed = one(&out, "resume");
+    assert_eq!(resumed["checkpoint"]["tick"], stepped, "{resumed}");
+    assert_eq!(resumed["tick"], stepped);
+    assert!(all(&out, "progress").is_empty());
+    checkpoints_as_uninterrupted(&out, resumed, &reference.checkpoints);
+    reaches_the_uninterrupted_state(&out, (&reference.digest, &reference.last));
+
+    // Refused by the argument parser, which writes text, not a record.
+    let output = common::output(Command::new(env!("CARGO_BIN_EXE_flife")).args([
+        "step",
+        text(&run_dir),
+        "--ticks",
+        "0",
+    ]));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty(), "nothing ran");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--ticks"));
+}
+
 /// A write-ahead run SIGKILLed part way (after reporting tick 70, wherever
 /// it then is) resumes to the uninterrupted state.
 #[test]

@@ -75,7 +75,7 @@ use crate::checkpointing::{
 
 use crate::run::{
     CheckpointAt, ControllerSummary, Finished, Plan, RUN_SCHEMA, RUN_SESSION, Record,
-    SkippedCheckpoint, configure, drive, finish, found, start, tracker, with_memory,
+    SkippedCheckpoint, Until, configure, drive, finish, found, start, tracker, with_memory,
 };
 
 pub use flife_store::Durability as StoreDurability;
@@ -1327,8 +1327,9 @@ pub fn restore_checkpoint(
 /// What to resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeOptions {
-    /// The committed tick to reach.
-    pub until: u64,
+    /// The committed tick to reach: a tick, or (`flife step`) a number of
+    /// ticks past the one the run resumes at once its journal is replayed.
+    pub until: Until,
     /// Emit a progress record at every multiple of this tick; zero for
     /// none.
     pub every: u64,
@@ -1352,7 +1353,7 @@ pub struct ResumeOptions {
     pub metrics_every: u64,
 }
 
-/// Resume the run in `run_dir` to committed tick `options.until`, passing
+/// Resume the run in `run_dir` to the committed tick `options.until` names, passing
 /// every record to `emit` in order: the start, a [`Record::Resume`] naming
 /// the checkpoint recovered (the newest that loads and restores to the
 /// run's configuration; the founding world if none does) and those passed
@@ -1366,7 +1367,7 @@ pub struct ResumeOptions {
 /// # Errors
 /// [`CoreError::StateConflict`] when `run_dir` is not a run directory, its
 /// catalog records the run under another configuration, the journal
-/// disagrees with the checkpoint, the run is already past `options.until`,
+/// disagrees with the checkpoint, the run is already past `options.until`'s tick,
 /// or it is a branch none of whose checkpoints restores; the store's,
 /// catalog's and session's errors.
 pub fn resume(
@@ -1409,7 +1410,8 @@ pub fn resume(
         start: with_memory(
             start(
                 &config,
-                options.until,
+                // The session sets the tick it resolves `until` to.
+                options.until.from(0),
                 cpu_workers,
                 controllers,
                 options.metrics_every,

@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use flife_cli::metrics::{dispersion, gini, morans_i, top_decile_share};
 use flife_cli::{
     ControllerChoice, Injection, METRICS_SCHEMA, Metrics, Persistence, Record, ResumeOptions,
-    RunOptions, ScheduledCommand, StoreDurability, Tally, Tracked, Tracker, found, resume,
+    RunOptions, ScheduledCommand, StoreDurability, Tally, Tracked, Tracker, Until, found, resume,
     run_with,
 };
 use flife_core::ids::{GenomeId, LineageId, OrganismId};
@@ -965,7 +965,7 @@ fn a_resumed_run_tracks_from_the_state_its_journal_replayed_to() {
         &ResumeOptions {
             checkpoint_mode: None,
             retained_bytes: None,
-            until: 240,
+            until: Until::Tick(240),
             every: 0,
             cpu_workers: None,
             controllers: ControllerChoice::Cpu,

@@ -957,7 +957,9 @@ fn a_filling_introduction_stays_within_the_staging_term() {
 /// attempt tries all its candidates and is rejected. What that step holds above
 /// what the world held before it is at most the staging term, the
 /// children's genomes' parameters (charged to the genome quota) and the
-/// state's room to grow to its bound.
+/// state's room to grow to its bound, on one worker and on eight, whose
+/// lanes run the tick's parallel phases; the eight workers' world is the
+/// one worker's, digest for digest.
 #[test]
 fn a_tick_of_births_stays_within_the_staging_term() {
     let _serial = serial();
@@ -977,7 +979,8 @@ fn a_tick_of_births_stays_within_the_staging_term() {
         ("chemistry_standard_deviation", "0.0"),
         ("sensing_log_scale_standard_deviation", "0.0"),
     ];
-    for rejecting in [false, true] {
+    let mut digests = Vec::new();
+    for (rejecting, workers) in [(false, 1), (true, 1), (false, 8), (true, 8)] {
         let mut pairs = crowded.to_vec();
         if rejecting {
             pairs.extend(unmutated);
@@ -988,7 +991,14 @@ fn a_tick_of_births_stays_within_the_staging_term() {
             .mutation
             .maximum_candidate_proposals_per_birth;
         let mut world = found(&config).expect("founds");
-        configure(&mut world, None, ControllerChoice::Cpu, None).expect("admitted");
+        configure(
+            &mut world,
+            NonZeroUsize::new(workers),
+            ControllerChoice::Cpu,
+            None,
+        )
+        .expect("admitted");
+        assert_eq!(world.cpu_workers(), workers);
         let footprint = world.footprint();
         let mut stepped = false;
         for _ in 0..16 {
@@ -1009,9 +1019,9 @@ fn a_tick_of_births_stays_within_the_staging_term() {
             let born = world.quota().allocated_bytes() - genomes;
             let room = footprint.state - state;
             println!(
-                "{} births and {} rejected of {live} live ({} attempted, up to {candidates} \
-                 candidates each) held {:.2} MiB above the world: staging {:.2}, children's \
-                 genomes {:.2}, state room {:.2}",
+                "{workers} workers: {} births and {} rejected of {live} live ({} attempted, up to \
+                 {candidates} candidates each) held {:.2} MiB above the world: staging {:.2}, \
+                 children's genomes {:.2}, state room {:.2}",
                 report.births.len(),
                 report.rejected.len(),
                 report.attempted,
@@ -1040,6 +1050,13 @@ fn a_tick_of_births_stays_within_the_staging_term() {
             break;
         }
         assert!(stepped, "no attempts in 16 ticks");
+        digests.push((rejecting, workers, world.tick(), world.digest()));
+    }
+    for (rejecting, workers, tick, digest) in &digests[2..] {
+        assert!(
+            digests[..2].contains(&(*rejecting, 1, *tick, *digest)),
+            "{workers} workers (rejecting {rejecting}) left a different world at {tick:?}"
+        );
     }
 }
 

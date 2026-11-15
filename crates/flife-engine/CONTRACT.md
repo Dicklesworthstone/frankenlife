@@ -1224,8 +1224,8 @@ velocity, first-order splitting at the configured fixed timestep.
   grant packets. The tick groups packets by cell and by organism with `flife_field::Bins` counting sorts instead
   of comparison sorts, in the same order, so the world is bit-identical. A reduction within the declaration
   allocates nothing, a hotspot included. FL-043 reserves the rest of the scratch for the capacity and charges each
-  tick's own lists at the staging bound. That bound is analytic: no test makes every organism reproduce in one
-  tick.
+  tick's own lists at the staging bound. That bound is analytic here; `flife-cli`'s `tests/memory_admission.rs`
+  measures it with every one of 2,048 organisms reproducing in one tick, on one worker and on eight.
 - The live-population quota counts every parent with a viable attempt as live. Its kept share is at least
   `minimum_parent_energy_after_split`, so only a minimum below the tiny threshold could make that conservative.
 - Resource epochs here are the committed world's: there are no leases, observers or render projections yet

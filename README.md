@@ -552,7 +552,10 @@ population kernel on the world's own workers (FL-025, any host), and `cpu` keeps
 refuses to run without a Metal device. `auto` (the default) takes Metal where the host has it and
 the world uses at most 8 CPU workers, where it measured faster (2.2× on one worker, 1.7× on two, 1.3× on four, 1.1×
 on eight). On a host without Metal it takes `torch` at up to 4 workers, where Linux measured it 1.41× on one worker
-and 1.11× on four (0.91× on eight). Whatever the choice and the `--cpu-workers`
+and 1.11× on four (0.91× on eight). On Apple silicon it also takes `torch` on any number of workers for a world of
+at least 25,000 organisms, where the controllers are most of the tick. On 16 workers of an M5 Ultra, `torch` measured
+1.02–1.03× the reference at 25,000 and 1.09–1.15× at 100,000. Linux x86-64 measured it 0.76–0.88× and 0.80× there,
+so Linux keeps the reference (`flife-backend-metal`'s contract has the runs). Whatever the choice and the `--cpu-workers`
 count, the world is the same bit for bit; the run's `start` record names the backend and `end` counts what it
 evaluated. Measured over 512 ticks of the preset on an M5 Ultra under other load (median of three interleaved
 runs, cv ≤ 2.5%), with all 4,096 founders alive:

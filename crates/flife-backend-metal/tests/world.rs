@@ -8,8 +8,8 @@
 //! of a few slots, and no parameter shard is rebuilt.
 
 use flife_backend_metal::{
-    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, BackendBudget, ControllerChoice, MetalBackend,
-    SHARD_BYTES,
+    AUTO_METAL_MAX_WORKERS, AUTO_TORCH_MAX_WORKERS, AUTO_TORCH_MIN_ORGANISMS, BackendBudget,
+    ControllerChoice, MetalBackend, SHARD_BYTES, TORCH_AT_SCALE,
 };
 use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
@@ -497,98 +497,125 @@ fn one_flipped_metal_output_bit_changes_the_world() {
 }
 
 /// `auto` takes Metal up to `AUTO_METAL_MAX_WORKERS` CPU workers on a host
-/// with a device. Without one it takes the FrankenTorch CPU route up to
-/// `AUTO_TORCH_MAX_WORKERS`, and the CPU reference above that; above
-/// `AUTO_METAL_MAX_WORKERS` it is the reference on any host. `cpu` never
+/// with a device. Without one, or above that, it takes the FrankenTorch CPU
+/// route up to `AUTO_TORCH_MAX_WORKERS`, or, on a host where
+/// `TORCH_AT_SCALE`, for a world of at least `AUTO_TORCH_MIN_ORGANISMS`, and
+/// the CPU reference otherwise. `cpu` never
 /// opens a device, `torch` is the FrankenTorch CPU route on the world's
 /// workers on any host, and `metal` ignores the worker count.
 #[test]
 fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let device = metal().is_some();
-    let described = |choice: ControllerChoice, workers: usize| {
+    let described = |choice: ControllerChoice, workers: usize, organisms: usize| {
         choice
-            .backend(workers, BackendBudget::UNBOUNDED)
+            .backend(workers, organisms, BackendBudget::UNBOUNDED)
             .map(|backend| backend.map(|backend| backend.describe()))
     };
-    // The rule on both kinds of host, wherever this runs.
+    let torch =
+        |workers: usize| format!("cpu (frankentorch population_affine_f32_into, {workers} lanes)");
+    // The rule on both kinds of host, wherever this runs: the preset's
+    // 4,096 organisms, just below the floor, at it, and the Desktop
+    // ecology preset's 100,000.
     use ControllerChoice::{Cpu, Metal, Torch};
-    let rule = [
+    let small = [
         (1, Metal, Torch),
         (2, Metal, Torch),
         (AUTO_TORCH_MAX_WORKERS, Metal, Torch),
         (AUTO_TORCH_MAX_WORKERS + 1, Metal, Cpu),
         (AUTO_METAL_MAX_WORKERS, Metal, Cpu),
         (AUTO_METAL_MAX_WORKERS + 1, Cpu, Cpu),
+        (16, Cpu, Cpu),
         (64, Cpu, Cpu),
     ];
-    for (workers, with_device, without) in rule {
-        assert_eq!(
-            ControllerChoice::auto_for(workers, true),
-            with_device,
-            "{workers}"
-        );
-        assert_eq!(
-            ControllerChoice::auto_for(workers, false),
-            without,
-            "{workers}"
-        );
-        // And this host's `auto` is the rule's choice for it.
-        let expected = described(ControllerChoice::auto_for(workers, device), workers)
-            .expect("the rule's choice opens");
-        assert_eq!(
-            described(ControllerChoice::Auto, workers).expect("auto never refuses"),
-            expected,
-            "auto at {workers} workers"
-        );
-    }
-    for workers in [
-        1,
-        2,
-        AUTO_TORCH_MAX_WORKERS,
-        AUTO_TORCH_MAX_WORKERS + 1,
-        AUTO_METAL_MAX_WORKERS,
+    let large = small.map(|(workers, with_device, _)| {
+        let with_device = if with_device == Metal { Metal } else { Torch };
+        (workers, with_device, Torch)
+    });
+    assert_eq!(
+        TORCH_AT_SCALE,
+        cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        "the floor holds only where it was measured faster"
+    );
+    for (organisms, at_scale) in [
+        (4_096, small),
+        (AUTO_TORCH_MIN_ORGANISMS - 1, small),
+        (AUTO_TORCH_MIN_ORGANISMS, large),
+        (100_000, large),
     ] {
-        let chosen = described(ControllerChoice::Auto, workers).expect("auto never refuses");
-        let torch = format!("cpu (frankentorch population_affine_f32_into, {workers} lanes)");
-        match chosen {
-            Some(name) if device => assert!(name.starts_with("metal"), "{name}"),
-            Some(name) => {
-                assert!(
-                    workers <= AUTO_TORCH_MAX_WORKERS,
-                    "auto at {workers} workers: {name}"
+        // A host where torch is not faster at scale keeps the small rule.
+        for (torch_at_scale, rule) in [(true, at_scale), (false, small)] {
+            for (workers, with_device, without) in rule {
+                assert_eq!(
+                    ControllerChoice::auto_on(workers, true, torch_at_scale, organisms),
+                    with_device,
+                    "{workers} workers, {organisms} organisms, torch at scale {torch_at_scale}"
                 );
-                assert_eq!(name, torch);
+                assert_eq!(
+                    ControllerChoice::auto_on(workers, false, torch_at_scale, organisms),
+                    without,
+                    "{workers} workers, {organisms} organisms, torch at scale {torch_at_scale}"
+                );
             }
-            None => assert!(
-                !device && workers > AUTO_TORCH_MAX_WORKERS,
-                "auto at {workers} workers is the reference"
-            ),
+        }
+        for (workers, ..) in small {
+            // `auto_for` is the rule for this build's kind of host.
+            for metal_device in [true, false] {
+                assert_eq!(
+                    ControllerChoice::auto_for(workers, metal_device, organisms),
+                    ControllerChoice::auto_on(workers, metal_device, TORCH_AT_SCALE, organisms),
+                );
+            }
+            // And this host's `auto` is the rule's choice for it.
+            let expected = described(
+                ControllerChoice::auto_for(workers, device, organisms),
+                workers,
+                organisms,
+            )
+            .expect("the rule's choice opens");
+            let chosen =
+                described(ControllerChoice::Auto, workers, organisms).expect("auto never refuses");
+            assert_eq!(
+                chosen, expected,
+                "auto at {workers} workers, {organisms} organisms"
+            );
+            match chosen {
+                Some(name) if device && workers <= AUTO_METAL_MAX_WORKERS => {
+                    assert!(name.starts_with("metal"), "{name}");
+                }
+                Some(name) => {
+                    assert!(
+                        workers <= AUTO_TORCH_MAX_WORKERS
+                            || (TORCH_AT_SCALE && organisms >= AUTO_TORCH_MIN_ORGANISMS),
+                        "auto at {workers} workers, {organisms} organisms: {name}"
+                    );
+                    assert_eq!(name, torch(workers));
+                }
+                None => assert!(
+                    workers > AUTO_TORCH_MAX_WORKERS
+                        && !(TORCH_AT_SCALE && organisms >= AUTO_TORCH_MIN_ORGANISMS)
+                        && !(device && workers <= AUTO_METAL_MAX_WORKERS),
+                    "auto at {workers} workers, {organisms} organisms is the reference"
+                ),
+            }
         }
     }
-    for workers in [AUTO_METAL_MAX_WORKERS + 1, 16, 64] {
-        assert!(
-            described(ControllerChoice::Auto, workers)
-                .expect("auto never refuses")
-                .is_none(),
-            "auto at {workers} workers is the reference"
-        );
-    }
-    assert!(described(ControllerChoice::Cpu, 1).expect("cpu").is_none());
+    assert!(
+        described(ControllerChoice::Cpu, 1, 4_096)
+            .expect("cpu")
+            .is_none()
+    );
     for workers in [1, 4, 64] {
-        let torch = described(ControllerChoice::Torch, workers)
+        let chosen = described(ControllerChoice::Torch, workers, 4_096)
             .expect("torch never refuses")
             .expect("torch is a backend");
-        assert_eq!(
-            torch,
-            format!("cpu (frankentorch population_affine_f32_into, {workers} lanes)")
-        );
+        assert_eq!(chosen, torch(workers));
     }
     assert_eq!(
         "torch".parse::<ControllerChoice>(),
         Ok(ControllerChoice::Torch)
     );
     assert!("gpu".parse::<ControllerChoice>().is_err());
-    let forced = described(ControllerChoice::Metal, 64);
+    let forced = described(ControllerChoice::Metal, 64, 4_096);
     if device {
         assert!(forced.expect("metal on a device").is_some());
     } else {

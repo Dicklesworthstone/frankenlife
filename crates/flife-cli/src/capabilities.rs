@@ -492,10 +492,11 @@ pub fn capabilities(
     let pinned = (source == "preset" && options.ticks == PROBE_TICKS).then_some(PRESET_DIGEST);
     let host = Host::current();
 
-    let ((cpu_workers, memory), reference) =
+    let ((cpu_workers, organisms, memory), reference) =
         run_route(config, ControllerChoice::Cpu, options, |world| {
             (
                 world.cpu_workers(),
+                world.population().len(),
                 crate::memory::admit(world, ControllerChoice::Auto, None, 0),
             )
         })?;
@@ -511,7 +512,7 @@ pub fn capabilities(
         cpu_workers,
         metal_device,
         takes: metal_device
-            .map(|device| route_name(ControllerChoice::auto_for(cpu_workers, device))),
+            .map(|device| route_name(ControllerChoice::auto_for(cpu_workers, device, organisms))),
     };
     let controllers = vec![
         reference_route(&reference, pinned),

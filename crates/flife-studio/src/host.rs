@@ -613,7 +613,11 @@ impl Studio {
             bytes: memory.backend,
             organisms: world.population().capacity() as u64,
         };
-        world.set_controller_backend(options.controllers.backend(world.cpu_workers(), budget)?);
+        world.set_controller_backend(options.controllers.backend(
+            world.cpu_workers(),
+            world.population().len(),
+            budget,
+        )?);
         let controllers = world
             .controller_report()
             .backend

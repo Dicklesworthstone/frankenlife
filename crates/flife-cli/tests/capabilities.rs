@@ -165,7 +165,8 @@ fn the_preset_reaches_its_pinned_world_on_every_route_this_host_opens() {
         assert!(metal.digest.is_none());
     }
     assert_eq!(report.auto.metal_device, Some(device));
-    let auto = ControllerChoice::auto_for(report.auto.cpu_workers, device);
+    let founders = usize::try_from(report.world.founders).expect("founders fit");
+    let auto = ControllerChoice::auto_for(report.auto.cpu_workers, device, founders);
     let expected = match auto {
         ControllerChoice::Metal => "metal",
         ControllerChoice::Torch => "torch",

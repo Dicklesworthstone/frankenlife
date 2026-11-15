@@ -137,7 +137,11 @@ pub fn install(world: &mut World, choice: ControllerChoice, bytes: u64) -> Resul
         bytes,
         organisms: world.population().capacity() as u64,
     };
-    world.set_controller_backend(choice.backend(world.cpu_workers(), budget)?);
+    world.set_controller_backend(choice.backend(
+        world.cpu_workers(),
+        world.population().len(),
+        budget,
+    )?);
     Ok(())
 }
 

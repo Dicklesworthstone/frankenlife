@@ -1228,8 +1228,9 @@ pub enum ControllerChoice {
     Metal,
     /// Metal where this host has a Metal device and the world runs on at
     /// most [`AUTO_METAL_MAX_WORKERS`] CPU workers; otherwise
-    /// [`ControllerChoice::Torch`] on at most [`AUTO_TORCH_MAX_WORKERS`];
-    /// otherwise the CPU reference.
+    /// [`ControllerChoice::Torch`] on at most [`AUTO_TORCH_MAX_WORKERS`], or,
+    /// where [`TORCH_AT_SCALE`], for a world of at least
+    /// [`AUTO_TORCH_MIN_ORGANISMS`]; otherwise the CPU reference.
     #[default]
     Auto,
 }
@@ -1252,24 +1253,64 @@ pub const AUTO_METAL_MAX_WORKERS: usize = 8;
 /// and 1.62x on one and 1.26x on four on an M5 Ultra.
 pub const AUTO_TORCH_MAX_WORKERS: usize = 4;
 
+/// The fewest organisms at which [`ControllerChoice::Auto`] takes
+/// FrankenTorch's CPU route on any number of CPU workers where it does not
+/// take Metal, on a host where [`TORCH_AT_SCALE`]. There the controllers
+/// are most of the tick.
+///
+/// Measured on sixteen workers with `tick_throughput`, 2026-11-15:
+/// - Ticks 32 to 160 of a founding world with every founder alive, each
+///   16-tick block against the reference in the same process, the same
+///   digests, two invocations each.
+/// - On an M5 Ultra: 1.030x and 1.022x at 25,000 (the Interactive preset)
+///   and 1.152x and 1.092x at 100,000 (the Desktop ecology preset), with at
+///   least 7 of 8 blocks faster in each and every cv at most 2.4%.
+/// - On Linux x86-64 (an AMD Threadripper PRO 5975WX): 0.76x and 0.88x at
+///   25,000 and 0.80x and 0.80x at 100,000, with no block faster and every
+///   cv at most 1.9%. So the floor holds only where it was measured faster.
+pub const AUTO_TORCH_MIN_ORGANISMS: usize = 25_000;
+
+/// Whether [`AUTO_TORCH_MIN_ORGANISMS`] applies on this build's host: on
+/// Apple silicon under macOS, where FrankenTorch's CPU route measured faster
+/// than the reference at scale on any number of workers. Its kernel is a
+/// CPU kernel, so this is the CPU's property, not the Metal device's. On
+/// Linux x86-64 it measured slower there, and other hosts are unmeasured.
+pub const TORCH_AT_SCALE: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+
 impl ControllerChoice {
-    /// What [`ControllerChoice::Auto`] is for a world on `cpu_workers`
-    /// threads on a host with or without a Metal device: Metal up to
-    /// [`AUTO_METAL_MAX_WORKERS`] where there is one, otherwise `torch` up to
-    /// [`AUTO_TORCH_MAX_WORKERS`], otherwise the CPU reference.
+    /// What [`ControllerChoice::Auto`] is for a world of `organisms` on
+    /// `cpu_workers` threads on this build's kind of host ([`TORCH_AT_SCALE`]),
+    /// with or without a Metal device: [`ControllerChoice::auto_on`].
     #[must_use]
-    pub const fn auto_for(cpu_workers: usize, metal_device: bool) -> Self {
+    pub const fn auto_for(cpu_workers: usize, metal_device: bool, organisms: usize) -> Self {
+        Self::auto_on(cpu_workers, metal_device, TORCH_AT_SCALE, organisms)
+    }
+
+    /// The rule on any kind of host: Metal up to [`AUTO_METAL_MAX_WORKERS`]
+    /// where there is a device; otherwise `torch` up to
+    /// [`AUTO_TORCH_MAX_WORKERS`], or from [`AUTO_TORCH_MIN_ORGANISMS`] where
+    /// `torch_at_scale`; otherwise the CPU reference.
+    #[must_use]
+    pub const fn auto_on(
+        cpu_workers: usize,
+        metal_device: bool,
+        torch_at_scale: bool,
+        organisms: usize,
+    ) -> Self {
         if metal_device && cpu_workers <= AUTO_METAL_MAX_WORKERS {
             Self::Metal
-        } else if cpu_workers <= AUTO_TORCH_MAX_WORKERS {
+        } else if cpu_workers <= AUTO_TORCH_MAX_WORKERS
+            || (torch_at_scale && organisms >= AUTO_TORCH_MIN_ORGANISMS)
+        {
             Self::Torch
         } else {
             Self::Cpu
         }
     }
 
-    /// The backend this choice selects on this host for a world on
-    /// `cpu_workers` threads, or `None` for the CPU reference.
+    /// The backend this choice selects on this host for a world of
+    /// `organisms` on `cpu_workers` threads, or `None` for the CPU
+    /// reference.
     ///
     /// # Errors
     /// For [`ControllerChoice::Metal`], [`MetalBackend::open`]'s errors. For
@@ -1282,6 +1323,7 @@ impl ControllerChoice {
     pub fn backend(
         self,
         cpu_workers: usize,
+        organisms: usize,
         budget: BackendBudget,
     ) -> Result<Option<Box<dyn ControllerBackend>>, CoreError> {
         let boxed = |backend: MetalBackend| -> Box<dyn ControllerBackend> { Box::new(backend) };
@@ -1300,14 +1342,18 @@ impl ControllerChoice {
             Self::Auto => {
                 // Opening the device is how this host says whether it has
                 // one, so only where `auto_for` could choose it.
-                if Self::auto_for(cpu_workers, true) == Self::Metal {
+                if Self::auto_for(cpu_workers, true, organisms) == Self::Metal {
                     match metal() {
                         Ok(backend) => return Ok(Some(boxed(backend))),
                         Err(CoreError::MissingCapability { .. }) => {}
                         Err(error) => return Err(error),
                     }
                 }
-                Self::auto_for(cpu_workers, false).backend(cpu_workers, budget)
+                Self::auto_for(cpu_workers, false, organisms).backend(
+                    cpu_workers,
+                    organisms,
+                    budget,
+                )
             }
         }
     }

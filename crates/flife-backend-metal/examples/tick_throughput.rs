@@ -53,7 +53,11 @@ fn found(
         NumericalProfile::reference_f32()?,
     )?;
     world.set_cpu_workers(workers)?;
-    world.set_controller_backend(choice.backend(workers.get(), BackendBudget::UNBOUNDED)?);
+    world.set_controller_backend(choice.backend(
+        workers.get(),
+        world.population().len(),
+        BackendBudget::UNBOUNDED,
+    )?);
     let mut owners = Vec::new();
     for phase in parts {
         match phase {

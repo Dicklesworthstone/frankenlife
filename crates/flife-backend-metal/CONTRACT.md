@@ -140,14 +140,33 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
   `flife_neural::ControllerBackend`, the port through which the world hands each tick's due evaluations over in
   one batch (`ControllerJob`: genome identity, arena slot, admitted controller, inputs). `ControllerChoice` (`cpu`, `torch`,
   `metal`, `auto`) is what the CLI and Studio select it with (`torch` is `flife-backend-cpu`'s `CpuBackend` on the
-  world's workers, on any host): `backend(cpu_workers, budget)` gives `auto` Metal only on a host with
+  world's workers, on any host): `backend(cpu_workers, organisms, budget)` gives `auto` Metal only on a host with
   a device and at most `AUTO_METAL_MAX_WORKERS` = 8 workers, where it measured faster (whole ticks, 256 ticks, two
   interleaved runs: 2 workers 27.5 → 16.3 ms, 4 workers 19.5 → 14.8 ms, 8 workers 15.8 → 14.3 ms). Where it does
   not take Metal, it takes `torch` at most `AUTO_TORCH_MAX_WORKERS` = 4 workers, where that measured faster on
-  Linux and macOS (`flife-backend-cpu`'s contract). `ControllerChoice::auto_for(cpu_workers, metal_device)` states
-  the rule for either kind of host. Test `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling` checks the
-  rule for both kinds on any host, and that this host's `auto` is the rule's choice for it.
-- FL-043: `backend(cpu_workers, budget)` takes a `BackendBudget` (re-exported from `flife-neural`: bytes, and the
+  Linux and macOS (`flife-backend-cpu`'s contract).
+- On Apple silicon (`TORCH_AT_SCALE`, a build for macOS on aarch64) it also takes `torch` on any number of workers
+  for a world of at least `AUTO_TORCH_MIN_ORGANISMS` = 25,000 organisms, counted live when its controllers are
+  chosen. There the controllers are most of the tick.
+- The floor was measured with `tick_throughput` on 16 workers, over ticks 32 to 160 of founding worlds, two
+  invocations each with the same digests:
+
+  | Host | Route | 25,000 organisms | 100,000 organisms |
+  |---|---|---|---|
+  | M5 Ultra | `torch` | 1.030×, 1.022× | 1.152×, 1.092× |
+  | M5 Ultra | Metal | 0.987×, 1.009× | 1.156×, 1.081× |
+  | Linux x86-64 (Threadripper PRO 5975WX) | `torch` | 0.76×, 0.88× | 0.80×, 0.80× |
+
+  On the M5 every cv was at most 2.4%. On Linux every cv was at most 1.9%, and no block was faster. FrankenTorch's
+  kernel is a CPU kernel, so the floor is the CPU's property, not the Metal device's. It holds only where it was
+  measured faster; other hosts are unmeasured.
+- `ControllerChoice::auto_on(cpu_workers, metal_device, torch_at_scale, organisms)` states the rule for any kind
+  of host, and `auto_for(cpu_workers, metal_device, organisms)` applies it with this build's `TORCH_AT_SCALE`.
+- Test `tests/world.rs::auto_takes_metal_only_up_to_its_worker_ceiling` checks:
+  - the rule for every kind of host, on any host, at 4,096, 24,999, 25,000 and 100,000 organisms;
+  - that `auto_for` is `auto_on` with this host's constant;
+  - that this host's `auto` is the rule's choice for it.
+- FL-043: `backend(cpu_workers, organisms, budget)` takes a `BackendBudget` (re-exported from `flife-neural`: bytes, and the
   organisms the world can hold), `BackendBudget::UNBOUNDED` for none. `MetalBackend::with_budget(shard_slots,
   budget)` opens its own `DeviceOwner` with `Limits { bytes: budget.bytes, .. }`; `open` and `with_shard_slots` are
   unbounded. A budget past the owner's limit, which is at most the device's headroom (below), is cut to that limit,

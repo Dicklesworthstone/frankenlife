@@ -2,20 +2,22 @@ schema = "frankenlife.experiment.v1"
 name = "fl034-e2-desktop-scale-up-pair-23"
 hypothesis = """Does the Interactive preset's ecology, scaled by area, hold the Desktop ecology profile's \
 population (plan 19.5: 512 x 512 x 33, 100,000 founders, F16 canonical weights) in the band 80,000 to \
-120,000 live? The one condition is presets/interactive-world.toml at 4x the area with 4x the sources \
-(128 x 1248, the Interactive preset's energy per area). Prediction, from E1's 1.655 to 1.700 energy/s of \
-source power per organism at both earlier scales: about 88,000 to 101,000 live at tick 8,192. This \
-directory holds one of four seed pairs (discovery 23, held-out 2023); the four together are E2 \
-(experiments/fl034/README.md)."""
+120,000 live? The control is presets/interactive-world.toml at 4x the area with 4x the sources \
+(128 x 1248, the Interactive preset's energy per area); the sweep raises source power 1.15x. Prediction, \
+from E1's 1.655 to 1.700 energy/s of source power per organism at both earlier scales: the control near \
+88,000 to 101,000 live at tick 8,192, 1.15x near 101,000 to 116,000. This directory holds one of four \
+seed pairs (discovery 23, held-out 2023); the four together are E2 (experiments/fl034/README.md)."""
 base = "../desktop-base.toml"
 ticks = 8192
 metrics_every = 1024
 control = "control"
-selection = """No selection by the tool: the condition runs on every seed and every run is reported. Rule, \
-declared before any run (TODO 2026-11-15 00:04:31 EST): the condition qualifies on a split when every run \
-of it on that split, over all four seed pairs, reaches tick 8,192 (no extinction, no capacity pause) with \
-final_live in 80,000 to 120,000. It is adopted for a Desktop ecology preset only if it qualifies on both \
-splits. Otherwise nothing is adopted and the next experiment is declared from these results."""
+selection = """No selection by the tool: every condition runs on every seed and every run is reported. Rule, \
+declared before any run (TODO 2026-11-15 00:04:31 EST; amended 00:13:31 EST, still before any run, when \
+flife experiment refused a specification with no condition beside its control): a condition qualifies on a \
+split when every run of it on that split, over all four seed pairs, reaches tick 8,192 (no extinction, no \
+capacity pause) with final_live in 80,000 to 120,000. The candidate is the lowest source power whose \
+discovery runs qualify; it is adopted for a Desktop ecology preset only if its held-out runs qualify too. \
+If none qualifies, nothing is adopted and the next experiment is declared from these results."""
 
 [seeds]
 discovery = [23]
@@ -23,3 +25,6 @@ held_out = [2023]
 
 [[conditions]]
 name = "control"
+
+[sweep]
+"sources.power_per_source" = [1435.2]

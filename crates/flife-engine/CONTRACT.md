@@ -32,7 +32,17 @@ FL-012 (`flife-3zm`) adds death, recycling, live storage and stable identity (pl
 FL-013 (`flife-x3o`) adds `world`, the ordered candidate tick and epoch publication (plan §7.5, §7.6, §8.1–§8.4,
 §9.4, §9.5, INV-01–INV-08, A.3 item 1, Appendix C.7, C.8):
 - `World::found`: a world at tick zero from a validated configuration, with its founders (`uniform` positions,
-  `zero` velocity) and seeded sources;
+  `zero` velocity) and seeded sources. It is `World::found_on` at `[execution] cpu_workers`;
+- `World::found_on(config, arrangement, profile, workers)` (FL-034): the founders made on `workers` threads,
+  and the world then using that many, as `set_cpu_workers` leaves it. Identities and genome buffers are issued
+  in identity order on the calling thread; each founder's traits, weights, seal, position and phase are grown
+  on contiguous identity-ordered runs (plan §3.4's bounded reference adapter: no more runs than workers or
+  started groups of 128 founders) and admitted in identity order; the error returned is the first in identity order. No
+  result depends on the count. The CLI's `run`, `render` and `capabilities` and the Studio's open and timeline
+  replay found on their `--cpu-workers`. At the 100,000-founder Desktop base (`experiments/fl034/desktop-base.toml`,
+  `flife run --ticks 1 --cpu-workers 16 --controllers cpu`) on the shared Mac (load 22–28 from other work), the
+  run took 14.7–15.9 s at 82fd4ba and 3.2–3.7 s with it (3 alternated rounds each, medians 15.0 and 3.3 s); the
+  final digest and every checkpoint chunk and manifest of a kept 1-tick run were byte-identical;
 - `World::advance`: phases 2–10 of §8.1 against the committed state, giving a checked `Candidate`, or a pause
   under `pause-before-commit`;
 - `Candidate::publish`: the population's whole-tick commit (`Population::commit_tick`), then the field, ledger,
@@ -802,6 +812,12 @@ streams. The small ecology pins its world digest, checked on Linux x86_64.
   - Population and genome-quota shortfalls pause the tick with every committed byte unchanged.
   - A numerical fault stops the run, preserves the committed state and refuses every later advance.
   - Founders follow A.3 item 1 (identities, quadrant coverage, a pinned founder position, the cooldown deadline).
+  - `tests/founding.rs` (FL-034): 1,100 founders (nine runs, the last short) founded on 2, 5, 9 and 64 workers
+    give the one-worker founding's digest and checkpoint bytes, genomes included, at the worker count given. Of
+    six planted defects, four in the parallel path (runs out of order, refused by `Population::admit`; a run's
+    founders not appended; the head run dropped; the worker count not kept) are caught by it, and two in the path
+    both share (traits drawn for another organism, weights on another draw lane) by G1's pinned digest. The
+    error path (a founder the quota refuses) is not reachable from a validated configuration and is not tested.
   - INV-08: an organism out of the field's reach evolves bit for bit as if alone.
   - `Population::check_tick` refusals: a forgotten, repeated, reordered, surviving-and-dying, starved or renamed
     organism, and a quota short of the dying genomes' bytes or count, each checked on its own.

@@ -19,13 +19,16 @@ use flife_core::ids::{GenomeId, OrganismId};
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream};
 use flife_core::{CoreError, ValidatedConfig};
 
-use crate::catalog::TopologyCatalog;
+use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
-use crate::genome::{AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, rescale};
+use crate::genome::{
+    AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, Unsealed, rescale,
+};
 use crate::init::{WeightAddress, initialize};
-use crate::quota::{GenomeQuota, WeightsMut};
+use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
 
-/// A founder's genome.
+/// A founder's genome: its traits ([`founder_traits`]), a buffer for
+/// [`founder_topology`] from `quota`, and [`grow_founder`] in it.
 ///
 /// # Errors
 /// As [`GenomeQuota::allocate`] when the quota refuses the genome, and
@@ -42,14 +45,57 @@ pub fn founder(
     initial_scale: f64,
 ) -> Result<Genome, CoreError> {
     let traits = founder_traits(rng, organism, limits, initial_scale)?;
+    let member = founder_topology(catalog)?;
+    let buffer = quota.allocate(catalog, member)?;
+    grow_founder(rng, organism, id, catalog, buffer, traits, limits).or_else(|unsealed| {
+        quota.abandon(unsealed.buffer)?;
+        Err(unsealed.error)
+    })
+}
+
+/// The member every founder takes: the catalog's default topology.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if the catalog does not hold it.
+pub fn founder_topology(catalog: &TopologyCatalog) -> Result<TopologyId, CoreError> {
     let member = catalog.default_topology();
-    let topology = catalog
+    catalog
         .topology(member)
+        .map(|_| member)
         .ok_or_else(|| CoreError::LayoutMismatch {
             buffer: "genome parameters",
             detail: "the default topology is not in the catalog".into(),
-        })?;
-    let mut buffer = quota.allocate(catalog, member)?;
+        })
+}
+
+/// [`founder`] after its allocation: `organism`'s weights drawn into
+/// `buffer`, which a quota allocated for [`founder_topology`], and the
+/// buffer sealed as genome `id` with `traits` ([`founder_traits`]). It
+/// takes no quota, so founders' buffers can be allocated in one place and
+/// filled on several workers.
+///
+/// # Errors
+/// [`Unsealed`], holding the buffer for its quota to abandon, with
+/// [`CoreError::NumericalInvalid`] or [`CoreError::Overflow`] if a draw or
+/// lane is out of range, or [`Genome::seal`]'s refusal.
+pub fn grow_founder(
+    rng: &SemanticRng,
+    organism: OrganismId,
+    id: GenomeId,
+    catalog: &TopologyCatalog,
+    mut buffer: ParameterBuffer,
+    traits: Traits,
+    limits: &TraitLimits,
+) -> Result<Genome, Unsealed> {
+    let Some(topology) = catalog.topology(buffer.topology()) else {
+        return Err(Unsealed {
+            error: CoreError::LayoutMismatch {
+                buffer: "genome parameters",
+                detail: "the buffer's topology is not in the catalog".into(),
+            },
+            buffer,
+        });
+    };
     let mut lane_error = None;
     let word =
         |weight: WeightAddress| match Lane::neuron_index(weight.layer, weight.output, weight.input)
@@ -66,13 +112,9 @@ pub fn founder(
         WeightsMut::F16(values) => initialize(topology, values, word),
     };
     if let Some(error) = lane_error.or_else(|| filled.err()) {
-        quota.abandon(buffer)?;
-        return Err(error);
+        return Err(Unsealed { error, buffer });
     }
-    Genome::seal(buffer, id, catalog, traits, None, limits).or_else(|unsealed| {
-        quota.abandon(unsealed.buffer)?;
-        Err(unsealed.error)
-    })
+    Genome::seal(buffer, id, catalog, traits, None, limits)
 }
 
 /// A founder's affinity direction, motion response and sensing scale.

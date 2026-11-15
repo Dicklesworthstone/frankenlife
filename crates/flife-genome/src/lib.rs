@@ -36,7 +36,7 @@ pub mod transition;
 
 pub use arena::GenomeArena;
 pub use catalog::{DENSE_104_36_CATALOG_V1, DENSE_104_36_MEMBERS, TopologyCatalog, TopologyId};
-pub use founder::{founder, founder_traits, initial_scale};
+pub use founder::{founder, founder_topology, founder_traits, grow_founder, initial_scale};
 pub use genome::{
     AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, SharedParameters, TraitLimits, Traits, Unsealed,
 };

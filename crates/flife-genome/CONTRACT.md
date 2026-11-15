@@ -38,7 +38,10 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
   `ReferenceController`.
 - `initialize` fills founders' parameters. `fan_in_weight` gives one weight from a word.
 - `map_parameters` writes a child's parameters from a parent's and reports the `Transition` kind.
-- `founder` and `founder_traits` (FL-010): a founder's charged, sealed genome and its traits.
+- `founder` and `founder_traits` (FL-010): a founder's charged, sealed genome and its traits. FL-034 splits
+  `founder` at its allocation: `founder_topology` (the catalog's default member) and `grow_founder` (the weights
+  drawn into a buffer a quota allocated, sealed with the traits; an `Unsealed` with the buffer on failure), so a
+  world can allocate founders' buffers in identity order and grow them on several workers.
 - FL-043: `GenomeArena::allocated_bytes` (its buckets' capacities) and `GenomeArena::bound_bytes(topologies,
   live)`, the most it holds for `live` genomes over at most `topologies` topologies: three slots' records for each
   genome in each topology, since a bucket grown by pushing holds at most twice its length and three times while it

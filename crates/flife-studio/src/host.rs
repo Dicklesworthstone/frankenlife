@@ -58,7 +58,7 @@ use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_engine::{Arrangement, CPU_REFERENCE, Followed, NumericalProfile, World};
+use flife_engine::{CPU_REFERENCE, Followed, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::{CommandBook, SessionClosed, SessionConfig};
@@ -432,12 +432,9 @@ impl Studio {
             Some(run) => Kept::New(Keeping::new(run.clone(), config)?),
             None => Kept::Not,
         };
+        // The founders are made on the session's workers (FL-034).
         Self::open_on(config, options, kept, || {
-            World::found(
-                config,
-                Arrangement::FreeList,
-                NumericalProfile::reference_f32()?,
-            )
+            flife_cli::found_on(config, options.cpu_workers)
         })
     }
 

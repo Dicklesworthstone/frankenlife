@@ -25,7 +25,7 @@ use flife_store::CommandJournal;
 use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
-use crate::found;
+use crate::found_on;
 use crate::memory::MemoryAdmission;
 use crate::persist::{CATALOG_FILE, Recovered, on_plain_thread, recover};
 use crate::run::{CheckpointAt, ControllerSummary, JournalMarks, SkippedCheckpoint, install};
@@ -202,7 +202,7 @@ pub fn render(
         video_encoder()?;
     }
     background(config)?;
-    let world = found(config)?;
+    let world = found_on(config, options.cpu_workers)?;
     draw(config, world, None, options, clock, emit)
 }
 

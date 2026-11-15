@@ -412,6 +412,26 @@ pub fn found(config: &ValidatedConfig) -> Result<World, CoreError> {
     )
 }
 
+/// [`found`], with the founders made on `cpu_workers` threads and the world
+/// then using them, if set ([`World::found_on`]): the same world.
+///
+/// # Errors
+/// [`World::found_on`]'s errors.
+pub fn found_on(
+    config: &ValidatedConfig,
+    cpu_workers: Option<NonZeroUsize>,
+) -> Result<World, CoreError> {
+    match cpu_workers {
+        Some(workers) => World::found_on(
+            config,
+            Arrangement::FreeList,
+            NumericalProfile::reference_f32()?,
+            workers,
+        ),
+        None => found(config),
+    }
+}
+
 /// The [`Record::Start`] for running `config` for `ticks`, declaring a
 /// metrics record every `metrics_every` ticks unless it is zero.
 #[must_use]
@@ -502,7 +522,7 @@ pub fn run_with(
             crate::checkpointing::admit(config, persistence.mode, persistence.retained_bytes)
         })
         .transpose()?;
-    let mut world = found(config)?;
+    let mut world = found_on(config, options.cpu_workers)?;
     let memory = configure(
         &mut world,
         options.cpu_workers,

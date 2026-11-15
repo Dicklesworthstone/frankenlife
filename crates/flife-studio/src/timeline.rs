@@ -33,9 +33,7 @@ use std::path::Path;
 
 use flife_core::ids::OrganismId;
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_engine::{
-    Arrangement, Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, Stepped, World,
-};
+use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS, Stepped, World};
 use flife_manim::{
     ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionEffect, RegionShape, Style,
     hex_rgb,
@@ -880,11 +878,7 @@ pub fn replay(
             }
             world
         }
-        None => World::found(
-            config,
-            Arrangement::FreeList,
-            NumericalProfile::reference_f32()?,
-        )?,
+        None => flife_cli::found_on(config, cpu_workers)?,
     };
     if let Some(workers) = cpu_workers {
         world.set_cpu_workers(workers)?;

@@ -48,7 +48,7 @@ use flife_engine::{Stepped, World};
 use serde::Serialize;
 
 use crate::experiment::Host;
-use crate::found;
+use crate::found_on;
 use crate::render::video_encoder;
 use crate::run::{ControllerSummary, configure};
 
@@ -325,10 +325,7 @@ fn run_route<T>(
     options: &CapabilitiesOptions,
     before: impl FnOnce(&World) -> T,
 ) -> Result<(T, Outcome), CoreError> {
-    let mut world = found(config)?;
-    if let Some(workers) = options.cpu_workers {
-        world.set_cpu_workers(workers)?;
-    }
+    let mut world = found_on(config, options.cpu_workers)?;
     let read = before(&world);
     let outcome = match configure(&mut world, None, choice, None) {
         Ok(_) => step(&mut world, options.ticks),

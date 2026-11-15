@@ -93,8 +93,8 @@ use flife_field::{
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
-    MutationRecord, Mutator, TopologyCatalog, TopologyId, TraitLimits, Traits, founder,
-    initial_scale,
+    MutationRecord, Mutator, ParameterBuffer, TopologyCatalog, TopologyId, TraitLimits, Traits,
+    founder_topology, founder_traits, grow_founder, initial_scale,
 };
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
@@ -864,6 +864,28 @@ impl World {
         arrangement: Arrangement,
         profile: NumericalProfile,
     ) -> Result<Self, CoreError> {
+        let workers = workers(config.config().execution.cpu_workers)?;
+        Self::found_on(config, arrangement, profile, workers)
+    }
+
+    /// [`World::found`] with the founders made on `workers` threads, the
+    /// world then using that many as [`World::set_cpu_workers`] leaves it
+    /// (FL-034: a hundred thousand founders take seconds on one). No result
+    /// depends on the count: identities and genome buffers are issued in
+    /// identity order on this thread, every other founder value is a
+    /// function of the world seed and the founder's stable identity
+    /// ([`flife_genome::founder()`]), the founders are admitted in identity
+    /// order, and the error returned is the first in identity order, as a
+    /// single thread would report it.
+    ///
+    /// # Errors
+    /// As [`World::found`], and [`World::set_cpu_workers`]'s.
+    pub fn found_on(
+        config: &ValidatedConfig,
+        arrangement: Arrangement,
+        profile: NumericalProfile,
+        workers: NonZeroUsize,
+    ) -> Result<Self, CoreError> {
         let rules = Rules::from_config(config, profile)?;
         let model = config.config();
         let limits = BufferLimits::host();
@@ -890,37 +912,13 @@ impl World {
                 bytes: u64::try_from(count.saturating_mul(size_of::<Entrant>()))
                     .unwrap_or(u64::MAX),
             })?;
-        let scale = initial_scale(config);
-        let cooldown_deadline = Tick::new(0).checked_add(config.report().cooldown_ticks)?;
-        for _ in 0..count {
-            let id = identities.organisms.issue()?;
-            let genome_id = identities.genomes.issue()?;
-            let genome = founder(
-                &rules.rng,
-                id,
-                genome_id,
-                &rules.catalog,
-                &mut quota,
-                &rules.limits,
-                scale,
-            )?;
-            let organism = Organism {
-                id,
-                genome: genome_id,
-                parent: None,
-                lineage: LineageId::new(id.get()),
-                generation: Generation::FOUNDER,
-                birth_tick: Tick::new(0),
-                position: founder_position(&rules.rng, &rules.grid, id)?,
-                velocity: [0.0, 0.0],
-                energy: model.population.initial_energy,
-                energy_change_rate: 0.0,
-                held: HeldOutput::INVALID,
-                phase: stable_phase(id, rules.interval)?,
-                cooldown_deadline,
-            };
-            entrants.push(Entrant { organism, genome });
-        }
+        let founding = Founding {
+            scale: initial_scale(config),
+            energy: model.population.initial_energy,
+            cooldown_deadline: Tick::new(0).checked_add(config.report().cooldown_ticks)?,
+        };
+        let seeds = seeds(&rules, &mut identities, &mut quota, count)?;
+        grow_founders(&rules, &founding, seeds, workers, &mut entrants)?;
         population.admit(&mut entrants)?;
 
         let sources = initial_sources(config, &rules)?;
@@ -940,7 +938,7 @@ impl World {
         let holdings = Holdings::new(field.current().energy_total(), organism_total(&population))?;
         let ledger = EnergyLedger::new(holdings, profile.residual);
         let scratch = Scratch::new(config, &rules, sources.len())?;
-        Ok(Self {
+        let mut world = Self {
             config: config.clone(),
             rules,
             tick: Tick::new(0),
@@ -963,7 +961,11 @@ impl World {
             watch: Watch::default(),
             ancestry: None,
             restored: 0,
-        })
+        };
+        if world.cpu_workers() != workers.get() {
+            world.set_cpu_workers(workers)?;
+        }
+        Ok(world)
     }
 
     /// The committed tick.
@@ -2426,6 +2428,181 @@ impl Scratch {
             deaths: reserved(rows, "deaths")?,
         })
     }
+}
+
+/// What every founder shares: the initial sensing scale and energy and the
+/// cooldown deadline.
+struct Founding {
+    scale: f64,
+    energy: f64,
+    cooldown_deadline: Tick,
+}
+
+/// One founder before its genome grows ([`seeds`]).
+enum Seed {
+    /// Its identities and the quota's buffer for its genome.
+    Ready {
+        organism: OrganismId,
+        genome: GenomeId,
+        buffer: ParameterBuffer,
+    },
+    /// An identity could not be issued: the founder fails before it draws
+    /// anything.
+    Unissued(CoreError),
+    /// The catalog has no default topology or the quota refused the buffer:
+    /// the founder fails after drawing its traits, as
+    /// [`flife_genome::founder()`] does.
+    Unallocated {
+        organism: OrganismId,
+        error: CoreError,
+    },
+}
+
+/// `count` founders' identities and genome buffers, issued from
+/// `identities` and `quota` in identity order on this thread, as
+/// [`flife_genome::founder()`] would one by one. The first founder that
+/// cannot be issued ends the list.
+///
+/// # Errors
+/// [`CoreError::AllocationFailed`] if the list cannot be reserved.
+fn seeds(
+    rules: &Rules,
+    identities: &mut Identities,
+    quota: &mut GenomeQuota,
+    count: usize,
+) -> Result<Vec<Seed>, CoreError> {
+    let member = founder_topology(&rules.catalog);
+    let mut seeds = reserved(count, "founder buffers")?;
+    for _ in 0..count {
+        let issued = identities
+            .organisms
+            .issue()
+            .and_then(|organism| identities.genomes.issue().map(|genome| (organism, genome)));
+        let (organism, genome) = match issued {
+            Ok(issued) => issued,
+            Err(error) => {
+                seeds.push(Seed::Unissued(error));
+                break;
+            }
+        };
+        match member
+            .clone()
+            .and_then(|member| quota.allocate(&rules.catalog, member))
+        {
+            Ok(buffer) => seeds.push(Seed::Ready {
+                organism,
+                genome,
+                buffer,
+            }),
+            Err(error) => {
+                seeds.push(Seed::Unallocated { organism, error });
+                break;
+            }
+        }
+    }
+    Ok(seeds)
+}
+
+/// Grow `seeds` into founders ([`grown`]) on at most `workers` threads,
+/// appending them to `entrants` in identity order: this thread and scoped
+/// workers it joins before returning, each over a contiguous
+/// identity-ordered run, with no more runs than workers or started groups
+/// of [`MINIMUM_ROWS_PER_LANE`] seeds (plan §3.4's bounded reference
+/// adapter, split as [`in_runs`] splits rows). A run stops at its first
+/// failure, and the error returned is the first in identity order. A
+/// founding that fails drops its buffers with its quota.
+fn grow_founders(
+    rules: &Rules,
+    founding: &Founding,
+    mut seeds: Vec<Seed>,
+    workers: NonZeroUsize,
+    entrants: &mut Vec<Entrant>,
+) -> Result<(), CoreError> {
+    let used = workers
+        .get()
+        .min(seeds.len().div_ceil(MINIMUM_ROWS_PER_LANE))
+        .max(1);
+    let length = seeds.len().div_ceil(used).max(1);
+    let mut runs = reserved(used, "founder runs")?;
+    while seeds.len() > length {
+        let last = (seeds.len() - 1) / length * length;
+        let mut run = reserved(seeds.len() - last, "founder buffers")?;
+        run.extend(seeds.drain(last..));
+        runs.push(run);
+    }
+    runs.push(seeds);
+    runs.reverse();
+    let grow = |run: Vec<Seed>| -> Result<Vec<Entrant>, CoreError> {
+        let mut founders = reserved(run.len(), "founders")?;
+        for seed in run {
+            founders.push(grown(rules, founding, seed)?);
+        }
+        Ok(founders)
+    };
+    let grow = &grow;
+    let mut runs = runs.into_iter();
+    let head = runs.next().unwrap_or_default();
+    std::thread::scope(|scope| {
+        let others: Vec<_> = runs.map(|run| scope.spawn(move || grow(run))).collect();
+        let mut result = grow(head).map(|founders| entrants.extend(founders));
+        for other in others {
+            let joined = other.join().unwrap_or_else(|_| {
+                Err(CoreError::StateConflict {
+                    operation: "found",
+                    detail: "a founding worker panicked".to_owned(),
+                })
+            });
+            if result.is_ok() {
+                result = joined.map(|founders| entrants.extend(founders));
+            }
+        }
+        result
+    })
+}
+
+/// `seed` grown into a founder: [`flife_genome::founder()`]'s traits and
+/// genome in the seed's buffer, then the organism at its seeded position
+/// and stable phase, failing where a single thread would.
+fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, CoreError> {
+    let (id, genome_id, buffer) = match seed {
+        Seed::Ready {
+            organism,
+            genome,
+            buffer,
+        } => (organism, genome, buffer),
+        Seed::Unissued(error) => return Err(error),
+        Seed::Unallocated { organism, error } => {
+            founder_traits(&rules.rng, organism, &rules.limits, founding.scale)?;
+            return Err(error);
+        }
+    };
+    let traits = founder_traits(&rules.rng, id, &rules.limits, founding.scale)?;
+    let genome = grow_founder(
+        &rules.rng,
+        id,
+        genome_id,
+        &rules.catalog,
+        buffer,
+        traits,
+        &rules.limits,
+    )
+    .map_err(|unsealed| unsealed.error)?;
+    let organism = Organism {
+        id,
+        genome: genome_id,
+        parent: None,
+        lineage: LineageId::new(id.get()),
+        generation: Generation::FOUNDER,
+        birth_tick: Tick::new(0),
+        position: founder_position(&rules.rng, &rules.grid, id)?,
+        velocity: [0.0, 0.0],
+        energy: founding.energy,
+        energy_change_rate: 0.0,
+        held: HeldOutput::INVALID,
+        phase: stable_phase(id, rules.interval)?,
+        cooldown_deadline: founding.cooldown_deadline,
+    };
+    Ok(Entrant { organism, genome })
 }
 
 fn organism_total(population: &Population) -> f64 {

@@ -73,7 +73,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use flife_core::checkpoint::{
-    CheckpointManifest, CheckpointReader, MANIFEST_MAX_BYTES, MODEL_MAX_BYTES, ManifestEntry,
+    CheckpointManifest, CheckpointReader, ChunkFamily, MANIFEST_MAX_BYTES, MODEL_MAX_BYTES,
+    ManifestEntry,
 };
 use flife_core::{CoreError, Sha256Digest, Sha256Stream};
 
@@ -1016,11 +1017,47 @@ impl ChunkStore {
     /// chunk's length is checked before anything is allocated for it);
     /// [`CoreError::StorageFailed`] if the host refuses a read.
     pub fn load(&self, sequence: u64) -> Result<Vec<u8>, CoreError> {
+        self.assemble(sequence, None).map(|(bytes, _)| bytes)
+    }
+
+    /// Checkpoint `sequence` as [`ChunkStore::load`] reassembles it, but
+    /// for `streamed`'s chunk, which stays in the store: the sealed prefix
+    /// and every other chunk in manifest order, each verified, and that
+    /// chunk's file opened to be read once, at its declared length (`None`
+    /// if the manifest names no such chunk). Together they are what
+    /// [`CheckpointReader::parse_streamed`]
+    /// reads, which verifies the chunk as it is streamed, so a restore never
+    /// holds it whole (FL-043).
+    ///
+    /// # Errors
+    /// As [`ChunkStore::load`] for the held chunks; the streamed chunk's
+    /// file is checked for its declared length, and opened.
+    pub fn load_streaming(
+        &self,
+        sequence: u64,
+        streamed: ChunkFamily,
+    ) -> Result<(Vec<u8>, Option<io::Take<File>>), CoreError> {
+        self.assemble(sequence, Some(streamed))
+    }
+
+    /// [`ChunkStore::load`] without `streamed`'s chunk, which is opened
+    /// instead.
+    fn assemble(
+        &self,
+        sequence: u64,
+        streamed: Option<ChunkFamily>,
+    ) -> Result<(Vec<u8>, Option<io::Take<File>>), CoreError> {
         let prefix = self.sealed_prefix(sequence)?;
         let manifest = CheckpointManifest::parse(&prefix)?;
+        let left = manifest
+            .entries()
+            .iter()
+            .filter(|entry| Some(entry.family) == streamed)
+            .map(|entry| entry.length)
+            .sum::<u64>();
         let total = u64::try_from(prefix.len())
             .ok()
-            .and_then(|sealed| sealed.checked_add(manifest.payload_length()))
+            .and_then(|sealed| sealed.checked_add(manifest.payload_length().saturating_sub(left)))
             .and_then(|total| usize::try_from(total).ok())
             .ok_or_else(|| refuse(format!("checkpoint {sequence} is too large for this host")))?;
         let mut bytes = Vec::new();
@@ -1031,8 +1068,17 @@ impl ChunkStore {
                 bytes: u64::try_from(total).unwrap_or(u64::MAX),
             })?;
         bytes.extend_from_slice(&prefix);
+        let mut source = None;
         for entry in manifest.entries() {
             let chunk = self.chunk_path(&entry.digest);
+            if Some(entry.family) == streamed {
+                source = Some(
+                    File::open(&chunk)
+                        .map_err(|error| storage("open chunk", &chunk, &error))?
+                        .take(entry.length),
+                );
+                continue;
+            }
             let start = bytes.len();
             File::open(&chunk)
                 .and_then(|file| file.take(entry.length).read_to_end(&mut bytes))
@@ -1048,7 +1094,7 @@ impl ChunkStore {
                 )));
             }
         }
-        Ok(bytes)
+        Ok((bytes, source))
     }
 
     /// Verify checkpoint `sequence` as [`ChunkStore::load`] does, without
@@ -1138,12 +1184,38 @@ impl ChunkStore {
         &self,
         mut accept: impl FnMut(u64, &[u8]) -> Result<T, CoreError>,
     ) -> Result<Recovered<T>, CoreError> {
+        self.newest(|sequence| {
+            self.load(sequence)
+                .and_then(|bytes| accept(sequence, &bytes))
+        })
+    }
+
+    /// [`ChunkStore::latest_valid`] over [`ChunkStore::load_streaming`]:
+    /// `accept` is given each checkpoint without `streamed`'s chunk, and
+    /// that chunk's opened file.
+    ///
+    /// # Errors
+    /// As [`ChunkStore::latest_valid`].
+    pub fn latest_valid_streaming<T>(
+        &self,
+        streamed: ChunkFamily,
+        mut accept: impl FnMut(u64, &[u8], Option<io::Take<File>>) -> Result<T, CoreError>,
+    ) -> Result<Recovered<T>, CoreError> {
+        self.newest(|sequence| {
+            self.load_streaming(sequence, streamed)
+                .and_then(|(held, source)| accept(sequence, &held, source))
+        })
+    }
+
+    /// The newest checkpoint for which `attempt` succeeds, with the reason
+    /// each newer one was passed over.
+    fn newest<T>(
+        &self,
+        mut attempt: impl FnMut(u64) -> Result<T, CoreError>,
+    ) -> Result<Recovered<T>, CoreError> {
         let mut skipped = Vec::new();
         for sequence in self.sequences()?.into_iter().rev() {
-            match self
-                .load(sequence)
-                .and_then(|bytes| accept(sequence, &bytes))
-            {
+            match attempt(sequence) {
                 Ok(value) => {
                     return Ok(Recovered {
                         latest: Some((sequence, value)),

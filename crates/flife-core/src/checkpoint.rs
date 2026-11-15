@@ -25,7 +25,9 @@
 //! are equal and its hash is also its content identity, so no codec can
 //! change a genome's meaning.
 
+use std::cell::Cell;
 use std::fmt;
+use std::io::Read;
 
 use crate::canonical::{Sha256Digest, Sha256Stream};
 use crate::error::CoreError;
@@ -655,18 +657,133 @@ struct Entry {
     items: u64,
     start: usize,
     end: usize,
+    /// Read through the reader's source, not held: its bounds are empty.
+    streamed: bool,
 }
 
-/// A parsed checkpoint whose structure and hashes were verified.
-#[derive(Debug, Clone)]
+/// A parsed checkpoint whose structure and hashes were verified: held whole
+/// ([`CheckpointReader::parse`]), or held but for one chunk that is read
+/// from a source a window at a time ([`CheckpointReader::parse_streamed`]).
 pub struct CheckpointReader<'a> {
     model: &'a str,
     entries: Vec<Entry>,
     payload: &'a [u8],
-    length: u64,
+    held: u64,
+    /// The streamed chunk's manifest entry and its source, until it is
+    /// streamed.
+    streamed: Option<ManifestEntry>,
+    source: Cell<Option<Box<dyn Read + 'a>>>,
+}
+
+impl fmt::Debug for CheckpointReader<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointReader")
+            .field("model", &self.model)
+            .field("entries", &self.entries)
+            .field("held", &self.held)
+            .field("streamed", &self.streamed.map(|entry| entry.family))
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> CheckpointReader<'a> {
+    /// Verify `held` (see the [module documentation](self)) but for the
+    /// chunk of family `streamed`: the sealed prefix, then every other chunk
+    /// in manifest order, without that one's bytes. Those are read from
+    /// `source` when it is streamed ([`CheckpointReader::stream`]), hashed as
+    /// they are read and checked against the manifest at the stream's end.
+    /// So a restore holds the world it builds, the other chunks and one
+    /// window of that chunk, not the whole container (FL-043): the genome
+    /// chunk, nearly all of a world's checkpoint, is the one to stream.
+    /// Require every family in `required`.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] naming the first defect in the
+    /// prefix or a held chunk, as [`CheckpointReader::parse`]; and for a
+    /// streamed chunk the manifest names but `source` does not give.
+    pub fn parse_streamed(
+        held: &'a [u8],
+        required: &[ChunkFamily],
+        streamed: ChunkFamily,
+        source: Option<Box<dyn Read + 'a>>,
+    ) -> Result<Self, CoreError> {
+        let manifest = CheckpointManifest::parse(held)?;
+        let payload = &held[manifest.sealed..];
+        let available = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+        let mut entries = Vec::with_capacity(manifest.entries.len());
+        let mut kept = None;
+        let mut at = 0_u64;
+        for entry in &manifest.entries {
+            if entry.family == streamed {
+                kept = Some(*entry);
+                entries.push(Entry {
+                    family: entry.family,
+                    version: entry.version,
+                    items: entry.items,
+                    start: 0,
+                    end: 0,
+                    streamed: true,
+                });
+                continue;
+            }
+            let end = at
+                .checked_add(entry.length)
+                .filter(|end| *end <= available)
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "chunk {} runs past the held payload's {} bytes",
+                        entry.family.name(),
+                        payload.len()
+                    ))
+                })?;
+            let (start, end_at) = (
+                usize::try_from(at).unwrap_or(usize::MAX),
+                usize::try_from(end).unwrap_or(usize::MAX),
+            );
+            if Sha256Digest::of(&payload[start..end_at]) != entry.digest {
+                return Err(refuse(format!(
+                    "chunk {} hash mismatch",
+                    entry.family.name()
+                )));
+            }
+            entries.push(Entry {
+                family: entry.family,
+                version: entry.version,
+                items: entry.items,
+                start,
+                end: end_at,
+                streamed: false,
+            });
+            at = end;
+        }
+        if at != available {
+            return Err(refuse(format!(
+                "{} held payload bytes, the held chunks cover {at}",
+                payload.len()
+            )));
+        }
+        if let Some(missing) = required
+            .iter()
+            .find(|family| !entries.iter().any(|entry| entry.family == **family))
+        {
+            return Err(refuse(format!("missing chunk {}", missing.name())));
+        }
+        if kept.is_some() && source.is_none() {
+            return Err(refuse(format!(
+                "chunk {} has no source to stream from",
+                streamed.name()
+            )));
+        }
+        Ok(Self {
+            model: manifest.model,
+            entries,
+            payload,
+            held: u64::try_from(held.len()).unwrap_or(u64::MAX),
+            streamed: kept,
+            source: Cell::new(source),
+        })
+    }
+
     /// Verify `bytes` (see the [module documentation](self)) and require
     /// every family in `required`.
     ///
@@ -705,6 +822,7 @@ impl<'a> CheckpointReader<'a> {
                 items: entry.items,
                 start,
                 end,
+                streamed: false,
             });
         }
         let expected = manifest.payload_length();
@@ -724,7 +842,9 @@ impl<'a> CheckpointReader<'a> {
             model: manifest.model,
             entries,
             payload,
-            length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            held: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            streamed: None,
+            source: Cell::new(None),
         })
     }
 
@@ -734,11 +854,13 @@ impl<'a> CheckpointReader<'a> {
         self.model
     }
 
-    /// The container's length: the sealed prefix and the payload, the bytes
-    /// a restore holds while it reads them.
+    /// The bytes the reader was given to hold while it is read: the whole
+    /// container for [`CheckpointReader::parse`]; the container without its
+    /// streamed chunk for [`CheckpointReader::parse_streamed`], whose stream
+    /// holds one window more ([`ChunkStream::held_bytes`]).
     #[must_use]
-    pub const fn container_length(&self) -> u64 {
-        self.length
+    pub const fn held_bytes(&self) -> u64 {
+        self.held
     }
 
     /// The families present, in order.
@@ -749,17 +871,72 @@ impl<'a> CheckpointReader<'a> {
     /// `family`'s chunk.
     ///
     /// # Errors
-    /// [`CoreError::IncompatibleCheckpoint`] if it is absent.
+    /// [`CoreError::IncompatibleCheckpoint`] if it is absent, or it is the
+    /// streamed chunk, which only [`CheckpointReader::stream`] reads.
     pub fn chunk(&self, family: ChunkFamily) -> Result<Chunk<'a>, CoreError> {
-        self.entries
+        let entry = self
+            .entries
             .iter()
             .find(|entry| entry.family == family)
-            .map(|entry| Chunk {
-                version: entry.version,
-                items: entry.items,
-                bytes: &self.payload[entry.start..entry.end],
-            })
-            .ok_or_else(|| refuse(format!("missing chunk {}", family.name())))
+            .ok_or_else(|| refuse(format!("missing chunk {}", family.name())))?;
+        if entry.streamed {
+            return Err(refuse(format!(
+                "chunk {} is streamed, not held",
+                family.name()
+            )));
+        }
+        Ok(Chunk {
+            version: entry.version,
+            items: entry.items,
+            bytes: &self.payload[entry.start..entry.end],
+        })
+    }
+
+    /// `family`'s chunk at schema `version`, as a stream: the streamed
+    /// chunk's source, once, or a held chunk's bytes.
+    ///
+    /// # Errors
+    /// As [`CheckpointReader::versioned`] for a held chunk; for the streamed
+    /// chunk, [`CoreError::IncompatibleCheckpoint`] for another version or a
+    /// second stream.
+    pub fn stream(&self, family: ChunkFamily, version: u16) -> Result<ChunkStream<'a>, CoreError> {
+        let Some(entry) = self.streamed.filter(|entry| entry.family == family) else {
+            let chunk = self.versioned(family, version)?;
+            return Ok(ChunkStream {
+                what: family.name(),
+                version: chunk.version,
+                items: chunk.items,
+                source: StreamSource::Held {
+                    bytes: chunk.bytes,
+                    at: 0,
+                },
+            });
+        };
+        if entry.version != version {
+            return Err(refuse(format!(
+                "chunk {} is version {}; this build reads {version}",
+                family.name(),
+                entry.version
+            )));
+        }
+        let read = self
+            .source
+            .take()
+            .ok_or_else(|| refuse(format!("chunk {} was streamed already", family.name())))?;
+        Ok(ChunkStream {
+            what: family.name(),
+            version: entry.version,
+            items: entry.items,
+            source: StreamSource::Read {
+                read,
+                length: entry.length,
+                digest: entry.digest,
+                sha256: Sha256Stream::new(),
+                taken: 0,
+                buffer: Vec::new(),
+                start: 0,
+            },
+        })
     }
 
     /// `family`'s chunk, which must be at schema `version`.
@@ -776,6 +953,254 @@ impl<'a> CheckpointReader<'a> {
             )));
         }
         Ok(chunk)
+    }
+}
+
+/// One chunk read a window at a time ([`CheckpointReader::stream`]). A held
+/// chunk's window is all of its unread bytes. A streamed chunk's window is
+/// what [`ChunkStream::fill`] read from its source into one buffer, reused
+/// from record to record; every byte read is hashed, and
+/// [`ChunkStream::finish`] checks the digest against the manifest. Bytes
+/// decoded before then are not yet verified, so a decode from them is kept
+/// only if the stream finishes.
+pub struct ChunkStream<'a> {
+    what: &'static str,
+    version: u16,
+    items: u64,
+    source: StreamSource<'a>,
+}
+
+enum StreamSource<'a> {
+    Held {
+        bytes: &'a [u8],
+        at: usize,
+    },
+    Read {
+        read: Box<dyn Read + 'a>,
+        length: u64,
+        digest: Sha256Digest,
+        sha256: Sha256Stream,
+        /// Bytes read from `read`.
+        taken: u64,
+        /// The window is `buffer[start..]`.
+        buffer: Vec<u8>,
+        start: usize,
+    },
+}
+
+impl fmt::Debug for ChunkStream<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChunkStream")
+            .field("chunk", &self.what)
+            .field("version", &self.version)
+            .field("items", &self.items)
+            .field("remaining", &self.remaining())
+            .field("held", &self.held_bytes())
+            .finish()
+    }
+}
+
+impl ChunkStream<'_> {
+    /// The chunk's schema version.
+    #[must_use]
+    pub const fn version(&self) -> u16 {
+        self.version
+    }
+
+    /// The chunk's logical item count, from its manifest entry.
+    #[must_use]
+    pub const fn items(&self) -> u64 {
+        self.items
+    }
+
+    /// The bytes read and not yet consumed.
+    #[must_use]
+    pub fn window(&self) -> &[u8] {
+        match &self.source {
+            StreamSource::Held { bytes, at } => &bytes[*at..],
+            StreamSource::Read { buffer, start, .. } => &buffer[*start..],
+        }
+    }
+
+    /// The chunk's bytes not yet consumed: the window's and those still in
+    /// the source.
+    #[must_use]
+    pub fn remaining(&self) -> u64 {
+        match &self.source {
+            StreamSource::Held { bytes, at } => u64::try_from(bytes.len() - at).unwrap_or(u64::MAX),
+            StreamSource::Read {
+                length,
+                taken,
+                buffer,
+                start,
+                ..
+            } => u64::try_from(buffer.len() - start)
+                .unwrap_or(u64::MAX)
+                .saturating_add(length.saturating_sub(*taken)),
+        }
+    }
+
+    /// The heap the stream holds: its buffer's allocation, or nothing for a
+    /// held chunk, whose bytes the reader holds.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        match &self.source {
+            StreamSource::Held { .. } => 0,
+            StreamSource::Read { buffer, .. } => crate::memory::capacity_bytes(buffer),
+        }
+    }
+
+    /// Read until the window holds `at_least` bytes, or all that remain.
+    /// The buffer is grown to the larger of `at_least` and
+    /// [`CHECKPOINT_PAGE_BYTES`], no more than the chunk holds, and only
+    /// when the window would not fit it.
+    ///
+    /// # Errors
+    /// [`CoreError::StorageFailed`] if the source fails,
+    /// [`CoreError::IncompatibleCheckpoint`] if it ends before the chunk's
+    /// length, and [`CoreError::AllocationFailed`] if the buffer cannot
+    /// grow.
+    pub fn fill(&mut self, at_least: usize) -> Result<(), CoreError> {
+        let remaining = self.remaining();
+        let what = self.what;
+        let StreamSource::Read {
+            read,
+            length,
+            digest,
+            sha256,
+            taken,
+            buffer,
+            start,
+        } = &mut self.source
+        else {
+            return Ok(());
+        };
+        let want = at_least.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if buffer.len() - *start >= want {
+            return Ok(());
+        }
+        buffer.copy_within(*start.., 0);
+        buffer.truncate(buffer.len() - *start);
+        *start = 0;
+        if buffer.capacity() < want {
+            let capacity = want
+                .max(CHECKPOINT_PAGE_BYTES)
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            buffer
+                .try_reserve_exact(capacity - buffer.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "checkpoint chunk window",
+                    bytes: u64::try_from(capacity).unwrap_or(u64::MAX),
+                })?;
+        }
+        // The buffer's room, up to the chunk's end, is zeroed once a fill,
+        // however many reads fill it, and never read past.
+        let mut filled = buffer.len();
+        let room = (buffer.capacity() - filled)
+            .min(usize::try_from(length.saturating_sub(*taken)).unwrap_or(usize::MAX));
+        buffer.resize(filled + room, 0);
+        let outcome = loop {
+            if filled >= want {
+                break Ok(());
+            }
+            match read.read(&mut buffer[filled..]) {
+                Ok(0) => {
+                    break Err(refuse(format!(
+                        "chunk {what} ends after {taken} of its {length} bytes"
+                    )));
+                }
+                Ok(got) => {
+                    let got = got.min(buffer.len() - filled);
+                    sha256.update(&buffer[filled..filled + got]);
+                    filled += got;
+                    *taken += u64::try_from(got).unwrap_or(u64::MAX);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    break Err(CoreError::StorageFailed {
+                        operation: "read chunk",
+                        path: format!("{what} chunk {digest}"),
+                        reason: error.to_string(),
+                    });
+                }
+            }
+        };
+        buffer.truncate(filled);
+        outcome
+    }
+
+    /// Consume `used` bytes of the window (at most all of it).
+    pub fn advance(&mut self, used: usize) {
+        match &mut self.source {
+            StreamSource::Held { bytes, at } => *at = at.saturating_add(used).min(bytes.len()),
+            StreamSource::Read { buffer, start, .. } => {
+                *start = start.saturating_add(used).min(buffer.len());
+            }
+        }
+    }
+
+    /// The next little-endian `u64`.
+    ///
+    /// # Errors
+    /// As [`ChunkStream::fill`], and [`CoreError::IncompatibleCheckpoint`]
+    /// if fewer than eight bytes remain.
+    pub fn u64(&mut self) -> Result<u64, CoreError> {
+        self.fill(8)?;
+        let mut input = ByteReader::new(self.window(), self.what);
+        let value = input.u64()?;
+        self.advance(8);
+        Ok(value)
+    }
+
+    /// A `u64` count of items of at least `width` bytes each, checked
+    /// against `maximum` and against the chunk's remaining bytes, as
+    /// [`ByteReader::count`].
+    ///
+    /// # Errors
+    /// As [`ChunkStream::u64`], and [`CoreError::IncompatibleCheckpoint`]
+    /// for a count above `maximum` or one the remaining bytes cannot hold.
+    pub fn count(&mut self, maximum: usize, width: usize) -> Result<usize, CoreError> {
+        let declared = self.u64()?;
+        let count = usize::try_from(declared)
+            .ok()
+            .filter(|count| *count <= maximum)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "chunk {} declares {declared} items, at most {maximum} allowed",
+                    self.what
+                ))
+            })?;
+        let needed = u64::try_from(count.saturating_mul(width)).unwrap_or(u64::MAX);
+        if needed > self.remaining() {
+            return Err(refuse(format!(
+                "chunk {} declares {count} items of {width} bytes, {} bytes remain",
+                self.what,
+                self.remaining()
+            )));
+        }
+        Ok(count)
+    }
+
+    /// Require that every byte was read and, for a streamed chunk, that
+    /// what was read is the chunk the manifest names.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] for unread bytes or a hash
+    /// mismatch.
+    pub fn finish(self) -> Result<(), CoreError> {
+        let unread = self.remaining();
+        if unread != 0 {
+            return Err(refuse(format!(
+                "chunk {} has {unread} unread bytes",
+                self.what
+            )));
+        }
+        if let StreamSource::Read { digest, sha256, .. } = self.source
+            && sha256.finish() != digest
+        {
+            return Err(refuse(format!("chunk {} hash mismatch", self.what)));
+        }
+        Ok(())
     }
 }
 

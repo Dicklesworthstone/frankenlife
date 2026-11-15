@@ -451,6 +451,7 @@ pub fn read_package(dir: &Path, profile: NumericalProfile) -> Result<(Package, W
     }
     let reader = CheckpointReader::parse(&bytes, &WORLD_CHECKPOINT_CHUNKS)?;
     let world = World::read_checkpoint(&reader, profile)?;
+    drop(reader);
     drop(bytes);
     let holdings = world.ledger().holdings();
     let disk = package.crop.disk();

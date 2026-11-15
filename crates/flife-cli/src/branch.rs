@@ -36,6 +36,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flife_core::canonical::Sha256Digest;
+use flife_core::checkpoint::ChunkFamily;
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, Tick};
 use flife_engine::NumericalProfile;
@@ -167,14 +168,17 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
     let (parent_session, _) = run_identity(parent, revision)?;
     let profile = NumericalProfile::reference_f32()?;
     let donor = ChunkStore::open(parent.join(STORE_DIR), options.durability)?;
-    let recovered = donor.latest_valid(|_, bytes| {
-        let restored = restorable(bytes, profile, revision, parent_session)?;
-        let tick = restored.world.tick().get();
-        if options.at.is_some_and(|at| at != tick) {
-            return Err(conflict(format!("it holds tick {tick}")));
-        }
-        Ok((restored, Sha256Digest::of(bytes)))
-    })?;
+    // The genome chunk is streamed, never held whole; the container's
+    // digest is the store's, hashed from its files a buffer at a time.
+    let recovered =
+        donor.latest_valid_streaming(ChunkFamily::Genomes, |sequence, held, genomes| {
+            let restored = restorable(held, genomes, profile, revision, parent_session)?;
+            let tick = restored.world.tick().get();
+            if options.at.is_some_and(|at| at != tick) {
+                return Err(conflict(format!("it holds tick {tick}")));
+            }
+            Ok((restored, donor.verify(sequence)?))
+        })?;
     let Some((sequence, (restored, digest))) = recovered.latest else {
         return Err(conflict(format!(
             "{} holds no checkpoint that restores{}",

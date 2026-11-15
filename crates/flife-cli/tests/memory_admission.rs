@@ -20,6 +20,11 @@
 //! - A package streams its container: it holds no more heap than cropping
 //!   its disk does, and one stream's fixed bytes; the file is the crop's
 //!   checkpoint encoded whole.
+//! - A restore streams its genome chunk: it holds the world it builds, the
+//!   rest of the checkpoint, one window and its temporaries, not the
+//!   container. A resume admits what its restore held as a phase of its
+//!   own, below the run's on the preset, so a budget of the run's phase
+//!   admits it.
 
 #![allow(
     clippy::expect_used,
@@ -42,9 +47,10 @@ use flife_cli::{
     configure, encoding_bytes, found, read_package, render, restore_checkpoint, resume, run_with,
     transplant, write_package,
 };
-use flife_core::checkpoint::CheckpointWriter;
+use flife_core::checkpoint::{CHECKPOINT_PAGE_BYTES, CheckpointWriter, ChunkFamily};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_engine::{Intervention, NumericalProfile, Stepped};
+use flife_store::ChunkStore;
 use peak_alloc::PeakAlloc;
 use serde_json::Value;
 
@@ -375,6 +381,15 @@ fn a_full_population_holds_no_more_heap_than_its_terms() {
 /// at 1 MiB; 0.39 MiB was measured for the package below.
 const RESTORE_ALLOWANCE: u64 = 1 << 20;
 
+/// What a restore holds for a moment for each organism it restores: its
+/// entries in the genome and entrant lists, and the population built from
+/// them. Like [`RESTORE_ALLOWANCE`], the reserve's. Declared here at 640
+/// bytes: fitted to two restores (the preset's 4,096 organisms at tick 8,
+/// 2.23 MiB beyond the world and what was held of the checkpoint, and the
+/// package's 469, 0.37 MiB), it is about 538 bytes an organism and
+/// 0.13 MiB besides.
+const RESTORED_ORGANISM_BYTES: u64 = 640;
+
 /// A transplant's package term (FL-042): its restored world and the
 /// container it was restored from. The preset's world, 8 ticks on, cropped
 /// to a disk of radius 24 about its centre and written as a package, is
@@ -510,11 +525,13 @@ fn preset_run() -> (PathBuf, u64) {
 
 /// A branch (FL-039) streams its founding checkpoint (FL-043): from opening
 /// the parent to its record, it holds no more heap than restoring the
-/// parent's checkpoint does (the restored world and the container it was
-/// restored from) and one stream's fixed bytes. Encoded whole, the founding
-/// checkpoint held a second container beside the world, and its encoder's
-/// genome chunk buffer grown by doubling: 696.7 MiB against a restore of
-/// 438.6 MiB. The parent's chunks are still linked, not copied.
+/// parent's checkpoint does (the restored world, and what the restore held
+/// of the checkpoint: all but its streamed genome chunk, and one window)
+/// and one stream's fixed bytes. Encoded whole, the founding checkpoint held
+/// a second container beside the world, and its encoder's genome chunk
+/// buffer grown by doubling: 696.7 MiB against a restore, which then held
+/// its container whole, of 438.6 MiB. The parent's chunks are still linked,
+/// not copied.
 #[test]
 fn a_branch_holds_no_more_heap_than_its_restore() {
     let _serial = serial();
@@ -524,7 +541,7 @@ fn a_branch_holds_no_more_heap_than_its_restore() {
     ALLOC.reset_peak_usage();
     let world = restore_checkpoint(&run_dir, &config, sequence).expect("restores");
     let restoring = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
-    let held = world.held_bytes();
+    let (held, restored) = (world.held_bytes(), world.restored_bytes());
     drop(world);
 
     let out = fresh("branched");
@@ -546,10 +563,11 @@ fn a_branch_holds_no_more_heap_than_its_restore() {
         panic!("a branch record");
     };
     println!(
-        "a restore held {:.2} MiB at its peak (the world {:.2}, its container {:.2}); a branch \
-         {:.2} MiB, {} chunks linked and {} written",
+        "a restore held {:.2} MiB at its peak (the world {:.2}, {:.2} of its {:.2} MiB \
+         container); a branch {:.2} MiB, {} chunks linked and {} written",
         mib(restoring),
         mib(held),
+        mib(restored),
         mib(bytes),
         mib(branching),
         chunks.linked,
@@ -636,10 +654,6 @@ struct Resumed {
     run_dir: PathBuf,
     /// The resume's records, or its refusal.
     outcome: Result<Vec<Value>, CoreError>,
-    /// The records it emitted either way.
-    records: Vec<Value>,
-    /// The store's files before the resume.
-    stored: Vec<(PathBuf, u64)>,
 }
 
 /// The preset's run under `config` to tick 8, checkpointed at 0 and 8 with
@@ -658,7 +672,6 @@ fn resumed(config: &ValidatedConfig, name: &str) -> Resumed {
         |_| {},
     )
     .expect("the run ends");
-    let stored = files(&run_dir.join(flife_cli::STORE_DIR));
     let held = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&held);
     let resumed = resume(
@@ -683,43 +696,37 @@ fn resumed(config: &ValidatedConfig, name: &str) -> Resumed {
     let records = held.lock().unwrap_or_else(PoisonError::into_inner).clone();
     Resumed {
         run_dir,
-        outcome: resumed.map(|_| records.clone()),
-        records,
-        stored,
+        outcome: resumed.map(|_| records),
     }
 }
 
-/// Every file under `dir`, with its length, in order.
-fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
-    let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        for entry in fs::read_dir(&next).expect("lists a directory") {
-            let path = entry.expect("an entry").path();
-            let metadata = fs::metadata(&path).expect("reads an entry");
-            if metadata.is_dir() {
-                pending.push(path);
-            } else {
-                found.push((path, metadata.len()));
-            }
-        }
-    }
-    found.sort();
-    found
+/// Checkpoint `sequence` in `run_dir`'s store: its length whole, and
+/// without its genome chunk.
+fn stored_lengths(run_dir: &Path, sequence: u64) -> (u64, u64) {
+    let store = ChunkStore::open(
+        run_dir.join(flife_cli::STORE_DIR),
+        StoreDurability::ProcessCrash,
+    )
+    .expect("opens the store");
+    let container = store.load(sequence).expect("loads the checkpoint").len() as u64;
+    let (held, _) = store
+        .load_streaming(sequence, ChunkFamily::Genomes)
+        .expect("loads all but its genome chunk");
+    (container, held.len() as u64)
 }
 
-/// A resumed run's restore (FL-043) is admitted as a phase of its own,
-/// against the run's budget: the world as its terms bound it (the genome
-/// quota, state, field and scratch), the container it was restored from,
-/// and the reserve. The preset's run, checkpointed at tick 8 with
-/// `pause-and-stream`, is resumed under its own budget first, which gives
-/// that phase's terms; the run's own phase is about 100 MiB smaller. At a
-/// budget of exactly the restore's phase, the resume is admitted, and its
-/// start record names the container as `restore` and the phase as its
-/// peak. At one byte fewer the run itself is admitted, but its resume is
-/// refused before it records or stores anything.
+/// A resumed run's restore (FL-043) streams its genome chunk, and is
+/// admitted, as a phase of its own, for what it held: the checkpoint
+/// without that chunk and one page-sized window (each of the preset's
+/// genome records is smaller than a page), not the container. The preset's
+/// run, checkpointed at tick 8 with `pause-and-stream`, is resumed under its
+/// own budget: the start record's `restore` is exactly that, the restore's
+/// phase is smaller than the run's, and the run's phase is the peak. Held
+/// whole, the container would have made the restore's phase the peak, about
+/// 100 MiB above the run's. At a budget of exactly the run's phase, which
+/// such a restore exceeded, the resume is admitted.
 #[test]
-fn a_resume_admits_its_restore_or_is_refused() {
+fn a_resume_streams_its_genomes_and_admits_what_it_held() {
     let _serial = serial();
     // No term depends on the budget, and every budget here has as many
     // digits as the preset's, so the container (which holds the
@@ -728,17 +735,11 @@ fn a_resume_admits_its_restore_or_is_refused() {
     let records = probe.outcome.expect("resumes");
     let resumed_from = &record(&records, "resume")["checkpoint"];
     assert_eq!(number(&resumed_from["tick"]), 8, "{resumed_from}");
-    let from = number(&resumed_from["sequence"]);
+    let (container, held) = stored_lengths(&probe.run_dir, number(&resumed_from["sequence"]));
+    let window = CHECKPOINT_PAGE_BYTES as u64;
     let memory = &record(&records, "start")["memory"];
     let term = |name: &str| number(&memory[name]);
-    let store = flife_store::ChunkStore::open(
-        probe.run_dir.join(flife_cli::STORE_DIR),
-        StoreDurability::ProcessCrash,
-    )
-    .expect("opens the store");
-    let container = store.load(from).expect("loads the checkpoint").len() as u64;
-    drop(store);
-    assert_eq!(term("restore"), container, "{memory}");
+    assert_eq!(term("restore"), held + window, "{memory}");
     let restoring = term("genomes")
         + term("state")
         + term("field")
@@ -754,54 +755,77 @@ fn a_resume_admits_its_restore_or_is_refused() {
         + term("checkpoint")
         + term("package")
         + term("reserve");
+    let whole = restoring - term("restore") + container;
     println!(
-        "a resume of the preset at tick 8: restoring {:.2} MiB (its container {:.2}), running \
-         {:.2} MiB",
+        "a resume of the preset at tick 8: restoring {:.2} MiB ({:.2} held and a {:.2} window of \
+         a {:.2} MiB container; {:.2} had it held the container), running {:.2} MiB",
         mib(restoring),
+        mib(held),
+        mib(window),
         mib(container),
+        mib(whole),
         mib(running),
     );
-    assert!(running < restoring, "{memory}");
-    assert_eq!(term("peak_bytes"), restoring, "{memory}");
-    let digits = |budget: u64| budget.to_string().len();
-    assert_eq!(digits(restoring - 1), digits(term("budget_bytes")));
-
-    let short = resumed(
-        &preset_with(&[("maximum_total_bytes", restoring - 1)]),
-        "restore-short",
-    );
-    match short.outcome {
-        Err(CoreError::BudgetExhausted {
-            budget,
-            required,
-            available,
-        }) => {
-            assert_eq!(budget, "peak memory while restoring (maximum_total_bytes)");
-            assert_eq!((required, available), (restoring, restoring - 1));
-        }
-        other => panic!("refused for the restore, not {other:?}"),
-    }
+    assert!(restoring < running, "{memory}");
+    assert_eq!(term("peak_bytes"), running, "{memory}");
     assert!(
-        short.records.is_empty(),
-        "nothing is recorded: {:?}",
-        short.records
+        running < whole,
+        "the whole container would have been the peak"
     );
-    assert_eq!(
-        files(&short.run_dir.join(flife_cli::STORE_DIR)),
-        short.stored,
-        "nothing is stored"
-    );
+    let digits = |budget: u64| budget.to_string().len();
+    assert_eq!(digits(running), digits(term("budget_bytes")));
 
     let exact = resumed(
-        &preset_with(&[("maximum_total_bytes", restoring)]),
+        &preset_with(&[("maximum_total_bytes", running)]),
         "restore-exact",
     );
-    let records = exact.outcome.expect("resumes");
+    let records = exact.outcome.expect("resumes at its run's phase");
     let memory = &record(&records, "start")["memory"];
     let term = |name: &str| number(&memory[name]);
-    assert_eq!(term("restore"), container, "{memory}");
-    assert_eq!(term("budget_bytes"), restoring, "{memory}");
-    assert_eq!(term("peak_bytes"), restoring, "{memory}");
+    assert_eq!(term("restore"), held + window, "{memory}");
+    assert_eq!(
+        (term("budget_bytes"), term("peak_bytes")),
+        (running, running),
+        "{memory}"
+    );
+}
+
+/// A restore streams its genome chunk (FL-043): restoring the preset's
+/// checkpoint at tick 8 holds the world it builds, what it held of the
+/// checkpoint (all but that chunk, and one window: the world's
+/// `restored_bytes`) and the restore's temporaries, not the container,
+/// which it held whole before: 438.58 MiB, the world's 274.05 and the
+/// container's 161.30.
+#[test]
+fn a_restore_holds_its_world_and_one_window_not_its_container() {
+    let _serial = serial();
+    let config = preset();
+    let (run_dir, sequence) = preset_run();
+    let (container, held) = stored_lengths(&run_dir, sequence);
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let world = restore_checkpoint(&run_dir, &config, sequence).expect("restores");
+    let restoring = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    let (built, restored) = (world.held_bytes(), world.restored_bytes());
+    let organisms = world.population().len() as u64;
+    let rest = restoring.saturating_sub(built + restored);
+    println!(
+        "a restore of {organisms} organisms held {:.2} MiB at its peak: the world {:.2}, {:.2} of \
+         the checkpoint (of {:.2}) and the rest {:.2} ({} bytes an organism)",
+        mib(restoring),
+        mib(built),
+        mib(restored),
+        mib(container),
+        mib(rest),
+        rest / organisms,
+    );
+    assert_eq!(restored, held + CHECKPOINT_PAGE_BYTES as u64);
+    let allowance = RESTORE_ALLOWANCE + organisms * RESTORED_ORGANISM_BYTES;
+    assert!(
+        restoring <= built + restored + allowance,
+        "a restore's heap peak {restoring} above its world {built}, what it held of the \
+         checkpoint {restored} and the restore's allowance {allowance}"
+    );
 }
 
 /// The preset's world, 8 ticks on, cropped to a disk of radius 24 about its

@@ -27,7 +27,8 @@ experiment knows what already ran and a report can list every run.
 
 **Outputs.**
 - `ChunkStore` with `open`, `publish`, `publish_observed`, `load`, `latest_valid`, `retain`, `sequences`,
-  `manifest_path`, `chunk_path`, `next_sequence` and `swept`.
+  `manifest_path`, `chunk_path`, `next_sequence` and `swept`; FL-043's `load_streaming` and
+  `latest_valid_streaming`.
 - `Publication`: the sequence number and how many chunks were written, shared and repaired, with the bytes written.
 - `Recovered`: the newest accepted checkpoint and every newer one skipped, each with its error class and reason.
 - `Retention`: the valid checkpoints counted, the manifests removed, and the chunk files removed and kept.
@@ -111,6 +112,12 @@ experiment knows what already ran and a report can list every run.
   container, byte for byte.
 - `latest_valid` tries checkpoints newest first and returns the first that loads and is accepted. It records every
   newer one with the reason it was passed over. A damaged checkpoint is never returned as a different world.
+- FL-043: `load_streaming(sequence, family)` is `load` without `family`'s chunk: the sealed prefix and every other
+  chunk in manifest order, each checked and verified as `load` does, and that chunk's file opened and limited to
+  its declared length (`None` when the manifest names no such chunk), for `CheckpointReader::parse_streamed`,
+  which verifies it as it is read. `latest_valid_streaming(family, accept)` is `latest_valid` over it. Both skip
+  in the same order and for the same reasons; a streamed chunk damaged in the store is refused by the reader's
+  stream, so its checkpoint is skipped as `latest_valid` would skip it. The command line restores this way.
 - `retain(n)` counts the newest `n` checkpoints that load and are accepted. It removes every manifest older than
   the oldest of them, then every chunk file that no remaining parseable manifest names. Invalid manifests newer
   than the oldest kept one stay, for inspection. With fewer than `n` valid checkpoints nothing is removed, and
@@ -238,6 +245,12 @@ manifests.
     each refused, and nothing is published.
   - `retention_by_verification_decides_as_retention_by_restoring`: with no damage and with damage to the newest
     or a middle checkpoint, `retain_intact` keeps and removes exactly what `retain(restore)` does.
+- FL-043, `a_streamed_recovery_restores_and_skips_as_a_whole_one`, against the ecology's checkpoints at ticks 8 and
+  64 (whose genome chunks differ): `load_streaming` gives the container without its genome chunk and that chunk's
+  file, each byte for byte. Recovery with the chunk streamed (`flife_runtime::restore_from` over
+  `CheckpointReader::parse_streamed`) restores what `latest_valid` restores, and with the newest genome chunk
+  flipped, truncated or missing it passes over the same checkpoint for the same reasons: a flipped byte decodes,
+  and is refused at the stream's end ("chunk genomes hash mismatch", where the whole load names the digest).
   - 14 planted mutants in `commit`, `verify`, `retain_intact` and `Stream`, and 2 in `flife-core`'s chunk writer
     (its page four times larger, caught by `flife-cli`'s memory test; a page left out of the chunk hash). 15 were
     caught on their first run. One (`commit` not refusing a chunk still open) survived until the open-chunk

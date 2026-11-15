@@ -187,9 +187,16 @@ each runs and owns the field.
   - a population at the host's bound;
   - the host's and the package's genome parameters, rebuilt;
   - the entrants' list for both populations, at twice its length.
-- FL-043, the restore's phase: `World::restored_bytes()` is the length of the checkpoint container
-  `World::read_checkpoint` read the world from (`CheckpointReader::container_length()`), 0 for a world founded,
-  cropped or otherwise built; it is not scientific state and enters no digest or checkpoint. Every admission of a
+- FL-043, a streamed restore: `World::read_checkpoint` decodes the genome chunk a record at a time through
+  `CheckpointReader::stream`. Before each genome the window is filled to the most its fixed part can take (its
+  identity, topology, parent, traits and sensing), then to its parameters' bytes once their count is read; the
+  stream is finished (and so verified) once every genome is sealed and before any later chunk is read. A reader
+  over a whole container decodes exactly as before. Over a streamed chunk, the restore holds the rest of the
+  checkpoint and one window, not the chunk.
+- FL-043, the restore's phase: `World::restored_bytes()` is what `World::read_checkpoint` held beside the world
+  it built: the bytes its reader held (`CheckpointReader::held_bytes()`, the whole container or all but a streamed
+  genome chunk) and the genome stream's window (`ChunkStream::held_bytes()`, 0 for a held chunk); 0 for a world
+  founded, cropped or otherwise built. It is not scientific state and enters no digest or checkpoint. Every admission of a
   restored world carries it as `MemoryAdmission::restore`, and admits the restore as a phase of its own,
   `MemoryAdmission::restoring_bytes()`: the genome quota, state, field, scratch, `restore` and the reserve. Over the
   budget: `BudgetExhausted` ("peak memory while restoring (maximum_total_bytes)"). `peak_bytes` is the larger of
@@ -898,6 +905,18 @@ Twenty planted mutants for the introduction (with `flife-runtime`'s and `flife-c
   footprint itself does not move.
 - `changing_workers_keeps_the_footprint_reserved`: at four workers the scratch and fields are larger and again
   fixed for 300 ticks with births; back at one worker the scratch is exactly the one-worker scratch, and fixed.
+
+`tests/restore.rs` (2 tests, FL-043), on the preset:
+- `a_streamed_restore_is_the_whole_one_and_holds_one_window`: at 512 founders two ticks on, in `f32` and `f16`,
+  the world restored with its genome chunk streamed from a reader (20.7 and 10.5 MB, several windows) has the
+  digest of the world restored whole, which is the original's. The whole restore's `restored_bytes()` is the
+  container's length; the streamed one's, the rest of the container and one page. A changed parameter byte is
+  refused at the stream's end, "chunk genomes hash mismatch".
+- `a_restore_over_the_budget_is_refused_by_its_own_phase`: at 4,096 founders two ticks on, restored whole, the
+  restore's phase (1,573,263,600 bytes, the container 169,134,640) is above the run's and is the peak. One byte
+  under it, the world restored whole is refused by that phase's figures, and the same checkpoint streamed is
+  admitted with the run's phase as its peak; at exactly it, the whole restore is admitted. Every budget has the
+  preset's ten digits, so the container is as long under each.
 
 `tests/controller_backend.rs`'s `installing_a_backend_reserves_exactly_its_batched_bytes`: installing a backend
 adds exactly `batched_bytes()` to the scratch and nothing to the state or fields, 60 ticks grow nothing, and

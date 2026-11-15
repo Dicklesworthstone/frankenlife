@@ -259,9 +259,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
 - FL-043: `start.memory` is the admission: `budget_bytes`, the fixed logical quota (`logical_parameters`,
   `logical_genome_bytes`), and the terms in bytes: `genomes` (the allocated genome quota), `state`, `field`,
   `scratch`, `births`, `render`, `checkpoint`, `package` (0 but for a transplant), `restore`, `reserve` and
-  `backend`. `restore` is the length of the checkpoint container a resumed world was restored from (0 for a world
-  founded), the restore's own phase: `genomes`, `state`, `field`, `scratch`, `restore` and `reserve`, before the
-  run's, which is every other term. `peak_bytes` is the larger phase, at most `budget_bytes`; a run that was not
+  `backend`. `restore` is what a resumed world's restore held beside it (0 for a world founded): the checkpoint
+  without its genome chunk, which is streamed from the store a window at a time and verified at its end, and that
+  window (one page, 1 MiB, unless a genome's parameters take more). It is the restore's own phase: `genomes`,
+  `state`, `field`, `scratch`, `restore` and `reserve`, before the run's, which is every other term. `peak_bytes` is the larger phase, at most `budget_bytes`; a run that was not
   restored peaks at its run's phase. `end.controllers`
   carries `resident_peak_bytes`, the most the backend held after any batch. A run admitted on the reference alone
   has `backend` 0. None of these is scientific state.
@@ -491,6 +492,12 @@ for, one at least, before a render is refused. Its first record is `start`, with
     `paused_seconds` (wall clock, not scientific state).
   - A metrics tracker re-founded on resume reads the committed world through `checkpoint_with`, without a copy.
 - FL-039:
+  - Every restore from a run's store (`resume`, `render --run-dir`, `branch`, `discover`, `inspect`) streams the
+    checkpoint's genome chunk (FL-043, `ChunkStore::latest_valid_streaming`, or `load_streaming` for a named
+    sequence): it holds the world it builds, the rest of the checkpoint and one window, never the chunk whole.
+    The chunk is hashed as it is read and the restore refused unless it matches, so a damaged genome chunk passes
+    its checkpoint over as before. The container SHA-256 a branch's session, a discovery's identity and an
+    inspection name is the store's `verify`, hashed from its files a buffer at a time once the restore succeeds.
   - A branch is a new session, `branch_session(SHA-256 of the parent checkpoint, name)`. Making the same branch again
     gives the same session and the same founding checkpoint bytes; siblings with different names differ (tested).
     A session already in the lineage is refused.
@@ -1157,9 +1164,10 @@ and `read_package`. None was planted for the check that the second encoding seal
 encoding is deterministic, so no test can make them differ) or for the flush under power loss (a crash would be
 needed to tell it apart).
 
-The restore's admission: 6 planted bugs, run with that test and flife-core's memory unit tests; all caught. The
-restored world forgetting its container, the restore's phase never checked, the peak without it, the phase without
-the container or also charging births, and the container's length as the payload's alone.
+The restore's admission: 6 planted bugs, run with that test (`a_resume_admits_its_restore_or_is_refused`, since
+replaced by the streamed restore's) and flife-core's memory unit tests; all caught. The restored world forgetting
+its container, the restore's phase never checked, the peak without it, the phase without the container or also
+charging births, and the container's length as the payload's alone.
 
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
@@ -1283,13 +1291,20 @@ the genome's identity off by one. A genome named by the organism's own identity 
 founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
 every run.
 
-`tests/memory_admission.rs` (18 tests, FL-043, about 43 s in a workspace run; a counting global allocator,
+`tests/memory_admission.rs` (19 tests, FL-043, about 43 s in a workspace run; a counting global allocator,
 `peak_alloc`, test only):
-- `a_resume_admits_its_restore_or_is_refused`: the preset's run, checkpointed at tick 8 with `pause-and-stream`,
-  resumed under its own budget. `start.memory.restore` is the length of the checkpoint the store loads (161.30
-  MiB), and the peak is the restore's phase, 1,500.38 MiB, against the run's 1,396.14. At a budget of exactly that
-  phase the run and its resume are admitted; at one byte fewer the run is admitted and its resume refused
-  (`budget-exhausted`, "peak memory while restoring"), with nothing recorded and the store unchanged.
+- `a_resume_streams_its_genomes_and_admits_what_it_held`: the preset's run, checkpointed at tick 8 with
+  `pause-and-stream`, resumed under its own budget. `start.memory.restore` is the checkpoint the store loads
+  without its genome chunk (3.08 MiB) and one 1 MiB window, of a 161.30 MiB container. The restore's phase,
+  1,343.16 MiB, is below the run's 1,396.14, which is the peak; holding the container, it was 1,500.38. At a
+  budget of exactly the run's phase, which that restore exceeded, the run and its resume are admitted. (The
+  refusal of a restore's phase over the budget is now the engine's `tests/restore.rs`: on the preset, a streamed
+  restore's phase is never the larger.)
+- `a_restore_holds_its_world_and_one_window_not_its_container`: restoring the branch test's tick-8 checkpoint
+  (below) peaks at 280.36 MiB: the world's 274.05, the 4.08 MiB it held of the checkpoint (`restored_bytes`) and
+  2.23 MiB of temporaries, within `RESTORE_ALLOWANCE` and `RESTORED_ORGANISM_BYTES` (640 bytes) for each of its
+  4,096 organisms (fitted to this restore and the package's below: about 538 bytes an organism and 0.13 MiB
+  besides). Holding its container, it peaked at 438.58 MiB.
 - `a_package_holds_no_more_heap_than_its_crop` (FL-042): the world of the branch test's tick-8 checkpoint (below),
   cropped to radius 64 about its centre (3,223 organisms), is written as a package. Cropping alone peaks at 243.94 MiB (the crop holds 240.67);
   `write_package` peaks at the same 243.94, at most cropping's peak and `CHECKPOINT_FIXED_BYTES`, for a container
@@ -1298,11 +1313,11 @@ every run.
   them copied into the container): `flife discover` of that disk with its package peaked at 775.26 MiB, and now
   peaks at 518.01 (the world and the crop).
 - `a_branch_holds_no_more_heap_than_its_restore` (FL-039): the preset run to tick 8, checkpointed at 0 and 8, is
-  branched at 8. Restoring that checkpoint peaks at 438.58 MiB (the world's 274.05 and its 161.30 MiB
-  container). The branch, from opening the parent to its record, peaks at the same 438.58: at most the restore's
+  branched at 8. Restoring that checkpoint peaks at 280.36 MiB (the world's 274.05 and 4.08 of its 161.30 MiB
+  container). The branch, from opening the parent to its record, peaks at the same 280.36: at most the restore's
   peak and `CHECKPOINT_FIXED_BYTES`. 10 chunks are linked and 1 (the command closure) written. Before the founding
   checkpoint was streamed, the branch peaked at 696.7 MiB: a second container, beside the encoder's genome chunk
-  buffer grown by doubling.
+  buffer grown by doubling; before the restore streamed its genome chunk, both peaked at 438.58.
 - `a_package_is_read_within_its_term_and_keeps_its_held_bytes` (FL-042): the preset 8 ticks on, cropped to radius
   24 about its centre (469 organisms) and written as a package, is read back. The reading's peak, 156.06 MiB, is
   within its term (155.69: the world's 135.39 and the container's 20.30) and `RESTORE_ALLOWANCE` (1 MiB, for the
@@ -1419,8 +1434,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for
     `branch`.
   - `discover`'s crop is not admitted against `maximum_total_bytes` (FL-043), and neither is `flife branch`'s or
-    `flife inspect`'s restore. Each is at most a copy of a world the run itself held and its container, which may
-    take the process past its budget. `discover`'s own restore is admitted with its thumbnail's render, as a phase
+    `flife inspect`'s restore. Each is at most a copy of a world the run itself held and what its restore holds
+    beside it (the checkpoint but its genome chunk, and one window), which may take the process past its budget. `discover`'s own restore is admitted with its thumbnail's render, as a phase
     of its own, once it has happened. `flife transplant` is admitted (above).
   - The transplant's package term over-counts in three ways:
     - it adds the reading phase (container and package world) to the graft phase, though they are not live at once;

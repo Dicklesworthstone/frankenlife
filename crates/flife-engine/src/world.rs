@@ -833,10 +833,10 @@ pub struct World {
     /// The live population's ancestry while the world traces it (FL-021):
     /// not scientific state, like the watch.
     ancestry: Option<Ancestry>,
-    /// The length of the checkpoint container the world was restored from,
-    /// which its restore held beside it (FL-043): its admission's `restore`
-    /// phase. Zero for a world founded, cropped or otherwise built. Not
-    /// scientific state, like the watch.
+    /// What the world's restore held beside it (FL-043): the checkpoint
+    /// bytes its reader held, and the window its genome stream read through.
+    /// Its admission's `restore` phase. Zero for a world founded, cropped or
+    /// otherwise built. Not scientific state, like the watch.
     restored: u64,
 }
 
@@ -1285,9 +1285,10 @@ impl World {
             .saturating_add(self.quota.allocated_bytes())
     }
 
-    /// The length of the checkpoint container this world was restored from
-    /// ([`World::read_checkpoint`]), which the restore held beside it; zero
-    /// for a world founded, cropped or otherwise built (FL-043).
+    /// What this world's restore ([`World::read_checkpoint`]) held beside
+    /// it: the bytes its checkpoint reader held (the whole container, or all
+    /// but a streamed genome chunk) and the genome stream's window. Zero for
+    /// a world founded, cropped or otherwise built (FL-043).
     #[must_use]
     pub const fn restored_bytes(&self) -> u64 {
         self.restored

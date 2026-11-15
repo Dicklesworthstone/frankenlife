@@ -47,7 +47,7 @@
 //! it is safe while the session runs.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -58,14 +58,14 @@ use asupersync::Cx;
 
 use flife_backend_metal::ControllerChoice;
 use flife_core::canonical::Sha256Digest;
-use flife_core::checkpoint::{CheckpointManifest, ChunkSink as _};
+use flife_core::checkpoint::{CheckpointManifest, CheckpointReader, ChunkFamily, ChunkSink as _};
 use flife_core::ids::{CommandId, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS, NumericalProfile, World};
 use flife_runtime::{
     Boundary, Command, CommandBook, Durability, Fork, Journal, JournalWriter, Restored,
-    SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into, open_journaled,
-    open_restored, restore,
+    SESSION_CHECKPOINT_CHUNKS, SessionConfig, SessionHandle, SessionOwner, Target, checkpoint_into,
+    open_journaled, open_restored, restore_from,
 };
 use flife_store::{ChunkStore, CommandJournal, IndexedCheckpoint, Publication, Stream};
 
@@ -596,16 +596,27 @@ pub fn open_session(
     }
 }
 
-/// Restore `bytes` if they hold a world of the configuration `revision`
-/// names and the commands of `session`: what makes a stored checkpoint one
-/// this run can resume from.
+/// Restore a stored checkpoint, `held` without its genome chunk and
+/// `genomes` that chunk's file ([`ChunkStore::load_streaming`]), if it
+/// holds a world of the configuration `revision` names and the commands of
+/// `session`: what makes a stored checkpoint one this run can resume from.
+/// The genome chunk, nearly all of a world's checkpoint, is decoded from a
+/// window as it is read and verified at its end, never held whole
+/// (FL-043).
 pub(crate) fn restorable(
-    bytes: &[u8],
+    held: &[u8],
+    genomes: Option<io::Take<File>>,
     profile: NumericalProfile,
     revision: Sha256Digest,
     session: SessionId,
 ) -> Result<Restored, CoreError> {
-    let restored = restore(bytes, profile)?;
+    let reader = CheckpointReader::parse_streamed(
+        held,
+        &SESSION_CHECKPOINT_CHUNKS,
+        ChunkFamily::Genomes,
+        genomes.map(|file| Box::new(file) as Box<dyn io::Read>),
+    )?;
+    let restored = restore_from(&reader, profile)?;
     if restored.world.config().config_hash() != revision {
         return Err(CoreError::StateConflict {
             operation: "resume run",
@@ -851,7 +862,9 @@ impl Checkpoints {
             (self.profile, self.filing.revision, self.filing.session);
         let recovered = self
             .store()?
-            .latest_valid(|_, bytes| restorable(bytes, profile, revision, session))?;
+            .latest_valid_streaming(ChunkFamily::Genomes, |_, held, genomes| {
+                restorable(held, genomes, profile, revision, session)
+            })?;
         let skipped = recovered
             .skipped
             .into_iter()
@@ -1299,10 +1312,11 @@ pub fn restore_checkpoint(
     let revision = config.config_hash();
     let (session, _) = run_identity(run_dir, revision)?;
     let store = ChunkStore::open(run_dir.join(STORE_DIR), StoreDurability::ProcessCrash)?;
-    let bytes = store.load(sequence)?;
+    let (held, genomes) = store.load_streaming(sequence, ChunkFamily::Genomes)?;
     drop(store);
     let restored = restorable(
-        &bytes,
+        &held,
+        genomes,
         NumericalProfile::reference_f32()?,
         revision,
         session,

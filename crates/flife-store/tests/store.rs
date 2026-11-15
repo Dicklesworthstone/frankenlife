@@ -15,18 +15,20 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use flife_core::checkpoint::{CheckpointManifest, ChunkFamily, ChunkSink};
+use flife_core::checkpoint::{CheckpointManifest, CheckpointReader, ChunkFamily, ChunkSink};
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_runtime::{CommandBook, checkpoint, checkpoint_into, restore};
+use flife_runtime::{
+    CommandBook, SESSION_CHECKPOINT_CHUNKS, checkpoint, checkpoint_into, restore, restore_from,
+};
 use flife_store::{ChunkStore, Durability, Flow, Observer, Publication, STORE_FORMAT, Step};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -651,6 +653,110 @@ fn damage_falls_back_to_the_last_valid_checkpoint_and_publishing_repairs_it() {
         restored(1, &store.load(1).expect("repaired")).expect("restores"),
         a_world
     );
+}
+
+/// The newest checkpoint that restores with its genome chunk streamed
+/// (FL-043), and why each newer one did not, as [`latest`] gives them.
+fn latest_streaming(store: &ChunkStore) -> (Option<(u64, Restored)>, Vec<String>) {
+    let recovered = store
+        .latest_valid_streaming(ChunkFamily::Genomes, |_, held, genomes| {
+            let reader = CheckpointReader::parse_streamed(
+                held,
+                &SESSION_CHECKPOINT_CHUNKS,
+                ChunkFamily::Genomes,
+                genomes.map(|file| Box::new(file) as Box<dyn Read>),
+            )?;
+            restore_from(&reader, profile())
+                .map(|session| (session.world.tick().get(), session.world.digest()))
+        })
+        .expect("lists");
+    let skipped = recovered
+        .skipped
+        .iter()
+        .map(|skip| format!("{} {}: {}", skip.sequence, skip.kind, skip.reason))
+        .collect();
+    (recovered.latest, skipped)
+}
+
+/// FL-043: a store loads a checkpoint without its genome chunk, every held
+/// chunk verified, and opens that chunk to be streamed; the two are the
+/// container, chunk for chunk. Recovering with that chunk streamed (and
+/// verified as it is read) restores the same checkpoint as recovering it
+/// whole, and passes over the same damaged ones: a genome chunk flipped,
+/// truncated or missing in the store, for the same reasons but where the
+/// whole load names the chunk's digest.
+#[test]
+fn a_streamed_recovery_restores_and_skips_as_a_whole_one() {
+    let config = ecology();
+    // Far enough apart that births have changed the genome chunk.
+    let [(a, a_world), (b, b_world)] = <[_; 2]>::try_from(checkpoints(&config, &[8, 64]))
+        .unwrap_or_else(|_| panic!("two checkpoints"));
+    let root = fresh("streamed-recovery");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
+    store.publish(&a).expect("publishes");
+    store.publish(&b).expect("publishes");
+
+    let (held, source) = store
+        .load_streaming(2, ChunkFamily::Genomes)
+        .expect("loads all but the genomes");
+    let mut genomes = Vec::new();
+    source
+        .expect("the genome chunk's file")
+        .read_to_end(&mut genomes)
+        .expect("reads the chunk");
+    let manifest = CheckpointManifest::parse(&b).expect("parses");
+    let payload = &b[manifest.sealed_length()..];
+    let (mut expected_held, mut expected_genomes) =
+        (b[..manifest.sealed_length()].to_vec(), &[][..]);
+    for entry in manifest.entries() {
+        let start = usize::try_from(entry.offset).expect("small");
+        let chunk = &payload[start..start + usize::try_from(entry.length).expect("small")];
+        if entry.family == ChunkFamily::Genomes {
+            expected_genomes = chunk;
+        } else {
+            expected_held.extend_from_slice(chunk);
+        }
+    }
+    assert!(held == expected_held, "the held bytes are the container's");
+    assert!(genomes == expected_genomes, "the file is the genome chunk");
+    assert_eq!(latest_streaming(&store), latest(&store));
+    assert_eq!(latest_streaming(&store).0, Some((2, b_world)));
+
+    let digest = chunk_digest(&b, ChunkFamily::Genomes);
+    assert!(!digests(&a).contains(&digest.to_hex()));
+    let unique = store.chunk_path(&digest);
+    let original = fs::read(&unique).expect("reads");
+    let skips_alike = |store: &ChunkStore, why: &str| {
+        let (streamed, streamed_skipped) = latest_streaming(store);
+        let (whole, whole_skipped) = latest(store);
+        assert_eq!(streamed, Some((1, a_world)), "{why}");
+        assert_eq!(streamed, whole, "{why}");
+        assert_eq!(streamed_skipped.len(), 1, "{why}: {streamed_skipped:?}");
+        assert_eq!(whole_skipped.len(), 1, "{why}: {whole_skipped:?}");
+        assert!(
+            streamed_skipped[0].starts_with("2 incompatible-checkpoint"),
+            "{why}: {streamed_skipped:?}"
+        );
+        (streamed_skipped[0].clone(), whole_skipped[0].clone())
+    };
+    flip(&unique, original.len() / 2);
+    let (streamed, whole) = skips_alike(&store, "a flipped genome byte");
+    assert!(
+        streamed.ends_with("chunk genomes hash mismatch"),
+        "{streamed}"
+    );
+    assert!(
+        whole.ends_with(&format!("chunk genomes ({digest}) hash mismatch")),
+        "{whole}"
+    );
+    fs::write(&unique, &original[..original.len() / 2]).expect("truncates");
+    let (streamed, whole) = skips_alike(&store, "a truncated genome chunk");
+    assert_eq!(streamed, whole);
+    fs::remove_file(&unique).expect("removes");
+    let (streamed, whole) = skips_alike(&store, "a missing genome chunk");
+    assert_eq!(streamed, whole);
+    fs::write(&unique, &original).expect("restores");
+    assert_eq!(latest_streaming(&store).0, Some((2, b_world)));
 }
 
 /// Run by [`a_write_that_fails_part_way_leaves_the_last_valid_checkpoint`]

@@ -60,8 +60,19 @@ are no hidden defaults.
   and declared reserve, shared by the command line and the Studio; the engine's `World::admit_memory` makes it.
 - FL-043, the restore's phase: `MemoryAdmission::restore`, a restored world's container, is not among
   `fixed_bytes()`; `restoring_bytes()` is the restore's phase, the genome quota, `state`, `field`, `scratch`,
-  `restore` and `reserve`, and `peak_bytes` the larger phase. `CheckpointReader::container_length()` is the
-  length of the bytes it parsed: the sealed prefix and the payload.
+  `restore` and `reserve`, and `peak_bytes` the larger phase. `CheckpointReader::held_bytes()` is the length of
+  the bytes it was given to hold (it replaced `container_length()`).
+- FL-043, a streamed restore: `CheckpointReader::parse_streamed(held, required, streamed, source)` verifies `held`,
+  the sealed prefix and every chunk but `streamed`'s in manifest order, as `parse` does (each held chunk's hash,
+  the held payload's exact coverage, the required families, the streamed one counted). That chunk's bytes come from
+  `source`, a `Box<dyn Read>`, through `CheckpointReader::stream(family, version)`, once: a `ChunkStream`. A held
+  chunk streams too, from its bytes. `chunk` and `versioned` refuse the streamed family. `ChunkStream` reads into
+  one buffer, grown to the larger of what a `fill` asks and `CHECKPOINT_PAGE_BYTES`, no more than the chunk
+  holds, and reused: `window`, `fill(at_least)`, `advance(used)`, `remaining`, `u64`, `count(maximum, width)`
+  (bounded by the chunk's remaining bytes, as `ByteReader::count` by its own), `items`, `version`, `held_bytes`
+  (the buffer's capacity; 0 for a held chunk) and `finish`. Every byte read is hashed, and `finish` refuses
+  unread bytes and a digest other than the manifest's. A source that fails is `storage-failed` ("read chunk");
+  one that ends early, `incompatible-checkpoint`.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.
@@ -160,6 +171,10 @@ are no hidden defaults.
   requires is present. A chunk is handed out only at the version its decoder asks for.
 - `ByteReader::count` checks a declared count against its cap and against the bytes left before anything is
   allocated, and `finish` refuses unread bytes. Floats travel as their bit patterns.
+- A streamed reader (FL-043) checks the held bytes as the reader checks a whole container, and its streamed chunk
+  as it is read: a chunk's bytes decoded before its stream finishes are not yet verified, so whatever is built
+  from them is kept only when `finish` succeeds. A streamed chunk is read once and never past its declared
+  length, and its window never holds more than the larger of one page and the largest `fill` asked of it.
 - `EnergyLedger::restore` takes only finite state whose next tick is present exactly when a tick has been
   checked, and whose cumulative residual is inside the budget's INV-03 allowance. The restored ledger checks
   later ticks as the original would.
@@ -327,6 +342,14 @@ and both digests are pinned by tests. Ledger sums run in a fixed order.
     and six manifest defects re-sealed so that only the defect can be the reason. A trailing byte and every
     truncation are refused too.
   - Counts bounded by their cap and by the bytes left, a flag byte of 2, and unread bytes.
+  - FL-043, `a_streamed_chunk_reads_as_the_held_one_from_one_window`: a 2.5 MiB chunk of 40 records, streamed
+    from a source that gives at most 1,000 bytes a read and is interrupted every other read, decodes byte for byte
+    from one page-sized window; the held chunks read as before. The streamed chunk is not held, another version
+    and a second stream are refused, and a held chunk streams from its bytes, holding nothing.
+  - FL-043, `a_streamed_chunk_is_verified_at_its_end_and_refused_by_name`: a changed byte decodes and is refused
+    at the stream's end by the chunk's hash; a short source, a failing one (`storage-failed`, "read chunk"), a
+    count the chunk cannot hold, a streamed chunk without a source, a held payload longer than its chunks, a
+    damaged held chunk and a missing required family are each refused by name.
 
 **Validity domain.** `frankenlife.config.v1`, `field-ecology-v1` (and FL-041's two ablation models) and
 `frankenlife.model-descriptor.v1`. FL-016:

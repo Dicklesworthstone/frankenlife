@@ -97,7 +97,10 @@ inherits every command and outcome, records the fork, and from then on admits on
   interventions: tick, position, intervention and applied energy.
 - Checkpoints (FL-016): `checkpoint`, `restore` and `Restored`, `SESSION_CHECKPOINT_CHUNKS`,
   `CommandBook::{write_checkpoint, read_checkpoint}` with `COMMANDS_CHUNK_VERSION`, and
-  `Command::from_canonical_bytes`.
+  `Command::from_canonical_bytes`. FL-043: `restore_from(reader, profile)` decodes a session from a parsed
+  reader, one over a whole container (what `restore` parses) or one whose genome chunk is streamed
+  (`CheckpointReader::parse_streamed`), with the same checks; a streamed chunk that fails its hash or its read
+  refuses the restore.
 - FL-039:
   - `CommandBook::branch(session, tick, checkpoint)` returns the branch's book;
   - `Fork { parent, admitted, tick, checkpoint }`, and `CommandBook::lineage` and `admitted_by`;

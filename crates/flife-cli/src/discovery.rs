@@ -48,6 +48,7 @@ use std::str::FromStr;
 
 use flife_backend_metal::ControllerChoice;
 use flife_core::canonical::Sha256Digest;
+use flife_core::checkpoint::ChunkFamily;
 use flife_core::memory::total;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{NumericalProfile, RegionMeasurement, World};
@@ -429,14 +430,17 @@ pub fn discover(
     // checkpoint to its pin, so no other process's retention can take the
     // checkpoint between the two.
     let mut store = ChunkStore::open(run_dir.join(STORE_DIR), options.durability)?;
-    let recovered = store.latest_valid(|_, bytes| {
-        let restored = restorable(bytes, profile, revision, session)?;
-        let tick = restored.world.tick().get();
-        if options.at.is_some_and(|at| at != tick) {
-            return Err(conflict(format!("it holds tick {tick}")));
-        }
-        Ok((restored.world, Sha256Digest::of(bytes)))
-    })?;
+    // The genome chunk is streamed, never held whole; the container's
+    // digest is the store's, hashed from its files a buffer at a time.
+    let recovered =
+        store.latest_valid_streaming(ChunkFamily::Genomes, |sequence, held, genomes| {
+            let restored = restorable(held, genomes, profile, revision, session)?;
+            let tick = restored.world.tick().get();
+            if options.at.is_some_and(|at| at != tick) {
+                return Err(conflict(format!("it holds tick {tick}")));
+            }
+            Ok((restored.world, store.verify(sequence)?))
+        })?;
     let Some((sequence, (world, checkpoint))) = recovered.latest else {
         return Err(conflict(format!(
             "{} holds no checkpoint that restores{}",

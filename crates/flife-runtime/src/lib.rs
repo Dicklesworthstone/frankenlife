@@ -36,7 +36,9 @@ pub mod session;
 pub use book::{
     BRANCHED_COMMANDS_CHUNK_VERSION, COMMANDS_CHUNK_VERSION, CommandBook, Fork, admitting_session,
 };
-pub use checkpoint::{Restored, SESSION_CHECKPOINT_CHUNKS, checkpoint, checkpoint_into, restore};
+pub use checkpoint::{
+    Restored, SESSION_CHECKPOINT_CHUNKS, checkpoint, checkpoint_into, restore, restore_from,
+};
 pub use command::{
     Accepted, Admission, COMMAND_SCHEMA, CancelReason, Cancellation, Command, CommandStatus,
     Durability, Outcome, Rejection, Target, VOLATILE_IN_MEMORY,

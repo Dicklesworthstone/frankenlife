@@ -103,8 +103,25 @@ fn agree(world: &World, book: &CommandBook) -> Result<(), CoreError> {
 /// describe one consistent world and closure; and as
 /// [`World::read_checkpoint`].
 pub fn restore(bytes: &[u8], profile: NumericalProfile) -> Result<Restored, CoreError> {
-    let reader = CheckpointReader::parse(bytes, &SESSION_CHECKPOINT_CHUNKS)?;
-    let world = World::read_checkpoint(&reader, profile)?;
-    let book = CommandBook::read_checkpoint(&reader, world.tick(), world.config().config_hash())?;
+    restore_from(
+        &CheckpointReader::parse(bytes, &SESSION_CHECKPOINT_CHUNKS)?,
+        profile,
+    )
+}
+
+/// Decode the session `reader` holds, under `profile`: a reader over a
+/// whole container ([`restore`]), or one that streams its genome chunk from
+/// a chunk store, so the restore never holds that chunk whole (FL-043).
+///
+/// # Errors
+/// As [`restore`], [`CheckpointReader::stream`] and
+/// [`flife_core::checkpoint::ChunkStream::finish`]: a streamed chunk that
+/// cannot be read, or whose bytes are not the ones its manifest names.
+pub fn restore_from(
+    reader: &CheckpointReader<'_>,
+    profile: NumericalProfile,
+) -> Result<Restored, CoreError> {
+    let world = World::read_checkpoint(reader, profile)?;
+    let book = CommandBook::read_checkpoint(reader, world.tick(), world.config().config_hash())?;
     Ok(Restored { world, book })
 }

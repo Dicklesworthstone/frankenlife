@@ -31,7 +31,7 @@
 //! bit.
 
 use flife_core::binary16::F16;
-use flife_core::checkpoint::{ByteReader, CheckpointReader, CheckpointWriter, Chunk, ChunkFamily};
+use flife_core::checkpoint::{ByteReader, CheckpointReader, CheckpointWriter, ChunkFamily};
 use flife_core::clock::{Tick, stable_phase};
 use flife_core::ids::{
     Generation, GenomeId, IdSequence, LineageId, OrganismId, ResourceEpoch, SourceId,
@@ -85,18 +85,24 @@ fn items(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-/// Refuse a chunk whose manifest item count is not what it holds.
-fn counted(chunk: &Chunk<'_>, family: ChunkFamily, held: usize) -> Result<(), CoreError> {
-    if chunk.items == items(held) {
+/// Refuse a chunk whose manifest item count, `manifest`, is not what it
+/// holds.
+fn counted(manifest: u64, family: ChunkFamily, held: usize) -> Result<(), CoreError> {
+    if manifest == items(held) {
         Ok(())
     } else {
         Err(refuse(format!(
-            "the manifest counts {} items in chunk {}, which holds {held}",
-            chunk.items,
+            "the manifest counts {manifest} items in chunk {}, which holds {held}",
             family.name()
         )))
     }
 }
+
+/// The most a genome record's fixed part takes before its parameter count:
+/// its identity, topology index, parent (a flag and an identity), traits
+/// and sensing. A stream's window is filled to this before each record.
+const GENOME_HEADER_BYTES: usize =
+    8 + 8 + 9 + 8 * (flife_genome::AFFINITY_TERMS + flife_genome::MOTION_RESPONSE_TERMS) + 8;
 
 const fn arrangement_code(arrangement: Arrangement) -> u8 {
     match arrangement {
@@ -395,7 +401,7 @@ impl World {
             *slot = input.u64()?;
         }
         input.finish()?;
-        counted(&chunk, ChunkFamily::Configuration, 1)?;
+        counted(chunk.items, ChunkFamily::Configuration, 1)?;
         let config = ValidatedConfig::from_toml(text)
             .map_err(|error| refuse(format!("the configuration does not validate: {error}")))?;
         if config.config_hash().as_bytes() != &recorded {
@@ -427,7 +433,7 @@ impl World {
         let algorithm = input.sized(NAME_MAX_BYTES)?;
         let seed = input.u64()?;
         input.finish()?;
-        counted(&chunk, ChunkFamily::Random, 1)?;
+        counted(chunk.items, ChunkFamily::Random, 1)?;
         if algorithm != FNP_PHILOX_SEMANTIC_V1.as_bytes() || seed != rules.rng.seed() {
             return Err(refuse(format!(
                 "random addressing {} with seed {seed}; this world uses {FNP_PHILOX_SEMANTIC_V1} with seed {}",
@@ -454,7 +460,7 @@ impl World {
             matches &= recorded == widths && input.u64()? == items(parameters);
         }
         input.finish()?;
-        counted(&chunk, ChunkFamily::Topology, catalog.len())?;
+        counted(chunk.items, ChunkFamily::Topology, catalog.len())?;
         if !matches {
             return Err(refuse("the topology catalog is not this build's"));
         }
@@ -495,7 +501,7 @@ impl World {
             );
         }
         input.finish()?;
-        counted(&chunk, ChunkFamily::Environment, paths.len())?;
+        counted(chunk.items, ChunkFamily::Environment, paths.len())?;
 
         let chunk = reader.versioned(ChunkFamily::Lifecycle, version)?;
         let mut input = ByteReader::new(chunk.bytes, "lifecycle chunk");
@@ -506,7 +512,7 @@ impl World {
         let events = input.u64()?;
         let quota_recorded = [input.u64()?, input.u64()?, input.u64()?];
         input.finish()?;
-        counted(&chunk, ChunkFamily::Lifecycle, 1)?;
+        counted(chunk.items, ChunkFamily::Lifecycle, 1)?;
 
         // The field.
         let mut field = FieldPair::zeroed(rules.grid, &flife_field::BufferLimits::host())?;
@@ -537,17 +543,25 @@ impl World {
             }
         }
         input.finish()?;
-        counted(&chunk, ChunkFamily::Field, field.current().as_slice().len())?;
+        counted(
+            chunk.items,
+            ChunkFamily::Field,
+            field.current().as_slice().len(),
+        )?;
 
-        // Genomes, rebuilt through the run's own quota and seal.
+        // Genomes, rebuilt through the run's own quota and seal, a record
+        // at a time from a window over the chunk: a streamed chunk is never
+        // held whole (FL-043), and is verified when the stream finishes.
         let maximum = usize::try_from(rules.maximum_population).unwrap_or(usize::MAX);
         let parameters_max = usize::try_from(catalog.maximum_parameters()).unwrap_or(usize::MAX);
         let mut quota = GenomeQuota::from_config(&config)?;
-        let chunk = reader.versioned(ChunkFamily::Genomes, version)?;
-        let mut input = ByteReader::new(chunk.bytes, "genomes chunk");
-        let live = input.count(maximum, 8)?;
+        let width = usize::try_from(quota.dtype().bytes()).unwrap_or(usize::MAX);
+        let mut stream = reader.stream(ChunkFamily::Genomes, version)?;
+        let live = stream.count(maximum, 8)?;
         let mut genomes = Vec::with_capacity(live);
         for _ in 0..live {
+            stream.fill(GENOME_HEADER_BYTES)?;
+            let mut input = ByteReader::new(stream.window(), "genomes chunk");
             let id = GenomeId::new(input.u64()?);
             let index = input.u64()?;
             let topology = usize::try_from(index)
@@ -566,10 +580,11 @@ impl World {
                 *value = input.f64()?;
             }
             let sensing = input.f64()?;
+            let used = stream.window().len() - input.remaining();
+            stream.advance(used);
             let traits = Traits::new(affinity, motion, sensing, &rules.limits)
                 .map_err(|error| refuse(format!("{id}'s traits: {error}")))?;
-            let width = usize::try_from(quota.dtype().bytes()).unwrap_or(usize::MAX);
-            let count = input.count(parameters_max, width)?;
+            let count = stream.count(parameters_max, width)?;
             let mut buffer = quota.allocate(catalog, topology)?;
             if buffer.values().len() != count {
                 quota.abandon(buffer)?;
@@ -577,6 +592,11 @@ impl World {
                     "{id} has {count} parameters; its topology has a different count"
                 )));
             }
+            if let Err(error) = stream.fill(count.saturating_mul(width)) {
+                quota.abandon(buffer)?;
+                return Err(error);
+            }
+            let mut input = ByteReader::new(stream.window(), "genomes chunk");
             let read = match buffer.values_mut() {
                 WeightsMut::F32(values) => values
                     .iter_mut()
@@ -585,6 +605,8 @@ impl World {
                     .iter_mut()
                     .try_for_each(|value| input.u16().map(|read| *value = F16::from_bits(read))),
             };
+            let used = stream.window().len() - input.remaining();
+            stream.advance(used);
             if let Err(error) = read {
                 quota.abandon(buffer)?;
                 return Err(error);
@@ -597,8 +619,9 @@ impl World {
             )?;
             genomes.push(genome);
         }
-        input.finish()?;
-        counted(&chunk, ChunkFamily::Genomes, live)?;
+        let (window, genome_items) = (stream.held_bytes(), stream.items());
+        stream.finish()?;
+        counted(genome_items, ChunkFamily::Genomes, live)?;
         if [quota.logical_bytes(), quota.allocated_bytes(), quota.live()] != quota_recorded {
             return Err(refuse(format!(
                 "the genomes' quota is {:?}; the checkpoint records {quota_recorded:?}",
@@ -608,10 +631,10 @@ impl World {
 
         // Organisms: particles and held state, row by row.
         let chunk = reader.versioned(ChunkFamily::Particles, version)?;
-        counted(&chunk, ChunkFamily::Particles, live)?;
+        counted(chunk.items, ChunkFamily::Particles, live)?;
         let mut particles = ByteReader::new(chunk.bytes, "particles chunk");
         let chunk = reader.versioned(ChunkFamily::Held, version)?;
-        counted(&chunk, ChunkFamily::Held, live)?;
+        counted(chunk.items, ChunkFamily::Held, live)?;
         let mut held = ByteReader::new(chunk.bytes, "held chunk");
         if particles.count(maximum, 8)? != live || held.count(maximum, 8)? != live {
             return Err(refuse("the particle, held and genome counts differ"));
@@ -731,7 +754,7 @@ impl World {
             *value = input.f64()?;
         }
         input.finish()?;
-        counted(&chunk, ChunkFamily::Ledger, 1)?;
+        counted(chunk.items, ChunkFamily::Ledger, 1)?;
         let [injected, removed, dissipated, turnover, residual] = sums;
         let ledger = EnergyLedger::restore(
             LedgerState {
@@ -790,7 +813,7 @@ impl World {
             watch: Watch::default(),
             // Nor any ancestry: a restored world traces none until told to.
             ancestry: None,
-            restored: reader.container_length(),
+            restored: reader.held_bytes().saturating_add(window),
         })
     }
 }

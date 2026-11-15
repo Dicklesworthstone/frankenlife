@@ -44,17 +44,24 @@ pub struct MemoryAdmission {
     /// it makes before the host's parts are released. Zero for every other
     /// host.
     pub package: u64,
+    /// A restored world's container, held beside the world while it was
+    /// built: a phase of its own, before the run's, and not among
+    /// [`MemoryAdmission::fixed_bytes`] (see
+    /// [`MemoryAdmission::restoring_bytes`]). Zero for a world not restored.
+    pub restore: u64,
     /// [`RESERVE_BYTES`].
     pub reserve: u64,
     /// The controller backend's budget: what the other terms leave, or zero
     /// for the CPU reference.
     pub backend: u64,
-    /// Every term: at most `budget_bytes`.
+    /// The larger phase: the run's ([`MemoryAdmission::fixed_bytes`] and the
+    /// backend) or the restore's ([`MemoryAdmission::restoring_bytes`]). At
+    /// most `budget_bytes`.
     pub peak_bytes: u64,
 }
 
 impl MemoryAdmission {
-    /// Every term but the backend's.
+    /// Every term of the run's phase but the backend's.
     #[must_use]
     pub fn fixed_bytes(&self) -> u64 {
         total([
@@ -66,6 +73,22 @@ impl MemoryAdmission {
             self.render,
             self.checkpoint,
             self.package,
+            self.reserve,
+        ])
+    }
+
+    /// The restore's phase: the world as its terms bound it (the genome
+    /// quota, state, field and scratch), the container it was read from and
+    /// the reserve. Nothing steps, observes or checkpoints while a world is
+    /// restored, and no backend is installed yet.
+    #[must_use]
+    pub fn restoring_bytes(&self) -> u64 {
+        total([
+            self.genomes,
+            self.state,
+            self.field,
+            self.scratch,
+            self.restore,
             self.reserve,
         ])
     }
@@ -103,5 +126,31 @@ mod tests {
         assert_eq!(bytes_for::<u64>(usize::MAX), u64::MAX);
         assert_eq!(total([1, 2, u64::MAX]), u64::MAX);
         assert_eq!(total([1, 2, 3]), 6);
+    }
+
+    #[test]
+    fn the_restore_is_a_phase_of_its_own() {
+        let admission = MemoryAdmission {
+            budget_bytes: 0,
+            logical_parameters: 0,
+            logical_genome_bytes: 0,
+            genomes: 1,
+            state: 2,
+            field: 4,
+            scratch: 8,
+            births: 16,
+            render: 32,
+            checkpoint: 64,
+            package: 128,
+            restore: 256,
+            reserve: 512,
+            backend: 1_024,
+            peak_bytes: 0,
+        };
+        assert_eq!(
+            admission.fixed_bytes(),
+            1 + 2 + 4 + 8 + 16 + 32 + 64 + 128 + 512
+        );
+        assert_eq!(admission.restoring_bytes(), 1 + 2 + 4 + 8 + 256 + 512);
     }
 }

@@ -31,6 +31,17 @@
 //!
 //! A world whose terms other than the backend's exceed the budget is
 //! refused before its host creates anything else.
+//!
+//! A restored world ([`World::read_checkpoint`]) was built beside the
+//! container it was read from: its restore is a phase of its own, before
+//! the run's. Its terms are the genome quota, the state, field and scratch
+//! terms, the container ([`World::restored_bytes`], the admission's
+//! `restore`) and the reserve; nothing steps, observes or checkpoints then,
+//! and no backend is installed. That phase must fit the budget too, and the
+//! peak is the larger of the two. The restore has already happened when its
+//! world is admitted: the world's terms are known only once it exists. A
+//! budget the restore exceeded is refused before the host steps, records or
+//! writes anything, but the restore itself was not held to it.
 
 use flife_core::CoreError;
 use flife_core::memory::{MemoryAdmission, RESERVE_BYTES};
@@ -46,13 +57,16 @@ impl World {
     /// and staging as births; `render`; `checkpoint`; and [`RESERVE_BYTES`]
     /// (its package term is zero: see [`World::admit_memory_beside`]).
     /// The backend is granted what they leave of `maximum_total_bytes`, or
-    /// nothing when not `batched`. Call it after the world's workers are set
-    /// and before its backend is installed, and give the backend
+    /// nothing when not `batched`. A restored world's restore is admitted as
+    /// its own phase ([`MemoryAdmission::restoring_bytes`], with
+    /// [`World::restored_bytes`] as its `restore`), and the peak is the
+    /// larger phase. Call it after the world's workers are set and before
+    /// its backend is installed, and give the backend
     /// [`MemoryAdmission::backend`] bytes.
     ///
     /// # Errors
     /// [`CoreError::BudgetExhausted`] when the terms other than the
-    /// backend's exceed `maximum_total_bytes`.
+    /// backend's, or the restore's phase, exceed `maximum_total_bytes`.
     pub fn admit_memory(
         &self,
         batched: bool,
@@ -97,6 +111,7 @@ impl World {
             render,
             checkpoint,
             package,
+            restore: self.restored_bytes(),
             reserve: RESERVE_BYTES,
             backend: 0,
             peak_bytes: 0,
@@ -109,10 +124,18 @@ impl World {
                 available: admission.budget_bytes,
             });
         }
+        let restoring = admission.restoring_bytes();
+        if restoring > admission.budget_bytes {
+            return Err(CoreError::BudgetExhausted {
+                budget: "peak memory while restoring (maximum_total_bytes)",
+                required: restoring,
+                available: admission.budget_bytes,
+            });
+        }
         if batched {
             admission.backend = admission.budget_bytes - fixed;
         }
-        admission.peak_bytes = fixed.saturating_add(admission.backend);
+        admission.peak_bytes = fixed.saturating_add(admission.backend).max(restoring);
         Ok(admission)
     }
 }

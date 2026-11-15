@@ -183,6 +183,7 @@ impl World {
                 settle: Settle::default(),
                 watch: Watch::default(),
                 ancestry: None,
+                restored: 0,
             },
             measurement,
         ))

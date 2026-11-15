@@ -790,6 +790,7 @@ impl World {
             watch: Watch::default(),
             // Nor any ancestry: a restored world traces none until told to.
             ancestry: None,
+            restored: reader.container_length(),
         })
     }
 }

@@ -258,8 +258,11 @@ for, one at least, before a render is refused. Its first record is `start`, with
   scientific state either.
 - FL-043: `start.memory` is the admission: `budget_bytes`, the fixed logical quota (`logical_parameters`,
   `logical_genome_bytes`), and the terms in bytes: `genomes` (the allocated genome quota), `state`, `field`,
-  `scratch`, `births`, `render`, `checkpoint`, `package` (0 but for a transplant), `reserve` and `backend`, with
-  `peak_bytes` their sum. `end.controllers`
+  `scratch`, `births`, `render`, `checkpoint`, `package` (0 but for a transplant), `restore`, `reserve` and
+  `backend`. `restore` is the length of the checkpoint container a resumed world was restored from (0 for a world
+  founded), the restore's own phase: `genomes`, `state`, `field`, `scratch`, `restore` and `reserve`, before the
+  run's, which is every other term. `peak_bytes` is the larger phase, at most `budget_bytes`; a run that was not
+  restored peaks at its run's phase. `end.controllers`
   carries `resident_peak_bytes`, the most the backend held after any batch. A run admitted on the reference alone
   has `backend` 0. None of these is scientific state.
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
@@ -1154,6 +1157,10 @@ and `read_package`. None was planted for the check that the second encoding seal
 encoding is deterministic, so no test can make them differ) or for the flush under power loss (a crash would be
 needed to tell it apart).
 
+The restore's admission: 6 planted bugs, run with that test and flife-core's memory unit tests; all caught. The
+restored world forgetting its container, the restore's phase never checked, the peak without it, the phase without
+the container or also charging births, and the container's length as the payload's alone.
+
 `tests/metrics.rs` (6 tests, FL-040, about 14 s):
 - `the_tracker_holds_the_committed_world_at_every_tick`. FL-037's 48-founder ecology with architecture mutation at
   a quarter of births, stepped directly for 1,200 ticks, and the preset's first 320 ticks. The tracker is fed only
@@ -1276,8 +1283,13 @@ the genome's identity off by one. A genome named by the organism's own identity 
 founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
 every run.
 
-`tests/memory_admission.rs` (17 tests, FL-043, about 33 s in a workspace run; a counting global allocator,
+`tests/memory_admission.rs` (18 tests, FL-043, about 43 s in a workspace run; a counting global allocator,
 `peak_alloc`, test only):
+- `a_resume_admits_its_restore_or_is_refused`: the preset's run, checkpointed at tick 8 with `pause-and-stream`,
+  resumed under its own budget. `start.memory.restore` is the length of the checkpoint the store loads (161.30
+  MiB), and the peak is the restore's phase, 1,500.38 MiB, against the run's 1,396.14. At a budget of exactly that
+  phase the run and its resume are admitted; at one byte fewer the run is admitted and its resume refused
+  (`budget-exhausted`, "peak memory while restoring"), with nothing recorded and the store unchanged.
 - `a_package_holds_no_more_heap_than_its_crop` (FL-042): the world of the branch test's tick-8 checkpoint (below),
   cropped to radius 64 about its centre (3,223 organisms), is written as a package. Cropping alone peaks at 243.94 MiB (the crop holds 240.67);
   `write_package` peaks at the same 243.94, at most cropping's peak and `CHECKPOINT_FIXED_BYTES`, for a container
@@ -1384,8 +1396,8 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - It renders forward from where `flife resume` would continue. It does not re-render an earlier interval from
     an older checkpoint (no `--at`): commands accepted after that checkpoint would have to be taken from a newer
     book or the journal, which is not built.
-  - Its restore is not admitted against `maximum_total_bytes` (FL-043), as for `inspect` and `branch`. The render
-    that follows is.
+  - Its restore is admitted with the render, as its own phase (`start.memory.restore`, FL-043), but only once it
+    has happened: a budget it exceeded is refused before the first frame, not before the restore.
   - It is the CLI's. The Studio's `--export` still replays a timeline from the founding world (its contract).
   - The frames show the committed world only: no clock, camera keyframes, captions or provenance overlay
     (§13.8's timeline).
@@ -1406,9 +1418,10 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - FL-042 is formally blocked by FL-020 (the Studio window); the bead stays open whatever these slices satisfy.
   - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for
     `branch`.
-  - `discover`'s crop and its encoding are not admitted against `maximum_total_bytes` (FL-043), and neither is
-    `flife branch`'s or `flife inspect`'s restore. Each is at most a copy of a world the run itself held, which may
-    take the process past its budget. `flife transplant` is admitted (above).
+  - `discover`'s crop is not admitted against `maximum_total_bytes` (FL-043), and neither is `flife branch`'s or
+    `flife inspect`'s restore. Each is at most a copy of a world the run itself held and its container, which may
+    take the process past its budget. `discover`'s own restore is admitted with its thumbnail's render, as a phase
+    of its own, once it has happened. `flife transplant` is admitted (above).
   - The transplant's package term over-counts in three ways:
     - it adds the reading phase (container and package world) to the graft phase, though they are not live at once;
     - its `births` term is charged, though it takes no step;

@@ -84,6 +84,7 @@ const fn admission(genomes: u64, budget_bytes: u64, peak_bytes: u64) -> MemoryAd
         render: 0,
         checkpoint: 0,
         package: 0,
+        restore: 0,
         reserve: 0,
         backend: 0,
         peak_bytes,

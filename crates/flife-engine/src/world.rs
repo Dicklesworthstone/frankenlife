@@ -833,6 +833,11 @@ pub struct World {
     /// The live population's ancestry while the world traces it (FL-021):
     /// not scientific state, like the watch.
     ancestry: Option<Ancestry>,
+    /// The length of the checkpoint container the world was restored from,
+    /// which its restore held beside it (FL-043): its admission's `restore`
+    /// phase. Zero for a world founded, cropped or otherwise built. Not
+    /// scientific state, like the watch.
+    restored: u64,
 }
 
 impl World {
@@ -952,6 +957,7 @@ impl World {
             settle: Settle::default(),
             watch: Watch::default(),
             ancestry: None,
+            restored: 0,
         })
     }
 
@@ -1277,6 +1283,14 @@ impl World {
         self.allocated()
             .total()
             .saturating_add(self.quota.allocated_bytes())
+    }
+
+    /// The length of the checkpoint container this world was restored from
+    /// ([`World::read_checkpoint`]), which the restore held beside it; zero
+    /// for a world founded, cropped or otherwise built (FL-043).
+    #[must_use]
+    pub const fn restored_bytes(&self) -> u64 {
+        self.restored
     }
 
     /// The most the world holds on the host while its population stays

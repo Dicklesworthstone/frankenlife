@@ -187,6 +187,15 @@ each runs and owns the field.
   - a population at the host's bound;
   - the host's and the package's genome parameters, rebuilt;
   - the entrants' list for both populations, at twice its length.
+- FL-043, the restore's phase: `World::restored_bytes()` is the length of the checkpoint container
+  `World::read_checkpoint` read the world from (`CheckpointReader::container_length()`), 0 for a world founded,
+  cropped or otherwise built; it is not scientific state and enters no digest or checkpoint. Every admission of a
+  restored world carries it as `MemoryAdmission::restore`, and admits the restore as a phase of its own,
+  `MemoryAdmission::restoring_bytes()`: the genome quota, state, field, scratch, `restore` and the reserve. Over the
+  budget: `BudgetExhausted` ("peak memory while restoring (maximum_total_bytes)"). `peak_bytes` is the larger of
+  that phase and the run's. The restore has happened by the time its world is admitted (a world's terms are known
+  only once it exists), so the refusal comes before the host steps, records or writes anything, but the restore
+  itself was not held to the budget.
 - FL-021 (`flife-zyc`, plan §14.2): `World::organism_snapshot(id)`, `Ok(None)` for an identity the population does
   not hold, or an `OrganismSnapshot`:
   - `tick`, the world's committed tick;

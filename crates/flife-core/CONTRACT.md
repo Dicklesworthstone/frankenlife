@@ -58,6 +58,10 @@ are no hidden defaults.
   charged its capacity times its element size, saturating. `memory::MemoryAdmission` (serializable, with
   `fixed_bytes()`, every term but the backend's) and `memory::RESERVE_BYTES` (64 MiB) are the preflight's decision
   and declared reserve, shared by the command line and the Studio; the engine's `World::admit_memory` makes it.
+- FL-043, the restore's phase: `MemoryAdmission::restore`, a restored world's container, is not among
+  `fixed_bytes()`; `restoring_bytes()` is the restore's phase, the genome quota, `state`, `field`, `scratch`,
+  `restore` and `reserve`, and `peak_bytes` the larger phase. `CheckpointReader::container_length()` is the
+  length of the bytes it parsed: the sealed prefix and the payload.
 
 **Invariants.**
 - An identity is never a storage slot and is never reissued. Exhausting a sequence is `Overflow`, never a wrap.

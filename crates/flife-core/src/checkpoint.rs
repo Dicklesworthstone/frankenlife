@@ -663,6 +663,7 @@ pub struct CheckpointReader<'a> {
     model: &'a str,
     entries: Vec<Entry>,
     payload: &'a [u8],
+    length: u64,
 }
 
 impl<'a> CheckpointReader<'a> {
@@ -723,6 +724,7 @@ impl<'a> CheckpointReader<'a> {
             model: manifest.model,
             entries,
             payload,
+            length: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         })
     }
 
@@ -730,6 +732,13 @@ impl<'a> CheckpointReader<'a> {
     #[must_use]
     pub const fn model(&self) -> &'a str {
         self.model
+    }
+
+    /// The container's length: the sealed prefix and the payload, the bytes
+    /// a restore holds while it reads them.
+    #[must_use]
+    pub const fn container_length(&self) -> u64 {
+        self.length
     }
 
     /// The families present, in order.

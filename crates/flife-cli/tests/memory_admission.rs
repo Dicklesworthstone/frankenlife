@@ -38,9 +38,9 @@ use flife_cli::memory::admit;
 use flife_cli::{
     BranchOptions, CHECKPOINT_FIXED_BYTES, CheckpointMode, ControllerChoice, Disk, MemoryAdmission,
     PACKAGE_WORLD_FILE, PackageSource, Persistence, RESERVE_BYTES, Record, RenderOptions,
-    RenderRecord, RunOptions, StoreDurability, Style, TransplantOptions, branch, configure,
-    encoding_bytes, found, read_package, render, restore_checkpoint, run_with, transplant,
-    write_package,
+    RenderRecord, ResumeOptions, RunOptions, StoreDurability, Style, TransplantOptions, branch,
+    configure, encoding_bytes, found, read_package, render, restore_checkpoint, resume, run_with,
+    transplant, write_package,
 };
 use flife_core::checkpoint::CheckpointWriter;
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
@@ -154,8 +154,8 @@ fn admitted(config: &ValidatedConfig, choice: ControllerChoice) -> MemoryAdmissi
 fn print(admission: &MemoryAdmission) {
     println!(
         "budget {:.1} MiB: genomes {:.1} ({} logical parameters), state {:.2}, field {:.2}, \
-         scratch {:.2}, births {:.2}, render {:.2}, checkpoint {:.2}, package {:.2}, reserve \
-         {:.1}, backend {:.1}; peak {:.1} MiB",
+         scratch {:.2}, births {:.2}, render {:.2}, checkpoint {:.2}, package {:.2}, restore \
+         {:.2}, reserve {:.1}, backend {:.1}; peak {:.1} MiB",
         mib(admission.budget_bytes),
         mib(admission.genomes),
         admission.logical_parameters,
@@ -166,6 +166,7 @@ fn print(admission: &MemoryAdmission) {
         mib(admission.render),
         mib(admission.checkpoint),
         mib(admission.package),
+        mib(admission.restore),
         mib(admission.reserve),
         mib(admission.backend),
         mib(admission.peak_bytes),
@@ -628,6 +629,179 @@ fn a_package_holds_no_more_heap_than_its_crop() {
     );
     assert_eq!(package.world.bytes, written.len() as u64);
     assert_eq!(package.world.sha256, Sha256Digest::of(&written).to_hex());
+}
+
+/// What [`resumed`] returns.
+struct Resumed {
+    run_dir: PathBuf,
+    /// The resume's records, or its refusal.
+    outcome: Result<Vec<Value>, CoreError>,
+    /// The records it emitted either way.
+    records: Vec<Value>,
+    /// The store's files before the resume.
+    stored: Vec<(PathBuf, u64)>,
+}
+
+/// The preset's run under `config` to tick 8, checkpointed at 0 and 8 with
+/// `pause-and-stream`, in a new directory `name`; then resumed to tick 9.
+fn resumed(config: &ValidatedConfig, name: &str) -> Resumed {
+    let run_dir = fresh(name);
+    let mut persistence = Persistence::new(&run_dir, config);
+    persistence.checkpoint_every = 8;
+    persistence.durability = StoreDurability::ProcessCrash;
+    persistence.mode = CheckpointMode::PauseAndStream;
+    run_with(
+        config,
+        options(8, ControllerChoice::Cpu),
+        &[],
+        Some(&persistence),
+        |_| {},
+    )
+    .expect("the run ends");
+    let stored = files(&run_dir.join(flife_cli::STORE_DIR));
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&held);
+    let resumed = resume(
+        &run_dir,
+        &ResumeOptions {
+            until: 9,
+            every: 0,
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+            checkpoint_every: None,
+            durability: StoreDurability::ProcessCrash,
+            checkpoint_mode: None,
+            retained_bytes: None,
+            metrics_every: 0,
+        },
+        move |record: &Record| {
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(serde_json::to_value(record).expect("a record serializes"));
+        },
+    );
+    let records = held.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    Resumed {
+        run_dir,
+        outcome: resumed.map(|_| records.clone()),
+        records,
+        stored,
+    }
+}
+
+/// Every file under `dir`, with its length, in order.
+fn files(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next).expect("lists a directory") {
+            let path = entry.expect("an entry").path();
+            let metadata = fs::metadata(&path).expect("reads an entry");
+            if metadata.is_dir() {
+                pending.push(path);
+            } else {
+                found.push((path, metadata.len()));
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A resumed run's restore (FL-043) is admitted as a phase of its own,
+/// against the run's budget: the world as its terms bound it (the genome
+/// quota, state, field and scratch), the container it was restored from,
+/// and the reserve. The preset's run, checkpointed at tick 8 with
+/// `pause-and-stream`, is resumed under its own budget first, which gives
+/// that phase's terms; the run's own phase is about 100 MiB smaller. At a
+/// budget of exactly the restore's phase, the resume is admitted, and its
+/// start record names the container as `restore` and the phase as its
+/// peak. At one byte fewer the run itself is admitted, but its resume is
+/// refused before it records or stores anything.
+#[test]
+fn a_resume_admits_its_restore_or_is_refused() {
+    let _serial = serial();
+    // No term depends on the budget, and every budget here has as many
+    // digits as the preset's, so the container (which holds the
+    // configuration's text) is as long under each.
+    let probe = resumed(&preset(), "restore-probe");
+    let records = probe.outcome.expect("resumes");
+    let resumed_from = &record(&records, "resume")["checkpoint"];
+    assert_eq!(number(&resumed_from["tick"]), 8, "{resumed_from}");
+    let from = number(&resumed_from["sequence"]);
+    let memory = &record(&records, "start")["memory"];
+    let term = |name: &str| number(&memory[name]);
+    let store = flife_store::ChunkStore::open(
+        probe.run_dir.join(flife_cli::STORE_DIR),
+        StoreDurability::ProcessCrash,
+    )
+    .expect("opens the store");
+    let container = store.load(from).expect("loads the checkpoint").len() as u64;
+    drop(store);
+    assert_eq!(term("restore"), container, "{memory}");
+    let restoring = term("genomes")
+        + term("state")
+        + term("field")
+        + term("scratch")
+        + term("restore")
+        + term("reserve");
+    let running = term("genomes")
+        + term("state")
+        + term("field")
+        + term("scratch")
+        + term("births")
+        + term("render")
+        + term("checkpoint")
+        + term("package")
+        + term("reserve");
+    println!(
+        "a resume of the preset at tick 8: restoring {:.2} MiB (its container {:.2}), running \
+         {:.2} MiB",
+        mib(restoring),
+        mib(container),
+        mib(running),
+    );
+    assert!(running < restoring, "{memory}");
+    assert_eq!(term("peak_bytes"), restoring, "{memory}");
+    let digits = |budget: u64| budget.to_string().len();
+    assert_eq!(digits(restoring - 1), digits(term("budget_bytes")));
+
+    let short = resumed(
+        &preset_with(&[("maximum_total_bytes", restoring - 1)]),
+        "restore-short",
+    );
+    match short.outcome {
+        Err(CoreError::BudgetExhausted {
+            budget,
+            required,
+            available,
+        }) => {
+            assert_eq!(budget, "peak memory while restoring (maximum_total_bytes)");
+            assert_eq!((required, available), (restoring, restoring - 1));
+        }
+        other => panic!("refused for the restore, not {other:?}"),
+    }
+    assert!(
+        short.records.is_empty(),
+        "nothing is recorded: {:?}",
+        short.records
+    );
+    assert_eq!(
+        files(&short.run_dir.join(flife_cli::STORE_DIR)),
+        short.stored,
+        "nothing is stored"
+    );
+
+    let exact = resumed(
+        &preset_with(&[("maximum_total_bytes", restoring)]),
+        "restore-exact",
+    );
+    let records = exact.outcome.expect("resumes");
+    let memory = &record(&records, "start")["memory"];
+    let term = |name: &str| number(&memory[name]);
+    assert_eq!(term("restore"), container, "{memory}");
+    assert_eq!(term("budget_bytes"), restoring, "{memory}");
+    assert_eq!(term("peak_bytes"), restoring, "{memory}");
 }
 
 /// The preset's world, 8 ticks on, cropped to a disk of radius 24 about its

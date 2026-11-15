@@ -1065,13 +1065,18 @@ fn a_running_studio_session_applies_strokes_where_it_reports() {
         }
         std::thread::sleep(Duration::from_millis(3));
     }
-    session.send(Intent::Pause).expect("offered");
+    // Every stroke applies while the session runs, and only then is it
+    // paused: a paused session holds a stroke accepted for the boundary it
+    // paused at until a step or a run reaches it, so a pause sent with the
+    // last stroke could leave that stroke waiting.
     let statuses = gather(&session, Vec::new(), |statuses| {
-        count(statuses, is_submitted) == offered
-            && count(statuses, is_finished) == offered
-            && statuses
-                .iter()
-                .any(|status| matches!(status, Status::Paused { .. }))
+        count(statuses, is_submitted) == offered && count(statuses, is_finished) == offered
+    });
+    session.send(Intent::Pause).expect("offered");
+    let statuses = gather(&session, statuses, |statuses| {
+        statuses
+            .iter()
+            .any(|status| matches!(status, Status::Paused { .. }))
     });
     assert!(
         !statuses

@@ -603,6 +603,11 @@ pub struct ControllerReport {
     /// The most bytes the backend has held after a batch, host and device
     /// ([`ControllerBackend::resident_bytes`], FL-043).
     pub resident_peak_bytes: u64,
+    /// The device's time on the backend's commands, summed over the
+    /// batches it returned, in nanoseconds
+    /// ([`ControllerBackend::last_device_nanoseconds`], FL-029): zero for
+    /// the reference alone and for a backend that runs on the host.
+    pub device_nanoseconds: u64,
 }
 
 /// What a world holds on the host, by plan §19.4's terms (FL-043): each
@@ -3200,8 +3205,13 @@ fn decide_all(
 /// How the batched path ended.
 enum Batched {
     /// Every decision is made: `batched` evaluations came from the backend
-    /// and `deferred` from the reference.
-    Done { batched: u64, deferred: u64 },
+    /// and `deferred` from the reference, and the backend's device spent
+    /// `device_nanoseconds` on them (zero when nothing was due).
+    Done {
+        batched: u64,
+        deferred: u64,
+        device_nanoseconds: u64,
+    },
     /// The backend failed.
     Device(CoreError),
 }
@@ -3238,9 +3248,15 @@ fn decide_with(
     );
     report.resident_peak_bytes = report.resident_peak_bytes.max(device.resident_bytes());
     match decided {
-        Ok(Batched::Done { batched, deferred }) => {
+        Ok(Batched::Done {
+            batched,
+            deferred,
+            device_nanoseconds,
+        }) => {
             report.batched = report.batched.saturating_add(batched);
             report.deferred = report.deferred.saturating_add(deferred);
+            report.device_nanoseconds =
+                report.device_nanoseconds.saturating_add(device_nanoseconds);
             Ok(())
         }
         Ok(Batched::Device(error)) => {
@@ -3317,10 +3333,12 @@ fn decide_batched(
         });
     }
     outputs.clear();
+    let mut device_nanoseconds = 0;
     if !jobs.is_empty() {
         if let Err(error) = device.evaluate(&jobs, outputs) {
             return Ok(Batched::Device(error));
         }
+        device_nanoseconds = device.last_device_nanoseconds();
         if outputs.len() != jobs.len() {
             return Ok(Batched::Device(CoreError::StateConflict {
                 operation: "batch controllers",
@@ -3372,6 +3390,7 @@ fn decide_batched(
     Ok(Batched::Done {
         batched: count(outputs.len() - deferred),
         deferred: count(deferred),
+        device_nanoseconds,
     })
 }
 

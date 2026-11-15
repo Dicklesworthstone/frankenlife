@@ -18,6 +18,7 @@ use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob};
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -274,6 +275,129 @@ fn under_half_its_bytes_metal_defers_and_the_world_is_the_reference() {
 /// most of the live genomes. In shards of 64 slots, so that a tick runs
 /// dozens of kernels in one command, the world is still the reference
 /// world, and each genome is uploaded exactly once while it lives.
+/// The Metal backend, summing its receipts' device seconds
+/// ([`MetalBackend::last_command`]) as each batch returns.
+#[derive(Debug)]
+struct Timed {
+    inner: MetalBackend,
+    seconds: Arc<Mutex<f64>>,
+}
+
+impl ControllerBackend for Timed {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+
+    fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
+    fn forget(&mut self) {
+        self.inner.forget();
+    }
+
+    fn last_device_nanoseconds(&self) -> u64 {
+        self.inner.last_device_nanoseconds()
+    }
+
+    fn evaluate(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+    ) -> Result<(), CoreError> {
+        self.inner.evaluate(jobs, outputs)?;
+        let mut seconds = self.seconds.lock().map_err(|_| CoreError::StateConflict {
+            operation: "sum device seconds",
+            detail: "poisoned".to_owned(),
+        })?;
+        *seconds += self.inner.last_command().map_or(0.0, |(_, time)| time);
+        Ok(())
+    }
+}
+
+/// Step `world` `ticks` times on `backend`. After each tick, the report's
+/// device time grew if the backend returned evaluations, and stayed where
+/// it was if it returned none. At the end it is the receipts' seconds, to
+/// a nanosecond a batch, and within the steps' wall time: submission waits
+/// for each command buffer. Returns the ticks that batched something and
+/// those that batched nothing.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn device_time_follows_the_batches(
+    world: &mut World,
+    backend: MetalBackend,
+    ticks: u64,
+) -> (u64, u64) {
+    let seconds = Arc::new(Mutex::new(0.0));
+    world.set_controller_backend(Some(Box::new(Timed {
+        inner: backend,
+        seconds: Arc::clone(&seconds),
+    })));
+    let (mut batching, mut idle) = (0, 0);
+    let mut last = world.controller_report().clone();
+    assert_eq!(last.device_nanoseconds, 0, "no batch yet");
+    let start = Instant::now();
+    for _ in 0..ticks {
+        world.step().expect("the metal world steps");
+        let report = world.controller_report().clone();
+        if report.batched > last.batched {
+            assert!(
+                report.device_nanoseconds > last.device_nanoseconds,
+                "tick {}: {} evaluations on the device took no device time: {report:?}",
+                world.tick().get(),
+                report.batched - last.batched
+            );
+            batching += 1;
+        } else {
+            assert_eq!(
+                report.device_nanoseconds,
+                last.device_nanoseconds,
+                "tick {}: a tick that batched nothing adds no device time",
+                world.tick().get()
+            );
+            idle += 1;
+        }
+        last = report;
+    }
+    let wall = start.elapsed();
+    let device = Duration::from_nanos(last.device_nanoseconds);
+    let receipts = Duration::from_secs_f64(*seconds.lock().expect("not poisoned"));
+    println!(
+        "{ticks} ticks ({batching} batching, {idle} idle): device {device:?}, receipts \
+         {receipts:?}, wall {wall:?}"
+    );
+    assert!(
+        device.abs_diff(receipts) <= Duration::from_nanos(batching + 1),
+        "the report's {device:?} is not the receipts' {receipts:?}"
+    );
+    assert!(device <= wall, "device {device:?} > wall {wall:?}");
+    (batching, idle)
+}
+
+#[test]
+fn the_report_sums_the_devices_time_on_its_batches() {
+    let Some(backend) = metal() else { return };
+    // The preset: every founder due every tick, so every tick batches.
+    let mut world = found();
+    assert_eq!(
+        device_time_follows_the_batches(&mut world, backend, 40),
+        (40, 0)
+    );
+
+    // One founder, due one tick in four: the ticks between batch nothing,
+    // and the backend's last command must not be counted again for them.
+    let Some(backend) = metal() else { return };
+    let preset = PRESET
+        .replace("initial_count = 4096\n", "initial_count = 1\n")
+        .replace(
+            "evaluation_interval_ticks = 1\n",
+            "evaluation_interval_ticks = 4\n",
+        );
+    assert_ne!(preset, PRESET);
+    let mut world = found_from(&preset);
+    let (batching, idle) = device_time_follows_the_batches(&mut world, backend, 40);
+    assert!(batching > 0 && idle > 0, "{batching} batching, {idle} idle");
+}
+
 #[test]
 fn at_interval_four_in_small_shards_each_genome_is_uploaded_once() {
     let Ok(inner) = MetalBackend::with_shard_slots(64) else {

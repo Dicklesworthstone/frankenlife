@@ -96,6 +96,10 @@ pub struct ControllerSummary {
     /// The most bytes it held after a batch, host and device (FL-043):
     /// within the start record's `memory.backend`.
     pub resident_peak_bytes: u64,
+    /// The device's time on its commands, summed over the run, in
+    /// nanoseconds (FL-029): zero for the CPU reference and for a backend
+    /// that runs on the host.
+    pub device_nanoseconds: u64,
 }
 
 impl ControllerSummary {
@@ -109,6 +113,7 @@ impl ControllerSummary {
             reference_ticks,
             failure,
             resident_peak_bytes,
+            device_nanoseconds,
         } = world.controller_report().clone();
         Self {
             backend: backend.unwrap_or_else(|| CPU_REFERENCE.to_owned()),
@@ -117,6 +122,7 @@ impl ControllerSummary {
             reference_ticks,
             failure,
             resident_peak_bytes,
+            device_nanoseconds,
         }
     }
 }

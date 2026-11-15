@@ -70,6 +70,14 @@ pub trait ControllerBackend: Debug + Send {
     /// world's slots name other genomes.
     fn forget(&mut self);
 
+    /// The device's time on the commands of the last
+    /// [`ControllerBackend::evaluate`], in nanoseconds (FL-029): zero for a
+    /// backend that runs on the host, and for a batch that dispatched
+    /// nothing.
+    fn last_device_nanoseconds(&self) -> u64 {
+        0
+    }
+
     /// Evaluate `jobs` in order. `outputs` becomes one entry per job: its
     /// 36 raw outputs, bit-identical to
     /// `job.controller.evaluate(job.inputs, _)`, or `None` where the

@@ -264,8 +264,10 @@ for, one at least, before a render is refused. Its first record is `start`, with
   window (one page, 1 MiB, unless a genome's parameters take more). It is the restore's own phase: `genomes`,
   `state`, `field`, `scratch`, `restore` and `reserve`, before the run's, which is every other term. `peak_bytes` is the larger phase, at most `budget_bytes`; a run that was not
   restored peaks at its run's phase. `end.controllers`
-  carries `resident_peak_bytes`, the most the backend held after any batch. A run admitted on the reference alone
-  has `backend` 0. None of these is scientific state.
+  carries `resident_peak_bytes`, the most the backend held after any batch, and `device_nanoseconds` (FL-029), the
+  device's time on the backend's commands summed over the run: 0 for `cpu` and `torch`, which run on the host. A
+  run admitted on the reference alone has `backend` 0. None of these is scientific state. `flife capabilities`'
+  routes carry the same summary; `tests/capabilities.rs` checks `metal`'s device time is above 0 and `torch`'s is 0.
 - `flife render` (`frankenlife.render.v1`): a `frame` record per PNG written (frame index, tick, live count, path,
   render seconds) at the founding tick and every `--every` ticks, then `end` (frames, tick, the committed digest,
   the video path if encoded, the controller summary, wall seconds, and the style: `mapping`, its `meaning`, `look`,

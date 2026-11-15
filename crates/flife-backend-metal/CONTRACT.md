@@ -203,6 +203,9 @@ FL-028's outputs:
 - `ResourceState`: `Available`, `Computing`, `Committed`, `Rendering`, `Checkpointing` or `Retiring` (§9.5).
 - `Usage`: buffers, bytes, retiring, read leases by purpose, write leases and running commands.
 - `MetalBackend::last_command` (FL-030): the last batch's kernels and its command buffer's device seconds.
+  `ControllerBackend::last_device_nanoseconds` (FL-029) gives the same time in nanoseconds, 0 before the first
+  batch and after one that dispatched nothing. The world sums it into `ControllerReport::device_nanoseconds`, which
+  run records carry as `controllers.device_nanoseconds`.
 
 **Residency.** `MetalBackend` keeps every buffer on the device across ticks. FL-026: each topology has a bucket of
 fixed-size parameter shards of at most `SHARD_BYTES` (256 MiB, 6,718 genomes of the preset's topology), fewer
@@ -498,7 +501,7 @@ A refusal changes nothing.
     1,101,004,800 patterns, zero and subnormals included, in about 3 s each. The fast path must fall back at least
     once and fewer than 1,000,000 times, so the fallback is exercised and the fast path carries the load.
   - Negative inputs (64 random windows of 65,536) and the saturated region equal the reference.
-- `tests/world.rs` (6 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
+- `tests/world.rs` (7 tests), the engine path. The real preset (4,096 founders, `[64, 32]`, every organism
   evaluated every tick) runs 400 ticks with its controllers on Metal next to the reference world. The digests
   match at every tick, through the founder crash, 42 births and mutation. All 1,254,756 evaluations came from the
   device (none deferred, no tick redone on the reference). The planted negative flips one output bit of one
@@ -517,6 +520,14 @@ A refusal changes nothing.
   - FL-030, `an_f16_world_on_metal_is_the_reference_world_at_every_tick`: the preset with
     `canonical_weight_dtype = "f16"` on Metal, in half shards, equals the reference F16 world at every tick for
     400 ticks, with births, every evaluation on the device and no tick redone.
+  - FL-029, `the_report_sums_the_devices_time_on_its_batches`: after each tick, `ControllerReport::
+    device_nanoseconds` has grown if the backend returned evaluations and is unchanged if it returned none. At the
+    end it equals the receipts' device seconds (summed by a wrapping backend) to a nanosecond a batch, and is
+    within the steps' wall time. On this M5 Ultra, 40 ticks of the preset took 16.8 ms of device time in 346 ms of
+    wall time, about 5%. A single founder due one tick in four batched on 11 ticks and nothing on 29.
+    Planted bugs, 5 of 5 caught, each by its intended assertion: the backend reporting no device time; a tick that
+    batched nothing counting the last command again; the report keeping only the last batch's time; microseconds
+    reported as nanoseconds; and the run records' summary dropping it (by flife-cli's `tests/capabilities.rs`).
 - `tests/residency.rs` (FL-026, 4 tests), in shards of 16 and 64:
   - 300 genomes over five topologies are uploaded once into 20 shards. Batches of a few upload and drop nothing.
     A slot at its next generation, holding another genome, is uploaded in its place with that genome's reference
@@ -1355,7 +1366,8 @@ per-pass thread spawning (6%).
   crash keeps the room they took.
 - Parameter shards are never freed before `forget`: after a population crash, device memory stays at the peak in
   whole shards. A topology's first genome allocates a whole 256 MiB shard, so the five catalog members can hold
-  1.25 GiB however few their genomes. Backend memory is not yet part of admission (FL-043).
+  1.25 GiB however few their genomes. Admission charges the backend its budget (FL-043), so this stays within
+  it.
 - A command's kernels run serially, so a population past one shard per topology pays 0.1–0.2 ms a tick per extra
   shard. Dispatching shards concurrently, since they write disjoint rows, would remove that; FrankenTorch's batch has
   only a serial encoder.
@@ -1368,13 +1380,14 @@ per-pass thread spawning (6%).
     (submit, then wait or poll for the receipt, with the bindings held meanwhile). No consumer needs it yet.
   - The engine path still submits one kernel per tick (`MetalBackend::evaluate`). Several kernels per command pay
     off once FL-032 moves the CPU phases around the controllers onto the device.
-  - `device_seconds` is in the receipt but not yet in run records or the throughput example.
+  - `device_seconds` reaches run records as `controllers.device_nanoseconds`, but not the throughput example.
   - A failed command buffer is tested through the gateway's seam: a real command buffer, left uncommitted. No
     device fault on this host fails a committed one (see the tests).
 - FL-028 gaps:
-  - The controllers and backend open their owners `UNBOUNDED`. Declaring the backend's byte budget at preflight,
-    and admitting observers' and checkpoints' peaks against it, is FL-043. Render and checkpoint consumers of
-    device leases are FL-033 and FL-038; today's renderer reads the CPU world's epochs (FL-017).
+  - Hosts give the backend its preflight budget (`MetalBackend::with_budget`, FL-043), and its owner admits no
+    more than that or the device's headroom. `MetalBackend::open` and the controllers alone still open
+    `UNBOUNDED` owners, still capped at the headroom. Render and checkpoint consumers of device leases are FL-033
+    and FL-038; today's renderer reads the CPU world's epochs (FL-017).
   - Only `f32` and `u32` elements. Textures, heaps and private-storage buffers are not owned yet.
   - `ResourceState` reports the dominant use when several overlap, by precedence: retiring, computing,
     checkpointing, rendering, committed, available. `usage` gives the lease counts.

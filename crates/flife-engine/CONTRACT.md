@@ -173,6 +173,10 @@ each runs and owns the field.
   installing a controller backend adds). `Population::allocated_bytes()`, `Population::bound_bytes(topologies)`
   and `PER_ORGANISM_BYTES` (an organism's index, free-list and genome-header entries). `ControllerReport` gains
   `resident_peak_bytes`, the most `ControllerBackend::resident_bytes` reported after any batch.
+- FL-029: `ControllerReport::device_nanoseconds`, the device's time on the backend's commands summed over the
+  batches it returned. The world reads it from `ControllerBackend::last_device_nanoseconds` (a provided method,
+  0 for a backend that runs on the host) right after each `evaluate`. A tick with nothing due calls no `evaluate`
+  and adds nothing. flife-backend-metal's `tests/world.rs` checks it on the device.
 - FL-043, second slice: `World::admit_memory(batched, checkpoint, render)`, the peak-memory preflight every host
   calls (moved here from `flife-cli` so the Studio can call it): the allocated genome quota, the footprint's state,
   field, scratch (plus `batched_bytes()` when `batched`) and staging, the host's `render` and `checkpoint` bytes,

@@ -586,6 +586,7 @@ mod tests {
             reference_ticks: u64::from(failure.is_some()),
             failure: failure.map(str::to_owned),
             resident_peak_bytes: 0,
+            device_nanoseconds: 0,
         }
     }
 

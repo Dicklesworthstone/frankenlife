@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use flife_backend_cpu::CpuBackend;
 use flife_core::CoreError;
@@ -1040,6 +1041,13 @@ impl MetalBackend {
 impl ControllerBackend for MetalBackend {
     fn describe(&self) -> String {
         format!("metal ({})", self.controllers.device_name())
+    }
+
+    fn last_device_nanoseconds(&self) -> u64 {
+        self.last_command.map_or(0, |(_, seconds)| {
+            Duration::try_from_secs_f64(seconds)
+                .map_or(0, |time| u64::try_from(time.as_nanos()).unwrap_or(u64::MAX))
+        })
     }
 
     fn resident_bytes(&self) -> u64 {

@@ -145,6 +145,7 @@ fn the_preset_reaches_its_pinned_world_on_every_route_this_host_opens() {
         (4096 * PROBE_TICKS, 0),
         "every founder, every tick, on the route"
     );
+    assert_eq!(summary.device_nanoseconds, 0, "torch runs on the host");
 
     let device = metal_device();
     let metal = route(&report.controllers, "metal");
@@ -154,6 +155,10 @@ fn the_preset_reaches_its_pinned_world_on_every_route_this_host_opens() {
         let summary = metal.controllers.as_ref().expect("a run");
         assert!(summary.backend.starts_with("metal ("), "{summary:?}");
         assert!(summary.batched > 0);
+        assert!(
+            summary.device_nanoseconds > 0,
+            "the device's time: {summary:?}"
+        );
     } else {
         assert_eq!(metal.status, RouteStatus::Unavailable, "{metal:?}");
         assert_eq!(metal.kind, Some("missing-capability"));

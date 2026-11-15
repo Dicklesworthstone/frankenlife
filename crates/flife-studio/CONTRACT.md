@@ -1023,6 +1023,23 @@ presentation state, not scientific state.
   plus its texel bytes (at most 59.7% and 43.2%; the largest copy 22.6 MB, a 4K frame of 16,384 dots and halos);
   the readback is the RGBA8 frame. The Studio's frame tally (`FrameTally::count_copies`, the `frame` and `end`
   records' copy fields) counts the same 48 reports' copies: their sum, the largest, and the readback sum.
+- `tests/frame_device.rs` (FL-043, FL-033, Metal compute, no window; its own binary, so nothing else allocates on the
+  device): after each frame through one `MetalRenderer`, what the process holds on the device
+  (`DeviceOwner::device_allocated_bytes`, Metal's `currentAllocatedSize`) beyond what it held before the renderer
+  opened is within the largest so far of the render term's offscreen device part: the upload's device copy (the
+  preparation limit plus the texel bytes), 12 of `DEVICE_BYTES_PER_PIXEL`'s 24 bytes a drawable pixel (the route's
+  RGBA16F and RGBA8 surfaces), a status word per tile and the bloom's row sums. Two passes, each with a renderer of
+  its own:
+  - `frame_upload.rs`'s 48 frames, with no overlay and no bloom: at most 84.9%; after the last, a 4K frame of
+    16,384 organisms, 122.59 MiB against 146.39 MiB;
+  - the view as the Studio builds it, with its overlay, each frame with and without the preset's bloom (96
+    frames): at most 64.4%; after the last, 130.80 MiB against 205.14 MiB. Each frame with the bloom also holds
+    no more beyond the same frame just before without it than the term charges the bloom. Some frame's bloom
+    holds more than nothing; the most is 5.23 MiB (the charge is 6.25 MiB at 1280 x 720 and 18.75 at
+    3840 x 2160).
+  The first renderer opens holding 507,904 bytes. The window's three drawables, the other 12 bytes a pixel, are not
+  measured: no window is opened. The device is read after each frame, so a peak within one is not seen. Planted
+  bugs: MUTANTS_FRAME_DEVICE.
 - `tests/kept_texels.rs` (FL-033, Metal compute, no window): on one `MetalRenderer`, the preset 30 ticks in, in
   points, density and raw density, a pan, a zoom and a frame between epochs copy none of the layers' texels: each
   frame equals a fresh renderer's byte for byte, and its upload is the fresh renderer's less exactly the texels of
@@ -1398,13 +1415,16 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   That it installs the bounded Metal backend runs only in a window, which no test here opened.
   - A resize past the opening size, in pixels and density bins, is not admitted again.
   - The device terms (`DEVICE_BYTES_PER_PIXEL`: the Metal route's RGBA16F and RGBA8 surfaces and three window
-    drawables; and the bloom's row sums) come from FrankenManim's and AppKit's buffers as declared, not from a measurement: device memory is
-    outside the heap the tests count.
+    drawables; and the bloom's row sums) come from FrankenManim's and AppKit's buffers as declared. Device memory
+    is outside the heap the tests count; `tests/frame_device.rs` reads the device itself and finds each offscreen
+    frame within the terms' offscreen part (at most 84.9% of the largest so far), and a bloom within its charge.
+    The window's drawables are not measured.
   - FrankenManim bounds neither the Metal route's host staging of a frame nor its device copy. Both are charged at
     the view's preparation limit plus its texel bytes, which they stayed within on 48 measured frames (at most
     59.7% and 43.2%); a frame beyond them is not refused. From `b104feec` the device keeps the last frame's texels
     between frames, at most the view's texel bytes, inside the same term. FrankenManim drops them before it
-    uploads others, so it never holds two sets, but no test sees device memory, so that is read from its code.
+    uploads others, so it never holds two sets. `tests/frame_device.rs` reads the device only between frames, so
+    that is read from its code.
   - On the preset at 1920 x 1080 points with a 2x display, the observers take 410.5 MiB and the backend gets
     235.9 MiB of the 2,048 (391.8 and 254.6 without the preset's bloom, whose f32 row sums are charged 18.75
     MiB of the device: since FrankenManim `c6ad9c5b` its bloom works in bands, holding 146 rows at sigma 3

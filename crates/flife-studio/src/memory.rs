@@ -28,6 +28,14 @@
 //! - while a bloom is configured, its row sums on the device
 //!   ([`WorldView::bloom_bytes`], FL-019).
 //!
+//! What the device holds for offscreen frames is read from the device
+//! itself (flife-studio's `tests/frame_device.rs`, FrankenManim
+//! `d1e1757b`). Over 48 bare frames it was within the device terms less
+//! the window's drawables (at most 84.9% of the largest so far), and over
+//! 96 frames of the view as the Studio builds it (its overlay, with and
+//! without the bloom) at most 64.4%. A bloom held no more than its charge.
+//! The window's drawables are not measured.
+//!
 //! A session kept in a run directory (FL-024) also charges its checkpoint
 //! ([`admit_kept`]): the most heap one holds beyond the live world, as the
 //! command line's runs charge it.

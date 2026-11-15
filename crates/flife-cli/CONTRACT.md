@@ -1441,8 +1441,9 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
     - the controller kernels hold 0.36 MiB on the device;
     - beyond what the owner counts, the device holds 0.10% more for the backend's buffers;
     - the owner admits no more than the device's headroom, and the backend's budget is cut to it.
-    That measurement is of the controller backend alone. The other Metal stages' owners and a renderer's device
-    memory are not.
+    That measurement is of the controller backend alone. flife-studio's `tests/frame_device.rs` measures what
+    FrankenManim's renderer holds on the device for offscreen frames, against the Studio's render term. The
+    other Metal stages' owners and a window's drawables are not measured.
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part, and a
     tick in which every live organism of half the capacity attempts (all born, or all rejected after every
     candidate) its birth part.

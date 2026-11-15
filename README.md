@@ -167,7 +167,7 @@ the tick it applied at and the energy it moved; the host's brush path has not be
 Tests compare every committed world with one stepped directly. Under retained, slow and cross-thread readers, the trajectory and a near-capacity admission decision are unchanged. `crates/flife-manim` (FL-018) is the FrankenManim adapter: an exact viewport from world units to drawable pixels and logical window points, and one bounded particle cloud lowered from each epoch onto FrankenManim's 3D camera route (checked against FrankenManim's own CPU renderer to 0.05 px). `crates/flife-studio` (FL-018) is the native host. The window, typed input and Metal presentation stay on the main thread, and the session owner runs on its own Asupersync thread behind a bounded intent lane. A harness-free live test drives the real preset entirely with real AppKit events. The view draws the energy field under glowing lineage-coloured organisms, and `flife render` writes the same view to PNG frames and MP4. FL-020 adds camera control and selection, and FL-021 a bounded organism snapshot on selection (a record and an on-screen panel) |
 | Does the stack compose? | **Yes (FL-001, FL-018).** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter now delivers typed pointer, button, scroll, key, modifier, focus, capture-loss and resize events (FL-018 added the bridge upstream in FrankenTorch), and a real window probe qualifies it. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
-| Has anything been benchmarked? | **No.** Every population, rate and frame-time number below is a **Target** or a **Derived** arithmetic estimate |
+| Has anything been benchmarked? | **Measured, not qualified.** Tick rates, frame times and memory peaks below were measured on named hosts (an M5 Ultra; x86-64 Linux) under the conditions stated with each. No rate gate has passed: G6 has run only offscreen, and G7 and G8 have not run. The profile table and the scale arithmetic are **Targets** and **Derived** estimates |
 | Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 58 beads with the plan's 141 dependency edges in `.beads/` for `br` |
 
 ---
@@ -441,6 +441,11 @@ cargo run --release -p flife-cli -- render --run-dir studio-run --ticks 1200 --e
 its source power chosen by FL-034's declared experiment E1 (`experiments/fl034/README.md`). Its populations
 settle at about 22,000 to 25,000 after an early bottleneck. Open it the same way:
 `cargo run --release -p flife-studio -- presets/interactive-world.toml`.
+`presets/desktop-world.toml` is the Desktop ecology profile's: 100,000 founders on 512 × 512 × 33 with F16
+weights, at the Interactive preset's energy per area, which FL-034's experiment E2 tested and adopted. All 8
+of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. It steps at about 8
+ticks per second on 16 workers of an M5 Ultra with all 100,000 founders alive, so it is a world to study, not
+yet one to watch at frame rate.
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`

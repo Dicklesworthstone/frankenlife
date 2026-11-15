@@ -266,7 +266,7 @@ The plan's labels apply to code comments, docs, commit messages and reports:
 |---|---|
 | Toolchain | `nightly-2026-08-31` (`rust-toolchain.toml`), shared with the FrankenSuite siblings; Rust 2024 edition; one Cargo workspace |
 | Async runtime | Asupersync v0.6.2 (`a5d23e8d`), the sole runtime, with one package id per closure. FrankenManim takes it from git and FrankenTorch from crates.io, so the root `[patch.crates-io]` maps the crates.io edge onto the same commit (plan §12.8) |
-| Sibling revisions | `franken_manim` `ac39e721`, `frankentorch` `c611501c`, `franken_numpy` `6492ff31`, plus FrankenManim's transitive pins; the full qualified set is in `franken-stack.lock` |
+| Sibling revisions | `franken_manim` `d1e1757b`, `frankentorch` `37e0d05e`, `franken_numpy` `6492ff31`, `frankensqlite` `074c2033`, plus FrankenManim's transitive pins; the full qualified set is in `franken-stack.lock` |
 | Root overrides | `[patch.crates-io]` in `Cargo.toml`: asupersync → `a5d23e8d`, and the reviewed `rust-block` `b39ae859d1ee8e8cb5eef6a516471f1578d26b96`. Both live at this root because Cargo ignores a dependency's own `[patch]` (plan §12.8) |
 
 Moving a pin is a deliberate event: requalify the capability probes and keep the old results.
@@ -633,7 +633,9 @@ The repository holds:
   `crates/flife-manim` and `crates/flife-studio` (FL-018), `crates/flife-store` (FL-035, FL-036, FL-038, FL-039, FL-041), and
   `crates/flife-backend-metal` (FL-030, FL-028, FL-029, FL-031's field, sensors and uptake), and `crates/flife-backend-cpu` (FL-025), each with its `CONTRACT.md`. FL-010 also adds `flife_core::rng` and
   `flife_field::seeding`;
-- `presets/reference-small-world.toml` (FL-015), the first real preset.
+- `presets/reference-small-world.toml` (FL-015), `presets/interactive-world.toml` (25,000 founders) and
+  `presets/desktop-world.toml` (100,000 founders, F16), the last two from FL-034's declared experiments E1 and E2
+  (`experiments/fl034/README.md`); `experiments/` holds each declared experiment's base, specifications and records.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and
@@ -873,7 +875,8 @@ item 4's order:
 - invalid or effective no-op candidates are rejected, never reinterpreted;
 - when every candidate is rejected, every buffer has been abandoned and the quota is unchanged.
 
-No simulation step exists. Every world capability is a proposed design or a Target until its gate records a pass.
+The world steps, renders, checkpoints and branches (see the crates above). A gate is passed only when its evidence is
+recorded on its work item; until then every claim it covers, including every scale, rate and visual claim, is a Target.
 
 ---
 

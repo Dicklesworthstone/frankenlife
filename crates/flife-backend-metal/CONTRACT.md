@@ -150,12 +150,20 @@ about 1–3% of the all-Metal tick (the whole tick's frontier and profile, below
 - FL-043: `backend(cpu_workers, budget)` takes a `BackendBudget` (re-exported from `flife-neural`: bytes, and the
   organisms the world can hold), `BackendBudget::UNBOUNDED` for none. `MetalBackend::with_budget(shard_slots,
   budget)` opens its own `DeviceOwner` with `Limits { bytes: budget.bytes, .. }`; `open` and `with_shard_slots` are
-  unbounded. `SHARD_SHARE` (8) and `staging_bytes(organisms, shards)` are public.
+  unbounded. A budget past the owner's limit, which is at most the device's headroom (below), is cut to that limit,
+  so the shards leave a batch's staging room on the device too; `MetalBackend::budget()` is what it holds at most.
+  `BackendBudget::UNBOUNDED` is kept whole, as its batches have no bound to stage for. `SHARD_SHARE` (8) and
+  `staging_bytes(organisms, shards)` are public.
 - The kernel alone: `Batch::push(topology, parameters, inputs)` for one organism's catalog topology, its parameters
   in the reference layout and its observation's 104 F64 inputs (topologies may mix in a batch); then
   `MetalControllers::open()`, `upload(&batch)` and `run(&resident, &mut outputs)`, or `evaluate` for both.
 - FL-028, the owner: `DeviceOwner::open(Limits { bytes, leases_per_purpose })` (`Limits::UNBOUNDED` for the
-  controllers today). It is cheap to clone and usable from any thread. It provides:
+  controllers today). It is cheap to clone and usable from any thread. FL-043 (plan §19.4, "device memory limits and
+  actual allocation results"): it admits no more than the device's headroom as it opens, its recommended working set
+  less what this process holds on it then, and `limits()` is what it admits. Each owner reads the headroom at its own
+  open, so owners opened together may jointly admit more than it. `device_working_set_bytes()` and
+  `device_allocated_bytes()` read the device (FrankenTorch's `Gateway::recommended_working_set_bytes` and
+  `Gateway::allocated_bytes`). It provides:
   - buffers: `zeroed::<T>(len)` and `upload(&[T])` for `T` = `f32` or `u32`, and `zeroed_owned`/`upload_owned`
     for buffers retired when dropped;
   - leases: `write(buffer)` and `read(buffer, Purpose)`, where a purpose is `Rendering`, `Checkpointing` or
@@ -597,6 +605,25 @@ A refusal changes nothing.
 - `tests/world.rs` adds the owner's account after the 400-tick preset run: exactly the backend's buffers (since
   FL-026, two per shard and three more), with no lease, command or retiring buffer left. The arithmetic, forward and world tests ran unchanged on the ported
   crate, every output still bit-identical.
+- `tests/device_memory.rs` (FL-043, 1 test in a binary of its own, about 2 s),
+  `the_device_holds_what_the_owner_counts_within_its_headroom`. It reads the device itself:
+  - With a first owner holding a 4 MiB ballast, a backend made with a budget past the device opens an owner whose
+    limit lies between the headroom before it opened and the headroom after its kernels compiled. Its budget is cut
+    to that limit.
+  - The controller kernels' device bytes are within `RESERVE_BYTES`.
+  - The preset runs 40 ticks on Metal, every digest the reference's, nothing deferred. The device then holds the
+    backend's buffers within the owner's count plus `ROUNDING_BYTES` (128 KiB) a buffer. That allowance is
+    FrankenTorch's measured bound on what the driver holds for one buffer beyond its length. The backend's resident
+    peak covers the owner's count.
+  - A 64 MiB budget is kept whole, and `BackendBudget::UNBOUNDED` stays unbounded while its owner's limit is the
+    headroom.
+  - On this M5 Ultra, the working set is 239,143,780,352 bytes and the limit is exactly the working set less the
+    4,653,056 bytes the process held. The kernels hold 376,832 bytes (0.36 MiB). The 5 buffers are counted at
+    270,789,600 bytes, and the device holds 267,296 bytes (0.10%) more than that.
+  - Off macOS it returns early, with no Metal device.
+  - Planted bugs: 6 of 6 caught. They were an owner admitting past the headroom; a headroom that ignores what the
+    device holds; a budget past it kept whole; `UNBOUNDED` cut; a 1 MiB device buffer, uncounted, beside each
+    buffer; and the device's holdings read as its working set.
 - `tests/field.rs` (FL-031, 5 tests), each step against `advance_field_on` on the same input, every candidate value
   and report term compared as bits:
   - `the_metal_step_is_the_reference_step_bit_for_bit`, three random fields each (zeros, subnormals, both signs,

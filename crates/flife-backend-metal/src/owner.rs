@@ -154,6 +154,8 @@ impl Purpose {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Device bytes its buffers may hold at once, retiring ones included.
+    /// An owner admits no more than the device's headroom as it opens
+    /// ([`DeviceOwner::open`]).
     pub bytes: u64,
     /// Read leases one purpose may hold at once (plan §9.5: outstanding
     /// leases are limited per consumer).
@@ -517,13 +519,24 @@ impl fmt::Debug for DeviceOwner {
 }
 
 impl DeviceOwner {
-    /// An owner of the default Metal device's buffers, admitting `limits`.
+    /// An owner of the default Metal device's buffers, admitting `limits`
+    /// and no more device bytes than the device's headroom as it opens
+    /// (FL-043, plan §19.4): its recommended working set less what this
+    /// process's resources hold on it then. [`DeviceOwner::limits`] is what
+    /// it admits.
     ///
     /// # Errors
     /// [`CoreError::MissingCapability`] without a Metal device, which is
     /// always the case off macOS.
     pub fn open(limits: Limits) -> Result<Self, CoreError> {
         let gateway = Gateway::open().map_err(metal)?;
+        let headroom = gateway
+            .recommended_working_set_bytes()
+            .saturating_sub(gateway.allocated_bytes());
+        let limits = Limits {
+            bytes: limits.bytes.min(headroom),
+            ..limits
+        };
         Ok(Self {
             shared: Arc::new(Shared {
                 id: OWNERS.fetch_add(1, Ordering::Relaxed),
@@ -550,6 +563,22 @@ impl DeviceOwner {
     #[must_use]
     pub fn max_buffer_bytes(&self) -> usize {
         self.shared.gateway.max_buffer_length()
+    }
+
+    /// The device's recommended working set, in bytes
+    /// (`MTLDevice.recommendedMaxWorkingSetSize`).
+    #[must_use]
+    pub fn device_working_set_bytes(&self) -> u64 {
+        self.shared.gateway.recommended_working_set_bytes()
+    }
+
+    /// What this process's resources hold on the device now
+    /// (`MTLDevice.currentAllocatedSize`): every owner's buffers as the
+    /// driver rounds them, the compiled kernels, and whatever else the
+    /// process made there, a renderer's included.
+    #[must_use]
+    pub fn device_allocated_bytes(&self) -> u64 {
+        self.shared.gateway.allocated_bytes()
     }
 
     /// What this owner holds.

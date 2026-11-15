@@ -1436,9 +1436,13 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - `reserve` is a declared allowance. Its host part is measured on the preset only: a headless run holds
     5.66 MiB beyond its world (`a_runs_own_heap_beyond_its_world_is_within_the_reserve`), and a run directory's
     catalog and store stay within their own 8 MiB allowance (`tests/checkpoint_memory.rs`). A Metal driver's own
-    heap is not measured: it allocates outside Rust's allocator. The device's working set and what it holds
-    (FrankenTorch `37e0d05e`'s `Gateway::recommended_working_set_bytes` and `Gateway::allocated_bytes`) are not in
-    this closure yet, since FrankenManim pins `ft-kernel-metal` at `0ae728fe` and it is a single-copy package.
+    host heap is not measured: it allocates outside Rust's allocator. Its device side is measured, by
+    flife-backend-metal's `tests/device_memory.rs`:
+    - the controller kernels hold 0.36 MiB on the device;
+    - beyond what the owner counts, the device holds 0.10% more for the backend's buffers;
+    - the owner admits no more than the device's headroom, and the backend's budget is cut to it.
+    That measurement is of the controller backend alone. The other Metal stages' owners and a renderer's device
+    memory are not.
   - The births term is an analytic worst case. The filling introduction tests its entrant and event part, and a
     tick in which every live organism of half the capacity attempts (all born, or all rejected after every
     candidate) its birth part.

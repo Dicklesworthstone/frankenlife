@@ -685,14 +685,30 @@ impl MetalBackend {
     /// made: its jobs are deferred to the reference, which gives the same
     /// bits.
     ///
+    /// The owner admits no more than the device's headroom as it opens
+    /// ([`DeviceOwner::open`]), and a budget past it is cut to it, so the
+    /// shards leave a batch's staging room on the device too
+    /// ([`MetalBackend::budget`]). [`BackendBudget::UNBOUNDED`] is left
+    /// whole, since its batches have no bound to stage for: its owner alone
+    /// refuses past the headroom, and a shard it refuses is not made.
+    ///
     /// # Errors
     /// As [`MetalControllers::open`].
     pub fn with_budget(shard_slots: u64, budget: BackendBudget) -> Result<Self, CoreError> {
+        let controllers = MetalControllers::open_with(Limits {
+            bytes: budget.bytes,
+            leases_per_purpose: u32::MAX,
+        })?;
+        let budget = if budget == BackendBudget::UNBOUNDED {
+            budget
+        } else {
+            BackendBudget {
+                bytes: budget.bytes.min(controllers.owner().limits().bytes),
+                ..budget
+            }
+        };
         Ok(Self {
-            controllers: MetalControllers::open_with(Limits {
-                bytes: budget.bytes,
-                leases_per_purpose: u32::MAX,
-            })?,
+            controllers,
             shard_slots: shard_slots.max(1),
             budget,
             shard_count: 0,
@@ -739,6 +755,13 @@ impl MetalBackend {
     #[must_use]
     pub const fn uploads(&self) -> u64 {
         self.uploads
+    }
+
+    /// What it holds at most: the budget it was made with, cut to the
+    /// device's headroom as it opened ([`MetalBackend::with_budget`]).
+    #[must_use]
+    pub const fn budget(&self) -> BackendBudget {
+        self.budget
     }
 
     /// The owner of every buffer this backend holds.

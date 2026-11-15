@@ -1311,7 +1311,7 @@ the genome's identity off by one. A genome named by the organism's own identity 
 founder, birth and introduction issues one organism and one genome identity together, so the two are equal in
 every run.
 
-`tests/memory_admission.rs` (19 tests, FL-043, about 43 s in a workspace run; a counting global allocator,
+`tests/memory_admission.rs` (20 tests, FL-043, about 50 s in a workspace run; a counting global allocator,
 `peak_alloc`, test only):
 - `a_resume_streams_its_genomes_and_admits_what_it_held`: the preset's run, checkpointed at tick 8 with
   `pause-and-stream`, resumed under its own budget. `start.memory.restore` is the checkpoint the store loads
@@ -1368,10 +1368,19 @@ every run.
 - `a_filling_introduction_stays_within_the_staging_term`: 512 founders of a capacity of 4,096, and at tick 0 an
   introduction of the other 3,584. The step holds 142.60 MiB above the world before it: within the staging term
   (13.47 MiB), the introduced genomes' parameters (136.55 MiB) and the state's room to its bound (1.34 MiB).
+- `a_tick_of_births_stays_within_the_staging_term`: 2,048 founders of a capacity of 4,096, each with 64 energy, no
+  cooldown and an attempt rate whose probability rounds to one, so every founder attempts in one tick. With the
+  preset's mutation all 2,048 are born, and the step holds 82.03 MiB above the world: within the staging term
+  (13.50 MiB), the children's genomes' parameters (78.32 MiB) and the state's room (1.14 MiB). With mutation all
+  but off every candidate is an effective no-op, so each attempt tries all 8 and all 2,048 are rejected: 3.45 MiB.
 - `a_render_holds_no_more_heap_than_a_plain_run_and_its_render_term`: the preset rendered at 1280 x 720 for 8 ticks
   every 2, in points and in density, holds at most the heap of the same world stepped without observers plus the
   admitted render term (observers held 52.7 MiB above the plain run, against a term of 302.5 MiB, which charges
   incompressible frames and the full ceiling).
+- `a_runs_own_heap_beyond_its_world_is_within_the_reserve`: the preset run headless on the CPU reference for 8 and
+  for 64 ticks, its records kept, ends on the digest of the same world founded, admitted and stepped directly. At
+  both lengths it holds 5.66 MiB more heap than that world (289.70 against 284.03 MiB), within the 64 MiB reserve:
+  the runtime's, the session's and the records'.
 - `a_renders_term_is_its_observers_and_a_short_budget_encodes_fewer_frames`: at 320 x 180 the term is exactly the
   feed, the view's buffers, the frame's job, the CPU route's buffers and four encodings. A budget with room for two
   encodings gets two; one byte short of room for one is refused.
@@ -1424,9 +1433,15 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - The encoding allowance and the preparation coefficients are measured on the pinned FrankenManim, not derived
     from it. The preparation limit is enforced by FrankenManim; the encoder's working set is not, and is charged
     at its worst measured case (noise).
-  - `reserve` is a declared allowance, not a measurement of the runtime's, the store's or the driver's heap.
-  - The births term is an analytic worst case. The filling introduction tests its entrant and event part; a tick
-    in which every organism reproduces, which would test its birth part, is not made.
+  - `reserve` is a declared allowance. Its host part is measured on the preset only: a headless run holds
+    5.66 MiB beyond its world (`a_runs_own_heap_beyond_its_world_is_within_the_reserve`), and a run directory's
+    catalog and store stay within their own 8 MiB allowance (`tests/checkpoint_memory.rs`). A Metal driver's own
+    heap is not measured: it allocates outside Rust's allocator. The device's working set and what it holds
+    (FrankenTorch `37e0d05e`'s `Gateway::recommended_working_set_bytes` and `Gateway::allocated_bytes`) are not in
+    this closure yet, since FrankenManim pins `ft-kernel-metal` at `0ae728fe` and it is a single-copy package.
+  - The births term is an analytic worst case. The filling introduction tests its entrant and event part, and a
+    tick in which every live organism of half the capacity attempts (all born, or all rejected after every
+    candidate) its birth part.
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
 - Only `validate`, `capabilities`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect`, `discover` and
   `transplant`. Step, analyze and export are later items (§14.6).

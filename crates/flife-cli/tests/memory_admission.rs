@@ -11,6 +11,10 @@
 //!   defers what does not fit, and the run reaches the reference's digest.
 //! - A full population's run, stepped on the CPU backend, holds no more
 //!   heap than its admitted terms, with its genomes at their actual bytes.
+//! - A filling introduction, and a tick in which every live organism
+//!   attempts to reproduce, stay within the staging term.
+//! - A headless run holds no more than the reserve beyond its world: the
+//!   runtime's, the session's and the records' heap.
 //! - A transplant's package (FL-042) is read within its term, the restored
 //!   world and its container, and keeps its `held_bytes`; a whole
 //!   transplant holds no more heap than its admitted terms, with the
@@ -1110,6 +1114,54 @@ fn a_render_holds_no_more_heap_than_a_plain_run_and_its_render_term() {
         assert!(
             peak <= plain + term,
             "render held {peak} > plain run {plain} + render term {term}"
+        );
+    }
+}
+
+/// The reserve (FL-043), measured: what `flife run` holds beyond its world.
+/// The preset run headless on the CPU reference, with its records kept,
+/// holds at most [`RESERVE_BYTES`] more heap than the same world founded,
+/// admitted and stepped the same ticks directly. The difference is the
+/// runtime's, the session's and the records'. A Metal driver's own heap is
+/// not in it: the driver allocates outside Rust's allocator.
+#[test]
+fn a_runs_own_heap_beyond_its_world_is_within_the_reserve() {
+    let _serial = serial();
+    let config = preset();
+    for ticks in [8, 64] {
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        let digest = {
+            let mut world = found(&config).expect("founds");
+            configure(&mut world, None, ControllerChoice::Cpu, None).expect("admitted");
+            for _ in 0..ticks {
+                assert!(matches!(
+                    world.step().expect("steps"),
+                    Stepped::Published(_)
+                ));
+            }
+            world.digest().to_hex()
+        };
+        let world = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+
+        let base = ALLOC.current_usage();
+        ALLOC.reset_peak_usage();
+        let records = records(&config, options(ticks, ControllerChoice::Cpu));
+        let run = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+        assert_eq!(record(&records, "end")["digest"], digest.as_str());
+        let beyond = run.saturating_sub(world);
+        println!(
+            "{ticks} ticks: the run's heap peak {:.2} MiB, its world's {:.2} MiB: {:.2} MiB beyond, \
+             of a {:.0} MiB reserve ({} records)",
+            mib(run),
+            mib(world),
+            mib(beyond),
+            mib(RESERVE_BYTES),
+            records.len()
+        );
+        assert!(
+            beyond <= RESERVE_BYTES,
+            "the run held {beyond} beyond its world, past the reserve"
         );
     }
 }

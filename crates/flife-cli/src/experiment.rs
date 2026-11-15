@@ -1559,7 +1559,20 @@ fn mean(values: &[f64]) -> Option<f64> {
     Some(sum / real(wide(values.len())))
 }
 
-fn results(runs: &[CatalogedRun]) -> Result<Vec<(CatalogedRun, RunResult)>, CoreError> {
+/// Whether `condition` has a cataloged run of one of `seeds` in `split`.
+pub(crate) fn ran_in(
+    results: &[(CatalogedRun, RunResult)],
+    condition: &str,
+    split: &str,
+    seeds: &[u64],
+) -> bool {
+    results.iter().any(|(run, _)| {
+        run.condition == condition && run.split == split && seeds.contains(&run.seed)
+    })
+}
+
+/// Every cataloged run with its result read.
+pub(crate) fn results(runs: &[CatalogedRun]) -> Result<Vec<(CatalogedRun, RunResult)>, CoreError> {
     runs.iter()
         .map(|run| {
             let result: RunResult =
@@ -1783,6 +1796,59 @@ pub fn sign_flip_p(differences: &[f64]) -> Option<f64> {
     Some(real(extreme) / real(total))
 }
 
+/// The seeds of `split`, of `seeds` in order, where `control` and
+/// `condition` both reached their tick with measures, with the two runs'
+/// measures; and the seeds left out (either run incomplete, or not run).
+pub(crate) fn paired(
+    results: &[(CatalogedRun, RunResult)],
+    control: &str,
+    condition: &str,
+    split: &str,
+    seeds: &[u64],
+) -> (Vec<(u64, Measures, Measures)>, Vec<u64>) {
+    let find = |condition: &str, seed: u64| {
+        results
+            .iter()
+            .find(|(run, _)| run.condition == condition && run.split == split && run.seed == seed)
+            .map(|(_, result)| result)
+    };
+    let mut paired = Vec::new();
+    let mut unpaired = Vec::new();
+    for &seed in seeds {
+        match (find(control, seed), find(condition, seed)) {
+            (Some(a), Some(b)) if a.complete() && b.complete() => {
+                if let (Some(a), Some(b)) = (a.measures, b.measures) {
+                    paired.push((seed, a, b));
+                } else {
+                    unpaired.push(seed);
+                }
+            }
+            _ => unpaired.push(seed),
+        }
+    }
+    (paired, unpaired)
+}
+
+/// Each measure's effect over `paired` (control first in each pair), in
+/// [`MEASURES`] order; a pair whose measure is undefined in either run is
+/// left out of that measure by seed.
+pub(crate) fn effects(paired: &[(u64, Measures, Measures)]) -> BTreeMap<&'static str, Effect> {
+    MEASURES
+        .iter()
+        .map(|measure| {
+            let mut pairs = Vec::new();
+            let mut undefined = Vec::new();
+            for (seed, a, b) in paired {
+                match ((measure.read)(a), (measure.read)(b)) {
+                    (Some(a), Some(b)) => pairs.push((a, b)),
+                    _ => undefined.push(*seed),
+                }
+            }
+            (measure.name, effect(&pairs, undefined))
+        })
+        .collect()
+}
+
 fn effect(pairs: &[(f64, f64)], undefined_seeds: Vec<u64>) -> Effect {
     let differences: Vec<f64> = pairs
         .iter()
@@ -1835,14 +1901,6 @@ impl Report {
                 _ => count.error += 1,
             }
         }
-        let find = |condition: &str, split: &str, seed: u64| {
-            results
-                .iter()
-                .find(|(run, _)| {
-                    run.condition == condition && run.split == split && run.seed == seed
-                })
-                .map(|(_, result)| result)
-        };
         let mut comparisons = Vec::new();
         for (split, seeds) in [
             (DISCOVERY, &experiment.spec.seeds.discovery),
@@ -1852,43 +1910,11 @@ impl Report {
                 if &condition.name == control {
                     continue;
                 }
-                let ran = seeds
-                    .iter()
-                    .any(|&seed| find(&condition.name, split, seed).is_some());
-                if !ran {
+                if !ran_in(&results, &condition.name, split, seeds) {
                     continue;
                 }
-                let mut paired = Vec::new();
-                let mut unpaired = Vec::new();
-                for &seed in seeds {
-                    match (
-                        find(control, split, seed),
-                        find(&condition.name, split, seed),
-                    ) {
-                        (Some(a), Some(b)) if a.complete() && b.complete() => {
-                            if let (Some(a), Some(b)) = (a.measures, b.measures) {
-                                paired.push((seed, a, b));
-                            } else {
-                                unpaired.push(seed);
-                            }
-                        }
-                        _ => unpaired.push(seed),
-                    }
-                }
-                let effects = MEASURES
-                    .iter()
-                    .map(|measure| {
-                        let mut pairs = Vec::new();
-                        let mut undefined = Vec::new();
-                        for (seed, a, b) in &paired {
-                            match ((measure.read)(a), (measure.read)(b)) {
-                                (Some(a), Some(b)) => pairs.push((a, b)),
-                                _ => undefined.push(*seed),
-                            }
-                        }
-                        (measure.name, effect(&pairs, undefined))
-                    })
-                    .collect();
+                let (paired, unpaired) = paired(&results, control, &condition.name, split, seeds);
+                let effects = effects(&paired);
                 comparisons.push(Comparison {
                     split: split.to_owned(),
                     condition: condition.name.clone(),

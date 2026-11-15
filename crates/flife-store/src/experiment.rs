@@ -191,6 +191,38 @@ impl ExperimentCatalog {
         }
     }
 
+    /// Open the existing catalog at `path` only to read it: nothing is
+    /// created, and no statement but a read is run (`flife analyze`).
+    ///
+    /// # Errors
+    /// [`CoreError::StorageFailed`] when `path` is not a file or the
+    /// database cannot be opened or read; [`CoreError::SchemaMismatch`] for
+    /// a database of another format.
+    pub fn read(path: &Path) -> Result<Self, CoreError> {
+        if !path.is_file() {
+            return Err(CoreError::StorageFailed {
+                operation: "open experiment catalog",
+                path: path.display().to_string(),
+                reason: "no experiment catalog".into(),
+            });
+        }
+        let location = path.display().to_string();
+        let connection = block_on_inline(Connection::open(location))
+            .map_err(|error| storage("open experiment catalog", path, &error))?;
+        let catalog = Self {
+            connection,
+            path: path.to_path_buf(),
+        };
+        let format = catalog.value("format")?;
+        if format.as_deref() != Some(EXPERIMENT_CATALOG_FORMAT) {
+            return Err(CoreError::SchemaMismatch {
+                expected: EXPERIMENT_CATALOG_FORMAT.into(),
+                found: format.unwrap_or_default(),
+            });
+        }
+        Ok(catalog)
+    }
+
     /// The database file.
     #[must_use]
     pub fn path(&self) -> &Path {

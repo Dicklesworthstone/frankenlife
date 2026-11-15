@@ -260,6 +260,18 @@ enum Command {
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
     },
+    /// Analyze experiment directories together, read-only: each condition's
+    /// paired differences from the control pooled across the experiments
+    /// that ran it, with the experiment report's statistics, beside each
+    /// experiment's own. One `frankenlife.analysis.v1` record. Refused
+    /// (exit 2) unless the experiments share their base configuration,
+    /// ticks, metrics interval, measures and control, define each shared
+    /// condition alike, and pool each seed once.
+    Analyze {
+        /// Two or more experiment directories `flife experiment` made.
+        #[arg(required = true, num_args = 2..)]
+        experiments: Vec<PathBuf>,
+    },
     /// Print a run directory's committed state at one of its checkpoints
     /// as NDJSON: a header, every live organism in identity order, with
     /// `--field` the field's energy plane, and with `--weights` an
@@ -744,6 +756,17 @@ fn main() -> ExitCode {
                 print,
             ) {
                 Ok(_) => ExitCode::SUCCESS,
+                Err(error) => fail(error.kind(), error.to_string()),
+            }
+        }
+        Command::Analyze { experiments } => {
+            let directories: Vec<&std::path::Path> =
+                experiments.iter().map(PathBuf::as_path).collect();
+            match flife_cli::analyze(&directories) {
+                Ok(analysis) => {
+                    print(&analysis);
+                    ExitCode::SUCCESS
+                }
                 Err(error) => fail(error.kind(), error.to_string()),
             }
         }

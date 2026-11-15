@@ -617,7 +617,7 @@ flife branch                # control and intervention branches from one checkpo
 flife experiment            # seed ensembles, sweeps and ablations against a control, every run cataloged (exists)
 flife discover              # a pinned discovery bundle: reference, selection, thumbnail, full-world export, local package (exists)
 flife transplant            # a local package grafted into a founded host, as a run that resumes (exists)
-flife analyze               # cross-experiment analysis of cataloged metrics
+flife analyze <dir> <dir>…  # experiments' cataloged effects pooled by condition, refused unless comparable (exists)
 flife render | export       # simulation-time frames and video through FrankenManim; render --run-dir continues a run, branch or transplant from its checkpoint (render exists)
 flife-studio <preset>       # the interactive microscope (exists, macOS)
 ```

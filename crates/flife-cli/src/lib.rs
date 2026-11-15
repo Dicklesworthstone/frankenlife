@@ -58,16 +58,17 @@
 //! `flife capabilities [--config C]`,
 //! `flife run <config> --ticks N --every K [--run-dir DIR]`,
 //! `flife render (<config> | --run-dir DIR) --ticks N --out FRAMES [--video V]`,
-//! `flife resume DIR --until T`,
+//! `flife resume DIR --until T`, `flife step DIR [--ticks N]`,
 //! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
 //! `flife inspect DIR [--at T] [--field]`,
 //! `flife discover DIR BUNDLE [--at T] [--region X,Y,R | --lineage L]`,
 //! `flife transplant PACKAGE DIR --config HOST --at X,Y [--name N]` and
-//! `flife experiment SPEC --out DIR`. The repository's presets live
+//! `flife experiment SPEC --out DIR` and `flife analyze DIR DIR…`. The repository's presets live
 //! in `presets/`.
 
 #![forbid(unsafe_code)]
 
+pub mod analyze;
 pub mod branch;
 pub mod capabilities;
 pub mod checkpointing;
@@ -84,6 +85,9 @@ pub mod run;
 pub mod transplant;
 pub mod validate;
 
+pub use analyze::{
+    ANALYSIS_SCHEMA, Analysis, AnalyzedExperiment, DesignedCondition, Part, Pooled, analyze,
+};
 pub use branch::{
     BRANCH_NAME_MAX_BYTES, BranchOptions, BranchParent, ForkRecord, FoundingChunks, Inherited,
     branch, branch_session,

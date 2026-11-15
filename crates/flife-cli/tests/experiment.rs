@@ -17,6 +17,8 @@
 //! - Each named ablation changes what it names, read from the runs' own
 //!   end and metrics records.
 //! - A specification that would leave a choice hidden is refused.
+//! - `flife analyze` pools experiments of one design into exactly the pairs
+//!   their own reports compare, and refuses experiments it cannot pool.
 
 #![allow(
     clippy::expect_used,
@@ -36,8 +38,8 @@ use std::sync::{Arc, Mutex};
 use flife_cli::experiment::{DISCOVERY, EXACT_TEST_MAX_SEEDS, HELD_OUT, RUNS_DIR, sign_flip_p};
 use flife_cli::{
     ABLATIONS, ControllerChoice, EXPERIMENT_CATALOG_FILE, Experiment, ExperimentOptions,
-    ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measures, Metrics, REPORT_FILE,
-    Record, Report, RunOptions, RunResult, Spec,
+    ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measures, Metrics, Part, REPORT_FILE,
+    Record, Report, RunOptions, RunResult, Spec, analyze,
 };
 use flife_core::{CoreError, Sha256Digest};
 use flife_store::{CatalogedRun, ExperimentCatalog};
@@ -1069,4 +1071,178 @@ fn the_sign_flip_test_by_hand() {
         sign_flip_p(&[1.0; EXACT_TEST_MAX_SEEDS]),
         Some(2.0 / f64::from(1_u32 << EXACT_TEST_MAX_SEEDS))
     );
+}
+
+/// `analyze`'s refusal of `directories`, whose detail must contain `detail`.
+#[track_caller]
+fn refused_analysis(directories: &[&Path], detail: &str) {
+    match analyze(directories) {
+        Err(CoreError::StateConflict { detail: found, .. }) => {
+            assert!(found.contains(detail), "{detail}: {found}");
+        }
+        other => panic!("expected a refusal naming {detail}, got {other:?}"),
+    }
+}
+
+/// `flife analyze` (plan §14.6). The emission experiment run again on
+/// disjoint seeds pools with the first. Each condition and split's pooled
+/// differences, counts and exact p-value are the two reports' own
+/// differences concatenated, and each experiment's part is its report's.
+/// The binary prints the library's record, the same twice. Refused:
+/// - one experiment alone, or one given twice;
+/// - other ticks, metrics interval or control;
+/// - a condition defined another way;
+/// - a seed already pooled;
+/// - a directory with no catalog.
+#[test]
+fn analysis_pools_experiments_into_the_pairs_their_reports_compare() {
+    let root = scratch("analyze");
+    let run_in = |name: &str, header: &str, conditions: &str| {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).expect("creates the specification's directory");
+        let spec = write_spec(&directory, header, conditions);
+        let out = directory.join("out");
+        let report = run(&spec, &out, 1, ControllerChoice::Cpu);
+        (out, report)
+    };
+    let (first, a) = run_in("first", EMISSION, EMISSION_CONDITIONS);
+    let again = EMISSION
+        .replace("discovery = [1, 2, 3]", "discovery = [4, 5]")
+        .replace("held_out = [11, 12]", "held_out = [13]");
+    let (second, b) = run_in("second", &again, EMISSION_CONDITIONS);
+
+    let analysis = analyze(&[&first, &second]).expect("the two pool");
+    assert_eq!(analysis.schema, "frankenlife.analysis.v1");
+    assert_eq!(analysis.base_config_hash, a.base_config_hash);
+    assert_eq!(analysis.ticks, 120);
+    assert_eq!(analysis.control, "control");
+    let identities: Vec<&str> = analysis
+        .experiments
+        .iter()
+        .map(|experiment| experiment.experiment.as_str())
+        .collect();
+    assert_eq!(identities, [a.experiment.as_str(), b.experiment.as_str()]);
+    assert_eq!(analysis.experiments[0].runs, a.runs.len());
+    assert_eq!(analysis.experiments[1].runs, b.runs.len());
+    assert_eq!(analysis.comparisons.len(), a.comparisons.len());
+    assert_eq!(analysis.measures.len(), MEASURES.len());
+    let mut differing = 0;
+    for pooled in &analysis.comparisons {
+        let own = |report: &Report| {
+            report
+                .comparisons
+                .iter()
+                .find(|c| c.split == pooled.split && c.condition == pooled.condition)
+                .cloned()
+                .expect("each report compares it")
+        };
+        let (ca, cb) = (own(&a), own(&b));
+        assert_eq!(pooled.control, "control");
+        assert_eq!(
+            pooled.experiments,
+            [a.experiment.clone(), b.experiment.clone()]
+        );
+        assert_eq!(pooled.seeds, [ca.seeds.clone(), cb.seeds.clone()]);
+        assert_eq!(
+            pooled.unpaired_seeds,
+            [ca.unpaired_seeds.clone(), cb.unpaired_seeds.clone()]
+        );
+        assert_eq!(pooled.effects.len(), MEASURES.len());
+        for (measure, effect) in &pooled.effects {
+            let (ea, eb) = (&ca.effects[measure], &cb.effects[measure]);
+            let mut differences = ea.differences.clone();
+            differences.extend(&eb.differences);
+            assert_eq!(effect.differences, differences, "{measure}");
+            assert_eq!(effect.n, ea.n + eb.n, "{measure}");
+            assert_eq!(effect.higher, ea.higher + eb.higher, "{measure}");
+            assert_eq!(effect.lower, ea.lower + eb.lower, "{measure}");
+            assert_eq!(effect.equal, ea.equal + eb.equal, "{measure}");
+            assert_eq!(effect.p_two_sided, sign_flip_p(&differences), "{measure}");
+            if !differences.is_empty() {
+                let mean = differences.iter().sum::<f64>() / differences.len() as f64;
+                assert_eq!(effect.mean_difference, mean, "{measure}");
+            }
+            let mut undefined = ea.undefined_seeds.clone();
+            undefined.extend(&eb.undefined_seeds);
+            assert_eq!(effect.undefined_seeds, undefined, "{measure}");
+            assert_eq!(
+                pooled.parts[measure],
+                [
+                    Part {
+                        n: ea.n,
+                        mean_difference: ea.mean_difference
+                    },
+                    Part {
+                        n: eb.n,
+                        mean_difference: eb.mean_difference
+                    }
+                ],
+                "{measure}"
+            );
+            differing += usize::from(differences.iter().any(|difference| *difference != 0.0));
+        }
+    }
+    assert!(differing > 0, "the ablations change some measure");
+
+    let printed = |directories: &[&Path]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_flife"))
+            .arg("analyze")
+            .args(directories)
+            .output()
+            .expect("flife runs");
+        (output.status.code(), output.stdout, output.stderr)
+    };
+    let (status, out, err) = printed(&[&first, &second]);
+    assert_eq!(status, Some(0), "{}", String::from_utf8_lossy(&err));
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(text.lines().count(), 1, "one record");
+    let record: Value = serde_json::from_str(text.trim_end()).expect("JSON");
+    assert_eq!(record, serde_json::to_value(&analysis).expect("serializes"));
+    assert_eq!(printed(&[&first, &second]).1, out, "the same bytes again");
+
+    refused_analysis(&[&first], "at least two");
+    refused_analysis(&[&first, &first], "given twice");
+    let shorter = EMISSION
+        .replace("ticks = 120", "ticks = 60")
+        .replace("discovery = [1, 2, 3]", "discovery = [6]")
+        .replace("held_out = [11, 12]", "held_out = []");
+    let two = "[[conditions]]\nname = \"control\"\n\n[[conditions]]\nname = \"no-emission\"\nablation = \"no-emission\"\n";
+    let (short, _) = run_in("short", &shorter, two);
+    refused_analysis(&[&first, &short], "ticks 60");
+    let one_seed = EMISSION
+        .replace("discovery = [1, 2, 3]", "discovery = [7]")
+        .replace("held_out = [11, 12]", "held_out = []");
+    let redefined = two.replace(
+        "ablation = \"no-emission\"",
+        "ablation = \"chemistry-only\"",
+    );
+    let (other, _) = run_in("redefined", &one_seed, &redefined);
+    refused_analysis(&[&first, &other], "defined differently");
+    let repeated = EMISSION
+        .replace("discovery = [1, 2, 3]", "discovery = [2]")
+        .replace("held_out = [11, 12]", "held_out = []");
+    let (again, _) = run_in("repeated", &repeated, two);
+    refused_analysis(&[&first, &again], "counted twice");
+    let sampled = EMISSION
+        .replace("ticks = 120", "ticks = 120\nmetrics_every = 40")
+        .replace("discovery = [1, 2, 3]", "discovery = [8]")
+        .replace("held_out = [11, 12]", "held_out = []");
+    let (sampled, _) = run_in("sampled", &sampled, two);
+    refused_analysis(&[&first, &sampled], "metrics interval 40");
+    let controlled = EMISSION
+        .replace("control = \"control\"", "control = \"no-emission\"")
+        .replace("discovery = [1, 2, 3]", "discovery = [9]")
+        .replace("held_out = [11, 12]", "held_out = []");
+    let (controlled, _) = run_in("controlled", &controlled, two);
+    refused_analysis(&[&first, &controlled], "control no-emission");
+    let empty = root.join("empty");
+    fs::create_dir_all(&empty).expect("creates an empty directory");
+    assert!(matches!(
+        analyze(&[&first, &empty]),
+        Err(CoreError::StorageFailed { .. })
+    ));
+    let (status, out, err) = printed(&[&first, &first]);
+    assert_eq!(status, Some(2));
+    assert!(out.is_empty(), "nothing analyzed");
+    assert!(String::from_utf8_lossy(&err).contains("given twice"));
 }

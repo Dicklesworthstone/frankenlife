@@ -138,6 +138,25 @@ for, one at least, before a render is refused. Its first record is `start`, with
   - In the library: `Experiment::load(path)` or `Experiment::new(spec, base_text)`, then `experiment(&experiment,
     dir, ExperimentOptions { cpu_workers, controllers }, emit)`. `Experiment::configuration(condition, seed)` gives
     any planned run's validated configuration.
+- `flife analyze DIR DIR...` (plan §14.6, §15.2–§15.5; bead flife-t9t) reads two or more experiment directories'
+  catalogs (`ExperimentCatalog::read`: nothing is created or written, nothing runs) and prints one
+  `frankenlife.analysis.v1` record (`analyze::Analysis`; `analyze(&[dir, ...])` in the library):
+  - the shared base configuration hash, ticks, metrics interval and control;
+  - each experiment's identity (the SHA-256 of its cataloged design), name, seeds and run count, in the order
+    given;
+  - every condition any of them defines, once, and the measures with their bases;
+  - for every split (discovery first) and non-control condition, a `Pooled` comparison:
+    - the experiments that ran it there, with their paired and unpaired seeds;
+    - each measure's effect over all their pairs, in that order, from the report's own code (`paired`, `effects`:
+      mean difference, rise/fall/tie counts, exact sign-flip p up to 20 pairs, undefined seeds);
+    - each experiment's own `n` and mean difference (`parts`), as its report has them.
+  - It is refused (exit 2, `state-conflict`, the difference named) for:
+    - fewer than two directories, or one experiment given twice;
+    - designs with another base configuration, ticks, metrics interval, control or measure list;
+    - a condition name defined with another ablation or keys;
+    - a seed that would enter one condition and split twice (under one base configuration it is the same run).
+  - A directory without a catalog is `storage-failed`, and another catalog or design format `schema-mismatch`.
+  - The record depends on the catalogs alone (no path, host or time): the same catalogs print the same bytes.
 
 - FL-042: `flife discover DIR BUNDLE --at T --name NAME --description TEXT (--region X,Y,R | --lineage L) --width W
   --height H --no-world --no-package --render-threads N --color C --look L --density --no-field --field-mapping F
@@ -1245,8 +1264,8 @@ was not equivalent: the test had reused a live organism's identity, which the li
 also reuses a dead organism's identity, which only that check refuses, and requires each refusal to name its check.
 The survivor and the five other mutants the refusal tests catch were run again, and all six were caught.
 
-`tests/experiment.rs` (7 tests: FL-041's six and one of FL-048's, about 9 s in release), on FL-037's 32 × 32
-ecology from the plan's own Appendix A:
+`tests/experiment.rs` (8 tests: FL-041's six, one of FL-048's and `flife analyze`'s, about 9 s in release), on
+FL-037's 32 × 32 ecology from the plan's own Appendix A:
 - `repeated_experiments_report_byte_identically_at_any_worker_count_and_across_a_kill`. Control, `no-emission` and
   `chemistry-only` over three discovery and two held-out seeds (15 runs). One CPU worker on the reference and three
   on `auto` write byte-identical reports. The `flife` binary is killed with SIGKILL after its fourth
@@ -1288,6 +1307,16 @@ ecology from the plan's own Appendix A:
 - `a_run_is_measured_by_its_last_metrics_record_only_at_its_end` (FL-048): a 120-tick run with a metrics record
   every 50 ticks has records at 50, 100 and 120. `Measures::of` takes `LastRecord::of` the tick-120 record, and
   none from the tick-100 record or from no record.
+- `analysis_pools_experiments_into_the_pairs_their_reports_compare` (`flife analyze`). The emission experiment above
+  and the same design on disjoint seeds (4 and 5; 13) pool. For every condition, split and measure, the pooled
+  differences are the two reports' differences concatenated, with summed counts and undefined seeds, the mean of
+  the concatenation and `sign_flip_p` of it. Each part is its report's `n` and mean difference, and some measure
+  differs. The binary prints one line equal to the library's record, byte-identical twice. Refused, each naming
+  the difference: one directory, one experiment twice, 60 ticks, a metrics interval of 40, another control, a
+  condition redefined with another ablation, and seed 2 pooled again; a directory without a catalog is
+  `storage-failed`. Six planted defects were all caught: no duplicate-seed check, the pooled effect from the last
+  experiment only, the metrics interval unchecked, the control unchecked, the condition definitions unchecked, and
+  a part's mean difference negated.
 
 Seven planted mutants in FL-048's measures were each caught: undefined seeds not named, an undefined measure
 counted as zero, organism Moran's I read from the field, the identity without the measures, topologies counted
@@ -1463,8 +1492,9 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
     tick in which every live organism of half the capacity attempts (all born, or all rejected after every
     candidate) its birth part.
   - Shards are never freed before `forget`, so a backend stays at its peak (FL-026); the budget bounds that peak.
-- Only `validate`, `capabilities`, `run`, `resume`, `render`, `branch`, `experiment`, `inspect`, `discover` and
-  `transplant`. Step, analyze and export are later items (§14.6).
+- Only `validate`, `capabilities`, `run`, `resume`, `step`, `render`, `branch`, `experiment`, `analyze`, `inspect`,
+  `discover` and `transplant`. A separate `export` is a later item (§14.6): frames come from `render`, a world from
+  `discover`'s full-world export and the Studio's timeline export.
 - `flife render --run-dir` gaps:
   - It renders forward from where `flife resume` would continue. It does not re-render an earlier interval from
     an older checkpoint (no `--at`): commands accepted after that checkpoint would have to be taken from a newer

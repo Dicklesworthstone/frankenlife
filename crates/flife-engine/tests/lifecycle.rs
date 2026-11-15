@@ -1156,6 +1156,63 @@ fn a_whole_tick_commit_finds_survivors_by_identity_across_gaps() {
     }
 }
 
+/// FL-034: an ascending walk finds what the searches find. Across a dead
+/// identity and a reused or moved slot, in both arrangements, each live
+/// identity asked in ascending order gets `genome`'s genome and
+/// `arena_slot`'s slot, an identity skipped changes nothing, and the dead
+/// identity, or one not above the last asked, is not alive.
+#[test]
+fn an_ascending_walk_finds_each_genome_and_arena_slot_the_searches_find() {
+    let world = World::new();
+    for arrangement in [Arrangement::Compact, Arrangement::FreeList] {
+        let mut genomes = quota();
+        let mut population = population(arrangement, 8);
+        let mut founders: Vec<Entrant> = [1, 3, 5, 6]
+            .into_iter()
+            .map(|id| world.founder(id, 2.0, &mut genomes))
+            .collect();
+        population.admit(&mut founders).expect("founders");
+        // 3 dies and 7 is born: the live identities are 1, 5, 6 and 7.
+        let three = alive(&population, 3);
+        let mut births = vec![world.child(7, &alive(&population, 1), 1, 0.5, &mut genomes)];
+        let collected = population
+            .commit(Tick::new(1), &[exhausted(&three, 1)], &mut births)
+            .expect("commit");
+        for entry in collected {
+            genomes.retire(entry.genome).expect("retire");
+        }
+
+        let mut walk = population.ascending();
+        for id in [1, 3, 5, 7] {
+            let id = OrganismId::new(id);
+            let (genome, slot) = walk.next(id);
+            assert_eq!(slot, population.arena_slot(id), "{id}");
+            match population.genome(id) {
+                Some(searched) => {
+                    assert!(slot.is_some(), "{id}");
+                    assert!(
+                        genome.is_some_and(|walked| std::ptr::eq(walked, searched)),
+                        "{id}"
+                    );
+                }
+                None => assert!(genome.is_none() && slot.is_none(), "{id}"),
+            }
+        }
+        assert!(population.genome(OrganismId::new(3)).is_none());
+
+        // An identity not above the last one found is not found, and the
+        // walk goes on from where it was.
+        let mut walk = population.ascending();
+        assert!(walk.next(OrganismId::new(6)).0.is_some());
+        assert_eq!(walk.next(OrganismId::new(5)), (None, None));
+        assert_eq!(walk.next(OrganismId::new(6)), (None, None));
+        assert_eq!(
+            walk.next(OrganismId::new(7)).1,
+            population.arena_slot(OrganismId::new(7))
+        );
+    }
+}
+
 #[test]
 fn dead_identities_are_never_readmitted() {
     let world = World::new();

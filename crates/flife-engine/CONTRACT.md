@@ -135,7 +135,9 @@ each runs and owns the field.
   `Recycling::settle`'s `DeathSettlement` (removed, dissipated, recycled and offered; `record` books the first two).
 - `Population`: `admit`, `update`, `commit` (the `Collected` deaths, each with its last row and genome, for the
   caller to retire), `get`, `iter` and `ids` in identity order, `iter_with_genomes` (each organism with its
-  genome, read from its one slot), `slot` and `slots`, `genome`, `arena_slot` and
+  genome, read from its one slot), `ascending` (FL-034: an `Ascending` walk whose `next(id)` gives `genome(id)` and
+  `arena_slot(id)` for ascending identities from one pass over the index; `(None, None)` for an identity not alive
+  or not above the last found, keeping the entries at and after it), `slot` and `slots`, `genome`, `arena_slot` and
   `arena` (FL-026: each live genome's generation-tagged slot, assigned at admission or birth and released at
   death, kept when the compact arrangement moves the organism, and reassigned in identity order on restore),
   `latest` and
@@ -827,6 +829,14 @@ streams. The small ecology pins its world digest, checked on Linux x86_64.
     `iter_with_genomes` gives `iter`'s organisms with `genome`'s genomes. Of five planted defects in the walk and
     in `iter_with_genomes`, each was caught; the one that drops the walk's equality check is caught by this test
     alone.
+  - `tests/lifecycle.rs::an_ascending_walk_finds_each_genome_and_arena_slot_the_searches_find` (FL-034): in the
+    same population, in both arrangements, `ascending().next` gives `genome`'s genome and `arena_slot`'s slot for
+    1, 3, 5 and 7 (6 skipped, the dead 3 not alive and not consuming 5's entry), and an identity not above the last
+    found is not found while the walk goes on. Its first version found the walk consuming the entry after a dead
+    identity; the walk now passes only entries below the identity asked. Four planted defects (taking the entry at
+    or after the identity; never passing lower entries; the batch asking for the next identity; the slot read
+    from the next slot) are each caught, three by this test and the batch's by `flife-backend-cpu`'s
+    `tests/world.rs` (`reference_ticks == 0`, its digests).
   - Twenty-two planted bugs were each caught by at least one of these tests: regular evaluation keyed to the input
     tick, newborns not forced, packet scratch leaking between organisms, every demand at one position, identities
     or the quota advanced in place, the field, epoch or event cursor not committed, deposits before the grants'
@@ -1240,6 +1250,13 @@ velocity, first-order splitting at the configured fixed timestep.
   preset at 512 founders for 300 ticks through a CPU batch backend that defers one job in seven, and the digests
   match the reference at every tick. Two planted negatives: one flipped output bit must change that tick's digest,
   and a planted device failure must leave the world unchanged and be reported.
+  FL-034: the batch's jobs take each due organism's genome and arena slot from one ascending walk of the identity
+  index (`Population::ascending`), not two searches per organism. In a sample of the 100k Desktop base on Metal
+  controllers (16 workers) those searches were about 11% of the main thread. A/B declared before running
+  (`flife run --ticks 288 --cpu-workers 16 --controllers metal`, ticks/s from tick 32 to 288, 356cd67 against
+  this tree, 4 alternated rounds on the shared Mac at load 21–35): 8.48–9.10 against 8.96–9.18 ticks/s, paired
+  ratios 1.072, 1.015, 0.984 and 1.070 (median 1.043, faster in 3 of 4), every final digest the same. That met the
+  declared rule (median ≥ 1.03, 3 of 4) under load; it is not a quiet-host figure.
 - `World::set_field_backend` (FL-031) hands phase 2 to a `flife_field::FieldBackend`, which must equal
   `advance_field_on`. If it errs, the step is redone on the reference from the same committed field: the
   backend writes only the candidate, so nothing it left there survives. The backend is then dropped, and

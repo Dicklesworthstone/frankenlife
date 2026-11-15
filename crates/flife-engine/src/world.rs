@@ -3486,18 +3486,25 @@ fn decide_batched(
     let mut jobs = Vec::new();
     reserve_for(&mut jobs, rows.len(), "controller jobs")?;
     let mut seen = 0;
+    // The rows are in identity order, so one walk of the index finds every
+    // genome and slot (FL-034: two searches per organism were about 11% of
+    // a 100k world's main thread on Metal controllers).
+    let mut live = population.ascending();
     for (organism, observation) in rows.iter().zip(observed) {
         seen += 1;
         if due(rules, organism, to) {
+            let (genome, slot) = live.next(organism.id);
             jobs.push(ControllerJob {
                 genome: organism.genome,
-                slot: population.arena_slot(organism.id).ok_or_else(|| {
-                    CoreError::StateConflict {
-                        operation: "controller batch",
-                        detail: format!("{} holds no arena slot", organism.id),
-                    }
+                slot: slot.ok_or_else(|| CoreError::StateConflict {
+                    operation: "controller batch",
+                    detail: format!("{} holds no arena slot", organism.id),
                 })?,
-                controller: genome_of(population, organism.id)?
+                controller: genome
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} has no genome", organism.id),
+                    })?
                     .controller(&rules.catalog, &rules.limits)?,
                 inputs: &observation.inputs,
             });

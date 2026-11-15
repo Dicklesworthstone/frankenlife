@@ -77,7 +77,8 @@ pub use lifecycle::{
 pub use measure::RegionMeasurement;
 pub use motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
 pub use population::{
-    Arrangement, Collected, Entrant, HeldOutput, Organism, POPULATION_DIGEST_SCHEMA, Population,
+    Arrangement, Ascending, Collected, Entrant, HeldOutput, Organism, POPULATION_DIGEST_SCHEMA,
+    Population,
 };
 pub use reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity,

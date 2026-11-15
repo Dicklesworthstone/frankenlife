@@ -49,6 +49,7 @@
 //! An organism keeps its arena slot when the compact arrangement moves it.
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
+use std::iter::Peekable;
 
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
@@ -301,6 +302,36 @@ pub struct Population {
     latest: Option<OrganismId>,
 }
 
+/// One ascending walk of a population's identity index (FL-034), for a
+/// caller visiting organisms in identity order: [`Ascending::next`] gives
+/// what [`Population::genome`] and [`Population::arena_slot`] give, read
+/// from the organism's one slot, without a search per organism.
+#[derive(Debug)]
+pub struct Ascending<'a> {
+    population: &'a Population,
+    live: Peekable<btree_map::Iter<'a, OrganismId, usize>>,
+}
+
+impl<'a> Ascending<'a> {
+    /// `id`'s genome and its genome's arena slot, for an `id` above every
+    /// identity this walk found before: the entries below `id` are passed,
+    /// and `id`'s is taken. `(None, None)` when `id` is not alive or not
+    /// above the last identity found; the walk then keeps the entries at
+    /// and after `id`.
+    pub fn next(&mut self, id: OrganismId) -> (Option<&'a Genome>, Option<ArenaSlot>) {
+        while self.live.next_if(|&(&entry, _)| entry < id).is_some() {}
+        let population = self.population;
+        self.live
+            .next_if(|&(&entry, _)| entry == id)
+            .map_or((None, None), |(_, &slot)| {
+                (
+                    population.genomes.get(slot).and_then(Option::as_ref),
+                    population.arena_slots.get(slot).copied().flatten(),
+                )
+            })
+    }
+}
+
 /// `id`'s slot, from an ascending walk of the index that has not passed
 /// `id`: the entries below `id` are skipped and the one at or after it is
 /// taken. `None` when `id` is not alive.
@@ -528,6 +559,16 @@ impl Population {
         self.index
             .get(&id)
             .and_then(|&slot| self.arena_slots.get(slot).copied().flatten())
+    }
+
+    /// A walk from the lowest identity that gives [`Population::genome`]
+    /// and [`Population::arena_slot`] for ascending identities ([`Ascending`]).
+    #[must_use]
+    pub fn ascending(&self) -> Ascending<'_> {
+        Ascending {
+            population: self,
+            live: self.index.iter().peekable(),
+        }
     }
 
     /// The genome arena: which slots live genomes hold.

@@ -31,7 +31,7 @@ export function Film() {
   useEffect(() => {
     const element = ref.current;
     if (!element) return;
-    // The film is about 24 MB: a reader who asks for less motion or less data gets the poster and the button.
+    // The film is about 10 MB: a reader who asks for less motion or less data gets the poster and the button.
     const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const saving = (navigator as { connection?: { saveData?: boolean } }).connection?.saveData === true;
     if (!still && !saving) {
@@ -75,6 +75,7 @@ export function Film() {
   const tick = world.ticks[frame] ?? world.from.tick;
   const live = world.live[frame] ?? 0;
   const simulated = (tick - world.from.tick) * secondsPerTick;
+  const zoom = render.zoom?.[frame] ?? 1;
 
   return (
     <figure className="glass-modern relative overflow-hidden rounded-3xl p-2 sm:p-3">
@@ -97,7 +98,7 @@ export function Film() {
           aria-label={`The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour} over the field's ${render.field_mapping}`}
         />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent px-4 pt-16 pb-4 sm:px-5">
-          <dl className="grid grid-cols-3 gap-3 font-mono text-white">
+          <dl className="grid grid-cols-4 gap-3 font-mono text-white">
             <div>
               <dt className="text-[9px] font-black tracking-[0.25em] text-green-400/80 uppercase">Tick</dt>
               <dd className="text-sm tabular-nums sm:text-base">{grouped(tick)}</dd>
@@ -109,6 +110,10 @@ export function Film() {
             <div>
               <dt className="text-[9px] font-black tracking-[0.25em] text-green-400/80 uppercase">Alive</dt>
               <dd className="text-sm tabular-nums sm:text-base">{grouped(live)}</dd>
+            </div>
+            <div>
+              <dt className="text-[9px] font-black tracking-[0.25em] text-green-400/80 uppercase">View</dt>
+              <dd className="text-sm tabular-nums sm:text-base">{zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`}</dd>
             </div>
           </dl>
         </div>

@@ -112,11 +112,31 @@ Every run reached its last tick, none came within 90,000 of the ceiling, and eac
 than settling. "By eye" means one person looking at frames. It is not the G5 review against the references,
 which has not been run.
 
+## Two controls on the preset
+
+These runs use the preset at seed 42 for 4,800 ticks, changing only `model`, with frames every 96 ticks. They are
+one run each.
+
+| Model | Live, second half | Highest | End digest | By eye |
+|---|---|---:|---|---|
+| `field-ecology-v1` (the preset) | 66,405–103,917 | 131,678 | `bb49c89c…` | rings, cells, membranes |
+| `field-ecology-v1-chemistry-only` | 75,695–135,297 | 165,601 | `5126f564…` | the same kinds of rings, cells and membranes |
+| `field-ecology-v1-fresh-offspring` | 766–3,796 | 43,816 | `ae5cf41d…` | diffuse scatter, no structure; dwindling |
+
+- **Chemistry-only.** Every controller is evaluated and charged, but its actions are decoded from zeros, so no
+  decision depends on what an organism senses. The shapes still form.
+- **Fresh offspring.** Each newborn's genome, including its chemical affinity and motion response, is drawn as a
+  founder's instead of inherited. No shapes form, and the population falls from 43,816 to 766.
+
+So in this world the shapes come from inherited chemistry: what each lineage eats, and how it climbs the field
+towards food. They do not come from its neural network's decisions. A lineage whose chemistry suits the food
+near it grows into a feeding front. That front eats a void into the field and becomes a membrane around it.
+
 ## What this does not show
 
 - The search's statistic rewards fine structure that moves and fills the world. It is not a measure of
   life-likeness, and the final choice was by eye.
 - Nothing here shows the structure persists past the runs above: 4,800 ticks is 150 simulated seconds.
-- The organisms' structures come from the field ecology: feeding fronts that eat voids into the field, and
-  colonies that follow moving sources. Whether the controllers' evolution adds anything to them at this
-  timescale has not been tested. An ablation against `field-ecology-v1-chemistry-only` would test it.
+- The controls above are one seed each. They show that inheritance is necessary for the shapes and that the
+  controllers' decisions are not. They do not show the controllers add nothing elsewhere, such as in which
+  lineages win over longer runs.

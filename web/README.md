@@ -29,15 +29,20 @@ configuration hash, seed, the starting tick and digest), every frame's tick and 
 command, flife's revision and binary hash, and the ffmpeg arguments. A fresh checkout renders them again:
 
 ```bash
-# From the repository root: the Desktop preset run to tick 8,192, kept in RUN (about a quarter
-# of an hour at the 9.8–10.2 ticks a second the README measured on 16 workers of an M5 Ultra).
+# From the repository root: the showcase preset run to tick 4,800, kept in RUN (15 minutes on 16
+# workers of an M5 Ultra; each checkpoint is about 2.8 GB).
 cargo build --release -p flife-cli
-target/release/flife run presets/desktop-world.toml --ticks 8192 --run-dir RUN
+target/release/flife run presets/showcase-world.toml --ticks 4800 --cpu-workers 16 --run-dir RUN
 
-# From web/: 301 frames from tick 8,192 to 17,792, one every 32 ticks, 1080 × 1080, at CRF 24
-# (the defaults). Paths are relative to where you run it; keep WORK (about 700 MB of PNGs) outside the repository.
-bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK
+# From web/: 401 frames from tick 4,800 to 8,000, one every 8 ticks, 1080 × 1080, over the energy
+# field, at CRF 20 (16 minutes with the camera's preview). Paths are relative to where you run it;
+# keep WORK (about 400 MB of PNGs) outside the repository.
+bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
+  --ticks 3200 --every 8 --field energy --look glow --crf 20
 ```
+
+`presets/showcase-world.toml` was chosen by an outer search for organism-like structure, and
+`../experiments/showcase/README.md` states how. The site says so beside the film.
 
 The camera (`--camera auto`, the default) is chosen from the run itself: `scripts/media.ts` first renders the
 same ticks small, as raw dots, and `scripts/director.ts` reads those frames' pixels to find where the organisms

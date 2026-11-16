@@ -59,6 +59,8 @@ export type FilmManifest = {
       options: { opening: number; transition: number; dwell: number; closing: number; zooms: number[] };
       keys: { tick: number; center: [number, number]; zoom: number }[];
     } | null;
+    /** Each frame's zoom, as flife render recorded its view (1 is the whole torus). */
+    zoom?: number[];
     mapping: string;
     meaning: string;
     look: string;

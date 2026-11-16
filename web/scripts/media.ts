@@ -21,11 +21,12 @@
 //   rendering, with the provenance it recorded (to try another `--crf`).
 // - ffmpeg encodes the frames with flife's own colour chain (render.rs's
 //   PNG_TO_H264: BT.709 limited range, 4:2:0, left chroma), at a CRF chosen
-//   for the web. The particles move a few pixels a frame, so little carries
-//   from one frame to the next: CRF 24 keeps them distinct at about 78 KB a
-//   frame (23.6 MB for the site's 301 frames), CRF 28 blurred them into
-//   blobs, and CRF 23 passed Cloudflare's limit. The poster and the social
-//   card are the first frame.
+//   for the web, under a bitrate ceiling that keeps any length within
+//   Cloudflare's limit. Particles that move a few pixels a frame carry
+//   little from one frame to the next: a raw-dot film of 301 frames needed
+//   CRF 24 (23.6 MB; 28 blurred the dots into blobs). The energy field is
+//   smooth and cheap, so the showcase film is CRF 20 at 10.1 MB for 401
+//   frames. The poster and the social card are the first frame.
 // - Each file is named by its SHA-256 and copied into public/media/, which
 //   is outside git like every FrankenLife recording (AGENTS.md); the
 //   committed manifest records each hash and how it was made.
@@ -317,6 +318,11 @@ const manifest = {
   render: {
     command: `flife render --run-dir RUN ${renderArgs.join(" ")}${provenance.camera ? " --camera CAMERA" : ""} --out FRAMES`,
     camera: provenance.camera,
+    // Each frame's zoom as flife render recorded it (1 is the whole torus), for the film's readout.
+    zoom: shown.map((record) => {
+      const view = record.view as { zoom?: number } | undefined;
+      return Math.round((view?.zoom ?? 1) * 100) / 100;
+    }),
     mapping: end.mapping as string,
     meaning: end.meaning as string,
     look: end.look as string,

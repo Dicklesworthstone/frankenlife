@@ -14,7 +14,20 @@ export const siteConfig = {
   plan: "https://github.com/Dicklesworthstone/frankenlife/blob/main/COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md",
   readme: "https://github.com/Dicklesworthstone/frankenlife#readme",
   fl048: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/fl048/README.md",
+  showcase: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/showcase/README.md",
   license: "https://github.com/Dicklesworthstone/frankenlife/blob/main/LICENSE",
+};
+
+// How the film's world and its camera were chosen (experiments/showcase/README.md,
+// web/scripts/director.ts). AGENTS.md: a selection procedure is stated, never implied.
+export const filmChoice = {
+  world: [
+    "This world's parameters were chosen by a search outside the simulation. It drew 300 configurations at random, ran each on a small world, and scored their raw frames for fine structure that moves. It then ran 110 variations of the best eight. A person chose one of the best by eye, against the reference screenshots, because its membranes, rings and colonies filled the world. The film shows that configuration on four times the area.",
+    "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, split and die by energy alone. The seed is the Desktop preset's 42, not a pick, and seeds the search never saw make the same kinds of shapes.",
+    "What makes the shapes is inherited chemistry, not the neural networks. In a control run where every newborn's genome is drawn fresh instead of inherited, no shapes form and the population dwindles from 43,816 to 766. In another, where every controller's decisions are zeroed, the same membranes and rings still form. A lineage whose chemistry suits the food near it grows into a feeding front, and that front eats a dark void into the field and becomes a membrane around it.",
+  ],
+  camera:
+    "The camera is chosen from the run, not by hand. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
 };
 
 export const navItems = [

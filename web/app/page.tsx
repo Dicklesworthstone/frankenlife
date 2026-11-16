@@ -25,6 +25,7 @@ import { SiteHeader } from "@/components/site-header";
 import {
   claims,
   commands,
+  filmChoice,
   gates,
   type GateState,
   heroStats,
@@ -74,6 +75,7 @@ export default function Home() {
     "# flife is `cargo run --release -p flife-cli --` in the repository",
     `flife run ${world.preset ?? "CONFIG"} --ticks ${world.from.tick} --run-dir RUN`,
     render.command.replace("FRAMES", "frames"),
+    ...(render.camera ? ["# CAMERA: lib/media.json's render.camera keys, as {\"keys\": [...]}"] : []),
   ];
   const crf = video.encode[video.encode.indexOf("-crf") + 1];
 
@@ -171,12 +173,37 @@ export default function Home() {
                   <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
                   <Row label="Colour" value={render.meaning} />
                   <Row label="Field" value={`${render.field_mapping}, ${render.look} look`} />
+                  <Row
+                    label="Camera"
+                    value={
+                      render.camera
+                        ? `${render.camera.keys.length} keys, chosen from the run`
+                        : "the whole torus, still"
+                    }
+                  />
                   <Row label="First digest" value={world.from.digest} mono />
                   <Row label="Last digest" value={world.to.digest} mono />
                 </dl>
               </FrankenContainer>
             </Reveal>
           </div>
+          <Reveal className="mt-4">
+            <div className="glass-modern rounded-2xl p-5 sm:p-6">
+              <MicroLabel>How this world was chosen</MicroLabel>
+              <div className="mt-4 space-y-3 text-sm leading-relaxed text-slate-300">
+                {filmChoice.world.map((paragraph) => (
+                  <p key={paragraph.slice(0, 24)}>{paragraph}</p>
+                ))}
+                {render.camera ? <p>{filmChoice.camera}</p> : null}
+                <p>
+                  <a className="text-green-300 underline-offset-4 hover:underline" href={siteConfig.showcase}>
+                    The search, every sample&apos;s score and the held-out seeds
+                  </a>
+                  .
+                </p>
+              </div>
+            </div>
+          </Reveal>
           <Reveal className="mt-4">
             <div className="glass-modern rounded-2xl p-5 sm:p-6">
               <MicroLabel>Make it yourself</MicroLabel>

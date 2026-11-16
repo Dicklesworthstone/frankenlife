@@ -453,7 +453,9 @@ frame rate.
 presets, its parameters were chosen by an outer search for organism-like structure: 410 configurations run and
 scored from their frames, and then a person chose by eye. `experiments/showcase/README.md` states the procedure,
 every sample's score and the held-out seeds. The organisms have no aesthetic fitness; the search only picked
-the constants.
+the constants. Two controls on the same world show where the shapes come from. With fresh offspring instead of
+inherited genomes, no shapes form. With the controllers' decisions zeroed (chemistry-only), they still form. So
+the shapes come from inherited chemistry, not from the neural networks.
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`

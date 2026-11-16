@@ -9,3 +9,5 @@ next-env.d.ts
 # Rendered media (`bun run media`). Like every FrankenLife recording it stays out of git (AGENTS.md, plan
 # §18.5); lib/media.json is its committed manifest, with each file's SHA-256 and how it was made.
 /public/media/
+# Media a newer film replaced, kept rather than deleted.
+/media-retired/

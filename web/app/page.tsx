@@ -172,7 +172,10 @@ export default function Home() {
                   <Row label="Ticks" value={`${grouped(world.from.tick)} → ${grouped(world.to.tick)}, a frame every ${world.every}`} />
                   <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
                   <Row label="Colour" value={render.meaning} />
-                  <Row label="Field" value={`${render.field_mapping}, ${render.look} look`} />
+                  <Row
+                    label="Field"
+                    value={`${render.field_mapping === "none" ? "not drawn" : render.field_mapping}, ${render.look} look`}
+                  />
                   <Row
                     label="Camera"
                     value={

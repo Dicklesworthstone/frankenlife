@@ -64,6 +64,7 @@ export type FilmManifest = {
     mapping: string;
     meaning: string;
     look: string;
+    /** `energy` or `composition`, or `none` when the field is not drawn. */
     field_mapping: string;
     controllers: string;
     /** `git rev-parse HEAD` of a clean source tree when it rendered. */

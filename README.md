@@ -448,14 +448,27 @@ of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With a
 8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
 frame rate.
 
-`presets/showcase-world.toml` is the world the website's film shows: 43,816 founders on 256 × 256 × 33 at
-Δt = 1/32 s. It makes membranes, rings, crescents and cell-like colonies that fill the torus. Unlike the profile
-presets, its parameters were chosen by an outer search for organism-like structure: 410 configurations run and
-scored from their frames, and then a person chose by eye. `experiments/showcase/README.md` states the procedure,
-every sample's score and the held-out seeds. The organisms have no aesthetic fitness; the search only picked
-the constants. Two controls on the same world show where the shapes come from. With fresh offspring instead of
-inherited genomes, no shapes form. With the controllers' decisions zeroed (chemistry-only), they still form. So
-the shapes come from inherited chemistry, not from the neural networks.
+`presets/tissue-world.toml` is the world the website's film shows: 10,954 founders on 128 × 128 × 33 at
+Δt = 1/32 s, whose population grows to 110,000–170,000 under a ceiling of 177,536. Organisms return about half
+of what they eat to the field as emission, in a chemical composition their networks choose and kin choose
+alike. Each lineage paints its surroundings with its own chemistry and grows into a single-colour colony. At
+this density the colonies merge into a nearly continuous tissue with membranes, voids and mesh walls.
+
+Unlike the profile presets, its parameters were chosen by an outer search, stage W. Stage W ran 233 small
+worlds and scored each that lived by its distance from 14 image statistics of the reference screenshots,
+and then a person chose by eye.
+The organisms have no aesthetic fitness; the search only picked the constants. Seeds the search never saw grow
+the same colonies, though they merge less.
+
+Two controls show where the structure comes from. With the controllers' decisions zeroed, nothing is emitted
+and the world fills with a featureless haze. With fresh offspring instead of inherited genomes, the
+population dies out.
+
+`presets/colony-world.toml` is the search's step before it: discrete colonies on a black field, held at a
+binding ceiling by `refuse-excess-births-v1`, plan §7.5's exhibition policy. `presets/showcase-world.toml` is
+the search's first choice: membranes, rings and crescents, which inherited chemistry makes without the
+networks. `experiments/showcase/README.md` states every selection, every sample's score and the held-out
+seeds.
 
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`

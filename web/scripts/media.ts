@@ -197,13 +197,6 @@ if (existsSync(made)) {
     const shots = previewed.filter((record) => record.record === "frame");
     const maps = activities(shots.map((record) => luminance(record.path ?? fail("a preview frame without a path"))));
     const frameCount = shots.length;
-    const options: DirectorOptions = {
-      opening: Math.round(frameCount * 0.08),
-      transition: Math.round(frameCount * 0.07),
-      dwell: Math.round(frameCount * 0.16),
-      closing: Math.round(frameCount * 0.06),
-      zooms: [3, 4.5, 2.5, 5, 3.5],
-    };
     // The torus in world units: [world] width and height of the run's configuration.
     const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(readFileSync(join(runDir, "config.toml"), "utf8"))?.[1] ?? "";
     const dimension = (key: string) => {
@@ -211,6 +204,17 @@ if (existsSync(made)) {
       return Number.isFinite(value) && value > 0 ? value : fail(`the run's [world] ${key} is not a positive number`);
     };
     const extent: [number, number] = [dimension("width"), dimension("height")];
+    // The shots' zooms were chosen for a 256-unit torus; each is scaled to this one so that a shot spans the
+    // same 51–102 world units on any torus of 128 units or more (a 128-unit torus zooms half as far); no zoom
+    // goes below 1.25.
+    const span = Math.min(...extent) / 256;
+    const options: DirectorOptions = {
+      opening: Math.round(frameCount * 0.08),
+      transition: Math.round(frameCount * 0.07),
+      dwell: Math.round(frameCount * 0.16),
+      closing: Math.round(frameCount * 0.06),
+      zooms: [3, 4.5, 2.5, 5, 3.5].map((zoom) => Math.max(1.25, Math.round(zoom * span * 100) / 100)),
+    };
     const keys = direct(
       shots.map((record) => record.tick ?? fail("a preview frame without a tick")),
       maps,
@@ -336,7 +340,8 @@ const manifest = {
     mapping: end.mapping as string,
     meaning: end.meaning as string,
     look: end.look as string,
-    field_mapping: end.field_mapping as string,
+    // `none` when the field is not drawn: flife names a mapping either way.
+    field_mapping: end.field === false ? "none" : (end.field_mapping as string),
     controllers,
     revision: provenance.revision,
     flife_sha256: provenance.flife_sha256,

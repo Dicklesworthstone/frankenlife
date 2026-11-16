@@ -29,25 +29,27 @@ configuration hash, seed, the starting tick and digest), every frame's tick and 
 command, flife's revision and binary hash, and the ffmpeg arguments. A fresh checkout renders them again:
 
 ```bash
-# From the repository root: the showcase preset run to tick 4,800, kept in RUN (15 minutes on 16
-# workers of an M5 Ultra; each checkpoint is about 2.8 GB).
+# From the repository root: the tissue preset run to tick 1,600, where the search stopped scoring it, kept
+# in RUN (about 5 minutes on 24 workers of an M5 Ultra).
 cargo build --release -p flife-cli
-target/release/flife run presets/showcase-world.toml --ticks 4800 --cpu-workers 16 --run-dir RUN
+target/release/flife run presets/tissue-world.toml --ticks 1600 --cpu-workers 24 --run-dir RUN
 
-# From web/: 401 frames from tick 4,800 to 8,000, one every 8 ticks, 1080 × 1080, over the energy
-# field, at CRF 20 (16 minutes with the camera's preview). Paths are relative to where you run it;
-# keep WORK (about 400 MB of PNGs) outside the repository.
+# From web/: 401 frames from tick 1,600 to 4,800, one every 8 ticks, 1080 × 1080, as raw dots coloured
+# by chemical affinity without the field. Paths are relative to where you run it; keep WORK (several
+# hundred MB of PNGs) outside the repository.
 bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
-  --ticks 3200 --every 8 --field energy --look glow --crf 20
+  --ticks 3200 --every 8 --field none --look raw --color affinity
 ```
 
-`presets/showcase-world.toml` was chosen by an outer search for organism-like structure, and
-`../experiments/showcase/README.md` states how. The site says so beside the film.
+`presets/tissue-world.toml` was chosen by an outer search against image statistics of the reference
+screenshots, and `../experiments/showcase/README.md` states how (stage W). The site says so beside the film.
 
 The camera (`--camera auto`, the default) is chosen from the run itself: `scripts/media.ts` first renders the
 same ticks small, as raw dots, and `scripts/director.ts` reads those frames' pixels to find where the organisms
 are changing most, then writes the path that `flife render --camera` follows. The film opens and closes on the
-whole torus and, in between, eases into the most active region of each shot. The rule is stated in
+whole torus and, in between, eases into the most active region of each shot. Each shot spans 51–102 world
+units on any torus of 128 units or more: the zooms are written for a 256-unit torus and scaled to the
+run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
 checks that the preview and the film end on the same world digest. `--camera none` films the whole torus.
 `--field energy|composition|none` and `--look glow|raw` choose how the frames are drawn.

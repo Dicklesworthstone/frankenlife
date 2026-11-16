@@ -31,7 +31,7 @@ export function Film() {
   useEffect(() => {
     const element = ref.current;
     if (!element) return;
-    // The film is about 10 MB: a reader who asks for less motion or less data gets the poster and the button.
+    // The film is over 20 MB: a reader who asks for less motion or less data gets the poster and the button.
     const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const saving = (navigator as { connection?: { saveData?: boolean } }).connection?.saveData === true;
     if (!still && !saving) {

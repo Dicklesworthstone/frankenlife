@@ -152,7 +152,7 @@ def distance(stats: np.ndarray, ref: dict) -> float:
 def sample_wide(index: int) -> dict:
     """A configuration from random.Random(200000 + index). Unlike stage 1's `sample`, the
     population quota binds: `refuse-excess-births-v1` (plan §7.5's exhibition policy) holds
-    the world at its cap instead of pausing, as the reference's (pop ~299,990 throughout).
+    the world at its cap instead of pausing, as the references' (pop 299,892-299,998 across the six screenshots).
     Reserves (the attempt threshold) reach 40 energy, not 4; the supply is broader; the
     sensing range, the mutation scales and the cap density are drawn too."""
     rng = random.Random(200000 + index)

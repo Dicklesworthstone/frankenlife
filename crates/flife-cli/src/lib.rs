@@ -70,6 +70,7 @@
 
 pub mod analyze;
 pub mod branch;
+pub mod camera;
 pub mod capabilities;
 pub mod checkpointing;
 pub mod discovery;
@@ -92,6 +93,7 @@ pub use branch::{
     BRANCH_NAME_MAX_BYTES, BranchOptions, BranchParent, ForkRecord, FoundingChunks, Inherited,
     branch, branch_session,
 };
+pub use camera::{CameraKey, CameraPath, CameraView};
 pub use capabilities::{
     Admitted, Auto, Build, CAPABILITIES_SCHEMA, Capabilities, CapabilitiesOptions, PRESET_DIGEST,
     PROBE_TICKS, ProbedWorld, Refusal, Route, RouteStatus, Video, capabilities,

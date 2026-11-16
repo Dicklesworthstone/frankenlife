@@ -5,8 +5,8 @@
 use std::num::NonZeroUsize;
 
 use flife_cli::{
-    ColorMapping, ControllerChoice, FieldComponent, FieldMapping, Look, Particles, RENDER_SCHEMA,
-    RenderOptions, RenderProjection, RenderRecord, Style, render,
+    CameraPath, CameraView, ColorMapping, ControllerChoice, FieldComponent, FieldMapping, Look,
+    Particles, RENDER_SCHEMA, RenderOptions, RenderProjection, RenderRecord, Style, render,
 };
 use flife_core::ValidatedConfig;
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -33,6 +33,7 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
         video: None,
         fps: 30,
         style: Style::default(),
+        camera: None,
     };
     let mut records = Vec::new();
     render(&config, &options, |record| records.push(record.clone())).expect("renders");
@@ -294,6 +295,104 @@ fn rendering_writes_png_frames_and_leaves_the_world_as_a_plain_run_leaves_it() {
     }
 }
 
+/// A camera path (FL-020's pan and zoom) changes which part of the torus
+/// each frame shows and nothing the world computes: the same digest as the
+/// whole-torus render, each frame record's view where the path puts it, and
+/// other pixels once it has zoomed.
+#[test]
+fn a_camera_path_moves_the_view_and_leaves_the_world_alone() {
+    let config = ValidatedConfig::from_toml(PRESET).expect("the preset validates");
+    let [width, height] = [config.config().world.width, config.config().world.height];
+    let scratch = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let options = |name: &str, camera: Option<CameraPath>| {
+        let out = scratch.join(name);
+        std::fs::create_dir_all(&out).expect("a scratch directory");
+        RenderOptions {
+            ticks: 8,
+            every: 4,
+            size: [96, 64],
+            out,
+            cpu_workers: NonZeroUsize::new(2),
+            controllers: ControllerChoice::Cpu,
+            render_threads: NonZeroUsize::MIN,
+            video: None,
+            fps: 30,
+            style: Style::default(),
+            camera,
+        }
+    };
+    // Hold the whole torus to tick 4, then ease to zoom 4 on a point near
+    // the corner by tick 8, crossing the seam.
+    let camera = CameraPath::from_json(&format!(
+        r#"{{"keys": [{{"tick": 4, "center": [{}, {}], "zoom": 1}},
+                     {{"tick": 8, "center": [{}, 2.5], "zoom": 4}}]}}"#,
+        width / 2.0,
+        height / 2.0,
+        width - 1.5,
+    ))
+    .expect("a path");
+    let mut plain = Vec::new();
+    render(&config, &options("flife-render-camera-plain", None), |r| {
+        plain.push(r.clone());
+    })
+    .expect("renders");
+    let mut moved = Vec::new();
+    render(
+        &config,
+        &options("flife-render-camera-moved", Some(camera.clone())),
+        |r| moved.push(r.clone()),
+    )
+    .expect("renders");
+
+    let end = |records: &[RenderRecord]| match records.last() {
+        Some(RenderRecord::End { digest, camera, .. }) => (digest.clone(), camera.clone()),
+        _ => panic!("the last record is the end"),
+    };
+    assert_eq!(end(&plain), (end(&moved).0, None));
+    assert_eq!(end(&moved).1, Some(camera));
+
+    let frames = |records: &[RenderRecord]| -> Vec<(u64, CameraView, Vec<u8>)> {
+        records
+            .iter()
+            .filter_map(|record| match record {
+                RenderRecord::Frame {
+                    tick, view, path, ..
+                } => Some((*tick, *view, std::fs::read(path).expect("the frame"))),
+                _ => None,
+            })
+            .collect()
+    };
+    let (plain, moved) = (frames(&plain), frames(&moved));
+    assert_eq!(plain.len(), 3);
+    let whole = CameraView {
+        center: [width / 2.0, height / 2.0],
+        zoom: 1.0,
+    };
+    for (index, ((tick, view, pixels), (moved_tick, moved_view, moved_pixels))) in
+        plain.iter().zip(&moved).enumerate()
+    {
+        assert_eq!(tick, moved_tick);
+        assert_eq!(
+            *view, whole,
+            "without a camera every frame is the whole torus"
+        );
+        if index < 2 {
+            // Ticks 0 and 4: held at the first key, the whole torus.
+            assert_eq!(*moved_view, whole);
+            assert_eq!(pixels, moved_pixels, "tick {tick}: the same pixels");
+        } else {
+            assert_eq!(
+                *moved_view,
+                CameraView {
+                    center: [width - 1.5, 2.5],
+                    zoom: 4.0
+                }
+            );
+            assert_ne!(pixels, moved_pixels, "tick {tick}: the zoomed view");
+        }
+    }
+}
+
 /// The `flife render` binary colours by the configuration's
 /// `[presentation] color_mapping` unless `--color` names another (in either
 /// spelling); a configuration naming an unregistered mapping is refused
@@ -436,6 +535,7 @@ fn a_video_holds_the_frames_in_bt709_limited_range_and_says_so() {
         video: Some(video.clone()),
         fps: 30,
         style: Style::default(),
+        camera: None,
     };
     let mut records = Vec::new();
     render(&config, &options, |record| records.push(record.clone())).expect("renders");

@@ -71,6 +71,9 @@ and its own registered model name, so an ablated run never shares a model identi
 `field-ecology-v1-chemistry-only` (decisions decode from an all-zero output) and `field-ecology-v1-fresh-offspring`
 (a newborn's genome is the one a founder would have at its identity).
 
+`field-ecology-v1-ungated-motion` is a motion variant under the same rule (plan §5.4): the chemical response's gain
+`g_u` is exactly 1 instead of the tick's uptake ratio, so an organism that absorbed nothing still follows the field.
+
 FL-043 (`flife-8gy`), first slice, gives the world a footprint (plan §19.4): the bytes its state, fields and tick
 scratch hold, each buffer charged its capacity, and the most they hold while the population stays within
 `population.maximum_count`. The fields and the tick's scratch are reserved for that capacity, so stepping never
@@ -556,7 +559,13 @@ each runs and owns the field.
   2–3), with an empty mutation record. Its energy, position, lineage, generation and quota charge follow the
   baseline's birth transaction. Nothing of the parent's parameters is carried except by chance (founders' zero
   biases).
-- The founding is the same under all three models: the model name changes no founder.
+- `field-ecology-v1-ungated-motion`: `Rules::response_gain` is 1 where the baseline uses `uptake_ratio(U, Δt,
+  U_max)`; the uptake ratio is still computed and its input checks still apply. The acceleration bound, drag,
+  speed limit, the `c_v ‖v‖²` cost and the whole-velocity scaling of unaffordable motion are the baseline's. A
+  settle backend never settles it: `motion_constants` refuses it (`MissingCapability`) before any dispatch, because
+  the port's motion applies the uptake ratio and the host takes its velocities without recomputing them. The tick
+  runs on the reference and the backend is dropped.
+- The founding is the same under every model: the model name changes no founder.
 
 **Invariants — the footprint (FL-043; §7.5, §19.4).**
 - Every term charges a buffer its capacity times its element size (`flife_core::memory`). Genome parameters are

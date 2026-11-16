@@ -20,6 +20,14 @@ pub const FIELD_ECOLOGY_V1_CHEMISTRY_ONLY: &str = "field-ecology-v1-chemistry-on
 /// their energy and every other rule are unchanged.
 pub const FIELD_ECOLOGY_V1_FRESH_OFFSPRING: &str = "field-ecology-v1-fresh-offspring";
 
+/// `field-ecology-v1` with one rule changed (plan §5.4): the chemical
+/// response's gain `g_u` is 1 instead of the tick's uptake ratio
+/// `U / (Δt U_max)`, so an organism that absorbed nothing still follows the
+/// field. Motion is still bounded by `maximum_acceleration` and
+/// `maximum_speed` and paid at `c_v ‖v‖²` from what the organism holds, so a
+/// starving organism can spend its last energy moving towards food.
+pub const FIELD_ECOLOGY_V1_UNGATED_MOTION: &str = "field-ecology-v1-ungated-motion";
+
 /// Chemical moment channels per field cell (§4.2).
 pub const MOMENT_CHANNELS: u32 = 32;
 

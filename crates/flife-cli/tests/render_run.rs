@@ -477,6 +477,7 @@ fn options(out: PathBuf, ticks: u64, every: u64) -> RenderOptions {
         video: None,
         fps: 30,
         style: Style::default(),
+        camera: None,
     }
 }
 

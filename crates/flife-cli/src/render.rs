@@ -25,6 +25,7 @@ use flife_store::CommandJournal;
 use fmn_codec::CompressionLevel;
 use serde::Serialize;
 
+use crate::camera::{CameraPath, CameraView};
 use crate::found_on;
 use crate::memory::MemoryAdmission;
 use crate::persist::{CATALOG_FILE, Recovered, on_plain_thread, recover};
@@ -34,7 +35,7 @@ use crate::run::{CheckpointAt, ControllerSummary, JournalMarks, SkippedCheckpoin
 pub const RENDER_SCHEMA: &str = "frankenlife.render.v1";
 
 /// What to render.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RenderOptions {
     /// Ticks to run after the founding frame.
     pub ticks: u64,
@@ -57,6 +58,9 @@ pub struct RenderOptions {
     /// How the frames are drawn: colour mapping, look, points or density,
     /// and the field.
     pub style: Style,
+    /// A keyframed pan and zoom; `None` shows the whole torus. Presentation
+    /// only: it changes no result.
+    pub camera: Option<CameraPath>,
 }
 
 /// Plan §13.4: "A fixed high-dimensional projection has a recorded matrix
@@ -144,6 +148,9 @@ pub enum RenderRecord {
         mean_speed: f64,
         /// The fastest live organism's speed.
         top_speed: f64,
+        /// Where the frame looks: its center in world units and its zoom,
+        /// 1 for the whole torus.
+        view: CameraView,
         /// The PNG.
         path: String,
         /// Seconds rendering and encoding it took.
@@ -173,6 +180,8 @@ pub enum RenderRecord {
         field: bool,
         /// What the field's colour means: `energy` or `composition`.
         field_mapping: &'static str,
+        /// The camera path the frames followed, if any.
+        camera: Option<CameraPath>,
         /// The fixed projection the affinity and composition colours take
         /// (boxed: its matrix is most of the record).
         projection: Box<RenderProjection>,
@@ -335,6 +344,14 @@ fn draw(
                 publisher.offer(&world)?;
                 let lease = viewer.latest()?;
                 let started = Instant::now();
+                if let Some(camera) = &options.camera {
+                    let (viewport, _) = camera.viewport(view.viewport(), world.tick().get())?;
+                    view.set_view(viewport)?;
+                }
+                let shown = CameraView {
+                    center: view.viewport().center(),
+                    zoom: view.viewport().zoom(),
+                };
                 view.show(&lease)?;
                 let live = lease.len();
                 let (mean_speed, top_speed) = speeds(lease.velocities());
@@ -359,6 +376,7 @@ fn draw(
                     live,
                     mean_speed,
                     top_speed,
+                    view: shown,
                     path: path.display().to_string(),
                     render_seconds: started.elapsed().as_secs_f64(),
                 });
@@ -392,6 +410,7 @@ fn draw(
         particles: options.style.particles.name(),
         field: options.style.field,
         field_mapping: options.style.field_mapping.name(),
+        camera: options.camera.clone(),
         projection: Box::new(RenderProjection::of(config)),
         controllers: ControllerSummary::of(&world),
         wall_seconds: clock.elapsed().as_secs_f64(),

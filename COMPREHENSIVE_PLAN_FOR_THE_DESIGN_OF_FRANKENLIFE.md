@@ -391,7 +391,7 @@ g_u(u_i/\Delta t)\left(\chi_{e,i}\nabla\tilde e+
 \right].
 $$
 
-For the baseline, `g_u = U_i/(Δt U_max,i)` when `U_max,i>0`, with zero response at zero capacity; the grant contract bounds this ratio to `[0,1]`, apart from declared roundoff reconciliation. `U_i` is the actual total granted uptake, not the request. Tildes denote the normalized local sensor quantities defined in Section 6.1. Each response coefficient has units of world-length squared per simulation-second squared, so its product with a normalized-field gradient is an acceleration. The 33 coefficients share a fixed Euclidean norm budget; `bound` is a radial clamp to `maximum_acceleration`. The response can be attractive or repulsive.
+For the baseline, `g_u = U_i/(Δt U_max,i)` when `U_max,i>0`, with zero response at zero capacity; the grant contract bounds this ratio to `[0,1]`, apart from declared roundoff reconciliation. The registered variant `field-ecology-v1-ungated-motion` sets `g_u = 1`, so an organism that absorbed nothing still follows the field and pays for its motion from what it holds; it is a different model identity, not a baseline setting. `U_i` is the actual total granted uptake, not the request. Tildes denote the normalized local sensor quantities defined in Section 6.1. Each response coefficient has units of world-length squared per simulation-second squared, so its product with a normalized-field gradient is an acceleration. The 33 coefficients share a fixed Euclidean norm budget; `bound` is a radial clamp to `maximum_acceleration`. The response can be attractive or repulsive.
 
 The baseline integrates nonnegative linear drag analytically while holding the chemical acceleration over the tick:
 

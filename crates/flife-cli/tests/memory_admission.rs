@@ -1106,6 +1106,7 @@ fn a_render_holds_no_more_heap_than_a_plain_run_and_its_render_term() {
             video: None,
             fps: 30,
             style,
+            camera: None,
         };
         let mut admitted = None;
         let base = ALLOC.current_usage();
@@ -1272,6 +1273,7 @@ fn a_renders_term_is_its_observers_and_a_short_budget_encodes_fewer_frames() {
             video: None,
             fps: 30,
             style: Style::default(),
+            camera: None,
         };
         let mut admitted = None;
         render(config, &options, |record| {

@@ -451,6 +451,11 @@ enum Command {
         /// the last two as bright as its energy.
         #[arg(long, default_value = "energy")]
         field_mapping: FieldMapping,
+        /// A camera path, as JSON: `{"keys": [{"tick", "center": [x, y],
+        /// "zoom"}, …]}`, eased between keys, held before the first and
+        /// after the last. Presentation only.
+        #[arg(long)]
+        camera: Option<PathBuf>,
     },
 }
 
@@ -519,6 +524,7 @@ fn main() -> ExitCode {
             density,
             no_field,
             field_mapping,
+            camera,
         } => render(
             (config.as_ref(), run_dir.as_ref()),
             ticks,
@@ -527,7 +533,7 @@ fn main() -> ExitCode {
             out,
             (cpu_workers, controllers),
             render_threads,
-            video,
+            (video, camera),
             fps,
             (
                 color,
@@ -884,10 +890,20 @@ fn render(
     out: PathBuf,
     (cpu_workers, controllers): (NonZeroUsize, ControllerChoice),
     render_threads: NonZeroUsize,
-    video: Option<PathBuf>,
+    (video, camera): (Option<PathBuf>, Option<PathBuf>),
     fps: u32,
     (color, style): (Option<ColorMapping>, Style),
 ) -> ExitCode {
+    let camera = match camera {
+        Some(path) => match std::fs::read_to_string(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))
+            .and_then(|text| flife_cli::CameraPath::from_json(&text).map_err(|e| e.to_string()))
+        {
+            Ok(camera) => Some(camera),
+            Err(error) => return fail("usage", format!("--camera: {error}")),
+        },
+        None => None,
+    };
     let config = match (run_dir, config) {
         (Some(run_dir), _) => match flife_cli::persist::read_config(run_dir) {
             Ok(config) => config,
@@ -914,6 +930,7 @@ fn render(
         video,
         fps,
         style,
+        camera,
     };
     let rendered = match run_dir {
         Some(run_dir) => flife_cli::render_run(run_dir, &options, print),

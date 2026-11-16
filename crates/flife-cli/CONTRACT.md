@@ -312,7 +312,13 @@ for, one at least, before a render is refused. Its first record is `start`, with
   `--field-mapping energy|composition|component-C` (the field's energy, its chemical composition lit by its
   energy, or moment channel C, 0 to 31, per unit energy from blue at −1 to red at +1, lit the same way; a channel
   past 31 is a usage error, exit 2). No style
-  changes the world. Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
+  changes the world. `--camera FILE` (`camera::CameraPath`, JSON `{"keys": [{"tick", "center": [x, y],
+  "zoom"}]}`, ticks strictly increasing, zoom in `[1, MAXIMUM_ZOOM]`) pans and zooms through FL-020's
+  `Viewport::with_view`: held before the first key and after the last, eased between keys with smoothstep, the
+  zoom geometrically and the center the shorter way round the torus. Each `frame` record carries its `view`
+  (center and zoom; the whole torus at zoom 1 without a camera) and `end` the `camera` path. It changes no result:
+  `tests/render.rs` renders with and without a path to the same digest, the same pixels while it holds the
+  whole torus, and other pixels once it has zoomed. Frames are the Studio's `WorldView` rendered on FrankenManim's CPU 3D
   route, with the configuration's bloom (`[presentation] bloom_enabled`, `bloom_strength`) on glowing frames and
   none on raw ones (FL-019); `tests/render.rs` renders the preset with `bloom_enabled = false` too: the glow frame
   differs and the raw frame is the same. Dots are at least `[presentation] point_radius_pixels` on screen

@@ -36,6 +36,7 @@ use flife_core::clock::Tick;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, Payment, sub_down};
 use flife_core::memory::{capacity_bytes, total};
+use flife_core::model::FIELD_ECOLOGY_V1_UNGATED_MOTION;
 use std::ops::Range;
 
 use flife_field::settle::{
@@ -50,8 +51,9 @@ use flife_genome::{BirthAttempt, Mutator, ParameterValues, Prepared, TopologyId}
 use flife_neural::{DenseTopology, WeightDtype, Weights};
 
 use super::{
-    DecisionLane, PACKETS_PER_ORGANISM, Rules, SettleReport, Settled, Stages, Working,
-    compositions_into, fit, genome_of, in_runs_mut, parameter_count, settle_all, settle_stages,
+    DecisionLane, ModelVariant, PACKETS_PER_ORGANISM, Rules, SettleReport, Settled, Stages,
+    Working, compositions_into, fit, genome_of, in_runs_mut, parameter_count, settle_all,
+    settle_stages,
 };
 use crate::chemistry::UptakeSettlement;
 use crate::costs::{MaintenanceBill, MaintenanceSettlement};
@@ -214,6 +216,9 @@ fn settle_on(
     lanes: &mut [DecisionLane],
     work: &mut SettleWork,
 ) -> Result<(), CoreError> {
+    // Before any dispatch: a model the port's motion does not implement is
+    // refused here, not after its chemistry has run.
+    let motion_constants = motion_constants(rules)?;
     let (by_demand, granted) = grants;
     let SettleWork {
         chemistry,
@@ -288,7 +293,7 @@ fn settle_on(
         row.exhausted = outcome.exhausted;
         row.absorbed = outcome.absorbed;
     }
-    device.motion(&motion_constants(rules)?, motion, motion_out)?;
+    device.motion(&motion_constants, motion, motion_out)?;
     expect_outcomes("motion", motion_out.len(), working.len())?;
     for (organism, outcome) in working.iter().zip(motion_out.iter()) {
         if outcome.died.is_some() {
@@ -395,7 +400,19 @@ fn settle_on(
 }
 
 /// The constants maintenance and motion use, as the port takes them.
+///
+/// The port's motion scales the response by the uptake ratio (§5.4), and the
+/// host takes its velocity and position without recomputing them, so a model
+/// whose gain is not that ratio is refused here and the tick runs on the
+/// reference.
 fn motion_constants(rules: &Rules) -> Result<MotionConstants, CoreError> {
+    if rules.variant == ModelVariant::UngatedMotion {
+        return Err(CoreError::MissingCapability {
+            capability: format!(
+                "a settle backend's motion under {FIELD_ECOLOGY_V1_UNGATED_MOTION}"
+            ),
+        });
+    }
     let (basal, sensor, sensor_unit_scale, neural) = rules.costs.coefficients();
     let (step_seconds, maximum_acceleration, cost) = rules.motion.step_limit_and_cost();
     if step_seconds.to_bits() != rules.step.seconds_per_tick().to_bits() {

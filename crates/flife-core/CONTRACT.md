@@ -275,7 +275,9 @@ Every issue is reported, not just the first.
 - FL-041, in `flife-engine`: two more `Role::Model` entries, `field-ecology-v1-chemistry-only` and
   `field-ecology-v1-fresh-offspring` (`model::FIELD_ECOLOGY_V1_CHEMISTRY_ONLY` and
   `FIELD_ECOLOGY_V1_FRESH_OFFSPRING`), each `field-ecology-v1` with one rule changed for §15.3's controls, cited to
-  `flife-engine`'s `tests/ablation.rs`.
+  `flife-engine`'s `tests/ablation.rs`. A third, `field-ecology-v1-ungated-motion`
+  (`model::FIELD_ECOLOGY_V1_UNGATED_MOTION`, §5.4), sets the motion response's gain to 1 instead of the uptake
+  ratio, cited to the same file.
   A configuration naming one validates like `field-ecology-v1` and has its own configuration hash and model
   descriptor.
 - Every other entry is `Specified`: defined in the plan and owned by the named FL item, with no known-answer

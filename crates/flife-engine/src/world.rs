@@ -76,6 +76,7 @@ use flife_core::ledger::{CompensatedSum, Ledger, LedgerLog};
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+    FIELD_ECOLOGY_V1_UNGATED_MOTION,
 };
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
@@ -408,9 +409,9 @@ struct Rules {
     initial_scale: f64,
 }
 
-/// Which `field-ecology-v1` model a world runs: the baseline, or one of
-/// FL-041's ablation models, each changing exactly one rule (plan §15.3,
-/// §21.6).
+/// Which `field-ecology-v1` model a world runs: the baseline, one of
+/// FL-041's ablation models (plan §15.3, §21.6), or a motion variant, each
+/// changing exactly one rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVariant {
     /// `field-ecology-v1`.
@@ -422,6 +423,9 @@ pub enum ModelVariant {
     /// `field-ecology-v1-fresh-offspring`: a newborn's genome is a
     /// founder's genome drawn at its own identity.
     FreshOffspring,
+    /// `field-ecology-v1-ungated-motion`: §5.4's response gain `g_u` is 1,
+    /// not the tick's uptake ratio.
+    UngatedMotion,
 }
 
 impl ModelVariant {
@@ -434,6 +438,7 @@ impl ModelVariant {
             FIELD_ECOLOGY_V1 => Ok(Self::Baseline),
             FIELD_ECOLOGY_V1_CHEMISTRY_ONLY => Ok(Self::ChemistryOnly),
             FIELD_ECOLOGY_V1_FRESH_OFFSPRING => Ok(Self::FreshOffspring),
+            FIELD_ECOLOGY_V1_UNGATED_MOTION => Ok(Self::UngatedMotion),
             other => Err(CoreError::UnknownAlgorithm {
                 role: "model",
                 name: other.to_owned(),
@@ -443,6 +448,19 @@ impl ModelVariant {
 }
 
 impl Rules {
+    /// §5.4's response gain `g_u` for a tick whose uptake absorbed
+    /// `absorbed`: the uptake ratio `U / (Δt U_max)`, or exactly 1 under
+    /// `field-ecology-v1-ungated-motion`.
+    fn response_gain(&self, absorbed: f64) -> Result<f64, CoreError> {
+        let ratio = uptake_ratio(absorbed, self.step, self.uptake_capacity)?;
+        Ok(match self.variant {
+            ModelVariant::UngatedMotion => 1.0,
+            ModelVariant::Baseline | ModelVariant::ChemistryOnly | ModelVariant::FreshOffspring => {
+                ratio
+            }
+        })
+    }
+
     fn from_config(config: &ValidatedConfig, profile: NumericalProfile) -> Result<Self, CoreError> {
         let model = config.config();
         let named = |role: &'static str, name: &str, implemented: &str| {
@@ -2084,7 +2102,9 @@ impl World {
                     limits: &rules.limits,
                     initial_scale: rules.initial_scale,
                 },
-                ModelVariant::Baseline | ModelVariant::ChemistryOnly => Offspring::Inherited,
+                ModelVariant::Baseline
+                | ModelVariant::ChemistryOnly
+                | ModelVariant::UngatedMotion => Offspring::Inherited,
             },
         };
         // FL-032: each inherited birth's first candidate mutated on the
@@ -3057,7 +3077,9 @@ fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
 fn raw_outputs(rules: &Rules, outputs: &[f32; ACTION_WIDTH]) -> [f64; ACTION_WIDTH] {
     match rules.variant {
         ModelVariant::ChemistryOnly => [0.0; ACTION_WIDTH],
-        ModelVariant::Baseline | ModelVariant::FreshOffspring => widen(outputs),
+        ModelVariant::Baseline | ModelVariant::FreshOffspring | ModelVariant::UngatedMotion => {
+            widen(outputs)
+        }
     }
 }
 
@@ -3852,7 +3874,7 @@ impl Stages for Reference<'_> {
         absorbed: f64,
         budget: &mut EnergyBudget,
     ) -> Result<MotionSettlement, CoreError> {
-        let ratio = uptake_ratio(absorbed, rules.step, rules.uptake_capacity)?;
+        let ratio = rules.response_gain(absorbed)?;
         let response = MotionResponse::new(*self.traits.motion_response(), &rules.motion)?;
         let acceleration = rules
             .motion

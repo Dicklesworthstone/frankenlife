@@ -1,0 +1,50 @@
+{
+ "sample": "c4-x1",
+ "lineage": [
+  "s1000",
+  "x2-c2-r1",
+  "s3027",
+  "s3104",
+  "e4-r8-d1-k8-w0",
+  "c4-x1"
+ ],
+ "how": {
+  "x2-c2-r1": "fed sweep of s1000: source power x2, ceiling 2 per cell (32,768), refuse-excess-births-v1",
+  "s3027": "match.py local round 1 (s3000-s3039) from x2-c2-r1: every number x[0.7, 1.4], sources x4 at the same total power",
+  "s3104": "match.py local round 2 (s3100-s3139) from s3027: every number x[0.7, 1.4]",
+  "e4-r8-d1-k8-w0": "trail sweep of s3104: emission rate x4 at transfer efficiency 0.95, sensor energy scale x8, decay x8 with source power x2.75",
+  "c4-x1": "dense sweep of e4-r8-d1-k8-w0: ceiling x4 (177,536) at the same supply"
+ },
+ "params": {
+  "model.model": "field-ecology-v1",
+  "world.diffusion": 0.4779470806843635,
+  "world.decay_per_second": 0.08180134709590955,
+  "sources.count": 64,
+  "sources.sigma_world_units": 7.48417383668699,
+  "sources.power_per_source": 4941.027094879585,
+  "sources.path_speed": 6.410313494046391,
+  "chemistry.toxicity_sensitivity": 0.08004322448442866,
+  "chemistry.discrimination_threshold": 0.2650172307387295,
+  "chemistry.affinity_gain": 14.526273238772319,
+  "chemistry.maximum_efficiency": 0.7770586814539951,
+  "chemistry.uptake_capacity_per_second": 2.9492327937803626,
+  "chemistry.uptake_half_saturation_density": 0.8053068970026153,
+  "chemistry.motion_response_norm_limit": 100.46031806268545,
+  "chemistry.maximum_acceleration": 19.89613931091116,
+  "chemistry.drag_per_second": 0.6083757943786642,
+  "chemistry.maximum_speed": 13.704534025211911,
+  "emission.maximum_fractional_rate_per_second": 0.9794496121644378,
+  "emission.transfer_efficiency": 0.95,
+  "emission.gate_threshold": 0.3550015047013456,
+  "costs.basal_energy_per_second": 0.6907773019435253,
+  "costs.motion_energy_per_speed_squared_second": 0.0004516873698736408,
+  "reproduction.minimum_parent_energy_before_attempt": 1.7783495135752738,
+  "reproduction.maximum_attempt_rate_per_second": 1.8104069618199279,
+  "reproduction.cooldown_seconds": 0.0642813376330189,
+  "death.residual_energy_recycle_fraction": 0.5251868376968575,
+  "population.initial_count": 10954,
+  "population.maximum_count": 177536,
+  "population.capacity_policy": "refuse-excess-births-v1",
+  "sensors.energy_density_scale": 8.0
+ }
+}

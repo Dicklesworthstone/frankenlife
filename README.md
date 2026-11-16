@@ -448,6 +448,13 @@ of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With a
 8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
 frame rate.
 
+`presets/showcase-world.toml` is the world the website's film shows: 43,816 founders on 256 × 256 × 33 at
+Δt = 1/32 s. It makes membranes, rings, crescents and cell-like colonies that fill the torus. Unlike the profile
+presets, its parameters were chosen by an outer search for organism-like structure: 410 configurations run and
+scored from their frames, and then a person chose by eye. `experiments/showcase/README.md` states the procedure,
+every sample's score and the held-out seeds. The organisms have no aesthetic fitness; the search only picked
+the constants.
+
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the

@@ -635,7 +635,9 @@ The repository holds:
   `flife_field::seeding`;
 - `presets/reference-small-world.toml` (FL-015), `presets/interactive-world.toml` (25,000 founders) and
   `presets/desktop-world.toml` (100,000 founders, F16), the last two from FL-034's declared experiments E1 and E2
-  (`experiments/fl034/README.md`); `experiments/` holds each declared experiment's base, specifications and records.
+  (`experiments/fl034/README.md`); `presets/showcase-world.toml` (43,816 founders, Δt = 1/32 s), the website
+  film's world, chosen by an outer search whose procedure `experiments/showcase/README.md` states;
+  `experiments/` holds each declared experiment's base, specifications and records.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and
 lab, NumPy-exact RNG and array layout, FrankenTorch matmul, a certified FrankenManim frame, Metal compute, and

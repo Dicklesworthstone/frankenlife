@@ -409,7 +409,9 @@ for, one at least, before a render is refused. Its first record is `start`, with
 - `frankenlife.inspect.v1` (`flife inspect`): an `inspect` record (the checkpoint's sequence, tick and SHA-256, the
   world's digest, model, size and grid, the live count, and the energy the field and the organisms hold), one
   `organism` record per live organism in identity order (identity, genome, lineage, generation, parent, birth
-  tick, position, velocity, energy, topology index, parameter count and affinity), and with `--field` one `field`
+  tick, position, velocity, energy, topology index, parameter count, affinity, the 33 motion-response
+  coefficients, the sensing scale, and the held controller outputs with the tick they were evaluated at, or
+  `null` for a newborn not yet evaluated), and with `--field` one `field`
   record: every cell's energy, row-major (`y · cells_x + x`), each `f32` widened exactly; then one `weights` record
   per organism `--weights` names, in the order named (its identity, genome, topology index, parameter count and
   weight `dtype` (`f32` or `f16`), and its `layers` in evaluation order: `inputs`, `outputs`, `weights[out][in]`

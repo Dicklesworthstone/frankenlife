@@ -51,8 +51,8 @@ use flife_genome::Traits;
 use flife_neural::{DecodedActions, LayerShape, Observation, WeightDtype};
 
 use crate::{
-    Descendants, EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism, Split,
-    Unviable, UptakeSettlement,
+    Capacity, Descendants, EmissionSettlement, MaintenanceSettlement, MotionSettlement, Organism,
+    Split, Unviable, UptakeSettlement,
 };
 
 /// How many published steps of a watched organism's [`Transactions`] the
@@ -197,6 +197,14 @@ pub enum ReproductionOutcome {
         split: Split,
         /// How many candidates were rejected.
         candidates: usize,
+    },
+    /// `refuse-excess-births-v1` refused the birth for capacity: no child
+    /// and no charge.
+    Refused {
+        /// The split the attempt proposed.
+        split: Split,
+        /// The quota that could not cover it.
+        resource: Capacity,
     },
 }
 

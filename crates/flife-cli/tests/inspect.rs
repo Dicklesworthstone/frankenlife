@@ -238,6 +238,33 @@ fn inspection_reports_the_committed_world_as_a_direct_world_holds_it() {
                 .map(|value| value.to_bits())
                 .collect();
             assert_eq!(affinity, expected);
+            let bits = |list: &Value| -> Vec<u64> {
+                list.as_array().expect("a list").iter().map(float).collect()
+            };
+            let traits = genome.traits();
+            assert_eq!(
+                bits(&record["motion_response"]),
+                traits
+                    .motion_response()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                float(&record["sensing_scale"]),
+                traits.sensing_scale().to_bits()
+            );
+            match (organism.held.outputs(), organism.held.evaluated_at()) {
+                (Some(outputs), Some(tick)) => {
+                    assert_eq!(record["held"]["evaluated_at"], tick.get());
+                    let stored: Vec<u64> = outputs
+                        .iter()
+                        .map(|&value| f64::from(value).to_bits())
+                        .collect();
+                    assert_eq!(bits(&record["held"]["outputs"]), stored);
+                }
+                _ => assert!(record["held"].is_null(), "{}", record["held"]),
+            }
             energy += organism.energy;
         }
         assert_eq!(

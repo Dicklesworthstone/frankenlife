@@ -8,7 +8,7 @@ export function FrankenBolt({ className }: { className?: string }) {
     <span
       aria-hidden="true"
       className={cn(
-        "relative flex h-3 w-3 items-center justify-center rounded-full border border-white/10 bg-gradient-to-br from-slate-700 via-slate-900 to-black shadow-[inset_0_1px_1px_rgba(255,255,255,0.05),0_1px_3px_rgba(0,0,0,0.6)]",
+        "pointer-events-none relative flex h-3 w-3 items-center justify-center rounded-full border border-white/10 bg-gradient-to-br from-slate-700 via-slate-900 to-black shadow-[inset_0_1px_1px_rgba(255,255,255,0.05),0_1px_3px_rgba(0,0,0,0.6)]",
         className,
       )}
     >

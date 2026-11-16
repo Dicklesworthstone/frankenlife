@@ -1670,6 +1670,7 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
                     ReproductionOutcome::Unviable(_) => "unviable",
                     ReproductionOutcome::Born { .. } => "born",
                     ReproductionOutcome::Rejected { .. } => "rejected",
+                    ReproductionOutcome::Refused { .. } => "refused",
                 }),
             }
         }),
@@ -2282,6 +2283,7 @@ mod tests {
             Some(super::ReproductionOutcome::Unviable(_)) => "unviable",
             Some(super::ReproductionOutcome::Born { .. }) => "born",
             Some(super::ReproductionOutcome::Rejected { .. }) => "rejected",
+            Some(super::ReproductionOutcome::Refused { .. }) => "refused",
             None => "none",
         };
         assert_eq!(ledger["reproduction"], reproduction);

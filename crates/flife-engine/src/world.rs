@@ -116,9 +116,9 @@ use crate::measure::{RegionMeasurement, measure};
 use crate::motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
-    Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityShortfall,
-    Identities, Offspring, ParentState, PopulationQuota, RejectedBirth, Reproduction,
-    ReproductionProposal, resolve_births_with,
+    Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityPolicy,
+    CapacityShortfall, Identities, Offspring, ParentState, PopulationQuota, RefusedBirth,
+    RejectedBirth, Reproduction, ReproductionProposal, resolve_births_with,
 };
 
 mod admission;
@@ -141,8 +141,9 @@ pub const QUALIFIED_REFERENCE: &str = "qualified-reference";
 /// The numerical fault policy this module implements (§7.6).
 pub const STOP_AND_PRESERVE: &str = "stop-and-preserve";
 
-/// The capacity policy this module implements (§7.5).
-pub const PAUSE_BEFORE_COMMIT: &str = "pause-before-commit";
+/// The research-mode capacity policy (§7.5); `refuse-excess-births-v1`
+/// is the exhibition-mode one ([`CapacityPolicy`]).
+pub use crate::reproduction::PAUSE_BEFORE_COMMIT;
 
 /// The initial positions this module implements (A.3 item 1).
 pub const UNIFORM_POSITIONS: &str = "uniform";
@@ -242,6 +243,9 @@ pub struct TickReport {
     pub introductions: Vec<IntroductionEvent>,
     /// Attempts whose every mutation candidate was rejected.
     pub rejected: Vec<RejectedBirth>,
+    /// Attempts `refuse-excess-births-v1` refused for capacity, in
+    /// identity order; always empty under `pause-before-commit`.
+    pub refused: Vec<RefusedBirth>,
     /// The deaths, in identity order.
     pub deaths: Vec<Death>,
     /// The uptake resolution.
@@ -404,6 +408,8 @@ struct Rules {
     half_saturation: f64,
     interval: u32,
     maximum_population: u64,
+    /// What a birth the fixed logical quotas cannot cover does (§7.5).
+    capacity: CapacityPolicy,
     profile: NumericalProfile,
     variant: ModelVariant,
     initial_scale: f64,
@@ -485,11 +491,6 @@ impl Rules {
             STOP_AND_PRESERVE,
         )?;
         named(
-            "population.capacity_policy",
-            &model.population.capacity_policy,
-            PAUSE_BEFORE_COMMIT,
-        )?;
-        named(
             "population.initial_positions",
             &model.population.initial_positions,
             UNIFORM_POSITIONS,
@@ -533,6 +534,7 @@ impl Rules {
             half_saturation: chemistry.uptake_half_saturation_density,
             interval: model.controller.evaluation_interval_ticks,
             maximum_population: u64::from(model.population.maximum_count),
+            capacity: CapacityPolicy::from_name(&model.population.capacity_policy)?,
             profile,
             variant: ModelVariant::of(&model.model)?,
             initial_scale: initial_scale(config),
@@ -2106,6 +2108,7 @@ impl World {
                 | ModelVariant::ChemistryOnly
                 | ModelVariant::UngatedMotion => Offspring::Inherited,
             },
+            capacity: rules.capacity,
         };
         // FL-032: each inherited birth's first candidate mutated on the
         // settle backend, if the world has one.
@@ -2216,7 +2219,7 @@ impl World {
             }
         }
         let attempted = requests.len();
-        let (born, rejected) = births.into_parts();
+        let (born, rejected, refused) = births.into_parts();
         // Room for the births and every introduction the population's
         // bound admits, so that appending introductions never grows it
         // (FL-043).
@@ -2315,6 +2318,7 @@ impl World {
             births: born_events,
             introductions,
             rejected,
+            refused,
             deaths: deaths.clone(),
             uptake,
             field_step,
@@ -3706,8 +3710,8 @@ fn local_chemistry(
 /// What a viable attempt by the watched organism came to in phase 8.
 ///
 /// # Errors
-/// [`CoreError::StateConflict`] if its birth was neither staged nor
-/// rejected.
+/// [`CoreError::StateConflict`] if its birth was neither staged, refused
+/// nor rejected.
 fn attempted(births: &Births, intent: &BirthIntent) -> Result<ReproductionOutcome, CoreError> {
     if let Some(birth) = births
         .born()
@@ -3717,6 +3721,16 @@ fn attempted(births: &Births, intent: &BirthIntent) -> Result<ReproductionOutcom
         return Ok(ReproductionOutcome::Born {
             child: birth.newborn.id,
             split: birth.split,
+        });
+    }
+    if let Some(refused) = births
+        .refused()
+        .iter()
+        .find(|refused| refused.parent == intent.parent)
+    {
+        return Ok(ReproductionOutcome::Refused {
+            split: intent.split,
+            resource: refused.resource,
         });
     }
     births
@@ -3729,7 +3743,10 @@ fn attempted(births: &Births, intent: &BirthIntent) -> Result<ReproductionOutcom
         })
         .ok_or_else(|| CoreError::StateConflict {
             operation: "record transactions",
-            detail: format!("{}'s birth was neither staged nor rejected", intent.parent),
+            detail: format!(
+                "{}'s birth was neither staged, refused nor rejected",
+                intent.parent
+            ),
         })
 }
 

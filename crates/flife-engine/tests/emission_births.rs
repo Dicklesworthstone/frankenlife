@@ -18,9 +18,9 @@ use flife_core::{
     ValidatedConfig,
 };
 use flife_engine::{
-    BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity, EmissionPolicy,
-    Identities, Motion, Offspring, ParentState, PopulationQuota, Reproduction,
-    ReproductionProposal, ReproductionRules, Unviable, Viability, resolve_births,
+    BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity, CapacityPolicy,
+    EmissionPolicy, Identities, Motion, Offspring, ParentState, PopulationQuota, Reproduction,
+    ReproductionProposal, ReproductionRules, Unviable, Viability, admission_key, resolve_births,
 };
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
@@ -1031,6 +1031,7 @@ fn c5_birth_splits_energy_and_dissipates_the_birth_cost() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let state = parent(1, [10.0, 20.0], 0);
     let request = BirthRequest {
@@ -1280,6 +1281,7 @@ fn child_offsets_are_uniform_by_area_inside_the_disk_and_wrap() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     for (id, position) in (1..).zip([[0.01, 127.99], [127.99, 0.0], [0.0, 0.0]]) {
         let births = staged(
@@ -1375,6 +1377,7 @@ fn cooldown_gates_attempts_and_only_a_birth_resets_it() {
         reproduction: &reproduction,
         mutator: &strict,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let requests = [
         BirthRequest {
@@ -1430,6 +1433,7 @@ fn newborns_start_inert_and_join_on_the_next_tick() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let state = parent(21, [64.0, 32.0], 0);
     let request = BirthRequest {
@@ -1511,6 +1515,7 @@ fn six_births(order: &[usize]) -> (Vec<String>, GenomeQuota, Identities, u64) {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let requests: Vec<BirthRequest<'_>> = order
         .iter()
@@ -1650,6 +1655,7 @@ fn settling_refuses_a_parent_whose_budget_moved_and_records_nothing() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let births = staged(
         resolve_births(
@@ -1699,6 +1705,7 @@ fn c5_a_rejected_allocation_commits_no_child_no_transfer_and_no_cost() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let requests = [
         BirthRequest {
@@ -1811,6 +1818,7 @@ fn population_slots_are_reserved_before_any_genome_work() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let requests: Vec<BirthRequest<'_>> = genomes
         .iter()
@@ -1875,6 +1883,163 @@ fn population_slots_are_reserved_before_any_genome_work() {
     assert!(PopulationQuota::new(4, 5).is_err());
 }
 
+/// §7.5's exhibition policy `refuse-excess-births-v1`: when the viable
+/// attempts outnumber the free slots, the slots go to the smallest
+/// admission keys, not the lowest identities; the rest are refused with no
+/// slot, identity or genome charge. A birth the genome quota cannot cover
+/// is refused in turn and the next is still tried.
+#[test]
+fn refused_births_fill_the_free_slots_in_key_order_and_charge_nothing() {
+    let reproduction = reproduction(0.05);
+    let rng = SemanticRng::new(SEED);
+    let catalog = catalog();
+    let mut quota = GenomeQuota::new(1 << 40, 1 << 40).expect("quota");
+    let genomes: Vec<Genome> = (1..=6)
+        .map(|id| founder_genome(id, &catalog, &mut quota))
+        .collect();
+    let before = quota.clone();
+    let mutator = mutator(quiet(), &catalog);
+    let world = grid();
+    let context = BirthContext {
+        rng: &rng,
+        grid: &world,
+        reproduction: &reproduction,
+        mutator: &mutator,
+        offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::RefuseExcessBirths,
+    };
+    let requests: Vec<BirthRequest<'_>> = genomes
+        .iter()
+        .zip(1_u64..)
+        .map(|(genome, id)| BirthRequest {
+            intent: intent(&reproduction, &parent(id, [id as f64, 1.0], 0), 9, 8.0, 0.5),
+            genome,
+        })
+        .collect();
+    let key = |id: u64| admission_key(&rng, OrganismId::new(id), Tick::new(9)).expect("key");
+    let mut by_key: Vec<u64> = (1..=6).collect();
+    by_key.sort_by_key(|&id| key(id));
+    let sorted = |ids: &[u64]| {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids
+    };
+    let parents = |births: &Births| -> (Vec<u64>, Vec<u64>) {
+        (
+            births
+                .born()
+                .iter()
+                .map(|birth| birth.parent.get())
+                .collect(),
+            births
+                .refused()
+                .iter()
+                .map(|refused| refused.parent.get())
+                .collect(),
+        )
+    };
+
+    // Two free slots for six births: the two smallest keys, staged in
+    // identity order with the next two identities.
+    let admitted = sorted(&by_key[..2]);
+    assert_ne!(admitted, [1, 2], "the keys do not follow identity here");
+    let mut ids = identities(10, 10);
+    let births = staged(
+        resolve_births(
+            &context,
+            &requests,
+            PopulationQuota::new(10, 8).expect("population"),
+            &mut ids,
+            &mut quota,
+        )
+        .expect("resolve"),
+    );
+    assert_eq!(parents(&births), (admitted, sorted(&by_key[2..])));
+    assert!(
+        births
+            .refused()
+            .iter()
+            .all(|refused| refused.resource == Capacity::PopulationSlots)
+    );
+    assert!(births.rejected().is_empty());
+    let children: Vec<u64> = births
+        .born()
+        .iter()
+        .map(|birth| birth.newborn.id.get())
+        .collect();
+    assert_eq!(children, [10, 11]);
+    assert_eq!(ids, identities(12, 12));
+    assert_eq!(quota.live(), before.live() + 2);
+    births.abandon(&mut quota).expect("abandon");
+    assert_eq!(quota, before);
+
+    // A full world refuses every birth and changes nothing.
+    let mut ids = identities(10, 10);
+    let births = staged(
+        resolve_births(
+            &context,
+            &requests,
+            PopulationQuota::new(8, 8).expect("population"),
+            &mut ids,
+            &mut quota,
+        )
+        .expect("resolve"),
+    );
+    assert_eq!(parents(&births), (vec![], vec![1, 2, 3, 4, 5, 6]));
+    assert_eq!(ids, identities(10, 10));
+    assert_eq!(quota, before);
+
+    // Room for all: nothing is refused, as under `pause-before-commit`.
+    let births = staged(
+        resolve_births(
+            &context,
+            &requests,
+            PopulationQuota::new(16, 8).expect("population"),
+            &mut ids,
+            &mut quota,
+        )
+        .expect("resolve"),
+    );
+    assert_eq!(parents(&births), (vec![1, 2, 3, 4, 5, 6], vec![]));
+    births.abandon(&mut quota).expect("abandon");
+
+    // A genome quota with room for one more genome: the first birth in
+    // identity order is staged and every later one refused for its bytes.
+    let one = before.logical_bytes() / 6;
+    let mut tight = GenomeQuota::new(before.logical_bytes() + one, 1 << 40).expect("quota");
+    let genomes: Vec<Genome> = (1..=6)
+        .map(|id| founder_genome(id, &catalog, &mut tight))
+        .collect();
+    let requests: Vec<BirthRequest<'_>> = genomes
+        .iter()
+        .zip(1_u64..)
+        .map(|(genome, id)| BirthRequest {
+            intent: intent(&reproduction, &parent(id, [id as f64, 1.0], 0), 9, 8.0, 0.5),
+            genome,
+        })
+        .collect();
+    let mut ids = identities(10, 10);
+    let births = staged(
+        resolve_births(
+            &context,
+            &requests,
+            PopulationQuota::new(16, 8).expect("population"),
+            &mut ids,
+            &mut tight,
+        )
+        .expect("resolve"),
+    );
+    assert_eq!(parents(&births), (vec![1], vec![2, 3, 4, 5, 6]));
+    assert!(
+        births
+            .refused()
+            .iter()
+            .all(|refused| refused.resource == Capacity::LogicalGenomeBytes)
+    );
+    assert_eq!(ids, identities(11, 11));
+    assert_eq!(tight.logical_bytes(), before.logical_bytes() + one);
+}
+
 #[test]
 fn rejected_births_charge_nothing_and_take_no_identity() {
     // C.16 at the transaction: a parent whose every candidate is an
@@ -1903,6 +2068,7 @@ fn rejected_births_charge_nothing_and_take_no_identity() {
         reproduction: &reproduction,
         mutator: &strict,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let requests = [
         BirthRequest {
@@ -1966,6 +2132,7 @@ fn malformed_birth_requests_are_refused_before_anything_is_staged() {
         reproduction: &reproduction,
         mutator: &mutator,
         offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
     };
     let at = |tick| BirthRequest {
         intent: intent(&reproduction, &parent(1, [1.0, 1.0], 0), tick, 9.0, 0.5),

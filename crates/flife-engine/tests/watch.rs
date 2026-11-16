@@ -558,7 +558,11 @@ fn total(values: impl IntoIterator<Item = f64>) -> f64 {
 fn attempted(record: &Transactions) -> bool {
     matches!(
         record.reproduction,
-        Some(ReproductionOutcome::Born { .. } | ReproductionOutcome::Rejected { .. })
+        Some(
+            ReproductionOutcome::Born { .. }
+                | ReproductionOutcome::Rejected { .. }
+                | ReproductionOutcome::Refused { .. }
+        )
     )
 }
 
@@ -635,7 +639,10 @@ fn replay(record: &Transactions, row: &Organism, rho: f64) {
             assert_eq!(split.available.to_bits(), budget.remaining().to_bits());
             budget.retain(split.parent).expect("keeps its share");
         }
-        Some(ReproductionOutcome::Rejected { split, .. }) => {
+        Some(
+            ReproductionOutcome::Rejected { split, .. }
+            | ReproductionOutcome::Refused { split, .. },
+        ) => {
             assert_eq!(split.available.to_bits(), budget.remaining().to_bits());
         }
         Some(ReproductionOutcome::CoolingDown { deadline }) => {

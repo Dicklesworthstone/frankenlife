@@ -103,8 +103,9 @@ pub struct Telemetry<'a> {
     /// genome quota and the budget's headroom.
     pub memory: &'a MemoryAdmission,
     /// Capacity shortfalls the session reported: under
-    /// `pause-before-commit`, the only capacity policy, a birth the quotas
-    /// cannot cover pauses the run, so these are its capacity rejections.
+    /// `pause-before-commit` a birth the quotas cannot cover pauses the
+    /// run. Under `refuse-excess-births-v1` it is refused instead, and the
+    /// tally counts it as a refused birth.
     pub capacity_pauses: u64,
     /// The newest durable checkpoint's tick, if the session has one.
     pub checkpoint: Option<Tick>,
@@ -242,8 +243,8 @@ pub fn overlay_text(state: &OverlayState<'_>) -> String {
 ///   to live genomes' parameters, the allocated genome quota, and what the
 ///   memory budget leaves above the Studio's admitted peak;
 /// - `18,586 births · 3 introduced · 18,255 deaths · no capacity pause · no
-///   fault`, from the epoch's tally (the introductions only when there are
-///   any); a tally from a later tick than the founding says
+///   fault`, from the epoch's tally (the introductions, and
+///   `N refused for capacity`, only when there are any); a tally from a later tick than the founding says
 ///   `from tick 512:` first, and without one the counts read `births and
 ///   deaths not counted`;
 /// - `injected 1234.5 · uptake 456.7 · dissipated 789.1 · residual
@@ -289,6 +290,12 @@ pub fn telemetry_lines(telemetry: &Telemetry<'_>, clock: Option<&ClockReading>) 
             let mut counts = vec![format!("{} births", grouped(tally.births))];
             if tally.introductions > 0 {
                 counts.push(format!("{} introduced", grouped(tally.introductions)));
+            }
+            if tally.refused_births > 0 {
+                counts.push(format!(
+                    "{} refused for capacity",
+                    grouped(tally.refused_births)
+                ));
             }
             counts.push(format!("{} deaths", grouped(tally.deaths)));
             let counts = counts.join(" · ");
@@ -870,6 +877,7 @@ fn transaction_lines(recent: &Recent) -> String {
         Some(ReproductionOutcome::Rejected { candidates, .. }) => {
             format!("{candidates} candidates rejected")
         }
+        Some(ReproductionOutcome::Refused { .. }) => "birth refused for capacity".to_owned(),
         None => "no reproduction stage".to_owned(),
     };
     let steps = if recent.steps == 1 {

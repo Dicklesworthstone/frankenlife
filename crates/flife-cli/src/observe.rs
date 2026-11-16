@@ -36,6 +36,8 @@ pub struct Tally {
     pub births: u64,
     /// Viable attempts whose every mutation candidate was rejected.
     pub rejected_births: u64,
+    /// Viable attempts `refuse-excess-births-v1` refused for capacity.
+    pub refused_births: u64,
     /// Deaths committed.
     pub deaths: u64,
     /// Deaths by the budget stage that exhausted them, or `removed`.
@@ -72,6 +74,7 @@ impl Tally {
         self.ticks += 1;
         self.births += count(report.births.len());
         self.rejected_births += count(report.rejected.len());
+        self.refused_births += count(report.refused.len());
         self.deaths += count(report.deaths.len());
         for death in &report.deaths {
             let stage = match death.cause {

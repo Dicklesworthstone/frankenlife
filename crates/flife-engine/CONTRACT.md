@@ -44,7 +44,8 @@ FL-013 (`flife-x3o`) adds `world`, the ordered candidate tick and epoch publicat
   run took 14.7–15.9 s at 82fd4ba and 3.2–3.7 s with it (3 alternated rounds each, medians 15.0 and 3.3 s); the
   final digest and every checkpoint chunk and manifest of a kept 1-tick run were byte-identical;
 - `World::advance`: phases 2–10 of §8.1 against the committed state, giving a checked `Candidate`, or a pause
-  under `pause-before-commit`;
+  under `pause-before-commit` (under `refuse-excess-births-v1` the tick publishes with the refusals in
+  `TickReport::refused`);
 - `Candidate::publish`: the population's whole-tick commit (`Population::commit_tick`), then the field, ledger,
   quota, identities, source paths, tick, epoch and event cursor together. Dropping or cancelling a candidate
   discards it;
@@ -375,7 +376,16 @@ each runs and owns the field.
   parent's energy and cooldown alone.
 - A fixed logical quota shortfall (`pause-before-commit`) or any error rolls back the whole stage. Every staged
   genome is retired, the identities are unchanged and no budget is touched. Retrying the unchanged requests gives
-  the same result. A physical refusal (`allocated genome bytes`, `AllocationFailed`) is an error, never a birth
+  the same result.
+- Under `refuse-excess-births-v1` (§7.5's exhibition-mode birth rejection, `CapacityPolicy::RefuseExcessBirths`)
+  the same quotas refuse births instead of pausing. When the viable attempts outnumber the free slots, the slots go
+  to the smallest admission keys (`admission_key`: word 0 of `(birth, parent, n, lane (attempt, 1), 0)`), not the
+  lowest identities, so old parents are not favoured; the rest are `RefusedBirth`s (`PopulationSlots`). An
+  admitted birth the genome quota cannot cover is refused in turn (`LogicalGenomeBytes`) and the next is still
+  tried. A refused birth takes no slot, identity or genome charge, and its parent keeps its energy and cooldown
+  (`tests/emission_births.rs::refused_births_fill_the_free_slots_in_key_order_and_charge_nothing`; a world held
+  at its quota for 192 ticks, `tests/world.rs::refused_births_hold_the_world_at_its_quota_without_pausing`). The
+  watched organism's outcome is `ReproductionOutcome::Refused`. A physical refusal (`allocated genome bytes`, `AllocationFailed`) is an error, never a birth
   rejection.
 - A `Birth` carries identity, genome, slot and energy together (INV-06). `Births::settle` checks every parent's
   budget bit for bit against its proposal before keeping exactly the split's parent share and recording anything.

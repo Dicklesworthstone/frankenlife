@@ -551,6 +551,66 @@ fn a_population_shortfall_pauses_the_tick_and_changes_nothing() {
     assert_eq!(committed(&world), before);
 }
 
+/// §7.5's exhibition mode, `refuse-excess-births-v1`: the world that
+/// pauses above runs on at its quota. The population never exceeds it,
+/// every attempt is born, rejected or refused, and the refusals are
+/// reported. A rerun is identical.
+#[test]
+fn refused_births_hold_the_world_at_its_quota_without_pausing() {
+    let config = ecology(&[
+        ("population", "maximum_count", "48"),
+        (
+            "population",
+            "capacity_policy",
+            "\"refuse-excess-births-v1\"",
+        ),
+    ]);
+    let run = || {
+        let mut world = found(&config, Arrangement::Compact);
+        let mut refused = 0;
+        let mut full = 0;
+        for _ in 0..192 {
+            let report = publish(&mut world);
+            assert!(report.live <= 48, "{} live", report.live);
+            assert_eq!(
+                report.attempted,
+                report.births.len() + report.rejected.len() + report.refused.len()
+            );
+            if !report.refused.is_empty() {
+                // Refusal happens only when the births filled every free
+                // slot: the quota counted each attempting parent as live,
+                // and only those dying after the split leave a gap.
+                let attempting: Vec<_> = report
+                    .births
+                    .iter()
+                    .map(|birth| birth.parent)
+                    .chain(report.refused.iter().map(|birth| birth.parent))
+                    .chain(report.rejected.iter().map(|birth| birth.parent))
+                    .collect();
+                let gaps = report
+                    .deaths
+                    .iter()
+                    .filter(|death| attempting.contains(&death.id))
+                    .count();
+                assert_eq!(report.live + gaps, 48);
+                full += 1;
+            }
+            let parents: Vec<_> = report.refused.iter().map(|birth| birth.parent).collect();
+            assert!(parents.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                report
+                    .births
+                    .iter()
+                    .all(|birth| !parents.contains(&birth.parent))
+            );
+            refused += report.refused.len();
+        }
+        assert!(full > 0 && refused > 0, "the quota never bound");
+        (refused, world.digest().to_hex())
+    };
+    assert_eq!(run(), run());
+}
+
 /// §7.5: the fixed logical genome quota pauses the tick the same way.
 #[test]
 fn a_genome_quota_shortfall_pauses_the_tick_and_changes_nothing() {

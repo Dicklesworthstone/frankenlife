@@ -296,6 +296,20 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-013",
         )
     },
+    // §7.5's exhibition-mode birth-rejection policy: the same fixed quotas,
+    // enforced by refusing births in admission-key order (a draw on the
+    // parent's stable identity and the tick), each refusal reported.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/emission_births.rs::refused_births_fill_the_free_slots_in_key_order_and_charge_nothing",
+        },
+        ..entry(
+            "refuse-excess-births-v1",
+            Role::CapacityPolicy,
+            "§7.5",
+            "FL-013",
+        )
+    },
     AlgorithmEntry {
         status: Status::Implemented {
             evidence: "test:flife-field::tests/field_layout.rs::appendix_a_initial_field_is_uniform_with_zero_moments",

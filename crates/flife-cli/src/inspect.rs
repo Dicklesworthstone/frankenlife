@@ -9,8 +9,10 @@
 //!   hold;
 //! - one [`InspectedOrganism`] per live organism, in identity order: its
 //!   identity, genome, lineage, generation, parent and birth tick, its
-//!   position, velocity and energy, its topology and parameter count, and
-//!   its genetic affinity direction;
+//!   position, velocity and energy, its topology and parameter count, its
+//!   heritable chemistry (affinity direction, the 33 motion-response
+//!   coefficients `χ_e, χ_0..χ_31` and the sensing scale) and its held
+//!   controller outputs, when it holds any;
 //! - with `field`, one [`InspectedField`]: the energy plane, row-major
 //!   (`y` outer, `x` inner), each cell's `f32` widened exactly;
 //! - with `weights`, one [`InspectedWeights`] per organism named, in the
@@ -126,6 +128,24 @@ pub struct InspectedOrganism {
     pub parameters: usize,
     /// Its genetic affinity direction.
     pub affinity: Vec<f64>,
+    /// Its motion-response coefficients: `χ_e` (energy) then `χ_0..χ_31`
+    /// (the moment channels), in world-length² per second².
+    pub motion_response: Vec<f64>,
+    /// Its sensing scale in world units.
+    pub sensing_scale: f64,
+    /// The raw controller outputs it holds, as stored (36 `f32`s, widened
+    /// exactly), and the tick they were evaluated at; none for a newborn
+    /// that has not been evaluated yet.
+    pub held: Option<InspectedHeld>,
+}
+
+/// An organism's held controller outputs.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InspectedHeld {
+    /// The tick they were evaluated at.
+    pub evaluated_at: u64,
+    /// The raw outputs, in the action layout (`flife_neural::actions`).
+    pub outputs: Vec<f64>,
 }
 
 /// The field's energy plane.
@@ -324,6 +344,16 @@ fn of(
             topology: genome.topology().index(),
             parameters: genome.parameters().len(),
             affinity: genome.traits().affinity().to_vec(),
+            motion_response: genome.traits().motion_response().to_vec(),
+            sensing_scale: genome.traits().sensing_scale(),
+            held: organism
+                .held
+                .outputs()
+                .zip(organism.held.evaluated_at())
+                .map(|(outputs, tick)| InspectedHeld {
+                    evaluated_at: tick.get(),
+                    outputs: outputs.iter().map(|&value| f64::from(value)).collect(),
+                }),
         });
     }
     let state = world.field();

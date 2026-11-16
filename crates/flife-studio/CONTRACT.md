@@ -1394,7 +1394,8 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     closing tick was in no checkpoint and was lost on resumption.
   - The checkpointer sharing a paused stroke's checkpoint at a multiple guards a race no test forces (a planted
     bug there survives).
-  - `pause-before-commit` is the only capacity policy, so a capacity rejection pauses the run; the binary counts
+  - Under `pause-before-commit` a capacity rejection pauses the run (under `refuse-excess-births-v1` it is a
+    refused birth the overlay counts as `N refused for capacity`, `tests/overlay.rs`); the binary counts
     the capacity pauses its session reports (a run's end, or a held step, for a shortfall) and marks the world
     paused when the current run ends. The crowded offscreen run exercises a run's end; a held step's shortfall
     (a step taken while paused) is not exercised through the binary.

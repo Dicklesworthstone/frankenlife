@@ -829,6 +829,8 @@ pub struct Tally {
     pub evaluations: u64,
     /// Birth attempts whose every mutation candidate was rejected.
     pub rejected_births: u64,
+    /// Birth attempts `refuse-excess-births-v1` refused for capacity.
+    pub refused_births: u64,
     /// The energy organisms gained by uptake: the uptake transfer's credit,
     /// what granted uptake left after each organism's efficiency.
     pub uptake: f64,
@@ -845,6 +847,7 @@ impl Tally {
             deaths: 0,
             evaluations: 0,
             rejected_births: 0,
+            refused_births: 0,
             uptake: 0.0,
         }
     }
@@ -856,6 +859,7 @@ impl Tally {
         self.deaths += report.deaths.len() as u64;
         self.evaluations += report.evaluated as u64;
         self.rejected_births += report.rejected.len() as u64;
+        self.refused_births += report.refused.len() as u64;
         self.uptake += report.closure.credited(Transfer::Uptake);
     }
 }

@@ -17,10 +17,10 @@ use flife_core::{
     CoreError, EnergyBudget, Flow, Holdings, ResidualBudget, Tick, TickSpan, ValidatedConfig,
 };
 use flife_engine::{
-    Arrangement, BirthContext, BirthRequest, BirthResolution, BudgetStage, Death, DeathCause,
-    DeathSettlement, Disposition, EmissionPolicy, Entrant, Fate, HeldOutput, Identities,
-    MaintenanceBill, MaintenanceCosts, Motion, Offspring, Organism, ParentState, Population,
-    PopulationQuota, Recycling, Reproduction, ReproductionProposal, ReproductionRules,
+    Arrangement, BirthContext, BirthRequest, BirthResolution, BudgetStage, CapacityPolicy, Death,
+    DeathCause, DeathSettlement, Disposition, EmissionPolicy, Entrant, Fate, HeldOutput,
+    Identities, MaintenanceBill, MaintenanceCosts, Motion, Offspring, Organism, ParentState,
+    Population, PopulationQuota, Recycling, Reproduction, ReproductionProposal, ReproductionRules,
     TinyEnergyPolicy, Vitality, resolve_births, settle_efficiencies,
 };
 use flife_field::sources::unit_direction;
@@ -1848,6 +1848,7 @@ fn births_and_deaths_commit_together_with_the_birth_transaction() {
             reproduction: &reproduction,
             mutator: &mutator,
             offspring: Offspring::Inherited,
+            capacity: CapacityPolicy::PauseBeforeCommit,
         };
         let parent_genome = population.genome(one.id).expect("genome");
         let mut identities = Identities {
@@ -1894,7 +1895,7 @@ fn births_and_deaths_commit_together_with_the_birth_transaction() {
 
         // Phase 8 commits the parent's kept share and deadline, the newborn,
         // and the death together.
-        let (born, _) = births.into_parts();
+        let (born, _, _) = births.into_parts();
         let mut entrants = Vec::new();
         for (birth, (parent, kept)) in born.into_iter().zip(kept) {
             let row = alive(&population, parent.get());

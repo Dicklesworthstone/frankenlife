@@ -1,5 +1,5 @@
-// `bun test`: the director's camera path on synthetic frames, where where the
-// activity is is known.
+// `bun test`: the director's camera path on synthetic frames whose activity
+// is known.
 import { describe, expect, test } from "bun:test";
 
 import { activities, direct } from "./director";

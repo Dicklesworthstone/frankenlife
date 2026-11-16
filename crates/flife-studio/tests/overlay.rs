@@ -113,6 +113,7 @@ const fn metrics() -> Metrics {
             deaths: 18_255,
             evaluations: 0,
             rejected_births: 2,
+            refused_births: 0,
             uptake: 456.74,
         }),
     }
@@ -626,6 +627,18 @@ fn the_telemetry_says_what_plan_14_1_lists() {
     assert_eq!(
         line(&introduced, &memory, &same, None, 4),
         "injected 1234.5 · removed 12.0 · uptake 456.7 · dissipated 789.1 · residual -3.4e-13"
+    );
+    // Births refused for capacity only when there are any.
+    let refused = Metrics {
+        tally: base.tally.map(|tally| Tally {
+            refused_births: 1_234,
+            ..tally
+        }),
+        ..base
+    };
+    assert_eq!(
+        line(&refused, &memory, &same, None, 3),
+        "18,586 births · 1,234 refused for capacity · 18,255 deaths · no capacity pause · no fault"
     );
     // A tally from a later tick says so; without one, nothing is counted.
     let later = Metrics {
@@ -1234,6 +1247,7 @@ fn the_longest_overlay_is_set_whole_within_its_budget() {
             deaths: 999_999_999_999,
             evaluations: 0,
             rejected_births: 0,
+            refused_births: 0,
             uptake: 99_999.94,
         }),
         ..metrics()

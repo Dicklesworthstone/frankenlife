@@ -169,7 +169,8 @@ export function direct(
   const end = ticks.length - 1 - options.closing - options.transition;
   while (frame + options.transition + options.dwell <= end) {
     const zoom = options.zooms[shot % options.zooms.length] as number;
-    // The view's half-width in cells: blur the shot's activity to it.
+    // Blur the shot's activity to about half the view's half-width, so the
+    // peak is a region the view holds with margin, not a single busy cell.
     const radius = Math.max(1, Math.round(GRID / (2 * zoom) / 2));
     const begin = frame + options.transition;
     const map = smooth(summed(maps, begin, begin + options.dwell), radius);
@@ -186,13 +187,14 @@ export function direct(
     }
     const target = peak(map, extent);
     // Drift towards the activity of the shot's second half, at most a
-    // quarter of the view.
+    // quarter of the view on each axis. The drifted center may leave the
+    // torus; `flife render --camera` wraps it.
     const late = smooth(summed(maps, begin + options.dwell / 2, begin + options.dwell), radius);
     const towards = peak(late, extent);
-    const limit = extent[0] / zoom / 4;
     const drift: [number, number] = [0, 0];
     for (const axis of [0, 1] as const) {
       const length = extent[axis];
+      const limit = length / zoom / 4;
       let d = (towards[axis] - target[axis]) % length;
       if (d > length / 2) d -= length;
       if (d < -length / 2) d += length;

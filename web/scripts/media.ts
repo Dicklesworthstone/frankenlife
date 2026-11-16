@@ -4,6 +4,7 @@
 //   bun scripts/media.ts --flife PATH --run-dir DIR --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080] [--fps 30] [--crf 24]
 //     [--camera auto|none] [--field energy|composition|none] [--look glow|raw]
+//     [--color lineage|affinity|energy|generation|motion|topology]
 //
 // - With `--camera auto` (the default) the run is first rendered small, as
 //   raw dots without the field (`--work`/preview), and scripts/director.ts
@@ -107,7 +108,7 @@ type Validation = {
 
 const flags = options();
 for (const key of flags.keys()) {
-  if (!["flife", "run-dir", "work", "ticks", "every", "size", "fps", "crf", "camera", "field", "look"].includes(key)) {
+  if (!["flife", "run-dir", "work", "ticks", "every", "size", "fps", "crf", "camera", "field", "look", "color"].includes(key)) {
     fail(`unknown option --${key}`);
   }
 }
@@ -136,7 +137,16 @@ const choice = (key: string, allowed: string[]) => {
 const cameraMode = choice("camera", ["auto", "none"]);
 const field = choice("field", ["energy", "composition", "none"]);
 const look = choice("look", ["glow", "raw"]);
-const style = [...(field === "none" ? ["--no-field"] : ["--field-mapping", field]), "--look", look];
+// Without --color, the run's own [presentation] color_mapping.
+const color = flags.has("color")
+  ? choice("color", ["lineage", "affinity", "energy", "generation", "motion", "topology"])
+  : null;
+const style = [
+  ...(field === "none" ? ["--no-field"] : ["--field-mapping", field]),
+  "--look",
+  look,
+  ...(color ? ["--color", color] : []),
+];
 // The preview the director reads: a multiple of its 128-cell grid.
 const PREVIEW = "512";
 

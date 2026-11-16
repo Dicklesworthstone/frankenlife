@@ -43,13 +43,35 @@
 //!    0)`, wrapped onto the torus.
 //!
 //! When either fixed logical quota cannot cover a birth, under
-//! `pause-before-commit` the whole stage is rolled back and reported as a
-//! [`CapacityShortfall`]. Every staged genome's charge is returned, and no
-//! identity, slot or energy is committed. Retrying the unchanged candidate
-//! reproduces the same proposals, randomness and identities. Any other
-//! failure, such as a physical allocation failure, also rolls everything
-//! back. It is returned as an error that pauses, retries or fails the run,
-//! and never becomes a birth-selection rule (§7.5).
+//! `pause-before-commit` (research mode, §7.5) the whole stage is rolled
+//! back and reported as a [`CapacityShortfall`]. Every staged genome's
+//! charge is returned, and no identity, slot or energy is committed.
+//! Retrying the unchanged candidate reproduces the same proposals,
+//! randomness and identities.
+//!
+//! Under `refuse-excess-births-v1`, §7.5's exhibition-mode birth-rejection
+//! policy, the same quotas are enforced by refusing births instead:
+//! - When the tick's viable attempts outnumber the free population slots,
+//!   the slots go to the attempts with the smallest admission keys, word 0
+//!   of `(birth, parent, n, lane (attempt, 1), 0)`. The key depends on the
+//!   parent's stable identity and the tick only, so the choice is
+//!   independent of arrival order, observation and backend, and it does
+//!   not favour old (low-identity) parents the way ascending identity
+//!   would. Ties, which need equal 64-bit words, fall to the lower
+//!   identity.
+//! - An admitted birth the logical genome quota cannot cover is refused in
+//!   turn, in ascending parent identity, and later births are still tried.
+//! - A refused birth ([`RefusedBirth`]) takes no slot, identity or genome
+//!   charge. Its parent keeps its energy, and its cooldown is unchanged, as
+//!   for any failed attempt, so it may attempt again next tick.
+//!
+//! The policy is part of the experiment's identity, and every refusal is
+//! reported, so the capacity pressure it imposes stays visible (§7.5).
+//!
+//! Any other failure, such as a physical allocation failure, rolls
+//! everything back under either policy. It is returned as an error that
+//! pauses, retries or fails the run, and never becomes a birth-selection
+//! rule (§7.5).
 //!
 //! **Commit.** A [`Birth`] carries the child's identity, genome, slot, and
 //! energy together (INV-06). [`Births::settle`] checks every parent's budget
@@ -566,6 +588,53 @@ pub struct BirthContext<'a> {
     pub mutator: &'a Mutator<'a>,
     /// Where a newborn's genome comes from.
     pub offspring: Offspring<'a>,
+    /// What a birth the fixed logical quotas cannot cover does.
+    pub capacity: CapacityPolicy,
+}
+
+/// `population.capacity_policy`: what a birth the fixed logical quotas
+/// cannot cover does (§7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityPolicy {
+    /// `pause-before-commit`, research mode: the tick pauses before commit
+    /// with nothing staged.
+    PauseBeforeCommit,
+    /// `refuse-excess-births-v1`, exhibition mode: births are admitted in
+    /// admission-key order until a quota is full, and the rest are refused
+    /// without charge (see the [module documentation](self)).
+    RefuseExcessBirths,
+}
+
+/// The research-mode capacity policy.
+pub const PAUSE_BEFORE_COMMIT: &str = "pause-before-commit";
+
+/// The exhibition-mode capacity policy.
+pub const REFUSE_EXCESS_BIRTHS: &str = "refuse-excess-births-v1";
+
+impl CapacityPolicy {
+    /// The policy named `name`.
+    ///
+    /// # Errors
+    /// [`CoreError::UnknownAlgorithm`] for any other name.
+    pub fn from_name(name: &str) -> Result<Self, CoreError> {
+        match name {
+            PAUSE_BEFORE_COMMIT => Ok(Self::PauseBeforeCommit),
+            REFUSE_EXCESS_BIRTHS => Ok(Self::RefuseExcessBirths),
+            _ => Err(CoreError::UnknownAlgorithm {
+                role: "population.capacity_policy",
+                name: name.to_owned(),
+            }),
+        }
+    }
+
+    /// The registered name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PauseBeforeCommit => PAUSE_BEFORE_COMMIT,
+            Self::RefuseExcessBirths => REFUSE_EXCESS_BIRTHS,
+        }
+    }
 }
 
 /// Where a newborn's genome comes from.
@@ -623,6 +692,17 @@ pub struct CapacityShortfall {
     pub proposed: Vec<OrganismId>,
     /// Births covered before the refused one.
     pub covered: usize,
+}
+
+/// A viable attempt `refuse-excess-births-v1` refused because a fixed
+/// logical quota could not cover it: no child, no charge, and the parent's
+/// energy and cooldown unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefusedBirth {
+    /// The parent.
+    pub parent: OrganismId,
+    /// The quota that could not cover it.
+    pub resource: Capacity,
 }
 
 /// A birth whose every candidate was rejected: no child, no charge, and the
@@ -715,6 +795,7 @@ impl Birth {
 pub struct Births {
     born: Vec<Birth>,
     rejected: Vec<RejectedBirth>,
+    refused: Vec<RefusedBirth>,
 }
 
 impl Births {
@@ -729,6 +810,13 @@ impl Births {
     #[must_use]
     pub fn rejected(&self) -> &[RejectedBirth] {
         &self.rejected
+    }
+
+    /// Births `refuse-excess-births-v1` refused, in ascending parent
+    /// identity.
+    #[must_use]
+    pub fn refused(&self) -> &[RefusedBirth] {
+        &self.refused
     }
 
     /// Settle every parent and record the endowments, all or nothing.
@@ -771,20 +859,22 @@ impl Births {
         roll_back(self.born, quota)
     }
 
-    /// The births and the rejected births.
+    /// The births, the rejected births and the refused births.
     #[must_use]
-    pub fn into_parts(self) -> (Vec<Birth>, Vec<RejectedBirth>) {
-        (self.born, self.rejected)
+    pub fn into_parts(self) -> (Vec<Birth>, Vec<RejectedBirth>, Vec<RefusedBirth>) {
+        (self.born, self.rejected, self.refused)
     }
 }
 
 /// The outcome of phase 8's birth stage.
 #[derive(Debug)]
 pub enum BirthResolution {
-    /// Every viable attempt was staged or rejected; the identities advanced.
+    /// Every viable attempt was staged, rejected or refused; the
+    /// identities advanced.
     Staged(Births),
-    /// A fixed logical quota could not cover a birth. Nothing is staged or
-    /// charged and the identities are unchanged.
+    /// Under `pause-before-commit`, a fixed logical quota could not cover a
+    /// birth. Nothing is staged or charged and the identities are
+    /// unchanged.
     Paused(CapacityShortfall),
 }
 
@@ -839,6 +929,7 @@ pub fn resolve_births_with(
         return Ok(BirthResolution::Staged(Births {
             born: Vec::new(),
             rejected: Vec::new(),
+            refused: Vec::new(),
         }));
     };
     if order.iter().any(|request| request.intent.tick != tick) {
@@ -851,12 +942,18 @@ pub fn resolve_births_with(
     let deadline = birth_tick.checked_add(context.reproduction.rules.cooldown)?;
 
     let mut working = identities.clone();
-    // Each request ends in one birth or one rejected birth: room for every
-    // request in both lists, so neither grows (FL-043).
+    // Each request ends in one birth, one rejected birth or one refused
+    // birth: room for every request in each list, so none grows (FL-043).
     let mut born: Vec<Birth> = Vec::new();
     let mut rejected: Vec<RejectedBirth> = Vec::new();
+    let mut refused: Vec<RefusedBirth> = Vec::new();
     reserve_births(&mut born, order.len(), "births")?;
     reserve_births(&mut rejected, order.len(), "rejected births")?;
+    let refusing = context.capacity == CapacityPolicy::RefuseExcessBirths;
+    if refusing {
+        reserve_births(&mut refused, order.len(), "refused births")?;
+        admit(context.rng, tick, population, &mut order, &mut refused)?;
+    }
     for request in &order {
         let prepared = first
             .binary_search_by_key(&request.intent.parent, |(parent, _)| *parent)
@@ -876,6 +973,12 @@ pub fn resolve_births_with(
         ) {
             Ok(Staged::Born(birth)) => born.push(*birth),
             Ok(Staged::Rejected(birth)) => rejected.push(birth),
+            Ok(Staged::Short { resource, .. }) if refusing => {
+                refused.push(RefusedBirth {
+                    parent: request.intent.parent,
+                    resource,
+                });
+            }
             Ok(Staged::Short {
                 resource,
                 required,
@@ -899,7 +1002,73 @@ pub fn resolve_births_with(
         }
     }
     *identities = working;
-    Ok(BirthResolution::Staged(Births { born, rejected }))
+    refused.sort_unstable_by_key(|birth| birth.parent);
+    Ok(BirthResolution::Staged(Births {
+        born,
+        rejected,
+        refused,
+    }))
+}
+
+/// `refuse-excess-births-v1`'s slot admission: when `order` (ascending
+/// parent identity) holds more births than `population` has free slots,
+/// keep the births with the smallest admission keys, still in ascending
+/// parent identity, and move the rest to `refused`.
+///
+/// # Errors
+/// [`CoreError::AllocationFailed`] if the keys cannot be held.
+fn admit(
+    rng: &SemanticRng,
+    tick: Tick,
+    population: PopulationQuota,
+    order: &mut Vec<&BirthRequest<'_>>,
+    refused: &mut Vec<RefusedBirth>,
+) -> Result<(), CoreError> {
+    let slots = usize::try_from(population.available()).unwrap_or(usize::MAX);
+    if order.len() <= slots {
+        return Ok(());
+    }
+    let mut keys: Vec<(u64, OrganismId)> = Vec::new();
+    reserve_births(&mut keys, order.len(), "admission keys")?;
+    for request in order.iter() {
+        let parent = request.intent.parent;
+        keys.push((admission_key(rng, parent, tick)?, parent));
+    }
+    // The first `slots` keys are admitted; they are sorted back by parent
+    // for the membership test.
+    keys.sort_unstable();
+    let admitted = keys.get_mut(..slots).unwrap_or_default();
+    admitted.sort_unstable_by_key(|&(_, parent)| parent);
+    order.retain(|request| {
+        let parent = request.intent.parent;
+        let keep = admitted
+            .binary_search_by_key(&parent, |&(_, admitted)| admitted)
+            .is_ok();
+        if !keep {
+            refused.push(RefusedBirth {
+                parent,
+                resource: Capacity::PopulationSlots,
+            });
+        }
+        keep
+    });
+    Ok(())
+}
+
+/// A parent's admission key at attempt tick `tick`: word 0 of
+/// `(birth, parent, n, lane (attempt, 1), 0)`.
+///
+/// # Errors
+/// As `Lane::new`, which does not fail for index 1.
+pub fn admission_key(rng: &SemanticRng, parent: OrganismId, tick: Tick) -> Result<u64, CoreError> {
+    let [word, ..] = rng.block(Address {
+        stream: Stream::Birth,
+        entity: parent.get(),
+        ordinal: tick.get(),
+        lane: Lane::new(0, LaneKind::Attempt, 1)?,
+        draw: 0,
+    });
+    Ok(word)
 }
 
 /// One request's staging outcome.

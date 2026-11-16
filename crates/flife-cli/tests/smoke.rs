@@ -366,6 +366,7 @@ fn the_smoke_run_shows_births_deaths_emissions_and_heritable_variation_in_raw_st
             ticks: 1024,
             births: 507,
             rejected_births: 0,
+            refused_births: 0,
             deaths: 3775,
             deaths_by_stage: BTreeMap::from([
                 ("chemistry", 159),

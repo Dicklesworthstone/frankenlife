@@ -16,7 +16,7 @@ cd web
 bun install
 bun run dev          # http://localhost:3000, once the media are in public/media/
 bun run typecheck
-bun test             # worker.ts's byte serving
+bun test             # worker.ts's byte serving, and the director's camera path
 bun run build        # refuses unless public/media/ holds exactly the manifest's files
 bun run deploy       # build, then `wrangler deploy` (needs `wrangler login`)
 ```
@@ -38,6 +38,14 @@ target/release/flife run presets/desktop-world.toml --ticks 8192 --run-dir RUN
 # (the defaults). Paths are relative to where you run it; keep WORK (about 700 MB of PNGs) outside the repository.
 bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK
 ```
+
+The camera (`--camera auto`, the default) is chosen from the run itself: `scripts/media.ts` first renders the
+same ticks small, as raw dots, and `scripts/director.ts` reads those frames' pixels to find where the organisms
+are changing most, then writes the path that `flife render --camera` follows. The film opens and closes on the
+whole torus and, in between, eases into the most active region of each shot. The rule is stated in
+`director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
+checks that the preview and the film end on the same world digest. `--camera none` films the whole torus.
+`--field energy|composition|none` and `--look glow|raw` choose how the frames are drawn.
 
 `scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the
 manifest names the revision. It renders into `--work`. Run it again with the same `--work` to re-encode

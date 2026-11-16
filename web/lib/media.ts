@@ -35,6 +35,8 @@ export type FilmManifest = {
     founders: number;
     grid: [number, number];
     timestep: [number, number];
+    /** The registered model the world runs (flife-core's registry). */
+    model?: string;
     /** The committed world the film starts from, by tick and digest. */
     from: { tick: number; digest: string };
     /** Each frame's tick and live organisms, in order. */
@@ -47,6 +49,16 @@ export type FilmManifest = {
   render: {
     /** The command, with the run directory as RUN and the frames as FRAMES. */
     command: string;
+    /**
+     * The camera path the film follows (CAMERA in the command), the rule
+     * that chose it from a whole-world preview, and that rule's timings;
+     * absent for a film of the whole torus.
+     */
+    camera?: {
+      rule: string;
+      options: { opening: number; transition: number; dwell: number; closing: number; zooms: number[] };
+      keys: { tick: number; center: [number, number]; zoom: number }[];
+    } | null;
     mapping: string;
     meaning: string;
     look: string;

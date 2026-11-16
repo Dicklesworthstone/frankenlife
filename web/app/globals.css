@@ -1,0 +1,200 @@
+@import "tailwindcss";
+
+/* FrankenLife: the FrankenSuite laboratory palette, dark by design. The film is
+   luminous particles on a dark field, and the page is the dark around it. */
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains), ui-monospace, monospace;
+}
+
+:root {
+  --color-bg: #020a02;
+  --color-surface: #051205;
+  --color-green-prime: #22c55e;
+  --color-green-glow: #4ade80;
+  --ease-stripe: cubic-bezier(0.19, 1, 0.22, 1);
+  color-scheme: dark;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 6rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  background-color: var(--color-bg);
+  color: #f1f5f9;
+  font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  line-height: 1.6;
+  letter-spacing: -0.01em;
+  overflow-x: hidden;
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
+  font-weight: 900;
+  line-height: 1.08;
+}
+
+code,
+pre,
+kbd {
+  font-family: var(--font-mono);
+  letter-spacing: 0;
+}
+
+/* Film grain, inline so nothing is fetched. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A//www.w3.org/2000/svg%27%20width%3D%27120%27%20height%3D%27120%27%3E%3Cfilter%20id%3D%27n%27%3E%3CfeTurbulence%20type%3D%27fractalNoise%27%20baseFrequency%3D%270.85%27%20numOctaves%3D%272%27%20stitchTiles%3D%27stitch%27%20seed%3D%272%27/%3E%3C/filter%3E%3Crect%20width%3D%27120%27%20height%3D%27120%27%20filter%3D%27url(%23n)%27/%3E%3C/svg%3E");
+  opacity: 0.035;
+  pointer-events: none;
+  z-index: 60;
+  contain: strict;
+}
+
+::selection {
+  background: rgba(34, 197, 94, 0.3);
+  color: #fff;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #010501;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1a2e1a;
+  border: 2px solid #010501;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-green-prime);
+}
+
+.glass-modern {
+  background: rgba(5, 18, 5, 0.8);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
+  border: 1px solid rgba(34, 197, 94, 0.12);
+  box-shadow:
+    0 4px 24px -1px rgba(0, 0, 0, 0.4),
+    inset 0 1px 1px rgba(255, 255, 255, 0.05);
+}
+
+.kinetic-card {
+  transition:
+    transform 400ms var(--ease-stripe),
+    border-color 400ms var(--ease-stripe),
+    box-shadow 400ms var(--ease-stripe);
+}
+
+.kinetic-card:hover {
+  transform: translateY(-3px);
+  border-color: rgba(34, 197, 94, 0.3);
+  box-shadow: 0 0 40px -10px rgba(34, 197, 94, 0.2);
+}
+
+.text-animate-green {
+  background: linear-gradient(to right, #4ade80, #bef264, #22c55e, #4ade80);
+  background-size: 300% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: text-gradient 8s linear infinite;
+}
+
+@keyframes text-gradient {
+  to {
+    background-position: 300% center;
+  }
+}
+
+/* Slow drifting light behind the page: the sources over the field. */
+.orbit {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(90px);
+  opacity: 0.22;
+  animation: drift 26s ease-in-out infinite alternate;
+  will-change: transform;
+}
+
+@keyframes drift {
+  from {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(8%, 6%, 0) scale(1.15);
+  }
+}
+
+/* <Reveal>: shown in the HTML; once <RevealController> arms the page, a block
+   below the fold waits, hidden, until it scrolls into view. */
+.reveal {
+  transition:
+    opacity 0.8s var(--ease-stripe) var(--reveal-delay, 0s),
+    transform 0.8s var(--ease-stripe) var(--reveal-delay, 0s);
+}
+
+.reveal-armed .reveal:not(.is-shown) {
+  opacity: 0;
+  transform: translateY(32px);
+}
+
+/* The hero's entrance: CSS alone, so it never waits for hydration. */
+.rise-in {
+  animation: rise-in 0.9s var(--ease-stripe) var(--rise-delay, 0ms) both;
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(32px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .orbit,
+  .text-animate-green,
+  .pulse-dot,
+  .rise-in {
+    animation: none;
+  }
+}

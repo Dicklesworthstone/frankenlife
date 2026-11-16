@@ -22,3 +22,5 @@ IMG_*.jpg
 IMG_*.png
 .env
 .env.*
+# The website (Next.js, its node_modules and its build output): no Rust build reads it.
+web/

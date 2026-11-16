@@ -678,6 +678,7 @@ presets/                                              FL-015 reference-small-wor
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation; FL-026 arena slots
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
+web/                                                  the project's website (Next.js, Cloudflare), showing a film flife render drew; the media stay out of git (web/README.md)
 .beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
 ```
 

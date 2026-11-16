@@ -1,0 +1,11 @@
+# Dependencies and build output
+/node_modules/
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+.wrangler/
+
+# Rendered media (`bun run media`). Like every FrankenLife recording it stays out of git (AGENTS.md, plan
+# §18.5); lib/media.json is its committed manifest, with each file's SHA-256 and how it was made.
+/public/media/

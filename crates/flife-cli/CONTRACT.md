@@ -139,7 +139,8 @@ for, one at least, before a render is refused. Its first record is `start`, with
     dir, ExperimentOptions { cpu_workers, controllers }, emit)`. `Experiment::configuration(condition, seed)` gives
     any planned run's validated configuration.
 - `flife analyze DIR DIR...` (plan §14.6, §15.2–§15.5; bead flife-t9t) reads two or more experiment directories'
-  catalogs (`ExperimentCatalog::read`: nothing is created or written, nothing runs) and prints one
+  catalogs (`ExperimentCatalog::read`, FrankenSQLite's read-only open: nothing is created or written, nothing
+  runs) and prints one
   `frankenlife.analysis.v1` record (`analyze::Analysis`; `analyze(&[dir, ...])` in the library):
   - the shared base configuration hash, ticks, metrics interval and control;
   - each experiment's identity (the SHA-256 of its cataloged design), name, seeds and run count, in the order
@@ -154,8 +155,13 @@ for, one at least, before a render is refused. Its first record is `start`, with
     - fewer than two directories, or one experiment given twice;
     - designs with another base configuration, ticks, metrics interval, control or measure list;
     - a condition name defined with another ablation or keys;
+    - a seed held out in one experiment and a discovery seed of another (every experiment runs its control on
+      every seed, so that control run would be in both splits, and the held-out comparison would not be held
+      out);
     - a seed that would enter one condition and split twice (under one base configuration it is the same run).
-  - A directory without a catalog is `storage-failed`, and another catalog or design format `schema-mismatch`.
+  - A directory without a catalog, or with a file in its place that is not one, is `storage-failed` (the file is
+    left as it was, with nothing created beside it), and another catalog or design format version
+    `schema-mismatch`.
   - The record depends on the catalogs alone (no path, host or time): the same catalogs print the same bytes.
 
 - FL-042: `flife discover DIR BUNDLE --at T --name NAME --description TEXT (--region X,Y,R | --lineage L) --width W
@@ -1311,12 +1317,16 @@ FL-037's 32 × 32 ecology from the plan's own Appendix A:
   and the same design on disjoint seeds (4 and 5; 13) pool. For every condition, split and measure, the pooled
   differences are the two reports' differences concatenated, with summed counts and undefined seeds, the mean of
   the concatenation and `sign_flip_p` of it. Each part is its report's `n` and mean difference, and some measure
-  differs. The binary prints one line equal to the library's record, byte-identical twice. Refused, each naming
-  the difference: one directory, one experiment twice, 60 ticks, a metrics interval of 40, another control, a
-  condition redefined with another ablation, and seed 2 pooled again; a directory without a catalog is
-  `storage-failed`. Six planted defects were all caught: no duplicate-seed check, the pooled effect from the last
-  experiment only, the metrics interval unchecked, the control unchecked, the condition definitions unchecked, and
-  a part's mean difference negated.
+  differs. Analyzing leaves both catalogs' files, and their database and log bytes, as they were. The binary
+  prints one line equal to the library's record, byte-identical twice. Refused, each naming the difference: one
+  directory, one experiment twice, 60 ticks, a metrics interval of 40, another control, a condition redefined
+  with another ablation, seed 3 held out after the first experiment's discovery (in either order), and seed 2
+  pooled again. A directory without a catalog is `storage-failed`, with nothing created in it, and so is a file
+  in the catalog's place that is not a database, left byte-identical with nothing created beside it. Eight planted
+  defects were all caught: no duplicate-seed check, the pooled effect from the last experiment only, the metrics
+  interval unchecked, the control unchecked, the condition definitions unchecked, a part's mean difference negated,
+  no cross-split check, and the catalog opened read-write (which leaves FrankenSQLite's two lock files beside a
+  file that is not a catalog).
 
 Seven planted mutants in FL-048's measures were each caught: undefined seeds not named, an undefined measure
 counted as zero, organism Moran's I read from the field, the identity without the measures, topologies counted

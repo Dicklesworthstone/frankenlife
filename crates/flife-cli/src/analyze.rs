@@ -21,6 +21,10 @@
 //! - A seed may enter one condition and split only once. Under one base
 //!   configuration a seed's run is the same run in every experiment, so a
 //!   seed pooled twice would be counted twice.
+//! - A seed is in one split across all the experiments. Each experiment runs
+//!   its control on every seed it has, so a discovery seed of one that is a
+//!   held-out seed of another would put the same control run in both
+//!   splits. The held-out comparison would then not be held out.
 //!
 //! The analysis is one versioned JSON record ([`ANALYSIS_SCHEMA`]) and
 //! depends on the catalogs alone: no path, host or time. The same catalogs
@@ -223,6 +227,31 @@ fn check_comparable(loaded: &[Loaded]) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Check that no seed is a discovery seed of one experiment and a held-out
+/// seed of another. One experiment's own splits are disjoint already
+/// (`flife experiment` refuses a seed in both).
+fn check_splits(loaded: &[Loaded]) -> Result<(), CoreError> {
+    let mut discovery: BTreeMap<u64, &Loaded> = BTreeMap::new();
+    for experiment in loaded {
+        for &seed in &experiment.design.seeds.discovery {
+            discovery.entry(seed).or_insert(experiment);
+        }
+    }
+    for experiment in loaded {
+        for seed in &experiment.design.seeds.held_out {
+            if let Some(other) = discovery.get(seed) {
+                return Err(refused(format!(
+                    "seed {seed} is held out in experiment `{}` ({}) and a discovery seed of \
+                     experiment `{}` ({}): its control run would be in both splits, so the \
+                     held-out comparison would not be held out",
+                    experiment.design.name, experiment.identity, other.design.name, other.identity
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Every condition the experiments define, each once, in first appearance;
 /// refused if two define one name differently.
 fn conditions(loaded: &[Loaded]) -> Result<Vec<DesignedCondition>, CoreError> {
@@ -309,7 +338,8 @@ fn pool(
 /// # Errors
 /// [`CoreError::StateConflict`] for fewer than two directories, an
 /// experiment given twice, experiments that are not comparable, a condition
-/// defined two ways, a seed pooled twice, or a malformed catalog;
+/// defined two ways, a seed in both splits, a seed pooled twice, or a
+/// malformed catalog;
 /// [`CoreError::StorageFailed`] for a directory without a readable catalog;
 /// [`CoreError::SchemaMismatch`] for a catalog or design of another format.
 pub fn analyze(directories: &[&Path]) -> Result<Analysis, CoreError> {
@@ -321,6 +351,7 @@ pub fn analyze(directories: &[&Path]) -> Result<Analysis, CoreError> {
         .map(|directory| load(directory))
         .collect::<Result<Vec<_>, _>>()?;
     check_comparable(&loaded)?;
+    check_splits(&loaded)?;
     let conditions = conditions(&loaded)?;
     let shared = &loaded[0].design;
     let mut comparisons = Vec::new();

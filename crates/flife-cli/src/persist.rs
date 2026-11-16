@@ -1411,7 +1411,7 @@ pub fn resume(
             start(
                 &config,
                 // The session sets the tick it resolves `until` to.
-                options.until.from(0),
+                options.until.resolve(0),
                 cpu_workers,
                 controllers,
                 options.metrics_every,

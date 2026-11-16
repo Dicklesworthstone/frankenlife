@@ -516,9 +516,9 @@ fn step(run_dir: &Path, ticks: u64, every: Option<u64>) -> (Option<i32>, Vec<Val
 /// replay knows (plan §12.3, §14.6): a run stopped at tick 152 whose newest
 /// checkpoint is damaged resumes from 147, replays command 3's outcome
 /// past it, and steps two ticks from where the replay stopped, reporting
-/// each by default. A second step resumes from the first one's final checkpoint and
-/// reaches the uninterrupted run's state at the horizon. Zero ticks is
-/// refused.
+/// each by default. A second step resumes from the first one's final
+/// checkpoint and reaches the uninterrupted run's state at the horizon. Zero
+/// ticks is refused.
 #[test]
 fn a_step_advances_from_the_newest_durable_tick() {
     let reference = uninterrupted();

@@ -660,7 +660,7 @@ pub enum Until {
 impl Until {
     /// The committed tick to reach from a session opened at `committed`.
     #[must_use]
-    pub const fn from(self, committed: u64) -> u64 {
+    pub const fn resolve(self, committed: u64) -> u64 {
         match self {
             Self::Tick(tick) => tick,
             Self::Past(ticks) => committed.saturating_add(ticks.get()),
@@ -670,7 +670,8 @@ impl Until {
 
 /// Drive the session from a client task on Asupersync's native
 /// current-thread runtime: submit the plan's commands, then step one tick at
-/// a time until the committed tick reaches `plan.until`, a capacity pause
+/// a time until the committed tick reaches the tick `plan.until` resolves to
+/// from the session's starting boundary, a capacity pause
 /// or a failure, emitting a progress record at every multiple of
 /// `plan.every`. With `checkpoints`, publish one at each tick it is due (the
 /// starting tick included, once the commands are admitted) and at the end
@@ -712,7 +713,7 @@ where
                 };
                 let snapshot = handle.inspect(&cx).await?;
                 let mut committed = snapshot.boundary.tick.get();
-                let until = plan.until.from(committed);
+                let until = plan.until.resolve(committed);
                 if until < committed {
                     return Err(CoreError::StateConflict {
                         operation: "continue the run",

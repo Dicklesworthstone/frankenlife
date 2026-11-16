@@ -49,8 +49,10 @@ experiment knows what already ran and a report can list every run.
   `Retention::pinned`. A pin is the empty file `pins/<sequence>.<holder SHA-256 hex>.pin`.
 - FL-041: `ExperimentCatalog` with `open`, `path`, `design`, `runs` and `record`; `CatalogedRun`; and
   `EXPERIMENT_CATALOG_FORMAT`. `ExperimentCatalog::read(path)` (for `flife analyze`) opens an existing catalog only
-  to read it: a path that is not a file is `storage-failed` and nothing is created; a database of another format is
-  `schema-mismatch`; no statement but a read is run.
+  to read it, with FrankenSQLite's read-only open (`compat::open_with_flags`, `SQLITE_OPEN_READ_ONLY`), its
+  write-ahead log included. A path that is not a file, or a file that is not a catalog, is `storage-failed`, and
+  nothing is created, not even FrankenSQLite's lock files beside it (a read-write open makes two). A catalog of
+  another format version is `schema-mismatch`. No statement but a read is run.
 
 **Invariants — layout.**
 - `FLIFESTORE` holds `frankenlife.chunk-store.v1`. A directory that is neither empty nor a store is not taken over.

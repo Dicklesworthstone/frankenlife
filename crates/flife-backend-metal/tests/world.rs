@@ -500,9 +500,9 @@ fn one_flipped_metal_output_bit_changes_the_world() {
 /// with a device. Without one, or above that, it takes the FrankenTorch CPU
 /// route up to `AUTO_TORCH_MAX_WORKERS`, or, on a host where
 /// `TORCH_AT_SCALE`, for a world of at least `AUTO_TORCH_MIN_ORGANISMS`, and
-/// the CPU reference otherwise. `cpu` never
-/// opens a device, `torch` is the FrankenTorch CPU route on the world's
-/// workers on any host, and `metal` ignores the worker count.
+/// the CPU reference otherwise. `cpu` never opens a device, `torch` is the
+/// FrankenTorch CPU route on the world's workers on any host, and `metal`
+/// ignores the worker count.
 #[test]
 fn auto_takes_metal_only_up_to_its_worker_ceiling() {
     let device = metal().is_some();

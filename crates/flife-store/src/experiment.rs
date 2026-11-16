@@ -191,13 +191,15 @@ impl ExperimentCatalog {
         }
     }
 
-    /// Open the existing catalog at `path` only to read it: nothing is
-    /// created, and no statement but a read is run (`flife analyze`).
+    /// Open the existing catalog at `path` only to read it (`flife
+    /// analyze`), with FrankenSQLite's read-only open: nothing is created,
+    /// not even its lock files beside a file that is not a catalog, and no
+    /// statement but a read is run. Its write-ahead log is read with it.
     ///
     /// # Errors
-    /// [`CoreError::StorageFailed`] when `path` is not a file or the
-    /// database cannot be opened or read; [`CoreError::SchemaMismatch`] for
-    /// a database of another format.
+    /// [`CoreError::StorageFailed`] when `path` is not a file, or not a
+    /// database with a catalog that can be opened and read;
+    /// [`CoreError::SchemaMismatch`] for a catalog of another format version.
     pub fn read(path: &Path) -> Result<Self, CoreError> {
         if !path.is_file() {
             return Err(CoreError::StorageFailed {
@@ -207,8 +209,11 @@ impl ExperimentCatalog {
             });
         }
         let location = path.display().to_string();
-        let connection = block_on_inline(Connection::open(location))
-            .map_err(|error| storage("open experiment catalog", path, &error))?;
+        let connection = block_on_inline(fsqlite::compat::open_with_flags(
+            &location,
+            fsqlite::compat::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ))
+        .map_err(|error| storage("open experiment catalog", path, &error))?;
         let catalog = Self {
             connection,
             path: path.to_path_buf(),

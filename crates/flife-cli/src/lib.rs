@@ -62,9 +62,9 @@
 //! `flife branch PARENT DIR [--at T] [--name N] [--inject …] [--remove …]`,
 //! `flife inspect DIR [--at T] [--field]`,
 //! `flife discover DIR BUNDLE [--at T] [--region X,Y,R | --lineage L]`,
-//! `flife transplant PACKAGE DIR --config HOST --at X,Y [--name N]` and
-//! `flife experiment SPEC --out DIR` and `flife analyze DIR DIR…`. The repository's presets live
-//! in `presets/`.
+//! `flife transplant PACKAGE DIR --config HOST --at X,Y [--name N]`,
+//! `flife experiment SPEC --out DIR` and `flife analyze DIR DIR…`. The
+//! repository's presets live in `presets/`.
 
 #![forbid(unsafe_code)]
 

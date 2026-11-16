@@ -266,7 +266,8 @@ enum Command {
     /// experiment's own. One `frankenlife.analysis.v1` record. Refused
     /// (exit 2) unless the experiments share their base configuration,
     /// ticks, metrics interval, measures and control, define each shared
-    /// condition alike, and pool each seed once.
+    /// condition alike, keep each seed in one split, and pool each seed
+    /// once.
     Analyze {
         /// Two or more experiment directories `flife experiment` made.
         #[arg(required = true, num_args = 2..)]

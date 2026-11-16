@@ -1092,8 +1092,10 @@ fn refused_analysis(directories: &[&Path], detail: &str) {
 /// - one experiment alone, or one given twice;
 /// - other ticks, metrics interval or control;
 /// - a condition defined another way;
+/// - a seed held out in one and a discovery seed of the other;
 /// - a seed already pooled;
-/// - a directory with no catalog.
+/// - a directory with no catalog, or a file there that is not one (left
+///   as it was).
 #[test]
 fn analysis_pools_experiments_into_the_pairs_their_reports_compare() {
     let root = scratch("analyze");
@@ -1110,8 +1112,31 @@ fn analysis_pools_experiments_into_the_pairs_their_reports_compare() {
         .replace("discovery = [1, 2, 3]", "discovery = [4, 5]")
         .replace("held_out = [11, 12]", "held_out = [13]");
     let (second, b) = run_in("second", &again, EMISSION_CONDITIONS);
+    // The catalog's files, and the bytes of its database and log.
+    let held = |directory: &Path| {
+        let mut files: Vec<(String, Option<Vec<u8>>)> = fs::read_dir(directory)
+            .expect("lists")
+            .map(|entry| {
+                let path = entry.expect("an entry").path();
+                let name = path
+                    .file_name()
+                    .expect("a name")
+                    .to_string_lossy()
+                    .into_owned();
+                let data = name
+                    .strip_prefix(EXPERIMENT_CATALOG_FILE)
+                    .is_some_and(|rest| rest.is_empty() || rest == "-wal")
+                    .then(|| fs::read(&path).expect("reads"));
+                (name, data)
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = (held(&first), held(&second));
 
     let analysis = analyze(&[&first, &second]).expect("the two pool");
+    assert_eq!((held(&first), held(&second)), before, "read only");
     assert_eq!(analysis.schema, "frankenlife.analysis.v1");
     assert_eq!(analysis.base_config_hash, a.base_config_hash);
     assert_eq!(analysis.ticks, 120);
@@ -1235,12 +1260,43 @@ fn analysis_pools_experiments_into_the_pairs_their_reports_compare() {
         .replace("held_out = [11, 12]", "held_out = []");
     let (controlled, _) = run_in("controlled", &controlled, two);
     refused_analysis(&[&first, &controlled], "control no-emission");
+    // Held out here, but a discovery seed of the first: its control run
+    // would be in both splits, whichever order they are given in.
+    let crossed = EMISSION
+        .replace("discovery = [1, 2, 3]", "discovery = [10]")
+        .replace("held_out = [11, 12]", "held_out = [3]");
+    let (crossed, _) = run_in("crossed", &crossed, two);
+    refused_analysis(&[&first, &crossed], "seed 3 is held out");
+    refused_analysis(&[&crossed, &first], "seed 3 is held out");
     let empty = root.join("empty");
     fs::create_dir_all(&empty).expect("creates an empty directory");
     assert!(matches!(
         analyze(&[&first, &empty]),
         Err(CoreError::StorageFailed { .. })
     ));
+    assert_eq!(
+        fs::read_dir(&empty).expect("lists").count(),
+        0,
+        "nothing created"
+    );
+    // A file in the catalog's place that is not a database is refused, and
+    // left as it was.
+    let garbage = root.join("garbage");
+    fs::create_dir_all(&garbage).expect("creates a directory");
+    fs::write(garbage.join(EXPERIMENT_CATALOG_FILE), b"not a database").expect("writes");
+    assert!(matches!(
+        analyze(&[&first, &garbage]),
+        Err(CoreError::StorageFailed { .. })
+    ));
+    assert_eq!(
+        fs::read(garbage.join(EXPERIMENT_CATALOG_FILE)).expect("reads"),
+        b"not a database"
+    );
+    assert_eq!(
+        fs::read_dir(&garbage).expect("lists").count(),
+        1,
+        "nothing created beside it"
+    );
     let (status, out, err) = printed(&[&first, &first]);
     assert_eq!(status, Some(2));
     assert!(out.is_empty(), "nothing analyzed");

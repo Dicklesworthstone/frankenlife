@@ -1,4 +1,6 @@
-// The Worker in front of /media/* (wrangler.jsonc's `run_worker_first`).
+// The Worker in front of the site (wrangler.jsonc's `run_worker_first`). It
+// sends www.frankenlife.org to frankenlife.org, serves the media's byte
+// ranges, and hands everything else to the static assets unchanged.
 //
 // Workers static assets answer a Range request with the whole file and a 200,
 // and Safari will not play a video from a server that does that: it asks for
@@ -89,8 +91,16 @@ export function mediaWorker(sizes: ReadonlyMap<string, number>) {
 
 export default mediaWorker(SIZES);
 
+/** The site's one address; a request to www. is sent there. */
+const APEX = "frankenlife.org";
+
 async function serve(request: Request, env: Env, sizes: ReadonlyMap<string, number>): Promise<Response> {
   const url = new URL(request.url);
+  if (url.hostname === `www.${APEX}`) {
+    url.hostname = APEX;
+    url.hash = "";
+    return Response.redirect(url.toString(), 301);
+  }
   if (!url.pathname.startsWith("/media/") || (request.method !== "GET" && request.method !== "HEAD")) {
     return env.ASSETS.fetch(request);
   }

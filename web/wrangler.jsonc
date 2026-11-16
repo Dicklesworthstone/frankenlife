@@ -1,17 +1,23 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   // The static export in `out/` (`bun run build`), served as Workers static
-  // assets. Only /media/* runs worker.ts first: static assets ignore Range
-  // requests, and Safari plays no video without them.
+  // assets at frankenlife.org. worker.ts runs first: it sends www. to the
+  // apex and serves the media's byte ranges (static assets ignore Range
+  // requests, and Safari plays no video without them); everything else goes
+  // straight to the assets.
   "name": "frankenlife",
   "main": "worker.ts",
   "compatibility_date": "2026-11-01",
   "workers_dev": true,
   "preview_urls": false,
+  "routes": [
+    { "pattern": "frankenlife.org", "custom_domain": true },
+    { "pattern": "www.frankenlife.org", "custom_domain": true }
+  ],
   "assets": {
     "directory": "./out",
     "binding": "ASSETS",
-    "run_worker_first": ["/media/*"],
+    "run_worker_first": true,
     "not_found_handling": "404-page",
     "html_handling": "auto-trailing-slash"
   }

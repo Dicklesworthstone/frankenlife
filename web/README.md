@@ -51,9 +51,11 @@ digest at the last frame is in the manifest (`world.to.digest`) and in the rende
 
 ## Cloudflare
 
-`bun run deploy` uploads `out/` as the Worker's static assets. Static assets answer a Range request with
-the whole file and a 200, and Safari plays no video from such a server, so `/media/*` runs `worker.ts`
-first: it streams only the bytes asked for as a 206, sized from `lib/media.json` (an asset's response
-from the binding has no Content-Length). Every other path is served as a plain static asset.
+`bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org.
+Static assets answer a Range request with the whole file and a 200, and Safari plays no video from such
+a server, so `worker.ts` runs first, and for `/media/*` it streams only the bytes asked for as a 206, sized from `lib/media.json` (an asset's response
+from the binding has no Content-Length). It also sends www.frankenlife.org to frankenlife.org; every
+other request goes to the static assets unchanged. Both names are custom domains on the Worker
+(`wrangler.jsonc`), so `wrangler deploy` attaches them and their certificates.
 `public/_headers` makes the media and Next's hashed build output immutable. The site's address is
 `siteConfig.url` in `lib/content.ts`; Open Graph and the sitemap use it.

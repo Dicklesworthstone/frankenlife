@@ -5,8 +5,8 @@
 
 export const siteConfig = {
   name: "FrankenLife",
-  // Where Cloudflare serves the site: wrangler.jsonc's Worker on the account's workers.dev subdomain.
-  url: "https://frankenlife.jeffrey-emanuel.workers.dev",
+  // Where Cloudflare serves the site: wrangler.jsonc's custom domain (www. redirects here).
+  url: "https://frankenlife.org",
   title: "FrankenLife — artificial life you can watch, replay and check",
   description:
     "A real-time artificial-life laboratory in memory-safe Rust. Organisms with their own heritable neural networks feed, signal, move, split and die through one shared energy field, and every committed tick is deterministic to the bit.",

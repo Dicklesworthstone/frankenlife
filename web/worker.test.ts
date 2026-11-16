@@ -112,6 +112,12 @@ describe("the media Worker", () => {
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(bytes);
   });
 
+  test("sends www. to the apex, keeping the path and query", async () => {
+    const response = await worker.fetch(new Request("https://www.frankenlife.org/media/x.mp4?t=1#top"), env);
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe("https://frankenlife.org/media/x.mp4?t=1");
+  });
+
   test("passes everything outside /media/ to the assets", async () => {
     const page = await worker.fetch(new Request("https://site.test/"), env);
     expect(await page.text()).toBe("page");

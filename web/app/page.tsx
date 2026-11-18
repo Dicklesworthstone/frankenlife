@@ -157,6 +157,7 @@ export default function Home() {
                 <MicroLabel>The world</MicroLabel>
                 <dl className="mt-5 space-y-3 text-sm">
                   <Row label="Preset" value={world.preset ?? world.name} mono />
+                  {world.model ? <Row label="Model" value={world.model} mono /> : null}
                   <Row label="Seed" value={String(world.seed)} mono />
                   <Row label="Founders" value={`${grouped(world.founders)} on a ${world.grid[0]} × ${world.grid[1]} field`} />
                   <Row label="Tick length" value={`${world.timestep[0]}/${world.timestep[1]} s of simulated time`} />

@@ -3,15 +3,19 @@
 //
 //   bun scripts/media.ts --flife PATH --run-dir DIR --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080] [--fps 30] [--crf 24]
-//     [--camera auto|none] [--field energy|composition|none] [--look glow|raw]
-//     [--color lineage|affinity|energy|generation|motion|topology]
+//     [--camera auto|none] [--field energy|composition|none] [--look glow|raw|sphere]
+//     [--color lineage|affinity|energy|generation|motion|topology] [--zooms 2.5,4,6]
+//     [--cpu-workers N] [--preview-from WORK]
 //
 // - With `--camera auto` (the default) the run is first rendered small, as
 //   raw dots without the field (`--work`/preview), and scripts/director.ts
 //   reads that preview's pixels to choose where each shot looks; the film is
 //   then rendered with `flife render --camera` along that path. The camera
 //   is presentation only: both renders reach the same digest, which the
-//   script checks.
+//   script checks. `--zooms` gives the shots' zooms on this torus, in turn;
+//   without it they span 51–102 world units (below). `--preview-from` reads
+//   another --work's finished preview of the same run and ticks instead of
+//   rendering it again (to try other zooms); the digest check still holds.
 //
 // - `flife render --run-dir` continues the run from its newest checkpoint
 //   that restores, as `flife resume` would, and writes no checkpoint, journal
@@ -108,7 +112,7 @@ type Validation = {
 
 const flags = options();
 for (const key of flags.keys()) {
-  if (!["flife", "run-dir", "work", "ticks", "every", "size", "fps", "crf", "camera", "field", "look", "color"].includes(key)) {
+  if (!["flife", "run-dir", "work", "ticks", "every", "size", "fps", "crf", "camera", "field", "look", "color", "zooms", "cpu-workers", "preview-from"].includes(key)) {
     fail(`unknown option --${key}`);
   }
 }
@@ -127,6 +131,9 @@ const every = count("every", "32", 1);
 const size = count("size", "1080", 2);
 const fps = count("fps", "30", 1);
 const crf = count("crf", "24", 0);
+// The world's threads for both renders, if given (no result depends on them; the run's [execution]
+// cpu_workers otherwise). Not part of the recorded render arguments, which name what was drawn.
+const workers = flags.has("cpu-workers") ? ["--cpu-workers", count("cpu-workers", "1", 1)] : [];
 // 4:2:0 video halves each dimension.
 if (Number(size) % 2 !== 0) fail("--size must be even");
 const choice = (key: string, allowed: string[]) => {
@@ -136,7 +143,14 @@ const choice = (key: string, allowed: string[]) => {
 };
 const cameraMode = choice("camera", ["auto", "none"]);
 const field = choice("field", ["energy", "composition", "none"]);
-const look = choice("look", ["glow", "raw"]);
+const look = choice("look", ["glow", "raw", "sphere"]);
+// The shots' zooms on the run's torus, if given: each at least 1.
+const zooms = flags.has("zooms")
+  ? (flags.get("zooms") as string).split(",").map((text) => {
+      const zoom = Number(text);
+      return Number.isFinite(zoom) && zoom >= 1 ? zoom : fail(`--zooms must list zooms of at least 1, got ${text}`);
+    })
+  : null;
 // Without --color, the run's own [presentation] color_mapping.
 const color = flags.has("color")
   ? choice("color", ["lineage", "affinity", "energy", "generation", "motion", "topology"])
@@ -187,9 +201,21 @@ if (existsSync(made)) {
   if (cameraMode === "auto") {
     const preview = join(work, "preview");
     const previewRecords = join(work, "preview.ndjson");
-    console.error(`media: previewing ${ticks} ticks of ${runDir} for the camera`);
     const previewArgs = ["--ticks", ticks, "--every", every, "--width", PREVIEW, "--height", PREVIEW];
-    run(flife, ["render", "--run-dir", runDir, ...previewArgs, "--no-field", "--look", "raw", "--out", preview], previewRecords);
+    if (flags.has("preview-from")) {
+      // Its records name its own frames; the copy is what the digest check below reads.
+      const reused = join(path("preview-from"), "preview.ndjson");
+      if (!existsSync(reused)) fail(`${reused} does not exist`);
+      copyFileSync(reused, previewRecords);
+      console.error(`media: reading the preview in ${reused} for the camera`);
+    } else {
+      console.error(`media: previewing ${ticks} ticks of ${runDir} for the camera`);
+      run(
+        flife,
+        ["render", "--run-dir", runDir, ...previewArgs, ...workers, "--no-field", "--look", "raw", "--out", preview],
+        previewRecords,
+      );
+    }
     const previewed = readFileSync(previewRecords, "utf8")
       .split("\n")
       .filter((line) => line.trim() !== "")
@@ -213,7 +239,7 @@ if (existsSync(made)) {
       transition: Math.round(frameCount * 0.07),
       dwell: Math.round(frameCount * 0.16),
       closing: Math.round(frameCount * 0.06),
-      zooms: [3, 4.5, 2.5, 5, 3.5].map((zoom) => Math.max(1.25, Math.round(zoom * span * 100) / 100)),
+      zooms: zooms ?? [3, 4.5, 2.5, 5, 3.5].map((zoom) => Math.max(1.25, Math.round(zoom * span * 100) / 100)),
     };
     const keys = direct(
       shots.map((record) => record.tick ?? fail("a preview frame without a tick")),
@@ -228,7 +254,7 @@ if (existsSync(made)) {
   console.error(`media: rendering ${ticks} ticks of ${runDir}, a frame every ${every}`);
   run(
     flife,
-    ["render", "--run-dir", runDir, ...renderArgs, ...(camera ? ["--camera", cameraFile] : []), "--out", frames],
+    ["render", "--run-dir", runDir, ...renderArgs, ...workers, ...(camera ? ["--camera", cameraFile] : []), "--out", frames],
     records,
   );
   provenance = {

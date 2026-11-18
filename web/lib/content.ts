@@ -22,9 +22,10 @@ export const siteConfig = {
 // web/scripts/director.ts). AGENTS.md: a selection procedure is stated, never implied.
 export const filmChoice = {
   world: [
-    "This world's parameters were chosen by a search outside the simulation, against the reference screenshots that inspired the project. It measured 14 statistics of those images (how much of the frame is lit, the sizes of its holes and bodies, how far one colour extends), ran 233 small worlds, and scored each that lived by its distance from them. A person chose the closest by eye. The film shows that world itself, from the tick where the search stopped looking.",
-    "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. Seeds the search never saw grow the same colonies, though they merge into one tissue less than this one does.",
-    "What makes the structure is emission, chosen by the neural networks. Organisms return about half of what they eat to the field, in a chemical composition their networks choose, and kin choose alike, so each lineage paints its surroundings with its own chemistry and grows into a single-colour colony; at this density the colonies merge into tissue. With every controller's decisions zeroed, nothing is emitted and the world fills with a featureless haze. With every newborn's genome drawn fresh instead of inherited, the population dies out.",
+    "The film's world is not the baseline model. It runs field-ecology-v1-contact, a registered variant with one added rule: every organism is a body 0.45 world units across, and after each tick overlapping bodies push apart while bodies within 1.5 diameters pull together by the square of how alike their inherited chemistry is. The rule moves organisms, never energy. It was added because the reference screenshots' organisms pack as spheres, which organisms that are points cannot do.",
+    "Its numbers were chosen by a search outside the simulation, against the reference screenshots that inspired the project. The search started from the tissue world, an earlier search's choice among 233 small worlds scored on 14 statistics of those images. It scored 21 worlds with bodies on the same statistics, measured at the screenshots' organism scale, and a person chose among the closest by eye, from close-ups. The statistic alone rates the tissue world as close as this one; the close-ups do not. The film shows the chosen world itself, from the tick where the search stopped looking.",
+    "Nothing the search measured feeds back into a run. The organisms have no aesthetic fitness: they feed, emit, split and die by energy alone. The seed is the Desktop preset's 42, not a pick. Seeds the search never saw grow the same rings, membranes and colonies, with more black between them.",
+    "Emission, chosen by the neural networks, makes the structure, and contact packs it. Organisms return about half of what they eat to the field, in a chemical composition their networks choose and kin choose alike, so each lineage paints its surroundings with its own chemistry. Adhesion then sorts lineages by that chemistry, as real tissues sort by adhesion, into domains with dark gaps between unlike neighbours. With every controller's decisions zeroed, nothing is emitted and the bodies pack into a featureless haze. With every newborn's genome drawn fresh instead of inherited, the population dies out.",
   ],
   camera:
     "The camera is chosen from the run, not by hand. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
@@ -71,7 +72,7 @@ export const principles = [
   },
   {
     title: "Organisms meet only through the field.",
-    body: "No pairwise attraction tables, collision forces or global reward functions in the baseline.",
+    body: "No pairwise attraction tables, collision forces or global reward functions in the baseline. The film's world is a registered variant that adds one rule, bodies that push apart and stick to alike chemistry, and says so.",
   },
   {
     title: "Signals cannot counterfeit food.",

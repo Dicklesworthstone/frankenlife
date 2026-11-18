@@ -29,20 +29,24 @@ configuration hash, seed, the starting tick and digest), every frame's tick and 
 command, flife's revision and binary hash, and the ffmpeg arguments. A fresh checkout renders them again:
 
 ```bash
-# From the repository root: the tissue preset run to tick 1,600, where the search stopped scoring it, kept
-# in RUN (about 5 minutes on 24 workers of an M5 Ultra).
+# From the repository root: the contact preset run to tick 1,600, where the search stopped scoring it,
+# kept in RUN (about 10 minutes on 16 workers of an M5 Ultra).
 cargo build --release -p flife-cli
-target/release/flife run presets/tissue-world.toml --ticks 1600 --cpu-workers 24 --run-dir RUN
+target/release/flife run presets/contact-world.toml --ticks 1600 --cpu-workers 16 --run-dir RUN
 
-# From web/: 401 frames from tick 1,600 to 4,800, one every 8 ticks, 1080 × 1080, as raw dots coloured
-# by chemical affinity without the field. Paths are relative to where you run it; keep WORK (several
-# hundred MB of PNGs) outside the repository.
+# From web/: 401 frames from tick 1,600 to 4,800, one every 8 ticks, 1080 × 1080, each organism drawn as a
+# lit sphere at its body's size and coloured by chemical affinity, without the field. Paths are relative
+# to where you run it; keep WORK (several hundred MB of PNGs) outside the repository.
 bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
-  --ticks 3200 --every 8 --field none --look raw --color affinity
+  --ticks 3200 --every 8 --field none --look sphere --color affinity --zooms 2.5,5,3.5,8,4.5 --cpu-workers 24
 ```
 
-`presets/tissue-world.toml` was chosen by an outer search against image statistics of the reference
-screenshots, and `../experiments/showcase/README.md` states how (stage W). The site says so beside the film.
+Without `--cpu-workers`, both renders run on the preset's `[execution] cpu_workers`, one thread for the
+showcase presets. No result depends on the count.
+
+`presets/contact-world.toml` was chosen by an outer search against image statistics of the reference
+screenshots and by eye, under the registered contact model, and `../experiments/showcase/README.md` states
+how (stage C). The site says so beside the film.
 
 The camera (`--camera auto`, the default) is chosen from the run itself: `scripts/media.ts` first renders the
 same ticks small, as raw dots, and `scripts/director.ts` reads those frames' pixels to find where the organisms
@@ -52,7 +56,8 @@ units on any torus of 128 units or more: the zooms are written for a 256-unit to
 run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
 checks that the preview and the film end on the same world digest. `--camera none` films the whole torus.
-`--field energy|composition|none` and `--look glow|raw` choose how the frames are drawn.
+`--field energy|composition|none` and `--look glow|raw|sphere` choose how the frames are drawn;
+`--zooms` lists the shots' zooms on the run's torus instead (the contact film's are closer, so bodies show).
 
 `scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the
 manifest names the revision. It renders into `--work`. Run it again with the same `--work` to re-encode

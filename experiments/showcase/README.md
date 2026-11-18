@@ -1,4 +1,4 @@
-# The showcase search: the parameter sets behind `presets/showcase-world.toml` and `presets/colony-world.toml`
+# The showcase search: the parameter sets behind the website's film
 
 This directory records how the worlds the website's film has shown were chosen. It is an outer search, a
 procedure outside the simulation that picked parameters for how the result looks. AGENTS.md asks that such a
@@ -6,9 +6,13 @@ selection be stated (rule 8; plan §2.4, §7.2, §15.5).
 
 - **Stages 1 and 2** chose `showcase-world`. They are recorded in the search (`search.py`), every sample's score
   (`scores.ndjson`) and the chosen sample's parameters (`s1000.json`).
-- **Stage W** continued from it to `colony-world`, the film's world now. It is recorded in `match.py`, the
+- **Stage W** continued from it to `colony-world` and `tissue-world`. It is recorded in `match.py`, the
   reference statistics (`reference.json`) and the chosen sample's parameters and ancestry (`colony.json`).
   [Stage W](#stage-w-matching-the-references-colony-world-and-tissue-world) has every step.
+- **Stage C** continued from `tissue-world` under a registered model variant with bodies,
+  `field-ecology-v1-contact` (plan §5.4), to `contact-world`, the film's world now. It is recorded in
+  `scale.py`, its reference statistics (`scale-reference.json`) and the chosen sample's parameters
+  (`contact.json`). [Stage C](#stage-c-bodies-that-pack-and-adhere-contact-world) has every step.
 
 Frames and per-run records stay outside git.
 
@@ -346,11 +350,145 @@ ceiling of 177,536. Its only difference from the sample is the genome quotas, ra
   - By eye: dense tissue with membranes, voids and mesh walls throughout. The colours narrow towards two or
     three as lineages consolidate.
 
-The website's film is this world from tick 1,600, where the search stopped scoring it, to 4,800. It has 401
-frames, one every 8 ticks, at 1080 × 1080: raw dots coloured by chemical affinity, without the field. Its camera
-is chosen from the run, as before, with each shot's zoom scaled to the 128-unit torus (1.25–2.5). It ends on
-the continued run's digest, `556c4973…5758d1`. `web/lib/media.json` records every frame's tick and live count,
-the camera's keys, flife's revision and binary hash, and the encoding.
+Until stage C, the website's film was this world from tick 1,600, where the search stopped scoring it, to
+4,800. It had 401 frames, one every 8 ticks, at 1080 × 1080: raw dots coloured by chemical affinity, without
+the field. Its camera was chosen from the run, as before, with each shot's zoom scaled to the 128-unit torus
+(1.25–2.5). It ended on the continued run's digest, `556c4973…5758d1`.
+
+## Stage C: bodies that pack and adhere, `contact-world`
+
+### Why
+
+The person who supplied the references sent a second set of 14 screenshots of the same simulation, zoomed in
+2.2–26×, and judged the tissue film still not organic enough. Up close, the references' organisms are
+shaded spheres of one size that pack without overlapping. They form single-file chains that bound voids,
+concentric arcs, foam and reticulated networks with small dark holes, and domains of one saturated colour
+with sharp edges and dark gaps between them. Their lit pixels have median OKLab lightness 0.40–0.57.
+
+No rule of `field-ecology-v1` can make that. Its organisms are points: any number share a spot, so a
+colony is a cloud, not a packing. Plan §5.4 keeps direct collisions and adhesion out of the baseline and
+leaves them to later model variants. Stage C registered one, `field-ecology-v1-contact`, with its two
+controls. Plan §5.4 has the rule:
+
+- every organism is a disk of the `[contact]` table's diameter;
+- after each tick, overlapping bodies push apart;
+- bodies near touching pull together by the square of how alike their heritable affinities are.
+
+It moves positions only, never energy. The search only chose the table's numbers.
+
+### A statistic at the references' scale
+
+match.py measures a frame at one pixel per field cell, the references' wide views. The new screenshots
+are close-ups, so `scale.py` first resizes every image until an organism is 2 pixels across: a screenshot
+by its zoom, which its overlay shows, and a frame by its bodies' drawn diameter. Then it cuts the image
+into match.py's 128-pixel patches and takes the same 14 statistics. Only the eight screenshots at zoom 5 or
+less leave whole patches (46 in all). `scale-reference.json` holds their statistics, and none of the images.
+
+Each batch below was scored on its last frame, at tick 1,600: 384 × 384 raw dots, coloured by affinity,
+drawn at the body's radius. The batches ran under different renderer palettes (the colour change below came
+mid-search). `a0` and `ct-d45`, the same world bit for bit, scored 1.62 and 1.52, so differences under about
+0.1 between batches mean nothing.
+
+### The batches
+
+Every sample is `tissue-world` (`c4-x1`) on seed 42 under `field-ecology-v1-contact`, with the child
+placement radius equal to the body diameter.
+
+| Sample | Change | Distance | Live, second half |
+|---|---|---:|---|
+| `ct-d30` | diameter 0.30, no adhesion | 1.07 | 101,037–160,634 |
+| `ct-d45` | diameter 0.45, no adhesion | 1.52 | 108,303–150,347 |
+| `ct-d60` | diameter 0.60, no adhesion | 2.05 | 105,052–153,323 |
+| `ct-d80` | diameter 0.80, no adhesion | 2.77 | 86,853–166,248 |
+| `a0` | `ct-d45` as a `[contact]` table: stiffness 0.5, adhesion 0 | 1.62 | 108,303–150,347 |
+| `a2` | adhesion 0.2, reach 1.5 diameters | 1.52 | 104,840–158,690 |
+| `a5` | adhesion 0.5 | 1.30 | 99,442–159,585 |
+| **`a10`** | **adhesion 1.0** | **0.69** | **87,701–159,501** |
+| `a5-r2` | adhesion 0.5, reach 2 | 1.46 | 67,497–99,156 |
+| `a10-r2` | adhesion 1.0, reach 2 | 2.25 | 14,531–17,464 |
+| `a5-m4` | adhesion 0.5, chemistry mutation ×4 | 1.22 | 101,929–154,895 |
+| `a10-k1` | adhesion 1.0, stiffness 1 | 1.59 | 99,861–149,498 |
+| `a10-r125` | adhesion 1.0, reach 1.25 | 1.40 | 106,252–151,377 |
+| `a10-r175` | adhesion 1.0, reach 1.75 | 1.53 | 67,145–124,933 |
+| `a10-m4` | adhesion 1.0, chemistry mutation ×4 | 0.85 | 92,597–169,733 |
+| `a10-d35` | adhesion 1.0, diameter 0.35 | 0.77 | 86,145–166,273 |
+| `a10-x2` | adhesion 1.0, food ×2, ceiling 260,000 | 1.20 | 151,816–211,990 |
+
+By eye, in the same order:
+
+- **Diameter, without adhesion.** At 0.30 the bodies form tubes and rings but rarely pack. At 0.45 they
+  pack into tissue with lumens, single-file membranes and small holes. At 0.60 they pack into nearly uniform
+  solids, and at 0.80 into hexagonal crystal.
+- **Adhesion.** It turns 0.45's smooth bodies into reticulated tissue: beaded strands, rings, foam, and
+  colour domains with dark gaps between unlike chemistry. At 1.0 the effect is strongest. With reach 2,
+  or 1.75, bodies clump into beads on strings, and the population falls.
+- **Stiffness 1** resolves every overlap at once and smooths the tissue again.
+- **The rest.** Faster mutation speckles each domain. A diameter of 0.35 makes a finer foam with more holes.
+  Double food grows rings, lacy membranes and glandular lobes, but fills less of the torus by tick 1,600.
+
+At adhesion `k_a ≤ 1`, a lone pair closes no further than touching, so `a10` is the strongest pull of that
+kind. A person chose `a10` by eye from close-ups drawn as spheres.
+
+### Colours
+
+The close-ups also showed the renderer's spheres paler than the references: median lit lightness 0.76,
+against 0.40–0.57. FrankenManim's true-dot shading mixed most of each dot towards white. The sphere look now
+uses little gloss and a deep shadow, so a body keeps its colour, with a dark rim and a soft highlight. The
+affinity palette's lightness is 0.46 ± 0.12 at chroma 0.26. A sphere-drawn `a10` frame's lit pixels then
+have median lightness 0.47. Both are presentation only.
+
+### Held-out seeds and controls
+
+Seeds the search never saw, scored the same way, and the two controls (seed 42):
+
+| Run | Distance | Live, second half | By eye |
+|---|---:|---|---|
+| seed 42 (chosen) | 0.69 | 87,701–159,501 | reticulated multicoloured tissue, tubes, rings, foam |
+| seed 1 | 1.20 | 76,023–89,072 | separate colonies: rings, lobes, membranes; more black between |
+| seed 2 | 1.25 | 68,032–119,654 | the same |
+| seed 3 | 1.26 | 72,549–104,198 | the same, with large single-file membrane rings |
+| `field-ecology-v1-contact-chemistry-only` | 0.90 | 177,536 (the ceiling) | a packed, mottled multicoloured haze filling the world: no colonies, rings or membranes |
+| `field-ecology-v1-contact-fresh-offspring` | — | 944, dying | sparse scatter |
+
+As with `tissue-world`, the held-out seeds grow the same kinds of structure, but they merge less and leave
+more of the torus black. The controls behave as they did without contact:
+
+- **Chemistry-only.** Nothing is emitted, and the bodies pack to the ceiling as a haze. So the colonies,
+  rings and membranes come from emission, chosen by the networks; contact only packs them. The statistic
+  still puts this haze at 0.90, nearer than any held-out seed, which is a limit of the statistic, not a
+  likeness.
+- **Fresh offspring.** The world dies, so inheritance is necessary.
+
+**The statistic does not separate the two models.** Scored the same way, `tissue-world` is 0.66–0.75 on
+seed 42 (by dot size) and 0.76–1.23 on its held-out seeds, as close as `contact-world` or closer. At 384
+pixels a body is 1–2 pixels, and the statistic sees domains, holes and coverage, not packing. It ranked
+contact samples, which all draw alike, against one another. The case for the contact model rests on the
+close-ups, judged by eye: bodies that pack, single-file membranes and foam, which the plain model cannot
+make.
+
+### The contact preset, and the film
+
+`presets/contact-world.toml` is `a10` itself: `tissue-world` with three changes, the model, a child
+placement radius of 0.45 and the `[contact]` table. It also keeps `tissue-world`'s raised genome quotas.
+
+- **The quotas never bound.** `flife run presets/contact-world.toml --ticks 1600` ends on the sample's own
+  digest, `ce3ed520…51a1f2`, on 16 workers, where the sample ran on 5.
+- **The test.** `crates/flife-cli/tests/contact_preset.rs` checks the preset's declared changes and its
+  table, and checks it against `contact.json`.
+
+The website's film is this world from tick 1,600, where the search stopped scoring it, to 4,800: 401 frames,
+one every 8 ticks, at 1080 × 1080. Each organism is drawn as a lit sphere at its body's size, coloured by
+chemical affinity, without the field.
+
+- **The run.** The population falls from 159,501 to 83,045 by about tick 2,050, then recovers to between
+  about 92,000 and 165,000. At four frames near tick 4,200 it touches the ceiling, 177,536, where
+  `refuse-excess-births-v1` refuses the births that do not fit. The run ends on digest `b76175a7…902bf5`.
+- **By eye.** Reticulated multicoloured tissue across the torus; up close, packed spheres in membranes,
+  tubes, interdigitated strands and glands, with domains of one chemistry against dark gaps.
+- **The camera** is chosen from the run by the same rule as before. Its shots are at zooms 3, 8 and 5 on
+  the 128-unit torus, where a body is 11, 30 and 19 pixels across, closer than the tissue film's 1.25–2.5,
+  so that the bodies show. `web/lib/media.json` records every frame's tick and live count, the camera's
+  keys, flife's revision and binary hash, and the encoding.
 
 ## What this does not show
 
@@ -360,6 +498,10 @@ the camera's keys, flife's revision and binary hash, and the encoding.
   §1.2), and a world whose frames share their spectrum and colour coherence need not work as theirs does.
   The closest sample, `c4-x1`, is still 0.76 standard deviations from the references on average, and its
   held-out seeds 1.1–2.0.
+- `contact-world` is a different model from the rest, not a better setting of the same one: its organisms
+  are bodies that push and stick (plan §5.4). The references' rules are unknown, and nothing here shows
+  they have contact or adhesion; packing spheres is what their close-ups look like.
+- Stage C's statistic does not prefer `contact-world` over `tissue-world`; the eye did, on close-ups.
 - `colony-world` is discrete colonies on a black field. `tissue-world` is closer to the references' continuous
   tissue on seed 42, less so on held-out seeds. In both, founder lineages narrow to a handful within 150
   simulated seconds, and the colours with them, where the references hold many colours at once.

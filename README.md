@@ -448,7 +448,19 @@ of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With a
 8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
 frame rate.
 
-`presets/tissue-world.toml` is the world the website's film shows: 10,954 founders on 128 × 128 × 33 at
+`presets/contact-world.toml` is the world the website's film shows. It is `tissue-world`, below, under a
+different model, `field-ecology-v1-contact`. Plan §5.4 gives the contact model one added rule: every
+organism is a body 0.45 world units across. After each tick, overlapping bodies push apart, and bodies
+within 1.5 diameters pull together by the square of how alike their heritable chemical affinities are.
+The rule moves positions only, never energy, and its numbers sit in the preset's `[contact]` table.
+
+Lineages sort by their chemistry, as tissues sort by adhesion. The world grows packed tissue: single-file
+membranes, rings and foam, and domains of one colour with dark gaps between unlike neighbours. Drawn with
+`--look sphere` at the body's radius, it looks like the reference screenshots' close-ups.
+`experiments/showcase/README.md` (stage C) states how the table's numbers were chosen. It also says what the
+choice does not show: its image statistic rates `tissue-world` as close, and held-out seeds merge less.
+
+`presets/tissue-world.toml` is the film's world before it: 10,954 founders on 128 × 128 × 33 at
 Δt = 1/32 s, whose population grows to 110,000–170,000 under a ceiling of 177,536. Organisms return about half
 of what they eat to the field as emission, in a chemical composition their networks choose and kin choose
 alike. Each lineage paints its surroundings with its own chemistry and grows into a single-colour colony. At

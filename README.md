@@ -454,9 +454,12 @@ organism is a body 0.45 world units across. After each tick, overlapping bodies 
 within 1.5 diameters pull together by the square of how alike their heritable chemical affinities are.
 The rule moves positions only, never energy, and its numbers sit in the preset's `[contact]` table.
 
-Lineages sort by their chemistry, as tissues sort by adhesion. The world grows packed tissue: single-file
+Lineages sort by their chemistry, as tissues sort by adhesion. The world grows tissue with single-file
 membranes, rings and foam, and domains of one colour with dark gaps between unlike neighbours. Drawn with
-`--look sphere` at the body's radius, it looks like the reference screenshots' close-ups.
+`--look sphere` at the body's radius, it looks like the reference screenshots' close-ups. Its bodies stack
+about three deep rather than pack, because the summed pull outweighs the soft push. A second variant,
+`field-ecology-v1-contact-inhibition` (plan §5.4), resolves overlap in extra push-only sweeps and packs
+them, but so far grows coarser structure; stage D of the same notes has the trials.
 `experiments/showcase/README.md` (stage C) states how the table's numbers were chosen. It also says what the
 choice does not show: its image statistic rates `tissue-world` as close, and held-out seeds merge less.
 

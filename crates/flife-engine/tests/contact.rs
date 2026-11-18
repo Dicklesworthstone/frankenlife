@@ -12,6 +12,13 @@
 //! On the first tick the two must spend, emit and give birth identically,
 //! keep every velocity, and differ only by that displacement of the
 //! survivors.
+//!
+//! `field-ecology-v1-contact-inhibition` relaxes that rule `[contact] sweeps`
+//! times per tick and removes from each survivor's velocity its component
+//! against `P_i = Σ_{j: d < D} p_ij u_ij`, the push alone of the bodies it
+//! overlapped. At one sweep its first tick is the contact model's in every
+//! flow, birth, position and energy, with each velocity the oracle's
+//! inhibited one, never faster.
 
 #![allow(
     clippy::expect_used,
@@ -25,7 +32,8 @@ use flife_core::ValidatedConfig;
 use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
     FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
-    FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
 };
 use flife_engine::contact::unit_affinity;
 use flife_engine::{Arrangement, ModelVariant, NumericalProfile, Stepped, TickReport, World};
@@ -114,6 +122,15 @@ fn text(model: &str, adhesion: f64) -> String {
         text.push_str(&table(adhesion));
     }
     text
+}
+
+/// [`text`] under a contact-inhibition `model`, with `sweeps`.
+fn inhibiting(model: &str, adhesion: f64, sweeps: u32) -> ValidatedConfig {
+    ValidatedConfig::from_toml(&format!(
+        "{}sweeps = {sweeps}\ninhibition = 1.0\n",
+        text(model, adhesion)
+    ))
+    .expect("a valid configuration")
 }
 
 fn found(config: &ValidatedConfig) -> World {
@@ -442,5 +459,247 @@ fn the_contact_table_belongs_to_the_contact_models() {
         ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4)
             .canonical_toml()
             .contains("[contact]\ndiameter = 0.6")
+    );
+}
+
+/// The push alone, `Σ_{j: d < D} p_ij u_ij` unclamped, over every pair of
+/// `survivors`.
+fn pushes(survivors: &BTreeMap<u64, [f64; 2]>) -> BTreeMap<u64, [f64; 2]> {
+    survivors
+        .iter()
+        .map(|(&id, &[x, y])| {
+            let mut sum = [0.0, 0.0];
+            for (&other, &[ox, oy]) in survivors {
+                let (dx, dy) = (image(x - ox), image(y - oy));
+                let distance = dx.hypot(dy);
+                if other == id || distance >= DIAMETER {
+                    continue;
+                }
+                let push = 0.5 * STIFFNESS * (DIAMETER - distance);
+                let (ux, uy) = if distance > 0.0 {
+                    (dx / distance, dy / distance)
+                } else if id > other {
+                    (1.0, 0.0)
+                } else {
+                    (-1.0, 0.0)
+                };
+                sum[0] += push * ux;
+                sum[1] += push * uy;
+            }
+            (id, sum)
+        })
+        .collect()
+}
+
+/// One tick of `contact` and of `inhibition` at one sweep (both with
+/// `adhesion`) from one founding: the same flows, births, positions and
+/// energies, and each velocity without its component against the oracle's
+/// push, so never faster. Returns how many velocities changed.
+fn first_tick_differs_only_by_inhibition(contact: &str, inhibition: &str, adhesion: f64) -> usize {
+    let mut plain = found(&ecology(contact, adhesion));
+    let mut inhibited = found(&inhibiting(inhibition, adhesion, 1));
+    assert_eq!(state(&plain), state(&inhibited), "one founding");
+    let report_plain = publish(&mut plain);
+    let report_inhibited = publish(&mut inhibited);
+    assert_eq!(
+        format!("{:?}", report_plain.closure),
+        format!("{:?}", report_inhibited.closure),
+        "inhibition changes no energy flow of the tick"
+    );
+    let born: BTreeSet<u64> = report_plain.births.iter().map(|b| b.child.get()).collect();
+    let born_inhibited: BTreeSet<u64> = report_inhibited
+        .births
+        .iter()
+        .map(|b| b.child.get())
+        .collect();
+    assert_eq!(born, born_inhibited, "the same births");
+    // The push is judged from the positions the survivors settled to before
+    // contact: the contact-free model's after the same tick (as in
+    // first_tick_differs_only_by_contact).
+    let mut free = found(&ecology(
+        match contact {
+            FIELD_ECOLOGY_V1_CONTACT => FIELD_ECOLOGY_V1,
+            FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY => FIELD_ECOLOGY_V1_CHEMISTRY_ONLY,
+            _ => FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+        },
+        0.0,
+    ));
+    publish(&mut free);
+    let settled: BTreeMap<u64, [f64; 2]> = state(&free)
+        .into_iter()
+        .filter(|(id, _)| !born.contains(id))
+        .map(|(id, (position, _, _))| (id, position))
+        .collect();
+    let push = pushes(&settled);
+    let (before, after) = (state(&plain), state(&inhibited));
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    let mut changed = 0;
+    for (id, &(position, velocity, energy)) in &before {
+        let (inhibited_position, inhibited_velocity, inhibited_energy) = after[id];
+        assert_eq!(position, inhibited_position, "{id}: one sweep moves alike");
+        assert_eq!(energy, inhibited_energy, "{id}: inhibition keeps energy");
+        let v = velocity.map(f64::from_bits);
+        let w = inhibited_velocity.map(f64::from_bits);
+        let [px, py] = push.get(id).copied().unwrap_or([0.0, 0.0]);
+        let length = px.hypot(py);
+        let expected = if length > 0.0 {
+            let n = [px / length, py / length];
+            let along = (v[0] * n[0] + v[1] * n[1]).min(0.0);
+            [v[0] - along * n[0], v[1] - along * n[1]]
+        } else {
+            v
+        };
+        for axis in 0..2 {
+            assert!(
+                (w[axis] - expected[axis]).abs() < 1e-12,
+                "{id}: velocity {w:?}, expected {expected:?} from {v:?} and push {px}, {py}"
+            );
+        }
+        assert!(
+            w[0].hypot(w[1]) <= v[0].hypot(v[1]),
+            "{id}: {w:?} is faster than {v:?}"
+        );
+        if velocity != inhibited_velocity {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+#[test]
+fn a_contact_inhibition_world_packs_and_never_speeds_a_body_up() {
+    for adhesion in [0.0, 0.4] {
+        let changed = first_tick_differs_only_by_inhibition(
+            FIELD_ECOLOGY_V1_CONTACT,
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
+            adhesion,
+        );
+        assert!(changed > 100, "crowded founders press: {changed} slowed");
+    }
+
+    // The 640 founders' disks cover 71% of the torus, which a packing holds.
+    // Over the 8 ticks before their first births, eight sweeps with
+    // inhibition leave them overlapping far less than the contact model's
+    // one sweep.
+    let mut plain = found(&ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4));
+    let mut inhibited = found(&inhibiting(FIELD_ECOLOGY_V1_CONTACT_INHIBITION, 0.4, 8));
+    for _ in 0..8 {
+        publish(&mut plain);
+        publish(&mut inhibited);
+    }
+    assert_eq!(inhibited.population().len(), 640, "no births yet");
+    let (soft, packed) = (overlap(&plain), overlap(&inhibited));
+    assert!(
+        packed < 0.25 * soft,
+        "overlap {packed} with inhibition and eight sweeps, {soft} without"
+    );
+}
+
+#[test]
+fn one_sweep_without_inhibition_is_the_contact_model_bit_for_bit() {
+    let text = format!(
+        "{}sweeps = 1\ninhibition = 0.0\n",
+        self::text(FIELD_ECOLOGY_V1_CONTACT_INHIBITION, 0.4)
+    );
+    let mut plain = found(&ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4));
+    let mut variant = found(&ValidatedConfig::from_toml(&text).expect("a valid configuration"));
+    let mut born = 0;
+    for tick in 0..96 {
+        let (a, b) = (publish(&mut plain), publish(&mut variant));
+        assert_eq!(
+            format!("{:?}", a.closure),
+            format!("{:?}", b.closure),
+            "tick {tick}"
+        );
+        assert_eq!(state(&plain), state(&variant), "tick {tick}");
+        born += a.births.len();
+    }
+    assert!(born > 0, "births happened");
+}
+
+#[test]
+fn the_contact_inhibition_controls_combine_inhibition_with_their_one_rule() {
+    for (name, variant) in [
+        (
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
+            ModelVariant::Inhibition,
+        ),
+        (
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+            ModelVariant::InhibitionChemistryOnly,
+        ),
+        (
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
+            ModelVariant::InhibitionFreshOffspring,
+        ),
+    ] {
+        assert_eq!(ModelVariant::of(name), Ok(variant));
+        assert!(variant.contact() && variant.inhibits());
+    }
+    assert!(ModelVariant::InhibitionChemistryOnly.decides_from_zero());
+    assert!(!ModelVariant::InhibitionChemistryOnly.fresh_offspring());
+    assert!(ModelVariant::InhibitionFreshOffspring.fresh_offspring());
+    assert!(!ModelVariant::InhibitionFreshOffspring.decides_from_zero());
+    assert!(!ModelVariant::Inhibition.decides_from_zero());
+    assert!(!ModelVariant::Inhibition.fresh_offspring());
+    for other in [
+        ModelVariant::Baseline,
+        ModelVariant::Contact,
+        ModelVariant::ContactChemistryOnly,
+        ModelVariant::ContactFreshOffspring,
+    ] {
+        assert!(!other.inhibits());
+    }
+    first_tick_differs_only_by_inhibition(
+        FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
+        FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+        0.4,
+    );
+    first_tick_differs_only_by_inhibition(
+        FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
+        FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
+        0.4,
+    );
+}
+
+#[test]
+fn sweeps_belong_to_the_contact_inhibition_models() {
+    let refused = |text: &str, path: &str| {
+        let error = ValidatedConfig::from_toml(text).expect_err("refused");
+        assert!(format!("{error:?}").contains(path), "{error:?}");
+    };
+    let bare = text(FIELD_ECOLOGY_V1_CONTACT_INHIBITION, 0.4);
+    refused(&format!("{bare}inhibition = 1.0\n"), "contact.sweeps");
+    refused(&format!("{bare}sweeps = 4\n"), "contact.inhibition");
+    let inhibition = format!("{bare}inhibition = 0.5\n");
+    for sweeps in [0, 17] {
+        refused(
+            &format!("{inhibition}sweeps = {sweeps}\n"),
+            "contact.sweeps",
+        );
+    }
+    for sweeps in [1, 16] {
+        assert!(ValidatedConfig::from_toml(&format!("{inhibition}sweeps = {sweeps}\n")).is_ok());
+    }
+    refused(
+        &format!("{bare}sweeps = 4\ninhibition = 1.5\n"),
+        "contact.inhibition",
+    );
+    let plain = text(FIELD_ECOLOGY_V1_CONTACT, 0.4);
+    refused(&format!("{plain}sweeps = 1\n"), "contact.sweeps");
+    refused(&format!("{plain}inhibition = 0.0\n"), "contact.inhibition");
+    // A plain contact model's canonical text is unchanged: it has no sweeps.
+    assert!(
+        !ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4)
+            .canonical_toml()
+            .contains("sweeps")
+    );
+    assert!(
+        inhibiting(FIELD_ECOLOGY_V1_CONTACT_INHIBITION, 0.4, 4)
+            .canonical_toml()
+            .contains("sweeps = 4")
     );
 }

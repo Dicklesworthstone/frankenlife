@@ -429,6 +429,21 @@ $$
 
 where `d_ij` is the minimum-image distance, `u_ij` the unit vector from `j` to `i` (two organisms at one point separate along `±x`, the higher identity towards `+x`), `a_i` organism `i`'s heritable affinity direction (each unit direction is rounded to `f32` before the cosine is summed in channel order), and `clamp` a radial clamp to `min(D/2, ½ min(h_x, h_y))`. Overlapping bodies push apart; bodies near touching pull together in proportion to how alike their chemistry is, a pull that vanishes at touching and at reach, as tissues sort by differential adhesion. Which lineages share chemistry, and so stick, is inherited and mutated with the genome; nothing in the rule names a lineage or a shape. The position is then wrapped. Contact moves positions only: it changes no velocity, energy or ledger entry, and the tick's emissions and births use the settled positions. Each sum runs over neighbour bins at least the reach wide in a fixed order and within a bin in identity order, so the displacement does not depend on the worker count. Newborns first take part on the next tick.
 
+The second variant is registered as `field-ecology-v1-contact-inhibition`, with its controls `field-ecology-v1-contact-inhibition-chemistry-only` and `field-ecology-v1-contact-inhibition-fresh-offspring`. It was added because the contact model's bodies stack rather than pack: in `contact-world`, half the survivors' nearest neighbours lie within a quarter of a diameter, and on average 22 bodies lie within one. Two things cause it, and the variant changes both. First, a survivor's velocity, which decays by only `e^{-\gamma\Delta t}` per tick, keeps carrying it into the bodies that pushed it back. Second, the rule's pair displacement is the gradient of a pair potential. Its soft core integrates to $\int V\,d^2r=\tfrac{\pi}{24}kD^4$, and its adhesion well to about $-0.103\,k_aD^4$, so for $k_a\gtrsim1.3k$ the integral is negative and a dense clump has lower energy than a packing. The variant requires two more keys in its table, which the plain contact models refuse:
+
+```toml
+sweeps = 8             # S in [1, 16]: relaxation sweeps per tick
+inhibition = 0.0       # c in [0, 1]: the share of a pressing velocity removed
+```
+
+Sweep 1 is the contact rule above. Each later sweep pushes overlapping bodies apart only, with $p_{ij}=\tfrac{k}{2}(D-d_{ij})$ for $d_{ij}<D$, clamped as before, computed from the positions $\operatorname{wrap}(x_i+\sum_{t<s}\Delta_i^t)$. The survivor ends at $\operatorname{wrap}(x_i+\sum_s\Delta_i^s)$, so adhesion pulls once per tick and the later sweeps resolve the overlap that it and motion leave. Then contact inhibits locomotion, as a cell stops crawling into the cells it touches. With $P_i=\sum_s\sum_{j:\,d_{ij}<D}p_{ij}u_{ij}$, the summed push alone of the bodies $i$ overlapped (adhesion's pull does not count), and $n=P_i/\lVert P_i\rVert$,
+
+$$
+v_i\leftarrow v_i-c\,\min(0,\,v_i\cdot n)\,n .
+$$
+
+A survivor loses at most the component of its velocity against the push and keeps the rest, so no speed is added; at $c=0$ every velocity is kept and only the sweeps differ from the contact model. The tick's motion was already paid from its own velocity, so no energy or ledger entry changes. The next tick's velocity, sensing and cost start from the inhibited velocity. Each sweep's sums run as the contact rule's, so the result does not depend on the worker count.
+
 ## 5.5 Paid emission
 
 The neural controller chooses an emission gate, a proposed expenditure `w≥0`, and a direction `a∈R³²`. Normalize the direction; if its norm is below a declared threshold, emit no directional packet under a specified no-op policy.

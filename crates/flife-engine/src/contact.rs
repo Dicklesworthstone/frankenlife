@@ -27,12 +27,36 @@
 //! ledger is the same with or without it. Emissions and births of the tick
 //! use the settled positions, before contact.
 //!
+//! The `field-ecology-v1-contact-inhibition` models relax `S` times per tick
+//! (`[contact] sweeps`). Sweep 1 is the rule above; each later sweep pushes
+//! overlapping bodies apart only, `p_ij = (k/2)(D − d)` for `d < D` (clamped
+//! as above), from the positions `wrap(x_i + Σ_{t<s} Δ_i^t)`, and the
+//! survivor ends at `wrap(x_i + Σ_s Δ_i^s)`. Adhesion thus pulls once per tick
+//! and the sweeps resolve the overlap it and motion leave: summed over every
+//! neighbour each sweep, the pull would outweigh the soft core
+//! (`∫ V d²r < 0` for `k_a ≳ 1.3 k`) and bodies would stack. They also
+//! inhibit locomotion. With `P_i = Σ_s Σ_{j: d < D} p_ij u_ij`, the push alone
+//! of the bodies a survivor overlapped, its velocity loses the component
+//! against `P_i`:
+//!
+//! ```text
+//! n = P_i / |P_i|,   v_i ← v_i − c min(0, v_i · n) n,
+//! ```
+//!
+//! with `c` the `[contact] inhibition`, so a body slows its crawl into its
+//! neighbours and keeps the rest of its velocity. Its speed never grows, so
+//! motion's energy is unchanged here.
+//!
 //! Each sum runs over the neighbour bins, at least the reach wide, in a fixed
 //! order, `(dy, dx)` from `(−1, −1)` to `(1, 1)`, and within a bin in identity
 //! order. Every body's sum is its own, so the bodies are split among the
 //! workers and a world's contact displacement is the same at any worker
 //! count.
 
+use flife_core::model::{
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, MAXIMUM_CONTACT_SWEEPS,
+};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::FieldGrid;
 use flife_genome::AFFINITY_TERMS;
@@ -55,6 +79,14 @@ pub struct ContactRules {
     pub adhesion: f64,
     /// `R`, adhesion's reach in diameters.
     pub range: f64,
+    /// `S`, relaxation sweeps per tick: 1 under the plain contact models.
+    pub sweeps: u32,
+    /// Whether survivors' pushes are kept for inhibition (the
+    /// contact-inhibition models).
+    pub inhibits: bool,
+    /// `c`, the share of a survivor's velocity against its push removed: 0
+    /// under the plain contact models.
+    pub inhibition: f64,
 }
 
 impl ContactRules {
@@ -67,11 +99,20 @@ impl ContactRules {
         let Some(contact) = &config.config().contact else {
             return Ok(None);
         };
+        let model = config.config().model.as_str();
         let rules = Self {
             diameter: contact.diameter,
             stiffness: contact.stiffness,
             adhesion: contact.adhesion,
             range: contact.adhesion_range,
+            sweeps: contact.sweeps.unwrap_or(1),
+            inhibits: [
+                FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
+                FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+                FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
+            ]
+            .contains(&model),
+            inhibition: contact.inhibition.unwrap_or(0.0),
         };
         rules.check()?;
         Ok(Some(rules))
@@ -84,13 +125,17 @@ impl ContactRules {
             && self.stiffness <= 1.0
             && (0.0..=1.0).contains(&self.adhesion)
             && self.range.is_finite()
-            && self.range >= 1.0;
+            && self.range >= 1.0
+            && (1..=MAXIMUM_CONTACT_SWEEPS).contains(&self.sweeps)
+            && (0.0..=1.0).contains(&self.inhibition);
         if ok {
             Ok(())
         } else {
             Err(CoreError::NumericalInvalid {
                 quantity: "contact",
-                detail: format!("{self:?}: D > 0, k in (0, 1], k_a in [0, 1] and R >= 1"),
+                detail: format!(
+                    "{self:?}: D > 0, k in (0, 1], k_a in [0, 1], R >= 1, S in [1, {MAXIMUM_CONTACT_SWEEPS}] and c in [0, 1]"
+                ),
             })
         }
     }
@@ -133,6 +178,9 @@ pub struct ContactScratch {
     members: Vec<usize>,
     /// Each position's bin.
     bins: Vec<usize>,
+    /// Each body's push from the bodies it overlaps, unclamped, when the
+    /// rules inhibit; empty otherwise.
+    pressed: Vec<[f64; 2]>,
 }
 
 /// A world's contact buffers: the survivors' gathered state, the
@@ -147,8 +195,16 @@ pub struct ContactWork {
     pub alive: Vec<bool>,
     /// Each one's unit affinity direction, when bodies adhere.
     pub affinities: Vec<[f32; AFFINITY_TERMS]>,
-    /// Each one's displacement, zero for those that die.
+    /// Each one's displacement, zero for those that die: the sum of its
+    /// sweeps'.
     pub displacements: Vec<[f64; 2]>,
+    /// Each one's push from the bodies it overlapped, summed over the
+    /// sweeps, when the rules inhibit; empty otherwise.
+    pub pressed: Vec<[f64; 2]>,
+    /// The settled positions, kept while later sweeps move `positions`.
+    settled: Vec<[f64; 2]>,
+    /// One sweep's displacements.
+    sweep: Vec<[f64; 2]>,
     scratch: ContactScratch,
 }
 
@@ -176,7 +232,12 @@ impl ContactWork {
         rules: &ContactRules,
         rows: usize,
     ) -> Result<Self, CoreError> {
-        let reach = rules.reach();
+        // Later sweeps push only, binned at the diameter: never fewer bins.
+        let reach = if rules.sweeps > 1 {
+            rules.diameter
+        } else {
+            rules.reach()
+        };
         let bins = bins_along(grid.world_width(), reach) * bins_along(grid.world_height(), reach);
         let mut work = Self::default();
         reserve(&mut work.positions, rows, "contact positions")?;
@@ -186,6 +247,14 @@ impl ContactWork {
             reserve(&mut work.affinities, rows, "contact affinities")?;
         }
         reserve(&mut work.displacements, rows, "contact displacements")?;
+        if rules.sweeps > 1 {
+            reserve(&mut work.settled, rows, "contact settled positions")?;
+            reserve(&mut work.sweep, rows, "contact sweep")?;
+        }
+        if rules.inhibits {
+            reserve(&mut work.pressed, rows, "contact pushes")?;
+            reserve(&mut work.scratch.pressed, rows, "contact sweep pushes")?;
+        }
         reserve(&mut work.scratch.members, rows, "contact members")?;
         reserve(&mut work.scratch.bins, rows, "contact bins")?;
         reserve(&mut work.scratch.starts, bins + 1, "contact bin starts")?;
@@ -201,19 +270,26 @@ impl ContactWork {
             bytes(&self.alive),
             bytes(&self.affinities),
             bytes(&self.displacements),
+            bytes(&self.pressed),
+            bytes(&self.settled),
+            bytes(&self.sweep),
             bytes(&self.scratch.members),
             bytes(&self.scratch.bins),
             bytes(&self.scratch.starts),
+            bytes(&self.scratch.pressed),
         ]
         .into_iter()
         .fold(0_u64, u64::saturating_add)
     }
 
-    /// [`relax`] on the gathered survivors, into [`Self::displacements`],
-    /// on up to `workers` threads.
+    /// [`relax`] on the gathered survivors, `rules.sweeps` times, into
+    /// [`Self::displacements`] (and [`Self::pressed`] when the rules
+    /// inhibit), on up to `workers` threads. After more than one sweep
+    /// [`Self::positions`] holds where each survivor ends.
     ///
     /// # Errors
-    /// As [`relax`].
+    /// As [`relax`], and [`CoreError::NumericalInvalid`] for a position that
+    /// cannot be wrapped.
     pub fn relax(
         &mut self,
         grid: &FieldGrid,
@@ -226,22 +302,80 @@ impl ContactWork {
             alive,
             affinities,
             displacements,
+            pressed,
+            settled,
+            sweep,
             scratch,
         } = self;
         let affinities = rules.adheres().then_some(affinities.as_slice());
-        relax(
-            grid,
-            rules,
-            Bodies {
-                positions,
-                ids,
-                alive,
-                affinities,
-            },
-            displacements,
-            scratch,
-            workers,
-        )
+        if rules.sweeps <= 1 {
+            relax(
+                grid,
+                rules,
+                Bodies {
+                    positions,
+                    ids,
+                    alive,
+                    affinities,
+                },
+                displacements,
+                scratch,
+                workers,
+            )?;
+            pressed.clear();
+            pressed.extend_from_slice(&scratch.pressed);
+            return Ok(());
+        }
+        let count = positions.len();
+        settled.clear();
+        settled.extend_from_slice(positions);
+        displacements.clear();
+        displacements.resize(count, [0.0, 0.0]);
+        pressed.clear();
+        if rules.inhibits {
+            pressed.resize(count, [0.0, 0.0]);
+        }
+        // Every sweep after the first pushes only.
+        let pushing = ContactRules {
+            adhesion: 0.0,
+            range: 1.0,
+            ..*rules
+        };
+        for index in 0..rules.sweeps {
+            let (rules, affinities) = if index == 0 {
+                (rules, affinities)
+            } else {
+                (&pushing, None)
+            };
+            relax(
+                grid,
+                rules,
+                Bodies {
+                    positions,
+                    ids,
+                    alive,
+                    affinities,
+                },
+                sweep,
+                scratch,
+                workers,
+            )?;
+            for (index, &[dx, dy]) in sweep.iter().enumerate() {
+                if dx != 0.0 || dy != 0.0 {
+                    let total = &mut displacements[index];
+                    total[0] += dx;
+                    total[1] += dy;
+                    let from = settled[index];
+                    positions[index] =
+                        grid.wrap_position([from[0] + total[0], from[1] + total[1]])?;
+                }
+            }
+            for (sum, push) in pressed.iter_mut().zip(&scratch.pressed) {
+                sum[0] += push[0];
+                sum[1] += push[1];
+            }
+        }
+        Ok(())
     }
 }
 
@@ -387,6 +521,8 @@ pub fn relax(
         stiffness,
         adhesion,
         range,
+        inhibits,
+        ..
     } = *rules;
     let reach = rules.reach();
     let (width, height) = (grid.world_width(), grid.world_height());
@@ -398,6 +534,7 @@ pub fn relax(
         starts,
         members,
         bins,
+        pressed,
     } = scratch;
     starts.clear();
     starts.resize(bins_x * bins_y + 1, 0);
@@ -438,6 +575,10 @@ pub fn relax(
 
     displacements.clear();
     displacements.resize(count, [0.0, 0.0]);
+    pressed.clear();
+    if inhibits {
+        pressed.resize(count, [0.0, 0.0]);
+    }
     let push_factor = 0.5 * stiffness;
     let pull_factor = if range > 1.0 {
         0.5 * adhesion / ((range - 1.0) * diameter)
@@ -450,16 +591,19 @@ pub fn relax(
     let beyond = reach_distance * reach_distance * (1.0 + 1e-9);
     let (half_width, half_height) = (0.5 * width, 0.5 * height);
     let (starts, members, bins) = (&*starts, &*members, &*bins);
-    let sum = |index: usize| -> [f64; 2] {
+    // A body's clamped displacement and its unclamped push from the bodies
+    // it overlaps.
+    let sum = |index: usize| -> ([f64; 2], [f64; 2]) {
         let bin = bins[index];
         if bin == usize::MAX {
-            return [0.0, 0.0];
+            return ([0.0, 0.0], [0.0, 0.0]);
         }
         let here = positions[index];
         let (bx, by) = (bin % bins_x, bin / bins_x);
         let (rows, row_count) = neighbours(by, bins_y);
         let (columns, column_count) = neighbours(bx, bins_x);
         let mut sum = [0.0_f64, 0.0_f64];
+        let mut overlapping = [0.0_f64, 0.0_f64];
         for &row in &rows[..row_count] {
             for &column in &columns[..column_count] {
                 let neighbour = row * bins_x + column;
@@ -475,7 +619,8 @@ pub fn relax(
                         continue;
                     }
                     let distance = dx.hypot(dy);
-                    let push = if distance < diameter {
+                    let overlaps = distance < diameter;
+                    let push = if overlaps {
                         push_factor * (diameter - distance)
                     } else if let Some(affinities) =
                         affinities.filter(|_| distance < reach_distance)
@@ -498,6 +643,10 @@ pub fn relax(
                     };
                     sum[0] += push * ux;
                     sum[1] += push * uy;
+                    if overlaps {
+                        overlapping[0] += push * ux;
+                        overlapping[1] += push * uy;
+                    }
                 }
             }
         }
@@ -506,11 +655,16 @@ pub fn relax(
             let scale = limit / length;
             sum = [sum[0] * scale, sum[1] * scale];
         }
-        sum
+        (sum, overlapping)
     };
-    let fill = |first: usize, out: &mut [[f64; 2]]| {
+    // `pushes` is empty when the rules do not inhibit.
+    let fill = |first: usize, out: &mut [[f64; 2]], pushes: &mut [[f64; 2]]| {
         for (offset, slot) in out.iter_mut().enumerate() {
-            *slot = sum(first + offset);
+            let (displacement, push) = sum(first + offset);
+            *slot = displacement;
+            if let Some(push_slot) = pushes.get_mut(offset) {
+                *push_slot = push;
+            }
         }
     };
     let used = workers
@@ -518,19 +672,26 @@ pub fn relax(
         .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
         .max(1);
     if used == 1 {
-        fill(0, displacements);
+        fill(0, displacements, pressed);
         return Ok(());
     }
     let length = count.div_ceil(used);
     let mut chunks = displacements.chunks_mut(length);
+    let mut push_chunks = pressed
+        .chunks_mut(length)
+        .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
     let head = chunks.next().unwrap_or_default();
+    let push_head = push_chunks.next().unwrap_or_default();
     let fill = &fill;
     std::thread::scope(|scope| {
         let others: Vec<_> = chunks
+            .zip(push_chunks)
             .enumerate()
-            .map(|(index, chunk)| scope.spawn(move || fill((index + 1) * length, chunk)))
+            .map(|(index, (chunk, pushes))| {
+                scope.spawn(move || fill((index + 1) * length, chunk, pushes))
+            })
             .collect();
-        fill(0, head);
+        fill(0, head, push_head);
         let mut result = Ok(());
         for other in others {
             if other.join().is_err() && result.is_ok() {
@@ -557,6 +718,9 @@ mod tests {
         stiffness: 0.5,
         adhesion: 0.0,
         range: 1.0,
+        sweeps: 1,
+        inhibits: false,
+        inhibition: 0.0,
     };
 
     fn run_with(
@@ -673,6 +837,7 @@ mod tests {
             stiffness: 0.5,
             adhesion: 0.4,
             range: 1.6,
+            ..PLAIN
         };
         // 0.65 apart: inside reach 0.8. Pull = (0.4/2) · 1 · 0.15 · 0.15 / 0.3.
         let positions = [[4.0, 4.0], [4.65, 4.0]];
@@ -742,6 +907,7 @@ mod tests {
             stiffness: 0.6,
             adhesion: 0.3,
             range: 1.5,
+            ..PLAIN
         };
         let out = run_with(&grid, &rules, &positions, Some(&affinities));
         let reach = 0.45 * 1.5;
@@ -797,6 +963,7 @@ mod tests {
             stiffness: 0.5,
             adhesion: 1.0,
             range: 1.5,
+            ..PLAIN
         };
         let at = |workers: usize| {
             let mut out = Vec::new();
@@ -822,6 +989,178 @@ mod tests {
         assert!(one.iter().any(|&bits| bits != 0));
         for workers in [2, 3, 4, 16] {
             assert_eq!(at(workers), one, "{workers} workers");
+        }
+    }
+
+    /// A world's contact work for `positions` (identity order, all alive),
+    /// relaxed under `rules` on `workers`.
+    fn work_with(
+        grid: &FieldGrid,
+        rules: &ContactRules,
+        positions: &[[f64; 2]],
+        affinities: Option<&[[f32; AFFINITY_TERMS]]>,
+        workers: usize,
+    ) -> ContactWork {
+        let mut work =
+            ContactWork::with_capacity(grid, rules, positions.len()).expect("contact buffers");
+        let reserved = work.allocated_bytes();
+        work.positions.extend_from_slice(positions);
+        work.ids.extend(0..positions.len() as u64);
+        work.alive
+            .extend(std::iter::repeat_n(true, positions.len()));
+        if let Some(affinities) = affinities {
+            work.affinities.extend_from_slice(affinities);
+        }
+        work.relax(grid, rules, workers).expect("contact");
+        assert_eq!(work.allocated_bytes(), reserved, "no sweep allocates");
+        work
+    }
+
+    /// The deepest overlap `max (D − d)₊` among `positions` moved by
+    /// `displacements` on a torus of `side`.
+    fn deepest(
+        positions: &[[f64; 2]],
+        displacements: &[[f64; 2]],
+        side: f64,
+        diameter: f64,
+    ) -> f64 {
+        let moved: Vec<[f64; 2]> = positions
+            .iter()
+            .zip(displacements)
+            .map(|(p, d)| {
+                [
+                    (p[0] + d[0]).rem_euclid(side),
+                    (p[1] + d[1]).rem_euclid(side),
+                ]
+            })
+            .collect();
+        let mut deepest = 0.0_f64;
+        for (index, a) in moved.iter().enumerate() {
+            for b in &moved[index + 1..] {
+                let dx = image(b[0], a[0], side, 0.5 * side);
+                let dy = image(b[1], a[1], side, 0.5 * side);
+                deepest = deepest.max(diameter - dx.hypot(dy));
+            }
+        }
+        deepest
+    }
+
+    /// `count` bodies scattered in a disk of radius `radius` about (8, 8).
+    fn pile(count: usize, radius: f64) -> Vec<[f64; 2]> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        (0..count)
+            .map(|_| {
+                let (r, a) = (radius * next().sqrt(), std::f64::consts::TAU * next());
+                [8.0 + r * a.cos(), 8.0 + r * a.sin()]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_sweep_is_the_plain_rule_and_more_sweeps_resolve_more_overlap() {
+        let grid = grid(16.0, 16);
+        let positions = pile(60, 1.5);
+        let plain = run_with(&grid, &PLAIN, &positions, None);
+        let once = work_with(&grid, &PLAIN, &positions, None, 1);
+        assert_eq!(once.displacements, plain);
+        assert_eq!(
+            once.positions, positions,
+            "one sweep leaves the gathered positions"
+        );
+        assert!(once.pressed.is_empty(), "the plain rule keeps no push");
+        let mut last = deepest(&positions, &plain, 16.0, 0.5);
+        for sweeps in [2, 4, 8] {
+            let rules = ContactRules { sweeps, ..PLAIN };
+            let work = work_with(&grid, &rules, &positions, None, 1);
+            let now = deepest(&positions, &work.displacements, 16.0, 0.5);
+            assert!(
+                now < last,
+                "{sweeps} sweeps: deepest overlap {now}, fewer: {last}"
+            );
+            last = now;
+            // The positions a sweep leaves are the gathered ones moved by the
+            // summed displacement, wrapped.
+            for ((p, d), q) in positions
+                .iter()
+                .zip(&work.displacements)
+                .zip(&work.positions)
+            {
+                let wrapped = grid
+                    .wrap_position([p[0] + d[0], p[1] + d[1]])
+                    .expect("wrap");
+                assert_eq!(&wrapped, q);
+            }
+        }
+    }
+
+    #[test]
+    fn the_push_counts_overlaps_and_not_adhesion() {
+        let grid = grid(16.0, 16);
+        let rules = ContactRules {
+            adhesion: 1.0,
+            range: 1.5,
+            inhibits: true,
+            ..PLAIN
+        };
+        // Body 0 overlaps body 1 (0.3 apart) and is pulled by body 2 (0.65
+        // apart, inside reach 0.75); all alike.
+        let positions = [[4.0, 4.0], [4.3, 4.0], [4.0, 4.65]];
+        let alike = [axis(0), axis(0), axis(0)];
+        let work = work_with(&grid, &rules, &positions, Some(&alike), 1);
+        let push = 0.25 * (0.5 - 0.3);
+        assert!(
+            (work.pressed[0][0] + push).abs() < 1e-15,
+            "{:?}",
+            work.pressed[0]
+        );
+        assert_eq!(work.pressed[0][1], 0.0, "adhesion's pull is not a push");
+        assert!(work.displacements[0][1] > 0.0, "but it moves the body");
+        assert_eq!(work.pressed[2], [0.0, 0.0], "body 2 overlaps nothing");
+        // Summed over sweeps.
+        let swept = work_with(
+            &grid,
+            &ContactRules { sweeps: 3, ..rules },
+            &positions,
+            Some(&alike),
+            1,
+        );
+        assert!(swept.pressed[0][0] < work.pressed[0][0]);
+    }
+
+    #[test]
+    fn sweeps_and_pushes_are_the_same_at_any_worker_count() {
+        let grid = grid(64.0, 64);
+        let positions: Vec<[f64; 2]> = pile(20_000, 30.0)
+            .into_iter()
+            .map(|p| p.map(|x| x.rem_euclid(64.0)))
+            .collect();
+        let rules = ContactRules {
+            adhesion: 1.0,
+            range: 1.5,
+            sweeps: 4,
+            inhibits: true,
+            ..PLAIN
+        };
+        let affinities: Vec<[f32; AFFINITY_TERMS]> =
+            (0..positions.len()).map(|index| axis(index % 3)).collect();
+        let bits = |workers: usize| {
+            let work = work_with(&grid, &rules, &positions, Some(&affinities), workers);
+            work.displacements
+                .iter()
+                .chain(&work.pressed)
+                .chain(&work.positions)
+                .flat_map(|d| d.map(f64::to_bits))
+                .collect::<Vec<u64>>()
+        };
+        let one = bits(1);
+        for workers in [2, 3, 4, 16] {
+            assert_eq!(bits(workers), one, "{workers} workers");
         }
     }
 }

@@ -915,6 +915,18 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
             U::Dimensionless,
             Positive,
         );
+        if let Some(sweeps) = c.sweeps {
+            r.int("contact", "sweeps", sweeps, U::Count, AtLeastOne);
+        }
+        if let Some(inhibition) = c.inhibition {
+            r.float(
+                "contact",
+                "inhibition",
+                inhibition,
+                U::Dimensionless,
+                UnitClosed,
+            );
+        }
     }
 
     let x = &config.execution;

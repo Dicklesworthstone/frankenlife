@@ -77,7 +77,9 @@ use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
     FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
-    FIELD_ECOLOGY_V1_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_UNGATED_MOTION,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+    FIELD_ECOLOGY_V1_UNGATED_MOTION,
 };
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
@@ -446,6 +448,17 @@ pub enum ModelVariant {
     /// `field-ecology-v1-contact-fresh-offspring`: contact, with a newborn's
     /// genome a founder's drawn at its own identity.
     ContactFreshOffspring,
+    /// `field-ecology-v1-contact-inhibition`: contact relaxed in sweeps, and
+    /// a body's velocity into the bodies it overlaps removed
+    /// ([`crate::contact`]).
+    Inhibition,
+    /// `field-ecology-v1-contact-inhibition-chemistry-only`: contact
+    /// inhibition, with actions decoded from an all-zero raw output.
+    InhibitionChemistryOnly,
+    /// `field-ecology-v1-contact-inhibition-fresh-offspring`: contact
+    /// inhibition, with a newborn's genome a founder's drawn at its own
+    /// identity.
+    InhibitionFreshOffspring,
 }
 
 impl ModelVariant {
@@ -462,6 +475,11 @@ impl ModelVariant {
             FIELD_ECOLOGY_V1_CONTACT => Ok(Self::Contact),
             FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY => Ok(Self::ContactChemistryOnly),
             FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING => Ok(Self::ContactFreshOffspring),
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION => Ok(Self::Inhibition),
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY => Ok(Self::InhibitionChemistryOnly),
+            FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING => {
+                Ok(Self::InhibitionFreshOffspring)
+            }
             other => Err(CoreError::UnknownAlgorithm {
                 role: "model",
                 name: other.to_owned(),
@@ -475,13 +493,19 @@ impl ModelVariant {
     /// chemistry-only controls).
     #[must_use]
     pub const fn decides_from_zero(self) -> bool {
-        matches!(self, Self::ChemistryOnly | Self::ContactChemistryOnly)
+        matches!(
+            self,
+            Self::ChemistryOnly | Self::ContactChemistryOnly | Self::InhibitionChemistryOnly
+        )
     }
 
     /// Whether a newborn's genome is drawn fresh (the inheritance controls).
     #[must_use]
     pub const fn fresh_offspring(self) -> bool {
-        matches!(self, Self::FreshOffspring | Self::ContactFreshOffspring)
+        matches!(
+            self,
+            Self::FreshOffspring | Self::ContactFreshOffspring | Self::InhibitionFreshOffspring
+        )
     }
 
     /// Whether survivors are displaced by soft-disk contact.
@@ -489,7 +513,22 @@ impl ModelVariant {
     pub const fn contact(self) -> bool {
         matches!(
             self,
-            Self::Contact | Self::ContactChemistryOnly | Self::ContactFreshOffspring
+            Self::Contact
+                | Self::ContactChemistryOnly
+                | Self::ContactFreshOffspring
+                | Self::Inhibition
+                | Self::InhibitionChemistryOnly
+                | Self::InhibitionFreshOffspring
+        )
+    }
+
+    /// Whether contact also removes a body's velocity into the bodies it
+    /// overlaps.
+    #[must_use]
+    pub const fn inhibits(self) -> bool {
+        matches!(
+            self,
+            Self::Inhibition | Self::InhibitionChemistryOnly | Self::InhibitionFreshOffspring
         )
     }
 }
@@ -2242,6 +2281,9 @@ impl World {
         } else {
             None
         };
+        // Under contact inhibition, each survivor's push from the bodies it
+        // overlapped; empty otherwise.
+        let pressed = contact.pressed.as_slice();
         for (index, organism) in working.iter().enumerate() {
             emitted += usize::from(organism.emitted);
             match organism.vitality.fate()? {
@@ -2255,9 +2297,15 @@ impl World {
                         ])?,
                         _ => organism.position,
                     };
+                    let velocity = match (pressed.get(index), &rules.contact) {
+                        (Some(&push), Some(bodies)) => {
+                            inhibited(organism.velocity, push, bodies.inhibition)
+                        }
+                        _ => organism.velocity,
+                    };
                     survivors.push(Organism {
                         position,
-                        velocity: organism.velocity,
+                        velocity,
                         energy,
                         energy_change_rate: (energy - organism.committed.energy) / seconds,
                         held: organism.held,
@@ -4022,6 +4070,27 @@ fn contact_rules(config: &ValidatedConfig) -> Result<Option<ContactRules>, CoreE
                 format!("[contact] belongs to a contact model, not {model}")
             },
         }])),
+    }
+}
+
+/// `velocity` without `share` of its component against `push`, the push of
+/// the bodies a survivor overlapped (contact inhibition of locomotion,
+/// [`crate::contact`]): unchanged for no push or a velocity along it.
+fn inhibited(velocity: [f64; 2], push: [f64; 2], share: f64) -> [f64; 2] {
+    let length = push[0].hypot(push[1]);
+    if !length.is_finite() || length <= 0.0 {
+        return velocity;
+    }
+    let normal = [push[0] / length, push[1] / length];
+    let along = velocity[0] * normal[0] + velocity[1] * normal[1];
+    if along < 0.0 && share > 0.0 {
+        let removed = share * along;
+        [
+            velocity[0] - removed * normal[0],
+            velocity[1] - removed * normal[1],
+        ]
+    } else {
+        velocity
     }
 }
 

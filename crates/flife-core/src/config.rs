@@ -81,6 +81,17 @@ pub struct ContactConfig {
     pub adhesion: f64,
     /// `R ≥ 1`: adhesion reaches from touching, `D`, to `R D`.
     pub adhesion_range: f64,
+    /// Relaxation sweeps per tick, in `[1, 16]`: required by the
+    /// contact-inhibition models and refused by the plain contact models,
+    /// whose rule is one sweep. Absent, the canonical text and hash are
+    /// unchanged.
+    #[serde(default)]
+    pub sweeps: Option<u32>,
+    /// `c` in `[0, 1]`: the share of a survivor's velocity against its
+    /// overlaps' push that contact removes. Required by the
+    /// contact-inhibition models and refused by the plain contact models.
+    #[serde(default)]
+    pub inhibition: Option<f64>,
 }
 
 impl RunConfig {

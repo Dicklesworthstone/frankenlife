@@ -18,8 +18,10 @@ use crate::config::{CONFIG_SCHEMA, RunConfig};
 use crate::error::{ConfigIssue, CoreError};
 use crate::model::{
     ACTION_WIDTH, FIELD_ECOLOGY_V1_CONTACT, FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
-    FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_HIDDEN_LAYERS,
-    MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count, genome_bank_bytes,
+    FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS,
+    MAXIMUM_HIDDEN_LAYERS, MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count, genome_bank_bytes,
 };
 use crate::registry::{self, REGISTRY};
 use crate::schema::{self, FloatBound, IntBound, Kind, Value};
@@ -241,14 +243,57 @@ pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
 }
 
 /// `[contact]` belongs to the contact models, which need it (plan §5.4), and
-/// adhesion begins where bodies touch.
+/// adhesion begins where bodies touch. `sweeps` belongs to the
+/// contact-inhibition models, which need it.
 fn check_contact(config: &RunConfig, issues: &mut Issues) {
-    let contact_model = [
-        FIELD_ECOLOGY_V1_CONTACT,
-        FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
-        FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
+    let model = config.model.as_str();
+    let inhibiting = [
+        FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
+        FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+        FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
     ]
-    .contains(&config.model.as_str());
+    .contains(&model);
+    let contact_model = inhibiting
+        || [
+            FIELD_ECOLOGY_V1_CONTACT,
+            FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
+            FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
+        ]
+        .contains(&model);
+    if let Some(contact) = &config.contact {
+        match (contact.sweeps, inhibiting) {
+            (None, true) => issues.add(
+                "contact.sweeps",
+                format!("{model} needs [contact] sweeps: its relaxation sweeps per tick"),
+            ),
+            (Some(_), false) if contact_model => issues.add(
+                "contact.sweeps",
+                format!(
+                    "{model} relaxes once per tick; sweeps belongs to a contact-inhibition model"
+                ),
+            ),
+            (Some(sweeps), true) if sweeps > MAXIMUM_CONTACT_SWEEPS => issues.add(
+                "contact.sweeps",
+                format!("must be <= {MAXIMUM_CONTACT_SWEEPS}, got {sweeps}"),
+            ),
+            _ => {}
+        }
+        match (contact.inhibition, inhibiting) {
+            (None, true) => issues.add(
+                "contact.inhibition",
+                format!(
+                    "{model} needs [contact] inhibition: the share of a pressing velocity removed"
+                ),
+            ),
+            (Some(_), false) if contact_model => issues.add(
+                "contact.inhibition",
+                format!(
+                    "{model} keeps every velocity; inhibition belongs to a contact-inhibition model"
+                ),
+            ),
+            _ => {}
+        }
+    }
     match (&config.contact, contact_model) {
         (None, true) => issues.add(
             "contact",

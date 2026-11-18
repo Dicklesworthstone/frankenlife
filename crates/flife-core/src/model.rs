@@ -48,6 +48,30 @@ pub const FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY: &str = "field-ecology-v1-cont
 pub const FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING: &str =
     "field-ecology-v1-contact-fresh-offspring";
 
+/// [`FIELD_ECOLOGY_V1_CONTACT`] with contact inhibition of locomotion (plan
+/// §5.4): after the contact model's displacement, `[contact] sweeps − 1`
+/// further sweeps push overlapping bodies apart only, each from the
+/// positions the last one left, and a survivor then loses the share
+/// `[contact] inhibition` of the part of its velocity opposed to the push of
+/// the bodies it overlapped, summed over its sweeps (adhesion's pull does
+/// not count). It keeps the rest of its velocity, so no speed is added and
+/// no energy or ledger entry changes.
+/// See `flife_engine::contact`.
+pub const FIELD_ECOLOGY_V1_CONTACT_INHIBITION: &str = "field-ecology-v1-contact-inhibition";
+
+/// [`FIELD_ECOLOGY_V1_CONTACT_INHIBITION`] with
+/// [`FIELD_ECOLOGY_V1_CHEMISTRY_ONLY`]'s rule: its chemistry-only control.
+pub const FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY: &str =
+    "field-ecology-v1-contact-inhibition-chemistry-only";
+
+/// [`FIELD_ECOLOGY_V1_CONTACT_INHIBITION`] with
+/// [`FIELD_ECOLOGY_V1_FRESH_OFFSPRING`]'s rule: its inheritance control.
+pub const FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING: &str =
+    "field-ecology-v1-contact-inhibition-fresh-offspring";
+
+/// The most contact sweeps a tick may run.
+pub const MAXIMUM_CONTACT_SWEEPS: u32 = 16;
+
 /// Chemical moment channels per field cell (§4.2).
 pub const MOMENT_CHANNELS: u32 = 32;
 

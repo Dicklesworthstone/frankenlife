@@ -60,6 +60,27 @@ pub struct RunConfig {
     pub recording: RecordingConfig,
     /// `[persistence]`
     pub persistence: PersistenceConfig,
+    /// `[contact]`: required by the contact models and refused by every
+    /// other (plan §5.4). Absent, nothing about a configuration changes,
+    /// its canonical text and hash included.
+    #[serde(default)]
+    pub contact: Option<ContactConfig>,
+}
+
+/// `[contact]` (plan §5.4): the contact models' body and its adhesion.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContactConfig {
+    /// `D`, an organism's body diameter, in world units.
+    pub diameter: f64,
+    /// `k` in `(0, 1]`: the fraction of each pair's overlap resolved per
+    /// tick, split between the two.
+    pub stiffness: f64,
+    /// `k_a` in `[0, 1]`: the like-to-like pull between bodies within reach;
+    /// zero for none.
+    pub adhesion: f64,
+    /// `R ≥ 1`: adhesion reaches from touching, `D`, to `R D`.
+    pub adhesion_range: f64,
 }
 
 impl RunConfig {

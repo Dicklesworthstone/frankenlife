@@ -45,7 +45,11 @@ pub const DOT_RADIUS_MAX_POINTS: f64 = 24.0;
 
 /// The sphere look's `(reflectiveness, gloss, shadow)`: FrankenManim's
 /// true-dot lighting, which shades each dot as a sphere facing the camera.
-pub const SPHERE_SHADING: [f64; 3] = [0.35, 0.45, 0.65];
+/// Both lifts towards white are kept small and the shadow deep, so a body
+/// keeps its colour, with a dark rim and a soft highlight, as the reference
+/// screenshots' close-ups show; together they raise the lit pixels' median
+/// OKLab lightness by about 0.05.
+pub const SPHERE_SHADING: [f64; 3] = [0.10, 0.12, 0.90];
 
 /// A halo's opacity: the soft glow around each organism.
 pub const HALO_ALPHA: f64 = 0.42;

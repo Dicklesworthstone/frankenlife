@@ -28,13 +28,15 @@ pub const FIELD_ECOLOGY_V1_FRESH_OFFSPRING: &str = "field-ecology-v1-fresh-offsp
 /// starving organism can spend its last energy moving towards food.
 pub const FIELD_ECOLOGY_V1_UNGATED_MOTION: &str = "field-ecology-v1-ungated-motion";
 
-/// `field-ecology-v1` with one rule added (plan §5.4's "direct collisions
-/// … define later model variants"): every organism is a disk whose diameter
-/// is `reproduction.child_position_offset_radius`, and after phase 8 each
-/// survivor is displaced by half of `k = 0.5` times its overlap with every
-/// other survivor, clamped to `min(D/2, ½ min(h_x, h_y))`. Contact moves
-/// positions only: no velocity, energy or ledger entry changes. See
-/// `flife_engine::contact`.
+/// `field-ecology-v1` with one rule added (plan §5.4's "direct collisions,
+/// adhesion … define later model variants"): every organism is a disk of
+/// the `[contact]` table's diameter `D`, and after phase 8 each survivor is
+/// displaced by `k/2` of its overlap with every other survivor, and pulled
+/// towards each one within `R D` by an adhesion `k_a` scaled by the square
+/// of their affinities' positive cosine, the sum clamped to
+/// `min(D/2, ½ min(h_x, h_y))`. Contact moves positions only: no velocity,
+/// energy or ledger entry changes. The model requires the `[contact]` table;
+/// every other refuses it. See `flife_engine::contact`.
 pub const FIELD_ECOLOGY_V1_CONTACT: &str = "field-ecology-v1-contact";
 
 /// [`FIELD_ECOLOGY_V1_CONTACT`] with

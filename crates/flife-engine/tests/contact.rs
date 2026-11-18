@@ -4,11 +4,14 @@
 //!
 //! The oracle is the rule written out over every pair (`flife_engine::contact`
 //! sums the same terms over neighbour bins): each survivor of a tick moves by
-//! `Σ_j (k/2)(D − d_ij) u_ij` over the survivors `j` closer than the body
-//! diameter `D`, clamped to `min(D/2, h/2)`. Each contact world is compared
-//! with its model without contact from the same founding. On the first tick
-//! the two must spend, emit and give birth identically, keep every velocity,
-//! and differ only by that displacement of the survivors.
+//! `Σ_j p_ij u_ij` over the other survivors, pushed apart by `(k/2)(D − d)`
+//! when closer than the body diameter `D`, and pulled together by
+//! `(k_a/2) cos₊(a_i, a_j)² (d − D)(R D − d) / ((R − 1) D)` when within the
+//! adhesion reach `R D`; the sum is clamped to `min(D/2, h/2)`. Each contact
+//! world is compared with its model without contact from the same founding.
+//! On the first tick the two must spend, emit and give birth identically,
+//! keep every velocity, and differ only by that displacement of the
+//! survivors.
 
 #![allow(
     clippy::expect_used,
@@ -24,7 +27,7 @@ use flife_core::model::{
     FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
     FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
 };
-use flife_engine::contact::CONTACT_STIFFNESS;
+use flife_engine::contact::unit_affinity;
 use flife_engine::{Arrangement, ModelVariant, NumericalProfile, Stepped, TickReport, World};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -33,12 +36,28 @@ const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_F
 const SIDE: f64 = 16.0;
 /// Field cells a side.
 const CELLS: f64 = 16.0;
-/// The body diameter, `reproduction.child_position_offset_radius`.
+/// The body diameter, `[contact] diameter`.
 const DIAMETER: f64 = 0.6;
+/// `[contact] stiffness`.
+const STIFFNESS: f64 = 0.5;
+/// `[contact] adhesion_range`.
+const RANGE: f64 = 1.5;
+
+/// The `[contact]` table with `adhesion`.
+fn table(adhesion: f64) -> String {
+    format!(
+        "[contact]\ndiameter = {DIAMETER:?}\nstiffness = {STIFFNESS:?}\nadhesion = {adhesion:?}\nadhesion_range = {RANGE:?}\n"
+    )
+}
 
 /// Appendix A's starter at 16 × 16 with 640 founders under `model`: crowded
-/// enough that uniform founders overlap.
-fn ecology(model: &str) -> ValidatedConfig {
+/// enough that uniform founders overlap. A contact model gets [`table`] with
+/// `adhesion`.
+fn ecology(model: &str, adhesion: f64) -> ValidatedConfig {
+    ValidatedConfig::from_toml(&text(model, adhesion)).expect("a valid configuration")
+}
+
+fn text(model: &str, adhesion: f64) -> String {
     let appendix = PLAN.find("## Appendix A").map_or("", |at| &PLAN[at..]);
     let start = appendix
         .find("```toml\n")
@@ -89,7 +108,12 @@ fn ecology(model: &str) -> ValidatedConfig {
         .position(|line| line.starts_with("model = "))
         .expect("the model key");
     lines[model_line] = format!("model = \"{model}\"");
-    ValidatedConfig::from_toml(&lines.join("\n")).expect("a valid configuration")
+    let mut text = lines.join("\n");
+    if ModelVariant::of(model).expect("a model").contact() {
+        text.push('\n');
+        text.push_str(&table(adhesion));
+    }
+    text
 }
 
 fn found(config: &ValidatedConfig) -> World {
@@ -139,9 +163,36 @@ fn image(difference: f64) -> f64 {
     }
 }
 
-/// The rule over every pair of `survivors` (identity → settled position).
-fn oracle(survivors: &BTreeMap<u64, [f64; 2]>) -> BTreeMap<u64, [f64; 2]> {
+/// Each live organism's unit affinity, by identity.
+fn affinities(world: &World) -> BTreeMap<u64, [f32; 32]> {
+    world
+        .population()
+        .iter()
+        .map(|organism| {
+            let genome = world.population().genome(organism.id).expect("a genome");
+            (organism.id.get(), unit_affinity(genome.traits().affinity()))
+        })
+        .collect()
+}
+
+fn alike(a: &[f32; 32], b: &[f32; 32]) -> f64 {
+    let cosine: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    cosine.max(0.0)
+}
+
+/// The rule over every pair of `survivors` (identity → settled position),
+/// with adhesion `adhesion` between their `affinities`.
+fn oracle(
+    survivors: &BTreeMap<u64, [f64; 2]>,
+    affinities: &BTreeMap<u64, [f32; 32]>,
+    adhesion: f64,
+) -> BTreeMap<u64, [f64; 2]> {
     let limit = (0.5 * DIAMETER).min(0.5 * SIDE / CELLS);
+    let reach = RANGE * DIAMETER;
     survivors
         .iter()
         .map(|(&id, &[x, y])| {
@@ -152,10 +203,15 @@ fn oracle(survivors: &BTreeMap<u64, [f64; 2]>) -> BTreeMap<u64, [f64; 2]> {
                 }
                 let (dx, dy) = (image(x - ox), image(y - oy));
                 let distance = dx.hypot(dy);
-                if distance >= DIAMETER {
+                let push = if distance < DIAMETER {
+                    0.5 * STIFFNESS * (DIAMETER - distance)
+                } else if adhesion > 0.0 && distance < reach {
+                    let alike = alike(&affinities[&id], &affinities[&other]);
+                    -0.5 * adhesion * alike * alike * (distance - DIAMETER) * (reach - distance)
+                        / ((RANGE - 1.0) * DIAMETER)
+                } else {
                     continue;
-                }
-                let push = 0.5 * CONTACT_STIFFNESS * (DIAMETER - distance);
+                };
                 let (ux, uy) = if distance > 0.0 {
                     (dx / distance, dy / distance)
                 } else if id > other {
@@ -187,13 +243,14 @@ fn overlap(world: &World) -> f64 {
     total
 }
 
-/// One tick of `plain` and of `contact` from one founding: the same flows,
-/// births, energies and velocities, and positions apart by exactly the
-/// oracle's displacement of the survivors.
-fn first_tick_differs_only_by_contact(plain: &str, contact: &str) {
-    let mut without = found(&ecology(plain));
-    let mut with = found(&ecology(contact));
+/// One tick of `plain` and of `contact` (with `adhesion`) from one founding:
+/// the same flows, births, energies and velocities, and positions apart by
+/// exactly the oracle's displacement of the survivors.
+fn first_tick_differs_only_by_contact(plain: &str, contact: &str, adhesion: f64) {
+    let mut without = found(&ecology(plain, 0.0));
+    let mut with = found(&ecology(contact, adhesion));
     assert_eq!(state(&without), state(&with), "one founding");
+    let chemistry = affinities(&with);
     let report_without = publish(&mut without);
     let report_with = publish(&mut with);
     assert_eq!(
@@ -221,7 +278,7 @@ fn first_tick_differs_only_by_contact(plain: &str, contact: &str) {
         .filter(|(id, _)| !born.contains(id))
         .map(|(&id, &(position, _, _))| (id, position))
         .collect();
-    let displacement = oracle(&survivors);
+    let displacement = oracle(&survivors, &chemistry, adhesion);
     let mut moved = 0;
     for (id, &(position, velocity, energy)) in &before {
         let (contacted, contacted_velocity, contacted_energy) = after[id];
@@ -248,12 +305,13 @@ fn first_tick_differs_only_by_contact(plain: &str, contact: &str) {
 
 #[test]
 fn a_contact_world_separates_overlapping_organisms_and_keeps_the_ledger() {
-    first_tick_differs_only_by_contact(FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CONTACT);
+    first_tick_differs_only_by_contact(FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CONTACT, 0.0);
+    first_tick_differs_only_by_contact(FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CONTACT, 0.4);
 
     // Over 64 ticks the contact world's bodies overlap less than half as much
     // (about a third here), and its ledger closes every tick.
-    let mut without = found(&ecology(FIELD_ECOLOGY_V1));
-    let mut with = found(&ecology(FIELD_ECOLOGY_V1_CONTACT));
+    let mut without = found(&ecology(FIELD_ECOLOGY_V1, 0.0));
+    let mut with = found(&ecology(FIELD_ECOLOGY_V1_CONTACT, 0.0));
     for _ in 0..64 {
         publish(&mut without);
         publish(&mut with);
@@ -298,31 +356,91 @@ fn the_contact_controls_combine_contact_with_their_one_rule() {
     first_tick_differs_only_by_contact(
         FIELD_ECOLOGY_V1_CHEMISTRY_ONLY,
         FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
+        0.4,
     );
     first_tick_differs_only_by_contact(
         FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
         FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
+        0.4,
+    );
+}
+
+/// The mean `cos₊(a_i, a_j)` over the live pairs within the adhesion reach.
+fn neighbours_alike(world: &World) -> f64 {
+    let chemistry = affinities(world);
+    let bodies: Vec<([f64; 2], u64)> = world
+        .population()
+        .iter()
+        .map(|o| (o.position, o.id.get()))
+        .collect();
+    let (mut total, mut pairs) = (0.0, 0_u32);
+    for (index, &([x, y], id)) in bodies.iter().enumerate() {
+        for &([ox, oy], other) in &bodies[index + 1..] {
+            if image(x - ox).hypot(image(y - oy)) < RANGE * DIAMETER {
+                total += alike(&chemistry[&id], &chemistry[&other]);
+                pairs += 1;
+            }
+        }
+    }
+    total / f64::from(pairs.max(1))
+}
+
+#[test]
+fn like_bodies_adhere_and_sort_into_their_own_neighbourhoods() {
+    // Adhesion pulls alike bodies together, so over 96 ticks a body's
+    // neighbours come to share its chemistry more than without adhesion.
+    let mut apart = found(&ecology(FIELD_ECOLOGY_V1_CONTACT, 0.0));
+    let mut sticky = found(&ecology(FIELD_ECOLOGY_V1_CONTACT, 1.0));
+    for _ in 0..96 {
+        publish(&mut apart);
+        publish(&mut sticky);
+    }
+    let (plain, sorted) = (neighbours_alike(&apart), neighbours_alike(&sticky));
+    assert!(
+        sorted > plain,
+        "neighbours alike {sorted} with adhesion, {plain} without"
     );
 }
 
 #[test]
-fn a_contact_world_needs_a_positive_body_diameter() {
-    let config = ecology(FIELD_ECOLOGY_V1_CONTACT);
-    let text = config.canonical_toml();
-    let zero = text.replace(
-        "child_position_offset_radius = 0.6",
-        "child_position_offset_radius = 0.0",
+fn the_contact_table_belongs_to_the_contact_models() {
+    let contact = text(FIELD_ECOLOGY_V1_CONTACT, 0.4);
+    assert!(ValidatedConfig::from_toml(&contact).is_ok());
+    let refused = |text: &str, path: &str| {
+        let error = ValidatedConfig::from_toml(text).expect_err("refused");
+        assert!(format!("{error:?}").contains(path), "{error:?}");
+    };
+    // A contact model without its table; another model with one.
+    refused(&contact.replace(&table(0.4), ""), "contact");
+    refused(
+        &format!("{}\n{}", text(FIELD_ECOLOGY_V1, 0.0), table(0.4)),
+        "contact",
     );
-    assert_ne!(text, zero, "the key is in the canonical text");
-    let config = ValidatedConfig::from_toml(&zero).expect("a valid configuration");
-    let error = World::found(
-        &config,
-        Arrangement::FreeList,
-        NumericalProfile::reference_f32().expect("profile"),
-    )
-    .expect_err("no body, no contact");
+    // Out of bounds: no body, no stiffness, adhesion over one, reach inside
+    // the body.
+    for (from, to, path) in [
+        ("diameter = 0.6", "diameter = 0.0", "contact.diameter"),
+        ("stiffness = 0.5", "stiffness = 0.0", "contact.stiffness"),
+        ("adhesion = 0.4", "adhesion = 1.5", "contact.adhesion"),
+        (
+            "adhesion_range = 1.5",
+            "adhesion_range = 0.9",
+            "contact.adhesion_range",
+        ),
+    ] {
+        assert!(contact.contains(from), "{from}");
+        refused(&contact.replace(from, to), path);
+    }
+    // Without the table nothing about another model's configuration
+    // changes: its canonical text has no contact key.
     assert!(
-        format!("{error}").contains("child_position_offset_radius"),
-        "{error}"
+        !ecology(FIELD_ECOLOGY_V1, 0.0)
+            .canonical_toml()
+            .contains("contact")
+    );
+    assert!(
+        ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4)
+            .canonical_toml()
+            .contains("[contact]\ndiameter = 0.6")
     );
 }

@@ -892,6 +892,31 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
         Role::NumericalFaultPolicy,
     );
 
+    if let Some(c) = &config.contact {
+        r.float("contact", "diameter", c.diameter, U::WorldLength, Positive);
+        r.float(
+            "contact",
+            "stiffness",
+            c.stiffness,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        r.float(
+            "contact",
+            "adhesion",
+            c.adhesion,
+            U::Dimensionless,
+            UnitClosed,
+        );
+        r.float(
+            "contact",
+            "adhesion_range",
+            c.adhesion_range,
+            U::Dimensionless,
+            Positive,
+        );
+    }
+
     let x = &config.execution;
     r.name("execution", "backend", &x.backend, Role::Backend);
     r.name(

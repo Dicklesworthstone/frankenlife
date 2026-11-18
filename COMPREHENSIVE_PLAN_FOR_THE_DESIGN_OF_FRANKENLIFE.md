@@ -406,13 +406,28 @@ Movement expenditure must be affordable. For the baseline's cost proportional to
 
 Density-based repulsion, direct collisions, adhesion, and pairwise predation are not silently added to solve unattractive output. They define later model variants.
 
-The first such variant is registered as `field-ecology-v1-contact`, with its controls `field-ecology-v1-contact-chemistry-only` and `field-ecology-v1-contact-fresh-offspring` (each adds the contact rule to the named model). It was added because the reference screenshots show bodies that pack without overlapping (§1.2), which no field-mediated rule of the baseline produces; it is a different model identity, never a baseline setting. Under it every organism is a disk of diameter `D`, the configuration's `reproduction.child_position_offset_radius`, so a newborn is placed within one body of its parent. After phase 8, each organism `i` that survives the tick is displaced by its overlaps with every other survivor, all computed from the settled positions before any displacement:
+The first such variant is registered as `field-ecology-v1-contact`, with its controls `field-ecology-v1-contact-chemistry-only` and `field-ecology-v1-contact-fresh-offspring` (each adds the contact rule to the named model). It was added because the reference screenshots show bodies that pack without overlapping and lineages that keep to sharp-edged domains (§1.2), which no field-mediated rule of the baseline produces; it is a different model identity, never a baseline setting. A contact model requires a `[contact]` table, which every other model refuses:
+
+```toml
+[contact]
+diameter = 0.45        # D, the body diameter in world units, > 0
+stiffness = 0.5        # k in (0, 1], the share of an overlap resolved per tick
+adhesion = 0.4         # k_a in [0, 1], the like-to-like pull; 0 for none
+adhesion_range = 1.5   # R >= 1: adhesion reaches from touching, D, to R D
+```
+
+Every organism is a disk of diameter `D`. After phase 8, each organism `i` that survives the tick is displaced by every other survivor within reach, all computed from the settled positions before any displacement:
 
 $$
-\Delta_i=\operatorname{clamp}\Big(\sum_{j\ne i,\ d_{ij}<D}\tfrac{k}{2}(D-d_{ij})\,u_{ij}\Big),\qquad k=\tfrac12,
+\Delta_i=\operatorname{clamp}\Big(\sum_{j\ne i}p_{ij}\,u_{ij}\Big),\qquad
+p_{ij}=\begin{cases}
+\tfrac{k}{2}(D-d_{ij}) & d_{ij}<D,\\[2pt]
+-\tfrac{k_a}{2}\,w_{ij}\,\dfrac{(d_{ij}-D)(RD-d_{ij})}{(R-1)D} & D\le d_{ij}<RD,
+\end{cases}
+\qquad w_{ij}=\max\big(0,\cos(a_i,a_j)\big)^2,
 $$
 
-where `d_ij` is the minimum-image distance, `u_ij` the unit vector from `j` to `i` (two organisms at one point separate along `±x`, the higher identity towards `+x`), and `clamp` a radial clamp to `min(D/2, ½ min(h_x, h_y))`. The position is then wrapped. Contact moves positions only: it changes no velocity, energy or ledger entry, and the tick's emissions and births use the settled positions. Each sum runs over neighbour bins at least `D` wide in a fixed order and within a bin in identity order, so the displacement does not depend on the worker count. Newborns first take part on the next tick.
+where `d_ij` is the minimum-image distance, `u_ij` the unit vector from `j` to `i` (two organisms at one point separate along `±x`, the higher identity towards `+x`), `a_i` organism `i`'s heritable affinity direction (each unit direction is rounded to `f32` before the cosine is summed in channel order), and `clamp` a radial clamp to `min(D/2, ½ min(h_x, h_y))`. Overlapping bodies push apart; bodies near touching pull together in proportion to how alike their chemistry is, a pull that vanishes at touching and at reach, as tissues sort by differential adhesion. Which lineages share chemistry, and so stick, is inherited and mutated with the genome; nothing in the rule names a lineage or a shape. The position is then wrapped. Contact moves positions only: it changes no velocity, energy or ledger entry, and the tick's emissions and births use the settled positions. Each sum runs over neighbour bins at least the reach wide in a fixed order and within a bin in identity order, so the displacement does not depend on the worker count. Newborns first take part on the next tick.
 
 ## 5.5 Paid emission
 

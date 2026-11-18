@@ -17,8 +17,9 @@ use crate::clock::{TickSpan, TimeStep};
 use crate::config::{CONFIG_SCHEMA, RunConfig};
 use crate::error::{ConfigIssue, CoreError};
 use crate::model::{
-    ACTION_WIDTH, INTRINSIC_INPUTS, MAXIMUM_HIDDEN_LAYERS, MOMENT_CHANNELS, SENSOR_WIDTH,
-    dense_parameter_count, genome_bank_bytes,
+    ACTION_WIDTH, FIELD_ECOLOGY_V1_CONTACT, FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_HIDDEN_LAYERS,
+    MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count, genome_bank_bytes,
 };
 use crate::registry::{self, REGISTRY};
 use crate::schema::{self, FloatBound, IntBound, Kind, Value};
@@ -226,6 +227,7 @@ fn check_text(path: &str, text: &str, issues: &mut Issues) {
 pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
     let mut issues = Issues::default();
     check_generic(&config, &mut issues);
+    check_contact(&config, &mut issues);
     let report = check_model(&config, &mut issues);
     match report {
         Some(report) if issues.0.is_empty() => Ok(ValidatedConfig { config, report }),
@@ -235,6 +237,38 @@ pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
             }
             Err(CoreError::InvalidConfig(issues.0))
         }
+    }
+}
+
+/// `[contact]` belongs to the contact models, which need it (plan §5.4), and
+/// adhesion begins where bodies touch.
+fn check_contact(config: &RunConfig, issues: &mut Issues) {
+    let contact_model = [
+        FIELD_ECOLOGY_V1_CONTACT,
+        FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
+        FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
+    ]
+    .contains(&config.model.as_str());
+    match (&config.contact, contact_model) {
+        (None, true) => issues.add(
+            "contact",
+            format!(
+                "{} needs a [contact] table: its bodies' diameter and adhesion",
+                config.model
+            ),
+        ),
+        (Some(_), false) => issues.add(
+            "contact",
+            format!("[contact] belongs to a contact model, not {}", config.model),
+        ),
+        (Some(contact), true) if contact.adhesion_range < 1.0 => issues.add(
+            "contact.adhesion_range",
+            format!(
+                "must be >= 1, got {}: adhesion reaches from touching outwards",
+                contact.adhesion_range
+            ),
+        ),
+        _ => {}
     }
 }
 

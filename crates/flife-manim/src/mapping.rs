@@ -779,9 +779,11 @@ pub const AFFINITY_GAIN: f64 = 6.531_972_647_421_808;
 
 /// The OKLab lightness of an organism with no affinity, and how far the
 /// third coordinate moves it either way. With [`AFFINITY_CHROMA`], chosen
-/// so that a world's colours span the reference screenshots' lit pixels
-/// (median OKLab lightness 0.50, chroma to 0.20 at the 90th percentile).
-pub const AFFINITY_LIGHTNESS: [f64; 2] = [0.62, 0.12];
+/// so that a world drawn as lit spheres ([`crate::SPHERE_SHADING`], which
+/// lifts lightness by about 0.05) spans the reference screenshots' lit
+/// pixels: median OKLab lightness 0.40 to 0.57, chroma to 0.20 at the 90th
+/// percentile. Dark olives and maroons are among them, as there.
+pub const AFFINITY_LIGHTNESS: [f64; 2] = [0.46, 0.12];
 
 /// The OKLab chroma the first two coordinates approach at full strength.
 pub const AFFINITY_CHROMA: f64 = 0.26;

@@ -81,8 +81,8 @@ use flife_core::model::{
 };
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
-    CoreError, EnergyBudget, EnergyLedger, Flow, Holdings, LedgerReport, ResidualBudget,
-    Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
+    ConfigIssue, CoreError, EnergyBudget, EnergyLedger, Flow, Holdings, LedgerReport,
+    ResidualBudget, Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
     Bins, BufferLimits, ConeTolerance, Demand, DepositSummary, Deposits, ExchangeStencil,
@@ -105,7 +105,7 @@ use flife_neural::{
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition};
-use crate::contact::ContactWork;
+use crate::contact::{ContactRules, ContactWork, unit_affinity};
 use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
 use crate::emission::{EmissionPolicy, EmissionSettlement};
 use crate::inspect::{
@@ -414,6 +414,8 @@ struct Rules {
     capacity: CapacityPolicy,
     profile: NumericalProfile,
     variant: ModelVariant,
+    /// The contact models' bodies (plan §5.4); none under every other.
+    contact: Option<ContactRules>,
     initial_scale: f64,
 }
 
@@ -575,6 +577,7 @@ impl Rules {
             capacity: CapacityPolicy::from_name(&model.population.capacity_policy)?,
             profile,
             variant: ModelVariant::of(&model.model)?,
+            contact: contact_rules(config)?,
             initial_scale: initial_scale(config),
         })
     }
@@ -2233,8 +2236,8 @@ impl World {
         let mut emitted = 0;
         // The contact models displace every survivor from the settled
         // positions, before any moves (crate::contact).
-        let contacted = if rules.variant.contact() {
-            contact_displacements(rules, working, contact)?;
+        let contacted = if let Some(bodies) = &rules.contact {
+            contact_displacements(rules, bodies, population, working, contact)?;
             Some(&contact.displacements)
         } else {
             None
@@ -2506,10 +2509,9 @@ impl Scratch {
             recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             survivors: reserved(rows, "survivors")?,
             deaths: reserved(rows, "deaths")?,
-            contact: if rules.variant.contact() {
-                ContactWork::with_capacity(&rules.grid, contact_diameter(rules)?, rows)?
-            } else {
-                ContactWork::default()
+            contact: match &rules.contact {
+                Some(bodies) => ContactWork::with_capacity(&rules.grid, bodies, rows)?,
+                None => ContactWork::default(),
             },
         })
     }
@@ -4003,38 +4005,53 @@ impl Stages for Reference<'_> {
     }
 }
 
-/// The contact models' body diameter: the child placement radius.
-fn contact_diameter(rules: &Rules) -> Result<f64, CoreError> {
-    let diameter = rules.reproduction.rules().offset_radius;
-    if diameter.is_finite() && diameter > 0.0 {
-        Ok(diameter)
-    } else {
-        Err(CoreError::NumericalInvalid {
-            quantity: "reproduction.child_position_offset_radius",
-            detail: format!(
-                "{diameter:?}: a contact model's body diameter is this radius, which must be positive"
-            ),
-        })
+/// The contact models' `[contact]` table, which they require and every
+/// other model refuses (validation checks both; this is the engine's own
+/// guard).
+fn contact_rules(config: &ValidatedConfig) -> Result<Option<ContactRules>, CoreError> {
+    let model = &config.config().model;
+    let rules = ContactRules::from_config(config)?;
+    match (ModelVariant::of(model)?.contact(), rules) {
+        (true, Some(rules)) => Ok(Some(rules)),
+        (false, None) => Ok(None),
+        (needs, _) => Err(CoreError::InvalidConfig(vec![ConfigIssue {
+            path: "contact".into(),
+            problem: if needs {
+                format!("{model} needs a [contact] table")
+            } else {
+                format!("[contact] belongs to a contact model, not {model}")
+            },
+        }])),
     }
 }
 
 /// Every working organism's contact displacement into `work`, from the
-/// settled positions of those that survive the tick.
+/// settled positions of those that survive the tick, with their affinity
+/// directions when bodies adhere.
 fn contact_displacements(
     rules: &Rules,
+    bodies: &ContactRules,
+    population: &Population,
     working: &[Working],
     work: &mut ContactWork,
 ) -> Result<(), CoreError> {
     work.positions.clear();
     work.ids.clear();
     work.alive.clear();
+    work.affinities.clear();
+    let adheres = bodies.adheres();
     for organism in working {
         work.positions.push(organism.position);
         work.ids.push(organism.committed.id.get());
         work.alive
             .push(matches!(organism.vitality.fate()?, Fate::Survives));
+        if adheres {
+            let genome = genome_of(population, organism.committed.id)?;
+            work.affinities
+                .push(unit_affinity(genome.traits().affinity()));
+        }
     }
-    work.relax(&rules.grid, contact_diameter(rules)?)
+    work.relax(&rules.grid, bodies)
 }
 
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,

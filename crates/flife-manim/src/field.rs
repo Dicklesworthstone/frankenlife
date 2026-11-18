@@ -420,7 +420,7 @@ impl FieldLayer {
                     (FieldMapping::Energy, Look::Glow) => {
                         linear(palette(display_value(mean as f32, scale)))
                     }
-                    (FieldMapping::Energy, Look::Raw) => {
+                    (FieldMapping::Energy, Look::Raw | Look::Sphere) => {
                         let grey = raw_value(mean as f32, scale);
                         LinearRgba {
                             r: grey,
@@ -434,7 +434,7 @@ impl FieldLayer {
                             .map(|(column, row)| index(column, row));
                         let level = match look {
                             Look::Glow => display_value(mean as f32, scale),
-                            Look::Raw => raw_value(mean as f32, scale),
+                            Look::Raw | Look::Sphere => raw_value(mean as f32, scale),
                         };
                         let hue = linear(affinity_rgb8(corner_composition(
                             corners.map(|at| (values[at], composition[at])),
@@ -451,7 +451,7 @@ impl FieldLayer {
                             .map(|(column, row)| index(column, row));
                         let level = match look {
                             Look::Glow => display_value(mean as f32, scale),
-                            Look::Raw => raw_value(mean as f32, scale),
+                            Look::Raw | Look::Sphere => raw_value(mean as f32, scale),
                         };
                         let components = field.components();
                         let hue = linear(component_rgb8(corner_component(

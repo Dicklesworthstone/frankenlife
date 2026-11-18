@@ -43,6 +43,10 @@ pub const DOT_RADIUS_MIN_POINTS: f64 = 1.5;
 /// is the disk the viewport places.
 pub const DOT_RADIUS_MAX_POINTS: f64 = 24.0;
 
+/// The sphere look's `(reflectiveness, gloss, shadow)`: FrankenManim's
+/// true-dot lighting, which shades each dot as a sphere facing the camera.
+pub const SPHERE_SHADING: [f64; 3] = [0.35, 0.45, 0.65];
+
 /// A halo's opacity: the soft glow around each organism.
 pub const HALO_ALPHA: f64 = 0.42;
 
@@ -75,12 +79,20 @@ pub fn dot_radius(viewport: &Viewport) -> f64 {
 /// point.
 #[must_use]
 pub fn dot_radius_at_least(viewport: &Viewport, min_points: f64) -> f64 {
+    dot_radius_with(viewport, min_points, DOT_RADIUS)
+}
+
+/// The dot radius in world units for a viewport whose dots are at least
+/// `min_points` on screen and whose organisms' bodies are `body` world
+/// units in radius: `body`, but at least `min_points` and at most
+/// [`DOT_RADIUS_MAX_POINTS`] points, at the viewport's pixels per point.
+#[must_use]
+pub fn dot_radius_with(viewport: &Viewport, min_points: f64, body: f64) -> f64 {
     // Points to pixels first: at one pixel per point the product is exact,
     // so the radius is bit for bit what a pixel bound gives.
     let pixels = viewport.pixels_per_point();
     let scale = viewport.scale();
-    DOT_RADIUS
-        .max(min_points * pixels / scale)
+    body.max(min_points * pixels / scale)
         .min(DOT_RADIUS_MAX_POINTS * pixels / scale)
 }
 
@@ -109,6 +121,8 @@ pub struct ParticleCloud {
     radius: f64,
     /// The smallest radius a dot takes on screen, in points.
     min_points: f64,
+    /// An organism's radius in world units.
+    body: f64,
     capacity: usize,
 }
 
@@ -134,6 +148,7 @@ impl ParticleCloud {
             halos: reserve("particle cloud halos")?,
             radius: DOT_RADIUS,
             min_points: DOT_RADIUS_MIN_POINTS,
+            body: DOT_RADIUS,
             capacity,
         })
     }
@@ -312,7 +327,7 @@ impl ParticleCloud {
 
     /// Clear the draws for a new lowering through `viewport`.
     fn begin(&mut self, viewport: &Viewport) {
-        self.radius = dot_radius_at_least(viewport, self.min_points);
+        self.radius = self.radius_on(viewport);
         self.draws.clear();
         self.halos.clear();
     }
@@ -329,14 +344,18 @@ impl ParticleCloud {
     ) {
         let color = mapped_color(style.mapping, traits, maximum_speed);
         let radius = self.radius;
-        self.draws.push(ThreeDDraw::TrueDot(TrueDotDraw::new(
+        let mut dot = TrueDotDraw::new(
             center,
             radius,
             LinearRgba {
                 a: color.a * opacity,
                 ..color
             },
-        )));
+        );
+        if style.look == Look::Sphere {
+            dot.shading = SPHERE_SHADING;
+        }
+        self.draws.push(ThreeDDraw::TrueDot(dot));
         if style.look == Look::Glow {
             self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
                 center,
@@ -347,6 +366,26 @@ impl ParticleCloud {
                 },
             )));
         }
+    }
+
+    /// The radius a dot takes in world units on `viewport`: the body radius
+    /// within the on-screen bounds.
+    #[must_use]
+    pub fn radius_on(&self, viewport: &Viewport) -> f64 {
+        dot_radius_with(viewport, self.min_points, self.body)
+    }
+
+    /// An organism's radius in world units.
+    #[must_use]
+    pub const fn body_radius(&self) -> f64 {
+        self.body
+    }
+
+    /// Draw organisms at `body` world units in radius, refitting the
+    /// current draws to `viewport`. The caller checks `body` is positive.
+    pub fn set_body_radius(&mut self, body: f64, viewport: &Viewport) {
+        self.body = body;
+        self.refit(viewport);
     }
 
     /// The smallest radius a dot takes on screen, in points:
@@ -379,7 +418,7 @@ impl ParticleCloud {
     /// not depend on the drawable, so only the pixel floor on the radius
     /// can change.
     pub fn refit(&mut self, viewport: &Viewport) {
-        let radius = dot_radius_at_least(viewport, self.min_points);
+        let radius = self.radius_on(viewport);
         let ratio = radius / self.radius;
         self.radius = radius;
         for draw in &mut self.draws {

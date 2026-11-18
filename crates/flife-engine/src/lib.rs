@@ -10,6 +10,8 @@
 //! - [`motion`]: the chemical response, drag integrated with a stable
 //!   `expm1`, speed and acceleration limits, affordability scaling of the
 //!   whole velocity, and the wrapped position step.
+//! - [`contact`]: the contact models' soft-disk displacement of every
+//!   survivor after phase 8, which moves positions only.
 //! - [`emission`]: paid emission from the post-motion budget, staged as a
 //!   next-tick deposit at the post-motion position (FL-011).
 //! - [`reproduction`]: phase 7's cooldown, Bernoulli attempt and viability
@@ -44,6 +46,7 @@
 
 pub mod ancestry;
 pub mod chemistry;
+pub mod contact;
 pub mod costs;
 pub mod emission;
 pub mod inspect;

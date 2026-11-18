@@ -221,6 +221,34 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     },
     AlgorithmEntry {
         status: Status::Implemented {
+            evidence: "test:flife-engine::tests/contact.rs::a_contact_world_separates_overlapping_organisms_and_keeps_the_ledger",
+        },
+        ..entry("field-ecology-v1-contact", Role::Model, "§5.4", "FL-006")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/contact.rs::the_contact_controls_combine_contact_with_their_one_rule",
+        },
+        ..entry(
+            "field-ecology-v1-contact-chemistry-only",
+            Role::Model,
+            "§5.4, §15.3, §21.6",
+            "FL-041",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/contact.rs::the_contact_controls_combine_contact_with_their_one_rule",
+        },
+        ..entry(
+            "field-ecology-v1-contact-fresh-offspring",
+            Role::Model,
+            "§5.4, §15.3, §21.6",
+            "FL-041",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
             evidence: "test:flife-field::tests/field_layout.rs::minimum_image_is_half_open_and_adds_no_rounding",
         },
         ..entry("periodic", Role::Boundary, "§4.1", "FL-003")

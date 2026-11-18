@@ -28,6 +28,24 @@ pub const FIELD_ECOLOGY_V1_FRESH_OFFSPRING: &str = "field-ecology-v1-fresh-offsp
 /// starving organism can spend its last energy moving towards food.
 pub const FIELD_ECOLOGY_V1_UNGATED_MOTION: &str = "field-ecology-v1-ungated-motion";
 
+/// `field-ecology-v1` with one rule added (plan §5.4's "direct collisions
+/// … define later model variants"): every organism is a disk whose diameter
+/// is `reproduction.child_position_offset_radius`, and after phase 8 each
+/// survivor is displaced by half of `k = 0.5` times its overlap with every
+/// other survivor, clamped to `min(D/2, ½ min(h_x, h_y))`. Contact moves
+/// positions only: no velocity, energy or ledger entry changes. See
+/// `flife_engine::contact`.
+pub const FIELD_ECOLOGY_V1_CONTACT: &str = "field-ecology-v1-contact";
+
+/// [`FIELD_ECOLOGY_V1_CONTACT`] with
+/// [`FIELD_ECOLOGY_V1_CHEMISTRY_ONLY`]'s rule: its chemistry-only control.
+pub const FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY: &str = "field-ecology-v1-contact-chemistry-only";
+
+/// [`FIELD_ECOLOGY_V1_CONTACT`] with
+/// [`FIELD_ECOLOGY_V1_FRESH_OFFSPRING`]'s rule: its inheritance control.
+pub const FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING: &str =
+    "field-ecology-v1-contact-fresh-offspring";
+
 /// Chemical moment channels per field cell (§4.2).
 pub const MOMENT_CHANNELS: u32 = 32;
 

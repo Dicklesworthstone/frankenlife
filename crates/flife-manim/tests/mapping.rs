@@ -222,6 +222,9 @@ fn mappings_parse_and_name_themselves() {
     }
     assert!("chemistry".parse::<ColorMapping>().is_err());
     assert_eq!("raw".parse::<Look>(), Ok(Look::Raw));
+    for look in [Look::Glow, Look::Raw, Look::Sphere] {
+        assert_eq!(look.name().parse::<Look>(), Ok(look));
+    }
     assert!("bloom".parse::<Look>().is_err());
     assert_eq!(Style::default().mapping, ColorMapping::Lineage);
 }
@@ -977,17 +980,17 @@ fn every_registered_colour_mapping_is_drawn_and_configurable() {
 #[test]
 fn affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale() {
     assert_eq!(AFFINITY_GAIN.to_bits(), (128.0_f64 / 3.0).sqrt().to_bits());
-    assert_eq!(AFFINITY_LIGHTNESS, [0.74, 0.10]);
-    assert_eq!(AFFINITY_CHROMA, 0.16);
-    // No affinity: a neutral grey at OKLab lightness 0.74.
+    assert_eq!(AFFINITY_LIGHTNESS, [0.62, 0.12]);
+    assert_eq!(AFFINITY_CHROMA, 0.26);
+    // No affinity: a neutral grey at OKLab lightness 0.62.
     let grey = affinity_rgb8([0.0; 3]);
     assert_eq!(grey[0], grey[1]);
     assert_eq!(grey[1], grey[2]);
-    assert!((oklab(grey)[0] - 0.74).abs() < 0.01, "{grey:?}");
+    assert!((oklab(grey)[0] - 0.62).abs() < 0.01, "{grey:?}");
     assert_eq!(affinity_rgb8([f32::NAN, f32::INFINITY, 0.0]), grey);
     // In the gamut, a colour is the recorded formula's OKLab point, up to the
     // byte rounding: gain √(128/3), the radial squash, then lightness
-    // 0.74 + 0.10 s₃ and chroma 0.16 (s₁, s₂).
+    // 0.62 + 0.12 s₃ and chroma 0.26 (s₁, s₂).
     for q in [
         [0.05_f32, 0.0, 0.0],
         [0.0, -0.05, 0.0],
@@ -998,7 +1001,7 @@ fn affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale() {
         let g = q.map(|c| f64::from(c) * (128.0_f64 / 3.0).sqrt());
         let squash = (1.0 + g.iter().map(|c| c * c).sum::<f64>()).sqrt();
         let s = g.map(|c| c / squash);
-        let expected = [0.74 + 0.10 * s[2], 0.16 * s[0], 0.16 * s[1]];
+        let expected = [0.62 + 0.12 * s[2], 0.26 * s[0], 0.26 * s[1]];
         let got = oklab(affinity_rgb8(q));
         for (component, (g, e)) in got.iter().zip(expected).enumerate() {
             assert!(
@@ -1024,7 +1027,7 @@ fn affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale() {
         );
         let [light, ..] = oklab(affinity_rgb8([0.0, 0.0, magnitude]));
         let [dark, ..] = oklab(affinity_rgb8([0.0, 0.0, -magnitude]));
-        assert!(light > 0.75 && dark < 0.73, "{magnitude}: {light} {dark}");
+        assert!(light > 0.63 && dark < 0.61, "{magnitude}: {light} {dark}");
     }
     // Stronger along one direction is more chromatic, and never wraps.
     let chroma = |q: [f32; 3]| {
@@ -1047,10 +1050,10 @@ fn affinity_is_a_fixed_projection_with_its_recorded_matrix_and_scale() {
                 let q = [x, y, z].map(|c| f32::from(c) / 4.0);
                 if q.iter().map(|c| c * c).sum::<f32>() <= 1.0 {
                     let rgb = affinity_rgb8(q);
-                    assert!(lightness(rgb) > 45.0, "{q:?}");
+                    assert!(lightness(rgb) > 40.0, "{q:?}");
                     let [l, a, b] = oklab(rgb);
                     assert!(a.hypot(b) <= AFFINITY_CHROMA + 0.012, "{q:?}: {rgb:?}");
-                    assert!((0.62..0.86).contains(&l), "{q:?}: {rgb:?} at {l}");
+                    assert!((0.49..0.75).contains(&l), "{q:?}: {rgb:?} at {l}");
                 }
             }
         }

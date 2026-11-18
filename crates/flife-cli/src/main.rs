@@ -342,7 +342,7 @@ enum Command {
         /// default is the configuration's `[presentation] color_mapping`.
         #[arg(long)]
         color: Option<ColorMapping>,
-        /// `glow` (the default) or `raw`.
+        /// `glow` (the default), `raw`, or `sphere`: raw with each organism lit as a sphere.
         #[arg(long, default_value = "glow")]
         look: Look,
         /// Draw organism density per screen bin instead of dots.
@@ -435,7 +435,8 @@ enum Command {
         /// configuration's `[presentation] color_mapping`.
         #[arg(long)]
         color: Option<ColorMapping>,
-        /// `glow` (the default) or `raw`: no halos and a linear grey field.
+        /// `glow` (the default), `raw`: no halos and a linear grey field, or `sphere`: raw with
+        /// each organism lit as a sphere at its body size.
         #[arg(long, default_value = "glow")]
         look: Look,
         /// Draw organism density per screen bin instead of dots.

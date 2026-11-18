@@ -157,7 +157,7 @@ fn corner_colours(cells: [u32; 2], plane: &[f32], scale: f64, look: Look) -> Vec
                     let [r, g, b] = palette(display_value(mean as f32, scale));
                     Srgb::from_rgb8(r, g, b).to_linear(1.0)
                 }
-                Look::Raw => {
+                Look::Raw | Look::Sphere => {
                     let grey = raw_value(mean as f32, scale);
                     LinearRgba {
                         r: grey,
@@ -330,7 +330,7 @@ fn composed_colours(field: &FieldTexture, scale: f64, look: Look) -> Vec<[f64; 3
             };
             let level = match look {
                 Look::Glow => display_value(mean as f32, scale),
-                Look::Raw => raw_value(mean as f32, scale),
+                Look::Raw | Look::Sphere => raw_value(mean as f32, scale),
             };
             let [r, g, b] = affinity_rgb8(q);
             let hue = Srgb::from_rgb8(r, g, b).to_linear(1.0);
@@ -378,7 +378,7 @@ fn component_colours(
             };
             let level = match look {
                 Look::Glow => display_value(mean as f32, scale),
-                Look::Raw => raw_value(mean as f32, scale),
+                Look::Raw | Look::Sphere => raw_value(mean as f32, scale),
             };
             let [r, g, b] = component_rgb8(value);
             let hue = Srgb::from_rgb8(r, g, b).to_linear(1.0);

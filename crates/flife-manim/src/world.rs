@@ -18,7 +18,7 @@ use crate::cloud::check_min_radius_points;
 use crate::mapping::{Look, Particles, Style};
 use crate::{
     DensityLayer, FieldLayer, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HudText, ParticleCloud,
-    REGION_SEGMENTS, Region, SELECTION_RING_SEGMENTS, Viewport, density_bins, dot_radius_at_least,
+    REGION_SEGMENTS, Region, SELECTION_RING_SEGMENTS, Viewport, density_bins, dot_radius_with,
     hud_glyphs, hud_plate, pick, region_outline, selection_ring_around,
 };
 
@@ -338,7 +338,7 @@ impl WorldView {
             Some(position) => Some(selection_ring_around(
                 &viewport,
                 position,
-                dot_radius_at_least(&viewport, self.cloud.min_radius_points()),
+                self.cloud.radius_on(&viewport),
             )?),
             None => None,
         };
@@ -427,7 +427,7 @@ impl WorldView {
             Some(position) => Some(selection_ring_around(
                 &self.viewport,
                 position,
-                dot_radius_at_least(&self.viewport, points),
+                dot_radius_with(&self.viewport, points, self.cloud.body_radius()),
             )?),
             None => None,
         };
@@ -440,6 +440,34 @@ impl WorldView {
     #[must_use]
     pub const fn point_radius(&self) -> f64 {
         self.cloud.min_radius_points()
+    }
+
+    /// Draw each organism at `radius` world units, its body (a contact
+    /// model's half diameter) in place of [`DOT_RADIUS`](crate::DOT_RADIUS),
+    /// within the same on-screen bounds.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `radius` is finite and
+    /// positive; as [`selection_ring_around`]. The view is unchanged on
+    /// error.
+    pub fn set_body_radius(&mut self, radius: f64) -> Result<(), CoreError> {
+        if !(radius.is_finite() && radius > 0.0) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "body radius",
+                detail: format!("{radius:?} world units is not a positive radius"),
+            });
+        }
+        let ring = match self.selected_position() {
+            Some(position) => Some(selection_ring_around(
+                &self.viewport,
+                position,
+                dot_radius_with(&self.viewport, self.cloud.min_radius_points(), radius),
+            )?),
+            None => None,
+        };
+        self.cloud.set_body_radius(radius, &self.viewport);
+        self.ring = ring;
+        Ok(())
     }
 
     /// The configured bloom at the viewport's pixel density, whatever the
@@ -455,7 +483,7 @@ impl WorldView {
     pub const fn frame_bloom(&self) -> Option<&Bloom> {
         match self.style.look {
             Look::Glow => self.bloom.as_ref(),
-            Look::Raw => None,
+            Look::Raw | Look::Sphere => None,
         }
     }
 
@@ -673,7 +701,7 @@ impl WorldView {
                 self.ring = Some(selection_ring_around(
                     &self.viewport,
                     position,
-                    dot_radius_at_least(&self.viewport, self.cloud.min_radius_points()),
+                    self.cloud.radius_on(&self.viewport),
                 )?);
                 self.selected = organism;
             }

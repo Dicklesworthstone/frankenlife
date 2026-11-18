@@ -135,8 +135,8 @@ struct Cli {
     /// `[presentation] color_mapping`. Keys 1 to 6 change it.
     #[arg(long)]
     color: Option<ColorMapping>,
-    /// `glow` (the default) or `raw`: no halos and a linear grey field. R
-    /// switches.
+    /// `glow` (the default), `raw`: no halos and a linear grey field, or
+    /// `sphere`: raw with each organism lit as a sphere. R cycles them.
     #[arg(long, default_value = "glow")]
     look: Look,
     /// Draw organism density per screen bin instead of dots. D switches.

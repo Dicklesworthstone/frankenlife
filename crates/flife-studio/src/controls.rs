@@ -673,7 +673,8 @@ impl Controls {
             KEY_R => {
                 self.style.look = match self.style.look {
                     Look::Glow => Look::Raw,
-                    Look::Raw => Look::Glow,
+                    Look::Raw => Look::Sphere,
+                    Look::Sphere => Look::Glow,
                 };
             }
             KEY_D => {

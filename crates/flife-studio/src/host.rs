@@ -1572,6 +1572,9 @@ pub(crate) fn studio_view(
             .then_some(presentation.bloom_strength),
     )?;
     view.set_point_radius(presentation.point_radius_pixels)?;
+    if let Some(radius) = flife_engine::contact::body_radius(config)? {
+        view.set_body_radius(radius)?;
+    }
     view.set_preparation_threads(frame_preparation_threads());
     Ok(view)
 }

@@ -320,6 +320,9 @@ fn draw(
             .then_some(presentation.bloom_strength),
     )?;
     view.set_point_radius(presentation.point_radius_pixels)?;
+    if let Some(radius) = flife_engine::contact::body_radius(config)? {
+        view.set_body_radius(radius)?;
+    }
     drop(founding);
     let (memory, encoders) = admit(&world, options, &publisher, &view)?;
     install(&mut world, options.controllers, memory.backend)?;

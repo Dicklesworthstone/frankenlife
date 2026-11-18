@@ -60,7 +60,7 @@ pub fn density_level(count: u32, scale: f64, look: Look) -> f64 {
     let count = f64::from(count);
     let level = match look {
         Look::Glow => count.ln_1p() / scale.ln_1p(),
-        Look::Raw => count / scale,
+        Look::Raw | Look::Sphere => count / scale,
     };
     level.clamp(0.0, 1.0)
 }
@@ -198,7 +198,7 @@ impl DensityLayer {
             let count = self.counts[cell];
             let level = density_level(count, self.scale, style.look);
             match style.look {
-                Look::Raw => LinearRgba {
+                Look::Raw | Look::Sphere => LinearRgba {
                     r: level,
                     g: level,
                     b: level,

@@ -290,6 +290,10 @@ pub enum Look {
     /// The raw diagnostic view (plan §2.3): no halos or other blending
     /// around the dots, and the field in linear grey.
     Raw,
+    /// Raw, with each dot lit as a sphere (FrankenManim's true-dot shading)
+    /// at the organism's body size: no halos, no bloom, the field in linear
+    /// grey.
+    Sphere,
 }
 
 impl Look {
@@ -299,6 +303,7 @@ impl Look {
         match self {
             Self::Glow => "glow",
             Self::Raw => "raw",
+            Self::Sphere => "sphere",
         }
     }
 }
@@ -310,7 +315,8 @@ impl FromStr for Look {
         match text {
             "glow" => Ok(Self::Glow),
             "raw" => Ok(Self::Raw),
-            _ => Err(format!("`{text}` is not a look: glow or raw")),
+            "sphere" => Ok(Self::Sphere),
+            _ => Err(format!("`{text}` is not a look: glow, raw or sphere")),
         }
     }
 }
@@ -772,17 +778,20 @@ pub const TOPOLOGY_PALETTE: [[u8; 3]; 8] = [
 pub const AFFINITY_GAIN: f64 = 6.531_972_647_421_808;
 
 /// The OKLab lightness of an organism with no affinity, and how far the
-/// third coordinate moves it either way.
-pub const AFFINITY_LIGHTNESS: [f64; 2] = [0.74, 0.10];
+/// third coordinate moves it either way. With [`AFFINITY_CHROMA`], chosen
+/// so that a world's colours span the reference screenshots' lit pixels
+/// (median OKLab lightness 0.50, chroma to 0.20 at the 90th percentile).
+pub const AFFINITY_LIGHTNESS: [f64; 2] = [0.62, 0.12];
 
 /// The OKLab chroma the first two coordinates approach at full strength.
-pub const AFFINITY_CHROMA: f64 = 0.16;
+pub const AFFINITY_CHROMA: f64 = 0.26;
 
 /// The colour of affinity coordinates `q`. They are scaled by
 /// [`AFFINITY_GAIN`] to `g` and squashed radially to `s = g / √(1 + |g|²)`,
 /// so `|s| < 1` and nothing refits. Then OKLab
-/// `L = 0.74 + 0.10 s₃`, `a = 0.16 s₁`, `b = 0.16 s₂` is converted to sRGB,
-/// each channel clamped to the gamut. No affinity is a neutral grey; the
+/// `L = 0.62 + 0.12 s₃`, `a = 0.26 s₁`, `b = 0.26 s₂` is converted to sRGB;
+/// a colour outside the gamut keeps its lightness and hue and takes the most
+/// chroma that fits. No affinity is a neutral grey; the
 /// hue turns with the direction in the first two coordinates, and opposite
 /// directions take opposite hues. A non-finite coordinate counts as 0.
 #[must_use]
@@ -798,12 +807,31 @@ pub fn affinity_rgb8(q: [f32; 3]) -> [u8; 3] {
     let squash = (1.0 + g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
     let s = g.map(|c| c / squash);
     let [lightness, swing] = AFFINITY_LIGHTNESS;
-    oklab_to_srgb(Oklab {
-        l: lightness + swing * s[2],
-        a: AFFINITY_CHROMA * s[0],
-        b: AFFINITY_CHROMA * s[1],
-    })
-    .to_rgb8()
+    let l = lightness + swing * s[2];
+    let at = |k: f64| {
+        oklab_to_srgb(Oklab {
+            l,
+            a: k * AFFINITY_CHROMA * s[0],
+            b: k * AFFINITY_CHROMA * s[1],
+        })
+    };
+    let inside = |c: Srgb| [c.r, c.g, c.b].iter().all(|v| (0.0..=1.0).contains(v));
+    let full = at(1.0);
+    if inside(full) {
+        return full.to_rgb8();
+    }
+    // Outside the gamut: the most chroma that fits at this lightness and
+    // hue, by bisection (the grey at k = 0 always fits).
+    let (mut low, mut high) = (0.0_f64, 1.0_f64);
+    for _ in 0..24 {
+        let middle = 0.5 * (low + high);
+        if inside(at(middle)) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    at(low).to_rgb8()
 }
 
 /// `t ∈ [0, 1]` along evenly spaced sRGB `stops`, interpolated in sRGB

@@ -661,6 +661,9 @@ fn draw(
         .then_some(model.presentation.bloom_strength);
     view.set_bloom(bloom)?;
     view.set_point_radius(model.presentation.point_radius_pixels)?;
+    if let Some(radius) = flife_engine::contact::body_radius(config)? {
+        view.set_body_radius(radius)?;
+    }
     let fitted = Viewport::fit(epoch.extent(), options.size)?;
     let camera = match options.selection {
         Selection::Region(disk) => {

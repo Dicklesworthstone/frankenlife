@@ -6,9 +6,10 @@ mod common;
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_manim::{
-    DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, LINEAGE_PALETTE, MAXIMUM_ZOOM,
-    ParticleCloud, Viewport, WorldView, density_bins, dot_radius, dot_radius_at_least, hex_rgb,
-    lineage_color, lineage_slot, selection_ring, selection_ring_around,
+    DOT_RADIUS, DOT_RADIUS_MAX_POINTS, DOT_RADIUS_MIN_POINTS, LINEAGE_PALETTE, Look, MAXIMUM_ZOOM,
+    ParticleCloud, SPHERE_SHADING, Style, Viewport, WorldView, density_bins, dot_radius,
+    dot_radius_at_least, hex_rgb, lineage_color, lineage_slot, selection_ring,
+    selection_ring_around,
 };
 use fmn_render::ThreeDDraw;
 
@@ -380,5 +381,68 @@ fn sizes_in_points_look_the_same_on_a_2x_screen() -> Result<(), CoreError> {
         two.set_pixels_per_point(f64::NAN),
         Err(CoreError::NumericalInvalid { .. })
     ));
+    Ok(())
+}
+
+#[test]
+#[expect(clippy::float_cmp, reason = "radii are compared bit for bit")]
+fn a_body_radius_sizes_every_dot_and_the_sphere_look_lights_them() -> Result<(), CoreError> {
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    // 640 px over 32 world units: 20 px per unit, so the world radius binds.
+    let mut view = WorldView::for_epoch(&epoch, [640, 640], [0, 0, 0])?;
+    view.show(&epoch)?;
+    assert_eq!(dots(view.cloud().draws())[0].radius, DOT_RADIUS);
+    let id = OrganismId::new(epoch.ids()[3]);
+    assert_eq!(view.select(Some(id))?, Some(id));
+    let position = view.selected_position().expect("drawn");
+
+    // A contact model's body: half its diameter, at once and on every show.
+    view.set_body_radius(0.2)?;
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.radius == 0.2)
+    );
+    assert!(ring_around(&view, position, 0.2)?);
+    view.show(&epoch)?;
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.radius == 0.2)
+    );
+    // The on-screen floor still binds a body smaller than it.
+    view.set_body_radius(0.01)?;
+    assert_eq!(
+        dots(view.cloud().draws())[0].radius,
+        DOT_RADIUS_MIN_POINTS / 20.0
+    );
+    for refused in [0.0, -0.1, f64::NAN, f64::INFINITY] {
+        assert!(view.set_body_radius(refused).is_err(), "{refused}");
+    }
+    view.set_body_radius(0.2)?;
+
+    // Raw dots are unlit; the sphere look lights each one, and only that.
+    assert!(
+        dots(view.cloud().draws())
+            .iter()
+            .all(|dot| dot.shading == [0.0; 3])
+    );
+    let flat = summary(view.cloud().draws());
+    view.set_style(Style {
+        look: Look::Sphere,
+        ..view.style()
+    });
+    view.show(&epoch)?;
+    let lit = dots(view.cloud().draws());
+    assert!(lit.iter().all(|dot| dot.shading == SPHERE_SHADING));
+    assert_eq!(
+        summary(view.cloud().draws()),
+        flat,
+        "same centres, radii, colours"
+    );
+    assert!(view.cloud().halos().is_empty(), "no halos");
+    assert!(view.frame_bloom().is_none(), "no bloom");
     Ok(())
 }

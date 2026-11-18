@@ -75,8 +75,9 @@ use flife_core::ids::{
 use flife_core::ledger::{CompensatedSum, Ledger, LedgerLog};
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::{
-    FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
-    FIELD_ECOLOGY_V1_UNGATED_MOTION,
+    FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
+    FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
+    FIELD_ECOLOGY_V1_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_UNGATED_MOTION,
 };
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
@@ -104,6 +105,7 @@ use flife_neural::{
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition};
+use crate::contact::ContactWork;
 use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
 use crate::emission::{EmissionPolicy, EmissionSettlement};
 use crate::inspect::{
@@ -417,7 +419,8 @@ struct Rules {
 
 /// Which `field-ecology-v1` model a world runs: the baseline, one of
 /// FL-041's ablation models (plan §15.3, §21.6), or a motion variant, each
-/// changing exactly one rule.
+/// changing exactly one rule; or the contact model (plan §5.4), which adds
+/// one, and its two ablations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVariant {
     /// `field-ecology-v1`.
@@ -432,6 +435,15 @@ pub enum ModelVariant {
     /// `field-ecology-v1-ungated-motion`: §5.4's response gain `g_u` is 1,
     /// not the tick's uptake ratio.
     UngatedMotion,
+    /// `field-ecology-v1-contact`: the baseline with soft-disk contact
+    /// ([`crate::contact`]).
+    Contact,
+    /// `field-ecology-v1-contact-chemistry-only`: contact, with actions
+    /// decoded from an all-zero raw output.
+    ContactChemistryOnly,
+    /// `field-ecology-v1-contact-fresh-offspring`: contact, with a newborn's
+    /// genome a founder's drawn at its own identity.
+    ContactFreshOffspring,
 }
 
 impl ModelVariant {
@@ -445,11 +457,38 @@ impl ModelVariant {
             FIELD_ECOLOGY_V1_CHEMISTRY_ONLY => Ok(Self::ChemistryOnly),
             FIELD_ECOLOGY_V1_FRESH_OFFSPRING => Ok(Self::FreshOffspring),
             FIELD_ECOLOGY_V1_UNGATED_MOTION => Ok(Self::UngatedMotion),
+            FIELD_ECOLOGY_V1_CONTACT => Ok(Self::Contact),
+            FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY => Ok(Self::ContactChemistryOnly),
+            FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING => Ok(Self::ContactFreshOffspring),
             other => Err(CoreError::UnknownAlgorithm {
                 role: "model",
                 name: other.to_owned(),
             }),
         }
+    }
+}
+
+impl ModelVariant {
+    /// Whether actions decode from an all-zero raw output (the
+    /// chemistry-only controls).
+    #[must_use]
+    pub const fn decides_from_zero(self) -> bool {
+        matches!(self, Self::ChemistryOnly | Self::ContactChemistryOnly)
+    }
+
+    /// Whether a newborn's genome is drawn fresh (the inheritance controls).
+    #[must_use]
+    pub const fn fresh_offspring(self) -> bool {
+        matches!(self, Self::FreshOffspring | Self::ContactFreshOffspring)
+    }
+
+    /// Whether survivors are displaced by soft-disk contact.
+    #[must_use]
+    pub const fn contact(self) -> bool {
+        matches!(
+            self,
+            Self::Contact | Self::ContactChemistryOnly | Self::ContactFreshOffspring
+        )
     }
 }
 
@@ -459,11 +498,10 @@ impl Rules {
     /// `field-ecology-v1-ungated-motion`.
     fn response_gain(&self, absorbed: f64) -> Result<f64, CoreError> {
         let ratio = uptake_ratio(absorbed, self.step, self.uptake_capacity)?;
-        Ok(match self.variant {
-            ModelVariant::UngatedMotion => 1.0,
-            ModelVariant::Baseline | ModelVariant::ChemistryOnly | ModelVariant::FreshOffspring => {
-                ratio
-            }
+        Ok(if self.variant == ModelVariant::UngatedMotion {
+            1.0
+        } else {
+            ratio
         })
     }
 
@@ -567,6 +605,8 @@ struct Scratch {
     recycling: Deposits,
     survivors: Vec<Organism>,
     deaths: Vec<Death>,
+    /// The contact models' buffers; empty under every other model.
+    contact: ContactWork,
 }
 
 /// Phases 3 and 4 for one organism: what it observed, and its held or newly
@@ -1399,6 +1439,7 @@ impl World {
                 scratch.recycling.allocated_bytes(),
                 capacity_bytes(&scratch.survivors),
                 capacity_bytes(&scratch.deaths),
+                scratch.contact.allocated_bytes(),
                 capacity_bytes(&self.controllers.outputs),
                 capacity_bytes(&self.controllers.by_row),
                 capacity_bytes(&self.sensors.queries),
@@ -1885,6 +1926,7 @@ impl World {
             recycling,
             survivors,
             deaths,
+            contact,
         } = scratch;
         let from = *tick;
         let to = from.next()?;
@@ -2098,15 +2140,14 @@ impl World {
             grid: &rules.grid,
             reproduction: &rules.reproduction,
             mutator: &mutator,
-            offspring: match rules.variant {
-                ModelVariant::FreshOffspring => Offspring::Fresh {
+            offspring: if rules.variant.fresh_offspring() {
+                Offspring::Fresh {
                     catalog: &rules.catalog,
                     limits: &rules.limits,
                     initial_scale: rules.initial_scale,
-                },
-                ModelVariant::Baseline
-                | ModelVariant::ChemistryOnly
-                | ModelVariant::UngatedMotion => Offspring::Inherited,
+                }
+            } else {
+                Offspring::Inherited
             },
             capacity: rules.capacity,
         };
@@ -2190,14 +2231,29 @@ impl World {
         let mut organisms = CompensatedSum::ZERO;
         let seconds = step.seconds_per_tick();
         let mut emitted = 0;
-        for organism in working.iter() {
+        // The contact models displace every survivor from the settled
+        // positions, before any moves (crate::contact).
+        let contacted = if rules.variant.contact() {
+            contact_displacements(rules, working, contact)?;
+            Some(&contact.displacements)
+        } else {
+            None
+        };
+        for (index, organism) in working.iter().enumerate() {
             emitted += usize::from(organism.emitted);
             match organism.vitality.fate()? {
                 Fate::Survives => {
                     let energy = organism.budget.remaining();
                     organisms.add(energy);
+                    let position = match contacted.and_then(|moves| moves.get(index)) {
+                        Some(&[dx, dy]) if dx != 0.0 || dy != 0.0 => rules.grid.wrap_position([
+                            organism.position[0] + dx,
+                            organism.position[1] + dy,
+                        ])?,
+                        _ => organism.position,
+                    };
                     survivors.push(Organism {
-                        position: organism.position,
+                        position,
                         velocity: organism.velocity,
                         energy,
                         energy_change_rate: (energy - organism.committed.energy) / seconds,
@@ -2450,6 +2506,11 @@ impl Scratch {
             recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
             survivors: reserved(rows, "survivors")?,
             deaths: reserved(rows, "deaths")?,
+            contact: if rules.variant.contact() {
+                ContactWork::with_capacity(&rules.grid, contact_diameter(rules)?, rows)?
+            } else {
+                ContactWork::default()
+            },
         })
     }
 }
@@ -3079,11 +3140,10 @@ fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
 /// The raw outputs a held output decodes from: the controller's, widened,
 /// or none under the chemistry-only variant.
 fn raw_outputs(rules: &Rules, outputs: &[f32; ACTION_WIDTH]) -> [f64; ACTION_WIDTH] {
-    match rules.variant {
-        ModelVariant::ChemistryOnly => [0.0; ACTION_WIDTH],
-        ModelVariant::Baseline | ModelVariant::FreshOffspring | ModelVariant::UngatedMotion => {
-            widen(outputs)
-        }
+    if rules.variant.decides_from_zero() {
+        [0.0; ACTION_WIDTH]
+    } else {
+        widen(outputs)
     }
 }
 
@@ -3941,6 +4001,40 @@ impl Stages for Reference<'_> {
             .reproduction
             .propose(&rules.rng, parent, tick, &organism.actions, budget)
     }
+}
+
+/// The contact models' body diameter: the child placement radius.
+fn contact_diameter(rules: &Rules) -> Result<f64, CoreError> {
+    let diameter = rules.reproduction.rules().offset_radius;
+    if diameter.is_finite() && diameter > 0.0 {
+        Ok(diameter)
+    } else {
+        Err(CoreError::NumericalInvalid {
+            quantity: "reproduction.child_position_offset_radius",
+            detail: format!(
+                "{diameter:?}: a contact model's body diameter is this radius, which must be positive"
+            ),
+        })
+    }
+}
+
+/// Every working organism's contact displacement into `work`, from the
+/// settled positions of those that survive the tick.
+fn contact_displacements(
+    rules: &Rules,
+    working: &[Working],
+    work: &mut ContactWork,
+) -> Result<(), CoreError> {
+    work.positions.clear();
+    work.ids.clear();
+    work.alive.clear();
+    for organism in working {
+        work.positions.push(organism.position);
+        work.ids.push(organism.committed.id.get());
+        work.alive
+            .push(matches!(organism.vitality.fate()?, Fate::Survives));
+    }
+    work.relax(&rules.grid, contact_diameter(rules)?)
 }
 
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,

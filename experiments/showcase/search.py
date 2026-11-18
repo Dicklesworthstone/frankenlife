@@ -178,6 +178,9 @@ def config_text(changes: dict, name: str, side: int = SIDE, seed: int = 42) -> s
     }
     left = {key: literal(v) for key, v in changes.items() if key != ("model", "model")}
     left.update(fixed)
+    # A contact model's [contact] table (plan §5.4) is not in the preset: it is appended.
+    contact = {key: left.pop(("contact", key)) for key in
+               ["diameter", "stiffness", "adhesion", "adhesion_range"] if ("contact", key) in left}
     section = None
     out = []
     for line in text.split("\n"):
@@ -198,6 +201,8 @@ def config_text(changes: dict, name: str, side: int = SIDE, seed: int = 42) -> s
     ]:
         assert text.count(old) == 1, old
         text = text.replace(old, new, 1)
+    if contact:
+        text = text.rstrip("\n") + "\n\n[contact]\n" + "".join(f"{k} = {v}\n" for k, v in contact.items())
     return text
 
 

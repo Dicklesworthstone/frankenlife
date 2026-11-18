@@ -2237,7 +2237,7 @@ impl World {
         // The contact models displace every survivor from the settled
         // positions, before any moves (crate::contact).
         let contacted = if let Some(bodies) = &rules.contact {
-            contact_displacements(rules, bodies, population, working, contact)?;
+            contact_displacements(rules, bodies, population, working, contact, lanes.len())?;
             Some(&contact.displacements)
         } else {
             None
@@ -4034,6 +4034,7 @@ fn contact_displacements(
     population: &Population,
     working: &[Working],
     work: &mut ContactWork,
+    workers: usize,
 ) -> Result<(), CoreError> {
     work.positions.clear();
     work.ids.clear();
@@ -4051,7 +4052,7 @@ fn contact_displacements(
                 .push(unit_affinity(genome.traits().affinity()));
         }
     }
-    work.relax(&rules.grid, bodies)
+    work.relax(&rules.grid, bodies, workers)
 }
 
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,

@@ -1,0 +1,52 @@
+{
+ "sample": "a10",
+ "model": "field-ecology-v1-contact",
+ "lineage": [
+  "c4-x1",
+  "ct-d45",
+  "a0",
+  "a10"
+ ],
+ "how": {
+  "ct-d45": "contact sweep of c4-x1 (tissue.json) under field-ecology-v1-contact: body diameter and child offset 0.30, 0.45, 0.60, 0.80; 0.45 chosen by eye",
+  "a0": "ct-d45 with its body as a [contact] table: diameter 0.45, stiffness 0.5, no adhesion (scale.py distance 1.62)",
+  "a10": "adhesion sweep of a0: adhesion 0, 0.2, 0.5, 1.0 at reaches 1.5 and 2 diameters, stiffness 0.5 and 1; then reaches 1.25 and 1.75, mutation x4, diameter 0.35, food x2: adhesion 1.0 at a reach of 1.5 closest (scale.py distance 0.69 at tick 1,600)"
+ },
+ "params": {
+  "model.model": "field-ecology-v1-contact",
+  "world.diffusion": 0.4779470806843635,
+  "world.decay_per_second": 0.08180134709590955,
+  "sources.count": 64,
+  "sources.sigma_world_units": 7.48417383668699,
+  "sources.power_per_source": 4941.027094879585,
+  "sources.path_speed": 6.410313494046391,
+  "chemistry.toxicity_sensitivity": 0.08004322448442866,
+  "chemistry.discrimination_threshold": 0.2650172307387295,
+  "chemistry.affinity_gain": 14.526273238772319,
+  "chemistry.maximum_efficiency": 0.7770586814539951,
+  "chemistry.uptake_capacity_per_second": 2.9492327937803626,
+  "chemistry.uptake_half_saturation_density": 0.8053068970026153,
+  "chemistry.motion_response_norm_limit": 100.46031806268545,
+  "chemistry.maximum_acceleration": 19.89613931091116,
+  "chemistry.drag_per_second": 0.6083757943786642,
+  "chemistry.maximum_speed": 13.704534025211911,
+  "emission.maximum_fractional_rate_per_second": 0.9794496121644378,
+  "emission.transfer_efficiency": 0.95,
+  "emission.gate_threshold": 0.3550015047013456,
+  "costs.basal_energy_per_second": 0.6907773019435253,
+  "costs.motion_energy_per_speed_squared_second": 0.0004516873698736408,
+  "reproduction.minimum_parent_energy_before_attempt": 1.7783495135752738,
+  "reproduction.maximum_attempt_rate_per_second": 1.8104069618199279,
+  "reproduction.cooldown_seconds": 0.0642813376330189,
+  "death.residual_energy_recycle_fraction": 0.5251868376968575,
+  "population.initial_count": 10954,
+  "population.maximum_count": 177536,
+  "population.capacity_policy": "refuse-excess-births-v1",
+  "sensors.energy_density_scale": 8.0,
+  "reproduction.child_position_offset_radius": 0.45,
+  "contact.diameter": 0.45,
+  "contact.stiffness": 0.5,
+  "contact.adhesion": 1.0,
+  "contact.adhesion_range": 1.5
+ }
+}

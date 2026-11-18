@@ -29,7 +29,9 @@
 //!
 //! Each sum runs over the neighbour bins, at least the reach wide, in a fixed
 //! order, `(dy, dx)` from `(−1, −1)` to `(1, 1)`, and within a bin in identity
-//! order, so a world's contact displacement is the same at any worker count.
+//! order. Every body's sum is its own, so the bodies are split among the
+//! workers and a world's contact displacement is the same at any worker
+//! count.
 
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::FieldGrid;
@@ -38,6 +40,9 @@ use flife_genome::AFFINITY_TERMS;
 /// The most bins a side may have; a smaller reach uses coarser bins, which
 /// find the same neighbours.
 const MAXIMUM_BINS_PER_SIDE: usize = 2048;
+
+/// The fewest bodies a worker sums; smaller worlds use fewer workers.
+const MINIMUM_BODIES_PER_WORKER: usize = 4096;
 
 /// A contact model's `[contact]` table.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,11 +209,17 @@ impl ContactWork {
         .fold(0_u64, u64::saturating_add)
     }
 
-    /// [`relax`] on the gathered survivors, into [`Self::displacements`].
+    /// [`relax`] on the gathered survivors, into [`Self::displacements`],
+    /// on up to `workers` threads.
     ///
     /// # Errors
     /// As [`relax`].
-    pub fn relax(&mut self, grid: &FieldGrid, rules: &ContactRules) -> Result<(), CoreError> {
+    pub fn relax(
+        &mut self,
+        grid: &FieldGrid,
+        rules: &ContactRules,
+        workers: usize,
+    ) -> Result<(), CoreError> {
         let Self {
             positions,
             ids,
@@ -229,6 +240,7 @@ impl ContactWork {
             },
             displacements,
             scratch,
+            workers,
         )
     }
 }
@@ -312,8 +324,23 @@ pub struct Bodies<'a> {
     pub affinities: Option<&'a [[f32; AFFINITY_TERMS]]>,
 }
 
+/// The minimum-image difference `to − from` along a side of `length`, for
+/// coordinates already checked to lie in `[0, length)`: the arithmetic of
+/// [`flife_field::minimum_image`], without its check.
+fn image(from: f64, to: f64, length: f64, half: f64) -> f64 {
+    let difference = to - from;
+    if difference >= half {
+        difference - length
+    } else if difference < -half {
+        difference + length
+    } else {
+        difference
+    }
+}
+
 /// Every survivor's contact displacement, written into `displacements`
-/// (aligned with the bodies; zero where a body dies).
+/// (aligned with the bodies; zero where a body dies), the bodies split
+/// among up to `workers` threads.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] for misaligned inputs, or no affinities when
@@ -325,6 +352,7 @@ pub fn relax(
     bodies: Bodies<'_>,
     displacements: &mut Vec<[f64; 2]>,
     scratch: &mut ContactScratch,
+    workers: usize,
 ) -> Result<(), CoreError> {
     rules.check()?;
     let Bodies {
@@ -417,10 +445,15 @@ pub fn relax(
         0.0
     };
     let reach_distance = diameter * range;
-    for index in 0..count {
+    // A pair whose squared distance is beyond this is beyond reach whatever
+    // the rounding of its distance; nearer pairs are judged by the distance.
+    let beyond = reach_distance * reach_distance * (1.0 + 1e-9);
+    let (half_width, half_height) = (0.5 * width, 0.5 * height);
+    let (starts, members, bins) = (&*starts, &*members, &*bins);
+    let sum = |index: usize| -> [f64; 2] {
         let bin = bins[index];
         if bin == usize::MAX {
-            continue;
+            return [0.0, 0.0];
         }
         let here = positions[index];
         let (bx, by) = (bin % bins_x, bin / bins_x);
@@ -435,7 +468,12 @@ pub fn relax(
                         continue;
                     }
                     // From the other body to this one.
-                    let [dx, dy] = grid.displacement(positions[other], here)?;
+                    let there = positions[other];
+                    let dx = image(there[0], here[0], width, half_width);
+                    let dy = image(there[1], here[1], height, half_height);
+                    if dx * dx + dy * dy > beyond {
+                        continue;
+                    }
                     let distance = dx.hypot(dy);
                     let push = if distance < diameter {
                         push_factor * (diameter - distance)
@@ -468,9 +506,42 @@ pub fn relax(
             let scale = limit / length;
             sum = [sum[0] * scale, sum[1] * scale];
         }
-        displacements[index] = sum;
+        sum
+    };
+    let fill = |first: usize, out: &mut [[f64; 2]]| {
+        for (offset, slot) in out.iter_mut().enumerate() {
+            *slot = sum(first + offset);
+        }
+    };
+    let used = workers
+        .max(1)
+        .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
+        .max(1);
+    if used == 1 {
+        fill(0, displacements);
+        return Ok(());
     }
-    Ok(())
+    let length = count.div_ceil(used);
+    let mut chunks = displacements.chunks_mut(length);
+    let head = chunks.next().unwrap_or_default();
+    let fill = &fill;
+    std::thread::scope(|scope| {
+        let others: Vec<_> = chunks
+            .enumerate()
+            .map(|(index, chunk)| scope.spawn(move || fill((index + 1) * length, chunk)))
+            .collect();
+        fill(0, head);
+        let mut result = Ok(());
+        for other in others {
+            if other.join().is_err() && result.is_ok() {
+                result = Err(CoreError::StateConflict {
+                    operation: "contact",
+                    detail: "a contact worker panicked".to_owned(),
+                });
+            }
+        }
+        result
+    })
 }
 
 #[cfg(test)]
@@ -508,6 +579,7 @@ mod tests {
             },
             &mut out,
             &mut ContactScratch::default(),
+            1,
         )
         .expect("contact");
         out
@@ -548,6 +620,7 @@ mod tests {
             },
             &mut out,
             &mut ContactScratch::default(),
+            1,
         )
         .expect("contact");
         assert_eq!(out, vec![[0.0, 0.0]; 2]);
@@ -635,6 +708,7 @@ mod tests {
                 },
                 &mut out,
                 &mut ContactScratch::default(),
+                1,
             )
             .is_err()
         );
@@ -698,6 +772,56 @@ mod tests {
             }
             assert!((out[index][0] - sum[0]).abs() < 1e-12, "{index}");
             assert!((out[index][1] - sum[1]).abs() < 1e-12, "{index}");
+        }
+    }
+
+    #[test]
+    fn the_displacement_is_the_same_at_any_worker_count() {
+        let grid = grid(64.0, 64);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1_u64 << 53) as f64
+        };
+        let count = 3 * MINIMUM_BODIES_PER_WORKER + 17;
+        let positions: Vec<[f64; 2]> = (0..count).map(|_| [next() * 64.0, next() * 64.0]).collect();
+        let affinities: Vec<[f32; AFFINITY_TERMS]> = (0..count)
+            .map(|_| unit_affinity(&std::array::from_fn(|_| next() - 0.5)))
+            .collect();
+        let ids: Vec<u64> = (0..count as u64).collect();
+        let alive: Vec<bool> = (0..count).map(|index| index % 11 != 3).collect();
+        let rules = ContactRules {
+            diameter: 0.5,
+            stiffness: 0.5,
+            adhesion: 1.0,
+            range: 1.5,
+        };
+        let at = |workers: usize| {
+            let mut out = Vec::new();
+            relax(
+                &grid,
+                &rules,
+                Bodies {
+                    positions: &positions,
+                    ids: &ids,
+                    alive: &alive,
+                    affinities: Some(&affinities),
+                },
+                &mut out,
+                &mut ContactScratch::default(),
+                workers,
+            )
+            .expect("contact");
+            out.iter()
+                .flat_map(|d| d.map(f64::to_bits))
+                .collect::<Vec<u64>>()
+        };
+        let one = at(1);
+        assert!(one.iter().any(|&bits| bits != 0));
+        for workers in [2, 3, 4, 16] {
+            assert_eq!(at(workers), one, "{workers} workers");
         }
     }
 }

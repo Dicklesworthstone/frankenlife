@@ -21,7 +21,11 @@ const SAMPLE: &str = include_str!("../../../experiments/showcase/contact.json");
 /// The preset's declared changes from the tissue preset, outside `[contact]`.
 const DECLARED: [(&str, &str, &str); 3] = [
     ("name", "\"tissue-world\"", "\"contact-world\""),
-    ("model", "\"field-ecology-v1\"", "\"field-ecology-v1-contact\""),
+    (
+        "model",
+        "\"field-ecology-v1\"",
+        "\"field-ecology-v1-contact\"",
+    ),
     ("reproduction.child_position_offset_radius", "0.25", "0.45"),
 ];
 

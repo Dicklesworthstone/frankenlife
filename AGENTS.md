@@ -637,9 +637,11 @@ The repository holds:
   `presets/desktop-world.toml` (100,000 founders, F16), the last two from FL-034's declared experiments E1 and E2
   (`experiments/fl034/README.md`); `presets/showcase-world.toml`, `presets/colony-world.toml` and
   `presets/tissue-world.toml` (Δt = 1/32 s), chosen by an outer search whose procedure
-  `experiments/showcase/README.md` states, and `presets/contact-world.toml`, the website film's world, which
+  `experiments/showcase/README.md` states, `presets/contact-world.toml`, which
   continues that search under the registered contact model `field-ecology-v1-contact` (plan §5.4: bodies
-  that push apart and alike chemistry that adheres, declared in a `[contact]` table);
+  that push apart and alike chemistry that adheres, declared in a `[contact]` table), and
+  `presets/confluent-world.toml`, the website film's world, `contact-world` on a field four times finer,
+  fed to its ceiling and with scattered offspring (stage E);
   `experiments/` holds each declared experiment's base, specifications and records.
 
 `flife-probes` qualifies the dependency closure. Its probes cover the closure itself, the Asupersync runtime and

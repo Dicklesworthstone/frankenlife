@@ -448,7 +448,16 @@ of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With a
 8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
 frame rate.
 
-`presets/contact-world.toml` is the world the website's film shows. It is `tissue-world`, below, under a
+`presets/confluent-world.toml` is the world the website's film shows. It is `contact-world`, below, with the
+same rules at another scale. Its field is four times finer than `contact-world`'s against its organisms'
+spacing (320 × 320 cells on an 80-unit torus), with every length the organisms and the field act on divided by
+four. Food is plentiful, so its 262,144 organisms sit at the ceiling, and children land up to 2.5 units from
+their parent. Its tissue fills the torus: coloured by founder lineage, saturated domains of one colour, each
+with its own labyrinth, foam or packed spheres. Against the corrected image statistic of the reference
+screenshots it is the nearest world the searches have scored, on seed 42 and on held-out seeds.
+`experiments/showcase/README.md` (stage E) has every trial and what the choice does not show.
+
+`presets/contact-world.toml` was the film's world before it. It is `tissue-world`, below, under a
 different model, `field-ecology-v1-contact`. Plan §5.4 gives the contact model one added rule: every
 organism is a body 0.45 world units across. After each tick, overlapping bodies push apart, and bodies
 within 1.5 diameters pull together by the square of how alike their heritable chemical affinities are.

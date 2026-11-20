@@ -515,7 +515,7 @@ while running or paused, and change only the picture:
 | Key | View |
 |---|---|
 | 1 to 6 | colour by lineage, energy (dark to bright), generation (logarithmic), motion (hue for heading, strength for speed), topology (catalog member) or chemical affinity (grey for none; like chemistry, like colour) |
-| R | the raw look: no halos, linear grey field |
+| R | the next look: glow, then raw (no halos, linear grey field), then sphere (raw, each dot lit as a sphere at its body size) |
 | D | density per screen bin instead of dots |
 | F | show or hide the field |
 | C | the field's chemical composition instead of its energy (hue for chemistry, in the affinity mapping's colours, brightness for energy), then its chosen component, then its energy again |

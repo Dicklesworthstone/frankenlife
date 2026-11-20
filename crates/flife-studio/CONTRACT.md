@@ -107,7 +107,7 @@ directory, with its pending commands and its checkpoint chain.
     | → or `.` (auto-repeat steps again), while paused | `Step` |
     | Esc, or ⌘W | `Close` (once) |
     | 1 to 6 | colour by lineage, energy, generation, motion, topology or chemical affinity |
-    | R | switch the glow and raw looks |
+    | R | the next look: glow, raw, then sphere |
     | D | switch dots and density |
     | F | show or hide the field |
     | C | show the field's energy, its chemical composition or its chosen component, in turn (FL-019) |
@@ -534,9 +534,9 @@ presentation state, not scientific state.
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
-  - The style keys (FL-019): 1 to 6 choose the six mappings in order, R, D and F switch the look, particles and
-    field, C the field's mapping (energy, composition, then the chosen component, its code pinned to
-    `kVK_ANSI_C`), and auto-repeat or ⌘ with a digit chooses nothing.
+  - The style keys (FL-019): 1 to 6 choose the six mappings in order, R cycles the look (glow, raw, sphere),
+    D and F switch particles and field, C the field's mapping (energy, composition, then the chosen component,
+    its code pinned to `kVK_ANSI_C`), and auto-repeat or ⌘ with a digit chooses nothing.
   - The bracket keys (FL-019, codes pinned to `kVK_ANSI_LeftBracket` and `kVK_ANSI_RightBracket`): `]` first shows
     component 0, then steps to 1 and 2, `[` back through 0 to 31; C cycles energy, composition and component 31;
     from energy `[` shows 31 again without stepping; repeat and ⌘ step nothing; only the field's mapping changed;

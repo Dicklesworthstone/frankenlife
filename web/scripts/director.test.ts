@@ -2,7 +2,7 @@
 // is known.
 import { describe, expect, test } from "bun:test";
 
-import { activities, direct } from "./director";
+import { type CameraKey, activities, cardFrame, direct } from "./director";
 
 const GRID = 128;
 const EXTENT: [number, number] = [256, 256];
@@ -87,5 +87,27 @@ describe("direct", () => {
     for (let i = 1; i < firsts.length; i++) {
       expect(distance(firsts[i]!, firsts[i - 1]!)).toBeGreaterThan(64);
     }
+  });
+});
+
+describe("cardFrame", () => {
+  const whole: [number, number] = [128, 128];
+  const key = (tick: number, zoom: number): CameraKey => ({ tick, center: whole, zoom });
+  const ticks = Array.from({ length: 41 }, (_, frame) => 2400 + 8 * frame);
+
+  test("is the middle frame of the closest shot", () => {
+    const keys = [key(2400, 1), key(2480, 1), key(2496, 1.6), key(2560, 1.6), key(2576, 3), key(2656, 3), key(2720, 1)];
+    // The zoom-3 shot holds from 2,576 to 2,656: its middle, 2,616, is frame 27.
+    expect(cardFrame(keys, ticks)).toBe(27);
+  });
+
+  test("takes the first of two shots at the highest zoom", () => {
+    const keys = [key(2400, 1), key(2480, 3), key(2560, 3), key(2576, 2), key(2640, 2), key(2656, 3), key(2720, 3)];
+    expect(cardFrame(keys, ticks)).toBe(15);
+  });
+
+  test("is the first frame for a path that never zooms in", () => {
+    expect(cardFrame([key(2400, 1), key(2720, 1)], ticks)).toBe(0);
+    expect(cardFrame([], ticks)).toBe(0);
   });
 });

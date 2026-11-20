@@ -25,7 +25,8 @@ export type FilmManifest = {
     encode: string[];
   };
   poster: MediaFile & { frame: number };
-  social: MediaFile & { width: number; height: number };
+  /** The social card: a 1200 × 630 crop of film frame `frame` (scripts/media.ts). */
+  social: MediaFile & { width: number; height: number; frame: number };
   world: {
     /** The repository preset whose configuration hash the run has. */
     preset: string | null;

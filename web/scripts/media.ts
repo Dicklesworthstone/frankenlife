@@ -31,7 +31,10 @@
 //   little from one frame to the next: a raw-dot film of 301 frames needed
 //   CRF 24 (23.6 MB; 28 blurred the dots into blobs). The energy field is
 //   smooth and cheap, so the showcase film is CRF 20 at 10.1 MB for 401
-//   frames. The poster and the social card are the first frame.
+//   frames. The poster is the first frame. The social card, under the
+//   site's share image (app/opengraph-image.tsx), is cut from the middle
+//   frame of the film's closest shot (director.ts's `cardFrame`), where
+//   single bodies show; a film of the whole torus uses its first frame.
 // - Each file is named by its SHA-256 and copied into public/media/, which
 //   is outside git like every FrankenLife recording (AGENTS.md); the
 //   committed manifest records each hash and how it was made.
@@ -44,7 +47,15 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync,
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { type CameraKey, DIRECTOR_RULE, type DirectorOptions, activities, direct, luminance } from "./director";
+import {
+  type CameraKey,
+  DIRECTOR_RULE,
+  type DirectorOptions,
+  activities,
+  cardFrame,
+  direct,
+  luminance,
+} from "./director";
 
 const WEB = fileURLToPath(new URL("..", import.meta.url));
 const REPO = resolve(WEB, "..");
@@ -324,8 +335,16 @@ const first = join(frames, "frame-000000.png");
 run("ffmpeg", ["-y", "-loglevel", "error", "-framerate", fps, "-i", join(frames, "frame-%06d.png"), ...encode, video]);
 const poster = join(work, "poster.jpg");
 run("ffmpeg", ["-y", "-loglevel", "error", "-i", first, "-q:v", "3", poster]);
+const card = provenance.camera
+  ? cardFrame(
+      provenance.camera.keys,
+      shown.map((record) => record.tick as number),
+    )
+  : 0;
+const cardSource = join(frames, `frame-${String(card).padStart(6, "0")}.png`);
+if (!existsSync(cardSource)) fail(`the social card's frame ${cardSource} is missing`);
 const social = join(work, "social.jpg");
-run("ffmpeg", ["-y", "-loglevel", "error", "-i", first, "-vf", "scale=1200:-1,crop=1200:630", "-q:v", "3", social]);
+run("ffmpeg", ["-y", "-loglevel", "error", "-i", cardSource, "-vf", "scale=1200:-1,crop=1200:630", "-q:v", "3", social]);
 
 const controllers = (end.controllers as { backend?: string } | undefined)?.backend ?? "unknown";
 const manifest = {
@@ -339,7 +358,7 @@ const manifest = {
     encode,
   },
   poster: { ...publish(poster, "poster", "jpg"), frame: 0 },
-  social: { ...publish(social, "social", "jpg"), width: 1200, height: 630 },
+  social: { ...publish(social, "social", "jpg"), width: 1200, height: 630, frame: card },
   world: {
     preset,
     name: world.name,

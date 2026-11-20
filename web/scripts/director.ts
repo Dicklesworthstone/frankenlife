@@ -210,3 +210,23 @@ export function direct(
   push(ticks.length - 1, whole, 1);
   return keys;
 }
+
+/**
+ * The frame the social card is cut from: the middle of the film's closest
+ * shot (the first shot at the path's highest zoom), where single bodies
+ * show. `ticks` are the film's frames' ticks, in order. A path that never
+ * leaves the whole torus gives the first frame.
+ */
+export function cardFrame(keys: readonly CameraKey[], ticks: readonly number[]): number {
+  const zoom = Math.max(1, ...keys.map((key) => key.zoom));
+  const first = zoom > 1 ? keys.findIndex((key) => key.zoom === zoom) : -1;
+  if (first < 0) return 0;
+  let last = first;
+  while (keys[last + 1]?.zoom === zoom) last += 1;
+  const middle = ((keys[first]?.tick ?? 0) + (keys[last]?.tick ?? 0)) / 2;
+  let best = 0;
+  ticks.forEach((tick, frame) => {
+    if (Math.abs(tick - middle) < Math.abs((ticks[best] ?? 0) - middle)) best = frame;
+  });
+  return best;
+}

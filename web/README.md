@@ -72,12 +72,12 @@ digest at the last frame is in the manifest (`world.to.digest`) and in the rende
 
 ## The share images
 
-`app/opengraph-image.tsx` (1200 × 630) and `app/twitter-image.tsx` (1200 × 600) are drawn at build time
-by `lib/og-card.tsx` with `next/og`. Their picture is the social card: a 1200 × 630 crop of the middle
-frame of the film's closest shot (`cardFrame` in `scripts/director.ts`; the manifest's `social.frame`),
-darkened beside the words. The organism count and the caption's world and tick come from the manifest.
-The build fetches the card's fonts (Inter, JetBrains Mono) from Google Fonts, as `next/font` does, and
-encodes the card as a JPEG of about 250 KB with ffmpeg, since a PNG of the frame is over 2 MB, more than
+`app/opengraph-image.tsx` (1200 × 630) and `app/twitter-image.tsx` (1200 × 600) are drawn at build time by
+`lib/og-card.tsx` with `next/og`. Their picture is the social card: a 1200 × 630 crop of the middle frame of
+the film's closest shot (`cardFrame` in `scripts/director.ts`; the manifest's `social.frame`), darkened
+beside the words. The organism count and the caption's world and tick come from the manifest. The build
+fetches the card's fonts (Inter, JetBrains Mono) from Google Fonts, as `next/font` does, and encodes the
+card as a JPEG (about 180 KB for this film) with ffmpeg, since a PNG of the frame is over 2 MB, more than
 some link previewers fetch. Next.js links both from the page's metadata with a content hash, so
 `app/layout.tsx` names no image itself.
 

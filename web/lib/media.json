@@ -1,9 +1,9 @@
 {
   "schema": "frankenlife.website-media.v1",
   "video": {
-    "src": "/media/film-b27888799b1d.mp4",
-    "sha256": "b27888799b1d5e73f58daa57eb653633a2a4599c5c125ac55e6a427774c5a807",
-    "bytes": 23017922,
+    "src": "/media/film-f30f39cea739.mp4",
+    "sha256": "f30f39cea7391591f2705b68e21e69da2d0ebb51ac3694eb5ff5964acfbe10a5",
+    "bytes": 23016433,
     "width": 1080,
     "height": 1080,
     "fps": 30,
@@ -37,11 +37,12 @@
     "frame": 0
   },
   "social": {
-    "src": "/media/social-b1f14b59d70c.jpg",
-    "sha256": "b1f14b59d70c7ccd63560c042e73527ad6ba0107cfb6c058b3b7cc2f561f9d0c",
-    "bytes": 709603,
+    "src": "/media/social-75012943e50e.jpg",
+    "sha256": "75012943e50eac6b300b3a61f662815505b8a54904a7cdf5e3f08cbb03ae276a",
+    "bytes": 426199,
     "width": 1200,
-    "height": 630
+    "height": 630,
+    "frame": 184
   },
   "world": {
     "preset": "presets/confluent-world.toml",

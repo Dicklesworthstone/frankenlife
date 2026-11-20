@@ -409,8 +409,29 @@ pub fn resolve_uptake(
     demands: &[Demand],
     grants: &mut Grants,
 ) -> Result<UptakeSummary, CoreError> {
+    resolve_uptake_on_workers(field, demands, grants, 1)
+}
+
+/// The fewest packets one thread of [`resolve_uptake_on_workers`] resolves.
+const UPTAKE_PACKETS_PER_RUN: usize = 2_048;
+
+/// [`resolve_uptake`] with per-cell grant resolution split across up to
+/// `workers` threads (this one and scoped workers joined before returning).
+/// Cells are independent once packets are grouped by cell; the host sums
+/// [`Tally`] in ascending cell order afterwards, so every grant, debit and
+/// summary bit is identical at any worker count, and zero steady-state
+/// allocations occur for non-hotspot cells (`<= 32` packets).
+///
+/// # Errors
+/// As [`resolve_uptake`], or [`CoreError::StateConflict`] if a worker panicked.
+pub fn resolve_uptake_on_workers(
+    field: &FieldState,
+    demands: &[Demand],
+    grants: &mut Grants,
+    workers: usize,
+) -> Result<UptakeSummary, CoreError> {
     grants.reset();
-    let result = resolve_into(field, demands, grants);
+    let result = resolve_into(field, demands, grants, workers);
     if result.is_err() {
         grants.reset();
     }
@@ -421,10 +442,11 @@ fn resolve_into(
     field: &FieldState,
     demands: &[Demand],
     grants: &mut Grants,
+    workers: usize,
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
     stage(&grid, demands, grants)?;
-    group_packets(&grid, grants)?;
+    group_packets(&grid, grants, workers)?;
 
     let energy = field.energy();
     let Grants {
@@ -435,16 +457,132 @@ fn resolve_into(
         rank,
         ..
     } = grants;
+    let items = packets.len();
+    let buckets = bins.buckets();
+    let offsets = bins.offsets();
+    let runs = workers.min(items / UPTAKE_PACKETS_PER_RUN).max(1);
     let mut tally = Tally::default();
-    for (cell, range) in bins.occupied() {
-        let value = cell_energy(energy, cell)?;
-        let length = range.len();
-        let Some(group) = packets.get_mut(range) else {
-            continue;
+
+    if runs == 1 {
+        for (cell, range) in bins.occupied() {
+            let value = cell_energy(energy, cell)?;
+            let length = range.len();
+            let Some(group) = packets.get_mut(range) else {
+                continue;
+            };
+            let debit = resolve_cell(group, cell, value, shares, rank)?;
+            tally.record(&debit, length);
+            debits.push(debit);
+        }
+    } else {
+        // Partition cells into `runs` contiguous ranges of roughly equal
+        // packet count, count occupied cells per range, and pre-size `debits`
+        // (already reserved to capacity in `Grants::with_capacity`).
+        let mut cell_bounds = Vec::with_capacity(runs + 1);
+        for run in 0..=runs {
+            if run == runs {
+                cell_bounds.push(buckets);
+            } else {
+                let target = items / runs * run + items % runs * run / runs;
+                let cell = offsets
+                    .partition_point(|&at| (at as usize) < target)
+                    .min(buckets);
+                cell_bounds.push(cell);
+            }
+        }
+        let mut occ_counts = Vec::with_capacity(runs);
+        let mut total_occupied = 0_usize;
+        for pair in cell_bounds.windows(2) {
+            let mut count = 0_usize;
+            for cell in pair[0]..pair[1] {
+                if offsets[cell] < offsets[cell + 1] {
+                    count += 1;
+                }
+            }
+            occ_counts.push(count);
+            total_occupied += count;
+        }
+        debits.resize(
+            total_occupied,
+            CellDebit {
+                cell: 0,
+                energy_before: 0.0,
+                energy_after: 0.0,
+                demanded: 0.0,
+                granted: 0.0,
+                contended: false,
+            },
+        );
+        // Split `packets` and `debits` into disjoint per-worker slices.
+        struct Slice<'a> {
+            cells: std::ops::Range<usize>,
+            pkt_base: usize,
+            packets: &'a mut [GrantPacket],
+            debits: &'a mut [CellDebit],
+        }
+        let mut slices = Vec::with_capacity(runs);
+        let mut rem_pkts = packets.as_mut_slice();
+        let mut rem_debits = debits.as_mut_slice();
+        for (pair, &occ) in cell_bounds.windows(2).zip(&occ_counts) {
+            let pkt_base = offsets.get(pair[0]).map_or(items, |&v| v as usize);
+            let pkt_end = offsets.get(pair[1]).map_or(items, |&v| v as usize);
+            let pkt_len = pkt_end.saturating_sub(pkt_base);
+            let (pkt_head, pkt_tail) = rem_pkts.split_at_mut(pkt_len);
+            rem_pkts = pkt_tail;
+            let (deb_head, deb_tail) = rem_debits.split_at_mut(occ);
+            rem_debits = deb_tail;
+            slices.push(Slice {
+                cells: pair[0]..pair[1],
+                pkt_base,
+                packets: pkt_head,
+                debits: deb_head,
+            });
+        }
+
+        let work = |slice: &mut Slice<'_>| -> Result<(), CoreError> {
+            let mut local_shares = Vec::new();
+            let mut local_rank = Vec::new();
+            let mut out_idx = 0_usize;
+            for cell in slice.cells.clone() {
+                let first = offsets[cell] as usize;
+                let end = offsets[cell + 1] as usize;
+                if first >= end {
+                    continue;
+                }
+                let value = cell_energy(energy, cell)?;
+                let local_start = first - slice.pkt_base;
+                let local_end = end - slice.pkt_base;
+                let group = &mut slice.packets[local_start..local_end];
+                let debit = resolve_cell(group, cell, value, &mut local_shares, &mut local_rank)?;
+                slice.debits[out_idx] = debit;
+                out_idx += 1;
+            }
+            Ok(())
         };
-        let debit = resolve_cell(group, cell, value, shares, rank)?;
-        tally.record(&debit, length);
-        debits.push(debit);
+        let work = &work;
+        let mut iter = slices.iter_mut();
+        let head = iter.next();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = iter.map(|s| scope.spawn(move || work(s))).collect();
+            let mut first_err = head.map_or(Ok(()), work);
+            for handle in handles {
+                let joined = handle.join().unwrap_or_else(|_| {
+                    Err(CoreError::StateConflict {
+                        operation: "resolve uptake",
+                        detail: "an uptake worker panicked".to_owned(),
+                    })
+                });
+                if first_err.is_ok() {
+                    first_err = joined;
+                }
+            }
+            first_err
+        })?;
+
+        for debit in debits.iter() {
+            let len = (offsets[debit.cell + 1] - offsets[debit.cell]) as usize;
+            tally.record(debit, len);
+        }
     }
     Ok(finish(grid, demands.len(), grants, tally))
 }
@@ -457,6 +595,27 @@ fn stage(grid: &FieldGrid, demands: &[Demand], grants: &mut Grants) -> Result<()
             required: u64::try_from(demands.len()).unwrap_or(u64::MAX),
             available: u64::try_from(grants.organisms).unwrap_or(u64::MAX),
         });
+    }
+    let strictly_ascending = demands
+        .windows(2)
+        .all(|pair| pair[0].organism < pair[1].organism);
+    if strictly_ascending {
+        for (index, demand) in demands.iter().enumerate() {
+            let stencil = footprint(grid, demand)?;
+            for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+                let requested = demand.amount * weight;
+                if requested > 0.0 {
+                    grants.staged.push(GrantPacket {
+                        cell,
+                        organism: demand.organism,
+                        demand: index,
+                        requested,
+                        granted: 0.0,
+                    });
+                }
+            }
+        }
+        return Ok(());
     }
     grants.identities.extend(
         demands
@@ -515,7 +674,7 @@ fn stage(grid: &FieldGrid, demands: &[Demand], grants: &mut Grants) -> Result<()
 
 /// Group the staged packets by cell, in identity order within each cell,
 /// into [`Grants::packets`].
-fn group_packets(grid: &FieldGrid, grants: &mut Grants) -> Result<(), CoreError> {
+fn group_packets(grid: &FieldGrid, grants: &mut Grants, workers: usize) -> Result<(), CoreError> {
     let Grants {
         staged,
         bins,
@@ -528,11 +687,60 @@ fn group_packets(grid: &FieldGrid, grants: &mut Grants) -> Result<(), CoreError>
     bins.group(cells, staged.len(), |at| {
         staged.get(at).map_or(usize::MAX, |packet| packet.cell)
     })?;
-    packets.extend(
-        bins.order()
-            .iter()
-            .filter_map(|&at| staged.get(at as usize).copied()),
-    );
+    let order = bins.order();
+    let items = order.len();
+    let runs = workers.min(items / UPTAKE_PACKETS_PER_RUN).max(1);
+    if runs == 1 {
+        packets.extend(
+            order
+                .iter()
+                .filter_map(|&at| staged.get(at as usize).copied()),
+        );
+    } else {
+        packets.resize(
+            items,
+            GrantPacket {
+                cell: 0,
+                organism: OrganismId::new(0),
+                demand: 0,
+                requested: 0.0,
+                granted: 0.0,
+            },
+        );
+        let staged_ref: &[GrantPacket] = staged;
+        let chunk = items.div_ceil(runs);
+        let gather = |ord_chunk: &[u32], dst_chunk: &mut [GrantPacket]| {
+            for (&at, dst) in ord_chunk.iter().zip(dst_chunk) {
+                if let Some(&pkt) = staged_ref.get(at as usize) {
+                    *dst = pkt;
+                }
+            }
+        };
+        let gather = &gather;
+        let mut ord_iter = order.chunks(chunk);
+        let mut dst_iter = packets.chunks_mut(chunk);
+        let head = ord_iter.next().zip(dst_iter.next());
+        let panicked = std::thread::scope(|scope| {
+            let handles: Vec<_> = ord_iter
+                .zip(dst_iter)
+                .map(|(o, d)| scope.spawn(move || gather(o, d)))
+                .collect();
+            if let Some((o, d)) = head {
+                gather(o, d);
+            }
+            let mut panicked = false;
+            for h in handles {
+                panicked |= h.join().is_err();
+            }
+            panicked
+        });
+        if panicked {
+            return Err(CoreError::StateConflict {
+                operation: "group uptake packets",
+                detail: "a packet gather worker panicked".to_owned(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -666,13 +874,17 @@ fn check_energy(cell: usize, energy: f32) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Cells with at most this many competing packets resolve on the stack with
+/// zero heap allocation.
+const STACK_CELL_PACKETS: usize = 32;
+
 /// Resolve one cell's packets, which are in identity order.
 fn resolve_cell(
     packets: &mut [GrantPacket],
     cell: usize,
     energy: f32,
-    shares: &mut Vec<Share>,
-    rank: &mut Vec<usize>,
+    shares_buf: &mut Vec<Share>,
+    rank_buf: &mut Vec<usize>,
 ) -> Result<CellDebit, CoreError> {
     check_energy(cell, energy)?;
     let mut demand = CompensatedSum::ZERO;
@@ -691,56 +903,80 @@ fn resolve_cell(
         ..
     } = at;
 
-    shares.clear();
+    let len = packets.len();
+    let mut stack_shares = [Share {
+        quanta: 0,
+        remainder: 0.0,
+    }; STACK_CELL_PACKETS];
+    let mut stack_rank = [0_usize; STACK_CELL_PACKETS];
+    let (shares, rank): (&mut [Share], &mut [usize]) = if len <= STACK_CELL_PACKETS {
+        (&mut stack_shares[..len], &mut stack_rank[..len])
+    } else {
+        shares_buf.clear();
+        shares_buf.resize(
+            len,
+            Share {
+                quanta: 0,
+                remainder: 0.0,
+            },
+        );
+        rank_buf.clear();
+        rank_buf.resize(len, 0);
+        (&mut shares_buf[..len], &mut rank_buf[..len])
+    };
+
     let mut floors = 0_u64;
-    for packet in packets.iter() {
+    for (i, packet) in packets.iter().enumerate() {
         let ideal = packet.requested * scale;
         let floor = ideal.floor();
         // `ideal ≤ n_c (1 + rounding) < 2^25`.
         let share = floor as u64;
         floors += share;
-        shares.push(Share {
+        shares[i] = Share {
             quanta: share,
             remainder: ideal - floor,
-        });
+        };
     }
-    rank.clear();
-    rank.extend(0..packets.len());
-    if floors < target {
-        // Largest remainder first; ties to the lower identity.
-        rank.sort_unstable_by(|&a, &b| {
-            shares[b]
-                .remainder
-                .total_cmp(&shares[a].remainder)
-                .then(a.cmp(&b))
-        });
-        let mut deficit = target - floors;
-        while deficit > 0 {
-            for &index in rank.iter() {
-                if deficit == 0 {
-                    break;
-                }
-                shares[index].quanta += 1;
-                deficit -= 1;
-            }
+    if floors != target {
+        for (i, slot) in rank.iter_mut().enumerate() {
+            *slot = i;
         }
-    } else if floors > target {
-        // Smallest remainder first; ties to the higher identity.
-        rank.sort_unstable_by(|&a, &b| {
-            shares[a]
-                .remainder
-                .total_cmp(&shares[b].remainder)
-                .then(b.cmp(&a))
-        });
-        let mut surplus = floors - target;
-        while surplus > 0 {
-            for &index in rank.iter() {
-                if surplus == 0 {
-                    break;
+        if floors < target {
+            // Largest remainder first; ties to the lower identity.
+            rank.sort_unstable_by(|&a, &b| {
+                shares[b]
+                    .remainder
+                    .total_cmp(&shares[a].remainder)
+                    .then(a.cmp(&b))
+            });
+            let mut deficit = target - floors;
+            while deficit > 0 {
+                for &index in rank.iter() {
+                    if deficit == 0 {
+                        break;
+                    }
+                    shares[index].quanta += 1;
+                    deficit -= 1;
                 }
-                if shares[index].quanta > 0 {
-                    shares[index].quanta -= 1;
-                    surplus -= 1;
+            }
+        } else {
+            // Smallest remainder first; ties to the higher identity.
+            rank.sort_unstable_by(|&a, &b| {
+                shares[a]
+                    .remainder
+                    .total_cmp(&shares[b].remainder)
+                    .then(b.cmp(&a))
+            });
+            let mut surplus = floors - target;
+            while surplus > 0 {
+                for &index in rank.iter() {
+                    if surplus == 0 {
+                        break;
+                    }
+                    if shares[index].quanta > 0 {
+                        shares[index].quanta -= 1;
+                        surplus -= 1;
+                    }
                 }
             }
         }
@@ -807,16 +1043,36 @@ pub fn apply_grants_on(
     }
     let debits: &[CellDebit] = &grants.debits;
     let scale = |planes: &mut [f32]| {
-        for plane in planes.chunks_exact_mut(cells.max(1)) {
-            for debit in debits.iter().filter(|debit| debit.granted > 0.0) {
-                let moment = &mut plane[debit.cell];
-                *moment = if debit.energy_after == 0.0 {
-                    0.0
-                } else {
-                    let ratio = f64::from(debit.energy_after) / f64::from(debit.energy_before);
-                    (f64::from(*moment) * ratio) as f32
-                };
+        const CHUNK: usize = 64;
+        let mut batch = [(0_usize, 0.0_f64); CHUNK];
+        let mut batch_len = 0_usize;
+        let flush = |planes: &mut [f32], batch: &[(usize, f64)]| {
+            for plane in planes.chunks_exact_mut(cells.max(1)) {
+                for &(cell, ratio) in batch {
+                    let moment = &mut plane[cell];
+                    *moment = if ratio == 0.0 {
+                        0.0
+                    } else {
+                        (f64::from(*moment) * ratio) as f32
+                    };
+                }
             }
+        };
+        for debit in debits.iter().filter(|debit| debit.granted > 0.0) {
+            let ratio = if debit.energy_after == 0.0 {
+                0.0
+            } else {
+                f64::from(debit.energy_after) / f64::from(debit.energy_before)
+            };
+            batch[batch_len] = (debit.cell, ratio);
+            batch_len += 1;
+            if batch_len == CHUNK {
+                flush(planes, &batch[..batch_len]);
+                batch_len = 0;
+            }
+        }
+        if batch_len > 0 {
+            flush(planes, &batch[..batch_len]);
         }
     };
     let used = workers.clamp(1, CHANNELS);
@@ -1141,7 +1397,7 @@ fn resolve_on(
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
     stage(&grid, demands, grants)?;
-    group_packets(&grid, grants)?;
+    group_packets(&grid, grants, 1)?;
     let energy = field.energy();
     let UptakeWork {
         cells,

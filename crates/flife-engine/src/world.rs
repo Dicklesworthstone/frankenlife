@@ -92,8 +92,8 @@ use flife_field::{
     GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
     SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
     Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
-    advance_field_on, demand, demands_on, initial_source, reduce_field_on, resolve_uptake,
-    resolve_uptake_on, state::CHANNELS,
+    advance_field_on, demand, demands_on, initial_source, reduce_field_on, resolve_uptake_on,
+    resolve_uptake_on_workers, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -102,7 +102,8 @@ use flife_genome::{
 };
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
-    DecodedActions, Intrinsic, Observation, SensorScales, decode, observe, widen,
+    DecodedActions, Intrinsic, Observation, SensorScales, decode, observe, observe_for_controller,
+    widen,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
@@ -118,7 +119,7 @@ use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::measure::{RegionMeasurement, measure};
 use crate::motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
-use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
+use crate::population::{Arrangement, CheckedTick, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityPolicy,
     CapacityShortfall, Identities, Offspring, ParentState, PopulationQuota, RefusedBirth,
@@ -299,6 +300,7 @@ struct Staged {
     tick: Tick,
     epoch: ResourceEpoch,
     events: u64,
+    checked: CheckedTick,
     births: Vec<Entrant>,
     ledger: EnergyLedger,
     quota: GenomeQuota,
@@ -354,24 +356,18 @@ impl Candidate<'_> {
             ancestry.admits(&staged.report)?;
         }
         let mut released_slots = Vec::new();
-        if world.controllers.backend.is_some() {
-            world.population.commit_tick_releasing(
-                staged.tick,
-                &world.scratch.survivors,
-                &world.scratch.deaths,
-                &mut staged.births,
-                &mut staged.quota,
-                &mut released_slots,
-            )?;
-        } else {
-            world.population.commit_tick(
-                staged.tick,
-                &world.scratch.survivors,
-                &world.scratch.deaths,
-                &mut staged.births,
-                &mut staged.quota,
-            )?;
-        }
+        let released = world
+            .controllers
+            .backend
+            .is_some()
+            .then_some(&mut released_slots);
+        world.population.apply_checked_tick(
+            staged.checked,
+            &world.scratch.survivors,
+            &mut staged.births,
+            &mut staged.quota,
+            released,
+        )?;
         if !released_slots.is_empty()
             && let Some(backend) = world.controllers.backend.as_mut()
         {
@@ -2049,7 +2045,7 @@ impl World {
 
         // Phases 3 and 4: the pyramid, then every remaining organism's
         // observation and its due or forced evaluation, in identity order.
-        let view = pyramid.build(observed)?;
+        let view = pyramid.build_on(observed, field_work.workers())?;
         let (sampled, sensor_failure) = sample_with(population, rows, &view, observed, sensors);
         decide_with(
             rules,
@@ -2422,7 +2418,8 @@ impl World {
         let closure = tick_ledger.close(closing)?;
         let mut next_ledger = ledger.clone();
         let cumulative = next_ledger.commit(&closure)?;
-        population.check_tick(to, survivors, deaths, &entrants, &next_quota)?;
+        let checked =
+            population.check_tick_staged(to, survivors, deaths, &entrants, &next_quota)?;
 
         let count =
             u64::try_from(deaths.len() + entrants.len()).map_err(|_| CoreError::Overflow {
@@ -2456,6 +2453,7 @@ impl World {
             tick: to,
             epoch: next_epoch,
             events: end,
+            checked,
             births: entrants,
             ledger: next_ledger,
             quota: next_quota,
@@ -3078,7 +3076,7 @@ fn uptake_with(
             Err(error) => {
                 report.reference_ticks = report.reference_ticks.saturating_add(1);
                 demands_on_lanes(field, &rule, working, demands, lanes)?;
-                let summary = resolve_uptake(field, demands, grants)?;
+                let summary = resolve_uptake_on_workers(field, demands, grants, lanes.len())?;
                 report.failure = Some(error.to_string());
                 *backend = None;
                 return Ok(summary);
@@ -3086,7 +3084,7 @@ fn uptake_with(
         }
     }
     demands_on_lanes(field, &rule, working, demands, lanes)?;
-    resolve_uptake(field, demands, grants)
+    resolve_uptake_on_workers(field, demands, grants, lanes.len())
 }
 
 /// Phase 5's demands on the reference, on the lanes: `demands` gets each
@@ -3116,20 +3114,6 @@ fn demands_on_lanes(
         }
         Ok(())
     })
-}
-
-/// Phase 3 for one organism (§8.1): its observation at its sensing scale,
-/// from the backend's `raw` sample if there is one.
-fn observation(
-    rules: &Rules,
-    population: &Population,
-    view: &PyramidView<'_>,
-    organism: &Organism,
-    raw: Option<&RawSample>,
-    from: Tick,
-) -> Result<Observation, CoreError> {
-    let raw = blended(population, view, organism, raw)?;
-    encode(rules, organism, &raw, from)
 }
 
 /// The watched organism's observation in the step from `from` to `to`,
@@ -3199,6 +3183,24 @@ fn encode(
     observe(raw, &intrinsic, &rules.scales)
 }
 
+/// As [`encode`], using [`observe_for_controller`] so the 69 `tanh`-saturated
+/// inputs avoid 13-division F64 `expm1_neg` while preserving every bit after
+/// the controller's F32 input narrowing (and keeping F64 gradients identical).
+fn encode_for_controller(
+    rules: &Rules,
+    organism: &Organism,
+    raw: &RawSample,
+    from: Tick,
+) -> Result<Observation, CoreError> {
+    let intrinsic = Intrinsic {
+        energy: organism.energy,
+        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
+        velocity: organism.velocity,
+        energy_change_per_second: organism.energy_change_rate,
+    };
+    observe_for_controller(raw, &intrinsic, &rules.scales)
+}
+
 /// Whether the organism evaluates its controller for tick `to`: due on its
 /// phase, or forced because it holds no valid output.
 fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
@@ -3235,20 +3237,20 @@ fn finish(
     })
 }
 
-/// Phases 3 and 4 for one organism (§8.1): its observation at its sensing
-/// scale, then its due or forced evaluation, decoded.
-fn decide(
+/// Phases 3 and 4 for one organism (§8.1): its already-sampled raw observation,
+/// encoded for the controller, then its due or forced evaluation, decoded.
+fn decide_from_raw(
     rules: &Rules,
-    population: &Population,
-    view: &PyramidView<'_>,
-    (organism, raw): (&Organism, Option<&RawSample>),
+    genome: &Genome,
+    organism: &Organism,
+    raw: &RawSample,
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
-    let observation = observation(rules, population, view, organism, raw, from)?;
+    let observation = encode_for_controller(rules, organism, raw, from)?;
     let due = due(rules, organism, to);
     let held = if due {
-        let outputs = genome_of(population, organism.id)?
+        let outputs = genome
             .controller(&rules.catalog, &rules.limits)?
             .evaluate(&observation.inputs, controller)?;
         HeldOutput::evaluated(to, outputs)?
@@ -3389,6 +3391,9 @@ fn settle_all(
             transactions,
             ..
         } = lane;
+        let mut live = run
+            .first()
+            .map(|first| population.ascending_from(first.committed.id));
         for (offset, organism) in run.iter_mut().enumerate() {
             packets.clear();
             for (packet, composition) in by_demand.bucket(start + offset).iter().filter_map(|&at| {
@@ -3400,7 +3405,13 @@ fn settle_all(
                     composition: *composition,
                 });
             }
-            let genome = genome_of(population, organism.committed.id)?;
+            let genome = live
+                .as_mut()
+                .and_then(|walk| walk.next(organism.committed.id).0)
+                .ok_or_else(|| CoreError::StateConflict {
+                    operation: "read genome",
+                    detail: format!("{} has no genome", organism.committed.id),
+                })?;
             let mut stages = Reference {
                 traits: genome.traits(),
                 parameters: parameter_count(&rules.catalog, genome)?,
@@ -3443,15 +3454,78 @@ fn compositions_into(
             operation: "compose packets",
             detail: format!("no room for {} compositions", granted.len()),
         })?;
-    let run = |packets: &[GrantPacket], slots: &mut [[f64; CHANNELS]]| {
-        let mut previous: Option<(usize, [f64; CHANNELS])> = None;
-        for (packet, slot) in packets.iter().zip(slots) {
-            let value = match previous {
-                Some((cell, value)) if cell == packet.cell => value,
-                _ => composition(observed, packet.cell)?,
-            };
-            *slot = value;
-            previous = Some((packet.cell, value));
+    let energy_plane = observed.energy();
+    let total_cells = energy_plane.len();
+    let all_data = observed.as_slice();
+    let planar_ok = all_data.len() == (CHANNELS + 1).saturating_mul(total_cells);
+    let run = |packets: &[GrantPacket], slots: &mut [[f64; CHANNELS]]| -> Result<(), CoreError> {
+        if !planar_ok {
+            let mut previous: Option<(usize, [f64; CHANNELS])> = None;
+            for (packet, slot) in packets.iter().zip(slots) {
+                let value = match previous {
+                    Some((cell, value)) if cell == packet.cell => value,
+                    _ => composition(observed, packet.cell)?,
+                };
+                *slot = value;
+                previous = Some((packet.cell, value));
+            }
+            return Ok(());
+        }
+        // Batch up to 32 distinct nonempty cells and read moment planes
+        // plane-by-plane so 512² (1 MiB plane stride) avoids 33-way L1D
+        // cache-set conflict misses while computing the exact same bits.
+        const COMP_BATCH: usize = 32;
+        let mut cells = [0_usize; COMP_BATCH];
+        let mut energies = [0.0_f64; COMP_BATCH];
+        let mut ranges = [(0_usize, 0_usize); COMP_BATCH];
+        let mut batch = [[0.0_f64; CHANNELS]; COMP_BATCH];
+        let mut i = 0_usize;
+        let n = packets.len();
+        while i < n {
+            let mut count = 0_usize;
+            while i < n && count < COMP_BATCH {
+                let cell = packets[i].cell;
+                let &e_raw = energy_plane
+                    .get(cell)
+                    .ok_or_else(|| CoreError::LayoutMismatch {
+                        buffer: "field",
+                        detail: format!("cell {cell} is not in this field"),
+                    })?;
+                let start = i;
+                i += 1;
+                while i < n && packets[i].cell == cell {
+                    i += 1;
+                }
+                let e = f64::from(e_raw);
+                if e > 0.0 {
+                    cells[count] = cell;
+                    energies[count] = e;
+                    ranges[count] = (start, i);
+                    count += 1;
+                } else {
+                    for slot in &mut slots[start..i] {
+                        *slot = [0.0; CHANNELS];
+                    }
+                }
+            }
+            if count > 0 {
+                for (channel, plane) in all_data[total_cells..]
+                    .chunks_exact(total_cells)
+                    .enumerate()
+                    .take(CHANNELS)
+                {
+                    for b in 0..count {
+                        batch[b][channel] = f64::from(plane[cells[b]]) / energies[b];
+                    }
+                }
+                for b in 0..count {
+                    let (start, end) = ranges[b];
+                    let z = batch[b];
+                    for slot in &mut slots[start..end] {
+                        *slot = z;
+                    }
+                }
+            }
         }
         Ok(())
     };
@@ -3517,17 +3591,70 @@ fn decide_all(
     }
     in_runs(rows, lanes, &|start, run, lane| {
         reserve_for(&mut lane.decisions, run.len(), "decisions")?;
-        for (index, organism) in run.iter().enumerate() {
-            let raw = sampled.and_then(|samples| samples.get(start + index));
-            let decision = decide(
-                rules,
-                population,
-                view,
-                (organism, raw),
-                ticks,
-                &mut lane.controller,
-            )?;
-            lane.decisions.push(decision);
+        let mut live = run.first().map(|first| population.ascending_from(first.id));
+        if let Some(samples) = sampled {
+            for (index, organism) in run.iter().enumerate() {
+                let genome = live
+                    .as_mut()
+                    .and_then(|walk| walk.next(organism.id).0)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} has no genome", organism.id),
+                    })?;
+                let raw = match samples.get(start + index) {
+                    Some(raw) => *raw,
+                    None => view.sample(organism.position, genome.traits().sensing_scale())?,
+                };
+                let decision =
+                    decide_from_raw(rules, genome, organism, &raw, ticks, &mut lane.controller)?;
+                lane.decisions.push(decision);
+            }
+            return Ok(());
+        }
+        const SAMPLE_BATCH: usize = 32;
+        let zero_sample = RawSample {
+            values: [0.0; RESPONSE_TERMS],
+            dx: [0.0; RESPONSE_TERMS],
+            dy: [0.0; RESPONSE_TERMS],
+        };
+        let mut queries = [SensorQuery {
+            position: [0.0, 0.0],
+            scale: 1.0,
+        }; SAMPLE_BATCH];
+        let mut raw_samples = [zero_sample; SAMPLE_BATCH];
+        let mut batch_genomes: [Option<&Genome>; SAMPLE_BATCH] = [None; SAMPLE_BATCH];
+        for chunk in run.chunks(SAMPLE_BATCH) {
+            let count = chunk.len();
+            for i in 0..count {
+                let organism = &chunk[i];
+                let genome = live
+                    .as_mut()
+                    .and_then(|walk| walk.next(organism.id).0)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} has no genome", organism.id),
+                    })?;
+                batch_genomes[i] = Some(genome);
+                queries[i] = SensorQuery {
+                    position: organism.position,
+                    scale: genome.traits().sensing_scale(),
+                };
+            }
+            view.sample_batch(&queries[..count], &mut raw_samples[..count])?;
+            for i in 0..count {
+                let Some(genome) = batch_genomes[i] else {
+                    continue;
+                };
+                let decision = decide_from_raw(
+                    rules,
+                    genome,
+                    &chunk[i],
+                    &raw_samples[i],
+                    ticks,
+                    &mut lane.controller,
+                )?;
+                lane.decisions.push(decision);
+            }
         }
         Ok(())
     })
@@ -3628,10 +3755,56 @@ fn decide_batched(
     }
     in_runs(rows, lanes, &|start, run, lane| {
         reserve_for(&mut lane.observed, run.len(), "observations")?;
-        for (index, organism) in run.iter().enumerate() {
-            let raw = sampled.and_then(|samples| samples.get(start + index));
-            let observed = observation(rules, population, view, organism, raw, from)?;
-            lane.observed.push(observed);
+        let mut live = run.first().map(|first| population.ascending_from(first.id));
+        if let Some(samples) = sampled {
+            for (index, organism) in run.iter().enumerate() {
+                let genome = live
+                    .as_mut()
+                    .and_then(|walk| walk.next(organism.id).0)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} has no genome", organism.id),
+                    })?;
+                let raw = match samples.get(start + index) {
+                    Some(raw) => *raw,
+                    None => view.sample(organism.position, genome.traits().sensing_scale())?,
+                };
+                lane.observed
+                    .push(encode_for_controller(rules, organism, &raw, from)?);
+            }
+            return Ok(());
+        }
+        const SAMPLE_BATCH: usize = 32;
+        let zero_sample = RawSample {
+            values: [0.0; RESPONSE_TERMS],
+            dx: [0.0; RESPONSE_TERMS],
+            dy: [0.0; RESPONSE_TERMS],
+        };
+        let mut queries = [SensorQuery {
+            position: [0.0, 0.0],
+            scale: 1.0,
+        }; SAMPLE_BATCH];
+        let mut raw_samples = [zero_sample; SAMPLE_BATCH];
+        for chunk in run.chunks(SAMPLE_BATCH) {
+            let count = chunk.len();
+            for (query, organism) in queries.iter_mut().zip(chunk) {
+                let genome = live
+                    .as_mut()
+                    .and_then(|walk| walk.next(organism.id).0)
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "read genome",
+                        detail: format!("{} has no genome", organism.id),
+                    })?;
+                *query = SensorQuery {
+                    position: organism.position,
+                    scale: genome.traits().sensing_scale(),
+                };
+            }
+            view.sample_batch(&queries[..count], &mut raw_samples[..count])?;
+            for (organism, raw) in chunk.iter().zip(&raw_samples[..count]) {
+                lane.observed
+                    .push(encode_for_controller(rules, organism, raw, from)?);
+            }
         }
         Ok(())
     })?;
@@ -3991,7 +4164,11 @@ impl Stages for Reference<'_> {
         rules: &Rules,
         budget: &mut EnergyBudget,
     ) -> Result<UptakeSettlement, CoreError> {
-        let affinity = Affinity::new(*self.traits.affinity(), &rules.chemistry)?;
+        let affinity = if rules.limits.affinity_norm() <= rules.chemistry.affinity_norm_limit() {
+            Affinity::trusted(*self.traits.affinity())
+        } else {
+            Affinity::new(*self.traits.affinity(), &rules.chemistry)?
+        };
         rules.chemistry.settle(&affinity, self.packets, budget)
     }
 
@@ -4020,7 +4197,12 @@ impl Stages for Reference<'_> {
         budget: &mut EnergyBudget,
     ) -> Result<MotionSettlement, CoreError> {
         let ratio = rules.response_gain(absorbed)?;
-        let response = MotionResponse::new(*self.traits.motion_response(), &rules.motion)?;
+        let response = if rules.limits.motion_response_norm() <= rules.motion.response_norm_limit()
+        {
+            MotionResponse::trusted(*self.traits.motion_response())
+        } else {
+            MotionResponse::new(*self.traits.motion_response(), &rules.motion)?
+        };
         let acceleration = rules
             .motion
             .acceleration(ratio, &response, &organism.gradients)?;

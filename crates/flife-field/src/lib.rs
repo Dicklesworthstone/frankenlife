@@ -94,5 +94,5 @@ pub use transport::{
 pub use uptake::{
     CellDebit, Demand, GrantDebit, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell,
     UptakeSummary, UptakeWork, apply_grants, apply_grants_on, demand, demands, demands_on,
-    resolve_uptake, resolve_uptake_on,
+    resolve_uptake, resolve_uptake_on, resolve_uptake_on_workers,
 };

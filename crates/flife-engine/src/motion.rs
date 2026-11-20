@@ -312,6 +312,13 @@ impl MotionResponse {
         Ok(Self(coefficients))
     }
 
+    /// Construct from traits already verified against a bound at or below
+    /// `motion.response_norm_limit`.
+    #[must_use]
+    pub(crate) const fn trusted(coefficients: [f64; RESPONSE_TERMS]) -> Self {
+        Self(coefficients)
+    }
+
     /// The coefficients.
     #[must_use]
     pub const fn coefficients(&self) -> &[f64; RESPONSE_TERMS] {

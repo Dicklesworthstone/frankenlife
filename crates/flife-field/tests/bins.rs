@@ -8,11 +8,12 @@
 
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
+use flife_field::pyramid::PLANES;
 use flife_field::state::CHANNELS;
 use flife_field::{
     Bins, BufferLimits, Cell, Demand, DepositSummary, Deposits, ExchangeStencil, FieldGrid,
-    FieldState, Grants, apply_deposits, apply_deposits_on, apply_grants, apply_grants_on,
-    resolve_uptake,
+    FieldState, Grants, RawSample, SensorPyramid, SensorQuery, apply_deposits, apply_deposits_on,
+    apply_grants, apply_grants_on, resolve_uptake, resolve_uptake_on_workers,
 };
 
 #[expect(
@@ -817,5 +818,147 @@ fn grants_apply_the_same_on_any_number_of_workers() {
             "{workers} workers"
         );
         assert!(planes(&stale) == before, "{workers} workers: written");
+    }
+}
+
+#[test]
+fn uptake_resolves_the_same_on_any_number_of_workers() {
+    let grid = grid(32, 32);
+    let snapshot = field(grid, 99);
+    // 4,000 demands including a large hotspot (> 32 packets in one cell) to
+    // exercise both stack and heap paths and parallel scatter + cell solve.
+    let demands = clustered(&grid, 4_000, 123);
+    let mut serial =
+        Grants::with_capacity(&grid, demands.len() as u64, &BufferLimits::host()).expect("declare");
+    let expected = resolve_uptake(&snapshot, &demands, &mut serial).expect("serial");
+    let want_packets = serial.packets().to_vec();
+    let want_debits = serial.debits().to_vec();
+    let want_totals = serial.totals().to_vec();
+
+    for workers in [0, 1, 2, 4, 8, 16] {
+        let mut grants = Grants::with_capacity(&grid, demands.len() as u64, &BufferLimits::host())
+            .expect("declare");
+        let allocated = grants.allocated();
+        let got = resolve_uptake_on_workers(&snapshot, &demands, &mut grants, workers)
+            .expect("parallel resolve");
+        assert_eq!(got, expected, "{workers} workers");
+        assert_eq!(grants.debits(), want_debits, "{workers} workers debits");
+        assert_eq!(grants.packets(), want_packets, "{workers} workers packets");
+        assert_eq!(grants.totals(), want_totals, "{workers} workers totals");
+        assert_eq!(grants.allocated(), allocated, "{workers} workers allocated");
+    }
+}
+
+#[test]
+fn pyramid_build_on_and_sample_batch_match_serial_bit_for_bit() {
+    // 128×128 >= 16,384 cells so `build_on` exercises the parallel 33-plane path.
+    let grid = grid(128, 128);
+    let snapshot = field(grid, 77);
+    let mut serial = SensorPyramid::new(grid, 4, &BufferLimits::host()).expect("pyramid");
+    let serial_view = serial.build(&snapshot).expect("serial build");
+
+    let mut next = lcg(555);
+    let level0_queries: Vec<SensorQuery> = (0..100)
+        .map(|_| SensorQuery {
+            position: [next() * 128.0, next() * 128.0],
+            scale: 1.0,
+        })
+        .collect();
+    let mixed_queries: Vec<SensorQuery> = (0..100)
+        .map(|_| SensorQuery {
+            position: [next() * 128.0, next() * 128.0],
+            scale: 1.0 + next() * 15.0,
+        })
+        .collect();
+
+    let zero = RawSample {
+        values: [0.0; PLANES],
+        dx: [0.0; PLANES],
+        dy: [0.0; PLANES],
+    };
+    let compare = |got: &[RawSample], want: &[RawSample], label: &str| {
+        assert_eq!(got.len(), want.len(), "{label}");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                g.values.map(f64::to_bits),
+                w.values.map(f64::to_bits),
+                "{label} values[{i}]"
+            );
+            assert_eq!(
+                g.dx.map(f64::to_bits),
+                w.dx.map(f64::to_bits),
+                "{label} dx[{i}]"
+            );
+            assert_eq!(
+                g.dy.map(f64::to_bits),
+                w.dy.map(f64::to_bits),
+                "{label} dy[{i}]"
+            );
+        }
+    };
+
+    let want_l0: Vec<RawSample> = level0_queries
+        .iter()
+        .map(|q| serial_view.sample(q.position, q.scale).expect("l0"))
+        .collect();
+    let want_mixed: Vec<RawSample> = mixed_queries
+        .iter()
+        .map(|q| serial_view.sample(q.position, q.scale).expect("mixed"))
+        .collect();
+
+    for workers in [1, 2, 4, 16] {
+        let mut par = SensorPyramid::new(grid, 4, &BufferLimits::host()).expect("pyramid");
+        let view = par.build_on(&snapshot, workers).expect("parallel build");
+        let mut got_l0 = vec![zero; level0_queries.len()];
+        view.sample_batch(&level0_queries, &mut got_l0)
+            .expect("batch l0");
+        compare(&got_l0, &want_l0, "level0");
+
+        let mut got_mixed = vec![zero; mixed_queries.len()];
+        view.sample_batch(&mixed_queries, &mut got_mixed)
+            .expect("batch mixed");
+        compare(&got_mixed, &want_mixed, "mixed");
+    }
+
+    // Also exercise power-of-two (non-unit) and non-power-of-two cell sizes,
+    // including wrapped negative/overshoot coordinates and exact cell centers.
+    for (label, cell_w, cell_h) in [("pow2", 2.0_f64, 0.5_f64), ("non_pow2", 1.3_f64, 0.7_f64)] {
+        let custom = FieldGrid::new(32, 32, 32.0 * cell_w, 32.0 * cell_h).expect("grid");
+        let snap = field(custom, 88);
+        let mut pyr = SensorPyramid::new(custom, 3, &BufferLimits::host()).expect("pyramid");
+        let view = pyr.build_on(&snap, 4).expect("build");
+        let finest = cell_w.max(cell_h);
+        let mut rng = lcg(999);
+        let l0: Vec<SensorQuery> = (0..64)
+            .map(|i| SensorQuery {
+                position: if i % 8 == 0 {
+                    [-0.25 * cell_w, 32.25 * cell_h]
+                } else {
+                    [rng() * 32.0 * cell_w, rng() * 32.0 * cell_h]
+                },
+                scale: finest,
+            })
+            .collect();
+        let mixed: Vec<SensorQuery> = (0..64)
+            .map(|_| SensorQuery {
+                position: [(rng() - 0.1) * 35.0 * cell_w, (rng() - 0.1) * 35.0 * cell_h],
+                scale: finest * (1.0 + rng() * 6.9),
+            })
+            .collect();
+        let want0: Vec<RawSample> = l0
+            .iter()
+            .map(|q| view.sample(q.position, q.scale).expect("sample l0"))
+            .collect();
+        let mut got0 = vec![zero; l0.len()];
+        view.sample_batch(&l0, &mut got0).expect("batch l0");
+        compare(&got0, &want0, label);
+
+        let wantm: Vec<RawSample> = mixed
+            .iter()
+            .map(|q| view.sample(q.position, q.scale).expect("sample mixed"))
+            .collect();
+        let mut gotm = vec![zero; mixed.len()];
+        view.sample_batch(&mixed, &mut gotm).expect("batch mixed");
+        compare(&gotm, &wantm, label);
     }
 }

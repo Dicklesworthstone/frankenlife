@@ -3,7 +3,7 @@
 //! `libm`, and the domain and symmetry each function promises.
 
 use flife_core::numerics::{
-    exp, exp_neg, expm1_neg, ln, log2, sigmoid, sin_cos_turns, tanh, tanh_f32,
+    exp, exp_neg, expm1_neg, ln, log2, sigmoid, sin_cos_turns, tanh, tanh_f32, tanh_f64_as_f32,
 };
 
 /// A total order on finite `f64` in which adjacent values differ by one.
@@ -682,4 +682,81 @@ fn tanh_f32_is_the_reference_tanh_rounded_to_f32_for_every_f32() {
         "{wrong} patterns differ; the first is {:?} ({first:#x?})",
         first.map(f32::from_bits)
     );
+}
+
+/// `tanh_f64_as_f32(x)` matches `tanh(x).map(|t| t as f32)` bit for bit across
+/// edges, branch boundaries, a wide sweep of F64 values, and adversarial F64
+/// inputs placed right on F32 rounding midpoints (`atanh(k + 0.5 ulp_f32)`).
+#[test]
+fn tanh_f64_as_f32_matches_tanh_rounded_including_f32_midpoints() {
+    let check = |x: f64| {
+        let want = tanh(x).map(|t| (t as f32).to_bits());
+        let got = tanh_f64_as_f32(x).map(f32::to_bits);
+        assert_eq!(
+            got,
+            want,
+            "tanh_f64_as_f32({x:?}) ({:#x}) gave {got:#x?}, want {want:#x?}",
+            x.to_bits()
+        );
+    };
+
+    for x in [
+        0.0,
+        -0.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::from_bits(1),
+        f64::from(f32::MIN_POSITIVE),
+        f64::from(f32::MIN_POSITIVE) * 0.5,
+        f64::from(f32::MIN_POSITIVE) * 2.0,
+        1.0 / 32.0,
+        (1.0_f64 / 32.0).next_down(),
+        (1.0_f64 / 32.0).next_up(),
+        1.0,
+        1.0_f64.next_down(),
+        1.0_f64.next_up(),
+        20.0,
+        20.0_f64.next_down(),
+        -20.0,
+        100.0,
+        -100.0,
+    ] {
+        check(x);
+    }
+
+    // Wide deterministic sweep across (-21, 21), spanning 2^-150 .. 21.
+    let mut state = 0x5EED_CAFE_BABE_1234_u64;
+    for _ in 0..200_000 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let sign = if state & 1 == 0 { 1.0 } else { -1.0 };
+        let exp_idx = ((state >> 1) % 160) as i32 - 155; // 2^-155 .. 2^4
+        let frac = ((state >> 11) as f64) / ((1_u64 << 53) as f64);
+        let x = sign * (1.0 + frac) * 2.0_f64.powi(exp_idx);
+        check(x);
+    }
+
+    // Adversarial F32 midpoints: y = f32 + 0.5 ulp_f32, x = atanh(y), plus
+    // nearby F64 neighbors around each tie.
+    for exp in -30_i32..0 {
+        let base = 2.0_f64.powi(exp);
+        let half_ulp_f32 = 2.0_f64.powi(exp - 24);
+        for k in 0..200_u32 {
+            let y_mid = base + (f64::from(k) * 2.0 + 1.0) * half_ulp_f32;
+            if y_mid >= 1.0 {
+                break;
+            }
+            let x_mid = y_mid.atanh();
+            let b = x_mid.to_bits();
+            for delta in [-16_i64, -4, -1, 0, 1, 4, 16] {
+                let x = f64::from_bits(b.wrapping_add_signed(delta));
+                check(x);
+                check(-x);
+            }
+        }
+    }
 }

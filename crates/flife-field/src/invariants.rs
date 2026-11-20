@@ -348,6 +348,12 @@ fn check_cell(
     Ok(residual)
 }
 
+/// Cells checked per cache-friendly plane-major block in [`check_range`].
+/// Accumulating squares plane by plane over 64 consecutive cells eliminates
+/// 33-way L1D cache-set conflict misses on power-of-two grids (e.g., 512²
+/// where each plane is 1 MiB) while preserving exact channel-order sums.
+const CHECK_BLOCK: usize = 64;
+
 /// Check cells `range` in cell-index order, stopping at the first offending
 /// cell, and measure them.
 fn check_range(
@@ -358,17 +364,88 @@ fn check_range(
     width: u64,
 ) -> Result<RangeSummary, CoreError> {
     let mut summary = RangeSummary::default();
-    let first = range.start;
-    for (offset, &cell_energy) in energy.get(range).unwrap_or(&[]).iter().enumerate() {
-        let index = first + offset;
-        let residual = check_cell(energy, moments, index, tolerance, width)?;
-        if residual > summary.max_cone_residual {
-            summary.max_cone_residual = residual;
-            summary.max_cone_residual_cell = Some(locate(index, width));
+    let end = range.end.min(energy.len());
+    let mut base = range.start;
+    while base < end {
+        let len = (end - base).min(CHECK_BLOCK);
+        let energy_block = energy.get(base..base + len).unwrap_or(&[]);
+        let mut bad_energy = energy_block.len() != len;
+        let mut energies = [0.0_f64; CHECK_BLOCK];
+        for (slot, &cell_energy) in energies.iter_mut().zip(energy_block) {
+            let e = f64::from(cell_energy);
+            if !e.is_finite() || e < 0.0 {
+                bad_energy = true;
+                break;
+            }
+            *slot = e;
         }
-        if f64::from(cell_energy) == 0.0 {
-            summary.empty_cells += 1;
+        if bad_energy {
+            for offset in 0..len {
+                let index = base + offset;
+                let residual = check_cell(energy, moments, index, tolerance, width)?;
+                if residual > summary.max_cone_residual {
+                    summary.max_cone_residual = residual;
+                    summary.max_cone_residual_cell = Some(locate(index, width));
+                }
+                if energy.get(index).is_some_and(|&v| f64::from(v) == 0.0) {
+                    summary.empty_cells += 1;
+                }
+            }
+            base += len;
+            continue;
         }
+
+        let mut squares = [0.0_f64; CHECK_BLOCK];
+        let mut bad_moment = false;
+        for plane in moments {
+            let Some(slice) = plane.get(base..base + len) else {
+                bad_moment = true;
+                break;
+            };
+            for (square, &m_raw) in squares.iter_mut().zip(slice) {
+                if !m_raw.is_finite() {
+                    bad_moment = true;
+                }
+                let m = f64::from(m_raw);
+                *square += m * m;
+            }
+        }
+        if bad_moment {
+            for (offset, &e) in energies.iter().enumerate().take(len) {
+                let index = base + offset;
+                let residual = check_cell(energy, moments, index, tolerance, width)?;
+                if residual > summary.max_cone_residual {
+                    summary.max_cone_residual = residual;
+                    summary.max_cone_residual_cell = Some(locate(index, width));
+                }
+                if e == 0.0 {
+                    summary.empty_cells += 1;
+                }
+            }
+            base += len;
+            continue;
+        }
+
+        for (offset, (&e, &sq)) in energies.iter().zip(&squares).enumerate().take(len) {
+            let residual = if sq == 0.0 {
+                0.0
+            } else {
+                (sq.sqrt() - e).max(0.0)
+            };
+            if !tolerance.allows(residual, e) {
+                // Fall back to `check_cell` from this exact cell to produce
+                // the identical error detail.
+                let _ = check_cell(energy, moments, base + offset, tolerance, width)?;
+            }
+            if residual > summary.max_cone_residual {
+                summary.max_cone_residual = residual;
+                summary.max_cone_residual_cell = Some(locate(base + offset, width));
+            }
+            if e == 0.0 {
+                summary.empty_cells += 1;
+            }
+        }
+        base += len;
     }
     Ok(summary)
 }

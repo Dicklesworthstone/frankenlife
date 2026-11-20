@@ -12,14 +12,6 @@
 /// Arguments are halved until they are at most this, then a series runs.
 const REDUCED: f64 = 1.0 / 16.0;
 
-/// Taylor terms after the constant for [`exp_neg`]. For `y ≤ 1/16` the
-/// first omitted term is below `(1/16)^13 / 13! ≈ 5e-26`.
-const EXP_TERMS: u32 = 12;
-
-/// Terms for [`expm1_neg`]'s series `y(1 − y/2(1 − y/3(…)))`. The first
-/// omitted term is below `(1/16)^14 / 14!`, relative to `y`.
-const EXPM1_TERMS: u32 = 13;
-
 /// Beyond this, `1 − e^(−x)` rounds to `1`: `e^(−38) < 2^(−54)`.
 const EXPM1_SATURATES: f64 = 40.0;
 
@@ -31,10 +23,6 @@ const TANH_SATURATES: f64 = 20.0;
 const LN2_HI: f64 = f64::from_bits(0x3fe6_2e42_fee0_0000);
 /// `ln 2 − LN2_HI`.
 const LN2_LO: f64 = f64::from_bits(0x3dea_39ef_3579_3c76);
-
-/// Taylor terms for `e^(−r)` with `|r| ≤ ln 2 / 2`: the first omitted term
-/// is below `0.35^16 / 16! ≈ 2e-21`.
-const REDUCED_EXP_TERMS: u32 = 15;
 
 /// Beyond this, `exp(−x)` is below half the smallest subnormal.
 const EXP_UNDERFLOWS: f64 = 746.0;
@@ -64,8 +52,11 @@ pub fn exp_neg(x: f64) -> Option<f64> {
     if !x.is_finite() || x < 0.0 {
         return None;
     }
+    if x == 0.0 {
+        return Some(1.0);
+    }
     if x <= REDUCED {
-        return Some(exp_series(x, EXP_TERMS));
+        return Some(exp_series_12(x));
     }
     if x >= EXP_UNDERFLOWS {
         return Some(0.0);
@@ -74,7 +65,7 @@ pub fn exp_neg(x: f64) -> Option<f64> {
     // exact by Sterbenz's lemma.
     let n = (x / core::f64::consts::LN_2).round();
     let r = (x - n * LN2_HI) - n * LN2_LO;
-    let scaled = exp_series(r, REDUCED_EXP_TERMS);
+    let scaled = exp_series_15(r);
     // `n ≥ 0` here, and below 1078: scale in two exact power-of-two steps
     // so that only a subnormal result rounds.
     let n = n as i32;
@@ -82,13 +73,70 @@ pub fn exp_neg(x: f64) -> Option<f64> {
     Some(scaled * power_of_two(-first) * power_of_two(first - n))
 }
 
-/// `Σ_{i ≤ terms} (−y)^i / i!` by Horner's rule from the highest term.
-fn exp_series(y: f64, terms: u32) -> f64 {
-    let mut series = 1.0_f64;
-    for term in (1..=terms).rev() {
-        series = 1.0 - y / f64::from(term) * series;
-    }
-    series
+/// `Σ_{i ≤ 12} (−y)^i / i!` by Horner's rule from the highest term.
+/// Independent quotients `y / k` are evaluated up front (with exact
+/// power-of-two multiplies for `2, 4, 8` and `y / 1 = y`) so out-of-order
+/// FP dividers pipeline concurrently while preserving every IEEE-754 bit.
+#[inline]
+fn exp_series_12(y: f64) -> f64 {
+    let q12 = y / 12.0;
+    let q11 = y / 11.0;
+    let q10 = y / 10.0;
+    let q9 = y / 9.0;
+    let q8 = y * 0.125;
+    let q7 = y / 7.0;
+    let q6 = y / 6.0;
+    let q5 = y / 5.0;
+    let q4 = y * 0.25;
+    let q3 = y / 3.0;
+    let q2 = y * 0.5;
+    let s = 1.0 - q12;
+    let s = 1.0 - q11 * s;
+    let s = 1.0 - q10 * s;
+    let s = 1.0 - q9 * s;
+    let s = 1.0 - q8 * s;
+    let s = 1.0 - q7 * s;
+    let s = 1.0 - q6 * s;
+    let s = 1.0 - q5 * s;
+    let s = 1.0 - q4 * s;
+    let s = 1.0 - q3 * s;
+    let s = 1.0 - q2 * s;
+    1.0 - y * s
+}
+
+/// `Σ_{i ≤ 15} (−y)^i / i!` by Horner's rule from the highest term,
+/// bit-identical to the unrolled loop.
+#[inline]
+fn exp_series_15(y: f64) -> f64 {
+    let q15 = y / 15.0;
+    let q14 = y / 14.0;
+    let q13 = y / 13.0;
+    let q12 = y / 12.0;
+    let q11 = y / 11.0;
+    let q10 = y / 10.0;
+    let q9 = y / 9.0;
+    let q8 = y * 0.125;
+    let q7 = y / 7.0;
+    let q6 = y / 6.0;
+    let q5 = y / 5.0;
+    let q4 = y * 0.25;
+    let q3 = y / 3.0;
+    let q2 = y * 0.5;
+    let s = 1.0 - q15;
+    let s = 1.0 - q14 * s;
+    let s = 1.0 - q13 * s;
+    let s = 1.0 - q12 * s;
+    let s = 1.0 - q11 * s;
+    let s = 1.0 - q10 * s;
+    let s = 1.0 - q9 * s;
+    let s = 1.0 - q8 * s;
+    let s = 1.0 - q7 * s;
+    let s = 1.0 - q6 * s;
+    let s = 1.0 - q5 * s;
+    let s = 1.0 - q4 * s;
+    let s = 1.0 - q3 * s;
+    let s = 1.0 - q2 * s;
+    1.0 - y * s
 }
 
 /// `2^k` for `−1022 ≤ k ≤ 1023`, built from its bits.
@@ -113,6 +161,9 @@ pub fn expm1_neg(x: f64) -> Option<f64> {
     if !x.is_finite() || x < 0.0 {
         return None;
     }
+    if x == 0.0 {
+        return Some(x);
+    }
     if x >= EXPM1_SATURATES {
         return Some(1.0);
     }
@@ -122,10 +173,32 @@ pub fn expm1_neg(x: f64) -> Option<f64> {
         return Some(1.0 - exp_neg(x)?);
     }
     let (y, halvings) = reduce(x);
-    let mut series = 1.0_f64;
-    for term in (2..=EXPM1_TERMS + 1).rev() {
-        series = 1.0 - y / f64::from(term) * series;
-    }
+    let q14 = y / 14.0;
+    let q13 = y / 13.0;
+    let q12 = y / 12.0;
+    let q11 = y / 11.0;
+    let q10 = y / 10.0;
+    let q9 = y / 9.0;
+    let q8 = y * 0.125;
+    let q7 = y / 7.0;
+    let q6 = y / 6.0;
+    let q5 = y / 5.0;
+    let q4 = y * 0.25;
+    let q3 = y / 3.0;
+    let q2 = y * 0.5;
+    let s = 1.0 - q14;
+    let s = 1.0 - q13 * s;
+    let s = 1.0 - q12 * s;
+    let s = 1.0 - q11 * s;
+    let s = 1.0 - q10 * s;
+    let s = 1.0 - q9 * s;
+    let s = 1.0 - q8 * s;
+    let s = 1.0 - q7 * s;
+    let s = 1.0 - q6 * s;
+    let s = 1.0 - q5 * s;
+    let s = 1.0 - q4 * s;
+    let s = 1.0 - q3 * s;
+    let series = 1.0 - q2 * s;
     let mut m = y * series;
     for _ in 0..halvings {
         m *= 2.0 - m;
@@ -145,6 +218,9 @@ pub fn expm1_neg(x: f64) -> Option<f64> {
 pub fn tanh(x: f64) -> Option<f64> {
     if !x.is_finite() {
         return None;
+    }
+    if x == 0.0 {
+        return Some(x);
     }
     let magnitude = x.abs();
     let value = if magnitude >= TANH_SATURATES {
@@ -197,6 +273,42 @@ pub fn tanh_f32(z: f32) -> Option<f32> {
         tanh_estrin(magnitude) as f32
     };
     Some(if z.is_sign_negative() { -value } else { value })
+}
+
+/// [`tanh`] of an F64 argument, rounded once to F32: for every `f64` `x`,
+/// `tanh_f64_as_f32(x)` is `tanh(x).map(|t| t as f32)`, bit for bit.
+///
+/// Evaluates [`tanh_estrin`] (one division instead of 13+) guarded by a
+/// double-rounding margin: [`tanh_estrin`]'s worst-case error over `(0, 20)`
+/// is below `4,000` F64 ulps, so whenever `approx` is safely normal in F32
+/// and the 29 truncated mantissa bits lie more than `65,536` ulps from the
+/// F32 rounding tie `0x1000_0000`, `approx as f32` cannot differ from
+/// `tanh(x) as f32`. Near a tie or in the F32 subnormal range (< 0.05% of
+/// inputs) it falls back to [`tanh`].
+#[must_use]
+pub fn tanh_f64_as_f32(x: f64) -> Option<f32> {
+    if !x.is_finite() {
+        return None;
+    }
+    if x == 0.0 {
+        return Some(x as f32);
+    }
+    let magnitude = x.abs();
+    if magnitude >= TANH_SATURATES {
+        return Some(if x.is_sign_negative() { -1.0 } else { 1.0 });
+    }
+    let approx = tanh_estrin(magnitude);
+    const TIE: u64 = 1 << 28;
+    const LOW_MASK: u64 = (1 << 29) - 1;
+    const MARGIN: u64 = 65_536;
+    if approx >= 2.0 * f64::from(f32::MIN_POSITIVE) {
+        let low = approx.to_bits() & LOW_MASK;
+        if low.abs_diff(TIE) > MARGIN {
+            let value = approx as f32;
+            return Some(if x.is_sign_negative() { -value } else { value });
+        }
+    }
+    tanh(x).map(|value| value as f32)
 }
 
 /// Below this `2|x|`, [`tanh_estrin`] takes `1 − e^(−2|x|)` from its own
@@ -381,12 +493,12 @@ pub fn exp(x: f64) -> Option<f64> {
         return None;
     }
     if x <= REDUCED {
-        return Some(exp_series(-x, EXP_TERMS));
+        return Some(exp_series_12(-x));
     }
     // `x < 710`, so `n ≤ 1024`; the reduction is exact as in `exp_neg`.
     let n = (x / core::f64::consts::LN_2).round();
     let r = (x - n * LN2_HI) - n * LN2_LO;
-    let scaled = exp_series(-r, REDUCED_EXP_TERMS);
+    let scaled = exp_series_15(-r);
     let n = n as i32;
     let first = n.min(1000);
     let value = scaled * power_of_two(first) * power_of_two(n - first);

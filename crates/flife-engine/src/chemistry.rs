@@ -241,6 +241,13 @@ impl Affinity {
         Ok(Self(direction))
     }
 
+    /// Construct from traits already verified against a bound at or below
+    /// `chemistry.affinity_norm_limit`.
+    #[must_use]
+    pub(crate) const fn trusted(direction: [f64; CHANNELS]) -> Self {
+        Self(direction)
+    }
+
     /// The direction.
     #[must_use]
     pub const fn direction(&self) -> &[f64; CHANNELS] {

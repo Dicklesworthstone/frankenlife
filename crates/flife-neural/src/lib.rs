@@ -40,5 +40,7 @@ pub use backend::{BackendBudget, ControllerBackend, ControllerJob};
 pub use controller::{
     ControllerScratch, DenseTopology, LayerShape, ReferenceController, Trace, widen,
 };
-pub use sensors::{Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe};
+pub use sensors::{
+    Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe, observe_for_controller,
+};
 pub use weights::{Weight, WeightDtype, Weights};

@@ -18,6 +18,7 @@
 //! normalizer is a fixed local constant: no population statistic reaches a
 //! controller (A.1).
 
+use flife_core::numerics::tanh_f64_as_f32;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::numerics::tanh;
 use flife_field::pyramid::{PLANES, RawSample};
@@ -212,6 +213,35 @@ pub fn observe(
     intrinsic: &Intrinsic,
     scales: &SensorScales,
 ) -> Result<Observation, CoreError> {
+    observe_with(raw, intrinsic, scales, tanh)
+}
+
+/// Encode `raw` and `intrinsic` for a controller whose first layer narrows
+/// every input to F32 (`input as f32`).
+///
+/// The unsaturated F64 `gradients` (used by motion) are identical to
+/// [`observe`], and each `tanh`-saturated entry in `inputs` holds the exact
+/// F32 rounding of `tanh(v)` widened to F64 via [`tanh_f64_as_f32`], so
+/// narrowing `inputs` to F32 produces the exact same bits as [`observe`].
+///
+/// # Errors
+/// As [`observe`].
+pub fn observe_for_controller(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+) -> Result<Observation, CoreError> {
+    observe_with(raw, intrinsic, scales, |v| {
+        tanh_f64_as_f32(v).map(f64::from)
+    })
+}
+
+fn observe_with(
+    raw: &RawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    saturate_fn: impl Fn(f64) -> Option<f64>,
+) -> Result<Observation, CoreError> {
     let invalid =
         |quantity: &'static str, detail: String| CoreError::NumericalInvalid { quantity, detail };
     let [density, moments @ ..] = raw.values;
@@ -262,7 +292,8 @@ pub fn observe(
     }
 
     let saturate = |value: f64| {
-        tanh(value).ok_or_else(|| invalid("sensor input", format!("tanh({value}) is undefined")))
+        saturate_fn(value)
+            .ok_or_else(|| invalid("sensor input", format!("tanh({value}) is undefined")))
     };
     let mut inputs = [0.0; SENSOR_WIDTH];
     let (observed, own) = inputs.split_at_mut(3 * PLANES);
@@ -280,12 +311,18 @@ pub fn observe(
         saturate(intrinsic.velocity[1] / scales.velocity)?,
         saturate(intrinsic.energy_change_per_second / scales.energy_change_per_second)?,
     ]);
-    if let Some(bad) = inputs
-        .iter()
-        .chain(gradients.iter().flatten())
-        .find(|value| !value.is_finite())
-    {
-        return Err(invalid("sensor input", format!("{bad} is not finite")));
+    for &value in &inputs {
+        if !value.is_finite() {
+            return Err(invalid("sensor input", format!("{value} is not finite")));
+        }
+    }
+    for &[gx, gy] in &gradients {
+        if !gx.is_finite() {
+            return Err(invalid("sensor input", format!("{gx} is not finite")));
+        }
+        if !gy.is_finite() {
+            return Err(invalid("sensor input", format!("{gy} is not finite")));
+        }
     }
     Ok(Observation { inputs, gradients })
 }

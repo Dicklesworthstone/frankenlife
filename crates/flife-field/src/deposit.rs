@@ -767,23 +767,29 @@ impl Deposits {
                 "these deposits were staged for another grid".into(),
             ));
         }
-        self.identities.clear();
-        self.identities.extend(
-            self.entries
-                .iter()
-                .enumerate()
-                .map(|(index, entry)| (entry.organism, index)),
-        );
-        self.identities.sort_unstable();
-        if let Some(pair) = self
-            .identities
+        let strictly_ascending = self
+            .entries
             .windows(2)
-            .find(|pair| pair[0].0 == pair[1].0)
-        {
-            return Err(conflict(format!(
-                "{} staged two deposits in one reduction",
-                pair[0].0
-            )));
+            .all(|pair| pair[0].organism < pair[1].organism);
+        if !strictly_ascending {
+            self.identities.clear();
+            self.identities.extend(
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.organism, index)),
+            );
+            self.identities.sort_unstable();
+            if let Some(pair) = self
+                .identities
+                .windows(2)
+                .find(|pair| pair[0].0 == pair[1].0)
+            {
+                return Err(conflict(format!(
+                    "{} staged two deposits in one reduction",
+                    pair[0].0
+                )));
+            }
         }
         if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
             return Err(conflict("a moment plane is missing".into()));
@@ -813,10 +819,17 @@ impl Deposits {
             ..
         } = self;
         sequence.clear();
-        for &(_, index) in identities.iter() {
-            if let Some(entry) = entries.get(index) {
+        if strictly_ascending {
+            for entry in entries.iter() {
                 // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
                 sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
+            }
+        } else {
+            for &(_, index) in identities.iter() {
+                if let Some(entry) = entries.get(index) {
+                    // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
+                    sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
+                }
             }
         }
         let buckets =
@@ -959,6 +972,32 @@ struct Run<'a> {
     received: &'a mut [f64],
 }
 
+/// Occupied cells accumulated before flushing moment writes plane-by-plane
+/// in [`reduce_run`]. Flushing 32 cells per plane avoids 32-way L1D
+/// cache-set thrashing on power-of-two grids (e.g. 512² where planes are
+/// 1 MiB apart) while writing bit-identical F32 values.
+const REDUCE_BATCH: usize = 32;
+
+/// Flush `count` buffered cell updates into `moments`, one plane at a time.
+fn flush_moment_batch(
+    moments: &mut [&mut [f32]; CHANNELS],
+    count: usize,
+    cell_at: &[usize; REDUCE_BATCH],
+    factors: &[f64; REDUCE_BATCH],
+    accum: &[[f64; CHANNELS]; REDUCE_BATCH],
+) {
+    for (channel, plane) in moments.iter_mut().enumerate() {
+        for b in 0..count {
+            let added = accum[b][channel] * factors[b];
+            if added != 0.0
+                && let Some(value) = plane.get_mut(cell_at[b])
+            {
+                *value = (f64::from(*value) + added) as f32;
+            }
+        }
+    }
+}
+
 /// Reduce and write `run`'s occupied cells in cell order, each as
 /// [`apply_deposits`] reduces it, filling `run.received` in the same order.
 /// Returns how many cells received a packet.
@@ -971,6 +1010,11 @@ fn reduce_run(
     entries: &[Entry],
 ) -> usize {
     let mut occupied = 0;
+    let mut batch_len = 0_usize;
+    let mut cell_at = [0_usize; REDUCE_BATCH];
+    let mut factors = [0.0_f64; REDUCE_BATCH];
+    let mut accum = [[0.0_f64; CHANNELS]; REDUCE_BATCH];
+
     for (at, cell) in run.cells.clone().enumerate() {
         let (Some(&first), Some(&end)) = (offsets.get(cell), offsets.get(cell + 1)) else {
             continue;
@@ -981,40 +1025,47 @@ fn reduce_run(
         let Some(energy) = run.energy.get_mut(at) else {
             continue;
         };
-        let group = order
-            .get(first as usize..end as usize)
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|&at| sequence.get(at as usize))
-            .filter_map(|&packet| packets.get(packet as usize));
+        let slice = order.get(first as usize..end as usize).unwrap_or(&[]);
         let before = *energy;
         let mut total = 0.0;
         let mut moment = [0.0; CHANNELS];
-        for packet in group {
+        for &ord in slice {
+            let Some(&seq) = sequence.get(ord as usize) else {
+                continue;
+            };
+            let Some(packet) = packets.get(seq as usize) else {
+                continue;
+            };
             total = add_down(total, packet.amount);
-            let direction = entries
-                .get(packet.entry)
-                .map_or(&[0.0; CHANNELS], |entry| &entry.direction);
-            for (slot, &component) in moment.iter_mut().zip(direction) {
-                *slot += packet.amount * component;
+            if let Some(entry) = entries.get(packet.entry) {
+                let amount = packet.amount;
+                for (slot, &component) in moment.iter_mut().zip(&entry.direction) {
+                    *slot += amount * component;
+                }
             }
         }
         let after = round_down_f32(add_down(f64::from(before), total));
         let received = f64::from(after) - f64::from(before);
         let factor = if total > 0.0 { received / total } else { 0.0 };
         *energy = after;
-        for (plane, &sum) in run.moments.iter_mut().zip(&moment) {
-            let added = sum * factor;
-            if added != 0.0
-                && let Some(value) = plane.get_mut(at)
-            {
-                *value = (f64::from(*value) + added) as f32;
-            }
-        }
         if let Some(slot) = run.received.get_mut(occupied) {
             *slot = received;
         }
         occupied += 1;
+
+        if factor != 0.0 {
+            cell_at[batch_len] = at;
+            factors[batch_len] = factor;
+            accum[batch_len] = moment;
+            batch_len += 1;
+            if batch_len == REDUCE_BATCH {
+                flush_moment_batch(&mut run.moments, batch_len, &cell_at, &factors, &accum);
+                batch_len = 0;
+            }
+        }
+    }
+    if batch_len > 0 {
+        flush_moment_batch(&mut run.moments, batch_len, &cell_at, &factors, &accum);
     }
     occupied
 }

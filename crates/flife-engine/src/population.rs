@@ -275,6 +275,59 @@ pub enum Arrangement {
     FreeList,
 }
 
+/// A validated tick commit returned by [`Population::check_tick_staged`] and
+/// consumed by [`Population::apply_checked_tick`] without re-scanning every
+/// survivor while the caller holds exclusive access to the population.
+#[derive(Debug)]
+pub(crate) struct CheckedTick {
+    dying: BTreeMap<OrganismId, Death>,
+}
+
+impl Population {
+    /// Validate a whole tick commit and return the checked deaths map so
+    /// [`Population::apply_checked_tick`] can commit it without re-checking
+    /// every survivor a second time.
+    pub(crate) fn check_tick_staged(
+        &self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &[Entrant],
+        quota: &GenomeQuota,
+    ) -> Result<CheckedTick, CoreError> {
+        let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
+        Ok(CheckedTick { dying })
+    }
+
+    /// Apply a tick commit already validated against this exact population
+    /// by [`Population::check_tick_staged`].
+    pub(crate) fn apply_checked_tick(
+        &mut self,
+        checked: CheckedTick,
+        survivors: &[Organism],
+        births: &mut Vec<Entrant>,
+        quota: &mut GenomeQuota,
+        released: Option<&mut Vec<ArenaSlot>>,
+    ) -> Result<(), CoreError> {
+        self.reserve_arena(births)?;
+        let index = core::mem::take(&mut self.index);
+        let mut live = index.iter();
+        for organism in survivors {
+            if let Some(slot) = next_slot(&mut live, organism.id) {
+                self.write(slot, organism);
+            }
+        }
+        self.index = index;
+        for collected in self.remove(checked.dying, released) {
+            quota.retire(collected.genome)?;
+        }
+        for entrant in births.drain(..) {
+            self.insert(entrant);
+        }
+        Ok(())
+    }
+}
+
 /// The live organisms (§9.1).
 #[derive(Debug)]
 pub struct Population {
@@ -309,7 +362,7 @@ pub struct Population {
 #[derive(Debug)]
 pub struct Ascending<'a> {
     population: &'a Population,
-    live: Peekable<btree_map::Iter<'a, OrganismId, usize>>,
+    live: Peekable<btree_map::Range<'a, OrganismId, usize>>,
 }
 
 impl<'a> Ascending<'a> {
@@ -567,7 +620,18 @@ impl Population {
     pub fn ascending(&self) -> Ascending<'_> {
         Ascending {
             population: self,
-            live: self.index.iter().peekable(),
+            live: self.index.range(..).peekable(),
+        }
+    }
+
+    /// A walk starting at the first live identity at or above `first`, for a
+    /// worker lane visiting a contiguous slice of identity-ordered organisms
+    /// without per-organism tree searches.
+    #[must_use]
+    pub fn ascending_from(&self, first: OrganismId) -> Ascending<'_> {
+        Ascending {
+            population: self,
+            live: self.index.range(first..).peekable(),
         }
     }
 
@@ -713,55 +777,8 @@ impl Population {
         births: &mut Vec<Entrant>,
         quota: &mut GenomeQuota,
     ) -> Result<(), CoreError> {
-        self.commit_tick_inner(tick, survivors, deaths, births, quota, None)
-    }
-
-    /// As [`Population::commit_tick`], appending every arena slot retired by
-    /// `deaths` to `released` so a controller backend can reclaim emptied
-    /// parameter shards (FL-043).
-    pub(crate) fn commit_tick_releasing(
-        &mut self,
-        tick: Tick,
-        survivors: &[Organism],
-        deaths: &[Death],
-        births: &mut Vec<Entrant>,
-        quota: &mut GenomeQuota,
-        released: &mut Vec<ArenaSlot>,
-    ) -> Result<(), CoreError> {
-        self.commit_tick_inner(tick, survivors, deaths, births, quota, Some(released))
-    }
-
-    fn commit_tick_inner(
-        &mut self,
-        tick: Tick,
-        survivors: &[Organism],
-        deaths: &[Death],
-        births: &mut Vec<Entrant>,
-        quota: &mut GenomeQuota,
-        released: Option<&mut Vec<ArenaSlot>>,
-    ) -> Result<(), CoreError> {
-        let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
-        self.reserve_arena(births)?;
-        // Checked above: the survivors ascend and each is alive, so one
-        // ordered walk of the index finds every slot. The index is moved
-        // out for the walk, because writing a slot borrows the population;
-        // `write` does not touch it.
-        let index = core::mem::take(&mut self.index);
-        let mut live = index.iter();
-        for organism in survivors {
-            if let Some(slot) = next_slot(&mut live, organism.id) {
-                self.write(slot, organism);
-            }
-        }
-        self.index = index;
-        for collected in self.remove(dying, released) {
-            // Checked above: the quota holds every one of these charges.
-            quota.retire(collected.genome)?;
-        }
-        for entrant in births.drain(..) {
-            self.insert(entrant);
-        }
-        Ok(())
+        let checked = self.check_tick_staged(tick, survivors, deaths, births, quota)?;
+        self.apply_checked_tick(checked, survivors, births, quota, None)
     }
 
     fn check_whole_tick(

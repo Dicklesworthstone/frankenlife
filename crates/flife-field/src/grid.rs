@@ -216,6 +216,9 @@ pub fn wrap_coordinate(coordinate: f64, length: f64) -> Result<f64, CoreError> {
             detail: format!("{coordinate:?} cannot wrap onto a {length:?} period"),
         });
     }
+    if coordinate >= 0.0 && coordinate < length {
+        return Ok(if coordinate == 0.0 { 0.0 } else { coordinate });
+    }
     let wrapped = coordinate.rem_euclid(length);
     if wrapped >= length || wrapped == 0.0 {
         return Ok(0.0);

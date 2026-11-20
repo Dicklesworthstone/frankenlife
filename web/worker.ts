@@ -13,6 +13,7 @@
 // against the file byte for byte (scripts/check-media.ts).
 
 import { film } from "./lib/media";
+import { SHARE_IMAGE_PATHS, SHARE_IMAGE_TYPE } from "./lib/share";
 
 type Env = { ASSETS: { fetch(request: Request): Promise<Response> } };
 
@@ -100,6 +101,14 @@ async function serve(request: Request, env: Env, sizes: ReadonlyMap<string, numb
     url.hostname = APEX;
     url.hash = "";
     return Response.redirect(url.toString(), 301);
+  }
+  // The share images have no extension in the static export, so the assets cannot tell their type.
+  if (SHARE_IMAGE_PATHS.includes(url.pathname)) {
+    const image = await env.ASSETS.fetch(request);
+    if (!image.ok) return image;
+    const headers = new Headers(image.headers);
+    headers.set("Content-Type", SHARE_IMAGE_TYPE);
+    return new Response(image.body, { status: image.status, headers });
   }
   if (!url.pathname.startsWith("/media/") || (request.method !== "GET" && request.method !== "HEAD")) {
     return env.ASSETS.fetch(request);

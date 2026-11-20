@@ -16,6 +16,10 @@ const env = {
   ASSETS: {
     async fetch(request: Request): Promise<Response> {
       const path = new URL(request.url).pathname;
+      // The static export's share images, which have no extension to type them by.
+      if (path === "/opengraph-image") {
+        return new Response("card", { headers: { "Content-Type": "application/octet-stream" } });
+      }
       if (path !== "/media/film.mp4") return new Response("page", { status: path === "/" ? 200 : 404 });
       // Delivered in uneven chunks, as a stream would be.
       let offset = 0;
@@ -116,6 +120,16 @@ describe("the media Worker", () => {
     const response = await worker.fetch(new Request("https://www.frankenlife.org/media/x.mp4?t=1#top"), env);
     expect(response.status).toBe(301);
     expect(response.headers.get("Location")).toBe("https://frankenlife.org/media/x.mp4?t=1");
+  });
+
+  test("serves the share images as JPEG, and a missing one as the assets answer", async () => {
+    const card = await worker.fetch(new Request("https://site.test/opengraph-image?0123abcd"), env);
+    expect(card.status).toBe(200);
+    expect(card.headers.get("Content-Type")).toBe("image/jpeg");
+    expect(await card.text()).toBe("card");
+    const missing = await worker.fetch(new Request("https://site.test/twitter-image"), env);
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get("Content-Type")).not.toBe("image/jpeg");
   });
 
   test("passes everything outside /media/ to the assets", async () => {

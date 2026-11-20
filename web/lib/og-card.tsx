@@ -6,12 +6,14 @@
 // `flife render` drew (scripts/media.ts records which); the card only darkens
 // it beside the words. Every figure it shows is lib/media.json's.
 
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ImageResponse } from "next/og";
 
 import { film } from "@/lib/media";
+import { SHARE_IMAGE_TYPE } from "@/lib/share";
 
 /** The lineage palette (flife-manim's mapping.rs, LINEAGE_PALETTE): the colours the film's organisms wear. */
 const LINEAGE = ["#2EC4B6", "#9B5DE5", "#F15BB5", "#9BF6FF", "#FFB627", "#B5E61D", "#FF6F59", "#4EA8DE"];
@@ -36,8 +38,8 @@ function picture(): string {
 
 const thousands = (n: number) => n.toLocaleString("en-US");
 
-/** The share card at `width × height` (1200 × 630 for Open Graph, 1200 × 600 for X). */
-export async function shareCard(width: number, height: number): Promise<ImageResponse> {
+/** The share card at `width × height` (1200 × 630 for Open Graph, 1200 × 600 for X), as JPEG (lib/share.ts). */
+export async function shareCard(width: number, height: number): Promise<Response> {
   const [display, body, mono] = await Promise.all([
     googleFont("Inter", 800),
     googleFont("Inter", 500),
@@ -49,7 +51,7 @@ export async function shareCard(width: number, height: number): Promise<ImageRes
   // The card's crop is 1200 × 630; at 600 tall it is centred.
   const offset = Math.round((height - social.height) / 2);
 
-  return new ImageResponse(
+  const card = new ImageResponse(
     <div
       style={{
         width,
@@ -217,15 +219,15 @@ export async function shareCard(width: number, height: number): Promise<ImageRes
               fontWeight: 500,
               lineHeight: 1.4,
               color: "#cbd5e1",
-              maxWidth: 600,
+              maxWidth: 630,
             }}
           >
-            {`${thousands(live)} organisms, each with its own neural network, grow tissue in one shared chemical field.`}
+            {`${thousands(live)} organisms, each with its own neural network, grow tissue in one chemical field.`}
           </div>
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          {[`${thousands(live)} organisms`, "own brain each", "deterministic"].map((label) => (
+          {["memory-safe Rust", "replayable to the bit", "no aesthetic fitness"].map((label) => (
             <div
               key={label}
               style={{
@@ -305,6 +307,16 @@ export async function shareCard(width: number, height: number): Promise<ImageRes
       ],
     },
   );
+  const png = Buffer.from(await card.arrayBuffer());
+  const jpeg = spawnSync(
+    "ffmpeg",
+    ["-loglevel", "error", "-f", "png_pipe", "-i", "pipe:0", "-q:v", "5", "-fflags", "+bitexact", "-flags:v", "+bitexact", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"],
+    { input: png, maxBuffer: 64 * 1024 * 1024 },
+  );
+  if (jpeg.status !== 0 || jpeg.stdout.length === 0) {
+    throw new Error(`og-card: ffmpeg could not encode the card as JPEG: ${String(jpeg.stderr)}`);
+  }
+  return new Response(new Uint8Array(jpeg.stdout), { headers: { "Content-Type": SHARE_IMAGE_TYPE } });
 }
 
 /** The card's alt text. */

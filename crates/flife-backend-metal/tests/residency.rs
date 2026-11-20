@@ -499,3 +499,137 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
     assert_eq!(backend.owner().usage().buffers, 3);
     Ok(())
 }
+
+/// The specialized binary16 forward pass checks layer inputs once against
+/// `2^-78` (`HALF_TINY_INPUT_BITS`) instead of per product: a nonzero input
+/// below `2^-78` can make a binary16 subnormal weight (`2^-24`) produce a
+/// subnormal product (`< 2^-102`) and must defer, while `2^-77` keeps every
+/// nonzero product at or above `2^-101` and must execute bit-identically on
+/// the device.
+#[test]
+fn half_kernel_defers_tiny_inputs_below_two_to_the_minus_78() -> Result<(), CoreError> {
+    let Some(mut backend) = backend(16) else {
+        return Ok(());
+    };
+    let topology = DenseTopology::new(&[8])?;
+    // Smallest positive binary16 subnormal is 2^-24 (raw bits 0x0001).
+    let tiny_weight = F16::from_bits(0x0001);
+    let mut parameters = vec![F16::ZERO; topology.parameter_count()];
+    for layer in topology.layers() {
+        for value in &mut parameters[layer.weights..layer.biases] {
+            *value = tiny_weight;
+        }
+        // Keep layer 0's post-bias activation O(1) so layer 1's inputs stay
+        // far above 2^-78, isolating the 2^-78 threshold check to layer 0.
+        for bias in &mut parameters[layer.biases..layer.biases + layer.outputs] {
+            *bias = F16::from_f64(1.0);
+        }
+    }
+    let mut below = [0.0_f64; SENSOR_WIDTH];
+    below[0] = 2.0_f64.powi(-80);
+    let mut above = [0.0_f64; SENSOR_WIDTH];
+    above[0] = 2.0_f64.powi(-77);
+
+    let jobs = vec![
+        ControllerJob {
+            genome: GenomeId::new(1),
+            slot: ArenaSlot::new(0, 0, 1),
+            controller: ReferenceController::new(&topology, &parameters, BOUND)?,
+            inputs: &below,
+        },
+        ControllerJob {
+            genome: GenomeId::new(2),
+            slot: ArenaSlot::new(0, 1, 1),
+            controller: ReferenceController::new(&topology, &parameters, BOUND)?,
+            inputs: &above,
+        },
+    ];
+    let want = reference(&jobs);
+    let mut outputs = Vec::new();
+    backend.evaluate(&jobs, &mut outputs)?;
+    assert_eq!(
+        outputs[0], None,
+        "nonzero input 2^-80 < 2^-78 must defer in the binary16 kernel"
+    );
+    assert!(
+        outputs[1].is_some(),
+        "nonzero input 2^-77 >= 2^-78 must execute on the device"
+    );
+    assert_eq!(bits(&outputs)[1], want[1]);
+    Ok(())
+}
+
+/// Hidden widths that are not multiples of 4 exercise the scalar fallback
+/// loop in both `forward_pass_f32` and `forward_pass_half` (while odd
+/// parameter counts in F16 defer cleanly as unaligned half slots).
+#[test]
+fn non_multiple_of_four_hidden_widths_match_reference_in_f32_and_f16() -> Result<(), CoreError> {
+    let (Some(mut wide), Some(mut half)) = (backend(16), backend(16)) else {
+        return Ok(());
+    };
+    let custom = [
+        DenseTopology::new(&[6])?,
+        DenseTopology::new(&[10, 6])?,
+        DenseTopology::new(&[5])?,
+    ];
+    let mut draws = Draws(4242);
+    let mut f32_params = Vec::new();
+    let mut f16_params = Vec::new();
+    let mut inputs_list = Vec::new();
+    for topology in &custom {
+        let mut params = vec![0.0_f32; topology.parameter_count()];
+        for layer in topology.layers() {
+            let scale = 1.0 / (layer.inputs as f64).sqrt();
+            for value in &mut params[layer.weights..layer.biases + layer.outputs] {
+                *value = (draws.symmetric() * scale) as f32;
+            }
+        }
+        let h: Vec<F16> = params
+            .iter()
+            .map(|&v| F16::from_f64(f64::from(v)))
+            .collect();
+        let mut inp = [0.0; SENSOR_WIDTH];
+        for v in &mut inp {
+            *v = draws.symmetric() * 2.0;
+        }
+        f32_params.push(params);
+        f16_params.push(h);
+        inputs_list.push(inp);
+    }
+
+    let wide_jobs: Vec<ControllerJob<'_>> = (0..custom.len())
+        .map(|i| {
+            Ok(ControllerJob {
+                genome: GenomeId::new(i as u64 + 1),
+                slot: ArenaSlot::new(i as u32, 0, 1),
+                controller: ReferenceController::new(&custom[i], &f32_params[i], BOUND)?,
+                inputs: &inputs_list[i],
+            })
+        })
+        .collect::<Result<_, CoreError>>()?;
+    let half_jobs: Vec<ControllerJob<'_>> = (0..custom.len())
+        .map(|i| {
+            Ok(ControllerJob {
+                genome: GenomeId::new(i as u64 + 100),
+                slot: ArenaSlot::new(i as u32, 0, 1),
+                controller: ReferenceController::new(&custom[i], &f16_params[i], BOUND)?,
+                inputs: &inputs_list[i],
+            })
+        })
+        .collect::<Result<_, CoreError>>()?;
+
+    let mut wide_out = Vec::new();
+    wide.evaluate(&wide_jobs, &mut wide_out)?;
+    assert_eq!(bits(&wide_out), reference(&wide_jobs));
+
+    let mut half_out = Vec::new();
+    half.evaluate(&half_jobs, &mut half_out)?;
+    let half_want = reference(&half_jobs);
+    // [6] (882 params) and [10, 6] (1368 params) have even lengths and execute on GPU.
+    assert!(half_out[0].is_some() && half_out[1].is_some());
+    assert_eq!(bits(&half_out)[0], half_want[0]);
+    assert_eq!(bits(&half_out)[1], half_want[1]);
+    // [5] has 741 (odd) parameters and defers cleanly in F16 shards.
+    assert_eq!(half_out[2], None);
+    Ok(())
+}

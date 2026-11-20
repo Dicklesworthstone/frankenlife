@@ -1259,6 +1259,25 @@ rounds' ratios were 1.32× and 1.45×, and the fastest rounds 1.31× and 1.41×.
 of weight bytes, against 431–439 GB/s for F32, so halving the bytes did not halve the time. At these sizes the
 kernel is not bound by its weight bytes alone (see the unexplained remainder under the known gaps).
 
+**Specialized F32/F16 forward kernels and single-pass host staging (Observed, 2026-11-20, Apple M5 Ultra,
+11 rounds, `identical = true`, `deferred = 0`).** Splitting `controller_forward` / `controller_forward_half`
+with `threadgroup float4` activations, coalesced 4-wide weight loads on 4-aligned rows (scalar fallback for
+non-4-aligned widths), once-per-layer `HALF_TINY_INPUT_BITS` (`2^-78`) check in the binary16 loop, branchless
+`min_z` tracking, direct-indexed `ShardTable` (`< 256`), cached per-bucket shape words, and single-pass
+parallel `f64 → f32` input narrowing + placement changed 80,000 `[64, 32]` organisms on the same host from
+baseline (`c9b800d`):
+- F16 shards (`resident_bandwidth 80000 64,32 11 f16`): `half_shard_device_ms` `4.769 → 3.426 ms`
+  (`335.1 → 466.4 GB/s`, fastest `3.317 ms`, `ratio_of_medians` F32/F16 `1.461× → 1.823×`; cv `13.99%`
+  under shared host load, so indicative rather than ≤5% gated); `f32_shard_device_ms` `6.969 → 6.247 ms`
+  (`458.6 → 511.7 GB/s`).
+- F32 shards (`resident_bandwidth 80000 64,32 11 f32`): `device_ms` `6.921 → 6.351 ms`
+  (`461.8 → 503.2 GB/s`), and `wall_ms` `16.871 → 10.835 ms` (`189.4 → 295.0 GB/s`, host staging cut
+  `9.95 → 4.48 ms`).
+- Whole-tick `desktop-world.toml` (100,000 F16 organisms, 16 workers, `digests_equal = true`):
+  `controller_device_nanoseconds` over 50 ticks dropped `271.1 → 201.0 ms` (`5.42 → 4.02 ms/tick`).
+- Regression guards in `tests/residency.rs`: `half_kernel_defers_tiny_inputs_below_two_to_the_minus_78` and
+  `non_multiple_of_four_hidden_widths_match_reference_in_f32_and_f16`.
+
 Negative evidence: storing each layer's weights `[in][out]`, so that a threadgroup's lanes read adjacent words, was
 measured in one process against the kernel's `[out][in]`. One template instantiated both orders; the two backends
 and the stream alternated over 21 paired rounds. Every output was identical. The paired `[out][in]`/`[in][out]`

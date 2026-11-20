@@ -610,8 +610,8 @@ struct DeviceShard {
 }
 
 /// Dense direct-indexed shard slots below this threshold (`0..256` covers
-/// >3.4M F16 genomes per topology with zero hashing); higher sparse shard IDs
-/// (such as synthetic `slot >= 1 << 40` tests) fall back to `HashMap`.
+/// over 3.4M F16 genomes per topology with zero hashing); higher sparse shard
+/// IDs (such as synthetic `slot >= 1 << 40` tests) fall back to `HashMap`.
 const DENSE_SHARDS: usize = 256;
 
 /// Per-topology shard map with O(1) direct indexing for normal arena shards
@@ -729,7 +729,6 @@ pub struct MetalBackend {
     /// Host staging, reused.
     staged_inputs: Vec<f32>,
     input_finite: Vec<u8>,
-    eligible: Vec<usize>,
     dispatched: Vec<usize>,
     values: Vec<f32>,
     flags: Vec<u32>,
@@ -809,7 +808,7 @@ impl MetalBackend {
             raw: None,
             faults: None,
             staged_inputs: Vec::new(),
-            eligible: Vec::new(),
+            input_finite: Vec::new(),
             dispatched: Vec::new(),
             values: Vec::new(),
             flags: Vec::new(),
@@ -897,19 +896,25 @@ impl MetalBackend {
             // Binary16 slots start on a word: an odd parameter count would
             // share one with the next slot, so such a member is deferred.
             let packs = dtype == WeightDtype::F32 || length.is_multiple_of(2);
+            let shape_words = usize::try_from(length)
+                .ok()
+                .and_then(|len| job_words(topology, len, 0, 0).ok())
+                .map(|words| [words[2], words[3], words[4]]);
             DeviceBucket {
                 topology: topology.clone(),
                 dtype,
-                geometry: packs
+                shape_words,
+                geometry: (packs && shape_words.is_some())
                     .then(|| {
                         ShardGeometry::fitting(length, limit.min(u64::from(u32::MAX)), shard_slots)
                             .ok()
                     })
                     .flatten(),
-                shards: HashMap::new(),
+                shards: ShardTable::default(),
             }
         });
-        let serves = bucket.topology == *topology
+        let serves = bucket.shape_words.is_some()
+            && bucket.topology == *topology
             && bucket.dtype == dtype
             && bucket
                 .geometry
@@ -917,24 +922,53 @@ impl MetalBackend {
         Ok(serves.then_some(bucket))
     }
 
-    /// Copy each eligible job's parameters to its slot unless they are
-    /// resident, then keep for dispatch the jobs whose slots hold their own
-    /// parameters: a slot two jobs of one batch name holds the last one's.
-    fn place(&mut self, jobs: &[ControllerJob<'_>]) -> Result<(), CoreError> {
-        let eligible = std::mem::take(&mut self.eligible);
+    /// Place every finite, shaped job into its resident device shard and stage
+    /// per-shard job words in a single pass when no live slot is overwritten
+    /// mid-batch; falls back to the two-pass reconciliation when an existing
+    /// occupant is overwritten (handling duplicate slots in one batch
+    /// identically to the reference contract).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single-pass placement and staging with duplicate-slot fallback"
+    )]
+    fn place_and_stage(
+        &mut self,
+        jobs: &[ControllerJob<'_>],
+    ) -> Result<(Vec<(usize, u64)>, bool), CoreError> {
         let owner = self.controllers.owner.clone();
         let mut uploads = 0;
         let budget = self.budget;
-        // What the shards hold, written back once the batch is placed. An
-        // error drops the backend, so a lost count is never used.
         let (mut held, mut shard_count) = (self.held, self.shard_count);
         let mut packed: Vec<u32> = Vec::new();
-        for &index in &eligible {
-            let Some(job) = jobs.get(index) else { continue };
-            let Some(bucket) = self.bucket(job)? else {
+        for bucket in self.buckets.iter_mut().flatten() {
+            for shard in bucket.shards.values_mut() {
+                shard.staged.clear();
+            }
+        }
+        let mut dispatched = std::mem::take(&mut self.dispatched);
+        dispatched.clear();
+        if dispatched.capacity() < jobs.len() {
+            let extra = jobs.len() - dispatched.capacity();
+            reserve(&mut dispatched, extra, "metal controller dispatch")?;
+        }
+        let mut touched = Vec::new();
+        let mut overwrote_existing = false;
+        let mut all_dispatched = true;
+        for (index, job) in jobs.iter().enumerate() {
+            if self.input_finite.get(index).copied().unwrap_or(0) == 0 {
+                all_dispatched = false;
+                continue;
+            }
+            let Ok(topology) = usize::try_from(job.slot.topology()) else {
+                all_dispatched = false;
                 continue;
             };
-            let Some(geometry) = bucket.geometry else {
+            let Some(bucket) = self.bucket(job)? else {
+                all_dispatched = false;
+                continue;
+            };
+            let (Some(geometry), Some(shape_words)) = (bucket.geometry, bucket.shape_words) else {
+                all_dispatched = false;
                 continue;
             };
             let dtype = bucket.dtype;
@@ -942,53 +976,59 @@ impl MetalBackend {
             let local = usize::try_from(at.slot_in_shard).map_err(|_| CoreError::Overflow {
                 quantity: "arena slot",
             })?;
-            let shard = match bucket.shards.entry(at.shard) {
-                Entry::Occupied(entry) => entry.into_mut(),
-                Entry::Vacant(entry) => {
-                    let elements = usize::try_from(geometry.shard_elements()).map_err(|_| {
-                        CoreError::Overflow {
-                            quantity: "arena shard elements",
-                        }
-                    })?;
-                    let slots = usize::try_from(geometry.slots_per_shard()).map_err(|_| {
-                        CoreError::Overflow {
-                            quantity: "arena shard slots",
-                        }
-                    })?;
-                    let bytes = geometry
-                        .shard_elements()
-                        .saturating_mul(dtype.bytes())
-                        .saturating_add(bytes_for::<Option<(u32, GenomeId)>>(slots))
-                        .saturating_add(SHARD_HOST_BYTES);
-                    let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
-                    if held.saturating_add(bytes).saturating_add(staging) > budget.bytes {
+            let shard = if let Some(shard) = bucket.shards.get_mut(at.shard) {
+                shard
+            } else {
+                let elements = usize::try_from(geometry.shard_elements()).map_err(|_| {
+                    CoreError::Overflow {
+                        quantity: "arena shard elements",
+                    }
+                })?;
+                let slots = usize::try_from(geometry.slots_per_shard()).map_err(|_| {
+                    CoreError::Overflow {
+                        quantity: "arena shard slots",
+                    }
+                })?;
+                let bytes = geometry
+                    .shard_elements()
+                    .saturating_mul(dtype.bytes())
+                    .saturating_add(bytes_for::<Option<(u32, GenomeId)>>(slots))
+                    .saturating_add(SHARD_HOST_BYTES);
+                let staging = staging_bytes(budget.organisms, shard_count.saturating_add(1));
+                if held.saturating_add(bytes).saturating_add(staging) > budget.bytes {
+                    all_dispatched = false;
+                    continue;
+                }
+                let made = match dtype {
+                    WeightDtype::F32 => owner
+                        .zeroed_owned::<f32>(elements)
+                        .map(ShardParameters::F32),
+                    // Slots of an even count fill whole words.
+                    WeightDtype::F16 => owner
+                        .zeroed_owned::<u32>(elements / 2)
+                        .map(ShardParameters::F16),
+                };
+                let parameters = match made {
+                    Ok(parameters) => parameters,
+                    Err(CoreError::BudgetExhausted { .. }) => {
+                        all_dispatched = false;
                         continue;
                     }
-                    let made = match dtype {
-                        WeightDtype::F32 => owner
-                            .zeroed_owned::<f32>(elements)
-                            .map(ShardParameters::F32),
-                        // Slots of an even count fill whole words.
-                        WeightDtype::F16 => owner
-                            .zeroed_owned::<u32>(elements / 2)
-                            .map(ShardParameters::F16),
-                    };
-                    let parameters = match made {
-                        Ok(parameters) => parameters,
-                        Err(CoreError::BudgetExhausted { .. }) => continue,
-                        Err(error) => return Err(error),
-                    };
-                    let mut occupants = Vec::new();
-                    occupants.try_reserve_exact(slots).map_err(|_| {
-                        CoreError::AllocationFailed {
-                            buffer: "metal controller slots",
-                            bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
-                        }
+                    Err(error) => return Err(error),
+                };
+                let mut occupants = Vec::new();
+                occupants
+                    .try_reserve_exact(slots)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "metal controller slots",
+                        bytes: bytes_for::<Option<(u32, GenomeId)>>(slots),
                     })?;
-                    occupants.resize(slots, None);
-                    held = held.saturating_add(bytes);
-                    shard_count = shard_count.saturating_add(1);
-                    entry.insert(DeviceShard {
+                occupants.resize(slots, None);
+                held = held.saturating_add(bytes);
+                shard_count = shard_count.saturating_add(1);
+                bucket.shards.insert(
+                    at.shard,
+                    DeviceShard {
                         parameters,
                         occupants,
                         live_count: 0,
@@ -996,74 +1036,145 @@ impl MetalBackend {
                         jobs: None,
                         job_capacity: 0,
                         staged: Vec::new(),
-                    })
-                }
+                    },
+                )
             };
             let own = Some((job.slot.generation(), job.genome));
             let Some(occupant) = shard.occupants.get_mut(local) else {
+                all_dispatched = false;
                 continue;
             };
-            if *occupant == own {
-                continue;
-            }
-            let offset = usize::try_from(at.offset).map_err(|_| CoreError::Overflow {
-                quantity: "arena offset",
-            })?;
-            // The old occupant is gone before the new one is written, so a
-            // failure leaves the slot empty, never mixed.
-            if occupant.take().is_some() {
-                shard.live_count = shard.live_count.saturating_sub(1);
-            }
-            match (&shard.parameters, job.controller.parameters()) {
-                (ShardParameters::F32(buffer), Weights::F32(values)) => {
-                    owner.write(buffer.buffer())?.write(offset, values)?;
+            if *occupant != own {
+                let offset = usize::try_from(at.offset).map_err(|_| CoreError::Overflow {
+                    quantity: "arena offset",
+                })?;
+                // The old occupant is gone before the new one is written, so a
+                // failure leaves the slot empty, never mixed.
+                if occupant.take().is_some() {
+                    shard.live_count = shard.live_count.saturating_sub(1);
+                    overwrote_existing = true;
                 }
-                // Two binary16 values a word, the even one low; the slot's
-                // first word is its even offset halved.
-                (ShardParameters::F16(words), Weights::F16(values)) => {
-                    packed.clear();
-                    reserve(&mut packed, values.len() / 2, "metal binary16 words")?;
-                    packed.extend(values.as_chunks::<2>().0.iter().map(|[low, high]| {
-                        u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
-                    }));
-                    owner.write(words.buffer())?.write(offset / 2, &packed)?;
+                match (&shard.parameters, job.controller.parameters()) {
+                    (ShardParameters::F32(buffer), Weights::F32(values)) => {
+                        owner.write(buffer.buffer())?.write(offset, values)?;
+                    }
+                    // Two binary16 values a word, the even one low; the slot's
+                    // first word is its even offset halved.
+                    (ShardParameters::F16(words), Weights::F16(values)) => {
+                        packed.clear();
+                        reserve(&mut packed, values.len() / 2, "metal binary16 words")?;
+                        packed.extend(values.as_chunks::<2>().0.iter().map(|[low, high]| {
+                            u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
+                        }));
+                        owner.write(words.buffer())?.write(offset / 2, &packed)?;
+                    }
+                    // A bucket serves only its own dtype (`bucket`).
+                    _ => {
+                        all_dispatched = false;
+                        continue;
+                    }
                 }
-                // A bucket serves only its own dtype (`bucket`).
-                _ => continue,
+                *occupant = own;
+                shard.live_count += 1;
+                uploads += 1;
             }
-            *occupant = own;
-            shard.live_count += 1;
-            uploads += 1;
+            let row = dispatched.len();
+            dispatched.push(index);
+            if !overwrote_existing {
+                let row_word = u32::try_from(row).map_err(|_| CoreError::LayoutMismatch {
+                    buffer: "metal controller batch",
+                    detail: format!("row {row} exceeds u32"),
+                })?;
+                let offset_word =
+                    u32::try_from(at.offset).map_err(|_| CoreError::LayoutMismatch {
+                        buffer: "metal controller batch",
+                        detail: format!("parameter offset {} exceeds u32", at.offset),
+                    })?;
+                if shard.staged.is_empty() {
+                    reserve(&mut touched, 1, "metal controller shards")?;
+                    touched.push((topology, at.shard));
+                }
+                reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
+                shard.staged.extend_from_slice(&[
+                    row_word,
+                    offset_word,
+                    shape_words[0],
+                    shape_words[1],
+                    shape_words[2],
+                ]);
+            }
         }
         self.uploads += uploads;
         (self.held, self.shard_count) = (held, shard_count);
-        self.dispatched.clear();
-        for &index in &eligible {
-            let Some(job) = jobs.get(index) else { continue };
-            let Some(bucket) = self.bucket(job)? else {
-                continue;
-            };
-            let resident = bucket.geometry.is_some_and(|geometry| {
+        self.dispatched = dispatched;
+
+        if overwrote_existing {
+            // At least one live slot was overwritten during this batch; drop
+            // any earlier job whose slot was evicted by a later job in the
+            // same batch and rebuild per-shard job lists cleanly.
+            touched.clear();
+            for bucket in self.buckets.iter_mut().flatten() {
+                for shard in bucket.shards.values_mut() {
+                    shard.staged.clear();
+                }
+            }
+            let candidates = std::mem::take(&mut self.dispatched);
+            for &index in &candidates {
+                let Some(job) = jobs.get(index) else { continue };
+                let Ok(topology) = usize::try_from(job.slot.topology()) else {
+                    all_dispatched = false;
+                    continue;
+                };
+                let Some(bucket) = self.buckets.get_mut(topology).and_then(Option::as_mut) else {
+                    all_dispatched = false;
+                    continue;
+                };
+                let (Some(geometry), Some(shape_words)) = (bucket.geometry, bucket.shape_words)
+                else {
+                    all_dispatched = false;
+                    continue;
+                };
                 let at = geometry.locate(job.slot.slot());
-                bucket
-                    .shards
-                    .get(&at.shard)
-                    .and_then(|shard| {
-                        shard
-                            .occupants
-                            .get(usize::try_from(at.slot_in_shard).ok()?)
-                            .copied()
-                    })
+                let Some(shard) = bucket.shards.get_mut(at.shard) else {
+                    all_dispatched = false;
+                    continue;
+                };
+                let resident = usize::try_from(at.slot_in_shard)
+                    .ok()
+                    .and_then(|local| shard.occupants.get(local).copied())
                     .flatten()
-                    == Some((job.slot.generation(), job.genome))
-            });
-            if resident {
-                reserve(&mut self.dispatched, 1, "metal controller dispatch")?;
+                    == Some((job.slot.generation(), job.genome));
+                if !resident {
+                    all_dispatched = false;
+                    continue;
+                }
+                let row = self.dispatched.len();
                 self.dispatched.push(index);
+                let row_word = u32::try_from(row).map_err(|_| CoreError::LayoutMismatch {
+                    buffer: "metal controller batch",
+                    detail: format!("row {row} exceeds u32"),
+                })?;
+                let offset_word =
+                    u32::try_from(at.offset).map_err(|_| CoreError::LayoutMismatch {
+                        buffer: "metal controller batch",
+                        detail: format!("parameter offset {} exceeds u32", at.offset),
+                    })?;
+                if shard.staged.is_empty() {
+                    reserve(&mut touched, 1, "metal controller shards")?;
+                    touched.push((topology, at.shard));
+                }
+                reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
+                shard.staged.extend_from_slice(&[
+                    row_word,
+                    offset_word,
+                    shape_words[0],
+                    shape_words[1],
+                    shape_words[2],
+                ]);
             }
         }
-        self.eligible = eligible;
-        Ok(())
+        touched.sort_unstable();
+        Ok((touched, all_dispatched))
     }
 
     /// Grow the per-organism buffers to hold `count` organisms.
@@ -1081,55 +1192,68 @@ impl MetalBackend {
         self.organisms = organisms;
         Ok(())
     }
+}
 
-    /// Stage every dispatched job: its inputs at its row, and its job words
-    /// in its shard's list. Returns each touched shard's key, in order.
-    fn stage(&mut self, jobs: &[ControllerJob<'_>]) -> Result<Vec<(usize, u64)>, CoreError> {
-        let count = self.dispatched.len();
-        self.staged_inputs.clear();
-        reserve(
-            &mut self.staged_inputs,
-            count * SENSOR_WIDTH,
-            "metal inputs",
-        )?;
-        for bucket in self.buckets.iter_mut().flatten() {
-            for shard in bucket.shards.values_mut() {
-                shard.staged.clear();
-            }
-        }
-        let mut touched = Vec::new();
-        for (row, &index) in self.dispatched.iter().enumerate() {
-            let Some(job) = jobs.get(index) else { continue };
-            let topology = usize::try_from(job.slot.topology()).unwrap_or(usize::MAX);
-            let Some(bucket) = self.buckets.get_mut(topology).and_then(Option::as_mut) else {
-                continue;
-            };
-            let Some(geometry) = bucket.geometry else {
-                continue;
-            };
-            let at = geometry.locate(job.slot.slot());
-            let Some(shard) = bucket.shards.get_mut(&at.shard) else {
-                continue;
-            };
-            let offset = usize::try_from(at.offset).unwrap_or(usize::MAX);
-            let words = job_words(
-                job.controller.topology(),
-                job.controller.parameters().len(),
-                offset,
-                row,
-            )?;
-            if shard.staged.is_empty() {
-                reserve(&mut touched, 1, "metal controller shards")?;
-                touched.push((topology, at.shard));
-            }
-            reserve(&mut shard.staged, JOB_WORDS, "metal jobs")?;
-            shard.staged.extend_from_slice(&words);
-            self.staged_inputs
-                .extend(job.inputs.iter().map(|&value| value as f32));
-        }
-        touched.sort_unstable();
-        Ok(touched)
+/// Narrow all `jobs`' sensor inputs (`f64 -> f32`) into `staged` and record
+/// per-job finiteness in `finite` in a single pass (parallelized for large
+/// batches).
+fn narrow_inputs(
+    jobs: &[ControllerJob<'_>],
+    staged: &mut Vec<f32>,
+    finite: &mut Vec<u8>,
+) -> Result<(), CoreError> {
+    let total_inputs = jobs.len().saturating_mul(SENSOR_WIDTH);
+    if staged.len() < total_inputs {
+        reserve(staged, total_inputs - staged.len(), "metal inputs")?;
+        staged.resize(total_inputs, 0.0);
     }
+    if finite.len() < jobs.len() {
+        reserve(finite, jobs.len() - finite.len(), "metal input flags")?;
+        finite.resize(jobs.len(), 0);
+    }
+    let out = &mut staged[..total_inputs];
+    let flags = &mut finite[..jobs.len()];
+    let narrow_chunk = |jobs: &[ControllerJob<'_>], out: &mut [f32], flags: &mut [u8]| {
+        for ((job, dst), flag) in jobs
+            .iter()
+            .zip(out.as_chunks_mut::<SENSOR_WIDTH>().0.iter_mut())
+            .zip(flags)
+        {
+            let mut ok = true;
+            for (slot, &value) in dst.iter_mut().zip(job.inputs) {
+                let narrowed = value as f32;
+                ok &= narrowed.is_finite();
+                *slot = narrowed;
+            }
+            *flag = u8::from(ok);
+        }
+    };
+    if jobs.len() < PARALLEL_INPUT_MIN_JOBS {
+        narrow_chunk(jobs, out, flags);
+    } else {
+        let threads = std::thread::available_parallelism()
+            .map_or(4, usize::from)
+            .clamp(1, PARALLEL_INPUT_MAX_THREADS)
+            .min(jobs.len().div_ceil(1024));
+        let chunk = jobs.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let mut job_chunks = jobs.chunks(chunk);
+            let mut out_chunks = out.chunks_mut(chunk * SENSOR_WIDTH);
+            let mut flag_chunks = flags.chunks_mut(chunk);
+            let head = (job_chunks.next(), out_chunks.next(), flag_chunks.next());
+            let mut handles = Vec::with_capacity(threads.saturating_sub(1));
+            for ((jc, oc), fc) in job_chunks.zip(out_chunks).zip(flag_chunks) {
+                handles.push(scope.spawn(move || narrow_chunk(jc, oc, fc)));
+            }
+            if let (Some(jc), Some(oc), Some(fc)) = head {
+                narrow_chunk(jc, oc, fc);
+            }
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+    }
+    Ok(())
 }
 
 impl ControllerBackend for MetalBackend {
@@ -1156,7 +1280,7 @@ impl ControllerBackend for MetalBackend {
         total(shards.chain([
             self.controllers.owner.usage().bytes,
             capacity_bytes(&self.staged_inputs),
-            capacity_bytes(&self.eligible),
+            capacity_bytes(&self.input_finite),
             capacity_bytes(&self.dispatched),
             capacity_bytes(&self.values),
             capacity_bytes(&self.flags),
@@ -1185,7 +1309,7 @@ impl ControllerBackend for MetalBackend {
             let Ok(local) = usize::try_from(at.slot_in_shard) else {
                 continue;
             };
-            let drop_shard = match bucket.shards.get_mut(&at.shard) {
+            let drop_shard = match bucket.shards.get_mut(at.shard) {
                 Some(shard) => {
                     if let Some(occupant) = shard.occupants.get_mut(local)
                         && occupant.is_some_and(|(generation, _)| generation == slot.generation())
@@ -1197,7 +1321,7 @@ impl ControllerBackend for MetalBackend {
                 }
                 None => false,
             };
-            if drop_shard && let Some(removed) = bucket.shards.remove(&at.shard) {
+            if drop_shard && let Some(removed) = bucket.shards.remove(at.shard) {
                 self.held = self.held.saturating_sub(removed.bytes);
                 self.shard_count = self.shard_count.saturating_sub(1);
             }
@@ -1212,38 +1336,30 @@ impl ControllerBackend for MetalBackend {
         outputs.clear();
         reserve(outputs, jobs.len(), "metal controller outputs")?;
         self.last_command = None;
-        self.eligible.clear();
-        // A job the kernel cannot take, or whose inputs the reference
-        // refuses, is deferred: the reference evaluates it, or refuses it.
-        for (index, entry) in jobs.iter().enumerate() {
-            let finite = entry.inputs.iter().all(|&value| (value as f32).is_finite());
-            let shaped = job_words(
-                entry.controller.topology(),
-                entry.controller.parameters().len(),
-                0,
-                0,
-            )
-            .is_ok();
-            if finite && shaped {
-                reserve(&mut self.eligible, 1, "metal controller dispatch")?;
-                self.eligible.push(index);
-            }
+        if jobs.is_empty() {
+            return Ok(());
         }
-        self.dispatched.clear();
-        if !self.eligible.is_empty() {
-            self.place(jobs)?;
-        }
+        narrow_inputs(jobs, &mut self.staged_inputs, &mut self.input_finite)?;
+        let (touched, all_dispatched) = self.place_and_stage(jobs)?;
         let count = self.dispatched.len();
         if count > 0 {
+            if !all_dispatched {
+                for (row, &index) in self.dispatched.iter().enumerate() {
+                    if row != index {
+                        let src = index * SENSOR_WIDTH;
+                        self.staged_inputs
+                            .copy_within(src..src + SENSOR_WIDTH, row * SENSOR_WIDTH);
+                    }
+                }
+            }
             self.hold(count)?;
-            let touched = self.stage(jobs)?;
             let owner = self.controllers.owner.clone();
             for &(topology, key) in &touched {
                 let Some(shard) = self
                     .buckets
                     .get_mut(topology)
                     .and_then(Option::as_mut)
-                    .and_then(|bucket| bucket.shards.get_mut(&key))
+                    .and_then(|bucket| bucket.shards.get_mut(key))
                 else {
                     continue;
                 };
@@ -1268,12 +1384,14 @@ impl ControllerBackend for MetalBackend {
                     detail: "buffers missing".to_owned(),
                 });
             };
-            owner.write(inputs)?.write(0, &self.staged_inputs)?;
+            owner
+                .write(inputs)?
+                .write(0, &self.staged_inputs[..count * SENSOR_WIDTH])?;
             let mut bindings = Vec::new();
             reserve(&mut bindings, touched.len(), "metal controller kernels")?;
             for &(topology, key) in &touched {
                 let bucket = self.buckets.get(topology).and_then(Option::as_ref);
-                let shard = bucket.and_then(|bucket| bucket.shards.get(&key));
+                let shard = bucket.and_then(|bucket| bucket.shards.get(key));
                 let Some((dtype, parameters, words, staged)) =
                     bucket.zip(shard).and_then(|(bucket, shard)| {
                         Some((
@@ -1315,28 +1433,46 @@ impl ControllerBackend for MetalBackend {
                 .collect();
             let receipt = owner.submit_batch(&kernels)?;
             self.last_command = Some((receipt.kernels, receipt.device_seconds));
-            self.values.clear();
-            self.values.resize(count * ACTION_WIDTH, 0.0);
-            owner.read_back(raw, &mut self.values)?;
-            self.flags.clear();
-            self.flags.resize(count, 0);
-            owner.read_back(faults, &mut self.flags)?;
+            let need_values = count * ACTION_WIDTH;
+            if self.values.len() < need_values {
+                let extra = need_values - self.values.len();
+                reserve(&mut self.values, extra, "metal controller outputs")?;
+                self.values.resize(need_values, 0.0);
+            }
+            owner.read_back(raw, &mut self.values[..need_values])?;
+            if self.flags.len() < count {
+                let extra = count - self.flags.len();
+                reserve(&mut self.flags, extra, "metal controller faults")?;
+                self.flags.resize(count, 0);
+            }
+            owner.read_back(faults, &mut self.flags[..count])?;
         }
-        let mut dispatched = self.dispatched.iter().zip(
-            self.values
+        if count == jobs.len() {
+            for (row, &flag) in self.values[..count * ACTION_WIDTH]
                 .as_chunks::<ACTION_WIDTH>()
                 .0
                 .iter()
-                .zip(&self.flags),
-        );
-        let mut next = dispatched.next();
-        for index in 0..jobs.len() {
-            match next {
-                Some((&at, (row, &flag))) if at == index => {
-                    outputs.push((flag == 0).then_some(*row));
-                    next = dispatched.next();
+                .zip(&self.flags[..count])
+            {
+                outputs.push((flag == 0).then_some(*row));
+            }
+        } else {
+            let mut dispatched = self.dispatched.iter().zip(
+                self.values[..count * ACTION_WIDTH]
+                    .as_chunks::<ACTION_WIDTH>()
+                    .0
+                    .iter()
+                    .zip(&self.flags[..count]),
+            );
+            let mut next = dispatched.next();
+            for index in 0..jobs.len() {
+                match next {
+                    Some((&at, (row, &flag))) if at == index => {
+                        outputs.push((flag == 0).then_some(*row));
+                        next = dispatched.next();
+                    }
+                    _ => outputs.push(None),
                 }
-                _ => outputs.push(None),
             }
         }
         Ok(())

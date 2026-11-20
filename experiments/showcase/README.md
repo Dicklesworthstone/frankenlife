@@ -685,6 +685,27 @@ million-organism world at zoom 1.95 holds as many as this whole torus):
 from tick 2,400, where the trials were scored, to 5,600, coloured by founder lineage. The population stays at
 the ceiling throughout.
 
+### After the film
+
+Seven more trials, seed 42 to tick 2,400, each the preset with one or two changes, after the film showed its
+two largest gaps from the references: no dark moats between domains, and few glands with bright rims. None is
+clearly nearer than the preset (`f64-d20` ties it on the statistic and looks hazier), so it stays.
+
+| Trial | Change from `confluent-world` | Distance | Occupied | By eye |
+|---|---|---:|---:|---|
+| `w80-o25` | none (the preset) | 0.74 | 0.99 | lineage domains of labyrinth, foam and packed spheres |
+| `cw-k30` | toxicity sensitivity 0.08 → 0.3 | 0.75 | 0.99 | the same domains; no moats |
+| `cw-k80` | toxicity sensitivity 0.08 → 0.8 | 0.75 | 1.00 | the same domains; no moats |
+| `cw-o10` | children within 1.0 units, not 2.5 | 1.13 | 0.96 | black gaps return between colonies |
+| `cw-o10-k30` | both | 1.14 | 0.97 | as `cw-o10` |
+| `f64-d16` | field 512² (about one organism per cell), body and sensing lengths ÷ 1.6, children still within 2.5 | 1.06 | 0.99 | dimmer, hazier domains; finer specks |
+| `f64-d20` | as `f64-d16`, bodies 0.20 across | 0.73 | 0.99 | as `f64-d16`, with more clumps close up |
+| `f64-o10-d16` | as `f64-d16`, children within 1.0 units | 1.34 | 0.96 | hazy, with black gaps |
+
+So poison does not draw moats in this model: domains meet without a gap whether toxicity sensitivity is the
+preset's 0.08 or ten times that. And the field's last factor of 1.6 towards the references' one organism per
+cell does not bring the image nearer; `f64-d20` ties the preset on the statistic and looks hazier.
+
 ## What this does not show
 
 - Stages 1–2's statistic rewards fine structure that moves and fills the world. It is not a measure of

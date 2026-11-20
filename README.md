@@ -454,12 +454,13 @@ torus), so each holds about 2.6 organisms where `contact-world`'s hold about ten
 acceleration and sensing scale is divided by four with them. Its bodies are 0.25 units across, one field
 cell. Food is plentiful, so its 262,144 organisms sit at the ceiling, and children land up to 2.5 units from
 their parent, so colonies fill the torus. Coloured by founder lineage, its tissue falls into saturated
-domains of one colour, each with its own labyrinth, foam or packed spheres. Against the corrected image
-statistic of the reference screenshots it scores 0.74 on seed 42 and 0.81–1.57 on three seeds the search
+domains of one colour, each with its own labyrinth, foam or packed spheres; the film lights each organism's
+lineage colour by its own energy (`--color lineage-energy`), so well-fed patches show pale and starving ones
+dark. Against the corrected image statistic of the reference screenshots it scores 0.74 on seed 42 and 0.81–1.57 on three seeds the search
 never saw. Scored the same way, `tissue-world` scores 1.03 and 1.82–2.25, and `contact-world` 1.93 and
 1.92–2.68. `experiments/showcase/README.md` (stage E) has every trial and what the choice does not show.
-The Studio opens it from its 10,954 founders:
-`cargo run --release -p flife-studio -- presets/confluent-world.toml`.
+The Studio opens it from its 10,954 founders, drawn as the film draws it (keys 1 to 7, R and F change that):
+`cargo run --release -p flife-studio -- presets/confluent-world.toml --color lineage-energy --look sphere --no-field`.
 
 `presets/contact-world.toml` is `tissue-world`, below, under a different model, `field-ecology-v1-contact`.
 Plan §5.4 gives the contact model one added rule: every organism is a body 0.45 world units across. After each

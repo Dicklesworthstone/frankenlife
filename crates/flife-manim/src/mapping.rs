@@ -642,14 +642,16 @@ pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
         .zip(epoch.velocities())
         .zip(epoch.affinities())
         .map(
-            move |(((((&lineage, &energy), &generation), &topology), &velocity), &affinity)| Traits {
-                lineage,
-                energy,
-                generation,
-                topology,
-                velocity,
-                affinity,
-                attempt_energy,
+            move |(((((&lineage, &energy), &generation), &topology), &velocity), &affinity)| {
+                Traits {
+                    lineage,
+                    energy,
+                    generation,
+                    topology,
+                    velocity,
+                    affinity,
+                    attempt_energy,
+                }
             },
         )
 }
@@ -883,9 +885,8 @@ pub const LINEAGE_ENERGY_LIGHTNESS: f64 = 0.55;
 const LINEAGE_ENERGY_STEPS: usize = 256;
 
 /// Each [`LINEAGE_PALETTE`] colour at each of its lightness steps.
-static LINEAGE_ENERGY_SHADES: LazyLock<
-    [[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()],
-> = LazyLock::new(|| {
+static LINEAGE_ENERGY_SHADES: LazyLock<[[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()]> =
+    LazyLock::new(|| {
         let mut shades = [[[0_u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()];
         for (palette, row) in LINEAGE_PALETTE.iter().zip(shades.iter_mut()) {
             let [r, g, b] = *palette;
@@ -902,7 +903,13 @@ static LINEAGE_ENERGY_SHADES: LazyLock<
 /// chroma if it fits the gamut, otherwise the most of it that fits, by
 /// bisection (no chroma always fits).
 fn most_chroma(l: f64, a: f64, b: f64) -> [u8; 3] {
-    let at = |k: f64| oklab_to_srgb(Oklab { l, a: k * a, b: k * b });
+    let at = |k: f64| {
+        oklab_to_srgb(Oklab {
+            l,
+            a: k * a,
+            b: k * b,
+        })
+    };
     let inside = |c: Srgb| [c.r, c.g, c.b].iter().all(|v| (0.0..=1.0).contains(v));
     let full = at(1.0);
     if inside(full) {
@@ -941,7 +948,11 @@ fn palette_shade(slot: usize, energy: f32, attempt_energy: f64) -> [u8; 3] {
         return LINEAGE_PALETTE[slot];
     }
     let energy = f64::from(energy);
-    let energy = if energy.is_finite() { energy.max(0.0) } else { 0.0 };
+    let energy = if energy.is_finite() {
+        energy.max(0.0)
+    } else {
+        0.0
+    };
     let lightness = (LINEAGE_ENERGY_LIGHTNESS * energy / attempt_energy).clamp(0.0, 1.0);
     let step = (lightness * (LINEAGE_ENERGY_STEPS - 1) as f64).round() as usize;
     LINEAGE_ENERGY_SHADES[slot][step.min(LINEAGE_ENERGY_STEPS - 1)]

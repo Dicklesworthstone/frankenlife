@@ -59,10 +59,10 @@ pub use mapping::{
     AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, ColorMapping, ENERGY_HALF, ENERGY_RAMP,
     FIELD_COMPONENTS, FieldComponent, FieldMapping, GENERATION_RAMP, GENERATION_SCALE,
     LEGEND_ATTEMPT_FRACTIONS, LEGEND_ENERGIES, LEGEND_GENERATIONS, LEGEND_HEADINGS,
-    LINEAGE_ENERGY_LIGHTNESS, LINEAGE_PALETTE, Legend, Look, MOTION_STILL, MOTION_WHEEL,
-    Particles, Style, TOPOLOGY_PALETTE, Traits, affinity_rgb8, energy_level, generation_level,
-    heading, legend_affinities, lineage_color, lineage_energy_rgb8, lineage_slot, linear,
-    mapped_color, mapped_rgb8, mix, ramp, speed_level, traits, wheel,
+    LINEAGE_ENERGY_LIGHTNESS, LINEAGE_PALETTE, Legend, Look, MOTION_STILL, MOTION_WHEEL, Particles,
+    Style, TOPOLOGY_PALETTE, Traits, affinity_rgb8, energy_level, generation_level, heading,
+    legend_affinities, lineage_color, lineage_energy_rgb8, lineage_slot, linear, mapped_color,
+    mapped_rgb8, mix, ramp, speed_level, traits, wheel,
 };
 pub use region::{
     REGION_ADDS_COLOR, REGION_MEASURES_COLOR, REGION_REMOVES_COLOR, REGION_SEGMENTS,

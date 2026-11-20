@@ -1,9 +1,9 @@
 {
   "schema": "frankenlife.website-media.v1",
   "video": {
-    "src": "/media/film-f30f39cea739.mp4",
-    "sha256": "f30f39cea7391591f2705b68e21e69da2d0ebb51ac3694eb5ff5964acfbe10a5",
-    "bytes": 23016433,
+    "src": "/media/film-65b03ad6b919.mp4",
+    "sha256": "65b03ad6b91921f30f5fabc8d9f02e929bb6b0ac36c3c095afba87ddff57e800",
+    "bytes": 23153809,
     "width": 1080,
     "height": 1080,
     "fps": 30,
@@ -31,15 +31,15 @@
     ]
   },
   "poster": {
-    "src": "/media/poster-9c388f120a33.jpg",
-    "sha256": "9c388f120a338f5bfa1dc3a90b3d627762e7264ff369ef02577fb0dca1448f18",
-    "bytes": 1161053,
+    "src": "/media/poster-d545d729f673.jpg",
+    "sha256": "d545d729f67361a31f518054c350ac9f4d743be0781efb4037ef4911ee3d1a17",
+    "bytes": 1040189,
     "frame": 0
   },
   "social": {
-    "src": "/media/social-75012943e50e.jpg",
-    "sha256": "75012943e50eac6b300b3a61f662815505b8a54904a7cdf5e3f08cbb03ae276a",
-    "bytes": 426199,
+    "src": "/media/social-4ba4280e3c60.jpg",
+    "sha256": "4ba4280e3c60eba6309d6253c5f6cb607f241179ebf3ef1a2d418993e2654607",
+    "bytes": 390277,
     "width": 1200,
     "height": 630,
     "frame": 184
@@ -876,7 +876,7 @@
     }
   },
   "render": {
-    "command": "flife render --run-dir RUN --ticks 3200 --every 8 --width 1080 --height 1080 --no-field --look sphere --color lineage --camera CAMERA --out FRAMES",
+    "command": "flife render --run-dir RUN --ticks 3200 --every 8 --width 1080 --height 1080 --no-field --look sphere --color lineage-energy --camera CAMERA --out FRAMES",
     "camera": {
       "rule": "activity |blur(L[t+1] − L[t−1])| of a whole-world raw preview, blurred to each shot's view; each shot looks where that activity was greatest over the shot, discounting regions already shown",
       "options": {
@@ -1378,12 +1378,12 @@
       1,
       1
     ],
-    "mapping": "lineage",
-    "meaning": "founder lineage: a stable categorical colour per lineage",
+    "mapping": "lineage-energy",
+    "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
     "look": "sphere",
     "field_mapping": "none",
     "controllers": "cpu (frankentorch population_affine_f32_into, 24 lanes)",
-    "revision": "64ed5b88ffc8e72c58ac646e39b442f6d0635b4a",
-    "flife_sha256": "1919ffd4dc13e674c5abc4c60e2da085049d321649542e66afcb14349a69018f"
+    "revision": "b4a6d62d77fad92ca8d8546233c0383f29edf929",
+    "flife_sha256": "e00f48150bdfd83a48242b5dc0a1d0bf377edeb956d7e86d1efe9b907d2539e0"
   }
 }

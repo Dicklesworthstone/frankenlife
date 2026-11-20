@@ -1210,11 +1210,7 @@ fn every_key_swatch_is_the_colour_its_mapping_gives_its_label() {
                     };
                     assert_eq!(swatch, with(mapping, traits), "{label}");
                 }
-                assert_eq!(
-                    labels[3],
-                    "1.5 x energy to divide",
-                    "{labels:?}"
-                );
+                assert_eq!(labels[3], "1.5 x energy to divide", "{labels:?}");
             }
             ColorMapping::Lineage => {
                 // Twelve unlabelled swatches, then what they mean.

@@ -708,12 +708,33 @@ million-organism world at zoom 1.95 holds as many as this whole torus):
 `presets/confluent-world.toml` is trial `w80-o25` with its name; its run reaches the trial's digest at tick
 2,400 (`3f279f51…`). Its header states each of its 22 changes from `contact-world`, and
 `crates/flife-cli/tests/confluent_preset.rs` holds it to them and to one factor of four. The film shows it
-from tick 2,400, where the trials were scored, to 5,600, coloured by founder lineage. The population stays at
-the ceiling throughout.
+from tick 2,400, where the trials were scored, to 5,600, its lineages lit by their energy (below). The
+population stays at the ceiling throughout.
 
 Its bodies stack, as `c4-d25`'s do, if less. At tick 2,400 the median nearest neighbour is 0.29 diameters,
 a body has 15.7 others within one diameter on average, and the disks' areas sum to 2.01 times the torus's
 while covering 0.76 of it: about 2.6 deep where there are bodies at all.
+
+### The film's colour
+
+Coloured by founder lineage, each lineage is one flat colour, and a domain reads as poster paint where the
+references' are mottled. The organisms' energy is not flat: at tick 2,400 it runs from 0.85 to 2.74 between
+the 10th and 90th percentiles, against a birth threshold of 1.78, and its bright and dark patches, a few
+bodies across, sit in lace and in rims around holes. So the `lineage-energy` mapping (FL-019,
+`founder-lineage-energy-v1`) keeps each lineage's hue and sets its OKLab lightness to 0.55 times the energy
+over that threshold: black with none, white from about 1.8 times it. It reads one organism's own row and the
+world's threshold, never other rows, so it adds no structure the world lacks.
+
+The same 1,024-px raw frame of tick 2,400, scored as every stage E trial was:
+
+| Colour | Distance |
+|---|---:|
+| chemical affinity (how the trials were scored) | 0.74 |
+| founder lineage (how the earlier film showed it) | 0.90 |
+| lineage lit by energy | 0.72 |
+
+The lightness rule was chosen among five on a 1,080-px frame (0.71 to 0.80); proportional to the energy
+was nearest. The colour changes no run: the film's frames reach the same digests.
 
 ### Further trials
 

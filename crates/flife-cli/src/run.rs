@@ -527,11 +527,26 @@ pub fn run_with(
         })
         .transpose()?;
     let mut world = found_on(config, options.cpu_workers)?;
-    let memory = configure(
+    let extra_lineages = scheduled
+        .iter()
+        .map(|command| match command {
+            ScheduledCommand::Introduce(intro) => {
+                usize::try_from(intro.count).unwrap_or(usize::MAX)
+            }
+            _ => 0,
+        })
+        .fold(0_usize, usize::saturating_add);
+    let observers = if options.metrics_every > 0 {
+        Tracker::bound_bytes(&world, extra_lineages)
+    } else {
+        0
+    };
+    let memory = configure_with_observers(
         &mut world,
         options.cpu_workers,
         options.controllers,
         checkpointing.as_ref(),
+        observers,
     )?;
     if let Some(persistence) = persistence {
         crate::persist::create(&persistence.run_dir, config)?;
@@ -602,10 +617,28 @@ pub fn configure(
     choice: ControllerChoice,
     checkpoint: Option<&CheckpointAdmission>,
 ) -> Result<MemoryAdmission, CoreError> {
+    configure_with_observers(world, cpu_workers, choice, checkpoint, 0)
+}
+
+/// [`configure`] with `observers` bytes of observer state (such as a
+/// [`Tracker`] when `--metrics-every` is nonzero) charged into the
+/// preflight's `render` term before the controller backend is granted the
+/// remainder (FL-043).
+///
+/// # Errors
+/// [`World::set_cpu_workers`]'s, [`crate::memory::admit`]'s and
+/// [`install`]'s.
+pub fn configure_with_observers(
+    world: &mut World,
+    cpu_workers: Option<NonZeroUsize>,
+    choice: ControllerChoice,
+    checkpoint: Option<&CheckpointAdmission>,
+    observers: u64,
+) -> Result<MemoryAdmission, CoreError> {
     if let Some(workers) = cpu_workers {
         world.set_cpu_workers(workers)?;
     }
-    let memory = crate::memory::admit(world, choice, checkpoint, 0)?;
+    let memory = crate::memory::admit(world, choice, checkpoint, observers)?;
     install(world, choice, memory.backend)?;
     Ok(memory)
 }

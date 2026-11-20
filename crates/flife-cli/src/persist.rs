@@ -1395,11 +1395,27 @@ pub fn resume(
             persistence.retained_bytes = retained;
         }
     })?;
-    let memory = configure(
+    let extra_lineages = book
+        .schedule()
+        .filter_map(|(_, _, id)| book.command(id))
+        .map(|command| match command.intervention {
+            Intervention::IntroduceOrganisms { count, .. } => {
+                usize::try_from(count).unwrap_or(usize::MAX)
+            }
+            _ => 0,
+        })
+        .fold(0_usize, usize::saturating_add);
+    let observers = if options.metrics_every > 0 {
+        crate::metrics::Tracker::bound_bytes(&world, extra_lineages)
+    } else {
+        0
+    };
+    let memory = crate::run::configure_with_observers(
         &mut world,
         options.cpu_workers,
         options.controllers,
         Some(checkpoints.admission()),
+        observers,
     )?;
     let cpu_workers = world.cpu_workers();
     let controllers = ControllerSummary::of(&world).backend;

@@ -1677,3 +1677,151 @@ fn branch_and_inspect_refuse_over_budget_without_creating_files() {
         "expected BudgetExhausted for inspect, got {inspect_err:?}"
     );
 }
+
+/// FL-043: `--metrics-every > 0` charges `Tracker::bound_bytes` in
+/// `MemoryAdmission::render` on `flife run` and `flife resume`, reduces the
+/// controller backend grant accordingly, refuses one byte short before
+/// creating a run directory, and bounds the tracker's actual measured heap
+/// (including `Tracker::sample`) on a full population with introductions.
+#[test]
+fn metrics_tracker_is_charged_in_preflight_and_stays_within_its_term() {
+    let _serial = serial();
+    let config = preset();
+    let world = found(&config).expect("the preset founds");
+    let plain_cpu = admit(&world, ControllerChoice::Cpu, None, 0).expect("plain cpu fits");
+    let plain_torch = admit(&world, ControllerChoice::Torch, None, 0).expect("plain torch fits");
+    let tracker_term = flife_cli::Tracker::bound_bytes(&world, 0);
+    assert!(tracker_term > 0, "tracker term must be nonzero");
+
+    // 1. A run with metrics_every > 0 reports `render = tracker_term` and
+    // reduces the backend grant by the exact same amount.
+    let mut torch_opts = options(4, ControllerChoice::Torch);
+    torch_opts.metrics_every = 2;
+    let with_metrics = records(&config, torch_opts);
+    let mem = &record(&with_metrics, "start")["memory"];
+    assert_eq!(number(&mem["render"]), tracker_term);
+    assert_eq!(
+        number(&mem["backend"]),
+        plain_torch.backend - tracker_term,
+        "backend grant must shrink by the tracker's observer charge"
+    );
+
+    // 2. One byte under peak_with_metrics refuses `run_with --metrics-every`
+    // before creating `run_dir`, while plain `metrics_every = 0` succeeds.
+    let run_peak_with_metrics = plain_cpu.peak_bytes + tracker_term;
+    let tight_run_cfg = preset_with(&[("maximum_total_bytes", run_peak_with_metrics - 1)]);
+    let refused_dir = fresh("metrics-admit-refused-run");
+    let mut refused_persist = Persistence::new(&refused_dir, &tight_run_cfg);
+    refused_persist.checkpoint_every = 4;
+    refused_persist.durability = StoreDurability::ProcessCrash;
+    let mut refused_opts = options(4, ControllerChoice::Cpu);
+    refused_opts.metrics_every = 2;
+    let err = run_with(
+        &tight_run_cfg,
+        refused_opts,
+        &[],
+        Some(&refused_persist),
+        |_| {},
+    )
+    .expect_err("run with metrics one byte short must refuse");
+    assert!(
+        matches!(err, CoreError::BudgetExhausted { .. }),
+        "expected BudgetExhausted, got {err:?}"
+    );
+    assert!(
+        !refused_dir.exists(),
+        "refused metrics run must not create run_dir"
+    );
+
+    // 3. Same refusal gate on `resume --metrics-every`: a run saved without
+    // metrics under a budget equal to `resume_peak_with_metrics - 1` succeeds
+    // on plain resume and refuses with BudgetExhausted on metrics resume.
+    let ckpt_admit = flife_cli::admit(
+        &config,
+        CheckpointMode::PauseAndStream,
+        config.config().execution.checkpoint_retained_bytes,
+    )
+    .expect("checkpoint admits");
+    let resume_plain = admit(&world, ControllerChoice::Cpu, Some(&ckpt_admit), 0).expect("fits");
+    let resume_with_metrics =
+        admit(&world, ControllerChoice::Cpu, Some(&ckpt_admit), tracker_term).expect("fits");
+    assert_eq!(
+        resume_with_metrics.peak_bytes,
+        resume_plain.peak_bytes + tracker_term
+    );
+    let tight_resume_cfg =
+        preset_with(&[("maximum_total_bytes", resume_with_metrics.peak_bytes - 1)]);
+    let resume_dir = fresh("metrics-admit-tight-resume");
+    let mut persist = Persistence::new(&resume_dir, &tight_resume_cfg);
+    persist.checkpoint_every = 2;
+    persist.mode = CheckpointMode::PauseAndStream;
+    persist.durability = StoreDurability::ProcessCrash;
+    let _ = run_with(
+        &tight_resume_cfg,
+        options(2, ControllerChoice::Cpu),
+        &[],
+        Some(&persist),
+        |_| {},
+    )
+    .expect("plain run fits below resume_with_metrics");
+
+    let resume_err = resume(
+        &resume_dir,
+        &ResumeOptions {
+            until: Until::Tick(4),
+            every: 0,
+            cpu_workers: None,
+            controllers: ControllerChoice::Cpu,
+            checkpoint_every: Some(2),
+            durability: StoreDurability::ProcessCrash,
+            checkpoint_mode: Some(CheckpointMode::PauseAndStream),
+            retained_bytes: None,
+            metrics_every: 2,
+        },
+        |_| {},
+    )
+    .expect_err("resume with metrics one byte short must refuse");
+    assert!(
+        matches!(resume_err, CoreError::BudgetExhausted { .. }),
+        "expected BudgetExhausted on resume, got {resume_err:?}"
+    );
+
+    // 4. Counting-allocator measurement: a full 4,096-organism population with
+    // extra introduced lineages holds strictly less heap in `Tracker` +
+    // `Tracker::sample` than `Tracker::bound_bytes`.
+    let full_cfg = preset_with(&[("initial_count", 4_096), ("maximum_count", 4_096)]);
+    let mut full_world = found(&full_cfg).expect("full world founds");
+    let bound = flife_cli::Tracker::bound_bytes(&full_world, 0);
+    let publisher = flife_render::Publisher::new(&full_world, 2, || {}).expect("publisher");
+    let viewer = publisher.feed().viewer(1).expect("viewer");
+    let epoch = viewer.latest().expect("epoch");
+
+    let base = ALLOC.current_usage();
+    ALLOC.reset_peak_usage();
+    let mut tracker = flife_cli::Tracker::new(&full_world, 2).expect("tracker");
+    let after_new = u64::try_from(ALLOC.current_usage().saturating_sub(base)).expect("fits");
+    for _ in 0..4 {
+        let Stepped::Published(report) = full_world.step().expect("step") else {
+            panic!("expected published tick");
+        };
+        tracker.record(&report).expect("record");
+    }
+    let _ = tracker.sample(&epoch).expect("sample");
+    let peak = u64::try_from(ALLOC.peak_usage().saturating_sub(base)).expect("fits");
+    drop(tracker);
+    println!(
+        "metrics Tracker on 4,096 full population: init {:.2} MiB, peak with sample() {:.2} MiB \
+         against bound {:.2} MiB",
+        mib(after_new),
+        mib(peak),
+        mib(bound),
+    );
+    assert!(
+        after_new <= bound,
+        "tracker init held {after_new} > bound {bound}"
+    );
+    assert!(
+        peak <= bound,
+        "tracker + sample held {peak} > bound {bound}"
+    );
+}

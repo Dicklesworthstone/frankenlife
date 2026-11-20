@@ -35,7 +35,8 @@ pub struct MemoryAdmission {
     pub scratch: u64,
     /// What a step holds while it runs: births and their staging.
     pub births: u64,
-    /// What observers hold; zero for a headless run.
+    /// What observers hold (render views, encoding, or the metrics tracker);
+    /// zero when none is active.
     pub render: u64,
     /// The checkpoint admission's peak, or zero without a run directory.
     pub checkpoint: u64,

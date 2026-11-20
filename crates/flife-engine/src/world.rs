@@ -1382,6 +1382,12 @@ impl World {
         &self.population
     }
 
+    /// How many controller topologies the run's catalog defines.
+    #[must_use]
+    pub fn topology_count(&self) -> usize {
+        self.rules.catalog.len()
+    }
+
     /// What the world holds on the host now (FL-043, plan §19.4): see
     /// [`Footprint`]. Its staging is zero; a step holds that only while it
     /// runs.

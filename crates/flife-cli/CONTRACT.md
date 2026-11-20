@@ -63,6 +63,10 @@ one frame's FrankenManim job, the CPU route's frame buffers and, while a bloom i
 `ENCODING_BYTES_PER_PIXEL` (the frame's 4 bytes and 48 for the PNG encoder's working set) and
 `ENCODING_BYTES_FIXED` (2 MiB) per frame. `ENCODERS` (4) frames encode at once, or as many as the budget has room
 for, one at least, before a render is refused. Its first record is `start`, with `memory` and `encoders`.
+When `--metrics-every` is nonzero on `flife run`, `flife resume`, `flife step` or `flife experiment`, `run_with` and
+`resume` also charge `Tracker::bound_bytes(&world, extra_lineages)` (the half-full `BTreeMap` node bound for live
+organisms, lineages including scheduled introductions, generations and topologies, plus `Tracker::sample`'s row and
+texel scratch) into `MemoryAdmission::render` before creating a run directory or installing the controller backend.
 
 **Inputs.**
 - A configuration or preset as TOML, validated by `flife_core::ValidatedConfig`.

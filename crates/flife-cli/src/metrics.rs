@@ -46,9 +46,10 @@ use std::time::Instant;
 use flife_core::CoreError;
 use flife_core::ids::{GenomeId, LineageId, OrganismId};
 use flife_core::ledger::{Flow, Transfer};
+use flife_core::memory::total;
 use flife_core::numerics;
 use flife_engine::{TickReport, World};
-use flife_render::Epoch;
+use flife_render::{Epoch, FIELD_TEXELS_MAX};
 use serde::Serialize;
 
 use crate::observe::Tally;
@@ -366,6 +367,53 @@ pub struct Tracker {
 }
 
 impl Tracker {
+    /// Peak host bytes this tracker and its [`Tracker::sample`] scratch can
+    /// hold for `world` plus `extra_lineages` organisms introduced by
+    /// scheduled commands during the run (FL-043, plan §19.4).
+    ///
+    /// Uses the same half-full `BTreeMap` node bound as
+    /// `flife_engine::Population::PER_ORGANISM_BYTES`: each entry takes at
+    /// most twice its key and value plus two pointer words.
+    #[must_use]
+    pub fn bound_bytes(world: &World, extra_lineages: usize) -> u64 {
+        const WORD: u64 = size_of::<usize>() as u64;
+        const LIVE_ENTRY: u64 =
+            2 * (size_of::<OrganismId>() as u64 + size_of::<Member>() as u64) + 2 * WORD;
+        const LINEAGE_ENTRY: u64 =
+            2 * (size_of::<LineageId>() as u64 + size_of::<Lineage>() as u64) + 2 * WORD;
+        const GENERATION_ENTRY: u64 =
+            2 * (size_of::<u32>() as u64 + size_of::<u64>() as u64) + 2 * WORD;
+        const TOPOLOGY_ENTRY: u64 =
+            2 * (size_of::<usize>() as u64 + size_of::<u64>() as u64) + 2 * WORD;
+        // `lineage_metrics()` grows a `Vec<LineageRow>` over live lineages
+        // (up to `2 * capacity` under geometric doubling).
+        const SAMPLE_ROW_BUDGET: u64 = 2 * size_of::<LineageRow>() as u64;
+        // Covers `dispersion` (16×16 bins), `window.flows`/`transfers`, and the
+        // power-of-two lifespan histogram.
+        const WINDOW_SCRATCH_BYTES: u64 = 64 << 10;
+
+        let capacity = world.population().capacity() as u64;
+        let max_lineages = capacity.saturating_add(extra_lineages as u64);
+        let topologies = (world.topology_count() as u64).min(capacity);
+        let grid = world.field().grid();
+        let texels = u64::from(grid.cells_x().min(FIELD_TEXELS_MAX))
+            .saturating_mul(u64::from(grid.cells_y().min(FIELD_TEXELS_MAX)));
+        // `resources()` holds `values: Vec<f64>` and one sorted or deviation
+        // `Vec<f64>` copy of the same length at a time.
+        let resource_scratch = texels.saturating_mul(2 * size_of::<f64>() as u64);
+
+        total([
+            capacity.saturating_mul(LIVE_ENTRY),
+            max_lineages.saturating_mul(LINEAGE_ENTRY),
+            capacity.saturating_mul(GENERATION_ENTRY),
+            // `topologies` plus the clone emitted in `PopulationMetrics`.
+            topologies.saturating_mul(2 * TOPOLOGY_ENTRY),
+            capacity.saturating_mul(SAMPLE_ROW_BUDGET),
+            resource_scratch,
+            WINDOW_SCRATCH_BYTES,
+        ])
+    }
+
     /// A tracker starting from `world`'s committed population, emitting a
     /// record every `every` ticks.
     ///

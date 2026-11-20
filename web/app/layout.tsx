@@ -10,7 +10,7 @@ const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "sw
 const jetbrains = JetBrains_Mono({ subsets: ["latin"], variable: "--font-jetbrains", display: "swap" });
 
 // The share images are app/opengraph-image.tsx and app/twitter-image.tsx, which Next.js
-// links itself (with a content hash); naming images here would override them.
+// links itself (with a hash of each route); naming images here would override them.
 export const metadata: Metadata = {
   metadataBase: new URL(siteConfig.url),
   title: siteConfig.title,

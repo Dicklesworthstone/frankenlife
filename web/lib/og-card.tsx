@@ -320,7 +320,7 @@ export async function shareCard(width: number, height: number): Promise<Response
     { input: png, maxBuffer: 64 * 1024 * 1024 },
   );
   if (jpeg.status !== 0 || jpeg.stdout.length === 0) {
-    throw new Error(`og-card: ffmpeg could not encode the card as JPEG: ${String(jpeg.stderr)}`);
+    throw new Error(`og-card: ffmpeg could not encode the card as JPEG: ${jpeg.error?.message ?? String(jpeg.stderr)}`);
   }
   return new Response(new Uint8Array(jpeg.stdout), { headers: { "Content-Type": SHARE_IMAGE_TYPE } });
 }

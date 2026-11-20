@@ -458,6 +458,8 @@ domains of one colour, each with its own labyrinth, foam or packed spheres. Agai
 statistic of the reference screenshots it scores 0.74 on seed 42 and 0.81–1.57 on three seeds the search
 never saw. Scored the same way, `tissue-world` scores 1.03 and 1.82–2.25, and `contact-world` 1.93 and
 1.92–2.68. `experiments/showcase/README.md` (stage E) has every trial and what the choice does not show.
+The Studio opens it from its 10,954 founders:
+`cargo run --release -p flife-studio -- presets/confluent-world.toml`.
 
 `presets/contact-world.toml` is `tissue-world`, below, under a different model, `field-ecology-v1-contact`.
 Plan §5.4 gives the contact model one added rule: every organism is a body 0.45 world units across. After each

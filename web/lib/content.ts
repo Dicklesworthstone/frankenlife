@@ -335,6 +335,10 @@ export const commands = [
     command: "cargo run --release -p flife-studio -- presets/reference-small-world.toml --width 960 --height 540",
   },
   {
+    comment: "The film's world in the Studio, from its 10,954 founders to the 262,144 ceiling",
+    command: "cargo run --release -p flife-studio -- presets/confluent-world.toml",
+  },
+  {
     comment: "A kept run, then a step past its newest durable tick",
     command:
       "cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 512 --run-dir my-run && cargo run --release -p flife-cli -- step my-run --ticks 64",

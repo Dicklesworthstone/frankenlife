@@ -661,7 +661,7 @@ impl Population {
         self.check_entrants(births, self.len() - dying.len())?;
         self.reserve_arena(births)?;
 
-        let collected = self.remove(dying);
+        let collected = self.remove(dying, None);
         for entrant in births.drain(..) {
             self.insert(entrant);
         }
@@ -713,6 +713,33 @@ impl Population {
         births: &mut Vec<Entrant>,
         quota: &mut GenomeQuota,
     ) -> Result<(), CoreError> {
+        self.commit_tick_inner(tick, survivors, deaths, births, quota, None)
+    }
+
+    /// As [`Population::commit_tick`], appending every arena slot retired by
+    /// `deaths` to `released` so a controller backend can reclaim emptied
+    /// parameter shards (FL-043).
+    pub(crate) fn commit_tick_releasing(
+        &mut self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &mut Vec<Entrant>,
+        quota: &mut GenomeQuota,
+        released: &mut Vec<ArenaSlot>,
+    ) -> Result<(), CoreError> {
+        self.commit_tick_inner(tick, survivors, deaths, births, quota, Some(released))
+    }
+
+    fn commit_tick_inner(
+        &mut self,
+        tick: Tick,
+        survivors: &[Organism],
+        deaths: &[Death],
+        births: &mut Vec<Entrant>,
+        quota: &mut GenomeQuota,
+        released: Option<&mut Vec<ArenaSlot>>,
+    ) -> Result<(), CoreError> {
         let dying = self.check_whole_tick(tick, survivors, deaths, births, quota)?;
         self.reserve_arena(births)?;
         // Checked above: the survivors ascend and each is alive, so one
@@ -727,7 +754,7 @@ impl Population {
             }
         }
         self.index = index;
-        for collected in self.remove(dying) {
+        for collected in self.remove(dying, released) {
             // Checked above: the quota holds every one of these charges.
             quota.retire(collected.genome)?;
         }
@@ -959,8 +986,13 @@ impl Population {
         Ok(())
     }
 
-    /// Remove the checked `dying` organisms.
-    fn remove(&mut self, dying: BTreeMap<OrganismId, Death>) -> Vec<Collected> {
+    /// Remove the checked `dying` organisms, optionally recording each retired
+    /// arena slot in `released`.
+    fn remove(
+        &mut self,
+        dying: BTreeMap<OrganismId, Death>,
+        mut released: Option<&mut Vec<ArenaSlot>>,
+    ) -> Vec<Collected> {
         let mut collected = Vec::with_capacity(dying.len());
         match self.arrangement {
             Arrangement::FreeList => {
@@ -970,7 +1002,11 @@ impl Population {
                     };
                     let organism = self.read(slot);
                     self.occupants[slot] = None;
-                    self.release_arena(slot);
+                    if let Some(arena_slot) = self.release_arena(slot)
+                        && let Some(out) = released.as_deref_mut()
+                    {
+                        out.push(arena_slot);
+                    }
                     if let Some(genome) = self.genomes[slot].take() {
                         collected.push(Collected {
                             death,
@@ -991,7 +1027,11 @@ impl Population {
                     if let Some(death) = dying.remove(&id) {
                         self.index.remove(&id);
                         let organism = self.read(slot);
-                        self.release_arena(slot);
+                        if let Some(arena_slot) = self.release_arena(slot)
+                            && let Some(out) = released.as_deref_mut()
+                        {
+                            out.push(arena_slot);
+                        }
                         if let Some(genome) = self.genomes[slot].take() {
                             collected.push(Collected {
                                 death,
@@ -1106,11 +1146,14 @@ impl Population {
     }
 
     /// Free the arena slot of the genome in population slot `slot`.
-    fn release_arena(&mut self, slot: usize) {
+    fn release_arena(&mut self, slot: usize) -> Option<ArenaSlot> {
         if let Some(arena_slot) = self.arena_slots[slot].take() {
             // Issued by `insert` and freed only here, so it is live.
             let released = self.arena.release(arena_slot);
             debug_assert!(released.is_ok(), "{released:?}");
+            Some(arena_slot)
+        } else {
+            None
         }
     }
 

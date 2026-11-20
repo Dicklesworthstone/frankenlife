@@ -53,8 +53,8 @@ use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
 use flife_core::numerics::tanh_f32;
 use flife_neural::{
-    ACTION_WIDTH, BackendBudget, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH,
-    ShardGeometry, Weight, Weights,
+    ACTION_WIDTH, ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, DenseTopology,
+    SENSOR_WIDTH, ShardGeometry, Weight, Weights,
 };
 use ft_kernel_cpu::population_affine_f32_into;
 
@@ -297,6 +297,9 @@ struct Shard {
     /// Each slot's packed occupant, its generation and genome, or `None`
     /// before its first.
     occupants: Vec<Option<(u32, GenomeId)>>,
+    /// Live packed occupants in `occupants`; when deaths drop this to zero,
+    /// the shard is reclaimed (FL-043).
+    live_count: usize,
 }
 
 /// One catalog member's packed slots, in shards.
@@ -380,7 +383,9 @@ impl Packing {
         }
         // The old occupant is gone before anything of the new one is
         // written, so a failure leaves the slot empty, never mixed.
-        shard.occupants[local] = None;
+        if shard.occupants[local].take().is_some() {
+            shard.live_count = shard.live_count.saturating_sub(1);
+        }
         pack(
             job.controller.parameters(),
             job.controller.topology(),
@@ -388,6 +393,7 @@ impl Packing {
             &mut shard.values[offset..end],
         )?;
         shard.occupants[local] = Some((job.slot.generation(), job.genome));
+        shard.live_count += 1;
         Ok((true, made))
     }
 }
@@ -619,6 +625,41 @@ impl ControllerBackend for CpuBackend {
         self.buckets.clear();
         self.held = 0;
         self.packs = 0;
+    }
+
+    fn release_slots(&mut self, slots: &[ArenaSlot]) {
+        for &slot in slots {
+            let Ok(topology) = usize::try_from(slot.topology()) else {
+                continue;
+            };
+            let Some(packing) = self
+                .buckets
+                .get_mut(topology)
+                .and_then(Option::as_mut)
+                .and_then(|bucket| bucket.packing.as_mut())
+            else {
+                continue;
+            };
+            let at = packing.geometry.locate(slot.slot());
+            let Ok(local) = usize::try_from(at.slot_in_shard) else {
+                continue;
+            };
+            let drop_shard = match packing.shards.get_mut(&at.shard) {
+                Some(shard) => {
+                    if let Some(occupant) = shard.occupants.get_mut(local)
+                        && occupant.is_some_and(|(generation, _)| generation == slot.generation())
+                    {
+                        *occupant = None;
+                        shard.live_count = shard.live_count.saturating_sub(1);
+                    }
+                    shard.live_count == 0
+                }
+                None => false,
+            };
+            if drop_shard && packing.shards.remove(&at.shard).is_some() {
+                self.held = self.held.saturating_sub(shard_bytes(&packing.geometry));
+            }
+        }
     }
 
     fn evaluate(

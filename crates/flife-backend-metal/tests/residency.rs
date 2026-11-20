@@ -413,3 +413,80 @@ fn shards_of_any_size_and_slots_past_32_bits_give_the_same_bits() -> Result<(), 
     }
     Ok(())
 }
+
+/// FL-043: retiring every live occupant of a Metal device shard drops the
+/// shard's parameter and job buffers immediately, reducing `shards()`,
+/// `resident_genomes()`, `resident_bytes()`, and `owner().usage()`, and
+/// freeing budget headroom for later shards.
+#[test]
+fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreError> {
+    let Some(mut backend) = backend(4) else {
+        return Ok(());
+    };
+    let topologies = topologies();
+    let cases = cases(&topologies, 40);
+    let jobs = jobs(&topologies, &cases, 0);
+    let mut outputs = Vec::new();
+    backend.evaluate(&jobs, &mut outputs)?;
+    let first = bits(&outputs);
+    assert_eq!(backend.shards(), 10);
+    assert_eq!(backend.resident_genomes(), 40);
+    let peak_resident = backend.resident_bytes();
+    let peak_usage = backend.owner().usage();
+    assert_eq!(peak_usage.buffers, 2 * 10 + 3);
+    let initial_uploads = backend.uploads();
+
+    // Wrong generation must leave every live slot and shard intact.
+    let wrong_gen: Vec<ArenaSlot> = jobs
+        .iter()
+        .map(|job| ArenaSlot::new(job.slot.topology(), job.slot.slot(), job.slot.generation() + 1))
+        .collect();
+    backend.release_slots(&wrong_gen);
+    assert_eq!(backend.shards(), 10);
+    assert_eq!(backend.resident_genomes(), 40);
+
+    // Retire shard 1 (slot >= 4) of all 5 topologies.
+    let shard1_slots: Vec<ArenaSlot> = jobs
+        .iter()
+        .filter(|job| job.slot.slot() >= 4)
+        .map(|job| job.slot)
+        .collect();
+    backend.release_slots(&shard1_slots);
+    assert_eq!(backend.shards(), 5);
+    assert_eq!(backend.resident_genomes(), 20);
+    let after_usage = backend.owner().usage();
+    assert_eq!(
+        after_usage.buffers,
+        2 * 5 + 3,
+        "dropped shards must release both parameter and job device buffers"
+    );
+    assert!(
+        after_usage.bytes < peak_usage.bytes && backend.resident_bytes() < peak_resident,
+        "device bytes ({} vs {}) and resident bytes ({} vs {}) must fall",
+        after_usage.bytes,
+        peak_usage.bytes,
+        backend.resident_bytes(),
+        peak_resident
+    );
+
+    // Surviving shard-0 jobs stay resident (zero re-uploads) and bit-identical.
+    let shard0_jobs: Vec<ControllerJob<'_>> =
+        jobs.iter().copied().filter(|job| job.slot.slot() < 4).collect();
+    backend.evaluate(&shard0_jobs, &mut outputs)?;
+    let expected0: Bits = jobs
+        .iter()
+        .zip(&first)
+        .filter(|(job, _)| job.slot.slot() < 4)
+        .map(|(_, out)| *out)
+        .collect();
+    assert_eq!(bits(&outputs), expected0);
+    assert_eq!(backend.uploads(), initial_uploads);
+
+    // Retiring shard 0 reclaims the remaining 5 shards too.
+    let shard0_slots: Vec<ArenaSlot> = shard0_jobs.iter().map(|job| job.slot).collect();
+    backend.release_slots(&shard0_slots);
+    assert_eq!(backend.shards(), 0);
+    assert_eq!(backend.resident_genomes(), 0);
+    assert_eq!(backend.owner().usage().buffers, 3);
+    Ok(())
+}

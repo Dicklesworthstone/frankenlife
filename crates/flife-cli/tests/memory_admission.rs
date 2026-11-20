@@ -1540,3 +1540,144 @@ fn a_cpu_frame_holds_no_more_heap_than_the_views_frame_terms() {
         );
     }
 }
+
+/// FL-043: `flife branch` and `flife inspect` admit their restored worlds
+/// against `[execution] maximum_total_bytes` (with `branch` also charging its
+/// streamed founding checkpoint and refusing before creating the branch
+/// directory).
+#[test]
+fn branch_and_inspect_refuse_over_budget_without_creating_files() {
+    let _serial = serial();
+    // Measure a 64-founder world's admission at 1 worker (used during the
+    // initial run via CLI override) vs 16 workers (declared in config.toml and
+    // used when `inspect`/`branch` restore it).
+    let probe_config = preset_with(&[
+        ("initial_count", 64),
+        ("maximum_count", 128),
+        ("cpu_workers", 16),
+    ]);
+    let probe_dir = fresh("branch-inspect-admit-probe");
+    let mut probe_opts = RunOptions::new(Until::Ticks(4));
+    probe_opts.controllers = ControllerChoice::Cpu;
+    probe_opts.cpu_workers = NonZeroUsize::new(1);
+    let mut probe_persist = Persistence::new(&probe_dir, &probe_config);
+    probe_persist.checkpoint_every = 4;
+    probe_persist.durability = StoreDurability::ProcessCrash;
+    probe_opts.persistence = Some(probe_persist);
+    let _ = run_with(&probe_config, &probe_opts, |_| Ok(())).expect("probe runs");
+
+    // Restore at 16 workers (default from config) and measure exact peaks.
+    let restored_16 = restore_checkpoint(&probe_dir, &probe_config, 1).expect("restores");
+    let inspect_peak = restored_16
+        .admit_memory(false, 0, 0)
+        .expect("probe inspect fits")
+        .peak_bytes;
+    let branch_peak = restored_16
+        .admit_memory(false, CHECKPOINT_FIXED_BYTES, 0)
+        .expect("probe branch fits")
+        .peak_bytes;
+    let mut restored_1 = restore_checkpoint(&probe_dir, &probe_config, 1).expect("restores");
+    restored_1
+        .set_cpu_workers(NonZeroUsize::new(1).expect("1"))
+        .expect("sets 1 worker");
+    let run_1_peak = restored_1
+        .admit_memory(false, CHECKPOINT_FIXED_BYTES, 0)
+        .expect("probe 1-worker run fits")
+        .peak_bytes;
+    assert!(
+        run_1_peak < branch_peak && inspect_peak < branch_peak,
+        "1-worker run ({run_1_peak}) and inspect ({inspect_peak}) must sit below 16-worker branch ({branch_peak})"
+    );
+
+    // Case 1: budget = branch_peak - 1 (still >= run_1_peak and >= inspect_peak):
+    // `run_with` on 1 worker succeeds, `inspect` succeeds, `branch` refuses
+    // with BudgetExhausted and creates no run directory.
+    let tight_branch_cfg = preset_with(&[
+        ("initial_count", 64),
+        ("maximum_count", 128),
+        ("cpu_workers", 16),
+        ("maximum_total_bytes", branch_peak - 1),
+    ]);
+    let tight_branch_dir = fresh("branch-inspect-admit-tight-branch");
+    let mut opts = RunOptions::new(Until::Ticks(4));
+    opts.controllers = ControllerChoice::Cpu;
+    opts.cpu_workers = NonZeroUsize::new(1);
+    let mut persist = Persistence::new(&tight_branch_dir, &tight_branch_cfg);
+    persist.checkpoint_every = 4;
+    persist.durability = StoreDurability::ProcessCrash;
+    opts.persistence = Some(persist);
+    let _ = run_with(&tight_branch_cfg, &opts, |_| Ok(())).expect("1-worker parent runs");
+
+    let inspected =
+        flife_cli::inspect(&tight_branch_dir, flife_cli::InspectOptions::default())
+            .expect("inspect fits below branch_peak");
+    assert_eq!(inspected.inspected.checkpoint.tick, 4);
+
+    let child_dir = fresh("branch-inspect-admit-child");
+    let branch_err = branch(
+        &tight_branch_dir,
+        &child_dir,
+        &BranchOptions {
+            at: Some(4),
+            name: Some("too-tight".into()),
+            commands: Vec::new(),
+            durability: StoreDurability::ProcessCrash,
+        },
+    )
+    .expect_err("branch one byte under peak must refuse");
+    assert!(
+        matches!(branch_err, CoreError::BudgetExhausted { .. }),
+        "expected BudgetExhausted for branch, got {branch_err:?}"
+    );
+    assert!(
+        !child_dir.exists(),
+        "refused branch must not create its run directory"
+    );
+
+    // Case 2: budget = inspect_peak - 1 (still >= run_1_peak when 16-worker
+    // scratch exceeds CHECKPOINT_FIXED_BYTES, or bump cpu_workers to 64 so
+    // inspect_peak > run_1_peak): verify `inspect` also refuses at peak - 1.
+    let wide_cfg = preset_with(&[
+        ("initial_count", 64),
+        ("maximum_count", 128),
+        ("cpu_workers", 64),
+    ]);
+    let mut wide_world = found(&wide_cfg).expect("founds");
+    let wide_inspect_peak = wide_world
+        .admit_memory(false, 0, 0)
+        .expect("wide inspect fits")
+        .peak_bytes;
+    wide_world
+        .set_cpu_workers(NonZeroUsize::new(1).expect("1"))
+        .expect("1 worker");
+    let wide_run_1_peak = wide_world
+        .admit_memory(false, CHECKPOINT_FIXED_BYTES, 0)
+        .expect("wide 1-worker run fits")
+        .peak_bytes;
+    assert!(
+        wide_run_1_peak < wide_inspect_peak,
+        "64-worker inspect ({wide_inspect_peak}) must exceed 1-worker run ({wide_run_1_peak})"
+    );
+    let tight_inspect_cfg = preset_with(&[
+        ("initial_count", 64),
+        ("maximum_count", 128),
+        ("cpu_workers", 64),
+        ("maximum_total_bytes", wide_inspect_peak - 1),
+    ]);
+    let tight_inspect_dir = fresh("branch-inspect-admit-tight-inspect");
+    let mut opts = RunOptions::new(Until::Ticks(4));
+    opts.controllers = ControllerChoice::Cpu;
+    opts.cpu_workers = NonZeroUsize::new(1);
+    let mut persist = Persistence::new(&tight_inspect_dir, &tight_inspect_cfg);
+    persist.checkpoint_every = 4;
+    persist.durability = StoreDurability::ProcessCrash;
+    opts.persistence = Some(persist);
+    let _ = run_with(&tight_inspect_cfg, &opts, |_| Ok(())).expect("1-worker parent runs");
+
+    let inspect_err = flife_cli::inspect(&tight_inspect_dir, flife_cli::InspectOptions::default())
+        .expect_err("inspect one byte under peak must refuse");
+    assert!(
+        matches!(inspect_err, CoreError::BudgetExhausted { .. }),
+        "expected BudgetExhausted for inspect, got {inspect_err:?}"
+    );
+}

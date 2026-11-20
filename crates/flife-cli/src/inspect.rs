@@ -251,6 +251,8 @@ pub fn inspect(run_dir: &Path, options: InspectOptions) -> Result<Inspection, Co
                 .map_or_else(String::new, |at| format!(" at tick {at}"))
         )));
     };
+    // FL-043: admit the restored world against `[execution] maximum_total_bytes`.
+    world.admit_memory(false, 0, 0)?;
     let checkpoint = InspectedCheckpoint {
         sequence,
         tick: world.tick().get(),

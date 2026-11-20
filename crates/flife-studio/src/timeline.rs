@@ -890,6 +890,26 @@ pub fn replay(
     // As `Studio::open` makes it: for the world restored, before a resumed
     // run's command journal replays past it.
     let mut view = crate::host::studio_view(config, &restored, *size, style.style()?, background)?;
+    // FL-043: admit the replay world and its observer buffers across the
+    // largest drawable size recorded in the timeline before stepping or
+    // rendering any frames.
+    let mut max_drawable = *size;
+    for record in records {
+        if let TimelineRecord::Resize { drawable } = record {
+            let area = u64::from(drawable[0]).saturating_mul(u64::from(drawable[1]));
+            let best = u64::from(max_drawable[0]).saturating_mul(u64::from(max_drawable[1]));
+            if area > best {
+                max_drawable = *drawable;
+            }
+        }
+    }
+    crate::memory::admit(
+        &world,
+        flife_backend_metal::ControllerChoice::Cpu,
+        &restored,
+        &view,
+        max_drawable,
+    )?;
     // The epoch the session opened on: the restored world's, or the one the
     // journal's commands reached, which the book records applied.
     let opened = from.as_ref().map_or(0, |start| start.tick);

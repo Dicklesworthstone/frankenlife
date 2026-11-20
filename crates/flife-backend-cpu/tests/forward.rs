@@ -513,3 +513,110 @@ fn it_evaluates_while_every_rayon_worker_is_busy() {
         .expect("the backend evaluates");
     assert!(evaluated > 800, "{evaluated} of 1024 evaluated");
 }
+
+/// FL-043: retiring every live occupant of a packed CPU shard reclaims the
+/// shard immediately, lowering `shards()` and `resident_bytes()` and returning
+/// budget room for subsequent shards. Wrong generations never evict a live
+/// occupant, and surviving shards stay packed without repacking.
+#[test]
+fn empty_shards_are_reclaimed_when_slots_retire() -> Result<(), CoreError> {
+    let topologies = topologies();
+    // 8 slots per topology, every case Typical (never deferred), 4 slots per shard -> 2 shards/topology.
+    let mut draws = Draws(17);
+    let mut cases = Vec::new();
+    for (topology, shape) in topologies.iter().enumerate() {
+        for _ in 0..8 {
+            cases.push(Case {
+                topology,
+                regime: Regime::Typical,
+                parameters: parameters(shape, Regime::Typical, &mut draws),
+                inputs: inputs(Regime::Typical, &mut draws),
+            });
+        }
+    }
+    let topo_count = topologies.len();
+    let jobs = jobs(&topologies, &cases);
+    let mut backend = CpuBackend::with_shard_slots(lanes(2), 4);
+    let mut outputs = Vec::new();
+    backend.evaluate(&jobs, &mut outputs)?;
+    let first = bits(&outputs);
+    assert_eq!(backend.shards(), topo_count * 2);
+    assert_eq!(backend.resident(), topo_count * 8);
+    let peak_bytes = backend.resident_bytes();
+    let initial_packs = backend.packs();
+
+    // Releasing every slot with the wrong generation must not drop anything.
+    let wrong_gen: Vec<ArenaSlot> = jobs
+        .iter()
+        .map(|job| ArenaSlot::new(job.slot.topology(), job.slot.slot(), job.slot.generation() + 1))
+        .collect();
+    backend.release_slots(&wrong_gen);
+    assert_eq!(backend.shards(), topo_count * 2);
+    assert_eq!(backend.resident(), topo_count * 8);
+
+    // Retire shard 1 (slot >= 4) of every topology, keeping shard 0 alive.
+    let shard1_slots: Vec<ArenaSlot> = jobs
+        .iter()
+        .filter(|job| job.slot.slot() >= 4)
+        .map(|job| job.slot)
+        .collect();
+    assert_eq!(shard1_slots.len(), topo_count * 4);
+    backend.release_slots(&shard1_slots);
+    assert_eq!(
+        backend.shards(),
+        topo_count,
+        "all emptied second shards reclaimed"
+    );
+    assert_eq!(backend.resident(), topo_count * 4);
+    assert!(
+        backend.resident_bytes() < peak_bytes,
+        "reclaimed shards must reduce resident_bytes ({} vs {peak_bytes})",
+        backend.resident_bytes()
+    );
+
+    // Surviving shard-0 jobs evaluate bit-identically with zero repacking.
+    let shard0_jobs: Vec<ControllerJob<'_>> = jobs
+        .iter()
+        .copied()
+        .filter(|job| job.slot.slot() < 4)
+        .collect();
+    backend.evaluate(&shard0_jobs, &mut outputs)?;
+    let expected0: Vec<_> = jobs
+        .iter()
+        .zip(&first)
+        .filter(|(job, _)| job.slot.slot() < 4)
+        .map(|(_, out)| *out)
+        .collect();
+    assert_eq!(bits(&outputs), expected0);
+    assert_eq!(backend.packs(), initial_packs);
+
+    // Under a tight budget that fits only shard 0 of each topology, retiring
+    // them lets shard 1 fit instead of deferring forever.
+    let tight_budget = flife_neural::BackendBudget {
+        bytes: backend.resident_bytes() + 4096,
+        organisms: (topo_count * 8) as u64,
+    };
+    let mut bounded = CpuBackend::with_budget(lanes(1), 4, tight_budget);
+    bounded.evaluate(&shard0_jobs, &mut outputs)?;
+    assert_eq!(bounded.shards(), topo_count);
+    let shard1_jobs: Vec<ControllerJob<'_>> = jobs
+        .iter()
+        .copied()
+        .filter(|job| job.slot.slot() >= 4)
+        .collect();
+    bounded.evaluate(&shard1_jobs, &mut outputs)?;
+    assert!(
+        outputs.iter().any(Option::is_none),
+        "tight budget must defer shard 1 while shard 0 is live"
+    );
+    let shard0_slots: Vec<ArenaSlot> = shard0_jobs.iter().map(|job| job.slot).collect();
+    bounded.release_slots(&shard0_slots);
+    assert_eq!(bounded.shards(), 0);
+    bounded.evaluate(&shard1_jobs, &mut outputs)?;
+    assert_eq!(bounded.shards(), topo_count);
+    assert!(
+        outputs.iter().all(Option::is_some),
+        "reclaimed budget must admit shard 1"
+    );
+    Ok(())
+}

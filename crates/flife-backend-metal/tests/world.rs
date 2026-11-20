@@ -622,3 +622,62 @@ fn auto_takes_metal_only_up_to_its_worker_ceiling() {
         assert!(matches!(forced, Err(CoreError::MissingCapability { .. })));
     }
 }
+
+/// FL-043: when organisms die in a live `World`, `Candidate::publish` notifies
+/// the installed controller backend through `release_slots`, reclaiming device
+/// shards once their occupants are all dead.
+#[test]
+fn deaths_reclaim_emptied_device_shards_in_a_world() {
+    let Some(backend) = (match MetalBackend::with_shard_slots(8) {
+        Ok(backend) => Some(backend),
+        Err(CoreError::MissingCapability { .. }) if !cfg!(target_os = "macos") => None,
+        Err(error) => panic!("this host should have Metal: {error}"),
+    }) else {
+        return;
+    };
+    let owner = backend.owner().clone();
+    // 24 founders, 8 per shard -> 3 shards; high basal cost starves everyone
+    // within a few ticks with zero sources.
+    let toml = PRESET
+        .replace("initial_count = 4096", "initial_count = 24")
+        .replace("power_per_source = 960.0", "power_per_source = 1.0e-6")
+        .replace(
+            "basal_energy_per_second = 0.8",
+            "basal_energy_per_second = 100.0",
+        );
+    assert!(toml.contains("power_per_source = 1.0e-6") && toml.contains("basal_energy_per_second = 100.0"));
+    let mut world = found_from(&toml);
+    world.set_controller_backend(Some(Box::new(backend)));
+
+    // Tick 1 evaluates all 24 founders across 3 shards before starvation finishes.
+    let first = world.step().expect("tick 1");
+    assert!(matches!(first, Stepped::Published(_)));
+    let peak_bytes = owner.usage().bytes;
+    let peak_buffers = owner.usage().buffers;
+    assert!(
+        peak_buffers >= 2 * 3 + 3,
+        "expected 3 shards on device after tick 1, got {peak_buffers} buffers"
+    );
+
+    // Step until all 24 organisms die.
+    for _ in 0..20 {
+        if world.population().is_empty() {
+            break;
+        }
+        assert!(matches!(world.step().expect("step"), Stepped::Published(_)));
+    }
+    assert!(
+        world.population().is_empty(),
+        "high basal cost must starve all 24 founders"
+    );
+    let after = owner.usage();
+    assert_eq!(
+        after.buffers, 3,
+        "all 3 emptied shards must drop from device once all occupants die ({after:?})"
+    );
+    assert!(
+        after.bytes < peak_bytes,
+        "device bytes must drop after extinction ({} vs {peak_bytes})",
+        after.bytes
+    );
+}

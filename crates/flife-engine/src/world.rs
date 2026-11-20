@@ -353,13 +353,30 @@ impl Candidate<'_> {
         if let Some(ancestry) = &world.ancestry {
             ancestry.admits(&staged.report)?;
         }
-        world.population.commit_tick(
-            staged.tick,
-            &world.scratch.survivors,
-            &world.scratch.deaths,
-            &mut staged.births,
-            &mut staged.quota,
-        )?;
+        let mut released_slots = Vec::new();
+        if world.controllers.backend.is_some() {
+            world.population.commit_tick_releasing(
+                staged.tick,
+                &world.scratch.survivors,
+                &world.scratch.deaths,
+                &mut staged.births,
+                &mut staged.quota,
+                &mut released_slots,
+            )?;
+        } else {
+            world.population.commit_tick(
+                staged.tick,
+                &world.scratch.survivors,
+                &world.scratch.deaths,
+                &mut staged.births,
+                &mut staged.quota,
+            )?;
+        }
+        if !released_slots.is_empty()
+            && let Some(backend) = world.controllers.backend.as_mut()
+        {
+            backend.release_slots(&released_slots);
+        }
         world.field.commit();
         world.ledger = staged.ledger;
         world.quota = staged.quota;

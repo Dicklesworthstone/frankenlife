@@ -31,8 +31,8 @@ use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_neural::{
-    ACTION_WIDTH, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH, ShardGeometry,
-    WeightDtype, Weights,
+    ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH,
+    ShardGeometry, WeightDtype, Weights,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -592,12 +592,17 @@ impl ShardParameters {
 }
 
 /// One shard of a topology's slots on the device: a whole shard's buffer,
-/// made when its first slot is needed and never moved or rebuilt.
+/// made when its first slot is needed, kept until every occupant retires
+/// (`release_slots`, FL-043) or `forget` drops it.
 struct DeviceShard {
     parameters: ShardParameters,
     /// Each slot's uploaded occupant, its generation and genome, or `None`
-    /// before its first.
+    /// before its first or after retirement.
     occupants: Vec<Option<(u32, GenomeId)>>,
+    /// Live uploaded occupants in `occupants`.
+    live_count: usize,
+    /// Exact bytes charged to `MetalBackend::held` when this shard was created.
+    bytes: u64,
     /// This shard's job words for the batch, and their capacity in jobs.
     jobs: Option<Owned<u32>>,
     job_capacity: usize,
@@ -901,6 +906,8 @@ impl MetalBackend {
                     entry.insert(DeviceShard {
                         parameters,
                         occupants,
+                        live_count: 0,
+                        bytes,
                         jobs: None,
                         job_capacity: 0,
                         staged: Vec::new(),
@@ -919,7 +926,9 @@ impl MetalBackend {
             })?;
             // The old occupant is gone before the new one is written, so a
             // failure leaves the slot empty, never mixed.
-            *occupant = None;
+            if occupant.take().is_some() {
+                shard.live_count = shard.live_count.saturating_sub(1);
+            }
             match (&shard.parameters, job.controller.parameters()) {
                 (ShardParameters::F32(buffer), Weights::F32(values)) => {
                     owner.write(buffer.buffer())?.write(offset, values)?;
@@ -938,6 +947,7 @@ impl MetalBackend {
                 _ => continue,
             }
             *occupant = own;
+            shard.live_count += 1;
             uploads += 1;
         }
         self.uploads += uploads;
@@ -1073,6 +1083,40 @@ impl ControllerBackend for MetalBackend {
         self.shard_count = 0;
         self.held = 0;
         self.uploads = 0;
+    }
+
+    fn release_slots(&mut self, slots: &[ArenaSlot]) {
+        for &slot in slots {
+            let Ok(topology) = usize::try_from(slot.topology()) else {
+                continue;
+            };
+            let Some(bucket) = self.buckets.get_mut(topology).and_then(Option::as_mut) else {
+                continue;
+            };
+            let Some(geometry) = bucket.geometry else {
+                continue;
+            };
+            let at = geometry.locate(slot.slot());
+            let Ok(local) = usize::try_from(at.slot_in_shard) else {
+                continue;
+            };
+            let drop_shard = match bucket.shards.get_mut(&at.shard) {
+                Some(shard) => {
+                    if let Some(occupant) = shard.occupants.get_mut(local)
+                        && occupant.is_some_and(|(generation, _)| generation == slot.generation())
+                    {
+                        *occupant = None;
+                        shard.live_count = shard.live_count.saturating_sub(1);
+                    }
+                    shard.live_count == 0
+                }
+                None => false,
+            };
+            if drop_shard && let Some(removed) = bucket.shards.remove(&at.shard) {
+                self.held = self.held.saturating_sub(removed.bytes);
+                self.shard_count = self.shard_count.saturating_sub(1);
+            }
+        }
     }
 
     fn evaluate(

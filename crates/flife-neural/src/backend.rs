@@ -70,6 +70,12 @@ pub trait ControllerBackend: Debug + Send {
     /// world's slots name other genomes.
     fn forget(&mut self);
 
+    /// Notify the backend that `slots` were retired by deaths at tick commit
+    /// (FL-043). Backends holding resident parameter shards mark matching
+    /// `(slot, generation)` entries unoccupied and reclaim any shard with no
+    /// live occupants remaining.
+    fn release_slots(&mut self, _slots: &[ArenaSlot]) {}
+
     /// The device's time on the commands of the last
     /// [`ControllerBackend::evaluate`], in nanoseconds (FL-029): zero for a
     /// backend that runs on the host, and for a batch that dispatched

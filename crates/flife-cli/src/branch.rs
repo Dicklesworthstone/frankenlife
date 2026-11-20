@@ -189,6 +189,9 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
         )));
     };
     let world = restored.world;
+    // FL-043: admit the restored world and its streamed founding checkpoint
+    // against `[execution] maximum_total_bytes` before creating `run_dir`.
+    world.admit_memory(false, crate::checkpointing::CHECKPOINT_FIXED_BYTES, 0)?;
     let tick = world.tick();
     let session = branch_session(digest, &name);
     let limits = SessionConfig::from_config(session, &config)?;

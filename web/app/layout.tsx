@@ -3,13 +3,14 @@ import { Inter, JetBrains_Mono } from "next/font/google";
 import type { ReactNode } from "react";
 
 import { siteConfig } from "@/lib/content";
-import { film } from "@/lib/media";
 
 import "./globals.css";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter", display: "swap" });
 const jetbrains = JetBrains_Mono({ subsets: ["latin"], variable: "--font-jetbrains", display: "swap" });
 
+// The share images are app/opengraph-image.tsx and app/twitter-image.tsx, which Next.js
+// links itself (with a content hash); naming images here would override them.
 export const metadata: Metadata = {
   metadataBase: new URL(siteConfig.url),
   title: siteConfig.title,
@@ -20,13 +21,11 @@ export const metadata: Metadata = {
     url: "/",
     siteName: siteConfig.name,
     type: "website",
-    images: [{ url: film.social.src, width: film.social.width, height: film.social.height }],
   },
   twitter: {
     card: "summary_large_image",
     title: siteConfig.title,
     description: siteConfig.description,
-    images: [film.social.src],
   },
 };
 

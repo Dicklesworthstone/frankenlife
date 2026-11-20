@@ -122,7 +122,7 @@ use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityPolicy,
     CapacityShortfall, Identities, Offspring, ParentState, PopulationQuota, RefusedBirth,
-    RejectedBirth, Reproduction, ReproductionProposal, resolve_births_with,
+    RejectedBirth, Reproduction, ReproductionProposal, resolve_births_with_workers,
 };
 
 mod admission;
@@ -2208,13 +2208,14 @@ impl World {
         let prepared = first.prepared();
         let mut next_identities = identities.clone();
         let mut next_quota = quota.clone();
-        let births = match resolve_births_with(
+        let births = match resolve_births_with_workers(
             &context,
             &prepared,
             &requests,
             PopulationQuota::new(rules.maximum_population, live)?,
             &mut next_identities,
             &mut next_quota,
+            lanes.len(),
         )? {
             BirthResolution::Staged(births) => births,
             BirthResolution::Paused(shortfall) => return Ok(Prepared::Paused(shortfall)),

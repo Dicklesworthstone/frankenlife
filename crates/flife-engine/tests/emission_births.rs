@@ -21,6 +21,7 @@ use flife_engine::{
     BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity, CapacityPolicy,
     EmissionPolicy, Identities, Motion, Offspring, ParentState, PopulationQuota, Reproduction,
     ReproductionProposal, ReproductionRules, Unviable, Viability, admission_key, resolve_births,
+    resolve_births_with_workers,
 };
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
@@ -2234,5 +2235,269 @@ fn emission_and_reproduction_rules_come_from_the_configuration() {
         },
     ] {
         assert!(Reproduction::new(broken).is_err(), "{broken:?}");
+    }
+}
+
+#[test]
+fn parallel_birth_proposals_are_bit_identical_at_any_worker_count() {
+    // flife-s0t: proposing admitted newborns' genomes in bounded parallel waves
+    // and committing serially must reproduce 1-worker resolution bit for bit at
+    // 1, 2, 4 and 16 workers across normal births (with topology mutations),
+    // rejections, pause-before-commit shortfalls and refuse-excess-births caps.
+    let reproduction = reproduction(0.05);
+    let rng = SemanticRng::new(SEED);
+    let catalog = catalog();
+    let world = grid();
+
+    // Case 1: 64 inherited births with topology mutations enabled.
+    let mut base_quota = GenomeQuota::new(1 << 32, 1 << 32).expect("quota");
+    let founders: Vec<Genome> = (1..=64)
+        .map(|id| founder_genome(id, &catalog, &mut base_quota))
+        .collect();
+    let requests: Vec<BirthRequest<'_>> = founders
+        .iter()
+        .zip(1_u64..)
+        .map(|(genome, id)| BirthRequest {
+            intent: intent(
+                &reproduction,
+                &parent(id, [(id % 16) as f64, (id / 16) as f64], 0),
+                17,
+                9.0,
+                0.45,
+            ),
+            genome,
+        })
+        .collect();
+    let evolving = mutator(
+        MutationParameters {
+            topology_change_probability: 0.25,
+            weight_probability: 0.15,
+            weight_standard_deviation: 0.05,
+            replacement_probability: 0.02,
+            chemistry_standard_deviation: 0.04,
+            sensing_log_scale_standard_deviation: 0.03,
+            reject_effective_noop: true,
+            maximum_candidates: 8,
+        },
+        &catalog,
+    );
+    let context = BirthContext {
+        rng: &rng,
+        grid: &world,
+        reproduction: &reproduction,
+        mutator: &evolving,
+        offspring: Offspring::Inherited,
+        capacity: CapacityPolicy::PauseBeforeCommit,
+    };
+
+    let run_case = |ctx: &BirthContext<'_>,
+                    reqs: &[BirthRequest<'_>],
+                    pop: PopulationQuota,
+                    quota_template: &GenomeQuota,
+                    workers: usize| {
+        let mut ids = identities(1000, 2000);
+        let mut q = quota_template.clone();
+        let res = resolve_births_with_workers(ctx, &[], reqs, pop, &mut ids, &mut q, workers)
+            .expect("resolve");
+        (res, ids, q)
+    };
+
+    let (ref_res, ref_ids, ref_q) = run_case(
+        &context,
+        &requests,
+        PopulationQuota::new(256, 64).expect("pop"),
+        &base_quota,
+        1,
+    );
+    let BirthResolution::Staged(ref_births) = ref_res else {
+        panic!("expected staged births");
+    };
+    assert_eq!(ref_births.born().len(), 64);
+    assert!(
+        ref_births
+            .born()
+            .iter()
+            .any(|birth| birth.record.topology.is_some()),
+        "expected at least one topology transition across 64 births"
+    );
+    for workers in [2, 4, 16] {
+        let (res, ids, q) = run_case(
+            &context,
+            &requests,
+            PopulationQuota::new(256, 64).expect("pop"),
+            &base_quota,
+            workers,
+        );
+        let BirthResolution::Staged(births) = res else {
+            panic!("workers={workers}: expected staged births");
+        };
+        assert_eq!(ids, ref_ids, "workers={workers}: identities");
+        assert_eq!(q, ref_q, "workers={workers}: quota");
+        assert_eq!(births.rejected(), ref_births.rejected());
+        assert_eq!(births.refused(), ref_births.refused());
+        assert_eq!(births.born().len(), ref_births.born().len());
+        for (got, want) in births.born().iter().zip(ref_births.born()) {
+            assert_eq!(got.parent, want.parent);
+            assert_eq!(got.newborn, want.newborn);
+            assert_eq!(got.record, want.record);
+            assert_eq!(got.genome.id(), want.genome.id());
+            assert_eq!(got.genome.topology(), want.genome.topology());
+            assert_eq!(got.genome.traits(), want.genome.traits());
+            assert!(
+                got.genome.parameters().same_bits(&want.genome.parameters()),
+                "workers={workers}: parameter bits differ for {}",
+                got.parent
+            );
+        }
+    }
+
+    // Case 2: All-rejecting effective-noop batch (tests rejection & scratch reuse).
+    let flat_parents: Vec<Genome> = (1..=24)
+        .map(|id| uniform_parent(id + 200, 0.5, &catalog, &mut base_quota))
+        .collect();
+    let flat_requests: Vec<BirthRequest<'_>> = flat_parents
+        .iter()
+        .zip(201_u64..)
+        .map(|(genome, id)| BirthRequest {
+            intent: intent(&reproduction, &parent(id, [1.0, 2.0], 0), 19, 9.0, 0.5),
+            genome,
+        })
+        .collect();
+    let strict = mutator(
+        MutationParameters {
+            weight_probability: 1.0,
+            weight_standard_deviation: 1.0e-12,
+            reject_effective_noop: true,
+            ..quiet()
+        },
+        &catalog,
+    );
+    let strict_ctx = BirthContext {
+        mutator: &strict,
+        ..context
+    };
+    let (ref_rej, ref_rej_ids, ref_rej_q) = run_case(
+        &strict_ctx,
+        &flat_requests,
+        PopulationQuota::new(256, 64).expect("pop"),
+        &base_quota,
+        1,
+    );
+    let BirthResolution::Staged(ref_rej) = ref_rej else {
+        panic!("expected staged rejections");
+    };
+    assert_eq!(ref_rej.rejected().len(), 24);
+    for workers in [2, 4, 16] {
+        let (res, ids, q) = run_case(
+            &strict_ctx,
+            &flat_requests,
+            PopulationQuota::new(256, 64).expect("pop"),
+            &base_quota,
+            workers,
+        );
+        let BirthResolution::Staged(births) = res else {
+            panic!("workers={workers}: expected staged rejections");
+        };
+        assert_eq!(ids, ref_rej_ids);
+        assert_eq!(q, ref_rej_q);
+        assert_eq!(births.rejected(), ref_rej.rejected());
+        assert!(births.born().is_empty());
+    }
+
+    // Case 3: pause-before-commit genome shortfall mid-wave rolls back identically.
+    let one_genome = founders[0].logical_bytes();
+    let mut tight_pause =
+        GenomeQuota::new(base_quota.logical_bytes() + one_genome * 10, 1 << 40).expect("quota");
+    let tight_parents: Vec<Genome> = (1..=32)
+        .map(|id| founder_genome(id, &catalog, &mut tight_pause))
+        .collect();
+    let tight_reqs: Vec<BirthRequest<'_>> = tight_parents
+        .iter()
+        .zip(1_u64..)
+        .map(|(genome, id)| BirthRequest {
+            intent: intent(&reproduction, &parent(id, [1.0, 1.0], 0), 21, 9.0, 0.5),
+            genome,
+        })
+        .collect();
+    // Re-size tight_pause to allow only 5 more genomes beyond its 32 parents.
+    let mut exact_pause = GenomeQuota::new(
+        tight_pause.logical_bytes() + one_genome * 5,
+        1 << 40,
+    )
+    .expect("quota");
+    let pause_parents: Vec<Genome> = (1..=32)
+        .map(|id| founder_genome(id, &catalog, &mut exact_pause))
+        .collect();
+    let pause_reqs: Vec<BirthRequest<'_>> = pause_parents
+        .iter()
+        .zip(1_u64..)
+        .map(|(genome, id)| BirthRequest {
+            intent: intent(&reproduction, &parent(id, [1.0, 1.0], 0), 21, 9.0, 0.5),
+            genome,
+        })
+        .collect();
+    let _ = tight_reqs;
+    let (ref_pause, ref_pause_ids, ref_pause_q) = run_case(
+        &context,
+        &pause_reqs,
+        PopulationQuota::new(256, 32).expect("pop"),
+        &exact_pause,
+        1,
+    );
+    let BirthResolution::Paused(ref_shortfall) = ref_pause else {
+        panic!("expected capacity shortfall");
+    };
+    for workers in [2, 4, 16] {
+        let (res, ids, q) = run_case(
+            &context,
+            &pause_reqs,
+            PopulationQuota::new(256, 32).expect("pop"),
+            &exact_pause,
+            workers,
+        );
+        let BirthResolution::Paused(shortfall) = res else {
+            panic!("workers={workers}: expected capacity shortfall");
+        };
+        assert_eq!(shortfall, ref_shortfall, "workers={workers}: shortfall");
+        assert_eq!(ids, ref_pause_ids, "workers={workers}: rollback ids");
+        assert_eq!(q, ref_pause_q, "workers={workers}: rollback quota");
+    }
+
+    // Case 4: refuse-excess-births-v1 with both slot and genome pressure.
+    let refuse_ctx = BirthContext {
+        capacity: CapacityPolicy::RefuseExcessBirths,
+        ..context
+    };
+    let (ref_refuse, ref_refuse_ids, ref_refuse_q) = run_case(
+        &refuse_ctx,
+        &pause_reqs,
+        PopulationQuota::new(48, 32).expect("pop"),
+        &exact_pause,
+        1,
+    );
+    let BirthResolution::Staged(ref_refuse) = ref_refuse else {
+        panic!("expected staged under refuse-excess-births-v1");
+    };
+    assert!(!ref_refuse.refused().is_empty());
+    assert!(!ref_refuse.born().is_empty());
+    for workers in [2, 4, 16] {
+        let (res, ids, q) = run_case(
+            &refuse_ctx,
+            &pause_reqs,
+            PopulationQuota::new(48, 32).expect("pop"),
+            &exact_pause,
+            workers,
+        );
+        let BirthResolution::Staged(births) = res else {
+            panic!("workers={workers}: expected staged");
+        };
+        assert_eq!(ids, ref_refuse_ids);
+        assert_eq!(q, ref_refuse_q);
+        assert_eq!(births.refused(), ref_refuse.refused());
+        assert_eq!(births.born().len(), ref_refuse.born().len());
+        for (got, want) in births.born().iter().zip(ref_refuse.born()) {
+            assert_eq!(got.newborn, want.newborn);
+            assert!(got.genome.parameters().same_bits(&want.genome.parameters()));
+        }
     }
 }

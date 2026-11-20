@@ -121,6 +121,21 @@ impl ParameterValues {
         }
     }
 
+    /// The number of parameters held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16(values) => values.len(),
+        }
+    }
+
+    /// Whether no parameters are held.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// The dtype.
     #[must_use]
     pub const fn dtype(&self) -> WeightDtype {
@@ -247,6 +262,22 @@ impl GenomeQuota {
             .unwrap_or(u64::MAX))
     }
 
+    /// Check whether a genome of catalog member `id` fits the catalog cap and
+    /// both quotas' logical-size lower bound, without allocating or mutating.
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] for a member above the parameter cap
+    /// or a quota that cannot cover its logical bytes;
+    /// [`CoreError::NumericalInvalid`] for an unknown member.
+    pub fn can_allocate(
+        &self,
+        catalog: &TopologyCatalog,
+        id: TopologyId,
+    ) -> Result<(), CoreError> {
+        let _ = self.check_admit_and_logical(catalog, id)?;
+        Ok(())
+    }
+
     /// Charge one genome of catalog member `id` and allocate its zeroed
     /// parameter buffer. Refused, with nothing charged or allocated, when
     /// the member is not admitted or either quota cannot cover it.
@@ -261,6 +292,82 @@ impl GenomeQuota {
         catalog: &TopologyCatalog,
         id: TopologyId,
     ) -> Result<ParameterBuffer, CoreError> {
+        let (topology, logical) = self.check_admit_and_logical(catalog, id)?;
+        let values = allocate_values(topology.parameter_count(), self.dtype)?;
+        let allocated = values.allocated_bytes();
+        // The host may reserve more than requested; the allocated quota
+        // counts what it actually reserved.
+        self.check(
+            ALLOCATED_GENOME_BYTES,
+            allocated,
+            self.allocated,
+            self.maximum_allocated,
+        )?;
+        self.logical += logical;
+        self.allocated += allocated;
+        self.live += 1;
+        Ok(ParameterBuffer {
+            values,
+            topology: id,
+            logical,
+            allocated,
+        })
+    }
+
+    /// Charge one genome of catalog member `id` by taking ownership of an
+    /// already-allocated parameter buffer without copying it (flife-s0t).
+    /// Refused, with nothing charged, when the member is not admitted,
+    /// `values` does not match `id` and this quota's dtype, or either quota
+    /// cannot cover it.
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] for a member above the parameter cap
+    /// or a quota that cannot cover it; [`CoreError::NumericalInvalid`] for
+    /// an unknown member; [`CoreError::LayoutMismatch`] when `values` does
+    /// not match `id` or this quota's dtype.
+    pub fn adopt(
+        &mut self,
+        catalog: &TopologyCatalog,
+        id: TopologyId,
+        values: ParameterValues,
+    ) -> Result<ParameterBuffer, CoreError> {
+        let (topology, logical) = self.check_admit_and_logical(catalog, id)?;
+        if values.dtype() != self.dtype || values.len() != topology.parameter_count() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "genome parameters",
+                detail: format!(
+                    "{} {} values do not match member {} ({} {} values)",
+                    values.len(),
+                    values.dtype().name(),
+                    id.index(),
+                    topology.parameter_count(),
+                    self.dtype.name()
+                ),
+            });
+        }
+        let allocated = values.allocated_bytes();
+        self.check(
+            ALLOCATED_GENOME_BYTES,
+            allocated,
+            self.allocated,
+            self.maximum_allocated,
+        )?;
+        self.logical += logical;
+        self.allocated += allocated;
+        self.live += 1;
+        Ok(ParameterBuffer {
+            values,
+            topology: id,
+            logical,
+            allocated,
+        })
+    }
+
+    fn check_admit_and_logical<'c>(
+        &self,
+        catalog: &'c TopologyCatalog,
+        id: TopologyId,
+    ) -> Result<(&'c DenseTopology, u64), CoreError> {
         let topology = catalog
             .topology(id)
             .ok_or_else(|| CoreError::NumericalInvalid {
@@ -288,25 +395,7 @@ impl GenomeQuota {
             self.allocated,
             self.maximum_allocated,
         )?;
-        let values = allocate_values(topology.parameter_count(), self.dtype)?;
-        let allocated = values.allocated_bytes();
-        // The host may reserve more than requested; the allocated quota
-        // counts what it actually reserved.
-        self.check(
-            ALLOCATED_GENOME_BYTES,
-            allocated,
-            self.allocated,
-            self.maximum_allocated,
-        )?;
-        self.logical += logical;
-        self.allocated += allocated;
-        self.live += 1;
-        Ok(ParameterBuffer {
-            values,
-            topology: id,
-            logical,
-            allocated,
-        })
+        Ok((topology, logical))
     }
 
     /// Return the charge of a buffer that never became a genome.

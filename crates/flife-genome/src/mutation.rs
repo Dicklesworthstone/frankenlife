@@ -50,7 +50,7 @@ use flife_core::rng::{
     Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, box_muller, choose,
 };
 use flife_core::{CoreError, Tick, ValidatedConfig};
-use flife_neural::{DenseTopology, Weight, Weights};
+use flife_neural::{DenseTopology, ReferenceController, Weight, WeightDtype, Weights};
 
 use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
@@ -58,7 +58,7 @@ use crate::genome::{
     AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, rescale, squared_norm,
 };
 use crate::init::fan_in_draw;
-use crate::quota::{GenomeQuota, ParameterBuffer, ParameterValues, WeightsMut};
+use crate::quota::{GenomeQuota, ParameterBuffer, ParameterValues, WeightsMut, allocate_values};
 use crate::transition::{Transition, map_parameters};
 
 /// The target selection this module implements.
@@ -286,6 +286,37 @@ pub enum Proposal {
     },
 }
 
+/// One birth attempt's mutation computed without touching a [`GenomeQuota`]
+/// or issuing a [`GenomeId`], so worker threads can propose independent
+/// children in parallel before a serial commit stamps identities and charges
+/// quotas (`flife-s0t`).
+#[derive(Debug)]
+pub enum DetachedProposal {
+    /// A validated child waiting only for quota adoption and its [`GenomeId`].
+    Child {
+        /// The catalog member of the accepted candidate.
+        topology: TopologyId,
+        /// The mutated parameter values, moved zero-copy into [`GenomeQuota::adopt`].
+        values: ParameterValues,
+        /// The mutated, validated traits.
+        traits: Traits,
+        /// The parent's genome identity.
+        parent: GenomeId,
+        /// How the child was made.
+        record: MutationRecord,
+        /// The catalog member chosen by each rejected candidate before the
+        /// accepted one, in candidate order.
+        rejected_topologies: Vec<TopologyId>,
+    },
+    /// Every candidate was rejected; nothing is held.
+    Rejected {
+        /// Every candidate's rejection, in order.
+        candidates: Vec<CandidateRejection>,
+        /// Each rejected candidate's member, in order.
+        rejected_topologies: Vec<TopologyId>,
+    },
+}
+
 /// A first candidate whose step 2 another engine computed (FL-032), for
 /// [`Mutator::propose_prepared`]: [`Mutator::unmutated`]'s member and
 /// values, mutated.
@@ -401,6 +432,16 @@ impl<'a> Mutator<'a> {
         &self.parameters
     }
 
+    /// The largest logical size of an admitted catalog member in `dtype`,
+    /// used to bound in-flight parallel proposal scratch (`flife-s0t`).
+    #[must_use]
+    pub fn maximum_genome_bytes(&self, dtype: WeightDtype) -> u64 {
+        self.catalog
+            .maximum_parameters()
+            .saturating_mul(dtype.bytes())
+            .max(1)
+    }
+
     /// Propose a child of `parent` for `attempt`, sealed as `child` and
     /// charged to `quota`, or reject the birth with every candidate's reason.
     ///
@@ -417,6 +458,209 @@ impl<'a> Mutator<'a> {
         quota: &mut GenomeQuota,
     ) -> Result<Proposal, CoreError> {
         self.propose_from(parent, attempt, child, quota, None)
+    }
+
+    /// Propose a child of `parent` for `attempt` in `dtype` without mutating
+    /// any quota or issuing a [`GenomeId`], so worker threads can compute
+    /// independent births in parallel (`flife-s0t`). Pass the result to
+    /// [`Mutator::commit_detached`] serially in identity order to obtain a
+    /// bit-identical [`Proposal`].
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] for a catalog member above the parameter
+    /// cap; [`CoreError::AllocationFailed`] when the host refuses a buffer;
+    /// [`CoreError::LayoutMismatch`] or [`CoreError::Overflow`] for a parent
+    /// that does not fit the catalog.
+    pub fn propose_detached(
+        &self,
+        parent: &Genome,
+        attempt: BirthAttempt,
+        dtype: WeightDtype,
+    ) -> Result<DetachedProposal, CoreError> {
+        let from = parent.topology();
+        let mut rejected = Vec::new();
+        let mut rejected_topologies = Vec::new();
+        let mut scratch: Option<(TopologyId, ParameterValues)> = None;
+        for candidate in 0..self.parameters.maximum_candidates {
+            let to = self.target(from, attempt, candidate)?;
+            let target = self
+                .catalog
+                .topology(to)
+                .ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "topology id",
+                    detail: format!("member {} is not in the catalog", to.index()),
+                })?;
+            let parameters = u64::try_from(target.parameter_count()).unwrap_or(u64::MAX);
+            if !self.catalog.admits(to) {
+                return Err(CoreError::BudgetExhausted {
+                    budget: "architecture_mutation.maximum_parameters",
+                    required: parameters,
+                    available: self.catalog.maximum_parameters(),
+                });
+            }
+            let mut values = match scratch.take() {
+                Some((cached_to, cached))
+                    if cached_to == to
+                        && cached.dtype() == dtype
+                        && cached.len() == target.parameter_count() =>
+                {
+                    cached
+                }
+                _ => allocate_values(target.parameter_count(), dtype)?,
+            };
+            let source = self.member(from)?;
+            let same = from == to;
+            let built = match (values.weights_mut(), parent.parameters()) {
+                (WeightsMut::F32(child), Weights::F32(parent_weights)) => {
+                    self.map_and_mutate(source, parent_weights, target, child, same, attempt, candidate)
+                }
+                (WeightsMut::F16(child), Weights::F16(parent_weights)) => {
+                    self.map_and_mutate(source, parent_weights, target, child, same, attempt, candidate)
+                }
+                _ => Err(CoreError::LayoutMismatch {
+                    buffer: "genome parameters",
+                    detail: "the parent's weight dtype is not the child buffer's".into(),
+                }),
+            }
+            .and_then(|(transition, counts)| {
+                let traits = self.traits_of(parent.traits(), attempt, candidate)?;
+                Ok((transition, counts, traits))
+            });
+            let (transition, counts, traits) = match built {
+                Ok(built) => built,
+                Err(CoreError::NumericalInvalid { quantity, detail }) => {
+                    rejected.push(CandidateRejection {
+                        candidate,
+                        reason: RejectionReason::Invalid(CoreError::NumericalInvalid {
+                            quantity,
+                            detail,
+                        }),
+                    });
+                    rejected_topologies.push(to);
+                    scratch = Some((to, values));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if self.parameters.reject_effective_noop
+                && to == from
+                && values.weights().same_bits(&parent.parameters())
+                && same_traits(&traits, parent.traits())
+            {
+                rejected.push(CandidateRejection {
+                    candidate,
+                    reason: RejectionReason::EffectiveNoop,
+                });
+                rejected_topologies.push(to);
+                scratch = Some((to, values));
+                continue;
+            }
+            if let Err(error) = ReferenceController::new(
+                target,
+                values.weights(),
+                self.limits.maximum_absolute_parameter(),
+            ) {
+                match error {
+                    CoreError::NumericalInvalid { .. } => {
+                        rejected.push(CandidateRejection {
+                            candidate,
+                            reason: RejectionReason::Invalid(error),
+                        });
+                        rejected_topologies.push(to);
+                        scratch = Some((to, values));
+                        continue;
+                    }
+                    other => return Err(other),
+                }
+            }
+            let topology_change = transition.map(|transition| TopologyChange {
+                from,
+                to,
+                transition,
+            });
+            return Ok(DetachedProposal::Child {
+                topology: to,
+                values,
+                traits,
+                parent: parent.id(),
+                record: MutationRecord {
+                    candidate,
+                    topology: topology_change,
+                    replaced: counts.replaced,
+                    perturbed: counts.perturbed,
+                    rejected,
+                },
+                rejected_topologies,
+            });
+        }
+        Ok(DetachedProposal::Rejected {
+            candidates: rejected,
+            rejected_topologies,
+        })
+    }
+
+    /// Commit a [`DetachedProposal`] serially against `quota` with identity
+    /// `child`, producing the exact [`Proposal`] (and errors) that
+    /// [`Mutator::propose`] would have produced (`flife-s0t`).
+    ///
+    /// # Errors
+    /// As [`Mutator::propose`].
+    pub fn commit_detached(
+        &self,
+        detached: DetachedProposal,
+        parent: &Genome,
+        attempt: BirthAttempt,
+        child: GenomeId,
+        quota: &mut GenomeQuota,
+    ) -> Result<Proposal, CoreError> {
+        let rejected_topologies = match &detached {
+            DetachedProposal::Child {
+                rejected_topologies,
+                ..
+            }
+            | DetachedProposal::Rejected {
+                rejected_topologies,
+                ..
+            } => rejected_topologies,
+        };
+        for &rejected_to in rejected_topologies {
+            if quota.can_allocate(self.catalog, rejected_to).is_err() {
+                drop(detached);
+                return self.propose(parent, attempt, child, quota);
+            }
+        }
+        match detached {
+            DetachedProposal::Rejected { candidates, .. } => {
+                Ok(Proposal::Rejected { candidates })
+            }
+            DetachedProposal::Child {
+                topology,
+                values,
+                traits,
+                parent: parent_id,
+                record,
+                ..
+            } => {
+                let buffer = quota.adopt(self.catalog, topology, values)?;
+                match Genome::seal(
+                    buffer,
+                    child,
+                    self.catalog,
+                    traits,
+                    Some(parent_id),
+                    &self.limits,
+                ) {
+                    Ok(genome) => Ok(Proposal::Child {
+                        genome: Box::new(genome),
+                        record,
+                    }),
+                    Err(unsealed) => {
+                        quota.abandon(unsealed.buffer)?;
+                        Err(unsealed.error)
+                    }
+                }
+            }
+        }
     }
 
     /// The first candidate (candidate 0) of `attempt` from `parent` before

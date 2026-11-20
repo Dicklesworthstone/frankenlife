@@ -439,7 +439,13 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
     // Wrong generation must leave every live slot and shard intact.
     let wrong_gen: Vec<ArenaSlot> = jobs
         .iter()
-        .map(|job| ArenaSlot::new(job.slot.topology(), job.slot.slot(), job.slot.generation() + 1))
+        .map(|job| {
+            ArenaSlot::new(
+                job.slot.topology(),
+                job.slot.slot(),
+                job.slot.generation() + 1,
+            )
+        })
         .collect();
     backend.release_slots(&wrong_gen);
     assert_eq!(backend.shards(), 10);
@@ -470,8 +476,11 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
     );
 
     // Surviving shard-0 jobs stay resident (zero re-uploads) and bit-identical.
-    let shard0_jobs: Vec<ControllerJob<'_>> =
-        jobs.iter().copied().filter(|job| job.slot.slot() < 4).collect();
+    let shard0_jobs: Vec<ControllerJob<'_>> = jobs
+        .iter()
+        .copied()
+        .filter(|job| job.slot.slot() < 4)
+        .collect();
     backend.evaluate(&shard0_jobs, &mut outputs)?;
     let expected0: Bits = jobs
         .iter()

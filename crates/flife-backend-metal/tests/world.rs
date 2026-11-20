@@ -645,7 +645,10 @@ fn deaths_reclaim_emptied_device_shards_in_a_world() {
             "basal_energy_per_second = 0.8",
             "basal_energy_per_second = 100.0",
         );
-    assert!(toml.contains("power_per_source = 1.0e-6") && toml.contains("basal_energy_per_second = 100.0"));
+    assert!(
+        toml.contains("power_per_source = 1.0e-6")
+            && toml.contains("basal_energy_per_second = 100.0")
+    );
     let mut world = found_from(&toml);
     world.set_controller_backend(Some(Box::new(backend)));
 

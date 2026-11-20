@@ -1539,11 +1539,11 @@ also at `write-ahead-before-apply`, one process per run directory, on local file
   - FL-042 is formally blocked by FL-020 (the Studio window); the bead stays open whatever these slices satisfy.
   - The Studio has no discover or transplant action; a run the Studio (or any process) holds is refused, as for
     `branch`.
-  - `flife branch`'s and `flife inspect`'s restores are not admitted against `maximum_total_bytes` (FL-043). Each is
-    at most a world the run itself held and what its restore holds beside it (the checkpoint but its genome chunk,
-    and one window), which may take the process past its budget. `discover`'s own restore is admitted with its
-    thumbnail's render, as a phase of its own, once it has happened; its crop is admitted before it is made.
-    `flife transplant` is admitted (above).
+  - `flife branch` and `flife inspect` now admit their restored worlds against `[execution] maximum_total_bytes`
+    (FL-043; `branch` also charges `CHECKPOINT_FIXED_BYTES` and refuses before creating its run directory;
+    `tests/memory_admission.rs::branch_and_inspect_refuse_over_budget_without_creating_files`). As with `resume` and
+    `discover`, the admission runs once the world is restored (because the world's terms are known only after
+    restoring it). `discover`'s crop is admitted before it is made; `flife transplant` is admitted (above).
   - `discover`'s crop term counts the population's genome arena and index entries at its capacity, as a world's
     footprint does, though a crop holds only the disk's organisms: 248.54 MiB against the 240.67 the crop holds at
     radius 64 on the preset.

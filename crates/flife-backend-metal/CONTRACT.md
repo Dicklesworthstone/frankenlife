@@ -1391,12 +1391,13 @@ per-pass thread spawning (6%).
   reaches 44–69% of a plain read in its fastest rounds, and nothing measured explains the rest: it is not
   profiled. Each per-product subnormal check is a candidate, as are the 64-lane threadgroup that the 32- and
   36-wide layers half fill, and one barrier per layer.
-- FL-043: the budget bounds the device's peak, but shards are still not freed when their genomes die, so a
-  crash keeps the room they took.
-- Parameter shards are never freed before `forget`: after a population crash, device memory stays at the peak in
-  whole shards. A topology's first genome allocates a whole 256 MiB shard, so the five catalog members can hold
-  1.25 GiB however few their genomes. Admission charges the backend its budget (FL-043), so this stays within
-  it.
+- FL-043: the budget bounds the device's peak, and `ControllerBackend::release_slots` now reclaims any shard whose
+  occupants have all retired at tick commit (dropping both its parameter and job device buffers;
+  `tests/residency.rs::empty_shards_are_reclaimed_on_device_when_slots_retire`,
+  `tests/world.rs::deaths_reclaim_emptied_device_shards_in_a_world`). Partially occupied shards remain resident
+  until their last occupant retires or `forget` runs. A topology's first genome still allocates a whole 256 MiB
+  shard, so the five catalog members can hold up to 1.25 GiB while at least one organism of each topology lives.
+  Admission charges the backend its budget (FL-043), so this stays within it.
 - A command's kernels run serially, so a population past one shard per topology pays 0.1–0.2 ms a tick per extra
   shard. Dispatching shards concurrently, since they write disjoint rows, would remove that; FrankenTorch's batch has
   only a serial encoder.

@@ -548,7 +548,13 @@ fn empty_shards_are_reclaimed_when_slots_retire() -> Result<(), CoreError> {
     // Releasing every slot with the wrong generation must not drop anything.
     let wrong_gen: Vec<ArenaSlot> = jobs
         .iter()
-        .map(|job| ArenaSlot::new(job.slot.topology(), job.slot.slot(), job.slot.generation() + 1))
+        .map(|job| {
+            ArenaSlot::new(
+                job.slot.topology(),
+                job.slot.slot(),
+                job.slot.generation() + 1,
+            )
+        })
         .collect();
     backend.release_slots(&wrong_gen);
     assert_eq!(backend.shards(), topo_count * 2);

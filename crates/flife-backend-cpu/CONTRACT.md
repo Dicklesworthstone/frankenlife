@@ -148,9 +148,9 @@ Linux and from 1.62× to 1.26× on macOS.
 - The kernel is called once per organism over that organism's packed weights. FL-026's shards hold a topology's
   genomes side by side, but a batch's due organisms are not adjacent slots (some are not due, some slots are
   free), so one call over several needs a gather or a whole-shard call. The kernel already takes `[B, I, O]`.
-- Shards are never freed before `forget`: after a population crash, memory stays at the peak in whole shards.
-  FL-043's budget bounds that peak, but a crash keeps the room the dead genomes' shards took, so later shards of
-  other topologies may be deferred.
+- Whole shards are reclaimed via `ControllerBackend::release_slots` once every live occupant of a shard retires at
+  tick commit (FL-043, `tests/forward.rs::empty_shards_are_reclaimed_when_slots_retire`). Partially occupied shards
+  remain allocated until their last occupant retires or `forget` runs.
 - Packing a newborn's parameters is a copy and a transpose, once per genome.
 - `auto` takes this backend only on a host without Metal, at up to four workers. The crossover between four and
   eight workers is not measured more finely. The loss at eight is not profiled; the next gap gives the hypothesis

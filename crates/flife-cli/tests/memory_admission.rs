@@ -1557,14 +1557,13 @@ fn branch_and_inspect_refuse_over_budget_without_creating_files() {
         ("cpu_workers", 16),
     ]);
     let probe_dir = fresh("branch-inspect-admit-probe");
-    let mut probe_opts = RunOptions::new(Until::Ticks(4));
-    probe_opts.controllers = ControllerChoice::Cpu;
+    let mut probe_opts = options(4, ControllerChoice::Cpu);
     probe_opts.cpu_workers = NonZeroUsize::new(1);
     let mut probe_persist = Persistence::new(&probe_dir, &probe_config);
     probe_persist.checkpoint_every = 4;
     probe_persist.durability = StoreDurability::ProcessCrash;
-    probe_opts.persistence = Some(probe_persist);
-    let _ = run_with(&probe_config, &probe_opts, |_| Ok(())).expect("probe runs");
+    let _ =
+        run_with(&probe_config, probe_opts, &[], Some(&probe_persist), |_| {}).expect("probe runs");
 
     // Restore at 16 workers (default from config) and measure exact peaks.
     let restored_16 = restore_checkpoint(&probe_dir, &probe_config, 1).expect("restores");
@@ -1599,18 +1598,16 @@ fn branch_and_inspect_refuse_over_budget_without_creating_files() {
         ("maximum_total_bytes", branch_peak - 1),
     ]);
     let tight_branch_dir = fresh("branch-inspect-admit-tight-branch");
-    let mut opts = RunOptions::new(Until::Ticks(4));
-    opts.controllers = ControllerChoice::Cpu;
+    let mut opts = options(4, ControllerChoice::Cpu);
     opts.cpu_workers = NonZeroUsize::new(1);
     let mut persist = Persistence::new(&tight_branch_dir, &tight_branch_cfg);
     persist.checkpoint_every = 4;
     persist.durability = StoreDurability::ProcessCrash;
-    opts.persistence = Some(persist);
-    let _ = run_with(&tight_branch_cfg, &opts, |_| Ok(())).expect("1-worker parent runs");
+    let _ = run_with(&tight_branch_cfg, opts, &[], Some(&persist), |_| {})
+        .expect("1-worker parent runs");
 
-    let inspected =
-        flife_cli::inspect(&tight_branch_dir, flife_cli::InspectOptions::default())
-            .expect("inspect fits below branch_peak");
+    let inspected = flife_cli::inspect(&tight_branch_dir, flife_cli::InspectOptions::default())
+        .expect("inspect fits below branch_peak");
     assert_eq!(inspected.inspected.checkpoint.tick, 4);
 
     let child_dir = fresh("branch-inspect-admit-child");
@@ -1665,14 +1662,13 @@ fn branch_and_inspect_refuse_over_budget_without_creating_files() {
         ("maximum_total_bytes", wide_inspect_peak - 1),
     ]);
     let tight_inspect_dir = fresh("branch-inspect-admit-tight-inspect");
-    let mut opts = RunOptions::new(Until::Ticks(4));
-    opts.controllers = ControllerChoice::Cpu;
+    let mut opts = options(4, ControllerChoice::Cpu);
     opts.cpu_workers = NonZeroUsize::new(1);
     let mut persist = Persistence::new(&tight_inspect_dir, &tight_inspect_cfg);
     persist.checkpoint_every = 4;
     persist.durability = StoreDurability::ProcessCrash;
-    opts.persistence = Some(persist);
-    let _ = run_with(&tight_inspect_cfg, &opts, |_| Ok(())).expect("1-worker parent runs");
+    let _ = run_with(&tight_inspect_cfg, opts, &[], Some(&persist), |_| {})
+        .expect("1-worker parent runs");
 
     let inspect_err = flife_cli::inspect(&tight_inspect_dir, flife_cli::InspectOptions::default())
         .expect_err("inspect one byte under peak must refuse");

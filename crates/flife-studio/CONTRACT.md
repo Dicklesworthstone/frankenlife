@@ -1519,10 +1519,11 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
     start, an allocation) leaves a pin with no timeline.
   - The export's manifest does not name the run directory or checkpoint a resumed timeline started from; the
     timeline, whose SHA-256 the manifest names, does.
-  - The replay admits nothing against `[execution] maximum_total_bytes` (FL-043): neither its world nor its
-    buffers and the export's (a view, a renderer, an RGBA8 frame, an NV12 frame and the encoders' scratch, each
-    bounded by one frame). It steps the world on the reference, with no controller backend. The manifest's frame
-    list grows with the frames.
+  - `timeline::replay` now admits its world and observer terms (across the largest drawable in the timeline's
+    `Resize` records) against `[execution] maximum_total_bytes` via `memory::admit` before stepping or rendering
+    frames (FL-043). Extra export scratch (an NV12 frame, the video encoder's buffers, and the manifest's per-frame
+    list) is not separately charged beyond the render term. It steps the world on the reference, with no controller
+    backend.
   - An advance replayed as a show survives the planted-bug run. A show re-lowers the field, whose display
     scale is `max(brightest, scale × 0.98)`. That only moves when the field's brightest value falls by more
     than 2% between the epochs an advance redraws, which G10's session never does. In such a session the

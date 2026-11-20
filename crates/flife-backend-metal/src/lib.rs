@@ -609,16 +609,100 @@ struct DeviceShard {
     staged: Vec<u32>,
 }
 
+/// Dense direct-indexed shard slots below this threshold (`0..256` covers
+/// >3.4M F16 genomes per topology with zero hashing); higher sparse shard IDs
+/// (such as synthetic `slot >= 1 << 40` tests) fall back to `HashMap`.
+const DENSE_SHARDS: usize = 256;
+
+/// Per-topology shard map with O(1) direct indexing for normal arena shards
+/// and a sparse `HashMap` fallback for arbitrary 64-bit shard IDs.
+#[derive(Default)]
+struct ShardTable {
+    dense: Vec<Option<DeviceShard>>,
+    sparse: HashMap<u64, DeviceShard>,
+}
+
+impl ShardTable {
+    fn get(&self, key: u64) -> Option<&DeviceShard> {
+        if let Ok(index) = usize::try_from(key)
+            && index < DENSE_SHARDS
+        {
+            return self.dense.get(index).and_then(Option::as_ref);
+        }
+        self.sparse.get(&key)
+    }
+
+    fn get_mut(&mut self, key: u64) -> Option<&mut DeviceShard> {
+        if let Ok(index) = usize::try_from(key)
+            && index < DENSE_SHARDS
+        {
+            return self.dense.get_mut(index).and_then(Option::as_mut);
+        }
+        self.sparse.get_mut(&key)
+    }
+
+    fn insert(&mut self, key: u64, shard: DeviceShard) -> &mut DeviceShard {
+        if let Ok(index) = usize::try_from(key)
+            && index < DENSE_SHARDS
+        {
+            if self.dense.len() <= index {
+                self.dense.resize_with(index + 1, || None);
+            }
+            return self.dense[index].insert(shard);
+        }
+        match self.sparse.entry(key) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(shard);
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => entry.insert(shard),
+        }
+    }
+
+    fn remove(&mut self, key: u64) -> Option<DeviceShard> {
+        if let Ok(index) = usize::try_from(key)
+            && index < DENSE_SHARDS
+        {
+            return self.dense.get_mut(index).and_then(Option::take);
+        }
+        self.sparse.remove(&key)
+    }
+
+    fn len(&self) -> usize {
+        self.dense.iter().flatten().count() + self.sparse.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &DeviceShard> {
+        self.dense.iter().flatten().chain(self.sparse.values())
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut DeviceShard> {
+        self.dense
+            .iter_mut()
+            .flatten()
+            .chain(self.sparse.values_mut())
+    }
+}
+
 /// One catalog member, as this backend first saw it.
 struct DeviceBucket {
     topology: DenseTopology,
     /// The weight dtype of its first genome, which its shards hold; a job of
     /// another dtype is deferred.
     dtype: WeightDtype,
+    /// Validated `[hidden_layers, w0, w1]` words for the kernel's `jobs`
+    /// buffer, cached once per topology; `None` for a shape the kernel refuses.
+    shape_words: Option<[u32; 3]>,
     /// `None` when not one slot fits a device shard: its jobs are deferred.
     geometry: Option<ShardGeometry>,
-    shards: HashMap<u64, DeviceShard>,
+    shards: ShardTable,
 }
+
+/// Minimum batch size before parallelizing host `f64 -> f32` input narrowing.
+const PARALLEL_INPUT_MIN_JOBS: usize = 2_048;
+
+/// Maximum host threads used for narrowing sensor inputs into `staged_inputs`.
+const PARALLEL_INPUT_MAX_THREADS: usize = 8;
 
 /// [`MetalControllers`] behind the engine's controller port, with every
 /// buffer resident (FL-026, plan §9.2). Each catalog member's genomes sit at
@@ -644,6 +728,7 @@ pub struct MetalBackend {
     faults: Option<Owned<u32>>,
     /// Host staging, reused.
     staged_inputs: Vec<f32>,
+    input_finite: Vec<u8>,
     eligible: Vec<usize>,
     dispatched: Vec<usize>,
     values: Vec<f32>,

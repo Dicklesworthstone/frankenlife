@@ -222,6 +222,14 @@ constant uint FAULT_TINY = 2u;
 // and any such step defers the organism to the reference.
 constant uint TINY_BITS = 0x0C800000u;
 
+// The F32 bits of 2^-78. Every nonzero binary16 weight has magnitude at least
+// 2^-24 (the smallest binary16 subnormal), so when every nonzero layer input
+// has magnitude at least 2^-78, every nonzero product w * x is at least
+// 2^-24 * 2^-78 = 2^-102 = TINY_BITS. Checking layer inputs once lets the
+// binary16 inner loop skip all per-product tiny checks while remaining
+// bit-identical to the reference.
+constant uint HALF_TINY_INPUT_BITS = 0x18800000u;
+
 // One threadgroup per organism, one thread per output neuron in turn. `jobs`
 // holds five words per organism: its row (`slot`) in `inputs`, `outputs` and
 // `faults`, the offset of its parameters in `params` (in elements of `W`),
@@ -230,12 +238,10 @@ constant uint TINY_BITS = 0x0C800000u;
 // nonzero word in `faults` defers the organism to the host, which evaluates
 // it on the reference controller: for its error, or for its exact value.
 //
-// `W` is the shard's weight type: `float`, or `half` for compact F16 genomes
-// (FL-030). Every parameter is read as `float(p)`, which is exact for both,
-// and the arithmetic after it is the same F32 arithmetic.
-template <typename W>
-static void forward_pass(
-    device const W *params,
+// F32 forward pass using coalesced float4 weight/activation loads when
+// 4-element aligned and branchless unsigned min-tracking for TINY_BITS.
+static void forward_pass_f32(
+    device const float *params,
     device const float *inputs,
     device const uint *jobs,
     device float *outputs,
@@ -243,15 +249,16 @@ static void forward_pass(
     uint organism,
     uint lane,
     uint lanes,
-    threadgroup float *sensed,
-    threadgroup float *first,
-    threadgroup float *second,
+    threadgroup float4 *sensed4,
+    threadgroup float4 *first4,
+    threadgroup float4 *second4,
     threadgroup atomic_uint *fault)
 {
     uint fallbacks = 0u;
     if (lane == 0u) {
         atomic_store_explicit(fault, 0u, memory_order_relaxed);
     }
+    threadgroup float *sensed = reinterpret_cast<threadgroup float *>(sensed4);
     uint slot = jobs[organism * 5u];
     for (uint i = lane; i < SENSORS; i += lanes) {
         sensed[i] = inputs[slot * SENSORS + i];
@@ -261,31 +268,58 @@ static void forward_pass(
     uint offset = jobs[organism * 5u + 1u];
     uint hidden = jobs[organism * 5u + 2u];
     uint widths[2] = {jobs[organism * 5u + 3u], jobs[organism * 5u + 4u]};
-    threadgroup const float *source = sensed;
+    threadgroup const float4 *source4 = sensed4;
     uint fan_in = SENSORS;
     for (uint layer = 0u; layer <= hidden; ++layer) {
         bool last = layer == hidden;
         uint fan_out = last ? ACTIONS : widths[layer];
-        threadgroup float *target = (layer == 0u) ? first : second;
-        device const W *weights = params + offset;
-        device const W *biases = weights + fan_in * fan_out;
+        threadgroup float4 *target4 = (layer == 0u) ? first4 : second4;
+        threadgroup float *target = reinterpret_cast<threadgroup float *>(target4);
+        threadgroup const float *source = reinterpret_cast<threadgroup const float *>(source4);
+        device const float *weights = params + offset;
+        device const float *biases = weights + fan_in * fan_out;
+        bool aligned4 = ((offset | fan_in) & 3u) == 0u;
+        uint quads = fan_in >> 2;
         for (uint o = lane; o < fan_out; o += lanes) {
-            device const W *row = weights + o * fan_in;
-            float z = float(biases[o]);
-            bool tiny = false;
-            for (uint i = 0u; i < fan_in; ++i) {
-                float w = float(row[i]);
-                float x = source[i];
-                float product = w * x;
-                uint wb = as_type<uint>(w) & 0x7FFFFFFFu;
-                uint xb = as_type<uint>(x) & 0x7FFFFFFFu;
-                uint pb = as_type<uint>(product) & 0x7FFFFFFFu;
-                uint zb = as_type<uint>(z) & 0x7FFFFFFFu;
-                tiny = tiny || (zb - 1u < TINY_BITS - 1u)
-                    || (pb < TINY_BITS && wb != 0u && xb != 0u);
-                z = z + product;
+            device const float *row = weights + o * fan_in;
+            float z = biases[o];
+            uint min_z = 0xFFFFFFFFu;
+            bool tiny_prod = false;
+            if (aligned4) {
+                device const float4 *row4 = reinterpret_cast<device const float4 *>(row);
+                uint4 tiny_p = uint4(0u);
+                for (uint q = 0u; q < quads; ++q) {
+                    float4 w = row4[q];
+                    float4 x = source4[q];
+                    float4 p = w * x;
+                    uint4 wb = as_type<uint4>(w) & 0x7FFFFFFFu;
+                    uint4 xb = as_type<uint4>(x) & 0x7FFFFFFFu;
+                    uint4 pb = as_type<uint4>(p) & 0x7FFFFFFFu;
+                    tiny_p |= select(uint4(0u), uint4(1u), (pb < TINY_BITS) & (wb != 0u) & (xb != 0u));
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.x;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.y;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.z;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.w;
+                }
+                tiny_prod = any(tiny_p != 0u);
+            } else {
+                for (uint i = 0u; i < fan_in; ++i) {
+                    float w = row[i];
+                    float x = source[i];
+                    float product = w * x;
+                    uint wb = as_type<uint>(w) & 0x7FFFFFFFu;
+                    uint xb = as_type<uint>(x) & 0x7FFFFFFFu;
+                    uint pb = as_type<uint>(product) & 0x7FFFFFFFu;
+                    tiny_prod = tiny_prod || (pb < TINY_BITS && wb != 0u && xb != 0u);
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + product;
+                }
             }
-            if (tiny) {
+            if (tiny_prod || min_z < TINY_BITS - 1u) {
                 atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
             }
             if (!isfinite(z)) {
@@ -300,7 +334,111 @@ static void forward_pass(
         offset += fan_in * fan_out + fan_out;
         fan_in = fan_out;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        source = target;
+        source4 = target4;
+    }
+    if (lane == 0u) {
+        faults[slot] = atomic_load_explicit(fault, memory_order_relaxed);
+    }
+}
+
+// Binary16 forward pass (compact F16, FL-030): every parameter is widened
+// exactly to F32 and accumulated in the reference order. Layer inputs are
+// checked once against HALF_TINY_INPUT_BITS (2^-78), eliminating per-product
+// subnormal checks from the inner loop and allowing coalesced half4 loads.
+static void forward_pass_half(
+    device const half *params,
+    device const float *inputs,
+    device const uint *jobs,
+    device float *outputs,
+    device uint *faults,
+    uint organism,
+    uint lane,
+    uint lanes,
+    threadgroup float4 *sensed4,
+    threadgroup float4 *first4,
+    threadgroup float4 *second4,
+    threadgroup atomic_uint *fault)
+{
+    uint fallbacks = 0u;
+    if (lane == 0u) {
+        atomic_store_explicit(fault, 0u, memory_order_relaxed);
+    }
+    threadgroup float *sensed = reinterpret_cast<threadgroup float *>(sensed4);
+    uint slot = jobs[organism * 5u];
+    uint tiny_in = 0u;
+    for (uint i = lane; i < SENSORS; i += lanes) {
+        float x = inputs[slot * SENSORS + i];
+        sensed[i] = x;
+        uint xb = as_type<uint>(x) & 0x7FFFFFFFu;
+        tiny_in |= uint(xb - 1u < HALF_TINY_INPUT_BITS - 1u);
+    }
+    if (tiny_in != 0u) {
+        atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint offset = jobs[organism * 5u + 1u];
+    uint hidden = jobs[organism * 5u + 2u];
+    uint widths[2] = {jobs[organism * 5u + 3u], jobs[organism * 5u + 4u]};
+    threadgroup const float4 *source4 = sensed4;
+    uint fan_in = SENSORS;
+    for (uint layer = 0u; layer <= hidden; ++layer) {
+        bool last = layer == hidden;
+        uint fan_out = last ? ACTIONS : widths[layer];
+        threadgroup float4 *target4 = (layer == 0u) ? first4 : second4;
+        threadgroup float *target = reinterpret_cast<threadgroup float *>(target4);
+        threadgroup const float *source = reinterpret_cast<threadgroup const float *>(source4);
+        device const half *weights = params + offset;
+        device const half *biases = weights + fan_in * fan_out;
+        bool aligned4 = ((offset | fan_in) & 3u) == 0u;
+        uint quads = fan_in >> 2;
+        for (uint o = lane; o < fan_out; o += lanes) {
+            device const half *row = weights + o * fan_in;
+            float z = float(biases[o]);
+            uint min_z = 0xFFFFFFFFu;
+            if (aligned4) {
+                device const half4 *row4 = reinterpret_cast<device const half4 *>(row);
+                for (uint q = 0u; q < quads; ++q) {
+                    float4 w = float4(row4[q]);
+                    float4 x = source4[q];
+                    float4 p = w * x;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.x;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.y;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.z;
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + p.w;
+                }
+            } else {
+                for (uint i = 0u; i < fan_in; ++i) {
+                    float product = float(row[i]) * source[i];
+                    min_z = min(min_z, (as_type<uint>(z) & 0x7FFFFFFFu) - 1u);
+                    z = z + product;
+                }
+            }
+            if (min_z < TINY_BITS - 1u) {
+                atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+            }
+            if (!isfinite(z)) {
+                atomic_fetch_or_explicit(fault, FAULT_NONFINITE, memory_order_relaxed);
+            }
+            if (last) {
+                outputs[slot * ACTIONS + o] = z;
+            } else {
+                float a = isfinite(z) ? activation(z, fallbacks) : 0.0f;
+                target[o] = a;
+                uint ab = as_type<uint>(a) & 0x7FFFFFFFu;
+                if (ab - 1u < HALF_TINY_INPUT_BITS - 1u) {
+                    atomic_fetch_or_explicit(fault, FAULT_TINY, memory_order_relaxed);
+                }
+            }
+        }
+        offset += fan_in * fan_out + fan_out;
+        fan_in = fan_out;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        source4 = target4;
     }
     if (lane == 0u) {
         faults[slot] = atomic_load_explicit(fault, memory_order_relaxed);
@@ -318,12 +456,12 @@ kernel void controller_forward(
     uint lane [[thread_position_in_threadgroup]],
     uint lanes [[threads_per_threadgroup]])
 {
-    threadgroup float sensed[SENSORS];
-    threadgroup float first[WIDEST];
-    threadgroup float second[WIDEST];
+    threadgroup float4 sensed4[SENSORS / 4];
+    threadgroup float4 first4[WIDEST / 4];
+    threadgroup float4 second4[WIDEST / 4];
     threadgroup atomic_uint fault;
-    forward_pass<float>(params, inputs, jobs, outputs, faults, organism, lane, lanes,
-                        sensed, first, second, &fault);
+    forward_pass_f32(params, inputs, jobs, outputs, faults, organism, lane, lanes,
+                     sensed4, first4, second4, &fault);
 }
 
 // The binary16 shards' forward pass (compact F16, FL-030): half the bytes a
@@ -338,12 +476,12 @@ kernel void controller_forward_half(
     uint lane [[thread_position_in_threadgroup]],
     uint lanes [[threads_per_threadgroup]])
 {
-    threadgroup float sensed[SENSORS];
-    threadgroup float first[WIDEST];
-    threadgroup float second[WIDEST];
+    threadgroup float4 sensed4[SENSORS / 4];
+    threadgroup float4 first4[WIDEST / 4];
+    threadgroup float4 second4[WIDEST / 4];
     threadgroup atomic_uint fault;
-    forward_pass<half>(params, inputs, jobs, outputs, faults, organism, lane, lanes,
-                       sensed, first, second, &fault);
+    forward_pass_half(params, inputs, jobs, outputs, faults, organism, lane, lanes,
+                      sensed4, first4, second4, &fault);
 }
 
 // The activation alone: out[i] is the F32 bits of the activation of the F32

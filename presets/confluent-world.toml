@@ -31,8 +31,8 @@
 #   4. Children placed up to 2.5 units from the parent, and a torus of 80
 #      units, let the colonies fill the torus instead of leaving most of it
 #      black: distance 0.74 against the corrected reference, within 0.01 of
-#      the nearest sample of any stage (contact-world 1.27, tissue-world
-#      0.78-1.00).
+#      stage E's nearest trial. Scored the same way, contact-world is 1.93
+#      and tissue-world 1.03-1.04.
 #   5. It was chosen by eye, coloured by lineage, against the references.
 #
 # Scale: 10,954 founders on an 80 x 80 periodic torus with a 320 x 320

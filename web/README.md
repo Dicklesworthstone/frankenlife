@@ -16,7 +16,7 @@ cd web
 bun install
 bun run dev          # http://localhost:3000, once the media are in public/media/
 bun run typecheck
-bun test             # worker.ts's byte serving, and the director's camera path
+bun test             # worker.ts's byte serving, and the director's camera path and card frame
 bun run build        # refuses unless public/media/ holds exactly the manifest's files
 bun run deploy       # build, then `wrangler deploy` (needs `wrangler login`)
 ```
@@ -70,13 +70,26 @@ content-hashed name. The script never deletes anything, so move the previous ren
 The same configuration, seed and starting checkpoint give the same frames on any machine. The world's
 digest at the last frame is in the manifest (`world.to.digest`) and in the render's `end` record.
 
+## The share images
+
+`app/opengraph-image.tsx` (1200 × 630) and `app/twitter-image.tsx` (1200 × 600) are drawn at build time
+by `lib/og-card.tsx` with `next/og`. Their picture is the social card: a 1200 × 630 crop of the middle
+frame of the film's closest shot (`cardFrame` in `scripts/director.ts`; the manifest's `social.frame`),
+darkened beside the words. The organism count and the caption's world and tick come from the manifest.
+The build fetches the card's fonts (Inter, JetBrains Mono) from Google Fonts, as `next/font` does, and
+encodes the card as a JPEG of about 250 KB with ffmpeg, since a PNG of the frame is over 2 MB, more than
+some link previewers fetch. Next.js links both from the page's metadata with a content hash, so
+`app/layout.tsx` names no image itself.
+
 ## Cloudflare
 
 `bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org.
 Static assets answer a Range request with the whole file and a 200, and Safari plays no video from such
-a server, so `worker.ts` runs first, and for `/media/*` it streams only the bytes asked for as a 206, sized from `lib/media.json` (an asset's response
-from the binding has no Content-Length). It also sends www.frankenlife.org to frankenlife.org; every
-other request goes to the static assets unchanged. Both names are custom domains on the Worker
+a server, so `worker.ts` runs first, and for `/media/*` it streams only the bytes asked for as a 206, sized
+from `lib/media.json` (an asset's response from the binding has no Content-Length). The static export
+writes the share images without an extension, so the Worker gives them their type, `image/jpeg`
+(`lib/share.ts`). It also sends www.frankenlife.org to frankenlife.org; every other request goes to the
+static assets unchanged. Both names are custom domains on the Worker
 (`wrangler.jsonc`), so `wrangler deploy` attaches them and their certificates.
 `public/_headers` makes the media and Next's hashed build output immutable. The site's address is
 `siteConfig.url` in `lib/content.ts`; Open Graph and the sitemap use it.

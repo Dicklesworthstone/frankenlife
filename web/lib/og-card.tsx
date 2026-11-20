@@ -22,10 +22,15 @@ const INK = "#020a02";
 /** A Google font as TrueType, which Satori reads (it cannot read WOFF2). */
 async function googleFont(family: string, weight: number): Promise<ArrayBuffer> {
   const query = `${family.replace(/ /g, "+")}:wght@${weight}`;
-  const css = await (await fetch(`https://fonts.googleapis.com/css2?family=${query}`)).text();
+  // A build that cannot reach the fonts fails within a minute rather than hanging.
+  const sheet = await fetch(`https://fonts.googleapis.com/css2?family=${query}`, {
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!sheet.ok) throw new Error(`og-card: Google Fonts answered ${sheet.status} for ${family} ${weight}`);
+  const css = await sheet.text();
   const url = /src: url\((\S+?)\) format\('(?:truetype|opentype)'\)/.exec(css)?.[1];
   if (!url) throw new Error(`og-card: no TrueType source for ${family} ${weight}`);
-  const font = await fetch(url);
+  const font = await fetch(url, { signal: AbortSignal.timeout(60_000) });
   if (!font.ok) throw new Error(`og-card: ${url} answered ${font.status}`);
   return font.arrayBuffer();
 }
@@ -96,17 +101,16 @@ export async function shareCard(width: number, height: number): Promise<Response
             "linear-gradient(180deg, rgba(2,10,2,0.5) 0%, rgba(2,10,2,0) 20%, rgba(2,10,2,0) 72%, rgba(2,10,2,0.82) 100%)",
         }}
       />
-      {/* A green glow behind the title. */}
+      {/* A green light from the top left, behind the title (linear: Satori's radial gradients band). */}
       <div
         style={{
           position: "absolute",
-          left: -260,
-          top: -220,
-          width: 820,
-          height: 820,
+          left: 0,
+          top: 0,
+          width,
+          height,
           display: "flex",
-          borderRadius: 410,
-          backgroundImage: "radial-gradient(circle, rgba(34,197,94,0.20) 0%, rgba(34,197,94,0.06) 42%, rgba(34,197,94,0) 66%)",
+          backgroundImage: "linear-gradient(155deg, rgba(34,197,94,0.16) 0%, rgba(34,197,94,0.05) 30%, rgba(34,197,94,0) 55%)",
         }}
       />
 
@@ -116,7 +120,7 @@ export async function shareCard(width: number, height: number): Promise<Response
           position: "absolute",
           left: 64,
           top: 54,
-          bottom: 54,
+          bottom: 66,
           width: 640,
           display: "flex",
           flexDirection: "column",
@@ -227,15 +231,17 @@ export async function shareCard(width: number, height: number): Promise<Response
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          {["memory-safe Rust", "replayable to the bit", "no aesthetic fitness"].map((label) => (
+          {["memory-safe Rust", "bit-exact replay", "no aesthetic fitness"].map((label) => (
             <div
               key={label}
               style={{
                 display: "flex",
+                flexShrink: 0,
+                whiteSpace: "nowrap",
                 padding: "9px 16px",
                 borderRadius: 22,
                 fontFamily: "JetBrains Mono",
-                fontSize: 17,
+                fontSize: 16,
                 color: "#d9f99d",
                 background: "rgba(34,197,94,0.12)",
                 border: "1px solid rgba(74,222,128,0.35)",
@@ -252,14 +258,14 @@ export async function shareCard(width: number, height: number): Promise<Response
         style={{
           position: "absolute",
           right: 28,
-          bottom: 30,
+          bottom: 20,
           display: "flex",
           alignItems: "center",
           gap: 10,
-          padding: "8px 14px",
-          borderRadius: 10,
+          padding: "6px 12px",
+          borderRadius: 9,
           fontFamily: "JetBrains Mono",
-          fontSize: 15,
+          fontSize: 14,
           color: "#e2e8f0",
           background: "rgba(2,10,2,0.72)",
           border: "1px solid rgba(255,255,255,0.14)",

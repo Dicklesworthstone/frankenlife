@@ -448,47 +448,49 @@ of E2's runs at its power settled at 91,664 to 99,361 live by tick 8,192. With a
 8.9–9.0 on the CPU reference (`tick_throughput`, ticks 32–160). So it is a world to study, not yet one to watch at
 frame rate.
 
-`presets/confluent-world.toml` is the world the website's film shows. It is `contact-world`, below, with the
-same rules at another scale. Its field is four times finer than `contact-world`'s against its organisms'
-spacing (320 × 320 cells on an 80-unit torus), with every length the organisms and the field act on divided by
-four. Food is plentiful, so its 262,144 organisms sit at the ceiling, and children land up to 2.5 units from
-their parent. Its tissue fills the torus: coloured by founder lineage, saturated domains of one colour, each
-with its own labyrinth, foam or packed spheres. Against the corrected image statistic of the reference
-screenshots it is the nearest world the searches have scored, on seed 42 and on held-out seeds.
-`experiments/showcase/README.md` (stage E) has every trial and what the choice does not show.
+`presets/confluent-world.toml` is the world the website's film shows: the contact model, below, at a finer
+scale than `contact-world`. Its field cells are a quarter of `contact-world`'s width (320 × 320 on an 80-unit
+torus), so each holds about 2.6 organisms where `contact-world`'s hold about ten, and every speed,
+acceleration and sensing scale is divided by four with them. Its bodies are 0.25 units across, one field
+cell. Food is plentiful, so its 262,144 organisms sit at the ceiling, and children land up to 2.5 units from
+their parent, so colonies fill the torus. Coloured by founder lineage, its tissue falls into saturated
+domains of one colour, each with its own labyrinth, foam or packed spheres. Against the corrected image
+statistic of the reference screenshots it scores 0.74 on seed 42 and 0.81–1.57 on three seeds the search
+never saw. Scored the same way, `tissue-world` scores 1.03 and 1.82–2.25, and `contact-world` 1.93 and
+1.92–2.68. `experiments/showcase/README.md` (stage E) has every trial and what the choice does not show.
 
-`presets/contact-world.toml` was the film's world before it. It is `tissue-world`, below, under a
-different model, `field-ecology-v1-contact`. Plan §5.4 gives the contact model one added rule: every
-organism is a body 0.45 world units across. After each tick, overlapping bodies push apart, and bodies
-within 1.5 diameters pull together by the square of how alike their heritable chemical affinities are.
-The rule moves positions only, never energy, and its numbers sit in the preset's `[contact]` table.
+`presets/contact-world.toml` is `tissue-world`, below, under a different model, `field-ecology-v1-contact`.
+Plan §5.4 gives the contact model one added rule: every organism is a body 0.45 world units across. After each
+tick, overlapping bodies push apart, and bodies within 1.5 diameters pull together by the square of how alike
+their heritable chemical affinities are. The rule moves positions only, never energy, and its numbers sit in
+the preset's `[contact]` table.
 
 Lineages sort by their chemistry, as tissues sort by adhesion. The world grows tissue with single-file
 membranes, rings and foam, and domains of one colour with dark gaps between unlike neighbours. Drawn with
 `--look sphere` at the body's radius, it looks like the reference screenshots' close-ups. Its bodies stack
 about three deep rather than pack, because the summed pull outweighs the soft push. A second variant,
-`field-ecology-v1-contact-inhibition` (plan §5.4), resolves overlap in extra push-only sweeps and packs
-them, but so far grows coarser structure; stage D of the same notes has the trials.
-`experiments/showcase/README.md` (stage C) states how the table's numbers were chosen. It also says what the
-choice does not show: its image statistic rates `tissue-world` as close, and held-out seeds merge less.
+`field-ecology-v1-contact-inhibition` (plan §5.4), resolves overlap in extra push-only sweeps and packs them,
+but so far grows coarser structure; stage D of the same notes has the trials. `experiments/showcase/README.md`
+(stage C) states how the table's numbers were chosen. It also says what the choice does not show: its image
+statistic rates `tissue-world` closer, and held-out seeds merge less.
 
-`presets/tissue-world.toml` was the film's world before that: 10,954 founders on 128 × 128 × 33 at
-Δt = 1/32 s, whose population grows to 110,000–170,000 under a ceiling of 177,536. Organisms return about half
-of what they eat to the field as emission, in a chemical composition their networks choose and kin choose
-alike. Each lineage paints its surroundings with its own chemistry and grows into a single-colour colony. At
-this density the colonies merge into a nearly continuous tissue with membranes, voids and mesh walls.
+`presets/tissue-world.toml` is the ecology both are built on, without bodies: 10,954 founders on
+128 × 128 × 33 at Δt = 1/32 s, whose population grows to 110,000–170,000 under a ceiling of 177,536. Organisms
+return about half of what they eat to the field as emission, in a chemical composition their networks choose
+and kin choose alike. Each lineage paints its surroundings with its own chemistry and grows into a
+single-colour colony. At this density the colonies merge into a nearly continuous tissue with membranes, voids
+and mesh walls.
 
 Unlike the profile presets, its parameters were chosen by an outer search, stage W. Stage W ran 233 small
-worlds and scored each that lived by its distance from 14 image statistics of the reference screenshots,
-and then a person chose by eye.
-The organisms have no aesthetic fitness; the search only picked the constants. Seeds the search never saw grow
-the same colonies, though they merge less.
+worlds and scored each that lived by its distance from 14 image statistics of the reference screenshots, and
+then a person chose by eye. The organisms have no aesthetic fitness; the search only picked the constants.
+Seeds the search never saw grow the same colonies, though they merge less.
 
 Two controls show where the structure comes from. With the controllers' decisions zeroed, nothing is emitted
 and the world fills with a featureless haze. With fresh offspring instead of inherited genomes, the
 population dies out.
 
-`presets/colony-world.toml` is the search's step before it: discrete colonies on a black field, held at a
+`presets/colony-world.toml` is stage W's sparser world: discrete colonies on a black field, held at a
 binding ceiling by `refuse-excess-births-v1`, plan §7.5's exhibition policy. `presets/showcase-world.toml` is
 the search's first choice: membranes, rings and crescents, which inherited chemistry makes without the
 networks. `experiments/showcase/README.md` states every selection, every sample's score and the held-out

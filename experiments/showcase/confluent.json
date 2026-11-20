@@ -1315,5 +1315,154 @@
    "worst": "shape_4.5_7 2.1, contrast 2.1, coverage 2.1",
    "digest": "53fd91301f928ed7df0a7c28dc890dc41b11a477501b26726b0e944dd8807827"
   }
- ]
+ ],
+ "baselines": {
+  "note": "presets/contact-world.toml and presets/tissue-world.toml on seeds 42, 1, 2 and 3 to tick 2,400, scored as the trials are (a 1024-px raw frame of the whole torus coloured by affinity) at the organism diameter: contact-world's body, 0.45; tissue-world, which has no body, at 0.30 and 0.45",
+  "runs": [
+   {
+    "trial": "rs-contact-s42",
+    "preset": "presets/contact-world.toml",
+    "seed": 42,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 120237,
+    "occupied_2_unit_bins": 0.67,
+    "distance": 1.929,
+    "worst": "voids 4.2, coverage 3.1, shape_4.5_7 2.5",
+    "digest": "a166b853bdbe003826fcfe1a9c422907a32c84e71d36307516c5c46da9b51a9a"
+   },
+   {
+    "trial": "rs-contact-s1",
+    "preset": "presets/contact-world.toml",
+    "seed": 1,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 90113,
+    "occupied_2_unit_bins": 0.573,
+    "distance": 2.678,
+    "worst": "voids 6.3, coverage 4.7, contrast 4.1",
+    "digest": "0e2a4ec9edf9def3025b0727361019bfb631827c64349128919c2102761a9868"
+   },
+   {
+    "trial": "rs-contact-s2",
+    "preset": "presets/contact-world.toml",
+    "seed": 2,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 128948,
+    "occupied_2_unit_bins": 0.669,
+    "distance": 2.164,
+    "worst": "voids 5.3, coverage 3.6, contrast 3.2",
+    "digest": "f9fb0dca1d1a8cf709f119c4bb2b2d68f1e330cdedd781cd106225ad35c03b47"
+   },
+   {
+    "trial": "rs-contact-s3",
+    "preset": "presets/contact-world.toml",
+    "seed": 3,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 142762,
+    "occupied_2_unit_bins": 0.719,
+    "distance": 1.915,
+    "worst": "voids 4.3, coverage 2.9, shape_4.5_7 2.7",
+    "digest": "b3cf56a5431967cbbd8fa2aeab226fae2a2713a6c3d1a806a96b59e81a0224c9"
+   },
+   {
+    "trial": "rs-tissue-s42",
+    "preset": "presets/tissue-world.toml",
+    "seed": 42,
+    "diameter": 0.3,
+    "tick": 2400,
+    "live": 120135,
+    "occupied_2_unit_bins": 0.776,
+    "distance": 1.032,
+    "worst": "voids 2.7, coverage 2.0, contrast 1.2",
+    "digest": "620c44040ca8e203de4580d376ca0679ebe7dbaee5c40a92705a03ac158c98c7"
+   },
+   {
+    "trial": "rs-tissue-s42",
+    "preset": "presets/tissue-world.toml",
+    "seed": 42,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 120135,
+    "occupied_2_unit_bins": 0.776,
+    "distance": 1.044,
+    "worst": "voids 2.3, shape_11_17 1.8, coverage 1.6",
+    "digest": "620c44040ca8e203de4580d376ca0679ebe7dbaee5c40a92705a03ac158c98c7"
+   },
+   {
+    "trial": "rs-tissue-s1",
+    "preset": "presets/tissue-world.toml",
+    "seed": 1,
+    "diameter": 0.3,
+    "tick": 2400,
+    "live": 89808,
+    "occupied_2_unit_bins": 0.673,
+    "distance": 1.973,
+    "worst": "voids 5.2, coverage 3.7, contrast 3.0",
+    "digest": "a8858d245c7dec65fe21661dc077d065b5afca76e85f9af2addd7b1c36bc6e8e"
+   },
+   {
+    "trial": "rs-tissue-s1",
+    "preset": "presets/tissue-world.toml",
+    "seed": 1,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 89808,
+    "occupied_2_unit_bins": 0.673,
+    "distance": 1.82,
+    "worst": "voids 4.5, coverage 3.2, contrast 2.6",
+    "digest": "a8858d245c7dec65fe21661dc077d065b5afca76e85f9af2addd7b1c36bc6e8e"
+   },
+   {
+    "trial": "rs-tissue-s2",
+    "preset": "presets/tissue-world.toml",
+    "seed": 2,
+    "diameter": 0.3,
+    "tick": 2400,
+    "live": 109845,
+    "occupied_2_unit_bins": 0.636,
+    "distance": 1.981,
+    "worst": "voids 5.4, coverage 3.5, contrast 2.8",
+    "digest": "d72df44d811d696314d089f2d1034d52863b27e44500702e100a310fd815be8c"
+   },
+   {
+    "trial": "rs-tissue-s2",
+    "preset": "presets/tissue-world.toml",
+    "seed": 2,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 109845,
+    "occupied_2_unit_bins": 0.636,
+    "distance": 1.892,
+    "worst": "voids 5.0, coverage 3.2, contrast 2.4",
+    "digest": "d72df44d811d696314d089f2d1034d52863b27e44500702e100a310fd815be8c"
+   },
+   {
+    "trial": "rs-tissue-s3",
+    "preset": "presets/tissue-world.toml",
+    "seed": 3,
+    "diameter": 0.3,
+    "tick": 2400,
+    "live": 104265,
+    "occupied_2_unit_bins": 0.564,
+    "distance": 2.249,
+    "worst": "voids 6.1, coverage 4.1, contrast 3.9",
+    "digest": "21c3ab428349049148b85e7d1784101cc83018dc173011a9df9aa680c3aa8205"
+   },
+   {
+    "trial": "rs-tissue-s3",
+    "preset": "presets/tissue-world.toml",
+    "seed": 3,
+    "diameter": 0.45,
+    "tick": 2400,
+    "live": 104265,
+    "occupied_2_unit_bins": 0.564,
+    "distance": 2.185,
+    "worst": "voids 6.0, coverage 3.8, contrast 3.3",
+    "digest": "21c3ab428349049148b85e7d1784101cc83018dc173011a9df9aa680c3aa8205"
+   }
+  ]
+ }
 }

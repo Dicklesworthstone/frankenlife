@@ -641,18 +641,40 @@ What each step found:
    9,000 of a 128-unit torus's 16,384. A higher ceiling (`w128-n393k`) is never reached: food stops it at
    254,000. A smaller torus (`w88-n262k`) fills more, and placing children up to 2.5 units from their
    parent fills most of it (`w88-o25`), seeding colonies into the empty, fed space. On an 80-unit torus the
-   tissue is confluent (`w80-o25`, 0.99 occupied) and the distance 0.74, as near as any sample of stages
-   W to E (`w80-o40-e200` ties it; `f64-d20`, below, scores 0.73): `contact-world` scores 1.27 and
-   `tissue-world` 0.78–1.00. Its worst statistics are now shapes at 2–7
+   tissue is confluent (`w80-o25`, 0.99 occupied) and the distance 0.74, as near as any trial of this
+   stage (`w80-o40-e200` ties it; `f64-d20`, below, scores 0.73). Scored the same way, `contact-world`
+   scores 1.93 and `tissue-world` 1.03–1.04 (below). Its worst statistics are now shapes at 2–7
    organisms, not voids. A sensor that stays linear to 200 (`e200`) does not help.
+
+### The presets it is compared with, scored the same way
+
+Stages C and D scored 384-px frames at tick 1,600, so their distances (`contact-world` 1.27, `tissue-world`
+0.78–1.00) do not compare with this stage's. Both presets were run again on seeds 42, 1, 2 and 3 to tick 2,400
+and scored as the trials are, at the organism diameter: `contact-world`'s body, 0.45, and for `tissue-world`,
+which has no body, 0.30 and 0.45. `confluent.json` records them under `baselines`.
+
+| Preset | Seed | Live | Occupied | Distance (`tissue-world`: at 0.30, 0.45) |
+|---|---:|---:|---:|---:|
+| `contact-world` | 42 | 120,237 | 0.67 | 1.93 |
+| `contact-world` | 1 | 90,113 | 0.57 | 2.68 |
+| `contact-world` | 2 | 128,948 | 0.67 | 2.16 |
+| `contact-world` | 3 | 142,762 | 0.72 | 1.92 |
+| `tissue-world` | 42 | 120,135 | 0.78 | 1.03, 1.04 |
+| `tissue-world` | 1 | 89,808 | 0.67 | 1.97, 1.82 |
+| `tissue-world` | 2 | 109,845 | 0.64 | 1.98, 1.89 |
+| `tissue-world` | 3 | 104,265 | 0.56 | 2.25, 2.19 |
+
+On every seed `confluent-world` is nearer: 0.74 on seed 42 against 1.93 and 1.03–1.04, and 0.81–1.57 on the
+held-out seeds against 1.92–2.68 and 1.82–2.25. The two older presets are still worst on voids and coverage.
 
 ### Held-out seeds
 
-`confluent-world` on seeds 1, 2 and 3 scores 1.57, 1.15, 0.81, against `contact-world`'s 2.55–2.80 and
-`tissue-world`'s 1.82–2.39. The variant with the linear sensor scores 1.61, 1.40 on seeds 1 and 2. Seed 1
-grows a finer mosaic of lineages (its worst statistic, colour coherence at 8 organisms, 4.9). Seed 2 reaches
-the ceiling later, at tick 2,100 against 900, and keeps more black, but grows the most reference-like frame of
-any trial by eye: rings and lace with rims, and closed loops like the references' glands.
+`confluent-world` on seeds 1, 2 and 3 scores 1.57, 1.15, 0.81, against `contact-world`'s 1.92–2.68 and
+`tissue-world`'s 1.82–2.25 on the same seeds, scored the same way. The variant with the linear sensor scores
+1.61, 1.40 on seeds 1 and 2. Seed 1 grows a finer mosaic of lineages (its worst statistic, colour coherence at
+8 organisms, 4.9). Seed 2 reaches the ceiling later, at tick 2,100 against 900, and keeps more black, but
+grows the most reference-like frame of any trial by eye: rings and lace with rims, and closed loops like the
+references' glands.
 
 ### Controls
 
@@ -724,14 +746,18 @@ cell does not bring the image nearer; `f64-d20` ties the preset on the statistic
   close-ups whose bodies, stage D found, stack.
 - Stage D's variant packs bodies, but no trial of it is as near the references as `tissue-world`,
   `contact-world` or `confluent-world`.
-- `confluent-world` is within 0.01 of the nearest sample to the corrected reference on seed 42, and nearer
-  than `tissue-world` and `contact-world` on held-out seeds, but it is smaller than the references: an 80-unit torus with a 320 × 320 field and 262,144 organisms, 2.6 to a field
-  cell, where the references hold a million. Its scale was matched to theirs by reading their overlays, not by
-  any known equation, and it was chosen by eye on one seed. Its 128-unit relatives fell from the ceiling after
-  tick 2,100; it holds there to tick 5,600, and nothing here shows it holds longer.
+- `confluent-world` is within 0.01 of stage E's nearest trial on seed 42, and nearer than `tissue-world` and
+  `contact-world` on every seed scored the same way, but it is smaller than the references: an 80-unit torus
+  with a 320 × 320 field and 262,144 organisms, 2.6 to a field cell, where the references hold a million. Its
+  scale was matched to theirs by reading their overlays, not by any known equation, and it was chosen by eye
+  on one seed. Its 128-unit relatives fell from the ceiling after tick 2,100; it holds there to tick 5,600,
+  and nothing here shows it holds longer.
 - `colony-world` is discrete colonies on a black field. `tissue-world` is closer to the references' continuous
   tissue on seed 42, less so on held-out seeds. In both, founder lineages narrow to a handful within 150
   simulated seconds, and the colours with them, where the references hold many colours at once.
+- Distances compare within a stage, not across: stage W used its own statistic, stages C and D 384-px
+  frames at tick 1,600, and stage E 1,024-px frames at tick 2,400. Stage E rescored the presets it is
+  compared with its way.
 - Nothing here shows the structure persists past the runs above: 5,600 ticks, the longest, is 175
   simulated seconds.
 - Every control above is one seed.

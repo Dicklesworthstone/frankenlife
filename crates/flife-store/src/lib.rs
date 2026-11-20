@@ -59,6 +59,8 @@
 //! per experiment directory holding the experiment's identity and design
 //! and one row per run, whatever its ending.
 
+#![forbid(unsafe_code)]
+
 pub mod experiment;
 pub mod journal;
 mod stream;

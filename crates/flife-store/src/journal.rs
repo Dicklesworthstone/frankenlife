@@ -43,8 +43,15 @@ use fsqlite::{Connection, FrankenError, SqliteValue};
 /// The catalog's format marker.
 pub const CATALOG_FORMAT: &str = "frankenlife.run-catalog.v1";
 
-const SCHEMA: [&str; 10] = [
+/// The format marker, created first so a database of another format is
+/// refused before any run-catalog tables are written to it (matching
+/// [`crate::ExperimentCatalog`]).
+const MARKER: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS catalog (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    "INSERT OR IGNORE INTO catalog (key, value) VALUES ('format', 'frankenlife.run-catalog.v1')",
+];
+
+const SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS runs (session INTEGER PRIMARY KEY, revision BLOB NOT NULL, \
      command_schema TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS commands (session INTEGER NOT NULL, admission INTEGER NOT NULL, \
@@ -65,7 +72,6 @@ const SCHEMA: [&str; 10] = [
     "CREATE TABLE IF NOT EXISTS branches (session INTEGER PRIMARY KEY, name TEXT NOT NULL, \
      parent_run TEXT NOT NULL, parent_sequence INTEGER NOT NULL, \
      created_unix_seconds INTEGER NOT NULL)",
-    "INSERT OR IGNORE INTO catalog (key, value) VALUES ('format', 'frankenlife.run-catalog.v1')",
 ];
 
 /// Where a branch run was made (Appendix B.1's identity): what
@@ -289,7 +295,7 @@ impl CommandJournal {
                 .execute("PRAGMA synchronous = FULL")
                 .await
                 .map_err(|error| fail("set synchronous mode", &error))?;
-            for statement in SCHEMA {
+            for statement in MARKER {
                 connection
                     .execute(statement)
                     .await
@@ -309,6 +315,12 @@ impl CommandJournal {
                     expected: CATALOG_FORMAT.into(),
                     found: found.unwrap_or_default(),
                 });
+            }
+            for statement in SCHEMA {
+                connection
+                    .execute(statement)
+                    .await
+                    .map_err(|error| fail("create run catalog schema", &error))?;
             }
             Ok(Self {
                 connection,

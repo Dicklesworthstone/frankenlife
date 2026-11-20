@@ -39,7 +39,9 @@ use flife_runtime::{
     SessionConfig, SessionHandle, SessionOwner, StepOutcome, Target, Watermarks, open_journaled,
     restore,
 };
-use flife_store::{CATALOG_FORMAT, ChunkStore, CommandJournal, Durability, IndexedCheckpoint};
+use flife_store::{
+    CATALOG_FORMAT, ChunkStore, CommandJournal, Durability, ExperimentCatalog, IndexedCheckpoint,
+};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
 const SESSION: SessionId = SessionId::new(7);
@@ -1756,4 +1758,47 @@ fn c14_a_crash_keeps_a_durable_cancellation_and_commands_beyond_the_checkpoint()
         (Tick::new(13), expected_13.digest()),
         "the journal alone replays to the checkpoint's world"
     );
+}
+
+#[test]
+fn opening_an_experiment_catalog_as_a_run_journal_refuses_without_mutating_tables() {
+    let dir = fresh("experiment-not-journal");
+    let path = dir.join("catalog.db");
+    let catalog = ExperimentCatalog::open(&path, "exp-1", "design-hash").expect("opens experiment");
+    drop(catalog);
+
+    let tables = |db: &Path| -> Vec<String> {
+        let location = db.display().to_string();
+        block_on_inline(async move {
+            let conn = fsqlite::Connection::open(location)
+                .await
+                .expect("opens sqlite");
+            let rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .await
+                .expect("lists tables");
+            rows.into_iter()
+                .filter_map(|row| row.get(0).and_then(fsqlite::SqliteValue::as_text).map(str::to_owned))
+                .collect()
+        })
+    };
+
+    let before = tables(&path);
+    assert_eq!(before, vec!["catalog".to_owned(), "runs".to_owned()]);
+
+    let error = CommandJournal::open(&path).expect_err("refuses experiment catalog");
+    assert!(
+        matches!(error, CoreError::SchemaMismatch { .. }),
+        "expected SchemaMismatch, got {error:?}"
+    );
+
+    let after = tables(&path);
+    assert_eq!(
+        after, before,
+        "refused CommandJournal::open must not create run-catalog tables in an experiment catalog"
+    );
+    // The experiment catalog still opens cleanly afterwards.
+    let reopened =
+        ExperimentCatalog::open(&path, "exp-1", "design-hash").expect("reopens experiment");
+    drop(reopened);
 }

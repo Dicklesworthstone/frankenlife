@@ -106,7 +106,7 @@ directory, with its pending commands and its checkpoint chain.
     | Space (not auto-repeat) | `Resume` or `Pause` |
     | → or `.` (auto-repeat steps again), while paused | `Step` |
     | Esc, or ⌘W | `Close` (once) |
-    | 1 to 6 | colour by lineage, energy, generation, motion, topology or chemical affinity |
+    | 1 to 7 | colour by lineage, energy, generation, motion, topology, chemical affinity, or lineage lit by energy |
     | R | the next look: glow, raw, then sphere |
     | D | switch dots and density |
     | F | show or hide the field |
@@ -534,7 +534,7 @@ presentation state, not scientific state.
   - Space toggling and ignoring repeat; stepping only while paused, with repeat stepping; Esc and ⌘W closing once.
   - Buttons through presses, motion and capture loss.
   - Focus, geometry rounding, hover through a non-integral logical size, and the tally.
-  - The style keys (FL-019): 1 to 6 choose the six mappings in order, R cycles the look (glow, raw, sphere),
+  - The style keys (FL-019): 1 to 7 choose the seven mappings in order, R cycles the look (glow, raw, sphere),
     D and F switch particles and field, C the field's mapping (energy, composition, then the chosen component,
     its code pinned to `kVK_ANSI_C`), and auto-repeat or ⌘ with a digit chooses nothing.
   - The bracket keys (FL-019, codes pinned to `kVK_ANSI_LeftBracket` and `kVK_ANSI_RightBracket`): `]` first shows
@@ -748,7 +748,7 @@ presentation state, not scientific state.
     1.00× real time · 60 fps`, then the key; one decimal below 100 ticks/s; the brush and the organism on one line,
     grouped in thousands; `999,999,999,999`, then `1.00e12` and `1.84e19` from a trillion, and a clock of
     `1.23e8 ticks/s · 2.50e5× real time`;
-  - `legends` of the preset gives each of the six mappings once, in `ColorMapping::ALL`'s order; each key's text
+  - `legends` of the preset gives each of the seven mappings once, in `ColorMapping::ALL`'s order; each key's text
     starts with its mapping's name and has one swatch for each `■`, and at 2x it is set whole, every glyph drawn
     and every `■` coloured by its swatch in order; the topology key names the preset's five members (`8`, `32`,
     `64, 32`, `96, 64`, `128, 96`);

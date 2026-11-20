@@ -15,6 +15,7 @@
 //! | motion | velocity | [`MOTION_WHEEL`] hue for the heading, mixed from [`MOTION_STILL`] by `√(speed / speed limit)` |
 //! | topology | catalog index `k` | [`TOPOLOGY_PALETTE`]`[k mod 8]`, catalog members in size order |
 //! | affinity | affinity coordinates `q` ([`flife_render::affinity_projection`]) | [`affinity_rgb8`]: OKLab hue and chroma from `q₁, q₂`, lightness from `q₃` |
+//! | lineage-energy | lineage id, energy `e`, the world's attempt energy `θ` | [`lineage_energy_rgb8`]: the lineage's palette hue and chroma at OKLab lightness [`LINEAGE_ENERGY_LIGHTNESS`]` × e / θ` |
 //!
 //! The field under the organisms has its own mapping ([`FieldMapping`],
 //! plan §13.4's "Local field"): its energy density through the look's
@@ -30,7 +31,7 @@ use std::sync::LazyLock;
 use flife_core::registry::{self, Role};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_render::Epoch;
-use fmn_core::color::{LinearRgba, Oklab, Srgb, oklab_to_srgb};
+use fmn_core::color::{LinearRgba, Oklab, Srgb, oklab_to_srgb, srgb_to_oklab};
 
 /// What a particle's colour means (plan §13.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -49,17 +50,21 @@ pub enum ColorMapping {
     /// Chemical affinity: a fixed projection of the heritable affinity
     /// direction (plan §13.4).
     Affinity,
+    /// Founder lineage and energy: the lineage's colour, as light as the
+    /// organism's energy against the energy it needs to attempt a birth.
+    LineageEnergy,
 }
 
 impl ColorMapping {
-    /// Every mapping, in the Studio's key order (1 to 6).
-    pub const ALL: [Self; 6] = [
+    /// Every mapping, in the Studio's key order (1 to 7).
+    pub const ALL: [Self; 7] = [
         Self::Lineage,
         Self::Energy,
         Self::Generation,
         Self::Motion,
         Self::Topology,
         Self::Affinity,
+        Self::LineageEnergy,
     ];
 
     /// The mapping's name, as flags and records spell it.
@@ -72,6 +77,7 @@ impl ColorMapping {
             Self::Motion => "motion",
             Self::Topology => "topology",
             Self::Affinity => "affinity",
+            Self::LineageEnergy => "lineage-energy",
         }
     }
 
@@ -86,6 +92,7 @@ impl ColorMapping {
             Self::Motion => "motion-heading-v1",
             Self::Topology => "topology-catalog-v1",
             Self::Affinity => "affinity-projection-v1",
+            Self::LineageEnergy => "founder-lineage-energy-v1",
         }
     }
 
@@ -128,9 +135,18 @@ impl ColorMapping {
                 "chemical affinity: a fixed projection of the 32 affinity terms; grey is none, \
                  like colours like chemistry, opposite directions opposite hues"
             }
+            Self::LineageEnergy => {
+                "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as \
+                 the organism holds more of the energy it needs to divide, black with none, white \
+                 with 1.8 times it"
+            }
         }
     }
 }
+
+/// The energies the lineage-energy mapping's key shows, as fractions of the
+/// energy an organism needs to attempt a birth.
+pub const LEGEND_ATTEMPT_FRACTIONS: [f32; 4] = [0.25, 0.5, 1.0, 1.5];
 
 /// The energies the energy mapping's key shows.
 pub const LEGEND_ENERGIES: [f32; 6] = [0.0, 1.0, 2.0, 4.0, 8.0, 16.0];
@@ -189,7 +205,9 @@ impl ColorMapping {
     ///   slower`;
     /// - topology: each member's colour and hidden widths;
     /// - affinity: [`legend_affinities`]: `none`, then the six directions,
-    ///   `like hue, like chemistry`.
+    ///   `like hue, like chemistry`;
+    /// - lineage-energy: the first palette colour at [`LEGEND_ATTEMPT_FRACTIONS`]
+    ///   of the energy to divide, then `x energy to divide`.
     #[must_use]
     pub fn legend(self, topologies: &[&[u32]]) -> Legend {
         let swatch = crate::HUD_SWATCH;
@@ -255,6 +273,13 @@ impl ColorMapping {
                 }
                 text.push_str(" like hue, like chemistry");
             }
+            Self::LineageEnergy => {
+                for fraction in LEGEND_ATTEMPT_FRACTIONS {
+                    let color = palette_shade(0, fraction, 1.0);
+                    labelled(&mut text, color, &fraction.to_string());
+                }
+                text.push_str(" x energy to divide");
+            }
         }
         Legend { text, swatches }
     }
@@ -275,7 +300,8 @@ impl FromStr for ColorMapping {
             .find(|mapping| mapping.name() == text || mapping.registry_name() == text)
             .ok_or_else(|| {
                 format!(
-                    "`{text}` is not a colour mapping: lineage, energy, generation, motion, topology or affinity"
+                    "`{text}` is not a colour mapping: lineage, energy, generation, motion, topology, \
+                     affinity or lineage-energy"
                 )
             })
     }
@@ -599,10 +625,14 @@ pub struct Traits {
     pub velocity: [f32; 2],
     /// The affinity direction's display coordinates.
     pub affinity: [f32; 3],
+    /// The least energy an organism of the world attempts a birth with
+    /// ([`Epoch::attempt_energy`]), the same for every row.
+    pub attempt_energy: f64,
 }
 
 /// Every row of `epoch` as [`Traits`], in identity order.
 pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
+    let attempt_energy = epoch.attempt_energy();
     epoch
         .lineages()
         .iter()
@@ -612,13 +642,14 @@ pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
         .zip(epoch.velocities())
         .zip(epoch.affinities())
         .map(
-            |(((((&lineage, &energy), &generation), &topology), &velocity), &affinity)| Traits {
+            move |(((((&lineage, &energy), &generation), &topology), &velocity), &affinity)| Traits {
                 lineage,
                 energy,
                 generation,
                 topology,
                 velocity,
                 affinity,
+                attempt_energy,
             },
         )
 }
@@ -791,7 +822,8 @@ pub const AFFINITY_CHROMA: f64 = 0.26;
 /// The colour of affinity coordinates `q`. They are scaled by
 /// [`AFFINITY_GAIN`] to `g` and squashed radially to `s = g / √(1 + |g|²)`,
 /// so `|s| < 1` and nothing refits. Then OKLab
-/// `L = 0.62 + 0.12 s₃`, `a = 0.26 s₁`, `b = 0.26 s₂` is converted to sRGB;
+/// `L = 0.46 + 0.12 s₃`, `a = 0.26 s₁`, `b = 0.26 s₂` ([`AFFINITY_LIGHTNESS`],
+/// [`AFFINITY_CHROMA`]) is converted to sRGB;
 /// a colour outside the gamut keeps its lightness and hue and takes the most
 /// chroma that fits. No affinity is a neutral grey; the
 /// hue turns with the direction in the first two coordinates, and opposite
@@ -834,6 +866,85 @@ pub fn affinity_rgb8(q: [f32; 3]) -> [u8; 3] {
         }
     }
     at(low).to_rgb8()
+}
+
+/// The lineage-energy mapping's OKLab lightness for an organism holding
+/// exactly the energy it needs to attempt a birth. Lightness is
+/// proportional to energy, so an organism with none is black and one with
+/// `1 / 0.55 ≈ 1.8` times that energy is white. Chosen against the
+/// reference screenshots (`experiments/showcase/scale.py`): on the film's
+/// world it scored best of the lightness rules tried, and it keeps the
+/// world's common energies (about 0.5 to 1.5 times the attempt energy)
+/// between dark and pale.
+pub const LINEAGE_ENERGY_LIGHTNESS: f64 = 0.55;
+
+/// The lightness steps of [`lineage_energy_rgb8`]: `0` to `255`, so each
+/// palette colour's 256 shades are computed once.
+const LINEAGE_ENERGY_STEPS: usize = 256;
+
+/// Each [`LINEAGE_PALETTE`] colour at each of its lightness steps.
+static LINEAGE_ENERGY_SHADES: LazyLock<
+    [[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()],
+> = LazyLock::new(|| {
+        let mut shades = [[[0_u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()];
+        for (palette, row) in LINEAGE_PALETTE.iter().zip(shades.iter_mut()) {
+            let [r, g, b] = *palette;
+            let base = srgb_to_oklab(Srgb::from_rgb8(r, g, b));
+            for (step, shade) in row.iter_mut().enumerate() {
+                let l = step as f64 / (LINEAGE_ENERGY_STEPS - 1) as f64;
+                *shade = most_chroma(l, base.a, base.b);
+            }
+        }
+        shades
+    });
+
+/// The sRGB colour at OKLab lightness `l` with hue `(a, b)`: the full
+/// chroma if it fits the gamut, otherwise the most of it that fits, by
+/// bisection (no chroma always fits).
+fn most_chroma(l: f64, a: f64, b: f64) -> [u8; 3] {
+    let at = |k: f64| oklab_to_srgb(Oklab { l, a: k * a, b: k * b });
+    let inside = |c: Srgb| [c.r, c.g, c.b].iter().all(|v| (0.0..=1.0).contains(v));
+    let full = at(1.0);
+    if inside(full) {
+        return full.to_rgb8();
+    }
+    let (mut low, mut high) = (0.0_f64, 1.0_f64);
+    for _ in 0..24 {
+        let middle = 0.5 * (low + high);
+        if inside(at(middle)) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    at(low).to_rgb8()
+}
+
+/// The lineage-energy colour of an organism of `lineage` holding `energy`
+/// in a world whose organisms attempt a birth from `attempt_energy`: the
+/// OKLab hue and chroma of the lineage's [`LINEAGE_PALETTE`] colour at
+/// lightness [`LINEAGE_ENERGY_LIGHTNESS`]` × energy / attempt_energy`,
+/// clamped to `[0, 1]` and rounded to one of 256 steps. A shade outside
+/// the gamut keeps its lightness and hue and takes the most chroma that
+/// fits, so the best fed go towards white. A negative or non-finite energy
+/// counts as 0; for an attempt energy that is not finite and positive the
+/// lineage's palette colour is unchanged.
+#[must_use]
+pub fn lineage_energy_rgb8(lineage: u64, energy: f32, attempt_energy: f64) -> [u8; 3] {
+    palette_shade(lineage_slot(lineage), energy, attempt_energy)
+}
+
+/// [`LINEAGE_PALETTE`]`[slot]` shaded as [`lineage_energy_rgb8`] shades a
+/// lineage's colour.
+fn palette_shade(slot: usize, energy: f32, attempt_energy: f64) -> [u8; 3] {
+    if !(attempt_energy.is_finite() && attempt_energy > 0.0) {
+        return LINEAGE_PALETTE[slot];
+    }
+    let energy = f64::from(energy);
+    let energy = if energy.is_finite() { energy.max(0.0) } else { 0.0 };
+    let lightness = (LINEAGE_ENERGY_LIGHTNESS * energy / attempt_energy).clamp(0.0, 1.0);
+    let step = (lightness * (LINEAGE_ENERGY_STEPS - 1) as f64).round() as usize;
+    LINEAGE_ENERGY_SHADES[slot][step.min(LINEAGE_ENERGY_STEPS - 1)]
 }
 
 /// `t ∈ [0, 1]` along evenly spaced sRGB `stops`, interpolated in sRGB
@@ -911,6 +1022,9 @@ pub fn mapped_rgb8(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) -
             TOPOLOGY_PALETTE[usize::from(traits.topology) % TOPOLOGY_PALETTE.len()]
         }
         ColorMapping::Affinity => affinity_rgb8(traits.affinity),
+        ColorMapping::LineageEnergy => {
+            lineage_energy_rgb8(traits.lineage, traits.energy, traits.attempt_energy)
+        }
     }
 }
 

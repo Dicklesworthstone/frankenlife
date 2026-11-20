@@ -21,8 +21,10 @@
 //!
 //! The epoch carries the inputs of §13.4's mappings: lineage, energy,
 //! generation, topology, motion and the chemical affinity's fixed
-//! projection ([`affinity_projection`]). Turning them into sizes and
-//! colours is a visual mapping (`presentation.color_mapping`, FL-019).
+//! projection ([`affinity_projection`]), and the world's constants they
+//! scale by: its speed limit and the least energy an organism attempts a
+//! birth with. Turning them into sizes and colours is a visual mapping
+//! (`presentation.color_mapping`, FL-019).
 //! Scientific code never reads an epoch back.
 
 use flife_core::ids::{OrganismId, RenderEpoch, ResourceEpoch};
@@ -876,6 +878,7 @@ pub struct Epoch {
     prior: Option<Prior>,
     step: TimeStep,
     maximum_speed: f64,
+    attempt_energy: f64,
     affinity_limit: f64,
     extent: [f64; 2],
     capacity: usize,
@@ -944,6 +947,7 @@ impl Epoch {
             prior: None,
             step: world.step_size(),
             maximum_speed: world.maximum_speed(),
+            attempt_energy: world.minimum_attempt_energy(),
             affinity_limit: world.trait_limits().affinity_norm(),
             extent: [grid.world_width(), grid.world_height()],
             capacity,
@@ -1116,6 +1120,14 @@ impl Epoch {
     #[must_use]
     pub const fn maximum_speed(&self) -> f64 {
         self.maximum_speed
+    }
+
+    /// The least energy an organism of the world attempts a birth with
+    /// (`reproduction.minimum_parent_energy_before_attempt`): the
+    /// lineage-energy mapping's scale.
+    #[must_use]
+    pub const fn attempt_energy(&self) -> f64 {
+        self.attempt_energy
     }
 
     /// The world's size, `[width, height]` in world units.

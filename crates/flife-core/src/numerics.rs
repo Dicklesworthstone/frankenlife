@@ -278,8 +278,8 @@ pub fn tanh_f32(z: f32) -> Option<f32> {
 /// [`tanh`] of an F64 argument, rounded once to F32: for every `f64` `x`,
 /// `tanh_f64_as_f32(x)` is `tanh(x).map(|t| t as f32)`, bit for bit.
 ///
-/// Evaluates [`tanh_estrin`] (one division instead of 13+) guarded by a
-/// double-rounding margin: [`tanh_estrin`]'s worst-case error over `(0, 20)`
+/// Evaluates `tanh_estrin` (one division instead of 13+) guarded by a
+/// double-rounding margin: `tanh_estrin`'s worst-case error over `(0, 20)`
 /// is below `4,000` F64 ulps, so whenever `approx` is safely normal in F32
 /// and the 29 truncated mantissa bits lie more than `65,536` ulps from the
 /// F32 rounding tie `0x1000_0000`, `approx as f32` cannot differ from

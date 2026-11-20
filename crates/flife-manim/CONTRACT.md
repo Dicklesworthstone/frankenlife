@@ -100,7 +100,8 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   | `generation` | `generation-log-v1` | generation `g` | `GENERATION_RAMP` (plasma 0.33 to 1, 7 stops) at `ln(1 + g) / ln(257)`, clamped |
   | `motion` | `motion-heading-v1` | velocity | `MOTION_WHEEL` hue for the heading (east coral, turning counter-clockwise on screen), mixed from the grey `MOTION_STILL` by `√(speed / speed limit)` |
   | `topology` | `topology-catalog-v1` | catalog index `k` | `TOPOLOGY_PALETTE[k mod 8]`; the first five are the catalog members in size order |
-  | `affinity` | `affinity-projection-v1` | the epoch's affinity projection `q` (flife-render) | `g = AFFINITY_GAIN · q`, squashed to `s = g / √(1 + ‖g‖²)`; OKLab `L = 0.74 + 0.10 s₃`, `a = 0.16 s₁`, `b = 0.16 s₂` (`AFFINITY_LIGHTNESS`, `AFFINITY_CHROMA`), then FrankenManim's `oklab_to_srgb` and its clamp to RGBA8 |
+  | `affinity` | `affinity-projection-v1` | the epoch's affinity projection `q` (flife-render) | `g = AFFINITY_GAIN · q`, squashed to `s = g / √(1 + ‖g‖²)`; OKLab `L = 0.46 + 0.12 s₃`, `a = 0.26 s₁`, `b = 0.26 s₂` (`AFFINITY_LIGHTNESS`, `AFFINITY_CHROMA`), through FrankenManim's `oklab_to_srgb`; a colour outside the sRGB gamut keeps its lightness and hue and takes the most chroma that fits (bisection) |
+  | `lineage-energy` | `founder-lineage-energy-v1` | lineage id, energy `e`, and the epoch's `attempt_energy` `θ` (the world's `reproduction.minimum_parent_energy_before_attempt`) | the lineage's `LINEAGE_PALETTE` colour's OKLab hue and chroma at `L = LINEAGE_ENERGY_LIGHTNESS · e / θ` (0.55), clamped to `[0, 1]` and rounded to one of 256 steps; a shade outside the gamut takes the most chroma that fits, so an organism with no energy is black and one with about 1.8 θ white. The 12 × 256 shades are computed once. A non-finite or nonpositive `θ` leaves the palette colour |
 
   `FromStr` takes either name. The affinity colour is grey for no affinity; organisms with like chemistry have
   like colours, and opposite directions have opposite hues. `AFFINITY_GAIN = √(128/3)` puts the founders, whose
@@ -119,7 +120,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - topology: each of `topologies` (the run's catalog members' hidden widths, in catalog order) in its palette
     colour, labelled `64, 32`;
   - affinity: `none`, then six directions 60 degrees apart in the first two coordinates at a founder's typical
-    radius (`legend_affinities`), then `like hue, like chemistry`.
+    radius (`legend_affinities`), then `like hue, like chemistry`;
+  - lineage-energy: the first palette colour (teal) at `LEGEND_ATTEMPT_FRACTIONS` 0.25, 0.5, 1 and 1.5 of the
+    attempt energy, then `x energy to divide` (short enough that the longest overlay stays within the HUD's
+    budget).
 - `FieldMapping` (FL-019, plan §13.4's "Local field"): `energy` (the default), `composition` (the fixed
   projection), or `component-C` (`Component(FieldComponent)`, chosen components: moment channel C, 0 to
   `FIELD_COMPONENTS` − 1 = 31), by `name()` and `FromStr` (exactly those names: `component-07` and `component-32`

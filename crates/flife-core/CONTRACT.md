@@ -223,8 +223,9 @@ Every issue is reported, not just the first.
 - Topology-catalog membership beyond depth and parameter cap (FL-009).
 - `[persistence] metrics_interval_ticks`, which nothing reads yet: a run's metrics interval is `flife run`'s
   `--metrics-every` (default none), and an experiment's its specification's `metrics_every`. Appendix A's 128
-  must stay valid, so the key cannot be refused the way `trails_enabled` is. Making it the default needs the
-  metrics tracker charged as an observer by the memory preflight first (FL-043).
+  must stay valid, so the key cannot be refused the way `trails_enabled` is. The memory preflight now charges
+  the metrics tracker (FL-043), so making the key the default is no longer blocked; it is a change to every
+  run's output and cost, not yet made.
 
 **Registry status.**
 - Implemented here with fixtures: `field-ecology-v1` and the `stable-identity` phase policy.

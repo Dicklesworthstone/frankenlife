@@ -975,16 +975,17 @@ fn t_asks_to_track_the_selection() {
     assert_eq!(controls.style(), style);
 }
 
-/// FL-019: the digit keys 1 to 6 (`kVK_ANSI_1` … `kVK_ANSI_6`, whose codes
-/// are not in order) choose the six mappings in order, R cycles the look
+/// FL-019: the digit keys 1 to 7 (`kVK_ANSI_1` … `kVK_ANSI_7`, whose codes
+/// are not in order) choose the seven mappings in order, R cycles the look
 /// (glow, raw, sphere), D and F switch the particles and the field, C cycles
 /// the field's mapping (energy, composition, then the chosen component),
 /// none of them makes an intent, and auto-repeat and ⌘ change nothing.
 #[test]
 fn style_keys_choose_the_mapping_look_particles_and_field() {
-    assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22]);
+    assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22, 26]);
     assert_eq!(ColorMapping::ALL.len(), KEY_DIGITS.len());
     assert_eq!(ColorMapping::ALL[5], ColorMapping::Affinity);
+    assert_eq!(ColorMapping::ALL[6], ColorMapping::LineageEnergy);
     let mut controls = Controls::new();
     assert_eq!(controls.style(), Style::default());
     for (&code, mapping) in KEY_DIGITS.iter().zip(ColorMapping::ALL).rev() {
@@ -1066,7 +1067,7 @@ fn style_keys_choose_the_mapping_look_particles_and_field() {
             ..Style::default()
         }
     );
-    assert_eq!(controls.tally().keys, 2 * 17 + 2);
+    assert_eq!(controls.tally().keys, 2 * 18 + 2);
 }
 
 /// Plan §13.4's chosen components: `[` and `]` (`kVK_ANSI_LeftBracket`,

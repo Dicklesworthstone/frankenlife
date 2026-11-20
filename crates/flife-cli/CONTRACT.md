@@ -311,8 +311,8 @@ texel scratch) into `MemoryAdmission::render` before creating a run directory or
   through, plan §13.4's recorded matrix and scaling, `RenderProjection`: `flife-render`'s
   `AffinityProjection::fixed()` rows, its 3 × 32 `matrix` of ±1 and its `divisor` √32, with the configuration's
   `affinity_limit`). FL-019's style flags choose what is drawn: `--color M` (`lineage`,
-  `energy`, `generation`, `motion`, `topology` or `affinity`, or a registered name such as `founder-lineage-v1`; by
-  default the configuration's `[presentation] color_mapping`), `--look glow|raw`, `--density`, `--no-field` and
+  `energy`, `generation`, `motion`, `topology`, `affinity` or `lineage-energy`, or a registered name such as
+  `founder-lineage-v1`; by default the configuration's `[presentation] color_mapping`), `--look glow|raw|sphere`, `--density`, `--no-field` and
   `--field-mapping energy|composition|component-C` (the field's energy, its chemical composition lit by its
   energy, or moment channel C, 0 to 31, per unit energy from blue at −1 to red at +1, lit the same way; a channel
   past 31 is a usage error, exit 2). No style

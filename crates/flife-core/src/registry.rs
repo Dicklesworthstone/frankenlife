@@ -836,6 +836,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-019",
         )
     },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/mapping.rs::lineage_energy_keeps_the_lineage_hue_and_lightens_with_energy",
+        },
+        ..entry(
+            "founder-lineage-energy-v1",
+            Role::ColorMapping,
+            "§13.4",
+            "FL-019",
+        )
+    },
     entry(
         "committed-states-one-epoch-late",
         Role::Interpolation,

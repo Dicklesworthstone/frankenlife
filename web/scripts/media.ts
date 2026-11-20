@@ -4,7 +4,8 @@
 //   bun scripts/media.ts --flife PATH --run-dir DIR --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080] [--fps 30] [--crf 24]
 //     [--camera auto|none] [--field energy|composition|none] [--look glow|raw|sphere]
-//     [--color lineage|affinity|energy|generation|motion|topology] [--zooms 2.5,4,6]
+//     [--color lineage|lineage-energy|affinity|energy|generation|motion|topology]
+//     [--zooms 2.5,4,6]
 //     [--cpu-workers N] [--preview-from WORK]
 //
 // - With `--camera auto` (the default) the run is first rendered small, as
@@ -164,7 +165,7 @@ const zooms = flags.has("zooms")
   : null;
 // Without --color, the run's own [presentation] color_mapping.
 const color = flags.has("color")
-  ? choice("color", ["lineage", "affinity", "energy", "generation", "motion", "topology"])
+  ? choice("color", ["lineage", "lineage-energy", "affinity", "energy", "generation", "motion", "topology"])
   : null;
 const style = [
   ...(field === "none" ? ["--no-field"] : ["--field-mapping", field]),

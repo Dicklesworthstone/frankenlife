@@ -432,9 +432,9 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         fps: u32,
         /// What the organisms' colour means: `lineage`, `energy`,
-        /// `generation`, `motion`, `topology` or `affinity` (or a registered
-        /// name such as `founder-lineage-v1`). The default is the
-        /// configuration's `[presentation] color_mapping`.
+        /// `generation`, `motion`, `topology`, `affinity` or `lineage-energy`
+        /// (or a registered name such as `founder-lineage-v1`). The default
+        /// is the configuration's `[presentation] color_mapping`.
         #[arg(long)]
         color: Option<ColorMapping>,
         /// `glow` (the default), `raw`: no halos and a linear grey field, or `sphere`: raw with

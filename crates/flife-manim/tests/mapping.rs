@@ -8,10 +8,11 @@ use flife_manim::HUD_SWATCH;
 use flife_manim::{
     AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, BLOOM_SIGMA_POINTS,
     BLOOM_WIDEST_REACH_PIXELS, ColorMapping, DensityLayer, ENERGY_HALF, ENERGY_RAMP,
-    GENERATION_RAMP, GENERATION_SCALE, LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL,
-    ParticleCloud, Particles, Style, TOPOLOGY_PALETTE, Traits, Viewport, WorldView, affinity_rgb8,
-    density_bins, density_level, energy_level, generation_level, heading, linear, mapped_color,
-    mapped_rgb8, mix, ramp, raw_value, speed_level, traits, wheel,
+    GENERATION_RAMP, GENERATION_SCALE, LEGEND_ATTEMPT_FRACTIONS, LINEAGE_ENERGY_LIGHTNESS,
+    LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL, ParticleCloud, Particles, Style,
+    TOPOLOGY_PALETTE, Traits, Viewport, WorldView, affinity_rgb8, density_bins, density_level,
+    energy_level, generation_level, heading, lineage_energy_rgb8, lineage_slot, linear,
+    mapped_color, mapped_rgb8, mix, ramp, raw_value, speed_level, traits, wheel,
 };
 use flife_render::FieldTexture;
 use fmn_core::color::{LinearRgba, Srgb, srgb_to_oklab};
@@ -66,6 +67,7 @@ fn row(lineage: u64, energy: f32, generation: u32, topology: u8, velocity: [f32;
         topology,
         velocity,
         affinity: [0.0; 3],
+        attempt_energy: 2.0,
     }
 }
 
@@ -251,6 +253,10 @@ fn every_dot_takes_its_own_rows_colour_in_every_mapping() {
         assert_eq!(
             row.affinity.map(f32::to_bits),
             epoch.affinities()[index].map(f32::to_bits)
+        );
+        assert_eq!(
+            row.attempt_energy.to_bits(),
+            epoch.attempt_energy().to_bits()
         );
     }
     let mut palettes = Vec::new();
@@ -849,7 +855,7 @@ fn a_colour_is_a_function_of_its_row_alone() {
         !survivors.is_empty(),
         "some founders live through both epochs"
     );
-    let mut compared = [0_usize; 6];
+    let mut compared = [0_usize; 7];
     for (slot, mapping) in ColorMapping::ALL.into_iter().enumerate() {
         for &(row, later) in &survivors {
             let (a, b) = (early_rows[row], late_rows[later]);
@@ -863,6 +869,11 @@ fn a_colour_is_a_function_of_its_row_alone() {
                 ColorMapping::Topology => a.topology == b.topology,
                 ColorMapping::Affinity => {
                     a.affinity.map(f32::to_bits) == b.affinity.map(f32::to_bits)
+                }
+                ColorMapping::LineageEnergy => {
+                    a.lineage == b.lineage
+                        && a.energy.to_bits() == b.energy.to_bits()
+                        && a.attempt_energy.to_bits() == b.attempt_energy.to_bits()
                 }
             };
             if same {
@@ -1179,6 +1190,32 @@ fn every_key_swatch_is_the_colour_its_mapping_gives_its_label() {
                     assert_eq!(swatch, with(mapping, row(0, 0.0, 0, topology, [0.0; 2])));
                 }
             }
+            ColorMapping::LineageEnergy => {
+                // The first palette colour at fractions of the energy to
+                // divide, the last label saying what they mean.
+                assert_eq!(labels.len(), LEGEND_ATTEMPT_FRACTIONS.len());
+                let first = (0..)
+                    .find(|&lineage| lineage_slot(lineage) == 0)
+                    .expect("a lineage in slot 0");
+                for ((label, &fraction), &swatch) in labels
+                    .iter()
+                    .zip(&LEGEND_ATTEMPT_FRACTIONS)
+                    .zip(&legend.swatches)
+                {
+                    let number = label.split(' ').next().unwrap_or_default();
+                    assert_eq!(number.parse::<f32>(), Ok(fraction), "{label}");
+                    let traits = Traits {
+                        attempt_energy: 1.0,
+                        ..row(first, fraction, 0, 0, [0.0; 2])
+                    };
+                    assert_eq!(swatch, with(mapping, traits), "{label}");
+                }
+                assert_eq!(
+                    labels[3],
+                    "1.5 x energy to divide",
+                    "{labels:?}"
+                );
+            }
             ColorMapping::Lineage => {
                 // Twelve unlabelled swatches, then what they mean.
                 assert_eq!(labels.len(), 12);
@@ -1259,4 +1296,94 @@ fn linear_bytes_are_the_srgb_transfer_bit_for_bit() {
         }
     }
     assert_eq!(compared, 256 * 52 * 3);
+}
+
+/// FL-019's lineage-energy mapping: each lineage keeps its palette colour's
+/// hue, and its lightness is [`LINEAGE_ENERGY_LIGHTNESS`] times the energy
+/// over the world's attempt energy, black with none and white from about
+/// 1.8 times it; only the lineage, the energy and that ratio matter.
+#[test]
+fn lineage_energy_keeps_the_lineage_hue_and_lightens_with_energy() {
+    let attempt = 1.75_f64;
+    let lightness = |rgb: [u8; 3]| oklab(rgb)[0];
+    for (slot, &palette) in LINEAGE_PALETTE.iter().enumerate() {
+        let lineage = (0..)
+            .find(|&lineage| lineage_slot(lineage) == slot)
+            .expect("a lineage in every slot");
+        let [palette_l, palette_a, palette_b] = oklab(palette);
+        let palette_hue = palette_b.atan2(palette_a);
+        let shade = |energy: f32| lineage_energy_rgb8(lineage, energy, attempt);
+        // No energy is black; a negative or non-finite energy counts as none.
+        for none in [0.0, -1.0, f32::NAN, f32::NEG_INFINITY] {
+            assert_eq!(shade(none), [0, 0, 0], "slot {slot}, {none}");
+        }
+        // From 1 / 0.55 of the attempt energy, white.
+        let white = (attempt / LINEAGE_ENERGY_LIGHTNESS) as f32 * 1.001;
+        for bright in [white, white * 2.0, f32::MAX] {
+            assert_eq!(shade(bright), [255, 255, 255], "slot {slot}");
+        }
+        // In between, lightness follows the energy, to a step's rounding,
+        // and never falls as the energy rises; the hue stays the lineage's.
+        let mut last = -1.0;
+        for step in 0..=200 {
+            let energy = (white * step as f32) / 200.0;
+            let rgb = shade(energy);
+            let l = lightness(rgb);
+            let expected = (LINEAGE_ENERGY_LIGHTNESS * f64::from(energy) / attempt).min(1.0);
+            // Below the OKLab lightness of sRGB byte 1 (about 0.067), bytes
+            // cannot follow it: those shades round towards black.
+            let tolerance = if expected < 0.07 { 0.07 } else { 0.012 };
+            assert!(
+                (l - expected).abs() < tolerance,
+                "slot {slot}: {energy}: {l} for {expected}"
+            );
+            assert!(l >= last - 1e-9, "slot {slot}: {energy}: {l} after {last}");
+            last = l;
+            let [_, a, b] = oklab(rgb);
+            if a.hypot(b) > 0.03 {
+                let off = (b.atan2(a) - palette_hue + std::f64::consts::PI)
+                    .rem_euclid(std::f64::consts::TAU)
+                    - std::f64::consts::PI;
+                assert!(off.abs() < 0.12, "slot {slot}: {energy}: hue off by {off}");
+            }
+        }
+        // At the palette colour's own lightness, the shade is that colour.
+        let own = (palette_l * attempt / LINEAGE_ENERGY_LIGHTNESS) as f32;
+        let near = shade(own);
+        for (x, y) in near.iter().zip(palette) {
+            assert!(x.abs_diff(y) <= 3, "slot {slot}: {near:?} for {palette:?}");
+        }
+        // Only the ratio of energy to attempt energy matters.
+        assert_eq!(
+            lineage_energy_rgb8(lineage, 1.0, 2.0),
+            lineage_energy_rgb8(lineage, 0.5, 1.0)
+        );
+        // Without a usable attempt energy, the palette colour.
+        for unusable in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(lineage_energy_rgb8(lineage, 1.0, unusable), palette);
+        }
+    }
+    // Through the mapping, nothing but the lineage, the energy and the
+    // attempt energy changes the colour.
+    let base = Traits {
+        attempt_energy: attempt,
+        ..row(7, 1.2, 0, 0, [0.0; 2])
+    };
+    let other = Traits {
+        generation: 90,
+        topology: 3,
+        velocity: [1.0, -2.0],
+        affinity: [0.3, -0.2, 0.1],
+        ..base
+    };
+    let mapped = |traits: Traits| mapped_rgb8(ColorMapping::LineageEnergy, &traits, 4.0);
+    assert_eq!(mapped(base), mapped(other));
+    assert_eq!(mapped(base), lineage_energy_rgb8(7, 1.2, attempt));
+    assert_ne!(
+        mapped(base),
+        mapped(Traits {
+            energy: 0.6,
+            ..base
+        })
+    );
 }

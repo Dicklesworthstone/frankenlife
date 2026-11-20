@@ -75,7 +75,7 @@ use crate::checkpointing::{
 
 use crate::run::{
     CheckpointAt, ControllerSummary, Finished, Plan, RUN_SCHEMA, RUN_SESSION, Record,
-    SkippedCheckpoint, Until, configure, drive, finish, found, start, tracker, with_memory,
+    SkippedCheckpoint, Until, drive, finish, found, start, tracker, with_memory,
 };
 
 pub use flife_store::Durability as StoreDurability;

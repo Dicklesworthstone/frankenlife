@@ -70,8 +70,8 @@ a sensor backend port. Its last part does it for phase 5: every organism's deman
 none is faster than the CPU yet (the sampler is 0.98× on one worker and 0.80× beside the Metal controllers on
 sixteen; uptake 0.95× and 0.90×), so none is on by default: the measured frontier is in the Metal crate's contract. FL-027 groups uptake, deposit and per-organism packets with a bounded stable counting sort, not a
 comparison sort: linear however organisms crowd, with scratch declared from the population maximum, in the same
-cell-then-identity order, so the world is bit-identical. FL-019 adds six colour mappings (lineage, energy, generation,
-motion, topology, chemical affinity), a raw look and density rendering, switched live in the Studio and chosen for `flife render`; the Studio's overlay
+cell-then-identity order, so the world is bit-identical. FL-019 adds seven colour mappings (lineage, energy, generation,
+motion, topology, chemical affinity, lineage lit by energy), a raw look and density rendering, switched live in the Studio and chosen for `flife render`; the Studio's overlay
 draws the shown mapping's colour key, each swatch in the colour its label maps to.
 FL-016 encodes a whole session, world and command book, as one sealed, chunked checkpoint (Appendix B.2). A
 world restored off phase, with newborns or after deaths publishes every later tick exactly as the uninterrupted
@@ -516,7 +516,7 @@ while running or paused, and change only the picture:
 
 | Key | View |
 |---|---|
-| 1 to 6 | colour by lineage, energy (dark to bright), generation (logarithmic), motion (hue for heading, strength for speed), topology (catalog member) or chemical affinity (grey for none; like chemistry, like colour) |
+| 1 to 7 | colour by lineage, energy (dark to bright), generation (logarithmic), motion (hue for heading, strength for speed), topology (catalog member), chemical affinity (grey for none; like chemistry, like colour) or lineage lit by energy (the lineage's colour, black with no energy, white with about 1.8 times what a birth needs) |
 | R | the next look: glow, then raw (no halos, linear grey field), then sphere (raw, each dot shaded as a sphere) |
 | D | density per screen bin instead of dots |
 | F | show or hide the field |

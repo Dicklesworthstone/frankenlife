@@ -1364,6 +1364,14 @@ impl World {
         self.rules.motion.maximum_speed()
     }
 
+    /// The least energy an organism attempts a birth with
+    /// (`reproduction.minimum_parent_energy_before_attempt`). Render epochs
+    /// carry it as the scale of the lineage-energy colour mapping (FL-019).
+    #[must_use]
+    pub const fn minimum_attempt_energy(&self) -> f64 {
+        self.rules.reproduction.rules().minimum_attempt_energy
+    }
+
     /// The run's bounds on heritable traits and parameters.
     #[must_use]
     pub const fn trait_limits(&self) -> &TraitLimits {

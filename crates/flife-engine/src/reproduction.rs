@@ -1100,6 +1100,19 @@ impl Drop for StopWorkers<'_> {
     }
 }
 
+fn propose_safely(
+    propose_one: &(impl Fn(&BirthRequest<'_>) -> Result<DetachedProposal, CoreError> + Sync),
+    request: &BirthRequest<'_>,
+) -> Result<DetachedProposal, CoreError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| propose_one(request))) {
+        Ok(result) => result,
+        Err(_) => Err(CoreError::StateConflict {
+            operation: "propose births",
+            detail: "a birth proposal worker panicked".into(),
+        }),
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "private wave coordinator for resolve_births_with_workers"
@@ -1120,6 +1133,52 @@ fn stage_parallel_waves(
     refused: &mut Vec<RefusedBirth>,
 ) -> Result<Option<CapacityShortfall>, CoreError> {
     let dtype = quota.dtype();
+    stage_parallel_waves_with(
+        context,
+        order,
+        birth_tick,
+        deadline,
+        population,
+        working,
+        quota,
+        refusing,
+        used,
+        wave_size,
+        born,
+        rejected,
+        refused,
+        &|request| {
+            let attempt = BirthAttempt {
+                parent: request.intent.parent,
+                tick: request.intent.tick,
+            };
+            context
+                .mutator
+                .propose_detached(request.genome, attempt, dtype)
+        },
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private wave coordinator for resolve_births_with_workers"
+)]
+fn stage_parallel_waves_with(
+    context: &BirthContext<'_>,
+    order: &[&BirthRequest<'_>],
+    birth_tick: Tick,
+    deadline: Tick,
+    population: PopulationQuota,
+    working: &mut Identities,
+    quota: &mut GenomeQuota,
+    refusing: bool,
+    used: usize,
+    wave_size: usize,
+    born: &mut Vec<Birth>,
+    rejected: &mut Vec<RejectedBirth>,
+    refused: &mut Vec<RefusedBirth>,
+    propose_one: &(impl Fn(&BirthRequest<'_>) -> Result<DetachedProposal, CoreError> + Sync),
+) -> Result<Option<CapacityShortfall>, CoreError> {
     let cursor = AtomicUsize::new(0);
     let wave_end = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -1156,14 +1215,7 @@ fn stage_parallel_waves(
                         let Some(request) = order.get(index) else {
                             break;
                         };
-                        let attempt = BirthAttempt {
-                            parent: request.intent.parent,
-                            tick: request.intent.tick,
-                        };
-                        let proposed =
-                            context
-                                .mutator
-                                .propose_detached(request.genome, attempt, dtype);
+                        let proposed = propose_safely(propose_one, request);
                         if worker_tx.send((index, proposed)).is_err() {
                             break;
                         }
@@ -1198,13 +1250,7 @@ fn stage_parallel_waves(
                 let Some(request) = order.get(index) else {
                     break;
                 };
-                let attempt = BirthAttempt {
-                    parent: request.intent.parent,
-                    tick: request.intent.tick,
-                };
-                let proposed = context
-                    .mutator
-                    .propose_detached(request.genome, attempt, dtype);
+                let proposed = propose_safely(propose_one, request);
                 main_results.push((index, proposed));
             }
             done_barrier.wait();
@@ -1614,4 +1660,143 @@ fn roll_back(born: Vec<Birth>, quota: &mut GenomeQuota) -> Result<(), CoreError>
         quota.retire(*birth.genome)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flife_genome::{MutationParameters, founder};
+
+    #[test]
+    fn parallel_proposal_panic_returns_state_conflict_without_deadlock_and_rolls_back() {
+        let plan = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
+        let appendix = &plan[plan.find("## Appendix A").unwrap()..];
+        let start = appendix.find("```toml\n").unwrap() + "```toml\n".len();
+        let length = appendix[start..].find("```").unwrap();
+        let validated = ValidatedConfig::from_toml(&appendix[start..start + length]).unwrap();
+        let grid = FieldGrid::from_config(&validated).unwrap();
+        let reproduction = Reproduction::from_config(&validated).unwrap();
+        let catalog = TopologyCatalog::from_config(&validated).unwrap();
+        let limits = TraitLimits::from_config(&validated).unwrap();
+        let mut quota = GenomeQuota::from_config(&validated).unwrap();
+        let rng = SemanticRng::new(99);
+        let mutator = Mutator::new(
+            rng,
+            MutationParameters::from_config(&validated).unwrap(),
+            &catalog,
+            limits,
+        )
+        .unwrap();
+
+        let mut identities = Identities {
+            organisms: IdSequence::starting_at(1),
+            genomes: IdSequence::starting_at(1),
+        };
+        let mut parents = Vec::new();
+        for i in 0..8u64 {
+            let id = identities.organisms.issue().unwrap();
+            let gid = identities.genomes.issue().unwrap();
+            let genome = founder(&rng, id, gid, &catalog, &mut quota, &limits, 1.0).unwrap();
+            parents.push((id, i, genome));
+        }
+
+        let Viability::Viable(split) = reproduction.split(10.0, 1.0 / 3.0).unwrap() else {
+            panic!("expected viable split");
+        };
+        let intents: Vec<BirthIntent> = parents
+            .iter()
+            .map(|(id, i, _)| BirthIntent {
+                parent: *id,
+                lineage: LineageId::new(1),
+                generation: Generation::new(1),
+                tick: Tick::new(5),
+                position: [1.0 + *i as f64, 2.0],
+                split,
+            })
+            .collect();
+        let requests: Vec<BirthRequest<'_>> = intents
+            .iter()
+            .zip(&parents)
+            .map(|(intent, (_, _, genome))| BirthRequest {
+                intent: *intent,
+                genome,
+            })
+            .collect();
+        let order: Vec<&BirthRequest<'_>> = requests.iter().collect();
+        let context = BirthContext {
+            grid: &grid,
+            reproduction: &reproduction,
+            mutator: &mutator,
+            rng: &rng,
+            offspring: Offspring::Inherited,
+            capacity: CapacityPolicy::PauseBeforeCommit,
+        };
+
+        let bytes_before = quota.allocated_bytes();
+        let logical_before = quota.logical_bytes();
+        let live_before = quota.live();
+        let dtype = quota.dtype();
+
+        // Panic on wave 0 (index 0), wave 0 (index 1), and wave 2 (index 5 after waves 0-1 staged births).
+        for panic_parent in [parents[0].0, parents[1].0, parents[5].0] {
+            let mut working = identities.clone();
+            let mut born = Vec::new();
+            let mut rejected = Vec::new();
+            let mut refused = Vec::new();
+            let result = stage_parallel_waves_with(
+                &context,
+                &order,
+                Tick::new(6),
+                Tick::new(20),
+                PopulationQuota::new(32, 8).unwrap(),
+                &mut working,
+                &mut quota,
+                false,
+                4,
+                2,
+                &mut born,
+                &mut rejected,
+                &mut refused,
+                &|request| {
+                    if request.intent.parent == panic_parent {
+                        panic!("injected proposal panic for parent {}", panic_parent.get());
+                    }
+                    let attempt = BirthAttempt {
+                        parent: request.intent.parent,
+                        tick: request.intent.tick,
+                    };
+                    context
+                        .mutator
+                        .propose_detached(request.genome, attempt, dtype)
+                },
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(CoreError::StateConflict {
+                        operation: "propose births",
+                        ..
+                    })
+                ),
+                "expected StateConflict on panic for parent {}, got {result:?}",
+                panic_parent.get()
+            );
+            assert!(born.is_empty(), "staged births must be drained on rollback");
+            assert_eq!(
+                quota.allocated_bytes(),
+                bytes_before,
+                "genome quota bytes must roll back after panic"
+            );
+            assert_eq!(
+                quota.logical_bytes(),
+                logical_before,
+                "logical genome bytes must roll back after panic"
+            );
+            assert_eq!(
+                quota.live(),
+                live_before,
+                "live genome count must roll back after panic"
+            );
+        }
+    }
 }

@@ -298,8 +298,8 @@ pub enum DetachedProposal {
         topology: TopologyId,
         /// The mutated parameter values, moved zero-copy into [`GenomeQuota::adopt`].
         values: ParameterValues,
-        /// The mutated, validated traits.
-        traits: Traits,
+        /// The mutated, validated traits (boxed: 65 f64 values inline).
+        traits: Box<Traits>,
         /// The parent's genome identity.
         parent: GenomeId,
         /// How the child was made.
@@ -511,12 +511,24 @@ impl<'a> Mutator<'a> {
             let source = self.member(from)?;
             let same = from == to;
             let built = match (values.weights_mut(), parent.parameters()) {
-                (WeightsMut::F32(child), Weights::F32(parent_weights)) => {
-                    self.map_and_mutate(source, parent_weights, target, child, same, attempt, candidate)
-                }
-                (WeightsMut::F16(child), Weights::F16(parent_weights)) => {
-                    self.map_and_mutate(source, parent_weights, target, child, same, attempt, candidate)
-                }
+                (WeightsMut::F32(child), Weights::F32(parent_weights)) => self.map_and_mutate(
+                    source,
+                    parent_weights,
+                    target,
+                    child,
+                    same,
+                    attempt,
+                    candidate,
+                ),
+                (WeightsMut::F16(child), Weights::F16(parent_weights)) => self.map_and_mutate(
+                    source,
+                    parent_weights,
+                    target,
+                    child,
+                    same,
+                    attempt,
+                    candidate,
+                ),
                 _ => Err(CoreError::LayoutMismatch {
                     buffer: "genome parameters",
                     detail: "the parent's weight dtype is not the child buffer's".into(),
@@ -581,7 +593,7 @@ impl<'a> Mutator<'a> {
             return Ok(DetachedProposal::Child {
                 topology: to,
                 values,
-                traits,
+                traits: Box::new(traits),
                 parent: parent.id(),
                 record: MutationRecord {
                     candidate,
@@ -630,9 +642,7 @@ impl<'a> Mutator<'a> {
             }
         }
         match detached {
-            DetachedProposal::Rejected { candidates, .. } => {
-                Ok(Proposal::Rejected { candidates })
-            }
+            DetachedProposal::Rejected { candidates, .. } => Ok(Proposal::Rejected { candidates }),
             DetachedProposal::Child {
                 topology,
                 values,
@@ -646,7 +656,7 @@ impl<'a> Mutator<'a> {
                     buffer,
                     child,
                     self.catalog,
-                    traits,
+                    *traits,
                     Some(parent_id),
                     &self.limits,
                 ) {

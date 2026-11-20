@@ -2420,11 +2420,8 @@ fn parallel_birth_proposals_are_bit_identical_at_any_worker_count() {
         })
         .collect();
     // Re-size tight_pause to allow only 5 more genomes beyond its 32 parents.
-    let mut exact_pause = GenomeQuota::new(
-        tight_pause.logical_bytes() + one_genome * 5,
-        1 << 40,
-    )
-    .expect("quota");
+    let mut exact_pause =
+        GenomeQuota::new(tight_pause.logical_bytes() + one_genome * 5, 1 << 40).expect("quota");
     let pause_parents: Vec<Genome> = (1..=32)
         .map(|id| founder_genome(id, &catalog, &mut exact_pause))
         .collect();

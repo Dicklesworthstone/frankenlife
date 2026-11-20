@@ -1778,7 +1778,11 @@ fn opening_an_experiment_catalog_as_a_run_journal_refuses_without_mutating_table
                 .await
                 .expect("lists tables");
             rows.into_iter()
-                .filter_map(|row| row.get(0).and_then(fsqlite::SqliteValue::as_text).map(str::to_owned))
+                .filter_map(|row| {
+                    row.get(0)
+                        .and_then(fsqlite::SqliteValue::as_text)
+                        .map(str::to_owned)
+                })
                 .collect()
         })
     };

@@ -269,11 +269,7 @@ impl GenomeQuota {
     /// [`CoreError::BudgetExhausted`] for a member above the parameter cap
     /// or a quota that cannot cover its logical bytes;
     /// [`CoreError::NumericalInvalid`] for an unknown member.
-    pub fn can_allocate(
-        &self,
-        catalog: &TopologyCatalog,
-        id: TopologyId,
-    ) -> Result<(), CoreError> {
+    pub fn can_allocate(&self, catalog: &TopologyCatalog, id: TopologyId) -> Result<(), CoreError> {
         let _ = self.check_admit_and_logical(catalog, id)?;
         Ok(())
     }

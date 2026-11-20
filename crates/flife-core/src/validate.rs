@@ -420,6 +420,23 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
             "trails are not drawn yet (FL-019, §13.5); set false",
         );
     }
+    // Nothing records from `[recording]`: the Studio records a session only
+    // when asked (`flife-studio --timeline`, FL-023), and every recording
+    // carries its provenance (§2.4). So a value that would change either is
+    // refused, not ignored.
+    if config.recording.enabled {
+        issues.add(
+            "recording.enabled",
+            "nothing records from the configuration; record a Studio session with \
+             flife-studio --timeline (FL-023); set false",
+        );
+    }
+    if !config.recording.include_provenance {
+        issues.add(
+            "recording.include_provenance",
+            "every recording carries its provenance (§2.4); set true",
+        );
+    }
     if config.population.initial_count > config.population.maximum_count {
         issues.add(
             "population.initial_count",

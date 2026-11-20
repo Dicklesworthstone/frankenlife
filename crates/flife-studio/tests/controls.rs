@@ -977,10 +977,9 @@ fn t_asks_to_track_the_selection() {
 
 /// FL-019: the digit keys 1 to 6 (`kVK_ANSI_1` … `kVK_ANSI_6`, whose codes
 /// are not in order) choose the six mappings in order, R cycles the look
-/// (glow, raw, sphere), D and F switch the particles and the field, C the
-/// field's mapping (energy,
-/// composition, then the chosen component), none of them makes an intent,
-/// and auto-repeat and ⌘ change nothing.
+/// (glow, raw, sphere), D and F switch the particles and the field, C cycles
+/// the field's mapping (energy, composition, then the chosen component),
+/// none of them makes an intent, and auto-repeat and ⌘ change nothing.
 #[test]
 fn style_keys_choose_the_mapping_look_particles_and_field() {
     assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22]);
@@ -1007,7 +1006,8 @@ fn style_keys_choose_the_mapping_look_particles_and_field() {
     assert_eq!(controls.style().mapping, ColorMapping::Lineage);
     assert!(tap(&mut controls, 22).is_empty());
     assert_eq!(controls.style().mapping, ColorMapping::Affinity);
-    // R, D, F and C change the style in turn; then each goes back.
+    // R, D, F and C change the style in turn. Going back, R and C, which
+    // cycle three ways, each take one press more than D and F.
     for (code, changed) in [
         (
             KEY_R,
@@ -1048,7 +1048,7 @@ fn style_keys_choose_the_mapping_look_particles_and_field() {
         assert_eq!(controls.style(), changed, "key {code}");
     }
     assert_eq!(KEY_C, 8, "kVK_ANSI_C");
-    // R cycles glow, raw and sphere, so raw goes back to glow through sphere.
+    // Raw goes back to glow through sphere.
     assert!(tap(&mut controls, KEY_R).is_empty());
     assert_eq!(controls.style().look, Look::Sphere);
     for code in [KEY_R, KEY_D, KEY_F, KEY_C] {

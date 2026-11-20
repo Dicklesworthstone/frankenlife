@@ -80,7 +80,8 @@ enum Command {
         every: u64,
         /// Print a metrics record (complete window, population and lineage
         /// statistics; spatial statistics sampled from the render epoch) at
-        /// every multiple of this tick and at the end; 0 for none.
+        /// every multiple of this tick and at the end; 0 for none. The
+        /// configuration's `[persistence] metrics_interval_ticks` is not read.
         #[arg(long, default_value_t = 0)]
         metrics_every: u64,
         /// Threads for the organism phases, replacing `[execution]
@@ -146,7 +147,8 @@ enum Command {
         every: u64,
         /// Print a metrics record (complete window, population and lineage
         /// statistics; spatial statistics sampled from the render epoch) at
-        /// every multiple of this tick and at the end; 0 for none.
+        /// every multiple of this tick and at the end; 0 for none. The
+        /// configuration's `[persistence] metrics_interval_ticks` is not read.
         #[arg(long, default_value_t = 0)]
         metrics_every: u64,
         /// Threads for the organism phases: a count or `auto`. No result
@@ -178,7 +180,7 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         every: u64,
         /// Print a metrics record at every multiple of this tick and at the
-        /// end; 0 for none.
+        /// end; 0 for none. `[persistence] metrics_interval_ticks` is not read.
         #[arg(long, default_value_t = 0)]
         metrics_every: u64,
         /// Threads for the organism phases: a count or `auto`. No result

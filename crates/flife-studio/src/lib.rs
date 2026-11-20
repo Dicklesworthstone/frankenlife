@@ -9,8 +9,9 @@
 //!
 //! Keys: Space runs or pauses, → or `.` steps one tick while paused, and
 //! Esc or ⌘W closes. 1 to 6 colour the organisms by lineage, energy,
-//! generation, motion, topology or chemical affinity; R switches between the glow and raw
-//! looks, D between points and density, and F shows or hides the field.
+//! generation, motion, topology or chemical affinity; R cycles the glow, raw
+//! and sphere looks, D switches points and density, and F shows or hides the
+//! field.
 //! The pointer reports the world point under it. Scrolling zooms about the
 //! pointer, a primary drag pans across the torus's seams, a click selects
 //! the organism drawn under it by identity, and 0 shows the whole torus

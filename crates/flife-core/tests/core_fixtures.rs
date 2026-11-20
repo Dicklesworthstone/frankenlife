@@ -393,6 +393,16 @@ fn model_abi_and_catalog_violations_are_refused() {
         "not drawn yet",
     );
     assert_refused(
+        |c| c.recording.enabled = true,
+        "recording.enabled",
+        "nothing records",
+    );
+    assert_refused(
+        |c| c.recording.include_provenance = false,
+        "recording.include_provenance",
+        "carries its provenance",
+    );
+    assert_refused(
         |c| c.population.initial_count = 20_000,
         "population.initial_count",
         "exceeds maximum_count",

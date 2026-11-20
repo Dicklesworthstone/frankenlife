@@ -14,7 +14,8 @@
 //! - [`DensityLayer`]: organism counts and mean colours per screen bin, for
 //!   worlds denser than their pixels (§2.3, §13.3).
 //! - [`Style`] and its parts: §13.4's colour mappings ([`ColorMapping`]),
-//!   the glow and raw looks ([`Look`]), points or density ([`Particles`]).
+//!   the glow, raw and sphere looks ([`Look`]), points or density
+//!   ([`Particles`]).
 //! - [`HudFont`] and [`HudText`]: lines of text over the world, fixed to
 //!   the drawable's corner, as triangles the 3D route draws (FL-024's
 //!   metric overlay).

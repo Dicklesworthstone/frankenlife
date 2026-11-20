@@ -199,6 +199,10 @@ are no hidden defaults.
 - Gradient training, mutation-rate evolution or automatic reseeding (none is part of `field-ecology-v1`).
 - `[presentation] trails_enabled = true` (FL-019): no renderer draws trails yet, so the key is refused rather than
   silently ignored. Appendix A and the preset set it false.
+- `[recording] enabled = true` or `include_provenance = false`: nothing records from the configuration (the
+  Studio records a session when asked, `flife-studio --timeline`, FL-023), and every recording carries its
+  provenance (§2.4), so neither value could take effect. Appendix A and every preset set `enabled = false`
+  and `include_provenance = true`.
 - An initial population above the ceiling.
 - A malformed name, background or schema string.
 
@@ -217,6 +221,10 @@ Every issue is reported, not just the first.
   and §7.5 admission enforces it at run time.
 - Host capability checks and backend/renderer combinations. Only one backend and one renderer are registered today.
 - Topology-catalog membership beyond depth and parameter cap (FL-009).
+- `[persistence] metrics_interval_ticks`, which nothing reads yet: a run's metrics interval is `flife run`'s
+  `--metrics-every` (default none), and an experiment's its specification's `metrics_every`. Appendix A's 128
+  must stay valid, so the key cannot be refused the way `trails_enabled` is. Making it the default needs the
+  metrics tracker charged as an observer by the memory preflight first (FL-043).
 
 **Registry status.**
 - Implemented here with fixtures: `field-ecology-v1` and the `stable-identity` phase policy.

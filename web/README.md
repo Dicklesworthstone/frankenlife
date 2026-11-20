@@ -60,12 +60,13 @@ checks that the preview and the film end on the same world digest. `--camera non
 `--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many
 organisms as the reference screenshots' views at zooms 3–6: a screenshot's zoom over 1.95.
 
-`scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the
-manifest names the revision. It renders into `--work`. Run it again with the same `--work` to re-encode
-the finished frames without rendering them, for example at another `--crf` when the video exceeds
-Cloudflare's 25 MiB limit for a static asset. Each output is copied into `public/media/` under a
-content-hashed name. The script never deletes anything, so move the previous render's files out of
-`public/media/` before building; `bun run build` names any it finds.
+`scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the manifest
+names the revision. It renders into `--work`. Run it again with the same `--work` to re-encode the finished
+frames without rendering them, for example at another `--crf` when the video exceeds Cloudflare's 25 MiB
+limit for a static asset. Each output is copied into `public/media/` under a content-hashed name. The frames
+are reproducible, the video's bytes are not: x264 on several threads encodes the same frames differently
+each time, so a re-encode gives the video a new name. The script never deletes anything, so move the
+previous render's files out of `public/media/` before building; `bun run build` names any it finds.
 
 The same configuration, seed and starting checkpoint give the same frames on any machine. The world's
 digest at the last frame is in the manifest (`world.to.digest`) and in the render's `end` record.
@@ -78,8 +79,9 @@ the film's closest shot (`cardFrame` in `scripts/director.ts`; the manifest's `s
 beside the words. The organism count and the caption's world and tick come from the manifest. The build
 fetches the card's fonts (Inter, JetBrains Mono) from Google Fonts, as `next/font` does, and encodes the
 card as a JPEG (about 180 KB for this film) with ffmpeg, since a PNG of the frame is over 2 MB, more than
-some link previewers fetch. Next.js links both from the page's metadata with a content hash, so
-`app/layout.tsx` names no image itself.
+some link previewers fetch. Next.js links both from the page's metadata with a hash, so `app/layout.tsx`
+names no image itself. The hash is of the route's source, not the picture, so a new film keeps the same
+URL: a platform that cached the old card shows it until its own refresh tool fetches it again.
 
 ## Cloudflare
 

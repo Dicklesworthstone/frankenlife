@@ -16,7 +16,7 @@ cd web
 bun install
 bun run dev          # http://localhost:3000, once the media are in public/media/
 bun run typecheck
-bun test             # worker.ts's byte serving, and the director's camera path and card frame
+bun test             # worker.ts's byte serving and share-image type, the director's camera and card frame
 bun run build        # refuses unless public/media/ holds exactly the manifest's files
 bun run deploy       # build, then `wrangler deploy` (needs `wrangler login`)
 ```

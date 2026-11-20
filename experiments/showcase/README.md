@@ -577,7 +577,8 @@ statistic.
 - **A ceiling, not food.** All fourteen references read `pop=999,9xx`, so their worlds sit at a population
   ceiling of a million with food to spare. `contact-world` is limited by food, about 160,000 against a
   ceiling of 177,536, and its organisms crowd the sources.
-- **Black.** Its corrected distance, 1.27, is worst on voids and coverage, as is every sample's in stage D.
+- **Black.** Its corrected distance, 1.27 as stage C scored it, is worst on voids and coverage, as is every
+  sample's in stage D.
 
 ### Trials
 
@@ -697,10 +698,10 @@ million-organism world at zoom 1.95 holds as many as this whole torus):
 - **Like the references.** The tissue fills the frame. Coloured by founder lineage, it falls into saturated
   domains of one colour, each with its own texture of worm-like labyrinth, foam or packed spheres, like r04,
   r06, r09 and r13. Close up, packed spheres in mixed clusters resemble r05.
-- **Unlike them.** Lineages mix more finely at domain edges, since children land up to 2.5 units away. The
-  references' largest structures, glands with a dark moat and a bright rim (r12), white lace networks (r07)
-  and moats between domains (r13), are rarer here. Coloured by affinity, every lineage is teal, green or
-  olive, where the references' colours are saturated and many.
+- **Unlike them.** Lineages mix more finely at domain edges, perhaps because children land up to 2.5 units
+  away. The references' largest structures, glands with a dark moat and a bright rim (r12), white lace
+  networks (r07) and moats between domains (r13), are rarer here. Coloured by affinity, every lineage is teal,
+  green or olive, where the references' colours are saturated and many.
 
 ### The confluent preset, and the film
 
@@ -709,6 +710,10 @@ million-organism world at zoom 1.95 holds as many as this whole torus):
 `crates/flife-cli/tests/confluent_preset.rs` holds it to them and to one factor of four. The film shows it
 from tick 2,400, where the trials were scored, to 5,600, coloured by founder lineage. The population stays at
 the ceiling throughout.
+
+Its bodies stack, as `c4-d25`'s do, if less. At tick 2,400 the median nearest neighbour is 0.29 diameters,
+a body has 15.7 others within one diameter on average, and the disks' areas sum to 2.01 times the torus's
+while covering 0.76 of it: about 2.6 deep where there are bodies at all.
 
 ### Further trials
 
@@ -739,9 +744,9 @@ cell does not bring the image nearer; `f64-d20` ties the preset on the statistic
   §1.2), and a world whose frames share their spectrum and colour coherence need not work as theirs does.
   The closest sample, `c4-x1`, is still 0.76 standard deviations from the references on average, and its
   held-out seeds 1.1–2.0.
-- `contact-world` is a different model from the rest, not a better setting of the same one: its organisms
-  are bodies that push and stick (plan §5.4). The references' rules are unknown, and nothing here shows
-  they have contact or adhesion; packing spheres is what their close-ups look like.
+- `contact-world` and `confluent-world` run a different model from the rest, not a better setting of the same
+  one: their organisms are bodies that push and stick (plan §5.4). The references' rules are unknown, and
+  nothing here shows they have contact or adhesion; packing spheres is what their close-ups look like.
 - Stage C's corrected statistic prefers `tissue-world` to `contact-world`; the eye chose the latter, on
   close-ups whose bodies, stage D found, stack.
 - Stage D's variant packs bodies, but no trial of it is as near the references as `tissue-world`,

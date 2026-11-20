@@ -722,7 +722,7 @@ crates/flife-manim/                                   FL-018 FrankenManim adapte
 crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
 crates/flife-backend-cpu/                             FL-025 FrankenTorch CPU controller route: the serial population kernel on the world's lanes, bit-identical to the reference; FL-026 per-topology packed shards
 crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; FL-026 per-topology parameter shards, each genome uploaded once, behind the engine's controller port; FL-031 field step, sensor pyramid and uptake behind the engine's field, sensor and uptake ports
-presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning
+presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning; FL-034's Interactive and Desktop worlds; the showcase worlds (experiments/showcase)
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation; FL-026 arena slots
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary

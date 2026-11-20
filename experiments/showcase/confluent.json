@@ -2,7 +2,7 @@
  "schema": "frankenlife.showcase.stage-e.v1",
  "reference": "experiments/showcase/scale-reference.json",
  "scored": "a 1024-px raw frame of the whole torus coloured by affinity, by scale.py at the body diameter (0.25 world units without a body) in pixels",
- "preset": "presets/confluent-world.toml is trial w80-o25; cw-seed1..3 are the preset on held-out seeds; cw-chem and cw-fresh are the preset under its chemistry-only and fresh-offspring controls",
+ "preset": "presets/confluent-world.toml is trial w80-o25; cw-seed1..3 are the preset on held-out seeds; cw-chem and cw-fresh are the preset under its chemistry-only and fresh-offspring controls; cw-k30, cw-k80, cw-o10, cw-o10-k30 and the f64 trials are the further trials of the notes, each the preset with one or two changes; baselines are contact-world and tissue-world scored the same way",
  "trials": [
   {
    "trial": "t2",

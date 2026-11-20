@@ -39,6 +39,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-manim/tests/mapping.rs"),
     ),
     (
+        "flife-manim::tests/frame_bytes.rs",
+        include_str!("../../flife-manim/tests/frame_bytes.rs"),
+    ),
+    (
         "flife-engine::tests/organism_phase.rs",
         include_str!("../../flife-engine/tests/organism_phase.rs"),
     ),

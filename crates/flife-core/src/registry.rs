@@ -729,7 +729,15 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("qualified-reference", Role::Determinism, "§16.1", "FL-013")
     },
-    entry("specified", Role::MathMode, "§10.3, A.1", "FL-008"),
+    // FL-008: F32 bias-first accumulation in ascending input order with no
+    // implicit FMA contraction, and `flife-core::numerics::tanh` rounded once
+    // to F32.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-neural::tests/controller.rs::accumulation_is_f32_bias_first_in_ascending_input_order",
+        },
+        ..entry("specified", Role::MathMode, "§10.3, A.1", "FL-008")
+    },
     // FL-036: `flife_runtime::open_journaled` over `flife-store`'s
     // FrankenSQLite command journal. An acceptance, cancellation or outcome
     // is relied on only once the journal's receipt says it is durable, and a
@@ -777,7 +785,14 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-017",
         )
     },
-    entry("franken-manim", Role::PresentationEngine, "§13.1", "FL-018"),
+    // FL-018: `flife-manim`'s native bulk-world adapter over FrankenManim's
+    // `ThreeDJob` and `ThreeDRenderer` (CPU and Metal offscreen/window routes).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/frame_bytes.rs::a_frames_preparation_is_within_the_views_limit",
+        },
+        ..entry("franken-manim", Role::PresentationEngine, "§13.1", "FL-018")
+    },
     // FL-019's colour mappings: each a fixed function of one render-epoch
     // row (flife-manim's `mapping` module).
     AlgorithmEntry {
@@ -833,7 +848,14 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         "§12.2, §13.8",
         "FL-023",
     ),
-    entry("frankensqlite", Role::PersistenceCatalog, "§16.6", "FL-036"),
+    // FL-036: `flife-store`'s FrankenSQLite run catalog, command journal and
+    // experiment catalog (`fsqlite` native engine).
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-store::tests/journal.rs::the_catalog_journals_idempotently_with_distinct_watermarks",
+        },
+        ..entry("frankensqlite", Role::PersistenceCatalog, "§16.6", "FL-036")
+    },
     // FL-037: `flife run --run-dir` and `flife resume`. The client takes no
     // step while a checkpoint is taken and published to the chunk store, so
     // the committed world cannot move under it; a run stopped by a damaged

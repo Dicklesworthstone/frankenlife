@@ -1,4 +1,5 @@
-//! `presets/confluent-world.toml` is `presets/contact-world.toml` at a
+//! `presets/confluent-world.toml`, the world the website's film shows, is
+//! `presets/contact-world.toml` at a
 //! field four times finer than its organisms' spacing, with food to spare
 //! and scattered offspring, chosen by trials scored against image
 //! statistics of the reference screenshots

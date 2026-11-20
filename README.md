@@ -472,7 +472,7 @@ them, but so far grows coarser structure; stage D of the same notes has the tria
 `experiments/showcase/README.md` (stage C) states how the table's numbers were chosen. It also says what the
 choice does not show: its image statistic rates `tissue-world` as close, and held-out seeds merge less.
 
-`presets/tissue-world.toml` is the film's world before it: 10,954 founders on 128 × 128 × 33 at
+`presets/tissue-world.toml` was the film's world before that: 10,954 founders on 128 × 128 × 33 at
 Δt = 1/32 s, whose population grows to 110,000–170,000 under a ceiling of 177,536. Organisms return about half
 of what they eat to the field as emission, in a chemical composition their networks choose and kin choose
 alike. Each lineage paints its surroundings with its own chemistry and grows into a single-colour colony. At

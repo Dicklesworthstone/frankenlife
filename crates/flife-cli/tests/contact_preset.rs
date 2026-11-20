@@ -1,4 +1,5 @@
-//! `presets/contact-world.toml` is the world the website's film shows:
+//! `presets/contact-world.toml` was the world the website's film showed
+//! until `presets/confluent-world.toml`:
 //! `presets/tissue-world.toml` under the contact model (plan §5.4), with the
 //! body and adhesion an outer search chose against image statistics of the
 //! reference screenshots (experiments/showcase/README.md, "Stage C", states

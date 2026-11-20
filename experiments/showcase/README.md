@@ -560,7 +560,7 @@ By eye:
 
 The statistic agrees on the coarsening. Its worst statistics are voids, and shape at 3.5–8.5 organisms. No
 trial is as near as `contact-world` (1.27) or `tissue-world` (0.78–1.00). So no preset uses the variant yet,
-and the website's film stays `contact-world`. The plan's rule and its tests are in place for a search that
+and the website's film stayed `contact-world` until stage E. The plan's rule and its tests are in place for a search that
 can grow fine structure out of packed bodies.
 
 ## Stage E: a finer field, fed and dispersed, `confluent-world`

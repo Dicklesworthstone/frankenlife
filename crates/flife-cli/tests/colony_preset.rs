@@ -1,4 +1,5 @@
-//! `presets/colony-world.toml` is the world the website's film shows: a
+//! `presets/colony-world.toml` was the world the website's film showed
+//! until `presets/tissue-world.toml`: a
 //! parameter set an outer search chose for organism-like structure, scored
 //! against image statistics of the reference screenshots
 //! (experiments/showcase/README.md, "Stage W", states the selection). These

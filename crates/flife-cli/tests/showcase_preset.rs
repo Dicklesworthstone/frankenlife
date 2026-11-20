@@ -1,4 +1,5 @@
-//! `presets/showcase-world.toml` is the world the website's film shows: a
+//! `presets/showcase-world.toml` was the world the website's film showed
+//! until `presets/colony-world.toml`: a
 //! parameter set an outer search chose for organism-like structure
 //! (experiments/showcase/README.md states the selection). These tests keep it
 //! exactly what the search chose: the Desktop preset with its declared

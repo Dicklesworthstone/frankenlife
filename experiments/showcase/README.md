@@ -1,6 +1,7 @@
 # The showcase search: the parameter sets behind the website's film
 
-This directory records how the worlds the website's film has shown were chosen. It is an outer search, a
+This directory records how the showcase presets were chosen; the website's film shows the last of them,
+`confluent-world`. It is an outer search, a
 procedure outside the simulation that picked parameters for how the result looks. AGENTS.md asks that such a
 selection be stated (rule 8; plan §2.4, §7.2, §15.5).
 
@@ -10,14 +11,14 @@ selection be stated (rule 8; plan §2.4, §7.2, §15.5).
   reference statistics (`reference.json`) and the chosen sample's parameters and ancestry (`colony.json`).
   [Stage W](#stage-w-matching-the-references-colony-world-and-tissue-world) has every step.
 - **Stage C** continued from `tissue-world` under a registered model variant with bodies,
-  `field-ecology-v1-contact` (plan §5.4), to `contact-world`, the film's world until stage E. It is recorded in
+  `field-ecology-v1-contact` (plan §5.4), to `contact-world`. It is recorded in
   `scale.py`, its reference statistics (`scale-reference.json`) and the chosen sample's parameters
   (`contact.json`). [Stage C](#stage-c-bodies-that-pack-and-adhere-contact-world) has every step.
 - **Stage D** measured that stage C's bodies stack, and registered `field-ecology-v1-contact-inhibition`,
   whose bodies pack. [Stage D](#stage-d-bodies-that-pack-field-ecology-v1-contact-inhibition) has its
   trials; no preset uses it yet.
-- **Stage E** continued from `contact-world` at a field four times finer than its organisms' spacing, with
-  food to spare, scattered offspring and a smaller torus, to `confluent-world`, the film's world now. It is
+- **Stage E** continued from `contact-world` on a field four times finer, with food to spare, scattered
+  offspring and a smaller torus, to `confluent-world`, the world the website's film shows. It is
   recorded in `confluent.json`. [Stage E](#stage-e-a-finer-field-fed-and-dispersed-confluent-world) has every
   trial.
 
@@ -357,10 +358,10 @@ ceiling of 177,536. Its only difference from the sample is the genome quotas, ra
   - By eye: dense tissue with membranes, voids and mesh walls throughout. The colours narrow towards two or
     three as lineages consolidate.
 
-Until stage C, the website's film was this world from tick 1,600, where the search stopped scoring it, to
-4,800. It had 401 frames, one every 8 ticks, at 1080 × 1080: raw dots coloured by chemical affinity, without
-the field. Its camera was chosen from the run, as before, with each shot's zoom scaled to the 128-unit torus
-(1.25–2.5). It ended on the continued run's digest, `556c4973…5758d1`.
+Stage W's film showed this world from tick 1,600, where the search stopped scoring it, to 4,800. It had 401
+frames, one every 8 ticks, at 1080 × 1080: raw dots coloured by chemical affinity, without the field. Its
+camera was chosen from the run, as before, with each shot's zoom scaled to the 128-unit torus (1.25–2.5). It
+ended on the continued run's digest, `556c4973…5758d1`.
 
 ## Stage C: bodies that pack and adhere, `contact-world`
 
@@ -491,7 +492,7 @@ placement radius of 0.45 and the `[contact]` table. It also keeps `tissue-world`
 - **The test.** `crates/flife-cli/tests/contact_preset.rs` checks the preset's declared changes and its
   table, and checks it against `contact.json`.
 
-Until stage E, the website's film was this world from tick 1,600, where the search stopped scoring it, to 4,800: 401 frames,
+Stage C's film showed this world from tick 1,600, where the search stopped scoring it, to 4,800: 401 frames,
 one every 8 ticks, at 1080 × 1080. Each organism is drawn as a lit sphere at its body's size, coloured by
 chemical affinity, without the field.
 
@@ -559,9 +560,8 @@ By eye:
   inhibition it flows in coherent streams.
 
 The statistic agrees on the coarsening. Its worst statistics are voids, and shape at 3.5–8.5 organisms. No
-trial is as near as `contact-world` (1.27) or `tissue-world` (0.78–1.00). So no preset uses the variant yet,
-and the website's film stayed `contact-world` until stage E. The plan's rule and its tests are in place for a search that
-can grow fine structure out of packed bodies.
+trial is as near as `contact-world` (1.27) or `tissue-world` (0.78–1.00). So no preset uses the variant yet.
+The plan's rule and its tests are in place for a search that can grow fine structure out of packed bodies.
 
 ## Stage E: a finer field, fed and dispersed, `confluent-world`
 
@@ -582,15 +582,17 @@ statistic.
 ### Trials
 
 Each trial is `contact-world` or `tissue-world` (seed 42) with every length the organisms and the field act on
-divided by a factor, 2 or 4: the grid spacing, the diffusion length (diffusion over the factor squared), speeds
-and accelerations, the motion-response limit (over its square, since gradients steepen), the sensing scales,
-gradient length and velocity scale, the child placement radius and the body. The motion cost per speed
+divided by a factor, 2 or 4: the grid spacing, the diffusion length (diffusion over the factor squared),
+speeds and accelerations, the motion-response limit (over its square, since gradients steepen), the sensing
+scales, gradient length and velocity scale, the child placement radius and the body. The motion cost per speed
 squared is multiplied by the factor squared, so a move of one cell costs what it did. The torus stays 128
 units unless stated, with the same founders, ceiling and food per unit area, so a finer field holds fewer
-organisms per cell. "Occupied" is the share of 2-unit squares holding an organism. The distance is
-`scale.py`'s against the corrected reference, from a 1,024-px raw frame of the whole torus coloured by
-affinity, at the body diameter (0.25 units without a body). `confluent.json` records every trial's changes,
-counts and digest.
+organisms per cell. The smaller tori keep the 128-unit torus's total food in fewer, stronger sources (30 on 88
+units, 25 on 80), so food per unit area rises. In the contact trials children land within one body diameter of
+their parent, as in `contact-world`, unless stated. "Occupied" is the share of 2-unit squares holding an
+organism. The distance is `scale.py`'s against the corrected reference, from a 1,024-px raw frame of the whole
+torus coloured by affinity, at the body diameter (0.25 units without a body). `confluent.json` records every
+trial's changes, counts and digest.
 
 | Trial | Change | Tick | Live | Occupied | Distance |
 |---|---|---:|---:|---:|---:|
@@ -614,7 +616,7 @@ counts and digest.
 | `o10-t` | `t4-cap-wide`, children within 1.0 | 2,400 | 262,144 | 0.58 | 1.85 |
 | `o10-c88` | `w88-n262k`, children within 1.0 | 2,400 | 262,144 | 0.80 | 1.74 |
 | `w88-e200` | `w88-n262k`, energy sensor scale 200 | 2,400 | 262,144 | 0.79 | 2.43 |
-| `w88-o25` | `w88-n262k`, children within 2.5 | 2,400 | 262,144 | 0.89 | 1.18 |
+| `w88-o25` | `w88-n262k`, children within 2.5 (and food 0.05% more, 949,267 against 948,810) | 2,400 | 262,144 | 0.89 | 1.18 |
 | `w88-o25-e200` | `w88-o25`, energy sensor scale 200 | 2,400 | 262,144 | 0.92 | 1.23 |
 | `w80-o25-e200` | `w88-o25-e200` on an 80-unit torus | 2,400 | 262,144 | 0.99 | 0.76 |
 | `w80-o40-e200` | `w80-o25-e200`, children within 4.0 | 2,400 | 262,144 | 1.00 | 0.74 |
@@ -628,7 +630,7 @@ What each step found:
    area against 90 under them, so the sensor reads 0.99 against 0.92 and only a colony's rim feels the food
    beyond it. Two of these 128-unit worlds then fell from the ceiling after tick 2,100, to 158,000 and
    175,000.
-3. **Bodies one spacing wide** (`c4-d25`) keep `contact-world`'s look at the finer scale: labyrinths of
+3. **Bodies one field cell wide** (`c4-d25`) keep `contact-world`'s look at the finer scale: labyrinths of
    strands two to four bodies thick inside each domain, a single-file rim around it and tubes between
    domains, like r13, r01 and r03. But the bodies stack: median nearest neighbour 0.20 diameters, 25 within
    one diameter, and a disk area of 0.76 of the torus covering 0.23. Packing them (`i4-d25`, the
@@ -639,17 +641,18 @@ What each step found:
    9,000 of a 128-unit torus's 16,384. A higher ceiling (`w128-n393k`) is never reached: food stops it at
    254,000. A smaller torus (`w88-n262k`) fills more, and placing children up to 2.5 units from their
    parent fills most of it (`w88-o25`), seeding colonies into the empty, fed space. On an 80-unit torus the
-   tissue is confluent (`w80-o25`, 0.99 occupied) and the distance 0.74, the nearest of any sample in any
-   stage: `contact-world` scores 1.27 and `tissue-world` 0.78–1.00. Its worst statistics are now shapes at 2–7
+   tissue is confluent (`w80-o25`, 0.99 occupied) and the distance 0.74, as near as any sample of stages
+   W to E (`w80-o40-e200` ties it; `f64-d20`, below, scores 0.73): `contact-world` scores 1.27 and
+   `tissue-world` 0.78–1.00. Its worst statistics are now shapes at 2–7
    organisms, not voids. A sensor that stays linear to 200 (`e200`) does not help.
 
 ### Held-out seeds
 
-`confluent-world` on seeds 1, 2 and 3 scores 1.57, 1.15, 0.81, against `contact-world`'s 2.55–2.80 and `tissue-world`'s
-1.82–2.39. The variant with the linear sensor scores 1.61, 1.40 on seeds 1 and 2. Seed 1 grows a finer mosaic
-of lineages (its worst statistic, colour coherence at 8 organisms, 4.9). Seed 2 reaches the ceiling later, at
-tick 2,100 against 900, and keeps more black, but grows the most reference-like frame of any trial by eye:
-rings and lace with rims, and closed loops like the references' glands.
+`confluent-world` on seeds 1, 2 and 3 scores 1.57, 1.15, 0.81, against `contact-world`'s 2.55–2.80 and
+`tissue-world`'s 1.82–2.39. The variant with the linear sensor scores 1.61, 1.40 on seeds 1 and 2. Seed 1
+grows a finer mosaic of lineages (its worst statistic, colour coherence at 8 organisms, 4.9). Seed 2 reaches
+the ceiling later, at tick 2,100 against 900, and keeps more black, but grows the most reference-like frame of
+any trial by eye: rings and lace with rims, and closed loops like the references' glands.
 
 ### Controls
 
@@ -685,11 +688,11 @@ million-organism world at zoom 1.95 holds as many as this whole torus):
 from tick 2,400, where the trials were scored, to 5,600, coloured by founder lineage. The population stays at
 the ceiling throughout.
 
-### After the film
+### Further trials
 
-Seven more trials, seed 42 to tick 2,400, each the preset with one or two changes, after the film showed its
-two largest gaps from the references: no dark moats between domains, and few glands with bright rims. None is
-clearly nearer than the preset (`f64-d20` ties it on the statistic and looks hazier), so it stays.
+Seven trials, seed 42 to tick 2,400, each the preset with one or two changes, aimed at its two largest gaps
+from the references: no dark moats between domains, and few glands with bright rims. None is clearly nearer
+than the preset (`f64-d20` ties it on the statistic and looks hazier), so it stays.
 
 | Trial | Change from `confluent-world` | Distance | Occupied | By eye |
 |---|---|---:|---:|---|
@@ -698,11 +701,11 @@ clearly nearer than the preset (`f64-d20` ties it on the statistic and looks haz
 | `cw-k80` | toxicity sensitivity 0.08 → 0.8 | 0.75 | 1.00 | the same domains; no moats |
 | `cw-o10` | children within 1.0 units, not 2.5 | 1.13 | 0.96 | black gaps return between colonies |
 | `cw-o10-k30` | both | 1.14 | 0.97 | as `cw-o10` |
-| `f64-d16` | field 512² (about one organism per cell), body and sensing lengths ÷ 1.6, children still within 2.5 | 1.06 | 0.99 | dimmer, hazier domains; finer specks |
+| `f64-d16` | field 512² (one organism per cell), every length the organisms and field act on ÷ 1.6 (body 0.156), children still within 2.5 | 1.06 | 0.99 | dimmer, hazier domains; finer specks |
 | `f64-d20` | as `f64-d16`, bodies 0.20 across | 0.73 | 0.99 | as `f64-d16`, with more clumps close up |
 | `f64-o10-d16` | as `f64-d16`, children within 1.0 units | 1.34 | 0.96 | hazy, with black gaps |
 
-So poison does not draw moats in this model: domains meet without a gap whether toxicity sensitivity is the
+So raising toxicity does not draw moats here: domains meet without a gap whether toxicity sensitivity is the
 preset's 0.08 or ten times that. And the field's last factor of 1.6 towards the references' one organism per
 cell does not bring the image nearer; `f64-d20` ties the preset on the statistic and looks hazier.
 
@@ -719,16 +722,18 @@ cell does not bring the image nearer; `f64-d20` ties the preset on the statistic
   they have contact or adhesion; packing spheres is what their close-ups look like.
 - Stage C's corrected statistic prefers `tissue-world` to `contact-world`; the eye chose the latter, on
   close-ups whose bodies, stage D found, stack.
-- Stage D's variant packs bodies, but no trial of it is as near the references as either preset.
-- `confluent-world` is the nearest sample to the corrected reference, on seed 42 and held-out seeds, but it is
-  smaller than the references: an 80-unit torus with a 320 × 320 field and 262,144 organisms, 2.6 to a field
+- Stage D's variant packs bodies, but no trial of it is as near the references as `tissue-world`,
+  `contact-world` or `confluent-world`.
+- `confluent-world` is within 0.01 of the nearest sample to the corrected reference on seed 42, and nearer
+  than `tissue-world` and `contact-world` on held-out seeds, but it is smaller than the references: an 80-unit torus with a 320 × 320 field and 262,144 organisms, 2.6 to a field
   cell, where the references hold a million. Its scale was matched to theirs by reading their overlays, not by
   any known equation, and it was chosen by eye on one seed. Its 128-unit relatives fell from the ceiling after
   tick 2,100; it holds there to tick 5,600, and nothing here shows it holds longer.
 - `colony-world` is discrete colonies on a black field. `tissue-world` is closer to the references' continuous
   tissue on seed 42, less so on held-out seeds. In both, founder lineages narrow to a handful within 150
   simulated seconds, and the colours with them, where the references hold many colours at once.
-- Nothing here shows the structure persists past the runs above: 4,800 ticks is 150 simulated seconds.
+- Nothing here shows the structure persists past the runs above: 5,600 ticks, the longest, is 175
+  simulated seconds.
 - Every control above is one seed.
   - In `showcase-world` they show that inheritance is necessary for the shapes and that the controllers'
     decisions are not. They do not show the controllers add nothing elsewhere, such as in which lineages win

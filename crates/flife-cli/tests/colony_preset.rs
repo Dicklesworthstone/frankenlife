@@ -1,11 +1,10 @@
-//! `presets/colony-world.toml` was the world the website's film showed
-//! until `presets/tissue-world.toml`: a
-//! parameter set an outer search chose for organism-like structure, scored
-//! against image statistics of the reference screenshots
-//! (experiments/showcase/README.md, "Stage W", states the selection). These
-//! tests keep it exactly what the search chose: the Desktop preset with its
-//! declared changes, each named in its header; the search's sample
-//! e4-r8-d1-k8-w0 on 4× its area; and valid, with its session admitting it.
+//! `presets/colony-world.toml` is a parameter set an outer search chose for
+//! organism-like structure, scored against image statistics of the reference
+//! screenshots (experiments/showcase/README.md, "Stage W", states the
+//! selection). These tests keep it exactly what the search chose: the Desktop
+//! preset with its declared changes, each named in its header; the search's
+//! sample e4-r8-d1-k8-w0 on 4× its area; and valid, with its session admitting
+//! it.
 
 mod preset_diff;
 

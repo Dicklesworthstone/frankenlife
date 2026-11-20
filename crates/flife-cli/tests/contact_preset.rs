@@ -1,12 +1,11 @@
-//! `presets/contact-world.toml` was the world the website's film showed
-//! until `presets/confluent-world.toml`:
-//! `presets/tissue-world.toml` under the contact model (plan §5.4), with the
-//! body and adhesion an outer search chose against image statistics of the
-//! reference screenshots (experiments/showcase/README.md, "Stage C", states
-//! the selection). These tests keep it exactly what the search chose: the
-//! tissue preset with its declared changes and the `[contact]` table, each
-//! named in its header; the search's sample a10 at its own scale; and valid,
-//! with its session admitting it.
+//! `presets/contact-world.toml` is `presets/tissue-world.toml` under the
+//! contact model (plan §5.4), with the body and adhesion an outer search chose
+//! against image statistics of the reference screenshots
+//! (experiments/showcase/README.md, "Stage C", states the selection). These
+//! tests keep it exactly what the search chose: the tissue preset with its
+//! declared changes and the `[contact]` table, each named in its header; the
+//! search's sample a10 at its own scale; and valid, with its session admitting
+//! it.
 
 mod preset_diff;
 

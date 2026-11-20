@@ -1,12 +1,10 @@
 //! `presets/confluent-world.toml`, the world the website's film shows, is
-//! `presets/contact-world.toml` at a
-//! field four times finer than its organisms' spacing, with food to spare
-//! and scattered offspring, chosen by trials scored against image
-//! statistics of the reference screenshots
-//! (experiments/showcase/README.md, "Stage E", states the selection). These
-//! tests keep it exactly what the trials chose: the contact preset with its
-//! declared changes, each named in its header; and valid, with its session
-//! admitting it.
+//! `presets/contact-world.toml` on a field four times finer, fed to its
+//! ceiling, with scattered offspring, chosen by trials scored against image
+//! statistics of the reference screenshots (experiments/showcase/README.md,
+//! "Stage E", states the selection). These tests keep it exactly what the
+//! trials chose: the contact preset with its declared changes, each named in
+//! its header; and valid, with its session admitting it.
 
 mod preset_diff;
 
@@ -56,10 +54,12 @@ fn the_preset_is_the_contact_preset_with_exactly_its_declared_changes() {
     assert_exactly_declared(CONTACT, PRESET, &DECLARED);
 }
 
-/// Every length the organisms and the field act on is the contact preset's
-/// divided by four, as stage E states, to the six significant figures the
-/// presets carry; the motion cost per speed squared is multiplied by
-/// sixteen, so a move of one cell costs what it did.
+/// The field's cell is the contact preset's divided by four, and so is
+/// every speed, acceleration and sensing scale, to the six significant
+/// figures the presets carry. Diffusion and the motion-response limit are
+/// divided by sixteen, and the motion cost per speed squared multiplied by
+/// sixteen, so a move of one cell costs what it did. The body and the child
+/// placement are not scaled: stage E chose them by trial.
 #[test]
 fn the_finer_scale_is_one_factor_of_four() {
     let contact: toml::Table = toml::from_str(CONTACT).unwrap_or_default();

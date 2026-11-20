@@ -1,5 +1,5 @@
-# confluent-world: contact-world with a field four times finer than its organisms' spacing, food to spare
-# and scattered offspring, so its tissue fills the torus (the website's film).
+# confluent-world: contact-world on a field four times finer, fed to its ceiling, with scattered
+# offspring, so its tissue fills the torus: the world the website's film shows.
 #
 # Category: an outer-searched parameter set (plan §2.4, §7.2, §15.5) under the
 # registered model variant field-ecology-v1-contact (plan §5.4), the model of
@@ -15,23 +15,24 @@
 # The rules are contact-world's; only the scale and three ecological
 # parameters differ. The selection (experiments/showcase/README.md, "Stage
 # E", has every trial):
-#   1. contact-world puts about eleven organisms in each field cell, the
+#   1. contact-world puts about ten organisms in each field cell, the
 #      references about one, so its field-made structure spans dozens of
-#      organisms. Every length the organisms and the field act on was made
-#      four times finer (grid spacing, diffusion length, speeds and
-#      accelerations, sensing scales, child placement, body), with the cost
-#      of a move of one cell unchanged.
+#      organisms. The field's cells and diffusion length, and every speed,
+#      acceleration and sensing scale, are four times finer, with the cost
+#      of a move of one cell unchanged. Steps 3 and 4 set the body and the
+#      child placement.
 #   2. The references' population counters read 999,9xx: their worlds sit
 #      at a ceiling with food to spare. Food was raised and spread (25
 #      sources of sigma 15 on an 80-unit torus, a total power of 949,000,
 #      three times contact-world's) and the ceiling set to 2^18.
-#   3. Bodies one organism-spacing wide (diameter 0.25) keep contact-world's
+#   3. Bodies one field cell wide (diameter 0.25) keep contact-world's
 #      labyrinths, rims and tubes; packing them harder (stiffness 1, half
 #      the adhesion, or the contact-inhibition variant) smooths them away.
 #   4. Children placed up to 2.5 units from the parent, and a torus of 80
 #      units, let the colonies fill the torus instead of leaving most of it
-#      black: distance 0.74 against the corrected reference, the nearest of
-#      any sample (contact-world 1.27, tissue-world 0.78-1.00).
+#      black: distance 0.74 against the corrected reference, within 0.01 of
+#      the nearest sample of any stage (contact-world 1.27, tissue-world
+#      0.78-1.00).
 #   5. It was chosen by eye, coloured by lineage, against the references.
 #
 # Scale: 10,954 founders on an 80 x 80 periodic torus with a 320 x 320

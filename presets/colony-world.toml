@@ -1,5 +1,5 @@
 # colony-world: a world chosen by an outer search for organism-like structure
-# (the website's film until tissue-world).
+# (experiments/showcase/README.md, stage W).
 #
 # Category: an outer-searched parameter set (plan §2.4, §7.2, §15.5), like
 # presets/showcase-world.toml, whose search it continues. A search outside

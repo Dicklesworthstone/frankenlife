@@ -30,7 +30,7 @@ command, flife's revision and binary hash, and the ffmpeg arguments. A fresh che
 
 ```bash
 # From the repository root: the confluent preset run to tick 2,400, where its trial was scored,
-# kept in RUN (about 30 minutes on 14 workers of an M5 Ultra).
+# kept in RUN (about 20 minutes on 14 workers of an M5 Ultra).
 cargo build --release -p flife-cli
 target/release/flife run presets/confluent-world.toml --ticks 2400 --cpu-workers 14 --run-dir RUN
 
@@ -57,7 +57,8 @@ run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
 checks that the preview and the film end on the same world digest. `--camera none` films the whole torus.
 `--field energy|composition|none` and `--look glow|raw|sphere` choose how the frames are drawn;
-`--zooms` lists the shots' zooms on the run's torus instead (the confluent film's, 1.6–5, show as many organisms as the reference screenshots' views at zooms 3–10: a screenshot's zoom over 1.95).
+`--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many
+organisms as the reference screenshots' views at zooms 3–6: a screenshot's zoom over 1.95.
 
 `scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the
 manifest names the revision. It renders into `--work`. Run it again with the same `--work` to re-encode

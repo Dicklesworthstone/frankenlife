@@ -43,7 +43,7 @@ use flife_engine::{
 };
 use flife_neural::{
     ACTION_WIDTH, ControllerBackend, ControllerJob, ControllerScratch, Intrinsic, SENSOR_WIDTH,
-    SensorScales, observe,
+    SensorScales, observe, observe_for_controller,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -375,9 +375,18 @@ fn a_watched_snapshot_holds_what_its_controller_read_and_its_activations() {
             velocity: row.velocity,
             energy_change_per_second: row.energy_change_rate,
         };
-        let encoded = observe(&sensed.raw, &intrinsic, &scales).expect("encodes");
+        // The controller's encoding of the recorded sample is its inputs; it
+        // is the reference encoding once narrowed to F32, as the controller
+        // narrows it (2482af0).
+        let encoded = observe_for_controller(&sensed.raw, &intrinsic, &scales).expect("encodes");
         assert_eq!(bits64(&encoded.inputs), bits64(&inputs));
         assert_eq!(encoded.gradients, sensed.observation.gradients);
+        let reference = observe(&sensed.raw, &intrinsic, &scales).expect("encodes");
+        assert_eq!(
+            reference.inputs.map(|value| (value as f32).to_bits()),
+            inputs.map(|value| (value as f32).to_bits())
+        );
+        assert_eq!(reference.gradients, encoded.gradients);
         check_activations(&world, id, &inputs, world.tick());
         for other in world.population().ids().filter(|&other| other != id) {
             let unwatched = self::snapshot(&world, other);

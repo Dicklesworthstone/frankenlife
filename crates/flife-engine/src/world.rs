@@ -102,8 +102,7 @@ use flife_genome::{
 };
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
-    DecodedActions, Intrinsic, Observation, SensorScales, decode, observe, observe_for_controller,
-    widen,
+    DecodedActions, Intrinsic, Observation, SensorScales, decode, observe_for_controller, widen,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
@@ -3159,7 +3158,9 @@ fn watched(
     Ok(Some(Sensed {
         tick: from,
         scale: genome_of(population, id)?.traits().sensing_scale(),
-        observation: encode(rules, organism, &raw, from)?,
+        // The controller's encoding (2482af0), so the record is the job's
+        // inputs bit for bit, not only after their narrowing to F32.
+        observation: encode_for_controller(rules, organism, &raw, from)?,
         raw,
         evaluated: due(rules, organism, to),
     }))
@@ -3181,25 +3182,10 @@ fn blended(
 }
 
 /// The observation encoded from the organism's raw sample and its own
-/// committed state at `from`.
-fn encode(
-    rules: &Rules,
-    organism: &Organism,
-    raw: &RawSample,
-    from: Tick,
-) -> Result<Observation, CoreError> {
-    let intrinsic = Intrinsic {
-        energy: organism.energy,
-        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
-        velocity: organism.velocity,
-        energy_change_per_second: organism.energy_change_rate,
-    };
-    observe(raw, &intrinsic, &rules.scales)
-}
-
-/// As [`encode`], using [`observe_for_controller`] so the 69 `tanh`-saturated
-/// inputs avoid 13-division F64 `expm1_neg` while preserving every bit after
-/// the controller's F32 input narrowing (and keeping F64 gradients identical).
+/// committed state at `from`, as its controller reads it:
+/// [`observe_for_controller`], so the 69 `tanh`-saturated inputs avoid
+/// 13-division F64 `expm1_neg` while keeping every bit after the
+/// controller's F32 input narrowing (and the F64 gradients identical).
 fn encode_for_controller(
     rules: &Rules,
     organism: &Organism,

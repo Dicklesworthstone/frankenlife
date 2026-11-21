@@ -489,7 +489,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Use RCH for heavy Cargo work. Never bypass the `rch` cargo shim.
+Use RCH for heavy Cargo work. Never bypass the `rch` cargo shim. The one exception is opening the Studio
+window, which has to build and run on the Mac: use `scripts/studio.sh`, never a hand-rolled bypass.
 
 ```bash
 rch exec -- env CARGO_TARGET_DIR="${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}/rch_target_flife" cargo test --workspace

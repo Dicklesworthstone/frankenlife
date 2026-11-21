@@ -437,6 +437,12 @@ cargo run --release -p flife-cli -- render --run-dir studio-run --ticks 1200 --e
     --width 1080 --height 1080 --out frames-run --video run.mp4
 ```
 
+Run these from the repository root. The Studio draws through Metal into an AppKit window, so it must be built
+and run on the Mac itself. On a machine with the `rch` cargo shim, `cargo run -p flife-studio` is sent to a Linux
+build worker instead, and from outside the repository it fails with `RCH-E415 ... manifest does not exist`.
+`scripts/studio.sh` takes the same arguments, works from any directory and keeps the build local:
+`scripts/studio.sh presets/confluent-world.toml --color lineage-energy --look sphere --no-field`.
+
 `presets/interactive-world.toml` is the Interactive profile's world (§19.5): 25,000 founders on 256 × 256 × 33,
 its source power chosen by FL-034's declared experiment E1 (`experiments/fl034/README.md`). Its populations
 settle at about 22,000 to 25,000 after an early bottleneck. Open it the same way:

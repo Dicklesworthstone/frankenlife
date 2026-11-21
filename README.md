@@ -473,7 +473,9 @@ membranes, rings and foam, and domains of one colour with dark gaps between unli
 `--look sphere` at the body's radius, it looks like the reference screenshots' close-ups. Its bodies stack
 about three deep rather than pack, because the summed pull outweighs the soft push. A second variant,
 `field-ecology-v1-contact-inhibition` (plan §5.4), resolves overlap in extra push-only sweeps and packs them,
-but so far grows coarser structure; stage D of the same notes has the trials. `experiments/showcase/README.md`
+but so far grows coarser structure; stage D of the same notes has the trials. A third,
+`field-ecology-v1-contact-sorting`, also pushes unlike chemistry apart; on the film's world it grows no frame
+nearer the references (stage E's further trials). `experiments/showcase/README.md`
 (stage C) states how the table's numbers were chosen. It also says what the choice does not show: its image
 statistic rates `tissue-world` closer, and held-out seeds merge less.
 

@@ -927,6 +927,15 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
                 UnitClosed,
             );
         }
+        if let Some(repulsion) = c.repulsion {
+            r.float(
+                "contact",
+                "repulsion",
+                repulsion,
+                U::Dimensionless,
+                UnitClosed,
+            );
+        }
     }
 
     let x = &config.execution;

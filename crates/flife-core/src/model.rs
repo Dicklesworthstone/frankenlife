@@ -69,6 +69,25 @@ pub const FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY: &str =
 pub const FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING: &str =
     "field-ecology-v1-contact-inhibition-fresh-offspring";
 
+/// [`FIELD_ECOLOGY_V1_CONTACT`] with cell sorting (plan §5.4): unlike
+/// chemistry repels. Within adhesion's reach, the pull's weight `w²`, the
+/// square of the affinities' positive cosine, becomes `(1 + r) w² − r` with
+/// `r` the `[contact] repulsion`: bodies as alike as `w² > r / (1 + r)` still
+/// pull, less strongly, and less alike ones push apart over the same shell,
+/// most strongly `r` times adhesion's pull. Contact still moves positions
+/// only. See `flife_engine::contact`.
+pub const FIELD_ECOLOGY_V1_CONTACT_SORTING: &str = "field-ecology-v1-contact-sorting";
+
+/// [`FIELD_ECOLOGY_V1_CONTACT_SORTING`] with
+/// [`FIELD_ECOLOGY_V1_CHEMISTRY_ONLY`]'s rule: its chemistry-only control.
+pub const FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY: &str =
+    "field-ecology-v1-contact-sorting-chemistry-only";
+
+/// [`FIELD_ECOLOGY_V1_CONTACT_SORTING`] with
+/// [`FIELD_ECOLOGY_V1_FRESH_OFFSPRING`]'s rule: its inheritance control.
+pub const FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING: &str =
+    "field-ecology-v1-contact-sorting-fresh-offspring";
+
 /// The most contact sweeps a tick may run.
 pub const MAXIMUM_CONTACT_SWEEPS: u32 = 16;
 

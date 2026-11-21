@@ -444,6 +444,20 @@ $$
 
 A survivor loses at most the component of its velocity against the push and keeps the rest, so no speed is added; at $c=0$ every velocity is kept and only the sweeps differ from the contact model. The tick's motion was already paid from its own velocity, so no energy or ledger entry changes. The next tick's velocity, sensing and cost start from the inhibited velocity. Each sweep's sums run as the contact rule's, so the result does not depend on the worker count.
 
+The third variant is registered as `field-ecology-v1-contact-sorting`, with its controls `field-ecology-v1-contact-sorting-chemistry-only` and `field-ecology-v1-contact-sorting-fresh-offspring`. Under the contact rule, unlike chemistry only fails to stick. In `confluent-world` at tick 2,400, neighbouring bodies of one lineage have affinity cosines of 0.96–0.99 and adhere almost fully, while neighbours of different lineages, at a median cosine of 0.29, barely adhere but never repel. In tissues, unlike cells also push apart (contact repulsion), which sharpens the boundaries between them. The variant requires one more key in its table, which the other contact models refuse:
+
+```toml
+repulsion = 0.5        # r in [0, 1]: unlike chemistry's push, as a share of adhesion's pull
+```
+
+Within adhesion's reach the weight becomes
+
+$$
+w_{ij}=(1+r)\,\max\big(0,\cos(a_i,a_j)\big)^2-r,
+$$
+
+with everything else as in the contact rule. Pairs with $\max(0,\cos)^2>r/(1+r)$ still pull, less than under the contact rule unless their chemistry is identical. Less alike pairs push apart over the same shell, by up to $r$ times the pull of identical chemistry. The push, like the pull, vanishes at touching and at reach, so it holds unlike bodies near the edge of reach rather than driving them beyond it. At $r=0$ the variant is the contact model. Contact still moves positions only.
+
 ## 5.5 Paid emission
 
 The neural controller chooses an emission gate, a proposed expenditure `w≥0`, and a direction `a∈R³²`. Normalize the direction; if its norm is below a declared threshold, emit no directional packet under a specified no-op policy.

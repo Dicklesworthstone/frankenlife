@@ -78,7 +78,9 @@ use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
     FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
-    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
     FIELD_ECOLOGY_V1_UNGATED_MOTION,
 };
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
@@ -471,6 +473,15 @@ pub enum ModelVariant {
     /// inhibition, with a newborn's genome a founder's drawn at its own
     /// identity.
     InhibitionFreshOffspring,
+    /// `field-ecology-v1-contact-sorting`: contact in which unlike chemistry
+    /// repels within adhesion's reach ([`crate::contact`]).
+    Sorting,
+    /// `field-ecology-v1-contact-sorting-chemistry-only`: sorting, with
+    /// actions decoded from an all-zero raw output.
+    SortingChemistryOnly,
+    /// `field-ecology-v1-contact-sorting-fresh-offspring`: sorting, with a
+    /// newborn's genome a founder's drawn at its own identity.
+    SortingFreshOffspring,
 }
 
 impl ModelVariant {
@@ -492,6 +503,9 @@ impl ModelVariant {
             FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING => {
                 Ok(Self::InhibitionFreshOffspring)
             }
+            FIELD_ECOLOGY_V1_CONTACT_SORTING => Ok(Self::Sorting),
+            FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY => Ok(Self::SortingChemistryOnly),
+            FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING => Ok(Self::SortingFreshOffspring),
             other => Err(CoreError::UnknownAlgorithm {
                 role: "model",
                 name: other.to_owned(),
@@ -507,7 +521,10 @@ impl ModelVariant {
     pub const fn decides_from_zero(self) -> bool {
         matches!(
             self,
-            Self::ChemistryOnly | Self::ContactChemistryOnly | Self::InhibitionChemistryOnly
+            Self::ChemistryOnly
+                | Self::ContactChemistryOnly
+                | Self::InhibitionChemistryOnly
+                | Self::SortingChemistryOnly
         )
     }
 
@@ -516,7 +533,10 @@ impl ModelVariant {
     pub const fn fresh_offspring(self) -> bool {
         matches!(
             self,
-            Self::FreshOffspring | Self::ContactFreshOffspring | Self::InhibitionFreshOffspring
+            Self::FreshOffspring
+                | Self::ContactFreshOffspring
+                | Self::InhibitionFreshOffspring
+                | Self::SortingFreshOffspring
         )
     }
 
@@ -531,6 +551,9 @@ impl ModelVariant {
                 | Self::Inhibition
                 | Self::InhibitionChemistryOnly
                 | Self::InhibitionFreshOffspring
+                | Self::Sorting
+                | Self::SortingChemistryOnly
+                | Self::SortingFreshOffspring
         )
     }
 

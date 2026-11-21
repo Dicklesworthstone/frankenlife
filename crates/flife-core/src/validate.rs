@@ -20,7 +20,9 @@ use crate::model::{
     ACTION_WIDTH, FIELD_ECOLOGY_V1_CONTACT, FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
-    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS,
     MAXIMUM_HIDDEN_LAYERS, MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count, genome_bank_bytes,
 };
 use crate::registry::{self, REGISTRY};
@@ -243,8 +245,9 @@ pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
 }
 
 /// `[contact]` belongs to the contact models, which need it (plan §5.4), and
-/// adhesion begins where bodies touch. `sweeps` belongs to the
-/// contact-inhibition models, which need it.
+/// adhesion begins where bodies touch. `sweeps` and `inhibition` belong to
+/// the contact-inhibition models, and `repulsion` to the contact-sorting
+/// models, which need them.
 fn check_contact(config: &RunConfig, issues: &mut Issues) {
     let model = config.model.as_str();
     let inhibiting = [
@@ -253,7 +256,14 @@ fn check_contact(config: &RunConfig, issues: &mut Issues) {
         FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
     ]
     .contains(&model);
+    let sorting = [
+        FIELD_ECOLOGY_V1_CONTACT_SORTING,
+        FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
+        FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING,
+    ]
+    .contains(&model);
     let contact_model = inhibiting
+        || sorting
         || [
             FIELD_ECOLOGY_V1_CONTACT,
             FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY,
@@ -290,6 +300,19 @@ fn check_contact(config: &RunConfig, issues: &mut Issues) {
                 format!(
                     "{model} keeps every velocity; inhibition belongs to a contact-inhibition model"
                 ),
+            ),
+            _ => {}
+        }
+        match (contact.repulsion, sorting) {
+            (None, true) => issues.add(
+                "contact.repulsion",
+                format!(
+                    "{model} needs [contact] repulsion: how strongly unlike chemistry pushes apart"
+                ),
+            ),
+            (Some(_), false) if contact_model => issues.add(
+                "contact.repulsion",
+                format!("{model} never repels; repulsion belongs to a contact-sorting model"),
             ),
             _ => {}
         }

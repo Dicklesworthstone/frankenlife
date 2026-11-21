@@ -19,6 +19,11 @@
 //! overlapped. At one sweep its first tick is the contact model's in every
 //! flow, birth, position and energy, with each velocity the oracle's
 //! inhibited one, never faster.
+//!
+//! `field-ecology-v1-contact-sorting` weighs the pull by
+//! `(1 + r) cos₊² − r` with `r` the `[contact] repulsion`, so unlike
+//! chemistry within reach pushes apart; its first tick is the oracle's with
+//! that weight, and at `r = 0` it is the contact model bit for bit.
 
 #![allow(
     clippy::expect_used,
@@ -33,7 +38,9 @@ use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
     FIELD_ECOLOGY_V1_CONTACT_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT_FRESH_OFFSPRING,
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
-    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
 };
 use flife_engine::contact::unit_affinity;
 use flife_engine::{Arrangement, ModelVariant, NumericalProfile, Stepped, TickReport, World};
@@ -133,6 +140,15 @@ fn inhibiting(model: &str, adhesion: f64, sweeps: u32) -> ValidatedConfig {
     .expect("a valid configuration")
 }
 
+/// [`text`] under a contact-sorting `model`, with `repulsion`.
+fn sorting(model: &str, adhesion: f64, repulsion: f64) -> ValidatedConfig {
+    ValidatedConfig::from_toml(&format!(
+        "{}repulsion = {repulsion:?}\n",
+        text(model, adhesion)
+    ))
+    .expect("a valid configuration")
+}
+
 fn found(config: &ValidatedConfig) -> World {
     World::found(
         config,
@@ -202,11 +218,13 @@ fn alike(a: &[f32; 32], b: &[f32; 32]) -> f64 {
 }
 
 /// The rule over every pair of `survivors` (identity → settled position),
-/// with adhesion `adhesion` between their `affinities`.
+/// with adhesion `adhesion` between their `affinities` and unlike chemistry
+/// repelled by `repulsion`.
 fn oracle(
     survivors: &BTreeMap<u64, [f64; 2]>,
     affinities: &BTreeMap<u64, [f32; 32]>,
     adhesion: f64,
+    repulsion: f64,
 ) -> BTreeMap<u64, [f64; 2]> {
     let limit = (0.5 * DIAMETER).min(0.5 * SIDE / CELLS);
     let reach = RANGE * DIAMETER;
@@ -224,7 +242,8 @@ fn oracle(
                     0.5 * STIFFNESS * (DIAMETER - distance)
                 } else if adhesion > 0.0 && distance < reach {
                     let alike = alike(&affinities[&id], &affinities[&other]);
-                    -0.5 * adhesion * alike * alike * (distance - DIAMETER) * (reach - distance)
+                    let weight = (1.0 + repulsion) * alike * alike - repulsion;
+                    -0.5 * adhesion * weight * (distance - DIAMETER) * (reach - distance)
                         / ((RANGE - 1.0) * DIAMETER)
                 } else {
                     continue;
@@ -264,8 +283,19 @@ fn overlap(world: &World) -> f64 {
 /// the same flows, births, energies and velocities, and positions apart by
 /// exactly the oracle's displacement of the survivors.
 fn first_tick_differs_only_by_contact(plain: &str, contact: &str, adhesion: f64) {
+    first_tick_moves_only_by_the_oracle(plain, &ecology(contact, adhesion), adhesion, 0.0);
+}
+
+/// [`first_tick_differs_only_by_contact`] for any contact `config` with
+/// `adhesion` and `repulsion`.
+fn first_tick_moves_only_by_the_oracle(
+    plain: &str,
+    config: &ValidatedConfig,
+    adhesion: f64,
+    repulsion: f64,
+) {
     let mut without = found(&ecology(plain, 0.0));
-    let mut with = found(&ecology(contact, adhesion));
+    let mut with = found(config);
     assert_eq!(state(&without), state(&with), "one founding");
     let chemistry = affinities(&with);
     let report_without = publish(&mut without);
@@ -295,7 +325,7 @@ fn first_tick_differs_only_by_contact(plain: &str, contact: &str, adhesion: f64)
         .filter(|(id, _)| !born.contains(id))
         .map(|(&id, &(position, _, _))| (id, position))
         .collect();
-    let displacement = oracle(&survivors, &chemistry, adhesion);
+    let displacement = oracle(&survivors, &chemistry, adhesion, repulsion);
     let mut moved = 0;
     for (id, &(position, velocity, energy)) in &before {
         let (contacted, contacted_velocity, contacted_energy) = after[id];
@@ -701,5 +731,110 @@ fn sweeps_belong_to_the_contact_inhibition_models() {
         inhibiting(FIELD_ECOLOGY_V1_CONTACT_INHIBITION, 0.4, 4)
             .canonical_toml()
             .contains("sweeps = 4")
+    );
+}
+
+#[test]
+fn sorting_pushes_unlike_bodies_apart_and_is_contact_without_repulsion() {
+    for repulsion in [0.5, 1.0] {
+        first_tick_moves_only_by_the_oracle(
+            FIELD_ECOLOGY_V1,
+            &sorting(FIELD_ECOLOGY_V1_CONTACT_SORTING, 0.4, repulsion),
+            0.4,
+            repulsion,
+        );
+    }
+
+    // Without repulsion the variant is the contact model, bit for bit.
+    let mut plain = found(&ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4));
+    let mut variant = found(&sorting(FIELD_ECOLOGY_V1_CONTACT_SORTING, 0.4, 0.0));
+    let mut born = 0;
+    for tick in 0..96 {
+        let (a, b) = (publish(&mut plain), publish(&mut variant));
+        assert_eq!(
+            format!("{:?}", a.closure),
+            format!("{:?}", b.closure),
+            "tick {tick}"
+        );
+        assert_eq!(state(&plain), state(&variant), "tick {tick}");
+        born += a.births.len();
+    }
+    assert!(born > 0, "births happened");
+}
+
+#[test]
+fn the_contact_sorting_controls_combine_sorting_with_their_one_rule() {
+    for (name, variant) in [
+        (FIELD_ECOLOGY_V1_CONTACT_SORTING, ModelVariant::Sorting),
+        (
+            FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
+            ModelVariant::SortingChemistryOnly,
+        ),
+        (
+            FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING,
+            ModelVariant::SortingFreshOffspring,
+        ),
+    ] {
+        assert_eq!(ModelVariant::of(name), Ok(variant));
+        assert!(variant.contact() && !variant.inhibits());
+    }
+    assert!(ModelVariant::SortingChemistryOnly.decides_from_zero());
+    assert!(!ModelVariant::SortingChemistryOnly.fresh_offspring());
+    assert!(ModelVariant::SortingFreshOffspring.fresh_offspring());
+    assert!(!ModelVariant::SortingFreshOffspring.decides_from_zero());
+    assert!(!ModelVariant::Sorting.decides_from_zero());
+    assert!(!ModelVariant::Sorting.fresh_offspring());
+    first_tick_moves_only_by_the_oracle(
+        FIELD_ECOLOGY_V1_CHEMISTRY_ONLY,
+        &sorting(FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY, 0.4, 1.0),
+        0.4,
+        1.0,
+    );
+    first_tick_moves_only_by_the_oracle(
+        FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
+        &sorting(FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, 0.4, 1.0),
+        0.4,
+        1.0,
+    );
+}
+
+#[test]
+fn repulsion_belongs_to_the_contact_sorting_models() {
+    let refused = |text: &str, path: &str| {
+        let error = ValidatedConfig::from_toml(text).expect_err("refused");
+        assert!(format!("{error:?}").contains(path), "{error:?}");
+    };
+    let bare = text(FIELD_ECOLOGY_V1_CONTACT_SORTING, 0.4);
+    refused(&bare, "contact.repulsion");
+    for repulsion in ["-0.1", "1.5"] {
+        refused(
+            &format!("{bare}repulsion = {repulsion}\n"),
+            "contact.repulsion",
+        );
+    }
+    for repulsion in ["0.0", "1.0"] {
+        assert!(ValidatedConfig::from_toml(&format!("{bare}repulsion = {repulsion}\n")).is_ok());
+    }
+    refused(
+        &format!("{bare}repulsion = 0.5\nsweeps = 2\n"),
+        "contact.sweeps",
+    );
+    let plain = text(FIELD_ECOLOGY_V1_CONTACT, 0.4);
+    refused(&format!("{plain}repulsion = 0.5\n"), "contact.repulsion");
+    let inhibiting = text(FIELD_ECOLOGY_V1_CONTACT_INHIBITION, 0.4);
+    refused(
+        &format!("{inhibiting}sweeps = 2\ninhibition = 1.0\nrepulsion = 0.5\n"),
+        "contact.repulsion",
+    );
+    // A contact model's canonical text is unchanged: it has no repulsion.
+    assert!(
+        !ecology(FIELD_ECOLOGY_V1_CONTACT, 0.4)
+            .canonical_toml()
+            .contains("repulsion")
+    );
+    assert!(
+        sorting(FIELD_ECOLOGY_V1_CONTACT_SORTING, 0.4, 0.5)
+            .canonical_toml()
+            .contains("repulsion = 0.5")
     );
 }

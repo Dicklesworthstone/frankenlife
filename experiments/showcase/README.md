@@ -757,6 +757,43 @@ So raising toxicity does not draw moats here: domains meet without a gap whether
 preset's 0.08 or ten times that. And the field's last factor of 1.6 towards the references' one organism per
 cell does not bring the image nearer; `f64-d20` ties the preset on the statistic and looks hazier.
 
+### Rules for sharper domains and finer strands
+
+The references' domains meet at sharp edges with dark gaps between them, and their strands are one or two
+organisms wide. This world's lineages interleave at their edges: coloured by lineage, its worst statistic is
+colour coherence at 4 organisms. Its strands are two to six bodies thick. Seven more trials, seed 42 to tick
+2,400, scored on the same frame coloured both ways, tried three levers:
+- **Repulsion between unlike chemistry.** This uses a third registered contact variant,
+  `field-ecology-v1-contact-sorting` (plan §5.4). At tick 2,400, neighbouring bodies of one lineage have
+  affinity cosines of 0.96–0.99 and adhere almost fully. Neighbours of different lineages, at a median of 0.29,
+  barely adhere but never repel. The variant weighs the pull by `(1 + r) cos₊² − r`, so unlike neighbours
+  within reach push apart.
+- **Packing.** Stage D's `field-ecology-v1-contact-inhibition` at eight sweeps had not been tried on this
+  world. Its bodies stack about 2.6 deep, where the references' close-ups pack.
+- **Faster chemical drift.** Chemistry mutation ×2 and ×4; ×4 was stage C's nearest sample (`a10-m4`).
+
+| Trial | Change from `confluent-world` | Distance, by affinity | Distance, lineage lit by energy | By eye |
+|---|---|---:|---:|---|
+| `w80-o25` | none (the preset) | 0.74 | 0.72 | lineage domains of labyrinth, foam and stacked spheres |
+| `s-r05` | sorting, repulsion 0.5 | 0.72 | 0.82 | a few more rings round dark lumens; otherwise the preset |
+| `s-r10` | sorting, repulsion 1 | 0.88 | 0.87 | lineages drawn into compact rounded clumps; less lace |
+| `s-r10-R2` | sorting, repulsion 1, reach 2 diameters | 2.43 | 2.72 | every lineage in separate beads a few bodies across |
+| `i-s8-c0` | the inhibition variant, 8 sweeps, inhibition 0 | 1.10 | 0.77 | packed, featureless sheets, hexagonal in places |
+| `i-s8-c1` | as `i-s8-c0`, inhibition 1 | 1.17 | 0.82 | as `i-s8-c0` |
+| `cw-m2` | chemistry mutation σ 0.01 → 0.02 | 0.83 | 0.67 | larger one-colour domains, single-file chains round voids up close; smoother domain interiors |
+| `cw-m4` | chemistry mutation σ 0.01 → 0.04 | 1.13 | 0.91 | smoother sheets |
+
+None is clearly nearer, so the preset stays:
+- **Repulsion.** Its push, like the pull, vanishes at reach, so it holds unlike bodies just inside reach
+  rather than opening moats. Coloured by lineage, colour coherence at 4 organisms gets worse, 2.3–2.4
+  standard deviations from the references against the preset's 1.8.
+- **`cw-m2`.** It is the nearest coloured as the film is, by 0.05. The preset's own spread over held-out seeds
+  (0.81–1.57) dwarfs that, and by eye its domain interiors are smoother.
+
+The sorting variant stays registered and tested, so these trials can be run again. At `r = 0` it is the
+contact model bit for bit, and the preset reran to its recorded digest at tick 2,400 (`3f279f51…`) on the build
+that adds it. `confluent.json` records each trial's changes, counts and digest.
+
 ## What this does not show
 
 - Stages 1–2's statistic rewards fine structure that moves and fills the world. It is not a measure of
@@ -771,7 +808,8 @@ cell does not bring the image nearer; `f64-d20` ties the preset on the statistic
 - Stage C's corrected statistic prefers `tissue-world` to `contact-world`; the eye chose the latter, on
   close-ups whose bodies, stage D found, stack.
 - Stage D's variant packs bodies, but no trial of it is as near the references as `tissue-world`,
-  `contact-world` or `confluent-world`.
+  `contact-world` or `confluent-world`. The sorting variant grew no frame nearer than `confluent-world` either,
+  at three settings on one seed.
 - `confluent-world` is within 0.01 of stage E's nearest trial on seed 42, and nearer than `tissue-world` and
   `contact-world` on every seed scored the same way, but it is smaller than the references: an 80-unit torus
   with a 320 × 320 field and 262,144 organisms, 2.6 to a field cell, where the references hold a million. Its

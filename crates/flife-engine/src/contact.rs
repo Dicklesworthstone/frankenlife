@@ -23,6 +23,19 @@
 //! `Δ_i` is clamped radially to `min(D/2, ½ min(h_x, h_y))`, and the position
 //! wrapped.
 //!
+//! The `field-ecology-v1-contact-sorting` models also push unlike chemistry
+//! apart (cell sorting). Within reach the weight becomes
+//!
+//! ```text
+//! w_ij = (1 + r) max(0, cos(a_i, a_j))² − r,
+//! ```
+//!
+//! with `r` the `[contact] repulsion`: pairs with `max(0, cos)² > r / (1 + r)`
+//! pull, less than under the plain rule, and less alike pairs push apart over
+//! the same shell, by up to `r` times the pull of identical chemistry. At
+//! `r = 0` the rule is the plain one. Repulsion acts only where adhesion does
+//! (`k_a > 0`, `R > 1`).
+//!
 //! Contact moves positions only. It changes no velocity and no energy, so the
 //! ledger is the same with or without it. Emissions and births of the tick
 //! use the settled positions, before contact.
@@ -87,6 +100,9 @@ pub struct ContactRules {
     /// `c`, the share of a survivor's velocity against its push removed: 0
     /// under the plain contact models.
     pub inhibition: f64,
+    /// `r`, how strongly unlike chemistry pushes apart within reach, as a
+    /// share of adhesion's pull: 0 except under the contact-sorting models.
+    pub repulsion: f64,
 }
 
 impl ContactRules {
@@ -113,6 +129,7 @@ impl ContactRules {
             ]
             .contains(&model),
             inhibition: contact.inhibition.unwrap_or(0.0),
+            repulsion: contact.repulsion.unwrap_or(0.0),
         };
         rules.check()?;
         Ok(Some(rules))
@@ -127,14 +144,15 @@ impl ContactRules {
             && self.range.is_finite()
             && self.range >= 1.0
             && (1..=MAXIMUM_CONTACT_SWEEPS).contains(&self.sweeps)
-            && (0.0..=1.0).contains(&self.inhibition);
+            && (0.0..=1.0).contains(&self.inhibition)
+            && (0.0..=1.0).contains(&self.repulsion);
         if ok {
             Ok(())
         } else {
             Err(CoreError::NumericalInvalid {
                 quantity: "contact",
                 detail: format!(
-                    "{self:?}: D > 0, k in (0, 1], k_a in [0, 1], R >= 1, S in [1, {MAXIMUM_CONTACT_SWEEPS}] and c in [0, 1]"
+                    "{self:?}: D > 0, k in (0, 1], k_a in [0, 1], R >= 1, S in [1, {MAXIMUM_CONTACT_SWEEPS}], c in [0, 1] and r in [0, 1]"
                 ),
             })
         }
@@ -522,6 +540,7 @@ pub fn relax(
         adhesion,
         range,
         inhibits,
+        repulsion,
         ..
     } = *rules;
     let reach = rules.reach();
@@ -626,11 +645,20 @@ pub fn relax(
                         affinities.filter(|_| distance < reach_distance)
                     {
                         let alike = cosine(&affinities[index], &affinities[other]).max(0.0);
-                        -pull_factor
-                            * alike
-                            * alike
-                            * (distance - diameter)
-                            * (reach_distance - distance)
+                        if repulsion > 0.0 {
+                            let weight = (1.0 + repulsion) * (alike * alike) - repulsion;
+                            -pull_factor
+                                * weight
+                                * (distance - diameter)
+                                * (reach_distance - distance)
+                        } else {
+                            // The plain rule, in its own order of operations.
+                            -pull_factor
+                                * alike
+                                * alike
+                                * (distance - diameter)
+                                * (reach_distance - distance)
+                        }
                     } else {
                         continue;
                     };
@@ -721,6 +749,7 @@ mod tests {
         sweeps: 1,
         inhibits: false,
         inhibition: 0.0,
+        repulsion: 0.0,
     };
 
     fn run_with(
@@ -877,6 +906,77 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn repulsion_pushes_unlike_bodies_apart_over_adhesions_shell() {
+        let grid = grid(16.0, 16);
+        let sticky = ContactRules {
+            diameter: 0.5,
+            stiffness: 0.5,
+            adhesion: 0.4,
+            range: 1.6,
+            ..PLAIN
+        };
+        // As in the test above: 0.65 apart, a full pull of 0.2 · 0.15² / 0.3.
+        let positions = [[4.0, 4.0], [4.65, 4.0]];
+        let pull = 0.2 * 0.15 * 0.15 / 0.3;
+        let at = |repulsion: f64, b: [f32; AFFINITY_TERMS]| {
+            let rules = ContactRules {
+                repulsion,
+                ..sticky
+            };
+            run_with(&grid, &rules, &positions, Some(&[axis(0), b]))
+        };
+        // No repulsion is the plain rule, bit for bit.
+        let mut half = axis(0);
+        half[1] = 1.0;
+        let half = unit_affinity(&half.map(f64::from));
+        for b in [axis(0), axis(1), half] {
+            assert_eq!(
+                at(0.0, b),
+                run_with(&grid, &sticky, &positions, Some(&[axis(0), b]))
+            );
+        }
+        // Identical chemistry pulls as before: (1 + r) · 1 − r = 1.
+        let kin = at(1.0, axis(0));
+        assert!((kin[0][0] - pull).abs() < 1e-12, "{kin:?}");
+        // Orthogonal chemistry pushes apart, r times the full pull.
+        for repulsion in [0.5, 1.0] {
+            let strangers = at(repulsion, axis(1));
+            assert!(
+                (strangers[0][0] + repulsion * pull).abs() < 1e-12,
+                "{strangers:?}"
+            );
+            assert!(
+                (strangers[1][0] - repulsion * pull).abs() < 1e-12,
+                "{strangers:?}"
+            );
+            assert_eq!(strangers[0][1], 0.0);
+        }
+        // cos² = ½ is the balance at r = 1: (1 + 1) · ½ − 1 = 0.
+        let balanced = at(1.0, half);
+        assert!(balanced[0][0].abs() < 1e-7, "{balanced:?}");
+        // Beyond reach, nothing, however unlike.
+        let rules = ContactRules {
+            repulsion: 1.0,
+            ..sticky
+        };
+        let far = run_with(
+            &grid,
+            &rules,
+            &[[4.0, 4.0], [4.85, 4.0]],
+            Some(&[axis(0), axis(1)]),
+        );
+        assert_eq!(far, vec![[0.0, 0.0]; 2]);
+        // r is a share of the pull, in [0, 1].
+        for repulsion in [-0.1, 1.5, f64::NAN] {
+            let rules = ContactRules {
+                repulsion,
+                ..sticky
+            };
+            assert!(rules.check().is_err(), "{repulsion}");
+        }
     }
 
     #[test]

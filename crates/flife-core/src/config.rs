@@ -92,6 +92,12 @@ pub struct ContactConfig {
     /// contact-inhibition models and refused by the plain contact models.
     #[serde(default)]
     pub inhibition: Option<f64>,
+    /// `r` in `[0, 1]`: how strongly unlike chemistry pushes apart within
+    /// adhesion's reach, as a share of adhesion's pull. Required by the
+    /// contact-sorting models and refused by every other contact model.
+    /// Absent, the canonical text and hash are unchanged.
+    #[serde(default)]
+    pub repulsion: Option<f64>,
 }
 
 impl RunConfig {

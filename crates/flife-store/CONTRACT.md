@@ -389,5 +389,6 @@ file-backed engine), one writer thread per session, one session per database at 
 - No RaptorQ or other error correction: damage is detected and recovery falls back, but damaged bytes are not
   reconstructed (§16.7).
 - FL-041: the experiment catalog is written by one process at a time; two processes continuing one experiment
-  directory are not prevented (no lock) or tested. `CommandJournal::open` still creates its tables before checking
-  the format, so pointing it at an experiment catalog adds empty journal tables to that file before refusing it.
+  directory are not prevented (no lock) or tested. `CommandJournal::open` writes only its format marker and verifies
+  `CATALOG_FORMAT` before creating run-catalog tables, so pointing it at an experiment catalog refuses with
+  `SchemaMismatch` without creating empty journal tables.

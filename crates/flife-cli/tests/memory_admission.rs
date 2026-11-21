@@ -1743,8 +1743,13 @@ fn metrics_tracker_is_charged_in_preflight_and_stays_within_its_term() {
     )
     .expect("checkpoint admits");
     let resume_plain = admit(&world, ControllerChoice::Cpu, Some(&ckpt_admit), 0).expect("fits");
-    let resume_with_metrics =
-        admit(&world, ControllerChoice::Cpu, Some(&ckpt_admit), tracker_term).expect("fits");
+    let resume_with_metrics = admit(
+        &world,
+        ControllerChoice::Cpu,
+        Some(&ckpt_admit),
+        tracker_term,
+    )
+    .expect("fits");
     assert_eq!(
         resume_with_metrics.peak_bytes,
         resume_plain.peak_bytes + tracker_term

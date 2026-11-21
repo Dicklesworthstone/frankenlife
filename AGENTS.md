@@ -582,7 +582,7 @@ If `am` fails, retry once after a few seconds, then continue without it.
 
 ## Beads (`br`) - Issue Tracking
 
-`.beads/issues.jsonl` mirrors the plan's backlog: 58 beads (prefix `flife`, one per FL-001 … FL-058) and the
+`.beads/issues.jsonl` mirrors the plan's backlog (FL-001 … FL-058 plus follow-on beads, 61 total, prefix `flife`) and the
 plan's 141 dependency edges, acyclic. Each title starts with its FL identifier and its `external_ref` holds it;
 labels give the lane (`foundation`, `heredity`, `studio`, `accel`, `persistence`, `scale`, `later`) and the
 earliest milestone that needs it (`m0` … `m6`). Keep titles, acceptance text and edges in step with the plan,
@@ -623,7 +623,7 @@ The repository holds:
 - the comprehensive plan (v0.2, §1–§28, Appendices A–E);
 - this file, the README and the license;
 - the toolchain pin and lint settings (`rust-toolchain.toml`, `.rustfmt.toml`, `clippy.toml`);
-- the work graph in `.beads/` (58 beads, prefix `flife`);
+- the work graph in `.beads/` (61 beads: FL-001 … FL-058 plus follow-on items, prefix `flife`);
 - the Cargo workspace (`Cargo.toml`, `Cargo.lock`) and `franken-stack.lock`;
 - `crates/flife-probes` (FL-001), `crates/flife-core` (FL-002, plus the FL-005 ledger and FL-006/FL-007
   numerics), `crates/flife-field` (FL-003–FL-005, the FL-007 pyramid, FL-011 deposits and FL-027 bins), `crates/flife-engine`

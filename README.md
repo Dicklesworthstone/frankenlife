@@ -168,7 +168,7 @@ Tests compare every committed world with one stepped directly. Under retained, s
 | Does the stack compose? | **Yes (FL-001, FL-018).** One `Cargo.lock` resolves a single Asupersync v0.6.2 package, which took upstream repins in FrankenManim and others (§12.8). Every probe matches its independent oracle: NumPy-exact RNG and array layout, an exact FrankenTorch matmul, Asupersync lab replay, a byte-identical certified FrankenManim frame and an exact Metal kernel. The native presenter now delivers typed pointer, button, scroll, key, modifier, focus, capture-loss and resize events (FL-018 added the bridge upstream in FrankenTorch), and a real window probe qualifies it. Linux x86_64 also qualifies, with Metal reported unavailable, and its certified frame is byte-identical to the Mac's |
 | Has the screenshot behaviour been reproduced? | **No.** The visual gate (G5) and the ecological gate (G9) are separate, and neither has run |
 | Has anything been benchmarked? | **Measured, not qualified.** Tick rates, frame times and memory peaks below were measured on named hosts (an M5 Ultra; x86-64 Linux) under the conditions stated with each. No rate gate has passed: G6 has run only offscreen, and G7 and G8 have not run. The profile table and the scale arithmetic are **Targets** and **Derived** estimates |
-| Is there a work plan? | **Yes.** 58 work items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 58 beads with the plan's 141 dependency edges in `.beads/` for `br` |
+| Is there a work plan? | **Yes.** 58 numbered plan items (FL-001 … FL-058) with dependencies and completion evidence, seven milestones (M0–M6) and 14 architecture decisions (§22–§26). They are instantiated as 61 beads (FL-001 … FL-058 plus 3 follow-on items) in `.beads/` for `br` |
 
 ---
 
@@ -722,17 +722,18 @@ crates/flife-field/                                   FL-003–FL-005, FL-007, F
 crates/flife-engine/                                  FL-006 per-packet chemistry, toxicity, maintenance, affordable motion; FL-011 emission and the birth transaction; FL-012 death, recycling, live organism store; FL-013 the ordered candidate tick and epoch publication
 crates/flife-runtime/                                 FL-014 Asupersync session owner, command admission, sealed boundaries and cancellation
 crates/flife-render/                                  FL-017 immutable compact render epochs, bounded slots, per-viewer leases, identity matching
-crates/flife-cli/                                     FL-015 the flife binary (validate, run), run records, raw-state tally and survey
+crates/flife-cli/                                     FL-015, FL-037–FL-042 the flife binary (validate, run, resume, step, branch, experiment, analyze, render, inspect, discover, transplant, capabilities)
+crates/flife-store/                                   FL-035, FL-036, FL-038, FL-039, FL-041 chunk store, atomic checkpoint manifests, FrankenSQLite run/command/experiment catalogs
 crates/flife-manim/                                   FL-018 FrankenManim adapter: exact viewport and camera, one bounded particle cloud per epoch
 crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
 crates/flife-backend-cpu/                             FL-025 FrankenTorch CPU controller route: the serial population kernel on the world's lanes, bit-identical to the reference; FL-026 per-topology packed shards
-crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; FL-026 per-topology parameter shards, each genome uploaded once, behind the engine's controller port; FL-031 field step, sensor pyramid and uptake behind the engine's field, sensor and uptake ports
+crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; FL-026 per-topology parameter shards, each genome uploaded once, behind the engine's controller port; FL-031–FL-032 field step, sensor pyramid, uptake and settle phases behind the engine's ports
 presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning; FL-034's Interactive and Desktop worlds; the showcase worlds (experiments/showcase)
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation; FL-026 arena slots
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
 web/                                                  the project's website (Next.js, Cloudflare), showing a film flife render drew; the media stay out of git (web/README.md)
-.beads/                                               the work graph: 58 beads mirroring FL-001 … FL-058 (JSONL is truth)
+.beads/                                               the work graph: 61 beads (FL-001 … FL-058 plus 3 follow-on items; JSONL is truth)
 ```
 
 Code, small independent fixtures, presets, benchmark definitions and compact gallery manifests will live here.

@@ -1228,10 +1228,9 @@ velocity, first-order splitting at the configured fixed timestep.
   is dropped. A weight dump is on demand (`World::organism_weights`), through `flife inspect --weights`, a
   session's `SessionHandle::organism_weights` and the Studio's W key.
 - Phase 1 applies what `flife-runtime` seals: single-cell `InjectEnergy` (FL-014) and `InjectMaterial` (FL-022),
-  disk `RemoveOrganisms` (FL-022), and single-cell `IntroduceOrganisms` (FL-022, entering in phase 8). Area
-  brushes, introducing a chosen genome rather than founder draws, source edits and the native input that maps a
-  brush stroke to these payloads are still FL-022. The exhibition-mode stable-ID birth rejection policy has no
-  registered name yet.
+- Area brushes, introducing a chosen genome rather than founder draws, source edits and drag painting for
+  non-removal brushes remain unbuilt. Exhibition-mode stable-ID birth rejection is registered as
+  `refuse-excess-births-v1` (`CapacityPolicy::RefuseExcessBirths`).
 - `stop-and-preserve` keeps the committed state and the fault's description, which names the quantity and,
   where the operator knows it, the organism. It does not yet retain the faulted candidate's buffers for
   inspection, and there is no exhibition containment mode.

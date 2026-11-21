@@ -880,18 +880,28 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-019",
         )
     },
-    entry(
-        "committed-states-one-epoch-late",
-        Role::Interpolation,
-        "§13.5, C.15",
-        "FL-020",
-    ),
-    entry(
-        "simulation-time",
-        Role::RecordingClock,
-        "§12.2, §13.8",
-        "FL-023",
-    ),
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-render::tests/interpolation.rs::interpolation_follows_each_organism_on_its_true_path_across_the_seams",
+        },
+        ..entry(
+            "committed-states-one-epoch-late",
+            Role::Interpolation,
+            "§13.5, C.15",
+            "FL-020",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-studio::tests/timeline.rs::a_recorded_session_replays_frame_for_frame",
+        },
+        ..entry(
+            "simulation-time",
+            Role::RecordingClock,
+            "§12.2, §13.8",
+            "FL-023",
+        )
+    },
     // FL-036: `flife-store`'s FrankenSQLite run catalog, command journal and
     // experiment catalog (`fsqlite` native engine).
     AlgorithmEntry {

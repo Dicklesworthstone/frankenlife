@@ -242,7 +242,7 @@ pub struct Presentation {
     pub mapping: &'static str,
     /// What that colour means.
     pub meaning: &'static str,
-    /// `glow` or `raw`.
+    /// `glow`, `raw` or `sphere`.
     pub look: &'static str,
     /// `points` or `density`.
     pub particles: &'static str,

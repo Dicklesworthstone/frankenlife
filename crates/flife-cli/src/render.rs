@@ -172,13 +172,14 @@ pub enum RenderRecord {
         mapping: &'static str,
         /// What that colour means.
         meaning: &'static str,
-        /// `glow` or `raw`.
+        /// `glow`, `raw` or `sphere`.
         look: &'static str,
         /// `points` or `density`.
         particles: &'static str,
         /// Whether the field is drawn.
         field: bool,
-        /// What the field's colour means: `energy` or `composition`.
+        /// What the field's colour means: `energy`, `composition` or
+        /// `component-C` for channel `C`.
         field_mapping: &'static str,
         /// The camera path the frames followed, if any.
         camera: Option<CameraPath>,

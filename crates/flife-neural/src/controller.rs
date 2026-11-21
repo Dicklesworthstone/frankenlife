@@ -33,15 +33,26 @@
 
 use flife_core::memory::capacity_bytes;
 use flife_core::model::{MAXIMUM_HIDDEN_LAYERS, dense_parameter_count};
-use flife_core::numerics::tanh_f32;
+use flife_core::numerics::{sigmoid, tanh_f32};
 use flife_core::{CoreError, ValidatedConfig};
 
 use crate::actions::ACTION_WIDTH;
 use crate::sensors::SENSOR_WIDTH;
 use crate::weights::{Weight, WeightDtype, Weights};
 
-/// The controller family this module implements.
+/// The baseline stateless dense MLP controller family.
 pub const INDEPENDENT_DENSE_MLP_V1: &str = "independent-dense-mlp-v1";
+
+/// The gated recurrent MLP controller family (plan §17.5, §25.2; FL-054):
+/// appends per-organism internal state `h ∈ [-1, 1]^S` to the 104 sensor
+/// inputs and extends the linear output layer by `2S` pre-activations
+/// `(candidate, gate)` to compute the bounded gated transition
+/// `h'_k = (1 − g_k) h_k + g_k tanh(c_k)` where `g_k = σ(z_g,k)`.
+pub const INDEPENDENT_RECURRENT_MLP_V1: &str = "independent-recurrent-mlp-v1";
+
+/// Maximum recurrent internal state width `S` (FL-054, plan §25.2).
+pub const MAXIMUM_RECURRENT_STATE_WIDTH: usize =
+    flife_core::model::MAXIMUM_RECURRENT_STATE_WIDTH as usize;
 
 /// The hidden activation this module implements.
 pub const TANH: &str = "tanh";
@@ -93,23 +104,53 @@ impl LayerShape {
     }
 }
 
-/// A dense topology `104 → hidden… → 36` with one or two hidden layers.
+/// A dense topology `(104 + S) → hidden… → (36 + 2S)` with one or two hidden
+/// layers (`S = 0` for `independent-dense-mlp-v1`, `1 ≤ S ≤ 16` for
+/// `independent-recurrent-mlp-v1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenseTopology {
     hidden_widths: Vec<u32>,
     layers: Vec<LayerShape>,
     parameters: usize,
     widest_hidden: usize,
+    recurrent_state_width: usize,
 }
 
 impl DenseTopology {
-    /// The topology with these hidden widths, in evaluation order.
+    /// The stateless topology `104 → hidden… → 36` with these hidden widths,
+    /// in evaluation order.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for no hidden layer, more than two,
     /// or a zero width; [`CoreError::Overflow`] for a parameter count past
     /// `usize`.
     pub fn new(hidden_widths: &[u32]) -> Result<Self, CoreError> {
+        Self::build(hidden_widths, 0)
+    }
+
+    /// A gated recurrent topology `(104 + S) → hidden… → (36 + 2S)` for
+    /// `independent-recurrent-mlp-v1` (FL-054, plan §25.2).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for `state_width` outside
+    /// `1..=MAXIMUM_RECURRENT_STATE_WIDTH`, or as [`DenseTopology::new`].
+    pub fn new_recurrent(hidden_widths: &[u32], state_width: u32) -> Result<Self, CoreError> {
+        let width = usize::try_from(state_width).map_err(|_| CoreError::Overflow {
+            quantity: "controller.recurrent_state_width",
+        })?;
+        if width == 0 || width > MAXIMUM_RECURRENT_STATE_WIDTH {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "controller.recurrent_state_width",
+                detail: format!(
+                    "recurrent state width must lie in 1..={MAXIMUM_RECURRENT_STATE_WIDTH}, got \
+                     {state_width}"
+                ),
+            });
+        }
+        Self::build(hidden_widths, width)
+    }
+
+    fn build(hidden_widths: &[u32], recurrent_state_width: usize) -> Result<Self, CoreError> {
         if hidden_widths.is_empty() || hidden_widths.len() > MAXIMUM_HIDDEN_LAYERS {
             return Err(CoreError::NumericalInvalid {
                 quantity: "controller.hidden_widths",
@@ -122,22 +163,32 @@ impl DenseTopology {
         let overflow = CoreError::Overflow {
             quantity: "controller parameter count",
         };
+        let input_width = SENSOR_WIDTH
+            .checked_add(recurrent_state_width)
+            .ok_or_else(|| overflow.clone())?;
+        let output_width = ACTION_WIDTH
+            .checked_add(
+                recurrent_state_width
+                    .checked_mul(2)
+                    .ok_or_else(|| overflow.clone())?,
+            )
+            .ok_or_else(|| overflow.clone())?;
         let total = dense_parameter_count(
-            u32::try_from(SENSOR_WIDTH).map_err(|_| overflow.clone())?,
+            u32::try_from(input_width).map_err(|_| overflow.clone())?,
             hidden_widths,
-            u32::try_from(ACTION_WIDTH).map_err(|_| overflow.clone())?,
+            u32::try_from(output_width).map_err(|_| overflow.clone())?,
         )?;
         let parameters = usize::try_from(total).map_err(|_| overflow.clone())?;
 
         // Every offset below is at most `parameters`, which fits.
         let mut layers = Vec::with_capacity(hidden_widths.len() + 1);
         let mut offset = 0;
-        let mut fan_in = SENSOR_WIDTH;
+        let mut fan_in = input_width;
         let mut widest_hidden = 0;
         for (index, width) in hidden_widths
             .iter()
             .map(|&width| usize::try_from(width).map_err(|_| overflow.clone()))
-            .chain([Ok(ACTION_WIDTH)])
+            .chain([Ok(output_width)])
             .enumerate()
         {
             let width = width?;
@@ -165,6 +216,7 @@ impl DenseTopology {
             layers,
             parameters,
             widest_hidden,
+            recurrent_state_width,
         })
     }
 
@@ -174,16 +226,11 @@ impl DenseTopology {
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for another controller family,
     /// activation, weight dtype or accumulation dtype; otherwise as
-    /// [`DenseTopology::new`].
+    /// [`DenseTopology::new`] or [`DenseTopology::new_recurrent`].
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let controller = &config.config().controller;
         WeightDtype::named(&controller.canonical_weight_dtype)?;
         for (role, name, implemented) in [
-            (
-                "controller.family",
-                &controller.family,
-                INDEPENDENT_DENSE_MLP_V1,
-            ),
             (
                 "controller.hidden_activation",
                 &controller.hidden_activation,
@@ -207,7 +254,23 @@ impl DenseTopology {
                 });
             }
         }
-        Self::new(&controller.hidden_widths)
+        match controller.family.as_str() {
+            INDEPENDENT_DENSE_MLP_V1 => Self::new(&controller.hidden_widths),
+            INDEPENDENT_RECURRENT_MLP_V1 => {
+                let width = controller.recurrent_state_width.ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "controller.recurrent_state_width",
+                        detail: "independent-recurrent-mlp-v1 requires recurrent_state_width"
+                            .to_owned(),
+                    }
+                })?;
+                Self::new_recurrent(&controller.hidden_widths, width)
+            }
+            other => Err(CoreError::UnknownAlgorithm {
+                role: "controller.family",
+                name: other.to_owned(),
+            }),
+        }
     }
 
     /// Hidden widths in evaluation order.
@@ -226,6 +289,31 @@ impl DenseTopology {
     #[must_use]
     pub const fn parameter_count(&self) -> usize {
         self.parameters
+    }
+
+    /// Recurrent internal state width `S` (`0` for stateless
+    /// `independent-dense-mlp-v1`).
+    #[must_use]
+    pub const fn recurrent_state_width(&self) -> usize {
+        self.recurrent_state_width
+    }
+
+    /// Whether this topology carries gated recurrent internal state.
+    #[must_use]
+    pub const fn is_recurrent(&self) -> bool {
+        self.recurrent_state_width > 0
+    }
+
+    /// Effective network input width (`104 + S`).
+    #[must_use]
+    pub const fn input_width(&self) -> usize {
+        SENSOR_WIDTH + self.recurrent_state_width
+    }
+
+    /// Effective network output width (`36 + 2S`).
+    #[must_use]
+    pub const fn output_width(&self) -> usize {
+        ACTION_WIDTH + 2 * self.recurrent_state_width
     }
 }
 
@@ -367,10 +455,13 @@ impl<'a> ReferenceController<'a> {
         self.parameters
     }
 
-    /// Evaluate the controller on one observation's inputs, giving the 36
-    /// raw outputs of its linear final layer.
+    /// Evaluate a stateless (`independent-dense-mlp-v1`) controller on one
+    /// observation's inputs, giving the 36 raw outputs of its linear final
+    /// layer.
     ///
     /// # Errors
+    /// [`CoreError::LayoutMismatch`] if called on a recurrent topology (use
+    /// [`ReferenceController::evaluate_recurrent`]);
     /// [`CoreError::NumericalInvalid`] for an input that is not finite in
     /// F32, or a pre-activation that overflows;
     /// [`CoreError::AllocationFailed`] if `scratch` must grow and cannot.
@@ -379,10 +470,213 @@ impl<'a> ReferenceController<'a> {
         inputs: &[f64; SENSOR_WIDTH],
         scratch: &mut ControllerScratch,
     ) -> Result<[f32; ACTION_WIDTH], CoreError> {
+        if self.topology.is_recurrent() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller state",
+                detail: format!(
+                    "recurrent controller (state width {}) requires evaluate_recurrent",
+                    self.topology.recurrent_state_width()
+                ),
+            });
+        }
         match self.parameters {
             Weights::F32(parameters) => self.evaluate_with(parameters, inputs, scratch),
             Weights::F16(parameters) => self.evaluate_with(parameters, inputs, scratch),
         }
+    }
+
+    /// Evaluate a gated recurrent (`independent-recurrent-mlp-v1`) controller
+    /// on `(inputs, state)`, returning the 36 linear action outputs and
+    /// writing the updated bounded internal state `h' ∈ [-1, 1]^S` into
+    /// `next_state` (FL-054, plan §25.2).
+    ///
+    /// Each state unit `k ∈ 0..S` transitions via the convex gated update
+    /// `h'_k = (1 − g_k) h_k + g_k c_k` in F32, where `c_k = tanh_f32(z_c,k)`
+    /// and `g_k = sigmoid(f64::from(z_g,k)) as f32` using host-independent
+    /// elementary functions, clamped to `[-1, 1]` against 1-ulp F32 rounding.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for a stateless topology or mismatched
+    /// state slice lengths; [`CoreError::NumericalInvalid`] for nonfinite
+    /// inputs, state outside `[-1, 1]`, or nonfinite activations/outputs;
+    /// [`CoreError::AllocationFailed`] if `scratch` must grow and cannot.
+    pub fn evaluate_recurrent(
+        &self,
+        inputs: &[f64; SENSOR_WIDTH],
+        state: &[f32],
+        scratch: &mut ControllerScratch,
+        next_state: &mut [f32],
+    ) -> Result<[f32; ACTION_WIDTH], CoreError> {
+        let width = self.topology.recurrent_state_width();
+        if width == 0 {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller state",
+                detail: "stateless controller does not accept recurrent state".to_owned(),
+            });
+        }
+        if state.len() != width || next_state.len() != width {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller state",
+                detail: format!(
+                    "expected recurrent state width {width}, got state={} next_state={}",
+                    state.len(),
+                    next_state.len()
+                ),
+            });
+        }
+        match self.parameters {
+            Weights::F32(parameters) => {
+                self.evaluate_recurrent_with(parameters, inputs, state, scratch, next_state)
+            }
+            Weights::F16(parameters) => {
+                self.evaluate_recurrent_with(parameters, inputs, state, scratch, next_state)
+            }
+        }
+    }
+
+    fn evaluate_recurrent_with<W: Weight>(
+        &self,
+        parameters: &[W],
+        inputs: &[f64; SENSOR_WIDTH],
+        state: &[f32],
+        scratch: &mut ControllerScratch,
+        next_state: &mut [f32],
+    ) -> Result<[f32; ACTION_WIDTH], CoreError> {
+        let width = self.topology.recurrent_state_width();
+        let mut rounded = [0.0_f32; SENSOR_WIDTH + MAXIMUM_RECURRENT_STATE_WIDTH];
+        for (index, (slot, &value)) in rounded[..SENSOR_WIDTH].iter_mut().zip(inputs).enumerate() {
+            let narrowed = value as f32;
+            if !narrowed.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "controller input",
+                    detail: format!("input {index} is {value}, not finite in F32"),
+                });
+            }
+            *slot = narrowed;
+        }
+        for (index, (slot, &h)) in rounded[SENSOR_WIDTH..SENSOR_WIDTH + width]
+            .iter_mut()
+            .zip(state)
+            .enumerate()
+        {
+            if !h.is_finite() || !(-1.0..=1.0).contains(&h) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "recurrent controller state",
+                    detail: format!("state[{index}] is {h}, outside [-1, 1]"),
+                });
+            }
+            *slot = h;
+        }
+
+        let Some((output_layer, hidden_layers)) = self.topology.layers.split_last() else {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller parameters",
+                detail: "a topology without an output layer".into(),
+            });
+        };
+        if hidden_layers.len() > MAXIMUM_HIDDEN_LAYERS {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "controller parameters",
+                detail: format!("{} hidden layers", hidden_layers.len()),
+            });
+        }
+        scratch.reserve(self.topology.widest_hidden)?;
+        let ControllerScratch { first, second } = scratch;
+
+        let mut source: &[f32] = &rounded[..SENSOR_WIDTH + width];
+        for (layer, activations) in hidden_layers.iter().zip([first, second]) {
+            affine(parameters, layer, source, |_, z| {
+                let activated = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "controller pre-activation",
+                    detail: format!("{z} overflowed"),
+                })?;
+                activations.push(activated);
+                Ok(())
+            })?;
+            source = activations.as_slice();
+        }
+
+        let mut raw = [0.0_f32; ACTION_WIDTH];
+        let mut candidates = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        let mut gates = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        let gate_start = ACTION_WIDTH + width;
+        affine(parameters, output_layer, source, |output, z| {
+            if !z.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "controller output",
+                    detail: format!("output {output} is {z}"),
+                });
+            }
+            if output < ACTION_WIDTH {
+                raw[output] = z;
+            } else if output < gate_start {
+                let k = output - ACTION_WIDTH;
+                candidates[k] = tanh_f32(z).ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "recurrent candidate pre-activation",
+                    detail: format!("candidate {k} pre-activation {z} overflowed"),
+                })?;
+            } else {
+                let k = output - gate_start;
+                let g = sigmoid(f64::from(z)).ok_or_else(|| CoreError::NumericalInvalid {
+                    quantity: "recurrent gate pre-activation",
+                    detail: format!("gate {k} pre-activation {z} overflowed"),
+                })? as f32;
+                if !g.is_finite() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "recurrent update gate",
+                        detail: format!("gate {k} is {g}"),
+                    });
+                }
+                gates[k] = g;
+            }
+            Ok(())
+        })?;
+        for k in 0..width {
+            let updated = ((1.0_f32 - gates[k]) * state[k] + gates[k] * candidates[k])
+                .clamp(-1.0_f32, 1.0_f32);
+            if !updated.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "recurrent controller state",
+                    detail: format!("next_state[{k}] is {updated}"),
+                });
+            }
+            next_state[k] = updated;
+        }
+        Ok(raw)
+    }
+
+    /// [`ReferenceController::evaluate_recurrent`], keeping each hidden
+    /// layer's activations and the updated recurrent state (FL-021, FL-054).
+    ///
+    /// # Errors
+    /// As [`ReferenceController::evaluate_recurrent`], and
+    /// [`CoreError::AllocationFailed`] when the copies cannot be stored.
+    pub fn trace_recurrent(
+        &self,
+        inputs: &[f64; SENSOR_WIDTH],
+        state: &[f32],
+        scratch: &mut ControllerScratch,
+    ) -> Result<RecurrentTrace, CoreError> {
+        let mut next_state = vec![0.0_f32; self.topology.recurrent_state_width()];
+        let outputs = self.evaluate_recurrent(inputs, state, scratch, &mut next_state)?;
+        let layers = self.topology.layers.len().saturating_sub(1);
+        let mut hidden = Vec::new();
+        for activations in [&scratch.first, &scratch.second].into_iter().take(layers) {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(activations.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "traced activations",
+                    bytes: u64::try_from(activations.len().saturating_mul(size_of::<f32>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+            copy.extend_from_slice(activations);
+            hidden.push(copy);
+        }
+        Ok(RecurrentTrace {
+            hidden,
+            outputs,
+            next_state,
+        })
     }
 
     /// [`ReferenceController::evaluate`] over weights of one dtype, each
@@ -493,6 +787,18 @@ pub struct Trace {
     pub hidden: Vec<Vec<f32>>,
     /// The 36 raw outputs of the linear final layer.
     pub outputs: [f32; ACTION_WIDTH],
+}
+
+/// One recurrent evaluation with its hidden activations and updated internal
+/// state ([`ReferenceController::trace_recurrent`], FL-054).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecurrentTrace {
+    /// Each hidden layer's activations, in evaluation order.
+    pub hidden: Vec<Vec<f32>>,
+    /// The 36 raw action outputs of the linear final layer.
+    pub outputs: [f32; ACTION_WIDTH],
+    /// The updated bounded internal state `h' ∈ [-1, 1]^S`.
+    pub next_state: Vec<f32>,
 }
 
 /// The raw outputs as the F64 values [`crate::actions::decode`] reads.

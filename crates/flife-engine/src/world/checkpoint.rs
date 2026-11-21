@@ -41,8 +41,8 @@ use flife_core::{
     CompensatedSum, CoreError, EnergyLedger, Holdings, LedgerState, ResidualBudget, ValidatedConfig,
 };
 use flife_field::{ConeTolerance, FIELD_PLANES, FieldPair, SeededPath};
-use flife_genome::{DENSE_104_36_CATALOG_V1, Genome, GenomeQuota, Traits, WeightsMut};
-use flife_neural::{ACTION_WIDTH, Weights};
+use flife_genome::{Genome, GenomeQuota, Traits, WeightsMut};
+use flife_neural::{ACTION_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, Weights};
 
 use super::{
     Controllers, Fields, NumericalProfile, Rules, Scratch, Sensors, Settle, Uptake, Watch, World,
@@ -51,8 +51,12 @@ use super::{
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
 
-/// Every chunk version this module writes and reads.
+/// Every baseline chunk version this module writes and reads.
 pub const WORLD_CHUNK_VERSION: u16 = 1;
+
+/// `Held` chunk version carrying per-organism recurrent internal state
+/// (`independent-recurrent-mlp-v1`, FL-054, plan §25.2).
+pub const WORLD_RECURRENT_HELD_VERSION: u16 = 2;
 
 /// The families a world's checkpoint holds, in the order they are written.
 pub const WORLD_CHECKPOINT_CHUNKS: [ChunkFamily; 10] = [
@@ -174,7 +178,7 @@ impl World {
             items(catalog.len()),
             &[ChunkFamily::Configuration],
             |out| {
-                out.sized(DENSE_104_36_CATALOG_V1.as_bytes());
+                out.sized(catalog.name().as_bytes());
                 out.u64(items(catalog.len()));
                 for id in catalog.ids() {
                     let (widths, parameters) =
@@ -313,9 +317,15 @@ impl World {
             },
         )?;
 
+        let state_width = self.rules.recurrent_state_width;
+        let held_version = if state_width > 0 {
+            WORLD_RECURRENT_HELD_VERSION
+        } else {
+            version
+        };
         writer.chunk_with(
             ChunkFamily::Held,
-            version,
+            held_version,
             items(live),
             &[ChunkFamily::Particles],
             |out| {
@@ -332,6 +342,13 @@ impl World {
                     out.u64(organism.cooldown_deadline.get());
                     out.u64(organism.birth_tick.get());
                     out.f64(organism.energy_change_rate);
+                    if state_width > 0 {
+                        let state = organism.held.recurrent_state();
+                        out.u8(u8::try_from(state.len()).unwrap_or(0));
+                        for value in state {
+                            out.f32(*value);
+                        }
+                    }
                 }
                 Ok(())
             },
@@ -446,8 +463,8 @@ impl World {
         let mut input = ByteReader::new(chunk.bytes, "topology chunk");
         let name = input.sized(NAME_MAX_BYTES)?;
         let catalog = &rules.catalog;
-        let mut matches = name == DENSE_104_36_CATALOG_V1.as_bytes()
-            && input.count(catalog.len(), 1)? == catalog.len();
+        let mut matches =
+            name == catalog.name().as_bytes() && input.count(catalog.len(), 1)? == catalog.len();
         for id in catalog.ids() {
             let (widths, parameters) = catalog.topology(id).map_or((&[][..], 0), |topology| {
                 (topology.hidden_widths(), topology.parameter_count())
@@ -633,7 +650,13 @@ impl World {
         let chunk = reader.versioned(ChunkFamily::Particles, version)?;
         counted(chunk.items, ChunkFamily::Particles, live)?;
         let mut particles = ByteReader::new(chunk.bytes, "particles chunk");
-        let chunk = reader.versioned(ChunkFamily::Held, version)?;
+        let state_width = rules.recurrent_state_width;
+        let held_version = if state_width > 0 {
+            WORLD_RECURRENT_HELD_VERSION
+        } else {
+            version
+        };
+        let chunk = reader.versioned(ChunkFamily::Held, held_version)?;
         counted(chunk.items, ChunkFamily::Held, live)?;
         let mut held = ByteReader::new(chunk.bytes, "held chunk");
         if particles.count(maximum, 8)? != live || held.count(maximum, 8)? != live {
@@ -662,16 +685,15 @@ impl World {
                     "held state for {held_id} where {id}'s is due"
                 )));
             }
-            let held_output = match held.option_u64()? {
+            let evaluated_raw = match held.option_u64()? {
                 Some(at) => {
                     let mut outputs = [0.0; ACTION_WIDTH];
                     for value in &mut outputs {
                         *value = held.f32()?;
                     }
-                    HeldOutput::evaluated(Tick::new(at), outputs)
-                        .map_err(|error| refuse(format!("{id}'s held output: {error}")))?
+                    Some((Tick::new(at), outputs))
                 }
-                None => HeldOutput::INVALID,
+                None => None,
             };
             let phase = held.u32()?;
             if phase != stable_phase(id, rules.interval)? {
@@ -689,6 +711,44 @@ impl World {
                     tick.get()
                 )));
             }
+            let held_output = if state_width > 0 {
+                let len = usize::from(held.u8()?);
+                let mut state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+                if len > MAXIMUM_RECURRENT_STATE_WIDTH {
+                    return Err(refuse(format!(
+                        "{id} has recurrent state width {len}, above {MAXIMUM_RECURRENT_STATE_WIDTH}"
+                    )));
+                }
+                for value in &mut state[..len] {
+                    *value = held.f32()?;
+                }
+                match evaluated_raw {
+                    Some((at, outputs)) => {
+                        if len != state_width {
+                            return Err(refuse(format!(
+                                "{id} has recurrent state width {len}, expected {state_width}"
+                            )));
+                        }
+                        HeldOutput::evaluated_recurrent(at, outputs, &state[..len]).map_err(
+                            |error| refuse(format!("{id}'s held recurrent state: {error}")),
+                        )?
+                    }
+                    None => {
+                        if len != 0 {
+                            return Err(refuse(format!(
+                                "{id} holds no output but carries {len} recurrent state values"
+                            )));
+                        }
+                        HeldOutput::INVALID
+                    }
+                }
+            } else {
+                match evaluated_raw {
+                    Some((at, outputs)) => HeldOutput::evaluated(at, outputs)
+                        .map_err(|error| refuse(format!("{id}'s held output: {error}")))?,
+                    None => HeldOutput::INVALID,
+                }
+            };
             entrants.push(Entrant {
                 organism: Organism {
                     id,

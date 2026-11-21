@@ -251,6 +251,8 @@ pub struct SensorsConfig {
 )]
 pub struct ControllerConfig {
     pub family: String,
+    #[serde(default)]
+    pub recurrent_state_width: Option<u32>,
     pub input_width: u32,
     pub hidden_widths: Vec<u32>,
     pub output_width: u32,

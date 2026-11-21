@@ -108,6 +108,10 @@ pub const ACTION_WIDTH: u32 = 36;
 /// Hidden layers the dense catalog admits: one or two (§6.4).
 pub const MAXIMUM_HIDDEN_LAYERS: usize = 2;
 
+/// Maximum per-organism recurrent internal state width admitted by
+/// `independent-recurrent-mlp-v1` (plan §25.2; FL-054).
+pub const MAXIMUM_RECURRENT_STATE_WIDTH: u32 = 16;
+
 /// Parameters, weights plus biases, of a dense network
 /// `input → hidden… → output` (§6.2).
 ///

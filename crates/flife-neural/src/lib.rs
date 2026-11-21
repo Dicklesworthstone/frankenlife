@@ -38,7 +38,8 @@ pub use actions::{ACTION_WIDTH, ActionDecoding, DecodedActions, Emission, decode
 pub use arena::{ArenaSlot, Placement, ShardGeometry};
 pub use backend::{BackendBudget, ControllerBackend, ControllerJob};
 pub use controller::{
-    ControllerScratch, DenseTopology, LayerShape, ReferenceController, Trace, widen,
+    ControllerScratch, DenseTopology, INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1,
+    LayerShape, MAXIMUM_RECURRENT_STATE_WIDTH, RecurrentTrace, ReferenceController, Trace, widen,
 };
 pub use sensors::{
     Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe, observe_for_controller,

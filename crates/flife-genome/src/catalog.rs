@@ -13,8 +13,13 @@ use flife_neural::DenseTopology;
 
 use crate::transition::{OVERLAP_PLUS_ZERO_OUTPUT_V1, PREFIX_AND_IDENTITY_BRIDGE_V1};
 
-/// The catalog this module implements.
+/// The baseline stateless dense topology catalog.
 pub const DENSE_104_36_CATALOG_V1: &str = "dense-104-36-catalog-v1";
+
+/// The gated recurrent topology catalog (FL-054, plan §6.4, §25.2): same five
+/// hidden-width members as [`DENSE_104_36_CATALOG_V1`] with effective width
+/// `(104 + S) → hidden… → (36 + 2S)`.
+pub const RECURRENT_104_36_CATALOG_V1: &str = "recurrent-104-36-catalog-v1";
 
 /// Hidden widths of every member of `dense-104-36-catalog-v1`, in catalog
 /// order.
@@ -36,6 +41,8 @@ impl TopologyId {
 /// One run's topology catalog under its parameter cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyCatalog {
+    name: &'static str,
+    recurrent_state_width: u32,
     members: Vec<DenseTopology>,
     maximum_parameters: u64,
     default: TopologyId,
@@ -56,17 +63,58 @@ impl TopologyCatalog {
             .iter()
             .map(|hidden| DenseTopology::new(hidden))
             .collect::<Result<Vec<_>, _>>()?;
+        Self::finish(
+            DENSE_104_36_CATALOG_V1,
+            0,
+            members,
+            maximum_parameters,
+            default_hidden,
+        )
+    }
+
+    /// `recurrent-104-36-catalog-v1` for state width `state_width` under
+    /// `maximum_parameters` (FL-054, plan §25.2).
+    ///
+    /// # Errors
+    /// As [`DenseTopology::new_recurrent`] and [`TopologyCatalog::dense_104_36_v1`].
+    pub fn recurrent_104_36_v1(
+        maximum_parameters: u64,
+        default_hidden: &[u32],
+        state_width: u32,
+    ) -> Result<Self, CoreError> {
+        let members = DENSE_104_36_MEMBERS
+            .iter()
+            .map(|hidden| DenseTopology::new_recurrent(hidden, state_width))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::finish(
+            RECURRENT_104_36_CATALOG_V1,
+            state_width,
+            members,
+            maximum_parameters,
+            default_hidden,
+        )
+    }
+
+    fn finish(
+        name: &'static str,
+        recurrent_state_width: u32,
+        members: Vec<DenseTopology>,
+        maximum_parameters: u64,
+        default_hidden: &[u32],
+    ) -> Result<Self, CoreError> {
         let position = members
             .iter()
             .position(|member| member.hidden_widths() == default_hidden)
             .ok_or_else(|| CoreError::NumericalInvalid {
                 quantity: "controller.hidden_widths",
-                detail: format!("{default_hidden:?} is not a member of {DENSE_104_36_CATALOG_V1}"),
+                detail: format!("{default_hidden:?} is not a member of {name}"),
             })?;
         let default = TopologyId(u8::try_from(position).map_err(|_| CoreError::Overflow {
             quantity: "topology id",
         })?);
         let catalog = Self {
+            name,
+            recurrent_state_width,
             members,
             maximum_parameters,
             default,
@@ -87,15 +135,11 @@ impl TopologyCatalog {
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for another catalog, inheritance map
     /// or depth-change map, or a controller this build cannot evaluate;
-    /// otherwise as [`TopologyCatalog::dense_104_36_v1`].
+    /// otherwise as [`TopologyCatalog::dense_104_36_v1`] or
+    /// [`TopologyCatalog::recurrent_104_36_v1`].
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let architecture = &config.config().architecture_mutation;
         for (role, name, implemented) in [
-            (
-                "architecture_mutation.catalog",
-                &architecture.catalog,
-                DENSE_104_36_CATALOG_V1,
-            ),
             (
                 "architecture_mutation.inheritance_map",
                 &architecture.inheritance_map,
@@ -115,7 +159,53 @@ impl TopologyCatalog {
             }
         }
         let default = DenseTopology::from_config(config)?;
-        Self::dense_104_36_v1(architecture.maximum_parameters, default.hidden_widths())
+        match architecture.catalog.as_str() {
+            DENSE_104_36_CATALOG_V1 => {
+                if default.is_recurrent() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "architecture_mutation.catalog",
+                        detail: format!(
+                            "recurrent controller requires {RECURRENT_104_36_CATALOG_V1}"
+                        ),
+                    });
+                }
+                Self::dense_104_36_v1(architecture.maximum_parameters, default.hidden_widths())
+            }
+            RECURRENT_104_36_CATALOG_V1 => {
+                if !default.is_recurrent() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "architecture_mutation.catalog",
+                        detail: format!("stateless controller requires {DENSE_104_36_CATALOG_V1}"),
+                    });
+                }
+                let state_width = u32::try_from(default.recurrent_state_width()).map_err(|_| {
+                    CoreError::Overflow {
+                        quantity: "controller.recurrent_state_width",
+                    }
+                })?;
+                Self::recurrent_104_36_v1(
+                    architecture.maximum_parameters,
+                    default.hidden_widths(),
+                    state_width,
+                )
+            }
+            other => Err(CoreError::UnknownAlgorithm {
+                role: "architecture_mutation.catalog",
+                name: other.to_owned(),
+            }),
+        }
+    }
+
+    /// Canonical registry name of this catalog.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// Recurrent internal state width `S` (`0` for stateless dense catalogs).
+    #[must_use]
+    pub const fn recurrent_state_width(&self) -> u32 {
+        self.recurrent_state_width
     }
 
     /// Members, admitted or not.

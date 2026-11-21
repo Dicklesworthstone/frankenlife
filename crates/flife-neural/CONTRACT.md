@@ -11,6 +11,16 @@ FL-008 (`flife-6fh`) covers the scalar reference controller between the two (pla
 C.16): `independent-dense-mlp-v1` with `tanh` hidden layers, a `linear` output layer and `f32` accumulation in a
 declared order. It is the known-answer oracle that accelerated routes are compared against.
 
+FL-054 (`flife-xk0`) adds the gated recurrent controller family `independent-recurrent-mlp-v1` (plan §17.5, §25.2):
+a bounded per-organism internal state `h ∈ [-1, 1]^S` (`1 ≤ S ≤ MAXIMUM_RECURRENT_STATE_WIDTH = 16`) appended to the
+104 sensor inputs, with effective topology `(104 + S) → hidden… → (36 + 2S)`. Output channels `0..36` stay the linear
+action logits; `36..36+S` feed candidate `c_k = tanh_f32(z_c,k)` and `36+S..36+2S` feed update gate
+`g_k = sigmoid(f64::from(z_g,k)) as f32` via host-independent `flife_core::numerics`, producing the bounded convex
+state transition `h'_k = ((1 − g_k) h_k + g_k c_k).clamp(-1, 1)` in F32. Every recurrent input, candidate, and gate
+parameter is part of `DenseTopology::parameter_count()`, so maintenance and genome quotas charge state transitions
+automatically. `ReferenceController::evaluate` refuses recurrent topologies (`LayoutMismatch`) and
+`evaluate_recurrent` / `trace_recurrent` require matching bounded state slices.
+
 The pyramid itself, its storage and its sampling are `flife_field::pyramid`; this crate encodes, evaluates and
 decodes. The FrankenTorch population adapter is FL-025 and the Metal kernels are FL-030. Genomes, their storage and
 initialization are FL-009. Applying decoded actions (emission, reproduction) is FL-011.

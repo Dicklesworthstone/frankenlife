@@ -29,8 +29,13 @@ pub fn admit(
     checkpoint: Option<&CheckpointAdmission>,
     render: u64,
 ) -> Result<MemoryAdmission, CoreError> {
+    let batched = match choice {
+        ControllerChoice::Cpu => false,
+        ControllerChoice::Auto => world.recurrent_state_width() == 0,
+        ControllerChoice::Torch | ControllerChoice::Metal => true,
+    };
     world.admit_memory(
-        choice != ControllerChoice::Cpu,
+        batched,
         checkpoint.map_or(0, |admission| admission.peak_bytes),
         render,
     )

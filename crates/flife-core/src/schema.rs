@@ -556,6 +556,15 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
 
     let k = &config.controller;
     r.name("controller", "family", &k.family, Role::ControllerFamily);
+    if let Some(width) = k.recurrent_state_width {
+        r.int(
+            "controller",
+            "recurrent_state_width",
+            width,
+            U::Count,
+            AtLeastOne,
+        );
+    }
     r.int(
         "controller",
         "input_width",

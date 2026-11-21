@@ -635,6 +635,13 @@ each runs and owns the field.
   emission, death/removal recycling, and `local_chemistry` through `rules.exchange`. CIC-only `UptakeBackend` and
   `SettleBackend` ports explicitly refuse non-`grid-cic-v1` worlds with `CoreError::MissingCapability` and fall back to
   the qualified CPU reference with `failure` recorded.
+- Recurrent controllers (`independent-recurrent-mlp-v1` + `recurrent-104-36-catalog-v1`, FL-054, plan §25.2): each
+  live organism's `HeldOutput` carries its bounded internal state `h ∈ [-1, 1]^S` (`1 ≤ S ≤ 16`); founders, newborns,
+  introduced, and grafted organisms start with zero state (`HeldOutput::INVALID`, zero leakage across reused slots,
+  INV-07); non-evaluation ticks preserve both held action logits and internal state; maintenance charges the full
+  recurrent parameter count `P`; checkpoints store recurrent state in `Held` chunk version `2`
+  (`WORLD_RECURRENT_HELD_VERSION`) and the catalog name in `Topology` (leaving stateless checkpoints bit-identical at
+  version `1`); and stateless `ControllerBackend` ports refuse recurrent worlds honestly with `MissingCapability`.
 - It takes `&self` and changes nothing: a world inspected in full before every tick commits the digests of one
   never inspected.
 - The held output is decoded by the function the tick uses (`raw_outputs` then `decode`), so the snapshot and the

@@ -107,6 +107,14 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-neural/tests/controller.rs"),
     ),
     (
+        "flife-neural::tests/recurrent.rs",
+        include_str!("../../flife-neural/tests/recurrent.rs"),
+    ),
+    (
+        "flife-engine::tests/recurrent.rs",
+        include_str!("../../flife-engine/tests/recurrent.rs"),
+    ),
+    (
         "flife-genome::tests/genomes.rs",
         include_str!("../../flife-genome/tests/genomes.rs"),
     ),

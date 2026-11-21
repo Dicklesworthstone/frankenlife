@@ -23,7 +23,8 @@ use crate::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS,
-    MAXIMUM_HIDDEN_LAYERS, MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count, genome_bank_bytes,
+    MAXIMUM_HIDDEN_LAYERS, MAXIMUM_RECURRENT_STATE_WIDTH, MOMENT_CHANNELS, SENSOR_WIDTH,
+    dense_parameter_count, genome_bank_bytes,
 };
 use crate::registry::{self, REGISTRY};
 use crate::schema::{self, FloatBound, IntBound, Kind, Value};
@@ -233,6 +234,7 @@ pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
     check_generic(&config, &mut issues);
     check_contact(&config, &mut issues);
     check_exchange(&config, &mut issues);
+    check_controller(&config, &mut issues);
     let report = check_model(&config, &mut issues);
     match report {
         Some(report) if issues.0.is_empty() => Ok(ValidatedConfig { config, report }),
@@ -426,6 +428,52 @@ fn check_exchange(config: &RunConfig, issues: &mut Issues) {
     }
 }
 
+/// `controller.recurrent_state_width` and `recurrent-104-36-catalog-v1`
+/// belong to `independent-recurrent-mlp-v1` (plan §17.5, §25.2; FL-054).
+fn check_controller(config: &RunConfig, issues: &mut Issues) {
+    let family = config.controller.family.as_str();
+    let catalog = config.architecture_mutation.catalog.as_str();
+    match (family, config.controller.recurrent_state_width) {
+        ("independent-dense-mlp-v1", Some(_)) => {
+            issues.add(
+                "controller.recurrent_state_width",
+                "recurrent_state_width belongs to independent-recurrent-mlp-v1, not \
+                 independent-dense-mlp-v1",
+            );
+        }
+        ("independent-recurrent-mlp-v1", None) => {
+            issues.add(
+                "controller.recurrent_state_width",
+                "independent-recurrent-mlp-v1 needs controller.recurrent_state_width",
+            );
+        }
+        ("independent-recurrent-mlp-v1", Some(width)) if width > MAXIMUM_RECURRENT_STATE_WIDTH => {
+            issues.add(
+                "controller.recurrent_state_width",
+                format!("must be <= {MAXIMUM_RECURRENT_STATE_WIDTH}, got {width}"),
+            );
+        }
+        _ => {}
+    }
+    match (family, catalog) {
+        ("independent-dense-mlp-v1", "recurrent-104-36-catalog-v1") => {
+            issues.add(
+                "architecture_mutation.catalog",
+                "recurrent-104-36-catalog-v1 belongs to independent-recurrent-mlp-v1, not \
+                 independent-dense-mlp-v1",
+            );
+        }
+        ("independent-recurrent-mlp-v1", "dense-104-36-catalog-v1") => {
+            issues.add(
+                "architecture_mutation.catalog",
+                "independent-recurrent-mlp-v1 needs architecture_mutation.catalog = \
+                 \"recurrent-104-36-catalog-v1\"",
+            );
+        }
+        _ => {}
+    }
+}
+
 /// The cross-key rules. Returns the report when every derived quantity
 /// could be computed; issues are recorded either way.
 #[expect(
@@ -483,10 +531,20 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
             ),
         );
     }
+    let recurrent_width = match (controller.family.as_str(), controller.recurrent_state_width) {
+        ("independent-recurrent-mlp-v1", Some(width))
+            if (1..=MAXIMUM_RECURRENT_STATE_WIDTH).contains(&width) =>
+        {
+            width
+        }
+        _ => 0,
+    };
     let default_parameter_count = dense_parameter_count(
-        controller.input_width,
+        controller.input_width.saturating_add(recurrent_width),
         &controller.hidden_widths,
-        controller.output_width,
+        controller
+            .output_width
+            .saturating_add(recurrent_width.saturating_mul(2)),
     );
     if let Err(error) = &default_parameter_count {
         issues.add("controller.hidden_widths", error.to_string());

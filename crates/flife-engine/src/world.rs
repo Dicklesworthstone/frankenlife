@@ -104,7 +104,8 @@ use flife_genome::{
 };
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
-    DecodedActions, Intrinsic, Observation, SensorScales, decode, observe_for_controller, widen,
+    DecodedActions, INDEPENDENT_RECURRENT_MLP_V1, Intrinsic, MAXIMUM_RECURRENT_STATE_WIDTH,
+    Observation, SensorScales, decode, observe_for_controller, widen,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
@@ -133,7 +134,7 @@ mod crop;
 mod graft;
 mod settle;
 
-pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION};
+pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_RECURRENT_HELD_VERSION};
 pub use graft::Graft;
 use settle::{Settle, settle_with};
 
@@ -309,6 +310,8 @@ struct Staged {
     paths: Vec<SeededPath>,
     /// The watched organism's observation in this step, if it observed.
     sensed: Option<Sensed>,
+    /// Its pre-evaluation recurrent internal state on this step, if any.
+    sensed_state: Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
     /// The watched organism's transactions in this step, if it settled.
     transactions: Option<Transactions>,
     report: TickReport,
@@ -385,6 +388,7 @@ impl Candidate<'_> {
         if let Some(sensed) = staged.sensed {
             if sensed.evaluated {
                 world.watch.evaluated = Some(sensed.clone());
+                world.watch.evaluated_state = staged.sensed_state;
             }
             world.watch.observed = Some(sensed);
         }
@@ -422,6 +426,7 @@ struct Rules {
     decoding: ActionDecoding,
     scales: SensorScales,
     catalog: TopologyCatalog,
+    recurrent_state_width: usize,
     limits: TraitLimits,
     mutation: MutationParameters,
     uptake_capacity: f64,
@@ -631,6 +636,8 @@ impl Rules {
         let grid = FieldGrid::from_config(config)?;
         let exchange = ExchangeKernel::from_config(config)?;
         let max_exchange_cells = exchange.max_cells(&grid);
+        let catalog = TopologyCatalog::from_config(config)?;
+        let recurrent_state_width = catalog.recurrent_state_width() as usize;
         Ok(Self {
             step: config.report().timestep,
             grid,
@@ -648,7 +655,8 @@ impl Rules {
             recycling: Recycling::from_config(config)?,
             decoding: ActionDecoding::from_config(config)?,
             scales: SensorScales::from_config(config)?,
-            catalog: TopologyCatalog::from_config(config)?,
+            catalog,
+            recurrent_state_width,
             limits: TraitLimits::from_config(config)?,
             mutation: MutationParameters::from_config(config)?,
             uptake_capacity: chemistry.uptake_capacity_per_second,
@@ -932,6 +940,9 @@ struct Watch {
     observed: Option<Sensed>,
     /// Its observation in the newest published step it evaluated in.
     evaluated: Option<Sensed>,
+    /// Its pre-evaluation recurrent internal state on the newest published
+    /// step it evaluated in (`independent-recurrent-mlp-v1`, FL-054).
+    evaluated_state: Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
     /// Its transactions in its last [`RECENT_STEPS`] published steps,
     /// oldest first. Each step's preparation reserves the room, so
     /// publishing never allocates.
@@ -1423,6 +1434,13 @@ impl World {
         self.rules.exchange
     }
 
+    /// Recurrent internal state width `S` (`0` for `independent-dense-mlp-v1`,
+    /// `1..=16` for `independent-recurrent-mlp-v1`, FL-054).
+    #[must_use]
+    pub const fn recurrent_state_width(&self) -> usize {
+        self.rules.recurrent_state_width
+    }
+
     /// The live population.
     #[must_use]
     pub const fn population(&self) -> &Population {
@@ -1743,26 +1761,52 @@ impl World {
             organism.held.outputs(),
         ) {
             (Some(recorded), Some(at), Some(held)) if recorded.tick.next().ok() == Some(at) => {
-                let trace = genome
-                    .controller(&self.rules.catalog, &self.rules.limits)?
-                    .trace(
+                let controller = genome.controller(&self.rules.catalog, &self.rules.limits)?;
+                let state_width = self.rules.recurrent_state_width;
+                let hidden = if state_width > 0 {
+                    let prev_state = self
+                        .watch
+                        .evaluated_state
+                        .unwrap_or([0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH]);
+                    let trace = controller.trace_recurrent(
+                        &recorded.observation.inputs,
+                        &prev_state[..state_width],
+                        &mut ControllerScratch::default(),
+                    )?;
+                    let state_matches = trace.next_state.iter().map(|v| v.to_bits()).eq(organism
+                        .held
+                        .recurrent_state()
+                        .iter()
+                        .map(|v| v.to_bits()));
+                    if trace.outputs.map(f32::to_bits) != held.map(f32::to_bits) || !state_matches {
+                        return Err(CoreError::StateConflict {
+                            operation: "inspect organism",
+                            detail: format!(
+                                "{id}'s recurrent output/state held from tick {} is not the \
+                                 reference's on the inputs recorded for it",
+                                at.get()
+                            ),
+                        });
+                    }
+                    trace.hidden
+                } else {
+                    let trace = controller.trace(
                         &recorded.observation.inputs,
                         &mut ControllerScratch::default(),
                     )?;
-                if trace.outputs.map(f32::to_bits) != held.map(f32::to_bits) {
-                    return Err(CoreError::StateConflict {
-                        operation: "inspect organism",
-                        detail: format!(
-                            "{id}'s output held from tick {} is not the reference's on the inputs \
-                             recorded for it",
-                            at.get()
-                        ),
-                    });
-                }
-                Some(Activations {
-                    tick: at,
-                    hidden: trace.hidden,
-                })
+                    if trace.outputs.map(f32::to_bits) != held.map(f32::to_bits) {
+                        return Err(CoreError::StateConflict {
+                            operation: "inspect organism",
+                            detail: format!(
+                                "{id}'s output held from tick {} is not the reference's on the \
+                                 inputs recorded for it",
+                                at.get()
+                            ),
+                        });
+                    }
+                    trace.hidden
+                };
+                Some(Activations { tick: at, hidden })
             }
             _ => None,
         };
@@ -2112,9 +2156,9 @@ impl World {
             lanes,
             controllers,
         )?;
-        let sensed = match watch.organism {
+        let (sensed, sensed_state) = match watch.organism {
             Some(id) => watched(rules, population, &view, sampled, rows, id, [from, to])?,
-            None => None,
+            None => (None, None),
         };
         // The reference sampled the tick without an error, so a backend that
         // met one failed where the reference does not.
@@ -2512,6 +2556,7 @@ impl World {
             identities: next_identities,
             paths: next_paths,
             sensed,
+            sensed_state,
             transactions,
             report,
         })))
@@ -3230,13 +3275,13 @@ fn watched(
     rows: &[Organism],
     id: OrganismId,
     [from, to]: [Tick; 2],
-) -> Result<Option<Sensed>, CoreError> {
+) -> Result<(Option<Sensed>, Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>), CoreError> {
     let Some((row, organism)) = rows
         .binary_search_by_key(&id, |organism| organism.id)
         .ok()
         .and_then(|row| rows.get(row).map(|organism| (row, organism)))
     else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let raw = blended(
         population,
@@ -3244,15 +3289,20 @@ fn watched(
         organism,
         sampled.and_then(|samples| samples.get(row)),
     )?;
-    Ok(Some(Sensed {
-        tick: from,
-        scale: genome_of(population, id)?.traits().sensing_scale(),
-        // The controller's encoding (2482af0), so the record is the job's
-        // inputs bit for bit, not only after their narrowing to F32.
-        observation: encode_for_controller(rules, organism, &raw, from)?,
-        raw,
-        evaluated: due(rules, organism, to),
-    }))
+    let prev_state =
+        (rules.recurrent_state_width > 0).then(|| organism.held.recurrent_state_array());
+    Ok((
+        Some(Sensed {
+            tick: from,
+            scale: genome_of(population, id)?.traits().sensing_scale(),
+            // The controller's encoding (2482af0), so the record is the job's
+            // inputs bit for bit, not only after their narrowing to F32.
+            observation: encode_for_controller(rules, organism, &raw, from)?,
+            raw,
+            evaluated: due(rules, organism, to),
+        }),
+        prev_state,
+    ))
 }
 
 /// The organism's raw sample at its sensing scale: the backend's `raw` if
@@ -3339,10 +3389,22 @@ fn decide_from_raw(
     let observation = encode_for_controller(rules, organism, raw, from)?;
     let due = due(rules, organism, to);
     let held = if due {
-        let outputs = genome
-            .controller(&rules.catalog, &rules.limits)?
-            .evaluate(&observation.inputs, controller)?;
-        HeldOutput::evaluated(to, outputs)?
+        let eval = genome.controller(&rules.catalog, &rules.limits)?;
+        let width = rules.recurrent_state_width;
+        if width > 0 {
+            let prev_state = organism.held.recurrent_state_array();
+            let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+            let outputs = eval.evaluate_recurrent(
+                &observation.inputs,
+                &prev_state[..width],
+                controller,
+                &mut next_state[..width],
+            )?;
+            HeldOutput::evaluated_recurrent(to, outputs, &next_state[..width])?
+        } else {
+            let outputs = eval.evaluate(&observation.inputs, controller)?;
+            HeldOutput::evaluated(to, outputs)?
+        }
     } else {
         organism.held
     };
@@ -3790,6 +3852,15 @@ fn decide_with(
     let Some(device) = backend.as_deref_mut() else {
         return decide_all(rules, population, view, sampled, rows, ticks, lanes);
     };
+    if rules.recurrent_state_width > 0 {
+        let error = CoreError::MissingCapability {
+            capability: format!("a controller backend under `{INDEPENDENT_RECURRENT_MLP_V1}`"),
+        };
+        report.failure = Some(error.to_string());
+        *backend = None;
+        report.reference_ticks = report.reference_ticks.saturating_add(1);
+        return decide_all(rules, population, view, sampled, rows, ticks, lanes);
+    }
     let decided = decide_batched(
         rules, population, view, sampled, rows, ticks, lanes, device, outputs, by_row,
     );

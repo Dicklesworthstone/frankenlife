@@ -146,6 +146,11 @@ pub struct InspectedHeld {
     pub evaluated_at: u64,
     /// The raw outputs, in the action layout (`flife_neural::actions`).
     pub outputs: Vec<f64>,
+    /// The bounded recurrent state carried into the next evaluation, as
+    /// stored (`f32` widened exactly), for recurrent controller families
+    /// (FL-054); omitted for stateless controllers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrent_state: Option<Vec<f64>>,
 }
 
 /// The field's energy plane.
@@ -352,9 +357,14 @@ fn of(
                 .held
                 .outputs()
                 .zip(organism.held.evaluated_at())
-                .map(|(outputs, tick)| InspectedHeld {
-                    evaluated_at: tick.get(),
-                    outputs: outputs.iter().map(|&value| f64::from(value)).collect(),
+                .map(|(outputs, tick)| {
+                    let state = organism.held.recurrent_state();
+                    InspectedHeld {
+                        evaluated_at: tick.get(),
+                        outputs: outputs.iter().map(|&value| f64::from(value)).collect(),
+                        recurrent_state: (!state.is_empty())
+                            .then(|| state.iter().map(|&value| f64::from(value)).collect()),
+                    }
                 }),
         });
     }

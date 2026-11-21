@@ -133,6 +133,28 @@ impl ControllerSummary {
 /// # Errors
 /// [`ControllerChoice::backend`]'s.
 pub fn install(world: &mut World, choice: ControllerChoice, bytes: u64) -> Result<(), CoreError> {
+    if world.recurrent_state_width() > 0 {
+        return match choice {
+            ControllerChoice::Cpu | ControllerChoice::Auto => {
+                world.set_controller_backend(None);
+                Ok(())
+            }
+            ControllerChoice::Torch => Err(CoreError::MissingCapability {
+                capability: format!(
+                    "torch batched controller backend for `{}` (use `--controllers cpu` or \
+                     `--controllers auto`)",
+                    world.config().config().controller.family
+                ),
+            }),
+            ControllerChoice::Metal => Err(CoreError::MissingCapability {
+                capability: format!(
+                    "metal batched controller backend for `{}` (use `--controllers cpu` or \
+                     `--controllers auto`)",
+                    world.config().config().controller.family
+                ),
+            }),
+        };
+    }
     let budget = BackendBudget {
         bytes,
         organisms: world.population().capacity() as u64,

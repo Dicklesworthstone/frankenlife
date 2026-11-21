@@ -598,6 +598,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     },
     AlgorithmEntry {
         status: Status::Implemented {
+            evidence: "test:flife-neural::tests/recurrent.rs::gated_recurrent_controller_matches_independent_oracle_and_stays_bounded",
+        },
+        ..entry(
+            "independent-recurrent-mlp-v1",
+            Role::ControllerFamily,
+            "§6.2, §17.5, §25.2",
+            "FL-054",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
             evidence: "test:flife-neural::tests/controller.rs::c16_a_tanh_layer_is_not_an_identity",
         },
         ..entry("tanh", Role::HiddenActivation, "§6.2", "FL-008")
@@ -660,6 +671,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             Role::TopologyCatalog,
             "§6.4",
             "FL-009",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/recurrent.rs::recurrent_world_stateful_replay_checkpoint_and_energy_costing",
+        },
+        ..entry(
+            "recurrent-104-36-catalog-v1",
+            Role::TopologyCatalog,
+            "§6.4, §25.2",
+            "FL-054",
         )
     },
     AlgorithmEntry {

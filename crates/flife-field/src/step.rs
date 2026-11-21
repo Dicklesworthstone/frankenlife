@@ -16,7 +16,7 @@ use crate::invariants::{ConeTolerance, FieldScan};
 use crate::layout::overflow;
 use crate::sources::{
     DepositReport, Source, SourceKernel, SourceSupport, component, deposit, deposit_energy,
-    deposit_moment,
+    deposit_energy_fused, deposit_moment, deposit_moments_fused,
 };
 use crate::state::{FieldPair, FieldState};
 use crate::transport::{
@@ -59,9 +59,30 @@ pub fn advance_field(
 ) -> Result<FieldStepReport, CoreError> {
     let (current, next) = pair.stage();
     let transported = transport(plan, current, next, scratch)?;
-    let mut deposits = Vec::with_capacity(sources.len());
-    for source in sources {
-        deposits.push(deposit(next, kernel, source, step, support)?);
+    if !kernel.is_fused() {
+        let mut deposits = Vec::with_capacity(sources.len());
+        for source in sources {
+            deposits.push(deposit(next, kernel, source, step, support)?);
+        }
+        return Ok(step_report(transported, deposits, next));
+    }
+    let grid = *next.grid();
+    let mut supports = vec![SourceSupport::new(); sources.len()];
+    for (source, slot) in sources.iter().zip(&mut supports) {
+        kernel.support_into(&grid, source.center(), slot)?;
+    }
+    let mut accum = Vec::new();
+    let deposits = deposit_energy_fused(next, sources, step, &mut supports, &mut accum)?;
+    let channels = usize::try_from(FIELD_PLANES - 1).map_err(|_| overflow())?;
+    let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+    let moments = next.moments_mut();
+    if cells == 0 || moments.len() != cells * channels {
+        return Err(crate::layout::mismatch(
+            "the candidate field has no moment planes".to_owned(),
+        ));
+    }
+    for (channel, plane) in moments.chunks_exact_mut(cells).enumerate() {
+        deposit_moments_fused(plane, sources, channel, &supports, &mut accum)?;
     }
     Ok(step_report(transported, deposits, next))
 }
@@ -186,6 +207,9 @@ pub struct FieldWork {
     limits: BufferLimits,
     transport: Vec<TransportScratch>,
     supports: Vec<SourceSupport>,
+    /// Per-worker F64 cell accumulators, reserved only for fused source kernels
+    /// (`flife-ze4`). Empty (0 bytes) for `normalized-truncated-minimum-image-gaussian-v1`.
+    fused_accum: Vec<Vec<f64>>,
 }
 
 impl FieldWork {
@@ -203,6 +227,7 @@ impl FieldWork {
             limits: *limits,
             transport: Vec::new(),
             supports: Vec::new(),
+            fused_accum: Vec::new(),
         };
         work.set_workers(workers)?;
         Ok(work)
@@ -234,7 +259,29 @@ impl FieldWork {
         for _ in 0..sources {
             supports.push(SourceSupport::for_kernel(kernel, &self.grid)?);
         }
+        let mut fused_accum = Vec::new();
+        if kernel.is_fused() {
+            let cells = usize::try_from(self.grid.cell_count()).map_err(|_| overflow())?;
+            let lanes = self.transport.len().max(1);
+            fused_accum
+                .try_reserve_exact(lanes)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "fused source accumulators",
+                    bytes: flife_core::memory::bytes_for::<Vec<f64>>(lanes),
+                })?;
+            for _ in 0..lanes {
+                let mut buf = Vec::new();
+                buf.try_reserve_exact(cells)
+                    .map_err(|_| CoreError::AllocationFailed {
+                        buffer: "fused source accumulator",
+                        bytes: flife_core::memory::bytes_for::<f64>(cells),
+                    })?;
+                buf.resize(cells, 0.0);
+                fused_accum.push(buf);
+            }
+        }
         self.supports = supports;
+        self.fused_accum = fused_accum;
         Ok(())
     }
 
@@ -246,10 +293,12 @@ impl FieldWork {
             [
                 capacity_bytes(&self.transport),
                 capacity_bytes(&self.supports),
+                capacity_bytes(&self.fused_accum),
             ]
             .into_iter()
             .chain(self.transport.iter().map(TransportScratch::allocated_bytes))
-            .chain(self.supports.iter().map(SourceSupport::allocated_bytes)),
+            .chain(self.supports.iter().map(SourceSupport::allocated_bytes))
+            .chain(self.fused_accum.iter().map(capacity_bytes)),
         )
     }
 
@@ -294,6 +343,7 @@ pub fn advance_field_on(
     let FieldWork {
         transport: scratches,
         supports,
+        fused_accum,
         ..
     } = work;
     let (current, next) = pair.stage();
@@ -305,25 +355,31 @@ pub fn advance_field_on(
     let grid = *next.grid();
     let refused = supports_on(kernel, &grid, sources, supports, scratches.len())?;
     let supported = refused.as_ref().map_or(sources.len(), |(index, _)| *index);
-    let mut deposits = Vec::with_capacity(sources.len());
-    for (source, support) in sources.iter().zip(supports.iter_mut()).take(supported) {
-        deposits.push(deposit_energy(next, source, step, support)?);
-    }
-    if let Some((_, error)) = refused {
-        return Err(error);
-    }
-
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
     let channels = usize::try_from(FIELD_PLANES - 1).map_err(|_| overflow())?;
-    let supports: &[SourceSupport] = supports;
-    let run = |first: usize, planes: &mut [f32]| -> Result<(), CoreError> {
-        for (offset, plane) in planes.chunks_exact_mut(cells).enumerate() {
-            for (source, support) in sources.iter().zip(supports) {
-                deposit_moment(plane, component(source, first + offset), support)?;
-            }
+    let fused = kernel.is_fused();
+
+    let deposits = if fused {
+        if let Some((_, error)) = refused {
+            return Err(error);
         }
-        Ok(())
+        let used = scratches.len().clamp(1, channels.max(1));
+        if fused_accum.len() < used {
+            fused_accum.resize_with(used, Vec::new);
+        }
+        deposit_energy_fused(next, sources, step, supports, &mut fused_accum[0])?
+    } else {
+        let mut deposits = Vec::with_capacity(sources.len());
+        for (source, support) in sources.iter().zip(supports.iter_mut()).take(supported) {
+            deposits.push(deposit_energy(next, source, step, support)?);
+        }
+        if let Some((_, error)) = refused {
+            return Err(error);
+        }
+        deposits
     };
+
+    let supports: &[SourceSupport] = supports;
     let moments = next.moments_mut();
     if cells == 0 || moments.len() != cells * channels {
         return Err(crate::layout::mismatch(
@@ -332,28 +388,78 @@ pub fn advance_field_on(
     }
     let used = scratches.len().clamp(1, channels.max(1));
     let per = channels.div_ceil(used);
-    let mut runs = moments.chunks_mut(per * cells);
-    let head = runs.next().unwrap_or(&mut []);
-    let run = &run;
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = runs
-            .enumerate()
-            .map(|(index, planes)| scope.spawn(move || run((index + 1) * per, planes)))
-            .collect();
-        let mut result = run(0, head);
-        for worker in workers {
-            let joined = worker.join().unwrap_or_else(|_| {
-                Err(CoreError::StateConflict {
-                    operation: "deposit",
-                    detail: "a deposit worker panicked".to_owned(),
-                })
-            });
-            if result.is_ok() {
-                result = joined;
-            }
+    if fused {
+        if fused_accum.len() < used {
+            fused_accum.resize_with(used, Vec::new);
         }
-        result
-    })?;
+        let mut runs = moments
+            .chunks_mut(per * cells)
+            .zip(fused_accum.iter_mut().take(used));
+        let head = runs.next();
+        let run =
+            |first: usize, planes: &mut [f32], accum: &mut Vec<f64>| -> Result<(), CoreError> {
+                for (offset, plane) in planes.chunks_exact_mut(cells).enumerate() {
+                    deposit_moments_fused(plane, sources, first + offset, supports, accum)?;
+                }
+                Ok(())
+            };
+        let run = &run;
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = runs
+                .enumerate()
+                .map(|(index, (planes, accum))| {
+                    scope.spawn(move || run((index + 1) * per, planes, accum))
+                })
+                .collect();
+            let mut result = match head {
+                Some((planes, accum)) => run(0, planes, accum),
+                None => Ok(()),
+            };
+            for worker in workers {
+                let joined = worker.join().unwrap_or_else(|_| {
+                    Err(CoreError::StateConflict {
+                        operation: "deposit",
+                        detail: "a deposit worker panicked".to_owned(),
+                    })
+                });
+                if result.is_ok() {
+                    result = joined;
+                }
+            }
+            result
+        })?;
+    } else {
+        let run = |first: usize, planes: &mut [f32]| -> Result<(), CoreError> {
+            for (offset, plane) in planes.chunks_exact_mut(cells).enumerate() {
+                for (source, support) in sources.iter().zip(supports) {
+                    deposit_moment(plane, component(source, first + offset), support)?;
+                }
+            }
+            Ok(())
+        };
+        let mut runs = moments.chunks_mut(per * cells);
+        let head = runs.next().unwrap_or(&mut []);
+        let run = &run;
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = runs
+                .enumerate()
+                .map(|(index, planes)| scope.spawn(move || run((index + 1) * per, planes)))
+                .collect();
+            let mut result = run(0, head);
+            for worker in workers {
+                let joined = worker.join().unwrap_or_else(|_| {
+                    Err(CoreError::StateConflict {
+                        operation: "deposit",
+                        detail: "a deposit worker panicked".to_owned(),
+                    })
+                });
+                if result.is_ok() {
+                    result = joined;
+                }
+            }
+            result
+        })?;
+    }
     Ok(step_report(transported, deposits, next))
 }
 

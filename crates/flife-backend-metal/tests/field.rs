@@ -583,3 +583,75 @@ fn random_worlds_step_as_the_reference() {
         }
     }
 }
+
+/// `flife-ze4`: `MetalField` matches CPU `advance_field_on` bit for bit under
+/// `normalized-truncated-minimum-image-gaussian-fused-v1` (multi-source fused
+/// F64 accumulation on both energy and moment planes).
+#[test]
+fn fused_source_kernel_matches_cpu_bit_for_bit() {
+    let Some(mut device) = metal() else {
+        return;
+    };
+    let mut rng = Rng(0x00F0_5ED1_1234_5678);
+    let centers = [
+        [8.3, 12.7],
+        [10.1, 14.2],
+        [24.9, 6.4],
+        [31.5, 29.8],
+        [2.2, 18.6],
+        [15.4, 21.1],
+    ];
+    let base = case(
+        "fused sources",
+        [32, 32],
+        [32.0, 32.0],
+        [0.327_384, 0.008_989_29],
+        [4.0, 4.0],
+        &centers,
+        &mut rng,
+    );
+    let fused = SourceKernel::new_fused(4.0, 4.0).expect("fused kernel");
+    let mut reference = random_pair(base.grid, &mut rng);
+    let mut accelerated = FieldPair::zeroed(base.grid, &LIMITS).expect("pair");
+    accelerated
+        .current_mut()
+        .copy_from(reference.current())
+        .expect("copy");
+    let mut work =
+        FieldWork::new(&base.grid, &LIMITS, NonZeroUsize::new(4).expect("4")).expect("work");
+    work.reserve_supports(base.sources.len(), &fused)
+        .expect("reserve");
+    for tick in 0..8 {
+        let expected = advance_field_on(
+            &mut reference,
+            &base.plan,
+            &fused,
+            &base.sources,
+            base.step,
+            &mut work,
+        )
+        .expect("cpu fused step");
+        let got = device
+            .advance(
+                &mut accelerated,
+                &base.plan,
+                &fused,
+                &base.sources,
+                base.step,
+            )
+            .expect("metal fused step");
+        let (want, have) = (
+            reference.stage().1.as_slice(),
+            accelerated.stage().1.as_slice(),
+        );
+        let differing = want
+            .iter()
+            .zip(have)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "tick {tick}: {differing} values differ");
+        assert_eq!(report_bits(&expected), report_bits(&got), "tick {tick}");
+        reference.commit();
+        accelerated.commit();
+    }
+}

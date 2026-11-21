@@ -81,7 +81,8 @@ pub use settle::{
     ProposalConstants, ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 pub use sources::{
-    DepositReport, PathSegment, Source, SourceKernel, SourceSupport, deposit_energy,
+    DepositReport, PathSegment, Source, SourceKernel, SourceSupport, TRUNCATED_GAUSSIAN_FUSED_V1,
+    TRUNCATED_GAUSSIAN_V1, deposit_energy, deposit_energy_fused,
 };
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
 pub use step::{

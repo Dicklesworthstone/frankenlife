@@ -432,6 +432,20 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
             "FL-004",
         )
     },
+    // flife-ze4: simultaneous sources accumulated per cell in F64 and rounded
+    // once to F32 per tick (matching Phase 9 deposit.rs), eliminating M-fold
+    // coherent binade rounding bias in high-source near-empty worlds.
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/transport_sources.rs::fused_source_kernel_eliminates_per_source_f32_rounding_bias",
+        },
+        ..entry(
+            "normalized-truncated-minimum-image-gaussian-fused-v1",
+            Role::SourceKernel,
+            "§4.5, A.3 item 9, flife-ze4",
+            "FL-004",
+        )
+    },
     // FL-004 implemented the arithmetic; FL-010 supplies the semantic draws
     // (`flife_field::seeding`).
     AlgorithmEntry {

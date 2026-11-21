@@ -31,8 +31,15 @@ use crate::state::{CHANNELS, FieldState};
 /// The spatial normalization this module implements.
 pub const FIXED_TOTAL_POWER: &str = "fixed-total-power";
 
-/// The source kernel this module implements.
+/// The source kernel this module implements (sequential per-source F32 rounding).
 pub const TRUNCATED_GAUSSIAN_V1: &str = "normalized-truncated-minimum-image-gaussian-v1";
+
+/// The fused source kernel (`flife-ze4`): identical normalized Gaussian weights
+/// to [`TRUNCATED_GAUSSIAN_V1`], but all simultaneous sources are accumulated
+/// per cell in F64 and rounded once to F32 per tick, eliminating M-fold
+/// coherent F32 rounding bias in high-source energy-rich worlds.
+pub const TRUNCATED_GAUSSIAN_FUSED_V1: &str =
+    "normalized-truncated-minimum-image-gaussian-fused-v1";
 
 /// The chemical-direction policy this module implements: a source's
 /// direction never changes.
@@ -44,15 +51,31 @@ pub const FIXED_PER_SOURCE: &str = "fixed-per-source";
 pub struct SourceKernel {
     sigma: f64,
     radius: f64,
+    fused: bool,
 }
 
 impl SourceKernel {
     /// A kernel of width `sigma` (world-length) truncated at
-    /// `cutoff_sigma × sigma`.
+    /// `cutoff_sigma × sigma` using sequential per-source F32 rounding
+    /// ([`TRUNCATED_GAUSSIAN_V1`]).
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless both are finite and positive.
     pub fn new(sigma: f64, cutoff_sigma: f64) -> Result<Self, CoreError> {
+        Self::with_mode(sigma, cutoff_sigma, false)
+    }
+
+    /// A fused kernel of width `sigma` truncated at `cutoff_sigma × sigma`
+    /// ([`TRUNCATED_GAUSSIAN_FUSED_V1`]): accumulates simultaneous sources per
+    /// cell in F64 and rounds once to F32 per tick.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless both are finite and positive.
+    pub fn new_fused(sigma: f64, cutoff_sigma: f64) -> Result<Self, CoreError> {
+        Self::with_mode(sigma, cutoff_sigma, true)
+    }
+
+    fn with_mode(sigma: f64, cutoff_sigma: f64, fused: bool) -> Result<Self, CoreError> {
         let radius = sigma * cutoff_sigma;
         for (quantity, value) in [
             ("sources.sigma_world_units", sigma),
@@ -66,7 +89,18 @@ impl SourceKernel {
                 });
             }
         }
-        Ok(Self { sigma, radius })
+        Ok(Self {
+            sigma,
+            radius,
+            fused,
+        })
+    }
+
+    /// Whether simultaneous sources fuse in F64 per cell before one F32 store
+    /// (`flife-ze4`).
+    #[must_use]
+    pub const fn is_fused(&self) -> bool {
+        self.fused
     }
 
     /// The kernel a validated configuration declares.
@@ -76,8 +110,16 @@ impl SourceKernel {
     /// chemical-direction policy, and the errors of [`SourceKernel::new`].
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let sources = &config.config().sources;
+        let fused = match sources.kernel.as_str() {
+            TRUNCATED_GAUSSIAN_V1 => false,
+            TRUNCATED_GAUSSIAN_FUSED_V1 => true,
+            other => {
+                return Err(CoreError::MissingCapability {
+                    capability: format!("source kernel `{other}`"),
+                });
+            }
+        };
         for (role, name, implemented) in [
-            ("source kernel", &sources.kernel, TRUNCATED_GAUSSIAN_V1),
             (
                 "source normalization",
                 &sources.spatial_normalization,
@@ -95,7 +137,11 @@ impl SourceKernel {
                 });
             }
         }
-        Self::new(sources.sigma_world_units, sources.kernel_cutoff_sigma)
+        Self::with_mode(
+            sources.sigma_world_units,
+            sources.kernel_cutoff_sigma,
+            fused,
+        )
     }
 
     /// `σ` in world-length.
@@ -630,6 +676,118 @@ pub fn deposit_energy(
         normalized_total,
         applied,
     })
+}
+
+/// Fused energy deposition for [`TRUNCATED_GAUSSIAN_FUSED_V1`] (`flife-ze4`):
+/// accumulates every simultaneous source's energy contribution per cell in F64
+/// (in source order) and rounds each touched cell once to F32. Records each
+/// source's per-cell amounts into its support for the moment planes.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if a support cell falls outside `state`, or
+/// [`CoreError::AllocationFailed`] if `accum` cannot hold the grid's cells.
+pub fn deposit_energy_fused(
+    state: &mut FieldState,
+    sources: &[Source],
+    step: TimeStep,
+    supports: &mut [SourceSupport],
+    accum: &mut Vec<f64>,
+) -> Result<Vec<DepositReport>, CoreError> {
+    let energy = state.energy_mut();
+    let cells = energy.len();
+    if accum.len() < cells {
+        let extra = cells - accum.len();
+        accum
+            .try_reserve_exact(extra)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "fused source energy accumulator",
+                bytes: bytes_for::<f64>(cells),
+            })?;
+        accum.resize(cells, 0.0);
+    }
+    let deltas = &mut accum[..cells];
+    deltas.fill(0.0);
+
+    let mut reports = Vec::with_capacity(sources.len());
+    for (source, support) in sources.iter().zip(supports.iter_mut()) {
+        let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
+        let mut normalized_total = 0.0;
+        support.amounts.clear();
+        for (index, weight) in support
+            .cells
+            .iter()
+            .map(|&(index, weight)| (index, weight / support.weight_sum))
+        {
+            let amount = declared * weight;
+            normalized_total += amount;
+            let slot = deltas.get_mut(index).ok_or_else(outside)?;
+            *slot += amount;
+            support.amounts.push(amount);
+        }
+        reports.push(DepositReport {
+            source: source.id,
+            support_cells: support.len(),
+            declared,
+            normalized_total,
+            applied: normalized_total,
+        });
+    }
+
+    let mut total_applied = 0.0;
+    for (cell, &delta) in energy.iter_mut().zip(deltas.iter()) {
+        if delta != 0.0 {
+            let before = f64::from(*cell);
+            let after = (before + delta) as f32;
+            total_applied += f64::from(after) - before;
+            *cell = after;
+        }
+    }
+    if let Some((last, leading)) = reports.split_last_mut() {
+        let leading_applied: f64 = leading.iter().map(|r| r.applied).sum();
+        last.applied = total_applied - leading_applied;
+    }
+    Ok(reports)
+}
+
+/// Fused moment deposition for one plane (`flife-ze4`): sums every source's
+/// `amount * component` per cell in source order in F64 and rounds each touched
+/// cell once to F32.
+pub(crate) fn deposit_moments_fused(
+    plane: &mut [f32],
+    sources: &[Source],
+    channel: usize,
+    supports: &[SourceSupport],
+    accum: &mut Vec<f64>,
+) -> Result<(), CoreError> {
+    let cells = plane.len();
+    if accum.len() < cells {
+        let extra = cells - accum.len();
+        accum
+            .try_reserve_exact(extra)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "fused source moment accumulator",
+                bytes: bytes_for::<f64>(cells),
+            })?;
+        accum.resize(cells, 0.0);
+    }
+    let deltas = &mut accum[..cells];
+    deltas.fill(0.0);
+    for (source, support) in sources.iter().zip(supports) {
+        let c = component(source, channel);
+        if c == 0.0 {
+            continue;
+        }
+        for (&(index, _), &amount) in support.cells.iter().zip(&support.amounts) {
+            let slot = deltas.get_mut(index).ok_or_else(outside)?;
+            *slot += amount * c;
+        }
+    }
+    for (moment, &delta) in plane.iter_mut().zip(deltas.iter()) {
+        if delta != 0.0 {
+            *moment = (f64::from(*moment) + delta) as f32;
+        }
+    }
+    Ok(())
 }
 
 /// One moment plane's part of [`deposit`]: `component` of each amount

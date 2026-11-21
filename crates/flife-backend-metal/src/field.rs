@@ -28,7 +28,7 @@ use flife_field::grid::FIELD_PLANES;
 use flife_field::{
     ConeTolerance, DepositSummary, Deposits, FieldBackend, FieldGrid, FieldLayout, FieldPair,
     FieldScan, FieldState, FieldStepReport, Grants, Source, SourceKernel, SourceSupport,
-    TransportPlan, deposit_energy, energy_report, step_report,
+    TransportPlan, deposit_energy, deposit_energy_fused, energy_report, step_report,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -66,7 +66,7 @@ const NOT_CANDIDATE: u32 = u32::MAX;
 /// Words of the stencil, weights-header and moments parameters.
 const STENCIL_WORDS: usize = 10;
 const HEADER_WORDS: usize = 14;
-const MOMENT_WORDS: usize = 7;
+const MOMENT_WORDS: usize = 8;
 
 /// Threads per threadgroup.
 const THREADS: usize = 256;
@@ -123,6 +123,7 @@ struct Host {
     ranks: Vec<u32>,
     weights: Vec<u32>,
     supports: Vec<SourceSupport>,
+    fused_accum: Vec<f64>,
 }
 
 /// Phase 2 of the tick on Metal; see the module documentation.
@@ -359,6 +360,7 @@ impl FieldBackend for MetalField {
             u32::from(plan.decay_factor() != 1.0),
         ]);
         put(&mut moment_params, 5, plan.decay_factor());
+        moment_params[7] = u32::from(kernel.is_fused());
         owner
             .write(buffers.field.buffer())?
             .write(0, pair.current().as_slice())?;
@@ -446,52 +448,109 @@ impl FieldBackend for MetalField {
             &mut host.energy,
         );
         next.energy_mut().copy_from_slice(&host.energy);
-        let mut deposits = Vec::with_capacity(count);
-        for (index, (source, support)) in sources.iter().zip(&mut host.supports).enumerate() {
-            let descriptor = &host.descriptors[index * DESCRIPTOR..][..DESCRIPTOR];
-            let first = descriptor[FIRST] as usize;
-            let candidates = descriptor[ROWS] as usize * descriptor[COLUMNS] as usize;
-            let mut weights = host.weights[2 * first..2 * (first + candidates)]
-                .as_chunks::<2>()
-                .0
-                .iter();
-            kernel.weigh_into(&grid, source.center(), support, |_, _| {
-                let pair = weights.next().ok_or_else(mismatch)?;
-                match u64::from(pair[0]) | (u64::from(pair[1]) << 32) {
-                    ABSENT => Ok(None),
-                    REFUSED => Err(CoreError::NumericalInvalid {
-                        quantity: "world displacement",
-                        detail: "the device refused a source displacement".to_owned(),
-                    }),
-                    bits => Ok(Some(f64::from_bits(bits))),
-                }
-            })?;
-            deposits.push(deposit_energy(next, source, step, support)?);
-            // Each present candidate's weight gives way to its amount, the
-            // value the reference deposits on the moment planes.
-            let mut amounts = support.amounts().iter();
-            for pair in host.weights[2 * first..2 * (first + candidates)]
-                .as_chunks_mut::<2>()
-                .0
-            {
-                if u64::from(pair[0]) | (u64::from(pair[1]) << 32) == ABSENT {
-                    continue;
-                }
-                let amount = *amounts.next().ok_or_else(mismatch)?;
-                // A non-finite amount could alias a marker; the reference
-                // takes such a step.
-                if !amount.is_finite() {
-                    return Err(CoreError::NumericalInvalid {
-                        quantity: "source amount",
-                        detail: "a source deposits a non-finite amount".to_owned(),
-                    });
-                }
-                *pair = words(amount);
+        let deposits = if kernel.is_fused() {
+            for (index, (source, support)) in sources.iter().zip(&mut host.supports).enumerate() {
+                let descriptor = &host.descriptors[index * DESCRIPTOR..][..DESCRIPTOR];
+                let first = descriptor[FIRST] as usize;
+                let candidates = descriptor[ROWS] as usize * descriptor[COLUMNS] as usize;
+                let mut weights = host.weights[2 * first..2 * (first + candidates)]
+                    .as_chunks::<2>()
+                    .0
+                    .iter();
+                kernel.weigh_into(&grid, source.center(), support, |_, _| {
+                    let pair = weights.next().ok_or_else(mismatch)?;
+                    match u64::from(pair[0]) | (u64::from(pair[1]) << 32) {
+                        ABSENT => Ok(None),
+                        REFUSED => Err(CoreError::NumericalInvalid {
+                            quantity: "world displacement",
+                            detail: "the device refused a source displacement".to_owned(),
+                        }),
+                        bits => Ok(Some(f64::from_bits(bits))),
+                    }
+                })?;
             }
-            if amounts.next().is_some() {
-                return Err(mismatch());
+            let deposits = deposit_energy_fused(
+                next,
+                sources,
+                step,
+                &mut host.supports[..count],
+                &mut host.fused_accum,
+            )?;
+            for (index, support) in host.supports.iter().take(count).enumerate() {
+                let descriptor = &host.descriptors[index * DESCRIPTOR..][..DESCRIPTOR];
+                let first = descriptor[FIRST] as usize;
+                let candidates = descriptor[ROWS] as usize * descriptor[COLUMNS] as usize;
+                let mut amounts = support.amounts().iter();
+                for pair in host.weights[2 * first..2 * (first + candidates)]
+                    .as_chunks_mut::<2>()
+                    .0
+                {
+                    if u64::from(pair[0]) | (u64::from(pair[1]) << 32) == ABSENT {
+                        continue;
+                    }
+                    let amount = *amounts.next().ok_or_else(mismatch)?;
+                    if !amount.is_finite() {
+                        return Err(CoreError::NumericalInvalid {
+                            quantity: "source amount",
+                            detail: "a source deposits a non-finite amount".to_owned(),
+                        });
+                    }
+                    *pair = words(amount);
+                }
+                if amounts.next().is_some() {
+                    return Err(mismatch());
+                }
             }
-        }
+            deposits
+        } else {
+            let mut deposits = Vec::with_capacity(count);
+            for (index, (source, support)) in sources.iter().zip(&mut host.supports).enumerate() {
+                let descriptor = &host.descriptors[index * DESCRIPTOR..][..DESCRIPTOR];
+                let first = descriptor[FIRST] as usize;
+                let candidates = descriptor[ROWS] as usize * descriptor[COLUMNS] as usize;
+                let mut weights = host.weights[2 * first..2 * (first + candidates)]
+                    .as_chunks::<2>()
+                    .0
+                    .iter();
+                kernel.weigh_into(&grid, source.center(), support, |_, _| {
+                    let pair = weights.next().ok_or_else(mismatch)?;
+                    match u64::from(pair[0]) | (u64::from(pair[1]) << 32) {
+                        ABSENT => Ok(None),
+                        REFUSED => Err(CoreError::NumericalInvalid {
+                            quantity: "world displacement",
+                            detail: "the device refused a source displacement".to_owned(),
+                        }),
+                        bits => Ok(Some(f64::from_bits(bits))),
+                    }
+                })?;
+                deposits.push(deposit_energy(next, source, step, support)?);
+                // Each present candidate's weight gives way to its amount, the
+                // value the reference deposits on the moment planes.
+                let mut amounts = support.amounts().iter();
+                for pair in host.weights[2 * first..2 * (first + candidates)]
+                    .as_chunks_mut::<2>()
+                    .0
+                {
+                    if u64::from(pair[0]) | (u64::from(pair[1]) << 32) == ABSENT {
+                        continue;
+                    }
+                    let amount = *amounts.next().ok_or_else(mismatch)?;
+                    // A non-finite amount could alias a marker; the reference
+                    // takes such a step.
+                    if !amount.is_finite() {
+                        return Err(CoreError::NumericalInvalid {
+                            quantity: "source amount",
+                            detail: "a source deposits a non-finite amount".to_owned(),
+                        });
+                    }
+                    *pair = words(amount);
+                }
+                if amounts.next().is_some() {
+                    return Err(mismatch());
+                }
+            }
+            deposits
+        };
 
         // Command two: the moments, decayed and deposited.
         if entries > 0 {

@@ -1230,7 +1230,11 @@ mod tests {
     #[test]
     fn wave_mutator_bounds_staging_per_wave_and_falls_back_cleanly_on_error() {
         let config = ValidatedConfig::from_toml(PRESET).expect("preset");
-        let rules = Rules::from_config(&config).expect("rules");
+        let rules = Rules::from_config(
+            &config,
+            crate::NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("rules");
         let catalog = TopologyCatalog::from_config(&config).expect("catalog");
         let limits = TraitLimits::from_config(&config).expect("limits");
         let reproduction = Reproduction::from_config(&config).expect("reproduction");
@@ -1240,16 +1244,17 @@ mod tests {
             .map(|id| {
                 founder(
                     &rules.rng,
-                    &catalog,
-                    limits,
-                    initial_scale(&config).expect("scale"),
                     OrganismId::new(id),
                     GenomeId::new(id),
+                    &catalog,
                     &mut quota,
+                    &limits,
+                    initial_scale(&config),
                 )
                 .expect("founder")
             })
             .collect();
+        let budget = EnergyBudget::new(9.0).expect("budget");
         let requests: Vec<BirthRequest<'_>> = parents
             .iter()
             .zip(1_u64..)
@@ -1262,7 +1267,7 @@ mod tests {
                     cooldown_deadline: Tick::ZERO,
                 };
                 let intent = match reproduction
-                    .attempted(&parent, Tick::new(5), 9.0, 0.5)
+                    .attempted(&parent, Tick::new(5), 0.5, &budget)
                     .expect("viable")
                 {
                     ReproductionProposal::Intent(intent) => intent,

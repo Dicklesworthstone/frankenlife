@@ -146,7 +146,7 @@ kernel void source_weights(
 // `f32(f64(m) + q·a)`). The amounts `q` are the host's: `deposit_energy`
 // computes them for the energy plane, and the host writes each over its
 // candidate's weight, leaving the absent ones marked.
-// params: cells, width, height, sources, decays, factor.
+// params: cells, width, height, sources, decays, factor (2 words), fused.
 kernel void source_moments(
     device const uint *diffused [[buffer(0)]],
     device const uint *params [[buffer(1)]],
@@ -170,25 +170,53 @@ kernel void source_moments(
     if (params[4] != 0u) {
         bits = d_to_f32_bits(d_mul(d_from_f32_bits(bits), d_word(params, 5u)));
     }
-    for (uint j = 0u; j < sources; ++j) {
-        device const uint *d = descriptors + j * DESCRIPTOR;
-        d64 component = d_word(d, DIRECTION + 2u * channel);
-        if ((component << 1) == 0ul) {
-            continue;
+    bool fused = params[7] != 0u;
+    if (fused) {
+        d64 delta = 0ul;
+        for (uint j = 0u; j < sources; ++j) {
+            device const uint *d = descriptors + j * DESCRIPTOR;
+            d64 component = d_word(d, DIRECTION + 2u * channel);
+            if ((component << 1) == 0ul) {
+                continue;
+            }
+            uint column = ranks[j * (width + height) + x];
+            uint row = ranks[j * (width + height) + width + y];
+            if (column == NOT_CANDIDATE || row == NOT_CANDIDATE) {
+                continue;
+            }
+            d64 amount = d_word(amounts, 2u * (d[FIRST] + row * d[COLUMNS] + column));
+            if (amount == ABSENT) {
+                continue;
+            }
+            delta = d_add(delta, d_mul(amount, component));
         }
-        uint column = ranks[j * (width + height) + x];
-        uint row = ranks[j * (width + height) + width + y];
-        if (column == NOT_CANDIDATE || row == NOT_CANDIDATE) {
-            continue;
+        if ((delta << 1) != 0ul) {
+            if (!f32_finite(bits)) {
+                atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+            }
+            bits = d_to_f32_bits(d_add(d_from_f32_bits(bits), delta));
         }
-        d64 amount = d_word(amounts, 2u * (d[FIRST] + row * d[COLUMNS] + column));
-        if (amount == ABSENT) {
-            continue;
+    } else {
+        for (uint j = 0u; j < sources; ++j) {
+            device const uint *d = descriptors + j * DESCRIPTOR;
+            d64 component = d_word(d, DIRECTION + 2u * channel);
+            if ((component << 1) == 0ul) {
+                continue;
+            }
+            uint column = ranks[j * (width + height) + x];
+            uint row = ranks[j * (width + height) + width + y];
+            if (column == NOT_CANDIDATE || row == NOT_CANDIDATE) {
+                continue;
+            }
+            d64 amount = d_word(amounts, 2u * (d[FIRST] + row * d[COLUMNS] + column));
+            if (amount == ABSENT) {
+                continue;
+            }
+            if (!f32_finite(bits)) {
+                atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+            }
+            bits = d_to_f32_bits(d_add(d_from_f32_bits(bits), d_mul(amount, component)));
         }
-        if (!f32_finite(bits)) {
-            atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
-        }
-        bits = d_to_f32_bits(d_add(d_from_f32_bits(bits), d_mul(amount, component)));
     }
     moments[id] = bits;
 }

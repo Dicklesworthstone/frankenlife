@@ -960,3 +960,136 @@ fn source_supports_on_any_number_of_workers_are_the_serial_supports() {
         assert!(got == one, "{count} workers: {} against {}", got.0, one.0);
     }
 }
+
+/// `flife-ze4`: sequential per-source F32 rounding in Phase 2 multiplies
+/// coherent binade rounding error by the number of overlapping sources `M`,
+/// breaching the `1e-5` cumulative INV-03 allowance in energy-rich, near-empty
+/// worlds. `normalized-truncated-minimum-image-gaussian-fused-v1` sums all
+/// simultaneous sources per cell in F64 and rounds once to F32 per tick,
+/// eliminating that bias (>100x below `1e-5`), preserving INV-01/INV-02,
+/// agreeing bit-for-bit with `v1` for a single source, and staying bit-exact
+/// across worker counts.
+#[test]
+fn fused_source_kernel_eliminates_per_source_f32_rounding_bias() {
+    let grid = FieldGrid::new(32, 32, 32.0, 32.0).expect("grid");
+    let limits = BufferLimits::new(1 << 28);
+    let step = TimeStep::new(1, 32).expect("step");
+    let plan = TransportPlan::new(&grid, step, 0.327_384, 0.008_989_29).expect("plan");
+
+    let mut dir = [0.0; CHANNELS];
+    dir[0] = 1.0;
+    let sources: Vec<Source> = (0_u32..256)
+        .map(|i| {
+            let x = (f64::from(i % 16) + 0.5) * 2.0;
+            let y = (f64::from(i / 16) + 0.5) * 2.0;
+            let mut d = [0.0; CHANNELS];
+            d[(i as usize) % CHANNELS] = if i % 2 == 0 { 1.0 } else { -1.0 };
+            Source::new(SourceId::new(i), [x, y], d, 311.335).expect("source")
+        })
+        .collect();
+
+    // 1. Single-source bit-exact agreement between v1 and fused-v1.
+    let single_v1 = SourceKernel::new(4.0, 4.0).expect("v1");
+    let single_fused = SourceKernel::new_fused(4.0, 4.0).expect("fused");
+    let mut p_v1 = FieldPair::zeroed(grid, &limits).expect("pair");
+    let mut p_fused = FieldPair::zeroed(grid, &limits).expect("pair");
+    let mut s1 = TransportScratch::new(&grid, &limits).expect("scratch");
+    let mut sup1 = SourceSupport::new();
+    let r_v1 = advance_field(
+        &mut p_v1,
+        &plan,
+        &single_v1,
+        &sources[..1],
+        step,
+        &mut s1,
+        &mut sup1,
+    )
+    .expect("v1");
+    let r_fused = advance_field(
+        &mut p_fused,
+        &plan,
+        &single_fused,
+        &sources[..1],
+        step,
+        &mut s1,
+        &mut sup1,
+    )
+    .expect("fused");
+    assert_eq!(
+        r_v1.injected_declared.to_bits(),
+        r_fused.injected_declared.to_bits()
+    );
+    assert_eq!(r_v1.energy_after.to_bits(), r_fused.energy_after.to_bits());
+    assert_eq!(
+        p_v1.next()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        p_fused
+            .next()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "single-source fused must equal v1 bit for bit"
+    );
+
+    // 2. High-source (M=256) energy-rich near-empty world over 240 ticks:
+    //    legacy v1 accumulates coherent bias past 1e-5, while fused-v1 stays
+    //    well below 1e-7 and preserves INV-01 / INV-02.
+    let v1_kernel = SourceKernel::new(4.0, 4.0).expect("v1");
+    let fused_kernel = SourceKernel::new_fused(4.0, 4.0).expect("fused");
+    let run_ticks = |kernel: SourceKernel, workers: usize| -> (f64, Vec<u32>) {
+        let mut pair = FieldPair::zeroed(grid, &limits).expect("pair");
+        let mut work = FieldWork::new(
+            &grid,
+            &limits,
+            std::num::NonZeroUsize::new(workers).expect("nonzero"),
+        )
+        .expect("work");
+        work.reserve_supports(sources.len(), &kernel)
+            .expect("reserve");
+        let mut cum_residual = 0.0_f64;
+        let mut cum_turnover = 0.0_f64;
+        for _ in 0..240 {
+            let report = advance_field_on(&mut pair, &plan, &kernel, &sources, step, &mut work)
+                .expect("step");
+            cum_residual += report.residual;
+            cum_turnover += report.injected_declared + report.transport.decay_removed;
+            pair.commit();
+        }
+        pair.current()
+            .check_invariants(ConeTolerance::new(1e-6, 1e-5).expect("tol"))
+            .expect("INV-01 and INV-02");
+        let normalized = cum_residual.abs() / cum_turnover;
+        let bits = pair
+            .current()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        (normalized, bits)
+    };
+
+    let (v1_norm, _) = run_ticks(v1_kernel, 4);
+    let (fused_norm_1, fused_bits_1) = run_ticks(fused_kernel, 1);
+    let (fused_norm_4, fused_bits_4) = run_ticks(fused_kernel, 4);
+    assert_eq!(
+        fused_bits_1, fused_bits_4,
+        "fused source deposition must be bit-identical across worker counts"
+    );
+    assert!(
+        v1_norm > 1.0e-5,
+        "expected legacy v1 to reproduce flife-ze4 coherent drift > 1e-5, got {v1_norm:.3e}"
+    );
+    assert!(
+        fused_norm_4 < 1.0e-7,
+        "expected fused-v1 normalized residual < 1e-7, got {fused_norm_4:.3e}"
+    );
+    assert!(
+        v1_norm / fused_norm_4.max(1e-18) > 100.0,
+        "expected >100x reduction (v1={v1_norm:.3e}, fused={fused_norm_4:.3e})"
+    );
+    let _ = (fused_norm_1, dir);
+}

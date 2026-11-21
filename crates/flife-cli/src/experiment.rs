@@ -1006,6 +1006,74 @@ struct Execution<'a> {
     records_sha256: &'a str,
 }
 
+/// The Appendix B.1 `source` group: build revision, FrankenSuite pins,
+/// compiler, target and profile, with unavailable facts left `null`.
+pub(crate) fn source_group() -> serde_json::Value {
+    serde_json::json!({
+        "revision": build_fact(env!("FLIFE_REVISION")),
+        "suite": build_fact(env!("FLIFE_SUITE")).map(|suite| suite.split(',').collect::<Vec<_>>()),
+        "rustc": build_fact(env!("FLIFE_RUSTC")),
+        "target": build_fact(env!("FLIFE_TARGET")),
+        "profile": build_fact(env!("FLIFE_PROFILE")),
+    })
+}
+
+/// The Appendix B.1 configuration-derived groups (`model`, `numerics`,
+/// `clocks`, `capacity`, `provenance`) shared by experiment and standalone
+/// run manifests.
+pub(crate) fn config_groups(
+    config: &ValidatedConfig,
+    ticks: u64,
+    interventions: u64,
+) -> serde_json::Value {
+    let c = config.config();
+    let timestep = config.report().timestep;
+    serde_json::json!({
+        "model": {
+            "config_schema": CONFIG_SCHEMA,
+            "model": c.model,
+            "descriptor": ModelDescriptor::of(config).digest().to_hex(),
+            "config_hash": config.config_hash().to_hex(),
+            "frankenlife_version": env!("CARGO_PKG_VERSION"),
+        },
+        "numerics": {
+            "field_dtype": c.world.field_dtype,
+            "weight_dtype": c.controller.canonical_weight_dtype,
+            "accumulation_dtype": c.controller.accumulation_dtype,
+            "math_mode": c.execution.math_mode,
+            "determinism": c.execution.determinism,
+            "rng": c.mutation.rng,
+            "residual_budget": "reference-f32 (§21.4)",
+        },
+        "clocks": {
+            "timestep": [timestep.numerator(), timestep.denominator()],
+            "controller_interval_ticks": c.controller.evaluation_interval_ticks,
+            "phase_policy": c.controller.phase_policy,
+            "ticks": ticks,
+        },
+        "capacity": {
+            "maximum_count": c.population.maximum_count,
+            "maximum_parameters": c.architecture_mutation.maximum_parameters,
+            "maximum_logical_genome_bytes": c.execution.maximum_logical_genome_bytes,
+            "maximum_allocated_genome_bytes": c.execution.maximum_allocated_genome_bytes,
+            "maximum_total_bytes": c.execution.maximum_total_bytes,
+            "checkpoint_retained_bytes": c.execution.checkpoint_retained_bytes,
+            "command_queue_capacity": c.execution.command_queue_capacity,
+            "control_queue_capacity": c.execution.control_queue_capacity,
+            "render_queue_capacity": c.execution.render_queue_capacity,
+        },
+        "provenance": {
+            "seed": c.seed,
+            "founders": c.population.initial_count,
+            "initializer": c.controller.initializer,
+            "rng": c.mutation.rng,
+            "command_durability": c.execution.command_durability,
+            "interventions": interventions,
+            "source_path": c.sources.path,
+        },
+    })
+}
+
 /// A run manifest (Appendix B.1), grouped as the appendix groups it. It is
 /// not part of the report: it holds the host, the build and wall time.
 fn manifest(
@@ -1025,54 +1093,7 @@ fn manifest(
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let model = config.map(|config| {
-        let c = config.config();
-        let timestep = config.report().timestep;
-        serde_json::json!({
-            "model": {
-                "config_schema": CONFIG_SCHEMA,
-                "model": c.model,
-                "descriptor": ModelDescriptor::of(config).digest().to_hex(),
-                "config_hash": config.config_hash().to_hex(),
-                "frankenlife_version": env!("CARGO_PKG_VERSION"),
-            },
-            "numerics": {
-                "field_dtype": c.world.field_dtype,
-                "weight_dtype": c.controller.canonical_weight_dtype,
-                "accumulation_dtype": c.controller.accumulation_dtype,
-                "math_mode": c.execution.math_mode,
-                "determinism": c.execution.determinism,
-                "rng": c.mutation.rng,
-                "residual_budget": "reference-f32 (§21.4)",
-            },
-            "clocks": {
-                "timestep": [timestep.numerator(), timestep.denominator()],
-                "controller_interval_ticks": c.controller.evaluation_interval_ticks,
-                "phase_policy": c.controller.phase_policy,
-                "ticks": experiment.spec.ticks,
-            },
-            "capacity": {
-                "maximum_count": c.population.maximum_count,
-                "maximum_parameters": c.architecture_mutation.maximum_parameters,
-                "maximum_logical_genome_bytes": c.execution.maximum_logical_genome_bytes,
-                "maximum_allocated_genome_bytes": c.execution.maximum_allocated_genome_bytes,
-                "maximum_total_bytes": c.execution.maximum_total_bytes,
-                "checkpoint_retained_bytes": c.execution.checkpoint_retained_bytes,
-                "command_queue_capacity": c.execution.command_queue_capacity,
-                "control_queue_capacity": c.execution.control_queue_capacity,
-                "render_queue_capacity": c.execution.render_queue_capacity,
-            },
-            "provenance": {
-                "seed": c.seed,
-                "founders": c.population.initial_count,
-                "initializer": c.controller.initializer,
-                "rng": c.mutation.rng,
-                "command_durability": c.execution.command_durability,
-                "interventions": 0,
-                "source_path": c.sources.path,
-            },
-        })
-    });
+    let model = config.map(|config| config_groups(config, experiment.spec.ticks, 0));
     let ticks_per_second = (execution.wall_seconds > 0.0 && result.tick > 0)
         .then(|| real(result.tick) / execution.wall_seconds);
     let mut manifest = serde_json::json!({
@@ -1089,13 +1110,7 @@ fn manifest(
             "parent": serde_json::Value::Null,
             "created_unix_seconds": created,
         },
-        "source": {
-            "revision": build_fact(env!("FLIFE_REVISION")),
-            "suite": build_fact(env!("FLIFE_SUITE")).map(|suite| suite.split(',').collect::<Vec<_>>()),
-            "rustc": build_fact(env!("FLIFE_RUSTC")),
-            "target": build_fact(env!("FLIFE_TARGET")),
-            "profile": build_fact(env!("FLIFE_PROFILE")),
-        },
+        "source": source_group(),
         "hardware": {
             "host": host,
             "cpu_workers": execution.cpu_workers,

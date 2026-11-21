@@ -52,7 +52,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 
@@ -86,6 +86,8 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub const CATALOG_FILE: &str = "catalog.db";
 /// The chunk store of the run's checkpoints.
 pub const STORE_DIR: &str = "store";
+/// The run's Appendix B.1 manifest (`frankenlife.run-manifest.v1`).
+pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// Where and how a run keeps itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +525,207 @@ pub fn create(run_dir: &Path, config: &ValidatedConfig) -> Result<(), CoreError>
         .map_err(|error| storage("flush run directory", run_dir, &error))
 }
 
+/// Write `manifest` (`frankenlife.run-manifest.v1`, Appendix B.1) into
+/// `run_dir/manifest.json` through a temporary file renamed into place,
+/// flushed under `durability`. Truncates any orphaned `.partial` file from
+/// an earlier crash so resuming always succeeds.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] if serialization fails;
+/// [`CoreError::StorageFailed`] on filesystem I/O failure.
+pub(crate) fn write_manifest(
+    run_dir: &Path,
+    manifest: &serde_json::Value,
+    durability: StoreDurability,
+) -> Result<(), CoreError> {
+    let mut text =
+        serde_json::to_string_pretty(manifest).map_err(|error| CoreError::StateConflict {
+            operation: "encode run manifest",
+            detail: error.to_string(),
+        })?;
+    text.push('\n');
+    let temporary = run_dir.join(format!("{MANIFEST_FILE}.partial"));
+    let path = run_dir.join(MANIFEST_FILE);
+    let mut file = File::create(&temporary)
+        .map_err(|error| storage("write run manifest", &temporary, &error))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| storage("write run manifest", &temporary, &error))?;
+    if durability == StoreDurability::PowerLoss {
+        file.sync_all()
+            .map_err(|error| storage("flush run manifest", &temporary, &error))?;
+    }
+    drop(file);
+    fs::rename(&temporary, &path)
+        .map_err(|error| storage("publish run manifest", &path, &error))?;
+    if durability == StoreDurability::PowerLoss {
+        File::open(run_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| storage("flush run directory", run_dir, &error))?;
+    }
+    Ok(())
+}
+
+/// Destination for writing `manifest.json` when a persisted run or resume
+/// completes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RunManifestTarget<'a> {
+    pub run_dir: &'a Path,
+    pub durability: StoreDurability,
+    pub kind: &'static str,
+}
+
+/// Build an Appendix B.1 `frankenlife.run-manifest.v1` JSON object for a
+/// standalone run directory (`run`, `resume`, `branch`, or `transplant`).
+pub(crate) fn build_manifest(
+    config: &ValidatedConfig,
+    ticks: u64,
+    interventions: u64,
+    identity: serde_json::Value,
+    hardware: serde_json::Value,
+    results: serde_json::Value,
+    artifacts: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let mut manifest = serde_json::json!({
+        "schema": crate::experiment::MANIFEST_SCHEMA,
+        "identity": identity,
+        "source": crate::experiment::source_group(),
+        "hardware": hardware,
+        "results": results,
+        "artifacts": artifacts,
+    });
+    if let (serde_json::Value::Object(groups), serde_json::Value::Object(out)) = (
+        crate::experiment::config_groups(config, ticks, interventions),
+        &mut manifest,
+    ) {
+        out.extend(groups);
+    }
+    manifest
+}
+
+/// Read the transplant parent provenance from `run_dir/transplant.json` if
+/// present, so resuming a transplant preserves its origin in `manifest.json`.
+fn transplant_parent(run_dir: &Path) -> Option<serde_json::Value> {
+    let text = fs::read_to_string(run_dir.join(crate::transplant::TRANSPLANT_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("package").map(|package| {
+        serde_json::json!({
+            "kind": "package",
+            "package": package,
+        })
+    })
+}
+
+/// Build and durably write `manifest.json` for a completed persisted run or
+/// resume (`flife run --run-dir`, `flife resume`, `flife step`).
+pub(crate) fn write_run_manifest(
+    target: RunManifestTarget<'_>,
+    closed: &flife_runtime::SessionClosed,
+    stop: &crate::run::Stop,
+    tally: &crate::observe::Tally,
+    survey: &crate::observe::Survey,
+    controllers: &ControllerSummary,
+    checkpoint: Option<(CheckpointAt, Option<Sha256Digest>)>,
+    wall_seconds: f64,
+) -> Result<(), CoreError> {
+    let config = closed.world.config();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let session = closed.book.session();
+    let lineage = closed.book.lineage();
+    let parent = if let Some(fork) = lineage.last() {
+        serde_json::json!({
+            "kind": "branch",
+            "parent_session": fork.parent.get(),
+            "admitted": fork.admitted,
+            "tick": fork.tick.get(),
+            "checkpoint_sha256": fork.checkpoint.to_hex(),
+            "lineage": lineage
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "parent": entry.parent.get(),
+                    "admitted": entry.admitted,
+                    "tick": entry.tick.get(),
+                    "sha256": entry.checkpoint.to_hex(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    } else if session != RUN_SESSION {
+        transplant_parent(target.run_dir).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    };
+    let (status, detail) = match stop {
+        crate::run::Stop::Reached => ("reached", None),
+        crate::run::Stop::CapacityPaused { detail } => ("capacity-paused", Some(detail.clone())),
+        crate::run::Stop::Failed { kind, detail, .. } => {
+            ("failed", Some(format!("{kind}: {detail}")))
+        }
+    };
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "throughput rate is approximate wall telemetry"
+    )]
+    let ticks_per_second =
+        (wall_seconds > 0.0 && tally.ticks > 0).then(|| (tally.ticks as f64) / wall_seconds);
+    let mut artifacts = vec![serde_json::json!({
+        "path": CONFIG_FILE,
+        "sha256": config.config_hash().to_hex(),
+    })];
+    if let Some((at, sha256)) = checkpoint {
+        let mut entry = serde_json::json!({
+            "kind": "checkpoint",
+            "sequence": at.sequence,
+            "tick": at.tick,
+        });
+        if let (Some(digest), serde_json::Value::Object(map)) = (sha256, &mut entry) {
+            map.insert(
+                "sha256".to_owned(),
+                serde_json::Value::String(digest.to_hex()),
+            );
+        }
+        artifacts.push(entry);
+    }
+    let identity = serde_json::json!({
+        "run": config.config().name,
+        "kind": target.kind,
+        "session": session.get(),
+        "parent": parent,
+        "created_unix_seconds": created,
+    });
+    let hardware = serde_json::json!({
+        "host": crate::experiment::Host::current(),
+        "cpu_workers": closed.world.cpu_workers(),
+        "controllers": controllers,
+    });
+    let mut results = serde_json::json!({
+        "status": status,
+        "tick": closed.boundary.tick.get(),
+        "digest": closed.world.digest().to_hex(),
+        "extinct": survey.live == 0,
+        "live": survey.live,
+        "ticks_published": tally.ticks,
+        "births": tally.births,
+        "deaths": tally.deaths,
+        "normalized_residual": tally.normalized_residual,
+        "wall_seconds": wall_seconds,
+        "ticks_per_second": ticks_per_second,
+    });
+    if let (Some(detail), serde_json::Value::Object(map)) = (detail, &mut results) {
+        map.insert("detail".to_owned(), serde_json::Value::String(detail));
+    }
+    let manifest = build_manifest(
+        config,
+        closed.boundary.tick.get(),
+        closed.book.admitted(),
+        identity,
+        hardware,
+        results,
+        artifacts,
+    );
+    write_manifest(target.run_dir, &manifest, target.durability)
+}
+
 /// The configuration `run_dir` holds.
 ///
 /// # Errors
@@ -676,6 +879,7 @@ pub struct Checkpoints {
     every: u64,
     admission: CheckpointAdmission,
     last: Option<CheckpointAt>,
+    last_sha256: Option<Sha256Digest>,
     in_flight: Option<InFlight>,
 }
 
@@ -841,6 +1045,7 @@ impl Checkpoints {
             every: persistence.checkpoint_every,
             admission,
             last: None,
+            last_sha256: None,
             in_flight: None,
         })
     }
@@ -874,13 +1079,18 @@ impl Checkpoints {
                 reason: skipped.reason,
             })
             .collect();
-        let restored = recovered.latest.map(|(sequence, restored)| {
-            self.last = Some(CheckpointAt {
-                sequence,
-                tick: restored.world.tick().get(),
-            });
-            restored
-        });
+        let restored = match recovered.latest {
+            Some((sequence, restored)) => {
+                let sha256 = self.store()?.verify(sequence)?;
+                self.last = Some(CheckpointAt {
+                    sequence,
+                    tick: restored.world.tick().get(),
+                });
+                self.last_sha256 = Some(sha256);
+                Some(restored)
+            }
+            None => None,
+        };
         Ok((restored, skipped))
     }
 
@@ -899,6 +1109,12 @@ impl Checkpoints {
     #[must_use]
     pub const fn last(&self) -> Option<CheckpointAt> {
         self.last
+    }
+
+    /// The verified container SHA-256 of [`Checkpoints::last`], if known.
+    #[must_use]
+    pub const fn last_sha256(&self) -> Option<Sha256Digest> {
+        self.last_sha256
     }
 
     /// The tick of [`Checkpoints::last`].
@@ -1023,6 +1239,7 @@ impl Checkpoints {
                             sequence,
                             tick: boundary.tick.get(),
                         });
+                        self.last_sha256 = None;
                     }
                     Err(error) => {
                         // Join the writer. When it stopped first, its own
@@ -1111,6 +1328,7 @@ impl Checkpoints {
         };
         if self.last.is_none_or(|last| last.sequence <= at.sequence) {
             self.last = Some(at);
+            self.last_sha256 = Some(filed.committed.digest);
         }
         Record::Checkpoint {
             schema: RUN_SCHEMA,
@@ -1441,7 +1659,16 @@ pub fn resume(
         metrics,
     };
     let driven = drive(owner, handle, plan, Some(checkpoints), emit, clock)?;
-    Ok(finish(driven, Some(run_dir), limits.durability, clock))
+    finish(
+        driven,
+        Some(RunManifestTarget {
+            run_dir,
+            durability: options.durability,
+            kind: "resume",
+        }),
+        limits.durability,
+        clock,
+    )
 }
 
 #[cfg(test)]

@@ -58,6 +58,7 @@
 //! [`World::graft_bytes`]: flife_engine::World::graft_bytes
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::SessionId;
@@ -73,7 +74,8 @@ use crate::checkpointing::{self, CheckpointMode};
 use crate::discovery::publish;
 use crate::package::{PackageSource, read_package};
 use crate::persist::{
-    CATALOG_FILE, Checkpoints, Persistence, StoreDurability, create, on_plain_thread, vacant,
+    CATALOG_FILE, CONFIG_FILE, Checkpoints, Persistence, StoreDurability, build_manifest, create,
+    on_plain_thread, vacant, write_manifest,
 };
 use crate::run::{CheckpointAt, RUN_SCHEMA, RUN_SESSION, Record, found};
 
@@ -311,16 +313,19 @@ pub fn transplant(
     else {
         return Err(conflict("the founding checkpoint was not published".into()));
     };
+    let transplant_package = TransplantPackage {
+        dir: package_dir.display().to_string(),
+        sha256: package.world.sha256,
+        digest: package.world.digest,
+        source: package.source,
+    };
+    let grafted_digest = world.digest().to_hex();
+    let live = world.population().len();
     let record = Record::Transplant {
         schema: RUN_SCHEMA,
-        name,
+        name: name.clone(),
         session: session.get(),
-        package: TransplantPackage {
-            dir: package_dir.display().to_string(),
-            sha256: package.world.sha256,
-            digest: package.world.digest,
-            source: package.source,
-        },
+        package: transplant_package.clone(),
         host: TransplantHost {
             config_hash: revision.to_hex(),
             founders,
@@ -345,9 +350,9 @@ pub fn transplant(
             sequence,
             tick: world.tick().get(),
         },
-        sha256,
+        sha256: sha256.clone(),
         bytes,
-        digest: world.digest().to_hex(),
+        digest: grafted_digest.clone(),
         memory: Box::new(memory),
     };
     let mut text =
@@ -356,11 +361,59 @@ pub fn transplant(
             detail: error.to_string(),
         })?;
     text.push('\n');
+    let transplant_sha256 = Sha256Digest::of(text.as_bytes()).to_hex();
     publish(
         run_dir,
         TRANSPLANT_FILE,
         text.as_bytes(),
         options.durability,
     )?;
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let manifest = build_manifest(
+        host,
+        world.tick().get(),
+        book.admitted(),
+        serde_json::json!({
+            "run": name,
+            "kind": "transplant",
+            "session": session.get(),
+            "parent": {
+                "kind": "package",
+                "package": transplant_package,
+            },
+            "created_unix_seconds": created,
+        }),
+        serde_json::json!({
+            "host": crate::experiment::Host::current(),
+            "cpu_workers": serde_json::Value::Null,
+            "controllers": serde_json::Value::Null,
+        }),
+        serde_json::json!({
+            "status": "founded",
+            "tick": world.tick().get(),
+            "digest": grafted_digest,
+            "extinct": live == 0,
+            "live": live,
+        }),
+        vec![
+            serde_json::json!({
+                "path": CONFIG_FILE,
+                "sha256": revision.to_hex(),
+            }),
+            serde_json::json!({
+                "kind": "checkpoint",
+                "sequence": sequence,
+                "tick": world.tick().get(),
+                "sha256": sha256,
+            }),
+            serde_json::json!({
+                "path": TRANSPLANT_FILE,
+                "sha256": transplant_sha256,
+            }),
+        ],
+    );
+    write_manifest(run_dir, &manifest, options.durability)?;
     Ok(record)
 }

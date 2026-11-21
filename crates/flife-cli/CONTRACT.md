@@ -407,7 +407,11 @@ texel scratch) into `MemoryAdmission::render` before creating a run directory or
   unreadable file. Exit status is 0 on success, 1 when a run stops early (a capacity pause or a failed tick), and 2
   for an unreadable or invalid configuration, a refused session or a refused run directory.
 - A run directory (FL-037) holds `config.toml` (the configuration's canonical TOML, written, flushed and renamed
-  into place), `catalog.db` (the run catalog and command journal) and `store/` (the chunk store). A branch's catalog also records
+  into place), `catalog.db` (the run catalog and command journal), `store/` (the chunk store), and `manifest.json`
+  (`frankenlife.run-manifest.v1`, Appendix B.1: identity, model, source pins, numerics, clocks, hardware, capacity,
+  provenance with actual admitted intervention count, results, and artifacts including `config.toml` and the newest
+  checkpoint's verified SHA-256, updated atomically on `flife run --run-dir`, `flife resume`, `flife step`,
+  `flife branch`, and `flife transplant`). A branch's catalog also records
   its lineage and its origin: the name, the parent run, the parent checkpoint's sequence and the creation time.
 - In `flife-core`, FL-015 adds `CoreError::kind`, a stable kebab-case class name, distinct for every variant.
 - `frankenlife.inspect.v1` (`flife inspect`): an `inspect` record (the checkpoint's sequence, tick and SHA-256, the

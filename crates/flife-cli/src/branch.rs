@@ -45,8 +45,9 @@ use flife_store::{BranchOrigin, ChunkStore, CommandJournal};
 use serde::Serialize;
 
 use crate::persist::{
-    CATALOG_FILE, Checkpoints, Persistence, STORE_DIR, ScheduledCommand, StoreDurability, create,
-    on_plain_thread, read_config, restorable, run_identity, scheduled,
+    CATALOG_FILE, CONFIG_FILE, Checkpoints, Persistence, STORE_DIR, ScheduledCommand,
+    StoreDurability, build_manifest, create, on_plain_thread, read_config, restorable,
+    run_identity, scheduled, write_manifest,
 };
 use crate::run::{CheckpointAt, RUN_SCHEMA, Record};
 
@@ -254,26 +255,75 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
     else {
         return Err(conflict("the founding checkpoint was not published".into()));
     };
+    let world_digest = world.digest().to_hex();
+    let parent_record = BranchParent {
+        run_dir: parent.display().to_string(),
+        session: parent_session.get(),
+        sequence,
+        tick: tick.get(),
+        sha256: digest.to_hex(),
+    };
+    let lineage_records: Vec<ForkRecord> = lineage
+        .iter()
+        .map(|fork| ForkRecord {
+            parent: fork.parent.get(),
+            admitted: fork.admitted,
+            tick: fork.tick.get(),
+            sha256: fork.checkpoint.to_hex(),
+        })
+        .collect();
+    let live = world.population().len();
+    let manifest = build_manifest(
+        &config,
+        tick.get(),
+        book.admitted(),
+        serde_json::json!({
+            "run": name,
+            "kind": "branch",
+            "session": session.get(),
+            "parent": {
+                "kind": "branch",
+                "parent_run_dir": parent_record.run_dir,
+                "parent_session": parent_record.session,
+                "parent_sequence": parent_record.sequence,
+                "tick": parent_record.tick,
+                "checkpoint_sha256": parent_record.sha256,
+                "lineage": lineage_records,
+            },
+            "created_unix_seconds": origin.created_unix_seconds,
+        }),
+        serde_json::json!({
+            "host": crate::experiment::Host::current(),
+            "cpu_workers": serde_json::Value::Null,
+            "controllers": serde_json::Value::Null,
+        }),
+        serde_json::json!({
+            "status": "founded",
+            "tick": tick.get(),
+            "digest": world_digest,
+            "extinct": live == 0,
+            "live": live,
+        }),
+        vec![
+            serde_json::json!({
+                "path": CONFIG_FILE,
+                "sha256": revision.to_hex(),
+            }),
+            serde_json::json!({
+                "kind": "checkpoint",
+                "sequence": founding,
+                "tick": tick.get(),
+                "sha256": sha256,
+            }),
+        ],
+    );
+    write_manifest(run_dir, &manifest, options.durability)?;
     Ok(Record::Branch {
         schema: RUN_SCHEMA,
         name,
         session: session.get(),
-        parent: BranchParent {
-            run_dir: parent.display().to_string(),
-            session: parent_session.get(),
-            sequence,
-            tick: tick.get(),
-            sha256: digest.to_hex(),
-        },
-        lineage: lineage
-            .iter()
-            .map(|fork| ForkRecord {
-                parent: fork.parent.get(),
-                admitted: fork.admitted,
-                tick: fork.tick.get(),
-                sha256: fork.checkpoint.to_hex(),
-            })
-            .collect(),
+        parent: parent_record,
+        lineage: lineage_records,
         inherited,
         commands,
         checkpoint: CheckpointAt {
@@ -286,7 +336,7 @@ pub fn branch(parent: &Path, run_dir: &Path, options: &BranchOptions) -> Result<
             written: written.saturating_sub(linked),
             linked,
         },
-        digest: world.digest().to_hex(),
+        digest: world_digest,
     })
 }
 

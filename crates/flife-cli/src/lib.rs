@@ -126,9 +126,9 @@ pub use package::{
     PACKAGE_WORLD_FILE, Package, PackageSource, PackageWorld, read_package, write_package,
 };
 pub use persist::{
-    CATALOG_FILE, CONFIG_FILE, Checkpoints, Injection, Introduction, Material, Persistence,
-    Recovered, Removal, ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability, create,
-    open_session, recover, restore_checkpoint, resume, vacant,
+    CATALOG_FILE, CONFIG_FILE, Checkpoints, Injection, Introduction, MANIFEST_FILE, Material,
+    Persistence, Recovered, Removal, ResumeOptions, STORE_DIR, ScheduledCommand, StoreDurability,
+    create, open_session, recover, restore_checkpoint, resume, vacant,
 };
 pub use render::{
     ENCODERS, ENCODING_BYTES_FIXED, ENCODING_BYTES_PER_PIXEL, PNG_TO_H264, RENDER_SCHEMA,

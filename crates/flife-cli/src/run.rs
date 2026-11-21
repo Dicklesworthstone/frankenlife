@@ -19,7 +19,6 @@
 //! ticks remain ([`crate::metrics`], FL-040).
 
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::Path;
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -39,7 +38,7 @@ use crate::checkpointing::CheckpointAdmission;
 use crate::memory::MemoryAdmission;
 use crate::metrics::{Declaration, Metrics, Tracker};
 use crate::observe::{Survey, Tally};
-use crate::persist::{Checkpoints, Persistence, ScheduledCommand};
+use crate::persist::{Checkpoints, Persistence, RunManifestTarget, ScheduledCommand};
 
 /// The schema of every record a run emits.
 pub const RUN_SCHEMA: &str = "frankenlife.run.v1";
@@ -608,12 +607,16 @@ pub fn run_with(
         metrics,
     };
     let driven = drive(owner, handle, plan, checkpoints, emit, clock)?;
-    Ok(finish(
+    finish(
         driven,
-        persistence.map(|persistence| persistence.run_dir.as_path()),
+        persistence.map(|persistence| RunManifestTarget {
+            run_dir: persistence.run_dir.as_path(),
+            durability: persistence.durability,
+            kind: "run",
+        }),
         limits.durability,
         clock,
-    ))
+    )
 }
 
 /// A metrics tracker over `world` for a record every `every` ticks; none
@@ -938,13 +941,14 @@ where
     })
 }
 
-/// Emit the [`Record::End`] for `driven` and return what the run did.
+/// Write `manifest.json` for a persisted run directory, emit [`Record::End`]
+/// for `driven`, and return what the run did.
 pub(crate) fn finish<E: FnMut(&Record)>(
     driven: Driven<E>,
-    run_dir: Option<&Path>,
+    target: Option<RunManifestTarget<'_>>,
     durability: Durability,
     clock: Instant,
-) -> Finished {
+) -> Result<Finished, CoreError> {
     let Driven {
         stop,
         tally,
@@ -953,13 +957,30 @@ pub(crate) fn finish<E: FnMut(&Record)>(
         checkpoints,
     } = driven;
     let survey = Survey::of(&closed.world);
-    let persisted = run_dir.map(|run_dir| Persisted {
-        run_dir: run_dir.display().to_string(),
+    let controllers = ControllerSummary::of(&closed.world);
+    let wall_seconds = clock.elapsed().as_secs_f64();
+    let checkpoint = checkpoints.as_ref().and_then(Checkpoints::last);
+    if let Some(target) = target {
+        let last =
+            checkpoint.map(|at| (at, checkpoints.as_ref().and_then(Checkpoints::last_sha256)));
+        crate::persist::write_run_manifest(
+            target,
+            &closed,
+            &stop,
+            &tally,
+            &survey,
+            &controllers,
+            last,
+            wall_seconds,
+        )?;
+    }
+    let persisted = target.map(|target| Persisted {
+        run_dir: target.run_dir.display().to_string(),
         durability: match durability {
             Durability::Volatile => VOLATILE_IN_MEMORY,
             Durability::WriteAhead => WRITE_AHEAD_BEFORE_APPLY,
         },
-        checkpoint: checkpoints.as_ref().and_then(Checkpoints::last),
+        checkpoint,
         journal: closed.journal.as_ref().map(|journal| JournalMarks {
             admitted: journal.durable.admitted,
             outcomes: journal.durable.outcomes,
@@ -972,16 +993,16 @@ pub(crate) fn finish<E: FnMut(&Record)>(
         digest: closed.world.digest().to_hex(),
         tally: Box::new(tally.clone()),
         survey: Box::new(survey.clone()),
-        controllers: ControllerSummary::of(&closed.world),
-        wall_seconds: clock.elapsed().as_secs_f64(),
+        controllers,
+        wall_seconds,
         persisted,
     });
-    Finished {
+    Ok(Finished {
         stop,
         tally,
         survey,
         closed,
-    }
+    })
 }
 
 fn missing(capability: String) -> CoreError {

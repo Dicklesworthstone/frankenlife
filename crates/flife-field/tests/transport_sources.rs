@@ -976,21 +976,25 @@ fn fused_source_kernel_eliminates_per_source_f32_rounding_bias() {
     let step = TimeStep::new(1, 32).expect("step");
     let plan = TransportPlan::new(&grid, step, 0.327_384, 0.008_989_29).expect("plan");
 
-    let mut dir = [0.0; CHANNELS];
-    dir[0] = 1.0;
-    let sources: Vec<Source> = (0_u32..256)
+    // Seeded non-lattice source positions scaling `s3131` (128x128, M=512,
+    // sigma=12.2112, power=311.335) down 4x in each dimension (16x in area and
+    // power) so cell energy (~85) and per-source outer-skirt q_j / ulp(e) match
+    // `s3131` exactly while running in ~1-2 seconds.
+    let sources: Vec<Source> = (0_u32..512)
         .map(|i| {
-            let x = (f64::from(i % 16) + 0.5) * 2.0;
-            let y = (f64::from(i / 16) + 0.5) * 2.0;
+            let h1 = i.wrapping_mul(2_654_435_761);
+            let h2 = i.wrapping_mul(2_246_822_519).wrapping_add(326_648_991);
+            let x = (f64::from(h1) / f64::from(u32::MAX)) * 32.0;
+            let y = (f64::from(h2) / f64::from(u32::MAX)) * 32.0;
             let mut d = [0.0; CHANNELS];
             d[(i as usize) % CHANNELS] = if i % 2 == 0 { 1.0 } else { -1.0 };
-            Source::new(SourceId::new(i), [x, y], d, 311.335).expect("source")
+            Source::new(SourceId::new(i), [x, y], d, 19.458_437_5).expect("source")
         })
         .collect();
 
     // 1. Single-source bit-exact agreement between v1 and fused-v1.
-    let single_v1 = SourceKernel::new(4.0, 4.0).expect("v1");
-    let single_fused = SourceKernel::new_fused(4.0, 4.0).expect("fused");
+    let single_v1 = SourceKernel::new(3.0528, 4.0).expect("v1");
+    let single_fused = SourceKernel::new_fused(3.0528, 4.0).expect("fused");
     let mut p_v1 = FieldPair::zeroed(grid, &limits).expect("pair");
     let mut p_fused = FieldPair::zeroed(grid, &limits).expect("pair");
     let mut s1 = TransportScratch::new(&grid, &limits).expect("scratch");
@@ -1035,11 +1039,11 @@ fn fused_source_kernel_eliminates_per_source_f32_rounding_bias() {
         "single-source fused must equal v1 bit for bit"
     );
 
-    // 2. High-source (M=256) energy-rich near-empty world over 240 ticks:
+    // 2. High-source (M=512) energy-rich near-empty world over 290 ticks:
     //    legacy v1 accumulates coherent bias past 1e-5, while fused-v1 stays
     //    well below 1e-7 and preserves INV-01 / INV-02.
-    let v1_kernel = SourceKernel::new(4.0, 4.0).expect("v1");
-    let fused_kernel = SourceKernel::new_fused(4.0, 4.0).expect("fused");
+    let v1_kernel = SourceKernel::new(3.0528, 4.0).expect("v1");
+    let fused_kernel = SourceKernel::new_fused(3.0528, 4.0).expect("fused");
     let run_ticks = |kernel: SourceKernel, workers: usize| -> (f64, Vec<u32>) {
         let mut pair = FieldPair::zeroed(grid, &limits).expect("pair");
         let mut work = FieldWork::new(
@@ -1052,7 +1056,7 @@ fn fused_source_kernel_eliminates_per_source_f32_rounding_bias() {
             .expect("reserve");
         let mut cum_residual = 0.0_f64;
         let mut cum_turnover = 0.0_f64;
-        for _ in 0..240 {
+        for _ in 0..290 {
             let report = advance_field_on(&mut pair, &plan, &kernel, &sources, step, &mut work)
                 .expect("step");
             cum_residual += report.residual;
@@ -1091,5 +1095,5 @@ fn fused_source_kernel_eliminates_per_source_f32_rounding_bias() {
         v1_norm / fused_norm_4.max(1e-18) > 100.0,
         "expected >100x reduction (v1={v1_norm:.3e}, fused={fused_norm_4:.3e})"
     );
-    let _ = (fused_norm_1, dir);
+    let _ = fused_norm_1;
 }

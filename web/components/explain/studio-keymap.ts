@@ -11,7 +11,7 @@ export const GROUPS: { id: KeyGroup; name: string; color: string; summary: strin
   { id: "look", name: "Look", color: "#F15BB5", summary: "Colour mappings and looks; the picture only." },
   { id: "field", name: "Field", color: "#67e8f9", summary: "What the field under the organisms shows; the picture only." },
   { id: "camera", name: "Camera and selection", color: "#FFB627", summary: "Reset, track, dump a controller; observer state only." },
-  { id: "tools", name: "Brushes and measuring", color: "#FF6F59", summary: "Commands the session applies at its next open boundary." },
+  { id: "tools", name: "Brushes and measuring", color: "#FF6F59", summary: "Brushes the session applies at its next open boundary; the measuring tool changes nothing." },
 ];
 
 export type StudioKey = { group: KeyGroup; name: string; action: string };

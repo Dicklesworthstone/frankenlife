@@ -307,7 +307,8 @@ export function IndependentWeights() {
         <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-[10px] font-black tracking-[0.2em] text-slate-500 uppercase">Inheritance</p>
-            <BasisBadge basis="record" />
+            {/* The thumbnails are drawn, like the grid above; only the figures under them are the record's. */}
+            <BasisBadge basis="diagram" />
           </div>
           <div className="mt-3 grid grid-cols-[repeat(3,minmax(0,5.5rem))] gap-4">
             {[
@@ -329,7 +330,8 @@ export function IndependentWeights() {
               </div>
             ))}
           </div>
-          <p className="mt-3 text-sm leading-relaxed text-slate-300">
+          <BasisBadge basis="record" className="mt-4" />
+          <p className="mt-2 text-sm leading-relaxed text-slate-300">
             In the reference world&apos;s 1,024-tick smoke run, live children keep{" "}
             <span className="font-mono text-green-300">99.8%</span> of their parent&apos;s parameters bit for bit,
             while unrelated founders share <span className="font-mono text-slate-200">1.3%</span>. Grandchildren carry

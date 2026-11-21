@@ -6,7 +6,9 @@
 //
 // FIXTURES holds the answers as the plan states them. They are never derived
 // from these functions; fixture-math.test.ts checks that the functions
-// reproduce them.
+// reproduce them. Two are the page's own: C.15's start (10, which the plan
+// leaves open) and the halfway frame that follows from it (10 − 48 / 2 on a
+// width-128 torus, 114).
 
 /** The answers Appendix C states (COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md). */
 export const FIXTURES = {
@@ -96,7 +98,9 @@ export function uptakeRule(cell: number, requests: readonly number[], quantum = 
       left -= 1;
     }
   } else if (left < 0) {
-    // Rounding the demand down took a quantum away: smallest remainders give it back, ties to the higher identity.
+    // Exactly, this never happens: the floors sum to at most ⌊Σ ideals⌋, which is at most the total. Floating point
+    // reaches it when the 1e-9 allowance floors an ideal just under k to k; the smallest remainders give the extra
+    // quantum back, ties to the higher identity.
     const order = [...shares].sort((x, y) => x.remainder - y.remainder || y.id - x.id);
     for (const share of order) {
       if (left === 0) break;

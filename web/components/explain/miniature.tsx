@@ -813,11 +813,12 @@ export function Miniature() {
 
           {/* Counts, the digest, replay */}
           <div className="order-7 min-w-0 rounded-2xl border border-white/10 bg-black/30 p-4 lg:mt-5">
-            {/* slop-ok(S12-three-cards): three counters (births, deaths, refused), not three cards. */}
+            {/* slop-ok(S12-three-cards): three counters (births, deaths, blocked divisions), not three cards. */}
             <dl className="grid grid-cols-3 items-end gap-3 font-mono text-xs tabular-nums">
               <Count label="births" value={snap?.births} />
               <Count label="deaths" value={snap?.deaths} />
-              <Count label="no room to divide" value={snap ? snap.crowded + snap.refused : undefined} />
+              {/* Events, like births: an organism hemmed in tries again next tick, and each try that finds no room counts. */}
+              <Count label="divisions blocked" value={snap ? snap.crowded + snap.refused : undefined} />
             </dl>
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/5 pt-4">
               <div className="min-w-0">
@@ -868,7 +869,7 @@ export function Miniature() {
               </div>
             </div>
             <p className="text-xs leading-relaxed text-slate-500">
-              <span className="text-slate-300">One shared</span> runs founder 1&apos;s network in every body, the
+              <span className="text-slate-300">One shared</span> runs the first founder&apos;s network in every body, the
               shortcut FrankenLife forbids. <span className="text-slate-300">Fresh weights</span> is one of its
               controls: a child draws new weights instead of inheriting. A switch restarts the world from tick 0 with
               the same seed, so you compare one changed rule; what the toy then does is not evidence about

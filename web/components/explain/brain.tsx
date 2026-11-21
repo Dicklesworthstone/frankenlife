@@ -15,7 +15,7 @@ import {
   widths,
 } from "@/components/explain/brain-math";
 import { DemoFrame, Segmented } from "@/components/explain/demo";
-import { useInView, useReducedMotion } from "@/lib/hooks";
+import { useFigureWidth, useInView, useReducedMotion } from "@/lib/hooks";
 import { cn, grouped } from "@/lib/utils";
 
 /**
@@ -36,13 +36,16 @@ const COLOUR: Record<string, string> = {
   spend: "#fde68a",
 };
 
-// The drawing's geometry, in viewBox units.
+// The drawing's geometry, in viewBox units. Its width is 640 where the page is wide; a phone draws it in as few as
+// 400 units, the columns closer together, so the labels (14 units) stay near 10 px instead of shrinking to 6.
 const VIEW_W = 640;
+const VIEW_W_LEAST = 400;
 const VIEW_H = 356;
 const TOP = 12;
 const SPAN = 300;
 const LEFT = 86;
-const RIGHT = VIEW_W - 98;
+/** The output column's distance from the right edge. */
+const RIGHT_MARGIN = 98;
 const NODE_W = 10;
 /** The least vertical distance between two group labels. */
 const LABEL_GAP = 16;
@@ -105,9 +108,14 @@ export function BrainAnatomy() {
   const topology = CATALOG[topologyIndex] ?? CATALOG[DEFAULT_TOPOLOGY]!;
   const layers = widths(topology);
   const parameters = parameterCount(layers);
+  const { ref: box, width: drawn } = useFigureWidth(VIEW_W);
+  const viewW = Math.round(Math.min(VIEW_W, Math.max(VIEW_W_LEAST, drawn * 1.4)));
+  const right = viewW - RIGHT_MARGIN;
+  // The footnote: 9.5 px at the least, and no larger than 11 units where the drawing is enlarged.
+  const footnote = Math.max(11, (9.5 * viewW) / drawn);
   const columns = layers.map((width, index) => ({
     width,
-    x: LEFT + ((RIGHT - LEFT) * index) / (layers.length - 1),
+    x: LEFT + ((right - LEFT) * index) / (layers.length - 1),
     span: layerSpan(width),
   }));
   const input = columns[0]!;
@@ -135,8 +143,8 @@ export function BrainAnatomy() {
       }
     }
     return result;
-    // `columns` follows from the topology alone.
-  }, [topologyIndex]);
+    // `columns` follows from the topology and the drawing's width.
+  }, [topologyIndex, viewW]);
 
   const activeGroup =
     active === null
@@ -224,152 +232,154 @@ export function BrainAnatomy() {
           />
         </div>
 
-        <svg
-          viewBox={`0 0 ${VIEW_W} ${VIEW_H}`}
-          className="diagram mx-auto h-auto w-full max-w-[52rem]"
-          role="img"
-          aria-label={`The controller network ${shape(topology)}, ${grouped(parameters)} parameters. Inputs: energy, 32 composition values, 33 x gradients, 33 y gradients and five inputs about the organism itself. Outputs: reproduction rate, child share, emission gate, 32-dimensional emission direction and emission spending.`}
-        >
-          <style>{`
-            @keyframes brain-flow { to { stroke-dashoffset: -28; } }
-            .brain-line { stroke-dasharray: 7 9; }
-            .brain-flowing .brain-line { animation: brain-flow 1.6s linear infinite; }
-          `}</style>
+        <div ref={box} className="mx-auto w-full max-w-[52rem]">
+          <svg
+            viewBox={`0 0 ${viewW} ${VIEW_H}`}
+            className="diagram block h-auto w-full"
+            role="img"
+            aria-label={`The controller network ${shape(topology)}, ${grouped(parameters)} parameters. Inputs: energy, 32 composition values, 33 x gradients, 33 y gradients and five inputs about the organism itself. Outputs: reproduction rate, child share, emission gate, 32-dimensional emission direction and emission spending.`}
+          >
+            <style>{`
+              @keyframes brain-flow { to { stroke-dashoffset: -28; } }
+              .brain-line { stroke-dasharray: 7 9; }
+              .brain-flowing .brain-line { animation: brain-flow 1.6s linear infinite; }
+            `}</style>
 
-          {/* The dense bands between layers. */}
-          {columns.slice(0, -1).map((_, band) => (
-            <path
-              key={`band-${band}`}
-              d={bandPath(band)}
-              fill={active ? activeColour : "#ffffff"}
-              fillOpacity={active ? (band === 0 || band === columns.length - 2 ? 0.16 : 0.08) : 0.035}
-              className="transition-[fill-opacity] duration-300"
-            />
-          ))}
-
-          {/* A sample of the connections, flowing left to right while on screen. */}
-          <g className={cn(flowing && "brain-flowing")} stroke={active ? activeColour : "#4ade80"} strokeOpacity={0.3}>
-            {lines.map((line, index) => (
-              <line
-                key={index}
-                className="brain-line"
-                x1={line.x1}
-                y1={line.y1}
-                x2={line.x2}
-                y2={line.y2}
-                strokeWidth={0.7}
-                style={{ animationDelay: `${-(index % 13) * 0.12}s` }}
+            {/* The dense bands between layers. */}
+            {columns.slice(0, -1).map((_, band) => (
+              <path
+                key={`band-${band}`}
+                d={bandPath(band)}
+                fill={active ? activeColour : "#ffffff"}
+                fillOpacity={active ? (band === 0 || band === columns.length - 2 ? 0.16 : 0.08) : 0.035}
+                className="transition-[fill-opacity] duration-300"
               />
             ))}
-          </g>
 
-          {/* Hidden layers: tanh neurons. */}
-          {columns.slice(1, -1).map((column, index) => (
-            <g key={`hidden-${index}`}>
-              {Array.from({ length: column.width }, (_, node) => {
-                const pitch = (column.span.to - column.span.from) / column.width;
-                return (
-                  <rect
-                    key={node}
-                    x={column.x - NODE_W / 2}
-                    y={column.span.from + pitch * node + Math.min(0.6, pitch * 0.15)}
-                    width={NODE_W}
-                    height={Math.max(0.8, pitch - Math.min(1.2, pitch * 0.3))}
-                    rx={Math.min(2, pitch / 3)}
-                    fill="#cbd5e1"
-                    fillOpacity={0.55}
-                  />
-                );
-              })}
+            {/* A sample of the connections, flowing left to right while on screen. */}
+            <g className={cn(flowing && "brain-flowing")} stroke={active ? activeColour : "#4ade80"} strokeOpacity={0.3}>
+              {lines.map((line, index) => (
+                <line
+                  key={index}
+                  className="brain-line"
+                  x1={line.x1}
+                  y1={line.y1}
+                  x2={line.x2}
+                  y2={line.y2}
+                  strokeWidth={0.7}
+                  style={{ animationDelay: `${-(index % 13) * 0.12}s` }}
+                />
+              ))}
             </g>
-          ))}
 
-          {/* Inputs and outputs, coloured by group. */}
-          {[
-            { side: "in" as const, list: inputs, column: input },
-            { side: "out" as const, list: outputs, column: output },
-          ].map(({ side, list, column }) => {
-            const ys = labelYs(list);
-            return list.map((entry, entryIndex) => {
-              const on = active?.side === side && active.id === entry.group.id;
-              const dim = active !== null && !on;
-              const pitch = (entry.to - entry.from) / entry.group.size;
-              const colour = COLOUR[entry.group.id] ?? "#ffffff";
-              const edge = side === "in" ? column.x - NODE_W / 2 - 2 : column.x + NODE_W / 2 + 2;
-              const labelX = side === "in" ? edge - 12 : edge + 12;
-              const centre = (entry.from + entry.to) / 2;
-              const labelY = ys[entryIndex] ?? centre;
-              return (
-                <g
-                  key={`${side}-${entry.group.id}`}
-                  onMouseEnter={() => setHovered({ side, id: entry.group.id })}
-                  onMouseLeave={() => setHovered(null)}
-                  onClick={() =>
-                    setPinned(pinned?.side === side && pinned.id === entry.group.id ? null : { side, id: entry.group.id })
-                  }
-                  className="cursor-pointer"
-                  opacity={dim ? 0.35 : 1}
-                >
-                  {/* A generous hit area. */}
-                  <rect
-                    x={side === "in" ? 0 : column.x - NODE_W}
-                    y={entry.from}
-                    width={side === "in" ? column.x + NODE_W : VIEW_W - column.x + NODE_W}
-                    height={Math.max(6, entry.to - entry.from)}
-                    fill="transparent"
-                  />
-                  {Array.from({ length: entry.group.size }, (_, node) => (
+            {/* Hidden layers: tanh neurons. */}
+            {columns.slice(1, -1).map((column, index) => (
+              <g key={`hidden-${index}`}>
+                {Array.from({ length: column.width }, (_, node) => {
+                  const pitch = (column.span.to - column.span.from) / column.width;
+                  return (
                     <rect
                       key={node}
                       x={column.x - NODE_W / 2}
-                      y={entry.from + pitch * node + Math.min(0.4, pitch * 0.12)}
+                      y={column.span.from + pitch * node + Math.min(0.6, pitch * 0.15)}
                       width={NODE_W}
-                      height={Math.max(0.9, pitch - Math.min(0.8, pitch * 0.24))}
+                      height={Math.max(0.8, pitch - Math.min(1.2, pitch * 0.3))}
                       rx={Math.min(2, pitch / 3)}
-                      fill={colour}
-                      fillOpacity={on ? 1 : 0.85}
+                      fill="#cbd5e1"
+                      fillOpacity={0.55}
                     />
-                  ))}
-                  <path
-                    d={`M${edge},${centre} L${side === "in" ? edge - 6 : edge + 6},${labelY} L${side === "in" ? labelX + 2 : labelX - 2},${labelY}`}
-                    fill="none"
-                    stroke={colour}
-                    strokeOpacity={0.5}
-                    strokeWidth={0.8}
-                  />
-                  <text
-                    x={labelX}
-                    y={labelY + 4}
-                    textAnchor={side === "in" ? "end" : "start"}
-                    fontSize={14}
-                    fontWeight={700}
-                    fill={colour}
-                  >
-                    {entry.group.short}
-                  </text>
-                </g>
-              );
-            });
-          })}
+                  );
+                })}
+              </g>
+            ))}
 
-          {/* Layer captions. */}
-          {columns.map((column, index) => (
-            <text
-              key={`caption-${index}`}
-              x={column.x}
-              y={VIEW_H - 18}
-              textAnchor="middle"
-              fontSize={14}
-              className="mono"
-              fill={index === 0 || index === columns.length - 1 ? "#e2e8f0" : "#94a3b8"}
-            >
-              {hiddenLabel(index, column.width)}
+            {/* Inputs and outputs, coloured by group. */}
+            {[
+              { side: "in" as const, list: inputs, column: input },
+              { side: "out" as const, list: outputs, column: output },
+            ].map(({ side, list, column }) => {
+              const ys = labelYs(list);
+              return list.map((entry, entryIndex) => {
+                const on = active?.side === side && active.id === entry.group.id;
+                const dim = active !== null && !on;
+                const pitch = (entry.to - entry.from) / entry.group.size;
+                const colour = COLOUR[entry.group.id] ?? "#ffffff";
+                const edge = side === "in" ? column.x - NODE_W / 2 - 2 : column.x + NODE_W / 2 + 2;
+                const labelX = side === "in" ? edge - 12 : edge + 12;
+                const centre = (entry.from + entry.to) / 2;
+                const labelY = ys[entryIndex] ?? centre;
+                return (
+                  <g
+                    key={`${side}-${entry.group.id}`}
+                    onMouseEnter={() => setHovered({ side, id: entry.group.id })}
+                    onMouseLeave={() => setHovered(null)}
+                    onClick={() =>
+                      setPinned(pinned?.side === side && pinned.id === entry.group.id ? null : { side, id: entry.group.id })
+                    }
+                    className="cursor-pointer"
+                    opacity={dim ? 0.35 : 1}
+                  >
+                    {/* A generous hit area. */}
+                    <rect
+                      x={side === "in" ? 0 : column.x - NODE_W}
+                      y={entry.from}
+                      width={side === "in" ? column.x + NODE_W : viewW - column.x + NODE_W}
+                      height={Math.max(6, entry.to - entry.from)}
+                      fill="transparent"
+                    />
+                    {Array.from({ length: entry.group.size }, (_, node) => (
+                      <rect
+                        key={node}
+                        x={column.x - NODE_W / 2}
+                        y={entry.from + pitch * node + Math.min(0.4, pitch * 0.12)}
+                        width={NODE_W}
+                        height={Math.max(0.9, pitch - Math.min(0.8, pitch * 0.24))}
+                        rx={Math.min(2, pitch / 3)}
+                        fill={colour}
+                        fillOpacity={on ? 1 : 0.85}
+                      />
+                    ))}
+                    <path
+                      d={`M${edge},${centre} L${side === "in" ? edge - 6 : edge + 6},${labelY} L${side === "in" ? labelX + 2 : labelX - 2},${labelY}`}
+                      fill="none"
+                      stroke={colour}
+                      strokeOpacity={0.5}
+                      strokeWidth={0.8}
+                    />
+                    <text
+                      x={labelX}
+                      y={labelY + 4}
+                      textAnchor={side === "in" ? "end" : "start"}
+                      fontSize={14}
+                      fontWeight={700}
+                      fill={colour}
+                    >
+                      {entry.group.short}
+                    </text>
+                  </g>
+                );
+              });
+            })}
+
+            {/* Layer captions. */}
+            {columns.map((column, index) => (
+              <text
+                key={`caption-${index}`}
+                x={column.x}
+                y={VIEW_H - 18}
+                textAnchor="middle"
+                fontSize={14}
+                className="mono"
+                fill={index === 0 || index === columns.length - 1 ? "#e2e8f0" : "#94a3b8"}
+              >
+                {hiddenLabel(index, column.width)}
+              </text>
+            ))}
+            <text x={output.x} y={VIEW_H - 2} textAnchor="middle" fontSize={footnote} fill="#64748b">
+              linear · σ once, in decoding
             </text>
-          ))}
-          <text x={output.x} y={VIEW_H - 2} textAnchor="middle" fontSize={11} fill="#64748b">
-            linear · σ once, in decoding
-          </text>
-        </svg>
+          </svg>
+        </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div>

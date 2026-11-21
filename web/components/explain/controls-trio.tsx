@@ -1,6 +1,6 @@
 "use client";
 
-import { ChevronLeft, ChevronRight, Quote, ScanSearch, X } from "lucide-react";
+import { ChevronLeft, ChevronRight, Quote, ScanSearch, Search, X } from "lucide-react";
 import {
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -46,7 +46,10 @@ export function ControlsTrio() {
   // The spot a reader kept (a click, a tap or the arrow keys). A mouse's hover only previews: when it leaves a
   // still, the loupe goes back to the kept spot, or away if none was kept.
   const kept = useRef<Spot | null>(OPENING);
+  // The spot kept when the loupe was last hidden (the button or Escape), for Show to bring back.
+  const hidden = useRef<Spot>(OPENING);
   const place = useCallback((next: Spot | null) => {
+    if (next === null && kept.current) hidden.current = kept.current;
     if (next === null || next.pinned) kept.current = next;
     setSpot(next);
   }, []);
@@ -151,15 +154,15 @@ export function ControlsTrio() {
             Tap a world to place a loupe; swipe to the next, and it stays on the same place.
           </span>
         </p>
-        {spot ? (
-          <button
-            type="button"
-            onClick={() => place(null)}
-            className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl border border-white/15 bg-black/30 px-3.5 text-xs font-bold text-white transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
-          >
-            <X className="h-3.5 w-3.5" aria-hidden="true" /> Hide loupe
-          </button>
-        ) : null}
+        {/* One button that flips, so a keyboard's focus stays on it either way. */}
+        <button
+          type="button"
+          onClick={() => place(spot ? null : hidden.current)}
+          className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl border border-white/15 bg-black/30 px-3.5 text-xs font-bold text-white transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
+        >
+          {spot ? <X className="h-3.5 w-3.5" aria-hidden="true" /> : <Search className="h-3.5 w-3.5" aria-hidden="true" />}
+          {spot ? "Hide loupe" : "Show loupe"}
+        </button>
       </div>
 
       <ol

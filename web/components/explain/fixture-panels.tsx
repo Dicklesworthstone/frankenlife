@@ -35,7 +35,7 @@ import {
   usefulGains,
   wrap,
 } from "@/components/explain/fixture-math";
-import { useReducedMotion } from "@/lib/hooks";
+import { useFigureWidth, useReducedMotion } from "@/lib/hooks";
 import { LINEAGE, TONE } from "@/lib/palette";
 import { cn } from "@/lib/utils";
 
@@ -355,8 +355,11 @@ export function UptakeFigure({
   stack: number[];
   created?: number;
 }) {
-  const scale = 11;
+  const { ref, width: across } = useFigureWidth(300);
+  // Bars run from `left` to two units short of the edge; a request of 268 / 11 fills them, as at 300 across.
   const left = 30;
+  const span = across - 32;
+  const scale = (11 * span) / 268;
   const rowHeight = 30;
   const height = 64 + requests.length * rowHeight;
   const colour = tone === "rule" ? TONE.rule : TONE.wrong;
@@ -376,80 +379,82 @@ export function UptakeFigure({
       <p className={cn("mb-2 text-[10px] font-black tracking-[0.16em] uppercase", tone === "rule" ? "text-green-300" : "text-rose-300")}>
         {title}
       </p>
-      <svg viewBox={`0 0 300 ${height}`} className="diagram h-auto w-full" role="img" aria-label={label}>
-        <defs>
-          <pattern id={`hatch-${tone}`} width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-            <line x1="0" y1="0" x2="0" y2="6" stroke={TONE.wrong} strokeWidth="2" />
-          </pattern>
-        </defs>
-        <text x={0} y={22} fontSize={11} fill="#94a3b8">
-          cell
-        </text>
-        {/* What the cell holds, outlined; what it gives, coloured by organism; what is left, faint. */}
-        <rect x={left} y={10} width={cell * scale} height={16} rx={3} fill={TONE.energy} fillOpacity={0.12} stroke={TONE.energy} strokeOpacity={0.6} />
-        {/* The cell can only give what it holds; anything granted past its end was created (the hatch). */}
-        {segments.map((segment) => (
-          <rect
-            key={segment.id}
-            x={segment.x}
-            y={10}
-            width={Math.max(0, Math.min(segment.width, cellEnd - segment.x))}
-            height={16}
-            fill={ORGANISMS[segment.id]?.color}
-            fillOpacity={0.85}
-          />
-        ))}
-        {created > 0 ? (
-          <>
+      <div ref={ref}>
+        <svg viewBox={`0 0 ${across} ${height}`} className="diagram block h-auto w-full" role="img" aria-label={label}>
+          <defs>
+            <pattern id={`hatch-${tone}`} width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+              <line x1="0" y1="0" x2="0" y2="6" stroke={TONE.wrong} strokeWidth="2" />
+            </pattern>
+          </defs>
+          <text x={0} y={22} fontSize={11} fill="#94a3b8">
+            cell
+          </text>
+          {/* What the cell holds, outlined; what it gives, coloured by organism; what is left, faint. */}
+          <rect x={left} y={10} width={cell * scale} height={16} rx={3} fill={TONE.energy} fillOpacity={0.12} stroke={TONE.energy} strokeOpacity={0.6} />
+          {/* The cell can only give what it holds; anything granted past its end was created (the hatch). */}
+          {segments.map((segment) => (
             <rect
-              x={cellEnd}
+              key={segment.id}
+              x={segment.x}
               y={10}
-              width={Math.max(0, Math.min(created * scale, 298 - cellEnd))}
+              width={Math.max(0, Math.min(segment.width, cellEnd - segment.x))}
               height={16}
-              fill={`url(#hatch-${tone})`}
-              stroke={TONE.wrong}
+              fill={ORGANISMS[segment.id]?.color}
+              fillOpacity={0.85}
             />
-            <text x={Math.min(cellEnd + 4, 220)} y={44} fontSize={11} fill={TONE.wrong} className="mono">
-              +{fixed(created)} from nothing
-            </text>
-          </>
-        ) : null}
-        <line x1={cellEnd} y1={6} x2={cellEnd} y2={30} stroke={TONE.energy} strokeWidth={1.5} />
-        {requests.map((request, id) => {
-          const y = 58 + id * rowHeight;
-          const grant = grants[id] ?? 0;
-          const organism = ORGANISMS[id];
-          return (
-            <g key={organism?.name ?? id}>
-              <circle cx={10} cy={y + 6} r={8} fill={organism?.color} />
-              <text x={10} y={y + 10} fontSize={10} fontWeight={800} textAnchor="middle" fill={TONE.ink}>
-                {organism?.name}
-              </text>
+          ))}
+          {created > 0 ? (
+            <>
               <rect
-                x={left}
-                y={y}
-                width={Math.min(request * scale, 268)}
-                height={12}
-                rx={3}
-                fill="none"
-                stroke={organism?.color}
-                strokeOpacity={0.6}
-                strokeDasharray="3 3"
+                x={cellEnd}
+                y={10}
+                width={Math.max(0, Math.min(created * scale, across - 2 - cellEnd))}
+                height={16}
+                fill={`url(#hatch-${tone})`}
+                stroke={TONE.wrong}
               />
-              <rect x={left} y={y} width={Math.min(grant * scale, 268)} height={12} rx={3} fill={organism?.color} fillOpacity={grant > 0 ? 0.85 : 0} />
-              <text
-                x={Math.min(left + Math.max(request, grant) * scale + 6, 262)}
-                y={y + 10}
-                fontSize={11}
-                fill={grant === 0 && request > 0 ? colour : "#e2e8f0"}
-                className="mono"
-              >
-                {fixed(request)}→{fixed(grant)}
+              <text x={Math.min(cellEnd + 4, across - 80)} y={44} fontSize={11} fill={TONE.wrong} className="mono">
+                +{fixed(created)} from nothing
               </text>
-            </g>
-          );
-        })}
-      </svg>
+            </>
+          ) : null}
+          <line x1={cellEnd} y1={6} x2={cellEnd} y2={30} stroke={TONE.energy} strokeWidth={1.5} />
+          {requests.map((request, id) => {
+            const y = 58 + id * rowHeight;
+            const grant = grants[id] ?? 0;
+            const organism = ORGANISMS[id];
+            return (
+              <g key={organism?.name ?? id}>
+                <circle cx={10} cy={y + 6} r={8} fill={organism?.color} />
+                <text x={10} y={y + 10} fontSize={10} fontWeight={800} textAnchor="middle" fill={TONE.ink}>
+                  {organism?.name}
+                </text>
+                <rect
+                  x={left}
+                  y={y}
+                  width={Math.min(request * scale, span)}
+                  height={12}
+                  rx={3}
+                  fill="none"
+                  stroke={organism?.color}
+                  strokeOpacity={0.6}
+                  strokeDasharray="3 3"
+                />
+                <rect x={left} y={y} width={Math.min(grant * scale, span)} height={12} rx={3} fill={organism?.color} fillOpacity={grant > 0 ? 0.85 : 0} />
+                <text
+                  x={Math.min(left + Math.max(request, grant) * scale + 6, across - 38)}
+                  y={y + 10}
+                  fontSize={11}
+                  fill={grant === 0 && request > 0 ? colour : "#e2e8f0"}
+                  className="mono"
+                >
+                  {fixed(request)}→{fixed(grant)}
+                </text>
+              </g>
+            );
+          })}
+        </svg>
+      </div>
     </div>
   );
 }
@@ -523,50 +528,75 @@ export function SignalsPanel() {
 }
 
 export function SignalsFigure({ a, b, cell, food }: { a: Packet; b: Packet; cell: Packet; food: number }) {
-  const scale = 6;
-  const y = 92;
-  const disk = (p: Packet, x: number, label: string, sub: string) => (
-    <g>
-      <circle cx={x} cy={y} r={p.e * scale} fill={TONE.energy} fillOpacity={0.1} stroke={TONE.energy} strokeOpacity={0.55} />
-      <Arrow from={[x, y]} to={[x + p.m[0] * scale, y - p.m[1] * scale]} color={TONE.chemistry} />
-      <text x={x} y={182} fontSize={13} textAnchor="middle" fill="#e2e8f0" fontWeight={700}>
-        {label}
-      </text>
-      <text x={x} y={198} fontSize={11} textAnchor="middle" fill="#94a3b8" className="mono">
-        {sub}
-      </text>
-    </g>
-  );
+  const { ref, width } = useFigureWidth(480);
+  // The layout is drawn for 480 across at 6 units to the energy (the cell's disk reaches radius 72), and fitted,
+  // centred, to the width: narrower, the disks shrink and the text does not.
+  const fit = Math.min(1, (width - 24) / 456);
+  const scale = 6 * fit;
+  const at = (x: number) => width / 2 + (x - 240) * fit;
+  // On a phone each packet's numbers take two lines, so neighbours' labels cannot meet.
+  const narrow = width < 420;
+  const y = narrow ? 90 : 98;
+  const name = y + 76 * Math.max(fit, 0.7) + 14;
+  const height = narrow ? name + 40 : name + 26;
+  const disk = (p: Packet, x: number, label: string) => {
+    const moment = `‖m‖ ${fixed(norm(p.m))}`;
+    return (
+      <g>
+        <circle cx={x} cy={y} r={p.e * scale} fill={TONE.energy} fillOpacity={0.1} stroke={TONE.energy} strokeOpacity={0.55} />
+        <Arrow from={[x, y]} to={[x + p.m[0] * scale, y - p.m[1] * scale]} color={TONE.chemistry} />
+        <text x={x} y={name} fontSize={13} textAnchor="middle" fill="#e2e8f0" fontWeight={700}>
+          {label}
+        </text>
+        {narrow ? (
+          <>
+            <text x={x} y={name + 16} fontSize={11} textAnchor="middle" fill="#94a3b8" className="mono">
+              e {fixed(p.e)}
+            </text>
+            <text x={x} y={name + 31} fontSize={11} textAnchor="middle" fill="#94a3b8" className="mono">
+              {moment}
+            </text>
+          </>
+        ) : (
+          <text x={x} y={name + 16} fontSize={11} textAnchor="middle" fill="#94a3b8" className="mono">
+            e {fixed(p.e)} · {moment}
+          </text>
+        )}
+      </g>
+    );
+  };
   const ma = norm(a.m);
   const mb = norm(b.m);
   return (
-    <svg
-      viewBox="0 0 480 210"
-      className="diagram h-auto w-full rounded-2xl border border-white/10 bg-black/25"
-      role="img"
-      aria-label={`Packet A: energy ${fixed(a.e)}, moment ${fixed(ma)}. Packet B: energy ${fixed(b.e)}, moment ${fixed(mb)}. The cell: energy ${fixed(cell.e)}, moment ${fixed(norm(cell.m))}. If the signals were the food, ${fixed(food)}.`}
-    >
-      {disk(a, 62, "Packet A", `e ${fixed(a.e)} · ‖m‖ ${fixed(ma)}`)}
-      <text x={124} y={y + 7} fontSize={22} textAnchor="middle" fill="#64748b">
-        +
-      </text>
-      {disk(b, 188, "Packet B", `e ${fixed(b.e)} · ‖m‖ ${fixed(mb)}`)}
-      <text x={256} y={y + 7} fontSize={22} textAnchor="middle" fill="#64748b">
-        =
-      </text>
-      {disk(cell, 368, "The cell", `e ${fixed(cell.e)} · ‖m‖ ${fixed(norm(cell.m))}`)}
-      {/* What would be left if the signal were the food. */}
-      <circle cx={368} cy={y} r={Math.max(0.5, food * scale)} fill="none" stroke={TONE.wrong} strokeWidth={1.8} strokeDasharray="4 3" />
-      <text x={474} y={22} fontSize={11} textAnchor="end" fill={TONE.wrong}>
-        - - if signals were food
-      </text>
-      <text x={6} y={22} fontSize={11} fill={TONE.energy}>
-        ○ energy
-      </text>
-      <text x={70} y={22} fontSize={11} fill={TONE.chemistry}>
-        → chemistry
-      </text>
-    </svg>
+    <div ref={ref} className="mx-auto max-w-[36rem] overflow-hidden rounded-2xl border border-white/10 bg-black/25">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="diagram block h-auto w-full"
+        role="img"
+        aria-label={`Packet A: energy ${fixed(a.e)}, moment ${fixed(ma)}. Packet B: energy ${fixed(b.e)}, moment ${fixed(mb)}. The cell: energy ${fixed(cell.e)}, moment ${fixed(norm(cell.m))}. If the signals were the food, ${fixed(food)}.`}
+      >
+        {disk(a, at(62), "Packet A")}
+        <text x={at(124)} y={y + 7} fontSize={22} textAnchor="middle" fill="#64748b">
+          +
+        </text>
+        {disk(b, at(188), "Packet B")}
+        <text x={at(256)} y={y + 7} fontSize={22} textAnchor="middle" fill="#64748b">
+          =
+        </text>
+        {disk(cell, at(368), "The cell")}
+        {/* What would be left if the signal were the food. */}
+        <circle cx={at(368)} cy={y} r={Math.max(0.5, food * scale)} fill="none" stroke={TONE.wrong} strokeWidth={1.8} strokeDasharray="4 3" />
+        <text x={12} y={20} fontSize={11} fill={TONE.energy}>
+          ○ energy
+        </text>
+        <text x={76} y={20} fontSize={11} fill={TONE.chemistry}>
+          → chemistry
+        </text>
+        <text x={width - 12} y={20} fontSize={11} textAnchor="end" fill={TONE.wrong}>
+          {narrow ? "- - signals as food" : "- - if signals were food"}
+        </text>
+      </svg>
+    </div>
   );
 }
 
@@ -651,43 +681,62 @@ export function ToxicityPanel() {
 }
 
 export function ToxicityFigure({ energy, ruleAfter, wrongAfter }: { energy: number; ruleAfter: number; wrongAfter: number }) {
+  const { ref, width } = useFigureWidth(470);
+  const height = 128;
   const min = -10;
-  const max = 7;
-  const X = (value: number) => 70 + ((value - min) / (max - min)) * 390;
+  const max = 8;
+  // The rows' names sit left of the plot, and the values hang off the bars' ends, so the plot is inset on both sides.
+  const left = 84;
+  const right = width - 16;
+  const X = (value: number) => left + ((value - min) / (max - min)) * (right - left);
   const zero = X(0);
-  const row = (y: number, label: string, after: number, colour: string) => (
-    <g>
-      <text x={0} y={y + 12} fontSize={12} fill="#cbd5e1" fontWeight={700}>
-        {label}
-      </text>
-      <rect x={Math.min(zero, X(after))} y={y} width={Math.abs(X(after) - zero)} height={16} rx={3} fill={colour} fillOpacity={0.8} />
-      <line x1={X(energy)} y1={y - 4} x2={X(energy)} y2={y + 20} stroke={TONE.energy} strokeWidth={2} strokeDasharray="3 2" />
-      <text x={X(after) + (after < 0 ? -6 : 6)} y={y + 12} fontSize={11} textAnchor={after < 0 ? "end" : "start"} fill={colour} className="mono">
-        {after === 0 ? "0: exhausted, it dies" : signed(after)}
-      </text>
-    </g>
-  );
+  // Said in full where it fits beside the zero line; on a phone, in fewer words.
+  const exhausted = right - zero >= 150 ? "0: exhausted, it dies" : "0: it dies";
+  const before = X(energy);
+  const row = (y: number, label: string, after: number, colour: string) => {
+    const value = after === 0 ? exhausted : signed(after);
+    const valueX = X(after) + (after < 0 ? -6 : 6);
+    // Monospace at 11 px is 0.6 em, 6.6 px, a character.
+    const valueWidth = value.length * 6.6;
+    return (
+      <g>
+        <text x={14} y={y + 12} fontSize={12} fill="#cbd5e1" fontWeight={700}>
+          {label}
+        </text>
+        <rect x={Math.min(zero, X(after))} y={y} width={Math.abs(X(after) - zero)} height={16} rx={3} fill={colour} fillOpacity={0.8} />
+        <line x1={before} y1={y - 4} x2={before} y2={y + 20} stroke={TONE.energy} strokeWidth={2} strokeDasharray="3 2" />
+        {/* A chip under the value, so the dotted marker never runs through it. */}
+        <rect x={(after < 0 ? valueX - valueWidth : valueX) - 3} y={y} width={valueWidth + 6} height={16} rx={3} fill={TONE.ink} />
+        <text x={valueX} y={y + 12} fontSize={11} textAnchor={after < 0 ? "end" : "start"} fill={colour} className="mono">
+          {value}
+        </text>
+      </g>
+    );
+  };
   return (
-    <svg
-      viewBox="0 0 470 120"
-      className="diagram h-auto w-full rounded-2xl border border-white/10 bg-black/25 p-2"
-      role="img"
-      aria-label={`The organism held ${fixed(energy)}. After the rule it holds ${fixed(ruleAfter)}; after the wrong version, ${fixed(wrongAfter)}.`}
-    >
-      <rect x={X(min)} y={6} width={zero - X(min)} height={92} fill={TONE.wrong} fillOpacity={0.06} />
-      <text x={X(min) + 4} y={110} fontSize={10} fill={TONE.wrong}>
-        negative energy: impossible
-      </text>
-      <line x1={zero} y1={4} x2={zero} y2={100} stroke="#64748b" />
-      <text x={zero} y={116} fontSize={10} textAnchor="middle" fill="#64748b" className="mono">
-        0
-      </text>
-      <text x={X(energy)} y={14} fontSize={10} textAnchor={X(energy) > 430 ? "end" : "middle"} fill={TONE.energy}>
-        before: {fixed(energy)}
-      </text>
-      {row(24, "Rule", ruleAfter, TONE.rule)}
-      {row(62, "Wrong", wrongAfter, TONE.wrong)}
-    </svg>
+    <div ref={ref} className="mx-auto max-w-[46rem] overflow-hidden rounded-2xl border border-white/10 bg-black/25">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="diagram block h-auto w-full"
+        role="img"
+        aria-label={`The organism held ${fixed(energy)}. After the rule it holds ${fixed(ruleAfter)}; after the wrong version, ${fixed(wrongAfter)}.`}
+      >
+        {/* Below the "before" label's row, so the label can sit across the zero line. */}
+        <rect x={X(min)} y={20} width={zero - X(min)} height={82} fill={TONE.wrong} fillOpacity={0.06} />
+        <text x={zero - 8} y={118} fontSize={11} textAnchor="end" fill={TONE.wrong}>
+          negative energy: impossible
+        </text>
+        <line x1={zero} y1={20} x2={zero} y2={102} stroke="#64748b" />
+        <text x={zero} y={118} fontSize={11} textAnchor="middle" fill="#64748b" className="mono">
+          0
+        </text>
+        <text x={before} y={16} fontSize={11} textAnchor={before > right - 30 ? "end" : "middle"} fill={TONE.energy}>
+          before: {fixed(energy)}
+        </text>
+        {row(26, "Rule", ruleAfter, TONE.rule)}
+        {row(64, "Wrong", wrongAfter, TONE.wrong)}
+      </svg>
+    </div>
   );
 }
 
@@ -713,6 +762,9 @@ function Ledger({ tone, rows, verdict, ok }: { tone: "rule" | "wrong"; rows: [st
 // ---------------------------------------------------------------------------
 // C.9 packet chemistry is not mixture chemistry.
 
+/** A dark outline under a label, so a curve that crosses it breaks around the letters. */
+const HALO = { stroke: TONE.ink, strokeWidth: 4, strokeLinejoin: "round", paintOrder: "stroke" } as const;
+
 /** Energy gained per unit absorbed at composition `dot`: η where it feeds, κη where it poisons. */
 const perUnit = (dot: number) => {
   const eta = efficiency(dot, C9_CHEMISTRY);
@@ -736,7 +788,8 @@ export function MixturePanel() {
   const atFixture = dot === C9_DEFAULT;
   const matches = near(rule.net, FIXTURES.c9.perPacket, 1e-11) && near(wrong.net, FIXTURES.c9.mixture, 1e-11);
 
-  const X = (d: number) => 54 + ((d + 1) / 2) * 470;
+  const { ref, width } = useFigureWidth(540);
+  const X = (d: number) => 52 + ((d + 1) / 2) * (width - 70);
   const yMin = -0.25;
   const yMax = 0.85;
   const Y = (v: number) => 20 + ((yMax - v) / (yMax - yMin)) * 190;
@@ -756,60 +809,71 @@ export function MixturePanel() {
         }
         wrong={<>Average the packets&apos; chemistry first, then apply the same rule once. Cheaper, and a different answer.</>}
       />
-      <svg
-        viewBox="0 0 540 250"
-        className="diagram h-auto w-full rounded-2xl border border-white/10 bg-black/25"
-        role="img"
-        aria-label={`Energy gained per unit absorbed against composition along the affinity. Packet 1 at 1, packet 2 at ${fixed(dot, 2)}, their mixture at ${fixed(average, 2)}. Per packet the organism nets ${signed(rule.net, 6)}; on the mixture ${signed(wrong.net, 6)}.`}
-      >
-        <rect x={X(-1)} y={20} width={X(1) - X(-1)} height={Y(0) - 20} fill={TONE.rule} fillOpacity={0.04} />
-        <rect x={X(-1)} y={Y(0)} width={X(1) - X(-1)} height={210 - Y(0)} fill={TONE.wrong} fillOpacity={0.06} />
-        <line x1={X(-1)} y1={Y(0)} x2={X(1)} y2={Y(0)} stroke="#64748b" />
-        <text x={X(-1) - 6} y={Y(0) + 4} fontSize={10} textAnchor="end" fill="#64748b" className="mono">
-          0
-        </text>
-        <text x={X(-1) - 6} y={Y(0.8) + 4} fontSize={10} textAnchor="end" fill="#64748b" className="mono">
-          0.8
-        </text>
-        <text x={X(1) - 6} y={Y(0) - 8} fontSize={10} textAnchor="end" fill={TONE.rule}>
-          feeds ↑
-        </text>
-        <text x={X(1) - 6} y={Y(0) + 16} fontSize={10} textAnchor="end" fill={TONE.wrong}>
-          poisons ↓
-        </text>
-        <path d={curve(perUnit, -1, 1, X, Y)} fill="none" stroke="#e2e8f0" strokeWidth={2} />
-        {[-1, 0, 1].map((tick) => (
-          <text
-            key={tick}
-            x={X(tick)}
-            y={228}
-            fontSize={11}
-            textAnchor={tick === -1 ? "start" : tick === 1 ? "end" : "middle"}
-            fill="#94a3b8"
-            className="mono"
-          >
-            {tick === -1 ? "−1 against" : tick === 0 ? "0 neutral" : "along +1"}
+      <div ref={ref} className="mx-auto max-w-[46rem] overflow-hidden rounded-2xl border border-white/10 bg-black/25">
+        <svg
+          viewBox={`0 0 ${width} 252`}
+          className="diagram block h-auto w-full"
+          role="img"
+          aria-label={`Energy gained per unit absorbed against composition along the affinity. Packet 1 at 1, packet 2 at ${fixed(dot, 2)}, their mixture at ${fixed(average, 2)}. Per packet the organism nets ${signed(rule.net, 6)}; on the mixture ${signed(wrong.net, 6)}.`}
+        >
+          <rect x={X(-1)} y={20} width={X(1) - X(-1)} height={Y(0) - 20} fill={TONE.rule} fillOpacity={0.04} />
+          <rect x={X(-1)} y={Y(0)} width={X(1) - X(-1)} height={210 - Y(0)} fill={TONE.wrong} fillOpacity={0.06} />
+          <line x1={X(-1)} y1={Y(0)} x2={X(1)} y2={Y(0)} stroke="#64748b" />
+          <text x={X(-1) - 6} y={Y(0) + 4} fontSize={11} textAnchor="end" fill="#64748b" className="mono">
+            0
           </text>
-        ))}
-        <text x={X(0)} y={244} fontSize={10} textAnchor="middle" fill="#64748b">
-          a·z: the packet&apos;s chemistry along the organism&apos;s affinity
-        </text>
-        {/* The chord: the per-packet result is twice its midpoint. */}
-        <line x1={p1[0]} y1={p1[1]} x2={p2[0]} y2={p2[1]} stroke={TONE.rule} strokeWidth={1.5} strokeDasharray="4 3" />
-        <circle cx={chordMid[0]} cy={chordMid[1]} r={5} fill={TONE.rule} />
-        <circle cx={p1[0]} cy={p1[1]} r={6} fill={LINEAGE[0]} stroke={TONE.ink} strokeWidth={1.5} />
-        <circle cx={p2[0]} cy={p2[1]} r={6} fill={LINEAGE[1]} stroke={TONE.ink} strokeWidth={1.5} />
-        <rect x={pm[0] - 5} y={pm[1] - 5} width={10} height={10} fill={TONE.wrong} transform={`rotate(45 ${pm[0]} ${pm[1]})`} />
-        <text x={p1[0] - 8} y={p1[1] - 10} fontSize={11} textAnchor="end" fill={LINEAGE[0]}>
-          packet 1
-        </text>
-        <text x={p2[0] + (dot < 0.6 ? 8 : -8)} y={p2[1] + (perUnit(dot) < 0 ? 18 : perUnit(dot) < 0.3 ? -10 : 18)} fontSize={11} textAnchor={dot < 0.6 ? "start" : "end"} fill={LINEAGE[1]}>
-          packet 2
-        </text>
-        <text x={pm[0] + 8} y={pm[1] + 18} fontSize={11} fill={TONE.wrong}>
-          mixture
-        </text>
-      </svg>
+          <text x={X(-1) - 6} y={Y(0.8) + 4} fontSize={11} textAnchor="end" fill="#64748b" className="mono">
+            0.8
+          </text>
+          <text x={X(1) - 6} y={Y(0) - 8} fontSize={11} textAnchor="end" fill={TONE.rule}>
+            feeds ↑
+          </text>
+          <text x={X(1) - 6} y={Y(0) + 17} fontSize={11} textAnchor="end" fill={TONE.wrong}>
+            poisons ↓
+          </text>
+          <path d={curve(perUnit, -1, 1, X, Y)} fill="none" stroke="#e2e8f0" strokeWidth={2} />
+          {[-1, 0, 1].map((tick) => (
+            <text
+              key={tick}
+              x={X(tick)}
+              y={228}
+              fontSize={11}
+              textAnchor={tick === -1 ? "start" : tick === 1 ? "end" : "middle"}
+              fill="#94a3b8"
+              className="mono"
+            >
+              {tick === -1 ? "−1 against" : tick === 0 ? "0 neutral" : "along +1"}
+            </text>
+          ))}
+          <text x={X(0)} y={246} fontSize={11} textAnchor="middle" fill="#64748b">
+            {width < 480 ? "a·z: chemistry along the affinity" : "a·z: the packet\u2019s chemistry along the organism\u2019s affinity"}
+          </text>
+          {/* The chord: the per-packet result is twice its midpoint. */}
+          <line x1={p1[0]} y1={p1[1]} x2={p2[0]} y2={p2[1]} stroke={TONE.rule} strokeWidth={1.5} strokeDasharray="4 3" />
+          <circle cx={chordMid[0]} cy={chordMid[1]} r={5} fill={TONE.rule} />
+          <circle cx={p1[0]} cy={p1[1]} r={6} fill={LINEAGE[0]} stroke={TONE.ink} strokeWidth={1.5} />
+          <circle cx={p2[0]} cy={p2[1]} r={6} fill={LINEAGE[1]} stroke={TONE.ink} strokeWidth={1.5} />
+          <rect x={pm[0] - 5} y={pm[1] - 5} width={10} height={10} fill={TONE.wrong} transform={`rotate(45 ${pm[0]} ${pm[1]})`} />
+          <text x={p1[0] - 8} y={p1[1] - 10} fontSize={11} textAnchor="end" fill={LINEAGE[0]} {...HALO}>
+            packet 1
+          </text>
+          {/* Left of the point, away from the "feeds"/"poisons" labels at the right, unless it is near the left edge. */}
+          <text x={p2[0] + (dot <= -0.2 ? 8 : -8)} y={p2[1] + (perUnit(dot) < 0 ? 18 : perUnit(dot) < 0.3 ? -10 : 18)} fontSize={11} textAnchor={dot <= -0.2 ? "start" : "end"} fill={LINEAGE[1]} {...HALO}>
+            packet 2
+          </text>
+          {/* Under the diamond, clear of the "poisons" label at the right even on a narrow phone; where the diamond sits on
+              packet 2 (both packets alike), to its left, between the packets' labels. */}
+          {Math.hypot(pm[0] - p2[0], pm[1] - p2[1]) < 40 ? (
+            <text x={pm[0] - 10} y={pm[1] + 4} fontSize={11} textAnchor="end" fill={TONE.wrong} {...HALO}>
+              mixture
+            </text>
+          ) : (
+            <text x={Math.min(Math.max(pm[0], 80), width - 30)} y={pm[1] + 22} fontSize={11} textAnchor="middle" fill={TONE.wrong} {...HALO}>
+              mixture
+            </text>
+          )}
+        </svg>
+      </div>
       <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
         <Readout label="Rule: per packet" value={signed(rule.net, 6)} tone="rule" note="gain − toxicity, over both packets" />
         <Readout label="Wrong: on the mixture" value={signed(wrong.net, 6)} tone="wrong" note={`one packet of 2 at a·z = ${fixed(average, 2)}`} />
@@ -845,7 +909,8 @@ export function LogitPanel() {
   const atFixture = logit === C11_DEFAULT;
   const matches = near(right, FIXTURES.c11.linear, 5e-9) && near(wrong, FIXTURES.c11.tanhFirst, 5e-9);
 
-  const X = (l: number) => 50 + ((l + 10) / 20) * 470;
+  const { ref, width } = useFigureWidth(540);
+  const X = (l: number) => 46 + ((l + 10) / 20) * (width - 66);
   const Y = (v: number) => 16 + (1 - v) * 180;
   const low = decodeTanhFirst(-100);
   const high = decodeTanhFirst(100);
@@ -856,38 +921,49 @@ export function LogitPanel() {
         rule={<>The network&apos;s last layer is linear. Its logit is decoded once, by sigmoid, into a gate or rate.</>}
         wrong={<>Give the output layer a hidden-style tanh, then decode. Every decision is squeezed into 0.27–0.73.</>}
       />
-      <svg
-        viewBox="0 0 540 236"
-        className="diagram h-auto w-full rounded-2xl border border-white/10 bg-black/25"
-        role="img"
-        aria-label={`Decoded value against the logit. At ${fixed(logit, 1)} the rule decodes ${fixed(right, 8)}; the wrong version ${fixed(wrong, 8)}.`}
-      >
-        <rect x={X(-10)} y={Y(high)} width={X(10) - X(-10)} height={Y(low) - Y(high)} fill={TONE.wrong} fillOpacity={0.08} />
-        <text x={X(-10) + 6} y={Y(high) + 14} fontSize={10} fill={TONE.wrong}>
-          all the wrong version can ever say
-        </text>
-        {[0, 0.5, 1].map((v) => (
-          <g key={v}>
-            <line x1={X(-10)} y1={Y(v)} x2={X(10)} y2={Y(v)} stroke="#334155" strokeDasharray={v === 0.5 ? "3 3" : undefined} />
-            <text x={X(-10) - 6} y={Y(v) + 4} fontSize={10} textAnchor="end" fill="#64748b" className="mono">
-              {v}
-            </text>
-          </g>
-        ))}
-        <path d={curve(decodeTanhFirst, -10, 10, X, Y)} fill="none" stroke={TONE.wrong} strokeWidth={2.2} />
-        <path d={curve(decodeLinear, -10, 10, X, Y)} fill="none" stroke={TONE.rule} strokeWidth={2.4} />
-        <line x1={X(logit)} y1={Y(1)} x2={X(logit)} y2={Y(0)} stroke="#94a3b8" strokeDasharray="2 3" />
-        <circle cx={X(logit)} cy={Y(right)} r={5.5} fill={TONE.rule} stroke={TONE.ink} strokeWidth={1.5} />
-        <circle cx={X(logit)} cy={Y(wrong)} r={5.5} fill={TONE.wrong} stroke={TONE.ink} strokeWidth={1.5} />
-        {[-10, -5, 0, 5, 10].map((tick) => (
-          <text key={tick} x={X(tick)} y={214} fontSize={11} textAnchor="middle" fill="#94a3b8" className="mono">
-            {tick}
+      <div ref={ref} className="mx-auto max-w-[46rem] overflow-hidden rounded-2xl border border-white/10 bg-black/25">
+        <svg
+          viewBox={`0 0 ${width} 238`}
+          className="diagram block h-auto w-full"
+          role="img"
+          aria-label={`Decoded value against the logit. At ${fixed(logit, 1)} the rule decodes ${fixed(right, 8)}; the wrong version ${fixed(wrong, 8)}.`}
+        >
+          <rect x={X(-10)} y={Y(high)} width={X(10) - X(-10)} height={Y(low) - Y(high)} fill={TONE.wrong} fillOpacity={0.08} />
+          <text x={X(-10) + 6} y={Y(high) + 15} fontSize={11} fill={TONE.wrong}>
+            {width < 480 ? (
+              <>
+                <tspan>all the wrong version</tspan>
+                <tspan x={X(-10) + 6} dy={14}>
+                  can ever say
+                </tspan>
+              </>
+            ) : (
+              "all the wrong version can ever say"
+            )}
           </text>
-        ))}
-        <text x={X(0)} y={230} fontSize={10} textAnchor="middle" fill="#64748b">
-          the output layer&apos;s logit
-        </text>
-      </svg>
+          {[0, 0.5, 1].map((v) => (
+            <g key={v}>
+              <line x1={X(-10)} y1={Y(v)} x2={X(10)} y2={Y(v)} stroke="#334155" strokeDasharray={v === 0.5 ? "3 3" : undefined} />
+              <text x={X(-10) - 6} y={Y(v) + 4} fontSize={11} textAnchor="end" fill="#64748b" className="mono">
+                {v}
+              </text>
+            </g>
+          ))}
+          <path d={curve(decodeTanhFirst, -10, 10, X, Y)} fill="none" stroke={TONE.wrong} strokeWidth={2.2} />
+          <path d={curve(decodeLinear, -10, 10, X, Y)} fill="none" stroke={TONE.rule} strokeWidth={2.4} />
+          <line x1={X(logit)} y1={Y(1)} x2={X(logit)} y2={Y(0)} stroke="#94a3b8" strokeDasharray="2 3" />
+          <circle cx={X(logit)} cy={Y(right)} r={5.5} fill={TONE.rule} stroke={TONE.ink} strokeWidth={1.5} />
+          <circle cx={X(logit)} cy={Y(wrong)} r={5.5} fill={TONE.wrong} stroke={TONE.ink} strokeWidth={1.5} />
+          {[-10, -5, 0, 5, 10].map((tick) => (
+            <text key={tick} x={X(tick)} y={214} fontSize={11} textAnchor="middle" fill="#94a3b8" className="mono">
+              {tick}
+            </text>
+          ))}
+          <text x={X(0)} y={232} fontSize={11} textAnchor="middle" fill="#64748b">
+            the output layer&apos;s logit
+          </text>
+        </svg>
+      </div>
       <div className="grid grid-cols-2 gap-2">
         <Readout label="Rule: sigmoid(logit)" value={fixed(right, 8)} tone="rule" />
         <Readout label="Wrong: sigmoid(tanh(logit))" value={fixed(wrong, 8)} tone="wrong" />
@@ -1166,7 +1242,9 @@ export function BirthPanel() {
 
 export function BirthBars({ title, tone, before, birth }: { title: string; tone: "rule" | "wrong"; before: number; birth: ReturnType<typeof birthRule> }) {
   const id = useId().replace(/[^a-zA-Z0-9_-]/g, "");
-  const scale = 250 / 20;
+  const { ref, width } = useFigureWidth(290);
+  // 20 units (the slider's most) fill the bar, 20 in from each side.
+  const scale = (width - 40) / 20;
   const parts: { label: string; value: number; fill: string }[] = [
     { label: "parent", value: birth.parent, fill: LINEAGE[0] },
     { label: "child", value: birth.child ?? 0, fill: LINEAGE[10] },
@@ -1179,41 +1257,43 @@ export function BirthBars({ title, tone, before, birth }: { title: string; tone:
       <p className={cn("mb-2 text-[10px] font-black tracking-[0.16em] uppercase", tone === "rule" ? "text-green-300" : "text-rose-300")}>
         {title}
       </p>
-      <svg
-        viewBox="0 0 290 76"
-        className="diagram h-auto w-full"
-        role="img"
-        aria-label={`${title}: before, the parent holds ${fixed(before)}. After: ${parts.map((part) => `${part.label} ${fixed(part.value)}`).join(", ")}.`}
-      >
-        <defs>
-          <pattern id={`vanished-${id}`} width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-            <line x1="0" y1="0" x2="0" y2="6" stroke={TONE.wrong} strokeWidth="2" />
-          </pattern>
-        </defs>
-        <text x={20} y={12} fontSize={10} fill="#94a3b8">
-          before
-        </text>
-        <rect x={20} y={16} width={before * scale} height={16} rx={3} fill={LINEAGE[0]} fillOpacity={0.85} />
-        <text x={20} y={50} fontSize={10} fill="#94a3b8">
-          after
-        </text>
-        {parts.map((part) => {
-          const x = cursor;
-          cursor += part.value * scale;
-          return (
-            <rect
-              key={part.label}
-              x={x}
-              y={54}
-              width={part.value * scale}
-              height={16}
-              fill={part.fill}
-              fillOpacity={0.85}
-              stroke={part.label === "vanished" ? TONE.wrong : "none"}
-            />
-          );
-        })}
-      </svg>
+      <div ref={ref}>
+        <svg
+          viewBox={`0 0 ${width} 76`}
+          className="diagram block h-auto w-full"
+          role="img"
+          aria-label={`${title}: before, the parent holds ${fixed(before)}. After: ${parts.map((part) => `${part.label} ${fixed(part.value)}`).join(", ")}.`}
+        >
+          <defs>
+            <pattern id={`vanished-${id}`} width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+              <line x1="0" y1="0" x2="0" y2="6" stroke={TONE.wrong} strokeWidth="2" />
+            </pattern>
+          </defs>
+          <text x={20} y={12} fontSize={11} fill="#94a3b8">
+            before
+          </text>
+          <rect x={20} y={16} width={before * scale} height={16} rx={3} fill={LINEAGE[0]} fillOpacity={0.85} />
+          <text x={20} y={50} fontSize={11} fill="#94a3b8">
+            after
+          </text>
+          {parts.map((part) => {
+            const x = cursor;
+            cursor += part.value * scale;
+            return (
+              <rect
+                key={part.label}
+                x={x}
+                y={54}
+                width={part.value * scale}
+                height={16}
+                fill={part.fill}
+                fillOpacity={0.85}
+                stroke={part.label === "vanished" ? TONE.wrong : "none"}
+              />
+            );
+          })}
+        </svg>
+      </div>
       <p className="mt-1 font-mono text-[11px] leading-relaxed text-slate-400">
         {parts.map((part) => `${part.label} ${fixed(part.value, 2)}`).join(" · ")}
       </p>

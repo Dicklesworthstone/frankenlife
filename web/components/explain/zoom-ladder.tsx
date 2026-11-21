@@ -184,7 +184,8 @@ const STOPS: Stop[] = [
       { label: "Stored as", value: "f16", note: "[controller] canonical_weight_dtype" },
     ],
     basis: "diagram",
-    hud: `one organism's controller · ${SHAPE.join(" → ")}`,
+    // No-break spaces keep the shape on one line, and the dot on the first, when a phone wraps the caption.
+    hud: `one organism's controller\u00a0· ${SHAPE.join("\u00a0→\u00a0")}`,
   },
   {
     rail: "Numbers",
@@ -217,15 +218,17 @@ const LAST = STOPS.length - 1;
 const SCROLLY_QUERY = "(min-width: 1024px) and (pointer: fine) and (prefers-reduced-motion: no-preference)";
 
 function useMedia(query: string): boolean {
-  return useSyncExternalStore(
-    (notify) => {
+  // Stable per query: a new `subscribe` on each render would have React unsubscribe and resubscribe every time.
+  const subscribe = useCallback(
+    (notify: () => void) => {
       const list = window.matchMedia(query);
       list.addEventListener("change", notify);
       return () => list.removeEventListener("change", notify);
     },
-    () => window.matchMedia(query).matches,
-    () => false,
+    [query],
   );
+  const snapshot = useCallback(() => window.matchMedia(query).matches, [query]);
+  return useSyncExternalStore(subscribe, snapshot, () => false);
 }
 
 // ─── Where each layer is at progress p ────────────────────────────────────────
@@ -439,6 +442,9 @@ export function ZoomLadder({ index }: { index?: string }) {
   const [stop, setStop] = useState(0);
   const progress = useRef(0);
   const stopRef = useRef(0);
+  // The badge names the layer most of the picture is, which a crossfade does not switch where the stop does.
+  const [shown, setShown] = useState<Basis>(STOPS[0]!.basis);
+  const shownRef = useRef<Basis>(STOPS[0]!.basis);
   const tween = useRef(0);
 
   const posterRef = useRef<HTMLImageElement>(null);
@@ -520,6 +526,12 @@ export function ZoomLadder({ index }: { index?: string }) {
     if (barRef.current) barRef.current.style.width = `${(length / view.span) * 100}cqw`;
     if (barLabelRef.current) barLabelRef.current.textContent = length === BODY ? `${length} units · one body` : `${length} unit${length === 1 ? "" : "s"}`;
     if (railRef.current) railRef.current.style.transform = `scaleX(${p / LAST})`;
+
+    const basis: Basis = frame.network + frame.mosaic > frame.poster + frame.card ? "diagram" : "render";
+    if (basis !== shownRef.current) {
+      shownRef.current = basis;
+      setShown(basis);
+    }
 
     const nearest = Math.round(p);
     if (nearest !== stopRef.current) {
@@ -711,7 +723,8 @@ export function ZoomLadder({ index }: { index?: string }) {
                   style={{ opacity: INITIAL.card, visibility: "hidden", transform: placement(CARD, INITIAL.view) }}
                 />
 
-                {/* The reticle on the picked organism. */}
+                {/* The reticle on the picked organism. A phone's stage draws these pictures at a third of their size, so
+                    their words are set larger there (CSS sizes SVG text in the drawing's own units). */}
                 <svg aria-hidden="true" viewBox="0 0 1000 1000" className="pointer-events-none absolute inset-0 h-full w-full">
                   <g ref={reticleRef} style={{ opacity: 0, visibility: "hidden" }}>
                     <circle r="20" fill="none" stroke={PICKED} strokeWidth="2" vectorEffect="non-scaling-stroke" />
@@ -719,17 +732,17 @@ export function ZoomLadder({ index }: { index?: string }) {
                     <line stroke={PICKED} strokeWidth="2" vectorEffect="non-scaling-stroke" />
                     <line stroke={PICKED} strokeWidth="2" vectorEffect="non-scaling-stroke" />
                     <line stroke={PICKED} strokeWidth="2" vectorEffect="non-scaling-stroke" />
-                    <text y="-8" fill="#ecfccb" fontSize="26" className="font-mono" paintOrder="stroke" stroke="#000" strokeWidth="6">
+                    <text y="-8" fill="#ecfccb" fontSize="26" className="font-mono @max-md:text-[34px]" paintOrder="stroke" stroke="#000" strokeWidth="6">
                       one organism
                     </text>
                   </g>
                 </svg>
 
-                {/* Its network. */}
+                {/* Its network; on a phone's stage, set lower, so its column heads clear the basis badge. */}
                 <div
                   ref={networkRef}
                   aria-hidden="true"
-                  className="pointer-events-none absolute inset-x-[5%] top-[7%] bottom-[11%] will-change-transform"
+                  className="pointer-events-none absolute inset-x-[5%] top-[7%] bottom-[11%] will-change-transform @max-md:top-[12%]"
                   style={{ opacity: 0, visibility: "hidden", transform: "scale(0.22)" }}
                 >
                   <svg viewBox="0 0 600 620" className="h-full w-full">
@@ -766,13 +779,13 @@ export function ZoomLadder({ index }: { index?: string }) {
                         textAnchor={label.anchor}
                         fontSize="17"
                         fill={label.colour}
-                        className="font-mono"
+                        className="font-mono @max-md:text-[22px]"
                       >
                         {label.text}
                       </text>
                     ))}
                     {NET.columns.map((x, index) => (
-                      <text key={x} x={x} y="42" textAnchor="middle" fontSize="19" fill="#e2e8f0" className="font-mono">
+                      <text key={x} x={x} y="42" textAnchor="middle" fontSize="19" fill="#e2e8f0" className="font-mono @max-md:text-[23px]">
                         {SHAPE[index]}
                       </text>
                     ))}
@@ -823,7 +836,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                 <Corners />
 
                 <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between gap-2 p-4 sm:p-6">
-                  <BasisBadge basis={current.basis} className="bg-black/60 backdrop-blur" />
+                  <BasisBadge basis={shown} className="bg-black/60 backdrop-blur" />
                   <div ref={realRef} className="rounded-lg bg-black/60 px-2 py-1 text-right font-mono text-[11px] leading-tight text-slate-200 backdrop-blur sm:text-xs">
                     <span ref={zoomRef} className="block text-base font-bold text-white sm:text-lg">
                       ×1
@@ -860,7 +873,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                   className="pointer-events-none absolute inset-x-0 bottom-0 p-4 sm:p-6"
                   style={{ opacity: 0, visibility: "hidden" }}
                 >
-                  <p className="rounded-lg bg-black/70 px-2.5 py-1.5 font-mono text-[11px] leading-snug text-slate-200 backdrop-blur sm:text-xs">
+                  <p className="rounded-lg bg-black/70 px-2.5 py-1.5 font-mono text-[11px] leading-snug text-balance text-slate-200 backdrop-blur sm:text-xs">
                     {current.hud ?? STOPS[3]?.hud}
                   </p>
                 </div>

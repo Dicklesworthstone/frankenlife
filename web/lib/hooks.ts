@@ -1,6 +1,6 @@
 "use client";
 
-import { type RefObject, useEffect, useState } from "react";
+import { type RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /** Whether the reader asks for less motion; false until the page has hydrated. */
 export function useReducedMotion(): boolean {
@@ -39,4 +39,31 @@ export function useInView(ref: RefObject<Element | null>, rootMargin = "120px"):
     return () => observer.disconnect();
   }, [ref, rootMargin]);
   return inView;
+}
+
+/**
+ * A figure drawn one viewBox unit to the CSS pixel. `ref` goes on the box the
+ * figure fills; `width` is that box's inner width (`fallback` until measured, as
+ * in the server's HTML). A scaled viewBox shrinks its text to a few pixels on a
+ * phone and swells it past the page's headings on a wide screen; laid out across
+ * the measured width instead, text keeps the size it is set at. Measured before
+ * the first paint, and again whenever the box resizes.
+ */
+export function useFigureWidth(fallback: number): { ref: RefObject<HTMLDivElement | null>; width: number } {
+  const ref = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(fallback);
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (!element) return;
+    const measure = () => {
+      const next = element.clientWidth;
+      if (next > 0) setWidth(next);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  return { ref, width };
 }

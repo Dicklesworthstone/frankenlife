@@ -21,6 +21,7 @@
 //! recorded as dissipation.
 
 use flife_core::ledger::{EnergyBudget, Ledger, Payment, sub_down};
+use flife_core::numerics::pow_positive;
 use flife_core::{CoreError, Flow, TimeStep, ValidatedConfig};
 
 /// The cost coefficients of `[costs]` that maintenance uses.
@@ -29,21 +30,19 @@ pub struct MaintenanceCosts {
     basal: f64,
     sensor: f64,
     sensor_unit_scale: f64,
+    sensor_scale_exponent: f64,
     neural: f64,
 }
 
 impl MaintenanceCosts {
     /// Coefficients `c_basal`, `c_sensor` (both ecological-energy per
     /// simulation-second), `s_unit` (world-length), the sensing-scale
-    /// exponent `α`, and `c_neural` (ecological-energy per parameter
+    /// exponent `α ≥ 0`, and `c_neural` (ecological-energy per parameter
     /// evaluation).
     ///
     /// # Errors
-    /// - [`CoreError::NumericalInvalid`] for a negative or nonfinite cost or
-    ///   a nonpositive unit scale.
-    /// - [`CoreError::MissingCapability`] for `α ≠ 1`: another exponent needs a
-    ///   host-independent power function, which the reference profile does
-    ///   not have yet.
+    /// [`CoreError::NumericalInvalid`] for a negative or nonfinite cost or
+    /// exponent, or a nonpositive unit scale.
     pub fn new(
         basal: f64,
         sensor: f64,
@@ -64,6 +63,11 @@ impl MaintenanceCosts {
                 sensor_unit_scale > 0.0,
             ),
             (
+                "costs.sensor_scale_cost_exponent",
+                exponent,
+                exponent >= 0.0,
+            ),
+            (
                 "costs.neural_energy_per_parameter_evaluation",
                 neural,
                 neural >= 0.0,
@@ -76,17 +80,11 @@ impl MaintenanceCosts {
                 });
             }
         }
-        if exponent.to_bits() != 1.0_f64.to_bits() {
-            return Err(CoreError::MissingCapability {
-                capability: format!(
-                    "a host-independent power function for costs.sensor_scale_cost_exponent = {exponent}"
-                ),
-            });
-        }
         Ok(Self {
             basal,
             sensor,
             sensor_unit_scale,
+            sensor_scale_exponent: exponent,
             neural,
         })
     }
@@ -106,10 +104,16 @@ impl MaintenanceCosts {
         )
     }
 
-    /// `(c_basal, c_sensor, s_unit, c_neural)`, for a device's phase 6
+    /// `(c_basal, c_sensor, s_unit, α, c_neural)`, for a device's phase 6
     /// (FL-032).
-    pub(crate) const fn coefficients(&self) -> (f64, f64, f64, f64) {
-        (self.basal, self.sensor, self.sensor_unit_scale, self.neural)
+    pub(crate) const fn coefficients(&self) -> (f64, f64, f64, f64, f64) {
+        (
+            self.basal,
+            self.sensor,
+            self.sensor_unit_scale,
+            self.sensor_scale_exponent,
+            self.neural,
+        )
     }
 
     /// The mandatory cost of one tick for an organism with sensing scale
@@ -119,7 +123,7 @@ impl MaintenanceCosts {
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a nonpositive or nonfinite
-    /// sensing scale.
+    /// sensing scale, or a sensing-scale power that overflows.
     pub fn mandatory(
         &self,
         step: TimeStep,
@@ -149,10 +153,39 @@ impl MaintenanceCosts {
                 detail: format!("{sensing_scale} is not a positive length"),
             });
         }
+        let factor = if self.sensor_scale_exponent.to_bits() == 1.0_f64.to_bits() {
+            sensing_scale / self.sensor_unit_scale
+        } else if self.sensor_scale_exponent == 0.0 {
+            1.0
+        } else {
+            let ratio = sensing_scale / self.sensor_unit_scale;
+            if !ratio.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "sensor cost",
+                    detail: format!(
+                        "({sensing_scale} / {})^{} is not finite",
+                        self.sensor_unit_scale, self.sensor_scale_exponent
+                    ),
+                });
+            }
+            if ratio == 0.0 {
+                0.0
+            } else {
+                pow_positive(ratio, self.sensor_scale_exponent).ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "sensor cost",
+                        detail: format!(
+                            "({sensing_scale} / {})^{} overflowed",
+                            self.sensor_unit_scale, self.sensor_scale_exponent
+                        ),
+                    }
+                })?
+            }
+        };
         let seconds = step.seconds_per_tick();
         Ok(MaintenanceBill {
             basal: seconds * self.basal,
-            sensor: seconds * (self.sensor * (sensing_scale / self.sensor_unit_scale)),
+            sensor: seconds * (self.sensor * factor),
             controller: if evaluated {
                 self.neural * f64::from(parameters)
             } else {

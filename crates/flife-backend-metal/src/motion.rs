@@ -34,14 +34,17 @@ use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 use crate::chemistry::{Slot, put, value, word};
 use crate::owner::{Binding, DeviceOwner, Kernel, Limits, Purpose, metal};
 
-/// The motion kernel source, with the software binary64 ahead of it.
+/// The motion kernel source, with the software binary64, Philox and
+/// flife-core's numerics ahead of it.
 pub const MOTION_MSL: &str = concat!(
     include_str!("softfloat64.metal"),
+    include_str!("philox.metal"),
+    include_str!("numerics.metal"),
     include_str!("motion.metal")
 );
 
 /// `motion.metal`'s layouts, in words.
-const PARAMS: usize = 29;
+const PARAMS: usize = 31;
 const ORGANISM: usize = 17 + 6 * MOTION_TERMS;
 const RESPONSE: usize = 17;
 const GRADIENTS: usize = RESPONSE + 2 * MOTION_TERMS;
@@ -173,6 +176,7 @@ impl MetalMotion {
             (23, constants.uptake_capacity),
             (25, constants.world_width),
             (27, constants.world_height),
+            (29, constants.sensor_scale_exponent),
         ] {
             put(&mut params, at, constant);
         }
@@ -338,6 +342,7 @@ fn check_constants(constants: &MotionConstants) -> Result<(), CoreError> {
         basal,
         sensor,
         sensor_unit_scale,
+        sensor_scale_exponent,
         neural,
         decay,
         force_coefficient,
@@ -361,6 +366,11 @@ fn check_constants(constants: &MotionConstants) -> Result<(), CoreError> {
             "costs.sensor_unit_scale_world_units",
             sensor_unit_scale,
             sensor_unit_scale > 0.0,
+        ),
+        (
+            "costs.sensor_scale_cost_exponent",
+            sensor_scale_exponent,
+            sensor_scale_exponent >= 0.0,
         ),
         (
             "costs.neural_energy_per_parameter_evaluation",

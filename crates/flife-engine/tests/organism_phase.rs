@@ -615,19 +615,44 @@ fn maintenance_charges_canonical_model_work_only() {
             Err(CoreError::NumericalInvalid { .. })
         ));
     }
-    assert!(matches!(
-        MaintenanceCosts::new(0.005, 0.001, 1.0, 1.5, 2.0e-9),
-        Err(CoreError::MissingCapability { .. })
-    ));
-    for [basal, sensor, unit_scale, neural] in [
-        [-0.005, 0.001, 1.0, 2.0e-9],
-        [0.005, -0.001, 1.0, 2.0e-9],
-        [0.005, 0.001, 0.0, 2.0e-9],
-        [0.005, 0.001, 1.0, -2.0e-9],
-        [f64::NAN, 0.001, 1.0, 2.0e-9],
+    // Non-unit sensing-scale exponents use the host-independent power function:
+    // α = 0 is scale-independent, α = 1.5 is superlinear, α = 2.0 is quadratic.
+    let constant = MaintenanceCosts::new(0.005, 0.001, 1.0, 0.0, 2.0e-9).expect("alpha = 0");
+    assert_eq!(
+        constant
+            .bill(dt, 3.0, parameters, false)
+            .expect("bill")
+            .sensor,
+        constant
+            .bill(dt, 0.25, parameters, false)
+            .expect("bill")
+            .sensor,
+    );
+    let superlinear = MaintenanceCosts::new(0.005, 0.001, 1.0, 1.5, 2.0e-9).expect("alpha = 1.5");
+    let quad = MaintenanceCosts::new(0.005, 0.001, 1.0, 2.0, 2.0e-9).expect("alpha = 2");
+    let super_bill = superlinear.bill(dt, 4.0, parameters, false).expect("bill");
+    let quad_bill = quad.bill(dt, 3.0, parameters, false).expect("bill");
+    assert!(
+        (super_bill.sensor * 128.0 - 0.008).abs() < 1.0e-15,
+        "4^1.5 = 8: {}",
+        super_bill.sensor * 128.0
+    );
+    assert!(
+        (quad_bill.sensor * 128.0 - 0.009).abs() < 1.0e-15,
+        "3^2 = 9: {}",
+        quad_bill.sensor * 128.0
+    );
+    for [basal, sensor, unit_scale, exponent, neural] in [
+        [-0.005, 0.001, 1.0, 1.0, 2.0e-9],
+        [0.005, -0.001, 1.0, 1.0, 2.0e-9],
+        [0.005, 0.001, 0.0, 1.0, 2.0e-9],
+        [0.005, 0.001, 1.0, -0.5, 2.0e-9],
+        [0.005, 0.001, 1.0, f64::NAN, 2.0e-9],
+        [0.005, 0.001, 1.0, 1.0, -2.0e-9],
+        [f64::NAN, 0.001, 1.0, 1.0, 2.0e-9],
     ] {
         assert!(matches!(
-            MaintenanceCosts::new(basal, sensor, unit_scale, 1.0, neural),
+            MaintenanceCosts::new(basal, sensor, unit_scale, exponent, neural),
             Err(CoreError::NumericalInvalid { .. })
         ));
     }

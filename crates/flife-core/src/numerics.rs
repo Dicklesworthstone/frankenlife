@@ -505,6 +505,28 @@ pub fn exp(x: f64) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// `base^exponent` for finite `base > 0` and finite `exponent`, computed
+/// identically on every IEEE-754 host (plan §5.6, A.1).
+///
+/// Handles the exact identities `x^0 = 1`, `x^1 = x` and `1^a = 1` without
+/// rounding, and otherwise evaluates [`exp`]`(exponent * `[`ln`]`(base))` using
+/// only host-independent operations. Returns `None` for a nonpositive or
+/// nonfinite base, a nonfinite exponent, or an overflowing result.
+#[must_use]
+pub fn pow_positive(base: f64, exponent: f64) -> Option<f64> {
+    if !base.is_finite() || base <= 0.0 || !exponent.is_finite() {
+        return None;
+    }
+    if exponent == 0.0 || base.to_bits() == 1.0_f64.to_bits() {
+        return Some(1.0);
+    }
+    if exponent.to_bits() == 1.0_f64.to_bits() {
+        return Some(base);
+    }
+    let scaled = exponent * ln(base)?;
+    exp(scaled)
+}
+
 /// `(sin 2πu, cos 2πu)` for `0 ≤ u < 1`, computed identically on every
 /// IEEE-754 host: an angle measured in turns, as a uniform draw gives it.
 ///

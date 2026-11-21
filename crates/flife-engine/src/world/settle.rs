@@ -413,7 +413,8 @@ fn motion_constants(rules: &Rules) -> Result<MotionConstants, CoreError> {
             ),
         });
     }
-    let (basal, sensor, sensor_unit_scale, neural) = rules.costs.coefficients();
+    let (basal, sensor, sensor_unit_scale, sensor_scale_exponent, neural) =
+        rules.costs.coefficients();
     let (step_seconds, maximum_acceleration, cost) = rules.motion.step_limit_and_cost();
     if step_seconds.to_bits() != rules.step.seconds_per_tick().to_bits() {
         return Err(differ(format!(
@@ -425,6 +426,7 @@ fn motion_constants(rules: &Rules) -> Result<MotionConstants, CoreError> {
         basal,
         sensor,
         sensor_unit_scale,
+        sensor_scale_exponent,
         neural,
         decay: rules.motion.decay(),
         force_coefficient: rules.motion.force_coefficient(),

@@ -3,7 +3,8 @@
 //! `libm`, and the domain and symmetry each function promises.
 
 use flife_core::numerics::{
-    exp, exp_neg, expm1_neg, ln, log2, sigmoid, sin_cos_turns, tanh, tanh_f32, tanh_f64_as_f32,
+    exp, exp_neg, expm1_neg, ln, log2, pow_positive, sigmoid, sin_cos_turns, tanh, tanh_f32,
+    tanh_f64_as_f32,
 };
 
 /// A total order on finite `f64` in which adjacent values differ by one.
@@ -759,4 +760,64 @@ fn tanh_f64_as_f32_matches_tanh_rounded_including_f32_midpoints() {
             }
         }
     }
+}
+
+#[test]
+fn pow_positive_is_host_independent_exact_on_identities_and_tracks_libm() {
+    // Domain refusals and overflow.
+    for (base, exponent) in [
+        (0.0, 1.0),
+        (-1.0, 2.0),
+        (f64::NAN, 1.0),
+        (f64::INFINITY, 1.0),
+        (2.0, f64::NAN),
+        (2.0, f64::INFINITY),
+        (2.0, f64::NEG_INFINITY),
+        (1.0e200, 4.0),
+    ] {
+        assert_eq!(
+            pow_positive(base, exponent),
+            None,
+            "pow_positive({base:?}, {exponent:?}) must refuse"
+        );
+    }
+    // Exact identities: x^0 = 1, x^1 = x (preserving exact bits), 1^a = 1.
+    for x in [f64::MIN_POSITIVE, 0.125, 0.3, 1.0, 2.718_281_828, f64::MAX] {
+        assert_eq!(
+            pow_positive(x, 0.0).map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert_eq!(
+            pow_positive(x, -0.0).map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+        assert_eq!(pow_positive(x, 1.0).map(f64::to_bits), Some(x.to_bits()));
+    }
+    for a in [-10.0, -0.5, 0.0, 0.5, 1.5, 2.0, 100.0] {
+        assert_eq!(
+            pow_positive(1.0, a).map(f64::to_bits),
+            Some(1.0_f64.to_bits())
+        );
+    }
+    // Agreement with platform libm across sensing-scale ratios and exponents.
+    for base in [0.0625, 0.25, 0.5, 0.75, 1.25, 2.0, 3.0, 4.0, 8.0, 16.0] {
+        for exponent in [0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0] {
+            let got = pow_positive(base, exponent).expect("finite power");
+            let want = base.powf(exponent);
+            let rel = (got - want).abs() / want;
+            assert!(
+                rel <= 1.0e-14,
+                "pow_positive({base}, {exponent}) = {got:e} vs {want:e} (rel {rel:e})"
+            );
+        }
+    }
+    // Cross-host pinned bits (exp(exponent * ln(base))).
+    assert_eq!(
+        pow_positive(2.0, 1.5).expect("2^1.5").to_bits(),
+        exp(1.5 * ln(2.0).expect("ln")).expect("exp").to_bits()
+    );
+    assert_eq!(
+        pow_positive(3.0, 2.0).expect("3^2").to_bits(),
+        exp(2.0 * ln(3.0).expect("ln")).expect("exp").to_bits()
+    );
 }

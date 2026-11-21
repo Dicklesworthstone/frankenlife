@@ -112,6 +112,8 @@ pub struct MotionConstants {
     pub sensor: f64,
     /// `costs.sensor_unit_scale_world_units`.
     pub sensor_unit_scale: f64,
+    /// `costs.sensor_scale_cost_exponent`.
+    pub sensor_scale_exponent: f64,
     /// `costs.neural_energy_per_parameter_evaluation`.
     pub neural: f64,
     /// `Motion::decay`, `e^(−γΔt)`.

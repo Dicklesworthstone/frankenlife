@@ -14,9 +14,9 @@
 // [5] sensor at unit scale, [7] the sensor unit scale and [9] neural costs;
 // [11] the drag decay e^(-gamma dt) and [13] the force coefficient;
 // [15] the maximum speed and [17] acceleration; [19] the motion cost;
-// [21] the response norm limit; [23] the uptake capacity per second; and
-// [25] the world's width and [27] height.
-constant uint M_PARAMS = 29u;
+// [21] the response norm limit; [23] the uptake capacity per second;
+// [25] the world's width and [27] height; and [29] the sensor scale cost exponent.
+constant uint M_PARAMS = 31u;
 
 constant uint M_TERMS = 33u;
 
@@ -104,6 +104,27 @@ static bool clamp_radius(thread d64 &x, thread d64 &y, d64 limit) {
     }
 }
 
+// numerics::pow_positive for finite positive base and finite exponent:
+// exact on exponent == 0, base == 1, exponent == 1; otherwise exp(exponent * ln(base)).
+static bool d_pow_positive(d64 base, d64 exponent, thread d64 &value) {
+    if (!d_finite(base) || !d_lt(0ul, base) || !d_finite(exponent)) {
+        return false;
+    }
+    if ((exponent << 1) == 0ul || base == ONE) {
+        value = ONE;
+        return true;
+    }
+    if (exponent == ONE) {
+        value = base;
+        return true;
+    }
+    d64 scaled = d_mul(exponent, d_ln(base));
+    if (!d_finite(scaled)) {
+        return false;
+    }
+    return exp_signed(scaled, value);
+}
+
 kernel void motion_settle(
     device const uint *params [[buffer(0)]],
     device const uint *organisms [[buffer(1)]],
@@ -140,7 +161,26 @@ kernel void motion_settle(
             return;
         }
         d64 basal = d_mul(seconds, m_load(params, 3u));
-        d64 sensor = d_mul(seconds, d_mul(m_load(params, 5u), d_div(scale, m_load(params, 7u))));
+        d64 exponent = m_load(params, 29u);
+        d64 factor;
+        if (exponent == ONE) {
+            factor = d_div(scale, m_load(params, 7u));
+        } else if ((exponent << 1) == 0ul) {
+            factor = ONE;
+        } else {
+            d64 ratio = d_div(scale, m_load(params, 7u));
+            if (!d_finite(ratio)) {
+                outcome[0] = STATUS_BILL;
+                return;
+            }
+            if ((ratio << 1) == 0ul) {
+                factor = 0ul;
+            } else if (!d_pow_positive(ratio, exponent, factor)) {
+                outcome[0] = STATUS_BILL;
+                return;
+            }
+        }
+        d64 sensor = d_mul(seconds, d_mul(m_load(params, 5u), factor));
         d64 controller = organism[3] != 0u ? d_mul(m_load(params, 9u), d_from_u32(organism[4])) : 0ul;
         // MaintenanceBill::settle: each share finite and nonnegative, the
         // total paid, and the payment split basal first, then sensor.

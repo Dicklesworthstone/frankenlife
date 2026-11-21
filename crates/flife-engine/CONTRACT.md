@@ -705,9 +705,9 @@ each runs and owns the field.
 - An affinity or motion response above its norm limit, or with a nonfinite component.
 - A negative or nonfinite grant, an efficiency outside `[−1, 1]`, or a nonfinite composition.
 - A gain offered to an exhausted budget (`StateConflict`).
-- Negative or nonfinite costs, a nonpositive sensor unit scale, or a nonpositive sensing scale.
-- A sensing-scale cost exponent other than `1`: another exponent needs a host-independent power function, which
-  the reference profile does not have (`MissingCapability`).
+- Negative or nonfinite costs, a negative or nonfinite sensing-scale cost exponent, a nonpositive sensor unit
+  scale, a nonpositive sensing scale, or a sensing-scale power that overflows. Non-unit exponents use
+  `flife_core::numerics::pow_positive` (and `motion.metal`'s matching `d_pow_positive`), keeping `α = 1` bit-identical.
 - Negative drag, nonpositive speed, acceleration or response limits, or a negative motion cost.
 - An uptake ratio outside `[0, 1]`, a nonfinite gradient, velocity or acceleration.
 - A configuration naming another chemistry family or evaluation (`UnknownAlgorithm`).

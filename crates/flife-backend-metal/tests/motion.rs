@@ -232,6 +232,7 @@ struct Numbers {
     basal: f64,
     sensor: f64,
     sensor_unit_scale: f64,
+    sensor_scale_exponent: f64,
     neural: f64,
     drag: f64,
     maximum_speed: f64,
@@ -245,8 +246,14 @@ struct Numbers {
 #[expect(clippy::expect_used, reason = "test helper")]
 fn rules(n: Numbers) -> Rules {
     let step = TimeStep::new(n.step.0, n.step.1).expect("a timestep");
-    let costs = MaintenanceCosts::new(n.basal, n.sensor, n.sensor_unit_scale, 1.0, n.neural)
-        .expect("valid costs");
+    let costs = MaintenanceCosts::new(
+        n.basal,
+        n.sensor,
+        n.sensor_unit_scale,
+        n.sensor_scale_exponent,
+        n.neural,
+    )
+    .expect("valid costs");
     let motion = Motion::new(
         step,
         n.drag,
@@ -268,6 +275,7 @@ fn rules(n: Numbers) -> Rules {
             basal: n.basal,
             sensor: n.sensor,
             sensor_unit_scale: n.sensor_unit_scale,
+            sensor_scale_exponent: n.sensor_scale_exponent,
             neural: n.neural,
             decay: motion.decay(),
             force_coefficient: motion.force_coefficient(),
@@ -296,6 +304,7 @@ fn preset_rules() -> Rules {
         basal: costs.basal_energy_per_second,
         sensor: costs.sensor_energy_per_second_at_unit_scale,
         sensor_unit_scale: costs.sensor_unit_scale_world_units,
+        sensor_scale_exponent: costs.sensor_scale_cost_exponent,
         neural: costs.neural_energy_per_parameter_evaluation,
         drag: chemistry.drag_per_second,
         maximum_speed: chemistry.maximum_speed,
@@ -611,6 +620,7 @@ fn motion_on_the_device_is_the_references() -> Result<(), CoreError> {
             basal: 1.5,
             sensor: 0.05,
             sensor_unit_scale: 0.75,
+            sensor_scale_exponent: 1.5,
             neural: 3.0e-6,
             drag: 0.0,
             maximum_speed: 3.0,
@@ -628,6 +638,7 @@ fn motion_on_the_device_is_the_references() -> Result<(), CoreError> {
             basal: -0.0,
             sensor: -0.0,
             sensor_unit_scale: 2.0,
+            sensor_scale_exponent: 0.0,
             neural: -0.0,
             drag: 1.0e5,
             maximum_speed: 0.5,
@@ -842,6 +853,7 @@ fn motion_the_reference_refuses_is_refused() -> Result<(), CoreError> {
         basal: 0.8,
         sensor: 4.0,
         sensor_unit_scale: 1.0,
+        sensor_scale_exponent: 1.0,
         neural: 2.0e-9,
         drag: 2.0,
         maximum_speed: rules.constants.maximum_speed,
@@ -963,6 +975,10 @@ fn motion_the_reference_refuses_is_refused() -> Result<(), CoreError> {
         },
         MotionConstants {
             decay: 1.5,
+            ..rules.constants
+        },
+        MotionConstants {
+            sensor_scale_exponent: -0.25,
             ..rules.constants
         },
     ] {

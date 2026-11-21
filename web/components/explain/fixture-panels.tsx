@@ -371,6 +371,9 @@ export function UptakeFigure({
     return segment;
   });
   const cellEnd = left + cell * scale;
+  // Beside the cell's end, or, where that would run it off the figure, ending at the edge (0.6 em a character).
+  const createdText = `+${fixed(created)} from nothing`;
+  const createdX = Math.min(cellEnd + 4, across - 2 - createdText.length * 6.6);
   const label = `${title}. Cell of ${fixed(cell)}; ${requests
     .map((request, id) => `${ORGANISMS[id]?.name} asks ${fixed(request)}, gets ${fixed(grants[id] ?? 0)}`)
     .join("; ")}${created > 0 ? `; ${fixed(created)} units created` : ""}.`;
@@ -413,8 +416,8 @@ export function UptakeFigure({
                 fill={`url(#hatch-${tone})`}
                 stroke={TONE.wrong}
               />
-              <text x={Math.min(cellEnd + 4, across - 80)} y={44} fontSize={11} fill={TONE.wrong} className="mono">
-                +{fixed(created)} from nothing
+              <text x={createdX} y={44} fontSize={11} fill={TONE.wrong} className="mono">
+                {createdText}
               </text>
             </>
           ) : null}
@@ -842,7 +845,8 @@ export function MixturePanel() {
               fill="#94a3b8"
               className="mono"
             >
-              {tick === -1 ? "−1 against" : tick === 0 ? "0 neutral" : "along +1"}
+              {/* "neutral" only where it clears "−1 against" (66 px) by its half (30 px) and a gap: not on a 320 px phone. */}
+              {tick === -1 ? "−1 against" : tick === 1 ? "along +1" : X(0) - X(-1) >= 100 ? "0 neutral" : "0"}
             </text>
           ))}
           <text x={X(0)} y={246} fontSize={11} textAnchor="middle" fill="#64748b">

@@ -48,15 +48,26 @@ const BASIS: Record<Basis, { label: string; className: string }> = {
 
 export function BasisBadge({ basis, className }: { basis: Basis; className?: string }) {
   const style = BASIS[basis];
+  // A badge breaks only at its " · ", and only where one line will not fit (a 320 px phone): each half stays whole.
+  const [head, tail] = style.label.split(" · ");
   return (
     <span
       className={cn(
-        "inline-flex shrink-0 items-center rounded-full border px-2.5 py-0.5 text-[10px] font-black tracking-[0.12em] whitespace-nowrap uppercase",
+        "inline-block max-w-full rounded-full border px-2.5 py-0.5 text-[10px] font-black tracking-[0.12em] uppercase",
         style.className,
         className,
       )}
     >
-      {style.label}
+      <span className="whitespace-nowrap">
+        {head}
+        {tail ? " ·" : null}
+      </span>
+      {tail ? (
+        <>
+          {" "}
+          <span className="whitespace-nowrap">{tail}</span>
+        </>
+      ) : null}
     </span>
   );
 }

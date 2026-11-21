@@ -111,7 +111,8 @@ export function BrainAnatomy() {
   const { ref: box, width: drawn } = useFigureWidth(VIEW_W);
   const viewW = Math.round(Math.min(VIEW_W, Math.max(VIEW_W_LEAST, drawn * 1.4)));
   const right = viewW - RIGHT_MARGIN;
-  // The footnote: 9.5 px at the least, and no larger than 11 units where the drawing is enlarged.
+  // The footnote: 9.5 px at the least where a phone shrinks the drawing, and never under its 11 units where a wide
+  // page enlarges it.
   const footnote = Math.max(11, (9.5 * viewW) / drawn);
   const columns = layers.map((width, index) => ({
     width,
@@ -361,12 +362,12 @@ export function BrainAnatomy() {
               });
             })}
 
-            {/* Layer captions. */}
+            {/* Layer captions, raised by as much as a phone enlarges the footnote under them. */}
             {columns.map((column, index) => (
               <text
                 key={`caption-${index}`}
                 x={column.x}
-                y={VIEW_H - 18}
+                y={VIEW_H - 7 - footnote}
                 textAnchor="middle"
                 fontSize={14}
                 className="mono"

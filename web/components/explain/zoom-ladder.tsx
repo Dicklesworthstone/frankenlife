@@ -487,6 +487,8 @@ export function ZoomLadder({ index }: { index?: string }) {
     set(mosaicRef.current, frame.mosaic, `scale(${frame.mosaicScale})`);
     set(changedRef.current, frame.changed);
     set(realRef.current, frame.real);
+    // Gone, the zoom readout gives its room back, so the basis badge beside it keeps to one line on a phone.
+    if (realRef.current) realRef.current.style.display = frame.real <= 0.001 ? "none" : "";
     set(realBottomRef.current, frame.real);
     set(diagramRef.current, frame.diagram);
 

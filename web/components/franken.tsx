@@ -39,7 +39,7 @@ export function FrankenStitch({ className }: { className?: string }) {
   );
 }
 
-/** A glass panel held by four bolts. */
+/** A panel held by four bolts. */
 export function FrankenContainer({
   children,
   className,
@@ -50,7 +50,7 @@ export function FrankenContainer({
   bolts?: boolean;
 }) {
   return (
-    <div className={cn("glass-modern relative rounded-2xl", className)}>
+    <div className={cn("panel relative rounded-2xl", className)}>
       {bolts && (
         <>
           <FrankenBolt className="absolute top-3 left-3" />
@@ -73,14 +73,34 @@ export function MicroLabel({ children, className }: { children: ReactNode; class
   );
 }
 
-/** A heading whose `[bracketed]` words are the one green word. */
-export function GreenTitle({ text }: { text: string }) {
+/**
+ * The reticle: four corner ticks around a specimen or a figure, the instrument's frame.
+ * Decorative only; the parent must be positioned.
+ */
+export function Reticle({ className, inset = 10, size = 14 }: { className?: string; inset?: number; size?: number }) {
+  const corner = "absolute border-[color:var(--reticle,rgba(187,247,208,0.45))]";
+  const box = { width: size, height: size };
+  return (
+    <span aria-hidden="true" className={cn("pointer-events-none absolute inset-0 z-10", className)}>
+      <span className={cn(corner, "border-t border-l")} style={{ ...box, top: inset, left: inset }} />
+      <span className={cn(corner, "border-t border-r")} style={{ ...box, top: inset, right: inset }} />
+      <span className={cn(corner, "border-b border-l")} style={{ ...box, bottom: inset, left: inset }} />
+      <span className={cn(corner, "border-b border-r")} style={{ ...box, bottom: inset, right: inset }} />
+    </span>
+  );
+}
+
+/**
+ * A heading whose `[bracketed]` words are the one green word: solid green, or,
+ * with `lit`, the hero's one gradient.
+ */
+export function GreenTitle({ text, lit = false }: { text: string; lit?: boolean }) {
   const parts = text.split(/(\[[^\]]+\])/);
   return (
     <>
       {parts.map((part, index) =>
         part.startsWith("[") && part.endsWith("]") ? (
-          <span key={index} className="text-animate-green">
+          <span key={index} className={lit ? "life-gradient" : "life-word"}>
             {part.slice(1, -1)}
           </span>
         ) : (

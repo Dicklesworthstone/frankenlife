@@ -11,3 +11,6 @@ next-env.d.ts
 /public/media/
 # Media a newer film replaced, kept rather than deleted.
 /media-retired/
+
+# Written by `next dev` before next.config.ts set agentRules: false; the repository root AGENTS.md is the contract.
+/AGENTS.md

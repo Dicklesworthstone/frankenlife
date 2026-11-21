@@ -9,10 +9,11 @@
 // 9110 byte serving. Everything else is the static export, served as it is.
 //
 // An asset's Response from the binding carries no Content-Length, so each
-// file's size comes from lib/media.json, which `bun run build` has checked
-// against the file byte for byte (scripts/check-media.ts).
+// file's size comes from its manifest (lib/media.json, lib/controls.json),
+// which `bun run build` has checked against the file byte for byte
+// (scripts/check-media.ts).
 
-import { film } from "./lib/media";
+import { mediaFiles } from "./lib/media";
 import { SHARE_IMAGE_PATHS, SHARE_IMAGE_TYPE } from "./lib/share";
 
 type Env = { ASSETS: { fetch(request: Request): Promise<Response> } };
@@ -83,7 +84,7 @@ export function parseRange(header: string, size: number): [number, number] | nul
 }
 
 /** Each medium's size in bytes, by its path on the site. */
-const SIZES = new Map([film.video, film.poster, film.social].map((file) => [file.src, file.bytes]));
+const SIZES = new Map(mediaFiles.map((file) => [file.src, file.bytes]));
 
 /** A Worker serving the media with these sizes; a file it has no size for is served whole. */
 export function mediaWorker(sizes: ReadonlyMap<string, number>) {

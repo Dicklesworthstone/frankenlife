@@ -13,10 +13,9 @@ import { join } from "node:path";
 import { ImageResponse } from "next/og";
 
 import { film } from "@/lib/media";
+import { LINEAGE } from "@/lib/palette";
 import { SHARE_IMAGE_TYPE } from "@/lib/share";
 
-/** The lineage palette (flife-manim's mapping.rs, LINEAGE_PALETTE): the colours the film's organisms wear. */
-const LINEAGE = ["#2EC4B6", "#9B5DE5", "#F15BB5", "#9BF6FF", "#FFB627", "#B5E61D", "#FF6F59", "#4EA8DE"];
 const INK = "#020a02";
 
 /** A Google font as TrueType, which Satori reads (it cannot read WOFF2). */
@@ -299,7 +298,8 @@ export async function shareCard(width: number, height: number): Promise<Response
           bottom: 0,
           height: 6,
           display: "flex",
-          backgroundImage: `linear-gradient(90deg, ${LINEAGE.join(", ")})`,
+          // The first eight of the lineage palette, the strip the card has always carried.
+          backgroundImage: `linear-gradient(90deg, ${LINEAGE.slice(0, 8).join(", ")})`,
         }}
       />
     </div>,

@@ -7,6 +7,9 @@ const nextConfig: NextConfig = {
   images: { unoptimized: true },
   poweredByHeader: false,
   reactStrictMode: true,
+  // `next dev` otherwise writes web/AGENTS.md when it sees a coding agent;
+  // the repository's AGENTS.md is the agents' contract.
+  agentRules: false,
 };
 
 export default nextConfig;

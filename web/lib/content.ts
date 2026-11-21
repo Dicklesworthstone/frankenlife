@@ -1,7 +1,14 @@
-// Every word and number on the site. Each figure here is one the repository
-// itself states (README.md, the crates' CONTRACT.md files, experiments/fl048)
-// or one the film's manifest records (lib/media.json); none is a target
-// dressed as a result.
+// Every word and number on the site outside the explainers (components/explain/,
+// whose figures cite their sources in their own captions). Each figure here is
+// one the repository itself states (README.md, the plan, the crates'
+// CONTRACT.md files, experiments/fl048 and experiments/showcase), one the
+// film's manifest records (lib/media.json), or, in `branchObservation`, one
+// this page observed and dates; none is a target dressed as a result.
+
+import { film } from "@/lib/media";
+
+/** The film's organisms on its first frame, from flife render's record of that frame. */
+const filmAlive = (film.world.live[0] ?? 0).toLocaleString("en-US");
 
 export const siteConfig = {
   name: "FrankenLife",
@@ -16,6 +23,7 @@ export const siteConfig = {
   fl048: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/fl048/README.md",
   showcase: "https://github.com/Dicklesworthstone/frankenlife/blob/main/experiments/showcase/README.md",
   license: "https://github.com/Dicklesworthstone/frankenlife/blob/main/LICENSE",
+  agents: "https://github.com/Dicklesworthstone/frankenlife/blob/main/AGENTS.md",
 };
 
 // How the film's world and its camera were chosen (experiments/showcase/README.md,
@@ -31,14 +39,260 @@ export const filmChoice = {
     "The camera is chosen from the run, not by hand. The same ticks are first rendered small; each shot then eases into the region where the organisms changed most during it, and the film opens and closes on the whole torus. The camera changes no result: the preview and the film end on the same digest.",
 };
 
-export const navItems = [
-  { href: "#film", label: "The film" },
-  { href: "#world", label: "The world" },
-  { href: "#tick", label: "One tick" },
-  { href: "#status", label: "Status" },
-  { href: "#science", label: "Science" },
-  { href: "#try", label: "Try it" },
-] as const;
+/**
+ * The page's five chapters, in order. Each wears one colour of the film's
+ * lineage palette (`LINEAGE[colour]`, lib/palette.ts), as the film colours each
+ * founder's descendants; `short` is the phone dock's label.
+ */
+export type Chapter = {
+  id: string;
+  number: string;
+  short: string;
+  label: string;
+  title: string;
+  thesis: string;
+  colour: number;
+  sections: { id: string; label: string }[];
+};
+
+export const chapters: Chapter[] = [
+  {
+    id: "world",
+    number: "01",
+    short: "World",
+    label: "The world",
+    title: "Every speck is [someone].",
+    thesis:
+      `The film shows ${filmAlive} organisms at once, and each is an individual: a body, an energy budget, offspring and its own neural network. Zoom in until you reach one, watch what it does in a tick, then run a small world of your own.`,
+    colour: 0,
+    sections: [
+      { id: "zoom", label: "From the world to one brain" },
+      { id: "what", label: "One tick in a life" },
+      { id: "alive", label: "A toy world to run" },
+    ],
+  },
+  {
+    id: "different",
+    number: "02",
+    short: "Different",
+    label: "Why it is different",
+    title: "Beautiful is easy. [Earned] is hard.",
+    thesis:
+      "Artificial-life imagery is easy to fake: one network copied into every body, energy from nowhere, a quiet cull, a renderer doing the work. FrankenLife forbids each shortcut, and its controls show the structure going when a cause is taken away.",
+    colour: 5,
+    sections: [
+      { id: "different", label: "Four forbidden shortcuts" },
+      { id: "controls", label: "Remove a cause" },
+      { id: "film", label: "What the film is" },
+    ],
+  },
+  {
+    id: "machinery",
+    number: "03",
+    short: "How",
+    label: "How it works",
+    title: "The [machinery].",
+    thesis:
+      "Independent brains, an explicit model with one energy ledger, rules pinned by answers you can compute by hand, and a tick that is published whole or not at all.",
+    colour: 3,
+    sections: [
+      { id: "brains", label: "Independent brains" },
+      { id: "world", label: "The model" },
+      { id: "rules", label: "Check it by hand" },
+      { id: "tick", label: "One tick" },
+    ],
+  },
+  {
+    id: "evidence",
+    number: "04",
+    short: "Evidence",
+    label: "What it can show",
+    title: "Claims, [kept apart].",
+    thesis:
+      "Replays that land on the same digest, experiments whose rules were written before they ran, a scale argued in arithmetic, and a status that names what is not done.",
+    colour: 4,
+    sections: [
+      { id: "replay", label: "Rewind and branch" },
+      { id: "science", label: "What the experiments found" },
+      { id: "claims", label: "Four claims" },
+      { id: "scale", label: "Why the scale is hard" },
+      { id: "status", label: "Honest status" },
+    ],
+  },
+  {
+    id: "lab",
+    number: "05",
+    short: "Lab",
+    label: "Use it",
+    title: "Your [laboratory].",
+    thesis:
+      "Eight worlds to open, a native Studio to watch and touch them, and a command line that records everything it does.",
+    colour: 7,
+    sections: [
+      { id: "worlds", label: "Eight worlds" },
+      { id: "studio", label: "Studio and command line" },
+      { id: "stack", label: "The Franken stack" },
+      { id: "try", label: "Run it yourself" },
+    ],
+  },
+];
+
+export type LifeStep = {
+  id: string;
+  name: string;
+  /** Who acts: the shared field, or one organism. */
+  actor: "field" | "organism";
+  /** Where it happens in the ordered tick (README "One tick"). */
+  phases: string;
+  body: string;
+  /** Where on this page the rule behind it can be checked. */
+  link?: { href: string; label: string };
+};
+
+// One organism's life, in the order the tick runs it (README "How the world works", plan §4–§8).
+export const lifeCycle: LifeStep[] = [
+  {
+    id: "sources",
+    name: "Sources",
+    actor: "field",
+    phases: "phase 2",
+    body: "Seeded Gaussian patches drift across the torus on smooth paths. Each injects a fixed power per simulated second, with a fixed chemical direction. Apart from a researcher's brush, it is the only food that enters the world.",
+  },
+  {
+    id: "field",
+    name: "Field",
+    actor: "field",
+    phases: "phases 2 and 9",
+    body: "Every cell holds energy and a 32-channel signed chemical signature that can never exceed it. One positive stencil spreads both, so energy is conserved before its declared decay.",
+    link: { href: "#rules", label: "Signals cannot counterfeit food (C.3)" },
+  },
+  {
+    id: "sense",
+    name: "Sense",
+    actor: "organism",
+    phases: "phases 3–4",
+    body: "Each organism reads energy, the 32 chemical channels and their gradients at its own inherited sensing scale, plus its own energy, age, velocity and recent change: 104 numbers.",
+    link: { href: "#brains", label: "The 104 inputs" },
+  },
+  {
+    id: "decide",
+    name: "Decide",
+    actor: "organism",
+    phases: "phase 4",
+    body: "Its own network, whose weights no other organism shares, turns those 104 numbers into 36: when to split, how much to give a child, whether to emit, what chemistry and how much.",
+    link: { href: "#brains", label: "Every organism, its own brain" },
+  },
+  {
+    id: "feed",
+    name: "Feed",
+    actor: "organism",
+    phases: "phases 5–6",
+    body: "It draws on the cells beneath it, and a contended cell shares in proportion. Its inherited affinity decides whether each packet feeds or poisons it.",
+    link: { href: "#rules", label: "Who eats, by hand (C.1, C.9)" },
+  },
+  {
+    id: "move",
+    name: "Move",
+    actor: "organism",
+    phases: "phase 7",
+    body: "No network output moves it. Inherited responses to the field's gradients accelerate it, drag slows it, and moving costs energy in proportion to speed squared.",
+  },
+  {
+    id: "emit",
+    name: "Emit",
+    actor: "organism",
+    phases: "phase 7, sensed after phase 9",
+    body: "It can pay energy to write the chemistry its network chose into the field. Neighbours sense it on the next tick, and the field never receives more than was paid, so no loop can amplify energy.",
+  },
+  {
+    id: "divide",
+    name: "Divide",
+    actor: "organism",
+    phases: "phases 7–8",
+    body: "A split costs energy and makes a child with a mutated copy of the parent's genome. Identity, genome, slot and energy transfer commit together, or nothing happens.",
+    link: { href: "#rules", label: "A birth is a transaction (C.5)" },
+  },
+  {
+    id: "die",
+    name: "Die",
+    actor: "organism",
+    phases: "phase 8, returned in 9",
+    body: "Zero energy after any stage is death, checked after every stage. Part of what it held returns to the field, as food and chemistry for whatever comes next.",
+  },
+];
+
+// README TL;DR: "A shared-weight network, an unaccounted energy source, a cull that keeps the screen
+// attractive, or a renderer benchmarked with inference switched off can each produce a gorgeous video
+// of nothing evolving." Each shortcut beside the rule that forbids it.
+export const shortcuts = [
+  {
+    shortcut: "One network, copied",
+    temptation: "Hundreds of thousands of organisms that are really one shared policy: cheap, fast and smooth.",
+    rule: "Every organism carries its own weights. Organisms with the same topology are batched to share a kernel and a memory layout, never a parameter, and a rare topology gets a correct fallback, never a different controller.",
+    refs: ["INV-13", "plan §6.5"],
+  },
+  {
+    shortcut: "Energy from nowhere",
+    temptation: "A world that thrives on food nobody paid for, or an overspent cell quietly zeroed.",
+    rule: "An energy ledger closes on every committed tick: total energy changes only by injection, removal and dissipation, within a declared residual. No correction may add energy to make it balance.",
+    refs: ["INV-03", "plan §4.4"],
+  },
+  {
+    shortcut: "A quiet cull",
+    temptation: "Ugly regions removed, an extinct world reseeded, an aesthetic score steering selection.",
+    rule: "No hidden culling, no reseeding after extinction and no aesthetic fitness inside the world. A capacity limit is explicit and recorded, and failed and extinct runs are kept.",
+    refs: ["INV-12", "plan §7.5, §15.5"],
+  },
+  {
+    shortcut: "A renderer with no brains",
+    temptation: "A smooth frame rate from a world that is not thinking, or one that skips ticks under load.",
+    rule: "The Studio reports committed ticks per second and simulated time apart from frames per second. The engine never skips ticks, enlarges Δt or lowers neural cadence under load while keeping the model's name.",
+    refs: ["plan §12.2", "§22.5"],
+  },
+];
+
+// README TL;DR: what exists, and what FrankenLife composes. Each line says what the other work shows,
+// in the README's words; none of it claims what that work lacks.
+export const priorWork = [
+  { name: "Neural cellular automata", shows: "learn one shared local rule" },
+  { name: "Lenia, Flow-Lenia, Particle Lenia", shows: "show what continuous local rules, mass conservation and interactive exploration can do" },
+  { name: "ScriptBots-style simulators", shows: "give agents direct interactions and pluggable brains" },
+  { name: "Neural-Kimchi-4B", shows: "shows the target look at the target scale" },
+];
+
+export const composes = [
+  { title: "An independent heritable brain for every organism", body: "Weights start random and change only by inherited mutation. Nothing is trained by gradient." },
+  { title: "Field-only interaction under an energy ledger", body: "Organisms touch each other only by eating and writing the shared field, and the books balance every tick." },
+  { title: "A deterministic tick that survives cancellation and crashes", body: "Checkpoint, kill, resume and branch: the same commands reach the same world, bit for bit." },
+  { title: "Live, inspectable, recordable animation of that same state", body: "FrankenManim draws committed epochs. Watching, zooming or recording never changes the world." },
+];
+
+// README "What FrankenLife is not".
+export const notThis = [
+  "Not a port of Neural-Kimchi-4B, and no claim of numerical parity with it.",
+  "Not a decorative particle animation: no shapes are painted in.",
+  "Not a shared-policy, distilled or low-rank shortcut presented as independent networks.",
+  "Not trained by gradient, and not scored by any aesthetic fitness function inside the world.",
+  "Not a claim about life: “species”, “colony” and “cooperation” are analysis labels with operational criteria.",
+];
+
+// What this page observed when it checked its own branch commands: the reference preset kept for 512 ticks,
+// stepped 64, branched as a control and with one energy brush, all three resumed to tick 1,024. Run on
+// 2026-11-21 with the flife-studio target's release `flife` (built from the working tree on 2026-11-20,
+// SHA-256 a159e6bf…), controllers on Metal, 8 CPU workers.
+export const branchObservation = {
+  date: "2026-11-21",
+  host: "Apple M5 Ultra, macOS 27.0.1",
+  binary: "a159e6bfbf1e8b8e",
+  tick: 1024,
+  from: 576,
+  brush: "256 energy at cell (64, 64), tick 640",
+  digests: [
+    { name: "The parent, resumed", digest: "2ade32c2f3e74f6f54181019774181e2aa0857bd79bd6c5a6f774f85e46a8183", same: true },
+    { name: "Control branch", digest: "2ade32c2f3e74f6f54181019774181e2aa0857bd79bd6c5a6f774f85e46a8183", same: true },
+    { name: "Brushed branch", digest: "0d910c5d40a76a1511bcef2eafccdf7bb748a60460fb81519aa4d91f785d8cc7", same: false },
+  ],
+};
 
 export type Stat = { value: string; label: string; note: string };
 
@@ -62,29 +316,6 @@ export const heroStats: Stat[] = [
     value: "≈10/s",
     label: "ticks, 100k organisms",
     note: "The Desktop ecology world on 16 workers of an M5 Ultra. Measured, not a passed gate.",
-  },
-];
-
-export const principles = [
-  {
-    title: "Every organism has its own weights.",
-    body: "Organisms with the same topology share a kernel and a memory layout, never a parameter.",
-  },
-  {
-    title: "Organisms meet only through the field.",
-    body: "No pairwise attraction tables, collision forces or global reward functions in the baseline. The film's world is a registered variant that adds one rule, bodies that push apart and stick to alike chemistry, and says so.",
-  },
-  {
-    title: "Signals cannot counterfeit food.",
-    body: "A cell holds spendable energy e and a 32-component chemical signature m with ‖m‖ ≤ e. Opposite signals can cancel each other's chemistry without creating or destroying energy.",
-  },
-  {
-    title: "Nothing is trained by gradient.",
-    body: "Weights start random and change only through inherited mutation.",
-  },
-  {
-    title: "The ledger always balances.",
-    body: "Energy in the organisms plus energy in the field changes only by injection, removal, dissipation and a declared numerical residual, every tick.",
   },
 ];
 
@@ -249,42 +480,210 @@ export const gates: { id: string; name: string; state: GateState; detail: string
 
 export type Verdict = "met" | "narrow" | "not";
 
-export const hypotheses: { id: string; name: string; verdict: Verdict; label: string; result: string }[] = [
+/**
+ * One measure, seed by seed: on `k` of `n` paired seeds the effect went the
+ * stated way, in the discovery split and in the held-out split
+ * (experiments/fl048/README.md).
+ */
+export type SeedStrip = { measure: string; discovery: [number, number]; heldOut: [number, number] };
+
+export const hypotheses: {
+  id: string;
+  name: string;
+  verdict: Verdict;
+  label: string;
+  result: string;
+  strips: SeedStrip[];
+}[] = [
   {
     id: "H1",
     name: "Persistent heterogeneous colonies",
     verdict: "met",
     label: "Met · a low bar",
-    result: "Every run that reached tick 8,192 kept clustered, spatially autocorrelated colonies: 32 of 32 and 16 of 16.",
+    result: "Every run that reached tick 8,192 ended with clustered, spatially autocorrelated colonies: 32 of 32 in E2, 16 of 16 E1 controls, and 112 of 112 runs across every ablation. A low bar: it is clustering at one sample, not colonies persisting through time, and it holds without controllers, emission or inheritance.",
+    strips: [{ measure: "E1 control meets the colony criterion", discovery: [8, 8], heldOut: [8, 8] }],
   },
   {
     id: "H2",
     name: "Controllers add behaviour beyond chemistry",
     verdict: "not",
     label: "Not supported",
-    result: "The chemistry-only ablation also stops emission, and removing emission alone has the same effects. The decisions' own effect is inconsistent.",
+    result: "Zeroing the controllers' decisions leaves more organisms alive, but that ablation also stops emission, and removing emission alone has the same effect. Compared with no-emission (post hoc), the decisions' own effect is inconsistent on every measure.",
+    strips: [
+      { measure: "Chemistry-only: more alive than control", discovery: [8, 8], heldOut: [7, 8] },
+      { measure: "Post hoc, chemistry-only against no-emission: more alive", discovery: [5, 8], heldOut: [4, 8] },
+    ],
   },
   {
     id: "H3",
     name: "Paid emission supports niche construction",
     verdict: "narrow",
     label: "Met narrowly",
-    result: "Emission evens the field (Gini lower on 6 of 8 seeds, held out 7 of 8) but leaves colonies' clustering unchanged: environment modification, not demonstrated niche construction.",
+    result: "Emission evens the field (Gini about 1.5% lower) but leaves how organisms cluster unchanged, and costs population: environment modification, not demonstrated niche construction.",
+    strips: [
+      { measure: "Field Gini lower with emission", discovery: [6, 8], heldOut: [7, 8] },
+      { measure: "Organism Morisita higher without emission", discovery: [4, 8], heldOut: [4, 8] },
+    ],
   },
   {
     id: "H4",
     name: "Visual structures are functional",
     verdict: "narrow",
     label: "Rule met · not established",
-    result: "The declared rule was met on one measure, but post hoc that effect is mostly an emptied disk refilling. A functional boundary is not established.",
+    result: "Removing a colony's boundary changed the field over the colony more than removing its interior, as declared. Post hoc, 85–98% of that effect is the emptied disk refilling. A functional boundary is not established.",
+    strips: [
+      { measure: "Field over the colony: boundary effect largest", discovery: [3, 4], heldOut: [3, 4] },
+      { measure: "Survival: boundary-specific", discovery: [1, 4], heldOut: [1, 4] },
+    ],
   },
   {
     id: "H5",
     name: "Architecture variation affects ecology",
     verdict: "not",
     label: "Not supported",
-    result: "Final population and births reverse sign between the discovery and held-out seeds.",
+    result: "Fixing every organism's topology raised the final population on the discovery seeds and lowered it on the held-out seeds: the effect reverses.",
+    strips: [{ measure: "Fixed topology: more alive than control", discovery: [7, 8], heldOut: [2, 8] }],
   },
+];
+
+// FL-048's inheritance control, the record's "strongest result in E1" (experiments/fl048/README.md).
+export const inheritance = {
+  title: "Selection acts on inherited variation.",
+  body: "Give every newborn the genome a founder would have drawn at its identity, with the default topology and no mutation, instead of its parent's mutated copy; it keeps its parent's lineage. The world then holds about half the organisms, and far more founder lineages survive side by side, because no lineage carries a heritable advantage.",
+  figures: [
+    { value: "−2,407", label: "organisms alive at the end", note: "discovery; −2,524 held out" },
+    { value: "+113.8", label: "founder lineages alive", note: "discovery; +110.9 held out" },
+    { value: "0.0078", label: "exact sign-flip p", note: "each, 8 of 8 seeds in both splits" },
+  ],
+  strips: [
+    { measure: "Fewer alive without inheritance", discovery: [8, 8], heldOut: [8, 8] },
+    { measure: "More founder lineages alive without inheritance", discovery: [8, 8], heldOut: [8, 8] },
+  ] satisfies SeedStrip[],
+  scope: "reference-small-world, 4,096 founders, 64 simulated seconds, 8 discovery and 8 held-out seeds, paired against the control.",
+};
+
+// The presets (presets/*.toml; README "Planned command surface"). `kind` says how each was chosen:
+// a profile's world is declared by its experiment; the others were picked by an outer search whose
+// procedure experiments/showcase/README.md states, never presented as arbitrary random starts.
+export const presets: {
+  file: string;
+  model: string;
+  founders: number;
+  ceiling: number;
+  grid: number;
+  torus: number;
+  dt: string;
+  kind: "profile" | "search";
+  chosen: string;
+  body: string;
+}[] = [
+  {
+    file: "reference-small-world",
+    model: "field-ecology-v1",
+    founders: 4096,
+    ceiling: 16384,
+    grid: 128,
+    torus: 128,
+    dt: "1/128",
+    kind: "profile",
+    chosen: "Reference profile · FL-015",
+    body: "Appendix A at the Reference scale, plus a declared viability tuning. Unfed founders starve and fed lineages breed; the smoke test pins its digest after 1,024 ticks.",
+  },
+  {
+    file: "interactive-world",
+    model: "field-ecology-v1",
+    founders: 25000,
+    ceiling: 40000,
+    grid: 256,
+    torus: 256,
+    dt: "1/128",
+    kind: "profile",
+    chosen: "Interactive profile · FL-034 E1",
+    body: "Source power chosen by a declared experiment. Populations settle at about 22,000 to 25,000 after an early bottleneck.",
+  },
+  {
+    file: "desktop-world",
+    model: "field-ecology-v1",
+    founders: 100000,
+    ceiling: 160000,
+    grid: 512,
+    torus: 512,
+    dt: "1/128",
+    kind: "profile",
+    chosen: "Desktop profile · FL-034 E2",
+    body: "F16 weights. All 8 of E2's runs settled at 91,664 to 99,361 alive. About 10 ticks a second on 16 workers of an M5 Ultra: a world to study, not yet one to watch at frame rate.",
+  },
+  {
+    file: "showcase-world",
+    model: "field-ecology-v1",
+    founders: 43816,
+    ceiling: 240000,
+    grid: 256,
+    torus: 256,
+    dt: "1/32",
+    kind: "search",
+    chosen: "Outer search · first choice",
+    body: "Membranes, rings and crescents, which inherited chemistry makes without the networks.",
+  },
+  {
+    file: "colony-world",
+    model: "field-ecology-v1",
+    founders: 43816,
+    ceiling: 177536,
+    grid: 256,
+    torus: 256,
+    dt: "1/32",
+    kind: "search",
+    chosen: "Outer search · stage W",
+    body: "Discrete colonies on a black field, held at a binding ceiling by refuse-excess-births-v1, the plan's declared exhibition policy.",
+  },
+  {
+    file: "tissue-world",
+    model: "field-ecology-v1",
+    founders: 10954,
+    ceiling: 177536,
+    grid: 128,
+    torus: 128,
+    dt: "1/32",
+    kind: "search",
+    chosen: "Outer search · stage W",
+    body: "Lineages paint their surroundings with their own emitted chemistry and merge into a nearly continuous tissue of membranes, voids and mesh walls, 110,000–170,000 strong.",
+  },
+  {
+    file: "contact-world",
+    model: "field-ecology-v1-contact",
+    founders: 10954,
+    ceiling: 177536,
+    grid: 128,
+    torus: 128,
+    dt: "1/32",
+    kind: "search",
+    chosen: "Outer search · stage C",
+    body: "tissue-world with bodies 0.45 units across that push apart and pull alike chemistry together: single-file membranes, rings and foam.",
+  },
+  {
+    file: "confluent-world",
+    model: "field-ecology-v1-contact",
+    founders: 10954,
+    ceiling: 262144,
+    grid: 320,
+    torus: 80,
+    dt: "1/32",
+    kind: "search",
+    chosen: "Outer search · stage E · the film",
+    body: "contact-world on a field four times finer, fed to its ceiling, with children landing up to 2.5 units away: saturated domains of labyrinth, foam and packed spheres.",
+  },
+];
+
+// Plan §22.1 / README "Milestones and gates": evidence gates, not calendar promises.
+export const milestones = [
+  { id: "M0", name: "Compatible foundation", deliverable: "Runtime, typed arrays, an independent-network batch and a FrankenManim frame in one program", gates: ["G0"] },
+  { id: "M1", name: "First living world", deliverable: "4,096 organisms with independent genomes, the ledger, reproduction, mutation and death, live", gates: ["G1", "G2"] },
+  { id: "M2", name: "Usable laboratory", deliverable: "A polished 25k profile, inspector, interventions, checkpoint, resume, branches, recording", gates: ["G3", "G5", "G6"] },
+  { id: "M3", name: "Qualified acceleration", deliverable: "CPU/Metal parity, persistent buffers, fused population inference, variable topology", gates: ["G4"] },
+  { id: "M4", name: "Screenshot-scale world", deliverable: "400k independent networks near 10k parameters on a 1024² field, interactive, honest clocks", gates: ["G7", "G8"] },
+  { id: "M5", name: "Scientific and visual release", deliverable: "A seed gallery, ablations, experiment reports, reliable Cinema export", gates: ["G9", "G10"] },
+  { id: "M6", name: "Additional model families", deliverable: "Recurrent controllers, multi-carrier chemistry or physical boundaries, each with a demonstrated need", gates: [] },
 ];
 
 export const stack = [
@@ -340,10 +739,35 @@ export const commands = [
       "cargo run --release -p flife-studio -- presets/confluent-world.toml --color lineage-energy --look sphere --no-field",
   },
   {
-    comment: "A kept run, then a step past its newest durable tick",
-    command:
-      "cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 512 --run-dir my-run && cargo run --release -p flife-cli -- step my-run --ticks 64",
+    comment: "A kept run, a step past its newest durable tick, a control branch and a branch with an energy brush",
+    command: [
+      "cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 512 --run-dir my-run",
+      "cargo run --release -p flife-cli -- step my-run --ticks 64",
+      "cargo run --release -p flife-cli -- branch my-run control",
+      "cargo run --release -p flife-cli -- branch my-run brushed --inject 640:64,64:256",
+    ].join("\n"),
   },
+  {
+    comment: "Resume all three to tick 1,024 and compare their last records' digests: the control's is the parent's",
+    command:
+      "for run in my-run control brushed; do cargo run --release -q -p flife-cli -- resume $run --until 1024 | tail -1; done",
+  },
+];
+
+// The flife binary's subcommands (crates/flife-cli/src/main.rs; README "Planned command surface").
+export const cliSurface = [
+  { name: "validate", body: "Range-check a configuration and report its memory and worst admitted allocation" },
+  { name: "capabilities", body: "Run each controller route against the reference: what this machine can run" },
+  { name: "run", body: "A headless run; with --run-dir, durable, journaled and checkpointed" },
+  { name: "resume", body: "Continue a run directory from its newest checkpoint that restores" },
+  { name: "step", body: "Advance a run past its newest durable tick, its journal replayed first" },
+  { name: "branch", body: "Control and intervention branches from one checkpoint" },
+  { name: "inspect", body: "A run's committed world at a checkpoint: every organism and cell, weights included" },
+  { name: "experiment", body: "Seed ensembles, sweeps and ablations against a control, every run cataloged" },
+  { name: "analyze", body: "Experiments' effects pooled by condition, refused unless comparable" },
+  { name: "discover", body: "A pinned discovery: reference, selection, thumbnail, world export, local package" },
+  { name: "transplant", body: "Graft a discovered package into a host world, as a new run that resumes" },
+  { name: "render", body: "Frames and MP4 through FrankenManim, from a configuration or a kept run" },
 ];
 
 export const inspiration =

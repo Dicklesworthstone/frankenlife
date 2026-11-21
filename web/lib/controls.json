@@ -1,0 +1,121 @@
+{
+  "schema": "frankenlife.website-controls.v1",
+  "preset": "presets/confluent-world.toml",
+  "seed": 42,
+  "tick": 2400,
+  "change": "model",
+  "torus": [
+    80,
+    80
+  ],
+  "body_diameter": 0.25,
+  "ceiling": 262144,
+  "render": {
+    "command": "flife render CONFIG --ticks 2400 --every 2400 --width 1080 --height 1080 --no-field --look sphere --color lineage-energy --out FRAMES",
+    "jpeg": [
+      "-q:v",
+      "3"
+    ],
+    "mapping": "lineage-energy",
+    "meaning": "founder lineage lit by energy: the lineage's colour (lineage-energy), lighter as the organism holds more of the energy it needs to divide, black with none, white with 1.8 times it",
+    "look": "sphere",
+    "field_mapping": "none"
+  },
+  "record": {
+    "json": "experiments/showcase/confluent.json",
+    "readme": "experiments/showcase/README.md, \"### Controls\"",
+    "rule": "plan §5.4: a registered variant runs beside its two controls"
+  },
+  "flife_sha256": "a159e6bfbf1e8b8e38e6b21b51888435784d082d49cde9c9125593208ff6e3d3",
+  "flife_version": "flife 0.0.1",
+  "revision": "fdf7a69055410af6bda73a6fa8ec19b4e11ada9b",
+  "uncommitted": [
+    "crates/flife-cli/CONTRACT.md",
+    "crates/flife-cli/src/branch.rs",
+    "crates/flife-cli/src/experiment.rs",
+    "crates/flife-cli/src/lib.rs",
+    "crates/flife-cli/src/persist.rs",
+    "crates/flife-cli/src/run.rs",
+    "crates/flife-cli/src/transplant.rs",
+    "crates/flife-cli/tests/run_manifest.rs"
+  ],
+  "host": "Apple M5 Ultra, macOS 27.0.1",
+  "date": "2026-11-21",
+  "stills": [
+    {
+      "id": "confluent",
+      "label": "The film's world",
+      "model": "field-ecology-v1-contact",
+      "removed": null,
+      "rule": "Every rule on: each organism's own network chooses its actions from what it senses, and a child inherits its parent's genome, mutated.",
+      "config_hash": "454f6c1afa56672e57b8fc89a1e6903613cdcf35e6be40acdcd19a8181b03c0c",
+      "src": "/media/poster-d545d729f673.jpg",
+      "poster": true,
+      "sha256": "d545d729f67361a31f518054c350ac9f4d743be0781efb4037ef4911ee3d1a17",
+      "bytes": 1040189,
+      "width": 1080,
+      "height": 1080,
+      "tick": 2400,
+      "live": 262144,
+      "digest": "3f279f51662ba456db526d2828b3faf19f93a7bd160deeb6f8e5f7f86f5134ed",
+      "controllers": "metal (Apple M5 Ultra)",
+      "record": {
+        "trial": "w80-o25",
+        "live": 262144,
+        "digest": "3f279f51662ba456db526d2828b3faf19f93a7bd160deeb6f8e5f7f86f5134ed",
+        "distance": 0.739,
+        "by_eye": "lineage domains of labyrinth, foam and packed spheres"
+      }
+    },
+    {
+      "id": "chemistry-only",
+      "label": "Decisions removed",
+      "model": "field-ecology-v1-contact-chemistry-only",
+      "removed": "the networks' decisions",
+      "rule": "Every network still runs and is still charged for, but every organism's actions decode from an all-zero output, so no network decides anything.",
+      "config_hash": "e3d421ba35e5d559c522669d0491a86bd5921915ba8d25c3e95471f487778b1b",
+      "src": "/media/controls-chemistry-only-7a268bd4fc3d.jpg",
+      "poster": false,
+      "sha256": "7a268bd4fc3d3da4cd6d1eae52f95d809f99ff950267af62af37d5a9cb2e44e7",
+      "bytes": 718969,
+      "width": 1080,
+      "height": 1080,
+      "tick": 2400,
+      "live": 262144,
+      "digest": "fa4d9ae6092e6f3f8a5eb14f9a266137afd1910c264041dd3b842cf5f76ba5dc",
+      "controllers": "metal (Apple M5 Ultra)",
+      "record": {
+        "trial": "cw-chem",
+        "live": 262144,
+        "digest": "fa4d9ae6092e6f3f8a5eb14f9a266137afd1910c264041dd3b842cf5f76ba5dc",
+        "distance": 1.441,
+        "by_eye": "a uniform mottled haze of small clumps: no domains, labyrinths or foam"
+      }
+    },
+    {
+      "id": "fresh-offspring",
+      "label": "Inheritance removed",
+      "model": "field-ecology-v1-contact-fresh-offspring",
+      "removed": "inheritance",
+      "rule": "Each newborn gets the genome a founder would have at its identity, unmutated, instead of its parent's mutated genome.",
+      "config_hash": "174ef0915f175c7c44ae52c08b8efa5113dec50150770681bb57cdce8bc9c657",
+      "src": "/media/controls-fresh-offspring-d87ae24fa041.jpg",
+      "poster": false,
+      "sha256": "d87ae24fa041c466fb79389540f0059d8fa39c3dfb53bfe22077317d7e4e7f73",
+      "bytes": 57487,
+      "width": 1080,
+      "height": 1080,
+      "tick": 2400,
+      "live": 1222,
+      "digest": "10b118f9b7dd52e3e89a97f7f1c23b02ccb6d5869b88d33719c65466d6c66d0a",
+      "controllers": "metal (Apple M5 Ultra)",
+      "record": {
+        "trial": "cw-fresh",
+        "live": 1222,
+        "digest": "10b118f9b7dd52e3e89a97f7f1c23b02ccb6d5869b88d33719c65466d6c66d0a",
+        "distance": 5.003,
+        "by_eye": "sparse scatter"
+      }
+    }
+  ]
+}

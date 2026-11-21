@@ -5,9 +5,51 @@ The project's page: Next.js 16 as a static export, served by Cloudflare as an as
 each frame's tick and live organisms taken from the render's own records. The Rust workspace does not
 build or read this directory (`.rchignore` keeps it out of remote builds too).
 
-Every word and figure is in `lib/content.ts`. Each one is stated by the repository (README.md, the
-crates' CONTRACT.md files, experiments/fl048) or recorded in the film's manifest (`lib/media.json`).
-Change the page's claims when the repository's change.
+Every word and figure outside the explainers is in `lib/content.ts`. Each one is stated by the
+repository (README.md, the plan, the crates' CONTRACT.md files, experiments/fl048 and
+experiments/showcase) or recorded in the film's manifest (`lib/media.json`); `branchObservation` is the
+one figure the page observed itself, with its date, host and binary. Change the page's claims when the
+repository's change.
+
+## The page's design
+
+The page is five chapters, defined by `chapters` in `lib/content.ts`: the world, why it is different, how
+it works, what it can show, and how to use it. The header's chapter links (a bottom dock on phones), each
+chapter's index and every section's number ("03.2") come from that list, so adding a section there is
+enough to number and link it. `components/section.tsx` has the two section layouts: `wide`, where an
+explainer gets the full width under its heading, and `split`, a sticky heading beside lists and prose.
+
+The look is a specimen under an instrument, always dark, in the FrankenSuite's green. The film is the
+hero's picture, not a decoration. Each chapter wears one colour of the film's lineage palette
+(`lib/palette.ts`) as `--chapter`, the way the film colours each founder's descendants. Corner ticks
+(`Reticle` in `components/franken.tsx`) frame anything that is a specimen or a figure. Surfaces are
+`panel`s; blurred glass is kept for the floating header and dock. Lists are ruled rather than boxed.
+`app/globals.css` holds the tokens, the display sizes and the muted text tone, which is raised from
+Tailwind's slate-500 to meet WCAG AA contrast on the ink.
+
+## The explainers
+
+`components/explain/` shows what the project does rather than only saying it. Each figure wears a badge
+(`DemoFrame`'s `basis`) that says what it is, so none is mistaken for a run:
+
+| Badge | Meaning | Figures |
+|---|---|---|
+| The rule, computed here | The model's rule recomputed in the browser on hand-sized numbers, beside its plausible wrong version; it starts at an Appendix C fixture's numbers and says when the answer matches the plan's | `fixture-bench.tsx` (C.1, C.3, C.2, C.9, C.11, C.15, C.5) |
+| Derived · arithmetic, not a benchmark | Arithmetic from stated assumptions | `scale.tsx` (README "Why the scale is hard") |
+| From the record | Figures an experiment or contract records | inside `weights.tsx` and `scale.tsx` |
+| Diagram · not simulation output | How the software is organised | `life-cycle.tsx`, `brain.tsx`, `weights.tsx` (seeded illustrative weights), `tick-pipeline.tsx`, `branches.tsx` (toy digests), `studio-keys.tsx`, the zoom ladder's last two rungs |
+| Rendered by flife · not drawn | Pixels `flife render` drew from a committed world; a manifest says how | the film, the zoom ladder's first three rungs (`zoom-ladder.tsx`, the film's poster and social card), `controls-trio.tsx` |
+| A toy in your browser · not FrankenLife | A small simulation written for the page, with four of the model's kinds of rule at toy scale; not FrankenLife's code, and nothing it shows is a result | `miniature.tsx` |
+
+Each figure's caption names the plan section, the crate file that implements the rule and, for the
+fixtures, the Rust test that checks the same answer. The pure arithmetic is in `fixture-math.ts`,
+`scale-math.ts`, `brain-math.ts`, `tick-machine.ts`, `branch-model.ts`, `zoom-ladder-geometry.ts` and
+`miniature-engine.ts`, and `bun test` checks it against the plan's stated answers (typed in separately,
+never computed by the code under test). The toy world uses only `+ − × ÷` and rounding down, which every
+browser computes to the same bit, so a seed replays to the same digest anywhere; its uptake is the same
+largest-remainder rule as fixture C.1, and a test holds the two to each other. The
+Studio's keys come from `crates/flife-studio/src/controls.rs`; change `studio-keymap.ts` when they do.
+Animations stop off screen and never run for a reader who asks for less motion.
 
 Bun only:
 
@@ -16,7 +58,9 @@ cd web
 bun install
 bun run dev          # http://localhost:3000, once the media are in public/media/
 bun run typecheck
-bun test             # worker.ts's byte serving and share-image type, the director's camera and card frame
+bun test             # worker.ts's byte serving and share-image type, the director's camera and card frame,
+                     # the controls' manifest against the record, the explainers' arithmetic against the
+                     # plan's fixtures, the toy world's determinism
 bun run build        # refuses unless public/media/ holds exactly the manifest's files
 bun run deploy       # build, then `wrangler deploy` (needs `wrangler login`)
 ```
@@ -88,10 +132,36 @@ URL: a platform that cached the old card shows it until its own refresh tool fet
 `bun run deploy` uploads `out/` as the Worker's static assets, served at https://frankenlife.org.
 Static assets answer a Range request with the whole file and a 200, and Safari plays no video from such
 a server, so `worker.ts` runs first, and for `/media/*` it streams only the bytes asked for as a 206, sized
-from `lib/media.json` (an asset's response from the binding has no Content-Length). The static export
+from the manifests, `lib/media.json` and `lib/controls.json` (an asset's response from the binding has
+no Content-Length). The static export
 writes the share images without an extension, so the Worker gives them their type, `image/jpeg`
 (`lib/share.ts`). It also sends www.frankenlife.org to frankenlife.org; every other request goes to the
 static assets unchanged. Both names are custom domains on the Worker
 (`wrangler.jsonc`), so `wrangler deploy` attaches them and their certificates.
 `public/_headers` makes the media and Next's hashed build output immutable. The site's address is
 `siteConfig.url` in `lib/content.ts`; Open Graph and the sitemap use it.
+
+## The controls
+
+`components/explain/controls-trio.tsx` shows the film's world beside its model's two controls (plan §5.4)
+at tick 2,400, the tick the showcase scored: `field-ecology-v1-contact-chemistry-only`, whose networks run
+and are charged but whose actions decode from an all-zero output, and
+`field-ecology-v1-contact-fresh-offspring`, whose newborns get a founder's genome instead of their
+parent's. Each is `presets/confluent-world.toml` with only its `model` (and `name`) changed, run from
+tick 0 inside `flife render` and drawn as the film is: 1080 × 1080, the whole torus, no field, the sphere
+look, lineage lit by energy. `lib/controls.json` is their committed manifest; the stills live in
+`public/media/` beside the film, outside git, and `bun run build` checks them the same way.
+
+```bash
+# From web/; WORK outside the repository. About 13 minutes for each full world on 8 workers of an
+# M5 Ultra (two at once), under a minute for the inheritance control.
+bun scripts/controls.ts --flife ../target/release/flife --work WORK --cpu-workers 8
+```
+
+The script refuses unless each world's digest and live count at tick 2,400 equal the ones
+`experiments/showcase/confluent.json` records for the trial it repeats (`w80-o25`, `cw-chem`,
+`cw-fresh`), and the full world's equals the film's starting digest: each still is the recorded run,
+drawn. The film's world, drawn and encoded as the poster was, is the poster byte for byte, so the
+manifest names the poster rather than a copy. The record's distances and the README's words for each
+frame ("### Controls" in `experiments/showcase/README.md`) are copied with their source.
+`scripts/controls.test.ts` checks the manifest against the record.

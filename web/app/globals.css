@@ -6,20 +6,37 @@
 @theme {
   --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), ui-monospace, monospace;
+  /* The muted tone of notes and captions. Tailwind's slate-500 (#64748b) is 4.2:1 on the ink, under
+     WCAG AA for small text; this one is 5.2:1 and still a clear step below slate-400 (7.7:1). */
+  --color-slate-500: #74839a;
 }
 
+/* The system, in roles (the FrankenSuite lab, derived for FrankenLife):
+   - ink: the dark field the organisms live on; every surface is a step above it.
+   - life: the one green word, actions, and "this is the rule" (green is life force).
+   - chapter: each chapter wears one colour of the film's lineage palette (lib/palette.ts),
+     the way the film colours each founder's descendants; set per chapter as --chapter.
+   - the reticle: corner ticks on anything that is a specimen or a figure, the instrument's frame. */
 :root {
   --color-bg: #020a02;
   --color-surface: #051205;
   --color-green-prime: #22c55e;
   --color-green-glow: #4ade80;
+  --ink: #020a02;
+  --ink-raised: #061407;
+  --life: #4ade80;
+  --life-soft: rgba(74, 222, 128, 0.12);
+  --hairline: rgba(187, 247, 208, 0.08);
+  --hairline-strong: rgba(187, 247, 208, 0.16);
+  --chapter: #4ade80;
   --ease-stripe: cubic-bezier(0.19, 1, 0.22, 1);
   color-scheme: dark;
 }
 
 html {
   scroll-behavior: smooth;
-  scroll-padding-top: 6rem;
+  scroll-padding-top: 5.5rem;
+  -webkit-text-size-adjust: 100%;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -29,23 +46,56 @@ html {
 }
 
 body {
-  background-color: var(--color-bg);
-  color: #f1f5f9;
+  background-color: var(--ink);
+  color: #e2e8f0;
   font-family: var(--font-sans);
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   line-height: 1.6;
-  letter-spacing: -0.01em;
+  letter-spacing: -0.011em;
   overflow-x: hidden;
 }
 
+/* Display type: the size carries the weight; tracking tightens as it grows. */
 h1,
 h2,
 h3 {
+  font-weight: 800;
+  line-height: 1.04;
+  letter-spacing: -0.035em;
+  text-wrap: balance;
+}
+
+h4,
+h5 {
+  font-weight: 700;
   letter-spacing: -0.02em;
-  font-weight: 900;
-  line-height: 1.08;
+  line-height: 1.2;
+}
+
+.display-1 {
+  font-size: clamp(3.1rem, 7.2vw, 7.4rem);
+  line-height: 0.94;
+  letter-spacing: -0.05em;
+}
+
+.display-2 {
+  font-size: clamp(2.5rem, 5.6vw, 5.4rem);
+  line-height: 0.98;
+  letter-spacing: -0.045em;
+}
+
+.display-3 {
+  font-size: clamp(1.9rem, 3.4vw, 3.2rem);
+  line-height: 1.04;
+  letter-spacing: -0.035em;
+}
+
+.lede {
+  font-size: clamp(1.06rem, 1.25vw, 1.22rem);
+  line-height: 1.62;
+  color: #cbd5e1;
 }
 
 code,
@@ -53,6 +103,10 @@ pre,
 kbd {
   font-family: var(--font-mono);
   letter-spacing: 0;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
 }
 
 /* Film grain, inline so nothing is fetched. */
@@ -90,60 +144,127 @@ body::before {
   background: var(--color-green-prime);
 }
 
+/* Floating chrome over moving content (the header, the dock): the only blurred glass. */
 .glass-modern {
-  background: rgba(5, 18, 5, 0.8);
-  backdrop-filter: blur(12px) saturate(120%);
-  -webkit-backdrop-filter: blur(12px) saturate(120%);
-  border: 1px solid rgba(34, 197, 94, 0.12);
+  background: rgba(4, 14, 5, 0.82);
+  backdrop-filter: blur(14px) saturate(130%);
+  -webkit-backdrop-filter: blur(14px) saturate(130%);
+  border: 1px solid rgba(74, 222, 128, 0.13);
   box-shadow:
-    0 4px 24px -1px rgba(0, 0, 0, 0.4),
-    inset 0 1px 1px rgba(255, 255, 255, 0.05);
+    0 8px 32px -8px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
 }
 
-.kinetic-card {
-  transition:
-    transform 400ms var(--ease-stripe),
-    border-color 400ms var(--ease-stripe),
-    box-shadow 400ms var(--ease-stripe);
+/* A panel: a surface one step above the ink, an edge and a top light, no blur.
+   The content inside is what carries the weight. */
+.panel {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0) 40%),
+    rgba(6, 20, 8, 0.66);
+  border: 1px solid var(--hairline);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
-.kinetic-card:hover {
-  transform: translateY(-3px);
-  border-color: rgba(34, 197, 94, 0.3);
-  box-shadow: 0 0 40px -10px rgba(34, 197, 94, 0.2);
+.panel-strong {
+  border-color: rgba(74, 222, 128, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 0 60px -24px rgba(74, 222, 128, 0.35);
 }
 
-.text-animate-green {
-  background: linear-gradient(to right, #4ade80, #bef264, #22c55e, #4ade80);
-  background-size: 300% auto;
+/* Rows separated by hairlines instead of a box each. */
+.ruled > * + * {
+  border-top: 1px solid var(--hairline);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .lift {
+    transition:
+      transform 400ms var(--ease-stripe),
+      border-color 400ms var(--ease-stripe),
+      box-shadow 400ms var(--ease-stripe);
+  }
+
+  .lift:hover {
+    transform: translateY(-2px);
+    border-color: rgba(74, 222, 128, 0.3);
+    box-shadow: 0 0 40px -12px rgba(74, 222, 128, 0.25);
+  }
+}
+
+/* The one green word. Solid, so it reads; the hero's is the one lit gradient. */
+.life-word {
+  color: var(--life);
+}
+
+.life-gradient {
+  background: linear-gradient(100deg, #d9f99d 0%, #86efac 30%, #4ade80 55%, #2dd4bf 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  animation: text-gradient 8s linear infinite;
 }
 
-@keyframes text-gradient {
-  to {
-    background-position: 300% center;
-  }
-}
-
-/* Slow drifting light behind the page: the sources over the field. */
-.orbit {
-  position: absolute;
+/* A lit sphere, like the film's organisms, in the chapter's colour: the page's signature mark. */
+.sphere {
+  display: inline-block;
   border-radius: 9999px;
-  filter: blur(90px);
-  opacity: 0.22;
-  animation: drift 26s ease-in-out infinite alternate;
-  will-change: transform;
+  background: radial-gradient(circle at 34% 30%, #ffffff 0%, var(--sphere, var(--chapter)) 32%, color-mix(in srgb, var(--sphere, var(--chapter)) 45%, #000) 78%);
+  box-shadow: 0 0 18px -2px color-mix(in srgb, var(--sphere, var(--chapter)) 70%, transparent);
 }
 
-@keyframes drift {
-  from {
-    transform: translate3d(-6%, -4%, 0) scale(1);
+/* The chapter numeral: drawn as an outline so it is architecture, not text to read. */
+.chapter-numeral {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  line-height: 0.8;
+  letter-spacing: -0.06em;
+  color: transparent;
+  -webkit-text-stroke: 1px color-mix(in srgb, var(--chapter) 55%, transparent);
+}
+
+/* A field of light behind the hero and the footer: one green source, still, like a source patch. */
+.field-light {
+  background:
+    radial-gradient(60rem 40rem at 12% -10%, rgba(34, 197, 94, 0.16), transparent 62%),
+    radial-gradient(40rem 30rem at 100% 110%, rgba(45, 212, 191, 0.06), transparent 60%);
+}
+
+/* The engineering grid, faded at its edges: the field's lattice. */
+.lattice {
+  background-image:
+    linear-gradient(rgba(187, 247, 208, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(187, 247, 208, 0.035) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse at 30% 20%, black 20%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse at 30% 20%, black 20%, transparent 70%);
+}
+
+/* The hero's specimen: the film feathered into the ink on its open sides. */
+.specimen-feather {
+  mask-image: linear-gradient(to bottom, black 78%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 78%, transparent 100%);
+}
+
+@media (min-width: 1024px) {
+  .specimen-feather {
+    mask-image: linear-gradient(to right, transparent 0%, black 16%), linear-gradient(to bottom, black 86%, transparent 100%);
+    mask-composite: intersect;
+    -webkit-mask-image: linear-gradient(to right, transparent 0%, black 16%), linear-gradient(to bottom, black 86%, transparent 100%);
+    -webkit-mask-composite: source-in;
   }
-  to {
-    transform: translate3d(8%, 6%, 0) scale(1.15);
+}
+
+/* Focus: one visible ring everywhere, in the life colour. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--life);
+  outline-offset: 2px;
+}
+
+/* The mobile dock keeps the page's last lines clear of itself. */
+@media (max-width: 767px) {
+  .dock-clearance {
+    padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
   }
 }
 
@@ -190,11 +311,91 @@ body::before {
   animation: pulse-dot 2.2s ease-in-out infinite;
 }
 
+/* The explainers' range inputs (components/explain/demo.tsx). */
+.demo-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 22px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.demo-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: linear-gradient(to right, rgba(74, 222, 128, 0.55), rgba(255, 255, 255, 0.12));
+}
+
+.demo-range::-moz-range-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.demo-range::-moz-range-progress {
+  height: 4px;
+  border-radius: 9999px;
+  background: rgba(74, 222, 128, 0.55);
+}
+
+.demo-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  margin-top: -7px;
+  height: 18px;
+  width: 18px;
+  border-radius: 9999px;
+  background: #4ade80;
+  border: 3px solid #020a02;
+  box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.6), 0 0 14px rgba(74, 222, 128, 0.45);
+}
+
+.demo-range::-moz-range-thumb {
+  height: 14px;
+  width: 14px;
+  border-radius: 9999px;
+  background: #4ade80;
+  border: 3px solid #020a02;
+  box-shadow: 0 0 0 1px rgba(74, 222, 128, 0.6), 0 0 14px rgba(74, 222, 128, 0.45);
+}
+
+.demo-range:focus-visible {
+  outline: 2px solid #4ade80;
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+/* The life cycle's step: the arc draws itself from the last node to this one. */
+.life-arc {
+  stroke-dasharray: 140;
+  stroke-dashoffset: 140;
+  animation: life-arc 900ms var(--ease-stripe) forwards;
+}
+
+@keyframes life-arc {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+/* SVG diagrams: text in the page's fonts, numbers aligned. */
+.diagram text {
+  font-family: var(--font-sans);
+}
+
+.diagram .mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .orbit,
-  .text-animate-green,
   .pulse-dot,
-  .rise-in {
+  .rise-in,
+  .life-arc {
     animation: none;
+  }
+
+  .life-arc {
+    stroke-dashoffset: 0;
   }
 }

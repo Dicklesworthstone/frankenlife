@@ -18,13 +18,13 @@ export function CopyCommand({ comment, command }: { comment: string; command: st
   };
 
   return (
-    <div className="group glass-modern rounded-2xl p-4">
+    <div className="group panel rounded-2xl p-4 sm:p-5">
       <div className="mb-2 flex items-start justify-between gap-3">
         <p className="font-mono text-xs text-slate-500"># {comment}</p>
         <button
           type="button"
           onClick={copy}
-          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 text-slate-400 transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-white/10 text-slate-400 transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
           aria-label={copied ? "Copied" : "Copy the command"}
         >
           {copied ? <Check className="h-4 w-4 text-green-400" /> : <Copy className="h-4 w-4" />}

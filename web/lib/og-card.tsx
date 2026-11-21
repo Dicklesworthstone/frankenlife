@@ -41,6 +41,8 @@ function picture(): string {
 }
 
 const thousands = (n: number) => n.toLocaleString("en-US");
+// flife render's own words for the colours, up to its colon ("founder lineage lit by energy"), as the film says.
+const colour = film.render.meaning.split(":")[0]?.trim() || film.render.mapping;
 
 /** The share card at `width × height` (1200 × 630 for Open Graph, 1200 × 600 for X), as JPEG (lib/share.ts). */
 export async function shareCard(width: number, height: number): Promise<Response> {
@@ -270,7 +272,7 @@ export async function shareCard(width: number, height: number): Promise<Response
           border: "1px solid rgba(255,255,255,0.14)",
         }}
       >
-        {`${world.name} · tick ${thousands(tick)} · colour = founder lineage`}
+        {`${world.name} · tick ${thousands(tick)} · colour = ${colour}`}
       </div>
       <div
         style={{
@@ -326,4 +328,4 @@ export async function shareCard(width: number, height: number): Promise<Response
 }
 
 /** The card's alt text. */
-export const shareAlt = `FrankenLife: ${thousands(film.world.live[film.social.frame] ?? film.world.live[0] ?? 0)} simulated organisms, each with its own neural network, grown into tissue and drawn by flife, under the headline "Evolution, bit for bit."`;
+export const shareAlt = `FrankenLife: a close view of a world of ${thousands(film.world.live[film.social.frame] ?? film.world.live[0] ?? 0)} simulated organisms, each with its own neural network, grown into tissue and drawn by flife, under the headline "Evolution, bit for bit."`;

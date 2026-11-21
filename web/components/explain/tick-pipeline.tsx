@@ -196,7 +196,7 @@ export function TickPipeline() {
                     className={cn(
                       "h-2 rounded-full transition-colors duration-300",
                       finished ? (state.status === "published" ? "bg-green-400" : "bg-cyan-300/70") : "bg-white/10",
-                      current && "animate-pulse bg-cyan-200",
+                      current && "bg-cyan-200 motion-safe:animate-pulse",
                       failed && state.status === "cancelled" && "bg-slate-400",
                       failed && state.status === "paused" && "bg-amber-300",
                       failed && state.status === "stopped" && "bg-rose-400",

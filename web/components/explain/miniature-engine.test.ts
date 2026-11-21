@@ -56,9 +56,9 @@ describe("uptake on whole quanta", () => {
     return { grants, tied };
   }
 
-  test("is the exact rule on random integer cells, and the page's C.1 rule wherever no remainders tie", () => {
+  test("is the exact rule on random integer cells, and the page's C.1 rule on every one, ties included", () => {
     const next = random(7);
-    let compared = 0;
+    let tiedCases = 0;
     for (let trial = 0; trial < 4000; trial++) {
       const n = 1 + Math.floor(next() * 6);
       const requests = Array.from({ length: n }, () => Math.floor(next() * 11));
@@ -69,13 +69,12 @@ describe("uptake on whole quanta", () => {
       expect(grants).toEqual(reference.grants);
       expect(granted).toBe(reference.grants.reduce((sum, g) => sum + g, 0));
       expect(granted).toBeLessThanOrEqual(cell);
-      // fixture-math works in floating point, where equal remainders can differ in the last bit.
-      if (!reference.tied) {
-        expect(grants).toEqual(uptakeRule(cell, requests, 1).grants.map((grant) => grant.granted));
-        compared += 1;
-      }
+      // fixture-math computes whole-number remainders exactly, so equal remainders tie exactly there too.
+      expect(grants).toEqual(uptakeRule(cell, requests, 1).grants.map((grant) => grant.granted));
+      if (reference.tied) tiedCases += 1;
     }
-    expect(compared).toBeGreaterThan(1500);
+    // The sweep must actually exercise ties, or "ties included" would be vacuous.
+    expect(tiedCases).toBeGreaterThan(100);
   });
 
   test("an exact three-way tie goes to the lowest identity", () => {

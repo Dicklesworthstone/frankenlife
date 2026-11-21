@@ -234,14 +234,16 @@ export function DemoButton({
   label?: string;
 }) {
   return (
+    // aria-disabled, not disabled: a button that disables itself when pressed (Reset, Replay, Next) keeps the
+    // keyboard's focus instead of dropping it to the page, and a screen reader still says it is unavailable.
     <button
       type="button"
-      onClick={onClick}
-      disabled={disabled}
+      onClick={disabled ? undefined : onClick}
+      aria-disabled={disabled || undefined}
       aria-pressed={pressed}
       aria-label={label}
       className={cn(
-        "inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3.5 py-2 text-xs font-bold text-white transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40",
+        "inline-flex items-center gap-2 rounded-xl border border-white/15 bg-black/30 px-3.5 py-2 text-xs font-bold text-white transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-40",
         pressed && "border-green-400/60 text-green-300",
         className,
       )}

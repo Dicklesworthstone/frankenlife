@@ -29,6 +29,10 @@ export function CopyCommand({ comment, command }: { comment: string; command: st
         >
           {copied ? <Check className="h-4 w-4 text-green-400" /> : <Copy className="h-4 w-4" />}
         </button>
+        {/* A focused button's new name is often not read out; this is. */}
+        <span className="sr-only" aria-live="polite">
+          {copied ? "Copied to the clipboard" : ""}
+        </span>
       </div>
       <pre className="overflow-x-auto text-[13px] leading-relaxed text-green-200 [scrollbar-width:thin]">
         <code>{command}</code>

@@ -88,6 +88,7 @@ function chapter(id: string): Chapter {
 function index(chapterId: string, sectionId: string): string {
   const owner = chapter(chapterId);
   const at = owner.sections.findIndex((section) => section.id === sectionId);
+  if (at < 0) throw new Error(`chapter ${chapterId} has no section ${sectionId}`);
   return `${owner.number}.${at + 1}`;
 }
 
@@ -191,7 +192,7 @@ export default function Home() {
         {/* ─── 01 · The world ─────────────────────────────────────────── */}
         <ChapterBlock chapter={chapter("world")}>
           <section id="zoom" aria-label="From the world to one brain" className="relative mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-20">
-            <ZoomLadder />
+            <ZoomLadder index={index("world", "zoom")} />
           </section>
 
           <Section
@@ -657,12 +658,13 @@ export default function Home() {
                     {/* slop-ok(S12-three-cards): the record states three figures for this control; the grid follows the data. */}
                     <dl className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                       {inheritance.figures.map((figure) => (
-                        <div key={figure.label} className="rounded-2xl border border-white/[0.08] bg-black/30 p-5">
-                          <dd className="font-mono text-3xl font-medium tracking-[-0.03em] text-green-200 tabular-nums">
+                        <div key={figure.label} className="flex flex-col rounded-2xl border border-white/[0.08] bg-black/30 p-5">
+                          {/* Label first for a screen reader (a group is dt then dd); the figure first on screen. */}
+                          <dt className="order-2 mt-2 text-sm text-slate-300">{figure.label}</dt>
+                          <dd className="order-1 font-mono text-3xl font-medium tracking-[-0.03em] text-green-200 tabular-nums">
                             {figure.value}
                           </dd>
-                          <dt className="mt-2 text-sm text-slate-300">{figure.label}</dt>
-                          <p className="mt-1 text-xs leading-snug text-slate-500">{figure.note}</p>
+                          <dd className="order-3 mt-1 text-xs leading-snug text-slate-500">{figure.note}</dd>
                         </div>
                       ))}
                     </dl>

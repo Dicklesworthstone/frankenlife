@@ -32,6 +32,28 @@ describe("the film's pictures on the torus", () => {
     });
   });
 
+  test("the camera crosses a seam as camera.rs does, half a torus apart included", () => {
+    // camera.rs wraps the step onto [0, 80) and then into (−40, 40]: 50 → 10 goes 40 east, through 70.
+    const half = cameraAt(
+      [
+        { tick: 0, center: [50, 40], zoom: 1 },
+        { tick: 100, center: [10, 40], zoom: 1 },
+      ],
+      50,
+    );
+    expect(half.center[0]).toBeCloseTo(70, 12);
+    // 78 → 2 is 4 east, across the seam; a key outside the torus holds wrapped.
+    const seam = cameraAt(
+      [
+        { tick: 0, center: [78, 40], zoom: 1 },
+        { tick: 100, center: [82, 40], zoom: 1 },
+      ],
+      50,
+    );
+    expect(seam.center[0]).toBeCloseTo(0, 12);
+    expect(cameraAt([{ tick: 0, center: [82, -4], zoom: 2 }], 10).center).toEqual([2, 76]);
+  });
+
   test("the card is frame 184 at tick 3,872, zoom 3, halfway between two keys: centre (28.125, 67.8125)", () => {
     const card = cardPlacement(film);
     expect(film.social.frame).toBe(184);

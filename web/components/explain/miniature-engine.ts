@@ -54,7 +54,7 @@ export const RULES = {
   bite: 10,
   /** Paid every tick, dissipated. */
   upkeep: 1,
-  /** Paid for motion: up to this many quanta at full speed on both axes, dissipated. */
+  /** Paid for motion: this many quanta at full speed on one axis, twice that on both, rounded down, dissipated. */
   moveCost: 1,
   /** Energy needed to divide, and the birth's cost, dissipated. */
   divideAt: 48,
@@ -71,7 +71,7 @@ export const RULES = {
   sourceRadius: 11,
   /** Per tick, each cell sends 1/32 of its energy to each of its four neighbours. */
   diffusion: 1 / 32,
-  /** Per tick, a cell loses 1/256 of its energy as heat. */
+  /** Per tick, a cell loses 1/512 of its energy as heat. */
   decay: 1 / 512,
   /** Quanta in every cell at tick 0, counted as injected. */
   initialField: 10,
@@ -140,7 +140,8 @@ export function random(seed: number): () => number {
   };
 }
 
-const ROOT_THREE = Math.sqrt(3);
+// √3 written out, so no engine's Math.sqrt can touch the state (every engine gives this value anyway).
+const ROOT_THREE = 1.7320508075688772;
 
 /** A unit draw, roughly Gaussian (Irwin–Hall, four uniforms), from arithmetic alone. */
 function gaussian(next: () => number): number {
@@ -331,7 +332,6 @@ export class World {
     this.injected = this.count * RULES.founderEnergy + CELLS * RULES.initialField;
   }
 
-  /** A fresh genome: weights in roughly [−1.7, 1.7], an eater's bias on the eat output. */
   /** A fresh genome: the forager's, every weight moved by a random amount. */
   private drawGenome(into: Float64Array): void {
     for (let p = 0; p < PARAMETERS; p++) into[p] = (FORAGER[p] ?? 0) + RULES.founderVariation * gaussian(this.draw);

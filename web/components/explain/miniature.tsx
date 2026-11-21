@@ -456,7 +456,8 @@ export function Miniature() {
         strip.width = Math.max(1, Math.round(strip.clientWidth * ratio));
         strip.height = Math.max(1, Math.round(strip.clientHeight * ratio));
       }
-      dirty.current = true;
+      // Resizing clears both canvases: paint them again now, or a paused world stays blank.
+      repaint();
     };
     fit();
     if (typeof ResizeObserver === "undefined") return;
@@ -539,6 +540,11 @@ export function Miniature() {
   useEffect(() => {
     if (!running) repaint();
   }, [running, selection, repaint, snap]);
+
+  // Readouts are taken every 250 ms while running: take one when it stops, so they show the tick the world is on.
+  useEffect(() => {
+    if (!running) refresh();
+  }, [running, refresh]);
 
   const step = () => {
     const w = world.current;
@@ -648,6 +654,11 @@ export function Miniature() {
     replaying.current = true;
     setReplayState({ state: "running", done: 0, target });
     const slice = () => {
+      // A new seed, a switch or Reset replaced the world: drop this replay rather than report it on the new one.
+      if (world.current !== live) {
+        replaying.current = false;
+        return;
+      }
       const until = Math.min(target, copy.tick + 400);
       while (copy.tick < until) copy.step();
       if (copy.tick < target) {
@@ -685,7 +696,7 @@ export function Miniature() {
           inherited mutation (INV-13). It leaves out chemistry and its 32 channels, emission, the sensing pyramid,
           the 9,988-parameter networks, the GPU kernels and the ordered ten-phase tick with its candidate world.
           Founders start from one forager&apos;s genome with every weight moved at random. Its step uses only +, −,
-          ×, ÷ and rounding down, which every browser computes to the same bit (never exp, tanh or sin, whose last
+          ×, ÷, rounding down and 32-bit integer arithmetic, which every browser computes to the same bit (never exp, tanh or sin, whose last
           bit can differ), so a seed reaches the same digest anywhere. The real rules:{" "}
           <a className="text-green-300 underline-offset-4 hover:underline" href="#rules">
             check them by hand
@@ -768,7 +779,7 @@ export function Miniature() {
                 {playing ? <Pause className="h-4 w-4" aria-hidden="true" /> : <Play className="h-4 w-4" aria-hidden="true" />}
                 {playing ? "Pause" : "Run"}
               </DemoButton>
-              <DemoButton onClick={step} disabled={playing} className="min-h-11" label="Advance one tick">
+              <DemoButton onClick={step} disabled={playing} className="min-h-11" label="Step: advance one tick">
                 <SkipForward className="h-4 w-4" aria-hidden="true" /> Step
               </DemoButton>
               <Segmented
@@ -893,7 +904,7 @@ export function Miniature() {
           </div>
 
           <div className="order-3 min-w-0">
-            <Inspector selection={selection} onFollow={follow} />
+            <Inspector selection={selection} onFollow={follow} shared={brains === "shared"} />
           </div>
 
           {/* The ledger */}
@@ -1054,7 +1065,16 @@ function Bar({ value, range, color }: { value: number; range: number; color: str
   );
 }
 
-function Inspector({ selection, onFollow }: { selection: Selection | null; onFollow: () => void }) {
+function Inspector({
+  selection,
+  onFollow,
+  shared,
+}: {
+  selection: Selection | null;
+  onFollow: () => void;
+  /** One shared brain: every organism runs the same weights. */
+  shared: boolean;
+}) {
   if (!selection) {
     return (
       <div className="rounded-2xl border border-dashed border-white/15 bg-black/20 p-4 text-sm leading-relaxed text-slate-400">
@@ -1125,7 +1145,7 @@ function Inspector({ selection, onFollow }: { selection: Selection | null; onFol
           {selection.diedAt === null && selection.born > 0 ? "; when it dies, the watch passes to the newest" : ""}
         </p>
         {selection.heir !== null ? (
-          <DemoButton onClick={onFollow} className="min-h-10 text-xs" label={`Follow organism ${grouped(selection.heir)}, its newest living child`}>
+          <DemoButton onClick={onFollow} className="min-h-10 text-xs" label={`Follow its child, organism ${grouped(selection.heir)}, the newest still alive`}>
             Follow its child <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
           </DemoButton>
         ) : selection.diedAt !== null ? (
@@ -1190,7 +1210,8 @@ function Inspector({ selection, onFollow }: { selection: Selection | null; onFol
           <WeightGrid weights={selection.weights} />
           <p className="mt-2 text-[11px] leading-snug text-slate-500">
             In order: {INPUTS} inputs into {HIDDEN} hidden units, the hidden units into {OUTPUTS} decisions, then{" "}
-            {OUTPUTS} biases. Green positive, rose negative. No other organism has these numbers.{" "}
+            {OUTPUTS} biases. Green positive, rose negative.{" "}
+            {shared ? "With one shared brain, every organism runs these same numbers." : "No other organism has these numbers."}
           </p>
         </div>
       </div>

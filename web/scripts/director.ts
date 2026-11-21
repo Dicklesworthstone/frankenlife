@@ -189,7 +189,7 @@ export function direct(
     // Drift towards the activity of the shot's second half, at most a
     // quarter of the view on each axis. The drifted center may leave the
     // torus; `flife render --camera` wraps it.
-    const late = smooth(summed(maps, begin + options.dwell / 2, begin + options.dwell), radius);
+    const late = smooth(summed(maps, begin + Math.floor(options.dwell / 2), begin + options.dwell), radius);
     const towards = peak(late, extent);
     const drift: [number, number] = [0, 0];
     for (const axis of [0, 1] as const) {

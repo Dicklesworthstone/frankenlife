@@ -61,7 +61,9 @@ function population(): { organisms: Organism[]; policy: number[] } {
       const mutated = Array.from({ length: size }, () => false);
       const changes = member === 0 ? 0 : 1 + Math.floor(random() * 3);
       for (let change = 0; change < changes; change++) {
-        const cell = Math.floor(random() * size);
+        // A fresh cell each time: a second, opposite change to one cell could undo the first.
+        let cell = Math.floor(random() * size);
+        while (mutated[cell]) cell = (cell + 1) % size;
         weights[cell] = Math.max(-1, Math.min(1, (weights[cell] ?? 0) + (random() < 0.5 ? -0.7 : 0.7)));
         mutated[cell] = true;
       }

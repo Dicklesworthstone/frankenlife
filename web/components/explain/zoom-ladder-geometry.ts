@@ -28,11 +28,13 @@ type Key = { tick: number; center: [number, number]; zoom: number };
  * smoothstep, the zoom geometrically and the centre the shorter way round.
  */
 export function cameraAt(keys: readonly Key[], tick: number): { center: [number, number]; zoom: number } {
+  // camera.rs's `wrap`: onto [0, TORUS).
+  const wrap = (value: number) => ((value % TORUS) + TORUS) % TORUS;
   const first = keys[0];
   const last = keys.at(-1);
   if (!first || !last) return { center: [TORUS / 2, TORUS / 2], zoom: 1 };
-  if (tick <= first.tick) return { center: [...first.center], zoom: first.zoom };
-  if (tick >= last.tick) return { center: [...last.center], zoom: last.zoom };
+  if (tick <= first.tick) return { center: [wrap(first.center[0]), wrap(first.center[1])], zoom: first.zoom };
+  if (tick >= last.tick) return { center: [wrap(last.center[0]), wrap(last.center[1])], zoom: last.zoom };
   let index = 0;
   while ((keys[index + 1]?.tick ?? Infinity) <= tick) index += 1;
   const from = keys[index] ?? first;
@@ -42,10 +44,10 @@ export function cameraAt(keys: readonly Key[], tick: number): { center: [number,
   const zoom = Math.exp(Math.log(from.zoom) + eased * (Math.log(to.zoom) - Math.log(from.zoom)));
   const center: [number, number] = [0, 0];
   for (const axis of [0, 1] as const) {
-    let step = to.center[axis] - from.center[axis];
+    // As camera.rs: the step wrapped onto [0, TORUS), then into (−TORUS/2, TORUS/2].
+    let step = wrap(to.center[axis] - from.center[axis]);
     if (step > TORUS / 2) step -= TORUS;
-    if (step < -TORUS / 2) step += TORUS;
-    center[axis] = (((from.center[axis] + eased * step) % TORUS) + TORUS) % TORUS;
+    center[axis] = wrap(from.center[axis] + eased * step);
   }
   return { center, zoom };
 }

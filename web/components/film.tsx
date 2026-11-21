@@ -87,9 +87,32 @@ export function Film({ className, feather = false }: { className?: string; feath
     return () => element.removeEventListener("timeupdate", onTime);
   }, []);
 
+  // Off screen the film pauses, so it decodes and redraws nothing while the reader is elsewhere; it plays on
+  // when it comes back, but only if it was playing when it left (a reader's own pause stays).
+  const pausedOffScreen = useRef(false);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry) return;
+      if (!entry.isIntersecting) {
+        if (!element.paused) {
+          pausedOffScreen.current = true;
+          element.pause();
+        }
+      } else if (pausedOffScreen.current) {
+        pausedOffScreen.current = false;
+        element.play().catch(() => {});
+      }
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
   const toggle = () => {
     const element = ref.current;
     if (!element) return;
+    pausedOffScreen.current = false;
     if (element.paused) {
       element.play().catch(() => {});
     } else {
@@ -117,7 +140,8 @@ export function Film({ className, feather = false }: { className?: string; feath
 
   return (
     <figure className={cn("relative", className)}>
-      <div className="relative aspect-square w-full overflow-hidden bg-black lg:rounded-[2rem]">
+      {/* A container, so the scale bar is sized in the frame's width (cqw), not its padded row's. */}
+      <div className="@container relative aspect-square w-full overflow-hidden bg-black lg:rounded-[2rem]">
         <video
           ref={ref}
           className={cn("h-full w-full object-cover", feather && "specimen-feather")}
@@ -131,7 +155,7 @@ export function Film({ className, feather = false }: { className?: string; feath
           preload="metadata"
           onPlay={() => setPlaying(true)}
           onPause={() => setPlaying(false)}
-          aria-label={`The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour} over the field's ${render.field_mapping}`}
+          aria-label={`The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour}${render.field_mapping === "none" ? "" : ` over the field's ${render.field_mapping}`}`}
         />
         <Reticle inset={14} size={18} />
 
@@ -165,7 +189,7 @@ export function Film({ className, feather = false }: { className?: string; feath
             </dl>
           </div>
           <div className="pointer-events-none mt-3 flex items-center gap-3" aria-hidden="true">
-            <span className="relative h-2 border-x border-b border-white/70" style={{ width: `${barPercent}%` }} />
+            <span className="relative h-2 shrink-0 border-x border-b border-white/70" style={{ width: `${barPercent}cqw` }} />
             <span className="font-mono text-[10px] text-slate-300">{barUnits} world units</span>
             <span className="ml-auto hidden font-mono text-[10px] text-slate-400 sm:inline">
               {grouped(world.founders)} founders · {world.grid[0]}² field · colour = {colour}

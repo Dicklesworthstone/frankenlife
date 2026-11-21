@@ -814,7 +814,7 @@ export function MixturePanel() {
         <Readout label="Rule: per packet" value={signed(rule.net, 6)} tone="rule" note="gain − toxicity, over both packets" />
         <Readout label="Wrong: on the mixture" value={signed(wrong.net, 6)} tone="wrong" note={`one packet of 2 at a·z = ${fixed(average, 2)}`} />
         <Readout label="Packet 1 (z = a)" value={signed(perUnit(1), 6)} note="η along the affinity" />
-        <Readout label="Packet 2" value={signed(perUnit(dot), 6)} note={dot < 0 ? "poison, charged at κ = 0.2" : "food"} />
+        <Readout label="Packet 2" value={signed(perUnit(dot), 6)} note={perUnit(dot) < 0 ? "poison, charged at κ = 0.2" : "food"} />
       </div>
       <Slider label="Packet 2's chemistry along the affinity, a·z" value={dot} min={-1} max={1} step={0.05} onChange={setDot} display={fixed(dot, 2)} />
       <p className="text-[11px] leading-relaxed text-slate-500">
@@ -945,7 +945,7 @@ export function WrapPanel() {
 
   // Moving dots, while playing: the wrong version along the minimum image; the rule along the true path, or snapping.
   const wrongDot = t === null ? null : minimumImageBetween(FROM, to, WIDTH, t);
-  const ruleDot = t === null ? null : safe ? wrap(FROM + t * moved, WIDTH) : t < 1 ? FROM : to;
+  const ruleDot = t === null ? null : safe ? wrap(FROM + t * moved, WIDTH) : to;
 
   return (
     <div className="space-y-5">
@@ -982,7 +982,7 @@ export function WrapPanel() {
           </DemoButton>
         </div>
       </div>
-      <Slider label="Distance moved between the two drawn epochs (at the speed limit)" value={moved} min={0} max={127} onChange={(value) => { setMoved(value); setT(null); }} />
+      <Slider label="Distance moved between the two drawn epochs (at the speed limit)" value={moved} min={0} max={127} onChange={(value) => { cancelAnimationFrame(frame.current); setMoved(value); setT(null); }} />
       <p className="text-[11px] leading-relaxed text-slate-500">
         The viewer does not know how far an organism went, only how far it could have gone: ticks × Δt × maximum speed.
         Here the organism moved at the limit, so the bound is the distance. The ring is one axis of the torus, its seam
@@ -994,6 +994,7 @@ export function WrapPanel() {
         atFixture={atFixture}
         matches={matches}
         onReset={() => {
+          cancelAnimationFrame(frame.current);
           setMoved(C15_DEFAULT);
           setT(null);
         }}

@@ -48,7 +48,8 @@ function slice(body: ReadableStream<Uint8Array>, start: number, end: number): Re
         }
         const first = offset;
         offset += value.byteLength;
-        if (offset <= start) continue;
+        // An empty chunk enqueues nothing, and a pull that enqueues nothing is not called again: read on.
+        if (offset <= start || value.byteLength === 0) continue;
         const from = Math.max(0, start - first);
         const to = Math.min(value.byteLength, end + 1 - first);
         if (to > from) controller.enqueue(value.subarray(from, to));

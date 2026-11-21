@@ -413,8 +413,8 @@ export function BrainAnatomy() {
             </p>
             <p className="mt-2 text-xs leading-relaxed text-slate-400">
               {shape(topology)}: {grouped(parameters * 4)} bytes of F32 weights and biases that belong to this organism
-              alone. Offspring move between the five networks by declared maps; a widened child computes exactly what
-              its parent did, while a change of depth claims no such thing (plan §6.4, fixture C.16).
+              alone. Offspring move between the five networks by declared maps; a widened copy computes exactly what
+              its parent did (before the child&apos;s own mutations), while a change of depth claims no such thing (plan §6.4, fixture C.16).
             </p>
           </div>
           <div className="rounded-2xl border border-amber-300/20 bg-amber-300/[0.04] p-4">

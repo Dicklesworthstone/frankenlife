@@ -230,6 +230,13 @@ const stills = CONDITIONS.map((condition) => {
   if (last.tick !== TICK || end.tick !== TICK) fail(`${condition.id}: its last frame is at tick ${String(last.tick)}, not ${TICK}`);
   const view = last.view as { center: [number, number]; zoom: number };
   if (view.zoom !== 1) fail(`${condition.id}: the still is at zoom ${view.zoom}, not the whole torus`);
+  // An adopted render is checked only by its config.toml: it must also be drawn as RENDER draws, or the
+  // manifest's command, mapping and size would misdescribe it.
+  if (end.look !== "sphere" || end.mapping !== "lineage-energy" || end.field !== false) {
+    fail(`${condition.id} was drawn ${String(end.look)}, ${String(end.mapping)}, field ${String(end.field)}; not ${STYLE.join(" ")}`);
+  }
+  const frame = readFileSync(String(last.path));
+  if (frame.readUInt32BE(16) !== SIZE || frame.readUInt32BE(20) !== SIZE) fail(`${String(last.path)} is not ${SIZE} × ${SIZE}`);
   const trial = trials.find((each) => each.trial === condition.trial) ?? fail(`${RECORD_JSON} has no trial ${condition.trial}`);
   if (trial.model !== condition.model || trial.seed !== film.world.seed || trial.tick !== TICK) {
     fail(`${condition.trial} is ${trial.model} seed ${trial.seed} at tick ${trial.tick}, not this condition`);

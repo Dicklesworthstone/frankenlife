@@ -43,6 +43,14 @@ export function ControlsTrio() {
   // The loupe opens on a lime labyrinth of the film's world, where the scatter of the inheritance control
   // also shows a few bodies; it is the reader's to move from there.
   const [spot, setSpot] = useState<Spot | null>(OPENING);
+  // The spot a reader kept (a click, a tap or the arrow keys). A mouse's hover only previews: when it leaves a
+  // still, the loupe goes back to the kept spot, or away if none was kept.
+  const kept = useRef<Spot | null>(OPENING);
+  const place = useCallback((next: Spot | null) => {
+    if (next === null || next.pinned) kept.current = next;
+    setSpot(next);
+  }, []);
+  const unhover = useCallback(() => setSpot(kept.current), []);
   const [zoom, setZoom] = useState<Zoom>("3");
   const [width, setWidth] = useState(0);
   const [current, setCurrent] = useState(0);
@@ -146,7 +154,7 @@ export function ControlsTrio() {
         {spot ? (
           <button
             type="button"
-            onClick={() => setSpot(null)}
+            onClick={() => place(null)}
             className="ml-auto inline-flex min-h-11 items-center gap-1.5 rounded-xl border border-white/15 bg-black/30 px-3.5 text-xs font-bold text-white transition hover:border-green-400/50 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none"
           >
             <X className="h-3.5 w-3.5" aria-hidden="true" /> Hide loupe
@@ -169,7 +177,8 @@ export function ControlsTrio() {
             count={stills.length}
             spot={spot}
             zoom={scale}
-            onSpot={setSpot}
+            onSpot={place}
+            onLeave={unhover}
             founders={film.world.founders}
           />
         ))}
@@ -180,9 +189,9 @@ export function ControlsTrio() {
         <button
           type="button"
           onClick={() => goTo(Math.max(0, current - 1))}
-          disabled={current === 0}
+          aria-disabled={current === 0}
           aria-label="The previous world"
-          className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/15 bg-black/30 text-white transition focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none disabled:opacity-30"
+          className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/15 bg-black/30 text-white transition focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30"
         >
           <ChevronLeft className="h-4 w-4" aria-hidden="true" />
         </button>
@@ -209,9 +218,9 @@ export function ControlsTrio() {
         <button
           type="button"
           onClick={() => goTo(Math.min(stills.length - 1, current + 1))}
-          disabled={current === stills.length - 1}
+          aria-disabled={current === stills.length - 1}
           aria-label="The next world"
-          className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/15 bg-black/30 text-white transition focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none disabled:opacity-30"
+          className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/15 bg-black/30 text-white transition focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30"
         >
           <ChevronRight className="h-4 w-4" aria-hidden="true" />
         </button>
@@ -280,6 +289,7 @@ function Panel({
   spot,
   zoom,
   onSpot,
+  onLeave,
   founders,
 }: {
   still: ControlStill;
@@ -288,6 +298,8 @@ function Panel({
   spot: Spot | null;
   zoom: number;
   onSpot: (spot: Spot | null) => void;
+  /** A mouse left the still: back to the kept spot. */
+  onLeave: () => void;
   founders: number;
 }) {
   const removed = still.removed !== null;
@@ -300,7 +312,7 @@ function Panel({
   };
   const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.pointerType === "touch") return;
-    onSpot({ ...at(event), pinned: spot?.pinned ?? false });
+    onSpot({ ...at(event), pinned: false });
   };
   // A click keeps the loupe where it lands. A touch places it only on a tap, so a swipe to the next world
   // (or down the page) leaves it where it was.
@@ -319,7 +331,7 @@ function Panel({
     if (Math.hypot(event.clientX - start.x, event.clientY - start.y) < 10) onSpot({ ...at(event), pinned: true });
   };
   const onPointerLeave = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.pointerType !== "touch" && spot && !spot.pinned) onSpot(null);
+    if (event.pointerType !== "touch") onLeave();
   };
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const step = event.shiftKey ? 0.1 : 0.025;

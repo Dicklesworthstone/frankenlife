@@ -314,7 +314,7 @@ export function ScaleCalculator() {
             On an Apple M5 Ultra (2026-11-10, with other GPU work on the device), FrankenLife&apos;s resident Metal
             controller kernel streamed F32 weights at <span className="font-mono text-amber-200">426–748 GB/s</span>{" "}
             in its fastest rounds, 0.44–0.69 of a plain read of the same bytes, every output identical to the CPU
-            reference. Against a four-billion-parameter F32 bank that is 28–47 full sweeps a second, for the
+            reference. Against a four-billion-parameter F32 bank that is 27–47 full sweeps a second, for the
             controllers alone; sensing, the field, births and deaths come on top.
           </p>
           <p className="mt-2 text-sm leading-relaxed text-slate-400">

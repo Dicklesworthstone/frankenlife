@@ -112,7 +112,7 @@ const STOPS: Stop[] = [
     figures: [
       { label: "Alive", value: grouped(LIVE_POSTER), note: `the render's count for frame ${film.poster.frame}` },
       { label: "View", value: `${TORUS} × ${TORUS} units`, note: "the whole torus; every edge wraps" },
-      { label: "Founders", value: grouped(film.world.founders), note: "one colour per founder's lineage" },
+      { label: "Founders", value: grouped(film.world.founders), note: `each lineage wears one of ${LINEAGE.length} colours` },
       { label: "Field", value: `${film.world.grid[0]} × ${film.world.grid[1]}`, note: "cells of energy and 32 chemical channels" },
     ],
     basis: "render",
@@ -125,7 +125,7 @@ const STOPS: Stop[] = [
       <>
         A {fmt(CARD_VIEW)} × {fmt(CARD_VIEW)}-unit patch of the film&apos;s closest shot, at the same place on the
         torus {grouped(CARD.tick - POSTER.tick)} ticks ({fmt(seconds(CARD.tick - POSTER.tick), 0)} simulated seconds)
-        later. Each colour is one founder&apos;s lineage, lighter where an organism holds more energy. The labyrinths,
+        later. Each founder&apos;s lineage wears one of {LINEAGE.length} colours, lighter where an organism holds more energy. The labyrinths,
         rims and foam come from what the networks choose to emit: in the record&apos;s control without emission, this
         world grows a uniform haze instead.
       </>
@@ -137,7 +137,7 @@ const STOPS: Stop[] = [
         note: `derived: ${grouped(LIVE_CARD)} alive over ${grouped(TORUS * TORUS)} square units, times ${fmt(CARD_VIEW * CARD_VIEW, 0)}`,
       },
       { label: "View", value: `${fmt(CARD_VIEW)} × ${fmt(CARD_VIEW)} units`, note: "the middle of the social card's crop" },
-      { label: "Tick", value: grouped(CARD.tick), note: `frame ${film.social.frame} of ${film.video.frames}` },
+      { label: "Tick", value: grouped(CARD.tick), note: `frame ${film.social.frame} of 0–${film.video.frames - 1}` },
       { label: "Camera", value: `zoom ${fmt(CARD.zoom, 2)}`, note: `flife render's record for frame ${film.social.frame}` },
     ],
     basis: "render",
@@ -192,14 +192,14 @@ const STOPS: Stop[] = [
     title: `[${grouped(PARAMETERS)}] numbers of its own.`,
     body: (
       <>
-        {parameterSum(SHAPE).replace(/ \+ /g, " + ")} = {grouped(PARAMETERS)} parameters. No other organism shares
-        them, and nothing trains them: there is no gradient. A child inherits a copy in which each weight changes with
+        In the founders&apos; shape, {parameterSum(SHAPE).replace(/ \+ /g, " + ")} = {grouped(PARAMETERS)} parameters. No other
+        organism shares them, and nothing trains them: there is no gradient. A child inherits a copy in which each weight changes with
         probability {WEIGHT_PROBABILITY}, so about {CHANGED} of the {grouped(PARAMETERS)} differ, and the world keeps
         whichever copies survive.
       </>
     ),
     figures: [
-      { label: "Parameters", value: grouped(PARAMETERS), note: `${LAYERS.map((size) => grouped(size)).join(" + ")}, layer by layer` },
+      { label: "Parameters", value: grouped(PARAMETERS), note: `${LAYERS.map((size) => grouped(size)).join(" + ")}, layer by layer, in the founders' shape` },
       { label: "Shared with", value: "no one", note: "each organism carries its own (INV-13)" },
       { label: "A child differs in", value: `≈ ${CHANGED}`, note: `derived: ${WEIGHT_PROBABILITY} × ${grouped(PARAMETERS)} ([mutation])` },
       { label: "Training", value: "none", note: "[controller] autograd = false" },
@@ -429,7 +429,8 @@ function changedCells(): { x: number; y: number }[] {
 
 // ─── The component ────────────────────────────────────────────────────────────
 
-export function ZoomLadder() {
+/** `index` is the section's number in its chapter ("01.1"), shown as every section shows its own. */
+export function ZoomLadder({ index }: { index?: string }) {
   const reduced = useReducedMotion();
   const scrolly = useMedia(SCROLLY_QUERY);
   const touch = useMedia("(pointer: coarse)");
@@ -515,7 +516,8 @@ export function ZoomLadder() {
         view.span >= TORUS - 1e-6 ? `${grouped(live)} alive` : `≈ ${grouped(roughly(inView(live, view.span)))} in view`;
     }
     const length = scaleBar(view.span, 0.28);
-    if (barRef.current) barRef.current.style.width = `${(length / view.span) * 100}%`;
+    // In the stage's width (cqw; the stage is the container), which is what `view.span` spans.
+    if (barRef.current) barRef.current.style.width = `${(length / view.span) * 100}cqw`;
     if (barLabelRef.current) barLabelRef.current.textContent = length === BODY ? `${length} units · one body` : `${length} unit${length === 1 ? "" : "s"}`;
     if (railRef.current) railRef.current.style.transform = `scaleX(${p / LAST})`;
 
@@ -648,8 +650,11 @@ export function ZoomLadder() {
             {/* The heading: first on a phone, beside the stage on wide screens. */}
             <header className="space-y-3 lg:col-start-2 lg:row-start-1 lg:self-start">
               <div className="inline-flex items-center gap-3">
-                <span className="h-px w-8 bg-green-500/40" />
-                <MicroLabel>Powers of ten</MicroLabel>
+                {index ? (
+                  <span className="font-mono text-[11px] font-medium text-[color:var(--chapter,#4ade80)] tabular-nums">{index}</span>
+                ) : null}
+                <span className="h-px w-6 bg-[color:var(--chapter,#4ade80)]/50" />
+                <MicroLabel className="text-slate-400">Powers of ten</MicroLabel>
               </div>
               <h3 className="display-3 text-white">
                 <GreenTitle text="From the world to [one brain]." />
@@ -677,7 +682,7 @@ export function ZoomLadder() {
                 onKeyDown={onKeyDown}
                 onPointerDown={onPointerDown}
                 onPointerUp={onPointerUp}
-                className="relative aspect-square w-full touch-pan-y overflow-hidden rounded-[1.75rem] border border-white/10 bg-black shadow-[0_0_90px_-30px_rgba(74,222,128,0.35)] select-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none lg:mx-auto lg:w-[min(100%,calc(100svh-8.5rem),46rem)]"
+                className="@container relative aspect-square w-full touch-pan-y overflow-hidden rounded-[1.75rem] border border-white/10 bg-black shadow-[0_0_90px_-30px_rgba(74,222,128,0.35)] select-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none lg:mx-auto lg:w-[min(100%,calc(100svh-8.5rem),46rem)]"
               >
                 {/* Real pixels: the poster, then the card. Each is the stage's width and placed on the torus by transform. */}
                 {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
@@ -833,7 +838,7 @@ export function ZoomLadder() {
                   <div className="relative">
                     <div ref={realBottomRef} style={{ opacity: INITIAL.real }} className="flex items-end justify-between gap-3">
                       <div className="min-w-0 flex-1">
-                        <span className="block h-[3px] rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.6)]" ref={barRef} style={{ width: "25%" }} />
+                        <span className="block h-[3px] rounded-full bg-white shadow-[0_0_8px_rgba(255,255,255,0.6)]" ref={barRef} style={{ width: "25cqw" }} />
                         <span ref={barLabelRef} className="mt-1.5 block font-mono text-[11px] text-slate-200 sm:text-xs">
                           20 units
                         </span>
@@ -868,9 +873,9 @@ export function ZoomLadder() {
                 <button
                   type="button"
                   onClick={() => goTo(stop - 1)}
-                  disabled={stop === 0}
+                  aria-disabled={stop === 0}
                   aria-label="Zoom out a step"
-                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
+                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
                 >
                   <ChevronLeft className="h-4 w-4" aria-hidden="true" />
                 </button>
@@ -906,9 +911,9 @@ export function ZoomLadder() {
                 <button
                   type="button"
                   onClick={() => goTo(stop + 1)}
-                  disabled={stop === LAST}
+                  aria-disabled={stop === LAST}
                   aria-label="Zoom in a step"
-                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
+                  className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-white/15 text-white transition-[border-color,color,opacity] hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none aria-disabled:pointer-events-none aria-disabled:opacity-30 [@media(min-width:1024px)_and_(pointer:fine)_and_(prefers-reduced-motion:no-preference)]:hidden"
                 >
                   <ChevronRight className="h-4 w-4" aria-hidden="true" />
                 </button>

@@ -1808,3 +1808,72 @@ fn an_armed_brushs_preview_is_the_stroke_a_click_there_submits() {
     assert_eq!(submitted, shown);
     studio.close().expect("closes");
 }
+
+#[test]
+fn oversize_live_resize_is_refused_without_exceeding_maximum_total_bytes() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let mut studio = Studio::open(&config(), &options(false)).expect("opens offscreen");
+    let first = studio.frame().expect("first frame");
+    assert!(first.drawn);
+    let admitted_metrics = studio.surface_metrics().expect("metrics");
+    let admitted_drawable = studio.view().viewport().drawable();
+
+    // A 16384x16384 drawable needs >6 GiB of device surfaces alone, well
+    // past the preset's 2 GiB maximum_total_bytes.
+    let huge = SurfaceMetrics {
+        logical_width: 8192.0,
+        logical_height: 8192.0,
+        backing_scale: f64::from(SCALE),
+        drawable_width: 16384,
+        drawable_height: 16384,
+    };
+    studio
+        .post_input(InputEvent::Resized(huge))
+        .expect("posts huge resize");
+    let refused_frame = studio.frame().expect("frame after huge resize");
+    assert!(!refused_frame.refitted, "oversize resize must not refit");
+    assert_eq!(studio.view().viewport().drawable(), admitted_drawable);
+    assert_eq!(studio.surface_metrics().expect("metrics"), admitted_metrics);
+    let statuses = studio.take_statuses();
+    assert!(
+        statuses.iter().any(|s| matches!(
+            s,
+            Status::ResizeRefused {
+                drawable: [16384, 16384],
+                required,
+                available,
+                ..
+            } if required > available
+        )),
+        "expected Status::ResizeRefused, got {statuses:?}"
+    );
+
+    // Repeating frames without a new resize must not spam ResizeRefused.
+    let _ = studio.frame().expect("next frame");
+    assert!(
+        !studio
+            .take_statuses()
+            .iter()
+            .any(|s| matches!(s, Status::ResizeRefused { .. }))
+    );
+
+    // A subsequent resize within budget succeeds cleanly.
+    let valid = SurfaceMetrics {
+        logical_width: 400.0,
+        logical_height: 250.0,
+        backing_scale: f64::from(SCALE),
+        drawable_width: 800,
+        drawable_height: 500,
+    };
+    studio
+        .post_input(InputEvent::Resized(valid))
+        .expect("posts valid resize");
+    let grown = studio.frame().expect("frame after valid resize");
+    assert!(grown.refitted && grown.drawn);
+    assert_eq!(studio.view().viewport().drawable(), [800, 500]);
+    assert_eq!(studio.surface_metrics().expect("metrics"), valid);
+    studio.close().expect("closes");
+}

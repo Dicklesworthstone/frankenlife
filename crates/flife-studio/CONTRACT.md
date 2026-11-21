@@ -1416,7 +1416,9 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   `memory` in its `open` record runs offscreen in `tests/offscreen_binary.rs`: on the CPU reference the terms sum
   to the peak, within the budget, with no backend term, and the observers are charged for the drawable in pixels.
   That it installs the bounded Metal backend runs only in a window, which no test here opened.
-  - A resize past the opening size, in pixels and density bins, is not admitted again.
+  - Live resizes and pixel-density changes are re-admitted through `memory::admit_resize` against
+    `memory::observer_limit` before mutating the view; an oversize resize that would exceed `maximum_total_bytes` is
+    refused with `Status::ResizeRefused` and keeps the previously admitted drawable size and density.
   - The device terms (`DEVICE_BYTES_PER_PIXEL`: the Metal route's RGBA16F and RGBA8 surfaces and three window
     drawables; and the bloom's row sums) come from FrankenManim's and AppKit's buffers as declared. Device memory
     is outside the heap the tests count; `tests/frame_device.rs` reads the device itself and finds each offscreen

@@ -40,14 +40,17 @@
 //! ([`admit_kept`]): the most heap one holds beyond the live world, as the
 //! command line's runs charge it.
 //!
-//! What a resize past the opening size adds, in pixels and density bins,
-//! is not admitted again.
+//! Live resizes and pixel-density changes are admitted through
+//! [`admit_resize`] against the observer ceiling [`observer_limit`] before
+//! mutating the view: any resize that would push the session past
+//! `[execution] maximum_total_bytes` is refused and the view keeps its last
+//! admitted drawable size and density (FL-043, INV-15).
 
 use flife_backend_metal::ControllerChoice;
 use flife_core::CoreError;
 use flife_core::memory::{MemoryAdmission, total};
 use flife_engine::World;
-use flife_manim::WorldView;
+use flife_manim::{Viewport, WorldView};
 use flife_render::Epoch;
 
 /// What FrankenManim's Metal route and the window hold per drawable pixel:
@@ -72,19 +75,109 @@ pub fn observer_bytes(
     drawable: [u32; 2],
 ) -> u64 {
     let slots = u64::from(world.config().config().execution.render_queue_capacity);
+    let feed_bytes = founding.reserved_bytes().saturating_mul(slots);
+    observer_bytes_with(
+        feed_bytes,
+        view.reserved_bytes(),
+        view.frame_bytes(),
+        view.preparation_limit(),
+        view.texel_bytes(),
+        view.bloom_bytes(drawable),
+        drawable,
+    )
+}
+
+fn observer_bytes_with(
+    feed_bytes: u64,
+    reserved_bytes: u64,
+    frame_bytes: u64,
+    preparation_limit: u64,
+    texel_bytes: u64,
+    bloom_bytes: u64,
+    drawable: [u32; 2],
+) -> u64 {
     let [width, height] = drawable.map(u64::from);
     let tiles = width.div_ceil(TILE).saturating_mul(height.div_ceil(TILE));
     total([
-        founding.reserved_bytes().saturating_mul(slots),
-        view.reserved_bytes(),
-        view.frame_bytes(),
-        total([view.preparation_limit(), view.texel_bytes()]).saturating_mul(2),
+        feed_bytes,
+        reserved_bytes,
+        frame_bytes,
+        total([preparation_limit, texel_bytes]).saturating_mul(2),
         width
             .saturating_mul(height)
             .saturating_mul(DEVICE_BYTES_PER_PIXEL),
         tiles.saturating_mul(4),
-        view.bloom_bytes(drawable),
+        bloom_bytes,
     ])
+}
+
+/// The Studio's observer bytes if `view` were resized to `drawable` pixels at
+/// `pixels_per_point` (FL-043): recomputes the density bins, texel upload,
+/// device surfaces, tile status words and bloom scratch without mutating
+/// `view`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+/// density.
+pub fn observer_bytes_for_resize(
+    feed_bytes: u64,
+    view: &WorldView,
+    drawable: [u32; 2],
+    pixels_per_point: f64,
+) -> Result<u64, CoreError> {
+    let target: Viewport = view
+        .viewport()
+        .resized(drawable)?
+        .with_pixels_per_point(pixels_per_point)?;
+    Ok(observer_bytes_with(
+        feed_bytes,
+        view.reserved_bytes_for(&target),
+        view.frame_bytes(),
+        view.preparation_limit(),
+        view.texel_bytes_for(&target),
+        view.bloom_bytes(drawable),
+        drawable,
+    ))
+}
+
+/// The most observer bytes a live resize may hold without exceeding
+/// `memory.budget_bytes`, given the fixed non-observer terms and the
+/// controller backend grant already handed out (FL-043).
+#[must_use]
+pub const fn observer_limit(memory: &MemoryAdmission) -> u64 {
+    let non_render = memory.fixed_bytes().saturating_sub(memory.render);
+    memory
+        .budget_bytes
+        .saturating_sub(non_render)
+        .saturating_sub(memory.backend)
+}
+
+/// Admit a live resize to `drawable` pixels at `pixels_per_point` under
+/// `memory`'s budget ceiling (FL-043, INV-15). Returns the new observer byte
+/// charge on success.
+///
+/// # Errors
+/// - [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+///   density;
+/// - [`CoreError::BudgetExhausted`] when the resized observer terms would
+///   exceed [`observer_limit`].
+pub fn admit_resize(
+    memory: &MemoryAdmission,
+    feed_bytes: u64,
+    view: &WorldView,
+    drawable: [u32; 2],
+    pixels_per_point: f64,
+) -> Result<u64, CoreError> {
+    let required = observer_bytes_for_resize(feed_bytes, view, drawable, pixels_per_point)?;
+    let available = observer_limit(memory);
+    if required > available {
+        return Err(CoreError::BudgetExhausted {
+            budget: "peak memory on resize (maximum_total_bytes)",
+            required,
+            available,
+        });
+    }
+    Ok(required)
 }
 
 /// Admit `world` with `controllers`' backend and the Studio's observers

@@ -1370,6 +1370,22 @@ fn status_record(status: &Status) -> Record<'static> {
             let (why, detail) = end(why);
             record("step-held", None, Some(at.get()), Some(why), detail)
         }
+        Status::ResizeRefused {
+            drawable,
+            pixels_per_point,
+            required,
+            available,
+        } => record(
+            "resize-refused",
+            None,
+            None,
+            Some("budget_exhausted"),
+            Some(format!(
+                "resize to {}x{} @ {pixels_per_point}x requires {required} observer bytes, \
+                 only {available} bytes fit maximum_total_bytes",
+                drawable[0], drawable[1]
+            )),
+        ),
         Status::Refused { kind, detail, .. } => {
             record("refused", None, None, Some(kind), Some(detail.clone()))
         }

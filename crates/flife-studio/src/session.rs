@@ -213,6 +213,18 @@ pub enum Status {
         /// The error.
         detail: String,
     },
+    /// A live resize or pixel-density change was refused because it would
+    /// exceed `[execution] maximum_total_bytes` (FL-043, INV-15).
+    ResizeRefused {
+        /// The requested drawable size in pixels.
+        drawable: [u32; 2],
+        /// The requested backing scale in pixels per point.
+        pixels_per_point: f64,
+        /// Observer bytes the resized surface would require.
+        required: u64,
+        /// Observer bytes available under the admitted peak budget.
+        available: u64,
+    },
     /// The session refused an intent.
     Refused {
         /// The intent.

@@ -319,6 +319,13 @@ pub struct Studio {
     controllers: String,
     /// The peak-memory admission it opened under (FL-043).
     memory: MemoryAdmission,
+    /// Bytes reserved for the render feed's epoch ring, for live resize
+    /// admission (FL-043).
+    feed_bytes: u64,
+    /// Last refused `(drawable, pixels_per_point.to_bits())` so one oversize
+    /// resize emits one `Status::ResizeRefused` instead of repeating every
+    /// frame (FL-043).
+    refused_resize: Option<([u32; 2], u64)>,
     /// The run directory the session is kept in (FL-024).
     keeping: Option<Keeping>,
     /// The last inspected organism and the material it converts best
@@ -600,6 +607,9 @@ impl Studio {
             .map_or([width, height], |metrics| {
                 [metrics.drawable_width, metrics.drawable_height]
             });
+        let feed_bytes = founding
+            .reserved_bytes()
+            .saturating_mul(u64::from(model.execution.render_queue_capacity));
         let memory = crate::memory::admit_kept(
             &world,
             options.controllers,
@@ -686,6 +696,8 @@ impl Studio {
             window_closed: false,
             controllers,
             memory,
+            feed_bytes,
+            refused_resize: None,
             keeping,
             material: None,
             founder_energy: model.population.initial_energy,
@@ -838,6 +850,10 @@ impl Studio {
     pub fn frame(&mut self) -> Result<Frame, CoreError> {
         self.tally.frames += 1;
         self.events.clear();
+        let previous_offscreen = match &self.target {
+            Target::Offscreen(offscreen) => Some(offscreen.metrics),
+            Target::Window(_) => None,
+        };
         let state = self.target.poll_input(&mut self.events)?;
         let (mut intents, mut refused) = (0, 0);
         for event in &self.events {
@@ -882,27 +898,85 @@ impl Studio {
             });
         }
 
-        let resized = match self.controls.drawable_size() {
-            Some(size) => {
-                let resized = self.view.resize(size)?;
-                if resized {
-                    self.note(|| TimelineRecord::Resize { drawable: size });
-                }
-                resized
-            }
-            None => false,
-        };
-        let redensed = match self.controls.metrics() {
+        let current_drawable = self.view.viewport().drawable();
+        let current_scale = self.view.viewport().pixels_per_point();
+        let desired_drawable = self.controls.drawable_size().unwrap_or(current_drawable);
+        let desired_scale = match self.controls.metrics() {
             Some(metrics) if metrics.backing_scale.is_finite() && metrics.backing_scale > 0.0 => {
-                let redensed = self.view.set_pixels_per_point(metrics.backing_scale)?;
-                if redensed {
-                    self.note(|| TimelineRecord::Density {
-                        pixels_per_point: Exact(metrics.backing_scale),
-                    });
-                }
-                redensed
+                metrics.backing_scale
             }
-            _ => false,
+            _ => current_scale,
+        };
+        let wants_geometry = desired_drawable != current_drawable
+            || desired_scale.to_bits() != current_scale.to_bits();
+        let (resized, redensed) = if wants_geometry {
+            match crate::memory::admit_resize(
+                &self.memory,
+                self.feed_bytes,
+                &self.view,
+                desired_drawable,
+                desired_scale,
+            ) {
+                Ok(required) => {
+                    self.refused_resize = None;
+                    let resized = if desired_drawable != current_drawable {
+                        let resized = self.view.resize(desired_drawable)?;
+                        if resized {
+                            self.note(|| TimelineRecord::Resize {
+                                drawable: desired_drawable,
+                            });
+                        }
+                        resized
+                    } else {
+                        false
+                    };
+                    let redensed = if desired_scale.to_bits() != current_scale.to_bits() {
+                        let redensed = self.view.set_pixels_per_point(desired_scale)?;
+                        if redensed {
+                            self.note(|| TimelineRecord::Density {
+                                pixels_per_point: Exact(desired_scale),
+                            });
+                        }
+                        redensed
+                    } else {
+                        false
+                    };
+                    self.memory.render = required;
+                    self.memory.peak_bytes = self
+                        .memory
+                        .fixed_bytes()
+                        .saturating_add(self.memory.backend)
+                        .max(self.memory.restoring_bytes());
+                    (resized, redensed)
+                }
+                Err(CoreError::BudgetExhausted {
+                    required,
+                    available,
+                    ..
+                }) => {
+                    if let (Target::Offscreen(offscreen), Some(previous)) =
+                        (&mut self.target, previous_offscreen)
+                    {
+                        offscreen.metrics = previous;
+                    }
+                    let key = (desired_drawable, desired_scale.to_bits());
+                    if self.refused_resize != Some(key) {
+                        self.refused_resize = Some(key);
+                        self.tally.refused += 1;
+                        self.statuses.push(Status::ResizeRefused {
+                            drawable: desired_drawable,
+                            pixels_per_point: desired_scale,
+                            required,
+                            available,
+                        });
+                    }
+                    (false, false)
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            self.refused_resize = None;
+            (false, false)
         };
         if redensed && !self.overlay.is_empty() {
             // The text keeps its size in points on the new screen.

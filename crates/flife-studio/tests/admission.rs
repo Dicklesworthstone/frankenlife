@@ -14,7 +14,10 @@ use flife_engine::{Arrangement, NumericalProfile, World};
 use flife_manim::WorldView;
 use flife_render::Epoch;
 use flife_studio::ControllerChoice;
-use flife_studio::memory::{DEVICE_BYTES_PER_PIXEL, admit, observer_bytes};
+use flife_studio::memory::{
+    DEVICE_BYTES_PER_PIXEL, admit, admit_resize, observer_bytes, observer_bytes_for_resize,
+    observer_limit,
+};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -147,4 +150,57 @@ fn the_studio_is_admitted_with_its_observers_and_the_backend_gets_the_rest() {
         }
         other => panic!("expected a peak-memory refusal, got {other:?}"),
     }
+}
+
+#[test]
+fn live_resize_is_admitted_within_headroom_and_refused_past_maximum_total_bytes() {
+    let config = preset_with(&[]);
+    let world = found(&config);
+    let founding = Epoch::standalone(&world).expect("an epoch");
+    let slots = u64::from(config.config().execution.render_queue_capacity);
+    let feed_bytes = founding.reserved_bytes() * slots;
+    let mut view = WorldView::for_epoch(&founding, [640, 400], [0, 0, 0]).expect("a view");
+    view.enable_overlay();
+
+    // Under CPU reference (`backend = 0`), remaining budget gives headroom to
+    // grow cleanly to 1920x1080 @ 1x, while an oversized 16384x16384 surface
+    // exceeds `maximum_total_bytes` and is refused.
+    let cpu = admit(&world, ControllerChoice::Cpu, &founding, &view, [640, 400]).expect("admits");
+    assert!(observer_limit(&cpu) > cpu.render);
+    let grown = admit_resize(&cpu, feed_bytes, &view, [1920, 1080], 1.0).expect("1080p fits");
+    assert!(grown > cpu.render);
+    assert_eq!(
+        grown,
+        observer_bytes_for_resize(feed_bytes, &view, [1920, 1080], 1.0).expect("computes")
+    );
+    match admit_resize(&cpu, feed_bytes, &view, [16384, 16384], 1.0) {
+        Err(CoreError::BudgetExhausted {
+            budget,
+            required,
+            available,
+        }) => {
+            assert!(budget.contains("resize"), "{budget}");
+            assert!(required > available);
+            assert_eq!(available, observer_limit(&cpu));
+        }
+        other => panic!("expected resize BudgetExhausted, got {other:?}"),
+    }
+
+    // Under a batched backend (`backend = budget - fixed`), shrinking fits
+    // while growing past the admitted ceiling is refused before allocation.
+    let batched = admit(
+        &world,
+        ControllerChoice::Torch,
+        &founding,
+        &view,
+        [640, 400],
+    )
+    .expect("admits");
+    assert_eq!(observer_limit(&batched), batched.render);
+    let shrunk = admit_resize(&batched, feed_bytes, &view, [320, 200], 1.0).expect("shrink fits");
+    assert!(shrunk < batched.render);
+    assert!(matches!(
+        admit_resize(&batched, feed_bytes, &view, [3840, 2160], 2.0),
+        Err(CoreError::BudgetExhausted { .. })
+    ));
 }

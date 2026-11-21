@@ -43,6 +43,14 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         include_str!("../../flife-manim/tests/frame_bytes.rs"),
     ),
     (
+        "flife-render::tests/interpolation.rs",
+        include_str!("../../flife-render/tests/interpolation.rs"),
+    ),
+    (
+        "flife-studio::tests/timeline.rs",
+        include_str!("../../flife-studio/tests/timeline.rs"),
+    ),
+    (
         "flife-engine::tests/organism_phase.rs",
         include_str!("../../flife-engine/tests/organism_phase.rs"),
     ),

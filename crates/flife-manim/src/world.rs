@@ -987,7 +987,15 @@ impl WorldView {
     /// pixel density changes the density's bins and so these bytes.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
-        let [columns, rows] = density_bins(&self.viewport).map(u64::from);
+        self.reserved_bytes_for(&self.viewport)
+    }
+
+    /// [`WorldView::reserved_bytes`] as if the view were fitted to `viewport`
+    /// (FL-043 live resize admission): recomputes the density bins and their
+    /// texture at `viewport` without mutating this view.
+    #[must_use]
+    pub fn reserved_bytes_for(&self, viewport: &Viewport) -> u64 {
+        let [columns, rows] = density_bins(viewport).map(u64::from);
         let bins = columns.saturating_mul(rows);
         let ring = SELECTION_RING_SEGMENTS as u64;
         let region = REGION_SEGMENTS as u64;
@@ -996,7 +1004,7 @@ impl WorldView {
             .saturating_mul(rows)
             .saturating_mul(bytes_for::<f32>(1) + bytes_for::<[f32; 3]>(1));
         let grids = total([
-            self.texel_bytes(),
+            self.texel_bytes_for(viewport),
             mesh_bytes(QUAD).saturating_mul(2),
             mesh_bytes((2 * ring, 2 * ring)),
             mesh_bytes((2 * region, 2 * region)),
@@ -1059,9 +1067,16 @@ impl WorldView {
     /// uploads the ones a frame draws with the frame.
     #[must_use]
     pub fn texel_bytes(&self) -> u64 {
+        self.texel_bytes_for(&self.viewport)
+    }
+
+    /// [`WorldView::texel_bytes`] at a hypothetical `viewport` (FL-043 live
+    /// resize admission).
+    #[must_use]
+    pub fn texel_bytes_for(&self, viewport: &Viewport) -> u64 {
         total([
             texel_bytes_of(self.field_texels),
-            texel_bytes_of(density_bins(&self.viewport)),
+            texel_bytes_of(density_bins(viewport)),
         ])
     }
 

@@ -931,6 +931,29 @@ pub fn resolve_births_with(
     resolve_births_with_workers(context, first, requests, population, identities, quota, 1)
 }
 
+/// Bounded-wave preparer for first-candidate parameter mutations on a settle
+/// backend (FL-032, FL-043): mutates at most one wave within
+/// [`PARALLEL_PROPOSAL_BUDGET_BYTES`] at a time so host staging stays bounded.
+pub(crate) trait FirstCandidateWave {
+    fn active(&self) -> bool;
+    fn prepare_wave(&mut self, wave: &[&BirthRequest<'_>]);
+    fn prepared(&self) -> Vec<(OrganismId, Prepared<'_>)>;
+}
+
+struct NoWavePreparer;
+
+impl FirstCandidateWave for NoWavePreparer {
+    fn active(&self) -> bool {
+        false
+    }
+
+    fn prepare_wave(&mut self, _wave: &[&BirthRequest<'_>]) {}
+
+    fn prepared(&self) -> Vec<(OrganismId, Prepared<'_>)> {
+        Vec::new()
+    }
+}
+
 /// [`resolve_births_with`], proposing admitted inherited newborns' genomes in
 /// bounded parallel waves across up to `workers` threads before committing
 /// them serially in ascending parent identity (`flife-s0t`). Results are bit
@@ -942,6 +965,49 @@ pub fn resolve_births_with(
 pub fn resolve_births_with_workers(
     context: &BirthContext<'_>,
     first: &[(OrganismId, Prepared<'_>)],
+    requests: &[BirthRequest<'_>],
+    population: PopulationQuota,
+    identities: &mut Identities,
+    quota: &mut GenomeQuota,
+    workers: usize,
+) -> Result<BirthResolution, CoreError> {
+    let mut none = NoWavePreparer;
+    resolve_births_inner(
+        context, first, &mut none, requests, population, identities, quota, workers,
+    )
+}
+
+/// [`resolve_births_with_workers`] with an optional bounded-wave settle
+/// preparer (FL-032, FL-043).
+pub(crate) fn resolve_births_with_wave_preparer(
+    context: &BirthContext<'_>,
+    preparer: &mut impl FirstCandidateWave,
+    requests: &[BirthRequest<'_>],
+    population: PopulationQuota,
+    identities: &mut Identities,
+    quota: &mut GenomeQuota,
+    workers: usize,
+) -> Result<BirthResolution, CoreError> {
+    resolve_births_inner(
+        context,
+        &[],
+        preparer,
+        requests,
+        population,
+        identities,
+        quota,
+        workers,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "private shared driver for resolve_births_with_workers and wave-bounded settle"
+)]
+fn resolve_births_inner(
+    context: &BirthContext<'_>,
+    first: &[(OrganismId, Prepared<'_>)],
+    preparer: &mut impl FirstCandidateWave,
     requests: &[BirthRequest<'_>],
     population: PopulationQuota,
     identities: &mut Identities,
@@ -994,12 +1060,72 @@ pub fn resolve_births_with_workers(
         .unwrap_or(1)
         .clamp(1, MAX_PARALLEL_WAVE);
     let parallel_workers = workers.min(wave_size).min(order.len());
-    let use_parallel = parallel_workers > 1
+    let use_wave_preparer = first.is_empty() && preparer.active();
+    let use_parallel = !use_wave_preparer
+        && parallel_workers > 1
         && order.len() >= MIN_PARALLEL_BIRTHS
         && matches!(context.offspring, Offspring::Inherited)
         && first.is_empty();
 
-    if use_parallel {
+    if use_wave_preparer {
+        for wave in order.chunks(wave_size) {
+            if preparer.active() {
+                preparer.prepare_wave(wave);
+            }
+            let wave_prepared = if preparer.active() {
+                preparer.prepared()
+            } else {
+                Vec::new()
+            };
+            for request in wave {
+                let prepared = wave_prepared
+                    .binary_search_by_key(&request.intent.parent, |(parent, _)| *parent)
+                    .ok()
+                    .and_then(|at| wave_prepared.get(at))
+                    .map(|(_, prepared)| *prepared);
+                match stage(
+                    context,
+                    prepared,
+                    request,
+                    birth_tick,
+                    deadline,
+                    population,
+                    &mut working,
+                    quota,
+                    born.len(),
+                ) {
+                    Ok(Staged::Born(birth)) => born.push(*birth),
+                    Ok(Staged::Rejected(birth)) => rejected.push(birth),
+                    Ok(Staged::Short { resource, .. }) if refusing => {
+                        refused.push(RefusedBirth {
+                            parent: request.intent.parent,
+                            resource,
+                        });
+                    }
+                    Ok(Staged::Short {
+                        resource,
+                        required,
+                        available,
+                    }) => {
+                        let covered = born.len();
+                        roll_back(born, quota)?;
+                        return Ok(BirthResolution::Paused(CapacityShortfall {
+                            resource,
+                            parent: request.intent.parent,
+                            required,
+                            available,
+                            proposed: order.iter().map(|request| request.intent.parent).collect(),
+                            covered,
+                        }));
+                    }
+                    Err(error) => {
+                        roll_back(born, quota)?;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    } else if use_parallel {
         let shortfall = stage_parallel_waves(
             context,
             &order,

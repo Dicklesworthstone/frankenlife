@@ -124,7 +124,7 @@ use crate::population::{Arrangement, CheckedTick, Entrant, HeldOutput, Organism,
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityPolicy,
     CapacityShortfall, Identities, Offspring, ParentState, PopulationQuota, RefusedBirth,
-    RejectedBirth, Reproduction, ReproductionProposal, resolve_births_with_workers,
+    RejectedBirth, Reproduction, ReproductionProposal, resolve_births_with_wave_preparer,
 };
 
 mod admission;
@@ -2242,24 +2242,21 @@ impl World {
             },
             capacity: rules.capacity,
         };
-        // FL-032: each inherited birth's first candidate mutated on the
-        // settle backend, if the world has one.
-        let first = match context.offspring {
-            Offspring::Inherited => settle::mutate_first_candidates(
-                settle_state,
-                rules,
-                &mutator,
-                &requests,
-                quota.dtype(),
-            ),
-            Offspring::Fresh { .. } => settle::FirstCandidates::default(),
-        };
-        let prepared = first.prepared();
+        // FL-032 / FL-043: each inherited birth's first candidate mutated on
+        // the settle backend in bounded waves (at most 2 MiB of parameter
+        // staging per wave), if the world has one.
+        let mut wave_mutator = settle::WaveMutator::new(
+            settle_state,
+            rules,
+            &mutator,
+            quota.dtype(),
+            matches!(context.offspring, Offspring::Inherited),
+        );
         let mut next_identities = identities.clone();
         let mut next_quota = quota.clone();
-        let births = match resolve_births_with_workers(
+        let births = match resolve_births_with_wave_preparer(
             &context,
-            &prepared,
+            &mut wave_mutator,
             &requests,
             PopulationQuota::new(rules.maximum_population, live)?,
             &mut next_identities,

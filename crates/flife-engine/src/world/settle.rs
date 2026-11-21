@@ -796,7 +796,7 @@ impl Stages for Device<'_> {
 }
 
 /// Phase 8's first candidates, their parameters mutated on the settle
-/// backend: for [`resolve_births_with`](crate::reproduction::resolve_births_with).
+/// backend: for [`resolve_births_with_wave_preparer`](crate::reproduction::resolve_births_with_wave_preparer).
 #[derive(Debug, Default)]
 pub(super) struct FirstCandidates {
     /// Each served birth's parent, member, and its values' range.
@@ -805,6 +805,17 @@ pub(super) struct FirstCandidates {
 }
 
 impl FirstCandidates {
+    /// Clear the wave's entries while keeping its bounded staging capacity.
+    fn clear(&mut self) {
+        self.births.clear();
+        if let Some(values) = &mut self.values {
+            match values {
+                ParameterValues::F32(values) => values.clear(),
+                ParameterValues::F16(values) => values.clear(),
+            }
+        }
+    }
+
     /// Each served birth's first candidate, by parent.
     pub(super) fn prepared(&self) -> Vec<(OrganismId, Prepared<'_>)> {
         let Some(values) = &self.values else {
@@ -835,104 +846,140 @@ impl FirstCandidates {
     }
 }
 
-/// Phase 8's parameter mutation on the world's settle backend (FL-032):
-/// each inherited birth's first candidate, its member chosen and its parent
-/// mapped onto it by the reference's `mutator`, mutated in one call. The
-/// host takes the mutated values as given: the rest of each child is the
-/// mutator's own ([`Mutator::propose_prepared`]). A birth the host cannot
-/// prepare is left to the reference; a backend that fails, or does not
-/// count one outcome per birth within its parameters, is dropped, and the
-/// tick's births are the reference's.
-pub(super) fn mutate_first_candidates(
-    settle: &mut Settle,
-    rules: &Rules,
-    mutator: &Mutator<'_>,
-    requests: &[BirthRequest<'_>],
+/// Bounded-wave mutator for phase 8 on the world's settle backend (FL-032,
+/// FL-043): reuses a single wave-sized parameter staging buffer (at most
+/// `PARALLEL_PROPOSAL_BUDGET_BYTES`) instead of materializing every birth in
+/// the tick at once.
+pub(super) struct WaveMutator<'a> {
+    settle: &'a mut Settle,
+    rules: &'a Rules,
+    mutator: &'a Mutator<'a>,
     dtype: WeightDtype,
-) -> FirstCandidates {
-    let Settle {
-        backend, report, ..
-    } = settle;
-    let Some(device) = backend.as_deref_mut() else {
-        return FirstCandidates::default();
-    };
-    let rates = &rules.mutation;
-    if requests.is_empty()
-        || (rates.replacement_probability <= 0.0 && rates.weight_probability <= 0.0)
-    {
-        return FirstCandidates::default();
+    enabled: bool,
+    scratch: FirstCandidates,
+    rows: Vec<MutationBirth>,
+    counts: Vec<MutationCounts>,
+}
+
+impl<'a> WaveMutator<'a> {
+    pub(super) fn new(
+        settle: &'a mut Settle,
+        rules: &'a Rules,
+        mutator: &'a Mutator<'a>,
+        dtype: WeightDtype,
+        inherited: bool,
+    ) -> Self {
+        let rates = &rules.mutation;
+        let enabled =
+            inherited && (rates.replacement_probability > 0.0 || rates.weight_probability > 0.0);
+        Self {
+            settle,
+            rules,
+            mutator,
+            dtype,
+            enabled,
+            scratch: FirstCandidates::default(),
+            rows: Vec::new(),
+            counts: Vec::new(),
+        }
     }
-    let mut values = match dtype {
-        WeightDtype::F32 => ParameterValues::F32(Vec::new()),
-        WeightDtype::F16 => ParameterValues::F16(Vec::new()),
-    };
-    let mut rows = Vec::new();
-    let mut births = Vec::new();
-    for request in requests {
-        let attempt = BirthAttempt {
-            parent: request.intent.parent,
-            tick: request.intent.tick,
+}
+
+impl crate::reproduction::FirstCandidateWave for WaveMutator<'_> {
+    fn active(&self) -> bool {
+        self.enabled && self.settle.backend.is_some()
+    }
+
+    fn prepare_wave(&mut self, requests: &[&BirthRequest<'_>]) {
+        self.scratch.clear();
+        self.rows.clear();
+        self.counts.clear();
+        if !self.active() || requests.is_empty() {
+            return;
+        }
+        let Settle {
+            backend, report, ..
+        } = self.settle;
+        let Some(device) = backend.as_deref_mut() else {
+            return;
         };
-        let start = values.weights().len();
-        let Ok(member) = mutator.unmutated(request.genome, attempt, &mut values) else {
-            continue;
+        let values = self.scratch.values.get_or_insert_with(|| match self.dtype {
+            WeightDtype::F32 => ParameterValues::F32(Vec::new()),
+            WeightDtype::F16 => ParameterValues::F16(Vec::new()),
+        });
+        for request in requests {
+            let attempt = BirthAttempt {
+                parent: request.intent.parent,
+                tick: request.intent.tick,
+            };
+            let start = values.weights().len();
+            let Ok(member) = self.mutator.unmutated(request.genome, attempt, values) else {
+                continue;
+            };
+            let end = values.weights().len();
+            match self
+                .rules
+                .catalog
+                .topology(member)
+                .and_then(|topology| mutation_birth(attempt, topology))
+            {
+                Some(row) => {
+                    self.rows.push(row);
+                    self.scratch.births.push((
+                        attempt.parent,
+                        member,
+                        start..end,
+                        MutationCounts::default(),
+                    ));
+                }
+                _ => truncate(values, start),
+            }
+        }
+        if self.rows.is_empty() {
+            return;
+        }
+        let rates = &self.rules.mutation;
+        let constants = MutationConstants {
+            seed: self.rules.rng.seed(),
+            replacement_probability: rates.replacement_probability,
+            weight_probability: rates.weight_probability,
+            weight_standard_deviation: rates.weight_standard_deviation,
         };
-        let end = values.weights().len();
-        match rules
-            .catalog
-            .topology(member)
-            .and_then(|topology| mutation_birth(attempt, topology))
-        {
-            Some(row) => {
-                rows.push(row);
-                births.push((
-                    attempt.parent,
-                    member,
-                    start..end,
-                    MutationCounts::default(),
-                ));
+        let served = match values {
+            ParameterValues::F32(values) => device.mutation(
+                &constants,
+                &self.rows,
+                MutationValues::F32(values),
+                &mut self.counts,
+            ),
+            ParameterValues::F16(values) => device.mutation(
+                &constants,
+                &self.rows,
+                MutationValues::F16(values),
+                &mut self.counts,
+            ),
+        }
+        .and_then(|()| check_counts(&self.rows, &self.counts));
+        match served {
+            Ok(()) => {
+                for (birth, served) in self.scratch.births.iter_mut().zip(&self.counts) {
+                    birth.3 = *served;
+                }
+                report.mutated = report
+                    .mutated
+                    .saturating_add(u64::try_from(self.scratch.births.len()).unwrap_or(u64::MAX));
             }
-            _ => truncate(&mut values, start),
-        }
-    }
-    if rows.is_empty() {
-        return FirstCandidates::default();
-    }
-    let constants = MutationConstants {
-        seed: rules.rng.seed(),
-        replacement_probability: rates.replacement_probability,
-        weight_probability: rates.weight_probability,
-        weight_standard_deviation: rates.weight_standard_deviation,
-    };
-    let mut counts = Vec::new();
-    let served = match &mut values {
-        ParameterValues::F32(values) => {
-            device.mutation(&constants, &rows, MutationValues::F32(values), &mut counts)
-        }
-        ParameterValues::F16(values) => {
-            device.mutation(&constants, &rows, MutationValues::F16(values), &mut counts)
-        }
-    }
-    .and_then(|()| check_counts(&rows, &counts));
-    match served {
-        Ok(()) => {
-            for (birth, served) in births.iter_mut().zip(&counts) {
-                birth.3 = *served;
-            }
-            report.mutated = report
-                .mutated
-                .saturating_add(u64::try_from(births.len()).unwrap_or(u64::MAX));
-            FirstCandidates {
-                births,
-                values: Some(values),
+            Err(error) => {
+                report.reference_ticks = report.reference_ticks.saturating_add(1);
+                report.failure = Some(error.to_string());
+                *backend = None;
+                self.scratch.clear();
             }
         }
-        Err(error) => {
-            report.reference_ticks = report.reference_ticks.saturating_add(1);
-            report.failure = Some(error.to_string());
-            *backend = None;
-            FirstCandidates::default()
-        }
+    }
+
+    fn prepared(&self) -> Vec<(OrganismId, Prepared<'_>)> {
+        self.scratch.prepared()
     }
 }
 
@@ -1028,5 +1075,308 @@ fn agrees(host: &ReproductionProposal, backend: ProposalOutcome) -> bool {
                 && same(intent.split.parent, parent)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "unit tests fail loudly on invariant violations"
+)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use flife_core::ValidatedConfig;
+    use flife_core::ids::{GenomeId, IdSequence, LineageId, OrganismId};
+    use flife_field::settle::{
+        ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionOrganism,
+        EmissionOutcome, MotionConstants, MotionOrganism, MotionOutcome, MutationBirth,
+        MutationConstants, MutationCounts, MutationValues, ProposalConstants, ProposalOrganism,
+        ProposalOutcome, SettleBackend,
+    };
+    use flife_field::{FieldGrid, FieldState};
+    use flife_genome::{
+        Genome, GenomeQuota, Mutator, TopologyCatalog, TraitLimits, WeightDtype, founder,
+        initial_scale,
+    };
+
+    use super::*;
+    use crate::reproduction::{
+        BirthContext, BirthRequest, BirthResolution, CapacityPolicy, Identities, Offspring,
+        ParentState, PopulationQuota, Reproduction, resolve_births_with_wave_preparer,
+        resolve_births_with_workers,
+    };
+
+    const PRESET: &str = include_str!("../../../../presets/reference-small-world.toml");
+
+    #[derive(Debug, Default)]
+    struct WaveLog {
+        wave_rows: Vec<usize>,
+        wave_bytes: Vec<usize>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingSettle {
+        log: Arc<Mutex<WaveLog>>,
+        fail_on_call: Option<usize>,
+        calls: usize,
+    }
+
+    impl SettleBackend for RecordingSettle {
+        fn describe(&self) -> String {
+            "recording-settle".into()
+        }
+
+        fn chemistry(
+            &mut self,
+            _observed: &FieldState,
+            _constants: &ChemistryConstants,
+            _organisms: &[ChemistryOrganism],
+            _packets: &[ChemistryPacket],
+            _out: &mut Vec<ChemistryOutcome>,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::MissingCapability {
+                capability: "test stub".into(),
+            })
+        }
+
+        fn motion(
+            &mut self,
+            _constants: &MotionConstants,
+            _organisms: &[MotionOrganism],
+            _out: &mut Vec<MotionOutcome>,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::MissingCapability {
+                capability: "test stub".into(),
+            })
+        }
+
+        fn emission(
+            &mut self,
+            _grid: &FieldGrid,
+            _efficiency: f64,
+            _organisms: &[EmissionOrganism],
+            _out: &mut Vec<EmissionOutcome>,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::MissingCapability {
+                capability: "test stub".into(),
+            })
+        }
+
+        fn proposal(
+            &mut self,
+            _constants: &ProposalConstants,
+            _organisms: &[ProposalOrganism],
+            _out: &mut Vec<ProposalOutcome>,
+        ) -> Result<(), CoreError> {
+            Err(CoreError::MissingCapability {
+                capability: "test stub".into(),
+            })
+        }
+
+        fn mutation(
+            &mut self,
+            _constants: &MutationConstants,
+            births: &[MutationBirth],
+            values: MutationValues<'_>,
+            out: &mut Vec<MutationCounts>,
+        ) -> Result<(), CoreError> {
+            self.calls += 1;
+            let bytes = match &values {
+                MutationValues::F32(slice) => std::mem::size_of_val(*slice),
+                MutationValues::F16(slice) => std::mem::size_of_val(*slice),
+            };
+            {
+                let mut log = self.log.lock().expect("lock");
+                log.wave_rows.push(births.len());
+                log.wave_bytes.push(bytes);
+            }
+            if self.fail_on_call == Some(self.calls) {
+                return Err(CoreError::StateConflict {
+                    operation: "recording mutation",
+                    detail: format!("planted failure on wave {}", self.calls),
+                });
+            }
+            out.clear();
+            // Perturb one parameter per birth cleanly so candidates are not no-ops.
+            let mut offset = 0usize;
+            for birth in births {
+                match &values {
+                    MutationValues::F32(_) => {}
+                    MutationValues::F16(_) => {}
+                }
+                let count = birth.parameters;
+                out.push(MutationCounts {
+                    replaced: 0,
+                    perturbed: 1,
+                });
+                offset += count;
+            }
+            let _ = offset;
+            if let MutationValues::F32(slice) = values {
+                let mut at = 0usize;
+                for birth in births {
+                    if let Some(first) = slice.get_mut(at) {
+                        *first += 0.01;
+                    }
+                    at += birth.parameters;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wave_mutator_bounds_staging_per_wave_and_falls_back_cleanly_on_error() {
+        let config = ValidatedConfig::from_toml(PRESET).expect("preset");
+        let rules = Rules::from_config(&config).expect("rules");
+        let catalog = TopologyCatalog::from_config(&config).expect("catalog");
+        let limits = TraitLimits::from_config(&config).expect("limits");
+        let reproduction = Reproduction::from_config(&config).expect("reproduction");
+        let mutator = Mutator::new(rules.rng, rules.mutation, &catalog, limits).expect("mutator");
+        let mut quota = GenomeQuota::new(1 << 30, 1 << 30).expect("quota");
+        let parents: Vec<Genome> = (1_u64..=120)
+            .map(|id| {
+                founder(
+                    &rules.rng,
+                    &catalog,
+                    limits,
+                    initial_scale(&config).expect("scale"),
+                    OrganismId::new(id),
+                    GenomeId::new(id),
+                    &mut quota,
+                )
+                .expect("founder")
+            })
+            .collect();
+        let requests: Vec<BirthRequest<'_>> = parents
+            .iter()
+            .zip(1_u64..)
+            .map(|(genome, id)| {
+                let parent = ParentState {
+                    id: OrganismId::new(id),
+                    lineage: LineageId::new(id),
+                    generation: flife_core::ids::Generation::FOUNDER,
+                    position: [10.0, 10.0],
+                    cooldown_deadline: Tick::ZERO,
+                };
+                let intent = match reproduction
+                    .attempted(&parent, Tick::new(5), 9.0, 0.5)
+                    .expect("viable")
+                {
+                    ReproductionProposal::Intent(intent) => intent,
+                    other => panic!("expected viable intent, got {other:?}"),
+                };
+                BirthRequest { intent, genome }
+            })
+            .collect();
+        let context = BirthContext {
+            rng: &rules.rng,
+            grid: &rules.grid,
+            reproduction: &reproduction,
+            mutator: &mutator,
+            offspring: Offspring::Inherited,
+            capacity: CapacityPolicy::PauseBeforeCommit,
+        };
+        let ids0 = Identities {
+            organisms: IdSequence::resume(Some(1000)),
+            genomes: IdSequence::resume(Some(1000)),
+        };
+
+        // 1. All waves succeed: 120 F32 births (~4.6 MiB total) must split into
+        //    >= 3 bounded waves, each holding <= 2 MiB of parameter staging.
+        let log = Arc::new(Mutex::new(WaveLog::default()));
+        let mut settle = Settle {
+            backend: Some(Box::new(RecordingSettle {
+                log: Arc::clone(&log),
+                fail_on_call: None,
+                calls: 0,
+            })),
+            ..Settle::default()
+        };
+        let mut ids = ids0.clone();
+        let mut q = quota.clone();
+        let mut wave = WaveMutator::new(&mut settle, &rules, &mutator, WeightDtype::F32, true);
+        let staged = resolve_births_with_wave_preparer(
+            &context,
+            &mut wave,
+            &requests,
+            PopulationQuota::new(1024, 120).expect("pop"),
+            &mut ids,
+            &mut q,
+            1,
+        )
+        .expect("staged");
+        assert!(matches!(staged, BirthResolution::Staged(b) if b.born().len() == 120));
+        let recorded = log.lock().expect("lock");
+        assert!(
+            recorded.wave_rows.len() >= 3,
+            "120 F32 births should split across >=3 waves, got {:?}",
+            recorded.wave_rows
+        );
+        assert!(
+            recorded.wave_bytes.iter().all(|&bytes| bytes <= (2 << 20)),
+            "every wave must stay within 2 MiB staging cap: {:?}",
+            recorded.wave_bytes
+        );
+        assert_eq!(settle.report.mutated, 120);
+        assert_eq!(settle.report.reference_ticks, 0);
+
+        // 2. Planted failure on wave 1 drops the backend cleanly and reproduces
+        //    the reference resolution bit for bit.
+        let fail_log = Arc::new(Mutex::new(WaveLog::default()));
+        let mut failing_settle = Settle {
+            backend: Some(Box::new(RecordingSettle {
+                log: Arc::clone(&fail_log),
+                fail_on_call: Some(1),
+                calls: 0,
+            })),
+            ..Settle::default()
+        };
+        let mut fail_ids = ids0.clone();
+        let mut fail_q = quota.clone();
+        let mut fail_wave = WaveMutator::new(
+            &mut failing_settle,
+            &rules,
+            &mutator,
+            WeightDtype::F32,
+            true,
+        );
+        let fallback = resolve_births_with_wave_preparer(
+            &context,
+            &mut fail_wave,
+            &requests,
+            PopulationQuota::new(1024, 120).expect("pop"),
+            &mut fail_ids,
+            &mut fail_q,
+            1,
+        )
+        .expect("fallback");
+        assert!(failing_settle.backend.is_none());
+        assert_eq!(failing_settle.report.reference_ticks, 1);
+        assert_eq!(failing_settle.report.mutated, 0);
+
+        let mut ref_ids = ids0;
+        let mut ref_q = quota;
+        let reference = resolve_births_with_workers(
+            &context,
+            &[],
+            &requests,
+            PopulationQuota::new(1024, 120).expect("pop"),
+            &mut ref_ids,
+            &mut ref_q,
+            1,
+        )
+        .expect("reference");
+        let (BirthResolution::Staged(got), BirthResolution::Staged(want)) = (fallback, reference)
+        else {
+            panic!("expected both staged");
+        };
+        assert_eq!(got.born().len(), want.born().len());
+        for (a, b) in got.born().iter().zip(want.born()) {
+            assert_eq!(a.newborn, b.newborn);
+            assert!(a.genome.parameters().same_bits(&b.genome.parameters()));
+        }
     }
 }

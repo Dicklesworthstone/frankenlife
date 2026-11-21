@@ -1837,7 +1837,7 @@ fn oversize_live_resize_is_refused_without_exceeding_maximum_total_bytes() {
     assert!(!refused_frame.refitted, "oversize resize must not refit");
     assert_eq!(studio.view().viewport().drawable(), admitted_drawable);
     assert_eq!(studio.surface_metrics().expect("metrics"), admitted_metrics);
-    let statuses = studio.take_statuses();
+    let statuses: Vec<_> = studio.take_statuses().collect();
     assert!(
         statuses.iter().any(|s| matches!(
             s,
@@ -1856,7 +1856,6 @@ fn oversize_live_resize_is_refused_without_exceeding_maximum_total_bytes() {
     assert!(
         !studio
             .take_statuses()
-            .iter()
             .any(|s| matches!(s, Status::ResizeRefused { .. }))
     );
 

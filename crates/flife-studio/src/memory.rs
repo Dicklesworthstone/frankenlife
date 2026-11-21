@@ -144,7 +144,7 @@ pub fn observer_bytes_for_resize(
 /// `memory.budget_bytes`, given the fixed non-observer terms and the
 /// controller backend grant already handed out (FL-043).
 #[must_use]
-pub const fn observer_limit(memory: &MemoryAdmission) -> u64 {
+pub fn observer_limit(memory: &MemoryAdmission) -> u64 {
     let non_render = memory.fixed_bytes().saturating_sub(memory.render);
     memory
         .budget_bytes

@@ -89,13 +89,13 @@ use flife_core::{
     ResidualBudget, Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
 use flife_field::{
-    Bins, BufferLimits, ConeTolerance, Demand, DepositSummary, Deposits, ExchangeStencil,
-    FieldBackend, FieldGrid, FieldPair, FieldState, FieldStepReport, FieldSummary, FieldWork,
-    GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
+    Bins, BufferLimits, ConeTolerance, Demand, DepositSummary, Deposits, ExchangeKernel,
+    ExchangeScratch, FieldBackend, FieldGrid, FieldPair, FieldState, FieldStepReport, FieldSummary,
+    FieldWork, GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
     SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
     Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
-    advance_field_on, demand, demands_on, initial_source, reduce_field_on, resolve_uptake_on,
-    resolve_uptake_on_workers, state::CHANNELS,
+    advance_field_on, demand_with_scratch, demands_on, initial_source, reduce_field_on,
+    resolve_uptake_on, resolve_uptake_with_on_workers, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -407,6 +407,8 @@ impl Candidate<'_> {
 struct Rules {
     step: TimeStep,
     grid: FieldGrid,
+    exchange: ExchangeKernel,
+    max_exchange_cells: usize,
     rng: SemanticRng,
     plan: TransportPlan,
     kernel: SourceKernel,
@@ -626,9 +628,14 @@ impl Rules {
             });
         }
         let chemistry = &model.chemistry;
+        let grid = FieldGrid::from_config(config)?;
+        let exchange = ExchangeKernel::from_config(config)?;
+        let max_exchange_cells = exchange.max_cells(&grid);
         Ok(Self {
             step: config.report().timestep,
-            grid: FieldGrid::from_config(config)?,
+            grid,
+            exchange,
+            max_exchange_cells,
             rng: SemanticRng::from_config(config)?,
             plan: TransportPlan::from_config(config)?,
             kernel: SourceKernel::from_config(config)?,
@@ -700,6 +707,9 @@ struct Decision {
 #[derive(Debug, Default)]
 struct DecisionLane {
     controller: ControllerScratch,
+    /// Footprint scratch for phase 5 demand computation under fixed-world
+    /// exchange kernels (FL-053; empty / 0 bytes under `grid-cic-v1`).
+    exchange: ExchangeScratch,
     /// The batched path's observations of this lane's run.
     observed: Vec<Observation>,
     decisions: Vec<Decision>,
@@ -1167,7 +1177,7 @@ impl World {
         lanes.shrink_to(workers);
         // A lane's share of the rows follows the count (FL-043).
         let batched = self.controllers.backend.is_some();
-        fit_lanes(lanes, capacity_of(&self.rules)?, batched)
+        fit_lanes(lanes, &self.rules, capacity_of(&self.rules)?, batched)
     }
 
     /// Evaluate due controllers in one batch on `backend` from the next
@@ -1209,7 +1219,7 @@ impl World {
         let controllers = &mut self.controllers;
         fit(&mut controllers.outputs, rows, "controller outputs")?;
         fit(&mut controllers.by_row, rows, "controller outputs by row")?;
-        fit_lanes(&mut self.scratch.lanes, rows, true)
+        fit_lanes(&mut self.scratch.lanes, &self.rules, rows, true)
     }
 
     /// Release the batched path's lists.
@@ -1406,6 +1416,13 @@ impl World {
         self.field.current()
     }
 
+    /// The run's organism-field exchange kernel (`grid-cic-v1` or
+    /// `fixed-world-gaussian-v1`, FL-053).
+    #[must_use]
+    pub const fn exchange_kernel(&self) -> ExchangeKernel {
+        self.rules.exchange
+    }
+
     /// The live population.
     #[must_use]
     pub const fn population(&self) -> &Population {
@@ -1509,6 +1526,7 @@ impl World {
         let lanes = scratch.lanes.iter().map(|lane| {
             total([
                 lane.controller.allocated_bytes(),
+                lane.exchange.allocated_bytes(),
                 capacity_bytes(&lane.observed),
                 capacity_bytes(&lane.decisions),
                 capacity_bytes(&lane.packets),
@@ -2042,6 +2060,7 @@ impl World {
             from,
             interventions,
             &rules.grid,
+            rules.exchange,
             population,
             &rules.recycling,
             rows,
@@ -2366,7 +2385,7 @@ impl World {
                     let affinity = genome_of(population, death.id)?.traits().affinity();
                     rules
                         .recycling
-                        .settle(&rules.grid, &death, affinity, recycling)?
+                        .settle_with(&rules.grid, rules.exchange, &death, affinity, recycling)?
                         .record(&mut tick_ledger)?;
                     deaths.push(death);
                 }
@@ -2576,11 +2595,18 @@ impl Scratch {
         let workers_configured = config.config().execution.cpu_workers;
         // Contribution scratch for the largest live population (§9.4): every
         // organism demands, emits and dies at most once per tick, and each
-        // touches at most four cells.
+        // touches at most `rules.max_exchange_cells` cells (4 under
+        // `grid-cic-v1`, up to 4,096 under `fixed-world-gaussian-v1`).
         let organisms = rules.maximum_population;
-        let packets = organisms.checked_mul(4).ok_or(CoreError::Overflow {
-            quantity: "organism packets",
-        })?;
+        let per_organism =
+            u64::try_from(rules.max_exchange_cells).map_err(|_| CoreError::Overflow {
+                quantity: "organism packets",
+            })?;
+        let packets = organisms
+            .checked_mul(per_organism)
+            .ok_or(CoreError::Overflow {
+                quantity: "organism packets",
+            })?;
         // Every per-organism list is reserved for the largest population too
         // (FL-043), so the footprint taken now bounds every later tick.
         let rows = capacity_of(rules)?;
@@ -2594,7 +2620,7 @@ impl Scratch {
             sampled: Vec::with_capacity(sources),
             working: reserved(rows, "working organisms")?,
             demands: reserved(rows, "organism demands")?,
-            grants: Grants::with_capacity(&rules.grid, organisms, &limits)?,
+            grants: Grants::with_capacity_for(&rules.grid, organisms, rules.exchange, &limits)?,
             by_demand: Bins::with_capacity("organism packets", organisms, packets, &limits)?,
             compositions: reserved(
                 usize::try_from(packets).map_err(|_| CoreError::Overflow {
@@ -2602,8 +2628,18 @@ impl Scratch {
                 })?,
                 "packet compositions",
             )?,
-            emissions: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
-            recycling: Deposits::with_capacity(&rules.grid, organisms, &limits)?,
+            emissions: Deposits::with_capacity_for(
+                &rules.grid,
+                organisms,
+                rules.exchange,
+                &limits,
+            )?,
+            recycling: Deposits::with_capacity_for(
+                &rules.grid,
+                organisms,
+                rules.exchange,
+                &limits,
+            )?,
             survivors: reserved(rows, "survivors")?,
             deaths: reserved(rows, "deaths")?,
             contact: match &rules.contact {
@@ -2817,12 +2853,12 @@ fn lanes(workers: usize, rules: &Rules) -> Result<Vec<DecisionLane>, CoreError> 
     for _ in 0..workers {
         lanes.push(lane(rules)?);
     }
-    fit_lanes(&mut lanes, capacity_of(rules)?, false)?;
+    fit_lanes(&mut lanes, rules, capacity_of(rules)?, false)?;
     Ok(lanes)
 }
 
 /// An empty decision lane with its controller scratch for the catalog's
-/// widest member.
+/// widest member and its exchange-footprint scratch for the world's kernel.
 fn lane(rules: &Rules) -> Result<DecisionLane, CoreError> {
     let widest = rules
         .catalog
@@ -2834,6 +2870,7 @@ fn lane(rules: &Rules) -> Result<DecisionLane, CoreError> {
             Some(topology) => ControllerScratch::new(topology)?,
             None => ControllerScratch::default(),
         },
+        exchange: ExchangeScratch::for_kernel(rules.exchange, &rules.grid)?,
         ..DecisionLane::default()
     })
 }
@@ -2859,13 +2896,23 @@ fn lane_rows(organisms: usize, lanes: usize) -> usize {
 /// with `batched` its observations, for the most rows it can take of
 /// `organisms`, and its packets for one organism; without `batched`,
 /// release its observations.
-fn fit_lanes(lanes: &mut [DecisionLane], organisms: usize, batched: bool) -> Result<(), CoreError> {
+fn fit_lanes(
+    lanes: &mut [DecisionLane],
+    rules: &Rules,
+    organisms: usize,
+    batched: bool,
+) -> Result<(), CoreError> {
     let rows = lane_rows(organisms, lanes.len());
     for lane in lanes {
         fit(&mut lane.decisions, rows, "decisions")?;
-        fit(&mut lane.packets, PACKETS_PER_ORGANISM, "organism packets")?;
+        fit(
+            &mut lane.packets,
+            rules.max_exchange_cells,
+            "organism packets",
+        )?;
         lane.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
-        lane.emissions.fit_staging(rows)?;
+        lane.emissions
+            .fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
         lane.transactions = None;
         if batched {
             fit(&mut lane.observed, rows, "observations")?;
@@ -3099,8 +3146,17 @@ fn uptake_with(
         work,
     } = uptake;
     if let Some(device) = backend.as_deref_mut() {
-        let served = demands_on(device, field, &rule, requesters(), work, demands)
-            .and_then(|()| resolve_uptake_on(device, field, demands, work, grants));
+        let served = if rules.exchange.is_grid_cic() {
+            demands_on(device, field, &rule, requesters(), work, demands)
+                .and_then(|()| resolve_uptake_on(device, field, demands, work, grants))
+        } else {
+            Err(CoreError::MissingCapability {
+                capability: format!(
+                    "an uptake backend under exchange kernel `{}`",
+                    rules.exchange.name()
+                ),
+            })
+        };
         match served {
             Ok(summary) => {
                 report.ticks = report.ticks.saturating_add(1);
@@ -3108,28 +3164,34 @@ fn uptake_with(
             }
             Err(error) => {
                 report.reference_ticks = report.reference_ticks.saturating_add(1);
-                demands_on_lanes(field, &rule, working, demands, lanes)?;
-                let summary = resolve_uptake_on_workers(field, demands, grants, lanes.len())?;
+                demands_on_lanes(field, &rule, rules.exchange, working, demands, lanes)?;
+                let summary = resolve_uptake_with_on_workers(
+                    field,
+                    rules.exchange,
+                    demands,
+                    grants,
+                    lanes.len(),
+                )?;
                 report.failure = Some(error.to_string());
                 *backend = None;
                 return Ok(summary);
             }
         }
     }
-    demands_on_lanes(field, &rule, working, demands, lanes)?;
-    resolve_uptake_on_workers(field, demands, grants, lanes.len())
+    demands_on_lanes(field, &rule, rules.exchange, working, demands, lanes)?;
+    resolve_uptake_with_on_workers(field, rules.exchange, demands, grants, lanes.len())
 }
 
 /// Phase 5's demands on the reference, on the lanes: `demands` gets each
 /// working organism's identity and position in identity order, then each
 /// lane computes a contiguous identity-ordered run of them ([`in_runs_mut`])
-/// with [`demand`], the function `flife_field::demands` applies to each in
-/// turn. A demand reads only the observed field, so the demands are the
-/// same at any lane count, and the error returned is the first in identity
-/// order, as one thread would report it.
+/// with [`demand_with_scratch`]. A demand reads only the observed field, so
+/// the demands are the same at any lane count, and the error returned is the
+/// first in identity order, as one thread would report it.
 fn demands_on_lanes(
     field: &FieldState,
     rule: &RequestRule,
+    exchange: ExchangeKernel,
     working: &[Working],
     demands: &mut Vec<Demand>,
     lanes: &mut [DecisionLane],
@@ -3141,9 +3203,16 @@ fn demands_on_lanes(
         position: organism.position,
         amount: 0.0,
     }));
-    in_runs_mut(demands, lanes, "uptake demands", &|_, run, _| {
+    in_runs_mut(demands, lanes, "uptake demands", &|_, run, lane| {
         for slot in run.iter_mut() {
-            *slot = demand(field, rule, slot.organism, slot.position)?;
+            *slot = demand_with_scratch(
+                field,
+                rule,
+                exchange,
+                slot.organism,
+                slot.position,
+                &mut lane.exchange,
+            )?;
         }
         Ok(())
     })
@@ -3974,12 +4043,11 @@ fn clear_tiny(
 /// [`OrganismSnapshot::local`]: the exchange footprint at `position` on
 /// `field`, each footprint cell's efficiency for `traits`' affinity, and
 /// A.1's request at the footprint's density, by the functions phase 5 and
-/// chemistry use. It reads at most four cells.
+/// chemistry use.
 ///
 /// # Errors
-/// As [`ExchangeStencil::at`], [`ExchangeStencil::density`],
-/// [`RequestRule::request`], [`Affinity::new`], [`composition`] and
-/// [`Chemistry::efficiency`].
+/// As [`ExchangeKernel::footprint_into`], [`RequestRule::request`],
+/// [`Affinity::new`], [`composition`] and [`Chemistry::efficiency`].
 fn local_chemistry(
     rules: &Rules,
     field: &FieldState,
@@ -3987,17 +4055,14 @@ fn local_chemistry(
     traits: &Traits,
 ) -> Result<LocalChemistry, CoreError> {
     let affinity = Affinity::new(*traits.affinity(), &rules.chemistry)?;
-    let stencil = ExchangeStencil::at(field.grid(), position)?;
-    let density = stencil.density(field)?;
-    let rule = RequestRule {
-        step: rules.step,
-        capacity_per_second: rules.uptake_capacity,
-        half_saturation_density: rules.half_saturation,
-    };
-    let request = rule.request(density)?;
-    let mut cells = Vec::with_capacity(stencil.cells().len());
+    let mut scratch = ExchangeScratch::new();
+    rules
+        .exchange
+        .footprint_into(field.grid(), position, &mut scratch)?;
+    let mut energy_amount = 0.0;
+    let mut cells = Vec::with_capacity(scratch.cells().len());
     let (mut gain, mut harm) = (0.0, 0.0);
-    for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+    for &(cell, weight) in scratch.cells() {
         let efficiency = rules
             .chemistry
             .efficiency(&affinity, &composition(field, cell)?)?;
@@ -4010,6 +4075,7 @@ fn local_chemistry(
                     buffer: "field",
                     detail: format!("exchange cell {cell} is not in this field"),
                 })?;
+        energy_amount += weight * f64::from(energy);
         gain += weight * efficiency.max(0.0);
         harm += weight * (-efficiency).max(0.0);
         cells.push(ExchangeCell {
@@ -4019,6 +4085,13 @@ fn local_chemistry(
             efficiency,
         });
     }
+    let density = energy_amount / field.grid().cell_area();
+    let rule = RequestRule {
+        step: rules.step,
+        capacity_per_second: rules.uptake_capacity,
+        half_saturation_density: rules.half_saturation,
+    };
+    let request = rule.request(density)?;
     Ok(LocalChemistry {
         cells,
         density,
@@ -4249,8 +4322,9 @@ impl Stages for Reference<'_> {
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
     ) -> Result<EmissionSettlement, CoreError> {
-        rules.emission.emit(
+        rules.emission.emit_with(
             &rules.grid,
+            rules.exchange,
             organism.committed.id,
             position,
             organism.actions.emission.as_ref(),

@@ -59,7 +59,9 @@ use flife_core::model::MOMENT_CHANNELS;
 use flife_core::{CoreError, TimeStep};
 
 use crate::bins::Bins;
-use crate::exchange::{ExchangeStencil, check_request, saturating_request};
+use crate::exchange::{
+    ExchangeKernel, ExchangeScratch, ExchangeStencil, check_request, saturating_request,
+};
 use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
 use crate::state::{CHANNELS, FieldState};
@@ -149,6 +151,7 @@ pub struct Grants {
     bins: Bins,
     shares: Vec<Share>,
     rank: Vec<usize>,
+    exchange: ExchangeScratch,
 }
 
 impl Default for Grants {
@@ -177,6 +180,7 @@ impl Grants {
             self.bins.allocated_bytes(),
             capacity_bytes(&self.shares),
             capacity_bytes(&self.rank),
+            self.exchange.allocated_bytes(),
         ])
     }
 
@@ -197,13 +201,14 @@ impl Grants {
             bins: Bins::new(UPTAKE_PACKETS),
             shares: Vec::new(),
             rank: Vec::new(),
+            exchange: ExchangeScratch::new(),
         }
     }
 
     /// Empty grants declared for at most `organisms` demands a resolution on
-    /// `grid` (§9.4). Their scratch is admitted against `limits` and
-    /// allocated now, so a resolution within the declaration never
-    /// allocates, and one beyond it is refused.
+    /// `grid` under `grid-cic-v1` (§9.4). Their scratch is admitted against
+    /// `limits` and allocated now, so a resolution within the declaration
+    /// never allocates, and one beyond it is refused.
     ///
     /// # Errors
     /// [`CoreError::BudgetExhausted`] when a scratch buffer exceeds
@@ -214,17 +219,34 @@ impl Grants {
         organisms: u64,
         limits: &BufferLimits,
     ) -> Result<Self, CoreError> {
+        Self::with_capacity_for(grid, organisms, ExchangeKernel::GridCicV1, limits)
+    }
+
+    /// Empty grants declared for at most `organisms` demands a resolution on
+    /// `grid` under `kernel` (FL-053, §9.4, FL-043).
+    ///
+    /// # Errors
+    /// As [`Grants::with_capacity`], plus [`CoreError::AllocationFailed`] if
+    /// footprint scratch cannot be reserved.
+    pub fn with_capacity_for(
+        grid: &FieldGrid,
+        organisms: u64,
+        kernel: ExchangeKernel,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
         let overflow = || CoreError::Overflow {
             quantity: UPTAKE_PACKETS,
         };
+        let packets_per_demand = u64::try_from(kernel.max_cells(grid)).map_err(|_| overflow())?;
         let packets = organisms
-            .checked_mul(PACKETS_PER_DEMAND)
+            .checked_mul(packets_per_demand)
             .ok_or_else(overflow)?;
         let packet_bytes = packets
             .checked_mul(std::mem::size_of::<GrantPacket>() as u64)
             .ok_or_else(overflow)?;
         limits.admit(UPTAKE_PACKETS, packet_bytes)?;
         let bins = Bins::with_capacity(UPTAKE_PACKETS, grid.cell_count(), packets, limits)?;
+        let exchange = ExchangeScratch::for_kernel(kernel, grid)?;
         let organisms = usize::try_from(organisms).map_err(|_| overflow())?;
         let packets = usize::try_from(packets).map_err(|_| overflow())?;
         let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
@@ -239,6 +261,7 @@ impl Grants {
             // One cell may hold every packet: the hotspot.
             shares: Vec::with_capacity(packets),
             rank: Vec::with_capacity(packets),
+            exchange,
             ..Self::new()
         })
     }
@@ -377,8 +400,15 @@ impl Grants {
 /// The name grants' scratch refusals carry.
 const UPTAKE_PACKETS: &str = "uptake packets";
 
-/// Check one demand and take its exchange footprint.
-fn footprint(grid: &FieldGrid, demand: &Demand) -> Result<ExchangeStencil, CoreError> {
+/// Check one demand's amount and stage its packets under `kernel`.
+fn stage_demand(
+    grid: &FieldGrid,
+    kernel: ExchangeKernel,
+    index: usize,
+    demand: &Demand,
+    exchange: &mut ExchangeScratch,
+    staged: &mut Vec<GrantPacket>,
+) -> Result<(), CoreError> {
     if !demand.amount.is_finite() || demand.amount < 0.0 {
         return Err(CoreError::NumericalInvalid {
             quantity: "uptake demand",
@@ -389,11 +419,72 @@ fn footprint(grid: &FieldGrid, demand: &Demand) -> Result<ExchangeStencil, CoreE
             ),
         });
     }
-    ExchangeStencil::at(grid, demand.position)
+    match kernel {
+        ExchangeKernel::GridCicV1 => {
+            let stencil = ExchangeStencil::at(grid, demand.position)?;
+            for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+                let requested = demand.amount * weight;
+                if requested > 0.0 {
+                    staged.push(GrantPacket {
+                        cell,
+                        organism: demand.organism,
+                        demand: index,
+                        requested,
+                        granted: 0.0,
+                    });
+                }
+            }
+        }
+        ExchangeKernel::FixedWorldGaussianV1 { .. } => {
+            kernel.footprint_into(grid, demand.position, exchange)?;
+            for &(cell, weight) in exchange.cells() {
+                let requested = demand.amount * weight;
+                if requested > 0.0 {
+                    staged.push(GrantPacket {
+                        cell,
+                        organism: demand.organism,
+                        demand: index,
+                        requested,
+                        granted: 0.0,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Resolve `demands` against the immutable `field` snapshot into `grants`.
-/// The field is not changed; [`apply_grants`] debits it.
+/// Check one demand under `kernel` without staging any packet (for reporting
+/// the first invalid demand in input order).
+fn check_demand(
+    grid: &FieldGrid,
+    kernel: ExchangeKernel,
+    demand: &Demand,
+    exchange: &mut ExchangeScratch,
+) -> Result<(), CoreError> {
+    if !demand.amount.is_finite() || demand.amount < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "uptake demand",
+            detail: format!(
+                "organism {} requests {}",
+                demand.organism.get(),
+                demand.amount
+            ),
+        });
+    }
+    match kernel {
+        ExchangeKernel::GridCicV1 => {
+            let _ = ExchangeStencil::at(grid, demand.position)?;
+        }
+        ExchangeKernel::FixedWorldGaussianV1 { .. } => {
+            kernel.footprint_into(grid, demand.position, exchange)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `demands` against the immutable `field` snapshot into `grants`
+/// under `grid-cic-v1`. The field is not changed; [`apply_grants`] debits it.
 ///
 /// # Errors
 /// - [`CoreError::BudgetExhausted`] for more demands than `grants` were
@@ -410,6 +501,19 @@ pub fn resolve_uptake(
     grants: &mut Grants,
 ) -> Result<UptakeSummary, CoreError> {
     resolve_uptake_on_workers(field, demands, grants, 1)
+}
+
+/// [`resolve_uptake`] under an explicit [`ExchangeKernel`] (FL-053).
+///
+/// # Errors
+/// As [`resolve_uptake`].
+pub fn resolve_uptake_with(
+    field: &FieldState,
+    kernel: ExchangeKernel,
+    demands: &[Demand],
+    grants: &mut Grants,
+) -> Result<UptakeSummary, CoreError> {
+    resolve_uptake_with_on_workers(field, kernel, demands, grants, 1)
 }
 
 /// The fewest packets one thread of [`resolve_uptake_on_workers`] resolves.
@@ -430,8 +534,23 @@ pub fn resolve_uptake_on_workers(
     grants: &mut Grants,
     workers: usize,
 ) -> Result<UptakeSummary, CoreError> {
+    resolve_uptake_with_on_workers(field, ExchangeKernel::GridCicV1, demands, grants, workers)
+}
+
+/// [`resolve_uptake_on_workers`] under an explicit [`ExchangeKernel`]
+/// (FL-053).
+///
+/// # Errors
+/// As [`resolve_uptake_on_workers`].
+pub fn resolve_uptake_with_on_workers(
+    field: &FieldState,
+    kernel: ExchangeKernel,
+    demands: &[Demand],
+    grants: &mut Grants,
+    workers: usize,
+) -> Result<UptakeSummary, CoreError> {
     grants.reset();
-    let result = resolve_into(field, demands, grants, workers);
+    let result = resolve_into(field, kernel, demands, grants, workers);
     if result.is_err() {
         grants.reset();
     }
@@ -440,12 +559,13 @@ pub fn resolve_uptake_on_workers(
 
 fn resolve_into(
     field: &FieldState,
+    kernel: ExchangeKernel,
     demands: &[Demand],
     grants: &mut Grants,
     workers: usize,
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
-    stage(&grid, demands, grants)?;
+    stage(&grid, kernel, demands, grants)?;
     group_packets(&grid, grants, workers)?;
 
     let energy = field.energy();
@@ -588,7 +708,12 @@ fn resolve_into(
 }
 
 /// Check `demands` and stage their packets in identity order.
-fn stage(grid: &FieldGrid, demands: &[Demand], grants: &mut Grants) -> Result<(), CoreError> {
+fn stage(
+    grid: &FieldGrid,
+    kernel: ExchangeKernel,
+    demands: &[Demand],
+    grants: &mut Grants,
+) -> Result<(), CoreError> {
     if demands.len() > grants.organisms {
         return Err(CoreError::BudgetExhausted {
             budget: UPTAKE_PACKETS,
@@ -601,19 +726,14 @@ fn stage(grid: &FieldGrid, demands: &[Demand], grants: &mut Grants) -> Result<()
         .all(|pair| pair[0].organism < pair[1].organism);
     if strictly_ascending {
         for (index, demand) in demands.iter().enumerate() {
-            let stencil = footprint(grid, demand)?;
-            for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
-                let requested = demand.amount * weight;
-                if requested > 0.0 {
-                    grants.staged.push(GrantPacket {
-                        cell,
-                        organism: demand.organism,
-                        demand: index,
-                        requested,
-                        granted: 0.0,
-                    });
-                }
-            }
+            stage_demand(
+                grid,
+                kernel,
+                index,
+                demand,
+                &mut grants.exchange,
+                &mut grants.staged,
+            )?;
         }
         return Ok(());
     }
@@ -646,27 +766,19 @@ fn stage(grid: &FieldGrid, demands: &[Demand], grants: &mut Grants) -> Result<()
         let Some(demand) = demands.get(index) else {
             continue;
         };
-        let stencil = match footprint(grid, demand) {
-            Ok(stencil) => stencil,
+        if let Err(error) = stage_demand(
+            grid,
+            kernel,
+            index,
+            demand,
+            &mut grants.exchange,
+            &mut grants.staged,
+        ) {
             // Report the first invalid demand in the order given.
-            Err(error) => {
-                return Err(demands
-                    .iter()
-                    .find_map(|demand| footprint(grid, demand).err())
-                    .unwrap_or(error));
-            }
-        };
-        for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
-            let requested = demand.amount * weight;
-            if requested > 0.0 {
-                grants.staged.push(GrantPacket {
-                    cell,
-                    organism: demand.organism,
-                    demand: index,
-                    requested,
-                    granted: 0.0,
-                });
-            }
+            return Err(demands
+                .iter()
+                .find_map(|item| check_demand(grid, kernel, item, &mut grants.exchange).err())
+                .unwrap_or(error));
         }
     }
     Ok(())
@@ -1149,8 +1261,8 @@ impl RequestRule {
     }
 }
 
-/// Phase 5's demands on the reference: for each `(organism, position)`, in
-/// order, its [`demand`].
+/// Phase 5's demands on the reference under `grid-cic-v1`: for each
+/// `(organism, position)`, in order, its [`demand`].
 ///
 /// # Errors
 /// The first organism's footprint, density or request refusal, in order.
@@ -1160,17 +1272,40 @@ pub fn demands(
     requesters: impl IntoIterator<Item = (OrganismId, [f64; 2])>,
     demands: &mut Vec<Demand>,
 ) -> Result<(), CoreError> {
+    demands_with(field, rule, ExchangeKernel::GridCicV1, requesters, demands)
+}
+
+/// Phase 5's demands on the reference under `kernel` (FL-053).
+///
+/// # Errors
+/// The first organism's footprint, density or request refusal, in order.
+pub fn demands_with(
+    field: &FieldState,
+    rule: &RequestRule,
+    kernel: ExchangeKernel,
+    requesters: impl IntoIterator<Item = (OrganismId, [f64; 2])>,
+    demands: &mut Vec<Demand>,
+) -> Result<(), CoreError> {
     demands.clear();
+    let mut scratch = ExchangeScratch::for_kernel(kernel, field.grid())?;
     for (organism, position) in requesters {
-        demands.push(demand(field, rule, organism, position)?);
+        demands.push(demand_with_scratch(
+            field,
+            rule,
+            kernel,
+            organism,
+            position,
+            &mut scratch,
+        )?);
     }
     Ok(())
 }
 
-/// One organism's phase 5 [`Demand`] on the reference, at its footprint's
-/// density: `rule.request(ExchangeStencil::at(grid, position)?.density(field)?)`.
-/// It reads only `field`, so callers may compute many at once, each into
-/// its own slot.
+/// One organism's phase 5 [`Demand`] on the reference under `grid-cic-v1`, at
+/// its footprint's density:
+/// `rule.request(ExchangeStencil::at(grid, position)?.density(field)?)`. It
+/// reads only `field`, so callers may compute many at once, each into its own
+/// slot.
 ///
 /// # Errors
 /// The footprint's, the density's or the request's refusal.
@@ -1180,7 +1315,38 @@ pub fn demand(
     organism: OrganismId,
     position: [f64; 2],
 ) -> Result<Demand, CoreError> {
-    let density = ExchangeStencil::at(field.grid(), position)?.density(field)?;
+    demand_with(field, rule, ExchangeKernel::GridCicV1, organism, position)
+}
+
+/// One organism's phase 5 [`Demand`] under `kernel` (FL-053).
+///
+/// # Errors
+/// As [`demand`].
+pub fn demand_with(
+    field: &FieldState,
+    rule: &RequestRule,
+    kernel: ExchangeKernel,
+    organism: OrganismId,
+    position: [f64; 2],
+) -> Result<Demand, CoreError> {
+    let mut scratch = ExchangeScratch::new();
+    demand_with_scratch(field, rule, kernel, organism, position, &mut scratch)
+}
+
+/// One organism's phase 5 [`Demand`] under `kernel`, reusing `scratch`
+/// (FL-053).
+///
+/// # Errors
+/// As [`demand`].
+pub fn demand_with_scratch(
+    field: &FieldState,
+    rule: &RequestRule,
+    kernel: ExchangeKernel,
+    organism: OrganismId,
+    position: [f64; 2],
+    scratch: &mut ExchangeScratch,
+) -> Result<Demand, CoreError> {
+    let density = kernel.density_with_scratch(field, position, scratch)?;
     Ok(Demand {
         organism,
         position,
@@ -1396,7 +1562,7 @@ fn resolve_on(
     grants: &mut Grants,
 ) -> Result<UptakeSummary, CoreError> {
     let grid = *field.grid();
-    stage(&grid, demands, grants)?;
+    stage(&grid, ExchangeKernel::GridCicV1, demands, grants)?;
     group_packets(&grid, grants, 1)?;
     let energy = field.energy();
     let UptakeWork {

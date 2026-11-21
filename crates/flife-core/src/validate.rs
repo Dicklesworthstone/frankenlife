@@ -232,6 +232,7 @@ pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
     let mut issues = Issues::default();
     check_generic(&config, &mut issues);
     check_contact(&config, &mut issues);
+    check_exchange(&config, &mut issues);
     let report = check_model(&config, &mut issues);
     match report {
         Some(report) if issues.0.is_empty() => Ok(ValidatedConfig { config, report }),
@@ -336,6 +337,91 @@ fn check_contact(config: &RunConfig, issues: &mut Issues) {
                 contact.adhesion_range
             ),
         ),
+        _ => {}
+    }
+}
+
+/// The most cells one fixed-world exchange footprint may span on a grid
+/// (FL-053, FL-043: bounds per-organism staging and memory admission).
+const MAXIMUM_EXCHANGE_CELLS: u64 = 4_096;
+
+/// `world.exchange_radius_world_units` belongs to `fixed-world-gaussian-v1`
+/// (plan §4.3, §11.6; FL-053): it must cover at least one cell spacing so
+/// every torus position has non-empty support, stay strictly below half the
+/// shorter world side so it never overlaps itself on the torus, and keep its
+/// per-organism support within [`MAXIMUM_EXCHANGE_CELLS`].
+fn check_exchange(config: &RunConfig, issues: &mut Issues) {
+    let world = &config.world;
+    match (
+        world.exchange_kernel.as_str(),
+        world.exchange_radius_world_units,
+    ) {
+        ("grid-cic-v1", Some(_)) => {
+            issues.add(
+                "world.exchange_radius_world_units",
+                "exchange_radius_world_units belongs to fixed-world-gaussian-v1, not grid-cic-v1",
+            );
+        }
+        ("fixed-world-gaussian-v1", None) => {
+            issues.add(
+                "world.exchange_radius_world_units",
+                "fixed-world-gaussian-v1 needs world.exchange_radius_world_units",
+            );
+        }
+        ("fixed-world-gaussian-v1", Some(radius))
+            if radius.is_finite()
+                && radius > 0.0
+                && world.width.is_finite()
+                && world.width > 0.0
+                && world.height.is_finite()
+                && world.height > 0.0
+                && world.grid_width >= 1
+                && world.grid_height >= 1 =>
+        {
+            let hx = world.width / f64::from(world.grid_width);
+            let hy = world.height / f64::from(world.grid_height);
+            let min_radius = hx.max(hy);
+            if radius < min_radius {
+                issues.add(
+                    "world.exchange_radius_world_units",
+                    format!(
+                        "must be >= max(h_x, h_y) = {min_radius:e} so every position covers at \
+                         least one cell center, got {radius:e}"
+                    ),
+                );
+            }
+            let half_world = 0.5 * world.width.min(world.height);
+            if radius >= half_world {
+                issues.add(
+                    "world.exchange_radius_world_units",
+                    format!(
+                        "must be < half the shorter world side ({half_world:e}) to avoid \
+                         self-overlap on the torus, got {radius:e}"
+                    ),
+                );
+            }
+            let axis_bound = |cell: f64, cells: u32| -> u64 {
+                let raw = (2.0 * radius / cell).floor();
+                if !raw.is_finite() || raw < 0.0 {
+                    u64::from(cells)
+                } else {
+                    (raw as u64).saturating_add(2).min(u64::from(cells))
+                }
+            };
+            let max_cells = axis_bound(hx, world.grid_width)
+                .saturating_mul(axis_bound(hy, world.grid_height))
+                .min(u64::from(world.grid_width).saturating_mul(u64::from(world.grid_height)));
+            if max_cells > MAXIMUM_EXCHANGE_CELLS {
+                issues.add(
+                    "world.exchange_radius_world_units",
+                    format!(
+                        "footprint spans up to {max_cells} cells on {}x{}, above the \
+                         {MAXIMUM_EXCHANGE_CELLS}-cell bound",
+                        world.grid_width, world.grid_height
+                    ),
+                );
+            }
+        }
         _ => {}
     }
 }

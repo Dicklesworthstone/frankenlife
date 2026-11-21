@@ -42,7 +42,7 @@ use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
 use flife_core::ledger::{EnergyBudget, TickLedger};
 use flife_core::{CoreError, Flow, ValidatedConfig};
 use flife_field::state::CHANNELS;
-use flife_field::{Deposits, FieldGrid};
+use flife_field::{Deposits, ExchangeKernel, FieldGrid};
 
 use crate::population::Organism;
 
@@ -428,9 +428,9 @@ impl Recycling {
         self.fraction
     }
 
-    /// Settle `death`'s residual. A recycled residual is staged in
-    /// `deposits` at the death position with `affinity`, the organism's
-    /// genetic affinity direction, as its chemistry.
+    /// Settle `death`'s residual under `grid-cic-v1`. A recycled residual is
+    /// staged in `deposits` at the death position with `affinity`, the
+    /// organism's genetic affinity direction, as its chemistry.
     ///
     /// # Errors
     /// - [`CoreError::StateConflict`] for an exhaustion death that claims a
@@ -440,6 +440,21 @@ impl Recycling {
     pub fn settle(
         &self,
         grid: &FieldGrid,
+        death: &Death,
+        affinity: &[f64; CHANNELS],
+        deposits: &mut Deposits,
+    ) -> Result<DeathSettlement, CoreError> {
+        self.settle_with(grid, ExchangeKernel::GridCicV1, death, affinity, deposits)
+    }
+
+    /// [`Recycling::settle`] under an explicit [`ExchangeKernel`] (FL-053).
+    ///
+    /// # Errors
+    /// As [`Recycling::settle`].
+    pub fn settle_with(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
         death: &Death,
         affinity: &[f64; CHANNELS],
         deposits: &mut Deposits,
@@ -469,7 +484,15 @@ impl Recycling {
             DeathCause::Removed(Disposition::Recycle) => {
                 if residual > 0.0 {
                     let offered = self.fraction * residual;
-                    deposits.push(grid, death.id, death.position, residual, offered, affinity)?;
+                    deposits.push_with(
+                        grid,
+                        exchange,
+                        death.id,
+                        death.position,
+                        residual,
+                        offered,
+                        affinity,
+                    )?;
                     settlement.recycled = residual;
                     settlement.offered = offered;
                 }

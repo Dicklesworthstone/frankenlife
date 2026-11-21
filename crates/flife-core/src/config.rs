@@ -138,6 +138,8 @@ pub struct WorldConfig {
     pub decay_per_second: f64,
     pub stability_policy: String,
     pub exchange_kernel: String,
+    #[serde(default)]
+    pub exchange_radius_world_units: Option<f64>,
     pub tiny_energy_policy: String,
     pub tiny_energy_threshold: f64,
 }

@@ -623,11 +623,18 @@ each runs and owns the field.
 
 **Invariants — inspection (FL-021; §14.2, §21.2 INV-09).**
 - A snapshot reads one row through the identity index, that organism's own genome, the topology catalog and the
-  committed field at its exchange footprint (at most four cells). It copies no controller parameter and nothing of
-  another organism or genome, so its cost does not grow with the population or the genome bank.
-- Its local chemistry is computed by the functions phase 5 and chemistry use (`ExchangeStencil::at`, `density`,
-  `RequestRule::request`, `Affinity::new`, `composition`, `Chemistry::efficiency`), so the panel and the tick
-  cannot disagree on the law.
+  committed field at its exchange footprint (at most four cells under `grid-cic-v1`, or the bounded fixed-world
+  footprint under `fixed-world-gaussian-v1`, FL-053). It copies no controller parameter and nothing of another organism
+  or genome, so its cost does not grow with the population or the genome bank.
+- Its local chemistry is computed by the functions phase 5 and chemistry use (`ExchangeKernel::footprint_into`, density
+  `Σ w_c e_c / (h_x h_y)`, `RequestRule::request`, `Affinity::new`, `composition`, `Chemistry::efficiency`), so the
+  panel and the tick cannot disagree on the law.
+- Fixed-world exchange (`fixed-world-gaussian-v1`, FL-053): `World` sizes its `Grants`, `by_demand`, `compositions`,
+  `emissions`, `recycling`, and per-lane `packets`/`emissions`/`exchange` scratch from `ExchangeKernel::max_cells`,
+  charges every byte in `World::footprint()` / `World::admit_memory` (FL-043), and dispatches phase 5 uptake, phase 7
+  emission, death/removal recycling, and `local_chemistry` through `rules.exchange`. CIC-only `UptakeBackend` and
+  `SettleBackend` ports explicitly refuse non-`grid-cic-v1` worlds with `CoreError::MissingCapability` and fall back to
+  the qualified CPU reference with `failure` recorded.
 - It takes `&self` and changes nothing: a world inspected in full before every tick commits the digests of one
   never inspected.
 - The held output is decoded by the function the tick uses (`raw_outputs` then `decode`), so the snapshot and the

@@ -233,6 +233,15 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
         &w.exchange_kernel,
         Role::ExchangeKernel,
     );
+    if let Some(radius) = w.exchange_radius_world_units {
+        r.float(
+            "world",
+            "exchange_radius_world_units",
+            radius,
+            U::WorldLength,
+            Positive,
+        );
+    }
     r.name(
         "world",
         "tiny_energy_policy",

@@ -70,7 +70,7 @@ use flife_core::rng::SemanticRng;
 use flife_core::{CoreError, Tick};
 use flife_field::sources::squared_norm;
 use flife_field::state::CHANNELS;
-use flife_field::{Deposits, FieldGrid, FieldState};
+use flife_field::{Deposits, ExchangeKernel, FieldGrid, FieldState};
 use flife_genome::{GenomeQuota, TopologyCatalog, TraitLimits, founder};
 
 use crate::lifecycle::{Death, Disposition, Recycling};
@@ -283,6 +283,7 @@ pub(crate) fn remove(
     tick: Tick,
     interventions: &[Intervention],
     grid: &FieldGrid,
+    exchange: ExchangeKernel,
     population: &Population,
     recycling: &Recycling,
     rows: &mut Vec<Organism>,
@@ -320,7 +321,7 @@ pub(crate) fn remove(
                         detail: format!("{} has no genome", organism.id),
                     })?;
             recycling
-                .settle(grid, &death, genome.traits().affinity(), deposits)?
+                .settle_with(grid, exchange, &death, genome.traits().affinity(), deposits)?
                 .record(ledger)?;
             deaths.push(death);
             energy += organism.energy;

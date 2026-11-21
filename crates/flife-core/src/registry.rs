@@ -348,6 +348,17 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
         },
         ..entry("grid-cic-v1", Role::ExchangeKernel, "§4.3, §5.1", "FL-005")
     },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-field::tests/fixed_footprint.rs::fixed_world_gaussian_footprint_converges_under_grid_refinement",
+        },
+        ..entry(
+            "fixed-world-gaussian-v1",
+            Role::ExchangeKernel,
+            "§4.3, §11.6",
+            "FL-053",
+        )
+    },
     // Clearing a tiny reservoir is the last budget stage (§8.2): a
     // reservoir strictly below the threshold is paid in full, recorded as
     // the `tiny-reservoir` flow, and the organism dies of it.

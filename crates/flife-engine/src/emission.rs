@@ -27,7 +27,7 @@
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, Payment};
 use flife_core::{CoreError, ValidatedConfig};
-use flife_field::{Deposits, FieldGrid};
+use flife_field::{Deposits, ExchangeKernel, FieldGrid};
 use flife_neural::Emission;
 
 /// The emission position this module implements.
@@ -91,9 +91,9 @@ impl EmissionPolicy {
         self.efficiency
     }
 
-    /// Settle `organism`'s `emission` at the emission stage: pay `f E` from
-    /// `budget` and stage `ρ f E` at `position`, its post-motion position,
-    /// in `deposits`.
+    /// Settle `organism`'s `emission` at the emission stage under `grid-cic-v1`:
+    /// pay `f E` from `budget` and stage `ρ f E` at `position`, its post-motion
+    /// position, in `deposits`.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a spending fraction outside
@@ -102,6 +102,35 @@ impl EmissionPolicy {
     pub fn emit(
         &self,
         grid: &FieldGrid,
+        organism: OrganismId,
+        position: [f64; 2],
+        emission: Option<&Emission>,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+    ) -> Result<EmissionSettlement, CoreError> {
+        self.emit_with(
+            grid,
+            ExchangeKernel::GridCicV1,
+            organism,
+            position,
+            emission,
+            budget,
+            deposits,
+        )
+    }
+
+    /// [`EmissionPolicy::emit`] under an explicit [`ExchangeKernel`] (FL-053).
+    ///
+    /// # Errors
+    /// As [`EmissionPolicy::emit`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors EmissionPolicy::emit with the explicit exchange kernel"
+    )]
+    pub fn emit_with(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
         organism: OrganismId,
         position: [f64; 2],
         emission: Option<&Emission>,
@@ -137,8 +166,9 @@ impl EmissionPolicy {
             return Ok(nothing);
         }
         let offered = self.efficiency * requested;
-        deposits.push(
+        deposits.push_with(
             grid,
+            exchange,
             organism,
             position,
             requested,

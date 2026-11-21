@@ -1,23 +1,431 @@
-//! The `grid-cic-v1` exchange footprint and the A.1 uptake request law
-//! (plan §4.3, §5.1, A.1).
+//! Exchange footprints (`grid-cic-v1` and `fixed-world-gaussian-v1`) and the
+//! A.1 uptake request law (plan §4.3, §5.1, §11.6, A.1; FL-005, FL-053).
 //!
-//! Consumption is local. An organism at `x` exchanges energy only with the
-//! cells of its bilinear cloud-in-cell footprint. The continuous cell index
-//! is `(x/h_x − ½, y/h_y − ½)`. Its floor selects the lower-left cell and
-//! its fractional part `(f_x, f_y)` gives the four weights
+//! Consumption is local. Under `grid-cic-v1`, an organism at `x` exchanges
+//! energy only with the cells of its bilinear cloud-in-cell footprint. The
+//! continuous cell index is `(x/h_x − ½, y/h_y − ½)`. Its floor selects the
+//! lower-left cell and its fractional part `(f_x, f_y)` gives the four weights
 //! `(1−f_x)(1−f_y)`, `f_x(1−f_y)`, `(1−f_x)f_y` and `f_x f_y`, wrapped
-//! periodically. A cell named twice on a grid one cell wide is combined
-//! into one entry, and zero weights are dropped. The weights are
-//! nonnegative and sum to one up to F64 rounding. A long-range sensor
-//! therefore never becomes long-range feeding.
+//! periodically. A cell named twice on a grid one cell wide is combined into
+//! one entry, and zero weights are dropped. The weights are nonnegative and
+//! sum to one up to F64 rounding.
+//!
+//! Under `fixed-world-gaussian-v1` (FL-053, plan §4.3, §11.6), the physical
+//! exchange radius `R` is fixed in world units rather than shrinking with
+//! grid spacing `h`. Every cell center within minimum-image distance `R` of
+//! `x` receives raw weight `k_c = exp(−|d_c|² / (2σ²))` with `σ = R / 3`
+//! (3σ cutoff, using host-independent `exp_neg`), normalized by `Σ k_c` in
+//! ascending cell-index order so `w_c ≥ 0` and `Σ w_c = 1` up to F64
+//! rounding. Under grid refinement at fixed physical world size and radius
+//! `R`, both sampled local density `Σ w_c e_c / (h_x h_y)` and deposited
+//! density converge smoothly to the continuous fixed-radius Gaussian integral.
+//! A long-range sensor therefore never becomes long-range feeding under either
+//! kernel.
 
-use flife_core::{CoreError, TimeStep};
+use flife_core::memory::{bytes_for, capacity_bytes, total};
+use flife_core::{CoreError, TimeStep, ValidatedConfig};
 
 use crate::grid::FieldGrid;
+use crate::numerics::exp_neg;
 use crate::state::FieldState;
 
-/// The exchange kernel this module implements.
+/// The baseline bilinear cloud-in-cell exchange kernel.
 pub const GRID_CIC_V1: &str = "grid-cic-v1";
+
+/// The fixed-world-radius truncated minimum-image Gaussian exchange kernel
+/// (FL-053, plan §4.3, §11.6).
+pub const FIXED_WORLD_GAUSSIAN_V1: &str = "fixed-world-gaussian-v1";
+
+/// Cutoff radius in units of `σ` for [`FIXED_WORLD_GAUSSIAN_V1`]: `R = 3σ`,
+/// matching the baseline source kernel's 3σ cutoff.
+pub const FIXED_WORLD_GAUSSIAN_CUTOFF_SIGMA: f64 = 3.0;
+
+/// The most cells one fixed-world exchange footprint may span (FL-053,
+/// FL-043).
+pub const MAXIMUM_EXCHANGE_CELLS: usize = 4_096;
+
+/// Reusable scratch for building an [`ExchangeKernel`] footprint without
+/// per-organism heap allocations during steady-state ticks (FL-043, FL-053).
+#[derive(Debug, Clone, Default)]
+pub struct ExchangeScratch {
+    columns: Vec<u32>,
+    rows: Vec<u32>,
+    cells: Vec<(usize, f64)>,
+}
+
+impl ExchangeScratch {
+    /// Empty scratch.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scratch reserved for any footprint of `kernel` on `grid` (FL-043).
+    /// Returns empty scratch (0 bytes) for [`ExchangeKernel::GridCicV1`],
+    /// whose four-cell stencil lives on the stack.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses the room.
+    pub fn for_kernel(kernel: ExchangeKernel, grid: &FieldGrid) -> Result<Self, CoreError> {
+        let ExchangeKernel::FixedWorldGaussianV1 { radius, .. } = kernel else {
+            return Ok(Self::new());
+        };
+        let cols = axis_candidate_bound(radius, grid.cell_width(), grid.cells_x());
+        let rows = axis_candidate_bound(radius, grid.cell_height(), grid.cells_y());
+        let max_cells = kernel.max_cells(grid);
+        let mut scratch = Self::new();
+        let refused = |bytes: u64| CoreError::AllocationFailed {
+            buffer: "exchange footprint scratch",
+            bytes,
+        };
+        scratch
+            .columns
+            .try_reserve_exact(cols)
+            .map_err(|_| refused(bytes_for::<u32>(cols)))?;
+        scratch
+            .rows
+            .try_reserve_exact(rows)
+            .map_err(|_| refused(bytes_for::<u32>(rows)))?;
+        scratch
+            .cells
+            .try_reserve_exact(max_cells)
+            .map_err(|_| refused(bytes_for::<(usize, f64)>(max_cells)))?;
+        Ok(scratch)
+    }
+
+    /// Bytes held by its scratch vectors (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        total([
+            capacity_bytes(&self.columns),
+            capacity_bytes(&self.rows),
+            capacity_bytes(&self.cells),
+        ])
+    }
+
+    /// The last built footprint: `(cell_index, weight)` pairs in strictly
+    /// ascending cell-index order, each weight positive.
+    #[must_use]
+    pub fn cells(&self) -> &[(usize, f64)] {
+        &self.cells
+    }
+}
+
+/// The organism-field exchange kernel (plan §4.3, §5.1, §11.6; FL-005,
+/// FL-053).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ExchangeKernel {
+    /// `grid-cic-v1`: bilinear cloud-in-cell footprint over at most four
+    /// adjacent cells.
+    GridCicV1,
+    /// `fixed-world-gaussian-v1`: normalized truncated minimum-image Gaussian
+    /// over cell centers within physical world-unit radius `radius` and
+    /// width `sigma = radius / 3`.
+    FixedWorldGaussianV1 {
+        /// Cutoff radius `R` in world-length.
+        radius: f64,
+        /// Gaussian width `σ = R / 3` in world-length.
+        sigma: f64,
+    },
+}
+
+impl ExchangeKernel {
+    /// The baseline `grid-cic-v1` kernel.
+    #[must_use]
+    pub const fn grid_cic() -> Self {
+        Self::GridCicV1
+    }
+
+    /// `fixed-world-gaussian-v1` with cutoff `radius` in world-length and
+    /// width `σ = radius / 3`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `radius` is finite and
+    /// strictly positive.
+    pub fn fixed_world_gaussian(radius: f64) -> Result<Self, CoreError> {
+        let sigma = radius / FIXED_WORLD_GAUSSIAN_CUTOFF_SIGMA;
+        if !(radius.is_finite() && radius > 0.0 && sigma.is_finite() && sigma > 0.0) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "world.exchange_radius_world_units",
+                detail: format!("{radius:?} is not finite and positive"),
+            });
+        }
+        Ok(Self::FixedWorldGaussianV1 { radius, sigma })
+    }
+
+    /// The exchange kernel a validated configuration declares.
+    ///
+    /// # Errors
+    /// [`CoreError::UnknownAlgorithm`] for an unrecognized kernel name,
+    /// [`CoreError::NumericalInvalid`] for a missing or invalid radius.
+    pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
+        let world = &config.config().world;
+        match world.exchange_kernel.as_str() {
+            GRID_CIC_V1 => Ok(Self::GridCicV1),
+            FIXED_WORLD_GAUSSIAN_V1 => {
+                let radius = world.exchange_radius_world_units.ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "world.exchange_radius_world_units",
+                        detail: "fixed-world-gaussian-v1 requires exchange_radius_world_units"
+                            .to_owned(),
+                    }
+                })?;
+                Self::fixed_world_gaussian(radius)
+            }
+            other => Err(CoreError::UnknownAlgorithm {
+                role: "world.exchange_kernel",
+                name: other.to_owned(),
+            }),
+        }
+    }
+
+    /// Canonical registry name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::GridCicV1 => GRID_CIC_V1,
+            Self::FixedWorldGaussianV1 { .. } => FIXED_WORLD_GAUSSIAN_V1,
+        }
+    }
+
+    /// Whether this is the baseline `grid-cic-v1` kernel.
+    #[must_use]
+    pub const fn is_grid_cic(self) -> bool {
+        matches!(self, Self::GridCicV1)
+    }
+
+    /// Physical cutoff radius in world-length, for fixed-world kernels.
+    #[must_use]
+    pub const fn radius(self) -> Option<f64> {
+        match self {
+            Self::GridCicV1 => None,
+            Self::FixedWorldGaussianV1 { radius, .. } => Some(radius),
+        }
+    }
+
+    /// Gaussian width `σ` in world-length, for fixed-world kernels.
+    #[must_use]
+    pub const fn sigma(self) -> Option<f64> {
+        match self {
+            Self::GridCicV1 => None,
+            Self::FixedWorldGaussianV1 { sigma, .. } => Some(sigma),
+        }
+    }
+
+    /// Upper bound on the number of cells one footprint of this kernel can
+    /// touch on `grid` (used for steady-state scratch sizing and FL-043
+    /// memory admission).
+    #[must_use]
+    pub fn max_cells(self, grid: &FieldGrid) -> usize {
+        match self {
+            Self::GridCicV1 => 4,
+            Self::FixedWorldGaussianV1 { radius, .. } => {
+                let bx = axis_footprint_bound(radius, grid.cell_width(), grid.cells_x());
+                let by = axis_footprint_bound(radius, grid.cell_height(), grid.cells_y());
+                let total = usize::try_from(grid.cell_count()).unwrap_or(usize::MAX);
+                bx.saturating_mul(by).min(total)
+            }
+        }
+    }
+
+    /// Compute the footprint at `position` (wrapped onto the torus) into
+    /// `scratch`, producing `(cell_index, weight)` pairs in strictly
+    /// ascending cell-index order with positive weights summing to one up
+    /// to F64 rounding.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonfinite coordinate or an
+    /// empty/nonpositive fixed-world support.
+    pub fn footprint_into(
+        self,
+        grid: &FieldGrid,
+        position: [f64; 2],
+        scratch: &mut ExchangeScratch,
+    ) -> Result<(), CoreError> {
+        scratch.cells.clear();
+        match self {
+            Self::GridCicV1 => {
+                let stencil = ExchangeStencil::at(grid, position)?;
+                for (&cell, &weight) in stencil.cells().iter().zip(stencil.weights()) {
+                    scratch.cells.push((cell, weight));
+                }
+                Ok(())
+            }
+            Self::FixedWorldGaussianV1 { radius, sigma } => {
+                let center = grid.wrap_position(position)?;
+                let cols_ok = axis_candidates(
+                    center[0],
+                    radius,
+                    grid.cell_width(),
+                    grid.cells_x(),
+                    &mut scratch.columns,
+                );
+                let rows_ok = axis_candidates(
+                    center[1],
+                    radius,
+                    grid.cell_height(),
+                    grid.cells_y(),
+                    &mut scratch.rows,
+                );
+                if !cols_ok || !rows_ok {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "exchange position",
+                        detail: format!("{position:?} is not a finite position"),
+                    });
+                }
+                let radius_squared = radius * radius;
+                let two_sigma_squared = 2.0 * sigma * sigma;
+                let hx = grid.cell_width();
+                let hy = grid.cell_height();
+                let mut weight_sum = 0.0;
+                for &row in &scratch.rows {
+                    let cy = (f64::from(row) + 0.5) * hy;
+                    for &column in &scratch.columns {
+                        let cx = (f64::from(column) + 0.5) * hx;
+                        let [dx, dy] = grid.displacement(center, [cx, cy])?;
+                        let d2 = dx * dx + dy * dy;
+                        if d2 > radius_squared {
+                            continue;
+                        }
+                        let raw = exp_neg(d2 / two_sigma_squared).ok_or_else(|| {
+                            CoreError::NumericalInvalid {
+                                quantity: "exchange weight",
+                                detail: format!("|d|² = {d2:?} has no Gaussian weight"),
+                            }
+                        })?;
+                        if raw <= 0.0 {
+                            continue;
+                        }
+                        let cell = grid.cell_index(column, row).ok_or_else(|| {
+                            CoreError::NumericalInvalid {
+                                quantity: "exchange footprint",
+                                detail: format!("cell ({column}, {row}) is outside the grid"),
+                            }
+                        })?;
+                        scratch.cells.push((cell, raw));
+                        weight_sum += raw;
+                    }
+                }
+                if scratch.cells.is_empty() || !weight_sum.is_finite() || weight_sum <= 0.0 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "exchange footprint",
+                        detail: format!(
+                            "no cell center lies within radius {radius:?} of {center:?} with \
+                             positive weight"
+                        ),
+                    });
+                }
+                for (_, weight) in &mut scratch.cells {
+                    *weight /= weight_sum;
+                }
+                scratch.cells.retain(|&(_, weight)| weight > 0.0);
+                if scratch.cells.is_empty() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "exchange footprint",
+                        detail: format!(
+                            "normalized weights at {center:?} underflowed to empty support"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Local energy density `Σ w_c e_c / (h_x h_y)` at `position` on
+    /// `field`, reusing `scratch` (ecological-energy per world-length²).
+    ///
+    /// # Errors
+    /// As [`ExchangeKernel::footprint_into`] and [`ExchangeStencil::density`].
+    pub fn density_with_scratch(
+        self,
+        field: &FieldState,
+        position: [f64; 2],
+        scratch: &mut ExchangeScratch,
+    ) -> Result<f64, CoreError> {
+        match self {
+            Self::GridCicV1 => ExchangeStencil::at(field.grid(), position)?.density(field),
+            Self::FixedWorldGaussianV1 { .. } => {
+                self.footprint_into(field.grid(), position, scratch)?;
+                let energy = field.energy();
+                let mut amount = 0.0;
+                for &(cell, weight) in scratch.cells() {
+                    let value =
+                        energy
+                            .get(cell)
+                            .copied()
+                            .ok_or_else(|| CoreError::LayoutMismatch {
+                                buffer: "field",
+                                detail: format!("exchange cell {cell} is not in this field"),
+                            })?;
+                    amount += weight * f64::from(value);
+                }
+                Ok(amount / field.grid().cell_area())
+            }
+        }
+    }
+
+    /// Local energy density `Σ w_c e_c / (h_x h_y)` at `position` on `field`.
+    ///
+    /// # Errors
+    /// As [`ExchangeKernel::density_with_scratch`].
+    pub fn density(self, field: &FieldState, position: [f64; 2]) -> Result<f64, CoreError> {
+        let mut scratch = ExchangeScratch::new();
+        self.density_with_scratch(field, position, &mut scratch)
+    }
+}
+
+/// Upper bound on cell centers along one axis within distance `radius` of
+/// any position (plus one extra cell against floating-point edge rounding).
+fn axis_footprint_bound(radius: f64, cell: f64, cells: u32) -> usize {
+    let whole = cells as usize;
+    let span = (2.0 * radius / cell).floor();
+    if span.is_finite() && span >= 0.0 && span < f64::from(cells) {
+        (span as usize).saturating_add(2).min(whole)
+    } else {
+        whole
+    }
+}
+
+/// Upper bound on candidate indices produced by [`axis_candidates`] before
+/// the exact disk test (widened by one cell on each side against rounding).
+fn axis_candidate_bound(radius: f64, cell: f64, cells: u32) -> usize {
+    let whole = cells as usize;
+    let span = (2.0 * radius / cell).ceil() + 5.0;
+    if span.is_finite() && span >= 0.0 && span < f64::from(cells) {
+        (span as usize).min(whole)
+    } else {
+        whole
+    }
+}
+
+/// Candidate cell indices along one periodic axis, sorted and distinct:
+/// every index whose center can lie within `radius` of `coordinate`.
+fn axis_candidates(
+    coordinate: f64,
+    radius: f64,
+    cell: f64,
+    cells: u32,
+    out: &mut Vec<u32>,
+) -> bool {
+    out.clear();
+    if !coordinate.is_finite() {
+        return false;
+    }
+    let low = ((coordinate - radius) / cell - 0.5).floor() - 1.0;
+    let high = ((coordinate + radius) / cell - 0.5).ceil() + 1.0;
+    let span = high - low + 1.0;
+    if !span.is_finite() || span >= f64::from(cells) {
+        out.extend(0..cells);
+        return true;
+    }
+    let (low, high) = (low as i64, high as i64);
+    let modulus = i64::from(cells);
+    out.extend((low..=high).filter_map(|index| u32::try_from(index.rem_euclid(modulus)).ok()));
+    out.sort_unstable();
+    out.dedup();
+    true
+}
 
 /// An organism's exchange footprint: at most four distinct cells in
 /// ascending index order, each with a positive weight.

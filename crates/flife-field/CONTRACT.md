@@ -101,7 +101,14 @@
   now delegates to) and `SensorPyramid::corners` (a level's `Corners` at a position: its `LevelGrid`, the two
   wrapped columns and rows, and the fractions `fx`, `fy`). `sample_level` reads its corners through the same
   function.
-- `ExchangeStencil`: an organism's footprint cells and weights, and its local density `Σ w_c e_c / (h_x h_y)`.
+- `ExchangeStencil`: an organism's `grid-cic-v1` footprint cells and weights, and its local density `Σ w_c e_c / (h_x h_y)`.
+  `ExchangeKernel` (FL-053) generalizes organism-field exchange to either `GridCicV1` (`grid-cic-v1`, 4-cell CIC) or
+  `FixedWorldGaussianV1` (`fixed-world-gaussian-v1`, normalized truncated minimum-image Gaussian over cell centers within
+  fixed physical radius `R` with `σ = R / 3`, host-independent `exp_neg`, bounded by `MAXIMUM_EXCHANGE_CELLS = 4096`),
+  with reusable `ExchangeScratch` (`for_kernel`, `allocated_bytes`), `footprint_into`, `density_with_scratch`,
+  `demand_with_scratch`, `demands_with`, `Grants::with_capacity_for`, `resolve_uptake_with`,
+  `resolve_uptake_with_on_workers`, `Deposits::with_capacity_for`, `Deposits::fit_staging_for_kernel`, and
+  `Deposits::push_with` (conservative multi-cell `split_slice` guaranteeing `Σ q_c ≤ offered`).
   `saturating_request` gives `d = Δt U_max r/(K + r)`.
 - `resolve_uptake` fills reusable `Grants`. These hold the `GrantPacket`s sorted by (cell, organism), one
   `CellDebit` per demanded cell, each organism's total `U_i` in input order, and an `UptakeSummary`.

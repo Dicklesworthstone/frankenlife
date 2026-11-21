@@ -61,7 +61,11 @@ pub mod uptake;
 
 pub use bins::Bins;
 pub use deposit::{DepositReduction, DepositSummary, Deposits, apply_deposits, apply_deposits_on};
-pub use exchange::{ExchangeStencil, check_request, saturating_request};
+pub use exchange::{
+    ExchangeKernel, ExchangeScratch, ExchangeStencil, FIXED_WORLD_GAUSSIAN_CUTOFF_SIGMA,
+    FIXED_WORLD_GAUSSIAN_V1, GRID_CIC_V1, MAXIMUM_EXCHANGE_CELLS, check_request,
+    saturating_request,
+};
 pub use footprint::{BufferLimits, FieldFootprint};
 pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 pub use invariants::{ConeTolerance, FieldScan, FieldSummary};
@@ -94,6 +98,7 @@ pub use transport::{
 };
 pub use uptake::{
     CellDebit, Demand, GrantDebit, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell,
-    UptakeSummary, UptakeWork, apply_grants, apply_grants_on, demand, demands, demands_on,
-    resolve_uptake, resolve_uptake_on, resolve_uptake_on_workers,
+    UptakeSummary, UptakeWork, apply_grants, apply_grants_on, demand, demand_with,
+    demand_with_scratch, demands, demands_on, demands_with, resolve_uptake, resolve_uptake_on,
+    resolve_uptake_on_workers, resolve_uptake_with, resolve_uptake_with_on_workers,
 };

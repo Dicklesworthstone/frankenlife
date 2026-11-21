@@ -216,8 +216,16 @@ fn settle_on(
     lanes: &mut [DecisionLane],
     work: &mut SettleWork,
 ) -> Result<(), CoreError> {
-    // Before any dispatch: a model the port's motion does not implement is
-    // refused here, not after its chemistry has run.
+    // Before any dispatch: a model or exchange kernel the port does not
+    // implement is refused here, not after its chemistry has run.
+    if !rules.exchange.is_grid_cic() {
+        return Err(CoreError::MissingCapability {
+            capability: format!(
+                "a settle backend's emission under exchange kernel `{}`",
+                rules.exchange.name()
+            ),
+        });
+    }
     let motion_constants = motion_constants(rules)?;
     let (by_demand, granted) = grants;
     let SettleWork {

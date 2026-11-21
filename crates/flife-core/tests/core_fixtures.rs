@@ -33,6 +33,10 @@ const EVIDENCE_FILES: &[(&str, &str)] = &[
         "flife-field::tests/uptake_ledger.rs",
         include_str!("../../flife-field/tests/uptake_ledger.rs"),
     ),
+    (
+        "flife-field::tests/fixed_footprint.rs",
+        include_str!("../../flife-field/tests/fixed_footprint.rs"),
+    ),
     ("flife-core::tests/numerics.rs", include_str!("numerics.rs")),
     (
         "flife-manim::tests/mapping.rs",

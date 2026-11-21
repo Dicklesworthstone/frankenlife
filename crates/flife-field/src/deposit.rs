@@ -48,7 +48,7 @@ use flife_core::memory::{capacity_bytes, total};
 use flife_core::model::MOMENT_CHANNELS;
 
 use crate::bins::Bins;
-use crate::exchange::ExchangeStencil;
+use crate::exchange::{ExchangeKernel, ExchangeScratch, ExchangeStencil};
 use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
 use crate::state::{CHANNELS, FieldState};
@@ -134,6 +134,8 @@ pub struct Deposits {
     /// The most deposits one reduction admits.
     organisms: usize,
     applied: bool,
+    exchange: ExchangeScratch,
+    shares: Vec<f64>,
 }
 
 impl Default for Deposits {
@@ -154,6 +156,8 @@ impl Deposits {
             capacity_bytes(&self.identities),
             capacity_bytes(&self.sequence),
             self.bins.allocated_bytes(),
+            self.exchange.allocated_bytes(),
+            capacity_bytes(&self.shares),
         ])
     }
 
@@ -171,13 +175,15 @@ impl Deposits {
             bins: Bins::new(DEPOSIT_PACKETS),
             organisms: usize::try_from(u32::MAX).unwrap_or(usize::MAX) / 4,
             applied: false,
+            exchange: ExchangeScratch::new(),
+            shares: Vec::new(),
         }
     }
 
     /// No deposits, declared for at most `organisms` deposits a reduction on
-    /// `grid` (§9.4). Their scratch is admitted against `limits` and
-    /// allocated now, so staging and reducing within the declaration never
-    /// allocates, and staging beyond it is refused.
+    /// `grid` under `grid-cic-v1` (§9.4). Their scratch is admitted against
+    /// `limits` and allocated now, so staging and reducing within the
+    /// declaration never allocates, and staging beyond it is refused.
     ///
     /// # Errors
     /// [`CoreError::BudgetExhausted`] when a scratch buffer exceeds
@@ -188,11 +194,28 @@ impl Deposits {
         organisms: u64,
         limits: &BufferLimits,
     ) -> Result<Self, CoreError> {
+        Self::with_capacity_for(grid, organisms, ExchangeKernel::GridCicV1, limits)
+    }
+
+    /// No deposits, declared for at most `organisms` deposits a reduction on
+    /// `grid` under `kernel` (FL-053, §9.4, FL-043).
+    ///
+    /// # Errors
+    /// As [`Deposits::with_capacity`], plus [`CoreError::AllocationFailed`] if
+    /// footprint scratch cannot be reserved.
+    pub fn with_capacity_for(
+        grid: &FieldGrid,
+        organisms: u64,
+        kernel: ExchangeKernel,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
         let overflow = || CoreError::Overflow {
             quantity: DEPOSIT_PACKETS,
         };
+        let max_cells = kernel.max_cells(grid);
+        let packets_per_deposit = u64::try_from(max_cells).map_err(|_| overflow())?;
         let packets = organisms
-            .checked_mul(PACKETS_PER_DEPOSIT)
+            .checked_mul(packets_per_deposit)
             .ok_or_else(overflow)?;
         let entry_bytes = organisms
             .checked_mul(std::mem::size_of::<Entry>() as u64)
@@ -203,6 +226,12 @@ impl Deposits {
         limits.admit(DEPOSIT_PACKETS, entry_bytes)?;
         limits.admit(DEPOSIT_PACKETS, received_bytes)?;
         let bins = Bins::with_capacity(DEPOSIT_PACKETS, grid.cell_count(), packets, limits)?;
+        let exchange = ExchangeScratch::for_kernel(kernel, grid)?;
+        let shares = if kernel.is_grid_cic() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(max_cells)
+        };
         let organisms = usize::try_from(organisms).map_err(|_| overflow())?;
         let packets = usize::try_from(packets).map_err(|_| overflow())?;
         Ok(Self {
@@ -213,6 +242,8 @@ impl Deposits {
             sequence: Vec::with_capacity(packets),
             bins,
             organisms,
+            exchange,
+            shares,
             ..Self::new()
         })
     }
@@ -320,17 +351,75 @@ impl Deposits {
         offered: f64,
         direction: &[f64; CHANNELS],
     ) -> Result<(), CoreError> {
-        self.check_entry(grid, paid, offered, direction)?;
-        let stencil = ExchangeStencil::at(grid, position)?;
-        let shares = split(&stencil, offered);
-        self.stage(
+        self.push_with(
             grid,
+            ExchangeKernel::GridCicV1,
             organism,
+            position,
             paid,
             offered,
             direction,
-            stencil.cells().iter().copied().zip(shares),
-        );
+        )
+    }
+
+    /// Stage `organism`'s deposit under `kernel` (FL-053).
+    ///
+    /// # Errors
+    /// As [`Deposits::push`]. Nothing is staged on error.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors Deposits::push with the explicit exchange kernel"
+    )]
+    pub fn push_with(
+        &mut self,
+        grid: &FieldGrid,
+        kernel: ExchangeKernel,
+        organism: OrganismId,
+        position: [f64; 2],
+        paid: f64,
+        offered: f64,
+        direction: &[f64; CHANNELS],
+    ) -> Result<(), CoreError> {
+        self.check_entry(grid, paid, offered, direction)?;
+        match kernel {
+            ExchangeKernel::GridCicV1 => {
+                let stencil = ExchangeStencil::at(grid, position)?;
+                let shares = split(&stencil, offered);
+                self.stage(
+                    grid,
+                    organism,
+                    paid,
+                    offered,
+                    direction,
+                    stencil.cells().iter().copied().zip(shares),
+                );
+            }
+            ExchangeKernel::FixedWorldGaussianV1 { .. } => {
+                kernel.footprint_into(grid, position, &mut self.exchange)?;
+                split_slice(self.exchange.cells(), offered, &mut self.shares);
+                let entry = self.entries.len();
+                self.grid = Some(*grid);
+                let first = self.packets.len();
+                for (&(cell, _), &amount) in self.exchange.cells().iter().zip(&self.shares) {
+                    if amount > 0.0 {
+                        self.packets.push(Packet {
+                            cell,
+                            organism,
+                            entry,
+                            amount,
+                        });
+                    }
+                }
+                self.entries.push(Entry {
+                    organism,
+                    paid: paid + 0.0,
+                    offered: offered + 0.0,
+                    direction: *direction,
+                    first,
+                    count: self.packets.len() - first,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -495,15 +584,51 @@ impl Deposits {
     /// [`CoreError::AllocationFailed`] if the room cannot be reserved;
     /// [`CoreError::Overflow`] if its size overflows.
     pub fn fit_staging(&mut self, organisms: usize) -> Result<(), CoreError> {
+        self.fit_staging_for(organisms, PACKETS_PER_DEPOSIT as usize)
+    }
+
+    /// [`Deposits::fit_staging`] sized for `kernel` on `grid`, reserving
+    /// footprint and share scratch as well as entries and packets so steady-state
+    /// staging allocates nothing (FL-053, FL-043).
+    ///
+    /// # Errors
+    /// As [`Deposits::fit_staging`].
+    pub fn fit_staging_for_kernel(
+        &mut self,
+        grid: &FieldGrid,
+        organisms: usize,
+        kernel: ExchangeKernel,
+    ) -> Result<(), CoreError> {
+        self.fit_staging_for(organisms, kernel.max_cells(grid))?;
+        self.exchange = ExchangeScratch::for_kernel(kernel, grid)?;
+        Ok(())
+    }
+
+    /// [`Deposits::fit_staging`] sized for at most `max_packets_per_deposit`
+    /// cells per deposit (FL-053, FL-043).
+    ///
+    /// # Errors
+    /// As [`Deposits::fit_staging`].
+    pub fn fit_staging_for(
+        &mut self,
+        organisms: usize,
+        max_packets_per_deposit: usize,
+    ) -> Result<(), CoreError> {
         self.clear();
-        let packets = usize::try_from(PACKETS_PER_DEPOSIT)
-            .ok()
-            .and_then(|per| organisms.checked_mul(per))
-            .ok_or(CoreError::Overflow {
-                quantity: DEPOSIT_PACKETS,
-            })?;
+        let packets =
+            organisms
+                .checked_mul(max_packets_per_deposit)
+                .ok_or(CoreError::Overflow {
+                    quantity: DEPOSIT_PACKETS,
+                })?;
         fit(&mut self.entries, organisms)?;
-        fit(&mut self.packets, packets)
+        fit(&mut self.packets, packets)?;
+        if max_packets_per_deposit > PACKETS_PER_DEPOSIT as usize {
+            fit(&mut self.shares, max_packets_per_deposit)?;
+        } else {
+            self.shares = Vec::new();
+        }
+        Ok(())
     }
 
     /// Move `other`'s staged deposits after these, in the order `other`
@@ -597,6 +722,51 @@ fn split(stencil: &ExchangeStencil, offered: f64) -> [f64; 4] {
         *share = sub_down(offered, others).max(0.0);
     }
     shares
+}
+
+/// Conservative multi-cell split for arbitrary footprints (FL-053): every
+/// share is nonnegative and `Σ_c share_c ≤ offered` holds in exact
+/// arithmetic, so a deposit never creates energy.
+fn split_slice(cells: &[(usize, f64)], offered: f64, shares: &mut Vec<f64>) {
+    shares.clear();
+    shares.resize(cells.len(), 0.0);
+    if cells.is_empty() || offered <= 0.0 {
+        return;
+    }
+    let mut largest = 0;
+    for (index, &(_, weight)) in cells.iter().enumerate() {
+        if weight > cells[largest].1 {
+            largest = index;
+        }
+    }
+    let mut others = 0.0;
+    for (index, (&(_, weight), share)) in cells.iter().zip(shares.iter_mut()).enumerate() {
+        if index != largest {
+            *share = offered * weight;
+            others = add_up(others, *share);
+        }
+    }
+    if others <= offered {
+        if let Some(share) = shares.get_mut(largest) {
+            *share = sub_down(offered, others).max(0.0);
+        }
+        return;
+    }
+    // Extreme edge case (e.g., subnormal offer or huge cell count where the
+    // upper-bounded sum of non-largest shares passed `offered`): clamp
+    // monotonically so `add_up` running sum never exceeds `offered`.
+    let mut running = 0.0;
+    for (&(_, weight), share) in cells.iter().zip(shares.iter_mut()) {
+        let mut amount = offered * weight;
+        if add_up(running, amount) > offered {
+            amount = sub_down(offered, running).max(0.0);
+            while amount > 0.0 && add_up(running, amount) > offered {
+                amount = amount.next_down();
+            }
+        }
+        *share = amount;
+        running = add_up(running, amount);
+    }
 }
 
 /// `a + b`, rounded so that it is never below the exact sum.
@@ -818,6 +988,11 @@ impl Deposits {
             bins,
             ..
         } = self;
+        if u32::try_from(packets.len()).is_err() {
+            return Err(CoreError::Overflow {
+                quantity: DEPOSIT_PACKETS,
+            });
+        }
         sequence.clear();
         if strictly_ascending {
             for entry in entries.iter() {

@@ -180,6 +180,37 @@ pub fn admit_resize(
     Ok(required)
 }
 
+/// The Studio's observer bytes for `world` at `drawable` pixels and
+/// `pixels_per_point` density (FL-043): recomputes density bins and texel
+/// uploads for the actual surface geometry without mutating `view`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+/// density.
+pub fn observer_bytes_at(
+    world: &World,
+    founding: &Epoch,
+    view: &WorldView,
+    drawable: [u32; 2],
+    pixels_per_point: f64,
+) -> Result<u64, CoreError> {
+    let slots = u64::from(world.config().config().execution.render_queue_capacity);
+    let feed_bytes = founding.reserved_bytes().saturating_mul(slots);
+    observer_bytes_for_resize(feed_bytes, view, drawable, pixels_per_point)
+}
+
+/// Whether `controllers` reserves the batched controller path for `world`.
+/// Recurrent worlds (`FL-054`) run on the CPU reference under `Auto` until a
+/// batched recurrent backend exists; explicit `Torch` / `Metal` choices are
+/// still refused by `flife_cli::run::install`.
+const fn uses_batched_controllers(world: &World, controllers: ControllerChoice) -> bool {
+    match controllers {
+        ControllerChoice::Cpu => false,
+        ControllerChoice::Auto => world.recurrent_state_width() == 0,
+        ControllerChoice::Torch | ControllerChoice::Metal => true,
+    }
+}
+
 /// Admit `world` with `controllers`' backend and the Studio's observers
 /// ([`observer_bytes`]). Call it after the world's workers are set and
 /// before its backend is installed, and give the backend
@@ -211,8 +242,32 @@ pub fn admit_kept(
     checkpoint: u64,
 ) -> Result<MemoryAdmission, CoreError> {
     world.admit_memory(
-        controllers != ControllerChoice::Cpu,
+        uses_batched_controllers(world, controllers),
         checkpoint,
         observer_bytes(world, founding, view, drawable),
+    )
+}
+
+/// [`admit_kept`] charging observers for the surface's opening `(drawable,
+/// pixels_per_point)` geometry so HiDPI, fractional-scale, or OS-resized
+/// opening surfaces match frame-1 [`admit_resize`] admission exactly (FL-043).
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+/// density; [`World::admit_memory`]'s refusal.
+pub fn admit_kept_at(
+    world: &World,
+    controllers: ControllerChoice,
+    founding: &Epoch,
+    view: &WorldView,
+    drawable: [u32; 2],
+    pixels_per_point: f64,
+    checkpoint: u64,
+) -> Result<MemoryAdmission, CoreError> {
+    let observers = observer_bytes_at(world, founding, view, drawable, pixels_per_point)?;
+    world.admit_memory(
+        uses_batched_controllers(world, controllers),
+        checkpoint,
+        observers,
     )
 }

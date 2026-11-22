@@ -732,6 +732,10 @@ struct Inspection {
     /// What the committed field offers it where it stands.
     local: LocalRecord,
     decoded: Option<Decoded>,
+    /// Bounded recurrent controller state carried into the next evaluation
+    /// (FL-054); omitted for stateless controller families.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recurrent_state: Option<Vec<f32>>,
     /// What it observed in the newest tick the world recorded for it.
     sensed: Option<SensedRecord>,
     /// The hidden activations its held output came from.
@@ -1665,6 +1669,8 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
             emission_direction: decoded.emission.map(|emission| emission.direction.to_vec()),
             emission_spend_fraction: decoded.emission.map(|emission| emission.spend_fraction),
         }),
+        recurrent_state: (!organism.held.recurrent_state().is_empty())
+            .then(|| organism.held.recurrent_state().to_vec()),
         sensed: snapshot.sensed.as_ref().map(|sensed| SensedRecord {
             tick: sensed.tick.get(),
             scale: sensed.scale,
@@ -2521,6 +2527,72 @@ mod tests {
                 "tick": null,
                 "controller": null,
             })
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "an F32 written out reads back as itself"
+    )]
+    fn resize_refused_and_recurrent_inspected_records_serialize_cleanly() {
+        let refused = line(&Status::ResizeRefused {
+            drawable: [3840, 2160],
+            pixels_per_point: 2.0,
+            required: 240_000_000,
+            available: 120_000_000,
+        });
+        assert_eq!(refused["record"], "status");
+        assert_eq!(refused["status"], "resize-refused");
+        assert_eq!(refused["why"], "budget_exhausted");
+        assert!(
+            refused["detail"]
+                .as_str()
+                .is_some_and(|text| text.contains("3840x2160") && text.contains("240000000"))
+        );
+
+        let recurrent_toml = include_str!("../../../presets/reference-small-world.toml")
+            .replace(
+                "family = \"independent-dense-mlp-v1\"",
+                "family = \"independent-recurrent-mlp-v1\"\nrecurrent_state_width = 4",
+            )
+            .replace(
+                "catalog = \"dense-104-36-catalog-v1\"",
+                "catalog = \"recurrent-104-36-catalog-v1\"",
+            );
+        let config = flife_core::ValidatedConfig::from_toml(&recurrent_toml).expect("valid");
+        let mut world = flife_engine::World::found(
+            &config,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("founds");
+        let id = world.population().ids().next().expect("founder");
+        world.watch(Some(id));
+        world.step().expect("steps");
+        let snapshot = world
+            .organism_snapshot(id)
+            .expect("inspects")
+            .expect("lives");
+        let expected_state = snapshot.organism.held.recurrent_state().to_vec();
+        assert_eq!(expected_state.len(), 4);
+        let record = line(&Status::Inspected {
+            organism: id,
+            seen: Tick::new(1),
+            snapshot: Some(Box::new(snapshot)),
+        });
+        let got: Vec<f32> = record["snapshot"]["recurrent_state"]
+            .as_array()
+            .expect("recurrent_state present on recurrent world")
+            .iter()
+            .map(|v| v.as_f64().expect("f64") as f32)
+            .collect();
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_state
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
         );
     }
 }

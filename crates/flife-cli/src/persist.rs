@@ -953,6 +953,21 @@ impl Filing {
             retired: store.retain_intact(self.keep)?.removed,
         })
     }
+
+    /// Look up the indexed container digest for `sequence` in `catalog.db`, if
+    /// present, without re-reading the checkpoint container from disk.
+    fn indexed_digest(&self, sequence: u64) -> Result<Option<Sha256Digest>, CoreError> {
+        let (catalog, session, revision) = (&self.catalog, self.session, self.revision);
+        on_plain_thread("read checkpoint digest", move || {
+            let mut journal = CommandJournal::open(catalog)?;
+            journal.open_run(session, revision)?;
+            Ok(journal
+                .checkpoints()?
+                .into_iter()
+                .find(|entry| entry.sequence == sequence)
+                .map(|entry| entry.digest))
+        })
+    }
 }
 
 /// A streamed checkpoint's container size: its sealed prefix and payload.
@@ -1085,12 +1100,15 @@ impl Checkpoints {
             .collect();
         let restored = match recovered.latest {
             Some((sequence, restored)) => {
-                let sha256 = self.store()?.verify(sequence)?;
                 self.last = Some(CheckpointAt {
                     sequence,
                     tick: restored.world.tick().get(),
                 });
-                self.last_sha256 = Some(sha256);
+                // Avoid re-reading the full checkpoint container here: runs that
+                // take a newer checkpoint overwrite `last_sha256`, and zero-step
+                // resumes resolve the digest lazily from `catalog.db` (or store
+                // verification if unindexed) via `resolve_last_sha256`.
+                self.last_sha256 = None;
                 Some(restored)
             }
             None => None,
@@ -1115,10 +1133,30 @@ impl Checkpoints {
         self.last
     }
 
-    /// The verified container SHA-256 of [`Checkpoints::last`], if known.
+    /// The verified container SHA-256 of [`Checkpoints::last`], if already in
+    /// memory.
     #[must_use]
     pub const fn last_sha256(&self) -> Option<Sha256Digest> {
         self.last_sha256
+    }
+
+    /// Resolve the verified container SHA-256 of [`Checkpoints::last`]: returns
+    /// the cached digest from this run if one was written, otherwise looks it
+    /// up in `catalog.db`, falling back to chunk-store verification only for
+    /// unindexed checkpoints.
+    pub(crate) fn resolve_last_sha256(&mut self) -> Result<Option<Sha256Digest>, CoreError> {
+        if let Some(digest) = self.last_sha256 {
+            return Ok(Some(digest));
+        }
+        let Some(last) = self.last else {
+            return Ok(None);
+        };
+        let digest = match self.filing.indexed_digest(last.sequence)? {
+            Some(digest) => digest,
+            None => self.store()?.verify(last.sequence)?,
+        };
+        self.last_sha256 = Some(digest);
+        Ok(Some(digest))
     }
 
     /// The tick of [`Checkpoints::last`].
@@ -1663,12 +1701,16 @@ pub fn resume(
         metrics,
     };
     let driven = drive(owner, handle, plan, Some(checkpoints), emit, clock)?;
+    let kind = match options.until {
+        Until::Tick(_) => "resume",
+        Until::Past(_) => "step",
+    };
     finish(
         driven,
         Some(RunManifestTarget {
             run_dir,
             durability: options.durability,
-            kind: "resume",
+            kind,
         }),
         limits.durability,
         clock,

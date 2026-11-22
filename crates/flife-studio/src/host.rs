@@ -52,7 +52,7 @@
 //! checkpoint that restores, the journal replayed past it, kept on in the
 //! same directory.
 
-use flife_backend_metal::{BackendBudget, ControllerChoice};
+use flife_backend_metal::ControllerChoice;
 use flife_cli::{CheckpointAdmission, CheckpointAt, Checkpoints, Recovered, SkippedCheckpoint};
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{OrganismId, SessionId};
@@ -600,34 +600,31 @@ impl Studio {
             background,
         )?;
         let font = HudFont::bundled()?;
-        let drawable = target
+        let initial_metrics = target
             .surface_metrics()
             .ok()
-            .filter(|metrics| metrics.drawable_width > 0 && metrics.drawable_height > 0)
-            .map_or([width, height], |metrics| {
-                [metrics.drawable_width, metrics.drawable_height]
-            });
+            .filter(|metrics| metrics.drawable_width > 0 && metrics.drawable_height > 0);
+        let drawable = initial_metrics.map_or([width, height], |metrics| {
+            [metrics.drawable_width, metrics.drawable_height]
+        });
+        let backing_scale = initial_metrics
+            .map(|metrics| metrics.backing_scale)
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(1.0);
         let feed_bytes = founding
             .reserved_bytes()
             .saturating_mul(u64::from(model.execution.render_queue_capacity));
-        let memory = crate::memory::admit_kept(
+        let memory = crate::memory::admit_kept_at(
             &world,
             options.controllers,
             &founding,
             &view,
             drawable,
+            backing_scale,
             kept.checkpoint_bytes(),
         )?;
         drop(founding);
-        let budget = BackendBudget {
-            bytes: memory.backend,
-            organisms: world.population().capacity() as u64,
-        };
-        world.set_controller_backend(options.controllers.backend(
-            world.cpu_workers(),
-            world.population().len(),
-            budget,
-        )?);
+        flife_cli::run::install(&mut world, options.controllers, memory.backend)?;
         let controllers = world
             .controller_report()
             .backend

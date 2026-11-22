@@ -233,6 +233,29 @@ fn standalone_run_resume_branch_and_transplant_write_appendix_b1_manifests() {
     assert_eq!(m_resume["artifacts"][1]["sha256"], ckpt_resume["sha256"]);
     assert!(!run_dir.join(format!("{MANIFEST_FILE}.partial")).exists());
 
+    // 2b. A zero-step resume (`--until 10` when already at tick 10) takes no
+    //     new checkpoint yet still resolves the verified checkpoint digest into
+    //     manifest.json cleanly.
+    let (status, _, err) = flife(&[
+        "resume",
+        text(&run_dir),
+        "--until",
+        "10",
+        "--every",
+        "0",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let m_noop_resume = read_manifest(&run_dir);
+    assert_eq!(m_noop_resume["identity"]["kind"], "resume");
+    assert_eq!(m_noop_resume["results"]["tick"], 10);
+    assert_eq!(m_noop_resume["results"]["ticks_published"], 0);
+    assert_eq!(
+        m_noop_resume["artifacts"][1]["sha256"],
+        ckpt_resume["sha256"]
+    );
+
     // 3. `flife branch` writes manifest.json recording parent provenance and
     //    founded status (without fabricating wall_seconds/ticks_per_second),
     //    and resuming the branch preserves its parent fork lineage.
@@ -274,7 +297,7 @@ fn standalone_run_resume_branch_and_transplant_write_appendix_b1_manifests() {
     ]);
     assert_eq!(status, Some(0), "{err:?}");
     let m_branch_step = read_manifest(&branch_dir);
-    assert_eq!(m_branch_step["identity"]["kind"], "resume");
+    assert_eq!(m_branch_step["identity"]["kind"], "step");
     assert_eq!(m_branch_step["identity"]["parent"]["kind"], "branch");
     assert_eq!(m_branch_step["identity"]["parent"]["parent_session"], 1);
     assert_eq!(m_branch_step["results"]["tick"], 8);
@@ -347,7 +370,7 @@ fn standalone_run_resume_branch_and_transplant_write_appendix_b1_manifests() {
     ]);
     assert_eq!(status, Some(0), "{err:?}");
     let m_transplant_step = read_manifest(&transplant_dir);
-    assert_eq!(m_transplant_step["identity"]["kind"], "resume");
+    assert_eq!(m_transplant_step["identity"]["kind"], "step");
     assert_eq!(m_transplant_step["identity"]["parent"]["kind"], "package");
     assert_eq!(
         m_transplant_step["identity"]["parent"]["package"]["sha256"],

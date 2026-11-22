@@ -1097,3 +1097,80 @@ fn fused_source_kernel_eliminates_per_source_f32_rounding_bias() {
     );
     let _ = fused_norm_1;
 }
+
+/// FL-043 / `flife-ze4`: changing worker count after `reserve_supports` on a
+/// fused-source `FieldWork` must grow/shrink `fused_accum` eagerly so
+/// `allocated_bytes()` is exact before the first step and steady-state steps
+/// allocate zero bytes.
+#[test]
+fn fused_field_work_set_workers_keeps_accumulators_sized_without_step_allocation() {
+    let grid = FieldGrid::new(32, 32, 32.0, 32.0).expect("grid");
+    let limits = BufferLimits::new(1 << 28);
+    let step = TimeStep::new(1, 32).expect("step");
+    let plan = TransportPlan::new(&grid, step, 0.3, 0.01).expect("plan");
+    let fused = SourceKernel::new_fused(3.0, 4.0).expect("fused");
+    let sources: Vec<Source> = (0_u32..4)
+        .map(|i| {
+            let mut d = [0.0; CHANNELS];
+            d[i as usize] = 1.0;
+            Source::new(SourceId::new(i), [4.0 + 6.0 * f64::from(i), 16.0], d, 10.0)
+                .expect("source")
+        })
+        .collect();
+
+    let one = std::num::NonZeroUsize::new(1).expect("1");
+    let four = std::num::NonZeroUsize::new(4).expect("4");
+    let two = std::num::NonZeroUsize::new(2).expect("2");
+
+    let mut work = FieldWork::new(&grid, &limits, one).expect("work");
+    work.reserve_supports(sources.len(), &fused)
+        .expect("reserve");
+    let bytes_1 = work.allocated_bytes();
+
+    work.set_workers(four).expect("grow to 4");
+    let bytes_4 = work.allocated_bytes();
+    let cells = usize::try_from(grid.cell_count()).expect("cells") as u64;
+    let extra_accum_min = 3 * cells * (std::mem::size_of::<f64>() as u64);
+    assert!(
+        bytes_4 >= bytes_1 + extra_accum_min,
+        "set_workers(4) must eagerly allocate 3 extra fused F64 cell accumulators \
+         (bytes_1={bytes_1}, bytes_4={bytes_4}, min_extra={extra_accum_min})"
+    );
+
+    let mut pair_4 = FieldPair::zeroed(grid, &limits).expect("pair");
+    advance_field_on(&mut pair_4, &plan, &fused, &sources, step, &mut work).expect("step on 4");
+    assert_eq!(
+        work.allocated_bytes(),
+        bytes_4,
+        "steady-state fused step at 4 workers must allocate zero bytes"
+    );
+
+    work.set_workers(two).expect("shrink to 2");
+    let bytes_2 = work.allocated_bytes();
+    assert!(
+        bytes_2 < bytes_4,
+        "shrinking workers must release excess fused accumulators"
+    );
+    let mut pair_2 = FieldPair::zeroed(grid, &limits).expect("pair");
+    advance_field_on(&mut pair_2, &plan, &fused, &sources, step, &mut work).expect("step on 2");
+    assert_eq!(
+        work.allocated_bytes(),
+        bytes_2,
+        "steady-state fused step at 2 workers must allocate zero bytes"
+    );
+    assert_eq!(
+        pair_4
+            .next()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        pair_2
+            .next()
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        "fused field step must remain bit-exact after resizing workers"
+    );
+}

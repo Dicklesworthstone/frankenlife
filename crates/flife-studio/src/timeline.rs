@@ -891,25 +891,40 @@ pub fn replay(
     // run's command journal replays past it.
     let mut view = crate::host::studio_view(config, &restored, *size, style.style()?, background)?;
     // FL-043: admit the replay world and its observer buffers across the
-    // largest drawable size recorded in the timeline before stepping or
-    // rendering any frames.
-    let mut max_drawable = *size;
+    // peak `(drawable, pixels_per_point)` state recorded in the timeline
+    // before stepping or rendering any frames.
+    let mut cur_drawable = *size;
+    let mut cur_scale = 1.0_f64;
+    let mut peak_observers =
+        crate::memory::observer_bytes_at(&world, &restored, &view, cur_drawable, cur_scale)?;
     for record in records {
-        if let TimelineRecord::Resize { drawable } = record {
-            let area = u64::from(drawable[0]).saturating_mul(u64::from(drawable[1]));
-            let best = u64::from(max_drawable[0]).saturating_mul(u64::from(max_drawable[1]));
-            if area > best {
-                max_drawable = *drawable;
+        match record {
+            TimelineRecord::Resize { drawable } => {
+                cur_drawable = *drawable;
+                let required = crate::memory::observer_bytes_at(
+                    &world,
+                    &restored,
+                    &view,
+                    cur_drawable,
+                    cur_scale,
+                )?;
+                peak_observers = peak_observers.max(required);
             }
+            TimelineRecord::Density { pixels_per_point } => {
+                cur_scale = pixels_per_point.0;
+                let required = crate::memory::observer_bytes_at(
+                    &world,
+                    &restored,
+                    &view,
+                    cur_drawable,
+                    cur_scale,
+                )?;
+                peak_observers = peak_observers.max(required);
+            }
+            _ => {}
         }
     }
-    crate::memory::admit(
-        &world,
-        flife_backend_metal::ControllerChoice::Cpu,
-        &restored,
-        &view,
-        max_drawable,
-    )?;
+    world.admit_memory(false, 0, peak_observers)?;
     // The epoch the session opened on: the restored world's, or the one the
     // journal's commands reached, which the book records applied.
     let opened = from.as_ref().map_or(0, |start| start.tick);

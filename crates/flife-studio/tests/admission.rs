@@ -15,8 +15,8 @@ use flife_manim::WorldView;
 use flife_render::Epoch;
 use flife_studio::ControllerChoice;
 use flife_studio::memory::{
-    DEVICE_BYTES_PER_PIXEL, admit, admit_resize, observer_bytes, observer_bytes_for_resize,
-    observer_limit,
+    DEVICE_BYTES_PER_PIXEL, admit, admit_kept_at, admit_resize, observer_bytes,
+    observer_bytes_for_resize, observer_limit,
 };
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -203,4 +203,93 @@ fn live_resize_is_admitted_within_headroom_and_refused_past_maximum_total_bytes(
         admit_resize(&batched, feed_bytes, &view, [3840, 2160], 2.0),
         Err(CoreError::BudgetExhausted { .. })
     ));
+}
+
+#[test]
+fn opening_admission_matches_frame_one_at_fractional_and_os_resized_surfaces() {
+    let config = preset_with(&[]);
+    let world = found(&config);
+    let founding = Epoch::standalone(&world).expect("an epoch");
+    let slots = u64::from(config.config().execution.render_queue_capacity);
+    let feed_bytes = founding.reserved_bytes() * slots;
+    // View starts at logical `[640, 400] @ 1.0` (before frame 1 records
+    // `Resize` and `Density`), while the host surface opens at an OS-resized
+    // or fractional-scale drawable whose density bins exceed `[640, 400] @ 1.0`.
+    let mut view = WorldView::for_epoch(&founding, [640, 400], [0, 0, 0]).expect("a view");
+    view.enable_overlay();
+
+    for (drawable, scale) in [([1280, 800], 2.0), ([1440, 900], 1.5), ([960, 600], 1.0)] {
+        let admitted = admit_kept_at(
+            &world,
+            ControllerChoice::Torch,
+            &founding,
+            &view,
+            drawable,
+            scale,
+            0,
+        )
+        .expect("admits opening surface");
+        assert_eq!(observer_limit(&admitted), admitted.render);
+        let frame_one = admit_resize(&admitted, feed_bytes, &view, drawable, scale)
+            .expect("frame 1 must never refuse its own opening geometry");
+        assert_eq!(frame_one, admitted.render);
+        assert!(
+            admit_resize(
+                &admitted,
+                feed_bytes,
+                &view,
+                [drawable[0] + 64, drawable[1] + 64],
+                scale,
+            )
+            .is_err(),
+            "growing past the admitted opening surface under full backend grant must be refused"
+        );
+    }
+}
+
+#[test]
+fn recurrent_studio_auto_admits_cpu_without_batched_budget_and_refuses_explicit_batched() {
+    let recurrent_toml = PRESET
+        .replace(
+            "family = \"independent-dense-mlp-v1\"",
+            "family = \"independent-recurrent-mlp-v1\"\nrecurrent_state_width = 4",
+        )
+        .replace(
+            "catalog = \"dense-104-36-catalog-v1\"",
+            "catalog = \"recurrent-104-36-catalog-v1\"",
+        );
+    let config = ValidatedConfig::from_toml(&recurrent_toml).expect("valid recurrent config");
+    let mut world = found(&config);
+    assert_eq!(world.recurrent_state_width(), 4);
+    let founding = Epoch::standalone(&world).expect("an epoch");
+    let mut view = WorldView::for_epoch(&founding, [640, 400], [0, 0, 0]).expect("a view");
+    view.enable_overlay();
+
+    // Auto routes recurrent worlds to the CPU reference (`backend == 0`) so
+    // Studio never starves observer headroom or installs an MLP-only backend.
+    let auto = admit_kept_at(
+        &world,
+        ControllerChoice::Auto,
+        &founding,
+        &view,
+        [1280, 800],
+        2.0,
+        0,
+    )
+    .expect("recurrent Auto admits");
+    assert_eq!(auto.backend, 0);
+    assert!(observer_limit(&auto) > auto.render);
+    flife_cli::run::install(&mut world, ControllerChoice::Auto, auto.backend)
+        .expect("recurrent Auto installs CPU reference");
+    assert!(world.controller_report().backend.is_none());
+
+    // Explicit batched choices refuse cleanly before opening a session.
+    for explicit in [ControllerChoice::Torch, ControllerChoice::Metal] {
+        let err = flife_cli::run::install(&mut world, explicit, 64 << 20)
+            .expect_err("explicit batched choice on recurrent world must refuse");
+        assert!(
+            matches!(err, CoreError::MissingCapability { .. }),
+            "expected MissingCapability for {explicit:?}, got {err:?}"
+        );
+    }
 }

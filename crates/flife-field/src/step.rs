@@ -210,6 +210,8 @@ pub struct FieldWork {
     /// Per-worker F64 cell accumulators, reserved only for fused source kernels
     /// (`flife-ze4`). Empty (0 bytes) for `normalized-truncated-minimum-image-gaussian-v1`.
     fused_accum: Vec<Vec<f64>>,
+    /// Whether the world's source kernel uses fused per-tick F64 accumulation.
+    fused: bool,
 }
 
 impl FieldWork {
@@ -228,6 +230,7 @@ impl FieldWork {
             transport: Vec::new(),
             supports: Vec::new(),
             fused_accum: Vec::new(),
+            fused: false,
         };
         work.set_workers(workers)?;
         Ok(work)
@@ -259,29 +262,17 @@ impl FieldWork {
         for _ in 0..sources {
             supports.push(SourceSupport::for_kernel(kernel, &self.grid)?);
         }
-        let mut fused_accum = Vec::new();
-        if kernel.is_fused() {
+        let fused = kernel.is_fused();
+        let fused_accum = if fused {
             let cells = usize::try_from(self.grid.cell_count()).map_err(|_| overflow())?;
-            let lanes = self.transport.len().max(1);
-            fused_accum
-                .try_reserve_exact(lanes)
-                .map_err(|_| CoreError::AllocationFailed {
-                    buffer: "fused source accumulators",
-                    bytes: flife_core::memory::bytes_for::<Vec<f64>>(lanes),
-                })?;
-            for _ in 0..lanes {
-                let mut buf = Vec::new();
-                buf.try_reserve_exact(cells)
-                    .map_err(|_| CoreError::AllocationFailed {
-                        buffer: "fused source accumulator",
-                        bytes: flife_core::memory::bytes_for::<f64>(cells),
-                    })?;
-                buf.resize(cells, 0.0);
-                fused_accum.push(buf);
-            }
-        }
+            let lanes = fused_lane_count(self.transport.len())?;
+            allocate_fused_accumulators(cells, lanes)?
+        } else {
+            Vec::new()
+        };
         self.supports = supports;
         self.fused_accum = fused_accum;
+        self.fused = fused;
         Ok(())
     }
 
@@ -308,14 +299,73 @@ impl FieldWork {
     /// As [`TransportScratch::new`]; the count is then unchanged.
     pub fn set_workers(&mut self, workers: NonZeroUsize) -> Result<(), CoreError> {
         let workers = workers.get();
-        let mut added = Vec::new();
+        let mut added_transport = Vec::new();
         for _ in self.transport.len()..workers {
-            added.push(TransportScratch::new(&self.grid, &self.limits)?);
+            added_transport.push(TransportScratch::new(&self.grid, &self.limits)?);
         }
-        self.transport.extend(added);
+        let target_lanes = if self.fused {
+            fused_lane_count(workers)?
+        } else {
+            0
+        };
+        let added_fused = if target_lanes > self.fused_accum.len() {
+            let cells = usize::try_from(self.grid.cell_count()).map_err(|_| overflow())?;
+            allocate_fused_accumulators(cells, target_lanes - self.fused_accum.len())?
+        } else {
+            Vec::new()
+        };
+        if workers > self.transport.len() {
+            self.transport
+                .try_reserve_exact(workers - self.transport.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "transport scratches",
+                    bytes: flife_core::memory::bytes_for::<TransportScratch>(workers),
+                })?;
+        }
+        if target_lanes > self.fused_accum.len() {
+            self.fused_accum
+                .try_reserve_exact(target_lanes - self.fused_accum.len())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "fused source accumulators",
+                    bytes: flife_core::memory::bytes_for::<Vec<f64>>(target_lanes),
+                })?;
+        }
+        self.transport.extend(added_transport);
         self.transport.truncate(workers);
+        self.transport.shrink_to(workers);
+        if self.fused {
+            self.fused_accum.extend(added_fused);
+            self.fused_accum.truncate(target_lanes);
+            self.fused_accum.shrink_to(target_lanes);
+        }
         Ok(())
     }
+}
+
+fn fused_lane_count(workers: usize) -> Result<usize, CoreError> {
+    let channels = usize::try_from(FIELD_PLANES - 1).map_err(|_| overflow())?;
+    Ok(workers.clamp(1, channels.max(1)))
+}
+
+fn allocate_fused_accumulators(cells: usize, count: usize) -> Result<Vec<Vec<f64>>, CoreError> {
+    let mut buffers = Vec::new();
+    buffers
+        .try_reserve_exact(count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "fused source accumulators",
+            bytes: flife_core::memory::bytes_for::<Vec<f64>>(count),
+        })?;
+    for _ in 0..count {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(cells)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "fused source accumulator",
+                bytes: flife_core::memory::bytes_for::<f64>(cells),
+            })?;
+        buf.resize(cells, 0.0);
+        buffers.push(buf);
+    }
+    Ok(buffers)
 }
 
 /// [`advance_field`] on up to [`FieldWork::workers`] threads: this one and

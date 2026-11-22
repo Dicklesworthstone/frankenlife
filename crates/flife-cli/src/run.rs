@@ -954,15 +954,18 @@ pub(crate) fn finish<E: FnMut(&Record)>(
         tally,
         closed,
         mut emit,
-        checkpoints,
+        mut checkpoints,
     } = driven;
     let survey = Survey::of(&closed.world);
     let controllers = ControllerSummary::of(&closed.world);
     let wall_seconds = clock.elapsed().as_secs_f64();
     let checkpoint = checkpoints.as_ref().and_then(Checkpoints::last);
     if let Some(target) = target {
-        let last =
-            checkpoint.map(|at| (at, checkpoints.as_ref().and_then(Checkpoints::last_sha256)));
+        let sha256 = match &mut checkpoints {
+            Some(checkpoints) => checkpoints.resolve_last_sha256()?,
+            None => None,
+        };
+        let last = checkpoint.map(|at| (at, sha256));
         crate::persist::write_run_manifest(
             target,
             &closed,

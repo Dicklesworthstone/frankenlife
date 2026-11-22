@@ -482,6 +482,13 @@ directory, with its pending commands and its checkpoint chain.
   (`FRAME_TIME_RANGE`), longer frames above it, and keeps the longest exactly: fixed memory for a run of any
   length. `percentile(p)` is the upper edge of the bucket holding the `⌈p · frames⌉`-th shortest frame (at most
   the longest), and the longest when that frame took the range or more.
+- `MoveLatencyBound` bounds a camera move's latency from above where input carries no event time, as in a window
+  (frankentorch's typed `InputEvent` has none). `poll_input` pumps every pending AppKit event and drains the
+  whole typed queue, so an event a frame drains reached the Studio after the previous frame's poll began. A move
+  took at most from that poll to the end of the frame that drew it. A frame that moved but was not drawn hands
+  its bound to the next drawn frame, several moves drawn by one frame give one bound (the earliest's), and a move
+  in the first frame, which no earlier poll bounds, gives none. It leaves out the window server's delivery before
+  the Studio's queue and the display's present and scan-out after the frame's work.
 
   Errors are `frankenlife.error.v1` on standard error. The exit code is 0 after a clean close, 2 when the
   configuration or window fails, and 1 after a later failure.
@@ -832,11 +839,15 @@ presentation state, not scientific state.
   view's copy, FL-019) add 0.8 MiB to the rest of the observers, and its components (32 bytes a texel in each of
   the feed's three slots, FL-019's chosen components) 1.5 MiB more (backend 114.3 MiB before them, 95.5 with
   bloom).
-- `tests/frame_times.rs` (4 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
+- `tests/frame_times.rs` (8 tests, FL-024): `FrameTimes` against a sorted list of the same times: none before a
   frame; 1 to 100 ms give the 50.1, 95.1 and 99.1 ms bucket edges, the longest at 1, the next rank between
   ranks, and none outside (0, 1]; frames at and past the range are counted and the longest stands for them, a
   frame a nanosecond under it in the last bucket; on 20,000 seeded times (5 to 30 ms, a few long, some past the
   range) every percentile from 0.001 to 1 is within one bucket above its order statistic, or the longest.
+  `MoveLatencyBound` on hand-worked frames (a drawn move, a first-frame move, undrawn moves handed on), and over
+  5,000 seeded frames of varying work and idle, with moves arriving at known moments and some frames undrawn:
+  a bound exactly when a move is drawn, never below its true latency from the arrival alone, and reached within
+  1 ms. Planted bugs 2 of 2 caught.
 - `tests/offscreen.rs` (11 tests, FL-024, FL-022, plan §14.3 and §2.2, Metal compute, no window), `Studio::open` offscreen on
   the preset at
   320 x 200 points and 2 pixels a point:

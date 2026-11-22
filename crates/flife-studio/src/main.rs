@@ -86,8 +86,9 @@ use flife_runtime::Outcome;
 use flife_studio::{
     Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
     ExportOptions, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Look, Measuring,
-    OverlayState, Particles, Resumed, STUDIO_SCHEMA, Status, Stroke, Studio, StudioOptions, Style,
-    Surface, Telemetry, TimelineRecord, legends, overlay_text, write_timeline_record,
+    MoveLatencyBound, OverlayState, Particles, Resumed, STUDIO_SCHEMA, Status, Stroke, Studio,
+    StudioOptions, Style, Surface, Telemetry, TimelineRecord, legends, overlay_text,
+    write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -616,6 +617,11 @@ enum Record<'a> {
         camera_moves: Option<u64>,
         camera_moves_unmoved: Option<u64>,
         camera_latency: Option<FrameTimeSummary>,
+        /// In a window or offscreen, each drawn camera move's latency bound:
+        /// from the poll before the one that drained it to the end of the
+        /// frame that drew it (`MoveLatencyBound`); absent before a move is
+        /// drawn.
+        camera_latency_bound: Option<FrameTimeSummary>,
         /// The newest checkpoint's tick (`--run`).
         checkpoint_tick: Option<u64>,
     },
@@ -1030,15 +1036,18 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    let (mut times, mut latency) = match FrameTimes::new().and_then(|a| Ok((a, FrameTimes::new()?)))
-    {
-        Ok(both) => both,
-        Err(error) => {
-            let code = fail(error.kind(), error.to_string(), 1);
-            let _ = studio.close();
-            return code;
-        }
-    };
+    let (mut times, mut latency, mut bounds) =
+        match FrameTimes::new().and_then(|a| Ok((a, FrameTimes::new()?, FrameTimes::new()?))) {
+            Ok(all) => all,
+            Err(error) => {
+                let code = fail(error.kind(), error.to_string(), 1);
+                let _ = studio.close();
+                return code;
+            }
+        };
+    // Every drawn camera move's latency bound, a window's included, whose
+    // input carries no event time (FL-024's G6).
+    let mut bound = MoveLatencyBound::new();
     // `--offscreen-zooms`: the arrival of the move posted for the next
     // frame, the moves posted and those that did not move the view.
     let mut arrived: Option<Instant> = None;
@@ -1054,9 +1063,14 @@ fn main() -> ExitCode {
                 return code;
             }
         };
+        let ended = Instant::now();
+        // `started` precedes the frame's poll, so the bound only widens.
+        if let Some(took) = bound.frame(started, ended, frame.moved, frame.drawn) {
+            bounds.record(took);
+        }
         if let Some(at) = arrived.take() {
             // This frame drained it and drew the move.
-            latency.record(at.elapsed());
+            latency.record(ended.saturating_duration_since(at));
             if !frame.moved {
                 unmoved += 1;
             }
@@ -1339,6 +1353,7 @@ fn main() -> ExitCode {
                 camera_moves: cli.offscreen_zooms.then_some(moves),
                 camera_moves_unmoved: cli.offscreen_zooms.then_some(unmoved),
                 camera_latency: latency.summary(),
+                camera_latency_bound: bounds.summary(),
                 checkpoint_tick: checkpoint.map(Tick::get),
             });
             ExitCode::SUCCESS

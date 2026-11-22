@@ -201,6 +201,18 @@ fn an_offscreen_run_reports_its_frames_and_closes_on_the_direct_world() {
     );
     let [l50, l95, lmax] = ["p50_ms", "p95_ms", "max_ms"].map(|key| float(latency, key));
     assert!(0.0 < l50 && l50 <= l95 && l95 <= lmax, "{latency}");
+    // The bound a window reports, here over the same moves: each arrived
+    // after the poll its bound starts from, so no percentile of the bounds
+    // is below the same percentile of the latencies.
+    let bounded = &end["camera_latency_bound"];
+    assert_eq!(number(bounded, "frames"), drawn, "{bounded}");
+    for key in ["p50_ms", "p95_ms", "p99_ms", "max_ms"] {
+        assert!(
+            float(bounded, key) >= float(latency, key),
+            "{key}: {bounded} below {latency}"
+        );
+    }
+    let b95 = float(bounded, "p95_ms");
     let wall = float(end, "wall_seconds");
     assert!(wall >= 2.5, "{wall} s");
     let times = &end["frame_times"];
@@ -214,7 +226,7 @@ fn an_offscreen_run_reports_its_frames_and_closes_on_the_direct_world() {
     println!(
         "offscreen 640x400 at 2x for {wall:.2} s: {frames} frames, tick {}; frame work p50 {p50:.1} \
          ms, p95 {p95:.1}, p99 {p99:.1}, max {max:.1}; {moves} camera moves, arrival to drawn \
-         p50 {l50:.1} ms, p95 {l95:.1}, max {lmax:.1}",
+         p50 {l50:.1} ms, p95 {l95:.1}, max {lmax:.1}; bound p95 {b95:.1}",
         number(end, "tick")
     );
 

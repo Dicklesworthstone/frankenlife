@@ -477,7 +477,10 @@ directory, with its pending commands and its checkpoint chain.
     from draining input to the overlay set, without the wait for the next frame); and with
     `--offscreen-zooms` the `camera_moves` posted, those whose frame did not move the view
     (`camera_moves_unmoved`), and `camera_latency`, each move's time from its arrival to the end of the frame
-    that drew it, as the same percentiles.
+    that drew it, as the same percentiles; and in a window or offscreen, `camera_latency_bound`, each drawn
+    move's `MoveLatencyBound` (from the poll before the one that drained it to the end of the frame that drew
+    it), as the same percentiles, absent before a move is drawn. It is a window's only latency figure, since
+    a window's input carries no event time.
 - `FrameTimes` counts frame times in 0.1 ms buckets (`FRAME_TIME_BUCKET`) up to one second
   (`FRAME_TIME_RANGE`), longer frames above it, and keeps the longest exactly: fixed memory for a run of any
   length. `percentile(p)` is the upper edge of the bucket holding the `⌈p · frames⌉`-th shortest frame (at most
@@ -963,8 +966,9 @@ presentation state, not scientific state.
   0.1 s run at one pixel a point; the world runs; every `frame` summary counts each frame rendered, none presented, and at least a 640 x 400 frame's bytes
   read back per frame; the `clock` records count frames; the `end` counts every frame rendered, no keys and no
   dropped input, a move in every third frame interval with none unmoved and every move but perhaps the last
-  drawn, and ordered percentiles; and the world it closed on is the configuration stepped directly to its tick,
-  digest for digest.
+  drawn, and ordered percentiles; `camera_latency_bound` over exactly the drawn moves, each of its percentiles
+  at least `camera_latency`'s (planted: the bound fed no moves, caught); and the world it closed on is the
+  configuration stepped directly to its tick, digest for digest.
 - `tests/telemetry_binary.rs` (3 tests, FL-024, FL-019, Metal compute, no window): `flife-studio --offscreen 2.5 --timeline
   T` on the preset at 32 x 32 with 384 founders that start above the birth threshold and pay 1.5 a second to live
   (in one run: through tick 763, 24 births, 361 deaths and 127,235 evaluations, the population alive). Each
@@ -1487,7 +1491,10 @@ reference CPU world; offscreen, any thread of a process on a host with a Metal d
   - The controllers ran on the CPU reference, not on Metal.
   - The host was not quiet.
   - The windowed G6 run is `flife-studio presets/reference-small-world.toml` on a 2x screen, which no test here
-    opens.
+    opens. Its `end` record gives `frame_times`, `presented` over `wall_seconds`, and `camera_latency_bound`
+    for the pans and zooms made in it. `tests/offscreen_binary.rs` checks the bound offscreen against the
+    posted moves' `camera_latency`: over the same moves, no percentile of the bounds is below theirs (one run:
+    p95 50.1 against 44.1 ms).
 - The colour key's swatches are their colours on the Metal route only without a bloom: the preset's bloom (0.15),
   which blurs the overlay with everything else, moved their interiors by up to 8 levels (the generation key) and
   16 (the affinity key). The binary's choice of the shown mapping's key each frame runs offscreen in

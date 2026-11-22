@@ -1,8 +1,9 @@
 //! Frame times (FL-024's G6 evidence, plan §13.7): how long each frame's
 //! work takes, as a bounded histogram, so a run of any length reports its
-//! percentiles in fixed memory.
+//! percentiles in fixed memory; and a bound on a camera move's latency in a
+//! window, whose input carries no event time ([`MoveLatencyBound`]).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flife_core::CoreError;
 use serde::Serialize;
@@ -129,5 +130,65 @@ impl FrameTimes {
             p99_ms: ms(self.percentile(0.99)?),
             max_ms: ms(self.longest),
         })
+    }
+}
+
+/// An upper bound on each drawn camera move's latency (FL-024's G6, plan
+/// §13.7) where input carries no event time, as in a window.
+///
+/// A frame's poll drains every input event queued since the previous poll.
+/// So an event a frame drains reached the Studio's queue after the previous
+/// frame's poll began, and a camera move took at most from that poll to the
+/// end of the frame that drew it. A frame that moved the view but was not
+/// drawn hands its bound to the next drawn frame. Several moves drawn by one
+/// frame give one bound, the earliest's.
+///
+/// What it leaves out: the window server's delivery before the event
+/// reaches the Studio's queue, and the display's present and scan-out after
+/// the frame's work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MoveLatencyBound {
+    /// When the latest frame polled its input.
+    previous_poll: Option<Instant>,
+    /// The start of the bound for the earliest move not yet drawn.
+    pending: Option<Instant>,
+}
+
+impl MoveLatencyBound {
+    /// No frame seen yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            previous_poll: None,
+            pending: None,
+        }
+    }
+
+    /// Account for a frame that polled its input at `polled` and ended its
+    /// work at `ended`, whether a camera move changed its view (`moved`),
+    /// and whether it was drawn.
+    ///
+    /// Returns the bound for the moves a drawn frame drew: from the poll
+    /// before the one that drained the earliest of them to `ended`. `None`
+    /// when it drew no move, and for a move in the first frame, before
+    /// which no poll bounds the event's arrival.
+    pub fn frame(
+        &mut self,
+        polled: Instant,
+        ended: Instant,
+        moved: bool,
+        drawn: bool,
+    ) -> Option<Duration> {
+        let previous = self.previous_poll.replace(polled);
+        if moved && self.pending.is_none() {
+            self.pending = previous;
+        }
+        if drawn {
+            self.pending
+                .take()
+                .map(|from| ended.saturating_duration_since(from))
+        } else {
+            None
+        }
     }
 }

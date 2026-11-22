@@ -84,7 +84,9 @@ pub use export::{
 };
 pub use flife_backend_metal::ControllerChoice;
 pub use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Motion, Particles, Style};
-pub use frames::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes};
+pub use frames::{
+    FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes, MoveLatencyBound,
+};
 pub use host::{
     Frame, FrameTally, PICK_RADIUS_POINTS, Resumed, STUDIO_SESSION, Studio, StudioClosed,
     StudioOptions, Surface,

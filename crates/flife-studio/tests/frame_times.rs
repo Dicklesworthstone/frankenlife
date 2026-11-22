@@ -1,6 +1,7 @@
 //! FL-024's frame-time histogram (G6 evidence): its percentiles against a
 //! sorted list of the same frame times, in fixed memory for any number of
-//! frames.
+//! frames. And the window's camera-move latency bound, against each move's
+//! true latency from a known arrival.
 
 #![allow(
     clippy::expect_used,
@@ -10,9 +11,9 @@
     reason = "test: a failure is a test failure"
 )]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use flife_studio::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimes};
+use flife_studio::{FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimes, MoveLatencyBound};
 
 fn ms(milliseconds: u64) -> Duration {
     Duration::from_millis(milliseconds)
@@ -125,4 +126,124 @@ fn every_percentile_is_within_a_bucket_above_its_frame() {
             assert!(got <= times.longest());
         }
     }
+}
+
+/// The moment `ms_after` milliseconds after `base`.
+fn at(base: Instant, ms_after: u64) -> Instant {
+    base + ms(ms_after)
+}
+
+#[test]
+fn a_drawn_move_is_bounded_from_the_previous_poll_to_its_frames_end() {
+    let base = Instant::now();
+    let mut bound = MoveLatencyBound::new();
+    // Polls every 33 ms, each frame's work 20 ms.
+    assert_eq!(bound.frame(at(base, 0), at(base, 20), false, true), None);
+    assert_eq!(
+        bound.frame(at(base, 33), at(base, 53), true, true),
+        Some(ms(53)),
+        "drained at the 33 ms poll, so it arrived after the 0 ms one"
+    );
+    assert_eq!(bound.frame(at(base, 66), at(base, 86), false, true), None);
+    assert_eq!(
+        bound.frame(at(base, 99), at(base, 140), true, true),
+        Some(ms(140 - 66))
+    );
+}
+
+#[test]
+fn a_move_in_the_first_frame_has_no_bound_and_none_carries_over() {
+    let base = Instant::now();
+    let mut bound = MoveLatencyBound::new();
+    assert_eq!(bound.frame(at(base, 0), at(base, 20), true, true), None);
+    assert_eq!(bound.frame(at(base, 33), at(base, 53), false, true), None);
+    assert_eq!(bound, {
+        let mut fresh = MoveLatencyBound::new();
+        fresh.frame(at(base, 33), at(base, 53), false, true);
+        fresh
+    });
+}
+
+#[test]
+fn an_undrawn_move_is_bounded_at_the_next_drawn_frame_from_its_own_poll() {
+    let base = Instant::now();
+    let mut bound = MoveLatencyBound::new();
+    assert_eq!(bound.frame(at(base, 0), at(base, 20), false, true), None);
+    // Moved but not drawn (an occluded window): nothing yet.
+    assert_eq!(bound.frame(at(base, 33), at(base, 40), true, false), None);
+    // A later move does not restart the bound: the earliest move's counts.
+    assert_eq!(
+        bound.frame(at(base, 66), at(base, 90), true, true),
+        Some(ms(90))
+    );
+    // A frame drawn after an undrawn move draws that move, moved or not.
+    assert_eq!(bound.frame(at(base, 99), at(base, 105), true, false), None);
+    assert_eq!(
+        bound.frame(at(base, 132), at(base, 150), false, true),
+        Some(ms(150 - 66))
+    );
+    assert_eq!(bound.frame(at(base, 165), at(base, 180), false, true), None);
+}
+
+#[test]
+fn the_bound_is_never_below_a_moves_true_latency() {
+    // Frames of varying work and idle; a move arrives at a known moment
+    // between two polls, is drained by the later poll, and is drawn by its
+    // frame unless that frame is occluded. Its true latency, arrival to the
+    // end of the drawing frame, is computed from the arrival alone.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let mut next = move |modulus: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % modulus
+    };
+    let base = Instant::now();
+    let mut bound = MoveLatencyBound::new();
+    let mut now_us = 0_u64;
+    let mut previous_poll_us: Option<u64> = None;
+    let mut arrival_us: Option<u64> = None;
+    let (mut bounded, mut tightest) = (0, Duration::MAX);
+    for _ in 0..5_000 {
+        let poll_us = now_us;
+        let end_us = poll_us + 1_000 + next(60_000);
+        // A move arrives between the previous poll and this one, so this
+        // poll drains it (none before the first poll).
+        let moved = previous_poll_us.is_some() && next(3) == 0;
+        if moved && arrival_us.is_none() {
+            let from = previous_poll_us.unwrap_or(0);
+            arrival_us = Some(from + next(poll_us - from + 1));
+        }
+        let drawn = next(10) != 0;
+        let got = bound.frame(
+            base + Duration::from_micros(poll_us),
+            base + Duration::from_micros(end_us),
+            moved,
+            drawn,
+        );
+        if drawn {
+            let truth = arrival_us
+                .take()
+                .map(|arrived| Duration::from_micros(end_us - arrived));
+            assert_eq!(
+                got.is_some(),
+                truth.is_some(),
+                "a bound exactly when a move is drawn"
+            );
+            if let (Some(got), Some(truth)) = (got, truth) {
+                assert!(got >= truth, "bound {got:?} below the true {truth:?}");
+                bounded += 1;
+                tightest = tightest.min(got - truth);
+            }
+        } else {
+            assert_eq!(got, None);
+        }
+        previous_poll_us = Some(poll_us);
+        now_us = end_us + next(40_000);
+    }
+    assert!(bounded > 1_000, "{bounded} moves bounded");
+    assert!(
+        tightest < Duration::from_millis(1),
+        "the bound is reached: {tightest:?}"
+    );
 }

@@ -9,6 +9,14 @@
   `positive-five-point-v1` transport with `subcycle` stability, exponential decay, and `fixed-total-power`
   deposits through the `normalized-truncated-minimum-image-gaussian-v1` kernel with `fixed-per-source`
   chemistry. It also covers the analytic `seeded-smooth-torus-v1` path integrator.
+- `flife-ze4` adds `normalized-truncated-minimum-image-gaussian-fused-v1`, the same kernel with every
+  simultaneous source's deposit summed per cell in F64 and rounded to F32 once a tick, as phase 9's deposits
+  are. `-v1` rounds after each source. With hundreds of sources in an energy-rich, sparsely eaten field those
+  roundings fall the same way across a binade and add up past INV-03's allowance: a 512-source world with no
+  founders stopped at tick 274. In `tests/transport_sources.rs`'s 512-source near-empty world, `-v1`'s residual
+  passes 1e-5 of the energy and the fused kernel's stays under 1e-7. The fused kernel changes digests wherever two or more sources deposit, so the presets keep `-v1`. Choose it in
+  `[sources] kernel` for source-dense worlds. `advance_field`, `advance_field_on` and Metal's `MetalField` agree
+  bit for bit.
 - FL-005 (`flife-f6x`) covers local uptake (§5.1, §5.2, §11.3, A.1, Appendix C.1, INV-04). That is the
   `grid-cic-v1` exchange footprint, A.1's saturating request, two-pass demand/grant resolution with
   `cell-quantum-largest-remainder-v1` reconciliation, and the proportional field debit. The energy ledger it
@@ -391,9 +399,9 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
 
 **Validity domain.**
 - Implemented here: `field-ecology-v1` with `periodic`, `f32`, `zero`, `positive-five-point-v1`, `subcycle`,
-  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1`, `fixed-per-source`, `grid-cic-v1`,
-  `positive-box-v1`, `log-linear-v1`, `seeded-unit-vectors` and `seeded-smooth-torus-v1` (the last two with
-  FL-010's draws).
+  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1` and its `-fused-v1`, `fixed-per-source`,
+  `grid-cic-v1`, `positive-box-v1`, `log-linear-v1`, `seeded-unit-vectors` and `seeded-smooth-torus-v1` (the last
+  two with FL-010's draws).
 - Host buffers in layout schema `frankenlife.field-layout.v1`.
 
 **Independent tests.**

@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 
 import { MicroLabel, Reticle } from "@/components/franken";
 import { cn } from "@/lib/utils";
@@ -19,7 +19,7 @@ import { cn } from "@/lib/utils";
  */
 export type Basis = "rule" | "derived" | "record" | "diagram" | "render" | "toy";
 
-const BASIS: Record<Basis, { label: string; className: string }> = {
+export const BASIS: Record<Basis, { label: string; className: string }> = {
   rule: {
     label: "The rule, computed here",
     className: "text-cyan-200 border-cyan-400/30 bg-cyan-400/10",
@@ -48,8 +48,8 @@ const BASIS: Record<Basis, { label: string; className: string }> = {
 
 export function BasisBadge({ basis, className }: { basis: Basis; className?: string }) {
   const style = BASIS[basis];
-  // A badge breaks only at its " · ", and only where one line will not fit (a 320 px phone): each half stays whole.
-  const [head, tail] = style.label.split(" · ");
+  // A badge breaks only after a " · ", and only where one line will not fit (a 320 px phone): each part stays whole.
+  const parts = style.label.split(" · ");
   return (
     <span
       className={cn(
@@ -58,16 +58,15 @@ export function BasisBadge({ basis, className }: { basis: Basis; className?: str
         className,
       )}
     >
-      <span className="whitespace-nowrap">
-        {head}
-        {tail ? " ·" : null}
-      </span>
-      {tail ? (
-        <>
-          {" "}
-          <span className="whitespace-nowrap">{tail}</span>
-        </>
-      ) : null}
+      {parts.map((part, index) => (
+        <Fragment key={part}>
+          {index > 0 ? " " : null}
+          <span className="whitespace-nowrap">
+            {part}
+            {index < parts.length - 1 ? " ·" : null}
+          </span>
+        </Fragment>
+      ))}
     </span>
   );
 }

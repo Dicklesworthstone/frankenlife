@@ -232,7 +232,8 @@ Every issue is reported, not just the first.
 - Implemented in `flife-field`:
   - FL-003: the `periodic` boundary, the `f32` field dtype and the `zero` field composition.
   - FL-004: `positive-five-point-v1`, `subcycle`, `fixed-total-power`,
-    `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`.
+    `normalized-truncated-minimum-image-gaussian-v1` and `fixed-per-source`; `flife-ze4` adds
+    `normalized-truncated-minimum-image-gaussian-fused-v1`, which the presets do not use.
   - FL-005: `grid-cic-v1`.
 - Implemented in `flife-engine` (FL-006): `bounded-affinity-v1` and `per-granted-cell-packet`. The heritable
   traits `affinity_direction` and `motion_response` have their representation, bound and use there.

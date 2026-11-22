@@ -755,8 +755,10 @@ fn the_view_draws_the_field_in_the_styles_mapping() {
     for (particles, look, drawn_field) in [
         (Particles::Points, Look::Glow, true),
         (Particles::Points, Look::Raw, true),
+        (Particles::Points, Look::Sphere, true),
         (Particles::Density, Look::Glow, true),
         (Particles::Density, Look::Raw, false),
+        (Particles::Density, Look::Sphere, false),
     ] {
         for field in [true, false] {
             let style = Style {

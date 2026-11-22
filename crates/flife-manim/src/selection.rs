@@ -107,7 +107,7 @@ pub fn selection_ring_around(
 /// `radius_pixels` of it, from `drawn` (identity, world position) pairs:
 /// the nearest by drawable distance, the lowest identity among equals.
 /// `None` when nothing is drawn that close, or for a non-finite position or
-/// radius.
+/// a negative or non-finite radius.
 #[must_use]
 pub fn pick(
     viewport: &Viewport,
@@ -115,7 +115,10 @@ pub fn pick(
     at: [f64; 2],
     radius_pixels: f64,
 ) -> Option<OrganismId> {
-    if !(at.iter().all(|value| value.is_finite()) && radius_pixels.is_finite()) {
+    if !(at.iter().all(|value| value.is_finite())
+        && radius_pixels.is_finite()
+        && radius_pixels >= 0.0)
+    {
         return None;
     }
     let mut best: Option<(f64, u64)> = None;
@@ -124,7 +127,7 @@ pub fn pick(
         let place = viewport.world_to_drawable(position);
         let (dx, dy) = (place[0] - at[0], place[1] - at[1]);
         let distance = dx * dx + dy * dy;
-        if distance > reach {
+        if !distance.is_finite() || distance > reach {
             continue;
         }
         let better = match best {

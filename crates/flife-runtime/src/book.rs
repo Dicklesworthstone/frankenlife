@@ -909,6 +909,11 @@ impl CommandBook {
             )));
         }
         let closed = input.flag()?;
+        if closed && sealed.is_some() {
+            return Err(refuse(
+                "a closed command book cannot hold a sealed boundary",
+            ));
+        }
         let count = input.count(RECORDS_MAX, 8)?;
         let mut book = Self {
             session,
@@ -976,12 +981,25 @@ impl CommandBook {
                 other => return Err(refuse(format!("unknown command status {other}"))),
             };
             match status {
+                CommandStatus::Pending if closed => {
+                    return Err(refuse(format!(
+                        "{} is pending in a closed command book",
+                        command.id
+                    )));
+                }
                 CommandStatus::Pending if accepted.effective < committed => {
                     return Err(refuse(format!(
                         "{} is pending for tick {}, before the committed tick {}",
                         command.id,
                         accepted.effective.get(),
                         committed.get()
+                    )));
+                }
+                CommandStatus::Pending if Some(accepted.effective) == sealed => {
+                    return Err(refuse(format!(
+                        "{} is pending for sealed tick {}",
+                        command.id,
+                        accepted.effective.get()
                     )));
                 }
                 CommandStatus::Sealed if Some(accepted.effective) != sealed => {
@@ -1026,6 +1044,12 @@ impl CommandBook {
             book.outcomes.push(id);
         }
         input.finish()?;
+        if u64::try_from(book.records.len()).ok() != Some(next_order) {
+            return Err(refuse(format!(
+                "the commands chunk holds {} records for {next_order} admissions",
+                book.records.len()
+            )));
+        }
         if chunk.items != u64::try_from(book.records.len()).unwrap_or(u64::MAX) {
             return Err(refuse(format!(
                 "the manifest counts {} command records, the chunk holds {}",

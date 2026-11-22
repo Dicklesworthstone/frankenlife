@@ -923,7 +923,11 @@ pub fn dispersion(positions: &[[f32; 2]], extent: [f64; 2], bins: usize) -> Disp
             morans_i: None,
         };
     };
-    if !extent.iter().all(|side| side.is_finite() && *side > 0.0) {
+    if !extent.iter().all(|side| side.is_finite() && *side > 0.0)
+        || positions
+            .iter()
+            .any(|position| !position.iter().all(|coordinate| coordinate.is_finite()))
+    {
         return Dispersion {
             bins,
             occupied: 0.0,

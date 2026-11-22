@@ -590,10 +590,12 @@ pub struct Style {
 
 impl Style {
     /// Whether a frame in this style draws the field: when it is on, except
-    /// under raw density, which is opaque.
+    /// under raw or sphere density, which is opaque.
     #[must_use]
     pub fn field_drawn(self) -> bool {
-        self.field && !(self.particles == Particles::Density && self.look == Look::Raw)
+        self.field
+            && !(self.particles == Particles::Density
+                && matches!(self.look, Look::Raw | Look::Sphere))
     }
 }
 

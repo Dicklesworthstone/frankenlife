@@ -221,7 +221,7 @@ pub fn interpolate(
     into.positions.clear();
     into.shown.clear();
     into.fading.clear();
-    into.snapped = false;
+    into.snapped = !gap.unambiguous;
     let rows = current.len();
     let grow = |buffer: &'static str, bytes: usize| CoreError::AllocationFailed {
         buffer,
@@ -248,7 +248,6 @@ pub fn interpolate(
                         wrapped_between(a[1], b[1], height, fraction),
                     ]);
                 } else {
-                    into.snapped = true;
                     into.positions.push(b);
                 }
                 into.shown.push(true);

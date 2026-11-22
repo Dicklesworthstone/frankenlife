@@ -568,6 +568,21 @@ fn damaged_checkpoints_are_refused() {
     }));
     assert!(reason.contains("did not end there"), "{reason}");
 
+    let reason = refused(&rewritten(&bytes, ChunkFamily::Commands, |data| {
+        // Bump next_order past the record count (creating an admission-order
+        // gap): next_order follows session (8), revision (32) and capacity (8).
+        data[48..56].copy_from_slice(&3_u64.to_le_bytes());
+    }));
+    assert!(reason.contains("admissions"), "{reason}");
+
+    let reason = refused(&rewritten(&bytes, ChunkFamily::Commands, |data| {
+        // Mark the book closed while command 1 is still pending: closed
+        // follows session (8), revision (32), capacity (8), next_order (8)
+        // and sealed tag (1, None).
+        data[57] = 1;
+    }));
+    assert!(reason.contains("closed"), "{reason}");
+
     // A manifest whose item count disagrees with its chunk.
     let reader = CheckpointReader::parse(&bytes, &[]).expect("parses");
     let mut writer = CheckpointWriter::new(reader.model());

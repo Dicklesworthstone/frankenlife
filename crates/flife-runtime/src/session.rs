@@ -1927,35 +1927,39 @@ impl SessionOwner {
                         *suspending = false;
                         closing.push(reply);
                         discard = true;
+                        break;
                     }
                     Control::Suspend(reply) => {
                         *suspending = closing.is_empty() || *suspending;
                         closing.push(reply);
                         discard = true;
+                        break;
                     }
                     other => deferred.push_back(other),
                 }
             }
-            while journal.as_ref().is_none_or(Durable::room)
-                && let Ok(submission) = science.try_recv()
-            {
-                admit_into(
-                    book,
-                    journal.as_mut(),
-                    grid,
-                    submission,
-                    committed,
-                    false,
-                    !closing.is_empty(),
-                );
+            if closing.is_empty() {
+                while journal.as_ref().is_none_or(Durable::room)
+                    && let Ok(submission) = science.try_recv()
+                {
+                    admit_into(
+                        book,
+                        journal.as_mut(),
+                        grid,
+                        submission,
+                        committed,
+                        false,
+                        false,
+                    );
+                }
             }
             if discard {
                 candidate.cancel();
-                if !closing.is_empty() {
-                    return Ticked::Closing;
-                }
                 for reply in pause {
                     deferred.push_front(Control::Pause(reply));
+                }
+                if !closing.is_empty() {
+                    return Ticked::Closing;
                 }
                 continue;
             }
@@ -2060,11 +2064,19 @@ impl SessionOwner {
             self.release_held(cx).await;
             while let Some(message) = self.deferred.pop_front() {
                 self.handle(cx, message).await;
+                if !self.closing.is_empty() {
+                    break 'session;
+                }
             }
             let mut abandoned = false;
             loop {
                 match self.control.try_recv() {
-                    Ok(message) => self.handle(cx, message).await,
+                    Ok(message) => {
+                        self.handle(cx, message).await;
+                        if !self.closing.is_empty() {
+                            break 'session;
+                        }
+                    }
                     Err(mpsc::RecvError::Disconnected) => {
                         abandoned = true;
                         break;
@@ -2133,7 +2145,12 @@ impl SessionOwner {
             let inbound =
                 Self::next_inbound(cx, control, room.then_some(science), released, receipts).await;
             match inbound {
-                Inbound::Control(message) => self.handle(cx, message).await,
+                Inbound::Control(message) => {
+                    self.handle(cx, message).await;
+                    if !self.closing.is_empty() {
+                        break 'session;
+                    }
+                }
                 Inbound::Science(submission) => {
                     let (committed, stopped) = (self.world.tick(), self.stopped());
                     self.admit(submission, committed, stopped);
@@ -2156,13 +2173,6 @@ impl SessionOwner {
         self.offer_render();
         self.render.close();
         self.end_run(RunEnd::Closed(boundary));
-        if !self.suspending {
-            let from = self.book.outcome_cursor();
-            self.book.close(boundary.tick);
-            if let Some(journal) = &mut self.journal {
-                journal.outcomes(&self.book, from);
-            }
-        }
         self.control.close();
         self.science.close();
         let mut queued: Vec<Control> = self.held.drain(..).collect();
@@ -2174,6 +2184,21 @@ impl SessionOwner {
         let mut submissions = Vec::new();
         while let Ok(submission) = self.science.try_recv() {
             submissions.push(submission);
+        }
+        // A close queued alongside a suspension wins before the book is
+        // finalized, matching the interactive close-vs-suspend rule.
+        if queued
+            .iter()
+            .any(|message| matches!(message, Control::Close(_)))
+        {
+            self.suspending = false;
+        }
+        if !self.suspending {
+            let from = self.book.outcome_cursor();
+            self.book.close(boundary.tick);
+            if let Some(journal) = &mut self.journal {
+                journal.outcomes(&self.book, from);
+            }
         }
         // A closed session holds nothing: a wait on its hold ends.
         if let Some((_, Some(waiting))) = self.hold.take() {
@@ -2209,13 +2234,17 @@ impl SessionOwner {
                     }
                 }
                 Control::Cancel { id, reply } => {
-                    let decision = match self.book.status(id) {
-                        Some(CommandStatus::Terminal(outcome)) => {
-                            Cancellation::AlreadyTerminal(outcome.clone())
+                    let answer = match self.book.status(id) {
+                        Some(CommandStatus::Terminal(outcome @ Outcome::Applied { .. })) => {
+                            Ok(Cancellation::TooLate(outcome.clone()))
                         }
-                        _ => Cancellation::Unknown,
+                        Some(CommandStatus::Terminal(outcome)) => {
+                            Ok(Cancellation::AlreadyTerminal(outcome.clone()))
+                        }
+                        Some(CommandStatus::Pending | CommandStatus::Sealed) => Err(closed()),
+                        None => Ok(Cancellation::Unknown),
                     };
-                    let _ = reply.send_blocking(Ok(decision));
+                    let _ = reply.send_blocking(answer);
                 }
                 Control::Status { id, reply } => {
                     let _ = reply.send_blocking(self.book.status(id).cloned());
@@ -2242,9 +2271,10 @@ impl SessionOwner {
                 }
             }
         }
-        // A closed book answers a retry of an accepted identity with its
-        // outcome and refuses everything else.
+        // A closed or suspended book answers a retry of an accepted identity
+        // with its status and refuses new commands as closed (not stopped).
         for submission in submissions {
+            let closing = self.suspending && self.book.status(submission.command.id).is_none();
             admit_into(
                 &mut self.book,
                 self.journal.as_mut(),
@@ -2252,7 +2282,7 @@ impl SessionOwner {
                 submission,
                 boundary.tick,
                 true,
-                false,
+                closing,
             );
         }
         // Every record sent is answered before anyone hears the session
@@ -2262,6 +2292,10 @@ impl SessionOwner {
         }
         for (id, reply) in durable {
             let answer = match (&self.journal, self.book.status(id)) {
+                (None, _) => Err(CoreError::StateConflict {
+                    operation: "read durable outcome",
+                    detail: format!("a {VOLATILE_IN_MEMORY} session's outcomes are never durable"),
+                }),
                 (Some(journal), Some(CommandStatus::Terminal(outcome)))
                     if outcome.cursor() < journal.durable.outcomes =>
                 {
@@ -2270,7 +2304,7 @@ impl SessionOwner {
                 (Some(journal), Some(CommandStatus::Terminal(_))) => {
                     Err(journal.failed.clone().unwrap_or_else(closed))
                 }
-                _ => Ok(None),
+                (Some(_), _) => Ok(None),
             };
             let _ = reply.send_blocking(answer);
         }

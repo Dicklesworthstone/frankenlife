@@ -407,16 +407,23 @@ impl FieldTexture {
         workers: usize,
     ) -> Result<Self, CoreError> {
         let mut texture = Self::sized(cells, cell_size)?;
-        let count = cells.map(|n| n as usize);
-        if planes.len() != count[0] * count[1] * (1 + CHANNELS) {
+        let expected = usize::try_from(cells[0])
+            .ok()
+            .and_then(|x| {
+                usize::try_from(cells[1])
+                    .ok()
+                    .and_then(|y| x.checked_mul(y))
+            })
+            .and_then(|cells| cells.checked_mul(1 + CHANNELS));
+        if expected != Some(planes.len()) {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!(
                     "{} values are not the {} planes of a {} × {} grid",
                     planes.len(),
                     1 + MOMENT_CHANNELS,
-                    count[0],
-                    count[1]
+                    cells[0],
+                    cells[1]
                 ),
             });
         }
@@ -430,6 +437,15 @@ impl FieldTexture {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!("a {cells:?} grid has no cells"),
+            });
+        }
+        let cell_area = cell_size[0] * cell_size[1];
+        if !cell_size.iter().all(|side| side.is_finite() && *side > 0.0)
+            || !(cell_area.is_finite() && cell_area > 0.0)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "render field cell size",
+                detail: format!("{cell_size:?} must be finite with positive area"),
             });
         }
         let block = cells.map(|n| n.div_ceil(FIELD_TEXELS_MAX));
@@ -582,18 +598,26 @@ impl FieldTexture {
         workers: usize,
     ) -> Result<(), CoreError> {
         let [cells_x, cells_y] = self.cells.map(|n| n as usize);
-        let cells = cells_x * cells_y;
-        let with_moments = planes.len() == cells * (1 + CHANNELS);
-        if planes.len() != cells && !with_moments {
+        let cells = usize::try_from(self.cells[0]).ok().and_then(|x| {
+            usize::try_from(self.cells[1])
+                .ok()
+                .and_then(|y| x.checked_mul(y))
+        });
+        let with_moments = cells
+            .and_then(|cells| cells.checked_mul(1 + CHANNELS))
+            .is_some_and(|total| planes.len() == total);
+        let Some(cells) = cells.filter(|&cells| planes.len() == cells || with_moments) else {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!(
-                    "{} values for an energy plane or the {} planes of a {cells_x} × {cells_y} grid",
+                    "{} values for an energy plane or the {} planes of a {} × {} grid",
                     planes.len(),
-                    1 + CHANNELS
+                    1 + CHANNELS,
+                    self.cells[0],
+                    self.cells[1]
                 ),
             });
-        }
+        };
         let (energy, moments) = planes.split_at(cells);
         let [width, height] = self.texels.map(|n| n as usize);
         let count = width * height;

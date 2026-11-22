@@ -453,6 +453,29 @@ fn a_large_field_is_a_bounded_block_mean_texture() {
         FieldTexture::from_plane([0, 4], cell_size, &[]),
         Err(CoreError::LayoutMismatch { .. })
     ));
+    assert!(matches!(
+        FieldTexture::from_plane([u32::MAX, u32::MAX], [1.0, 1.0], &[]),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    assert!(matches!(
+        FieldTexture::from_planes([u32::MAX, u32::MAX], [1.0, 1.0], &[]),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    for bad in [
+        [0.0, 1.0],
+        [-1.0, 1.0],
+        [f64::NAN, 1.0],
+        [f64::INFINITY, 1.0],
+        [1e-200, 1e-200],
+    ] {
+        assert!(
+            matches!(
+                FieldTexture::from_plane([2, 2], bad, &[1.0; 4]),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "{bad:?}"
+        );
+    }
 }
 
 /// A texture projected on workers is the one-thread texture bit for bit:

@@ -303,3 +303,38 @@ fn interpolation_outside_its_rules_is_refused() {
         Err(CoreError::StateConflict { .. })
     ));
 }
+
+/// An ambiguous gap sets `snapped` even when no organism lived across the
+/// gap, so trail consumers know the gap could not be interpolated.
+#[test]
+fn ambiguous_gap_sets_snapped_without_continuing_organisms() {
+    let mut world = found(&ecology(&[]), Arrangement::FreeList);
+    let mut publisher = publisher(&world);
+    let prior = publisher
+        .feed()
+        .viewer(1)
+        .expect("a viewer")
+        .latest()
+        .expect("a lease");
+    let remove_all: Vec<Intervention> = [[0.0, 0.0], [16.0, 0.0], [0.0, 16.0], [16.0, 16.0]]
+        .into_iter()
+        .map(|center| Intervention::RemoveOrganisms {
+            center,
+            radius: 16.0,
+            disposition: Disposition::Remove,
+        })
+        .collect();
+    match world.step_with(&remove_all).expect("the tick runs") {
+        Stepped::Published(report) => assert_eq!(report.live, 0),
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    }
+    for _ in 0..599 {
+        step(&mut world);
+    }
+    let current = offer_and_lease(&mut publisher, &world);
+    assert!(current.is_empty());
+    let mut into = Interpolation::default();
+    let gap = interpolate(&prior, &current, 0.5, &mut into).expect("interpolates");
+    assert!(!gap.unambiguous);
+    assert!(into.snapped);
+}

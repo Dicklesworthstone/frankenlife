@@ -64,6 +64,21 @@ fn a_pick_is_the_nearest_drawn_identity_through_a_panned_view() {
     );
     assert_eq!(pick(&viewport, drawn, [f64::NAN, 400.0], 8.0), None);
     assert_eq!(pick(&viewport, drawn, center, f64::INFINITY), None);
+    assert_eq!(pick(&viewport, drawn, center, -8.0), None);
+    let with_nan = [(99, [f64::NAN, 64.0]), (1, [127.5, 64.0])];
+    assert_eq!(
+        pick(&viewport, with_nan, center, PICK_RADIUS_PIXELS),
+        Some(OrganismId::new(1))
+    );
+    assert_eq!(
+        pick(
+            &viewport,
+            [(99, [f64::NAN, 64.0])],
+            center,
+            PICK_RADIUS_PIXELS
+        ),
+        None
+    );
     // Zoomed 64 times, 0.5 units is 200 px: nothing is within reach of the
     // center, but the pointer over organism 2 finds it.
     let deep = view([128.0, 128.0], [800, 800], [0.0, 64.0], 64.0);

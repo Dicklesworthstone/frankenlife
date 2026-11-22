@@ -1062,3 +1062,153 @@ fn a_native_runtime_session_runs_the_same_protocol() {
     assert_eq!(direct.digest(), closed.world.digest());
     assert!(matches!(found(&config).step(), Ok(Stepped::Published(_))));
 }
+
+/// Requests queued behind a `suspend()` in the same turn are drained by
+/// `shut_down()`: a step does not advance the world after suspend, a new
+/// submission is refused as `Closed` (never `Stopped`), a retry of an
+/// accepted identity still returns its status, cancelling an applied
+/// command is `TooLate`, cancelling a pending command fails with
+/// `QueueClosed` (never `Unknown`), and `durable_outcome` on a volatile
+/// session still reports `StateConflict`.
+#[test]
+fn queued_requests_behind_suspend_report_honest_shutdown_outcomes() {
+    let config = ecology(&[
+        ("execution", "control_queue_capacity", "16"),
+        ("execution", "command_queue_capacity", "16"),
+    ]);
+    let applied_cmd = command(1, at(0), inject([4, 4], 1.0));
+    let pending_cmd = command(2, at(1000), inject([5, 5], 1.0));
+    let fresh_cmd = command(3, at(1000), inject([6, 6], 1.0));
+    let (owner, handle) = open(found(&config), &config, SESSION).expect("open");
+    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+    let spawner = runtime.handle();
+    let closed = runtime.block_on(async move {
+        let owner = spawner
+            .try_spawn(async move {
+                let cx = cx();
+                owner.run(&cx).await
+            })
+            .expect("owner");
+        let client = spawner
+            .try_spawn(async move {
+                let cx = cx();
+                accepted(&handle.submit(&cx, applied_cmd).await.expect("applied"));
+                accepted(&handle.submit(&cx, pending_cmd).await.expect("pending"));
+                let stepped = handle.step(&cx).await.expect("step");
+                let boundary = *published(&stepped).0;
+                assert_eq!(boundary.tick, Tick::new(1));
+
+                // Poll all futures once without yielding so every message is
+                // enqueued on the owner's channels in exact order before the
+                // owner next wakes up.
+                let mut suspend = std::pin::pin!(handle.suspend(&cx));
+                let mut step_after = std::pin::pin!(handle.step(&cx));
+                let mut cancel_applied = std::pin::pin!(handle.cancel(&cx, applied_cmd.id));
+                let mut cancel_pending = std::pin::pin!(handle.cancel(&cx, pending_cmd.id));
+                let mut durable = std::pin::pin!(handle.durable_outcome(&cx, applied_cmd.id));
+                let mut submit_fresh = std::pin::pin!(handle.submit(&cx, fresh_cmd));
+                let mut submit_retry = std::pin::pin!(handle.submit(&cx, pending_cmd));
+
+                let mut suspend_out = None;
+                let mut step_out = None;
+                let mut cancel_applied_out = None;
+                let mut cancel_pending_out = None;
+                let mut durable_out = None;
+                let mut submit_fresh_out = None;
+                let mut submit_retry_out = None;
+
+                std::future::poll_fn(|context| {
+                    if suspend_out.is_none()
+                        && let Poll::Ready(v) = suspend.as_mut().poll(context)
+                    {
+                        suspend_out = Some(v);
+                    }
+                    if step_out.is_none()
+                        && let Poll::Ready(v) = step_after.as_mut().poll(context)
+                    {
+                        step_out = Some(v);
+                    }
+                    if cancel_applied_out.is_none()
+                        && let Poll::Ready(v) = cancel_applied.as_mut().poll(context)
+                    {
+                        cancel_applied_out = Some(v);
+                    }
+                    if cancel_pending_out.is_none()
+                        && let Poll::Ready(v) = cancel_pending.as_mut().poll(context)
+                    {
+                        cancel_pending_out = Some(v);
+                    }
+                    if durable_out.is_none()
+                        && let Poll::Ready(v) = durable.as_mut().poll(context)
+                    {
+                        durable_out = Some(v);
+                    }
+                    if submit_fresh_out.is_none()
+                        && let Poll::Ready(v) = submit_fresh.as_mut().poll(context)
+                    {
+                        submit_fresh_out = Some(v);
+                    }
+                    if submit_retry_out.is_none()
+                        && let Poll::Ready(v) = submit_retry.as_mut().poll(context)
+                    {
+                        submit_retry_out = Some(v);
+                    }
+                    if suspend_out.is_some()
+                        && step_out.is_some()
+                        && cancel_applied_out.is_some()
+                        && cancel_pending_out.is_some()
+                        && durable_out.is_some()
+                        && submit_fresh_out.is_some()
+                        && submit_retry_out.is_some()
+                    {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+
+                assert_eq!(suspend_out.expect("suspend").expect("ok"), boundary);
+                assert!(matches!(
+                    step_out.expect("step"),
+                    Err(CoreError::QueueClosed { .. })
+                ));
+                assert!(matches!(
+                    cancel_applied_out.expect("cancel applied"),
+                    Ok(Cancellation::TooLate(Outcome::Applied { .. }))
+                ));
+                assert!(matches!(
+                    cancel_pending_out.expect("cancel pending"),
+                    Err(CoreError::QueueClosed { .. })
+                ));
+                assert!(matches!(
+                    durable_out.expect("durable"),
+                    Err(CoreError::StateConflict { .. })
+                ));
+                assert_eq!(
+                    submit_fresh_out.expect("fresh").expect("answered"),
+                    Admission::Rejected(Rejection::Closed)
+                );
+                assert!(matches!(
+                    submit_retry_out.expect("retry").expect("answered"),
+                    Admission::Accepted {
+                        retry: true,
+                        status: CommandStatus::Pending,
+                        ..
+                    }
+                ));
+                boundary
+            })
+            .expect("client");
+        let boundary = client.await;
+        let closed = owner.await;
+        assert_eq!(closed.boundary, boundary);
+        closed
+    });
+    assert_eq!(closed.boundary.tick, Tick::new(1));
+    assert_eq!(
+        closed.book.status(pending_cmd.id),
+        Some(&CommandStatus::Pending)
+    );
+    assert!(!closed.book.is_closed());
+}

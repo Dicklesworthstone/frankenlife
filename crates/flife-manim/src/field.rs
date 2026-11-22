@@ -168,7 +168,7 @@ fn check(field: &FieldTexture) -> Result<(), CoreError> {
     let [columns, rows] = field.texels().map(|n| n as usize);
     let (values, composition, components) =
         (field.values(), field.composition(), field.components());
-    if values.len() != columns * rows
+    if columns.checked_mul(rows) != Some(values.len())
         || values.is_empty()
         || composition.len() != values.len()
         || components.len() != values.len()

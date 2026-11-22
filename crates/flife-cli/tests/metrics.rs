@@ -1229,6 +1229,9 @@ fn spatial_statistics_guard_zero_bins_overflow_and_non_finite_inputs() {
     let bad_extent = dispersion(&[[1.0, 2.0]], [0.0, 16.0], 4);
     assert_eq!(bad_extent.occupied, 0.0);
     assert_eq!(bad_extent.morans_i, None);
+    let non_finite_pos = dispersion(&[[f32::NAN, 2.0], [1.0, 2.0]], [16.0, 16.0], 4);
+    assert_eq!(non_finite_pos.occupied, 0.0);
+    assert_eq!(non_finite_pos.morans_i, None);
 
     assert_eq!(morans_i(&[1.0, 2.0, 3.0, 4.0], [usize::MAX, 2]), None);
     assert_eq!(morans_i(&[1.0, f64::NAN, 3.0, 4.0], [2, 2]), None);

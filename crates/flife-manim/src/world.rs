@@ -911,7 +911,7 @@ impl WorldView {
     /// The current frame's draws in painter order: the field, then the
     /// density layer, or every halo and then every dot, then the brush's
     /// region, then the selection ring, then the overlay's plate and text.
-    /// Raw density is opaque, so the field is left out under it.
+    /// Raw and sphere density are opaque, so the field is left out under them.
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the list cannot be reserved.

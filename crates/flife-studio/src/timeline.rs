@@ -113,15 +113,15 @@ impl From<AffinityProjection> for TimelineProjection {
 pub struct TimelineStyle {
     /// The colour mapping.
     pub mapping: String,
-    /// `glow` or `raw`.
+    /// `glow`, `raw` or `sphere`.
     pub look: String,
     /// `points` or `density`.
     pub particles: String,
     /// Whether the field is drawn.
     pub field: bool,
-    /// What the field's colour means: `energy` or `composition`. A record
-    /// from before FL-019's composition mapping has none, and means
-    /// `energy`.
+    /// What the field's colour means: `energy`, `composition` or `component-C`
+    /// (`0` to `31`). A record from before FL-019's composition mapping has
+    /// none, and means `energy`.
     #[serde(default = "energy_field")]
     pub field_mapping: String,
 }
@@ -891,39 +891,9 @@ pub fn replay(
     // run's command journal replays past it.
     let mut view = crate::host::studio_view(config, &restored, *size, style.style()?, background)?;
     // FL-043: admit the replay world and its observer buffers across the
-    // peak `(drawable, pixels_per_point)` state recorded in the timeline
-    // before stepping or rendering any frames.
-    let mut cur_drawable = *size;
-    let mut cur_scale = 1.0_f64;
-    let mut peak_observers =
-        crate::memory::observer_bytes_at(&world, &restored, &view, cur_drawable, cur_scale)?;
-    for record in records {
-        match record {
-            TimelineRecord::Resize { drawable } => {
-                cur_drawable = *drawable;
-                let required = crate::memory::observer_bytes_at(
-                    &world,
-                    &restored,
-                    &view,
-                    cur_drawable,
-                    cur_scale,
-                )?;
-                peak_observers = peak_observers.max(required);
-            }
-            TimelineRecord::Density { pixels_per_point } => {
-                cur_scale = pixels_per_point.0;
-                let required = crate::memory::observer_bytes_at(
-                    &world,
-                    &restored,
-                    &view,
-                    cur_drawable,
-                    cur_scale,
-                )?;
-                peak_observers = peak_observers.max(required);
-            }
-            _ => {}
-        }
-    }
+    // peak rendered `(drawable, pixels_per_point)` state recorded in the
+    // timeline before stepping or rendering any frames.
+    let peak_observers = peak_observer_bytes(&world, &restored, &view, *size, records)?;
     world.admit_memory(false, 0, peak_observers)?;
     // The epoch the session opened on: the restored world's, or the one the
     // journal's commands reached, which the book records applied.
@@ -1049,6 +1019,56 @@ pub fn replay(
         digest: reached,
         commands: applied.len(),
     })
+}
+
+/// Peak observer bytes a timeline replay requires across its initial size,
+/// every rendering or epoch-update record (`Show`, `Place`, `Advance`, `Draw`),
+/// and its final surface state (FL-043). Evaluates `(drawable,
+/// pixels_per_point)` pairs only at points where density bins or frame
+/// surfaces actually allocate, so a Retina `Resize` paired with `Density`
+/// before a frame never incurs a phantom 1x density-bin charge.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+/// density in `records`.
+pub fn peak_observer_bytes(
+    world: &World,
+    restored: &flife_render::Epoch,
+    view: &flife_manim::WorldView,
+    initial_size: [u32; 2],
+    records: &[TimelineRecord],
+) -> Result<u64, CoreError> {
+    let mut cur_drawable = initial_size;
+    let mut cur_scale = 1.0_f64;
+    let mut peak =
+        crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+    for record in records {
+        match record {
+            TimelineRecord::Resize { drawable } => {
+                cur_drawable = *drawable;
+            }
+            TimelineRecord::Density { pixels_per_point } => {
+                cur_scale = pixels_per_point.0;
+            }
+            TimelineRecord::Show { .. }
+            | TimelineRecord::Place { .. }
+            | TimelineRecord::Advance { .. }
+            | TimelineRecord::Draw { .. } => {
+                let required = crate::memory::observer_bytes_at(
+                    world,
+                    restored,
+                    view,
+                    cur_drawable,
+                    cur_scale,
+                )?;
+                peak = peak.max(required);
+            }
+            _ => {}
+        }
+    }
+    let final_bytes =
+        crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+    Ok(peak.max(final_bytes))
 }
 
 /// Step `world` to committed tick `tick` ([`step_to`]) and publish it: the

@@ -115,6 +115,12 @@ impl Keeping {
         &self.admission
     }
 
+    /// The checkpoint durability used for the run directory.
+    #[must_use]
+    pub const fn durability(&self) -> flife_cli::StoreDurability {
+        self.persistence.durability
+    }
+
     /// The bytes a checkpoint is charged in the memory admission
     /// ([`World::admit_memory`]'s checkpoint term).
     #[must_use]

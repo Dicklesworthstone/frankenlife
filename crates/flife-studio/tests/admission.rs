@@ -13,11 +13,11 @@ use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, World};
 use flife_manim::WorldView;
 use flife_render::Epoch;
-use flife_studio::ControllerChoice;
 use flife_studio::memory::{
-    DEVICE_BYTES_PER_PIXEL, admit, admit_kept_at, admit_resize, observer_bytes,
+    DEVICE_BYTES_PER_PIXEL, admit, admit_kept_at, admit_resize, observer_bytes, observer_bytes_at,
     observer_bytes_for_resize, observer_limit,
 };
+use flife_studio::{ControllerChoice, Exact, TimelineRecord, peak_observer_bytes};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -292,4 +292,84 @@ fn recurrent_studio_auto_admits_cpu_without_batched_budget_and_refuses_explicit_
             "expected MissingCapability for {explicit:?}, got {err:?}"
         );
     }
+}
+
+#[test]
+fn atomic_refit_surface_and_timeline_peak_admission_avoid_phantom_1x_retina_spike() {
+    let config = preset_with(&[]);
+    let world = found(&config);
+    let founding = Epoch::standalone(&world).expect("an epoch");
+    let mut view = WorldView::for_epoch(&founding, [1920, 1080], [0, 0, 0]).expect("a view");
+    view.enable_overlay();
+
+    // Invalid scale must leave the view completely unchanged even when drawable changed.
+    let before = *view.viewport();
+    assert!(view.refit_surface([3840, 2160], 0.0).is_err());
+    assert!(view.refit_surface([3840, 2160], f64::NAN).is_err());
+    assert_eq!(*view.viewport(), before);
+
+    // Valid Retina `Resize` paired immediately with `Density` before `Draw`
+    // must admit at `[3840, 2160] @ 2.0`, NOT the phantom `[3840, 2160] @ 1.0`
+    // density-bin charge.
+    let retina_records = [
+        TimelineRecord::Resize {
+            drawable: [3840, 2160],
+        },
+        TimelineRecord::Density {
+            pixels_per_point: Exact(2.0),
+        },
+        TimelineRecord::Draw {
+            frame: 1,
+            tick: 0,
+            wall_seconds: Exact(0.016),
+        },
+    ];
+    let retina_peak = peak_observer_bytes(&world, &founding, &view, [1920, 1080], &retina_records)
+        .expect("computes retina peak");
+    let expected_2x =
+        observer_bytes_at(&world, &founding, &view, [3840, 2160], 2.0).expect("2x bytes");
+    let phantom_1x =
+        observer_bytes_at(&world, &founding, &view, [3840, 2160], 1.0).expect("1x bytes");
+    assert!(
+        phantom_1x > expected_2x,
+        "4K @ 1x has 4x as many density bins as 4K @ 2x"
+    );
+    assert_eq!(
+        retina_peak, expected_2x,
+        "paired Resize + Density before Draw must not overcharge 1x density bins"
+    );
+
+    // Conversely, drawing a frame at 4K @ 1x BEFORE switching to 2x DOES charge 4K @ 1x.
+    let drawn_at_1x_records = [
+        TimelineRecord::Resize {
+            drawable: [3840, 2160],
+        },
+        TimelineRecord::Draw {
+            frame: 1,
+            tick: 0,
+            wall_seconds: Exact(0.016),
+        },
+        TimelineRecord::Density {
+            pixels_per_point: Exact(2.0),
+        },
+    ];
+    let drawn_1x_peak =
+        peak_observer_bytes(&world, &founding, &view, [1920, 1080], &drawn_at_1x_records)
+            .expect("computes 1x draw peak");
+    assert_eq!(drawn_1x_peak, phantom_1x);
+
+    // Atomic refit succeeds and updates both drawable and pixels_per_point together.
+    assert_eq!(
+        view.refit_surface([3840, 2160], 2.0).expect("refits"),
+        (true, true)
+    );
+    assert_eq!(view.viewport().drawable(), [3840, 2160]);
+    assert_eq!(
+        view.viewport().pixels_per_point().to_bits(),
+        2.0_f64.to_bits()
+    );
+    assert_eq!(
+        view.refit_surface([3840, 2160], 2.0).expect("no-op refit"),
+        (false, false)
+    );
 }

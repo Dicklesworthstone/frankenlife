@@ -615,6 +615,58 @@ fn transplant_parent(run_dir: &Path) -> Option<serde_json::Value> {
     })
 }
 
+fn session_parent(run_dir: &Path, closed: &flife_runtime::SessionClosed) -> serde_json::Value {
+    let session = closed.book.session();
+    let lineage = closed.book.lineage();
+    if let Some(fork) = lineage.last() {
+        serde_json::json!({
+            "kind": "branch",
+            "parent_session": fork.parent.get(),
+            "admitted": fork.admitted,
+            "tick": fork.tick.get(),
+            "checkpoint_sha256": fork.checkpoint.to_hex(),
+            "lineage": lineage
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "parent": entry.parent.get(),
+                    "admitted": entry.admitted,
+                    "tick": entry.tick.get(),
+                    "sha256": entry.checkpoint.to_hex(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    } else if session != RUN_SESSION {
+        transplant_parent(run_dir).unwrap_or(serde_json::Value::Null)
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn session_artifacts(
+    config: &ValidatedConfig,
+    checkpoint: Option<(CheckpointAt, Option<&str>)>,
+) -> Vec<serde_json::Value> {
+    let mut artifacts = vec![serde_json::json!({
+        "path": CONFIG_FILE,
+        "sha256": config.config_hash().to_hex(),
+    })];
+    if let Some((at, sha256)) = checkpoint {
+        let mut entry = serde_json::json!({
+            "kind": "checkpoint",
+            "sequence": at.sequence,
+            "tick": at.tick,
+        });
+        if let (Some(digest), serde_json::Value::Object(map)) = (sha256, &mut entry) {
+            map.insert(
+                "sha256".to_owned(),
+                serde_json::Value::String(digest.to_owned()),
+            );
+        }
+        artifacts.push(entry);
+    }
+    artifacts
+}
+
 /// Build and durably write `manifest.json` for a completed persisted run or
 /// resume (`flife run --run-dir`, `flife resume`, `flife step`).
 #[expect(
@@ -636,29 +688,7 @@ pub(crate) fn write_run_manifest(
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
     let session = closed.book.session();
-    let lineage = closed.book.lineage();
-    let parent = if let Some(fork) = lineage.last() {
-        serde_json::json!({
-            "kind": "branch",
-            "parent_session": fork.parent.get(),
-            "admitted": fork.admitted,
-            "tick": fork.tick.get(),
-            "checkpoint_sha256": fork.checkpoint.to_hex(),
-            "lineage": lineage
-                .iter()
-                .map(|entry| serde_json::json!({
-                    "parent": entry.parent.get(),
-                    "admitted": entry.admitted,
-                    "tick": entry.tick.get(),
-                    "sha256": entry.checkpoint.to_hex(),
-                }))
-                .collect::<Vec<_>>(),
-        })
-    } else if session != RUN_SESSION {
-        transplant_parent(target.run_dir).unwrap_or(serde_json::Value::Null)
-    } else {
-        serde_json::Value::Null
-    };
+    let parent = session_parent(target.run_dir, closed);
     let (status, detail) = match stop {
         crate::run::Stop::Reached => ("reached", None),
         crate::run::Stop::CapacityPaused { detail } => ("capacity-paused", Some(detail.clone())),
@@ -672,24 +702,11 @@ pub(crate) fn write_run_manifest(
     )]
     let ticks_per_second =
         (wall_seconds > 0.0 && tally.ticks > 0).then(|| (tally.ticks as f64) / wall_seconds);
-    let mut artifacts = vec![serde_json::json!({
-        "path": CONFIG_FILE,
-        "sha256": config.config_hash().to_hex(),
-    })];
-    if let Some((at, sha256)) = checkpoint {
-        let mut entry = serde_json::json!({
-            "kind": "checkpoint",
-            "sequence": at.sequence,
-            "tick": at.tick,
-        });
-        if let (Some(digest), serde_json::Value::Object(map)) = (sha256, &mut entry) {
-            map.insert(
-                "sha256".to_owned(),
-                serde_json::Value::String(digest.to_hex()),
-            );
-        }
-        artifacts.push(entry);
-    }
+    let digest_hex = checkpoint.and_then(|(_, d)| d.map(|digest| digest.to_hex()));
+    let artifacts = session_artifacts(
+        config,
+        checkpoint.map(|(at, _)| (at, digest_hex.as_deref())),
+    );
     let identity = serde_json::json!({
         "run": config.config().name,
         "kind": target.kind,
@@ -728,6 +745,90 @@ pub(crate) fn write_run_manifest(
         artifacts,
     );
     write_manifest(target.run_dir, &manifest, target.durability)
+}
+
+/// Build and durably write Appendix B.1 `manifest.json` when a kept Studio
+/// session (`flife-studio --run` or `--resume`) closes cleanly. Omits step
+/// tally fields that the Studio does not accumulate instead of fabricating
+/// them, and resolves an omitted checkpoint digest from `catalog.db`.
+///
+/// # Errors
+/// As [`write_manifest`] and the catalog lookup when resolving an uncached
+/// checkpoint digest.
+pub fn write_studio_manifest(
+    run_dir: &Path,
+    durability: StoreDurability,
+    resumed: bool,
+    closed: &flife_runtime::SessionClosed,
+    checkpoint: Option<(CheckpointAt, Option<&str>)>,
+    wall_seconds: f64,
+) -> Result<(), CoreError> {
+    let config = closed.world.config();
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let session = closed.book.session();
+    let parent = session_parent(run_dir, closed);
+    let resolved_hex = match checkpoint {
+        Some((at, None)) => {
+            let catalog = run_dir.join(CATALOG_FILE);
+            let revision = config.config_hash();
+            on_plain_thread("read checkpoint digest", move || {
+                let mut journal = CommandJournal::open(&catalog)?;
+                journal.open_run(session, revision)?;
+                Ok(journal
+                    .checkpoints()?
+                    .into_iter()
+                    .find(|entry| entry.sequence == at.sequence)
+                    .map(|entry| entry.digest.to_hex()))
+            })?
+        }
+        Some((_, Some(hex))) => Some(hex.to_owned()),
+        None => None,
+    };
+    let artifacts = session_artifacts(
+        config,
+        checkpoint.map(|(at, _)| (at, resolved_hex.as_deref())),
+    );
+    let survey = crate::observe::Survey::of(&closed.world);
+    let controllers = ControllerSummary::of(&closed.world);
+    let (status, detail) = match closed.world.fault() {
+        Some(fault) => ("failed", Some(format!("{fault:?}"))),
+        None => ("closed", None),
+    };
+    let identity = serde_json::json!({
+        "run": config.config().name,
+        "kind": if resumed { "studio-resume" } else { "studio" },
+        "session": session.get(),
+        "parent": parent,
+        "created_unix_seconds": created,
+    });
+    let hardware = serde_json::json!({
+        "host": crate::experiment::Host::current(),
+        "cpu_workers": closed.world.cpu_workers(),
+        "controllers": controllers,
+    });
+    let mut results = serde_json::json!({
+        "status": status,
+        "tick": closed.boundary.tick.get(),
+        "digest": closed.world.digest().to_hex(),
+        "extinct": survey.live == 0,
+        "live": survey.live,
+        "wall_seconds": wall_seconds,
+    });
+    if let (Some(detail), serde_json::Value::Object(map)) = (detail, &mut results) {
+        map.insert("detail".to_owned(), serde_json::Value::String(detail));
+    }
+    let manifest = build_manifest(
+        config,
+        closed.boundary.tick.get(),
+        closed.book.admitted(),
+        identity,
+        hardware,
+        results,
+        artifacts,
+    );
+    write_manifest(run_dir, &manifest, durability)
 }
 
 /// The configuration `run_dir` holds.

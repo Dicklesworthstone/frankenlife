@@ -103,7 +103,7 @@ pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{
     AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineCheckpoint,
     TimelineIntervention, TimelineProjection, TimelineRecord, TimelineRegion, TimelineStart,
-    TimelineStyle, read_timeline, replay, write_timeline_record,
+    TimelineStyle, peak_observer_bytes, read_timeline, replay, write_timeline_record,
 };
 
 /// The schema of the Studio's NDJSON records.

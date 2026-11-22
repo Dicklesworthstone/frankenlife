@@ -299,6 +299,34 @@ impl WorldView {
         Ok(true)
     }
 
+    /// Atomically refit both the drawable size and `pixels_per_point` in one
+    /// pass (avoiding redundant rebuilds and any partial mutation if either
+    /// argument is rejected). Returns `(resized, redensed)`.
+    ///
+    /// # Errors
+    /// As [`Viewport::resized`], [`Viewport::with_pixels_per_point`], and
+    /// [`Viewport::camera`]; the view is unchanged on error.
+    pub fn refit_surface(
+        &mut self,
+        drawable: [u32; 2],
+        pixels_per_point: f64,
+    ) -> Result<(bool, bool), CoreError> {
+        let resized = drawable != self.viewport.drawable();
+        let redensed = pixels_per_point.to_bits() != self.viewport.pixels_per_point().to_bits();
+        if !resized && !redensed {
+            return Ok((false, false));
+        }
+        let mut viewport = self.viewport;
+        if resized {
+            viewport = viewport.resized(drawable)?;
+        }
+        if redensed {
+            viewport = viewport.with_pixels_per_point(pixels_per_point)?;
+        }
+        self.adopt(viewport)?;
+        Ok((resized, redensed))
+    }
+
     /// Look at `viewport` (the same world): a pan, a zoom or a reset. Place
     /// the shown epoch again ([`WorldView::place`]) to draw it there.
     /// Returns whether the view changed.

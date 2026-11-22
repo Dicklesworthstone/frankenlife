@@ -377,4 +377,50 @@ fn standalone_run_resume_branch_and_transplant_write_appendix_b1_manifests() {
         transplant_rec["package"]["sha256"]
     );
     assert_eq!(m_transplant_step["results"]["tick"], 2);
+
+    // 5. Kept Studio close (`write_studio_manifest`) writes Appendix B.1
+    //    `manifest.json` with `kind = "studio"` or `"studio-resume"`, omits
+    //    unmeasured step-tally fields, preserves parent provenance, and
+    //    resolves an uncached checkpoint digest cleanly from `catalog.db`.
+    let recovered = flife_cli::recover(&branch_dir, |_| {}).expect("recovers branch");
+    let expected_ckpt = recovered.from.expect("branch has checkpoint");
+    let expected_digest = recovered.world.digest().to_hex();
+    let closed = flife_runtime::SessionClosed {
+        world: recovered.world,
+        book: recovered.book,
+        boundary: flife_runtime::Boundary {
+            tick: flife_core::Tick::new(expected_ckpt.tick),
+            epoch: flife_core::ids::ResourceEpoch::new(1),
+        },
+        render: Default::default(),
+        journal: None,
+    };
+    flife_cli::write_studio_manifest(
+        &branch_dir,
+        flife_cli::StoreDurability::ProcessCrash,
+        true,
+        &closed,
+        Some((expected_ckpt, None)),
+        1.25,
+    )
+    .expect("writes studio-resume manifest");
+    let m_studio = read_manifest(&branch_dir);
+    assert_common_groups(&m_studio, &expected_hash);
+    assert_eq!(m_studio["identity"]["kind"], "studio-resume");
+    assert_eq!(m_studio["identity"]["parent"]["kind"], "branch");
+    assert_eq!(m_studio["results"]["status"], "closed");
+    assert_eq!(m_studio["results"]["tick"], expected_ckpt.tick);
+    assert_eq!(m_studio["results"]["digest"], expected_digest);
+    assert!(
+        m_studio["results"].get("ticks_published").is_none(),
+        "studio manifest must omit unmeasured step tally fields"
+    );
+    assert_eq!(m_studio["artifacts"][1]["kind"], "checkpoint");
+    assert_eq!(m_studio["artifacts"][1]["sequence"], expected_ckpt.sequence);
+    assert!(
+        m_studio["artifacts"][1]["sha256"]
+            .as_str()
+            .is_some_and(|hex| hex.len() == 64),
+        "studio manifest must resolve uncached checkpoint sha256 from catalog.db: {m_studio}"
+    );
 }

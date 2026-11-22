@@ -328,6 +328,12 @@ pub struct Studio {
     refused_resize: Option<([u32; 2], u64)>,
     /// The run directory the session is kept in (FL-024).
     keeping: Option<Keeping>,
+    /// Newest checkpoint published or recovered for the kept run directory,
+    /// tracked across `take_statuses()` drains so `Studio::close` writes an
+    /// accurate Appendix B.1 `manifest.json`.
+    last_checkpoint: Option<(CheckpointAt, Option<String>)>,
+    /// Whether checkpointing failed (`Status::Unkept`) during this session.
+    unkept: bool,
     /// The last inspected organism and the material it converts best
     /// (FL-022): the material brush's composition while it is selected.
     material: Option<(OrganismId, Option<[f64; flife_engine::MATERIAL_CHANNELS]>)>,
@@ -533,6 +539,7 @@ impl Studio {
                 tick,
             });
         }
+        studio.last_checkpoint = from.map(|checkpoint| (checkpoint, None));
         studio.resumed = Some(Resumed {
             checkpoint: from,
             skipped,
@@ -696,6 +703,8 @@ impl Studio {
             feed_bytes,
             refused_resize: None,
             keeping,
+            last_checkpoint: None,
+            unkept: false,
             material: None,
             founder_energy: model.population.initial_energy,
             font,
@@ -873,13 +882,32 @@ impl Studio {
         let before = self.statuses.len();
         for status in self.session.statuses() {
             self.controls.follow(&status);
-            if let Status::Inspected {
-                organism,
-                snapshot: Some(snapshot),
-                ..
-            } = &status
-            {
-                self.material = Some((*organism, material_for(snapshot.traits.affinity())));
+            match &status {
+                Status::Inspected {
+                    organism,
+                    snapshot: Some(snapshot),
+                    ..
+                } => {
+                    self.material = Some((*organism, material_for(snapshot.traits.affinity())));
+                }
+                Status::Checkpointed {
+                    tick,
+                    sequence,
+                    sha256,
+                    ..
+                } => {
+                    self.last_checkpoint = Some((
+                        CheckpointAt {
+                            sequence: *sequence,
+                            tick: tick.get(),
+                        },
+                        Some(sha256.clone()),
+                    ));
+                }
+                Status::Unkept { .. } => {
+                    self.unkept = true;
+                }
+                _ => {}
             }
             self.statuses.push(status);
         }
@@ -916,28 +944,18 @@ impl Studio {
             ) {
                 Ok(required) => {
                     self.refused_resize = None;
-                    let resized = if desired_drawable != current_drawable {
-                        let resized = self.view.resize(desired_drawable)?;
-                        if resized {
-                            self.note(|| TimelineRecord::Resize {
-                                drawable: desired_drawable,
-                            });
-                        }
-                        resized
-                    } else {
-                        false
-                    };
-                    let redensed = if desired_scale.to_bits() != current_scale.to_bits() {
-                        let redensed = self.view.set_pixels_per_point(desired_scale)?;
-                        if redensed {
-                            self.note(|| TimelineRecord::Density {
-                                pixels_per_point: Exact(desired_scale),
-                            });
-                        }
-                        redensed
-                    } else {
-                        false
-                    };
+                    let (resized, redensed) =
+                        self.view.refit_surface(desired_drawable, desired_scale)?;
+                    if resized {
+                        self.note(|| TimelineRecord::Resize {
+                            drawable: desired_drawable,
+                        });
+                    }
+                    if redensed {
+                        self.note(|| TimelineRecord::Density {
+                            pixels_per_point: Exact(desired_scale),
+                        });
+                    }
                     self.memory.render = required;
                     self.memory.peak_bytes = self
                         .memory
@@ -1611,6 +1629,42 @@ impl Studio {
         drop(self.current);
         let input_dropped = self.target.input_dropped();
         let (session, statuses) = self.session.close_reporting()?;
+        for status in &statuses {
+            match status {
+                Status::Checkpointed {
+                    tick,
+                    sequence,
+                    sha256,
+                    ..
+                } => {
+                    self.last_checkpoint = Some((
+                        CheckpointAt {
+                            sequence: *sequence,
+                            tick: tick.get(),
+                        },
+                        Some(sha256.clone()),
+                    ));
+                }
+                Status::Unkept { .. } => {
+                    self.unkept = true;
+                }
+                _ => {}
+            }
+        }
+        if let Some(keeping) = &self.keeping
+            && !self.unkept
+        {
+            flife_cli::write_studio_manifest(
+                keeping.run_dir(),
+                keeping.durability(),
+                self.resumed.is_some(),
+                &session,
+                self.last_checkpoint
+                    .as_ref()
+                    .map(|(at, sha)| (*at, sha.as_deref())),
+                self.opened.elapsed().as_secs_f64(),
+            )?;
+        }
         window?;
         Ok(StudioClosed {
             session,

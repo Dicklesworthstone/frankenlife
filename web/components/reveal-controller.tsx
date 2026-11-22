@@ -2,6 +2,8 @@
 
 import { useEffect } from "react";
 
+import { isSkipped } from "@/lib/hooks";
+
 /**
  * Arms every <Reveal> on the page once: blocks already on screen stay as
  * they are, and each one below waits, hidden, until it scrolls into view.
@@ -24,8 +26,8 @@ export function RevealController() {
       { rootMargin: "0px 0px -10% 0px", threshold: 0.05 },
     );
     for (const block of blocks) {
-      // Already visible (the reader is looking at it): leave it, with no entrance.
-      if (block.getBoundingClientRect().top < window.innerHeight) {
+      // Already visible (the reader is looking at it): leave it, with no entrance. A skipped one is far below.
+      if (!isSkipped(block) && block.getBoundingClientRect().top < window.innerHeight) {
         block.classList.add("is-shown");
       } else {
         observer.observe(block);

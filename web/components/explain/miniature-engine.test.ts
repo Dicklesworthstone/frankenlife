@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 
 import { uptakeRule } from "@/components/explain/fixture-math";
 import {
+  type Brains,
   CAPACITY,
+  type Children,
   type Mode,
   PARAMETERS,
   RULES,
@@ -136,6 +138,21 @@ describe("the ledger", () => {
 });
 
 describe("determinism", () => {
+  // From the first digest (word by word, weights one float at a time), which the faster loop must still equal.
+  test("the digest is the one it has always been", () => {
+    const at = (seed: number, brains: Brains, children: Children, ticks: number, brushed: boolean) => {
+      const world = new World(seed, { brains, children });
+      if (brushed) world.brush(40, 50);
+      for (let t = 0; t < ticks; t++) world.step();
+      return world.digest();
+    };
+    expect(at(7, "own", "inherit", 0, false)).toBe("be6db711389d9054");
+    expect(at(7, "own", "inherit", 400, false)).toBe("fd9c538b1496b0cd");
+    expect(at(7, "own", "inherit", 400, true)).toBe("cd0864c0565e758a");
+    expect(at(11, "shared", "inherit", 250, false)).toBe("2104861d9c6aaef5");
+    expect(at(3, "own", "fresh", 250, false)).toBe("5881c303da658d85");
+  });
+
   test("the same seed reaches the same digest; another seed does not", () => {
     const a = new World(11, OWN);
     const b = new World(11, OWN);

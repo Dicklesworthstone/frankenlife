@@ -269,8 +269,10 @@ body::before {
 }
 
 /* <Reveal>: shown in the HTML; once <RevealController> arms the page, a block
-   below the fold waits, hidden, until it scrolls into view. */
-.reveal {
+   below the fold waits, hidden, until it scrolls into view. Only the entrance
+   is a transition: the hiding is at once, off screen, so a section skipped
+   there is never left part way through it. */
+.reveal.is-shown {
   transition:
     opacity 0.8s var(--ease-stripe) var(--reveal-delay, 0s),
     transform 0.8s var(--ease-stripe) var(--reveal-delay, 0s);
@@ -279,6 +281,33 @@ body::before {
 .reveal-armed .reveal:not(.is-shown) {
   opacity: 0;
   transform: translateY(32px);
+  transition: none;
+}
+
+/* The first view: until the page has settled, the sections below it are skipped as well, at about the height they will
+   have, so the first paint waits for nothing it does not show. The script in app/layout.tsx arms this, and
+   <SkipOffscreen> ends it by laying the sections out one at a time. */
+.first-view [data-skip] {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 1700px;
+}
+
+@media (max-width: 767px) {
+  .first-view [data-skip] {
+    contain-intrinsic-block-size: auto 2900px;
+  }
+}
+
+/* <SkipOffscreen>: a section far off screen is neither laid out nor painted, and keeps the height it had.
+   Contained from the start, as content-visibility would: text snaps to pixels within its section either way, so
+   turning the skipping on moves no line of it. */
+[data-skip] {
+  contain: layout paint style;
+}
+
+.skip-offscreen [data-skip] {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto var(--skip-height);
 }
 
 /* The hero's entrance: CSS alone, so it never waits for hydration. */
@@ -288,7 +317,8 @@ body::before {
 
 @keyframes rise-in {
   from {
-    opacity: 0;
+    /* Not 0: browsers leave text at exactly 0 out of the page's largest paint until something happens to repaint it. */
+    opacity: 0.01;
     transform: translateY(32px);
   }
   to {

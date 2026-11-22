@@ -32,7 +32,7 @@ import {
   sigmoidToy,
   tanhToy,
 } from "@/components/explain/miniature-engine";
-import { useInView, useReducedMotion } from "@/lib/hooks";
+import { isSkipped, useInView, useReducedMotion } from "@/lib/hooks";
 import { LINEAGE, TONE } from "@/lib/palette";
 import { cn, grouped } from "@/lib/utils";
 
@@ -138,11 +138,13 @@ const FIELD_LUT = (() => {
 })();
 
 /** A lit sphere in a lineage's colour, drawn once per lineage. */
-function sphereSprite(color: string, size: number): HTMLCanvasElement {
-  const sprite = document.createElement("canvas");
+function sphereSprite(color: string, size: number): CanvasImageSource {
+  // An immutable bitmap where the browser has one: a canvas is checked for changes at each of the thousand draws a frame.
+  const sprite: HTMLCanvasElement | OffscreenCanvas =
+    typeof OffscreenCanvas === "function" ? new OffscreenCanvas(size, size) : document.createElement("canvas");
   sprite.width = size;
   sprite.height = size;
-  const g = sprite.getContext("2d");
+  const g = sprite.getContext("2d") as CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null;
   if (!g) return sprite;
   const r = size / 2;
   const glow = g.createRadialGradient(r, r, r * 0.35, r, r, r);
@@ -158,16 +160,20 @@ function sphereSprite(color: string, size: number): HTMLCanvasElement {
   g.beginPath();
   g.arc(r, r, r * 0.56, 0, Math.PI * 2);
   g.fill();
-  return sprite;
+  return "transferToImageBitmap" in sprite ? sprite.transferToImageBitmap() : sprite;
 }
 
 type Ripple = { x: number; y: number; at: number };
+
+/** What the field's picture was last made from: a frame between two ticks reuses it. */
+type FieldPicture = { world: World | null; tick: number };
 
 function drawWorld(
   canvas: HTMLCanvasElement,
   fieldCanvas: HTMLCanvasElement,
   image: ImageData,
-  sprites: HTMLCanvasElement[],
+  picture: FieldPicture,
+  sprites: CanvasImageSource[],
   world: World,
   selected: number | null,
   cursor: { x: number; y: number } | null,
@@ -182,18 +188,22 @@ function drawWorld(
   const w = canvas.width;
   const cell = w / SIZE;
 
-  // The field, one pixel a cell, smoothed as it is scaled up.
-  const data = image.data;
-  const field = world.field;
-  for (let c = 0; c < field.length; c++) {
-    const v = Math.min(1, Math.sqrt((field[c] ?? 0) / 40));
-    const k = Math.round(v * 255) * 3;
-    data[c * 4] = FIELD_LUT[k] ?? 0;
-    data[c * 4 + 1] = FIELD_LUT[k + 1] ?? 0;
-    data[c * 4 + 2] = FIELD_LUT[k + 2] ?? 0;
-    data[c * 4 + 3] = 255;
+  // The field, one pixel a cell, smoothed as it is scaled up. It changes only when the world steps.
+  if (picture.world !== world || picture.tick !== world.tick) {
+    const data = image.data;
+    const field = world.field;
+    for (let c = 0; c < field.length; c++) {
+      const v = Math.min(1, Math.sqrt((field[c] ?? 0) / 40));
+      const k = Math.round(v * 255) * 3;
+      data[c * 4] = FIELD_LUT[k] ?? 0;
+      data[c * 4 + 1] = FIELD_LUT[k + 1] ?? 0;
+      data[c * 4 + 2] = FIELD_LUT[k + 2] ?? 0;
+      data[c * 4 + 3] = 255;
+    }
+    fg.putImageData(image, 0, 0);
+    picture.world = world;
+    picture.tick = world.tick;
   }
-  fg.putImageData(image, 0, 0);
   g.imageSmoothingEnabled = true;
   g.imageSmoothingQuality = "high";
   g.globalAlpha = fade;
@@ -221,7 +231,8 @@ function drawWorld(
     if (!sprite) continue;
     const e = world.energy[i] ?? 0;
     const d = cell * (1.25 + 0.9 * Math.min(1.5, Math.sqrt(e / RULES.divideAt)));
-    g.globalAlpha = focusLineage < 0 || lineage === focusLineage ? 1 : 0.28;
+    const alpha = focusLineage < 0 || lineage === focusLineage ? 1 : 0.28;
+    if (g.globalAlpha !== alpha) g.globalAlpha = alpha;
     g.drawImage(sprite, (world.x[i] ?? 0) * cell - d / 2, (world.y[i] ?? 0) * cell - d / 2, d, d);
   }
   g.globalAlpha = 1;
@@ -328,7 +339,14 @@ export function Miniature() {
   const cursor = useRef<{ x: number; y: number } | null>(null);
   const ripples = useRef<Ripple[]>([]);
   const history = useRef({ data: new Int32Array(HISTORY * LINEAGES), filled: 0, head: 0 });
-  const drawing = useRef<{ field: HTMLCanvasElement; image: ImageData; sprites: HTMLCanvasElement[] } | null>(null);
+  const drawing = useRef<{
+    field: HTMLCanvasElement;
+    image: ImageData;
+    picture: FieldPicture;
+    sprites: CanvasImageSource[];
+  } | null>(null);
+  /** Whether the history strip on the page is out of date: it changes with a sample or a resize, not with a frame. */
+  const stripDue = useRef(true);
   const dirty = useRef(true);
   const replaying = useRef(false);
 
@@ -352,6 +370,7 @@ export function Miniature() {
     h.data.set(counts, h.head * LINEAGES);
     h.head = (h.head + 1) % HISTORY;
     h.filled = Math.min(HISTORY, h.filled + 1);
+    stripDue.current = true;
   }, []);
 
   const select = useCallback((w: World, identity: number | null) => {
@@ -455,12 +474,14 @@ export function Miniature() {
       if (strip) {
         strip.width = Math.max(1, Math.round(strip.clientWidth * ratio));
         strip.height = Math.max(1, Math.round(strip.clientHeight * ratio));
+        stripDue.current = true;
       }
       // Resizing clears both canvases: paint them again now, or a paused world stays blank.
       repaint();
     };
-    fit();
-    if (typeof ResizeObserver === "undefined") return;
+    const observes = typeof ResizeObserver !== "undefined";
+    if (!observes || !isSkipped(element)) fit();
+    if (!observes) return;
     const observer = new ResizeObserver(fit);
     observer.observe(element);
     return () => observer.disconnect();
@@ -476,6 +497,7 @@ export function Miniature() {
     drawing.current = {
       field,
       image: context.createImageData(SIZE, SIZE),
+      picture: { world: null, tick: -1 },
       sprites: LINEAGE.map((color) => sphereSprite(color, 48)),
     };
     dirty.current = true;
@@ -488,9 +510,12 @@ export function Miniature() {
     if (!w || !d || !target) return;
     const slot = selectedIdentity.current !== null ? w.find(selectedIdentity.current) : -1;
     ripples.current = ripples.current.filter((ripple) => now - ripple.at < 900);
-    drawWorld(target, d.field, d.image, d.sprites, w, slot >= 0 ? slot : null, cursor.current, ripples.current, now, fade);
+    drawWorld(target, d.field, d.image, d.picture, d.sprites, w, slot >= 0 ? slot : null, cursor.current, ripples.current, now, fade);
     const strip = historyCanvas.current;
-    if (strip) drawHistory(strip, history.current.data, history.current.filled, history.current.head);
+    if (strip && stripDue.current) {
+      stripDue.current = false;
+      drawHistory(strip, history.current.data, history.current.filled, history.current.head);
+    }
   }, []);
 
   // The loop: only while playing and on screen; readouts a few times a second, never per frame.

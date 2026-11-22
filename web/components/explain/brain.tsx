@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   CATALOG,
@@ -50,7 +50,78 @@ const NODE_W = 10;
 /** The least vertical distance between two group labels. */
 const LABEL_GAP = 16;
 
+// The flow: dashes of 7 units and gaps of 9 that travel at 17.5 units a second, each line a twelfth of a second or
+// so ahead of the last. A cycle is 32 units, two whole dash patterns, so it repeats without a jump.
+const DASH: [number, number] = [7, 9];
+const FLOW_SPEED = 17.5;
+const FLOW_CYCLE = 32;
+const FLOW_LEAD = 0.12;
+const FLOW_WIDTH = 0.7;
+const FLOW_OPACITY = 0.3;
+
 type Span = { from: number; to: number };
+type Line = { x1: number; y1: number; x2: number; y2: number };
+
+/**
+ * The flowing connections, as a canvas laid exactly over the drawing's lines. 138 dash animations in the drawing
+ * itself restyle and repaint all of it on every frame; here a frame is 138 strokes.
+ */
+function Flow({ lines, viewW, colour }: { lines: Line[]; viewW: number; colour: string }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const canvas = ref.current;
+    const context = canvas?.getContext("2d");
+    if (!canvas || !context) return;
+    const box = canvas.parentElement;
+    if (!box) return;
+    let scale = 1;
+    const paint = (now: number) => {
+      // Timed from the clock, not from this effect, so a change of colour or size never moves the dashes.
+      const seconds = now / 1000;
+      context.setTransform(1, 0, 0, 1, 0, 0);
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.setTransform(scale, 0, 0, scale, 0, 0);
+      context.setLineDash(DASH);
+      context.lineWidth = FLOW_WIDTH;
+      context.globalAlpha = FLOW_OPACITY;
+      context.strokeStyle = colour;
+      for (let index = 0; index < lines.length; index++) {
+        const line = lines[index]!;
+        context.lineDashOffset = -((FLOW_SPEED * (seconds + (index % 13) * FLOW_LEAD)) % FLOW_CYCLE);
+        context.beginPath();
+        context.moveTo(line.x1, line.y1);
+        context.lineTo(line.x2, line.y2);
+        context.stroke();
+      }
+    };
+    /** Whole device pixels, shown at exactly their size, so the lines are never resampled. */
+    const fit = () => {
+      const ratio = window.devicePixelRatio || 1;
+      const { width, height } = box.getBoundingClientRect();
+      canvas.width = Math.max(1, Math.ceil(width * ratio));
+      canvas.height = Math.max(1, Math.ceil(height * ratio));
+      canvas.style.width = `${canvas.width / ratio}px`;
+      canvas.style.height = `${canvas.height / ratio}px`;
+      scale = (width * ratio) / viewW;
+      // Resizing clears it: paint now, not on the next frame.
+      paint(performance.now());
+    };
+    fit();
+    let handle = 0;
+    const loop = (now: number) => {
+      paint(now);
+      handle = requestAnimationFrame(loop);
+    };
+    handle = requestAnimationFrame(loop);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
+    observer?.observe(box);
+    return () => {
+      cancelAnimationFrame(handle);
+      observer?.disconnect();
+    };
+  }, [lines, viewW, colour]);
+  return <canvas ref={ref} aria-hidden="true" className="pointer-events-none absolute top-0 left-0 max-w-none" />;
+}
 
 /** A layer of `width` nodes, centred: each node's pitch, at most 12 units. */
 function layerSpan(width: number): Span {
@@ -233,19 +304,9 @@ export function BrainAnatomy() {
           />
         </div>
 
-        <div ref={box} className="mx-auto w-full max-w-[52rem]">
-          <svg
-            viewBox={`0 0 ${viewW} ${VIEW_H}`}
-            className="diagram block h-auto w-full"
-            role="img"
-            aria-label={`The controller network ${shape(topology)}, ${grouped(parameters)} parameters. Inputs: energy, 32 composition values, 33 x gradients, 33 y gradients and five inputs about the organism itself. Outputs: reproduction rate, child share, emission gate, 32-dimensional emission direction and emission spending.`}
-          >
-            <style>{`
-              @keyframes brain-flow { to { stroke-dashoffset: -28; } }
-              .brain-line { stroke-dasharray: 7 9; }
-              .brain-flowing .brain-line { animation: brain-flow 1.6s linear infinite; }
-            `}</style>
-
+        <div ref={box} className="relative mx-auto w-full max-w-[52rem]">
+          {/* Under the figure, and in its box: the bands, and the connections at rest. */}
+          <svg aria-hidden="true" viewBox={`0 0 ${viewW} ${VIEW_H}`} className="absolute inset-0 h-full w-full">
             {/* The dense bands between layers. */}
             {columns.slice(0, -1).map((_, band) => (
               <path
@@ -257,22 +318,27 @@ export function BrainAnatomy() {
               />
             ))}
 
-            {/* A sample of the connections, flowing left to right while on screen. */}
-            <g className={cn(flowing && "brain-flowing")} stroke={active ? activeColour : "#4ade80"} strokeOpacity={0.3}>
+            {/* A sample of the connections, as they are drawn where nothing flows. */}
+            <g
+              stroke={active ? activeColour : "#4ade80"}
+              strokeOpacity={FLOW_OPACITY}
+              strokeWidth={FLOW_WIDTH}
+              strokeDasharray={DASH.join(" ")}
+              style={flowing ? { display: "none" } : undefined}
+            >
               {lines.map((line, index) => (
-                <line
-                  key={index}
-                  className="brain-line"
-                  x1={line.x1}
-                  y1={line.y1}
-                  x2={line.x2}
-                  y2={line.y2}
-                  strokeWidth={0.7}
-                  style={{ animationDelay: `${-(index % 13) * 0.12}s` }}
-                />
+                <line key={index} x1={line.x1} y1={line.y1} x2={line.x2} y2={line.y2} />
               ))}
             </g>
-
+          </svg>
+          {/* The same connections, flowing left to right while on screen. */}
+          {flowing ? <Flow lines={lines} viewW={viewW} colour={active ? activeColour : "#4ade80"} /> : null}
+          <svg
+            viewBox={`0 0 ${viewW} ${VIEW_H}`}
+            className="diagram relative block h-auto w-full"
+            role="img"
+            aria-label={`The controller network ${shape(topology)}, ${grouped(parameters)} parameters. Inputs: energy, 32 composition values, 33 x gradients, 33 y gradients and five inputs about the organism itself. Outputs: reproduction rate, child share, emission gate, 32-dimensional emission direction and emission spending.`}
+          >
             {/* Hidden layers: tanh neurons. */}
             {columns.slice(1, -1).map((column, index) => (
               <g key={`hidden-${index}`}>

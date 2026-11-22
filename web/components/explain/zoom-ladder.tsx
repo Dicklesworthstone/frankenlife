@@ -3,8 +3,10 @@
 import { ChevronLeft, ChevronRight, MousePointer2 } from "lucide-react";
 import {
   type KeyboardEvent,
+  memo,
   type PointerEvent,
   type ReactNode,
+  type Ref,
   useCallback,
   useEffect,
   useMemo,
@@ -430,6 +432,80 @@ function changedCells(): { x: number; y: number }[] {
   return cells;
 }
 
+/** The network of one organism: 1,239 elements, the same at every step, so it is drawn once and never reconciled. */
+const Network = memo(function Network() {
+  const net = useMemo(network, []);
+  return (
+    <svg viewBox="0 0 600 620" className="h-full w-full">
+      <defs>
+        <radialGradient id="zoom-ladder-body" cx="0.5" cy="0.5" r="0.5">
+          <stop offset="0" stopColor={PICKED} stopOpacity="0.16" />
+          <stop offset="0.7" stopColor={PICKED} stopOpacity="0.06" />
+          <stop offset="1" stopColor={PICKED} stopOpacity="0" />
+        </radialGradient>
+      </defs>
+      <circle cx="300" cy="312" r="292" fill="url(#zoom-ladder-body)" />
+      <circle cx="300" cy="312" r="288" fill="none" stroke={PICKED} strokeOpacity="0.35" strokeWidth="1.5" />
+      <g strokeWidth="0.7">
+        {net.edges.map((edge, index) => (
+          <line
+            key={index}
+            x1={edge.x1}
+            y1={edge.y1}
+            x2={edge.x2}
+            y2={edge.y2}
+            stroke={edge.w < 0 ? "#67e8f9" : "#fbbf24"}
+            strokeOpacity={0.06 + 0.3 * Math.abs(edge.w)}
+          />
+        ))}
+      </g>
+      {net.dots.map((dot, index) => (
+        <circle key={index} cx={dot.x} cy={dot.y} r={dot.r} fill={dot.colour} />
+      ))}
+      {net.labels.map((label) => (
+        <text
+          key={label.text}
+          x={label.x}
+          y={label.y + 5}
+          textAnchor={label.anchor}
+          fontSize="17"
+          fill={label.colour}
+          className="font-mono @max-md:text-[22px]"
+        >
+          {label.text}
+        </text>
+      ))}
+      {NET.columns.map((x, index) => (
+        <text key={x} x={x} y="42" textAnchor="middle" fontSize="19" fill="#e2e8f0" className="font-mono @max-md:text-[23px]">
+          {SHAPE[index]}
+        </text>
+      ))}
+    </svg>
+  );
+});
+
+/** The cells a child's copy would change; `groupRef` is the group the stage fades in. */
+const Changed = memo(function Changed({ groupRef }: { groupRef: Ref<SVGGElement> }) {
+  const changed = useMemo(changedCells, []);
+  return (
+    // One glow for them all: a filter on each cell is a blur on each cell, again at every step of the fade.
+    <g ref={groupRef} style={{ opacity: 0, visibility: "hidden", filter: "drop-shadow(0 0 6px rgba(255,255,255,0.9))" }}>
+      {changed.map((cell, index) => (
+        <rect
+          key={index}
+          x={cell.x - 2}
+          y={cell.y - 2}
+          width={CELL + 3}
+          height={CELL + 3}
+          fill="#ffffff"
+          stroke="#ffffff"
+          strokeWidth="2"
+        />
+      ))}
+    </g>
+  );
+});
+
 // ─── The component ────────────────────────────────────────────────────────────
 
 /** `index` is the section's number in its chapter ("01.1"), shown as every section shows its own. */
@@ -466,15 +542,38 @@ export function ZoomLadder({ index }: { index?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawn = useRef(false);
 
-  const net = useMemo(network, []);
-  const changed = useMemo(changedCells, []);
   const mosaicBlocks = useMemo(blocks, []);
+
+  // The network starts hidden: it is mounted once the page has loaded and the browser is idle, or when the ladder comes
+  // near, whichever is first.
+  const [met, setMet] = useState(false);
+  useEffect(() => {
+    if (met) return;
+    if (near || typeof requestIdleCallback !== "function") {
+      setMet(true);
+      return;
+    }
+    let idle = 0;
+    const whenIdle = () => {
+      idle = requestIdleCallback(() => setMet(true), { timeout: 3000 });
+    };
+    if (document.readyState === "complete") whenIdle();
+    else window.addEventListener("load", whenIdle, { once: true });
+    return () => {
+      window.removeEventListener("load", whenIdle);
+      if (idle) cancelIdleCallback(idle);
+    };
+  }, [near, met]);
 
   /** Writes every layer's transform and every readout for progress `p`, without a React render. */
   const apply = useCallback((p: number) => {
     progress.current = p;
     const frame = frameAt(p);
     const { view } = frame;
+    /** Writes only a change: a text set again is laid out again. */
+    const text = (element: HTMLElement | null, value: string) => {
+      if (element && element.textContent !== value) element.textContent = value;
+    };
     const set = (element: HTMLElement | SVGElement | null, opacity: number, transform?: string) => {
       if (!element) return;
       element.style.opacity = String(opacity);
@@ -493,7 +592,9 @@ export function ZoomLadder({ index }: { index?: string }) {
     set(diagramRef.current, frame.diagram);
 
     const reticle = reticleRef.current;
-    if (reticle) {
+    if (reticle && frame.reticle <= 0.001) {
+      set(reticle, 0);
+    } else if (reticle) {
       const x = ((OX - (view.cx - view.span / 2)) / view.span) * 1000;
       const y = ((OY - (view.cy - view.span / 2)) / view.span) * 1000;
       const r = Math.max(14, (BODY / 2 / view.span) * 1000 * 2.1);
@@ -512,21 +613,22 @@ export function ZoomLadder({ index }: { index?: string }) {
 
     const first = p < 0.75;
     const live = first ? LIVE_POSTER : LIVE_CARD;
-    if (tickRef.current) {
-      tickRef.current.textContent = first
+    text(
+      tickRef.current,
+      first
         ? `tick ${grouped(POSTER.tick)} · frame ${film.poster.frame}`
-        : `tick ${grouped(CARD.tick)} · frame ${film.social.frame}`;
-    }
-    if (zoomRef.current) zoomRef.current.textContent = `×${fmt(TORUS / view.span, TORUS / view.span < 10 ? 1 : 0)}`;
-    if (spanRef.current) spanRef.current.textContent = `${fmt(view.span, view.span < 10 ? 1 : 0)} × ${fmt(view.span, view.span < 10 ? 1 : 0)} units`;
-    if (countRef.current) {
-      countRef.current.textContent =
-        view.span >= TORUS - 1e-6 ? `${grouped(live)} alive` : `≈ ${grouped(roughly(inView(live, view.span)))} in view`;
-    }
+        : `tick ${grouped(CARD.tick)} · frame ${film.social.frame}`,
+    );
+    text(zoomRef.current, `×${fmt(TORUS / view.span, TORUS / view.span < 10 ? 1 : 0)}`);
+    text(spanRef.current, `${fmt(view.span, view.span < 10 ? 1 : 0)} × ${fmt(view.span, view.span < 10 ? 1 : 0)} units`);
+    text(
+      countRef.current,
+      view.span >= TORUS - 1e-6 ? `${grouped(live)} alive` : `≈ ${grouped(roughly(inView(live, view.span)))} in view`,
+    );
     const length = scaleBar(view.span, 0.28);
     // In the stage's width (cqw; the stage is the container), which is what `view.span` spans.
     if (barRef.current) barRef.current.style.width = `${(length / view.span) * 100}cqw`;
-    if (barLabelRef.current) barLabelRef.current.textContent = length === BODY ? `${length} units · one body` : `${length} unit${length === 1 ? "" : "s"}`;
+    text(barLabelRef.current, length === BODY ? `${length} units · one body` : `${length} unit${length === 1 ? "" : "s"}`);
     if (railRef.current) railRef.current.style.transform = `scaleX(${p / LAST})`;
 
     const basis: Basis = frame.network + frame.mosaic > frame.poster + frame.card ? "diagram" : "render";
@@ -696,7 +798,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                 onKeyDown={onKeyDown}
                 onPointerDown={onPointerDown}
                 onPointerUp={onPointerUp}
-                className="@container relative aspect-square w-full touch-pan-y overflow-hidden rounded-[1.75rem] border border-white/10 bg-black shadow-[0_0_90px_-30px_rgba(74,222,128,0.35)] select-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none lg:mx-auto lg:w-[min(100%,calc(100svh-8.5rem),46rem)]"
+                className="@container relative aspect-square w-full touch-pan-y overflow-hidden contain-strict rounded-[1.75rem] border border-white/10 bg-black shadow-[0_0_90px_-30px_rgba(74,222,128,0.35)] select-none focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none lg:mx-auto lg:w-[min(100%,calc(100svh-8.5rem),46rem)]"
               >
                 {/* Real pixels: the poster, then the card. Each is the stage's width and placed on the torus by transform. */}
                 {/* eslint-disable-next-line @next/next/no-img-element -- a static export; the manifest names the file */}
@@ -747,51 +849,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                   className="pointer-events-none absolute inset-x-[5%] top-[7%] bottom-[11%] will-change-transform @max-md:top-[12%]"
                   style={{ opacity: 0, visibility: "hidden", transform: "scale(0.22)" }}
                 >
-                  <svg viewBox="0 0 600 620" className="h-full w-full">
-                    <defs>
-                      <radialGradient id="zoom-ladder-body" cx="0.5" cy="0.5" r="0.5">
-                        <stop offset="0" stopColor={PICKED} stopOpacity="0.16" />
-                        <stop offset="0.7" stopColor={PICKED} stopOpacity="0.06" />
-                        <stop offset="1" stopColor={PICKED} stopOpacity="0" />
-                      </radialGradient>
-                    </defs>
-                    <circle cx="300" cy="312" r="292" fill="url(#zoom-ladder-body)" />
-                    <circle cx="300" cy="312" r="288" fill="none" stroke={PICKED} strokeOpacity="0.35" strokeWidth="1.5" />
-                    <g strokeWidth="0.7">
-                      {net.edges.map((edge, index) => (
-                        <line
-                          key={index}
-                          x1={edge.x1}
-                          y1={edge.y1}
-                          x2={edge.x2}
-                          y2={edge.y2}
-                          stroke={edge.w < 0 ? "#67e8f9" : "#fbbf24"}
-                          strokeOpacity={0.06 + 0.3 * Math.abs(edge.w)}
-                        />
-                      ))}
-                    </g>
-                    {net.dots.map((dot, index) => (
-                      <circle key={index} cx={dot.x} cy={dot.y} r={dot.r} fill={dot.colour} />
-                    ))}
-                    {net.labels.map((label) => (
-                      <text
-                        key={label.text}
-                        x={label.x}
-                        y={label.y + 5}
-                        textAnchor={label.anchor}
-                        fontSize="17"
-                        fill={label.colour}
-                        className="font-mono @max-md:text-[22px]"
-                      >
-                        {label.text}
-                      </text>
-                    ))}
-                    {NET.columns.map((x, index) => (
-                      <text key={x} x={x} y="42" textAnchor="middle" fontSize="19" fill="#e2e8f0" className="font-mono @max-md:text-[23px]">
-                        {SHAPE[index]}
-                      </text>
-                    ))}
-                  </svg>
+                  {met ? <Network /> : null}
                 </div>
 
                 {/* Its numbers. */}
@@ -803,21 +861,7 @@ export function ZoomLadder({ index }: { index?: string }) {
                 >
                   <canvas ref={canvasRef} width={MOSAIC_W} height={MOSAIC_H} className="h-full w-full object-contain" />
                   <svg viewBox={`0 0 ${MOSAIC_W} ${MOSAIC_H}`} className="absolute inset-0 h-full w-full">
-                    <g ref={changedRef} style={{ opacity: 0, visibility: "hidden" }}>
-                      {changed.map((cell, index) => (
-                        <rect
-                          key={index}
-                          x={cell.x - 2}
-                          y={cell.y - 2}
-                          width={CELL + 3}
-                          height={CELL + 3}
-                          fill="#ffffff"
-                          stroke="#ffffff"
-                          strokeWidth="2"
-                          style={{ filter: "drop-shadow(0 0 6px rgba(255,255,255,0.9))" }}
-                        />
-                      ))}
-                    </g>
+                    <Changed groupRef={changedRef} />
                     {mosaicBlocks.map((block) => (
                       <text
                         key={block.label}

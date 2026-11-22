@@ -383,7 +383,9 @@ export function UptakeFigure({
         {title}
       </p>
       <div ref={ref}>
-        <svg viewBox={`0 0 ${across} ${height}`} className="diagram block h-auto w-full" role="img" aria-label={label}>
+        {/* Its height is set, not scaled from the width: before it is measured, it would be a hundred pixels taller, and a
+            link to anything below would land that far off. */}
+        <svg viewBox={`0 0 ${across} ${height}`} className="diagram block w-full" style={{ height }} role="img" aria-label={label}>
           <defs>
             <pattern id={`hatch-${tone}`} width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
               <line x1="0" y1="0" x2="0" y2="6" stroke={TONE.wrong} strokeWidth="2" />

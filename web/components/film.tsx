@@ -1,7 +1,7 @@
 "use client";
 
 import { Pause, Play } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { type Ref, useCallback, useEffect, useRef, useState } from "react";
 
 import { Reticle } from "@/components/franken";
 import { controls, film } from "@/lib/media";
@@ -15,9 +15,12 @@ const secondsPerTick = world.timestep[0] / world.timestep[1];
 // flife render's own words for the colours, up to its colon: "founder lineage".
 const colour = render.meaning.split(":")[0]?.trim() || render.mapping;
 
-/** The frame shown at `time` seconds into the video. */
-function frameAt(time: number): number {
-  return Math.min(last, Math.max(0, Math.floor(time * video.fps + 1e-6)));
+/**
+ * The frame shown at `time` seconds into the video. A frame's own time reaches the page in whole microseconds (the
+ * second frame's as 0.033333), just short of the frame when rounded down, so a thousandth of a frame is allowed.
+ */
+export function frameAt(time: number): number {
+  return Math.min(last, Math.max(0, Math.floor(time * video.fps + 1e-3)));
 }
 
 type Shot = { from: number; to: number; label: string; hold: boolean };
@@ -42,16 +45,103 @@ const SHOTS: Shot[] = (() => {
 })();
 const span = world.to.tick - world.from.tick || 1;
 const position = (tick: number) => `${((tick - world.from.tick) / span) * 100}%`;
+const HOLDS = SHOTS.filter((shot) => shot.hold);
+const HOLD_NOW = "absolute inset-y-0 rounded-full bg-green-300/80";
+const HOLD_THEN = "absolute inset-y-0 rounded-full bg-green-500/35";
+
+/** What the readout says of frame `frame`, each from flife render's own record of it. */
+function readings(frame: number) {
+  const tick = world.ticks[frame] ?? world.from.tick;
+  const zoom = render.zoom?.[frame] ?? 1;
+  // A scale bar in world units: the view spans torus / zoom units across the frame.
+  const barUnits = zoom >= 2 ? 5 : 10;
+  return {
+    tick,
+    tickText: grouped(tick),
+    simulated: `+${((tick - world.from.tick) * secondsPerTick).toFixed(1)} s`,
+    live: grouped(world.live[frame] ?? 0),
+    view: zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`,
+    barWidth: `${(barUnits * zoom * 100) / torusWidth}cqw`,
+    barText: `${barUnits} world units`,
+    elapsed: (tick - world.from.tick) / span,
+    described: `tick ${grouped(tick)}, ${zoom < 1.05 ? "the whole torus" : `zoom ${zoom.toFixed(1)}`}`,
+  };
+}
+const FIRST = readings(0);
+
+/** The live dot's opacity at `now`: 1 to 0.35 and back every 2.2 s, eased at both ends, as `.pulse-dot` does it. */
+function pulse(now: number): number {
+  return 0.675 + 0.325 * Math.cos((2 * Math.PI * now) / 2200);
+}
+
+/** How often the seek control's own value follows the film; nothing on screen reads it. */
+const SEEK_EVERY_MS = 250;
 
 /**
  * The rendered world, with a readout of the frame on screen: its committed
  * tick, the simulated time since the film's first frame and the organisms
  * alive, each from flife render's own record of that frame.
+ *
+ * The readout changes with every frame, so it is written to the page directly
+ * (`show`), never through a React render: React only ever renders frame 0.
  */
 export function Film({ className, feather = false }: { className?: string; feather?: boolean }) {
   const ref = useRef<HTMLVideoElement>(null);
-  const [frame, setFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
+  // Whether the film's own frames drive the readout and the live dot (`requestVideoFrameCallback`).
+  const [perFrame, setPerFrame] = useState(false);
+
+  const shown = useRef(0);
+  const dotRef = useRef<HTMLSpanElement>(null);
+  const tickRef = useRef<HTMLElement>(null);
+  const simulatedRef = useRef<HTMLElement>(null);
+  const liveRef = useRef<HTMLElement>(null);
+  const viewRef = useRef<HTMLElement>(null);
+  const barRef = useRef<HTMLSpanElement>(null);
+  const barTextRef = useRef<HTMLSpanElement>(null);
+  const elapsedRef = useRef<HTMLSpanElement>(null);
+  const markerRef = useRef<HTMLSpanElement>(null);
+  const holdRefs = useRef<(HTMLSpanElement | null)[]>([]);
+  const seekRef = useRef<HTMLInputElement>(null);
+  const seekAt = useRef(0);
+
+  /** Bring the seek control up to the frame on screen: late while the film plays, at once before it is used. */
+  const syncSeek = useCallback(() => {
+    const input = seekRef.current;
+    if (!input) return;
+    seekAt.current = performance.now();
+    const value = String(shown.current);
+    if (input.value !== value) input.value = value;
+    input.setAttribute("aria-valuetext", readings(shown.current).described);
+  }, []);
+
+  /** Write frame `frame`'s record on the page, changing only what differs. */
+  const show = useCallback(
+    (frame: number, seekNow = false) => {
+      if (frame !== shown.current) {
+        shown.current = frame;
+        const now = readings(frame);
+        const text = (element: HTMLElement | null, value: string) => {
+          if (element && element.textContent !== value) element.textContent = value;
+        };
+        text(tickRef.current, now.tickText);
+        text(simulatedRef.current, now.simulated);
+        text(liveRef.current, now.live);
+        text(viewRef.current, now.view);
+        text(barTextRef.current, now.barText);
+        if (barRef.current && barRef.current.style.width !== now.barWidth) barRef.current.style.width = now.barWidth;
+        if (elapsedRef.current) elapsedRef.current.style.transform = `scaleX(${now.elapsed})`;
+        if (markerRef.current) markerRef.current.style.transform = `translateX(${now.elapsed * 100}%)`;
+        HOLDS.forEach((shot, index) => {
+          const element = holdRefs.current[index];
+          const name = now.tick >= shot.from && now.tick <= shot.to ? HOLD_NOW : HOLD_THEN;
+          if (element && element.className !== name) element.className = name;
+        });
+      }
+      if (seekNow || performance.now() - seekAt.current > SEEK_EVERY_MS) syncSeek();
+    },
+    [syncSeek],
+  );
 
   useEffect(() => {
     const element = ref.current;
@@ -66,14 +156,16 @@ export function Film({ className, feather = false }: { className?: string; feath
     }
     let handle = 0;
     let stopped = false;
-    // React skips the render when the frame is the one already shown.
-    const show = (time: number) => setFrame(frameAt(time));
+    const dot = dotRef.current;
     // Older Safari and Firefox have no per-frame callback; `timeupdate` is coarser but correct.
-    const perFrame =
+    const supported =
       typeof (element as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback === "function";
-    if (perFrame) {
-      const onFrame = (_now: number, metadata: VideoFrameCallbackMetadata) => {
-        show(metadata.mediaTime);
+    if (supported) {
+      setPerFrame(true);
+      const onFrame = (now: number, metadata: VideoFrameCallbackMetadata) => {
+        show(frameAt(metadata.mediaTime), element.paused);
+        // On the film's frames, not a CSS animation of its own: that would redraw the film at the display's rate.
+        if (dot && !still && !element.paused) dot.style.opacity = pulse(now).toFixed(3);
         if (!stopped) handle = element.requestVideoFrameCallback(onFrame);
       };
       handle = element.requestVideoFrameCallback(onFrame);
@@ -82,10 +174,10 @@ export function Film({ className, feather = false }: { className?: string; feath
         element.cancelVideoFrameCallback(handle);
       };
     }
-    const onTime = () => show(element.currentTime);
+    const onTime = () => show(frameAt(element.currentTime));
     element.addEventListener("timeupdate", onTime);
     return () => element.removeEventListener("timeupdate", onTime);
-  }, []);
+  }, [show]);
 
   // Off screen the film pauses, so it decodes and redraws nothing while the reader is elsewhere; it plays on
   // when it comes back, but only if it was playing when it left (a reader's own pause stays).
@@ -124,19 +216,10 @@ export function Film({ className, feather = false }: { className?: string; feath
   const seek = (target: number) => {
     const element = ref.current;
     const clamped = Math.min(last, Math.max(0, target));
-    setFrame(clamped);
+    show(clamped, true);
     // The middle of the frame's interval, so rounding never lands on its neighbour.
     if (element) element.currentTime = (clamped + 0.5) / video.fps;
   };
-
-  const tick = world.ticks[frame] ?? world.from.tick;
-  const live = world.live[frame] ?? 0;
-  const simulated = (tick - world.from.tick) * secondsPerTick;
-  const zoom = render.zoom?.[frame] ?? 1;
-
-  // A scale bar in world units: the view spans torus / zoom units across the frame.
-  const barUnits = zoom >= 2 ? 5 : 10;
-  const barPercent = (barUnits * zoom * 100) / torusWidth;
 
   return (
     <figure className={cn("relative", className)}>
@@ -154,7 +237,11 @@ export function Film({ className, feather = false }: { className?: string; feath
           playsInline
           preload="metadata"
           onPlay={() => setPlaying(true)}
-          onPause={() => setPlaying(false)}
+          onPause={() => {
+            setPlaying(false);
+            syncSeek();
+            if (dotRef.current) dotRef.current.style.opacity = "";
+          }}
           aria-label={`The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour}${render.field_mapping === "none" ? "" : ` over the field's ${render.field_mapping}`}`}
         />
         <Reticle inset={14} size={18} />
@@ -162,8 +249,9 @@ export function Film({ className, feather = false }: { className?: string; feath
         {/* What this is, on its face. */}
         <div className="pointer-events-none absolute top-4 left-4 z-10 flex items-center gap-2 rounded-full border border-white/10 bg-black/60 px-3 py-1.5 backdrop-blur-md sm:top-5 sm:left-5">
           <span
+            ref={dotRef}
             aria-hidden="true"
-            className={cn("h-1.5 w-1.5 rounded-full bg-green-400", playing && "pulse-dot")}
+            className={cn("h-1.5 w-1.5 rounded-full bg-green-400", playing && !perFrame && "pulse-dot")}
           />
           <span className="font-mono text-[10px] font-medium tracking-[0.16em] text-green-200 uppercase">
             Rendered by flife · not drawn
@@ -182,15 +270,17 @@ export function Film({ className, feather = false }: { className?: string; feath
         <div className="absolute inset-x-0 bottom-0 z-10 bg-gradient-to-t from-black via-black/70 to-transparent px-4 pt-28 pb-3 sm:px-6 sm:pb-4">
           <div className="pointer-events-none flex items-end justify-between gap-4">
             <dl className="grid flex-1 grid-cols-4 gap-2 font-mono text-white sm:gap-4">
-              <Readout label="Tick" value={grouped(tick)} />
-              <Readout label="Sim time" value={`+${simulated.toFixed(1)} s`} />
-              <Readout label="Alive" value={grouped(live)} />
-              <Readout label="View" value={zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`} />
+              <Readout label="Tick" value={FIRST.tickText} valueRef={tickRef} />
+              <Readout label="Sim time" value={FIRST.simulated} valueRef={simulatedRef} />
+              <Readout label="Alive" value={FIRST.live} valueRef={liveRef} />
+              <Readout label="View" value={FIRST.view} valueRef={viewRef} />
             </dl>
           </div>
           <div className="pointer-events-none mt-3 flex items-center gap-3" aria-hidden="true">
-            <span className="relative h-2 shrink-0 border-x border-b border-white/70" style={{ width: `${barPercent}cqw` }} />
-            <span className="font-mono text-[10px] text-slate-300">{barUnits} world units</span>
+            <span ref={barRef} className="relative h-2 shrink-0 border-x border-b border-white/70" style={{ width: FIRST.barWidth }} />
+            <span ref={barTextRef} className="font-mono text-[10px] text-slate-300">
+              {FIRST.barText}
+            </span>
             <span className="ml-auto hidden font-mono text-[10px] text-slate-400 sm:inline">
               {grouped(world.founders)} founders · {world.grid[0]}² field · colour = {colour}
             </span>
@@ -198,16 +288,20 @@ export function Film({ className, feather = false }: { className?: string; feath
           <div className="relative mt-3 h-8 rounded-md has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-green-400/70">
             <div className="absolute inset-x-0 top-1 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
               {/* Elapsed first, the shots over it, so a hold stays readable once played. */}
-              <span aria-hidden="true" className="absolute inset-y-0 left-0 bg-green-400/25" style={{ width: position(tick) }} />
-              {SHOTS.filter((shot) => shot.hold).map((shot) => (
+              <span
+                ref={elapsedRef}
+                aria-hidden="true"
+                className="absolute inset-0 origin-left bg-green-400/25"
+                style={{ transform: `scaleX(${FIRST.elapsed})` }}
+              />
+              {HOLDS.map((shot, index) => (
                 <span
                   key={shot.from}
+                  ref={(element) => {
+                    holdRefs.current[index] = element;
+                  }}
                   aria-hidden="true"
-                  className={
-                    tick >= shot.from && tick <= shot.to
-                      ? "absolute inset-y-0 rounded-full bg-green-300/80"
-                      : "absolute inset-y-0 rounded-full bg-green-500/35"
-                  }
+                  className={FIRST.tick >= shot.from && FIRST.tick <= shot.to ? HOLD_NOW : HOLD_THEN}
                   style={{
                     left: position(shot.from),
                     width: `calc(${position(shot.to)} - ${position(shot.from)} - 2px)`,
@@ -216,12 +310,16 @@ export function Film({ className, feather = false }: { className?: string; feath
                 />
               ))}
             </div>
+            {/* As wide as the axis, so its shift in percent of itself is the film's share of the axis. */}
             <span
+              ref={markerRef}
               aria-hidden="true"
-              className="pointer-events-none absolute top-0 h-3.5 w-[3px] -translate-x-1/2 rounded-full bg-green-200 shadow-[0_0_10px_rgba(134,239,172,0.9)]"
-              style={{ left: position(tick) }}
-            />
-            {SHOTS.filter((shot) => shot.hold).map((shot) => (
+              className="pointer-events-none absolute inset-x-0 top-0 h-3.5"
+              style={{ transform: `translateX(${FIRST.elapsed * 100}%)` }}
+            >
+              <span className="absolute top-0 left-0 h-3.5 w-[3px] -translate-x-1/2 rounded-full bg-green-200 shadow-[0_0_10px_rgba(134,239,172,0.9)]" />
+            </span>
+            {HOLDS.map((shot) => (
               <span
                 key={`label-${shot.from}`}
                 aria-hidden="true"
@@ -232,14 +330,18 @@ export function Film({ className, feather = false }: { className?: string; feath
               </span>
             ))}
             <input
+              ref={seekRef}
               type="range"
               min={0}
               max={last}
               step={1}
-              value={frame}
+              defaultValue={0}
+              onFocus={syncSeek}
+              onPointerDown={syncSeek}
+              onKeyDown={syncSeek}
               onChange={(event) => seek(Number(event.target.value))}
               aria-label="Seek the film by tick"
-              aria-valuetext={`tick ${grouped(tick)}, ${zoom < 1.05 ? "the whole torus" : `zoom ${zoom.toFixed(1)}`}`}
+              aria-valuetext={FIRST.described}
               className="absolute inset-x-0 -top-2 h-8 w-full cursor-pointer opacity-0"
             />
           </div>
@@ -249,11 +351,14 @@ export function Film({ className, feather = false }: { className?: string; feath
   );
 }
 
-function Readout({ label, value }: { label: string; value: string }) {
+/** `valueRef`'s text is rewritten every frame: its box is sized without it (one line), so a new value lays out nothing else. */
+function Readout({ label, value, valueRef }: { label: string; value: string; valueRef: Ref<HTMLElement> }) {
   return (
     <div className="min-w-0">
       <dt className="truncate text-[9px] font-semibold tracking-[0.2em] text-green-200 uppercase [text-shadow:0_1px_6px_rgba(0,0,0,0.9)]">{label}</dt>
-      <dd className="truncate text-[13px] tabular-nums sm:text-base">{value}</dd>
+      <dd ref={valueRef} className="h-[20.8px] truncate text-[13px] tabular-nums contain-strict sm:h-6 sm:text-base">
+        {value}
+      </dd>
     </div>
   );
 }

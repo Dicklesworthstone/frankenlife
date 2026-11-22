@@ -32,6 +32,7 @@ import { RevealController } from "@/components/reveal-controller";
 import { SEED_TONES, SeedStrips } from "@/components/seed-strip";
 import { ChapterBlock, Section } from "@/components/section";
 import { SiteHeader } from "@/components/site-header";
+import { SkipOffscreen } from "@/components/skip-offscreen";
 import {
   branchObservation,
   type Chapter,
@@ -111,6 +112,7 @@ export default function Home() {
     <>
       <SiteHeader />
       <RevealController />
+      <SkipOffscreen />
       <main id="main" className="relative isolate">
         <span id="top" aria-hidden="true" className="absolute top-0" />
 

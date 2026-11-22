@@ -716,44 +716,52 @@ export class World {
 
   /** A 64-bit digest of the whole state (tick, field, every organism and its weights), as 16 hex digits. */
   digest(): string {
-    let a = 0x811c9dc5 ^ this.seed;
-    let b = 0x01000193 ^ Math.imul(this.seed, 0x9e3779b1);
-    const mix = (word: number) => {
-      a = Math.imul(a ^ word, 0x01000193);
-      b = Math.imul((b ^ word) + 0x7f4a7c15, 0x85ebca77);
-      b ^= b >>> 13;
-    };
-    const bits = new Float64Array(1);
-    const words = new Uint32Array(bits.buffer);
-    const mixFloat = (value: number) => {
-      bits[0] = value;
-      mix(words[0] ?? 0);
-      mix(words[1] ?? 0);
-    };
-    mix(this.tick);
-    mix(this.count);
-    mix(this.mode.brains === "own" ? 1 : 2);
-    mix(this.mode.children === "inherit" ? 1 : 2);
-    for (let c = 0; c < CELLS; c++) mix(this.field[c] ?? 0);
+    const state = new Int32Array([0x811c9dc5 ^ this.seed, 0x01000193 ^ Math.imul(this.seed, 0x9e3779b1)]);
+    const few = new Int32Array(9);
+    const bits = new Float64Array(2);
+    const bitWords = new Int32Array(bits.buffer);
+    // The weights' own words, low then high, as a Float64Array holds them.
+    const weightWords = new Int32Array(this.weights.buffer, this.weights.byteOffset, this.weights.length * 2);
+    few[0] = this.tick;
+    few[1] = this.count;
+    few[2] = this.mode.brains === "own" ? 1 : 2;
+    few[3] = this.mode.children === "inherit" ? 1 : 2;
+    mixWords(state, few, 0, 4);
+    mixWords(state, this.field, 0, CELLS);
     for (let i = 0; i < this.count; i++) {
-      mix(this.identity[i] ?? 0);
-      mix(this.energy[i] ?? 0);
-      mix(this.age[i] ?? 0);
-      mix(this.lineage[i] ?? 0);
-      mix(this.generation[i] ?? 0);
-      mixFloat(this.x[i] ?? 0);
-      mixFloat(this.y[i] ?? 0);
-      const base = i * PARAMETERS;
-      for (let p = 0; p < PARAMETERS; p++) mixFloat(this.weights[base + p] ?? 0);
+      few[0] = this.identity[i] ?? 0;
+      few[1] = this.energy[i] ?? 0;
+      few[2] = this.age[i] ?? 0;
+      few[3] = this.lineage[i] ?? 0;
+      few[4] = this.generation[i] ?? 0;
+      bits[0] = this.x[i] ?? 0;
+      bits[1] = this.y[i] ?? 0;
+      few.set(bitWords, 5);
+      mixWords(state, few, 0, 9);
+      mixWords(state, weightWords, i * PARAMETERS * 2, (i + 1) * PARAMETERS * 2);
     }
     const hex = (n: number) => (n >>> 0).toString(16).padStart(8, "0");
-    return hex(a) + hex(b);
+    return hex(state[0] ?? 0) + hex(state[1] ?? 0);
   }
 
   /** The organism's own weights (a copy). */
   weightsOf(i: number): Float64Array {
     return this.weights.slice(i * PARAMETERS, (i + 1) * PARAMETERS);
   }
+}
+
+/** Mixes words `from` to `to` into the digest's two halves; local variables, so the loop compiles to plain integers. */
+function mixWords(state: Int32Array, words: Int32Array, from: number, to: number): void {
+  let a = state[0] ?? 0;
+  let b = state[1] ?? 0;
+  for (let k = from; k < to; k++) {
+    const word = words[k] ?? 0;
+    a = Math.imul(a ^ word, 0x01000193);
+    b = Math.imul((b ^ word) + 0x7f4a7c15, 0x85ebca77);
+    b ^= b >>> 13;
+  }
+  state[0] = a;
+  state[1] = b;
 }
 
 function add(array: Int32Array, index: number, amount: number): void {

@@ -109,6 +109,7 @@ export function Section({
     return (
       <section
         id={id}
+        data-skip
         aria-labelledby={headingId}
         className={cn("relative mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-20 lg:py-24", className)}
       >
@@ -129,6 +130,7 @@ export function Section({
   return (
     <section
       id={id}
+      data-skip
       aria-labelledby={headingId}
       className={cn("relative mx-auto max-w-7xl px-4 py-14 sm:px-6 md:py-20 lg:py-24", className)}
     >

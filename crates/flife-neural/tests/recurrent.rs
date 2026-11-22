@@ -1,6 +1,11 @@
 //! FL-054: independent known-answer, bounded-execution, and schema tests for
 //! `independent-recurrent-mlp-v1` (plan §6.2, §17.5, §25.2).
 
+#![allow(
+    clippy::expect_used,
+    reason = "test helpers: a failure in one is a test failure"
+)]
+
 use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::numerics::{sigmoid, tanh};
@@ -161,7 +166,7 @@ fn gated_recurrent_controller_matches_independent_oracle_and_stays_bounded() {
     // 2. Bit-exact oracle comparison across 1-hidden and 2-hidden topologies in F32 and F16.
     for (hidden, s) in [(&[8_u32][..], 4_u32), (&[64, 32][..], 8_u32)] {
         let topo = DenseTopology::new_recurrent(hidden, s).expect("topo");
-        let f32_params = pseudo_values(0x5eed_054 + u64::from(s), topo.parameter_count(), 0.4);
+        let f32_params = pseudo_values(0x05ee_d054 + u64::from(s), topo.parameter_count(), 0.4);
         let f16_params: Vec<F16> = f32_params
             .iter()
             .map(|&v| F16::from_f64(f64::from(v)))
@@ -225,7 +230,7 @@ fn gated_recurrent_controller_matches_independent_oracle_and_stays_bounded() {
     for step in 0..200_u32 {
         let mut x = [0.0_f64; SENSOR_WIDTH];
         for (i, slot) in x.iter_mut().enumerate() {
-            *slot = if (i + step as usize) % 2 == 0 {
+            *slot = if (i + step as usize).is_multiple_of(2) {
                 1.0
             } else {
                 -1.0

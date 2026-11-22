@@ -617,6 +617,10 @@ fn transplant_parent(run_dir: &Path) -> Option<serde_json::Value> {
 
 /// Build and durably write `manifest.json` for a completed persisted run or
 /// resume (`flife run --run-dir`, `flife resume`, `flife step`).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run directory, the closed session and each B.1 section's own source"
+)]
 pub(crate) fn write_run_manifest(
     target: RunManifestTarget<'_>,
     closed: &flife_runtime::SessionClosed,

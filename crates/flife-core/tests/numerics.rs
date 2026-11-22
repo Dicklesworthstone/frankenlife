@@ -782,7 +782,7 @@ fn pow_positive_is_host_independent_exact_on_identities_and_tracks_libm() {
         );
     }
     // Exact identities: x^0 = 1, x^1 = x (preserving exact bits), 1^a = 1.
-    for x in [f64::MIN_POSITIVE, 0.125, 0.3, 1.0, 2.718_281_828, f64::MAX] {
+    for x in [f64::MIN_POSITIVE, 0.125, 0.3, 1.0, 2.75, f64::MAX] {
         assert_eq!(
             pow_positive(x, 0.0).map(f64::to_bits),
             Some(1.0_f64.to_bits())

@@ -3,6 +3,12 @@
 //! FL-043 memory admission, checkpoint round-trip, and honest CIC-only
 //! backend refusal).
 
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helpers: a failure in one is a test failure"
+)]
+
 use std::num::NonZeroUsize;
 
 use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};

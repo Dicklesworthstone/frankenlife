@@ -1089,11 +1089,6 @@ fn agrees(host: &ReproductionProposal, backend: ProposalOutcome) -> bool {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "unit tests fail loudly on invariant violations"
-)]
 mod tests {
     use std::sync::{Arc, Mutex};
 

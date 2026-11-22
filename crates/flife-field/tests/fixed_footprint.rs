@@ -3,6 +3,11 @@
 //! convergence against independent continuous integrals (plan §4.3, §11.6,
 //! INV-01..INV-05).
 
+#![allow(
+    clippy::expect_used,
+    reason = "test helpers: a failure in one is a test failure"
+)]
+
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{Holdings, ResidualBudget, TickLedger, Transfer};
 use flife_core::{CoreError, TimeStep};

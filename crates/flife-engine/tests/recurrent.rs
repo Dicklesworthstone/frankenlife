@@ -4,6 +4,12 @@
 //! checkpoints/workers/arrangements, parameter-count energy costing, bounded
 //! memory admission, and honest refusal on stateless `ControllerBackend` ports.
 
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helpers: a failure in one is a test failure"
+)]
+
 use std::num::NonZeroUsize;
 
 use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};

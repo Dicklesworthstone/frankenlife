@@ -173,8 +173,7 @@ fn standalone_run_resume_branch_and_transplant_write_appendix_b1_manifests() {
         .expect("end record");
     let ckpt = out
         .iter()
-        .filter(|r| r["record"] == "checkpoint")
-        .last()
+        .rfind(|r| r["record"] == "checkpoint")
         .expect("final checkpoint");
 
     let m_run = read_manifest(&run_dir);
@@ -223,8 +222,7 @@ fn standalone_run_resume_branch_and_transplant_write_appendix_b1_manifests() {
         .expect("end record");
     let ckpt_resume = out
         .iter()
-        .filter(|r| r["record"] == "checkpoint")
-        .last()
+        .rfind(|r| r["record"] == "checkpoint")
         .expect("resume checkpoint");
     let m_resume = read_manifest(&run_dir);
     assert_common_groups(&m_resume, &expected_hash);

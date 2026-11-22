@@ -192,9 +192,9 @@ struct Planned {
 /// - [`CoreError::StorageFailed`] when `out` exists or a file cannot be
 ///   written.
 /// - [`CoreError::StateConflict`] for frame times that are not finite and
-///   in order, for more slots than a `u32` counts, or for a frame of
-///   another size than its drawable. Before anything is written, for an
-///   MP4 asked of an export whose video is withheld.
+///   in order, frame ticks that go backwards, more slots than a `u32`
+///   counts, or a frame of another size than its drawable. Before anything
+///   is written, for an MP4 asked of an export whose video is withheld.
 /// - [`CoreError::MissingCapability`] before anything is written, for an
 ///   MP4 asked for without a runnable ffmpeg listing libx264; as
 ///   [`flife_cli::encode_y4m`] when its encode fails.
@@ -235,6 +235,9 @@ pub fn export(
         return Err(conflict(
             "the frames' wall times are not finite and in order".into(),
         ));
+    }
+    if !planned.is_sorted_by_key(|frame| frame.tick) {
+        return Err(conflict("the frames' ticks are not in order".into()));
     }
     let counts = slot_counts(&walls, options.frames_per_second)?;
     let withheld = match planned.first() {
@@ -353,7 +356,7 @@ pub fn export(
         clippy::cast_precision_loss,
         reason = "a tick count far below 2^53 is exact"
     )]
-    let shown = (ticks[1] - ticks[0]) as f64;
+    let shown = ticks[1].saturating_sub(ticks[0]) as f64;
     let manifest = ExportManifest {
         schema: EXPORT_SCHEMA.to_owned(),
         mode: "live-capture".to_owned(),
@@ -550,5 +553,98 @@ fn conflict(detail: String) -> CoreError {
     CoreError::StateConflict {
         operation: "export a studio timeline",
         detail,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use flife_core::{CoreError, ValidatedConfig};
+    use flife_manim::Style;
+
+    use super::{ExportOptions, export, slot_counts};
+    use crate::timeline::{Exact, TimelineRecord, write_timeline_record};
+
+    const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
+
+    fn timeline_text(records: &[TimelineRecord]) -> String {
+        let mut out = Vec::new();
+        for record in records {
+            write_timeline_record(&mut out, record).expect("serializes timeline record");
+        }
+        String::from_utf8(out).expect("utf-8 timeline")
+    }
+
+    #[test]
+    fn export_rejects_backwards_frame_ticks_and_unsorted_walls_before_writing() {
+        let config = ValidatedConfig::from_toml(PRESET).expect("valid preset");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let out = std::env::temp_dir().join(format!(
+            "flife-export-guard-{}-{unique}",
+            std::process::id()
+        ));
+        let options = ExportOptions {
+            frames_per_second: NonZeroU32::new(30).expect("non-zero fps"),
+            cpu_workers: None,
+            mp4: false,
+        };
+        let header = TimelineRecord::header(&config, [320, 200], Style::default());
+
+        let backwards_ticks = timeline_text(&[
+            header.clone(),
+            TimelineRecord::Draw {
+                frame: 0,
+                tick: 5,
+                wall_seconds: Exact(0.016),
+            },
+            TimelineRecord::Draw {
+                frame: 1,
+                tick: 3,
+                wall_seconds: Exact(0.032),
+            },
+        ]);
+        let err = export(&config, &backwards_ticks, options, &out)
+            .expect_err("backwards frame ticks must be refused without panicking");
+        assert!(
+            matches!(err, CoreError::StateConflict { ref detail, .. } if detail.contains("ticks")),
+            "expected StateConflict on ticks, got {err:?}"
+        );
+        assert!(
+            !out.exists(),
+            "refused export must not create the output directory"
+        );
+
+        let backwards_walls = timeline_text(&[
+            header,
+            TimelineRecord::Draw {
+                frame: 0,
+                tick: 1,
+                wall_seconds: Exact(0.050),
+            },
+            TimelineRecord::Draw {
+                frame: 1,
+                tick: 2,
+                wall_seconds: Exact(0.010),
+            },
+        ]);
+        let err = export(&config, &backwards_walls, options, &out)
+            .expect_err("backwards wall times must be refused");
+        assert!(
+            matches!(err, CoreError::StateConflict { ref detail, .. } if detail.contains("wall times")),
+            "expected StateConflict on wall times, got {err:?}"
+        );
+        assert!(!out.exists());
+
+        let fps = NonZeroU32::new(10).expect("non-zero fps");
+        assert_eq!(slot_counts(&[], fps).expect("empty"), Vec::<u64>::new());
+        assert_eq!(slot_counts(&[1.0], fps).expect("single"), vec![1]);
+        assert_eq!(
+            slot_counts(&[0.0, 0.25], fps).expect("three slots"),
+            vec![3, 0]
+        );
     }
 }

@@ -911,13 +911,27 @@ pub fn replay(
     // The tick of the epoch the view was last given: each frame's.
     let mut showing = opened;
     let mut frames = 0;
+    // Coalesce adjacent Resize / Density records so Retina refits perform a
+    // single atomic `refit_surface` (matching `Studio::frame` and
+    // `peak_observer_bytes`) instead of allocating phantom 1x density bins.
+    let mut pending_drawable = *size;
+    let mut pending_scale = 1.0_f64;
+    let mut geometry_dirty = false;
     for (index, record) in records.iter().enumerate() {
+        if geometry_dirty && flushes_geometry(record) {
+            view.refit_surface(pending_drawable, pending_scale)?;
+            geometry_dirty = false;
+        }
         match record {
             TimelineRecord::Resize { drawable } => {
-                view.resize(*drawable)?;
+                view.viewport().resized(*drawable)?;
+                pending_drawable = *drawable;
+                geometry_dirty = true;
             }
             TimelineRecord::Density { pixels_per_point } => {
-                view.set_pixels_per_point(pixels_per_point.0)?;
+                view.viewport().with_pixels_per_point(pixels_per_point.0)?;
+                pending_scale = pixels_per_point.0;
+                geometry_dirty = true;
             }
             TimelineRecord::Overlay { text, swatches } => {
                 crate::host::lay_out_overlay(&mut view, &font, text, swatches)?;
@@ -1005,6 +1019,9 @@ pub fn replay(
             | TimelineRecord::End { .. } => {}
         }
     }
+    if geometry_dirty {
+        view.refit_surface(pending_drawable, pending_scale)?;
+    }
     drop(epochs);
     step_to(&mut world, *end, &at)?;
     let reached = world.digest().to_hex();
@@ -1021,12 +1038,29 @@ pub fn replay(
     })
 }
 
+/// Whether `record` depends on the view's current `(drawable,
+/// pixels_per_point)` geometry and therefore flushes any coalesced
+/// `Resize` / `Density` updates before executing.
+const fn flushes_geometry(record: &TimelineRecord) -> bool {
+    matches!(
+        record,
+        TimelineRecord::Overlay { .. }
+            | TimelineRecord::View { .. }
+            | TimelineRecord::Select { .. }
+            | TimelineRecord::Region { .. }
+            | TimelineRecord::Show { .. }
+            | TimelineRecord::Place { .. }
+            | TimelineRecord::Advance { .. }
+            | TimelineRecord::Draw { .. }
+    )
+}
+
 /// Peak observer bytes a timeline replay requires across its initial size,
-/// every rendering or epoch-update record (`Show`, `Place`, `Advance`, `Draw`),
-/// and its final surface state (FL-043). Evaluates `(drawable,
-/// pixels_per_point)` pairs only at points where density bins or frame
-/// surfaces actually allocate, so a Retina `Resize` paired with `Density`
-/// before a frame never incurs a phantom 1x density-bin charge.
+/// every geometry flush point (`Overlay`, `View`, `Select`, `Region`, `Show`,
+/// `Place`, `Advance`, `Draw`), and its final surface state (FL-043).
+/// Coalesces adjacent `Resize` and `Density` records exactly as [`replay`]
+/// does via `WorldView::refit_surface`, so a Retina `Resize` paired with
+/// `Density` before a frame never incurs a phantom 1x density-bin charge.
 ///
 /// # Errors
 /// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
@@ -1040,35 +1074,36 @@ pub fn peak_observer_bytes(
 ) -> Result<u64, CoreError> {
     let mut cur_drawable = initial_size;
     let mut cur_scale = 1.0_f64;
+    let mut geometry_dirty = false;
     let mut peak =
         crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
     for record in records {
+        if geometry_dirty && flushes_geometry(record) {
+            let required =
+                crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+            peak = peak.max(required);
+            geometry_dirty = false;
+        }
         match record {
             TimelineRecord::Resize { drawable } => {
+                view.viewport().resized(*drawable)?;
                 cur_drawable = *drawable;
+                geometry_dirty = true;
             }
             TimelineRecord::Density { pixels_per_point } => {
+                view.viewport().with_pixels_per_point(pixels_per_point.0)?;
                 cur_scale = pixels_per_point.0;
-            }
-            TimelineRecord::Show { .. }
-            | TimelineRecord::Place { .. }
-            | TimelineRecord::Advance { .. }
-            | TimelineRecord::Draw { .. } => {
-                let required = crate::memory::observer_bytes_at(
-                    world,
-                    restored,
-                    view,
-                    cur_drawable,
-                    cur_scale,
-                )?;
-                peak = peak.max(required);
+                geometry_dirty = true;
             }
             _ => {}
         }
     }
-    let final_bytes =
-        crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
-    Ok(peak.max(final_bytes))
+    if geometry_dirty {
+        let final_bytes =
+            crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+        peak = peak.max(final_bytes);
+    }
+    Ok(peak)
 }
 
 /// Step `world` to committed tick `tick` ([`step_to`]) and publish it: the

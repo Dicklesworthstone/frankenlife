@@ -358,6 +358,62 @@ fn atomic_refit_surface_and_timeline_peak_admission_avoid_phantom_1x_retina_spik
             .expect("computes 1x draw peak");
     assert_eq!(drawn_1x_peak, phantom_1x);
 
+    // An overlay or camera record between Resize and Density also flushes
+    // geometry in `replay`, so `peak_observer_bytes` admits that exact state.
+    let overlay_between_records = [
+        TimelineRecord::Resize {
+            drawable: [3840, 2160],
+        },
+        TimelineRecord::Overlay {
+            text: "tick 0".to_owned(),
+            swatches: Vec::new(),
+        },
+        TimelineRecord::Density {
+            pixels_per_point: Exact(2.0),
+        },
+    ];
+    let overlay_between_peak = peak_observer_bytes(
+        &world,
+        &founding,
+        &view,
+        [1920, 1080],
+        &overlay_between_records,
+    )
+    .expect("computes overlay flush peak");
+    assert_eq!(overlay_between_peak, phantom_1x);
+
+    // Invalid Resize / Density records fail immediately even if overwritten.
+    let invalid_intermediate = [
+        TimelineRecord::Resize {
+            drawable: [0, 1080],
+        },
+        TimelineRecord::Resize {
+            drawable: [1920, 1080],
+        },
+    ];
+    assert!(matches!(
+        peak_observer_bytes(
+            &world,
+            &founding,
+            &view,
+            [1920, 1080],
+            &invalid_intermediate
+        ),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    let invalid_scale = [
+        TimelineRecord::Density {
+            pixels_per_point: Exact(0.0),
+        },
+        TimelineRecord::Density {
+            pixels_per_point: Exact(2.0),
+        },
+    ];
+    assert!(matches!(
+        peak_observer_bytes(&world, &founding, &view, [1920, 1080], &invalid_scale),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
     // Atomic refit succeeds and updates both drawable and pixels_per_point together.
     assert_eq!(
         view.refit_surface([3840, 2160], 2.0).expect("refits"),

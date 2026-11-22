@@ -416,6 +416,12 @@ fn hash_bounded(path: &Path, limit: u64) -> Result<(u64, Sha256Digest), CoreErro
             Err(error) => return Err(storage("read package file", path, &error)),
         }
     }
+    if read > limit {
+        return Err(refuse(format!(
+            "{} is longer than {limit} bytes",
+            path.display()
+        )));
+    }
     Ok((read, sha256.finish()))
 }
 

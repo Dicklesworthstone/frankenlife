@@ -57,7 +57,7 @@ use flife_cli::{CheckpointAdmission, CheckpointAt, Checkpoints, Recovered, Skipp
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
-use flife_core::{CoreError, ValidatedConfig};
+use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{CPU_REFERENCE, Followed, World};
 use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
@@ -896,13 +896,7 @@ impl Studio {
                     sha256,
                     ..
                 } => {
-                    self.last_checkpoint = Some((
-                        CheckpointAt {
-                            sequence: *sequence,
-                            tick: tick.get(),
-                        },
-                        Some(sha256.clone()),
-                    ));
+                    record_checkpoint(&mut self.last_checkpoint, *tick, *sequence, sha256.clone());
                 }
                 Status::Unkept { .. } => {
                     self.unkept = true;
@@ -1637,13 +1631,7 @@ impl Studio {
                     sha256,
                     ..
                 } => {
-                    self.last_checkpoint = Some((
-                        CheckpointAt {
-                            sequence: *sequence,
-                            tick: tick.get(),
-                        },
-                        Some(sha256.clone()),
-                    ));
+                    record_checkpoint(&mut self.last_checkpoint, *tick, *sequence, sha256.clone());
                 }
                 Status::Unkept { .. } => {
                     self.unkept = true;
@@ -1673,6 +1661,28 @@ impl Studio {
             input_dropped,
             statuses,
         })
+    }
+}
+
+/// Remember the highest-sequence checkpoint published in a session so an
+/// out-of-order status never overwrites a newer checkpoint in `manifest.json`.
+fn record_checkpoint(
+    slot: &mut Option<(CheckpointAt, Option<String>)>,
+    tick: Tick,
+    sequence: u64,
+    sha256: String,
+) {
+    if slot
+        .as_ref()
+        .is_none_or(|(previous, _)| sequence >= previous.sequence)
+    {
+        *slot = Some((
+            CheckpointAt {
+                sequence,
+                tick: tick.get(),
+            },
+            Some(sha256),
+        ));
     }
 }
 

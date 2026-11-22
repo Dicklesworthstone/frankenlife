@@ -364,8 +364,9 @@ file-backed engine), one writer thread per session, one session per database at 
 - A real full disk is not exercised: the size limit produces the same short write, from the same code path.
 - A run's catalog row is its identity, configuration hash and command schema, plus its journal and checkpoint
   index. The rest of Appendix B.1's run manifest (source and suite revisions, toolchain, numerics, clocks,
-  hardware, capacity, results and artifacts) is recorded only for experiment runs, in FL-041's experiment catalog;
-  a run kept with `flife run --run-dir` has none.
+  hardware, capacity, results and artifacts) is not a catalog column. Experiment runs keep it in FL-041's
+  experiment catalog; a run directory keeps it as `manifest.json`, which `flife-cli` writes beside `catalog.db`
+  (its contract).
 - The catalog records a branch's lineage and origin (FL-039), but not lineage of organisms: FL-040's lineage
   summaries are `flife run` records, not catalog rows. `flife checkpoint`/`resume`, a CLI
   that opens a journal (`flife run` refuses `write-ahead-before-apply`) and resuming from the store are FL-037.

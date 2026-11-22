@@ -914,12 +914,29 @@ fn motility(epoch: &Epoch) -> Motility {
     reason = "organism and bin counts are far below 2^53"
 )]
 pub fn dispersion(positions: &[[f32; 2]], extent: [f64; 2], bins: usize) -> Dispersion {
-    let mut counts = vec![0_u64; bins * bins];
+    let Some(cells) = bins.checked_mul(bins).filter(|&cells| cells > 0) else {
+        return Dispersion {
+            bins,
+            occupied: 0.0,
+            variance_to_mean: None,
+            morisita: None,
+            morans_i: None,
+        };
+    };
+    if !extent.iter().all(|side| side.is_finite() && *side > 0.0) {
+        return Dispersion {
+            bins,
+            occupied: 0.0,
+            variance_to_mean: None,
+            morisita: None,
+            morans_i: None,
+        };
+    }
+    let mut counts = vec![0_u64; cells];
     for position in positions {
         let [x, y] = [0, 1].map(|axis| bin(f64::from(position[axis]), extent[axis], bins));
         counts[y * bins + x] += 1;
     }
-    let cells = counts.len();
     let total: u64 = counts.iter().sum();
     let occupied = counts.iter().filter(|&&n| n > 0).count();
     let mean = ratio(total, count(cells)).unwrap_or(0.0);
@@ -964,13 +981,13 @@ fn bin(x: f64, extent: f64, bins: usize) -> usize {
 pub fn morans_i(values: &[f64], size: [usize; 2]) -> Option<f64> {
     let [width, height] = size;
     let n = values.len();
-    if n == 0 || n != width * height {
+    if n == 0 || width.checked_mul(height) != Some(n) || values.iter().any(|v| !v.is_finite()) {
         return None;
     }
     let mean = values.iter().sum::<f64>() / real(n);
     let deviations: Vec<f64> = values.iter().map(|value| value - mean).collect();
     let variance: f64 = deviations.iter().map(|z| z * z).sum();
-    if variance <= 0.0 {
+    if !(variance.is_finite() && variance > 0.0) {
         return None;
     }
     let mut cross = 0.0;
@@ -992,11 +1009,14 @@ pub fn morans_i(values: &[f64], size: [usize; 2]) -> Option<f64> {
 /// `None` when they sum to zero.
 #[must_use]
 pub fn gini(values: &[f64]) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
     let total: f64 = sorted.iter().sum();
-    if n == 0 || total <= 0.0 {
+    if !(total.is_finite() && total > 0.0) {
         return None;
     }
     let weighted: f64 = sorted
@@ -1011,10 +1031,13 @@ pub fn gini(values: &[f64]) -> Option<f64> {
 /// of them (rounded up). `None` when they sum to zero.
 #[must_use]
 pub fn top_decile_share(values: &[f64]) -> Option<f64> {
+    if values.is_empty() || values.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| b.total_cmp(a));
     let total: f64 = sorted.iter().sum();
-    if sorted.is_empty() || total <= 0.0 {
+    if !(total.is_finite() && total > 0.0) {
         return None;
     }
     let top: f64 = sorted.iter().take(sorted.len().div_ceil(10)).sum();

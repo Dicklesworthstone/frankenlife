@@ -601,7 +601,8 @@ impl Controls {
             }
         } else {
             let (dx, dy) = (position.x - press.x, position.y - press.y);
-            if dx.hypot(dy) <= CLICK_SLOP_POINTS {
+            let distance = dx.hypot(dy);
+            if !(distance.is_finite() && distance > CLICK_SLOP_POINTS) {
                 return;
             }
             self.dragging = true;

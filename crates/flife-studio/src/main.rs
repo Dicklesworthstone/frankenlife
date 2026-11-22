@@ -1025,8 +1025,12 @@ fn main() -> ExitCode {
     let mut telemetry_metrics: Option<Metrics> = None;
     let mut current_run = None;
     let mut capacity_pauses = 0_u64;
-    // The newest checkpoint's tick (`--run`).
-    let mut checkpoint = None;
+    // The newest checkpoint's sequence and tick (`--run` or `--resume`).
+    let mut checkpoint: Option<(u64, Tick)> = studio.resumed().and_then(|resumed| {
+        resumed
+            .checkpoint
+            .map(|at| (at.sequence, Tick::new(at.tick)))
+    });
     // The last inspection's answer and whom it was about (FL-021's panel).
     let mut inspected = None;
     // The last measurement's answer (plan §14.3's measurement region).
@@ -1111,7 +1115,9 @@ fn main() -> ExitCode {
                 Status::Inspected {
                     organism, snapshot, ..
                 } => inspected = Some((*organism, snapshot.clone())),
-                Status::Checkpointed { tick, .. } => checkpoint = Some(*tick),
+                Status::Checkpointed { tick, sequence, .. } => {
+                    note_checkpoint(&mut checkpoint, *sequence, *tick);
+                }
                 Status::Measured {
                     measurement: answer,
                     ..
@@ -1256,7 +1262,7 @@ fn main() -> ExitCode {
                 evaluation_interval_ticks: model.controller.evaluation_interval_ticks,
                 memory: studio.memory(),
                 capacity_pauses,
-                checkpoint,
+                checkpoint: checkpoint.map(|(_, tick)| tick),
             }),
         });
         let swatches: Vec<[u8; 3]> = legend
@@ -1324,8 +1330,8 @@ fn main() -> ExitCode {
                 return fail(error.kind(), error.to_string(), 1);
             }
             for status in &closed.statuses {
-                if let Status::Checkpointed { tick, .. } = status {
-                    checkpoint = Some(*tick);
+                if let Status::Checkpointed { tick, sequence, .. } = status {
+                    note_checkpoint(&mut checkpoint, *sequence, *tick);
                 }
                 print(&status_record(status));
             }
@@ -1358,7 +1364,7 @@ fn main() -> ExitCode {
                 camera_moves_unmoved: cli.offscreen_zooms.then_some(unmoved),
                 camera_latency: latency.summary(),
                 camera_latency_bound: bounds.summary(),
-                checkpoint_tick: checkpoint.map(Tick::get),
+                checkpoint_tick: checkpoint.map(|(_, tick)| tick.get()),
             });
             ExitCode::SUCCESS
         }
@@ -1744,6 +1750,14 @@ fn end(why: &End) -> (&'static str, Option<String>) {
         End::CapacityPaused { detail } => ("capacity-paused", Some(detail.clone())),
         End::Failed { kind, detail } => (kind, Some(detail.clone())),
         End::Closed => ("closed", None),
+    }
+}
+
+/// Remember the highest-sequence checkpoint published or resumed so an
+/// out-of-order status never regresses telemetry or `end.checkpoint_tick`.
+fn note_checkpoint(slot: &mut Option<(u64, Tick)>, sequence: u64, tick: Tick) {
+    if slot.is_none_or(|(previous, _)| sequence >= previous) {
+        *slot = Some((sequence, tick));
     }
 }
 
@@ -2594,5 +2608,15 @@ mod tests {
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>()
         );
+
+        let mut checkpoint = Some((4, Tick::new(512)));
+        super::note_checkpoint(&mut checkpoint, 3, Tick::new(256));
+        assert_eq!(
+            checkpoint,
+            Some((4, Tick::new(512))),
+            "stale lower sequence must not overwrite a newer checkpoint"
+        );
+        super::note_checkpoint(&mut checkpoint, 5, Tick::new(640));
+        assert_eq!(checkpoint, Some((5, Tick::new(640))));
     }
 }

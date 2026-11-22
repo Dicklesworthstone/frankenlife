@@ -1149,3 +1149,32 @@ fn moves_are_kept_in_order_until_taken() {
     assert_eq!(moves(&mut controls).len(), 256);
     assert!(moves(&mut controls).is_empty());
 }
+
+#[test]
+fn non_finite_pointer_motion_never_triggers_drag_or_corrupts_click() {
+    let mut controls = Controls::new();
+    tap(&mut controls, KEY_X);
+    controls.apply(&button(true, point(100.0, 100.0)));
+    for bad in [
+        point(f64::NAN, 100.0),
+        point(100.0, f64::NAN),
+        point(f64::INFINITY, 100.0),
+        point(100.0, f64::NEG_INFINITY),
+    ] {
+        controls.apply(&drag_to(bad));
+        assert!(
+            !controls.dragging(),
+            "non-finite {bad:?} must not start drag"
+        );
+        assert_eq!(controls.drawing(), None);
+    }
+    controls.apply(&button(false, point(100.0, 100.0)));
+    assert_eq!(
+        moves(&mut controls),
+        [CameraMove::Brush {
+            at: point(100.0, 100.0),
+            brush: Brush::Removal,
+            settings: BrushSettings::default(),
+        }]
+    );
+}

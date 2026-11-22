@@ -773,7 +773,7 @@ pub fn write_studio_manifest(
         Some((at, None)) => {
             let catalog = run_dir.join(CATALOG_FILE);
             let revision = config.config_hash();
-            on_plain_thread("read checkpoint digest", move || {
+            let indexed = on_plain_thread("read checkpoint digest", move || {
                 let mut journal = CommandJournal::open(&catalog)?;
                 journal.open_run(session, revision)?;
                 Ok(journal
@@ -781,7 +781,15 @@ pub fn write_studio_manifest(
                     .into_iter()
                     .find(|entry| entry.sequence == at.sequence)
                     .map(|entry| entry.digest.to_hex()))
-            })?
+            })?;
+            match indexed {
+                Some(hex) => Some(hex),
+                None => {
+                    let store =
+                        ChunkStore::open(run_dir.join(STORE_DIR), StoreDurability::ProcessCrash)?;
+                    Some(store.verify(at.sequence)?.to_hex())
+                }
+            }
         }
         Some((_, Some(hex))) => Some(hex.to_owned()),
         None => None,

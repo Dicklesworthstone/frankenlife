@@ -1212,3 +1212,29 @@ fn a_sample_refuses_an_epoch_of_another_world() {
     );
     tracker.sample(&epoch_of(&world)).expect("its own epoch");
 }
+
+#[test]
+fn spatial_statistics_guard_zero_bins_overflow_and_non_finite_inputs() {
+    let zero_bins = dispersion(&[[1.0, 2.0]], [16.0, 16.0], 0);
+    assert_eq!(
+        (
+            zero_bins.bins,
+            zero_bins.occupied,
+            zero_bins.variance_to_mean,
+            zero_bins.morisita,
+            zero_bins.morans_i,
+        ),
+        (0, 0.0, None, None, None)
+    );
+    let bad_extent = dispersion(&[[1.0, 2.0]], [0.0, 16.0], 4);
+    assert_eq!(bad_extent.occupied, 0.0);
+    assert_eq!(bad_extent.morans_i, None);
+
+    assert_eq!(morans_i(&[1.0, 2.0, 3.0, 4.0], [usize::MAX, 2]), None);
+    assert_eq!(morans_i(&[1.0, f64::NAN, 3.0, 4.0], [2, 2]), None);
+    assert_eq!(morans_i(&[1.0, f64::INFINITY, 3.0, 4.0], [2, 2]), None);
+    assert_eq!(gini(&[1.0, f64::NAN, 2.0]), None);
+    assert_eq!(gini(&[1.0, f64::INFINITY, 2.0]), None);
+    assert_eq!(top_decile_share(&[1.0, f64::NAN, 2.0]), None);
+    assert_eq!(top_decile_share(&[1.0, f64::INFINITY, 2.0]), None);
+}

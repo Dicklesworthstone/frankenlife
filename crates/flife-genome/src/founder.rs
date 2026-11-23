@@ -16,16 +16,25 @@
 //! founder's stable organism identity.
 
 use flife_core::ids::{GenomeId, OrganismId};
-use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream};
+use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{CoreError, ValidatedConfig};
 
 use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
 use crate::genome::{
-    AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, Unsealed, rescale,
+    AFFINITY_TERMS, CADHERIN_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, TraitLimits,
+    Traits, Unsealed, rescale,
 };
 use crate::init::{WeightAddress, initialize};
 use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
+
+/// Base index on [`LaneKind::Direction`] for the two Box–Muller pairs
+/// (`0x1300`, `0x1301`) that initialize and mutate a `V2-13` 4-D cadherin tag.
+pub const CADHERIN_TAG_LANE_BASE: u64 = 0x1300;
+
+/// Index on [`LaneKind::Direction`] (`0x1310`) for initializing and mutating a
+/// `V2-13` cadherin cohesiveness scalar `s_i ∈ [0, 1]`.
+pub const CADHERIN_COHESIVENESS_LANE: u64 = 0x1310;
 
 /// A founder's genome: its traits ([`founder_traits`]), a buffer for
 /// [`founder_topology`] from `quota`, and [`grow_founder`] in it.
@@ -143,6 +152,77 @@ pub fn founder_traits(
         limits.motion_response_norm(),
     )?;
     Traits::new(affinity, motion_response, initial_scale, limits)
+}
+
+/// A founder's genome with `V2-13` trait initialization governed by `limits`
+/// ([`founder_traits_v2`]). Bit-identical to [`founder`] with zero extra
+/// Philox draws when `!limits.cadherin_enabled()`.
+///
+/// # Errors
+/// As [`founder`].
+pub fn founder_v2(
+    rng: &SemanticRng,
+    organism: OrganismId,
+    id: GenomeId,
+    catalog: &TopologyCatalog,
+    quota: &mut GenomeQuota,
+    limits: &TraitLimits,
+    initial_scale: f64,
+) -> Result<Genome, CoreError> {
+    let traits = founder_traits_v2(rng, organism, limits, initial_scale)?;
+    let member = founder_topology(catalog)?;
+    let buffer = quota.allocate(catalog, member)?;
+    grow_founder(rng, organism, id, catalog, buffer, traits, limits).or_else(|unsealed| {
+        quota.abandon(unsealed.buffer)?;
+        Err(unsealed.error)
+    })
+}
+
+/// A founder's `V2-13` 4-D cadherin unit tag and cohesiveness from semantic
+/// Philox lanes `(Stream::Founders, organism, 0, Direction, 0x1300..0x1301)`
+/// and `(Stream::Founders, organism, 0, Direction, 0x1310)`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] or [`CoreError::Overflow`] if a draw or
+/// lane is out of range.
+pub fn founder_cadherin_traits(
+    rng: &SemanticRng,
+    organism: OrganismId,
+) -> Result<CadherinTraits, CoreError> {
+    let mut tag = [0.0; CADHERIN_TERMS];
+    for (pair, slots) in (0_u64..).zip(tag.chunks_mut(2)) {
+        let lane = Lane::new(0, LaneKind::Direction, CADHERIN_TAG_LANE_BASE + pair)?;
+        let [first, second, ..] = rng.block(address(organism, lane));
+        for (slot, normal) in slots
+            .iter_mut()
+            .zip(flife_core::rng::box_muller(first, second)?)
+        {
+            *slot = normal;
+        }
+    }
+    let lane = Lane::new(0, LaneKind::Direction, CADHERIN_COHESIVENESS_LANE)?;
+    let cohesiveness = half_open_unit(rng.block(address(organism, lane))[0]);
+    CadherinTraits::normalized(tag, cohesiveness)
+}
+
+/// A founder's traits including `V2-13` cadherin when `limits.cadherin_enabled()`.
+/// Bit-identical to [`founder_traits`] with zero extra Philox draws when
+/// `!limits.cadherin_enabled()`.
+///
+/// # Errors
+/// As [`founder_traits`] and [`founder_cadherin_traits`].
+pub fn founder_traits_v2(
+    rng: &SemanticRng,
+    organism: OrganismId,
+    limits: &TraitLimits,
+    initial_scale: f64,
+) -> Result<Traits, CoreError> {
+    let base = founder_traits(rng, organism, limits, initial_scale)?;
+    if !limits.cadherin_enabled() {
+        return Ok(base);
+    }
+    let cadherin = founder_cadherin_traits(rng, organism)?;
+    base.with_cadherin_traits(Some(cadherin))
 }
 
 /// The configured initial sensing scale (`sensors.initial_scale_world_units`).

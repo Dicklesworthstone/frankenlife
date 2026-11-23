@@ -49,13 +49,15 @@ use flife_core::numerics::{exp, ln};
 use flife_core::rng::{
     Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, box_muller, choose,
 };
-use flife_core::{CoreError, Tick, ValidatedConfig};
+use flife_core::{CoreError, Tick, V2Feature, ValidatedConfig};
 use flife_neural::{DenseTopology, ReferenceController, Weight, WeightDtype, Weights};
 
 use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
+use crate::founder::{CADHERIN_COHESIVENESS_LANE, CADHERIN_TAG_LANE_BASE};
 use crate::genome::{
-    AFFINITY_TERMS, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits, rescale, squared_norm,
+    AFFINITY_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits,
+    normalize_cadherin_tag, rescale, squared_norm,
 };
 use crate::init::fan_in_draw;
 use crate::quota::{GenomeQuota, ParameterBuffer, ParameterValues, WeightsMut, allocate_values};
@@ -150,7 +152,11 @@ impl MutationParameters {
             maximum_candidates: u8::try_from(mutation.maximum_candidate_proposals_per_birth)
                 .unwrap_or(u8::MAX),
         };
-        parameters.validate()?;
+        let has_v2_trait_mutation = model.v2.as_ref().is_some_and(|v2| {
+            (v2.is_enabled(V2Feature::PcpPolarity) && v2.polarity.polarity_mutation_std > 0.0)
+                || (v2.is_enabled(V2Feature::Cadherin4d) && v2.contact.cadherin.mutation_std > 0.0)
+        });
+        parameters.validate_inner(has_v2_trait_mutation)?;
         Ok(parameters)
     }
 
@@ -161,6 +167,19 @@ impl MutationParameters {
     /// negative or nonfinite deviation, a candidate count outside `1..=8`,
     /// or a strict no-op rule with every operator disabled (§7.3).
     pub fn validate(&self) -> Result<(), CoreError> {
+        self.validate_inner(false)
+    }
+
+    /// Check the rates and limits, counting active `V2-13` cadherin mutation
+    /// configured on `limits` toward `reject_effective_noop`.
+    ///
+    /// # Errors
+    /// As [`MutationParameters::validate`].
+    pub fn validate_with_limits(&self, limits: &TraitLimits) -> Result<(), CoreError> {
+        self.validate_inner(limits.cadherin_enabled() && limits.cadherin_mutation_std() > 0.0)
+    }
+
+    fn validate_inner(&self, v2_trait_operator_active: bool) -> Result<(), CoreError> {
         for (quantity, value) in [
             (
                 "architecture_mutation.probability_per_birth",
@@ -213,7 +232,8 @@ impl MutationParameters {
             || self.replacement_probability > 0.0
             || (self.weight_probability > 0.0 && self.weight_standard_deviation > 0.0)
             || self.chemistry_standard_deviation > 0.0
-            || self.sensing_log_scale_standard_deviation > 0.0;
+            || self.sensing_log_scale_standard_deviation > 0.0
+            || v2_trait_operator_active;
         if self.reject_effective_noop && !any_operator {
             return Err(CoreError::NumericalInvalid {
                 quantity: "mutation.reject_effective_noop",
@@ -394,6 +414,99 @@ pub fn reflect_log_scale(scale: f64, delta: f64, range: [f64; 2]) -> Result<f64,
     )))
 }
 
+/// `value + delta`, reflected at `0.0` and `1.0` until inside `[0.0, 1.0]`,
+/// then clamped against last-bit rounding (`V2-13` cadherin cohesiveness).
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a non-finite input, `value` outside
+/// `[0.0, 1.0]`, or a step that does not reflect inside within 64 bounces.
+pub fn reflect_unit_interval(value: f64, delta: f64) -> Result<f64, CoreError> {
+    let invalid = |detail: String| CoreError::NumericalInvalid {
+        quantity: "cadherin cohesiveness",
+        detail,
+    };
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(invalid(format!("{value} is outside [0, 1]")));
+    }
+    if !delta.is_finite() {
+        return Err(invalid(format!("step {delta} is not finite")));
+    }
+    let mut current = value + delta;
+    if !current.is_finite() {
+        return Err(invalid(format!("cohesiveness {current} is not finite")));
+    }
+    for _ in 0..REFLECTIONS {
+        if current > 1.0 {
+            current = 2.0 - current;
+        } else if current < 0.0 {
+            current = -current;
+        } else {
+            return Ok(current.clamp(0.0, 1.0));
+        }
+    }
+    Err(invalid(format!(
+        "{value} with step {delta} does not reflect into [0, 1]"
+    )))
+}
+
+/// Semantically addressed `V2-13` cadherin mutation for candidate `candidate`
+/// of `attempt` under Gaussian deviation `mutation_std`.
+///
+/// - When `mutation_std == 0.0`, returns `parent` bit-for-bit with zero Philox
+///   draws.
+/// - Otherwise perturbs the 4-D tag on `(Stream::Mutation, parent, tick,
+///   Direction, 0x1300..0x1301)` and renormalizes via
+///   [`flife_core::numerics::shrink_to_left_fold_norm_limit`], and perturbs
+///   cohesiveness on `(Stream::Mutation, parent, tick, Direction, 0x1310)`
+///   with bounded reflection into `[0.0, 1.0]`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a negative/non-finite `mutation_std`,
+/// a zero/non-finite mutated tag norm, or an unreflectable cohesiveness step;
+/// [`CoreError::Overflow`] if a lane overflows.
+pub fn mutate_cadherin_traits(
+    rng: &SemanticRng,
+    parent: CadherinTraits,
+    mutation_std: f64,
+    attempt: BirthAttempt,
+    candidate: u8,
+) -> Result<CadherinTraits, CoreError> {
+    if !mutation_std.is_finite() || mutation_std < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.contact.cadherin.mutation_std",
+            detail: format!("{mutation_std} is not a non-negative finite standard deviation"),
+        });
+    }
+    if mutation_std == 0.0 {
+        return Ok(parent);
+    }
+    let address = |lane| Address {
+        stream: Stream::Mutation,
+        entity: attempt.parent.get(),
+        ordinal: attempt.tick.get(),
+        lane,
+        draw: 0,
+    };
+    let mut tag = *parent.tag();
+    for (pair, slots) in (0_u64..).zip(tag.chunks_mut(2)) {
+        let lane = Lane::new(
+            candidate,
+            LaneKind::Direction,
+            CADHERIN_TAG_LANE_BASE + pair,
+        )?;
+        let [first, second, ..] = rng.block(address(lane));
+        for (slot, normal) in slots.iter_mut().zip(box_muller(first, second)?) {
+            *slot += mutation_std * normal;
+        }
+    }
+    normalize_cadherin_tag(&mut tag)?;
+    let lane = Lane::new(candidate, LaneKind::Direction, CADHERIN_COHESIVENESS_LANE)?;
+    let [first, second, ..] = rng.block(address(lane));
+    let [normal, _] = box_muller(first, second)?;
+    let cohesiveness = reflect_unit_interval(parent.cohesiveness(), mutation_std * normal)?;
+    CadherinTraits::new(tag, cohesiveness)
+}
+
 /// Mutation for one run: its semantic source, rates, catalog and bounds.
 #[derive(Debug, Clone)]
 pub struct Mutator<'a> {
@@ -426,7 +539,7 @@ impl<'a> Mutator<'a> {
         catalog: &'a TopologyCatalog,
         limits: TraitLimits,
     ) -> Result<Self, CoreError> {
-        parameters.validate()?;
+        parameters.validate_with_limits(&limits)?;
         Ok(Self {
             rng,
             parameters,
@@ -1161,7 +1274,17 @@ impl<'a> Mutator<'a> {
             let [normal, _] = box_muller(first, second)?;
             scale = reflect_log_scale(scale, deviation * normal, self.limits.scale_range())?;
         }
-        Traits::new(affinity, motion_response, scale, &self.limits)
+        let cadherin = match traits.cadherin_traits() {
+            Some(parent_cad) => Some(mutate_cadherin_traits(
+                &self.rng,
+                parent_cad,
+                self.limits.cadherin_mutation_std(),
+                attempt,
+                candidate,
+            )?),
+            None => None,
+        };
+        Traits::with_cadherin(affinity, motion_response, scale, cadherin, &self.limits)
     }
 
     fn member(&self, id: TopologyId) -> Result<&'a DenseTopology, CoreError> {
@@ -1203,7 +1326,15 @@ fn same_f64(a: &[f64], b: &[f64]) -> bool {
 }
 
 fn same_traits(a: &Traits, b: &Traits) -> bool {
+    let same_cadherin = match (a.cadherin_traits(), b.cadherin_traits()) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            same_f64(x.tag(), y.tag()) && x.cohesiveness().to_bits() == y.cohesiveness().to_bits()
+        }
+        _ => false,
+    };
     same_f64(a.affinity(), b.affinity())
         && same_f64(a.motion_response(), b.motion_response())
         && a.sensing_scale().to_bits() == b.sensing_scale().to_bits()
+        && same_cadherin
 }

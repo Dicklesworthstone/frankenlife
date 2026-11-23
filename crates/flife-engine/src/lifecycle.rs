@@ -40,7 +40,8 @@
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
 use flife_core::ledger::{EnergyBudget, TickLedger};
-use flife_core::{CoreError, Flow, ValidatedConfig};
+use flife_core::model::is_v2_model;
+use flife_core::{CoreError, Flow, V2Feature, ValidatedConfig};
 use flife_field::state::CHANNELS;
 use flife_field::{Deposits, ExchangeKernel, FieldGrid};
 
@@ -181,14 +182,27 @@ impl Vitality {
     }
 }
 
-/// `dissipate-and-record` (§8.2, A.1).
+/// Tiny-energy / viability-floor policy (§8.2, A.1, `V2-11`).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TinyEnergyPolicy {
-    threshold: f64,
+pub enum TinyEnergyPolicy {
+    /// `dissipate-and-record` (§8.2, A.1): clear reservoirs strictly below
+    /// `threshold` and dissipate them into [`Flow::TinyReservoir`].
+    DissipateAndRecord {
+        /// Energy threshold below which a live reservoir is dissipated.
+        threshold: f64,
+    },
+    /// `V2-11` (`lysis-recycling`): clear reservoirs strictly below
+    /// `viability_floor` and recycle the residual through [`DeathCause::Lysed`]
+    /// and [`Recycling`] with zero [`Flow::TinyReservoir`] double-spend.
+    LysisRecycle {
+        /// Viability energy floor `E_viable > 0`.
+        viability_floor: f64,
+    },
 }
 
 impl TinyEnergyPolicy {
-    /// Clear reservoirs strictly below `threshold`.
+    /// Clear reservoirs strictly below `threshold` under
+    /// `dissipate-and-record`.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] unless `threshold` is finite and
@@ -200,42 +214,91 @@ impl TinyEnergyPolicy {
                 detail: format!("{threshold} is not a finite nonnegative energy"),
             });
         }
-        Ok(Self {
+        Ok(Self::DissipateAndRecord {
             threshold: threshold + 0.0,
         })
     }
 
-    /// The policy of a validated configuration.
+    /// Clear reservoirs strictly below `viability_floor` under `V2-11`
+    /// (`lysis-recycling`).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `viability_floor` is finite and
+    /// strictly positive.
+    pub fn lysis_recycle(viability_floor: f64) -> Result<Self, CoreError> {
+        if !(viability_floor.is_finite() && viability_floor > 0.0) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.metabolism.lysis.viability_energy_floor",
+                detail: format!("{viability_floor} is not a finite positive energy"),
+            });
+        }
+        Ok(Self::LysisRecycle {
+            viability_floor: viability_floor + 0.0,
+        })
+    }
+
+    /// The policy of a validated configuration (`LysisRecycle` when
+    /// `field-ecology-v2` enables `lysis-recycling`, otherwise
+    /// `DissipateAndRecord`).
     ///
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for another policy; otherwise as
-    /// [`TinyEnergyPolicy::new`].
+    /// [`TinyEnergyPolicy::new`] or [`TinyEnergyPolicy::lysis_recycle`].
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
-        let world = &config.config().world;
+        let model = config.config();
+        let world = &model.world;
         if world.tiny_energy_policy != DISSIPATE_AND_RECORD {
             return Err(CoreError::UnknownAlgorithm {
                 role: "world.tiny_energy_policy",
                 name: world.tiny_energy_policy.clone(),
             });
         }
-        Self::new(world.tiny_energy_threshold)
+        let baseline = Self::new(world.tiny_energy_threshold)?;
+        if is_v2_model(&model.model)
+            && let Some(v2) = model.v2.as_ref()
+            && v2.is_enabled(V2Feature::LysisRecycling)
+        {
+            let limit = model
+                .reproduction
+                .minimum_child_energy
+                .min(model.reproduction.minimum_parent_energy_after_split);
+            let floor = v2
+                .metabolism
+                .lysis
+                .viability_energy_floor
+                .unwrap_or_else(|| 0.10_f64.min(0.5 * limit));
+            return Self::lysis_recycle(floor);
+        }
+        Ok(baseline)
     }
 
-    /// The threshold.
+    /// The threshold (`tiny_energy_threshold` or `viability_energy_floor`).
     #[must_use]
     pub const fn threshold(&self) -> f64 {
-        self.threshold
+        match *self {
+            Self::DissipateAndRecord { threshold } => threshold,
+            Self::LysisRecycle { viability_floor } => viability_floor,
+        }
+    }
+
+    /// Whether cleared energy recycles as a lysed corpse (`V2-11`) rather than
+    /// dissipating into [`Flow::TinyReservoir`].
+    #[must_use]
+    pub const fn is_lysis(&self) -> bool {
+        matches!(self, Self::LysisRecycle { .. })
     }
 
     /// The last budget stage: clear `budget` if it holds strictly less than
-    /// the threshold. Returns the cleared energy, which the caller records
-    /// as [`Flow::TinyReservoir`]. A cleared budget is exhausted.
+    /// the threshold. Returns the cleared energy. Under `DissipateAndRecord`
+    /// the caller records it as [`Flow::TinyReservoir`]; under `LysisRecycle`
+    /// the caller hands it to [`Death::lysed`] and [`Recycling`] with zero
+    /// [`Flow::TinyReservoir`] charge. A cleared budget is exhausted.
     ///
     /// # Errors
     /// None in practice; payments of a budget's own balance always succeed.
     pub fn clear(&self, budget: &mut EnergyBudget) -> Result<f64, CoreError> {
         let remaining = budget.remaining();
-        if budget.is_exhausted() || remaining >= self.threshold {
+        if budget.is_exhausted() || remaining >= self.threshold() {
             return Ok(0.0);
         }
         let paid = budget.pay(remaining)?;
@@ -283,6 +346,10 @@ impl Disposition {
 pub enum DeathCause {
     /// The named budget stage exhausted it.
     Exhausted(BudgetStage),
+    /// `V2-11` (`lysis-recycling`): its energy fell strictly below the
+    /// viability floor at the named stage and its residual was handed to
+    /// [`Recycling`].
+    Lysed(BudgetStage),
     /// It was explicitly removed.
     Removed(Disposition),
 }
@@ -324,6 +391,23 @@ impl Death {
         stage: BudgetStage,
     ) -> Result<Self, CoreError> {
         Self::collect(organism, tick, position, DeathCause::Exhausted(stage), 0.0)
+    }
+
+    /// `organism` lysed below the `V2-11` viability floor at `stage` during
+    /// the advance to `tick`, at its resulting `position`, leaving `residual`
+    /// energy to be settled by [`Recycling`].
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonfinite position or a negative
+    /// or nonfinite residual.
+    pub fn lysed(
+        organism: &Organism,
+        tick: Tick,
+        position: [f64; 2],
+        stage: BudgetStage,
+        residual: f64,
+    ) -> Result<Self, CoreError> {
+        Self::collect(organism, tick, position, DeathCause::Lysed(stage), residual)
     }
 
     /// `organism` explicitly removed at `tick` with `residual` energy and the
@@ -481,7 +565,7 @@ impl Recycling {
                 settlement.dissipated = residual;
                 Ok(settlement)
             }
-            DeathCause::Removed(Disposition::Recycle) => {
+            DeathCause::Removed(Disposition::Recycle) | DeathCause::Lysed(_) => {
                 if residual > 0.0 {
                     let offered = self.fraction * residual;
                     deposits.push_with(

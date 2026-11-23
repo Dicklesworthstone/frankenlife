@@ -2885,12 +2885,38 @@ impl World {
                     });
                 }
                 Fate::Dies(stage) => {
-                    let death =
-                        Death::exhausted(&organism.committed, to, organism.position, stage)?;
-                    let affinity = genome_of(population, death.id)?.traits().affinity();
+                    let genome = genome_of(population, organism.committed.id)?;
+                    let recurrent_h0 = organism.committed.held.recurrent_state_array()[0];
+                    let (death, corpse_dir) = if organism.lysed_residual > 0.0 {
+                        let death = Death::lysed(
+                            &organism.committed,
+                            to,
+                            organism.position,
+                            stage,
+                            organism.lysed_residual,
+                        )?;
+                        let direction = rules
+                            .v2
+                            .lysis()
+                            .map_or(CorpseDirection::GeneticAffinity, |lysis| {
+                                lysis.corpse_direction
+                            });
+                        let a_eff = effective_affinity(genome.traits(), recurrent_h0, &rules.v2);
+                        let corpse_dir = corpse_affinity_direction(
+                            &a_eff,
+                            direction,
+                            rules.v2.active_carrier0_channels(),
+                            rules.chemistry.affinity_norm_limit(),
+                        )?;
+                        (death, corpse_dir)
+                    } else {
+                        let death =
+                            Death::exhausted(&organism.committed, to, organism.position, stage)?;
+                        (death, *genome.traits().affinity())
+                    };
                     rules
                         .recycling
-                        .settle_with(&rules.grid, rules.exchange, &death, affinity, recycling)?
+                        .settle_with(&rules.grid, rules.exchange, &death, &corpse_dir, recycling)?
                         .record(&mut tick_ledger)?;
                     deaths.push(death);
                 }
@@ -2999,6 +3025,11 @@ impl World {
             };
             emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
             recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
+        }
+        if let Some(byproducts) = byproducts.as_mut() {
+            let byproduct_summary =
+                apply_deposits_to_carrier_on(next, byproducts, next.carrier0(), workers)?;
+            byproduct_summary.record(&mut tick_ledger, Transfer::MetabolicByproduct)?;
         }
 
         // Phase 10: invariants, accounting and the population's commit. The
@@ -3234,6 +3265,16 @@ impl Scratch {
                 &limits,
             )?,
             trail_emissions: if rules.v2.dual_carrier().is_some() {
+                Some(Deposits::with_capacity_for(
+                    &rules.grid,
+                    organisms,
+                    rules.exchange,
+                    &limits,
+                )?)
+            } else {
+                None
+            },
+            byproducts: if rules.v2.waste().is_some() {
                 Some(Deposits::with_capacity_for(
                     &rules.grid,
                     organisms,
@@ -3550,6 +3591,12 @@ fn fit_lanes(
             trail.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
         } else {
             lane.trail_emissions = None;
+        }
+        if rules.v2.waste().is_some() {
+            let byproducts = lane.byproducts.get_or_insert_with(Deposits::new);
+            byproducts.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+        } else {
+            lane.byproducts = None;
         }
         lane.emission_paid = CompensatedSum::ZERO;
         lane.transactions = None;
@@ -4564,6 +4611,9 @@ fn settle_all(
         if let Some(trail) = lane.trail_emissions.as_mut() {
             trail.clear();
         }
+        if let Some(byproducts) = lane.byproducts.as_mut() {
+            byproducts.clear();
+        }
         lane.emission_paid = CompensatedSum::ZERO;
         lane.transactions = None;
     }
@@ -4573,6 +4623,7 @@ fn settle_all(
             flows,
             emissions,
             trail_emissions,
+            byproducts,
             emission_paid,
             transactions,
             ..
@@ -4598,8 +4649,9 @@ fn settle_all(
                     operation: "read genome",
                     detail: format!("{} has no genome", organism.committed.id),
                 })?;
+            let traits = genome.traits();
             let mut stages = Reference {
-                traits: genome.traits(),
+                traits,
                 parameters: parameter_count(&rules.catalog, genome)?,
                 packets,
             };
@@ -4607,11 +4659,13 @@ fn settle_all(
             settle_stages(
                 rules,
                 organism,
+                traits,
                 &mut stages,
                 from,
                 flows,
                 emissions,
                 trail_emissions.as_mut(),
+                byproducts.as_mut(),
                 emission_paid,
                 record,
             )?
@@ -5433,20 +5487,28 @@ fn find(working: &[Working], id: OrganismId) -> Option<&Working> {
         .and_then(|index| working.get(index))
 }
 
-/// The tiny-reservoir stage, the last of §8.2. Returns what it took.
+/// The tiny-reservoir / viability-floor lysis stage, the last of §8.2.
+/// Returns what went to [`Flow::TinyReservoir`] (always `0.0` when `lysis-recycling`
+/// diverts the residual into `organism.lysed_residual` for `Transfer::Recycling`).
 fn clear_tiny(
     tiny: &TinyEnergyPolicy,
     organism: &mut Working,
     ledger: &mut TickLedger,
 ) -> Result<f64, CoreError> {
     let cleared = tiny.clear(&mut organism.budget)?;
-    if cleared > 0.0 {
-        ledger.record(Flow::TinyReservoir, cleared)?;
-    }
+    let tiny_flow = if tiny.is_lysis() {
+        organism.lysed_residual = cleared;
+        0.0
+    } else {
+        if cleared > 0.0 {
+            ledger.record(Flow::TinyReservoir, cleared)?;
+        }
+        cleared
+    };
     organism
         .vitality
         .check(BudgetStage::TinyReservoir, &organism.budget)?;
-    Ok(cleared)
+    Ok(tiny_flow)
 }
 
 /// [`OrganismSnapshot::local`]: the exchange footprint at `position` on
@@ -5567,9 +5629,6 @@ struct Settled {
     secretory_readiness: f32,
     emission_cooldown_deadline: Tick,
     emitted: bool,
-    /// Residual energy captured by `V2-11` viability-floor lysis in Phase 8
-    /// `clear_tiny`, handed to `Recycling` without `Flow::TinyReservoir`.
-    lysed_residual: f64,
     intent: Option<BirthIntent>,
 }
 
@@ -5937,29 +5996,62 @@ fn contact_displacements(
 /// returned [`Settled`].
 #[expect(
     clippy::too_many_arguments,
-    reason = "ordered phases 6 and 7 stage runner including optional V2-15 trail deposits and paid accumulator"
+    reason = "ordered phases 6 and 7 stage runner including optional V2-11 byproducts, V2-15 trail deposits and paid accumulator"
 )]
 fn settle_stages(
     rules: &Rules,
     organism: &Working,
+    traits: &Traits,
     stages: &mut impl Stages,
     from: Tick,
     ledger: &mut impl Ledger,
     emissions: &mut Deposits,
     trail_emissions: Option<&mut Deposits>,
+    byproducts: Option<&mut Deposits>,
     emission_paid: &mut CompensatedSum,
     record: Option<&mut Option<Transactions>>,
 ) -> Result<Settled, CoreError> {
     let mut settled = Settled::of(organism);
     let opening = settled.budget.remaining();
     let uptake = stages.uptake(rules, &mut settled.budget)?;
-    uptake.record(ledger)?;
+    let mut byproduct_staged = 0.0;
+    if let (Some(waste_rule), Some(byproducts)) = (rules.v2.waste(), byproducts) {
+        let unconverted = sub_down(uptake.absorbed, uptake.gain).max(0.0);
+        let candidate = (waste_rule.byproduct_recycle_fraction * unconverted).min(unconverted);
+        let retained_uptake = uptake.absorbed - candidate;
+        if candidate > 0.0 && retained_uptake >= uptake.gain {
+            let recurrent_h0 = organism.committed.held.recurrent_state_array()[0];
+            let a_eff = effective_affinity(traits, recurrent_h0, &rules.v2);
+            let waste_dir = symplectic_waste_direction(
+                &a_eff,
+                rules.v2.active_carrier0_channels(),
+                rules.chemistry.affinity_norm_limit(),
+            )?;
+            byproducts.push_with(
+                &rules.grid,
+                rules.exchange,
+                organism.committed.id,
+                organism.committed.position,
+                candidate,
+                candidate,
+                &waste_dir,
+            )?;
+            ledger.transfer(Transfer::Uptake, retained_uptake, uptake.gain)?;
+            ledger.record(Flow::Toxicity, uptake.toxicity.paid)?;
+            byproduct_staged = candidate;
+        } else {
+            uptake.record(ledger)?;
+        }
+    } else {
+        uptake.record(ledger)?;
+    }
     let absorbed = uptake.absorbed;
     let mut record = record.map(|slot| {
         slot.insert(Transactions {
             tick: from,
             opening,
             uptake,
+            byproduct_staged,
             maintenance: None,
             motion: None,
             emission: None,

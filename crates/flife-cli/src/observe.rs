@@ -79,6 +79,7 @@ impl Tally {
         for death in &report.deaths {
             let stage = match death.cause {
                 DeathCause::Exhausted(stage) => stage.name(),
+                DeathCause::Lysed(_) => "lysed",
                 DeathCause::Removed(_) => "removed",
             };
             *self.deaths_by_stage.entry(stage).or_insert(0) += 1;

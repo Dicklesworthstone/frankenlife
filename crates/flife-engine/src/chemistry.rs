@@ -23,11 +23,15 @@
 //! `b > 0` it is mildly harmful.
 
 use flife_core::ledger::{CompensatedSum, EnergyBudget, Ledger, Payment};
+use flife_core::numerics::symplectic_rotate_channels;
 use flife_core::{CoreError, Flow, Transfer, ValidatedConfig};
 use flife_field::FieldState;
 use flife_field::numerics::tanh;
 use flife_field::settle::ChemistryConstants;
 use flife_field::state::CHANNELS;
+use flife_genome::Traits;
+
+use crate::world::{CorpseDirection, V2Rules};
 
 /// The chemistry family this module implements.
 pub const BOUNDED_AFFINITY_V1: &str = "bounded-affinity-v1";
@@ -378,4 +382,98 @@ pub fn settle_efficiencies(
         gain,
         toxicity,
     })
+}
+
+/// Effective chemical affinity `a_eff` of an organism (`V2-11` / `V2-12` seam).
+///
+/// Returns `*traits.affinity()` in baseline and `V2-11`; `V2-12` activates the
+/// epigenetic rotation `a_eff(h_0)` through this single entry point so uptake,
+/// corpse lysis (`-a_eff` / `J a_eff`), and obligate symplectic waste
+/// (`J a_eff`) always share the exact same effective affinity (2nd-Law rule:
+/// `a_eff · J a_eff == 0` for every cell type).
+#[must_use]
+pub fn effective_affinity(
+    traits: &Traits,
+    _recurrent_state_h0: f32,
+    _rules: &V2Rules,
+) -> [f64; CHANNELS] {
+    *traits.affinity()
+}
+
+/// Chemical direction deposited by a lysed corpse (`V2-11`, `lysis-recycling`)
+/// over `0..active_carrier0_channels` (`32` on single-carrier fields, `24` on
+/// `V2-15` dual-carrier Carrier 0), zeroing any trailing channels.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `active_carrier0_channels > CHANNELS`,
+/// `affinity` contains a nonfinite component, or symplectic rotation refuses
+/// `affinity_norm_limit`.
+pub fn corpse_affinity_direction(
+    affinity: &[f64; CHANNELS],
+    direction: CorpseDirection,
+    active_carrier0_channels: usize,
+    affinity_norm_limit: f64,
+) -> Result<[f64; CHANNELS], CoreError> {
+    if active_carrier0_channels > CHANNELS {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "active carrier-0 channels",
+            detail: format!("{active_carrier0_channels} exceeds {CHANNELS}"),
+        });
+    }
+    match direction {
+        CorpseDirection::GeneticAffinity => {
+            if active_carrier0_channels == CHANNELS {
+                return Ok(*affinity);
+            }
+            let mut out = [0.0_f64; CHANNELS];
+            for (dst, &src) in out[..active_carrier0_channels]
+                .iter_mut()
+                .zip(&affinity[..active_carrier0_channels])
+            {
+                if !src.is_finite() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "corpse affinity direction",
+                        detail: format!("component {src} is not finite"),
+                    });
+                }
+                *dst = src + 0.0;
+            }
+            Ok(out)
+        }
+        CorpseDirection::NegatedAffinity => {
+            let mut out = [0.0_f64; CHANNELS];
+            for (dst, &src) in out[..active_carrier0_channels]
+                .iter_mut()
+                .zip(&affinity[..active_carrier0_channels])
+            {
+                if !src.is_finite() {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "corpse affinity direction",
+                        detail: format!("component {src} is not finite"),
+                    });
+                }
+                *dst = if src == 0.0 { 0.0 } else { -src };
+            }
+            Ok(out)
+        }
+        CorpseDirection::SymplecticAffinity => {
+            symplectic_rotate_channels(affinity, active_carrier0_channels, affinity_norm_limit)
+        }
+    }
+}
+
+/// Chemical direction `J a_eff` deposited by obligate symplectic metabolic waste
+/// (`V2-11`, `symplectic-waste`) strictly into Carrier 0
+/// (`0..active_carrier0_channels`, `32` single-carrier or `24` under `V2-15`),
+/// guaranteeing `a_eff · J a_eff == 0` and exact left-fold
+/// `‖J a_eff‖₂² <= affinity_norm_limit²`.
+///
+/// # Errors
+/// As [`symplectic_rotate_channels`].
+pub fn symplectic_waste_direction(
+    affinity: &[f64; CHANNELS],
+    active_carrier0_channels: usize,
+    affinity_norm_limit: f64,
+) -> Result<[f64; CHANNELS], CoreError> {
+    symplectic_rotate_channels(affinity, active_carrier0_channels, affinity_norm_limit)
 }

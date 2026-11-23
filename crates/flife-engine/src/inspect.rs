@@ -157,6 +157,9 @@ pub struct Transactions {
     /// Chemistry: the uptake it absorbed, the gain credited and the
     /// toxicity paid.
     pub uptake: UptakeSettlement,
+    /// Energy staged as obligate symplectic metabolic waste (`V2-11`);
+    /// zero when `symplectic-waste` is disabled.
+    pub byproduct_staged: f64,
     /// Maintenance: basal, sensor and controller costs, requested and paid.
     pub maintenance: Option<MaintenanceSettlement>,
     /// Motion: the proposed and applied velocity and its cost.

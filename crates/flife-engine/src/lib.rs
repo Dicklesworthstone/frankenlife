@@ -62,7 +62,8 @@ pub use ancestry::{
     ANCESTRY_PATH, Ancestor, AncestryHeld, Descendants, Followed, ROOM_PER_ORGANISM,
 };
 pub use chemistry::{
-    Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, settle_efficiencies,
+    Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
+    effective_affinity, settle_efficiencies, symplectic_waste_direction,
 };
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement, senescence_multiplier};
 pub use emission::{
@@ -99,9 +100,10 @@ pub use reproduction::{
 };
 pub use world::{
     Advance, BirthEvent, BuddingRules, CPU_REFERENCE, Candidate, CarrierSpec, ControllerReport,
-    CrowdingMode, CrowdingRules, FieldReport, Footprint, Graft, IntroductionEvent, ModelVariant,
-    NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE,
-    SenescenceRules, SensorReport, SettleReport, Stepped, TickReport, UNIFORM_POSITIONS,
-    UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA,
-    WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION, World, ZERO_VELOCITY, founder_position,
+    CorpseDirection, CrowdingMode, CrowdingRules, FieldReport, Footprint, Graft, IntroductionEvent,
+    LysisRules, ModelVariant, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT,
+    QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SenescenceRules, SensorReport, SettleReport, Stepped,
+    TickReport, UNIFORM_POSITIONS, UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS,
+    WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION,
+    WasteRules, World, ZERO_VELOCITY, founder_position,
 };

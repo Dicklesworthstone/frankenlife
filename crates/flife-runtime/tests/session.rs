@@ -1229,7 +1229,7 @@ fn held_step_wakes_immediately_when_hold_is_released_without_further_control() {
                 // yielding so the owner parks Step in `self.held` and drains
                 // `Hold { tick: None }` in `control.try_recv()`.
                 let mut step_fut = std::pin::pin!(handle.step(&cx));
-                let mut release_fut = std::pin::pin!(hold.release(&cx));
+                let mut release_fut = std::pin::pin!(handle.release(&cx));
                 let mut step_out = None;
                 let mut release_out = None;
                 std::future::poll_fn(|context| {
@@ -1319,7 +1319,7 @@ fn close_during_first_held_step_prevents_second_held_step_from_publishing() {
                     // Queue release and close back-to-back so close hits StepA's
                     // cancellation boundary (or before StepA starts), and wait
                     // for all three to settle.
-                    let mut release = std::pin::pin!(hold.release(&cx));
+                    let mut release = std::pin::pin!(handle.release(&cx));
                     let mut close = std::pin::pin!(handle.close(&cx));
                     let mut released = None;
                     let mut closed_at = None;

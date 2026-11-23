@@ -1083,12 +1083,12 @@ fn resolve_uptake_refuses_f64_overflowing_cell_demand_without_hanging() {
         Demand {
             organism: OrganismId::new(1),
             position: [0.5, 0.5],
-            requested: 1.0e308,
+            amount: 1.0e308,
         },
         Demand {
             organism: OrganismId::new(2),
             position: [0.5, 0.5],
-            requested: 1.0e308,
+            amount: 1.0e308,
         },
     ];
     let mut grants = Grants::new();

@@ -1865,7 +1865,7 @@ fn checkpoint_and_take_refuse_after_journal_failure() {
         let take_held = spawner
             .try_spawn(async move {
                 take_handle
-                    .checkpoint_with(&Cx::current().expect("a task context"), |_, _, b| Ok(b))
+                    .checkpoint_with(&Cx::current().expect("a task context"), |_, _, b| b)
                     .await
             })
             .expect("take_held");
@@ -1895,7 +1895,7 @@ fn checkpoint_and_take_refuse_after_journal_failure() {
             matches!(cp_after, Err(CoreError::StorageFailed { .. })),
             "post-failure checkpoint must refuse, got {cp_after:?}"
         );
-        let take_after = handle.checkpoint_with(&cx, |_, _, b| Ok(b)).await;
+        let take_after = handle.checkpoint_with(&cx, |_, _, b| b).await;
         assert!(
             matches!(take_after, Err(CoreError::StorageFailed { .. })),
             "post-failure checkpoint_with must refuse, got {take_after:?}"

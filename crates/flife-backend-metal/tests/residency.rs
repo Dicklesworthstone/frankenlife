@@ -560,8 +560,9 @@ fn half_kernel_defers_tiny_inputs_below_two_to_the_minus_78() -> Result<(), Core
 }
 
 /// Hidden widths that are not multiples of 4 exercise the scalar fallback
-/// loop in both `forward_pass_f32` and `forward_pass_half` (while odd
-/// parameter counts in F16 defer cleanly as unaligned half slots).
+/// loop in both `forward_pass_f32` and `forward_pass_half`, and Trap A's
+/// 4-element F16 shard stride guarantees even odd parameter counts (`[5]` =
+/// 741 params -> 744-element F16 stride) execute on GPU with 0 deferrals.
 #[test]
 fn non_multiple_of_four_hidden_widths_match_reference_in_f32_and_f16() -> Result<(), CoreError> {
     let (Some(mut wide), Some(mut half)) = (backend(16), backend(16)) else {
@@ -625,11 +626,249 @@ fn non_multiple_of_four_hidden_widths_match_reference_in_f32_and_f16() -> Result
     let mut half_out = Vec::new();
     half.evaluate(&half_jobs, &mut half_out)?;
     let half_want = reference(&half_jobs);
-    // [6] (882 params) and [10, 6] (1368 params) have even lengths and execute on GPU.
-    assert!(half_out[0].is_some() && half_out[1].is_some());
-    assert_eq!(bits(&half_out)[0], half_want[0]);
-    assert_eq!(bits(&half_out)[1], half_want[1]);
-    // [5] has 741 (odd) parameters and defers cleanly in F16 shards.
-    assert_eq!(half_out[2], None);
+    // [6] (882 params), [10, 6] (1368 params), and odd [5] (741 params,
+    // padded to 744-element F16 stride) all execute on GPU with 0 deferrals.
+    assert!(
+        half_out.iter().all(Option::is_some),
+        "expected 0 F16 alignment deferrals across [6], [10, 6], [5]"
+    );
+    assert_eq!(bits(&half_out), half_want);
+    Ok(())
+}
+
+/// V2-01 cross-backend bit-exact parity across Reference, FrankenTorch CPU
+/// (`CpuBackend`), and Metal (`MetalControllers` + `MetalBackend` F32 & F16):
+/// covers `(104, 36)`, `(104, 40)`, `(108, 44)`, `(112, 48)`, and odd
+/// `(105, 37)` across 1-hidden, 2-hidden, and odd-width topologies with
+/// **0 F16 alignment deferrals** (Trap A 4-element F16 stride + Trap B
+/// `sensed4[WIDEST / 4]`), plus recurrent `update_recurrent_state` parity.
+#[test]
+fn variable_width_reference_torch_and_metal_bit_exact() -> Result<(), CoreError> {
+    use std::num::NonZeroUsize;
+
+    use flife_backend_cpu::CpuBackend;
+    use flife_backend_metal::{Batch, MetalControllers};
+
+    let cases_dims: [(u32, u32, &[&[u32]]); 5] = [
+        (104, 36, &[&[8], &[64, 32]]),
+        (104, 40, &[&[8], &[64, 32]]),
+        (108, 44, &[&[16], &[64, 32]]),
+        (112, 48, &[&[32], &[64, 32]]),
+        (105, 37, &[&[5], &[8], &[32, 16]]),
+    ];
+
+    let mut draws = Draws(0x2026_0201);
+    let metal_direct = match MetalControllers::open() {
+        Ok(controllers) => Some(controllers),
+        Err(CoreError::MissingCapability { .. }) if !cfg!(target_os = "macos") => None,
+        Err(error) => return Err(error),
+    };
+    let mut metal_f32 = backend(8);
+    let mut metal_f16 = backend(8);
+
+    for (dim_idx, &(in_w, out_w, hidden_list)) in cases_dims.iter().enumerate() {
+        let topos: Vec<DenseTopology> = hidden_list
+            .iter()
+            .map(|h| DenseTopology::with_io(in_w, h, out_w))
+            .collect::<Result<_, _>>()?;
+
+        let per_topo = 10_usize;
+        let total = topos.len() * per_topo;
+        let mut f32_params = Vec::with_capacity(total);
+        let mut f16_params = Vec::with_capacity(total);
+        let mut inputs_list = Vec::with_capacity(total);
+        let mut topo_indices = Vec::with_capacity(total);
+        for (t_idx, topo) in topos.iter().enumerate() {
+            for _ in 0..per_topo {
+                let mut p = vec![0.0_f32; topo.parameter_count()];
+                for layer in topo.layers() {
+                    let scale = 1.0 / (layer.inputs as f64).sqrt();
+                    for v in &mut p[layer.weights..layer.biases + layer.outputs] {
+                        // Avoid tiny weights near 2^-78 so normal Metal jobs never
+                        // trigger the subnormal deferral path and we verify 0 deferrals.
+                        let raw = draws.symmetric();
+                        let nudged = if raw.abs() < 1.0e-3 { 0.25 } else { raw };
+                        *v = (nudged * scale) as f32;
+                    }
+                }
+                let h: Vec<F16> = p.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+                let inp: Vec<f64> = (0..in_w as usize)
+                    .map(|_| {
+                        let raw = draws.symmetric();
+                        let nudged = if raw.abs() < 1.0e-3 { 0.5 } else { raw };
+                        nudged * 1.5
+                    })
+                    .collect();
+                f32_params.push(p);
+                f16_params.push(h);
+                inputs_list.push(inp);
+                topo_indices.push(t_idx);
+            }
+        }
+
+        // Build jobs for F32 and F16.
+        let mut next_slot = vec![0_u64; topos.len()];
+        let mut jobs_f32 = Vec::with_capacity(total);
+        let mut jobs_f16 = Vec::with_capacity(total);
+        let mut direct_batch = Batch::new();
+        for i in 0..total {
+            let t = topo_indices[i];
+            let slot = next_slot[t];
+            next_slot[t] += 1;
+            let bucket_id = (dim_idx * 8 + t) as u32;
+            jobs_f32.push(ControllerJob {
+                genome: GenomeId::new((dim_idx as u64 + 1) * 10_000 + i as u64),
+                slot: ArenaSlot::new(bucket_id, slot, 1),
+                controller: ReferenceController::new(&topos[t], &f32_params[i], BOUND)?,
+                inputs: &inputs_list[i],
+            });
+            jobs_f16.push(ControllerJob {
+                genome: GenomeId::new((dim_idx as u64 + 1) * 20_000 + i as u64),
+                slot: ArenaSlot::new(bucket_id, slot, 1),
+                controller: ReferenceController::new(&topos[t], &f16_params[i], BOUND)?,
+                inputs: &inputs_list[i],
+            });
+            direct_batch.push(&topos[t], &f32_params[i], &inputs_list[i])?;
+        }
+
+        // 1. Reference oracle.
+        let want_f32 = reference(&jobs_f32);
+        let want_f16 = reference(&jobs_f16);
+        assert!(want_f32.iter().all(Option::is_some));
+        assert!(want_f16.iter().all(Option::is_some));
+
+        // 2. FrankenTorch CPU backend (F32 & F16).
+        let lanes = NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN);
+        let mut cpu = CpuBackend::new(lanes);
+        let mut out_cpu_f32 = Vec::new();
+        cpu.evaluate(&jobs_f32, &mut out_cpu_f32)?;
+        assert_eq!(
+            bits(&out_cpu_f32),
+            want_f32,
+            "CpuBackend F32 mismatch for ({in_w}, {out_w})"
+        );
+        let mut cpu_f16 = CpuBackend::new(lanes);
+        let mut out_cpu_f16 = Vec::new();
+        cpu_f16.evaluate(&jobs_f16, &mut out_cpu_f16)?;
+        assert_eq!(
+            bits(&out_cpu_f16),
+            want_f16,
+            "CpuBackend F16 mismatch for ({in_w}, {out_w})"
+        );
+
+        // 3. MetalControllers direct Batch (F32) + MetalBackend resident F32 & F16.
+        if let Some(controllers) = metal_direct.as_ref() {
+            let mut out_direct = Vec::new();
+            controllers.evaluate(&direct_batch, &mut out_direct)?;
+            assert!(
+                out_direct.iter().all(Option::is_some),
+                "MetalControllers deferred a job for ({in_w}, {out_w})"
+            );
+            assert_eq!(
+                bits(&out_direct),
+                want_f32,
+                "MetalControllers F32 mismatch for ({in_w}, {out_w})"
+            );
+        }
+        if let Some(backend_f32) = metal_f32.as_mut() {
+            let mut out_m32 = Vec::new();
+            backend_f32.evaluate(&jobs_f32, &mut out_m32)?;
+            assert!(
+                out_m32.iter().all(Option::is_some),
+                "MetalBackend F32 deferred a job for ({in_w}, {out_w})"
+            );
+            assert_eq!(
+                bits(&out_m32),
+                want_f32,
+                "MetalBackend F32 mismatch for ({in_w}, {out_w})"
+            );
+        }
+        if let Some(backend_f16) = metal_f16.as_mut() {
+            let uploads_before = backend_f16.uploads();
+            let mut out_m16 = Vec::new();
+            backend_f16.evaluate(&jobs_f16, &mut out_m16)?;
+            let deferred_f16 = out_m16.iter().filter(|o| o.is_none()).count();
+            assert_eq!(
+                deferred_f16, 0,
+                "MetalBackend F16 had {deferred_f16} alignment deferrals for ({in_w}, {out_w})"
+            );
+            assert_eq!(
+                backend_f16.uploads() - uploads_before,
+                total as u64,
+                "every F16 genome must upload for ({in_w}, {out_w})"
+            );
+            assert_eq!(
+                bits(&out_m16),
+                want_f16,
+                "MetalBackend F16 mismatch for ({in_w}, {out_w})"
+            );
+        }
+    }
+
+    // Verify Bundle A recurrent (106 sensors + S=2 -> [64, 32] -> 40 actions + 2*2 tail = 108/44)
+    // matches ReferenceController::evaluate_recurrent_slice bit-for-bit across
+    // CpuBackend and MetalBackend F16/F32 using shared `update_recurrent_state`.
+    let rec_topo = DenseTopology::with_io_recurrent(106, &[64, 32], 40, 2)?;
+    let mut rec_f32 = vec![0.0_f32; rec_topo.parameter_count()];
+    for layer in rec_topo.layers() {
+        let scale = 1.0 / (layer.inputs as f64).sqrt();
+        for v in &mut rec_f32[layer.weights..layer.biases + layer.outputs] {
+            let raw = draws.symmetric();
+            *v = (if raw.abs() < 1.0e-3 { 0.25 } else { raw } * scale) as f32;
+        }
+    }
+    let rec_f16: Vec<F16> = rec_f32
+        .iter()
+        .map(|&v| F16::from_f64(f64::from(v)))
+        .collect();
+    let sensor_in: Vec<f64> = (0..106)
+        .map(|_| {
+            let raw = draws.symmetric();
+            if raw.abs() < 1.0e-3 { 0.5 } else { raw }
+        })
+        .collect();
+    let state = [0.45_f32, -0.35];
+    let mut combined_in = sensor_in.clone();
+    combined_in.extend(state.iter().map(|&h| f64::from(h)));
+
+    let ctrl_f16 = ReferenceController::new(&rec_topo, &rec_f16, BOUND)?;
+    let mut scratch = ControllerScratch::new(&rec_topo)?;
+    let mut ref_next = [0.0_f32; 2];
+    let ref_actions =
+        ctrl_f16.evaluate_recurrent_slice(&sensor_in, &state, 2.5, &mut scratch, &mut ref_next)?;
+
+    let rec_job = ControllerJob {
+        genome: GenomeId::new(999_001),
+        slot: ArenaSlot::new(63, 0, 1),
+        controller: ctrl_f16,
+        inputs: &combined_in,
+    };
+    let mut cpu = CpuBackend::new(NonZeroUsize::MIN);
+    let mut cpu_out = Vec::new();
+    cpu.evaluate(&[rec_job], &mut cpu_out)?;
+    let cpu_raw = cpu_out[0].expect("recurrent F16 on CpuBackend");
+    let mut cpu_next = [0.0_f32; 2];
+    flife_neural::update_recurrent_state(&state, &cpu_raw[40..44], 2.5, &mut cpu_next)?;
+    assert_eq!(
+        cpu_raw[..40].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        ref_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(cpu_next.map(f32::to_bits), ref_next.map(f32::to_bits));
+
+    if let Some(backend_f16) = metal_f16.as_mut() {
+        let mut metal_out = Vec::new();
+        backend_f16.evaluate(&[rec_job], &mut metal_out)?;
+        let metal_raw = metal_out[0].expect("recurrent F16 on MetalBackend");
+        let mut metal_next = [0.0_f32; 2];
+        flife_neural::update_recurrent_state(&state, &metal_raw[40..44], 2.5, &mut metal_next)?;
+        assert_eq!(
+            metal_raw[..40]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            ref_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(metal_next.map(f32::to_bits), ref_next.map(f32::to_bits));
+    }
     Ok(())
 }

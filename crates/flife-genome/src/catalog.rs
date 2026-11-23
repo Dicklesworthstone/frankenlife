@@ -8,8 +8,9 @@
 //! listed, so identities do not shift, but is not admitted: no genome may
 //! take it and no transition may target it.
 
+use flife_core::model::is_v2_model;
 use flife_core::{CoreError, ValidatedConfig};
-use flife_neural::DenseTopology;
+use flife_neural::{ActionLayout, DenseTopology, SensorLayout};
 
 use crate::transition::{OVERLAP_PLUS_ZERO_OUTPUT_V1, PREFIX_AND_IDENTITY_BRIDGE_V1};
 
@@ -95,6 +96,29 @@ impl TopologyCatalog {
         )
     }
 
+    /// Build a five-member catalog directly from canonical [`SensorLayout`] and
+    /// [`ActionLayout`] (V2-01).
+    ///
+    /// # Errors
+    /// As [`DenseTopology::from_layouts`] and [`TopologyCatalog::dense_104_36_v1`].
+    pub fn from_layouts(
+        name: &'static str,
+        sensors: &SensorLayout,
+        actions: &ActionLayout,
+        maximum_parameters: u64,
+        default_hidden: &[u32],
+    ) -> Result<Self, CoreError> {
+        let state_width =
+            u32::try_from(sensors.recurrent_state_width()).map_err(|_| CoreError::Overflow {
+                quantity: "controller.recurrent_state_width",
+            })?;
+        let members = DENSE_104_36_MEMBERS
+            .iter()
+            .map(|hidden| DenseTopology::from_layouts(sensors, hidden, actions))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::finish(name, state_width, members, maximum_parameters, default_hidden)
+    }
+
     fn finish(
         name: &'static str,
         recurrent_state_width: u32,
@@ -159,6 +183,44 @@ impl TopologyCatalog {
             }
         }
         let default = DenseTopology::from_config(config)?;
+        if is_v2_model(&config.config().model) {
+            let name = match architecture.catalog.as_str() {
+                DENSE_104_36_CATALOG_V1 => DENSE_104_36_CATALOG_V1,
+                RECURRENT_104_36_CATALOG_V1 => RECURRENT_104_36_CATALOG_V1,
+                other => {
+                    return Err(CoreError::UnknownAlgorithm {
+                        role: "architecture_mutation.catalog",
+                        name: other.to_owned(),
+                    });
+                }
+            };
+            let abi = config.v2_abi();
+            let state_width = usize::try_from(abi.recurrent_state_width).map_err(|_| {
+                CoreError::Overflow {
+                    quantity: "controller.recurrent_state_width",
+                }
+            })?;
+            let sensors = SensorLayout::new(
+                abi.dual_carrier_sensors,
+                abi.hippo_crowding_sensor,
+                abi.notch_delta_sensor,
+                state_width,
+            )?;
+            let actions = ActionLayout::new(
+                abi.so2_motor_actions,
+                abi.so2_budding_actions,
+                abi.emt_gate_action,
+                abi.wake_pump_action,
+                state_width,
+            )?;
+            return Self::from_layouts(
+                name,
+                &sensors,
+                &actions,
+                architecture.maximum_parameters,
+                default.hidden_widths(),
+            );
+        }
         match architecture.catalog.as_str() {
             DENSE_104_36_CATALOG_V1 => {
                 if default.is_recurrent() {

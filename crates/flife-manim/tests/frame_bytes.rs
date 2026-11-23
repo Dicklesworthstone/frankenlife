@@ -307,8 +307,8 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
         };
         for (center, zoom) in [
             ([12.0, 20.0], 2.0),
-            ([0.1, 31.9], 4.0),
-            ([16.0, 16.0], 16.0),
+            ([0.1, 127.9], 4.0),
+            ([64.0, 64.0], 16.0),
         ] {
             let mut view = WorldView::for_epoch(&epoch, drawable, [2, 3, 8]).expect("a view");
             view.set_style(style);
@@ -354,9 +354,8 @@ fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
             unculled.extend_from_slice(view.cloud().draws());
             unculled.extend(view.region_draw());
             unculled.extend(view.selection_draw());
-            let mut ref_job =
-                ThreeDJob::new(view.camera().camera(), &unculled, Tiling::default())
-                    .expect("reference job");
+            let mut ref_job = ThreeDJob::new(view.camera().camera(), &unculled, Tiling::default())
+                .expect("reference job");
             if let Some(b) = view.frame_bloom() {
                 ref_job = ref_job.with_bloom(b.clone());
             }

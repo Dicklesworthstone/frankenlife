@@ -10,8 +10,9 @@ use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::numerics::{sigmoid, tanh};
 use flife_neural::{
-    ACTION_WIDTH, ControllerScratch, DenseTopology, MAXIMUM_RECURRENT_STATE_WIDTH,
-    ReferenceController, SENSOR_WIDTH, Weight,
+    ACTION_WIDTH, ActionLayout, ControllerScratch, DenseTopology, MAX_ACTION_WIDTH,
+    MAX_CONTROLLER_OUTPUT_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, RawOutputs,
+    ReferenceController, SENSOR_WIDTH, SensorLayout, Weight, update_recurrent_state,
 };
 
 /// Independent scalar oracle written straight from §6.2 and §25.2 without
@@ -282,5 +283,166 @@ fn gated_recurrent_controller_matches_independent_oracle_and_stays_bounded() {
     assert!(matches!(
         DenseTopology::new_recurrent(&[8], MAXIMUM_RECURRENT_STATE_WIDTH as u32 + 1),
         Err(CoreError::NumericalInvalid { .. })
+    ));
+}
+
+/// V2-01: canonical pure-scientific `SensorLayout` & `ActionLayout` index
+/// allocation, alignment properties, `V2Abi` agreement, `DenseTopology::from_layouts`,
+/// and shared `update_recurrent_state` (including slow epigenetic gate bias `b_epi`).
+#[test]
+fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
+    assert_eq!(MAX_SENSOR_WIDTH, 128);
+    assert_eq!(MAX_ACTION_WIDTH, 48);
+    assert_eq!(MAX_CONTROLLER_OUTPUT_WIDTH, 80);
+
+    // 1. Baseline v1 (104/36).
+    let v1_s = SensorLayout::v1();
+    let v1_a = ActionLayout::v1();
+    assert_eq!(
+        (v1_s.observation_width(), v1_s.recurrent_state_width(), v1_s.input_width()),
+        (104, 0, 104)
+    );
+    assert_eq!(
+        (v1_a.action_width(), v1_a.recurrent_state_width(), v1_a.raw_output_width()),
+        (36, 0, 36)
+    );
+    assert!(v1_s.is_aligned4());
+    assert_eq!(v1_s.dual_carrier_trails(), None);
+    assert_eq!(v1_s.hippo_crowding(), None);
+    assert_eq!(v1_s.notch_delta(), None);
+    assert_eq!(v1_s.recurrent_state(), None);
+    assert_eq!(v1_a.so2_motor(), None);
+    assert_eq!(v1_a.so2_budding(), None);
+    assert_eq!(v1_a.emt_gate(), None);
+    assert_eq!(v1_a.wake_pump(), None);
+
+    // 2. Bundle A (Animal Tissue: hippo + notch + S=2 -> 108; so2-motor + S=2 -> 40/44).
+    let bundle_a_s = SensorLayout::new(false, true, true, 2).expect("bundle A sensors");
+    let bundle_a_a = ActionLayout::new(true, false, false, false, 2).expect("bundle A actions");
+    assert_eq!(bundle_a_s.input_width(), 108);
+    assert!(bundle_a_s.is_aligned4());
+    assert_eq!(bundle_a_s.hippo_crowding(), Some(104));
+    assert_eq!(bundle_a_s.notch_delta(), Some(105));
+    assert_eq!(bundle_a_s.recurrent_state(), Some(106));
+    assert_eq!(bundle_a_s.recurrent_state_range(), 106..108);
+    assert_eq!(bundle_a_a.action_width(), 40);
+    assert_eq!(bundle_a_a.raw_output_width(), 44);
+    assert_eq!(bundle_a_a.so2_motor(), Some(36));
+    assert_eq!(bundle_a_a.recurrent_candidates(), 40..42);
+    assert_eq!(bundle_a_a.recurrent_gates(), 42..44);
+    assert_eq!(bundle_a_a.recurrent_tail(), 40..44);
+
+    // 3. Bundle B (Super-Colony: dual-carrier-trails -> 108; so2-motor + so2-budding -> 42).
+    let bundle_b_s = SensorLayout::new(true, false, false, 0).expect("bundle B sensors");
+    let bundle_b_a = ActionLayout::new(true, true, false, false, 0).expect("bundle B actions");
+    assert_eq!(bundle_b_s.input_width(), 108);
+    assert_eq!(bundle_b_s.dual_carrier_trails(), Some(104));
+    assert_eq!(bundle_b_a.action_width(), 42);
+    assert_eq!(bundle_b_a.so2_motor(), Some(36));
+    assert_eq!(bundle_b_a.so2_budding(), Some(40));
+
+    // 4. All-21 (S=2): 104 + 4 + 1 + 1 + 2 = 112 sensors; 36 + 4 + 2 + 1 + 1 = 44 actions, 48 raw.
+    let all_s = SensorLayout::new(true, true, true, 2).expect("all sensors");
+    let all_a = ActionLayout::new(true, true, true, true, 2).expect("all actions");
+    assert_eq!(all_s.input_width(), 112);
+    assert!(all_s.is_aligned4());
+    assert_eq!(all_s.dual_carrier_trails(), Some(104));
+    assert_eq!(all_s.hippo_crowding(), Some(108));
+    assert_eq!(all_s.notch_delta(), Some(109));
+    assert_eq!(all_s.recurrent_state(), Some(110));
+    assert_eq!(all_a.action_width(), 44);
+    assert_eq!(all_a.raw_output_width(), 48);
+    assert_eq!(all_a.so2_motor(), Some(36));
+    assert_eq!(all_a.so2_budding(), Some(40));
+    assert_eq!(all_a.emt_gate(), Some(42));
+    assert_eq!(all_a.wake_pump(), Some(43));
+    assert_eq!(all_a.recurrent_candidates(), 44..46);
+    assert_eq!(all_a.recurrent_gates(), 46..48);
+
+    // 5. Custom odd subset (105 sensors, 37 outputs): pure scientific, NO silent padding!
+    let odd_s = SensorLayout::new(false, true, false, 0).expect("odd sensors");
+    let odd_a = ActionLayout::new(false, false, true, false, 0).expect("odd actions");
+    assert_eq!(odd_s.input_width(), 105);
+    assert!(!odd_s.is_aligned4());
+    assert_eq!(odd_a.action_width(), 37);
+    assert_eq!(odd_a.raw_output_width(), 37);
+
+    // 6. DenseTopology::from_layouts & V2Abi round-trip.
+    let topo = DenseTopology::from_layouts(&bundle_a_s, &[64, 32], &bundle_a_a).expect("topo");
+    assert_eq!(topo.sensor_width(), 106);
+    assert_eq!(topo.input_width(), 108);
+    assert_eq!(topo.action_width(), 40);
+    assert_eq!(topo.raw_output_width(), 44);
+    assert_eq!(topo.recurrent_state_width(), 2);
+    assert_eq!(
+        topo.parameter_count(),
+        (108 * 64 + 64) + (64 * 32 + 32) + (32 * 44 + 44)
+    );
+    assert!(matches!(
+        DenseTopology::from_layouts(&bundle_a_s, &[8], &v1_a),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+
+    // 7. Shared `update_recurrent_state` matches independent formula for both
+    //    `gate_bias = 0.0` (FL-054) and negative/positive `gate_bias` (V2-12).
+    let state = [0.6_f32, -0.5, 0.25];
+    let raw_tail = [0.8_f32, -1.25, 0.0, -0.5, 1.0, 0.25];
+    for bias in [0.0_f64, -2.5, 2.5] {
+        let mut next = [0.0_f32; 3];
+        update_recurrent_state(&state, &raw_tail, bias, &mut next).expect("update");
+        for k in 0..3 {
+            let cand = tanh(f64::from(raw_tail[k])).expect("tanh") as f32;
+            let gate_arg = if bias == 0.0 {
+                f64::from(raw_tail[3 + k])
+            } else {
+                f64::from(raw_tail[3 + k]) + bias
+            };
+            let gate = sigmoid(gate_arg).expect("sigmoid") as f32;
+            let expected = ((1.0_f32 - gate) * state[k] + gate * cand).clamp(-1.0_f32, 1.0_f32);
+            assert_eq!(next[k].to_bits(), expected.to_bits(), "bias={bias} k={k}");
+        }
+    }
+
+    // Verify `evaluate_raw` + `update_recurrent_state` == `evaluate_recurrent_slice` bit-for-bit.
+    let params = pseudo_values(0x5632_0001, topo.parameter_count(), 0.35);
+    let ctrl = ReferenceController::new(&topo, &params, 10.0).expect("ctrl");
+    let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+    let sensor_in: Vec<f64> = (0..106).map(|i| ((i as f64) * 0.21).sin()).collect();
+    let h0 = [0.4_f32, -0.7];
+    let mut full_in = sensor_in.clone();
+    full_in.extend(h0.iter().map(|&v| f64::from(v)));
+
+    let raw: RawOutputs = ctrl.evaluate_raw(&full_in, &mut scratch).expect("raw");
+    assert_eq!(raw.len(), 44);
+    let mut via_raw_next = [0.0_f32; 2];
+    update_recurrent_state(&h0, &raw[40..44], -2.5, &mut via_raw_next).expect("update");
+
+    let mut via_slice_next = [0.0_f32; 2];
+    let slice_actions = ctrl
+        .evaluate_recurrent_slice(&sensor_in, &h0, -2.5, &mut scratch, &mut via_slice_next)
+        .expect("recurrent slice");
+    assert_eq!(slice_actions.len(), 40);
+    assert_eq!(
+        raw[..40].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        slice_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        via_raw_next.map(f32::to_bits),
+        via_slice_next.map(f32::to_bits)
+    );
+
+    // Refusals for `update_recurrent_state`.
+    let mut bad_next = [0.0_f32; 2];
+    assert!(matches!(
+        update_recurrent_state(&h0, &raw[40..44], f64::NAN, &mut bad_next),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        update_recurrent_state(&[1.2, 0.0], &raw[40..44], 0.0, &mut bad_next),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        update_recurrent_state(&h0, &raw[40..43], 0.0, &mut bad_next),
+        Err(CoreError::LayoutMismatch { .. })
     ));
 }

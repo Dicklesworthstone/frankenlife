@@ -84,7 +84,9 @@ impl Viewport {
         if !fit_scale.is_finite() || fit_scale <= 0.0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "viewport fit scale",
-                detail: format!("extent {extent:?} in drawable {drawable:?} gives scale {fit_scale}"),
+                detail: format!(
+                    "extent {extent:?} in drawable {drawable:?} gives scale {fit_scale}"
+                ),
             });
         }
         let viewport = Self::placed(

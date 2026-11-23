@@ -68,7 +68,7 @@
 
 use flife_core::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
-    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, MAXIMUM_CONTACT_SWEEPS,
+    FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, MAXIMUM_CONTACT_SWEEPS, is_v2_model,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::FieldGrid;
@@ -116,18 +116,23 @@ impl ContactRules {
             return Ok(None);
         };
         let model = config.config().model.as_str();
+        let inhibits = if is_v2_model(model) {
+            contact.inhibition.is_some()
+        } else {
+            [
+                FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
+                FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
+                FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
+            ]
+            .contains(&model)
+        };
         let rules = Self {
             diameter: contact.diameter,
             stiffness: contact.stiffness,
             adhesion: contact.adhesion,
             range: contact.adhesion_range,
             sweeps: contact.sweeps.unwrap_or(1),
-            inhibits: [
-                FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
-                FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
-                FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING,
-            ]
-            .contains(&model),
+            inhibits,
             inhibition: contact.inhibition.unwrap_or(0.0),
             repulsion: contact.repulsion.unwrap_or(0.0),
         };

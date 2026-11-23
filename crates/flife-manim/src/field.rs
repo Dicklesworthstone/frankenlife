@@ -545,44 +545,41 @@ impl FieldLayer {
         // Prepare any resized cache buffers before mutating `self` so an
         // allocation failure leaves the previous texture, quad and cache
         // intact. In steady state (`capacity() == len`) no allocation occurs.
-        let mut new_values = if self.built_values.capacity() == values.len() {
+        let new_values = if self.built_values.capacity() == values.len() {
             None
         } else {
             let mut buf = Vec::new();
-            buf.try_reserve_exact(values.len()).map_err(|_| {
-                CoreError::AllocationFailed {
+            buf.try_reserve_exact(values.len())
+                .map_err(|_| CoreError::AllocationFailed {
                     buffer: "field layer values",
                     bytes: u64::try_from(values.len().saturating_mul(size_of::<f32>()))
                         .unwrap_or(u64::MAX),
-                }
-            })?;
+                })?;
             Some(buf)
         };
         let kept_comp = if composed { composition.len() } else { 0 };
-        let mut new_composition = if self.built_composition.capacity() == kept_comp {
+        let new_composition = if self.built_composition.capacity() == kept_comp {
             None
         } else {
             let mut buf = Vec::new();
-            buf.try_reserve_exact(kept_comp).map_err(|_| {
-                CoreError::AllocationFailed {
+            buf.try_reserve_exact(kept_comp)
+                .map_err(|_| CoreError::AllocationFailed {
                     buffer: "field layer compositions",
                     bytes: u64::try_from(kept_comp.saturating_mul(size_of::<[f32; 3]>()))
                         .unwrap_or(u64::MAX),
-                }
-            })?;
+                })?;
             Some(buf)
         };
         let kept_channel = if channel.is_some() { values.len() } else { 0 };
-        let mut new_component = if self.built_component.capacity() == kept_channel {
+        let new_component = if self.built_component.capacity() == kept_channel {
             None
         } else {
             let mut buf = Vec::new();
-            buf.try_reserve_exact(kept_channel).map_err(|_| {
-                CoreError::AllocationFailed {
+            buf.try_reserve_exact(kept_channel)
+                .map_err(|_| CoreError::AllocationFailed {
                     buffer: "field layer components",
                     bytes: u64::try_from(kept_channel).unwrap_or(u64::MAX),
-                }
-            })?;
+                })?;
             Some(buf)
         };
 
@@ -593,13 +590,13 @@ impl FieldLayer {
             self.quad_key = Some(want_quad);
         }
         self.scale = scale;
-        if let Some(buf) = new_values.take() {
+        if let Some(buf) = new_values {
             self.built_values = buf;
         } else {
             self.built_values.clear();
         }
         self.built_values.extend_from_slice(values);
-        if let Some(buf) = new_composition.take() {
+        if let Some(buf) = new_composition {
             self.built_composition = buf;
         } else {
             self.built_composition.clear();
@@ -607,7 +604,7 @@ impl FieldLayer {
         if composed {
             self.built_composition.extend_from_slice(composition);
         }
-        if let Some(buf) = new_component.take() {
+        if let Some(buf) = new_component {
             self.built_component = buf;
         } else {
             self.built_component.clear();

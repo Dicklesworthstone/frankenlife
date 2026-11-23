@@ -53,12 +53,21 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
   - `emission_gate = σ(o_2)`;
   - `emission`: a unit direction from `o_3..o_34` and `spend_fraction = 1 − e^(−r_max σ(o_35) Δt)`, present only
     when the gate is open and the direction is valid.
-- Index constants for every ABI slot (`VALUES`, `X_DERIVATIVES`, …, `EMISSION_SPEND`), with `SENSOR_WIDTH = 104`
-  and `ACTION_WIDTH = 36`.
-- `DenseTopology`: hidden widths, `parameter_count` (`P`, weights plus biases, the figure maintenance charges), and
-  each layer's `LayerShape`, which maps `weight[out][in]` and `bias[out]` to packed offsets.
-- `ReferenceController::evaluate` returns the 36 raw F32 outputs of the linear final layer, and `widen` gives the
-  exact F64 values `decode` reads. `ControllerScratch` is reusable activation storage.
+- Index constants for every ABI slot (`VALUES`, `X_DERIVATIVES`, …, `EMISSION_SPEND`), with `SENSOR_WIDTH = 104`,
+  `ACTION_WIDTH = 36`, and V2-01 variable-width ceilings `MAX_SENSOR_WIDTH = 128`, `MAX_ACTION_WIDTH = 48`, and
+  `MAX_CONTROLLER_OUTPUT_WIDTH = 80`.
+- V2-01 pure scientific layouts `SensorLayout` and `ActionLayout` (`from_config`, `from_v2_abi`, `new`, `v1`,
+  `v1_recurrent`): identical across Reference CPU, FrankenTorch CPU, and Metal, with zero silent Metal-only dead lanes.
+- `DenseTopology`: generalized `(input_width <= 128, raw_output_width <= 80)` via `with_io`, `with_io_recurrent`, and
+  `from_layouts` alongside `new` and `new_recurrent`; hidden widths, `parameter_count` (`P`, weights plus biases, the
+  figure maintenance charges), and each layer's `LayerShape`.
+- `RawOutputs` (inline `Copy` up to 80 F32s) and shared `update_recurrent_state(state, raw_tail, gate_bias, next_state)`
+  so Reference, FrankenTorch CPU, and Metal F16/F32 share one bit-exact gated recurrent transition.
+- `ShardGeometry` (Trap A defense-in-depth): `new_for_dtype` and `fitting_for_dtype` pad F16 `slot_stride_elements`
+  to `parameters.next_multiple_of(4)`, guaranteeing 0 F16 Metal alignment deferrals even for odd-output topologies.
+- `ReferenceController::evaluate` (baseline 104/36), `evaluate_raw` (dynamic up to 128/80), `evaluate_recurrent`,
+  `evaluate_recurrent_slice`, `trace`, `trace_raw`, and `trace_recurrent`. `ControllerScratch` is reusable activation
+  storage.
 - `ReferenceController::trace` (FL-021, plan §14.2's sampled activations) is `evaluate` keeping each hidden layer's
   activations: a `Trace { hidden, outputs }` whose `outputs` are `evaluate`'s bit for bit and whose `hidden` are the
   F32 values the next layer read, one vector per hidden layer in evaluation order. It refuses what `evaluate`

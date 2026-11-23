@@ -27,7 +27,7 @@ use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, total};
 use flife_core::{CoreError, EnergyLedger, Holdings};
 use flife_field::{BufferLimits, FieldPair};
-use flife_genome::{Genome, GenomeQuota, Traits, WeightsMut};
+use flife_genome::{Genome, GenomeQuota, WeightsMut};
 use flife_neural::Weights;
 
 use super::{
@@ -56,13 +56,7 @@ pub(super) fn reseal(
     id: GenomeId,
     parent: Option<GenomeId>,
 ) -> Result<Genome, CoreError> {
-    let traits = genome.traits();
-    let traits = Traits::new(
-        *traits.affinity(),
-        *traits.motion_response(),
-        traits.sensing_scale(),
-        &rules.limits,
-    )?;
+    let traits = genome.traits().reseal(&rules.limits)?;
     let mut buffer = quota.allocate(&rules.catalog, genome.topology())?;
     let copied = match (buffer.values_mut(), genome.parameters()) {
         (WeightsMut::F32(to), Weights::F32(from)) if to.len() == from.len() => {

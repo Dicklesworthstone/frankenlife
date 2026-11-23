@@ -18,8 +18,8 @@ in frankentorch, added for this item. This crate is `forbid(unsafe_code)`.
   `CpuBackend::with_budget(lanes, shard_slots, budget)`. `new` and `with_shard_slots` are unbounded. The CLI grants
   what its preflight leaves (`flife-cli`'s `memory`).
 
-**Outputs.** One entry per job, in batch order: its 36 raw outputs, or `None` for a deferred job, which the world
-evaluates on the reference.
+**Outputs.** One entry per job, in batch order: its `flife_neural::RawOutputs` (length `raw_output_width <= 80`), or
+`None` for a deferred job, which the world evaluates on the reference.
 
 **The arithmetic.**
 - Each input is rounded once to F32.
@@ -37,11 +37,13 @@ evaluates on the reference.
 - an output that is not finite.
 
 It is also `None` when its shape is not one this backend takes:
-- not 104 inputs in, 36 outputs out, and each layer feeding the next;
+- `input_width` outside `1..=128`, `raw_output_width` outside `1..=80`, `job.inputs.len() != input_width`, or a layer
+  not feeding the next;
 - more than `MAXIMUM_HIDDEN_LAYERS` = 2 hidden layers;
 - a parameter count other than its layers'.
 
-The catalog's topologies all qualify.
+Both `v1` (`104/36`) and `v2` variable-width/recurrent topologies (including odd widths such as `105/37` and recurrent
+`108/44`) qualify and match `ReferenceController::evaluate_raw` bit for bit.
 
 **Executor** (plan §3.4, §12.5). The kernel runs on its caller's thread. It touches no rayon pool, spawns nothing
 and allocates nothing. `CpuBackend` splits a batch into at most `lanes` contiguous runs of at least

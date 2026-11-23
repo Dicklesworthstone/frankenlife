@@ -81,7 +81,8 @@ use flife_core::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
-    FIELD_ECOLOGY_V1_UNGATED_MOTION,
+    FIELD_ECOLOGY_V1_UNGATED_MOTION, FIELD_ECOLOGY_V2, FIELD_ECOLOGY_V2_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V2_FIXED_CONTROLLER, FIELD_ECOLOGY_V2_FRESH_OFFSPRING,
 };
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
@@ -94,8 +95,9 @@ use flife_field::{
     FieldWork, GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
     SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
     Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
-    advance_field_on, demand_with_scratch, demands_on, initial_source, reduce_field_on,
-    resolve_uptake_on, resolve_uptake_with_on_workers, state::CHANNELS,
+    advance_field_on, apply_deposits_on, apply_grants_on, demand_with_scratch, demands_on,
+    initial_source, reduce_field_on, resolve_uptake_on, resolve_uptake_with_on_workers,
+    state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -103,9 +105,10 @@ use flife_genome::{
     founder_topology, founder_traits, grow_founder, initial_scale,
 };
 use flife_neural::{
-    ACTION_WIDTH, ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch,
-    DecodedActions, INDEPENDENT_RECURRENT_MLP_V1, Intrinsic, MAXIMUM_RECURRENT_STATE_WIDTH,
-    Observation, SensorScales, decode, observe_for_controller, widen,
+    ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch, DecodedActions, Intrinsic,
+    MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs,
+    SENSOR_WIDTH, SensorScales, decode_slice, observe_for_controller, update_recurrent_state,
+    widen_slice,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
@@ -133,10 +136,15 @@ mod checkpoint;
 mod crop;
 mod graft;
 mod settle;
+mod v2;
 
-pub use checkpoint::{WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_RECURRENT_HELD_VERSION};
+pub use checkpoint::{
+    WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_RECURRENT_HELD_VERSION,
+    WORLD_V2_CHUNK_VERSION,
+};
 pub use graft::Graft;
 use settle::{Settle, settle_with};
+pub use v2::{CarrierSpec, V2Rules};
 
 /// The backend this module implements: the scalar CPU reference.
 pub const CPU_REFERENCE: &str = "cpu-reference";
@@ -439,13 +447,15 @@ struct Rules {
     variant: ModelVariant,
     /// The contact models' bodies (plan §5.4); none under every other.
     contact: Option<ContactRules>,
+    /// Modular `field-ecology-v2*` feature rules and sensor/action layouts.
+    v2: V2Rules,
     initial_scale: f64,
 }
 
-/// Which `field-ecology-v1` model a world runs: the baseline, one of
-/// FL-041's ablation models (plan §15.3, §21.6), or a motion variant, each
-/// changing exactly one rule; or the contact model (plan §5.4), which adds
-/// one, and its two ablations.
+/// Which `field-ecology-v1*` or `field-ecology-v2*` model a world runs: the
+/// baseline, one of FL-041's ablation models (plan §15.3, §21.6), a motion
+/// variant, a contact variant (plan §5.4), or the modular `field-ecology-v2`
+/// ecology and its controls (V2-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelVariant {
     /// `field-ecology-v1`.
@@ -489,6 +499,17 @@ pub enum ModelVariant {
     /// `field-ecology-v1-contact-sorting-fresh-offspring`: sorting, with a
     /// newborn's genome a founder's drawn at its own identity.
     SortingFreshOffspring,
+    /// `field-ecology-v2`: modular emergent ecology (V2-01).
+    V2,
+    /// `field-ecology-v2-chemistry-only`: v2 with actions decoded from an
+    /// all-zero raw output while controllers are still evaluated and charged.
+    V2ChemistryOnly,
+    /// `field-ecology-v2-fresh-offspring`: v2 with each newborn drawing a
+    /// fresh founder genome at its own identity.
+    V2FreshOffspring,
+    /// `field-ecology-v2-fixed-controller`: v2 with controller weights and
+    /// topology frozen across inheritance while traits still mutate.
+    V2FixedController,
 }
 
 impl ModelVariant {
@@ -513,6 +534,10 @@ impl ModelVariant {
             FIELD_ECOLOGY_V1_CONTACT_SORTING => Ok(Self::Sorting),
             FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY => Ok(Self::SortingChemistryOnly),
             FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING => Ok(Self::SortingFreshOffspring),
+            FIELD_ECOLOGY_V2 => Ok(Self::V2),
+            FIELD_ECOLOGY_V2_CHEMISTRY_ONLY => Ok(Self::V2ChemistryOnly),
+            FIELD_ECOLOGY_V2_FRESH_OFFSPRING => Ok(Self::V2FreshOffspring),
+            FIELD_ECOLOGY_V2_FIXED_CONTROLLER => Ok(Self::V2FixedController),
             other => Err(CoreError::UnknownAlgorithm {
                 role: "model",
                 name: other.to_owned(),
@@ -522,6 +547,22 @@ impl ModelVariant {
 }
 
 impl ModelVariant {
+    /// Whether this variant belongs to the `field-ecology-v2*` family.
+    #[must_use]
+    pub const fn is_v2(self) -> bool {
+        matches!(
+            self,
+            Self::V2 | Self::V2ChemistryOnly | Self::V2FreshOffspring | Self::V2FixedController
+        )
+    }
+
+    /// Whether controller weights and topology stay fixed across inheritance
+    /// (`field-ecology-v2-fixed-controller`).
+    #[must_use]
+    pub const fn fixed_controller(self) -> bool {
+        matches!(self, Self::V2FixedController)
+    }
+
     /// Whether actions decode from an all-zero raw output (the
     /// chemistry-only controls).
     #[must_use]
@@ -532,6 +573,7 @@ impl ModelVariant {
                 | Self::ContactChemistryOnly
                 | Self::InhibitionChemistryOnly
                 | Self::SortingChemistryOnly
+                | Self::V2ChemistryOnly
         )
     }
 
@@ -544,6 +586,7 @@ impl ModelVariant {
                 | Self::ContactFreshOffspring
                 | Self::InhibitionFreshOffspring
                 | Self::SortingFreshOffspring
+                | Self::V2FreshOffspring
         )
     }
 
@@ -637,7 +680,8 @@ impl Rules {
         let exchange = ExchangeKernel::from_config(config)?;
         let max_exchange_cells = exchange.max_cells(&grid);
         let catalog = TopologyCatalog::from_config(config)?;
-        let recurrent_state_width = catalog.recurrent_state_width() as usize;
+        let v2 = V2Rules::from_config(config)?;
+        let recurrent_state_width = v2.sensors().recurrent_state_width();
         Ok(Self {
             step: config.report().timestep,
             grid,
@@ -667,6 +711,7 @@ impl Rules {
             profile,
             variant: ModelVariant::of(&model.model)?,
             contact: contact_rules(config)?,
+            v2,
             initial_scale: initial_scale(config),
         })
     }
@@ -720,6 +765,10 @@ struct DecisionLane {
     exchange: ExchangeScratch,
     /// The batched path's observations of this lane's run.
     observed: Vec<Observation>,
+    /// Expanded controller input vectors for batched runs whose layout
+    /// exceeds baseline `SENSOR_WIDTH` (recurrent or v2 extra sensors); empty
+    /// (0 bytes) on baseline 104-input worlds.
+    controller_inputs: Vec<[f64; MAX_SENSOR_WIDTH]>,
     decisions: Vec<Decision>,
     /// Phases 6 and 7 of this lane's run: one organism's packets at a
     /// time, the run's ledger flows and staged emissions in identity order,
@@ -924,9 +973,9 @@ struct Controllers {
     backend: Option<Box<dyn ControllerBackend>>,
     report: ControllerReport,
     /// One per due evaluation, in identity order.
-    outputs: Vec<Option<[f32; ACTION_WIDTH]>>,
+    outputs: Vec<Option<RawOutputs>>,
     /// One per row: the backend's outputs for a due organism it evaluated.
-    by_row: Vec<Option<[f32; ACTION_WIDTH]>>,
+    by_row: Vec<Option<RawOutputs>>,
 }
 
 /// The one organism the world records observations and transactions for
@@ -1239,6 +1288,7 @@ impl World {
         self.controllers.by_row = Vec::new();
         for lane in &mut self.scratch.lanes {
             lane.observed = Vec::new();
+            lane.controller_inputs = Vec::new();
         }
     }
 
@@ -1435,10 +1485,17 @@ impl World {
     }
 
     /// Recurrent internal state width `S` (`0` for `independent-dense-mlp-v1`,
-    /// `1..=16` for `independent-recurrent-mlp-v1`, FL-054).
+    /// `1..=16` for `independent-recurrent-mlp-v1` / `epigenetic-recurrence`,
+    /// FL-054, V2-01).
     #[must_use]
     pub const fn recurrent_state_width(&self) -> usize {
         self.rules.recurrent_state_width
+    }
+
+    /// Resolved `field-ecology-v2` rules and sensor/action ABI layouts (V2-01).
+    #[must_use]
+    pub const fn v2_rules(&self) -> &V2Rules {
+        &self.rules.v2
     }
 
     /// The live population.
@@ -1509,15 +1566,23 @@ impl World {
 
     /// What installing a controller backend reserves on top of
     /// [`World::footprint`] (FL-043): its outputs and a slot per row for the
-    /// population's capacity, and each lane's observations for the most
-    /// rows it can take.
+    /// population's capacity, and each lane's observations (plus expanded
+    /// input vectors when the controller layout exceeds `SENSOR_WIDTH`) for
+    /// the most rows it can take.
     #[must_use]
     pub fn batched_bytes(&self) -> u64 {
         let organisms = self.population.capacity();
         let lanes = self.scratch.lanes.len();
+        let rows = lane_rows(organisms, lanes);
+        let expanded = if self.rules.v2.sensors().input_width() > SENSOR_WIDTH {
+            bytes_for::<[f64; MAX_SENSOR_WIDTH]>(rows).saturating_mul(lanes as u64)
+        } else {
+            0
+        };
         total([
-            bytes_for::<Option<[f32; ACTION_WIDTH]>>(organisms).saturating_mul(2),
-            bytes_for::<Observation>(lane_rows(organisms, lanes)).saturating_mul(lanes as u64),
+            bytes_for::<Option<RawOutputs>>(organisms).saturating_mul(2),
+            bytes_for::<Observation>(rows).saturating_mul(lanes as u64),
+            expanded,
         ])
     }
 
@@ -1546,6 +1611,7 @@ impl World {
                 lane.controller.allocated_bytes(),
                 lane.exchange.allocated_bytes(),
                 capacity_bytes(&lane.observed),
+                capacity_bytes(&lane.controller_inputs),
                 capacity_bytes(&lane.decisions),
                 capacity_bytes(&lane.packets),
                 lane.flows.allocated_bytes(),

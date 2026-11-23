@@ -75,11 +75,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use flife_backend_metal::ControllerChoice;
 use flife_cli::{CheckpointAdmission, InspectedLayer, InspectedWeights};
 use flife_core::memory::MemoryAdmission;
-use flife_core::{CoreError, Tick, ValidatedConfig};
+use flife_core::schema::Scope;
+use flife_core::{
+    CoreError, FeatureOverride, RunConfig, Tick, V2Feature, ValidatedConfig,
+    apply_feature_overrides,
+};
 use flife_engine::{Followed, OrganismSnapshot, ReproductionOutcome};
 use flife_render::{AffinityProjection, Metrics};
 use flife_runtime::Outcome;
@@ -102,9 +106,12 @@ const ERROR_SCHEMA: &str = "frankenlife.error.v1";
     about = "FrankenLife's Studio: the live world in a native window"
 )]
 struct Cli {
-    /// The configuration or preset, as TOML; with `--resume`, none (the run
-    /// directory holds it).
-    #[arg(required_unless_present = "resume", conflicts_with = "resume")]
+    /// The configuration or preset, as TOML; with `--resume` or
+    /// `--list-features`, none.
+    #[arg(
+        required_unless_present_any = ["resume", "list_features"],
+        conflicts_with_all = ["resume", "list_features"]
+    )]
     config: Option<PathBuf>,
     /// Content width in points; `[presentation] width` by default.
     #[arg(long, requires = "height")]
@@ -206,6 +213,64 @@ struct Cli {
         conflicts_with_all = ["run", "export"]
     )]
     resume: Option<PathBuf>,
+    /// Disable one or more `field-ecology-v2` feature slugs or aliases
+    /// (`all-v2`, `bundle-a`, `bundle-b`), comma-separated or repeated.
+    /// Founding-only: refused with `--resume` (`INV-14`) and on v1 models.
+    #[arg(long, value_name = "FEATURE[,...]", conflicts_with = "resume")]
+    disable: Vec<String>,
+    /// Enable one or more `field-ecology-v2` feature slugs or aliases,
+    /// applied in exact command-line order with `--disable` and `--v1-compat`.
+    /// Founding-only: refused with `--resume` (`INV-14`) and on v1 models.
+    #[arg(long, value_name = "FEATURE[,...]", conflicts_with = "resume")]
+    enable: Vec<String>,
+    /// Disable all 21 `field-ecology-v2` features (equivalent to
+    /// `--disable all-v2`), applied in exact command-line order.
+    /// Founding-only: refused with `--resume` (`INV-14`) and on v1 models.
+    #[arg(long, conflicts_with = "resume")]
+    v1_compat: bool,
+    /// Print all 21 `field-ecology-v2` feature slugs, default profile
+    /// memberships, `INV-08` status, and ABI impact, then exit.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "resume",
+            "run",
+            "timeline",
+            "export",
+            "offscreen",
+            "disable",
+            "enable",
+            "v1_compat",
+        ]
+    )]
+    list_features: bool,
+}
+
+/// Extract `--disable`, `--enable`, and `--v1-compat` overrides in exact
+/// left-to-right command-line order so combinations like
+/// `--disable all-v2 --enable so2-motor` and `--enable so2-motor --v1-compat`
+/// resolve unambiguously.
+fn extract_feature_overrides(cli: &Cli, matches: &ArgMatches) -> Vec<FeatureOverride> {
+    let mut ordered: Vec<(usize, FeatureOverride)> = Vec::new();
+    if let Some(indices) = matches.indices_of("disable") {
+        for (index, value) in indices.zip(&cli.disable) {
+            ordered.push((index, FeatureOverride::Disable(value.clone())));
+        }
+    }
+    if let Some(indices) = matches.indices_of("enable") {
+        for (index, value) in indices.zip(&cli.enable) {
+            ordered.push((index, FeatureOverride::Enable(value.clone())));
+        }
+    }
+    if cli.v1_compat
+        && let Some(indices) = matches.indices_of("v1_compat")
+    {
+        for index in indices {
+            ordered.push((index, FeatureOverride::V1Compat));
+        }
+    }
+    ordered.sort_by_key(|(index, _)| *index);
+    ordered.into_iter().map(|(_, item)| item).collect()
 }
 
 /// A timeline file being written (`--timeline`).
@@ -627,6 +692,17 @@ enum Record<'a> {
         checkpoint_tick: Option<u64>,
     },
     /// `--export`'s summary (FL-023); the manifest in `out` has the rest.
+    /// One `field-ecology-v2` feature entry printed by `--list-features`.
+    Feature {
+        schema: &'static str,
+        slug: &'static str,
+        bit: u64,
+        scope: &'static str,
+        bundle_a_default: bool,
+        bundle_b_default: bool,
+        inv08_status: &'static str,
+        abi_impact: &'static str,
+    },
     Export {
         schema: &'static str,
         out: String,
@@ -874,11 +950,22 @@ struct ErrorRecord<'a> {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
+    if cli.list_features {
+        for feature in V2Feature::ALL {
+            print(&feature_record(feature));
+        }
+        return ExitCode::SUCCESS;
+    }
+    let overrides = extract_feature_overrides(&cli, &matches);
     let loaded = match (&cli.resume, &cli.config) {
         (Some(run_dir), _) => flife_cli::persist::read_config(run_dir)
             .map_err(|error| fail(error.kind(), error.to_string(), 2)),
-        (None, Some(path)) => load(path),
+        (None, Some(path)) => load(path, &overrides),
         // The arguments require one or the other.
         (None, None) => Err(fail(
             "internal",
@@ -1780,10 +1867,36 @@ fn next_slot(slot: Instant, period: Duration, now: Instant) -> Instant {
     (slot + period).max(now)
 }
 
-fn load(path: &PathBuf) -> Result<ValidatedConfig, ExitCode> {
+fn feature_record(feature: V2Feature) -> Record<'static> {
+    let scope = match feature.scope() {
+        Scope::Run => "run",
+        Scope::Model => "model",
+        Scope::Numerics => "numerics",
+        Scope::Execution => "execution",
+        Scope::Presentation => "presentation",
+    };
+    Record::Feature {
+        schema: STUDIO_SCHEMA,
+        slug: feature.slug(),
+        bit: feature.bit(),
+        scope,
+        bundle_a_default: feature.default_in_bundle_a(),
+        bundle_b_default: feature.default_in_bundle_b(),
+        inv08_status: feature.inv08_status(),
+        abi_impact: feature.abi_impact(),
+    }
+}
+
+fn load_toml(text: &str, overrides: &[FeatureOverride]) -> Result<ValidatedConfig, CoreError> {
+    let mut parsed = RunConfig::from_toml(text)?;
+    apply_feature_overrides(&mut parsed, overrides)?;
+    flife_core::validate(parsed)
+}
+
+fn load(path: &Path, overrides: &[FeatureOverride]) -> Result<ValidatedConfig, ExitCode> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| fail("io", format!("{}: {error}", path.display()), 2))?;
-    ValidatedConfig::from_toml(&text).map_err(|error| fail(error.kind(), error.to_string(), 2))
+    load_toml(&text, overrides).map_err(|error| fail(error.kind(), error.to_string(), 2))
 }
 
 fn print(record: &impl Serialize) {
@@ -2571,7 +2684,7 @@ mod tests {
         assert_eq!(refused["status"], "resize-refused");
         assert_eq!(
             refused["why"],
-            CoreError::BudgetExhausted {
+            flife_core::CoreError::BudgetExhausted {
                 budget: "",
                 required: 0,
                 available: 0,
@@ -2584,7 +2697,27 @@ mod tests {
                 .is_some_and(|text| text.contains("3840x2160") && text.contains("240000000"))
         );
 
-        let telemetry_metrics = Metrics {
+        let telemetry_metrics = flife_render::Metrics {
+            tick: Tick::new(5),
+            live: 10,
+            organism_energy: 20.0,
+            field_energy: 30.0,
+            max_generation: 2,
+            events: 0,
+            parameters: 1024,
+            genome_logical_bytes: 4096,
+            genome_allocated_bytes: 4096,
+            ledger: flife_core::LedgerReport {
+                initial: 50.0,
+                final_energy: 50.0,
+                injected: 0.0,
+                removed: 0.0,
+                dissipated: 0.0,
+                expected: 50.0,
+                residual: 0.0,
+                normalized_residual: 0.0,
+            },
+            faulted: false,
             tally: Some(flife_render::Tally {
                 since: Tick::ZERO,
                 births: 4,
@@ -2595,31 +2728,8 @@ mod tests {
                 refused_births: 7,
                 uptake: 1.5,
             }),
-            ..Metrics {
-                tick: Tick::new(5),
-                live: 10,
-                organism_energy: 20.0,
-                field_energy: 30.0,
-                max_generation: 2,
-                events: 0,
-                parameters: 1024,
-                genome_logical_bytes: 4096,
-                genome_allocated_bytes: 4096,
-                ledger: flife_core::LedgerReport {
-                    initial: 50.0,
-                    final_energy: 50.0,
-                    injected: 0.0,
-                    removed: 0.0,
-                    dissipated: 0.0,
-                    expected: 50.0,
-                    residual: 0.0,
-                    normalized_residual: 0.0,
-                },
-                faulted: false,
-                tally: None,
-            }
         };
-        let memory = MemoryAdmission {
+        let memory = flife_core::memory::MemoryAdmission {
             budget_bytes: 1_000_000,
             logical_parameters: 1024,
             logical_genome_bytes: 4096,
@@ -2699,5 +2809,135 @@ mod tests {
         );
         super::note_checkpoint(&mut checkpoint, 5, Tick::new(640));
         assert_eq!(checkpoint, Some((5, Tick::new(640))));
+    }
+
+    #[test]
+    fn v2_feature_toggle_arguments_and_list_features_follow_v2_01_contract() {
+        use clap::{CommandFactory, FromArgMatches};
+        use flife_core::{FeatureOverride, V2Feature};
+
+        let parse_raw = |args: &[&str]| {
+            let matches = super::Cli::command().try_get_matches_from(
+                std::iter::once("flife-studio").chain(args.iter().copied()),
+            )?;
+            let cli = super::Cli::from_arg_matches(&matches)?;
+            let overrides = super::extract_feature_overrides(&cli, &matches);
+            Ok::<_, clap::Error>((cli, overrides))
+        };
+
+        // Exact left-to-right CLI ordering is preserved.
+        let (cli, overrides) = parse_raw(&[
+            "v2.toml",
+            "--disable",
+            "all-v2",
+            "--enable",
+            "so2-motor,oases",
+            "--disable",
+            "oases",
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(!cli.list_features);
+        assert_eq!(
+            overrides,
+            vec![
+                FeatureOverride::Disable("all-v2".to_owned()),
+                FeatureOverride::Enable("so2-motor,oases".to_owned()),
+                FeatureOverride::Disable("oases".to_owned()),
+            ]
+        );
+
+        let (_, compat_first) = parse_raw(&["v2.toml", "--v1-compat", "--enable", "so2-motor"])
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            compat_first,
+            vec![
+                FeatureOverride::V1Compat,
+                FeatureOverride::Enable("so2-motor".to_owned()),
+            ]
+        );
+        let (_, compat_last) = parse_raw(&["v2.toml", "--enable", "so2-motor", "--v1-compat"])
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            compat_last,
+            vec![
+                FeatureOverride::Enable("so2-motor".to_owned()),
+                FeatureOverride::V1Compat,
+            ]
+        );
+
+        // Export accepts founding toggles so exported timelines match config_hash.
+        let (export_cli, export_overrides) = parse_raw(&[
+            "v2.toml",
+            "--disable",
+            "oases",
+            "--export",
+            "t.ndjson",
+            "--out",
+            "out",
+        ])
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(export_cli.export.is_some());
+        assert_eq!(
+            export_overrides,
+            vec![FeatureOverride::Disable("oases".to_owned())]
+        );
+
+        // Standalone `--list-features` succeeds without a config path.
+        let (list_cli, list_overrides) =
+            parse_raw(&["--list-features"]).unwrap_or_else(|error| panic!("{error}"));
+        assert!(list_cli.list_features);
+        assert!(list_cli.config.is_none());
+        assert!(list_overrides.is_empty());
+
+        // Strict INV-14 refusals: toggles are refused on `--resume`, and
+        // `--list-features` is refused with run/config/resume/toggle flags.
+        for refused in [
+            &["--resume", "run-dir", "--disable", "oases"][..],
+            &["--resume", "run-dir", "--enable", "oases"][..],
+            &["--resume", "run-dir", "--v1-compat"][..],
+            &["--resume", "run-dir", "--list-features"][..],
+            &["v2.toml", "--list-features"][..],
+            &["--list-features", "--disable", "oases"][..],
+            &["--list-features", "--v1-compat"][..],
+        ] {
+            assert!(parse_raw(refused).is_err(), "{refused:?} must be refused");
+        }
+
+        // `--list-features` serializes all 21 features with exact metadata.
+        let records: Vec<Value> = V2Feature::ALL
+            .into_iter()
+            .map(|feature| {
+                serde_json::to_value(super::feature_record(feature))
+                    .expect("serializes feature record")
+            })
+            .collect();
+        assert_eq!(records.len(), 21);
+        assert_eq!(records[0]["record"], "feature");
+        assert_eq!(records[0]["slug"], "oases");
+        assert_eq!(records[0]["scope"], "model");
+        assert_eq!(records[0]["bundle_a_default"], false);
+        assert_eq!(records[0]["bundle_b_default"], true);
+        assert_eq!(records[20]["slug"], "v2-visual-mappings");
+        assert_eq!(records[20]["scope"], "presentation");
+
+        // `load_toml` refuses toggles on v1 configs and applies left-to-right
+        // overrides cleanly on v2 configs.
+        let v1_toml = include_str!("../../../presets/reference-small-world.toml");
+        assert!(matches!(
+            super::load_toml(v1_toml, &[FeatureOverride::V1Compat]),
+            Err(flife_core::CoreError::InvalidConfig(_))
+        ));
+        let v2_toml = v1_toml.replacen(
+            "model = \"field-ecology-v1\"",
+            "model = \"field-ecology-v2\"",
+            1,
+        );
+        let only_so2 = super::load_toml(&v2_toml, &compat_first).expect("v2 compat + so2-motor");
+        assert_eq!(only_so2.v2_feature_bitmask(), V2Feature::So2Motor.bit());
+        assert_eq!(only_so2.v2_abi().action_width, 40);
+        let all_off = super::load_toml(&v2_toml, &compat_last).expect("v2 so2-motor then compat");
+        assert_eq!(all_off.v2_feature_bitmask(), 0);
+        assert_eq!(all_off.v2_abi().action_width, 36);
+        assert_ne!(only_so2.config_hash(), all_off.config_hash());
     }
 }

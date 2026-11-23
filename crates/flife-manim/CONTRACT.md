@@ -235,9 +235,10 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     none. It returns whether the region changed, rebuilds the outline for every view change and density, and
     leaves the view as it was when the region is refused; `region()` and `region_draw()`;
   - `draws()` is the frame in painter order: the field (when `Style::field_drawn`, in the style's field mapping),
-    then the density
-    layer, or every halo and then every dot, then the brush's region, then the selection ring; `job()` wraps it
-    in a `ThreeDJob`;
+    then the density layer, or every halo and then every dot (at zoom > 1 for a placed viewport, `WorldView::draws`
+    conservatively culls dots and halos whose 3D billboards lie strictly outside the camera frustum, preserving
+    bit-exact rendered pixels while `ParticleCloud::draws` keeps every row), then the brush's region, then the
+    selection ring; `job()` wraps it in a `ThreeDJob`;
   - `set_point_radius(points)` (FL-019) sets the dots' smallest radius on screen
     (`ParticleCloud::set_min_radius_points`); the shown dots, their halos and the selection ring change at
     once, and the ring is `selection_ring_around` the view's dot at every refit and reselection;
@@ -580,10 +581,13 @@ route.
 
 **Known gaps.**
 - Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The layers'
-  textures are rebuilt on the CPU when what they show changes (a show of a new epoch, a restyle; a placement keeps
-  the density's, and the field's for bitwise the same values), and both are uploaded with every Metal frame;
-  resident device textures and buffers and the shared-device resource bridge are still FL-033's (and FL-028's typed
-  Metal buffers).
+  textures are rebuilt on the CPU when what they show changes (a show of a new epoch, a restyle; hidden fields track
+  display scale without rebuilding an unused texture, `Look::Raw`/`Look::Sphere` share identical field and density
+  textures, and unchanged viewports reuse the cached periodic quad). Both are still uploaded with every Metal frame.
+  Completing `FL-033` requires three upstream FrankenManim (`fmn-render`, pinned `d1e1757b`) additions:
+  1. a versioned/lease-keyed dynamic `Texture` constructor or in-place GPU texture update that bypasses `Texture::from_premultiplied_linear`'s mandatory CPU SHA-256 over every texel;
+  2. a bulk GPU-resident `ParticleCloud` / instanced-dot draw primitive backed by a device buffer instead of per-organism CPU `ThreeDDraw::TrueDot` expansion into `RasterTriangle`s and `FlatThreeDFrame` host tables;
+  3. a shared-device Metal resource-lease bridge into `MetalRenderer` / `NativePreviewRenderer` accepting typed read leases from `flife-backend-metal::DeviceOwner` (FL-028) without host round-trips.
 - The overlay's text is triangles flattened for the em it was laid out at. A host lays it out again for a new pixel
   density (the Studio does). A glyph's edges are the 3D route's triangle edges, so it is not hinted or subpixel
   antialiased. A bloom blurs the text a little, as it does everything drawn before it, and the overlay is not

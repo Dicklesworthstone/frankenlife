@@ -283,9 +283,9 @@ impl DensityLayer {
             }
         };
         let mut texels = Vec::new();
-        texels.try_reserve_exact(cells).map_err(|_| {
-            allocation("density layer texels", cells, size_of::<[f32; 4]>())
-        })?;
+        texels
+            .try_reserve_exact(cells)
+            .map_err(|_| allocation("density layer texels", cells, size_of::<[f32; 4]>()))?;
         let mut ring = [[[0.0_f64; 4]; DENSITY_BINS_MAX as usize]; 2];
         fill_row(rows - 1, &mut ring[0][..columns]);
         let mut prev = 0_usize;

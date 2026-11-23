@@ -56,7 +56,7 @@ use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
 use flife_core::memory::{capacity_bytes, total};
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_genome::{Genome, GenomeArena, GenomeQuota, MutationRecord};
-use flife_neural::{ACTION_WIDTH, ArenaSlot, MAXIMUM_RECURRENT_STATE_WIDTH};
+use flife_neural::{ACTION_WIDTH, ArenaSlot, MAX_ACTION_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH};
 
 use crate::lifecycle::Death;
 use crate::reproduction::{Birth, Newborn};
@@ -65,13 +65,14 @@ use crate::reproduction::{Birth, Newborn};
 pub const POPULATION_DIGEST_SCHEMA: &str = "frankenlife.population-state.v1";
 
 /// A controller's held raw outputs (§6.6) and, for
-/// `independent-recurrent-mlp-v1` (FL-054, §25.2), its bounded internal
-/// recurrent state `h ∈ [-1, 1]^S`. An invalid output cannot be read, so a
-/// stale one can never be decoded.
+/// `independent-recurrent-mlp-v1` / `epigenetic-recurrence` (FL-054, V2-01,
+/// V2-12), its bounded internal recurrent state `h ∈ [-1, 1]^S`. An invalid
+/// output cannot be read, so a stale one can never be decoded.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeldOutput {
     evaluated_at: Option<Tick>,
-    outputs: [f32; ACTION_WIDTH],
+    output_len: u8,
+    outputs: [f32; MAX_ACTION_WIDTH],
     state_len: u8,
     state: [f32; MAXIMUM_RECURRENT_STATE_WIDTH],
 }
@@ -81,55 +82,28 @@ impl HeldOutput {
     /// evaluation.
     pub const INVALID: Self = Self {
         evaluated_at: None,
-        outputs: [0.0; ACTION_WIDTH],
+        output_len: 0,
+        outputs: [0.0; MAX_ACTION_WIDTH],
         state_len: 0,
         state: [0.0; MAXIMUM_RECURRENT_STATE_WIDTH],
     };
 
-    /// `outputs`, evaluated at `tick` by a stateless controller.
+    /// No held output (next advance forces first evaluation, Appendix C.13),
+    /// carrying inherited bounded epigenetic state `state ∈ [-1, 1]^S` (V2-01,
+    /// V2-12).
     ///
     /// # Errors
-    /// [`CoreError::NumericalInvalid`] for a nonfinite output.
-    pub fn evaluated(tick: Tick, outputs: [f32; ACTION_WIDTH]) -> Result<Self, CoreError> {
-        if let Some(index) = outputs.iter().position(|value| !value.is_finite()) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "held controller output",
-                detail: format!("output {index} is {}", outputs[index]),
-            });
-        }
-        Ok(Self {
-            evaluated_at: Some(tick),
-            outputs,
-            state_len: 0,
-            state: [0.0; MAXIMUM_RECURRENT_STATE_WIDTH],
-        })
-    }
-
-    /// `outputs` and bounded recurrent `state ∈ [-1, 1]^S`, evaluated at
-    /// `tick` by `independent-recurrent-mlp-v1` (FL-054).
-    ///
-    /// # Errors
-    /// [`CoreError::LayoutMismatch`] for a state length outside
-    /// `1..=MAXIMUM_RECURRENT_STATE_WIDTH`; [`CoreError::NumericalInvalid`]
-    /// for a nonfinite output or a state entry outside `[-1, 1]`.
-    pub fn evaluated_recurrent(
-        tick: Tick,
-        outputs: [f32; ACTION_WIDTH],
-        state: &[f32],
-    ) -> Result<Self, CoreError> {
-        if state.is_empty() || state.len() > MAXIMUM_RECURRENT_STATE_WIDTH {
+    /// [`CoreError::LayoutMismatch`] if `state.len() > MAXIMUM_RECURRENT_STATE_WIDTH`;
+    /// [`CoreError::NumericalInvalid`] if any entry lies outside `[-1, 1]` or is
+    /// nonfinite.
+    pub fn newborn_with_state(state: &[f32]) -> Result<Self, CoreError> {
+        if state.len() > MAXIMUM_RECURRENT_STATE_WIDTH {
             return Err(CoreError::LayoutMismatch {
                 buffer: "recurrent controller state",
                 detail: format!(
-                    "expected 1..={MAXIMUM_RECURRENT_STATE_WIDTH} state values, got {}",
+                    "expected at most {MAXIMUM_RECURRENT_STATE_WIDTH} state values, got {}",
                     state.len()
                 ),
-            });
-        }
-        if let Some(index) = outputs.iter().position(|value| !value.is_finite()) {
-            return Err(CoreError::NumericalInvalid {
-                quantity: "held controller output",
-                detail: format!("output {index} is {}", outputs[index]),
             });
         }
         let mut stored = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
@@ -142,12 +116,116 @@ impl HeldOutput {
             }
             *slot = value;
         }
+        let state_len = u8::try_from(state.len()).map_err(|_| CoreError::Overflow {
+            quantity: "recurrent controller state width",
+        })?;
         Ok(Self {
-            evaluated_at: Some(tick),
-            outputs,
-            state_len: state.len() as u8,
+            evaluated_at: None,
+            output_len: 0,
+            outputs: [0.0; MAX_ACTION_WIDTH],
+            state_len,
             state: stored,
         })
+    }
+
+    /// Baseline 36-element `outputs`, evaluated at `tick` by a stateless
+    /// controller.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonfinite output.
+    pub fn evaluated(tick: Tick, outputs: [f32; ACTION_WIDTH]) -> Result<Self, CoreError> {
+        Self::evaluated_slice(tick, &outputs)
+    }
+
+    /// Variable-width `outputs` (`ACTION_WIDTH..=MAX_ACTION_WIDTH`), evaluated
+    /// at `tick` by a stateless controller (V2-01).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for a length outside
+    /// `ACTION_WIDTH..=MAX_ACTION_WIDTH`; [`CoreError::NumericalInvalid`] for
+    /// a nonfinite output.
+    pub fn evaluated_slice(tick: Tick, outputs: &[f32]) -> Result<Self, CoreError> {
+        if outputs.len() < ACTION_WIDTH || outputs.len() > MAX_ACTION_WIDTH {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "held controller output",
+                detail: format!(
+                    "expected {ACTION_WIDTH}..={MAX_ACTION_WIDTH} outputs, got {}",
+                    outputs.len()
+                ),
+            });
+        }
+        if let Some(index) = outputs.iter().position(|value| !value.is_finite()) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "held controller output",
+                detail: format!("output {index} is {}", outputs[index]),
+            });
+        }
+        let mut stored = [0.0_f32; MAX_ACTION_WIDTH];
+        stored[..outputs.len()].copy_from_slice(outputs);
+        let output_len = u8::try_from(outputs.len()).map_err(|_| CoreError::Overflow {
+            quantity: "held controller output width",
+        })?;
+        Ok(Self {
+            evaluated_at: Some(tick),
+            output_len,
+            outputs: stored,
+            state_len: 0,
+            state: [0.0; MAXIMUM_RECURRENT_STATE_WIDTH],
+        })
+    }
+
+    /// Baseline 36-element `outputs` and bounded recurrent `state ∈ [-1, 1]^S`,
+    /// evaluated at `tick` by `independent-recurrent-mlp-v1` (FL-054).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for a state length outside
+    /// `1..=MAXIMUM_RECURRENT_STATE_WIDTH`; [`CoreError::NumericalInvalid`]
+    /// for a nonfinite output or a state entry outside `[-1, 1]`.
+    pub fn evaluated_recurrent(
+        tick: Tick,
+        outputs: [f32; ACTION_WIDTH],
+        state: &[f32],
+    ) -> Result<Self, CoreError> {
+        Self::evaluated_recurrent_slice(tick, &outputs, state)
+    }
+
+    /// Variable-width `outputs` (`ACTION_WIDTH..=MAX_ACTION_WIDTH`) and bounded
+    /// recurrent `state ∈ [-1, 1]^S`, evaluated at `tick` (FL-054, V2-01).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for lengths outside their bounds;
+    /// [`CoreError::NumericalInvalid`] for a nonfinite output or a state entry
+    /// outside `[-1, 1]`.
+    pub fn evaluated_recurrent_slice(
+        tick: Tick,
+        outputs: &[f32],
+        state: &[f32],
+    ) -> Result<Self, CoreError> {
+        if state.is_empty() || state.len() > MAXIMUM_RECURRENT_STATE_WIDTH {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "recurrent controller state",
+                detail: format!(
+                    "expected 1..={MAXIMUM_RECURRENT_STATE_WIDTH} state values, got {}",
+                    state.len()
+                ),
+            });
+        }
+        let mut base = Self::evaluated_slice(tick, outputs)?;
+        let mut stored = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        for (index, (slot, &value)) in stored.iter_mut().zip(state).enumerate() {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "recurrent controller state",
+                    detail: format!("state[{index}] is {value}, outside [-1, 1]"),
+                });
+            }
+            *slot = value;
+        }
+        base.state_len = u8::try_from(state.len()).map_err(|_| CoreError::Overflow {
+            quantity: "recurrent controller state width",
+        })?;
+        base.state = stored;
+        Ok(base)
     }
 
     /// Whether an output is held.
@@ -162,25 +240,26 @@ impl HeldOutput {
         self.evaluated_at
     }
 
-    /// The held outputs, if any.
+    /// The held action outputs (`ACTION_WIDTH..=MAX_ACTION_WIDTH`), if any.
     #[must_use]
-    pub const fn outputs(&self) -> Option<&[f32; ACTION_WIDTH]> {
+    pub fn outputs(&self) -> Option<&[f32]> {
         if self.evaluated_at.is_some() {
-            Some(&self.outputs)
+            Some(&self.outputs[..usize::from(self.output_len)])
         } else {
             None
         }
     }
 
     /// The held recurrent internal state slice (empty for stateless
-    /// controllers or unevaluated organisms).
+    /// controllers or unevaluated organisms without inherited state).
     #[must_use]
     pub fn recurrent_state(&self) -> &[f32] {
         &self.state[..usize::from(self.state_len)]
     }
 
     /// Fixed-width array holding the recurrent state in its leading lanes
-    /// (zero-filled for unevaluated organisms and unused tail lanes).
+    /// (zero-filled for unevaluated organisms without inherited state and
+    /// unused tail lanes).
     #[must_use]
     pub const fn recurrent_state_array(&self) -> [f32; MAXIMUM_RECURRENT_STATE_WIDTH] {
         self.state
@@ -1018,6 +1097,9 @@ impl Population {
                 (Some(tick), Some(outputs)) => {
                     bytes.push(1);
                     bytes.extend_from_slice(&tick.get().to_le_bytes());
+                    if outputs.len() != ACTION_WIDTH {
+                        bytes.push(outputs.len() as u8);
+                    }
                     for value in outputs {
                         bytes.extend_from_slice(&value.to_bits().to_le_bytes());
                     }
@@ -1029,7 +1111,18 @@ impl Population {
                         }
                     }
                 }
-                _ => bytes.push(0),
+                _ => {
+                    let recurrent = organism.held.recurrent_state();
+                    if recurrent.is_empty() {
+                        bytes.push(0);
+                    } else {
+                        bytes.push(2);
+                        bytes.push(recurrent.len() as u8);
+                        for value in recurrent {
+                            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+                        }
+                    }
+                }
             }
             bytes.extend_from_slice(&organism.phase.to_le_bytes());
             bytes.extend_from_slice(&organism.cooldown_deadline.get().to_le_bytes());

@@ -26,7 +26,7 @@
 use std::ops::Range;
 
 use flife_core::numerics::{expm1_neg, sigmoid};
-use flife_core::{CoreError, TimeStep, ValidatedConfig};
+use flife_core::{CoreError, TimeStep, V2Abi, ValidatedConfig};
 use flife_field::settle::EmissionAction;
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
@@ -185,15 +185,50 @@ impl ActionLayout {
         })
     }
 
-    /// Resolve the action layout of a validated configuration.
+    /// Build an [`ActionLayout`] directly from `flife-core`'s canonical
+    /// [`V2Abi`].
+    ///
+    /// # Errors
+    /// As [`ActionLayout::new`] if `abi` carries an out-of-range state width
+    /// or output width.
+    pub fn from_v2_abi(abi: V2Abi) -> Result<Self, CoreError> {
+        let state_width =
+            usize::try_from(abi.recurrent_state_width).map_err(|_| CoreError::Overflow {
+                quantity: "controller.recurrent_state_width",
+            })?;
+        let layout = Self::new(
+            abi.so2_motor_actions,
+            abi.so2_budding_actions,
+            abi.emt_gate_action,
+            abi.wake_pump_action,
+            state_width,
+        )?;
+        if layout.action_width() != abi.action_width as usize
+            || layout.raw_output_width() != abi.raw_output_width as usize
+        {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "action layout",
+                detail: format!(
+                    "V2Abi ({}/{}) disagrees with ActionLayout ({}/{})",
+                    abi.action_width,
+                    abi.raw_output_width,
+                    layout.action_width(),
+                    layout.raw_output_width()
+                ),
+            });
+        }
+        Ok(layout)
+    }
+
+    /// Resolve the action layout of a validated configuration (`v1` or `v2`).
     ///
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for an unsupported controller family, or
     /// [`CoreError::NumericalInvalid`] for an out-of-range recurrent width.
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let controller = &config.config().controller;
-        let recurrent_state_width = match controller.family.as_str() {
-            INDEPENDENT_DENSE_MLP_V1 => 0,
+        match controller.family.as_str() {
+            INDEPENDENT_DENSE_MLP_V1 => {}
             INDEPENDENT_RECURRENT_MLP_V1 => {
                 let width = controller.recurrent_state_width.ok_or_else(|| {
                     CoreError::NumericalInvalid {
@@ -211,9 +246,6 @@ impl ActionLayout {
                         ),
                     });
                 }
-                usize::try_from(width).map_err(|_| CoreError::Overflow {
-                    quantity: "controller.recurrent_state_width",
-                })?
             }
             other => {
                 return Err(CoreError::UnknownAlgorithm {
@@ -221,8 +253,8 @@ impl ActionLayout {
                     name: other.to_owned(),
                 });
             }
-        };
-        Self::new(false, false, false, false, recurrent_state_width)
+        }
+        Self::from_v2_abi(config.v2_abi())
     }
 
     /// Number of action logits stored in `HeldOutput.outputs` (`36..=48`).

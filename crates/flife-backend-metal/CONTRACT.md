@@ -255,13 +255,27 @@ in what the shards already held leave; the owner refuses any device buffer past 
 evaluates it on the reference, which gives the same bits. `resident_bytes` is the owner's bytes plus the host
 vectors and each shard's host records.
 
-FL-030, compact F16 (plan §10.3): a bucket holds the weight dtype of its first genome. Its F16 shards hold binary16
-values two to a `u32` word, the even element in the low half (the owner keeps only `f32` and `u32` buffers), and
-`controller_forward_half` reads them as `half`. It is the same `forward_pass` template as `controller_forward`,
-instantiated for `half`, and each weight and bias is widened exactly to F32 before the same arithmetic. So a shard
-of `SHARD_BYTES` holds twice the slots (13,437 of the preset's topology), a shard is charged two bytes a parameter
-under a budget, and each warm batch streams half the weight bytes. A job whose dtype is not its bucket's is
-deferred, and so is an F16 member with an odd parameter count (none in the catalog), whose slots would share words.
+FL-030, compact F16 (plan §10.3) & V2-01 variable-width ABI: a bucket holds the weight dtype of its first genome.
+Its F16 shards hold binary16 values two to a `u32` word, the even element in the low half (the owner keeps only `f32`
+and `u32` buffers), and `controller_forward_half` reads them as `half`. It is the same `forward_pass` algorithm as
+`controller_forward`, with each weight and bias widened exactly to F32 before the same arithmetic. `ShardGeometry::fitting_for_dtype`
+pads every F16 slot stride to `parameters.next_multiple_of(4)` (Trap A defense-in-depth), so every F16 slot starts
+on a 4-element (`half4`, 8-byte, `u32`-word-aligned) boundary and even odd-parameter topologies achieve **0 F16
+alignment deferrals** (an odd final parameter packs into the low 16 bits of its slot's last `u32` word with zero
+padding in the high 16 bits, inside its own padded stride). Standard catalog topologies (`1,164`, `4,548`, `9,988`,
+`18,628`, `29,316`) are already multiples of 4, so their shard capacities (`13,437` slots of `9,988` in `SHARD_BYTES`)
+and byte counts are unchanged. A job whose dtype is not its bucket's is deferred.
+
+Both `controller_forward` and `controller_forward_half` take a 2-word `dims` uniform buffer (`buffer(5)`:
+`[input_width, raw_output_width]`, `1 <= input_width <= 128`, `1 <= raw_output_width <= 80`) and size their
+threadgroup input buffer as `sensed4[WIDEST / 4]` (`32` `float4`s = `128` floats, Trap B). The `aligned4 = ((offset |
+fan_in) & 3u) == 0u` branch runs coalesced `float4`/`half4` Layer 0 for 4-aligned widths (`104`, `108`, `112`) and
+falls cleanly onto the exact scalar loop for custom non-4-aligned CLI feature subsets (`105`) without adding silent
+Metal-only dead input lanes (AGENTS.md Rule 15). `MetalBackend` holds 4 per-backend staging buffers (`inputs`, `raw`,
+`faults`, `dims`) beside `2` buffers per shard (`parameters`, `jobs`). Recurrent topologies evaluate their full
+`action_width + 2 * S` linear output width on the device and delegate the gated transition to `flife_neural::update_recurrent_state`
+on the host, achieving bit-exact Reference / FrankenTorch CPU / Metal F16/F32 parity with zero `d_sigmoid` shader
+duplication.
 
 **Invariants.**
 - Every non-deferred output is the reference controller's, bit for bit:

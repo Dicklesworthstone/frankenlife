@@ -21,7 +21,7 @@
 use std::ops::Range;
 
 use flife_core::numerics::tanh_f64_as_f32;
-use flife_core::{CoreError, ValidatedConfig};
+use flife_core::{CoreError, V2Abi, ValidatedConfig};
 use flife_field::numerics::tanh;
 use flife_field::pyramid::{PLANES, RawSample};
 
@@ -159,15 +159,49 @@ impl SensorLayout {
         })
     }
 
-    /// Resolve the sensor layout of a validated configuration.
+    /// Build a [`SensorLayout`] directly from `flife-core`'s canonical
+    /// [`V2Abi`].
+    ///
+    /// # Errors
+    /// As [`SensorLayout::new`] if `abi` carries an out-of-range state width
+    /// or total width.
+    pub fn from_v2_abi(abi: V2Abi) -> Result<Self, CoreError> {
+        let state_width =
+            usize::try_from(abi.recurrent_state_width).map_err(|_| CoreError::Overflow {
+                quantity: "controller.recurrent_state_width",
+            })?;
+        let layout = Self::new(
+            abi.dual_carrier_sensors,
+            abi.hippo_crowding_sensor,
+            abi.notch_delta_sensor,
+            state_width,
+        )?;
+        if layout.observation_width() != abi.sensor_width as usize
+            || layout.input_width() != abi.input_width as usize
+        {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor layout",
+                detail: format!(
+                    "V2Abi ({}/{}) disagrees with SensorLayout ({}/{})",
+                    abi.sensor_width,
+                    abi.input_width,
+                    layout.observation_width(),
+                    layout.input_width()
+                ),
+            });
+        }
+        Ok(layout)
+    }
+
+    /// Resolve the sensor layout of a validated configuration (`v1` or `v2`).
     ///
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for an unsupported controller family, or
     /// [`CoreError::NumericalInvalid`] for an out-of-range recurrent width.
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let controller = &config.config().controller;
-        let recurrent_state_width = match controller.family.as_str() {
-            INDEPENDENT_DENSE_MLP_V1 => 0,
+        match controller.family.as_str() {
+            INDEPENDENT_DENSE_MLP_V1 => {}
             INDEPENDENT_RECURRENT_MLP_V1 => {
                 let width = controller.recurrent_state_width.ok_or_else(|| {
                     CoreError::NumericalInvalid {
@@ -185,9 +219,6 @@ impl SensorLayout {
                         ),
                     });
                 }
-                usize::try_from(width).map_err(|_| CoreError::Overflow {
-                    quantity: "controller.recurrent_state_width",
-                })?
             }
             other => {
                 return Err(CoreError::UnknownAlgorithm {
@@ -195,8 +226,8 @@ impl SensorLayout {
                     name: other.to_owned(),
                 });
             }
-        };
-        Self::new(false, false, false, recurrent_state_width)
+        }
+        Self::from_v2_abi(config.v2_abi())
     }
 
     /// Non-recurrent sensor observation width (`104` + active v2 sensor lanes).

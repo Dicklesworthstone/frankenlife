@@ -1017,7 +1017,8 @@ impl WorldView {
         let density = style.particles == Particles::Density;
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
-        let cull = !density && self.placed_viewport == Some(self.viewport) && self.viewport.zoom() > 1.0;
+        let cull =
+            !density && self.placed_viewport == Some(self.viewport) && self.viewport.zoom() > 1.0;
         let [fw, fh] = self.viewport.frame_shape();
         let (half_fw, half_fh) = (0.5 * fw, 0.5 * fh);
         let focal = self.camera.camera().frame().focal_distance();

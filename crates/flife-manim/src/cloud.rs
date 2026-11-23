@@ -407,7 +407,8 @@ impl ParticleCloud {
                 let energies = current.energies();
                 current_colors.for_each(positions.len(), |row, color| {
                     if shown[row] {
-                        let center = Viewport::scene_point_with(start, extent, half, positions[row]);
+                        let center =
+                            Viewport::scene_point_with(start, extent, half, positions[row]);
                         self.draws
                             .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
                         self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
@@ -424,7 +425,8 @@ impl ParticleCloud {
             Look::Raw => {
                 current_colors.for_each(positions.len(), |row, color| {
                     if shown[row] {
-                        let center = Viewport::scene_point_with(start, extent, half, positions[row]);
+                        let center =
+                            Viewport::scene_point_with(start, extent, half, positions[row]);
                         self.draws
                             .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
                     }
@@ -433,7 +435,8 @@ impl ParticleCloud {
             Look::Sphere => {
                 current_colors.for_each(positions.len(), |row, color| {
                     if shown[row] {
-                        let center = Viewport::scene_point_with(start, extent, half, positions[row]);
+                        let center =
+                            Viewport::scene_point_with(start, extent, half, positions[row]);
                         let mut dot = TrueDotDraw::new(center, radius, color);
                         dot.shading = SPHERE_SHADING;
                         self.draws.push(ThreeDDraw::TrueDot(dot));

@@ -626,3 +626,145 @@ fn empty_shards_are_reclaimed_when_slots_retire() -> Result<(), CoreError> {
     );
     Ok(())
 }
+
+/// V2-01: variable `(input_width, raw_output_width)` topologies (including
+/// Bundle A `108/44`, Bundle B `108/40`, All-21 `112/48`, odd custom `105/37`,
+/// and recurrent state transitions via shared `update_recurrent_state`) match
+/// `ReferenceController` bit-for-bit on `CpuBackend` in both F32 and F16.
+#[test]
+fn variable_width_reference_and_torch_bit_exact() -> Result<(), CoreError> {
+    let mut draws = Draws(0x0002_0001);
+    let widths: [(u32, u32, &[u32]); 6] = [
+        (104, 36, &[8]),
+        (104, 40, &[64, 32]),
+        (108, 44, &[32, 16]),
+        (112, 48, &[64, 32]),
+        (105, 37, &[5]),
+        (110, 76, &[16]),
+    ];
+
+    for (in_w, out_w, hidden) in widths {
+        let topology = DenseTopology::with_io(in_w, hidden, out_w)?;
+        assert_eq!(topology.input_width(), in_w as usize);
+        assert_eq!(topology.raw_output_width(), out_w as usize);
+
+        let f32_params: Vec<Vec<f32>> = (0..12)
+            .map(|_| {
+                let mut vals = vec![0.0_f32; topology.parameter_count()];
+                for layer in topology.layers() {
+                    let scale = 1.5 / (layer.inputs as f64).sqrt();
+                    for value in &mut vals[layer.weights..layer.biases + layer.outputs] {
+                        *value = (draws.symmetric() * scale) as f32;
+                    }
+                }
+                vals
+            })
+            .collect();
+        let f16_params: Vec<Vec<F16>> = f32_params
+            .iter()
+            .map(|vals| vals.iter().map(|&v| F16::from_f64(f64::from(v))).collect())
+            .collect();
+        let input_vecs: Vec<Vec<f64>> = (0..12)
+            .map(|_| (0..in_w as usize).map(|_| draws.symmetric() * 2.0).collect())
+            .collect();
+
+        // F32 parity on 1 and 4 lanes.
+        let f32_jobs: Vec<ControllerJob<'_>> = (0..12)
+            .map(|i| {
+                Ok(ControllerJob {
+                    genome: GenomeId::new(i as u64 + 1),
+                    slot: ArenaSlot::new(0, i as u64, 1),
+                    controller: ReferenceController::new(&topology, &f32_params[i], BOUND)?,
+                    inputs: &input_vecs[i],
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+
+        let mut want_f32 = Vec::with_capacity(f32_jobs.len());
+        let mut scratch = ControllerScratch::new(&topology)?;
+        for job in &f32_jobs {
+            want_f32.push(Some(
+                job.controller
+                    .evaluate_raw(job.inputs, &mut scratch)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        for lane_count in [1, 4] {
+            let mut backend = CpuBackend::new(lanes(lane_count));
+            let mut out = Vec::new();
+            backend.evaluate(&f32_jobs, &mut out)?;
+            assert_eq!(
+                bits(&out),
+                want_f32,
+                "F32 ({in_w}, {out_w}) {hidden:?} lanes={lane_count}"
+            );
+        }
+
+        // F16 parity.
+        let f16_jobs: Vec<ControllerJob<'_>> = (0..12)
+            .map(|i| {
+                Ok(ControllerJob {
+                    genome: GenomeId::new(100 + i as u64),
+                    slot: ArenaSlot::new(0, i as u64, 1),
+                    controller: ReferenceController::new(&topology, &f16_params[i], BOUND)?,
+                    inputs: &input_vecs[i],
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+        let mut want_f16 = Vec::with_capacity(f16_jobs.len());
+        for job in &f16_jobs {
+            want_f16.push(Some(
+                job.controller
+                    .evaluate_raw(job.inputs, &mut scratch)?
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        let mut backend_f16 = CpuBackend::new(lanes(2));
+        let mut out_f16 = Vec::new();
+        backend_f16.evaluate(&f16_jobs, &mut out_f16)?;
+        assert_eq!(bits(&out_f16), want_f16, "F16 ({in_w}, {out_w}) {hidden:?}");
+    }
+
+    // Recurrent topology (106 sensors + S=2 -> [16] -> 40 actions + 2*2 tail = 108/44):
+    // CpuBackend raw output + shared update_recurrent_state == ReferenceController::evaluate_recurrent_slice.
+    let rec_topo = DenseTopology::with_io_recurrent(106, &[16], 40, 2)?;
+    assert_eq!(rec_topo.input_width(), 108);
+    assert_eq!(rec_topo.raw_output_width(), 44);
+    let rec_params: Vec<f32> = (0..rec_topo.parameter_count())
+        .map(|_| (draws.symmetric() * 0.25) as f32)
+        .collect();
+    let sensor_in: Vec<f64> = (0..106).map(|_| draws.symmetric() * 1.5).collect();
+    let state = [0.35_f32, -0.625];
+    let mut combined_in = sensor_in.clone();
+    combined_in.extend(state.iter().map(|&h| f64::from(h)));
+
+    let ctrl = ReferenceController::new(&rec_topo, &rec_params, BOUND)?;
+    let mut scratch = ControllerScratch::new(&rec_topo)?;
+    let mut ref_next = [0.0_f32; 2];
+    let ref_actions =
+        ctrl.evaluate_recurrent_slice(&sensor_in, &state, 2.5, &mut scratch, &mut ref_next)?;
+
+    let job = ControllerJob {
+        genome: GenomeId::new(999),
+        slot: ArenaSlot::new(0, 0, 1),
+        controller: ctrl,
+        inputs: &combined_in,
+    };
+    let mut backend = CpuBackend::new(lanes(1));
+    let mut out = Vec::new();
+    backend.evaluate(&[job], &mut out)?;
+    let got_raw = out[0].expect("recurrent job evaluated on CpuBackend");
+    assert_eq!(got_raw.len(), 44);
+    let mut torch_next = [0.0_f32; 2];
+    flife_neural::update_recurrent_state(&state, &got_raw[40..44], 2.5, &mut torch_next)?;
+    assert_eq!(
+        got_raw[..40].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        ref_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(torch_next.map(f32::to_bits), ref_next.map(f32::to_bits));
+    Ok(())
+}

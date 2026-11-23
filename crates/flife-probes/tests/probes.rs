@@ -110,6 +110,21 @@ fn a_second_asupersync_copy_is_caught() {
 }
 
 #[test]
+fn a_second_fsqlite_or_cpu_kernel_copy_is_caught() {
+    for (name, version) in [("fsqlite", "0.4.13"), ("frankentorch-kernel-cpu", "0.1.0")] {
+        let doubled = format!(
+            "{}\n[[package]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+            flife_probes::CARGO_LOCK
+        );
+        let report = flife_probes::closure_probe(&doubled, flife_probes::STACK_LOCK);
+        assert!(
+            report.failed(),
+            "a duplicate crates.io {name} must fail the closure probe"
+        );
+    }
+}
+
+#[test]
 fn ndjson_lines_are_single_line_objects() {
     let line = flife_probes::native_input_probe().to_json_line();
     assert!(line.starts_with("{\"schema\":\"flife.probe.v1\""));

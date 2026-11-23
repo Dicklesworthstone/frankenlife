@@ -1179,7 +1179,6 @@ fn fused_field_work_set_workers_keeps_accumulators_sized_without_step_allocation
 /// `supports` lengths with `CoreError::LayoutMismatch` instead of silently
 /// truncating trailing sources via `.zip()`.
 #[test]
-#[expect(clippy::expect_used, reason = "test assertion")]
 fn deposit_energy_fused_refuses_mismatched_source_and_support_lengths() {
     let g = grid(8, 8, 8.0, 8.0);
     let mut state = zeroed(g);

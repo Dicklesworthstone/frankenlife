@@ -16,10 +16,11 @@
 //! A job is deferred (its output is `None`, and the world evaluates it on the
 //! reference) when the reference would refuse it: an input that is not finite
 //! in F32, a pre-activation or output that is not finite. It is also deferred
-//! when its controller has a shape this backend does not take: not 104 inputs
-//! in, 36 outputs out and each layer feeding the next, more than
-//! [`MAXIMUM_HIDDEN_LAYERS`] hidden layers, or a parameter count other than
-//! the layers'.
+//! when its controller has a shape this backend does not take: input width
+//! outside `1..=MAX_SENSOR_WIDTH`, raw output width outside
+//! `1..=MAX_CONTROLLER_OUTPUT_WIDTH`, mismatched input slice length, layers
+//! that do not feed the next, more than [`MAXIMUM_HIDDEN_LAYERS`] hidden
+//! layers, or a parameter count other than the layers'.
 //!
 //! **Executor** (plan §3.4, §12.5). The kernel runs on the thread that calls
 //! it and touches no rayon pool. [`CpuBackend`] splits a batch into at most

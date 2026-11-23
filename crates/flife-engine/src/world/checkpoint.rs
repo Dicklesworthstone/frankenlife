@@ -814,9 +814,8 @@ impl World {
                     }
                     match evaluated_raw {
                         Some((at, outputs, out_len)) => {
-                            HeldOutput::evaluated_slice(at, &outputs[..out_len]).map_err(|error| {
-                                refuse(format!("{id}'s held output: {error}"))
-                            })?
+                            HeldOutput::evaluated_slice(at, &outputs[..out_len])
+                                .map_err(|error| refuse(format!("{id}'s held output: {error}")))?
                         }
                         None => HeldOutput::INVALID,
                     }
@@ -876,9 +875,7 @@ impl World {
                             &outputs[..out_len],
                             &state[..len],
                         )
-                        .map_err(|error| {
-                            refuse(format!("{id}'s held recurrent state: {error}"))
-                        })?
+                        .map_err(|error| refuse(format!("{id}'s held recurrent state: {error}")))?
                     }
                     None => {
                         if len != 0 {

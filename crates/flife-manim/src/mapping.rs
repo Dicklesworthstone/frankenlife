@@ -921,7 +921,7 @@ static LINEAGE_ENERGY_SHADES: LazyLock<[[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE
 /// The sRGB colour at OKLab lightness `l` with hue `(a, b)`: the full
 /// chroma if it fits the gamut, otherwise the most of it that fits, by
 /// bisection (no chroma always fits).
-fn most_chroma(l: f64, a: f64, b: f64) -> [u8; 3] {
+pub(crate) fn most_chroma(l: f64, a: f64, b: f64) -> [u8; 3] {
     let at = |k: f64| {
         oklab_to_srgb(Oklab {
             l,

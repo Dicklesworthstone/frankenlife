@@ -27,7 +27,7 @@ use flife_field::FieldState;
 use flife_genome::TopologyCatalog;
 use flife_neural::{
     ACTION_WIDTH, ActionDecoding, ControllerScratch, ReferenceController, SENSOR_WIDTH,
-    WeightDtype, decode, widen,
+    WeightDtype, decode,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -142,11 +142,10 @@ fn check_every_snapshot(world: &World, config: &ValidatedConfig, chemistry_only:
         assert_eq!(snapshot.parameters, genome.parameters().len());
         assert_eq!(snapshot.traits, *genome.traits());
         let expected = organism.held.outputs().map(|outputs| {
-            let raw = if chemistry_only {
-                [0.0; ACTION_WIDTH]
-            } else {
-                widen(outputs)
-            };
+            let mut raw = [0.0; ACTION_WIDTH];
+            if !chemistry_only {
+                flife_neural::widen_slice(outputs, &mut raw).expect("widens");
+            }
             decode(&raw, world.step_size(), &decoding).expect("decodes")
         });
         assert_eq!(snapshot.decoded, expected);

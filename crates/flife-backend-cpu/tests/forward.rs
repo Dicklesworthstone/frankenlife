@@ -665,7 +665,11 @@ fn variable_width_reference_and_torch_bit_exact() -> Result<(), CoreError> {
             .map(|vals| vals.iter().map(|&v| F16::from_f64(f64::from(v))).collect())
             .collect();
         let input_vecs: Vec<Vec<f64>> = (0..12)
-            .map(|_| (0..in_w as usize).map(|_| draws.symmetric() * 2.0).collect())
+            .map(|_| {
+                (0..in_w as usize)
+                    .map(|_| draws.symmetric() * 2.0)
+                    .collect()
+            })
             .collect();
 
         // F32 parity on 1 and 4 lanes.
@@ -762,7 +766,10 @@ fn variable_width_reference_and_torch_bit_exact() -> Result<(), CoreError> {
     let mut torch_next = [0.0_f32; 2];
     flife_neural::update_recurrent_state(&state, &got_raw[40..44], 2.5, &mut torch_next)?;
     assert_eq!(
-        got_raw[..40].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        got_raw[..40]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
         ref_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
     assert_eq!(torch_next.map(f32::to_bits), ref_next.map(f32::to_bits));

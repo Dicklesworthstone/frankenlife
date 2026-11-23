@@ -35,6 +35,7 @@ mod hud;
 mod mapping;
 mod region;
 mod selection;
+mod v2;
 mod viewport;
 mod world;
 
@@ -71,6 +72,21 @@ pub use region::{
 pub use selection::{
     PICK_RADIUS_PIXELS, SELECTION_RING_COLOR, SELECTION_RING_GAP_POINTS, SELECTION_RING_SEGMENTS,
     SELECTION_RING_WIDTH_POINTS, pick, selection_ring, selection_ring_around,
+};
+pub use v2::{
+    APICAL_TICK_COLOR, APICAL_TICK_END_RATIO, APICAL_TICK_HALF_WIDTH_RATIO,
+    APICAL_TICK_START_RATIO, CELL_STATE_HUE_TWIST_RADIANS, CELL_STATE_LIGHTNESS_RANGE,
+    CELL_STATE_MAPPING_NAME, CELL_STATE_REGISTRY_NAME, CELL_STATE_STEPS, FieldOverlayKind,
+    FieldOverlayLayer, LEGEND_CELL_STATES, OVERLAY_LOG_GAIN, POLARITY_ANGLE_SCALE,
+    POLARITY_MAPPING_NAME, POLARITY_REGISTRY_NAME, POLARITY_UNPOLARIZED,
+    POLARITY_UNPOLARIZED_COLOR, POLARITY_WHEEL_CHROMA, POLARITY_WHEEL_LIGHTNESS,
+    TRAIL_CARRIER_NAME, TRAIL_CARRIER_PALETTE, V2ColorMapping, VASCULAR_CONDUCTANCE_NAME,
+    VASCULAR_CONDUCTANCE_PALETTE, apical_tick_draw, apical_tick_quad, apical_ticks_mesh,
+    build_composite_overlay_texture, build_overlay_texture, cell_state_color, cell_state_legend,
+    cell_state_rgb8, decode_cell_state, decode_polarity_radians, lower_cell_state_colors,
+    lower_polarity_colors, overlay_blend_linear, overlay_level, overlay_log_value, polarity_color,
+    polarity_legend, polarity_rgb8, polarity_scene_direction, polarity_turn, polarity_wheel_rgb8,
+    quantize_cell_state, quantize_polarity, trail_carrier_rgb8, vascular_conductance_rgb8,
 };
 pub use viewport::{MAXIMUM_ZOOM, Viewport};
 pub use world::{

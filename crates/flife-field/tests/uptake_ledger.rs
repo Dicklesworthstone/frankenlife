@@ -1065,7 +1065,6 @@ fn tick_ledgers_need_no_run_ledger_for_single_fixtures() {
 /// `CoreError::NumericalInvalid` instead of overflowing `floors` or entering
 /// an unbounded surplus adjustment loop.
 #[test]
-#[expect(clippy::expect_used, reason = "test assertion")]
 fn resolve_uptake_refuses_f64_overflowing_cell_demand_without_hanging() {
     let g = grid(4, 4, 4.0, 4.0);
     let mut state = zeroed(g);

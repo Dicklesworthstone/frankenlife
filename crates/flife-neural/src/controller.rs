@@ -38,9 +38,7 @@ use flife_core::model::{MAXIMUM_HIDDEN_LAYERS, dense_parameter_count};
 use flife_core::numerics::{sigmoid, tanh_f32};
 use flife_core::{CoreError, ValidatedConfig};
 
-use crate::actions::{
-    ACTION_WIDTH, ActionLayout, MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH,
-};
+use crate::actions::{ACTION_WIDTH, ActionLayout, MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH};
 use crate::sensors::{MAX_SENSOR_WIDTH, SENSOR_WIDTH, SensorLayout};
 use crate::weights::{Weight, WeightDtype, Weights};
 
@@ -1269,7 +1267,11 @@ pub fn widen_slice(raw: &[f32], out: &mut [f64]) -> Result<(), CoreError> {
     if raw.len() != out.len() {
         return Err(CoreError::LayoutMismatch {
             buffer: "controller outputs",
-            detail: format!("cannot widen {} outputs into {} slots", raw.len(), out.len()),
+            detail: format!(
+                "cannot widen {} outputs into {} slots",
+                raw.len(),
+                out.len()
+            ),
         });
     }
     for (dst, &src) in out.iter_mut().zip(raw) {

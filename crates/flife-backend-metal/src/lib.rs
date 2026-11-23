@@ -184,25 +184,27 @@ impl Batch {
             self.parameters.len(),
             self.len(),
         )?;
-        let next_organisms = self
-            .len()
-            .checked_add(1)
-            .ok_or_else(|| CoreError::LayoutMismatch {
-                buffer: "metal controller batch",
-                detail: "organism count overflows".to_owned(),
-            })?;
-        let in_end = next_organisms
-            .checked_mul(input_width)
-            .ok_or_else(|| CoreError::LayoutMismatch {
-                buffer: "metal controller batch",
-                detail: "input staging count overflows".to_owned(),
-            })?;
-        let out_end = next_organisms
-            .checked_mul(output_width)
-            .ok_or_else(|| CoreError::LayoutMismatch {
-                buffer: "metal controller batch",
-                detail: "output staging count overflows".to_owned(),
-            })?;
+        let next_organisms =
+            self.len()
+                .checked_add(1)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal controller batch",
+                    detail: "organism count overflows".to_owned(),
+                })?;
+        let in_end =
+            next_organisms
+                .checked_mul(input_width)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal controller batch",
+                    detail: "input staging count overflows".to_owned(),
+                })?;
+        let out_end =
+            next_organisms
+                .checked_mul(output_width)
+                .ok_or_else(|| CoreError::LayoutMismatch {
+                    buffer: "metal controller batch",
+                    detail: "output staging count overflows".to_owned(),
+                })?;
         if u32::try_from(in_end).is_err() || u32::try_from(out_end).is_err() {
             return Err(CoreError::LayoutMismatch {
                 buffer: "metal controller batch",
@@ -1006,16 +1008,15 @@ impl MetalBackend {
                 topology: topology.clone(),
                 dtype,
                 shape_words,
-                geometry: shape_words
-                    .and_then(|_| {
-                        ShardGeometry::fitting_for_dtype(
-                            length,
-                            dtype,
-                            limit.min(u64::from(u32::MAX)),
-                            shard_slots,
-                        )
-                        .ok()
-                    }),
+                geometry: shape_words.and_then(|_| {
+                    ShardGeometry::fitting_for_dtype(
+                        length,
+                        dtype,
+                        limit.min(u64::from(u32::MAX)),
+                        shard_slots,
+                    )
+                    .ok()
+                }),
                 shards: ShardTable::default(),
             }
         });
@@ -1343,12 +1344,20 @@ impl MetalBackend {
                 quantity: "metal controller output elements",
             })?
             .max(need_outputs);
-        // Retire the old buffers first, so their bytes are free again.
+        // Retire the old buffers first, so their bytes are free again, and
+        // allocate all three before committing capacities so a mid-growth
+        // error never leaves stale capacities behind.
         (self.inputs, self.raw, self.faults) = (None, None, None);
+        self.input_capacity = 0;
+        self.output_capacity = 0;
+        self.fault_capacity = 0;
         let owner = &self.controllers.owner;
-        self.inputs = Some(owner.zeroed_owned(in_elems)?);
-        self.raw = Some(owner.zeroed_owned(out_elems)?);
-        self.faults = Some(owner.zeroed_owned(organisms)?);
+        let inputs = owner.zeroed_owned(in_elems)?;
+        let raw = owner.zeroed_owned(out_elems)?;
+        let faults = owner.zeroed_owned(organisms)?;
+        self.inputs = Some(inputs);
+        self.raw = Some(raw);
+        self.faults = Some(faults);
         self.input_capacity = in_elems;
         self.output_capacity = out_elems;
         self.fault_capacity = organisms;
@@ -1365,9 +1374,12 @@ fn narrow_inputs(
     staged: &mut Vec<f32>,
     finite: &mut Vec<u8>,
 ) -> Result<(), CoreError> {
-    let total_inputs = jobs.len().checked_mul(input_width).ok_or(CoreError::Overflow {
-        quantity: "metal inputs",
-    })?;
+    let total_inputs = jobs
+        .len()
+        .checked_mul(input_width)
+        .ok_or(CoreError::Overflow {
+            quantity: "metal inputs",
+        })?;
     if staged.len() < total_inputs {
         reserve(staged, total_inputs - staged.len(), "metal inputs")?;
         staged.resize(total_inputs, 0.0);
@@ -1517,7 +1529,12 @@ impl ControllerBackend for MetalBackend {
             outputs.resize(jobs.len(), None);
             return Ok(());
         };
-        narrow_inputs(jobs, input_width, &mut self.staged_inputs, &mut self.input_finite)?;
+        narrow_inputs(
+            jobs,
+            input_width,
+            &mut self.staged_inputs,
+            &mut self.input_finite,
+        )?;
         let (touched, all_dispatched) = self.place_and_stage(jobs, (input_width, output_width))?;
         let count = self.dispatched.len();
         if count > 0 {

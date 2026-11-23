@@ -6,7 +6,7 @@
 
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob, ControllerScratch};
+use flife_neural::{ControllerBackend, ControllerJob, ControllerScratch, RawOutputs};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -61,7 +61,7 @@ impl ControllerBackend for ReferenceBatch {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.calls += 1;
         if self.fail_at == Some(self.calls) {
@@ -76,7 +76,7 @@ impl ControllerBackend for ReferenceBatch {
                 outputs.push(None);
                 continue;
             }
-            match job.controller.evaluate(job.inputs, &mut self.scratch) {
+            match job.controller.evaluate_raw(job.inputs, &mut self.scratch) {
                 Ok(mut raw) => {
                     if index == 1 && self.flip_at == Some(self.calls) {
                         raw[0] = f32::from_bits(raw[0].to_bits() ^ 1);

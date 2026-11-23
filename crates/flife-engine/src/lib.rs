@@ -95,6 +95,6 @@ pub use world::{
     Footprint, Graft, IntroductionEvent, ModelVariant, NumericalFault, NumericalProfile,
     PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SensorReport, SettleReport,
     Stepped, TickReport, UNIFORM_POSITIONS, UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS,
-    WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION,
-    WORLD_V2_CHUNK_VERSION, World, ZERO_VELOCITY, founder_position,
+    WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION,
+    World, ZERO_VELOCITY, founder_position,
 };

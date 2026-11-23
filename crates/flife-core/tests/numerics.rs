@@ -851,7 +851,10 @@ fn numerics_normalize_turns_shrink_and_symplectic_channels() {
     // Bump one extra ulp so left-fold is strictly 1.0 + >=2 ulp.
     adv[1] = adv[1].next_up();
     let before = left_fold_sq(&adv);
-    assert!(before > 1.0, "adversarial setup must exceed 1.0: {before:?}");
+    assert!(
+        before > 1.0,
+        "adversarial setup must exceed 1.0: {before:?}"
+    );
     shrink_to_left_fold_norm_limit(&mut adv, 1.0).expect("shrink brings inside unit ball");
     let after = left_fold_sq(&adv);
     assert!(after <= 1.0, "left-fold squared norm {after:?} > 1.0");

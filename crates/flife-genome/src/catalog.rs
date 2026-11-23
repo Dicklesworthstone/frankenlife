@@ -116,7 +116,13 @@ impl TopologyCatalog {
             .iter()
             .map(|hidden| DenseTopology::from_layouts(sensors, hidden, actions))
             .collect::<Result<Vec<_>, _>>()?;
-        Self::finish(name, state_width, members, maximum_parameters, default_hidden)
+        Self::finish(
+            name,
+            state_width,
+            members,
+            maximum_parameters,
+            default_hidden,
+        )
     }
 
     fn finish(
@@ -195,11 +201,10 @@ impl TopologyCatalog {
                 }
             };
             let abi = config.v2_abi();
-            let state_width = usize::try_from(abi.recurrent_state_width).map_err(|_| {
-                CoreError::Overflow {
+            let state_width =
+                usize::try_from(abi.recurrent_state_width).map_err(|_| CoreError::Overflow {
                     quantity: "controller.recurrent_state_width",
-                }
-            })?;
+                })?;
             let sensors = SensorLayout::new(
                 abi.dual_carrier_sensors,
                 abi.hippo_crowding_sensor,

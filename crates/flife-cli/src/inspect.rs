@@ -89,6 +89,12 @@ pub struct Inspected {
     pub digest: String,
     /// The model it runs.
     pub model: String,
+    /// Enabled scientific `field-ecology-v2` feature slugs, sorted; omitted
+    /// for `field-ecology-v1*` runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v2_features: Option<Vec<&'static str>>,
+    /// Whether this run satisfies `INV-08` (purely field-mediated interaction).
+    pub inv08_pure_field: bool,
     /// The world's extent and grid.
     pub world: InspectedExtent,
     /// Live organisms.
@@ -378,6 +384,8 @@ fn of(
         checkpoint,
         digest: world.digest().to_hex(),
         model: world.config().config().model.clone(),
+        v2_features: world.config().enabled_v2_features(),
+        inv08_pure_field: world.config().inv08_pure_field(),
         world: InspectedExtent {
             width: grid.world_width(),
             height: grid.world_height(),

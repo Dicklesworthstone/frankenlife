@@ -1048,7 +1048,11 @@ fn v2_feature_registry_auto_profile_and_validation() {
     assert_eq!(V2Feature::BUNDLE_B_DEFAULTS.len(), 13);
     let mut slugs = std::collections::BTreeSet::new();
     for feature in V2Feature::ALL {
-        assert!(slugs.insert(feature.slug()), "duplicate slug {}", feature.slug());
+        assert!(
+            slugs.insert(feature.slug()),
+            "duplicate slug {}",
+            feature.slug()
+        );
         assert_eq!(V2Feature::from_slug(feature.slug()), Some(feature));
         assert_eq!(
             V2Feature::expand_slug_or_alias(feature.slug()),
@@ -1210,7 +1214,8 @@ fn v2_feature_registry_auto_profile_and_validation() {
     v2_hippo.crowding.enabled = Some(true);
     v2_hippo.crowding.mode = "cell-occupancy-v1".into();
     cell_hippo.v2 = Some(v2_hippo);
-    let cell_hippo = validate(cell_hippo).expect("cell-occupancy-v1 hippo validates without contact");
+    let cell_hippo =
+        validate(cell_hippo).expect("cell-occupancy-v1 hippo validates without contact");
     assert!(cell_hippo.inv08_pure_field());
 
     // 8. Refusal of notch-delta without epigenetic-recurrence.
@@ -1241,7 +1246,11 @@ fn v2_model_descriptor_differs_when_feature_toggled() {
             .canonical_text()
             .contains("v2_inv08_pure_field\ttrue\n")
     );
-    assert!(base_desc.canonical_text().contains("v2_abi\t108/42/42/34\n"));
+    assert!(
+        base_desc
+            .canonical_text()
+            .contains("v2_abi\t108/42/42/34\n")
+    );
 
     // Toggling a scientific feature without ABI change (oases) MUST change ModelDescriptor!
     let mut no_oases_cfg = starter();
@@ -1254,7 +1263,11 @@ fn v2_model_descriptor_differs_when_feature_toggled() {
     let no_oases = validate(no_oases_cfg).unwrap();
     let no_oases_desc = ModelDescriptor::of(&no_oases);
     assert_ne!(no_oases_desc.digest(), base_desc.digest());
-    assert!(!no_oases_desc.canonical_text().contains("v2_feature\toases\n"));
+    assert!(
+        !no_oases_desc
+            .canonical_text()
+            .contains("v2_feature\toases\n")
+    );
 
     // Toggling an ABI-changing feature (so2-motor) updates v2_abi and ModelDescriptor!
     let mut no_motor_cfg = starter();

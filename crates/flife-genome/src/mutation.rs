@@ -126,8 +126,7 @@ impl MutationParameters {
                 });
             }
         }
-        let fixed_controller =
-            model.model == flife_core::model::FIELD_ECOLOGY_V2_FIXED_CONTROLLER;
+        let fixed_controller = model.model == flife_core::model::FIELD_ECOLOGY_V2_FIXED_CONTROLLER;
         let parameters = Self {
             topology_change_probability: if architecture.enabled && !fixed_controller {
                 architecture.probability_per_birth

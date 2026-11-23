@@ -1805,11 +1805,11 @@ impl World {
             .topology(genome.topology())
             .ok_or_else(|| missing("topology in the catalog"))?;
         let decoded = match organism.held.outputs() {
-            Some(outputs) => Some(decode(
-                &raw_outputs(&self.rules, outputs),
-                self.rules.step,
-                &self.rules.decoding,
-            )?),
+            Some(outputs) => {
+                let mut raw = [0.0_f64; MAX_ACTION_WIDTH];
+                let slice = raw_outputs(&self.rules, outputs, &mut raw)?;
+                Some(decode_slice(slice, self.rules.step, &self.rules.decoding)?)
+            }
             None => None,
         };
         let local = local_chemistry(
@@ -1828,51 +1828,83 @@ impl World {
         ) {
             (Some(recorded), Some(at), Some(held)) if recorded.tick.next().ok() == Some(at) => {
                 let controller = genome.controller(&self.rules.catalog, &self.rules.limits)?;
+                let sensors = self.rules.v2.sensors();
+                let actions = self.rules.v2.actions();
                 let state_width = self.rules.recurrent_state_width;
-                let hidden = if state_width > 0 {
-                    let prev_state = self
-                        .watch
-                        .evaluated_state
-                        .unwrap_or([0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH]);
-                    let trace = controller.trace_recurrent(
-                        &recorded.observation.inputs,
+                let obs_width = sensors.observation_width();
+                let input_width = sensors.input_width();
+                let mut full_inputs = [0.0_f64; MAX_SENSOR_WIDTH];
+                full_inputs[..SENSOR_WIDTH].copy_from_slice(&recorded.observation.inputs);
+                let prev_state = self
+                    .watch
+                    .evaluated_state
+                    .unwrap_or([0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH]);
+                if state_width > 0 {
+                    for (slot, &h) in full_inputs[obs_width..input_width]
+                        .iter_mut()
+                        .zip(&prev_state[..state_width])
+                    {
+                        *slot = f64::from(h);
+                    }
+                }
+                let trace = controller.trace_raw(
+                    &full_inputs[..input_width],
+                    &mut ControllerScratch::default(),
+                )?;
+                let action_width = actions.action_width();
+                let trace_actions = trace.outputs.action_slice(action_width).ok_or_else(|| {
+                    CoreError::StateConflict {
+                        operation: "inspect organism",
+                        detail: format!(
+                            "{id}'s reference trace returned {} outputs, expected at least \
+                             {action_width}",
+                            trace.outputs.len()
+                        ),
+                    }
+                })?;
+                let outputs_match = trace_actions
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .eq(held.iter().map(|value| value.to_bits()));
+                let state_matches = if state_width > 0 {
+                    let tail = trace.outputs.recurrent_tail(action_width).ok_or_else(|| {
+                        CoreError::StateConflict {
+                            operation: "inspect organism",
+                            detail: format!("{id}'s reference trace missed recurrent tail"),
+                        }
+                    })?;
+                    let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+                    update_recurrent_state(
                         &prev_state[..state_width],
-                        &mut ControllerScratch::default(),
+                        tail,
+                        self.rules.v2.epigenetic_gate_bias(),
+                        &mut next_state[..state_width],
                     )?;
-                    let state_matches = trace.next_state.iter().map(|v| v.to_bits()).eq(organism
-                        .held
-                        .recurrent_state()
+                    next_state[..state_width]
                         .iter()
-                        .map(|v| v.to_bits()));
-                    if trace.outputs.map(f32::to_bits) != held.map(f32::to_bits) || !state_matches {
-                        return Err(CoreError::StateConflict {
-                            operation: "inspect organism",
-                            detail: format!(
-                                "{id}'s recurrent output/state held from tick {} is not the \
-                                 reference's on the inputs recorded for it",
-                                at.get()
-                            ),
-                        });
-                    }
-                    trace.hidden
+                        .map(|value| value.to_bits())
+                        .eq(organism
+                            .held
+                            .recurrent_state()
+                            .iter()
+                            .map(|value| value.to_bits()))
                 } else {
-                    let trace = controller.trace(
-                        &recorded.observation.inputs,
-                        &mut ControllerScratch::default(),
-                    )?;
-                    if trace.outputs.map(f32::to_bits) != held.map(f32::to_bits) {
-                        return Err(CoreError::StateConflict {
-                            operation: "inspect organism",
-                            detail: format!(
-                                "{id}'s output held from tick {} is not the reference's on the \
-                                 inputs recorded for it",
-                                at.get()
-                            ),
-                        });
-                    }
-                    trace.hidden
+                    true
                 };
-                Some(Activations { tick: at, hidden })
+                if !outputs_match || !state_matches {
+                    return Err(CoreError::StateConflict {
+                        operation: "inspect organism",
+                        detail: format!(
+                            "{id}'s output held from tick {} is not the reference's on the \
+                             inputs recorded for it",
+                            at.get()
+                        ),
+                    });
+                }
+                Some(Activations {
+                    tick: at,
+                    hidden: trace.hidden,
+                })
             }
             _ => None,
         };
@@ -2567,8 +2599,25 @@ impl World {
         // the world has one (FL-032), else on the field's workers.
         let (_, next) = field.stage();
         let workers = field_work.workers();
-        let [emitted_summary, recycled_summary] =
-            reduce_field_with(next, grants, [emissions, recycling], workers, fields)?;
+        let mut summaries = [None; 2];
+        reduce_field_with(
+            next,
+            grants,
+            &mut [
+                (emissions, CarrierSpec::Carrier0),
+                (recycling, CarrierSpec::Carrier0),
+            ],
+            &mut summaries,
+            workers,
+            fields,
+        )?;
+        let [Some(emitted_summary), Some(recycled_summary)] = summaries else {
+            return Err(CoreError::StateConflict {
+                operation: "reduce field deposits",
+                detail: "missing deposit reduction summaries for emissions and recycling"
+                    .to_owned(),
+            });
+        };
         emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
         recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
 
@@ -3014,6 +3063,7 @@ fn fit_lanes(
     batched: bool,
 ) -> Result<(), CoreError> {
     let rows = lane_rows(organisms, lanes.len());
+    let needs_expanded = rules.v2.sensors().input_width() > SENSOR_WIDTH;
     for lane in lanes {
         fit(&mut lane.decisions, rows, "decisions")?;
         fit(
@@ -3027,8 +3077,14 @@ fn fit_lanes(
         lane.transactions = None;
         if batched {
             fit(&mut lane.observed, rows, "observations")?;
+            if needs_expanded {
+                fit(&mut lane.controller_inputs, rows, "controller inputs")?;
+            } else {
+                lane.controller_inputs = Vec::new();
+            }
         } else {
             lane.observed = Vec::new();
+            lane.controller_inputs = Vec::new();
         }
     }
     Ok(())
@@ -3089,37 +3145,76 @@ fn advance_field_with(
     advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
 }
 
-/// Phase 9 on the world's field backend if it has one (FL-032). Any error
-/// there leaves the field, grants and deposits as they were, and hands the
-/// reduction to [`reduce_field_on`], which reproduces the reference's own
-/// error or finds none; with none, the backend failed where the reference
-/// does not, and the world stops using it. Either way the reduction is the
-/// reference's.
+/// Phase 9 on the world's field backend if it has one (FL-032), generalized to
+/// arbitrary multi-deposit slices for `field-ecology-v2` (V2-01). When given
+/// the baseline 2-stream `Carrier0` pair (`emissions`, `recycling`), it takes
+/// the `FieldBackend::reduce` fast path; any error there falls back cleanly to
+/// the reference. Multi-stream slices reduce grants once then each deposit
+/// stream in fixed slice order.
 fn reduce_field_with(
     next: &mut FieldState,
     grants: &mut Grants,
-    deposits: [&mut Deposits; 2],
+    deposits: &mut [(&mut Deposits, CarrierSpec)],
+    out: &mut [Option<DepositSummary>],
     workers: usize,
     fields: &mut Fields,
-) -> Result<[DepositSummary; 2], CoreError> {
-    let Fields { backend, report } = fields;
-    let [emissions, recycling] = deposits;
-    if let Some(device) = backend.as_deref_mut() {
-        match device.reduce(next, grants, [&mut *emissions, &mut *recycling]) {
-            Ok(summaries) => {
-                report.reductions = report.reductions.saturating_add(1);
-                return Ok(summaries);
-            }
-            Err(error) => {
-                report.reference_reductions = report.reference_reductions.saturating_add(1);
-                let summaries = reduce_field_on(next, grants, [emissions, recycling], workers)?;
-                report.failure = Some(error.to_string());
-                *backend = None;
-                return Ok(summaries);
+) -> Result<(), CoreError> {
+    if deposits.len() != out.len() {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "deposit summaries",
+            detail: format!(
+                "{} deposit streams for {} summary slots",
+                deposits.len(),
+                out.len()
+            ),
+        });
+    }
+    if deposits.len() == 2
+        && deposits[0].1 == CarrierSpec::Carrier0
+        && deposits[1].1 == CarrierSpec::Carrier0
+    {
+        let (first, rest) = deposits.split_at_mut(1);
+        let emissions = &mut *first[0].0;
+        let recycling = &mut *rest[0].0;
+        let Fields { backend, report } = fields;
+        if let Some(device) = backend.as_deref_mut() {
+            match device.reduce(next, grants, [&mut *emissions, &mut *recycling]) {
+                Ok([emitted, recycled]) => {
+                    report.reductions = report.reductions.saturating_add(1);
+                    out[0] = Some(emitted);
+                    out[1] = Some(recycled);
+                    return Ok(());
+                }
+                Err(error) => {
+                    report.reference_reductions = report.reference_reductions.saturating_add(1);
+                    let [emitted, recycled] =
+                        reduce_field_on(next, grants, [emissions, recycling], workers)?;
+                    out[0] = Some(emitted);
+                    out[1] = Some(recycled);
+                    report.failure = Some(error.to_string());
+                    *backend = None;
+                    return Ok(());
+                }
             }
         }
+        let [emitted, recycled] = reduce_field_on(next, grants, [emissions, recycling], workers)?;
+        out[0] = Some(emitted);
+        out[1] = Some(recycled);
+        return Ok(());
     }
-    reduce_field_on(next, grants, [emissions, recycling], workers)
+    if deposits
+        .iter()
+        .any(|(_, carrier)| *carrier == CarrierSpec::Carrier1)
+    {
+        return Err(CoreError::MissingCapability {
+            capability: "dual-carrier Carrier 1 field reduction (V2-15)".to_owned(),
+        });
+    }
+    apply_grants_on(next, grants, workers)?;
+    for ((deposit, _), slot) in deposits.iter_mut().zip(out.iter_mut()) {
+        *slot = Some(apply_deposits_on(next, deposit, workers)?);
+    }
+    Ok(())
 }
 
 /// Phase 10's check of the next field (INV-01, INV-02 at `tolerance`), on
@@ -3413,13 +3508,25 @@ fn due(rules: &Rules, organism: &Organism, to: Tick) -> bool {
 }
 
 /// The raw outputs a held output decodes from: the controller's, widened,
-/// or none under the chemistry-only variant.
-fn raw_outputs(rules: &Rules, outputs: &[f32; ACTION_WIDTH]) -> [f64; ACTION_WIDTH] {
+/// or zeroed under the chemistry-only variants.
+fn raw_outputs<'a>(
+    rules: &Rules,
+    outputs: &[f32],
+    buffer: &'a mut [f64; MAX_ACTION_WIDTH],
+) -> Result<&'a [f64], CoreError> {
+    let len = outputs.len();
+    let dst = buffer
+        .get_mut(..len)
+        .ok_or_else(|| CoreError::LayoutMismatch {
+            buffer: "held controller output",
+            detail: format!("output width {len} exceeds maximum {MAX_ACTION_WIDTH}"),
+        })?;
     if rules.variant.decides_from_zero() {
-        [0.0; ACTION_WIDTH]
+        dst.fill(0.0);
     } else {
-        widen(outputs)
+        widen_slice(outputs, dst)?;
     }
+    Ok(dst)
 }
 
 /// The rest of phase 4: the held output, newly evaluated or not, decoded.
@@ -3434,12 +3541,93 @@ fn finish(
         operation: "decode held output",
         detail: format!("{} holds no valid output", organism.id),
     })?;
+    let mut raw = [0.0_f64; MAX_ACTION_WIDTH];
+    let slice = raw_outputs(rules, outputs, &mut raw)?;
     Ok(Decision {
         held,
         evaluated,
-        actions: decode(&raw_outputs(rules, outputs), rules.step, &rules.decoding)?,
+        actions: decode_slice(slice, rules.step, &rules.decoding)?,
         gradients: observation.gradients,
     })
+}
+
+/// Evaluate one due organism's controller on the scalar reference, handling
+/// dynamic sensor/action layouts and optional gated recurrent state.
+fn evaluate_reference_held(
+    rules: &Rules,
+    genome: &Genome,
+    organism: &Organism,
+    observation: &Observation,
+    to: Tick,
+    controller: &mut ControllerScratch,
+) -> Result<HeldOutput, CoreError> {
+    let eval = genome.controller(&rules.catalog, &rules.limits)?;
+    let sensors = rules.v2.sensors();
+    let obs_width = sensors.observation_width();
+    let state_width = rules.recurrent_state_width;
+    let mut expanded_obs = [0.0_f64; MAX_SENSOR_WIDTH];
+    let sensor_slice: &[f64] = if obs_width == SENSOR_WIDTH {
+        &observation.inputs
+    } else {
+        expanded_obs[..SENSOR_WIDTH].copy_from_slice(&observation.inputs);
+        &expanded_obs[..obs_width]
+    };
+    if state_width > 0 {
+        let prev_state = organism.held.recurrent_state_array();
+        let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        let raw = eval.evaluate_recurrent_slice(
+            sensor_slice,
+            &prev_state[..state_width],
+            rules.v2.epigenetic_gate_bias(),
+            controller,
+            &mut next_state[..state_width],
+        )?;
+        HeldOutput::evaluated_recurrent_slice(to, raw.as_slice(), &next_state[..state_width])
+    } else {
+        let raw = eval.evaluate_raw(sensor_slice, controller)?;
+        HeldOutput::evaluated_slice(to, raw.as_slice())
+    }
+}
+
+/// Build `HeldOutput` from one backend's full `RawOutputs`, applying the
+/// canonical host `update_recurrent_state` when `state_width > 0`.
+fn held_from_raw(
+    rules: &Rules,
+    organism: &Organism,
+    to: Tick,
+    raw: &RawOutputs,
+) -> Result<HeldOutput, CoreError> {
+    let actions = rules.v2.actions();
+    let action_width = actions.action_width();
+    let state_width = rules.recurrent_state_width;
+    let action_slice = raw
+        .action_slice(action_width)
+        .ok_or_else(|| CoreError::LayoutMismatch {
+            buffer: "controller outputs",
+            detail: format!(
+                "backend returned {} outputs, expected at least {action_width}",
+                raw.len()
+            ),
+        })?;
+    if state_width > 0 {
+        let tail = raw
+            .recurrent_tail(action_width)
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "controller outputs",
+                detail: "backend output missed recurrent tail".to_owned(),
+            })?;
+        let prev_state = organism.held.recurrent_state_array();
+        let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
+        update_recurrent_state(
+            &prev_state[..state_width],
+            tail,
+            rules.v2.epigenetic_gate_bias(),
+            &mut next_state[..state_width],
+        )?;
+        HeldOutput::evaluated_recurrent_slice(to, action_slice, &next_state[..state_width])
+    } else {
+        HeldOutput::evaluated_slice(to, action_slice)
+    }
 }
 
 /// Phases 3 and 4 for one organism (§8.1): its already-sampled raw observation,
@@ -3455,22 +3643,7 @@ fn decide_from_raw(
     let observation = encode_for_controller(rules, organism, raw, from)?;
     let due = due(rules, organism, to);
     let held = if due {
-        let eval = genome.controller(&rules.catalog, &rules.limits)?;
-        let width = rules.recurrent_state_width;
-        if width > 0 {
-            let prev_state = organism.held.recurrent_state_array();
-            let mut next_state = [0.0_f32; MAXIMUM_RECURRENT_STATE_WIDTH];
-            let outputs = eval.evaluate_recurrent(
-                &observation.inputs,
-                &prev_state[..width],
-                controller,
-                &mut next_state[..width],
-            )?;
-            HeldOutput::evaluated_recurrent(to, outputs, &next_state[..width])?
-        } else {
-            let outputs = eval.evaluate(&observation.inputs, controller)?;
-            HeldOutput::evaluated(to, outputs)?
-        }
+        evaluate_reference_held(rules, genome, organism, &observation, to, controller)?
     } else {
         organism.held
     };
@@ -3918,15 +4091,6 @@ fn decide_with(
     let Some(device) = backend.as_deref_mut() else {
         return decide_all(rules, population, view, sampled, rows, ticks, lanes);
     };
-    if rules.recurrent_state_width > 0 {
-        let error = CoreError::MissingCapability {
-            capability: format!("a controller backend under `{INDEPENDENT_RECURRENT_MLP_V1}`"),
-        };
-        report.failure = Some(error.to_string());
-        *backend = None;
-        report.reference_ticks = report.reference_ticks.saturating_add(1);
-        return decide_all(rules, population, view, sampled, rows, ticks, lanes);
-    }
     let decided = decide_batched(
         rules, population, view, sampled, rows, ticks, lanes, device, outputs, by_row,
     );
@@ -3972,16 +4136,45 @@ fn decide_batched(
     [from, to]: [Tick; 2],
     lanes: &mut [DecisionLane],
     device: &mut dyn ControllerBackend,
-    outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
-    by_row: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+    outputs: &mut Vec<Option<RawOutputs>>,
+    by_row: &mut Vec<Option<RawOutputs>>,
 ) -> Result<Batched, CoreError> {
+    let sensors = rules.v2.sensors();
+    let actions = rules.v2.actions();
+    let input_width = sensors.input_width();
+    let obs_width = sensors.observation_width();
+    let state_width = rules.recurrent_state_width;
+    let raw_output_width = actions.raw_output_width();
+    let needs_expanded = input_width > SENSOR_WIDTH;
+
     for lane in lanes.iter_mut() {
         lane.observed.clear();
+        lane.controller_inputs.clear();
         lane.decisions.clear();
     }
     in_runs(rows, lanes, &|start, run, lane| {
         reserve_for(&mut lane.observed, run.len(), "observations")?;
+        if needs_expanded {
+            reserve_for(&mut lane.controller_inputs, run.len(), "controller inputs")?;
+        }
         let mut live = run.first().map(|first| population.ascending_from(first.id));
+        let push_obs = |lane: &mut DecisionLane, organism: &Organism, obs: Observation| {
+            if needs_expanded {
+                let mut full = [0.0_f64; MAX_SENSOR_WIDTH];
+                full[..SENSOR_WIDTH].copy_from_slice(&obs.inputs);
+                if state_width > 0 {
+                    let prev = organism.held.recurrent_state_array();
+                    for (slot, &h) in full[obs_width..input_width]
+                        .iter_mut()
+                        .zip(&prev[..state_width])
+                    {
+                        *slot = f64::from(h);
+                    }
+                }
+                lane.controller_inputs.push(full);
+            }
+            lane.observed.push(obs);
+        };
         if let Some(samples) = sampled {
             for (index, organism) in run.iter().enumerate() {
                 let genome = live
@@ -3995,8 +4188,8 @@ fn decide_batched(
                     Some(raw) => *raw,
                     None => view.sample(organism.position, genome.traits().sensing_scale())?,
                 };
-                lane.observed
-                    .push(encode_for_controller(rules, organism, &raw, from)?);
+                let obs = encode_for_controller(rules, organism, &raw, from)?;
+                push_obs(lane, organism, obs);
             }
             return Ok(());
         }
@@ -4028,14 +4221,13 @@ fn decide_batched(
             }
             view.sample_batch(&queries[..count], &mut raw_samples[..count])?;
             for (organism, raw) in chunk.iter().zip(&raw_samples[..count]) {
-                lane.observed
-                    .push(encode_for_controller(rules, organism, raw, from)?);
+                let obs = encode_for_controller(rules, organism, raw, from)?;
+                push_obs(lane, organism, obs);
             }
         }
         Ok(())
     })?;
 
-    let observed = lanes.iter().flat_map(|lane| lane.observed.iter());
     let mut jobs = Vec::new();
     reserve_for(&mut jobs, rows.len(), "controller jobs")?;
     let mut seen = 0;
@@ -4043,24 +4235,49 @@ fn decide_batched(
     // genome and slot (FL-034: two searches per organism were about 11% of
     // a 100k world's main thread on Metal controllers).
     let mut live = population.ascending();
-    for (organism, observation) in rows.iter().zip(observed) {
-        seen += 1;
-        if due(rules, organism, to) {
-            let (genome, slot) = live.next(organism.id);
-            jobs.push(ControllerJob {
-                genome: organism.genome,
-                slot: slot.ok_or_else(|| CoreError::StateConflict {
-                    operation: "controller batch",
-                    detail: format!("{} holds no arena slot", organism.id),
-                })?,
-                controller: genome
-                    .ok_or_else(|| CoreError::StateConflict {
-                        operation: "read genome",
-                        detail: format!("{} has no genome", organism.id),
-                    })?
-                    .controller(&rules.catalog, &rules.limits)?,
-                inputs: &observation.inputs,
-            });
+    if needs_expanded {
+        let expanded = lanes.iter().flat_map(|lane| lane.controller_inputs.iter());
+        for (organism, full) in rows.iter().zip(expanded) {
+            seen += 1;
+            if due(rules, organism, to) {
+                let (genome, slot) = live.next(organism.id);
+                jobs.push(ControllerJob {
+                    genome: organism.genome,
+                    slot: slot.ok_or_else(|| CoreError::StateConflict {
+                        operation: "controller batch",
+                        detail: format!("{} holds no arena slot", organism.id),
+                    })?,
+                    controller: genome
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.id),
+                        })?
+                        .controller(&rules.catalog, &rules.limits)?,
+                    inputs: &full[..input_width],
+                });
+            }
+        }
+    } else {
+        let observed = lanes.iter().flat_map(|lane| lane.observed.iter());
+        for (organism, observation) in rows.iter().zip(observed) {
+            seen += 1;
+            if due(rules, organism, to) {
+                let (genome, slot) = live.next(organism.id);
+                jobs.push(ControllerJob {
+                    genome: organism.genome,
+                    slot: slot.ok_or_else(|| CoreError::StateConflict {
+                        operation: "controller batch",
+                        detail: format!("{} holds no arena slot", organism.id),
+                    })?,
+                    controller: genome
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.id),
+                        })?
+                        .controller(&rules.catalog, &rules.limits)?,
+                    inputs: &observation.inputs,
+                });
+            }
         }
     }
     if seen != rows.len() {
@@ -4082,6 +4299,19 @@ fn decide_batched(
                 detail: format!("{} outputs for {} jobs", outputs.len(), jobs.len()),
             }));
         }
+        if let Some(bad) = outputs
+            .iter()
+            .flatten()
+            .find(|raw| raw.len() != raw_output_width)
+        {
+            return Ok(Batched::Device(CoreError::StateConflict {
+                operation: "batch controllers",
+                detail: format!(
+                    "backend returned {} outputs, expected {raw_output_width}",
+                    bad.len()
+                ),
+            }));
+        }
     }
     drop(jobs);
 
@@ -4096,7 +4326,7 @@ fn decide_batched(
         };
         by_row.push(output);
     }
-    let by_row: &[Option<[f32; ACTION_WIDTH]>] = by_row;
+    let by_row: &[Option<RawOutputs>] = by_row;
     in_runs(rows, lanes, &|start, run, lane| {
         let DecisionLane {
             controller,
@@ -4108,13 +4338,20 @@ fn decide_batched(
         for (index, (organism, observation)) in run.iter().zip(observed.iter()).enumerate() {
             let evaluated = due(rules, organism, to);
             let held = if evaluated {
-                let outputs = match by_row.get(start + index).copied().flatten() {
-                    Some(outputs) => outputs,
-                    None => genome_of(population, organism.id)?
-                        .controller(&rules.catalog, &rules.limits)?
-                        .evaluate(&observation.inputs, controller)?,
-                };
-                HeldOutput::evaluated(to, outputs)?
+                match by_row.get(start + index).copied().flatten() {
+                    Some(raw) => held_from_raw(rules, organism, to, &raw)?,
+                    None => {
+                        let genome = genome_of(population, organism.id)?;
+                        evaluate_reference_held(
+                            rules,
+                            genome,
+                            organism,
+                            observation,
+                            to,
+                            controller,
+                        )?
+                    }
+                }
             } else {
                 organism.held
             };
@@ -4484,13 +4721,18 @@ impl Stages for Reference<'_> {
     }
 }
 
-/// The contact models' `[contact]` table, which they require and every
-/// other model refuses (validation checks both; this is the engine's own
+/// The contact models' `[contact]` table, which `field-ecology-v1-contact*`
+/// requires, every other v1 model refuses, and `field-ecology-v2*` admits
+/// optionally (validation checks the same rules; this is the engine's own
 /// guard).
 fn contact_rules(config: &ValidatedConfig) -> Result<Option<ContactRules>, CoreError> {
     let model = &config.config().model;
+    let variant = ModelVariant::of(model)?;
     let rules = ContactRules::from_config(config)?;
-    match (ModelVariant::of(model)?.contact(), rules) {
+    if variant.is_v2() {
+        return Ok(rules);
+    }
+    match (variant.contact(), rules) {
         (true, Some(rules)) => Ok(Some(rules)),
         (false, None) => Ok(None),
         (needs, _) => Err(CoreError::InvalidConfig(vec![ConfigIssue {

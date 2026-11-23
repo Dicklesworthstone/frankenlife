@@ -22,6 +22,7 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   density), whether the field is drawn and its `FieldMapping` (energy, composition or a component). `field_drawn()` is whether a
   frame draws the field: when it is on, except under raw density, which is opaque.
 - `WorldView` holds all of them, and builds each frame's `ThreeDJob`.
+- `v2` (`V2-16`, `v2-visual-mappings`, `FL-052`): pure read-only (`INV-09`) visual mapping primitives ready to consume optional `Epoch::cell_states() -> Option<&[i8]>`, `Epoch::polarities() -> Option<&[i16]>`, `FieldTexture::trail_energy() -> Option<&[f32]>`, and `FieldTexture::vascular_conductance() -> Option<&[f32]>` slices (`cell-state-v1`, `polarity-v1`, bulk `apical_ticks_mesh` for sphere mode, `FieldOverlayKind` / `FieldOverlayLayer` / linear compositing for `trail-carrier` and `vascular-conductance`, and compact legends strictly within FL-024's `33,792` HUD vertex cap).
 
 **Inputs.**
 - An FL-017 `Epoch`, read only: identity-ordered positions, velocities, energies, lineages, generations,

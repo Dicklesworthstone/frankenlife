@@ -42,8 +42,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use flife_backend_metal::ControllerChoice;
 use flife_core::config::CONFIG_SCHEMA;
+use flife_core::model::is_v2_model;
 use flife_core::{
-    ConfigIssue, CoreError, ModelDescriptor, RunConfig, Sha256Digest, ValidatedConfig,
+    ConfigIssue, CoreError, FeatureOverride, ModelDescriptor, RunConfig, Sha256Digest,
+    ValidatedConfig,
 };
 use flife_store::{CatalogedRun, ExperimentCatalog};
 use serde::{Deserialize, Serialize};
@@ -149,6 +151,26 @@ pub fn ablation(name: &str) -> Result<&'static Ablation, CoreError> {
             role: "experiment ablation",
             name: name.to_owned(),
         })
+}
+
+/// Model-family-aware overrides for a named ablation (V2-01): routes
+/// `chemistry-only`, `fresh-offspring`, and `fixed-controller` to the
+/// `field-ecology-v2-*` control models when `base_model` is `field-ecology-v2*`,
+/// while keeping `field-ecology-v1*` 100% unchanged.
+fn ablation_set_for_model(
+    ablation: &'static Ablation,
+    base_model: &str,
+) -> &'static [(&'static str, &'static str)] {
+    if is_v2_model(base_model) {
+        match ablation.name {
+            "chemistry-only" => &[("model", "\"field-ecology-v2-chemistry-only\"")],
+            "fresh-offspring" => &[("model", "\"field-ecology-v2-fresh-offspring\"")],
+            "fixed-controller" => &[("model", "\"field-ecology-v2-fixed-controller\"")],
+            _ => ablation.set,
+        }
+    } else {
+        ablation.set
+    }
 }
 
 /// An experiment specification, as parsed.
@@ -333,6 +355,18 @@ impl Experiment {
     /// inconsistent specification or an invalid condition;
     /// [`CoreError::UnknownAlgorithm`] for an unknown ablation.
     pub fn load(path: &Path) -> Result<Self, CoreError> {
+        Self::load_with_overrides(path, &[])
+    }
+
+    /// As [`Experiment::load`], applying founding `field-ecology-v2*` feature
+    /// overrides to the base configuration before resolving conditions (V2-01).
+    ///
+    /// # Errors
+    /// As [`Experiment::load`], plus override validation errors.
+    pub fn load_with_overrides(
+        path: &Path,
+        overrides: &[FeatureOverride],
+    ) -> Result<Self, CoreError> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| spec_error(path.display().to_string(), error.to_string()))?;
         let spec: Spec = toml::from_str(&text)
@@ -341,7 +375,7 @@ impl Experiment {
         let base_path = directory.join(&spec.base);
         let base_text = std::fs::read_to_string(&base_path)
             .map_err(|error| spec_error("base", format!("{}: {error}", base_path.display())))?;
-        Self::new(spec, &base_text)
+        Self::new_with_overrides(spec, &base_text, overrides)
     }
 
     /// Resolve `spec` against the base configuration `base_text`.
@@ -349,6 +383,19 @@ impl Experiment {
     /// # Errors
     /// As [`Experiment::load`].
     pub fn new(spec: Spec, base_text: &str) -> Result<Self, CoreError> {
+        Self::new_with_overrides(spec, base_text, &[])
+    }
+
+    /// Resolve `spec` against `base_text` with founding `field-ecology-v2*`
+    /// feature overrides applied to the base configuration (V2-01).
+    ///
+    /// # Errors
+    /// As [`Experiment::load`].
+    pub fn new_with_overrides(
+        spec: Spec,
+        base_text: &str,
+        overrides: &[FeatureOverride],
+    ) -> Result<Self, CoreError> {
         if spec.schema != EXPERIMENT_SCHEMA {
             return Err(CoreError::SchemaMismatch {
                 expected: EXPERIMENT_SCHEMA.into(),
@@ -367,14 +414,22 @@ impl Experiment {
         if spec.ticks == 0 {
             return Err(spec_error("ticks", "must be at least 1"));
         }
-        let base_hash = ValidatedConfig::from_toml(base_text)?.config_hash();
-        let base: toml::Table = toml::from_str(base_text)
+        let validated_base = ValidatedConfig::from_toml_with_overrides(base_text, overrides)?;
+        let base_hash = validated_base.config_hash();
+        let base_model = validated_base.config().model.clone();
+        let base_source = if is_v2_model(&base_model) || !overrides.is_empty() {
+            validated_base.canonical_toml()
+        } else {
+            base_text.to_owned()
+        };
+        let base: toml::Table = toml::from_str(&base_source)
             .map_err(|error| spec_error("base", error.to_string().trim().to_owned()))?;
         Self::check_seeds(&spec.seeds)?;
 
         let mut conditions = Vec::new();
         for condition in &spec.conditions {
             conditions.push(Self::resolve(
+                &base_model,
                 &spec.set,
                 &condition.name,
                 condition.ablation.as_deref(),
@@ -391,7 +446,7 @@ impl Experiment {
             for (key, value) in combination {
                 set.insert(key, parse_literal(&value)?);
             }
-            conditions.push(Self::resolve(&spec.set, &name, None, &set)?);
+            conditions.push(Self::resolve(&base_model, &spec.set, &name, None, &set)?);
         }
         let mut names = BTreeSet::new();
         for condition in &conditions {
@@ -511,6 +566,7 @@ impl Experiment {
     /// then its ablation's. An ablation's keys are its definition, so a
     /// condition that also sets one is refused.
     fn resolve(
+        base_model: &str,
         shared: &BTreeMap<String, toml::Value>,
         name: &str,
         ablation_name: Option<&str>,
@@ -521,7 +577,10 @@ impl Experiment {
         for (key, value) in shared.iter().chain(own) {
             set.insert(key.clone(), literal(value)?);
         }
-        for &(key, value) in ablation.map_or(&[][..], |ablation| ablation.set) {
+        let ablation_set = ablation.map_or(&[][..], |ablation| {
+            ablation_set_for_model(ablation, base_model)
+        });
+        for &(key, value) in ablation_set {
             if set.insert(key.to_owned(), value.to_owned()).is_some() {
                 return Err(spec_error(
                     format!("condition `{name}`"),

@@ -102,35 +102,34 @@ fn reference(
 ) -> Result<Vec<Option<RawOutputs>>, CoreError> {
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
     let length = genomes.len().div_ceil(threads).max(1);
-    let parts: Vec<Result<Vec<Option<RawOutputs>>, CoreError>> =
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = genomes
-                .chunks(length)
-                .zip(observations.chunks(length))
-                .map(|(genomes, observations)| {
-                    scope.spawn(move || {
-                        let mut scratch = ControllerScratch::new(topology)?;
-                        genomes
-                            .iter()
-                            .zip(observations)
-                            .map(|(genome, inputs)| {
-                                Ok(ReferenceController::new(topology, genome, BOUND)?
-                                    .evaluate_raw(inputs, &mut scratch)
-                                    .ok())
-                            })
-                            .collect()
-                    })
+    let parts: Vec<Result<Vec<Option<RawOutputs>>, CoreError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = genomes
+            .chunks(length)
+            .zip(observations.chunks(length))
+            .map(|(genomes, observations)| {
+                scope.spawn(move || {
+                    let mut scratch = ControllerScratch::new(topology)?;
+                    genomes
+                        .iter()
+                        .zip(observations)
+                        .map(|(genome, inputs)| {
+                            Ok(ReferenceController::new(topology, genome, BOUND)?
+                                .evaluate_raw(inputs, &mut scratch)
+                                .ok())
+                        })
+                        .collect()
                 })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err(refused("a reference thread panicked".to_owned())))
-                })
-                .collect()
-        });
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(refused("a reference thread panicked".to_owned())))
+            })
+            .collect()
+    });
     let mut all = Vec::with_capacity(genomes.len());
     for part in parts {
         all.extend(part?);

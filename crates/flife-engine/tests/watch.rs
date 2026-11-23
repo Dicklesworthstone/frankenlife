@@ -42,8 +42,8 @@ use flife_engine::{
     OrganismSnapshot, RECENT_STEPS, ReproductionOutcome, Stepped, TickReport, Transactions, World,
 };
 use flife_neural::{
-    ACTION_WIDTH, ControllerBackend, ControllerJob, ControllerScratch, Intrinsic, SENSOR_WIDTH,
-    SensorScales, observe, observe_for_controller,
+    ACTION_WIDTH, ControllerBackend, ControllerJob, ControllerScratch, Intrinsic, RawOutputs,
+    SENSOR_WIDTH, SensorScales, observe, observe_for_controller,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -196,13 +196,15 @@ impl ControllerBackend for Recorder {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         let mut recorded = self.jobs.lock().expect("not poisoned");
         recorded.clear();
         outputs.clear();
         for job in jobs {
-            recorded.push((job.genome, *job.inputs));
+            let mut fixed = [0.0_f64; SENSOR_WIDTH];
+            fixed.copy_from_slice(&job.inputs[..SENSOR_WIDTH]);
+            recorded.push((job.genome, fixed));
             outputs.push(None);
         }
         Ok(())
@@ -230,11 +232,11 @@ impl ControllerBackend for Liar {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         outputs.clear();
         for job in jobs {
-            let mut raw = job.controller.evaluate(job.inputs, &mut self.scratch)?;
+            let mut raw = job.controller.evaluate_raw(job.inputs, &mut self.scratch)?;
             raw[0] = f32::from_bits(raw[0].to_bits() ^ 1);
             outputs.push(Some(raw));
         }

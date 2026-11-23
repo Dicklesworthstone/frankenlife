@@ -30,14 +30,22 @@
     reason = "test helpers: a failure in one is a test failure"
 )]
 
+use std::collections::BTreeMap;
+
+use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
 use flife_core::config::ChemistryConfig;
 use flife_core::model::{
-    FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_FRESH_OFFSPRING,
-    FIELD_ECOLOGY_V1_UNGATED_MOTION,
+    FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
+    FIELD_ECOLOGY_V1_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_UNGATED_MOTION, FIELD_ECOLOGY_V2,
+    FIELD_ECOLOGY_V2_CHEMISTRY_ONLY, FIELD_ECOLOGY_V2_FIXED_CONTROLLER,
+    FIELD_ECOLOGY_V2_FRESH_OFFSPRING,
 };
 use flife_core::rng::SemanticRng;
-use flife_core::{Flow, ValidatedConfig};
-use flife_engine::{Arrangement, ModelVariant, NumericalProfile, Stepped, TickReport, World};
+use flife_core::{FeatureOverride, Flow, ValidatedConfig};
+use flife_engine::{
+    Arrangement, ModelVariant, NumericalProfile, Stepped, TickReport, WORLD_CHECKPOINT_CHUNKS,
+    World,
+};
 use flife_genome::{GenomeQuota, TopologyCatalog, TraitLimits, founder, initial_scale};
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -173,13 +181,26 @@ fn the_model_key_names_each_variant_and_refuses_others() {
             ModelVariant::FreshOffspring,
         ),
         (FIELD_ECOLOGY_V1_UNGATED_MOTION, ModelVariant::UngatedMotion),
+        (FIELD_ECOLOGY_V2, ModelVariant::V2),
+        (
+            FIELD_ECOLOGY_V2_CHEMISTRY_ONLY,
+            ModelVariant::V2ChemistryOnly,
+        ),
+        (
+            FIELD_ECOLOGY_V2_FRESH_OFFSPRING,
+            ModelVariant::V2FreshOffspring,
+        ),
+        (
+            FIELD_ECOLOGY_V2_FIXED_CONTROLLER,
+            ModelVariant::V2FixedController,
+        ),
     ] {
         assert_eq!(ModelVariant::of(name), Ok(variant));
         // Each validates under its registered name.
         let config = ecology(name, &[]);
         assert_eq!(config.config().model, name);
     }
-    assert!(ModelVariant::of("field-ecology-v2").is_err());
+    assert!(ModelVariant::of("field-ecology-v99").is_err());
     let text = PLAN.replace(
         "model = \"field-ecology-v1\"",
         "model = \"field-ecology-v1-shuffled\"",
@@ -537,4 +558,349 @@ fn a_settle_backend_never_settles_an_ungated_motion_tick() {
             assert_eq!(calls, 1, "the baseline's chemistry reached it");
         }
     }
+}
+
+/// Build TOML text for `ecology` with optional appended sections (e.g. `[contact]`).
+fn ecology_toml(model: &str, extra: &[(&str, &str, &str)], append: &str) -> String {
+    let appendix = PLAN.find("## Appendix A").map_or("", |at| &PLAN[at..]);
+    let start = appendix
+        .find("```toml\n")
+        .map_or(0, |at| at + "```toml\n".len());
+    let length = appendix[start..].find("```").unwrap_or(0);
+    let mut lines: Vec<String> = appendix[start..start + length]
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut overrides = vec![
+        ("world", "width", "32.0"),
+        ("world", "height", "32.0"),
+        ("world", "grid_width", "32"),
+        ("world", "grid_height", "32"),
+        ("population", "initial_count", "48"),
+        ("population", "maximum_count", "1024"),
+        ("population", "initial_energy", "3.0"),
+        ("sources", "count", "4"),
+        ("sources", "power_per_source", "120.0"),
+        ("sources", "sigma_world_units", "3.0"),
+        ("sources", "path_direction_interval_seconds", "2.0"),
+        ("chemistry", "uptake_capacity_per_second", "8.0"),
+        ("costs", "basal_energy_per_second", "0.6"),
+        (
+            "reproduction",
+            "minimum_parent_energy_before_attempt",
+            "2.2",
+        ),
+        ("reproduction", "maximum_attempt_rate_per_second", "4.0"),
+        ("reproduction", "cooldown_seconds", "0.25"),
+    ];
+    overrides.extend_from_slice(extra);
+    for (section, key, value) in overrides {
+        let header = format!("[{section}]");
+        let first = lines
+            .iter()
+            .position(|line| line.trim() == header)
+            .expect("a section");
+        let line = lines[first + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with('['))
+            .position(|line| line.split('=').next().map(str::trim) == Some(key))
+            .map(|offset| first + 1 + offset)
+            .expect("a key");
+        lines[line] = format!("{key} = {value}");
+    }
+    let model_line = lines
+        .iter()
+        .position(|line| line.starts_with("model = "))
+        .expect("the model key");
+    lines[model_line] = format!("model = \"{model}\"");
+    let mut text = lines.join("\n");
+    if !append.is_empty() {
+        text.push('\n');
+        text.push_str(append);
+    }
+    text
+}
+
+/// V2-01 E2E: `field-ecology-v2 --v1-compat` matches `field-ecology-v1` bit
+/// for bit over 256 ticks on `64×64`, and `field-ecology-v2` with `[contact]`
+/// plus `--v1-compat` matches `field-ecology-v1-contact` bit for bit over 256
+/// ticks on `64×64`.
+#[test]
+fn e2e_v2_disable_all_matches_v1_and_v1_contact_bit_for_bit() {
+    let grid64 = [
+        ("world", "width", "64.0"),
+        ("world", "height", "64.0"),
+        ("world", "grid_width", "64"),
+        ("world", "grid_height", "64"),
+        ("population", "initial_count", "64"),
+        ("sources", "power_per_source", "240.0"),
+    ];
+
+    // 1. Pure-field v1 vs v2 --v1-compat.
+    let v1_cfg =
+        ValidatedConfig::from_toml(&ecology_toml(FIELD_ECOLOGY_V1, &grid64, "")).expect("v1");
+    let v2_cfg = ValidatedConfig::from_toml_with_overrides(
+        &ecology_toml(FIELD_ECOLOGY_V2, &grid64, ""),
+        &[FeatureOverride::V1Compat],
+    )
+    .expect("v2 compat");
+    assert!(v2_cfg.inv08_pure_field());
+    assert_eq!(v2_cfg.v2_feature_bitmask(), 0);
+    let mut w_v1 = found(&v1_cfg);
+    let mut w_v2 = found(&v2_cfg);
+    assert_eq!(w_v1.digest(), w_v2.digest(), "tick 0 pure-field parity");
+    let mut births = 0usize;
+    let mut emitted = 0usize;
+    for tick in 1..=256 {
+        let r1 = publish(&mut w_v1);
+        let r2 = publish(&mut w_v2);
+        births += r1.births.len();
+        emitted += r1.emitted;
+        assert_eq!(
+            r1.births.len(),
+            r2.births.len(),
+            "birth count parity at tick {tick}"
+        );
+        assert_eq!(
+            w_v1.digest(),
+            w_v2.digest(),
+            "pure-field WorldDigest parity at tick {tick}"
+        );
+    }
+    assert!(births > 0, "expected births over 256 ticks");
+    assert!(emitted > 0, "expected emissions over 256 ticks");
+
+    // 2. Contact v1-contact vs v2 + [contact] --v1-compat.
+    let contact =
+        "\n[contact]\ndiameter = 0.25\nstiffness = 0.5\nadhesion = 0.25\nadhesion_range = 2.0\n";
+    let v1c_cfg =
+        ValidatedConfig::from_toml(&ecology_toml(FIELD_ECOLOGY_V1_CONTACT, &grid64, contact))
+            .expect("v1-contact");
+    let v2c_cfg = ValidatedConfig::from_toml_with_overrides(
+        &ecology_toml(FIELD_ECOLOGY_V2, &grid64, contact),
+        &[FeatureOverride::V1Compat],
+    )
+    .expect("v2-contact compat");
+    assert!(!v2c_cfg.inv08_pure_field());
+    assert_eq!(v2c_cfg.v2_feature_bitmask(), 0);
+    let mut w_v1c = found(&v1c_cfg);
+    let mut w_v2c = found(&v2c_cfg);
+    assert_eq!(w_v1c.digest(), w_v2c.digest(), "tick 0 contact parity");
+    for tick in 1..=256 {
+        let _ = publish(&mut w_v1c);
+        let _ = publish(&mut w_v2c);
+        assert_eq!(
+            w_v1c.digest(),
+            w_v2c.digest(),
+            "contact WorldDigest parity at tick {tick}"
+        );
+    }
+}
+
+/// V2-01 evidence for `field-ecology-v2-chemistry-only` and
+/// `field-ecology-v2-fresh-offspring` (cited in `flife-core::registry`).
+#[test]
+fn v2_chemistry_only_and_fresh_offspring_controls() {
+    let base_cfg = ValidatedConfig::from_toml_with_overrides(
+        &ecology_toml(FIELD_ECOLOGY_V2, &[], ""),
+        &[FeatureOverride::V1Compat],
+    )
+    .expect("v2 base");
+    let chem_cfg = ValidatedConfig::from_toml_with_overrides(
+        &ecology_toml(FIELD_ECOLOGY_V2_CHEMISTRY_ONLY, &[], ""),
+        &[FeatureOverride::V1Compat],
+    )
+    .expect("v2 chemistry-only");
+    let mut baseline = found(&base_cfg);
+    let mut ablated = found(&chem_cfg);
+    assert_eq!(genomes(&baseline), genomes(&ablated));
+
+    let first = publish(&mut baseline);
+    let other = publish(&mut ablated);
+    assert_eq!(first.evaluated, other.evaluated);
+    assert!(first.evaluated > 0);
+    for flow in [
+        Flow::ControllerCost,
+        Flow::SensorCost,
+        Flow::MotionCost,
+        Flow::Maintenance,
+    ] {
+        assert_eq!(
+            first.closure.flow(flow).to_bits(),
+            other.closure.flow(flow).to_bits(),
+            "{flow:?}"
+        );
+    }
+    let baseline_course = course(&mut baseline, 239);
+    let ablated_course = course(&mut ablated, 239);
+    assert_eq!(ablated_course.emitters + other.emitted, 0);
+    assert!(baseline_course.emitters + first.emitted > 0);
+    assert!(ablated_course.shares.len() >= 5);
+    for share in &ablated_course.shares {
+        assert!((share - 0.5).abs() < 1.0e-12, "share {share}");
+    }
+
+    // Fresh offspring draws each child's genome as a founder at its own identity.
+    let fresh_cfg = ValidatedConfig::from_toml_with_overrides(
+        &ecology_toml(FIELD_ECOLOGY_V2_FRESH_OFFSPRING, &[], ""),
+        &[FeatureOverride::V1Compat],
+    )
+    .expect("v2 fresh-offspring");
+    let mut fresh_world = found(&fresh_cfg);
+    let rng = SemanticRng::from_config(&fresh_cfg).expect("rng");
+    let catalog = TopologyCatalog::from_config(&fresh_cfg).expect("catalog");
+    let limits = TraitLimits::from_config(&fresh_cfg).expect("limits");
+    let mut quota = GenomeQuota::from_config(&fresh_cfg).expect("quota");
+    let scale = initial_scale(&fresh_cfg);
+    let mut checked_births = 0usize;
+    for _ in 0..240 {
+        let report = publish(&mut fresh_world);
+        for birth in &report.births {
+            let child_genome = fresh_world
+                .population()
+                .genome(birth.child)
+                .expect("child genome");
+            let expected = founder(
+                &rng,
+                birth.child,
+                birth.genome,
+                &catalog,
+                &mut quota,
+                &limits,
+                scale,
+            )
+            .expect("oracle founder");
+            assert_eq!(child_genome.topology(), expected.topology());
+            assert_eq!(child_genome.traits(), expected.traits());
+            assert!(child_genome.parameters().same_bits(&expected.parameters()));
+            checked_births += 1;
+        }
+        if checked_births >= 8 {
+            break;
+        }
+    }
+    assert!(
+        checked_births >= 8,
+        "expected at least 8 fresh-offspring births"
+    );
+}
+
+/// V2-01 E2E: `field-ecology-v2-fixed-controller` preserves controller weights
+/// and topology 100% across inheritance over 512 ticks while still mutating
+/// chemical/sensing traits, and survives checkpoint v3 round-trip bit-for-bit.
+#[test]
+fn e2e_v2_fixed_controller_control_mutates_traits_not_weights() {
+    let config = ValidatedConfig::from_toml_with_overrides(
+        &ecology_toml(FIELD_ECOLOGY_V2_FIXED_CONTROLLER, &[], ""),
+        &[FeatureOverride::V1Compat],
+    )
+    .expect("v2 fixed-controller");
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    let mut world = World::found(&config, Arrangement::FreeList, profile).expect("found");
+
+    // Snapshot every founder's controller topology + exact weight bits by lineage.
+    let mut founder_controllers: BTreeMap<u64, (usize, Vec<u32>)> = BTreeMap::new();
+    let mut known_traits: BTreeMap<u64, (Vec<u64>, Vec<u64>, u64)> = BTreeMap::new();
+    for organism in world.population().iter() {
+        let genome = world
+            .population()
+            .genome(organism.id)
+            .expect("founder genome");
+        let bits: Vec<u32> = genome.parameters().iter().map(f32::to_bits).collect();
+        founder_controllers.insert(organism.lineage.get(), (genome.topology().index(), bits));
+        let traits = genome.traits();
+        known_traits.insert(
+            organism.id.get(),
+            (
+                traits.affinity().iter().map(|v| v.to_bits()).collect(),
+                traits
+                    .motion_response()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect(),
+                traits.sensing_scale().to_bits(),
+            ),
+        );
+    }
+
+    let mut total_births = 0usize;
+    let mut trait_mutations = 0usize;
+    let mut checkpoint_bytes = None;
+
+    for tick in 1..=512 {
+        let report = publish(&mut world);
+        for birth in &report.births {
+            total_births += 1;
+            let child = world.population().get(birth.child).expect("child row");
+            let genome = world
+                .population()
+                .genome(birth.child)
+                .expect("child genome");
+            let child_bits: Vec<u32> = genome.parameters().iter().map(f32::to_bits).collect();
+            let (want_topo, want_bits) = founder_controllers
+                .get(&child.lineage.get())
+                .expect("lineage recorded");
+            assert_eq!(
+                genome.topology().index(),
+                *want_topo,
+                "fixed-controller must preserve topology for child {}",
+                birth.child
+            );
+            assert_eq!(
+                &child_bits, want_bits,
+                "fixed-controller must preserve 100% of weights for child {}",
+                birth.child
+            );
+            let traits = genome.traits();
+            let child_traits = (
+                traits
+                    .affinity()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                traits
+                    .motion_response()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                traits.sensing_scale().to_bits(),
+            );
+            if let Some(parent_traits) = known_traits.get(&birth.parent.get())
+                && *parent_traits != child_traits
+            {
+                trait_mutations += 1;
+            }
+            known_traits.insert(birth.child.get(), child_traits);
+        }
+        if tick == 256 {
+            let mut writer = CheckpointWriter::new(&config.config().model);
+            world
+                .write_checkpoint(&mut writer)
+                .expect("writes v3 checkpoint");
+            checkpoint_bytes = Some(writer.finish().expect("finishes checkpoint"));
+        }
+    }
+
+    assert!(
+        total_births >= 10,
+        "expected >= 10 births, got {total_births}"
+    );
+    assert!(
+        trait_mutations > 0,
+        "expected > 0 trait mutations under fixed-controller"
+    );
+
+    // Restore tick-256 v3 checkpoint and step to tick 512: must match bit-for-bit.
+    let bytes = checkpoint_bytes.expect("checkpoint at tick 256");
+    let reader = CheckpointReader::parse(&bytes, &WORLD_CHECKPOINT_CHUNKS).expect("parses v3");
+    let mut resumed = World::read_checkpoint(&reader, profile).expect("restores v3");
+    assert_eq!(resumed.tick().get(), 256);
+    for _ in 257..=512 {
+        publish(&mut resumed);
+    }
+    assert_eq!(
+        resumed.digest(),
+        world.digest(),
+        "v3 checkpoint resume must reproduce tick-512 WorldDigest bit-for-bit"
+    );
 }

@@ -6,14 +6,19 @@
     reason = "test helpers: a failure in one is a test failure"
 )]
 
-use flife_core::CoreError;
 use flife_core::binary16::F16;
+use flife_core::config::{ContactConfig, RunConfig};
+use flife_core::model::FIELD_ECOLOGY_V2;
 use flife_core::numerics::{sigmoid, tanh};
+use flife_core::v2::V2Config;
+use flife_core::{CoreError, ValidatedConfig, validate};
 use flife_neural::{
-    ACTION_WIDTH, ActionLayout, ControllerScratch, DenseTopology, MAX_ACTION_WIDTH,
-    MAX_CONTROLLER_OUTPUT_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, RawOutputs,
-    ReferenceController, SENSOR_WIDTH, SensorLayout, Weight, update_recurrent_state,
+    ACTION_WIDTH, ActionLayout, ControllerScratch, DenseTopology, INDEPENDENT_RECURRENT_MLP_V1,
+    MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH,
+    RawOutputs, ReferenceController, SENSOR_WIDTH, SensorLayout, Weight, update_recurrent_state,
 };
+
+const STARTER_TOML: &str = include_str!("../../../presets/reference-small-world.toml");
 
 /// Independent scalar oracle written straight from §6.2 and §25.2 without
 /// sharing production evaluation helpers.
@@ -299,11 +304,19 @@ fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
     let v1_s = SensorLayout::v1();
     let v1_a = ActionLayout::v1();
     assert_eq!(
-        (v1_s.observation_width(), v1_s.recurrent_state_width(), v1_s.input_width()),
+        (
+            v1_s.observation_width(),
+            v1_s.recurrent_state_width(),
+            v1_s.input_width()
+        ),
         (104, 0, 104)
     );
     assert_eq!(
-        (v1_a.action_width(), v1_a.recurrent_state_width(), v1_a.raw_output_width()),
+        (
+            v1_a.action_width(),
+            v1_a.recurrent_state_width(),
+            v1_a.raw_output_width()
+        ),
         (36, 0, 36)
     );
     assert!(v1_s.is_aligned4());
@@ -424,7 +437,10 @@ fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
     assert_eq!(slice_actions.len(), 40);
     assert_eq!(
         raw[..40].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        slice_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        slice_actions
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         via_raw_next.map(f32::to_bits),
@@ -445,4 +461,110 @@ fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
         update_recurrent_state(&h0, &raw[40..43], 0.0, &mut bad_next),
         Err(CoreError::LayoutMismatch { .. })
     ));
+}
+
+fn starter_config() -> RunConfig {
+    RunConfig::from_toml(STARTER_TOML).expect("reference-small-world preset parses")
+}
+
+fn sample_contact() -> ContactConfig {
+    ContactConfig {
+        diameter: 0.25,
+        stiffness: 0.5,
+        adhesion: 0.2,
+        adhesion_range: 1.5,
+        sweeps: None,
+        inhibition: None,
+        repulsion: None,
+    }
+}
+
+/// Real `ValidatedConfig` -> `SensorLayout::from_config` / `ActionLayout::from_config`
+/// / `DenseTopology::from_config` integration across v1, v1-recurrent, and all
+/// v2 profiles (`minimal`, `supercolony`, `tissue`, `all`).
+#[test]
+fn v2_validated_configs_resolve_sensor_action_layouts_and_topology() {
+    let check = |cfg: &ValidatedConfig, want_obs: usize, want_state: usize, want_actions: usize| {
+        let abi = cfg.v2_abi();
+        let sensors = SensorLayout::from_config(cfg).expect("sensor layout");
+        let actions = ActionLayout::from_config(cfg).expect("action layout");
+        let topo = DenseTopology::from_config(cfg).expect("topology");
+
+        assert_eq!(sensors.observation_width(), want_obs);
+        assert_eq!(sensors.recurrent_state_width(), want_state);
+        assert_eq!(sensors.input_width(), want_obs + want_state);
+        assert_eq!(actions.action_width(), want_actions);
+        assert_eq!(actions.recurrent_state_width(), want_state);
+        assert_eq!(actions.raw_output_width(), want_actions + 2 * want_state);
+
+        assert_eq!(sensors.observation_width(), abi.sensor_width as usize);
+        assert_eq!(sensors.input_width(), abi.input_width as usize);
+        assert_eq!(actions.action_width(), abi.action_width as usize);
+        assert_eq!(actions.raw_output_width(), abi.raw_output_width as usize);
+
+        assert_eq!(topo.sensor_width(), want_obs);
+        assert_eq!(topo.input_width(), want_obs + want_state);
+        assert_eq!(topo.action_width(), want_actions);
+        assert_eq!(topo.raw_output_width(), want_actions + 2 * want_state);
+        assert_eq!(topo.recurrent_state_width(), want_state);
+    };
+
+    // 1. Baseline field-ecology-v1 (104/36).
+    let v1 = validate(starter_config()).expect("v1 validates");
+    check(&v1, 104, 0, 36);
+
+    // 2. field-ecology-v1 with independent-recurrent-mlp-v1 (S=4 -> 108/44).
+    let mut v1_rec = starter_config();
+    v1_rec.controller.family = INDEPENDENT_RECURRENT_MLP_V1.to_owned();
+    v1_rec.controller.recurrent_state_width = Some(4);
+    let v1_rec = validate(v1_rec).expect("v1 recurrent validates");
+    check(&v1_rec, 104, 4, 36);
+
+    // 3. field-ecology-v2 minimal (v1 compat -> 104/36).
+    let mut minimal = starter_config();
+    minimal.model = FIELD_ECOLOGY_V2.to_owned();
+    minimal.v2 = Some(V2Config {
+        profile: "minimal".to_owned(),
+        ..V2Config::default()
+    });
+    let minimal = validate(minimal).expect("v2 minimal validates");
+    check(&minimal, 104, 0, 36);
+
+    // 4. field-ecology-v2 supercolony / Bundle B (dual-carrier +4, motor +4, budding +2 -> 108/42).
+    let mut bundle_b = starter_config();
+    bundle_b.model = FIELD_ECOLOGY_V2.to_owned();
+    let bundle_b = validate(bundle_b).expect("v2 supercolony validates");
+    check(&bundle_b, 108, 0, 42);
+
+    // 5. field-ecology-v2 tissue / Bundle A default (notch +1, S=2 -> 107; motor +4 -> 40/44).
+    let mut tissue = starter_config();
+    tissue.model = FIELD_ECOLOGY_V2.to_owned();
+    tissue.contact = Some(sample_contact());
+    let tissue = validate(tissue).expect("v2 tissue validates");
+    check(&tissue, 105, 2, 40);
+
+    // 6. field-ecology-v2 tissue with hippo expose_sensor (108/40/44).
+    let mut tissue_108 = starter_config();
+    tissue_108.model = FIELD_ECOLOGY_V2.to_owned();
+    tissue_108.contact = Some(sample_contact());
+    let mut v2_t = V2Config::default();
+    v2_t.crowding.expose_sensor = true;
+    tissue_108.v2 = Some(v2_t);
+    let tissue_108 = validate(tissue_108).expect("v2 tissue 108/44 validates");
+    check(&tissue_108, 106, 2, 40);
+
+    // 7. field-ecology-v2 all-21 + expose_sensor + neural wake pump (112/44/48).
+    let mut all_cfg = starter_config();
+    all_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    all_cfg.contact = Some(sample_contact());
+    let mut v2_all = V2Config {
+        profile: "all".to_owned(),
+        ..V2Config::default()
+    };
+    v2_all.crowding.expose_sensor = true;
+    v2_all.emission.offset.mode = "polarized-pump-v1".to_owned();
+    v2_all.emission.offset.pump_direction_mode = "neural-output-v1".to_owned();
+    all_cfg.v2 = Some(v2_all);
+    let all_cfg = validate(all_cfg).expect("v2 all-21 validates");
+    check(&all_cfg, 110, 2, 44);
 }

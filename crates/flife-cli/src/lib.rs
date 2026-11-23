@@ -75,6 +75,7 @@ pub mod capabilities;
 pub mod checkpointing;
 pub mod discovery;
 pub mod experiment;
+pub mod features;
 pub mod inspect;
 pub mod memory;
 pub mod metrics;
@@ -112,6 +113,7 @@ pub use experiment::{
     ExperimentOptions, ExperimentRecord, LastRecord, MANIFEST_SCHEMA, MEASURES, Measure, Measures,
     REPORT_FILE, REPORT_SCHEMA, Report, RunResult, Spec, experiment,
 };
+pub use features::{FEATURES_SCHEMA, FeatureInfo, FeatureListing, list_features};
 pub use flife_backend_metal::{BackendBudget, ControllerChoice};
 pub use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Particles, Style};
 pub use inspect::{

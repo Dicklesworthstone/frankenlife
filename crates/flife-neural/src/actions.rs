@@ -501,7 +501,10 @@ pub fn decode_slice(
     if raw.len() < ACTION_WIDTH {
         return Err(CoreError::LayoutMismatch {
             buffer: "controller outputs",
-            detail: format!("expected at least {ACTION_WIDTH} outputs, got {}", raw.len()),
+            detail: format!(
+                "expected at least {ACTION_WIDTH} outputs, got {}",
+                raw.len()
+            ),
         });
     }
     if let Some((index, value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {

@@ -13,7 +13,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use flife_cli::{
     BranchOptions, CheckpointMode, ColorMapping, ControllerChoice, DiscoverOptions, Discovery,
     ERROR_SCHEMA, Experiment, ExperimentOptions, FieldMapping, Injection, InspectOptions,
@@ -30,14 +30,67 @@ struct DiscoverRecord<'a> {
     #[serde(flatten)]
     discovery: &'a Discovery,
 }
-use flife_core::ValidatedConfig;
+use flife_core::{FeatureOverride, ValidatedConfig};
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
-#[command(name = "flife", version, about = "FrankenLife's headless command line")]
+#[command(
+    name = "flife",
+    version,
+    about = "FrankenLife's headless command line",
+    arg_required_else_help = true
+)]
 struct Cli {
+    /// Print the canonical registry of all 21 `field-ecology-v2` feature
+    /// toggles with bundle defaults, `INV-08` status, and ABI impact.
+    #[arg(long)]
+    list_features: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+}
+
+/// Founding-only `field-ecology-v2` feature toggles (V2-01, INV-14).
+/// Values are extracted via `ArgMatches` in [`ordered_overrides`] to preserve
+/// exact left-to-right CLI ordering across interleaved `--disable`, `--enable`,
+/// and `--v1-compat` flags.
+#[derive(Debug, clap::Args)]
+#[expect(
+    dead_code,
+    reason = "values read via ordered_overrides(ArgMatches) to preserve exact CLI flag order"
+)]
+struct FeatureFlags {
+    /// Disable one or more `field-ecology-v2` feature slugs or aliases
+    /// (`all-v2`, `bundle-a`, `bundle-b`), comma-separated or repeatable.
+    #[arg(long = "disable", value_name = "SLUGS")]
+    disable: Vec<String>,
+    /// Enable one or more `field-ecology-v2` feature slugs or aliases
+    /// (`all-v2`, `bundle-a`, `bundle-b`), comma-separated or repeatable.
+    #[arg(long = "enable", value_name = "SLUGS")]
+    enable: Vec<String>,
+    /// Disable every `field-ecology-v2` feature (`--disable all-v2` alias)
+    /// for exact v1 compatibility verification.
+    #[arg(long = "v1-compat", action = clap::ArgAction::Count)]
+    v1_compat: u8,
+}
+
+/// Hidden toggle traps on resuming commands (`resume`, `step`) so passing
+/// `--disable`/`--enable`/`--v1-compat` returns a structured
+/// `frankenlife.error.v1` refusal citing `INV-14` instead of silently ignoring
+/// or mutating checkpoint provenance.
+#[derive(Debug, clap::Args)]
+struct RefusedFeatureFlags {
+    #[arg(long = "disable", value_name = "SLUGS", hide = true)]
+    disable: Vec<String>,
+    #[arg(long = "enable", value_name = "SLUGS", hide = true)]
+    enable: Vec<String>,
+    #[arg(long = "v1-compat", action = clap::ArgAction::Count, hide = true)]
+    v1_compat: u8,
+}
+
+impl RefusedFeatureFlags {
+    fn any(&self) -> bool {
+        !self.disable.is_empty() || !self.enable.is_empty() || self.v1_compat > 0
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -46,6 +99,8 @@ enum Command {
     Validate {
         /// The configuration or preset, as TOML.
         config: PathBuf,
+        #[command(flatten)]
+        features: FeatureFlags,
     },
     /// Report what this machine and build can run. Every controller route
     /// (`cpu`, `torch`, `metal`) runs a world and is compared with the
@@ -66,6 +121,8 @@ enum Command {
         /// count or `auto`. No result depends on it; `auto`'s route does.
         #[arg(long, value_parser = parse_workers)]
         cpu_workers: Option<NonZeroUsize>,
+        #[command(flatten)]
+        features: FeatureFlags,
     },
     /// Run a configuration headlessly through the session owner, printing
     /// NDJSON records.
@@ -132,6 +189,8 @@ enum Command {
         /// commands, in order.
         #[arg(long = "introduce", value_name = "TICK:X,Y:COUNT:ENERGY")]
         introductions: Vec<Introduction>,
+        #[command(flatten)]
+        features: FeatureFlags,
     },
     /// Continue the run in a run directory from its newest checkpoint that
     /// restores, replaying its command journal, to a committed tick.
@@ -162,6 +221,8 @@ enum Command {
         controllers: ControllerChoice,
         #[command(flatten)]
         checkpoints: CheckpointFlags,
+        #[command(flatten)]
+        refused_features: RefusedFeatureFlags,
     },
     /// Advance the run in a run directory TICKS committed ticks past its
     /// newest durable one: `flife resume` from its newest checkpoint that
@@ -179,8 +240,9 @@ enum Command {
         /// none.
         #[arg(long, default_value_t = 1)]
         every: u64,
-        /// Print a metrics record at every multiple of this tick and at the
-        /// end; 0 for none. `[persistence] metrics_interval_ticks` is not read.
+        /// Print a metrics record (complete window, population and lineage
+        /// statistics; spatial statistics sampled from the render epoch) at
+        /// every multiple of this tick and at the end; 0 for none. `[persistence] metrics_interval_ticks` is not read.
         #[arg(long, default_value_t = 0)]
         metrics_every: u64,
         /// Threads for the organism phases: a count or `auto`. No result
@@ -193,6 +255,8 @@ enum Command {
         controllers: ControllerChoice,
         #[command(flatten)]
         checkpoints: CheckpointFlags,
+        #[command(flatten)]
+        refused_features: RefusedFeatureFlags,
     },
     /// Branch a run directory at one of its checkpoints into a new run
     /// directory: a control branch, or with `--inject`, `--inject-material`,
@@ -261,6 +325,8 @@ enum Command {
         /// No result depends on it.
         #[arg(long, default_value = "auto")]
         controllers: ControllerChoice,
+        #[command(flatten)]
+        features: FeatureFlags,
     },
     /// Analyze experiment directories together, read-only: each condition's
     /// paired differences from the control pooled across the experiments
@@ -386,6 +452,8 @@ enum Command {
         /// atomic renames.
         #[arg(long, default_value = "power-loss", value_parser = parse_durability)]
         checkpoint_durability: StoreDurability,
+        #[command(flatten)]
+        features: FeatureFlags,
     },
     /// Run a configuration headlessly and render it to PNG frames (and
     /// optionally an MP4) through the Studio's FrankenManim view; or, with
@@ -459,6 +527,8 @@ enum Command {
         /// after the last. Presentation only.
         #[arg(long)]
         camera: Option<PathBuf>,
+        #[command(flatten)]
+        features: FeatureFlags,
     },
 }
 
@@ -495,9 +565,72 @@ struct ErrorRecord<'a> {
     detail: String,
 }
 
+/// Extract `--disable`, `--enable`, and `--v1-compat` in exact command-line
+/// order so chains like `--disable all-v2 --enable so2-motor` apply cleanly.
+fn ordered_overrides(matches: &clap::ArgMatches) -> Vec<FeatureOverride> {
+    let mut entries: Vec<(usize, FeatureOverride)> = Vec::new();
+    if let (Some(indices), Some(values)) = (
+        matches.indices_of("disable"),
+        matches.get_many::<String>("disable"),
+    ) {
+        for (idx, value) in indices.zip(values) {
+            entries.push((idx, FeatureOverride::Disable(value.clone())));
+        }
+    }
+    if let (Some(indices), Some(values)) = (
+        matches.indices_of("enable"),
+        matches.get_many::<String>("enable"),
+    ) {
+        for (idx, value) in indices.zip(values) {
+            entries.push((idx, FeatureOverride::Enable(value.clone())));
+        }
+    }
+    if matches.value_source("v1_compat") == Some(clap::parser::ValueSource::CommandLine)
+        && let Some(indices) = matches.indices_of("v1_compat")
+    {
+        for idx in indices {
+            entries.push((idx, FeatureOverride::V1Compat));
+        }
+    }
+    entries.sort_by_key(|(idx, _)| *idx);
+    entries.into_iter().map(|(_, item)| item).collect()
+}
+
+fn refuse_resuming_toggles(command_name: &str) -> ExitCode {
+    fail(
+        "incompatible_checkpoint",
+        format!(
+            "v2 feature toggles (--disable/--enable/--v1-compat) are refused on `{command_name}` \
+             (INV-14): features are baked into the checkpoint configuration and cannot be mutated \
+             on resume or replay"
+        ),
+    )
+}
+
 fn main() -> ExitCode {
-    match Cli::parse().command {
-        Command::Validate { config } => match load(&config) {
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
+    if cli.list_features {
+        print(&flife_cli::list_features());
+        return ExitCode::SUCCESS;
+    }
+    let overrides = matches
+        .subcommand()
+        .map_or_else(Vec::new, |(_, sub)| ordered_overrides(sub));
+    let Some(command) = cli.command else {
+        return fail(
+            "usage",
+            "a subcommand or --list-features is required".to_owned(),
+        );
+    };
+    match command {
+        Command::Validate {
+            config,
+            features: _,
+        } => match load(&config, &overrides) {
             Ok(config) => {
                 print(&Validation::of(&config));
                 ExitCode::SUCCESS
@@ -508,7 +641,18 @@ fn main() -> ExitCode {
             config,
             ticks,
             cpu_workers,
-        } => capabilities(config.as_ref(), ticks, cpu_workers),
+            features: _,
+        } => {
+            if config.is_none() && !overrides.is_empty() {
+                return fail(
+                    "usage",
+                    "v2 feature toggles (--disable/--enable/--v1-compat) require `--config <PATH>` \
+                     on `flife capabilities`"
+                        .to_owned(),
+                );
+            }
+            capabilities(config.as_ref(), &overrides, ticks, cpu_workers)
+        }
         Command::Render {
             config,
             run_dir,
@@ -528,31 +672,38 @@ fn main() -> ExitCode {
             no_field,
             field_mapping,
             camera,
-        } => render(
-            (config.as_ref(), run_dir.as_ref()),
-            ticks,
-            every,
-            [width, height],
-            out,
-            (cpu_workers, controllers),
-            render_threads,
-            (video, camera),
-            fps,
-            (
-                color,
-                Style {
-                    look,
-                    particles: if density {
-                        Particles::Density
-                    } else {
-                        Particles::Points
+            features: _,
+        } => {
+            if run_dir.is_some() && !overrides.is_empty() {
+                return refuse_resuming_toggles("flife render --run-dir");
+            }
+            render(
+                (config.as_ref(), run_dir.as_ref()),
+                &overrides,
+                ticks,
+                every,
+                [width, height],
+                out,
+                (cpu_workers, controllers),
+                render_threads,
+                (video, camera),
+                fps,
+                (
+                    color,
+                    Style {
+                        look,
+                        particles: if density {
+                            Particles::Density
+                        } else {
+                            Particles::Points
+                        },
+                        field: !no_field,
+                        field_mapping,
+                        ..Style::default()
                     },
-                    field: !no_field,
-                    field_mapping,
-                    ..Style::default()
-                },
-            ),
-        ),
+                ),
+            )
+        }
         Command::Run {
             config,
             ticks,
@@ -566,8 +717,9 @@ fn main() -> ExitCode {
             materials,
             removals,
             introductions,
+            features: _,
         } => {
-            let config = match load(&config) {
+            let config = match load(&config, &overrides) {
                 Ok(config) => config,
                 Err(code) => return code,
             };
@@ -703,8 +855,9 @@ fn main() -> ExitCode {
             at,
             name,
             checkpoint_durability,
+            features: _,
         } => {
-            let host = match load(&config) {
+            let host = match load(&config, &overrides) {
                 Ok(host) => host,
                 Err(code) => return code,
             };
@@ -751,8 +904,9 @@ fn main() -> ExitCode {
             out,
             cpu_workers,
             controllers,
+            features: _,
         } => {
-            let experiment = match Experiment::load(&spec) {
+            let experiment = match Experiment::load_with_overrides(&spec, &overrides) {
                 Ok(experiment) => experiment,
                 Err(error) => return fail(error.kind(), error.to_string()),
             };
@@ -788,21 +942,27 @@ fn main() -> ExitCode {
             cpu_workers,
             controllers,
             checkpoints,
-        } => exit(flife_cli::resume(
-            &run_dir,
-            &ResumeOptions {
-                until: Until::Tick(until),
-                every,
-                cpu_workers,
-                controllers,
-                checkpoint_every: checkpoints.checkpoint_every,
-                durability: checkpoints.checkpoint_durability,
-                checkpoint_mode: checkpoints.checkpoint_mode,
-                retained_bytes: checkpoints.checkpoint_retained_bytes,
-                metrics_every,
-            },
-            print,
-        )),
+            refused_features,
+        } => {
+            if refused_features.any() {
+                return refuse_resuming_toggles("flife resume");
+            }
+            exit(flife_cli::resume(
+                &run_dir,
+                &ResumeOptions {
+                    until: Until::Tick(until),
+                    every,
+                    cpu_workers,
+                    controllers,
+                    checkpoint_every: checkpoints.checkpoint_every,
+                    durability: checkpoints.checkpoint_durability,
+                    checkpoint_mode: checkpoints.checkpoint_mode,
+                    retained_bytes: checkpoints.checkpoint_retained_bytes,
+                    metrics_every,
+                },
+                print,
+            ))
+        }
         Command::Step {
             run_dir,
             ticks,
@@ -811,21 +971,27 @@ fn main() -> ExitCode {
             cpu_workers,
             controllers,
             checkpoints,
-        } => exit(flife_cli::resume(
-            &run_dir,
-            &ResumeOptions {
-                until: Until::Past(ticks),
-                every,
-                cpu_workers,
-                controllers,
-                checkpoint_every: checkpoints.checkpoint_every,
-                durability: checkpoints.checkpoint_durability,
-                checkpoint_mode: checkpoints.checkpoint_mode,
-                retained_bytes: checkpoints.checkpoint_retained_bytes,
-                metrics_every,
-            },
-            print,
-        )),
+            refused_features,
+        } => {
+            if refused_features.any() {
+                return refuse_resuming_toggles("flife step");
+            }
+            exit(flife_cli::resume(
+                &run_dir,
+                &ResumeOptions {
+                    until: Until::Past(ticks),
+                    every,
+                    cpu_workers,
+                    controllers,
+                    checkpoint_every: checkpoints.checkpoint_every,
+                    durability: checkpoints.checkpoint_durability,
+                    checkpoint_mode: checkpoints.checkpoint_mode,
+                    retained_bytes: checkpoints.checkpoint_retained_bytes,
+                    metrics_every,
+                },
+                print,
+            ))
+        }
     }
 }
 
@@ -887,6 +1053,7 @@ fn parse_workers(text: &str) -> Result<NonZeroUsize, String> {
 /// configuration cannot be read or is invalid, 1 when the render fails.
 fn render(
     (config, run_dir): (Option<&PathBuf>, Option<&PathBuf>),
+    overrides: &[FeatureOverride],
     ticks: u64,
     every: u64,
     size: [u32; 2],
@@ -912,7 +1079,7 @@ fn render(
             Ok(config) => config,
             Err(error) => return fail(error.kind(), error.to_string()),
         },
-        (None, Some(config)) => match load(config) {
+        (None, Some(config)) => match load(config, overrides) {
             Ok(config) => config,
             Err(code) => return code,
         },
@@ -954,10 +1121,11 @@ fn render(
 /// (an error record).
 fn capabilities(
     config: Option<&PathBuf>,
+    overrides: &[FeatureOverride],
     ticks: u64,
     cpu_workers: Option<NonZeroUsize>,
 ) -> ExitCode {
-    let config = match config.map(load).transpose() {
+    let config = match config.map(|path| load(path, overrides)).transpose() {
         Ok(config) => config,
         Err(code) => return code,
     };
@@ -977,10 +1145,11 @@ fn capabilities(
     }
 }
 
-fn load(path: &PathBuf) -> Result<ValidatedConfig, ExitCode> {
+fn load(path: &PathBuf, overrides: &[FeatureOverride]) -> Result<ValidatedConfig, ExitCode> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| fail("io", format!("{}: {error}", path.display())))?;
-    ValidatedConfig::from_toml(&text).map_err(|error| fail(error.kind(), error.to_string()))
+    ValidatedConfig::from_toml_with_overrides(&text, overrides)
+        .map_err(|error| fail(error.kind(), error.to_string()))
 }
 
 fn print(record: &impl Serialize) {

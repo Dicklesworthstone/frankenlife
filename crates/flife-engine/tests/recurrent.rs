@@ -21,8 +21,8 @@ use flife_genome::{
     DENSE_104_36_CATALOG_V1, RECURRENT_104_36_CATALOG_V1, WeightAddress, map_parameters,
 };
 use flife_neural::{
-    ACTION_WIDTH, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
-    INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1, ReferenceController, SENSOR_WIDTH,
+    ControllerBackend, ControllerJob, ControllerScratch, DenseTopology, INDEPENDENT_DENSE_MLP_V1,
+    INDEPENDENT_RECURRENT_MLP_V1, ReferenceController, SENSOR_WIDTH,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -348,10 +348,20 @@ impl ControllerBackend for StubMlpControllerBackend {
 
     fn evaluate(
         &mut self,
-        _jobs: &[ControllerJob<'_>],
-        _outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        jobs: &[ControllerJob<'_>],
+        outputs: &mut Vec<Option<flife_neural::RawOutputs>>,
     ) -> Result<(), CoreError> {
-        panic!("MLP-only controller backend must never be dispatched on a recurrent world");
+        if jobs
+            .iter()
+            .any(|job| job.controller.topology().is_recurrent())
+        {
+            return Err(CoreError::MissingCapability {
+                capability: format!("a controller backend under `{INDEPENDENT_RECURRENT_MLP_V1}`"),
+            });
+        }
+        outputs.clear();
+        outputs.resize(jobs.len(), None);
+        Ok(())
     }
 }
 

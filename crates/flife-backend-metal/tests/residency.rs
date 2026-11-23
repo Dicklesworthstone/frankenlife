@@ -196,7 +196,7 @@ fn a_genome_is_uploaded_once_and_a_later_occupant_takes_its_place() -> Result<()
     // one uploaded, and the other is deferred, never given its outputs.
     let both = [changed[0], jobs[0]];
     backend.evaluate(&both, &mut outputs)?;
-    assert_eq!(bits(&outputs), [None, first[0]]);
+    assert_eq!(bits(&outputs), [None, first[0].clone()]);
 
     // The same slot and generation with another genome is another occupant.
     let mut renamed = changed[0];
@@ -850,7 +850,10 @@ fn variable_width_reference_torch_and_metal_bit_exact() -> Result<(), CoreError>
     let mut cpu_next = [0.0_f32; 2];
     flife_neural::update_recurrent_state(&state, &cpu_raw[40..44], 2.5, &mut cpu_next)?;
     assert_eq!(
-        cpu_raw[..40].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        cpu_raw[..40]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
         ref_actions.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
     );
     assert_eq!(cpu_next.map(f32::to_bits), ref_next.map(f32::to_bits));

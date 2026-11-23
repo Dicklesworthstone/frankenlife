@@ -40,6 +40,13 @@ pub struct Validation {
     pub cooldown_ticks: u64,
     /// The command durability the session will use.
     pub command_durability: String,
+    /// Enabled scientific `field-ecology-v2` feature slugs, sorted; omitted
+    /// for `field-ecology-v1*` configurations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v2_features: Option<Vec<&'static str>>,
+    /// Whether this configuration satisfies `INV-08` (purely field-mediated
+    /// interaction).
+    pub inv08_pure_field: bool,
 }
 
 impl Validation {
@@ -70,6 +77,8 @@ impl Validation {
             worst_case_fits_logical_quota: report.worst_case_fits_logical_quota,
             cooldown_ticks: report.cooldown_ticks.get(),
             command_durability: model.execution.command_durability.clone(),
+            v2_features: config.enabled_v2_features(),
+            inv08_pure_field: config.inv08_pure_field(),
         }
     }
 }

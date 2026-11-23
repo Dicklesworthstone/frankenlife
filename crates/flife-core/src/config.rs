@@ -151,9 +151,7 @@ impl RunConfig {
     /// Whether `feature` is active on this configuration (`false` for all `v1` configs).
     #[must_use]
     pub fn is_v2_feature_enabled(&self, feature: V2Feature) -> bool {
-        self.v2
-            .as_ref()
-            .is_some_and(|v2| v2.is_enabled(feature))
+        self.v2.as_ref().is_some_and(|v2| v2.is_enabled(feature))
     }
 
     /// Bitmask of active v2 features (`0` for all `v1` configs).

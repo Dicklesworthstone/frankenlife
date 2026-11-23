@@ -23,13 +23,12 @@ use crate::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, FIELD_ECOLOGY_V2_FIXED_CONTROLLER,
-    INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS, MAXIMUM_HIDDEN_LAYERS,
-    MAXIMUM_RECURRENT_STATE_WIDTH, MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count,
-    genome_bank_bytes, is_v2_model,
+    INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS, MAXIMUM_HIDDEN_LAYERS, MAXIMUM_RECURRENT_STATE_WIDTH,
+    MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count, genome_bank_bytes, is_v2_model,
 };
 use crate::registry::{self, REGISTRY};
 use crate::schema::{self, FloatBound, IntBound, Kind, Value};
-use crate::v2::{self, V2Abi, V2Feature};
+use crate::v2::{self, FeatureOverride, V2Abi, V2Feature};
 
 /// Quantities derived while validating (plan A.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +80,39 @@ impl ValidatedConfig {
     /// [`CoreError::InvalidConfig`] listing every issue found.
     pub fn from_toml(text: &str) -> Result<Self, CoreError> {
         validate(RunConfig::from_toml(text)?)
+    }
+
+    /// Parse TOML, apply founding `field-ecology-v2*` feature overrides in
+    /// order, and validate the resulting configuration (V2-01).
+    ///
+    /// # Errors
+    /// [`CoreError::InvalidConfig`] for malformed TOML, overrides passed on a
+    /// `field-ecology-v1*` model, unknown feature slugs/aliases, or any
+    /// validation issue.
+    pub fn from_toml_with_overrides(
+        text: &str,
+        overrides: &[FeatureOverride],
+    ) -> Result<Self, CoreError> {
+        let mut config = RunConfig::from_toml(text)?;
+        v2::apply_feature_overrides(&mut config, overrides)?;
+        validate(config)
+    }
+
+    /// Enabled scientific `field-ecology-v2` feature slugs, sorted; `None` for
+    /// `field-ecology-v1*` configurations.
+    #[must_use]
+    pub fn enabled_v2_features(&self) -> Option<Vec<&'static str>> {
+        self.config.v2.as_ref().map(|v2| {
+            let mut slugs: Vec<&'static str> = V2Feature::ALL
+                .into_iter()
+                .filter(|&feature| {
+                    feature.scope() == crate::schema::Scope::Model && v2.is_enabled(feature)
+                })
+                .map(V2Feature::slug)
+                .collect();
+            slugs.sort_unstable();
+            slugs
+        })
     }
 
     /// The validated configuration.

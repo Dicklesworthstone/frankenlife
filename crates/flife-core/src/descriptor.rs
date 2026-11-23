@@ -88,7 +88,11 @@ impl ModelDescriptor {
                     let _ = writeln!(canonical, "v2_feature\t{slug}");
                 }
             }
-            let _ = writeln!(canonical, "v2_inv08_pure_field\t{}", config.inv08_pure_field());
+            let _ = writeln!(
+                canonical,
+                "v2_inv08_pure_field\t{}",
+                config.inv08_pure_field()
+            );
             let _ = writeln!(canonical, "v2_abi\t{}", config.v2_abi().descriptor_tag());
         }
         let digest = Sha256Digest::of(canonical.as_bytes());

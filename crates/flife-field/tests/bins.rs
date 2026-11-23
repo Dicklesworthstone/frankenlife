@@ -987,7 +987,6 @@ fn bins_handles_usize_max_bucket_without_overflow_panic() {
 /// Inf) must be refused cleanly by `apply_deposits` without writing `+Inf` or
 /// `NaN` into the field (INV-01).
 #[test]
-#[expect(clippy::expect_used, reason = "test assertion")]
 fn apply_deposits_refuses_f64_overflow_without_mutating_field() {
     let g = grid(4, 4);
     let mut state = FieldState::zeroed(g, &BufferLimits::host()).expect("field");

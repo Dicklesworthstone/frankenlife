@@ -543,6 +543,6 @@ impl Deref for Lease {
     type Target = Epoch;
 
     fn deref(&self) -> &Epoch {
-        &self.held.epoch
+        &self.epoch
     }
 }

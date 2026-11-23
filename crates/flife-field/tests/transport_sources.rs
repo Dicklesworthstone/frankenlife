@@ -1192,11 +1192,12 @@ fn deposit_energy_fused_refuses_mismatched_source_and_support_lengths() {
     ];
     let mut supports = vec![SourceSupport::new()];
     kernel
-        .support_into(&g, sources[0].center, &mut supports[0])
+        .support_into(&g, sources[0].center(), &mut supports[0])
         .expect("support 0");
     let mut accum = Vec::new();
-    let err = flife_field::deposit_energy_fused(&mut state, &sources, tick(), &mut supports, &mut accum)
-        .expect_err("mismatched lengths must be refused");
+    let err =
+        flife_field::deposit_energy_fused(&mut state, &sources, tick(), &mut supports, &mut accum)
+            .expect_err("mismatched lengths must be refused");
     assert!(
         matches!(err, CoreError::LayoutMismatch { .. }),
         "expected LayoutMismatch, got {err:?}"

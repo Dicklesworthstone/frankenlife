@@ -444,3 +444,90 @@ fn atomic_refit_surface_and_timeline_peak_admission_avoid_phantom_1x_retina_spik
         (false, false)
     );
 }
+
+/// V2-16 (`INV-15`): Studio memory admission accounts honestly for optional
+/// `Epoch` (`cell_states` 1 B/org, `polarities` 2 B/org) and `FieldTexture`
+/// (`trail_energy` 4 B/texel, `vascular_conductance` 4 B/texel) buffers
+/// multiplied by `render_queue_capacity`, and drops that delta to exactly zero
+/// when `--disable v2-visual-mappings` is set.
+#[test]
+#[expect(clippy::expect_used, reason = "test: a failure here is a test failure")]
+fn v2_visual_mappings_observer_bytes_account_honestly_and_drop_to_zero_when_disabled() {
+    use flife_core::FeatureOverride;
+
+    let mut v2_toml = PRESET.replacen(
+        "model = \"field-ecology-v1\"",
+        "model = \"field-ecology-v2\"",
+        1,
+    );
+    v2_toml.push_str(
+        "\n[contact]\ndiameter = 0.25\nstiffness = 0.5\nadhesion = 0.25\nadhesion_range = 2.0\n",
+    );
+
+    let enabled_cfg = ValidatedConfig::from_toml_with_overrides(
+        &v2_toml,
+        &[FeatureOverride::Enable("all-v2".to_owned())],
+    )
+    .expect("valid v2 all-features config");
+    let disabled_cfg = ValidatedConfig::from_toml_with_overrides(
+        &v2_toml,
+        &[
+            FeatureOverride::Enable("all-v2".to_owned()),
+            FeatureOverride::Disable("v2-visual-mappings".to_owned()),
+        ],
+    )
+    .expect("valid v2 without visual mappings config");
+
+    let world_on = found(&enabled_cfg);
+    let world_off = found(&disabled_cfg);
+    let founding_on = Epoch::standalone(&world_on).expect("v2 epoch on");
+    let founding_off = Epoch::standalone(&world_off).expect("v2 epoch off");
+    assert!(founding_on.cell_states().is_some());
+    assert!(founding_on.polarities().is_some());
+    assert!(founding_on.field().trail_energy().is_some());
+    assert!(founding_on.field().vascular_conductance().is_some());
+    assert!(founding_off.cell_states().is_none());
+    assert!(founding_off.polarities().is_none());
+    assert!(founding_off.field().trail_energy().is_none());
+    assert!(founding_off.field().vascular_conductance().is_none());
+
+    let capacity = founding_on.capacity() as u64;
+    let [tx, ty] = founding_on.field().texels().map(u64::from);
+    let expected_slot_delta = capacity * (1 + 2) + (tx * ty) * (4 + 4);
+    assert_eq!(
+        founding_on.reserved_bytes() - founding_off.reserved_bytes(),
+        expected_slot_delta
+    );
+
+    let mut view_on = WorldView::for_epoch(&founding_on, [1280, 720], [0, 0, 0]).expect("view on");
+    let mut view_off =
+        WorldView::for_epoch(&founding_off, [1280, 720], [0, 0, 0]).expect("view off");
+    view_on.enable_overlay();
+    view_off.enable_overlay();
+
+    let slots = u64::from(enabled_cfg.config().execution.render_queue_capacity);
+    let obs_on = observer_bytes(&world_on, &founding_on, &view_on, [2560, 1440]);
+    let obs_off = observer_bytes(&world_off, &founding_off, &view_off, [2560, 1440]);
+    assert_eq!(obs_on - obs_off, slots * expected_slot_delta);
+
+    let admitted_on = admit(
+        &world_on,
+        ControllerChoice::Cpu,
+        &founding_on,
+        &view_on,
+        [2560, 1440],
+    )
+    .expect("admits v2 on");
+    let admitted_off = admit(
+        &world_off,
+        ControllerChoice::Cpu,
+        &founding_off,
+        &view_off,
+        [2560, 1440],
+    )
+    .expect("admits v2 off");
+    assert_eq!(
+        admitted_on.render - admitted_off.render,
+        slots * expected_slot_delta
+    );
+}

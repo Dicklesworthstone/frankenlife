@@ -1001,8 +1001,8 @@ fn apply_deposits_refuses_f64_overflow_without_mutating_field() {
         .push(&g, OrganismId::new(2), [0.5, 0.5], 1.0e308, 1.0e308, &dir)
         .expect("stages second");
 
-    let err = apply_deposits(&mut state, &mut deposits)
-        .expect_err("overflowing total must be refused");
+    let err =
+        apply_deposits(&mut state, &mut deposits).expect_err("overflowing total must be refused");
     assert!(
         matches!(err, CoreError::NumericalInvalid { .. }),
         "expected NumericalInvalid, got {err:?}"

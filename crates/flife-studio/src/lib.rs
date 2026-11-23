@@ -73,17 +73,21 @@ pub use brush::{
 };
 pub use clock::{ClockMeter, ClockReading};
 pub use controls::{
-    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_C, KEY_D, KEY_DIGITS, KEY_E,
-    KEY_EQUAL, KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M, KEY_MINUS, KEY_PERIOD,
-    KEY_R, KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SLASH, KEY_SPACE, KEY_T, KEY_W, KEY_X, KEY_ZERO,
-    ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT, scroll_zoom,
+    CLICK_SLOP_POINTS, CameraMove, Controls, InputTally, Intent, KEY_8, KEY_9, KEY_C, KEY_D,
+    KEY_DIGITS, KEY_E, KEY_EQUAL, KEY_ESCAPE, KEY_F, KEY_G, KEY_I, KEY_LEFT_BRACKET, KEY_M,
+    KEY_MINUS, KEY_PERIOD, KEY_R, KEY_RIGHT, KEY_RIGHT_BRACKET, KEY_SLASH, KEY_SPACE, KEY_T,
+    KEY_V2_DIGITS, KEY_W, KEY_X, KEY_ZERO, ZOOM_PER_LINE, ZOOM_PER_POINT, ZOOM_STEP_LIMIT,
+    scroll_zoom,
 };
 pub use export::{
     ENCODED_FILE, EXPORT_SCHEMA, ExportManifest, ExportOptions, ExportedEncoding, ExportedFrame,
     ExportedVideo, MANIFEST_FILE, VIDEO_FILE, export, slot_counts,
 };
 pub use flife_backend_metal::ControllerChoice;
-pub use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Motion, Particles, Style};
+pub use flife_manim::{
+    ColorMapping, FieldComponent, FieldMapping, FieldOverlayKind, Look, Motion, Particles, Style,
+    V2ColorMapping,
+};
 pub use frames::{
     FRAME_TIME_BUCKET, FRAME_TIME_RANGE, FrameTimeSummary, FrameTimes, MoveLatencyBound,
 };
@@ -95,8 +99,8 @@ pub use keep::Keeping;
 pub use measure::{Disk, MeasurePreview};
 pub use overlay::{
     BrushPreview, Inspected, Measuring, OverlayState, PANEL_ANCESTORS, Recent, Telemetry,
-    field_key, inspector_lines, legends, measuring_lines, overlay_text, preview_line, recent,
-    telemetry_lines,
+    active_field_key, field_key, inspector_lines, legends, measuring_lines, overlay_text,
+    preview_line, recent, telemetry_lines, v2_legends,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};

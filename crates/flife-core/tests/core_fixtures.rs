@@ -1209,8 +1209,10 @@ fn v2_feature_registry_auto_profile_and_validation() {
     // hippo-crowding with mode = cell-occupancy-v1 IS pure-field INV-08!
     let mut cell_hippo = starter();
     cell_hippo.model = FIELD_ECOLOGY_V2.to_owned();
-    let mut v2_hippo = V2Config::default();
-    v2_hippo.profile = "minimal".into();
+    let mut v2_hippo = V2Config {
+        profile: "minimal".into(),
+        ..V2Config::default()
+    };
     v2_hippo.crowding.enabled = Some(true);
     v2_hippo.crowding.mode = "cell-occupancy-v1".into();
     cell_hippo.v2 = Some(v2_hippo);

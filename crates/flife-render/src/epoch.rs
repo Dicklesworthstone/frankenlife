@@ -29,7 +29,7 @@
 
 use flife_core::ids::{OrganismId, RenderEpoch, ResourceEpoch};
 use flife_core::model::MOMENT_CHANNELS;
-use flife_core::{CoreError, LedgerReport, Tick, TimeStep, Transfer};
+use flife_core::{CoreError, LedgerReport, Tick, TimeStep, Transfer, V2Feature};
 use flife_engine::{Followed, TickReport, World};
 
 /// The most texels a field texture has along either axis. A larger grid is
@@ -97,6 +97,56 @@ const CHANNELS: usize = MOMENT_CHANNELS as usize;
 /// energy, in `[−1, 1]`, is held as the nearest multiple of `1 / 127`, an
 /// [`i8`] in `[−127, 127]` ([`FieldTexture::components`]).
 pub const COMPONENT_STEPS: i8 = 127;
+
+/// Quantization denominator for the primary recurrent cell state `h_0`
+/// (`V2-16`, `cell-state-v1`): values in `[−1, 1]` quantize onto `[−127, 127]`.
+pub const CELL_STATE_STEPS: i8 = 127;
+
+/// Quantization scale for the quantized apical-basal polarity angle
+/// (`V2-16`, `polarity-v1`): `atan2(p_y, p_x) ∈ [−π, π]` maps onto
+/// `[−32767, +32767]`, preserving exact branch-cut continuity across `±π`.
+pub const POLARITY_ANGLE_SCALE: i16 = i16::MAX;
+
+/// Explicit sentinel in [`Epoch::polarities`] indicating an unpolarized
+/// organism (zero-length or non-finite polarity vector, e.g., EMT-detached).
+pub const POLARITY_UNPOLARIZED: i16 = i16::MIN;
+
+/// Quantize a primary recurrent cell state `h_0 ∈ [−1, 1]` into an [`i8`] in
+/// `[−127, 127]` (`V2-16`, `INV-09`). Non-finite inputs map to `0`.
+#[must_use]
+pub fn quantize_cell_state(h0: f32) -> i8 {
+    let value = f64::from(h0);
+    if !value.is_finite() {
+        return 0;
+    }
+    ((value.clamp(-1.0, 1.0) * f64::from(CELL_STATE_STEPS)).round() as i32)
+        .clamp(-i32::from(CELL_STATE_STEPS), i32::from(CELL_STATE_STEPS)) as i8
+}
+
+/// Quantize a world-space polarity vector `[p_x, p_y]` (world x east, y down)
+/// into an [`i16`] angle (`V2-16`, `INV-09`). Zero or non-finite vectors map
+/// to [`POLARITY_UNPOLARIZED`]; valid angles map `atan2(p_y, p_x) / π × 32767`
+/// onto `[−32767, +32767]`.
+#[must_use]
+pub fn quantize_polarity(polarity: [f32; 2]) -> i16 {
+    let x = f64::from(polarity[0]);
+    let y = f64::from(polarity[1]);
+    if !(x.is_finite() && y.is_finite()) || (x == 0.0 && y == 0.0) {
+        return POLARITY_UNPOLARIZED;
+    }
+    let angle = y.atan2(x);
+    if !angle.is_finite() {
+        return POLARITY_UNPOLARIZED;
+    }
+    let scaled = (angle / std::f64::consts::PI) * f64::from(POLARITY_ANGLE_SCALE);
+    if !scaled.is_finite() {
+        return POLARITY_UNPOLARIZED;
+    }
+    (scaled.round() as i32).clamp(
+        -i32::from(POLARITY_ANGLE_SCALE),
+        i32::from(POLARITY_ANGLE_SCALE),
+    ) as i16
+}
 
 /// A block's moment channel sum `moment` per unit of its energy sum
 /// `energy` as [`FieldTexture::components`] holds it: `moment / energy`
@@ -186,6 +236,8 @@ pub enum Dtype {
     U8,
     /// Signed 8-bit.
     I8,
+    /// Signed 16-bit.
+    I16,
     /// Unsigned 32-bit.
     U32,
     /// Unsigned 64-bit.
@@ -200,6 +252,7 @@ impl Dtype {
     pub const fn bytes(self) -> usize {
         match self {
             Self::U8 | Self::I8 => 1,
+            Self::I16 => 2,
             Self::U32 | Self::F32 => 4,
             Self::U64 => 8,
         }
@@ -234,10 +287,26 @@ pub enum View {
     /// Each field texel's moment channels per unit energy, quantized for
     /// display ([`FieldTexture::components`]), row-major.
     FieldComponents,
+    /// Optional `V2-16` primary recurrent cell state `h_0` quantized onto
+    /// `[−127, 127]` (`1 B/org`, present only when `v2-visual-mappings` and
+    /// recurrence are enabled).
+    CellState,
+    /// Optional `V2-16` apical-basal polarity angle quantized onto
+    /// `[−32767, 32767]` with [`POLARITY_UNPOLARIZED`] sentinel (`2 B/org`,
+    /// present only when `v2-visual-mappings` and `pcp-polarity` are enabled).
+    Polarity,
+    /// Optional `V2-16` block-mean Carrier-1 trail energy density (`4 B/texel`,
+    /// present only when `v2-visual-mappings` and `dual-carrier-trails` are
+    /// enabled).
+    FieldTrailEnergy,
+    /// Optional `V2-16` block-mean incident vascular conductance (`4 B/texel`,
+    /// present only when `v2-visual-mappings` and `vascular-field` are
+    /// enabled).
+    FieldVascularConductance,
 }
 
 impl View {
-    /// Every view, in declaration order.
+    /// Every always-present baseline view, in declaration order.
     pub const ALL: [Self; 11] = [
         Self::Identity,
         Self::Position,
@@ -250,6 +319,16 @@ impl View {
         Self::Field,
         Self::FieldComposition,
         Self::FieldComponents,
+    ];
+
+    /// Every optional `V2-16` view, in declaration order. Each is allocated
+    /// only when `v2-visual-mappings` and its backing `field-ecology-v2`
+    /// feature are enabled (`0` bytes reserved on v1 or when disabled).
+    pub const V2_OPTIONAL: [Self; 4] = [
+        Self::CellState,
+        Self::Polarity,
+        Self::FieldTrailEnergy,
+        Self::FieldVascularConductance,
     ];
 
     /// The view's name.
@@ -267,6 +346,10 @@ impl View {
             Self::Field => "field",
             Self::FieldComposition => "field-composition",
             Self::FieldComponents => "field-components",
+            Self::CellState => "cell-state",
+            Self::Polarity => "polarity",
+            Self::FieldTrailEnergy => "field-trail-energy",
+            Self::FieldVascularConductance => "field-vascular-conductance",
         }
     }
 }
@@ -331,7 +414,11 @@ pub enum FieldChannel {
 /// A bounded field texture derived from the committed field (§9.5, B.3:
 /// an explicit channel projection and source scale): each texel's mean
 /// energy density, and its mean composition through a fixed projection and
-/// as chosen components (plan §13.4, "Local field").
+/// as chosen components (plan §13.4, "Local field"). When `V2-16`
+/// (`v2-visual-mappings`) and the corresponding `field-ecology-v2` features
+/// are enabled, it also holds optional fixed-capacity trail-energy and
+/// vascular-conductance overlay planes (`None` and `0` bytes reserved on v1
+/// or when disabled).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldTexture {
     channel: FieldChannel,
@@ -342,6 +429,8 @@ pub struct FieldTexture {
     values: Vec<f32>,
     composition: Vec<[f32; 3]>,
     components: Vec<[i8; CHANNELS]>,
+    trail_energy: Option<Vec<f32>>,
+    vascular_conductance: Option<Vec<f32>>,
 }
 
 impl FieldTexture {
@@ -431,8 +520,84 @@ impl FieldTexture {
         Ok(texture)
     }
 
-    /// A texture for a `cells` grid of `cell_size` cells, allocated once.
+    /// As [`FieldTexture::from_planes`], also projecting optional `V2-16`
+    /// scalar overlay planes (Carrier-1 trail energy density and incident
+    /// vascular conductance), each block-averaged in F64 rows-then-columns.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for an empty grid or a plane of the
+    /// wrong length; [`CoreError::AllocationFailed`].
+    pub fn from_planes_with_overlays(
+        cells: [u32; 2],
+        cell_size: [f64; 2],
+        planes: &[f32],
+        trail_plane: Option<&[f32]>,
+        vascular_plane: Option<&[f32]>,
+    ) -> Result<Self, CoreError> {
+        Self::from_planes_with_overlays_on(cells, cell_size, planes, trail_plane, vascular_plane, 1)
+    }
+
+    /// As [`FieldTexture::from_planes_with_overlays`], its texel rows
+    /// projected on at most `workers` threads: bit-identical to `workers = 1`.
+    ///
+    /// # Errors
+    /// As [`FieldTexture::from_planes_with_overlays`], and
+    /// [`CoreError::StateConflict`] when a worker panicked.
+    pub fn from_planes_with_overlays_on(
+        cells: [u32; 2],
+        cell_size: [f64; 2],
+        planes: &[f32],
+        trail_plane: Option<&[f32]>,
+        vascular_plane: Option<&[f32]>,
+        workers: usize,
+    ) -> Result<Self, CoreError> {
+        let mut texture = Self::sized_with_v2(
+            cells,
+            cell_size,
+            trail_plane.is_some(),
+            vascular_plane.is_some(),
+        )?;
+        let expected = usize::try_from(cells[0])
+            .ok()
+            .and_then(|x| {
+                usize::try_from(cells[1])
+                    .ok()
+                    .and_then(|y| x.checked_mul(y))
+            })
+            .and_then(|cells| cells.checked_mul(1 + CHANNELS));
+        if expected != Some(planes.len()) {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render field texture",
+                detail: format!(
+                    "{} values are not the {} planes of a {} × {} grid",
+                    planes.len(),
+                    1 + MOMENT_CHANNELS,
+                    cells[0],
+                    cells[1]
+                ),
+            });
+        }
+        let cell_area = cell_size[0] * cell_size[1];
+        texture.project_on(planes, cell_area, workers)?;
+        texture.project_overlays_on(trail_plane, vascular_plane, cell_area, workers)?;
+        Ok(texture)
+    }
+
+    /// A texture for a `cells` grid of `cell_size` cells, allocated once, with
+    /// no optional `V2-16` overlays.
     fn sized(cells: [u32; 2], cell_size: [f64; 2]) -> Result<Self, CoreError> {
+        Self::sized_with_v2(cells, cell_size, false, false)
+    }
+
+    /// A texture for a `cells` grid of `cell_size` cells, allocated once, with
+    /// optional `V2-16` trail-energy and vascular-conductance overlay planes
+    /// reserved only when requested (`INV-15`).
+    fn sized_with_v2(
+        cells: [u32; 2],
+        cell_size: [f64; 2],
+        trail: bool,
+        vascular: bool,
+    ) -> Result<Self, CoreError> {
         if cells.contains(&0) {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
@@ -467,6 +632,12 @@ impl FieldTexture {
             values: reserved(count, "render field texture")?,
             composition: reserved(count, "render field composition")?,
             components: reserved(count, "render field components")?,
+            trail_energy: trail
+                .then(|| reserved(count, "render field trail energy"))
+                .transpose()?,
+            vascular_conductance: vascular
+                .then(|| reserved(count, "render field vascular conductance"))
+                .transpose()?,
         })
     }
 
@@ -572,6 +743,108 @@ impl FieldTexture {
             count: self.components.len(),
             bounds: Bounds::Magnitude(f32::from(COMPONENT_STEPS)),
         }
+    }
+
+    /// Optional `V2-16` block-mean Carrier-1 trail energy density (`e_1`),
+    /// row-major (`texels[0] * texels[1]`): `Some` only when
+    /// `v2-visual-mappings` and `dual-carrier-trails` are enabled (`None` and
+    /// `0` bytes reserved on v1 or when disabled).
+    #[must_use]
+    pub fn trail_energy(&self) -> Option<&[f32]> {
+        self.trail_energy.as_deref()
+    }
+
+    /// The trail-energy overlay's declared layout, when present.
+    #[must_use]
+    pub fn trail_energy_layout(&self) -> Option<Layout> {
+        self.trail_energy.as_ref().map(|values| Layout {
+            view: View::FieldTrailEnergy,
+            dtype: Dtype::F32,
+            components: 1,
+            count: values.len(),
+            bounds: Bounds::NonNegative,
+        })
+    }
+
+    /// Optional `V2-16` block-mean incident vascular conductance (`g_e`),
+    /// row-major (`texels[0] * texels[1]`): `Some` only when
+    /// `v2-visual-mappings` and `vascular-field` are enabled (`None` and `0`
+    /// bytes reserved on v1 or when disabled).
+    #[must_use]
+    pub fn vascular_conductance(&self) -> Option<&[f32]> {
+        self.vascular_conductance.as_deref()
+    }
+
+    /// The vascular-conductance overlay's declared layout, when present.
+    #[must_use]
+    pub fn vascular_conductance_layout(&self) -> Option<Layout> {
+        self.vascular_conductance.as_ref().map(|values| Layout {
+            view: View::FieldVascularConductance,
+            dtype: Dtype::F32,
+            components: 1,
+            count: values.len(),
+            bounds: Bounds::NonNegative,
+        })
+    }
+
+    /// Refill optional `V2-16` overlay buffers in place without reallocating.
+    /// When a buffer is reserved but its backing plane is not yet supplied by
+    /// the field state, it is zero-filled cleanly.
+    fn project_overlays_on(
+        &mut self,
+        trail_plane: Option<&[f32]>,
+        vascular_plane: Option<&[f32]>,
+        cell_area: f64,
+        workers: usize,
+    ) -> Result<(), CoreError> {
+        let cells = self.cells.map(|n| n as usize);
+        let block = self.block.map(|n| n as usize);
+        let texels = self.texels.map(|n| n as usize);
+        if let Some(out) = &mut self.trail_energy {
+            if let Some(plane) = trail_plane {
+                let grid = ScalarOverlayGrid {
+                    cells,
+                    block,
+                    texels,
+                    divisor: cell_area,
+                };
+                project_scalar_plane_on(plane, grid, workers, "render field trail energy", out)?;
+            } else {
+                out.clear();
+                out.resize(texels[0] * texels[1], 0.0);
+            }
+        } else if trail_plane.is_some() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render field trail energy",
+                detail: "trail plane offered to a texture without a trail buffer".to_owned(),
+            });
+        }
+        if let Some(out) = &mut self.vascular_conductance {
+            if let Some(plane) = vascular_plane {
+                let grid = ScalarOverlayGrid {
+                    cells,
+                    block,
+                    texels,
+                    divisor: 1.0,
+                };
+                project_scalar_plane_on(
+                    plane,
+                    grid,
+                    workers,
+                    "render field vascular conductance",
+                    out,
+                )?;
+            } else {
+                out.clear();
+                out.resize(texels[0] * texels[1], 0.0);
+            }
+        } else if vascular_plane.is_some() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render field vascular conductance",
+                detail: "vascular plane offered to a texture without a vascular buffer".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Refill from row-major `planes` of `cell_area` cells: an energy plane
@@ -890,6 +1163,120 @@ impl Tally {
     }
 }
 
+/// Grid geometry for projecting one row-major scalar overlay plane into a
+/// bounded field texture block-mean buffer.
+#[derive(Clone, Copy)]
+struct ScalarOverlayGrid {
+    cells: [usize; 2],
+    block: [usize; 2],
+    texels: [usize; 2],
+    divisor: f64,
+}
+
+/// Project one row-major scalar `plane` into `out` in place (zero allocation
+/// once reserved), summing each block in F64 rows-then-columns on at most
+/// `workers` threads, bit-identical to `workers = 1`.
+fn project_scalar_plane_on(
+    plane: &[f32],
+    grid: ScalarOverlayGrid,
+    workers: usize,
+    buffer: &'static str,
+    out: &mut Vec<f32>,
+) -> Result<(), CoreError> {
+    let [cells_x, cells_y] = grid.cells;
+    let expected = cells_x.checked_mul(cells_y);
+    if expected != Some(plane.len()) {
+        return Err(CoreError::LayoutMismatch {
+            buffer,
+            detail: format!(
+                "{} values are not one scalar plane of a {} × {} grid",
+                plane.len(),
+                cells_x,
+                cells_y
+            ),
+        });
+    }
+    let [width, height] = grid.texels;
+    let count = width * height;
+    out.clear();
+    out.resize(count, 0.0);
+    let used = workers
+        .min(height.div_ceil(MINIMUM_TEXEL_ROWS_PER_WORKER))
+        .max(1);
+    let per = height.div_ceil(used).max(1);
+    let chunk = per * width;
+    let mut runs = out.chunks_mut(chunk);
+    let Some(first_run) = runs.next() else {
+        return Ok(());
+    };
+    let project_run = |first_row: usize, slice: &mut [f32]| {
+        let [block_x, block_y] = grid.block;
+        for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
+            let texel_y = first_row + offset;
+            let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
+            for (texel_x, out_value) in row_values.iter_mut().enumerate() {
+                let cols = texel_x * block_x..((texel_x + 1) * block_x).min(cells_x);
+                let mut sum = 0.0_f64;
+                for y in rows.clone() {
+                    for &value in &plane[y * cells_x + cols.start..y * cells_x + cols.end] {
+                        sum += f64::from(value);
+                    }
+                }
+                let denom = (rows.len() * cols.len()) as f64 * grid.divisor;
+                *out_value = saturate(sum / denom);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = runs
+            .enumerate()
+            .map(|(index, run)| scope.spawn(move || project_run((index + 1) * per, run)))
+            .collect();
+        project_run(0, first_run);
+        let mut joined = Ok(());
+        for handle in handles {
+            if handle.join().is_err() {
+                joined = Err(CoreError::StateConflict {
+                    operation: "project render field overlay",
+                    detail: "an overlay texture worker panicked".to_owned(),
+                });
+            }
+        }
+        joined
+    })
+}
+
+/// Which optional `V2-16` views a world activates. All four are `false` on
+/// `field-ecology-v1*` and whenever `v2-visual-mappings` is disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct V2Views {
+    cell_states: bool,
+    polarities: bool,
+    trail_energy: bool,
+    vascular_conductance: bool,
+}
+
+impl V2Views {
+    fn for_world(world: &World) -> Self {
+        let config = world.config();
+        if !config.is_v2_feature_enabled(V2Feature::V2VisualMappings) {
+            return Self {
+                cell_states: false,
+                polarities: false,
+                trail_energy: false,
+                vascular_conductance: false,
+            };
+        }
+        Self {
+            cell_states: config.is_v2_feature_enabled(V2Feature::EpigeneticRecurrence)
+                || world.recurrent_state_width() > 0,
+            polarities: config.is_v2_feature_enabled(V2Feature::PcpPolarity),
+            trail_energy: config.is_v2_feature_enabled(V2Feature::DualCarrierTrails),
+            vascular_conductance: config.is_v2_feature_enabled(V2Feature::VascularField),
+        }
+    }
+}
+
 /// An immutable compact render epoch: exactly one committed world (B.3).
 ///
 /// A consumer only ever sees an epoch through a lease taken after its
@@ -914,6 +1301,8 @@ pub struct Epoch {
     generations: Vec<u32>,
     topologies: Vec<u8>,
     affinities: Vec<[f32; 3]>,
+    cell_states: Option<Vec<i8>>,
+    polarities: Option<Vec<i16>>,
     field: FieldTexture,
     metrics: Metrics,
     followed: Option<Followed>,
@@ -964,6 +1353,7 @@ impl Epoch {
     pub(crate) fn allocate(world: &World) -> Result<Self, CoreError> {
         let capacity = world.population().capacity();
         let grid = world.field().grid();
+        let v2 = V2Views::for_world(world);
         Ok(Self {
             id: RenderEpoch::new(0),
             tick: world.tick(),
@@ -983,9 +1373,19 @@ impl Epoch {
             generations: reserved(capacity, "render generation view")?,
             topologies: reserved(capacity, "render topology view")?,
             affinities: reserved(capacity, "render affinity view")?,
-            field: FieldTexture::sized(
+            cell_states: v2
+                .cell_states
+                .then(|| reserved(capacity, "render cell-state view"))
+                .transpose()?,
+            polarities: v2
+                .polarities
+                .then(|| reserved(capacity, "render polarity view"))
+                .transpose()?,
+            field: FieldTexture::sized_with_v2(
                 [grid.cells_x(), grid.cells_y()],
                 [grid.cell_width(), grid.cell_height()],
+                v2.trail_energy,
+                v2.vascular_conductance,
             )?,
             metrics: Metrics {
                 tick: world.tick(),
@@ -1035,6 +1435,21 @@ impl Epoch {
                 ),
             });
         }
+        let v2 = V2Views::for_world(world);
+        let slot_v2 = V2Views {
+            cell_states: self.cell_states.is_some(),
+            polarities: self.polarities.is_some(),
+            trail_energy: self.field.trail_energy.is_some(),
+            vascular_conductance: self.field.vascular_conductance.is_some(),
+        };
+        if v2 != slot_v2 {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render epoch",
+                detail: format!(
+                    "a slot allocated for optional views {slot_v2:?} was offered a world with {v2:?}"
+                ),
+            });
+        }
         let width = extent.map(|length| length as f32);
         self.ids.clear();
         self.positions.clear();
@@ -1044,6 +1459,12 @@ impl Epoch {
         self.generations.clear();
         self.topologies.clear();
         self.affinities.clear();
+        if let Some(states) = &mut self.cell_states {
+            states.clear();
+        }
+        if let Some(polarities) = &mut self.polarities {
+            polarities.clear();
+        }
         let affinity_limit = world.trait_limits().affinity_norm();
         let mut organism_energy = 0.0_f64;
         let mut max_generation = 0_u32;
@@ -1075,6 +1496,21 @@ impl Epoch {
                 genome.traits().affinity(),
                 affinity_limit,
             ));
+            if let Some(states) = &mut self.cell_states {
+                let h0 = organism
+                    .held
+                    .recurrent_state()
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0);
+                states.push(quantize_cell_state(h0));
+            }
+            if let Some(polarities) = &mut self.polarities {
+                // Until V2-08 lands organism polarity vectors on `Organism`,
+                // reserved polarity slots honestly report the unpolarized
+                // sentinel rather than fabricating directions.
+                polarities.push(POLARITY_UNPOLARIZED);
+            }
             organism_energy += organism.energy;
             max_generation = max_generation.max(organism.generation.get());
             parameters += genome.parameters().len() as u64;
@@ -1086,6 +1522,10 @@ impl Epoch {
             grid.cell_area(),
             world.cpu_workers(),
         )?;
+        // Until V2-15 / V2-14 expose Carrier-1 and incident conductance planes
+        // on `FieldState`, reserved overlay slots are zero-filled in place.
+        self.field
+            .project_overlays_on(None, None, grid.cell_area(), world.cpu_workers())?;
         self.id = id;
         self.tick = world.tick();
         self.resource = world.epoch();
@@ -1243,6 +1683,49 @@ impl Epoch {
         &self.affinities
     }
 
+    /// Optional `V2-16` primary recurrent cell states `h_0` quantized onto
+    /// `[−127, 127]` (`1 B/org`), in stable identity order (`C.7`). `Some`
+    /// only when `v2-visual-mappings` and recurrence are enabled (`None` and
+    /// `0` bytes reserved on v1 or when disabled).
+    #[must_use]
+    pub fn cell_states(&self) -> Option<&[i8]> {
+        self.cell_states.as_deref()
+    }
+
+    /// The cell-state view's declared layout, when present.
+    #[must_use]
+    pub fn cell_states_layout(&self) -> Option<Layout> {
+        self.cell_states.as_ref().map(|values| Layout {
+            view: View::CellState,
+            dtype: Dtype::I8,
+            components: 1,
+            count: values.len(),
+            bounds: Bounds::Magnitude(f32::from(CELL_STATE_STEPS)),
+        })
+    }
+
+    /// Optional `V2-16` apical-basal polarity angles quantized onto
+    /// `[−32767, +32767]` with [`POLARITY_UNPOLARIZED`] sentinel (`2 B/org`),
+    /// in stable identity order (`C.7`). `Some` only when `v2-visual-mappings`
+    /// and `pcp-polarity` are enabled (`None` and `0` bytes reserved on v1 or
+    /// when disabled).
+    #[must_use]
+    pub fn polarities(&self) -> Option<&[i16]> {
+        self.polarities.as_deref()
+    }
+
+    /// The polarity view's declared layout, when present.
+    #[must_use]
+    pub fn polarities_layout(&self) -> Option<Layout> {
+        self.polarities.as_ref().map(|values| Layout {
+            view: View::Polarity,
+            dtype: Dtype::I16,
+            components: 1,
+            count: values.len(),
+            bounds: Bounds::Any,
+        })
+    }
+
     /// The norm limit the affinity coordinates are scaled by:
     /// `chemistry.affinity_norm_limit`.
     #[must_use]
@@ -1303,13 +1786,51 @@ impl Epoch {
         ]
     }
 
-    /// The bytes this slot's buffers have actually reserved. Allocated
-    /// once, it is the population ceiling times 53 bytes a row plus 48 a
-    /// texel, and a projection never changes it.
+    /// Every optional `V2-16` view's declared layout that is present in this
+    /// epoch, in [`View::V2_OPTIONAL`] order. Empty on `field-ecology-v1*` or
+    /// when `v2-visual-mappings` is disabled.
+    #[must_use]
+    pub fn optional_layouts(&self) -> Vec<Layout> {
+        let mut layouts = Vec::new();
+        if let Some(layout) = self.cell_states_layout() {
+            layouts.push(layout);
+        }
+        if let Some(layout) = self.polarities_layout() {
+            layouts.push(layout);
+        }
+        if let Some(layout) = self.field.trail_energy_layout() {
+            layouts.push(layout);
+        }
+        if let Some(layout) = self.field.vascular_conductance_layout() {
+            layouts.push(layout);
+        }
+        layouts
+    }
+
+    /// Every baseline and present optional view's declared layout, in
+    /// [`View::ALL`] followed by [`View::V2_OPTIONAL`] order.
+    #[must_use]
+    pub fn all_layouts(&self) -> Vec<Layout> {
+        let optional = self.optional_layouts();
+        let mut layouts = Vec::with_capacity(View::ALL.len() + optional.len());
+        layouts.extend(self.layouts());
+        layouts.extend(optional);
+        layouts
+    }
+
+    /// The bytes this slot's buffers have actually reserved (`INV-15`).
+    /// Allocated once, it is the population ceiling times 53 bytes a row plus
+    /// 48 a texel on v1 (and when `v2-visual-mappings` is disabled), plus any
+    /// enabled optional `V2-16` views (`1 B/org` cell-state, `2 B/org`
+    /// polarity, `4 B/texel` trail-energy, `4 B/texel` vascular-conductance),
+    /// and a projection never changes it.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
         fn bytes<T>(values: &Vec<T>) -> u64 {
             (values.capacity() as u64).saturating_mul(size_of::<T>() as u64)
+        }
+        fn opt_bytes<T>(values: &Option<Vec<T>>) -> u64 {
+            values.as_ref().map_or(0, bytes)
         }
         [
             bytes(&self.ids),
@@ -1320,9 +1841,13 @@ impl Epoch {
             bytes(&self.generations),
             bytes(&self.topologies),
             bytes(&self.affinities),
+            opt_bytes(&self.cell_states),
+            opt_bytes(&self.polarities),
             bytes(&self.field.values),
             bytes(&self.field.composition),
             bytes(&self.field.components),
+            opt_bytes(&self.field.trail_energy),
+            opt_bytes(&self.field.vascular_conductance),
         ]
         .into_iter()
         .fold(0, u64::saturating_add)
@@ -1393,6 +1918,59 @@ impl Epoch {
                 format!("{} texels for {texels:?}", self.field.components.len()),
             );
         }
+        if let Some(states) = &self.cell_states {
+            if states.len() != count {
+                return refuse(
+                    View::CellState,
+                    format!("{} rows for {count} identities", states.len()),
+                );
+            }
+            if let Some(&value) = states
+                .iter()
+                .find(|&&v| i16::from(v).abs() > i16::from(CELL_STATE_STEPS))
+            {
+                return refuse(
+                    View::CellState,
+                    format!("{value} exceeds {CELL_STATE_STEPS}"),
+                );
+            }
+        }
+        if let Some(polarities) = &self.polarities
+            && polarities.len() != count
+        {
+            return refuse(
+                View::Polarity,
+                format!("{} rows for {count} identities", polarities.len()),
+            );
+        }
+        if let Some(trail) = &self.field.trail_energy {
+            if trail.len() != texels[0] * texels[1] {
+                return refuse(
+                    View::FieldTrailEnergy,
+                    format!("{} texels for {texels:?}", trail.len()),
+                );
+            }
+            if let Some(value) = trail.iter().find(|v| !v.is_finite() || **v < 0.0) {
+                return refuse(
+                    View::FieldTrailEnergy,
+                    format!("{value} is not finite and >= 0"),
+                );
+            }
+        }
+        if let Some(vascular) = &self.field.vascular_conductance {
+            if vascular.len() != texels[0] * texels[1] {
+                return refuse(
+                    View::FieldVascularConductance,
+                    format!("{} texels for {texels:?}", vascular.len()),
+                );
+            }
+            if let Some(value) = vascular.iter().find(|v| !v.is_finite() || **v < 0.0) {
+                return refuse(
+                    View::FieldVascularConductance,
+                    format!("{value} is not finite and >= 0"),
+                );
+            }
+        }
         for layout in self.layouts() {
             match layout.bounds {
                 Bounds::Wrapped(extent) => {
@@ -1456,5 +2034,78 @@ impl Epoch {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "unit tests: an unexpected error is a test failure"
+)]
+mod tests {
+    use super::*;
+    use flife_core::ValidatedConfig;
+    use flife_engine::{Arrangement, NumericalProfile};
+
+    const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
+
+    fn v2_all_world() -> World {
+        let mut toml = PRESET.replace(
+            "model = \"field-ecology-v1\"",
+            "model = \"field-ecology-v2\"",
+        );
+        toml.push_str(
+            "\n[contact]\ndiameter = 0.25\nstiffness = 0.5\nadhesion = 0.25\nadhesion_range = 2.0\n",
+        );
+        let overrides = [flife_core::FeatureOverride::Enable("all-v2".to_owned())];
+        let config = ValidatedConfig::from_toml_with_overrides(&toml, &overrides)
+            .expect("valid v2 all-features config");
+        World::found(
+            &config,
+            Arrangement::FreeList,
+            NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("founds")
+    }
+
+    #[test]
+    fn check_refuses_corrupted_optional_v2_views() {
+        let world = v2_all_world();
+        let clean = Epoch::standalone(&world).expect("standalone epoch");
+        clean.check().expect("clean v2 epoch passes check");
+        assert!(clean.cell_states().is_some());
+        assert!(clean.polarities().is_some());
+        assert!(clean.field().trail_energy().is_some());
+        assert!(clean.field().vascular_conductance().is_some());
+
+        // Planted negative 1: cell_states = -128 exceeds CELL_STATE_STEPS (127).
+        let mut bad = clean.clone();
+        bad.cell_states.as_mut().expect("cell_states")[0] = i8::MIN;
+        assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
+
+        // Planted negative 2: cell_states row-count mismatch.
+        let mut bad = clean.clone();
+        bad.cell_states.as_mut().expect("cell_states").pop();
+        assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
+
+        // Planted negative 3: polarities row-count mismatch.
+        let mut bad = clean.clone();
+        bad.polarities.as_mut().expect("polarities").pop();
+        assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
+
+        // Planted negative 4: negative trail_energy texel.
+        let mut bad = clean.clone();
+        bad.field.trail_energy.as_mut().expect("trail")[0] = -0.01;
+        assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
+
+        // Planted negative 5: NaN vascular_conductance texel.
+        let mut bad = clean.clone();
+        bad.field.vascular_conductance.as_mut().expect("vascular")[0] = f32::NAN;
+        assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
+
+        // Planted negative 6: trail_energy texel-count mismatch.
+        let mut bad = clean;
+        bad.field.trail_energy.as_mut().expect("trail").pop();
+        assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
     }
 }

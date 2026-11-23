@@ -23,9 +23,10 @@ pub mod feed;
 pub mod pairing;
 
 pub use epoch::{
-    AFFINITY_AXES, AffinityProjection, Bounds, COMPONENT_STEPS, Dtype, Epoch, FIELD_TEXELS_MAX,
-    FieldChannel, FieldTexture, Layout, MINIMUM_TEXEL_ROWS_PER_WORKER, Metrics, Prior, Tally, View,
-    affinity_projection,
+    AFFINITY_AXES, AffinityProjection, Bounds, CELL_STATE_STEPS, COMPONENT_STEPS, Dtype, Epoch,
+    FIELD_TEXELS_MAX, FieldChannel, FieldTexture, Layout, MINIMUM_TEXEL_ROWS_PER_WORKER, Metrics,
+    POLARITY_ANGLE_SCALE, POLARITY_UNPOLARIZED, Prior, Tally, View, affinity_projection,
+    quantize_cell_state, quantize_polarity,
 };
 pub use feed::{DISPLAY_PAIR, Feed, Lease, Publication, Publisher, RenderStats, Viewer};
 pub use pairing::{

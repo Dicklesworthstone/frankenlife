@@ -1255,3 +1255,362 @@ fn projected_epoch_refreshes_speed_limit_and_attempt_energy() {
     assert_eq!(lease.attempt_energy(), offered.minimum_attempt_energy());
     assert_shows(&lease, &offered);
 }
+
+fn v2_ecology(
+    overrides: &[(&str, &str, &str)],
+    with_contact: bool,
+    features: &[flife_core::FeatureOverride],
+) -> ValidatedConfig {
+    let mut lines: Vec<String> = PRESET.lines().map(str::to_owned).collect();
+    let mut all_overrides = vec![
+        ("world", "width", "32.0"),
+        ("world", "height", "32.0"),
+        ("world", "grid_width", "32"),
+        ("world", "grid_height", "32"),
+        ("population", "initial_count", "48"),
+        ("population", "maximum_count", "72"),
+    ];
+    all_overrides.extend_from_slice(overrides);
+    for (section, key, value) in all_overrides {
+        let header = format!("[{section}]");
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == header)
+            .unwrap_or_else(|| panic!("no section {header}"));
+        let line = lines[start + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with('['))
+            .position(|line| line.split('=').next().map(str::trim) == Some(key))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or_else(|| panic!("no key {key} in {header}"));
+        lines[line] = format!("{key} = {value}");
+    }
+    let mut text = lines.join("\n").replacen(
+        "model = \"field-ecology-v1\"",
+        "model = \"field-ecology-v2\"",
+        1,
+    );
+    if with_contact {
+        text.push_str(
+            "\n[contact]\ndiameter = 0.25\nstiffness = 0.5\nadhesion = 0.25\nadhesion_range = 2.0\n",
+        );
+    }
+    ValidatedConfig::from_toml_with_overrides(&text, features).expect("valid v2 config")
+}
+
+/// V2-16: on v1, `--v1-compat`, and `--disable v2-visual-mappings`, all four
+/// optional `Epoch`/`FieldTexture` views are `None` and reserve zero extra
+/// bytes (`INV-15`).
+#[test]
+fn v2_visual_mappings_disabled_matches_v1_epoch_zero_extra_bytes() {
+    let row = 8 + 8 + 8 + 4 + 8 + 4 + 1 + 12;
+    let v1_slot = 72 * row + 32 * 32 * (4 + 12 + 32);
+
+    let cases = [
+        ("v1", ecology(&[("population", "maximum_count", "72")])),
+        (
+            "v2-compat",
+            v2_ecology(&[], false, &[flife_core::FeatureOverride::V1Compat]),
+        ),
+        (
+            "v2-all-minus-visual",
+            v2_ecology(
+                &[],
+                true,
+                &[
+                    flife_core::FeatureOverride::Enable("all-v2".to_owned()),
+                    flife_core::FeatureOverride::Disable("v2-visual-mappings".to_owned()),
+                ],
+            ),
+        ),
+    ];
+
+    for (label, config) in cases {
+        let world = found(&config, Arrangement::FreeList);
+        let epoch = Epoch::standalone(&world).expect("standalone epoch");
+        epoch.check().expect("valid epoch");
+        assert_eq!(epoch.cell_states(), None, "{label}: cell_states");
+        assert_eq!(epoch.polarities(), None, "{label}: polarities");
+        assert_eq!(epoch.field().trail_energy(), None, "{label}: trail_energy");
+        assert_eq!(
+            epoch.field().vascular_conductance(),
+            None,
+            "{label}: vascular_conductance"
+        );
+        assert!(
+            epoch.optional_layouts().is_empty(),
+            "{label}: optional_layouts"
+        );
+        assert_eq!(epoch.all_layouts().len(), 11, "{label}: all_layouts");
+        assert_eq!(epoch.reserved_bytes(), v1_slot, "{label}: reserved_bytes");
+    }
+}
+
+/// V2-16: optional `Epoch` & `FieldTexture` columns account for exact `INV-15`
+/// byte budgets per enabled feature bundle, never reallocate across ticks, and
+/// project bit-identically across storage arrangements (`C.7`).
+#[test]
+fn v2_optional_views_accounting_and_slot_order_invariance_c7() {
+    let base_row = 8 + 8 + 8 + 4 + 8 + 4 + 1 + 12;
+    let base_slot = 72 * base_row + 32 * 32 * (4 + 12 + 32);
+
+    // Bundle A (tissue auto): cell_states (1 B/org) + polarities (2 B/org) only.
+    let bundle_a = v2_ecology(&[], true, &[]);
+    let world_a = found(&bundle_a, Arrangement::FreeList);
+    let epoch_a = Epoch::standalone(&world_a).expect("bundle A epoch");
+    epoch_a.check().expect("bundle A check");
+    assert!(epoch_a.cell_states().is_some());
+    assert!(epoch_a.polarities().is_some());
+    assert!(epoch_a.field().trail_energy().is_none());
+    assert!(epoch_a.field().vascular_conductance().is_none());
+    assert_eq!(epoch_a.optional_layouts().len(), 2);
+    assert_eq!(epoch_a.reserved_bytes(), base_slot + 72 * (1 + 2));
+
+    // Bundle B (pure-field auto): trail_energy (4 B/texel) + vascular_conductance (4 B/texel) only.
+    let bundle_b = v2_ecology(&[], false, &[]);
+    let world_b = found(&bundle_b, Arrangement::FreeList);
+    let epoch_b = Epoch::standalone(&world_b).expect("bundle B epoch");
+    epoch_b.check().expect("bundle B check");
+    assert!(epoch_b.cell_states().is_none());
+    assert!(epoch_b.polarities().is_none());
+    assert!(epoch_b.field().trail_energy().is_some());
+    assert!(epoch_b.field().vascular_conductance().is_some());
+    assert_eq!(epoch_b.optional_layouts().len(), 2);
+    assert_eq!(epoch_b.reserved_bytes(), base_slot + 32 * 32 * (4 + 4));
+
+    // All-v2: all 4 optional views active, fixed capacity across ticks, C.7 slot-order invariance.
+    let all_v2 = v2_ecology(
+        &[],
+        true,
+        &[flife_core::FeatureOverride::Enable("all-v2".to_owned())],
+    );
+    let expected_all_slot = base_slot + 72 * (1 + 2) + 32 * 32 * (4 + 4);
+    let mut compact = found(&all_v2, Arrangement::Compact);
+    let mut freelist = found(&all_v2, Arrangement::FreeList);
+    let mut pub_compact = publisher(&compact);
+    let mut pub_freelist = publisher(&freelist);
+    assert_eq!(pub_compact.reserved_bytes(), 3 * expected_all_slot);
+    assert_eq!(pub_freelist.reserved_bytes(), 3 * expected_all_slot);
+
+    for _ in 0..32 {
+        step(&mut compact);
+        step(&mut freelist);
+        let a = offer_and_lease(&mut pub_compact, &compact);
+        let b = offer_and_lease(&mut pub_freelist, &freelist);
+        a.check().expect("compact v2 check");
+        b.check().expect("freelist v2 check");
+        assert_eq!(
+            *a, *b,
+            "C.7: v2 epoch must not depend on storage arrangement"
+        );
+        assert_eq!(a.reserved_bytes(), expected_all_slot);
+        assert_eq!(pub_compact.reserved_bytes(), 3 * expected_all_slot);
+        let optional: Vec<_> = a
+            .optional_layouts()
+            .into_iter()
+            .map(|l| (l.view, l.dtype, l.components, l.count))
+            .collect();
+        assert_eq!(
+            optional,
+            vec![
+                (View::CellState, Dtype::I8, 1, a.len()),
+                (View::Polarity, Dtype::I16, 1, a.len()),
+                (View::FieldTrailEnergy, Dtype::F32, 1, 32 * 32),
+                (View::FieldVascularConductance, Dtype::F32, 1, 32 * 32),
+            ]
+        );
+        // Verify cell_states match live recurrent state h_0 in identity order.
+        let expected_states: Vec<i8> = compact
+            .population()
+            .iter_with_genomes()
+            .map(|(org, _)| {
+                flife_render::quantize_cell_state(
+                    org.held.recurrent_state().first().copied().unwrap_or(0.0),
+                )
+            })
+            .collect();
+        assert_eq!(a.cell_states(), Some(expected_states.as_slice()));
+        assert_eq!(
+            a.polarities(),
+            Some(vec![flife_render::POLARITY_UNPOLARIZED; a.len()].as_slice())
+        );
+    }
+}
+
+/// V2-16 (`INV-09`): enabling, publishing, leasing, or disabling
+/// `v2-visual-mappings` produces zero scientific feedback (`WorldDigest`
+/// bit-identical to a headless world on every tick).
+#[test]
+fn v2_inv09_presentation_zero_scientific_feedback() {
+    let with_visual = v2_ecology(
+        &[],
+        true,
+        &[flife_core::FeatureOverride::Enable("all-v2".to_owned())],
+    );
+    let without_visual = v2_ecology(
+        &[],
+        true,
+        &[
+            flife_core::FeatureOverride::Enable("all-v2".to_owned()),
+            flife_core::FeatureOverride::Disable("v2-visual-mappings".to_owned()),
+        ],
+    );
+    let mut headless = found(&with_visual, Arrangement::FreeList);
+    let mut observed = found(&with_visual, Arrangement::FreeList);
+    let mut disabled = found(&without_visual, Arrangement::FreeList);
+    let mut pub_obs = publisher(&observed);
+    let mut pub_dis = publisher(&disabled);
+    assert_eq!(headless.digest(), observed.digest());
+    assert_eq!(headless.digest(), disabled.digest());
+
+    for tick in 1..=64 {
+        step(&mut headless);
+        step(&mut observed);
+        step(&mut disabled);
+        let lease_obs = offer_and_lease(&mut pub_obs, &observed);
+        let lease_dis = offer_and_lease(&mut pub_dis, &disabled);
+        assert!(lease_obs.cell_states().is_some());
+        assert!(lease_dis.cell_states().is_none());
+        assert_eq!(
+            headless.digest(),
+            observed.digest(),
+            "INV-09 violated with v2-visual-mappings at tick {tick}"
+        );
+        assert_eq!(
+            headless.digest(),
+            disabled.digest(),
+            "INV-09 violated with --disable v2-visual-mappings at tick {tick}"
+        );
+    }
+}
+
+/// V2-16: quantization helpers (`cell-state-v1`, `polarity-v1`) and scalar
+/// overlay block-mean projection (`trail_energy`, `vascular_conductance`)
+/// match independent F64 oracles, preserve partial edge blocks, and are
+/// bit-identical across worker counts.
+#[test]
+fn v2_quantization_and_overlay_block_mean_oracle() {
+    use flife_render::{
+        CELL_STATE_STEPS, POLARITY_ANGLE_SCALE, POLARITY_UNPOLARIZED, quantize_cell_state,
+        quantize_polarity,
+    };
+
+    assert_eq!(CELL_STATE_STEPS, 127);
+    assert_eq!(POLARITY_ANGLE_SCALE, i16::MAX);
+    assert_eq!(POLARITY_UNPOLARIZED, i16::MIN);
+    assert_eq!(quantize_cell_state(-2.0), -127);
+    assert_eq!(quantize_cell_state(-1.0), -127);
+    assert_eq!(quantize_cell_state(0.0), 0);
+    assert_eq!(quantize_cell_state(0.5), 64);
+    assert_eq!(quantize_cell_state(1.0), 127);
+    assert_eq!(quantize_cell_state(2.0), 127);
+    assert_eq!(quantize_cell_state(f32::NAN), 0);
+    assert_eq!(quantize_cell_state(f32::INFINITY), 0);
+    assert_eq!(quantize_cell_state(f32::NEG_INFINITY), 0);
+
+    assert_eq!(quantize_polarity([0.0, 0.0]), POLARITY_UNPOLARIZED);
+    assert_eq!(quantize_polarity([f32::NAN, 1.0]), POLARITY_UNPOLARIZED);
+    assert_eq!(
+        quantize_polarity([1.0, f32::INFINITY]),
+        POLARITY_UNPOLARIZED
+    );
+    assert_eq!(quantize_polarity([1.0, 0.0]), 0);
+    assert_eq!(quantize_polarity([0.0, 1.0]), 16_384);
+    assert_eq!(quantize_polarity([0.0, -1.0]), -16_384);
+    assert_eq!(quantize_polarity([-1.0, 1.0e-9]), POLARITY_ANGLE_SCALE);
+    assert_eq!(quantize_polarity([-1.0, -1.0e-9]), -POLARITY_ANGLE_SCALE);
+
+    // Non-divisible 513 × 515 grid -> 2×2 blocks with 1-wide / 1-tall edge blocks.
+    let cells = [513_u32, 515_u32];
+    let cell_size = [0.25_f64, 0.5_f64];
+    let cell_area = cell_size[0] * cell_size[1];
+    let n = (cells[0] * cells[1]) as usize;
+    let mut planes = vec![0.0_f32; n * 33];
+    let mut trail = vec![0.0_f32; n];
+    let mut vascular = vec![0.0_f32; n];
+    for y in 0..cells[1] as usize {
+        for x in 0..cells[0] as usize {
+            let idx = y * cells[0] as usize + x;
+            planes[idx] = ((x * 7 + y * 13) % 97) as f32 * 0.01;
+            trail[idx] = ((x * 11 + y * 5 + 3) % 89) as f32 * 0.02;
+            vascular[idx] = 1.0 + ((x * 3 + y * 17) % 53) as f32 * 0.05;
+        }
+    }
+
+    let serial = FieldTexture::from_planes_with_overlays_on(
+        cells,
+        cell_size,
+        &planes,
+        Some(&trail),
+        Some(&vascular),
+        1,
+    )
+    .expect("serial overlay texture");
+    let parallel = FieldTexture::from_planes_with_overlays_on(
+        cells,
+        cell_size,
+        &planes,
+        Some(&trail),
+        Some(&vascular),
+        4,
+    )
+    .expect("parallel overlay texture");
+    assert_eq!(
+        serial, parallel,
+        "overlay projection must be worker-invariant"
+    );
+
+    // Independent F64 block-mean oracle.
+    let [bx, by] = serial.block().map(|v| v as usize);
+    let [tx, ty] = serial.texels().map(|v| v as usize);
+    let [cx, cy] = cells.map(|v| v as usize);
+    assert_eq!([bx, by], [2, 2]);
+    assert_eq!([tx, ty], [257, 258]);
+    let mut expected_trail = Vec::with_capacity(tx * ty);
+    let mut expected_vascular = Vec::with_capacity(tx * ty);
+    for row in 0..ty {
+        let ys = row * by..((row + 1) * by).min(cy);
+        for col in 0..tx {
+            let xs = col * bx..((col + 1) * bx).min(cx);
+            let mut sum_t = 0.0_f64;
+            let mut sum_v = 0.0_f64;
+            for y in ys.clone() {
+                for x in xs.clone() {
+                    let idx = y * cx + x;
+                    sum_t += f64::from(trail[idx]);
+                    sum_v += f64::from(vascular[idx]);
+                }
+            }
+            let block_cells = (ys.len() * xs.len()) as f64;
+            expected_trail.push((sum_t / (block_cells * cell_area)) as f32);
+            expected_vascular.push((sum_v / block_cells) as f32);
+        }
+    }
+    assert_eq!(serial.trail_energy(), Some(expected_trail.as_slice()));
+    assert_eq!(
+        serial.vascular_conductance(),
+        Some(expected_vascular.as_slice())
+    );
+    assert!(
+        FieldTexture::from_planes_with_overlays(
+            cells,
+            cell_size,
+            &planes,
+            Some(&trail[..10]),
+            None
+        )
+        .is_err(),
+        "wrong trail plane length must be refused"
+    );
+    assert!(
+        FieldTexture::from_planes_with_overlays(
+            cells,
+            cell_size,
+            &planes,
+            None,
+            Some(&vascular[..10])
+        )
+        .is_err(),
+        "wrong vascular plane length must be refused"
+    );
+}

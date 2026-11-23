@@ -1274,100 +1274,99 @@ fn close_during_first_held_step_prevents_second_held_step_from_publishing() {
         let (results, closed) = bounded_lab(seed, &config, 200_000, |handle| {
             let h_a = handle.clone();
             let h_b = handle.clone();
-            vec![
-                Box::pin(async move {
-                    let cx = cx();
-                    let hold = handle.hold(&cx, Tick::new(0)).await.expect("hold");
-                    assert_eq!(hold.reached(&cx).await.expect("at 0").tick, Tick::new(0));
-                    // Poll both steps onto the control lane, then confirm via
-                    // FIFO `inspect` that both have been parked in `self.held`.
-                    let mut step_a = std::pin::pin!(h_a.step(&cx));
-                    let mut step_b = std::pin::pin!(h_b.step(&cx));
-                    let mut inspect = std::pin::pin!(handle.inspect(&cx));
-                    let mut out_a = None;
-                    let mut out_b = None;
-                    let mut inspected = None;
-                    std::future::poll_fn(|context| {
-                        if out_a.is_none()
-                            && let Poll::Ready(v) = step_a.as_mut().poll(context)
-                        {
-                            out_a = Some(v);
-                        }
-                        if out_b.is_none()
-                            && let Poll::Ready(v) = step_b.as_mut().poll(context)
-                        {
-                            out_b = Some(v);
-                        }
-                        if inspected.is_none()
-                            && let Poll::Ready(v) = inspect.as_mut().poll(context)
-                        {
-                            inspected = Some(v);
-                        }
-                        if inspected.is_some() {
-                            Poll::Ready(())
-                        } else {
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                    assert_eq!(
-                        inspected.expect("inspected").expect("ok").boundary.tick,
-                        Tick::new(0)
-                    );
-                    assert!(out_a.is_none() && out_b.is_none(), "both steps are held");
-
-                    // Queue release and close back-to-back so close hits StepA's
-                    // cancellation boundary (or before StepA starts), and wait
-                    // for all three to settle.
-                    let mut release = std::pin::pin!(handle.release(&cx));
-                    let mut close = std::pin::pin!(handle.close(&cx));
-                    let mut released = None;
-                    let mut closed_at = None;
-                    std::future::poll_fn(|context| {
-                        if released.is_none()
-                            && let Poll::Ready(v) = release.as_mut().poll(context)
-                        {
-                            released = Some(v);
-                        }
-                        if released.is_some()
-                            && closed_at.is_none()
-                            && let Poll::Ready(v) = close.as_mut().poll(context)
-                        {
-                            closed_at = Some(v);
-                        }
-                        if out_a.is_none()
-                            && let Poll::Ready(v) = step_a.as_mut().poll(context)
-                        {
-                            out_a = Some(v);
-                        }
-                        if out_b.is_none()
-                            && let Poll::Ready(v) = step_b.as_mut().poll(context)
-                        {
-                            out_b = Some(v);
-                        }
-                        if released.is_some()
-                            && closed_at.is_some()
-                            && out_a.is_some()
-                            && out_b.is_some()
-                        {
-                            Poll::Ready(())
-                        } else {
-                            Poll::Pending
-                        }
-                    })
-                    .await;
-                    released.expect("release").expect("released");
-                    let boundary = closed_at.expect("close").expect("closed");
-                    assert_eq!(boundary.tick, Tick::new(0), "neither held step published");
-                    for (label, step) in [("step_a", out_a.expect("a")), ("step_b", out_b.expect("b"))] {
-                        assert!(
-                            !matches!(step, Ok(StepOutcome::Published { .. })),
-                            "{label} must not publish after close: {step:?}"
-                        );
+            vec![Box::pin(async move {
+                let cx = cx();
+                let hold = handle.hold(&cx, Tick::new(0)).await.expect("hold");
+                assert_eq!(hold.reached(&cx).await.expect("at 0").tick, Tick::new(0));
+                // Poll both steps onto the control lane, then confirm via
+                // FIFO `inspect` that both have been parked in `self.held`.
+                let mut step_a = std::pin::pin!(h_a.step(&cx));
+                let mut step_b = std::pin::pin!(h_b.step(&cx));
+                let mut inspect = std::pin::pin!(handle.inspect(&cx));
+                let mut out_a = None;
+                let mut out_b = None;
+                let mut inspected = None;
+                std::future::poll_fn(|context| {
+                    if out_a.is_none()
+                        && let Poll::Ready(v) = step_a.as_mut().poll(context)
+                    {
+                        out_a = Some(v);
                     }
-                    boundary
-                }) as Client<Boundary>,
-            ]
+                    if out_b.is_none()
+                        && let Poll::Ready(v) = step_b.as_mut().poll(context)
+                    {
+                        out_b = Some(v);
+                    }
+                    if inspected.is_none()
+                        && let Poll::Ready(v) = inspect.as_mut().poll(context)
+                    {
+                        inspected = Some(v);
+                    }
+                    if inspected.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert_eq!(
+                    inspected.expect("inspected").expect("ok").boundary.tick,
+                    Tick::new(0)
+                );
+                assert!(out_a.is_none() && out_b.is_none(), "both steps are held");
+
+                // Queue release and close back-to-back so close hits StepA's
+                // cancellation boundary (or before StepA starts), and wait
+                // for all three to settle.
+                let mut release = std::pin::pin!(handle.release(&cx));
+                let mut close = std::pin::pin!(handle.close(&cx));
+                let mut released = None;
+                let mut closed_at = None;
+                std::future::poll_fn(|context| {
+                    if released.is_none()
+                        && let Poll::Ready(v) = release.as_mut().poll(context)
+                    {
+                        released = Some(v);
+                    }
+                    if released.is_some()
+                        && closed_at.is_none()
+                        && let Poll::Ready(v) = close.as_mut().poll(context)
+                    {
+                        closed_at = Some(v);
+                    }
+                    if out_a.is_none()
+                        && let Poll::Ready(v) = step_a.as_mut().poll(context)
+                    {
+                        out_a = Some(v);
+                    }
+                    if out_b.is_none()
+                        && let Poll::Ready(v) = step_b.as_mut().poll(context)
+                    {
+                        out_b = Some(v);
+                    }
+                    if released.is_some()
+                        && closed_at.is_some()
+                        && out_a.is_some()
+                        && out_b.is_some()
+                    {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                released.expect("release").expect("released");
+                let boundary = closed_at.expect("close").expect("closed");
+                assert_eq!(boundary.tick, Tick::new(0), "neither held step published");
+                for (label, step) in [("step_a", out_a.expect("a")), ("step_b", out_b.expect("b"))]
+                {
+                    assert!(
+                        !matches!(step, Ok(StepOutcome::Published { .. })),
+                        "{label} must not publish after close: {step:?}"
+                    );
+                }
+                boundary
+            }) as Client<Boundary>]
         });
         assert_eq!(results[0].tick, Tick::new(0), "seed {seed}");
         assert_eq!(closed.boundary.tick, Tick::new(0), "seed {seed}");

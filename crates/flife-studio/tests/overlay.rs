@@ -1692,3 +1692,106 @@ fn a_measurement_says_what_its_disk_holds() {
         "paused · tick 7\nenergy ■ 0 ■ 1 ■ 2 ■ 4 ■ 8 ■ 16"
     );
 }
+
+/// V2-16: every `V2ColorMapping` (`cell-state-v1`, `polarity-v1`) paired with
+/// every `FieldOverlayKind` (`trail-carrier`, `vascular-conductance`) plus
+/// worst-case telemetry, clock, brush preview, and full inspector panel fits
+/// cleanly within FL-024's HUD vertex and triangle caps at both 2× and 3×
+/// scale, with zero refused or left-out glyphs.
+#[test]
+fn v2_legends_and_field_overlays_fit_within_hud_vertex_cap() {
+    use flife_manim::Style;
+    use flife_studio::{FieldOverlayKind, V2ColorMapping, active_field_key, v2_legends};
+
+    let v2_keys = v2_legends();
+    assert_eq!(v2_keys.len(), V2ColorMapping::ALL.len());
+
+    // `active_field_key` respects `Style::field_drawn()` and falls back to v1 field_key.
+    let hidden = Style {
+        field: false,
+        ..Style::default()
+    };
+    assert_eq!(
+        active_field_key(hidden, Some(FieldOverlayKind::TrailCarrier)),
+        None
+    );
+    let shown = Style::default();
+    assert_eq!(active_field_key(shown, None), None);
+    for kind in FieldOverlayKind::ALL {
+        assert_eq!(active_field_key(shown, Some(kind)), Some(kind.legend()));
+    }
+
+    let font = HudFont::bundled().expect("bundled HUD font");
+    let longest = known();
+    let widest = metrics();
+    let memory = admission(999 * GIB, 999 * GIB, 1 * GIB);
+    let preview = widest_preview(Brush::Removal, BrushSettings::default());
+
+    for (mapping, legend) in &v2_keys {
+        for kind in FieldOverlayKind::ALL {
+            let field = kind.legend();
+            assert!(
+                legend.swatches.len() + field.swatches.len() <= HUD_MAX_SWATCHES,
+                "{mapping:?} + {kind:?} exceeds HUD_MAX_SWATCHES"
+            );
+            let text = overlay_text(&OverlayState {
+                paused: Some(true),
+                shown: Some(Tick::new(999_999_999_999)),
+                clock: Some(&READING),
+                legend,
+                field_key: Some(&field),
+                brush: Some(Brush::Removal),
+                preview: Some(preview),
+                measuring: None,
+                selected: Some(OrganismId::new(999_999_999_999)),
+                inspected: Some(Inspected::Read(&longest)),
+                telemetry: Some(Telemetry {
+                    metrics: &widest,
+                    model: "field-ecology-v2",
+                    seed: u64::MAX,
+                    evaluation_interval_ticks: u32::MAX,
+                    memory: &memory,
+                    capacity_pauses: 999_999_999_999,
+                    checkpoint: Some(Tick::new(999_999_999_999)),
+                }),
+            });
+            let colors: Vec<_> = legend
+                .swatches
+                .iter()
+                .chain(&field.swatches)
+                .map(|&rgb| linear(rgb))
+                .collect();
+            let glyphs = text.chars().filter(|c| !c.is_whitespace()).count();
+            for scale in [2.0_f32, 3.0_f32] {
+                let laid = font
+                    .text_with_swatches(&text, HUD_TEXT_POINTS * scale, &colors)
+                    .unwrap_or_else(|error| panic!("{mapping:?} + {kind:?} @{scale}x: {error}"));
+                assert_eq!(laid.glyphs(), glyphs, "{mapping:?} + {kind:?} @{scale}x");
+                assert_eq!(laid.refused(), 0, "{mapping:?} + {kind:?} @{scale}x");
+                assert_eq!(laid.left_out(), 0, "{mapping:?} + {kind:?} @{scale}x");
+                assert!(
+                    laid.vertices().len() <= HUD_MAX_VERTICES,
+                    "{mapping:?} + {kind:?} @{scale}x vertices {}",
+                    laid.vertices().len()
+                );
+                assert!(
+                    laid.triangles().len() <= HUD_MAX_TRIANGLES,
+                    "{mapping:?} + {kind:?} @{scale}x triangles {}",
+                    laid.triangles().len()
+                );
+                if (scale - 2.0).abs() < f32::EPSILON {
+                    assert!(
+                        laid.vertices().len() * 5 <= HUD_MAX_VERTICES * 4,
+                        "{mapping:?} + {kind:?} @2x vertices {} exceed 80% HUD cap",
+                        laid.vertices().len()
+                    );
+                    assert!(
+                        laid.triangles().len() * 5 <= HUD_MAX_TRIANGLES * 4,
+                        "{mapping:?} + {kind:?} @2x triangles {} exceed 80% HUD cap",
+                        laid.triangles().len()
+                    );
+                }
+            }
+        }
+    }
+}

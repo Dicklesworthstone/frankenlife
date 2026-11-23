@@ -163,7 +163,10 @@ impl Bins {
             if bucket >= buckets {
                 return Err(outside(item, bucket));
             }
-            match bucket.checked_add(1).and_then(|next| self.offsets.get_mut(next)) {
+            match bucket
+                .checked_add(1)
+                .and_then(|next| self.offsets.get_mut(next))
+            {
                 Some(count) => *count += 1,
                 None => return Err(outside(item, bucket)),
             }
@@ -237,7 +240,9 @@ impl Bins {
     pub fn range(&self, bucket: usize) -> Range<usize> {
         match (
             self.offsets.get(bucket),
-            bucket.checked_add(1).and_then(|next| self.offsets.get(next)),
+            bucket
+                .checked_add(1)
+                .and_then(|next| self.offsets.get(next)),
         ) {
             (Some(&start), Some(&end)) => start as usize..end as usize,
             _ => 0..0,

@@ -89,10 +89,10 @@ use flife_render::{AffinityProjection, Metrics};
 use flife_runtime::Outcome;
 use flife_studio::{
     Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
-    ExportOptions, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Look, Measuring,
-    MoveLatencyBound, OverlayState, Particles, Resumed, STUDIO_SCHEMA, Status, Stroke, Studio,
-    StudioOptions, Style, Surface, Telemetry, TimelineRecord, legends, overlay_text,
-    write_timeline_record,
+    ExportOptions, FieldMapping, FieldOverlayKind, FrameTimeSummary, FrameTimes, Inspected, Intent,
+    Look, Measuring, MoveLatencyBound, OverlayState, Particles, Resumed, STUDIO_SCHEMA, Status,
+    Stroke, Studio, StudioOptions, Style, Surface, Telemetry, TimelineRecord, V2ColorMapping,
+    active_field_key, legends, overlay_text, v2_legends, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -1123,7 +1123,7 @@ fn main() -> ExitCode {
     let mut inspected = None;
     // The last measurement's answer (plan §14.3's measurement region).
     let mut measurement = None;
-    // Every colour mapping's key (FL-019's legend).
+    // Every colour mapping's key (FL-019's legend and V2-16's optional keys).
     let keys = match legends(&config) {
         Ok(keys) => keys,
         Err(error) => {
@@ -1132,6 +1132,7 @@ fn main() -> ExitCode {
             return code;
         }
     };
+    let v2_keys = v2_legends();
     let (mut times, mut latency, mut bounds) =
         match FrameTimes::new().and_then(|a| Ok((a, FrameTimes::new()?, FrameTimes::new()?))) {
             Ok(all) => all,
@@ -1229,14 +1230,18 @@ fn main() -> ExitCode {
         }
         if frame.restyled {
             let style = studio.view().style();
+            let v2_mapping = studio.controls().v2_mapping();
+            let field_overlay = studio.controls().field_overlay();
             print(&Record::View {
                 schema: STUDIO_SCHEMA,
-                mapping: style.mapping.name(),
-                meaning: style.mapping.meaning(),
+                mapping: v2_mapping.map_or_else(|| style.mapping.name(), V2ColorMapping::name),
+                meaning: v2_mapping
+                    .map_or_else(|| style.mapping.meaning(), V2ColorMapping::meaning),
                 look: style.look.name(),
                 particles: style.particles.name(),
                 field: style.field,
-                field_mapping: style.field_mapping.name(),
+                field_mapping: field_overlay
+                    .map_or_else(|| style.field_mapping.name(), FieldOverlayKind::name),
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
             });
         }
@@ -1318,11 +1323,17 @@ fn main() -> ExitCode {
         }
         let style = studio.view().style();
         let mapping = style.mapping;
-        let field_key = flife_studio::field_key(style);
-        let Some(legend) = keys
-            .iter()
-            .find_map(|(key, legend)| (*key == mapping).then_some(legend))
-        else {
+        let v2_mapping = studio.controls().v2_mapping();
+        let field_key = active_field_key(style, studio.controls().field_overlay());
+        let legend = if let Some(v2) = v2_mapping {
+            v2_keys
+                .iter()
+                .find_map(|(key, legend)| (*key == v2).then_some(legend))
+        } else {
+            keys.iter()
+                .find_map(|(key, legend)| (*key == mapping).then_some(legend))
+        };
+        let Some(legend) = legend else {
             let code = fail("internal", format!("no key for the {mapping} mapping"), 1);
             let _ = studio.close();
             return code;
@@ -2708,14 +2719,20 @@ mod tests {
             genome_logical_bytes: 4096,
             genome_allocated_bytes: 4096,
             ledger: flife_core::LedgerReport {
+                ticks: 5,
                 initial: 50.0,
-                final_energy: 50.0,
+                current: 50.0,
                 injected: 0.0,
                 removed: 0.0,
                 dissipated: 0.0,
-                expected: 50.0,
+                turnover: 0.0,
                 residual: 0.0,
-                normalized_residual: 0.0,
+                normalized: None,
+                versus_initial: None,
+                versus_current: None,
+                largest_tick_residual: 0.0,
+                drift_per_tick: None,
+                allowance: 1.0,
             },
             faulted: false,
             tally: Some(flife_render::Tally {

@@ -52,6 +52,16 @@ A slow consumer can therefore cost display freshness, never the world.
   | field-components | i8 × 32 per texel | each in `[−127, 127]` |
 
   These are the inputs of §13.4's mappings. Turning them into sizes and colours is FL-019's.
+- Optional `V2-16` views (`View::V2_OPTIONAL`, gated on `V2Feature::V2VisualMappings` and their backing `field-ecology-v2` feature; `None` and `0` bytes reserved on `field-ecology-v1*` or when `v2-visual-mappings` is disabled):
+
+  | View | Dtype × components | Bounds | Gate |
+  |---|---|---|---|
+  | `cell-state` (`Epoch::cell_states`) | `i8` × 1 (`1 B/org`) | `[-127, 127]` (`CELL_STATE_STEPS`) | `v2-visual-mappings` ∧ (`epigenetic-recurrence` ∨ `recurrent_state_width > 0`) |
+  | `polarity` (`Epoch::polarities`) | `i16` × 1 (`2 B/org`) | any (`[-32767, +32767]`, `POLARITY_UNPOLARIZED = i16::MIN`) | `v2-visual-mappings` ∧ `pcp-polarity` |
+  | `field-trail-energy` (`FieldTexture::trail_energy`) | `f32` × 1 (`4 B/texel`) | finite, ≥ 0 | `v2-visual-mappings` ∧ `dual-carrier-trails` |
+  | `field-vascular-conductance` (`FieldTexture::vascular_conductance`) | `f32` × 1 (`4 B/texel`) | finite, ≥ 0 | `v2-visual-mappings` ∧ `vascular-field` |
+
+  `Epoch::layouts()` retains the 11 always-present baseline layouts; `Epoch::optional_layouts()` and `Epoch::all_layouts()` report present optional layouts; `Epoch::reserved_bytes()` accounts for every preallocated optional buffer (`INV-15`), and `Epoch::check()` validates every present optional view's length and bounds. `cell_states` projects live `organism.held.recurrent_state()[0]` via `quantize_cell_state`; `polarities` reports `POLARITY_UNPOLARIZED` until `V2-08` adds organism polarity vectors; `trail_energy` and `vascular_conductance` zero-fill preallocated slots until `V2-15` / `V2-14` expose Carrier-1 and incident conductance planes on `FieldState`, and `FieldTexture::from_planes_with_overlays(_on)` projects explicit scalar planes through the same multi-worker deterministic F64 block-mean pipeline.
 - The affinity view (FL-019, `affinity_projection`) is a fixed projection of each organism's 32 affinity terms
   `a`: `q_k = (Σ_j H[r_k][j] a_j) / (√32 · L)` for the rows `r = AFFINITY_AXES = [7, 14, 25]` of the 32 × 32
   Sylvester Hadamard matrix `H[r][j] = (−1)^popcount(r & j)`, with `L` the world's `affinity_norm_limit`. The rows

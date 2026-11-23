@@ -42,20 +42,25 @@
 //! | W | dump the selected organism's whole controller (FL-021) |
 //! | T | track the selected organism, the camera keeping it centred, or stop (plan §14.3) |
 //!
-//! and, for the presentation owner alone (FL-019's [`Style`]):
+//! and, for the presentation owner alone (FL-019's [`Style`] and `V2-16`'s
+//! modular `v2-visual-mappings` overlays):
 //!
 //! | Key | Style |
 //! |---|---|
 //! | 1 to 7 | colour by lineage, energy, generation, motion, topology, chemical affinity or lineage and energy |
+//! | 8, 9 | when `v2-visual-mappings` is enabled: colour by recurrent cell state (`cell-state-v1`) or apical-basal polarity (`polarity-v1`); no-op on v1 or when disabled |
 //! | R | glow, raw or sphere |
 //! | D | points or density |
 //! | F | field on or off |
-//! | C | the field's energy, its chemical composition, or its chosen component, in turn ([`FieldMapping`](flife_manim::FieldMapping)) |
+//! | C | the field's energy, its chemical composition, or its chosen component, in turn ([`FieldMapping`](flife_manim::FieldMapping)); when `v2-visual-mappings` is enabled, also cycles the `trail-carrier` and `vascular-conductance` overlays ([`FieldOverlayKind`](flife_manim::FieldOverlayKind)) |
 //! | `[` or `]` | the field's chosen component: shown, then the previous or next channel ([`FieldComponent`](flife_manim::FieldComponent)) |
 
 use flife_core::Tick;
 use flife_core::ids::OrganismId;
-use flife_manim::{ColorMapping, FieldComponent, FieldMapping, Look, Particles, Style, Viewport};
+use flife_manim::{
+    ColorMapping, FieldComponent, FieldMapping, FieldOverlayKind, Look, Particles, Style,
+    V2ColorMapping, Viewport,
+};
 use fmn_render::metal::{
     ButtonSet, InputEvent, LogicalPoint, PointerButton, ScrollUnit, SurfaceMetrics,
 };
@@ -76,6 +81,12 @@ pub const KEY_ESCAPE: u16 = 53;
 pub const KEY_W: u16 = 13;
 /// `kVK_ANSI_1` to `kVK_ANSI_7`, for [`ColorMapping::ALL`] in order.
 pub const KEY_DIGITS: [u16; 7] = [18, 19, 20, 21, 23, 22, 26];
+/// `kVK_ANSI_8`, for [`V2ColorMapping::CellState`] when `v2-visual-mappings` is enabled.
+pub const KEY_8: u16 = 28;
+/// `kVK_ANSI_9`, for [`V2ColorMapping::Polarity`] when `v2-visual-mappings` is enabled.
+pub const KEY_9: u16 = 25;
+/// `kVK_ANSI_8` and `kVK_ANSI_9`, for [`V2ColorMapping::ALL`] in order.
+pub const KEY_V2_DIGITS: [u16; 2] = [KEY_8, KEY_9];
 /// `kVK_ANSI_R`.
 pub const KEY_R: u16 = 15;
 /// `kVK_ANSI_D`.
@@ -342,6 +353,16 @@ pub struct Controls {
     settings: BrushSettings,
     /// The field component C and the bracket keys show: the last chosen.
     component: FieldComponent,
+    /// Whether `V2-16` (`v2-visual-mappings`) keys `8`, `9` and extended `C`
+    /// field overlays are enabled for this world. Always `false` on v1 or
+    /// when `--disable v2-visual-mappings` is set.
+    v2_visual_enabled: bool,
+    /// Active `V2-16` organism colour mapping (`8` = cell state, `9` = polarity),
+    /// overriding `style.mapping` while `Some`.
+    v2_mapping: Option<V2ColorMapping>,
+    /// Active `V2-16` secondary field overlay (`trail-carrier` or
+    /// `vascular-conductance`) cycled through `C`.
+    field_overlay: Option<FieldOverlayKind>,
 }
 
 impl Controls {
@@ -670,6 +691,13 @@ impl Controls {
     fn restyle(&mut self, code: u16) {
         if let Some(slot) = KEY_DIGITS.iter().position(|&digit| digit == code) {
             self.style.mapping = ColorMapping::ALL[slot];
+            self.v2_mapping = None;
+            return;
+        }
+        if let Some(slot) = KEY_V2_DIGITS.iter().position(|&digit| digit == code) {
+            if self.v2_visual_enabled {
+                self.v2_mapping = Some(V2ColorMapping::ALL[slot]);
+            }
             return;
         }
         match code {
@@ -687,8 +715,34 @@ impl Controls {
                 };
             }
             KEY_F => self.style.field = !self.style.field,
-            KEY_C => self.style.field_mapping = self.style.field_mapping.next(self.component),
+            KEY_C => {
+                if self.v2_visual_enabled {
+                    match (self.field_overlay, self.style.field_mapping) {
+                        (None, FieldMapping::Energy) => {
+                            self.style.field_mapping = FieldMapping::Composition;
+                        }
+                        (None, FieldMapping::Composition) => {
+                            self.style.field_mapping = FieldMapping::Component(self.component);
+                        }
+                        (None, FieldMapping::Component(_)) => {
+                            self.style.field_mapping = FieldMapping::Energy;
+                            self.field_overlay = Some(FieldOverlayKind::TrailCarrier);
+                        }
+                        (Some(FieldOverlayKind::TrailCarrier), _) => {
+                            self.style.field_mapping = FieldMapping::Energy;
+                            self.field_overlay = Some(FieldOverlayKind::VascularConductance);
+                        }
+                        (Some(FieldOverlayKind::VascularConductance), _) => {
+                            self.style.field_mapping = FieldMapping::Energy;
+                            self.field_overlay = None;
+                        }
+                    }
+                } else {
+                    self.style.field_mapping = self.style.field_mapping.next(self.component);
+                }
+            }
             KEY_LEFT_BRACKET | KEY_RIGHT_BRACKET => {
+                self.field_overlay = None;
                 // The first press shows the chosen component; later ones
                 // step through the channels.
                 if self.style.field_mapping.component().is_some() {
@@ -717,6 +771,59 @@ impl Controls {
         if let Some(component) = style.field_mapping.component() {
             self.component = component;
         }
+    }
+
+    /// Whether `V2-16` (`v2-visual-mappings`) keys `8`, `9` and extended `C`
+    /// field overlays are enabled.
+    #[must_use]
+    pub const fn v2_visual_enabled(&self) -> bool {
+        self.v2_visual_enabled
+    }
+
+    /// Enable or disable `V2-16` (`v2-visual-mappings`) key bindings.
+    /// Disabling clears any active v2 colour mapping or field overlay.
+    pub const fn set_v2_visual_enabled(&mut self, enabled: bool) {
+        self.v2_visual_enabled = enabled;
+        if !enabled {
+            self.v2_mapping = None;
+            self.field_overlay = None;
+        }
+    }
+
+    /// Active `V2-16` organism colour mapping (`8` = cell state, `9` =
+    /// polarity), or `None` when a baseline `1..7` mapping is selected or
+    /// `v2-visual-mappings` is disabled.
+    #[must_use]
+    pub const fn v2_mapping(&self) -> Option<V2ColorMapping> {
+        self.v2_mapping
+    }
+
+    /// Set the active `V2-16` organism colour mapping. Ignored (`None`) when
+    /// `v2-visual-mappings` is disabled.
+    pub const fn set_v2_mapping(&mut self, mapping: Option<V2ColorMapping>) {
+        self.v2_mapping = if self.v2_visual_enabled {
+            mapping
+        } else {
+            None
+        };
+    }
+
+    /// Active `V2-16` secondary field overlay (`trail-carrier` or
+    /// `vascular-conductance`), or `None` when showing a baseline field
+    /// mapping or when `v2-visual-mappings` is disabled.
+    #[must_use]
+    pub const fn field_overlay(&self) -> Option<FieldOverlayKind> {
+        self.field_overlay
+    }
+
+    /// Set the active `V2-16` secondary field overlay. Ignored (`None`) when
+    /// `v2-visual-mappings` is disabled.
+    pub const fn set_field_overlay(&mut self, overlay: Option<FieldOverlayKind>) {
+        self.field_overlay = if self.v2_visual_enabled {
+            overlay
+        } else {
+            None
+        };
     }
 
     fn request_close(&mut self) -> Option<Intent> {

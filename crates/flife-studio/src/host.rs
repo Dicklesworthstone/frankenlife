@@ -57,9 +57,12 @@ use flife_cli::{CheckpointAdmission, CheckpointAt, Checkpoints, Recovered, Skipp
 use flife_core::canonical::Sha256Digest;
 use flife_core::ids::{OrganismId, SessionId};
 use flife_core::memory::MemoryAdmission;
-use flife_core::{CoreError, Tick, ValidatedConfig};
+use flife_core::{CoreError, Tick, V2Feature, ValidatedConfig};
 use flife_engine::{CPU_REFERENCE, Followed, World};
-use flife_manim::{HUD_TEXT_POINTS, HudFont, Motion, Style, Viewport, WorldView, hex_rgb, linear};
+use flife_manim::{
+    FieldOverlayKind, HUD_TEXT_POINTS, HudFont, Motion, Style, V2ColorMapping, Viewport, WorldView,
+    hex_rgb, linear,
+};
 use flife_render::{DISPLAY_PAIR, Epoch, Feed, Lease, Prior, Viewer};
 use flife_runtime::{CommandBook, SessionClosed, SessionConfig};
 use fmn_frame::FrameBuffer;
@@ -358,6 +361,10 @@ pub struct Studio {
     following: Option<OrganismId>,
     /// The disk the measuring tool placed, while it is armed (plan §14.3).
     measure: Option<Disk>,
+    /// Last applied `V2-16` organism colour mapping, for `Frame::restyled`.
+    v2_mapping: Option<V2ColorMapping>,
+    /// Last applied `V2-16` secondary field overlay, for `Frame::restyled`.
+    field_overlay: Option<FieldOverlayKind>,
     /// What [`Studio::resume`] recovered.
     resumed: Option<Resumed>,
 }
@@ -683,6 +690,7 @@ impl Studio {
         }
         let mut controls = Controls::new();
         controls.set_style(options.style);
+        controls.set_v2_visual_enabled(config.is_v2_feature_enabled(V2Feature::V2VisualMappings));
         controls.reserve_moves(INPUT_QUEUE_CAPACITY)?;
         Ok(Self {
             target,
@@ -721,6 +729,8 @@ impl Studio {
             tracking: false,
             following: None,
             measure: None,
+            v2_mapping: None,
+            field_overlay: None,
             resumed: None,
         })
     }
@@ -908,13 +918,23 @@ impl Studio {
         let statuses = self.statuses.len() - before;
 
         let style = self.controls.style();
-        let restyled = style != self.view.style();
-        if restyled {
+        let style_changed = style != self.view.style();
+        if style_changed {
             self.view.set_style(style);
-            self.tally.restyles += 1;
             self.note(|| TimelineRecord::Style {
                 style: style.into(),
             });
+        }
+        let v2_mapping = self.controls.v2_mapping();
+        let field_overlay = self.controls.field_overlay();
+        let v2_restyled = v2_mapping != self.v2_mapping || field_overlay != self.field_overlay;
+        if v2_restyled {
+            self.v2_mapping = v2_mapping;
+            self.field_overlay = field_overlay;
+        }
+        let restyled = style_changed || v2_restyled;
+        if restyled {
+            self.tally.restyles += 1;
         }
 
         let current_drawable = self.view.viewport().drawable();

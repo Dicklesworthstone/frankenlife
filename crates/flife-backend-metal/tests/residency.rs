@@ -1010,17 +1010,70 @@ fn recurrent_reference_torch_and_metal_f16_f32_bit_exact() -> Result<(), CoreErr
     let mut metal_f32 = backend(64);
     let mut metal_f16 = backend(64);
 
-    let suites: [(&str, u32, u32, u32, &[&[u32]], usize); 5] = [
-        ("S=2 108/44 (Bundle A)", 106, 40, 2, &TOPOLOGIES, 1_024),
-        ("S=4 108/44 (FL-054)", 104, 36, 4, &TOPOLOGIES, 1_024),
-        ("S=2 107/41 odd-unaligned", 105, 37, 2, &[&[5], &[8]], 32),
-        ("S=2 112/48 (All-21)", 110, 44, 2, &[&[64, 32]], 32),
-        ("S=16 120/68 max-state", 104, 36, 16, &[&[32]], 32),
+    struct Suite<'a> {
+        label: &'a str,
+        sensor_w: u32,
+        action_w: u32,
+        state_w: u32,
+        hiddens: &'a [&'a [u32]],
+        count: usize,
+    }
+
+    let suites = [
+        Suite {
+            label: "S=2 108/44 (Bundle A)",
+            sensor_w: 106,
+            action_w: 40,
+            state_w: 2,
+            hiddens: &TOPOLOGIES,
+            count: 1_024,
+        },
+        Suite {
+            label: "S=4 108/44 (FL-054)",
+            sensor_w: 104,
+            action_w: 36,
+            state_w: 4,
+            hiddens: &TOPOLOGIES,
+            count: 1_024,
+        },
+        Suite {
+            label: "S=2 107/41 odd-unaligned",
+            sensor_w: 105,
+            action_w: 37,
+            state_w: 2,
+            hiddens: &[&[5], &[8]],
+            count: 32,
+        },
+        Suite {
+            label: "S=2 112/48 (All-21)",
+            sensor_w: 110,
+            action_w: 44,
+            state_w: 2,
+            hiddens: &[&[64, 32]],
+            count: 32,
+        },
+        Suite {
+            label: "S=16 120/68 max-state",
+            sensor_w: 104,
+            action_w: 36,
+            state_w: 16,
+            hiddens: &[&[32]],
+            count: 32,
+        },
     ];
 
     let lanes = NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN);
-    for (suite_idx, &(label, sensor_w, action_w, state_w, hiddens, count)) in
-        suites.iter().enumerate()
+    for (
+        suite_idx,
+        &Suite {
+            label,
+            sensor_w,
+            action_w,
+            state_w,
+            hiddens,
+            count,
+        },
+    ) in suites.iter().enumerate()
     {
         let topos: Vec<DenseTopology> = hiddens
             .iter()
@@ -1057,18 +1110,15 @@ fn recurrent_reference_torch_and_metal_f16_f32_bit_exact() -> Result<(), CoreErr
             let sensors: Vec<f64> = (0..sensor_w as usize)
                 .map(|_| {
                     let raw = draws.symmetric();
-                    if raw.abs() < 1.0e-3 {
-                        0.5
-                    } else {
-                        raw
-                    }
-                    *1.5
+                    let nudged = if raw.abs() < 1.0e-3 { 0.5 } else { raw };
+                    nudged * 1.5
                 })
                 .collect();
             let state: Vec<f32> = (0..s)
                 .map(|_| {
                     let raw = draws.symmetric();
-                    (if raw.abs() < 1.0e-3 { 0.25 } else { raw } * 0.95) as f32
+                    let nudged = if raw.abs() < 1.0e-3 { 0.25 } else { raw };
+                    (nudged * 0.95) as f32
                 })
                 .collect();
             let mut combined = Vec::with_capacity(in_w);

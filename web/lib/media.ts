@@ -25,6 +25,18 @@ export type MasterVideo = {
   encode: string[];
 };
 
+/** One <= 25 MiB Cloudflare-safe MP4 segment of a multi-segment film. */
+export type VideoSegment = MediaFile & {
+  /** Zero-based frame index into the full film where this segment starts. */
+  start_frame: number;
+  /** Number of frames encoded in this segment. */
+  frames: number;
+  /** Committed world tick of this segment's first frame. */
+  start_tick: number;
+  /** Committed world tick of this segment's last frame. */
+  end_tick: number;
+};
+
 export type FilmManifest = {
   schema: typeof MEDIA_SCHEMA;
   video: MediaFile & {
@@ -34,6 +46,12 @@ export type FilmManifest = {
     frames: number;
     /** The ffmpeg arguments that encoded it from flife's PNG frames. */
     encode: string[];
+    /**
+     * Optional ordered sequence of <= 25 MiB Cloudflare-safe segments making up
+     * the full film (e.g. high-bitrate 4K60 split cleanly across camera cuts).
+     * Absent or length 1 for single-file films.
+     */
+    segments?: VideoSegment[];
     /** Optional unconstrained archival master (e.g. 4K60) written outside public/media/. */
     master?: MasterVideo;
   };
@@ -147,7 +165,21 @@ export type ControlsManifest = {
 // A JSON import types each array as a list, not a pair; scripts/controls.ts writes the shape above.
 export const controls = controlsManifest as unknown as ControlsManifest;
 
+/** Every file a film + controls manifest pair serves from /media/, deduplicated by path. */
+export function collectMediaFiles(filmManifest: FilmManifest, controlsManifest: ControlsManifest): MediaFile[] {
+  const videoFiles: MediaFile[] =
+    filmManifest.video.segments && filmManifest.video.segments.length > 0
+      ? [filmManifest.video, ...filmManifest.video.segments]
+      : [filmManifest.video];
+  return [
+    ...new Map(
+      [...videoFiles, filmManifest.poster, filmManifest.social, ...controlsManifest.stills].map((file) => [
+        file.src,
+        file,
+      ]),
+    ).values(),
+  ];
+}
+
 /** Every file the site serves from /media/, once each, as the manifests name them. */
-export const mediaFiles: MediaFile[] = [
-  ...new Map([film.video, film.poster, film.social, ...controls.stills].map((file) => [file.src, file])).values(),
-];
+export const mediaFiles: MediaFile[] = collectMediaFiles(film, controls);

@@ -594,7 +594,7 @@ fn recurrent_epigenetic_gate_bias_unit() {
         next_epi[0].to_bits(),
         (sigmoid(-2.5).expect("sigmoid(-2.5)") as f32).to_bits()
     );
-    let expected_k1 = ((1.0_f32 - expected_g) * 0.8 + expected_g * (-1.0_f32)).clamp(-1.0, 1.0);
+    let expected_k1 = ((1.0_f32 - expected_g) * 0.8 - expected_g).clamp(-1.0, 1.0);
     assert!(
         (next_epi[1] - expected_k1).abs() < 1.0e-6 && next_epi[1] > 0.65,
         "slow epigenetic gate must retain most of state[1]=0.8, got {}",

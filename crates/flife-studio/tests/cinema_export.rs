@@ -650,8 +650,8 @@ fn export_manifest_v2_provenance_round_trips_and_stays_v1_backward_compatible() 
 /// End-to-end G10 Metal qualification: records a `field-ecology-v2` session
 /// cycling through `V2-16` visual mappings (`CellState`, `Polarity`,
 /// `TrailCarrier`, `VascularConductance`), exports in `SimulationTime` mode at
-/// both **1080p** and **4K** with a torus-spanning `CameraPath`, verifies PNG
-/// + y4m + provenance alignment, and confirms tight-budget 4K export refuses
+/// both **1080p** and **4K** with a torus-spanning `CameraPath`, verifies PNG,
+/// y4m, and provenance alignment, and confirms tight-budget 4K export refuses
 /// without creating `out`.
 #[test]
 fn g10_cinema_1080p_and_4k_simulation_time_export_with_v2_mappings_and_camera() {

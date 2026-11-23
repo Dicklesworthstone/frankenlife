@@ -187,7 +187,7 @@ impl V2ColorMapping {
     pub const fn meaning(self) -> &'static str {
         match self {
             Self::CellState => {
-                "cell state: founder lineage hue darkened for h0 < 0 and lightened for h0 > 0"
+                "cell-state: founder lineage hue darkened for h0 < 0 and lightened for h0 > 0"
             }
             Self::Polarity => {
                 "apical polarity: cyclic perceptual OKLab hue wheel by apical angle, grey when unpolarized"

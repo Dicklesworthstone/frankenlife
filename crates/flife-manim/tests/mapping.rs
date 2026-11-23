@@ -1466,14 +1466,31 @@ fn mix_non_finite_and_density_sphere_reuse_and_zero_population() {
 
     // Zero-population density layer produces all-clear glow and all-black raw.
     let ext = epoch.extent();
+    let half = ext[0].min(ext[1]) * 0.5;
+    let clear_torus = [
+        flife_engine::Intervention::RemoveOrganisms {
+            center: [ext[0] * 0.25, ext[1] * 0.25],
+            radius: half,
+            disposition: flife_engine::Disposition::Remove,
+        },
+        flife_engine::Intervention::RemoveOrganisms {
+            center: [ext[0] * 0.75, ext[1] * 0.25],
+            radius: half,
+            disposition: flife_engine::Disposition::Remove,
+        },
+        flife_engine::Intervention::RemoveOrganisms {
+            center: [ext[0] * 0.25, ext[1] * 0.75],
+            radius: half,
+            disposition: flife_engine::Disposition::Remove,
+        },
+        flife_engine::Intervention::RemoveOrganisms {
+            center: [ext[0] * 0.75, ext[1] * 0.75],
+            radius: half,
+            disposition: flife_engine::Disposition::Remove,
+        },
+    ];
     assert!(matches!(
-        world
-            .step_with(&[flife_engine::Intervention::RemoveOrganisms {
-                center: [ext[0] / 2.0, ext[1] / 2.0],
-                radius: ext[0].hypot(ext[1]),
-                disposition: flife_engine::Disposition::Remove,
-            }])
-            .expect("step"),
+        world.step_with(&clear_torus).expect("step"),
         flife_engine::Stepped::Published(_)
     ));
     let empty = common::epoch(&world);

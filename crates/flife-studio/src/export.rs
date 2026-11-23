@@ -284,11 +284,12 @@ pub fn plan_simulation_samples(
     let rate = f64::from(fps.get());
     let mut samples = Vec::with_capacity(count_usize);
     for frame in 0..count {
-        let tick = start_tick
-            .checked_add(frame.saturating_mul(step))
-            .ok_or_else(|| CoreError::Overflow {
-                quantity: "cinema simulation-time tick",
-            })?;
+        let tick =
+            start_tick
+                .checked_add(frame.saturating_mul(step))
+                .ok_or(CoreError::Overflow {
+                    quantity: "cinema simulation-time tick",
+                })?;
         #[expect(
             clippy::cast_precision_loss,
             reason = "tick and frame counts far below 2^53 are exact in f64"

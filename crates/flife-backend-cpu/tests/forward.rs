@@ -878,17 +878,63 @@ fn flife_backend_cpu_40_output_motor_and_42_output_budding_match_reference() -> 
 fn recurrent_reference_torch_f16_f32_bit_exact() -> Result<(), CoreError> {
     let mut draws = Draws(0x2026_0012);
 
+    struct Suite<'a> {
+        label: &'a str,
+        sensor_w: u32,
+        action_w: u32,
+        state_w: u32,
+        hiddens: &'a [&'a [u32]],
+        count: usize,
+    }
+
     // 1,024 organisms distributed across all 5 catalog hidden shapes for S=2 (108/44)
     // and S=4 (108/44).
-    let suites: [(&str, u32, u32, u32, &[&[u32]], usize); 4] = [
-        ("S=2 108/44 (Bundle A)", 106, 40, 2, &TOPOLOGIES, 1_024),
-        ("S=4 108/44 (FL-054)", 104, 36, 4, &TOPOLOGIES, 1_024),
-        ("S=2 107/41 odd", 105, 37, 2, &[&[5], &[8]], 32),
-        ("S=16 120/68 max-state", 104, 36, 16, &[&[32]], 32),
+    let suites = [
+        Suite {
+            label: "S=2 108/44 (Bundle A)",
+            sensor_w: 106,
+            action_w: 40,
+            state_w: 2,
+            hiddens: &TOPOLOGIES,
+            count: 1_024,
+        },
+        Suite {
+            label: "S=4 108/44 (FL-054)",
+            sensor_w: 104,
+            action_w: 36,
+            state_w: 4,
+            hiddens: &TOPOLOGIES,
+            count: 1_024,
+        },
+        Suite {
+            label: "S=2 107/41 odd",
+            sensor_w: 105,
+            action_w: 37,
+            state_w: 2,
+            hiddens: &[&[5], &[8]],
+            count: 32,
+        },
+        Suite {
+            label: "S=16 120/68 max-state",
+            sensor_w: 104,
+            action_w: 36,
+            state_w: 16,
+            hiddens: &[&[32]],
+            count: 32,
+        },
     ];
 
-    for (suite_idx, &(label, sensor_w, action_w, state_w, hiddens, count)) in
-        suites.iter().enumerate()
+    for (
+        suite_idx,
+        &Suite {
+            label,
+            sensor_w,
+            action_w,
+            state_w,
+            hiddens,
+            count,
+        },
+    ) in suites.iter().enumerate()
     {
         let topologies: Vec<DenseTopology> = hiddens
             .iter()

@@ -128,6 +128,44 @@ pub fn travel_direction(
     Ok([cos, sin])
 }
 
+/// Source `source`'s heterogeneous oasis Gaussian width `σ_j` (`V2-02`) drawn
+/// deterministically from `[sigma_min, sigma_max]` via word 0 of
+/// `(source placement, source, 0, lane (sensing_scale, 0), 0)`.
+///
+/// When `sigma_min == sigma_max`, returns `sigma_min` directly without
+/// rounding drift.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] unless `0 < sigma_min <= sigma_max` and
+/// both are finite.
+pub fn source_sigma(
+    rng: &SemanticRng,
+    source: SourceId,
+    sigma_min: f64,
+    sigma_max: f64,
+) -> Result<f64, CoreError> {
+    if !sigma_min.is_finite() || !sigma_max.is_finite() || sigma_min <= 0.0 || sigma_max < sigma_min
+    {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.oases.sigma_world_units",
+            detail: format!("invalid oasis sigma range [{sigma_min:?}, {sigma_max:?}]"),
+        });
+    }
+    if sigma_min == sigma_max {
+        return Ok(sigma_min);
+    }
+    let [word, ..] = block(
+        rng,
+        Stream::SourcePlacement,
+        source,
+        0,
+        LaneKind::SensingScale,
+        0,
+    )?;
+    let unit = half_open_unit(word);
+    Ok((sigma_min + (sigma_max - sigma_min) * unit).clamp(sigma_min, sigma_max))
+}
+
 /// Source `source` at its initial center with its seeded chemical direction
 /// and total power `power`.
 ///

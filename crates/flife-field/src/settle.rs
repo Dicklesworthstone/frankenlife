@@ -162,6 +162,90 @@ pub struct MotionOrganism {
     pub gradients: [[f64; 2]; MOTION_TERMS],
 }
 
+/// Run-constant parameters for `V2-05` (`so2-motor`) neural chemotaxis,
+/// chiral contour patrol, and energy-scaled guarded heading propulsion.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotorSteeringConstants {
+    /// `v2.motor.energy_gradient_gain` (`κ_E ≥ 0`).
+    pub energy_gradient_gain: f64,
+    /// `v2.motor.chemical_gradient_gain` (`κ_C ≥ 0`).
+    pub chemical_gradient_gain: f64,
+    /// `v2.motor.chiral_contour_gain` (`κ_⊥ ≥ 0`).
+    pub chiral_contour_gain: f64,
+    /// `v2.motor.heading_propulsion_fraction` (`a_prop / a_max ∈ [0, 1]`).
+    pub heading_propulsion_fraction: f64,
+    /// `sensors.internal_energy_scale` (`E_s > 0`).
+    pub internal_energy_scale: f64,
+}
+
+/// Per-organism decoded `V2-05` (`so2-motor`) steering controls, each in
+/// `(-1, 1)` (or `0.0` when disabled / `chemistry-only`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotorSteeringInputs {
+    /// Energy-gradient modulation `m_e`.
+    pub energy_gradient: f64,
+    /// Chemical-gradient modulation `m_c`.
+    pub chemical_gradient: f64,
+    /// Chiral perpendicular contour modulation `m_perp`.
+    pub chiral_contour: f64,
+    /// Guarded heading propulsion modulation `m_prop`.
+    pub heading_propulsion: f64,
+}
+
+impl MotorSteeringInputs {
+    /// Whether all four steering outputs are zero, engaging the exact `v1`
+    /// single-loop acceleration fast-path (0 ulp drift).
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.energy_gradient == 0.0
+            && self.chemical_gradient == 0.0
+            && self.chiral_contour == 0.0
+            && self.heading_propulsion == 0.0
+    }
+}
+
+/// Per-organism `field-ecology-v2` motion extensions paired by index with
+/// [`MotionOrganism`]: `V2-03` (`senescence`) `basal_multiplier` and `V2-05`
+/// (`so2-motor`) decoded [`MotorSteeringInputs`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MotionV2Extras {
+    /// `V2-03` (`senescence`) basal maintenance multiplier `m_age ≥ 1.0`
+    /// (`1.0` when disabled), applied in exact associativity
+    /// `(seconds * constants.basal) * basal_multiplier`.
+    pub basal_multiplier: f64,
+    /// `V2-05` (`so2-motor`) decoded steering outputs (all zero when disabled
+    /// or `chemistry-only`, engaging the exact `v1` fast-path).
+    pub motor: MotorSteeringInputs,
+}
+
+impl Default for MotionV2Extras {
+    fn default() -> Self {
+        Self {
+            basal_multiplier: 1.0,
+            motor: MotorSteeringInputs::default(),
+        }
+    }
+}
+
+impl MotionV2Extras {
+    /// Exact `v1` identity: `basal_multiplier == 1.0` and all motor outputs `0.0`.
+    pub const IDENTITY: Self = Self {
+        basal_multiplier: 1.0,
+        motor: MotorSteeringInputs {
+            energy_gradient: 0.0,
+            chemical_gradient: 0.0,
+            chiral_contour: 0.0,
+            heading_propulsion: 0.0,
+        },
+    };
+
+    /// Whether this organism's extensions match the exact `v1` identity.
+    #[must_use]
+    pub fn is_v1_identity(&self) -> bool {
+        self.basal_multiplier == 1.0 && self.motor.is_zero()
+    }
+}
+
 /// The stage whose exhaustion check found the budget exhausted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExhaustedAt {
@@ -314,6 +398,54 @@ pub trait SettleBackend: std::fmt::Debug + Send {
         out: &mut Vec<MotionOutcome>,
     ) -> Result<(), CoreError>;
 
+    /// Maintenance and motion with `field-ecology-v2` extensions (`V2-03`
+    /// senescence `basal_multiplier` and `V2-05` `so2-motor` steering).
+    ///
+    /// Backends that do not override this delegate directly to
+    /// [`SettleBackend::motion`] when every organism's [`MotionV2Extras`] is
+    /// at the exact `v1` identity, and otherwise return
+    /// [`CoreError::MissingCapability`] so the engine falls back cleanly to
+    /// the reference without silent divergence.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] when `extras.len() != organisms.len()`,
+    /// [`CoreError::NumericalInvalid`] for an invalid `basal_multiplier`,
+    /// [`CoreError::MissingCapability`] when unimplemented for active v2
+    /// extensions, or as [`SettleBackend::motion`].
+    fn motion_v2(
+        &mut self,
+        constants: &MotionConstants,
+        motor_constants: Option<&MotorSteeringConstants>,
+        organisms: &[MotionOrganism],
+        extras: &[MotionV2Extras],
+        out: &mut Vec<MotionOutcome>,
+    ) -> Result<(), CoreError> {
+        if organisms.len() != extras.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "motion v2 extras",
+                detail: format!("{} extras for {} organisms", extras.len(), organisms.len()),
+            });
+        }
+        for (index, extra) in extras.iter().enumerate() {
+            if !extra.basal_multiplier.is_finite() || extra.basal_multiplier < 1.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "motion basal multiplier",
+                    detail: format!(
+                        "organism {index} basal_multiplier {:?} is not finite and >= 1.0",
+                        extra.basal_multiplier
+                    ),
+                });
+            }
+        }
+        if extras.iter().all(MotionV2Extras::is_v1_identity) {
+            return self.motion(constants, organisms, out);
+        }
+        let _ = motor_constants;
+        Err(CoreError::MissingCapability {
+            capability: "v2 motion settlement (senescence / so2-motor)".into(),
+        })
+    }
+
     /// The emission of each organism alive after motion, on `grid` with
     /// transfer efficiency `efficiency`.
     ///
@@ -326,6 +458,41 @@ pub trait SettleBackend: std::fmt::Debug + Send {
         organisms: &[EmissionOrganism],
         out: &mut Vec<EmissionOutcome>,
     ) -> Result<(), CoreError>;
+
+    /// Emission with a `V2-04` (`surplus-emission`) energy floor: each
+    /// organism spends its fraction only out of
+    /// `max(available - energy_floor, 0)`.
+    ///
+    /// When `energy_floor == 0.0`, delegates directly to
+    /// [`SettleBackend::emission`] for bit-exact `v1` parity. Backends that do
+    /// not override this return [`CoreError::MissingCapability`] for positive
+    /// floors so the engine falls back cleanly to the reference.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a negative or nonfinite
+    /// `energy_floor`, [`CoreError::MissingCapability`] when unimplemented
+    /// for a positive floor, or as [`SettleBackend::emission`].
+    fn emission_with_floor(
+        &mut self,
+        grid: &FieldGrid,
+        efficiency: f64,
+        energy_floor: f64,
+        organisms: &[EmissionOrganism],
+        out: &mut Vec<EmissionOutcome>,
+    ) -> Result<(), CoreError> {
+        if !energy_floor.is_finite() || energy_floor < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.emission.surplus_floor.energy_floor",
+                detail: format!("{energy_floor:?} is not finite and nonnegative"),
+            });
+        }
+        if energy_floor == 0.0 {
+            return self.emission(grid, efficiency, organisms, out);
+        }
+        Err(CoreError::MissingCapability {
+            capability: "v2 surplus-emission energy floor".into(),
+        })
+    }
 
     /// The reproduction proposal of each organism alive after emission.
     ///

@@ -21,11 +21,14 @@
 
 use flife_core::ids::SourceId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
-use flife_core::{CoreError, TickSpan, TimeStep, ValidatedConfig};
+use flife_core::numerics::{normalize_turns, sin_cos_turns};
+use flife_core::rng::SemanticRng;
+use flife_core::{CoreError, Tick, TickSpan, TimeStep, V2Feature, ValidatedConfig};
 
 use crate::grid::{FieldGrid, wrap_coordinate};
 use crate::layout::overflow;
 use crate::numerics::exp_neg;
+use crate::seeding::source_sigma;
 use crate::state::{CHANNELS, FieldState};
 
 /// The spatial normalization this module implements.
@@ -50,6 +53,7 @@ pub const FIXED_PER_SOURCE: &str = "fixed-per-source";
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceKernel {
     sigma: f64,
+    cutoff_sigma: f64,
     radius: f64,
     fused: bool,
 }
@@ -91,9 +95,26 @@ impl SourceKernel {
         }
         Ok(Self {
             sigma,
+            cutoff_sigma,
             radius,
             fused,
         })
+    }
+
+    /// The same kernel family and cutoff factor with a different width `sigma`
+    /// (`V2-02` heterogeneous oasis radii).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `sigma` and `sigma * cutoff_sigma`
+    /// are finite and positive.
+    pub fn with_sigma(&self, sigma: f64) -> Result<Self, CoreError> {
+        Self::with_mode(sigma, self.cutoff_sigma, self.fused)
+    }
+
+    /// The cutoff factor `cutoff_sigma` in units of `σ`.
+    #[must_use]
+    pub const fn cutoff_sigma(&self) -> f64 {
+        self.cutoff_sigma
     }
 
     /// Whether simultaneous sources fuse in F64 per cell before one F32 store
@@ -461,6 +482,14 @@ impl SourceSupport {
         &self.amounts
     }
 
+    /// Clear support cells and amounts when a source has zero power this tick
+    /// (`V2-02` inactive oasis), retaining allocated capacity.
+    pub(crate) fn clear_for_zero_power(&mut self) {
+        self.cells.clear();
+        self.weight_sum = 0.0;
+        self.amounts.clear();
+    }
+
     /// `(cell index, k_c / Σ k)` in cell-index order.
     pub fn normalized(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
         self.cells
@@ -554,6 +583,253 @@ impl Source {
     pub const fn power(&self) -> f64 {
         self.power
     }
+
+    /// The same source with a new total power `power` (`V2-02` oasis
+    /// modulation).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a negative or nonfinite power.
+    pub fn with_power(&self, power: f64) -> Result<Self, CoreError> {
+        Self::new(self.id, self.center, self.direction, power)
+    }
+}
+
+/// Phase-staggered ephemeral oasis resource landscape (`V2-02`, slug `oases`).
+///
+/// Modulates each source's power deterministically as a pure function of
+/// committed tick `n` via host-independent [`normalize_turns`] and
+/// [`sin_cos_turns`], normalizing across all `M` sources so total global
+/// injected power stays constant `M × P_base` across every tick while
+/// individual oases bloom and fade.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OasisSchedule {
+    bloom_period_seconds: f64,
+    minimum_power_fraction: f64,
+    sigma_min_world_units: f64,
+    sigma_max_world_units: f64,
+}
+
+impl OasisSchedule {
+    /// Construct an oasis modulation schedule.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `bloom_period_seconds > 0`,
+    /// `minimum_power_fraction ∈ [0, 1]`, and `0 < sigma_min <= sigma_max`
+    /// with all values finite.
+    pub fn new(
+        bloom_period_seconds: f64,
+        minimum_power_fraction: f64,
+        sigma_min_world_units: f64,
+        sigma_max_world_units: f64,
+    ) -> Result<Self, CoreError> {
+        if !bloom_period_seconds.is_finite() || bloom_period_seconds <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.oases.bloom_period_seconds",
+                detail: format!("{bloom_period_seconds:?} is not finite and positive"),
+            });
+        }
+        if !minimum_power_fraction.is_finite() || !(0.0..=1.0).contains(&minimum_power_fraction) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.oases.minimum_power_fraction",
+                detail: format!("{minimum_power_fraction:?} is outside [0, 1]"),
+            });
+        }
+        if !sigma_min_world_units.is_finite()
+            || !sigma_max_world_units.is_finite()
+            || sigma_min_world_units <= 0.0
+            || sigma_max_world_units < sigma_min_world_units
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.oases.sigma_world_units",
+                detail: format!(
+                    "invalid sigma range [{sigma_min_world_units:?}, {sigma_max_world_units:?}]"
+                ),
+            });
+        }
+        Ok(Self {
+            bloom_period_seconds,
+            minimum_power_fraction,
+            sigma_min_world_units,
+            sigma_max_world_units,
+        })
+    }
+
+    /// Resolve `[v2.oases]` from a validated configuration: `None` on `v1` or
+    /// when `V2Feature::Oases` is disabled.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for invalid bounds or when
+    /// `0 < sources.count < 3` with `minimum_power_fraction == 0.0` (which
+    /// hits `0/0 = NaN` at phase zeroes).
+    pub fn from_config(config: &ValidatedConfig) -> Result<Option<Self>, CoreError> {
+        let Some(v2) = config.config().v2.as_ref() else {
+            return Ok(None);
+        };
+        if !v2.is_enabled(V2Feature::Oases) {
+            return Ok(None);
+        }
+        let oases = &v2.oases;
+        let count = config.config().sources.count;
+        if count > 0 && count < 3 && oases.minimum_power_fraction == 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.oases.minimum_power_fraction",
+                detail: format!(
+                    "oases with sources.count = {count} (< 3) and minimum_power_fraction = 0.0 \
+                     can hit 0/0 = NaN at phase zeroes"
+                ),
+            });
+        }
+        let base_sigma = config.config().sources.sigma_world_units;
+        let sigma_min = oases.sigma_min_world_units.unwrap_or(base_sigma);
+        let sigma_max = oases.sigma_max_world_units.unwrap_or(sigma_min);
+        Self::new(
+            oases.bloom_period_seconds,
+            oases.minimum_power_fraction,
+            sigma_min,
+            sigma_max,
+        )
+        .map(Some)
+    }
+
+    /// Bloom period `T_bloom` in simulation-seconds.
+    #[must_use]
+    pub const fn bloom_period_seconds(&self) -> f64 {
+        self.bloom_period_seconds
+    }
+
+    /// Minimum envelope floor `∈ [0, 1]`.
+    #[must_use]
+    pub const fn minimum_power_fraction(&self) -> f64 {
+        self.minimum_power_fraction
+    }
+
+    /// Minimum per-source Gaussian width `σ_min` in world-length.
+    #[must_use]
+    pub const fn sigma_min_world_units(&self) -> f64 {
+        self.sigma_min_world_units
+    }
+
+    /// Maximum per-source Gaussian width `σ_max` in world-length.
+    #[must_use]
+    pub const fn sigma_max_world_units(&self) -> f64 {
+        self.sigma_max_world_units
+    }
+
+    /// Compute constant-total-power modulated source powers `P_j(t)` for
+    /// `count` sources at committed tick `tick` (mid-tick time
+    /// `t = (n + 0.5) Δt`), writing them into `out` (reusing its capacity).
+    ///
+    /// Includes a defensive `sum_w > 0.0` guard returning zero power rather
+    /// than `0/0 = NaN` if called directly with `count < 3` and floor `0.0`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `base_power` is negative/nonfinite
+    /// or the mid-tick phase is nonfinite.
+    pub fn powers_at(
+        &self,
+        tick: Tick,
+        step: TimeStep,
+        count: usize,
+        base_power: f64,
+        out: &mut Vec<f64>,
+    ) -> Result<(), CoreError> {
+        if !base_power.is_finite() || base_power < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sources.power_per_source",
+                detail: format!("{base_power:?} is not finite and nonnegative"),
+            });
+        }
+        out.clear();
+        if count == 0 {
+            return Ok(());
+        }
+        out.resize(count, 0.0);
+        let dt = f64::from(step.numerator()) / f64::from(step.denominator());
+        let mid_time = (tick.get() as f64 + 0.5) * dt;
+        let m_f64 = count as f64;
+        let min_frac = self.minimum_power_fraction;
+        let span = 1.0 - min_frac;
+        let mut sum_w = 0.0;
+        for (j, slot) in out.iter_mut().enumerate() {
+            let u_j = (mid_time / self.bloom_period_seconds) + (j as f64 / m_f64);
+            let phase = normalize_turns(u_j).ok_or_else(|| CoreError::NumericalInvalid {
+                quantity: "oasis phase",
+                detail: format!("u_{j} = {u_j:?} is not finite"),
+            })?;
+            let (sin_val, _) = sin_cos_turns(phase).ok_or_else(|| CoreError::NumericalInvalid {
+                quantity: "oasis phase",
+                detail: format!("normalized phase {phase:?} left [0, 1)"),
+            })?;
+            let pos = sin_val.max(0.0);
+            let w_j = min_frac + span * (pos * pos);
+            *slot = w_j;
+            sum_w += w_j;
+        }
+        let total_power = m_f64 * base_power;
+        if !total_power.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sources.power_per_source",
+                detail: format!("total oasis power {total_power:?} overflows F64"),
+            });
+        }
+        if sum_w > 0.0 && sum_w.is_finite() {
+            for slot in out.iter_mut() {
+                *slot = if *slot == 0.0 {
+                    0.0
+                } else {
+                    total_power * (*slot / sum_w)
+                };
+            }
+        } else {
+            out.fill(0.0);
+        }
+        Ok(())
+    }
+
+    /// Update each source's power in `sources` to its modulated `P_j(t)` at
+    /// committed tick `tick`, reusing `scratch`.
+    ///
+    /// # Errors
+    /// As [`OasisSchedule::powers_at`] and [`Source::with_power`].
+    pub fn apply_powers(
+        &self,
+        tick: Tick,
+        step: TimeStep,
+        base_power: f64,
+        sources: &mut [Source],
+        scratch: &mut Vec<f64>,
+    ) -> Result<(), CoreError> {
+        self.powers_at(tick, step, sources.len(), base_power, scratch)?;
+        for (source, &power) in sources.iter_mut().zip(scratch.iter()) {
+            *source = source.with_power(power)?;
+        }
+        Ok(())
+    }
+
+    /// Deterministically seed one [`SourceKernel`] per source with its
+    /// heterogeneous `σ_j ∈ [sigma_min_world_units, sigma_max_world_units]`,
+    /// preserving `base`'s cutoff factor and fused mode.
+    ///
+    /// # Errors
+    /// As [`source_sigma`] and [`SourceKernel::with_sigma`].
+    pub fn seed_kernels(
+        &self,
+        rng: &SemanticRng,
+        base: &SourceKernel,
+        sources: &[Source],
+    ) -> Result<Vec<SourceKernel>, CoreError> {
+        let mut kernels = Vec::with_capacity(sources.len());
+        for source in sources {
+            let sigma = source_sigma(
+                rng,
+                source.id(),
+                self.sigma_min_world_units,
+                self.sigma_max_world_units,
+            )?;
+            kernels.push(base.with_sigma(sigma)?);
+        }
+        Ok(kernels)
+    }
 }
 
 /// `Σ a_k²` in channel order, in F64: the norm rule for every chemical
@@ -627,6 +903,16 @@ pub fn deposit(
     step: TimeStep,
     support: &mut SourceSupport,
 ) -> Result<DepositReport, CoreError> {
+    if source.power == 0.0 {
+        support.clear_for_zero_power();
+        return Ok(DepositReport {
+            source: source.id,
+            support_cells: 0,
+            declared: 0.0,
+            normalized_total: 0.0,
+            applied: 0.0,
+        });
+    }
     let grid = *state.grid();
     kernel.support_into(&grid, source.center, support)?;
     let report = deposit_energy(state, source, step, support)?;
@@ -650,6 +936,16 @@ pub fn deposit_energy(
     step: TimeStep,
     support: &mut SourceSupport,
 ) -> Result<DepositReport, CoreError> {
+    if source.power == 0.0 {
+        support.amounts.clear();
+        return Ok(DepositReport {
+            source: source.id,
+            support_cells: 0,
+            declared: 0.0,
+            normalized_total: 0.0,
+            applied: 0.0,
+        });
+    }
     let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
     let mut normalized_total = 0.0;
     let mut applied = 0.0;
@@ -684,8 +980,9 @@ pub fn deposit_energy(
 /// source's per-cell amounts into its support for the moment planes.
 ///
 /// # Errors
-/// [`CoreError::LayoutMismatch`] if a support cell falls outside `state`, or
-/// [`CoreError::AllocationFailed`] if `accum` cannot hold the grid's cells.
+/// [`CoreError::LayoutMismatch`] if `sources.len() != supports.len()` or a
+/// support cell falls outside `state`, or [`CoreError::AllocationFailed`] if
+/// `accum` cannot hold the grid's cells.
 pub fn deposit_energy_fused(
     state: &mut FieldState,
     sources: &[Source],
@@ -720,9 +1017,19 @@ pub fn deposit_energy_fused(
 
     let mut reports = Vec::with_capacity(sources.len());
     for (source, support) in sources.iter().zip(supports.iter_mut()) {
+        support.amounts.clear();
+        if source.power == 0.0 {
+            reports.push(DepositReport {
+                source: source.id,
+                support_cells: 0,
+                declared: 0.0,
+                normalized_total: 0.0,
+                applied: 0.0,
+            });
+            continue;
+        }
         let declared = source.power * f64::from(step.numerator()) / f64::from(step.denominator());
         let mut normalized_total = 0.0;
-        support.amounts.clear();
         for (index, weight) in support
             .cells
             .iter()
@@ -752,9 +1059,14 @@ pub fn deposit_energy_fused(
             *cell = after;
         }
     }
-    if let Some((last, leading)) = reports.split_last_mut() {
-        let leading_applied: f64 = leading.iter().map(|r| r.applied).sum();
-        last.applied = total_applied - leading_applied;
+    if let Some(last_active) = reports.iter().rposition(|r| r.declared > 0.0) {
+        let other_applied: f64 = reports
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| index != last_active)
+            .map(|(_, report)| report.applied)
+            .sum();
+        reports[last_active].applied = total_applied - other_applied;
     }
     Ok(reports)
 }

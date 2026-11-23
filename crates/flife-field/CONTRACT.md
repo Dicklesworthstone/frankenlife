@@ -188,6 +188,27 @@
   each buffer at its capacity. `SourceKernel::candidate_bound(grid)`, the most candidate columns and rows one
   support takes (per axis `⌈2r/h⌉ + 5`, at most the axis); `SourceSupport::for_kernel(kernel, grid)`, a support
   with room for any of them; and `FieldWork::reserve_supports(sources, kernel)`, so that no step grows a support.
+- V2 Wave-1 (`V2-02` `oases`, `V2-09` `tight-junctions`, and `settle`/`FieldBackend` v2 seams):
+  - `OasisSchedule` (`sources.rs`) and `source_sigma` (`seeding.rs`, addressed at
+    `(SourcePlacement, source, 0, SensingScale, 0)`): phase-staggered constant-total-power modulation
+    `w_j(t) = min_frac + (1 - min_frac) max(0, sin(2π(t/T + j/M)))²` via host-independent
+    `normalize_turns`/`sin_cos_turns`, enforcing the `M < 3 && min_frac == 0` guard and skipping
+    `power == 0.0` cleanly in `deposit`, `deposit_energy`, `deposit_energy_fused`, and `advance_field_v2_on`
+    (with fused rounding residual attributed to the last active source so dormant oases report `applied == 0.0`).
+    `SourceKernel::cutoff_sigma` and `SourceKernel::with_sigma` support heterogeneous per-source widths `σ_j`.
+  - `BarrierMode` (`harmonic-v1` / `min-v1`), `TightJunctions`, `FluxEdges`, `count_cell_occupancy`,
+    `transport_flux`, `transport_flux_on`, and `transport_flux_range_on(..., plane_range, energy_plane, scratches)`
+    (`transport.rs`): passive symmetric face-conductance diffusion with mandatory `.min(r_x)`/`.min(r_y)` upper
+    clamps and exact IEEE-754 stencil evaluation order
+    `((center * u_c + (r_w * u_w + r_e * u_e)) + (r_s * u_s + r_n * u_n)) as f32` over reusable `plane_range`
+    slices (`0 B` scratch when disabled; admitted through `FieldWork::reserve_flux` and `allocated_bytes`).
+  - `FieldStepOptions` (`BASELINE`), `FieldWork::reserve_supports_for_kernels`, `FieldWork::prepare_tight_junctions`,
+    `advance_field_v2_on`, and `FieldBackend::advance_v2` (default method delegating exact v1 steps to `advance`
+    and refusing active v2 extensions with `CoreError::MissingCapability`).
+  - `MotorSteeringConstants`, `MotorSteeringInputs`, `MotionV2Extras` (`IDENTITY`), `SettleBackend::motion_v2`,
+    and `SettleBackend::emission_with_floor` (`settle.rs`): additive Wave-1 seams for `V2-03` (`basal_multiplier`),
+    `V2-04` (`energy_floor`), and `V2-05` (`so2-motor`), delegating v1 identity to `motion`/`emission` and
+    refusing active v2 parameters with `CoreError::MissingCapability` until a backend overrides them.
 
 **Invariants — representation (FL-003).**
 - Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy

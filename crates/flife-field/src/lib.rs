@@ -75,26 +75,29 @@ pub use pyramid::{
 };
 pub use seeding::{
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, chemical_direction, initial_center,
-    initial_source, travel_direction,
+    initial_source, source_sigma, travel_direction,
 };
 pub use settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
     EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MUTATION_LAYERS,
-    MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome,
-    MutationBirth, MutationConstants, MutationCounts, MutationLayer, MutationValues,
-    ProposalConstants, ProposalOrganism, ProposalOutcome, SettleBackend,
+    MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome, MotionV2Extras,
+    MotorSteeringConstants, MotorSteeringInputs, MovementOutcome, MutationBirth, MutationConstants,
+    MutationCounts, MutationLayer, MutationValues, ProposalConstants, ProposalOrganism,
+    ProposalOutcome, SettleBackend,
 };
 pub use sources::{
-    DepositReport, PathSegment, Source, SourceKernel, SourceSupport, TRUNCATED_GAUSSIAN_FUSED_V1,
-    TRUNCATED_GAUSSIAN_V1, deposit_energy, deposit_energy_fused,
+    DepositReport, OasisSchedule, PathSegment, Source, SourceKernel, SourceSupport,
+    TRUNCATED_GAUSSIAN_FUSED_V1, TRUNCATED_GAUSSIAN_V1, deposit_energy, deposit_energy_fused,
 };
 pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
 pub use step::{
-    FieldBackend, FieldStepReport, FieldWork, advance_field, advance_field_on, reduce_field_on,
-    step_report,
+    FieldBackend, FieldStepOptions, FieldStepReport, FieldWork, advance_field, advance_field_on,
+    advance_field_v2_on, reduce_field_on, step_report,
 };
 pub use transport::{
-    TransportPlan, TransportReport, TransportScratch, energy_report, transport_on,
+    BarrierMode, FluxEdges, HARMONIC_V1, MIN_V1, TightJunctions, TransportPlan, TransportReport,
+    TransportScratch, count_cell_occupancy, energy_report, transport_flux, transport_flux_on,
+    transport_flux_range_on, transport_on,
 };
 pub use uptake::{
     CellDebit, Demand, GrantDebit, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell,

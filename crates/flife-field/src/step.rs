@@ -20,7 +20,8 @@ use crate::sources::{
 };
 use crate::state::{FieldPair, FieldState};
 use crate::transport::{
-    TransportPlan, TransportReport, TransportScratch, sum, transport, transport_on,
+    FluxEdges, TightJunctions, TransportPlan, TransportReport, TransportScratch,
+    count_cell_occupancy, sum, transport, transport_flux_on, transport_on,
 };
 use crate::uptake::{Grants, apply_grants_on};
 
@@ -69,7 +70,11 @@ pub fn advance_field(
     let grid = *next.grid();
     let mut supports = vec![SourceSupport::new(); sources.len()];
     for (source, slot) in sources.iter().zip(&mut supports) {
-        kernel.support_into(&grid, source.center(), slot)?;
+        if source.power() == 0.0 {
+            slot.clear_for_zero_power();
+        } else {
+            kernel.support_into(&grid, source.center(), slot)?;
+        }
     }
     let mut accum = Vec::new();
     let deposits = deposit_energy_fused(next, sources, step, &mut supports, &mut accum)?;
@@ -115,6 +120,34 @@ pub fn step_report(
     }
 }
 
+/// Optional `field-ecology-v2` Phase 2 overrides (`V2-02` heterogeneous
+/// per-source oasis kernels and `V2-09` passive symmetric tight-junction face
+/// conductances). When both are `None`, Phase 2 executes the exact `v1` path
+/// bit for bit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FieldStepOptions<'a> {
+    /// Per-source [`SourceKernel`]s (`V2-02` heterogeneous `σ_j`). Must match
+    /// `sources.len()` when `Some`.
+    pub source_kernels: Option<&'a [SourceKernel]>,
+    /// Precomputed symmetric face conductances (`V2-09` tight junctions /
+    /// `V2-14` vascular field).
+    pub flux_edges: Option<&'a FluxEdges>,
+}
+
+impl FieldStepOptions<'_> {
+    /// Exact `v1` baseline options (uniform kernel and uniform stencil).
+    pub const BASELINE: Self = Self {
+        source_kernels: None,
+        flux_edges: None,
+    };
+
+    /// Whether no v2 Phase 2 override is active.
+    #[must_use]
+    pub const fn is_baseline(&self) -> bool {
+        self.source_kernels.is_none() && self.flux_edges.is_none()
+    }
+}
+
 /// The field backend port (plan §10.7, §11.1): phase 2 of the tick on an
 /// accelerator. The composition root (the CLI, the Studio) chooses an
 /// implementation and gives it to the world; the engine depends only on
@@ -144,6 +177,36 @@ pub trait FieldBackend: std::fmt::Debug + Send {
         sources: &[Source],
         step: TimeStep,
     ) -> Result<FieldStepReport, CoreError>;
+
+    /// [`advance_field_v2_on`]'s step with `field-ecology-v2` Phase 2 options
+    /// (`V2-02` heterogeneous/zero-power oases and `V2-09` flux-form tight
+    /// junctions).
+    ///
+    /// Backends that do not override this delegate directly to
+    /// [`FieldBackend::advance`] when `options.is_baseline()` and every source
+    /// has positive power, and otherwise return [`CoreError::MissingCapability`]
+    /// so the world falls back cleanly to the reference without silent
+    /// divergence.
+    ///
+    /// # Errors
+    /// [`CoreError::MissingCapability`] when unimplemented for active v2
+    /// options, or as [`FieldBackend::advance`].
+    fn advance_v2(
+        &mut self,
+        pair: &mut FieldPair,
+        plan: &TransportPlan,
+        kernel: &SourceKernel,
+        sources: &[Source],
+        step: TimeStep,
+        options: FieldStepOptions<'_>,
+    ) -> Result<FieldStepReport, CoreError> {
+        if options.is_baseline() && sources.iter().all(|source| source.power() > 0.0) {
+            return self.advance(pair, plan, kernel, sources, step);
+        }
+        Err(CoreError::MissingCapability {
+            capability: "v2 field advance (oases / tight-junctions)".into(),
+        })
+    }
 
     /// [`reduce_field_on`]'s phase 9 (FL-032): `grants`' debit, then each
     /// of `deposits` reduced in turn, into `field`, the tick's candidate,
@@ -212,6 +275,12 @@ pub struct FieldWork {
     fused_accum: Vec<Vec<f64>>,
     /// Whether the world's source kernel uses fused per-tick F64 accumulation.
     fused: bool,
+    /// Reusable per-cell organism occupancy scratch (`V2-09` tight junctions).
+    /// Empty (0 bytes) when disabled.
+    cell_occupancy: Vec<u32>,
+    /// Reusable precomputed symmetric face conductances (`V2-09` tight
+    /// junctions). `None` (0 bytes) when disabled.
+    flux_edges: Option<FluxEdges>,
 }
 
 impl FieldWork {
@@ -231,6 +300,8 @@ impl FieldWork {
             supports: Vec::new(),
             fused_accum: Vec::new(),
             fused: false,
+            cell_occupancy: Vec::new(),
+            flux_edges: None,
         };
         work.set_workers(workers)?;
         Ok(work)
@@ -276,8 +347,114 @@ impl FieldWork {
         Ok(())
     }
 
-    /// Bytes its transport scratch, one per worker, and its source supports
-    /// hold (FL-043).
+    /// Give it a support sized individually for each per-source kernel in
+    /// `kernels` (`V2-02` heterogeneous oasis `σ_j`), so steady-state steps
+    /// allocate zero bytes (FL-043).
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] if `kernels` mixes fused and non-fused
+    /// modes, or as [`SourceSupport::for_kernel`]; nothing changes on error.
+    pub fn reserve_supports_for_kernels(
+        &mut self,
+        kernels: &[SourceKernel],
+    ) -> Result<(), CoreError> {
+        let fused = kernels.first().is_some_and(SourceKernel::is_fused);
+        if kernels.iter().any(|kernel| kernel.is_fused() != fused) {
+            return Err(CoreError::StateConflict {
+                operation: "reserve per-source supports",
+                detail: "all per-source kernels must share one fused mode".into(),
+            });
+        }
+        let mut supports = Vec::new();
+        supports
+            .try_reserve_exact(kernels.len())
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "source supports",
+                bytes: flife_core::memory::bytes_for::<SourceSupport>(kernels.len()),
+            })?;
+        for kernel in kernels {
+            supports.push(SourceSupport::for_kernel(kernel, &self.grid)?);
+        }
+        let fused_accum = if fused {
+            let cells = usize::try_from(self.grid.cell_count()).map_err(|_| overflow())?;
+            let lanes = fused_lane_count(self.transport.len())?;
+            allocate_fused_accumulators(cells, lanes)?
+        } else {
+            Vec::new()
+        };
+        self.supports = supports;
+        self.fused_accum = fused_accum;
+        self.fused = fused;
+        Ok(())
+    }
+
+    /// Reserve reusable `cell_occupancy` and `FluxEdges` scratch for `V2-09`
+    /// tight-junction diffusion, admitted against `self.limits` (FL-043 /
+    /// INV-15). Leaves 0 bytes allocated unless called.
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`], [`CoreError::AllocationFailed`], or
+    /// [`CoreError::Overflow`]; nothing changes on error.
+    pub fn reserve_flux(&mut self) -> Result<(), CoreError> {
+        let cells = usize::try_from(self.grid.cell_count()).map_err(|_| overflow())?;
+        let occ_bytes = self.grid.cell_count().checked_mul(4).ok_or_else(overflow)?;
+        self.limits
+            .admit("cell occupancy scratch bytes", occ_bytes)?;
+        let mut occupancy = Vec::new();
+        occupancy
+            .try_reserve_exact(cells)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "cell occupancy scratch",
+                bytes: occ_bytes,
+            })?;
+        occupancy.resize(cells, 0);
+        let edges = FluxEdges::new(&self.grid, &self.limits)?;
+        self.cell_occupancy = occupancy;
+        self.flux_edges = Some(edges);
+        Ok(())
+    }
+
+    /// Recompute `cell_occupancy` and `flux_edges` from post-Phase-1 organism
+    /// `positions` for `barrier` and `plan`, allocating scratch first if
+    /// [`FieldWork::reserve_flux`] has not been called yet.
+    ///
+    /// # Errors
+    /// As [`FieldWork::reserve_flux`], [`count_cell_occupancy`], and
+    /// [`TightJunctions::fill_edges`].
+    pub fn prepare_tight_junctions(
+        &mut self,
+        barrier: &TightJunctions,
+        plan: &TransportPlan,
+        positions: &[[f64; 2]],
+    ) -> Result<&FluxEdges, CoreError> {
+        if self.flux_edges.is_none() {
+            self.reserve_flux()?;
+        }
+        count_cell_occupancy(&self.grid, positions, &mut self.cell_occupancy)?;
+        let Some(edges) = self.flux_edges.as_mut() else {
+            return Err(CoreError::StateConflict {
+                operation: "prepare tight junctions",
+                detail: "flux edge scratch was not initialized".into(),
+            });
+        };
+        barrier.fill_edges(plan, &self.cell_occupancy, edges)?;
+        Ok(&*edges)
+    }
+
+    /// The last computed cell occupancy counts, if `V2-09` scratch is active.
+    #[must_use]
+    pub fn cell_occupancy(&self) -> &[u32] {
+        &self.cell_occupancy
+    }
+
+    /// The last computed flux edges, if `V2-09` scratch is active.
+    #[must_use]
+    pub fn flux_edges(&self) -> Option<&FluxEdges> {
+        self.flux_edges.as_ref()
+    }
+
+    /// Bytes its transport scratch, source supports, and optional `V2-09` flux
+    /// scratch hold (FL-043).
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         total(
@@ -285,6 +462,10 @@ impl FieldWork {
                 capacity_bytes(&self.transport),
                 capacity_bytes(&self.supports),
                 capacity_bytes(&self.fused_accum),
+                capacity_bytes(&self.cell_occupancy),
+                self.flux_edges
+                    .as_ref()
+                    .map_or(0, FluxEdges::allocated_bytes),
             ]
             .into_iter()
             .chain(self.transport.iter().map(TransportScratch::allocated_bytes))
@@ -390,6 +571,52 @@ pub fn advance_field_on(
     step: TimeStep,
     work: &mut FieldWork,
 ) -> Result<FieldStepReport, CoreError> {
+    advance_field_v2_on(
+        pair,
+        plan,
+        kernel,
+        sources,
+        step,
+        FieldStepOptions::BASELINE,
+        work,
+    )
+}
+
+/// [`advance_field_on`] with optional `field-ecology-v2` Phase 2 overrides
+/// (`V2-02` heterogeneous per-source oasis kernels and `V2-09` passive
+/// symmetric tight-junction face conductances).
+///
+/// With [`FieldStepOptions::BASELINE`], executes the exact `v1` baseline
+/// operators bit for bit.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if `options.source_kernels` does not match
+/// `sources.len()`, [`CoreError::StateConflict`] if per-source kernels mix
+/// fused and non-fused modes or a worker panics, or as [`advance_field_on`]
+/// and [`transport_flux_on`].
+pub fn advance_field_v2_on(
+    pair: &mut FieldPair,
+    plan: &TransportPlan,
+    kernel: &SourceKernel,
+    sources: &[Source],
+    step: TimeStep,
+    options: FieldStepOptions<'_>,
+    work: &mut FieldWork,
+) -> Result<FieldStepReport, CoreError> {
+    if let Some(kernels) = options.source_kernels {
+        if kernels.len() != sources.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "per-source kernels",
+                detail: format!("{} kernels for {} sources", kernels.len(), sources.len()),
+            });
+        }
+        if kernels.iter().any(|k| k.is_fused() != kernel.is_fused()) {
+            return Err(CoreError::StateConflict {
+                operation: "advance field",
+                detail: "per-source kernels must share the base kernel's fused mode".into(),
+            });
+        }
+    }
     let FieldWork {
         transport: scratches,
         supports,
@@ -397,13 +624,23 @@ pub fn advance_field_on(
         ..
     } = work;
     let (current, next) = pair.stage();
-    let transported = transport_on(plan, current, next, scratches)?;
+    let transported = match options.flux_edges {
+        Some(edges) => transport_flux_on(plan, edges, current, next, scratches)?,
+        None => transport_on(plan, current, next, scratches)?,
+    };
     if supports.len() < sources.len() {
         supports.resize_with(sources.len(), SourceSupport::new);
     }
     let supports = &mut supports[..sources.len()];
     let grid = *next.grid();
-    let refused = supports_on(kernel, &grid, sources, supports, scratches.len())?;
+    let refused = supports_on(
+        kernel,
+        options.source_kernels,
+        &grid,
+        sources,
+        supports,
+        scratches.len(),
+    )?;
     let supported = refused.as_ref().map_or(sources.len(), |(index, _)| *index);
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
     let channels = usize::try_from(FIELD_PLANES - 1).map_err(|_| overflow())?;
@@ -524,6 +761,7 @@ pub fn advance_field_on(
 /// before its own was refused.
 fn supports_on(
     kernel: &SourceKernel,
+    per_source: Option<&[SourceKernel]>,
     grid: &FieldGrid,
     sources: &[Source],
     supports: &mut [SourceSupport],
@@ -537,7 +775,14 @@ fn supports_on(
             .zip(supports)
             .enumerate()
             .find_map(|(offset, (source, support))| {
-                kernel
+                if source.power() == 0.0 {
+                    support.clear_for_zero_power();
+                    return None;
+                }
+                let active_kernel = per_source
+                    .and_then(|kernels| kernels.get(first + offset))
+                    .unwrap_or(kernel);
+                active_kernel
                     .support_into(grid, source.center(), support)
                     .err()
                     .map(|error| (first + offset, error))

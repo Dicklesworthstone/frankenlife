@@ -25,9 +25,9 @@
 
 use std::ops::Range;
 
-use flife_core::numerics::{expm1_neg, sigmoid};
+use flife_core::numerics::{expm1_neg, shrink_to_left_fold_norm_limit, sigmoid, tanh};
 use flife_core::{CoreError, TimeStep, V2Abi, ValidatedConfig};
-use flife_field::settle::EmissionAction;
+use flife_field::settle::{EmissionAction, MotorSteeringInputs};
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
 
@@ -282,10 +282,30 @@ impl ActionLayout {
         self.so2_motor
     }
 
+    /// Contiguous range of the 4 `so2-motor` outputs `(m_e, m_c, m_perp, m_prop)`,
+    /// if active (`V2-05`).
+    #[must_use]
+    pub const fn motor_slots(&self) -> Option<Range<usize>> {
+        match self.so2_motor {
+            Some(start) => Some(start..(start + SO2_MOTOR_OUTPUTS)),
+            None => None,
+        }
+    }
+
     /// Start index of the 2 `so2-budding` outputs `(o_rad, o_tan)`, if active.
     #[must_use]
     pub const fn so2_budding(&self) -> Option<usize> {
         self.so2_budding
+    }
+
+    /// Contiguous range of the 2 `so2-budding` outputs `(o_rad, o_tan)`,
+    /// if active (`V2-06`).
+    #[must_use]
+    pub const fn budding_slots(&self) -> Option<Range<usize>> {
+        match self.so2_budding {
+            Some(start) => Some(start..(start + SO2_BUDDING_OUTPUTS)),
+            None => None,
+        }
     }
 
     /// Index of the `emt-gate` output `o_adh`, if active.
@@ -294,9 +314,21 @@ impl ActionLayout {
         self.emt_gate
     }
 
+    /// Index of the `emt-gate` output `o_adh`, if active (`V2-08`).
+    #[must_use]
+    pub const fn emt_slot(&self) -> Option<usize> {
+        self.emt_gate
+    }
+
     /// Index of the `wake-offset` neural pump output `o_pump`, if active.
     #[must_use]
     pub const fn wake_pump(&self) -> Option<usize> {
+        self.wake_pump
+    }
+
+    /// Index of the `wake-offset` neural pump output `o_pump`, if active (`V2-04`).
+    #[must_use]
+    pub const fn pump_slot(&self) -> Option<usize> {
         self.wake_pump
     }
 
@@ -455,8 +487,141 @@ impl From<Emission> for EmissionAction {
     }
 }
 
+/// Decoded `so2-motor` (`V2-05`) SO(2)-equivariant steering controls in `[-1, 1]`,
+/// each decoded via host-independent [`flife_core::numerics::tanh`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MotorSteering {
+    /// `m_e = tanh(o_0)`: energy-gradient chemotaxis modulation.
+    pub energy_gradient: f64,
+    /// `m_c = tanh(o_1)`: chemical-gradient chemotaxis modulation.
+    pub chemical_gradient: f64,
+    /// `m_perp = tanh(o_2)`: chiral contour-following modulation (`g^⊥`).
+    pub chiral_contour: f64,
+    /// `m_prop = tanh(o_3)`: guarded heading-propulsion modulation (`ĥ`).
+    pub heading_propulsion: f64,
+}
+
+impl MotorSteering {
+    /// Neutral zero steering (recovers baseline static chemotaxis bit-for-bit).
+    pub const ZERO: Self = Self {
+        energy_gradient: 0.0,
+        chemical_gradient: 0.0,
+        chiral_contour: 0.0,
+        heading_propulsion: 0.0,
+    };
+
+    /// Decode the four linear `so2-motor` logits `[o_e, o_c, o_perp, o_prop]`
+    /// via host-independent [`flife_core::numerics::tanh`].
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if any logit is nonfinite.
+    pub fn decode(raw: [f64; SO2_MOTOR_OUTPUTS]) -> Result<Self, CoreError> {
+        let squash = |index: usize, value: f64| {
+            tanh(value).ok_or_else(|| CoreError::NumericalInvalid {
+                quantity: "so2-motor output",
+                detail: format!("motor output {index} is {value}"),
+            })
+        };
+        Ok(Self {
+            energy_gradient: squash(0, raw[0])?,
+            chemical_gradient: squash(1, raw[1])?,
+            chiral_contour: squash(2, raw[2])?,
+            heading_propulsion: squash(3, raw[3])?,
+        })
+    }
+
+    /// Whether all four steering controls are numerically zero (`±0.0`), enabling
+    /// the bit-exact baseline single-loop motion fast-path.
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.energy_gradient == 0.0
+            && self.chemical_gradient == 0.0
+            && self.chiral_contour == 0.0
+            && self.heading_propulsion == 0.0
+    }
+
+    /// The four decoded controls in canonical slot order
+    /// `[energy_gradient, chemical_gradient, chiral_contour, heading_propulsion]`.
+    #[must_use]
+    pub const fn to_array(&self) -> [f64; SO2_MOTOR_OUTPUTS] {
+        [
+            self.energy_gradient,
+            self.chemical_gradient,
+            self.chiral_contour,
+            self.heading_propulsion,
+        ]
+    }
+}
+
+impl From<MotorSteering> for MotorSteeringInputs {
+    /// Convert decoded `so2-motor` steering to phase 6's plain-data settle port (`V2-05`).
+    fn from(motor: MotorSteering) -> Self {
+        Self {
+            energy_gradient: motor.energy_gradient,
+            chemical_gradient: motor.chemical_gradient,
+            chiral_contour: motor.chiral_contour,
+            heading_propulsion: motor.heading_propulsion,
+        }
+    }
+}
+
+/// Decoded `so2-budding` (`V2-06`) local-frame budding offset
+/// `u_local = clamp_radius([tanh(o_rad), tanh(o_tan)], 1.0)` in the
+/// `(∇̂q, ∇̂q^⊥)` basis, guaranteed to satisfy exact left-fold
+/// `radial² + tangential² <= 1.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct BuddingSteering {
+    /// Radial component along `e_1` (`∇̂q` or fallback unit axis), in `[-1, 1]`.
+    pub radial: f64,
+    /// Tangential component along `e_2 = [-e_1[1], e_1[0]]`, in `[-1, 1]`.
+    pub tangential: f64,
+}
+
+impl BuddingSteering {
+    /// Neutral zero budding offset (places daughter inside `r_local` only).
+    pub const ZERO: Self = Self {
+        radial: 0.0,
+        tangential: 0.0,
+    };
+
+    /// Decode the two linear `so2-budding` logits `[o_rad, o_tan]` via
+    /// host-independent [`flife_core::numerics::tanh`], then radially clamp to
+    /// the unit disk via [`shrink_to_left_fold_norm_limit`].
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if either logit is nonfinite.
+    pub fn decode(raw: [f64; SO2_BUDDING_OUTPUTS]) -> Result<Self, CoreError> {
+        let radial = tanh(raw[0]).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "so2-budding output",
+            detail: format!("budding output 0 is {}", raw[0]),
+        })?;
+        let tangential = tanh(raw[1]).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "so2-budding output",
+            detail: format!("budding output 1 is {}", raw[1]),
+        })?;
+        let mut local = [radial, tangential];
+        shrink_to_left_fold_norm_limit(&mut local, 1.0)?;
+        Ok(Self {
+            radial: local[0],
+            tangential: local[1],
+        })
+    }
+
+    /// Whether both local components are numerically zero (`±0.0`).
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.radial == 0.0 && self.tangential == 0.0
+    }
+
+    /// The decoded local-frame offset `[radial, tangential]`.
+    #[must_use]
+    pub const fn to_array(&self) -> [f64; SO2_BUDDING_OUTPUTS] {
+        [self.radial, self.tangential]
+    }
+}
+
 /// One tick's decoded actions.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct DecodedActions {
     /// `λ = λ_max σ(o_split)`, attempts per second.
     pub attempt_rate: f64,
@@ -469,6 +634,16 @@ pub struct DecodedActions {
     /// The emission proposal: present when the gate is open and the
     /// direction is valid.
     pub emission: Option<Emission>,
+    /// Decoded `so2-motor` (`V2-05`) steering controls, when active in `layout`.
+    pub motor: Option<MotorSteering>,
+    /// Decoded `so2-budding` (`V2-06`) local-frame budding offset, when active in `layout`.
+    pub budding: Option<BuddingSteering>,
+    /// Decoded `emt-gate` (`V2-08`) sigmoid `σ(o_adh) ∈ [0, 1]`, when active in `layout`.
+    /// (`V2-08` multiplies by `2.0` to form the adhesion multiplier `2 σ(o_adh)`.)
+    pub emt_gate: Option<f64>,
+    /// Decoded `wake-offset` (`V2-04`) neural pump control `tanh(o_pump) ∈ [-1, 1]`,
+    /// when `mode = "polarized-pump-v1"` and `pump_direction_mode = "neural-output-v1"`.
+    pub wake_pump: Option<f64>,
 }
 
 /// Decode `raw`, the 36 baseline linear outputs of one controller evaluation,
@@ -487,7 +662,7 @@ pub fn decode(
 
 /// Decode the baseline `0..36` actions from a variable-width slice `raw`
 /// (`raw.len() >= ACTION_WIDTH`) while checking finiteness across every entry
-/// in `raw`.
+/// in `raw`. Optional v2 fields are `None`.
 ///
 /// # Errors
 /// [`CoreError::LayoutMismatch`] if `raw.len() < ACTION_WIDTH`;
@@ -498,13 +673,29 @@ pub fn decode_slice(
     step: TimeStep,
     decoding: &ActionDecoding,
 ) -> Result<DecodedActions, CoreError> {
-    if raw.len() < ACTION_WIDTH {
+    decode_with_layout(raw, step, decoding, &ActionLayout::v1())
+}
+
+/// Decode the baseline `0..36` actions plus any active `field-ecology-v2`
+/// action slots declared by `layout` from `raw`
+/// (`raw.len() >= layout.action_width()`), checking finiteness across every
+/// entry in `raw`.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if `raw.len() < layout.action_width()`;
+/// [`CoreError::NumericalInvalid`] for any nonfinite output, or an emission
+/// direction whose norm overflows.
+pub fn decode_with_layout(
+    raw: &[f64],
+    step: TimeStep,
+    decoding: &ActionDecoding,
+    layout: &ActionLayout,
+) -> Result<DecodedActions, CoreError> {
+    let required = layout.action_width();
+    if raw.len() < required {
         return Err(CoreError::LayoutMismatch {
             buffer: "controller outputs",
-            detail: format!(
-                "expected at least {ACTION_WIDTH} outputs, got {}",
-                raw.len()
-            ),
+            detail: format!("expected at least {required} outputs, got {}", raw.len()),
         });
     }
     if let Some((index, value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {
@@ -562,11 +753,49 @@ pub fn decode_slice(
     } else {
         None
     };
+
+    let motor = match layout.motor_slots() {
+        Some(slots) => {
+            let start = slots.start;
+            Some(MotorSteering::decode([
+                output(start),
+                output(start + 1),
+                output(start + 2),
+                output(start + 3),
+            ])?)
+        }
+        None => None,
+    };
+    let budding = match layout.budding_slots() {
+        Some(slots) => {
+            let start = slots.start;
+            Some(BuddingSteering::decode([output(start), output(start + 1)])?)
+        }
+        None => None,
+    };
+    let emt_gate = match layout.emt_slot() {
+        Some(slot) => Some(squash(slot)?),
+        None => None,
+    };
+    let wake_pump = match layout.pump_slot() {
+        Some(slot) => Some(
+            tanh(output(slot)).ok_or_else(|| CoreError::NumericalInvalid {
+                quantity: "wake-offset pump output",
+                detail: format!("tanh(output {slot}) is undefined"),
+            })?,
+        ),
+        None => None,
+    };
+
     Ok(DecodedActions {
         attempt_rate,
         attempt_probability,
         child_fraction,
         emission_gate,
         emission,
+        motor,
+        budding,
+        emt_gate,
+        wake_pump,
     })
 }

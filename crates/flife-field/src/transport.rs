@@ -22,8 +22,10 @@
 //! `((c·u + r_x·(u_w + u_e)) + r_y·(u_s + u_n))`, evaluated in that order
 //! and rounded once to F32. Decay is `f32(f64(u) × factor)`.
 
+use std::ops::Range;
+
 use flife_core::memory::capacity_bytes;
-use flife_core::{CoreError, TimeStep, ValidatedConfig};
+use flife_core::{CoreError, TimeStep, V2Feature, ValidatedConfig};
 
 use crate::footprint::BufferLimits;
 use crate::grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
@@ -36,6 +38,12 @@ pub const POSITIVE_FIVE_POINT_V1: &str = "positive-five-point-v1";
 
 /// The stability policy this module implements.
 pub const SUBCYCLE: &str = "subcycle";
+
+/// Harmonic face-conductance composition for `V2-09` (`tight-junctions`).
+pub const HARMONIC_V1: &str = "harmonic-v1";
+
+/// Minimum face-conductance composition for `V2-09` (`tight-junctions`).
+pub const MIN_V1: &str = "min-v1";
 
 /// The most substeps one tick may take. A configuration needing more is
 /// refused rather than run at unbounded cost.
@@ -605,6 +613,692 @@ pub fn sum(values: &[f32]) -> f64 {
         .fold(0.0, |total, &value| total + f64::from(value))
 }
 
+/// Face-conductance combination rule for `V2-09` (`tight-junctions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BarrierMode {
+    /// Commutative harmonic mean `2 (φ_c φ_n) / (φ_c + φ_n)`.
+    HarmonicV1,
+    /// Minimum `min(φ_c, φ_n)`.
+    MinV1,
+}
+
+impl BarrierMode {
+    /// Parse a `v2.barrier.mode` identifier.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            HARMONIC_V1 => Some(Self::HarmonicV1),
+            MIN_V1 => Some(Self::MinV1),
+            _ => None,
+        }
+    }
+
+    /// Canonical mode string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HarmonicV1 => HARMONIC_V1,
+            Self::MinV1 => MIN_V1,
+        }
+    }
+}
+
+/// Passive organism-impeded symmetric face diffusion (`V2-09`, slug
+/// `tight-junctions`, 100% pure field-mediated `INV-08`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TightJunctions {
+    mode: BarrierMode,
+    minimum_permeability: f64,
+    occupancy_impedance: f64,
+}
+
+impl TightJunctions {
+    /// Construct a tight-junction permeability rule.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `minimum_permeability ∈ (0, 1]`
+    /// and `occupancy_impedance ≥ 0` are finite.
+    pub fn new(
+        mode: BarrierMode,
+        minimum_permeability: f64,
+        occupancy_impedance: f64,
+    ) -> Result<Self, CoreError> {
+        if !minimum_permeability.is_finite()
+            || minimum_permeability <= 0.0
+            || minimum_permeability > 1.0
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.barrier.minimum_permeability",
+                detail: format!("{minimum_permeability:?} is outside (0, 1]"),
+            });
+        }
+        if !occupancy_impedance.is_finite() || occupancy_impedance < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.barrier.occupancy_impedance",
+                detail: format!("{occupancy_impedance:?} is not finite and nonnegative"),
+            });
+        }
+        Ok(Self {
+            mode,
+            minimum_permeability,
+            occupancy_impedance,
+        })
+    }
+
+    /// Resolve `[v2.barrier]` from a validated configuration: `None` on `v1`
+    /// or when `V2Feature::TightJunctions` is disabled.
+    ///
+    /// # Errors
+    /// [`CoreError::UnknownAlgorithm`] for an unrecognized barrier mode, or as
+    /// [`TightJunctions::new`].
+    pub fn from_config(config: &ValidatedConfig) -> Result<Option<Self>, CoreError> {
+        let Some(v2) = config.config().v2.as_ref() else {
+            return Ok(None);
+        };
+        if !v2.is_enabled(V2Feature::TightJunctions) {
+            return Ok(None);
+        }
+        let barrier = &v2.barrier;
+        let mode =
+            BarrierMode::parse(&barrier.mode).ok_or_else(|| CoreError::UnknownAlgorithm {
+                role: "v2.barrier.mode",
+                name: barrier.mode.clone(),
+            })?;
+        Self::new(
+            mode,
+            barrier.minimum_permeability,
+            barrier.occupancy_impedance,
+        )
+        .map(Some)
+    }
+
+    /// The face-conductance combination mode.
+    #[must_use]
+    pub const fn mode(&self) -> BarrierMode {
+        self.mode
+    }
+
+    /// Minimum permeability `φ_min ∈ (0, 1]`.
+    #[must_use]
+    pub const fn minimum_permeability(&self) -> f64 {
+        self.minimum_permeability
+    }
+
+    /// Occupancy impedance `κ_tj ≥ 0`.
+    #[must_use]
+    pub const fn occupancy_impedance(&self) -> f64 {
+        self.occupancy_impedance
+    }
+
+    /// Cell permeability `φ_c = φ_min + (1 − φ_min) / (1 + κ_tj · n_c)` in F64.
+    #[must_use]
+    #[inline]
+    pub fn cell_permeability(&self, occupancy: u32) -> f64 {
+        self.minimum_permeability
+            + (1.0 - self.minimum_permeability)
+                / (1.0 + self.occupancy_impedance * f64::from(occupancy))
+    }
+
+    /// Precompute symmetric east (`edge_x`) and north (`edge_y`) face
+    /// conductances for `plan` from per-cell organism occupancy `occupancy`
+    /// (`V2-09` single-pass outside the 33/34-plane loop), with mandatory
+    /// upper clamp to `(r_x, r_y)` guaranteeing nonnegative center weights.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if `occupancy` or `edges` does not match
+    /// `plan.grid()`.
+    pub fn fill_edges(
+        &self,
+        plan: &TransportPlan,
+        occupancy: &[u32],
+        edges: &mut FluxEdges,
+    ) -> Result<(), CoreError> {
+        if edges.grid != plan.grid {
+            return Err(mismatch(
+                "flux edges belong to a different grid than the transport plan".into(),
+            ));
+        }
+        let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+        if occupancy.len() != cells || edges.edge_x.len() != cells || edges.edge_y.len() != cells {
+            return Err(mismatch(format!(
+                "tight-junction buffers ({}, {}, {}) do not match {cells} grid cells",
+                occupancy.len(),
+                edges.edge_x.len(),
+                edges.edge_y.len()
+            )));
+        }
+        let width = usize::try_from(plan.grid.cells_x()).map_err(|_| overflow())?;
+        let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
+        let (r_x, r_y) = plan.ratios();
+        for y in 0..height {
+            let row = y * width;
+            let north_row = if y + 1 == height { 0 } else { (y + 1) * width };
+            for x in 0..width {
+                let east = if x + 1 == width { 0 } else { x + 1 };
+                let c = row + x;
+                let phi_c = self.cell_permeability(occupancy[c]);
+                let phi_e = self.cell_permeability(occupancy[row + east]);
+                let phi_n = self.cell_permeability(occupancy[north_row + x]);
+                let (face_x, face_y) = match self.mode {
+                    BarrierMode::HarmonicV1 => {
+                        let fx = r_x * ((2.0 * (phi_c * phi_e)) / (phi_c + phi_e));
+                        let fy = r_y * ((2.0 * (phi_c * phi_n)) / (phi_c + phi_n));
+                        (fx, fy)
+                    }
+                    BarrierMode::MinV1 => (r_x * phi_c.min(phi_e), r_y * phi_c.min(phi_n)),
+                };
+                edges.edge_x[c] = face_x.min(r_x);
+                edges.edge_y[c] = face_y.min(r_y);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Precomputed symmetric east and north face conductances (`edge_x`, `edge_y`)
+/// for doubly-stochastic flux-form diffusion (`V2-09`, reusable by `V2-14`
+/// vascular fields and `V2-15` dual-carrier trails).
+///
+/// `edge_x[c]` is the conductance across the east face of cell `c` (between
+/// `(x, y)` and `((x + 1) mod W, y)`), and `edge_y[c]` is the conductance
+/// across the north face of cell `c` (between `(x, y)` and `(x, (y + 1) mod H)`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FluxEdges {
+    grid: FieldGrid,
+    edge_x: Vec<f64>,
+    edge_y: Vec<f64>,
+}
+
+impl FluxEdges {
+    /// Allocate reusable `(edge_x, edge_y)` face-conductance buffers for
+    /// `grid`, admitted against `limits` (FL-043 / INV-15).
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] above `limits`,
+    /// [`CoreError::AllocationFailed`] if the host refuses, or
+    /// [`CoreError::Overflow`].
+    pub fn new(grid: &FieldGrid, limits: &BufferLimits) -> Result<Self, CoreError> {
+        let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+        let per_axis_bytes = grid.cell_count().checked_mul(8).ok_or_else(overflow)?;
+        let total_bytes = per_axis_bytes.checked_mul(2).ok_or_else(overflow)?;
+        limits.admit("flux edge conductance bytes", total_bytes)?;
+        let mut edge_x = Vec::new();
+        edge_x
+            .try_reserve_exact(cells)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "flux east edge conductances",
+                bytes: per_axis_bytes,
+            })?;
+        edge_x.resize(cells, 0.0);
+        let mut edge_y = Vec::new();
+        edge_y
+            .try_reserve_exact(cells)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "flux north edge conductances",
+                bytes: per_axis_bytes,
+            })?;
+        edge_y.resize(cells, 0.0);
+        Ok(Self {
+            grid: *grid,
+            edge_x,
+            edge_y,
+        })
+    }
+
+    /// Bytes its two face-conductance buffers hold (FL-043).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        capacity_bytes(&self.edge_x).saturating_add(capacity_bytes(&self.edge_y))
+    }
+
+    /// The grid these face conductances belong to.
+    #[must_use]
+    pub const fn grid(&self) -> &FieldGrid {
+        &self.grid
+    }
+
+    /// East face conductances `r^E_c`, in row-major cell order.
+    #[must_use]
+    pub fn edge_x(&self) -> &[f64] {
+        &self.edge_x
+    }
+
+    /// North face conductances `r^N_c`, in row-major cell order.
+    #[must_use]
+    pub fn edge_y(&self) -> &[f64] {
+        &self.edge_y
+    }
+
+    /// Writable east face conductances (for `V2-14` vascular composition).
+    pub fn edge_x_mut(&mut self) -> &mut [f64] {
+        &mut self.edge_x
+    }
+
+    /// Writable north face conductances (for `V2-14` vascular composition).
+    pub fn edge_y_mut(&mut self) -> &mut [f64] {
+        &mut self.edge_y
+    }
+}
+
+/// Exact integer per-cell organism occupancy `n_c` from world positions
+/// (associative/commutative `INV-11`, shared by `V2-09` tight junctions and
+/// `V2-07` `cell-occupancy-v1`), reusing `occupancy`'s allocation.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a nonfinite position, or
+/// [`CoreError::Overflow`] if the grid cell count exceeds `usize`.
+pub fn count_cell_occupancy(
+    grid: &FieldGrid,
+    positions: &[[f64; 2]],
+    occupancy: &mut Vec<u32>,
+) -> Result<(), CoreError> {
+    let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+    occupancy.clear();
+    occupancy.resize(cells, 0);
+    let max_x = grid.cells_x().saturating_sub(1);
+    let max_y = grid.cells_y().saturating_sub(1);
+    let cell_w = grid.cell_width();
+    let cell_h = grid.cell_height();
+    for &position in positions {
+        let [x, y] = grid.wrap_position(position)?;
+        let cx = ((x / cell_w).floor() as u32).min(max_x);
+        let cy = ((y / cell_h).floor() as u32).min(max_y);
+        if let Some(index) = grid.cell_index(cx, cy)
+            && let Some(slot) = occupancy.get_mut(index)
+        {
+            *slot = slot.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+/// Flux-form doubly-stochastic transport and decay of `current` into `next`
+/// using precomputed symmetric face conductances `edges` (`V2-09`).
+///
+/// # Errors
+/// As [`transport_flux_on`].
+pub fn transport_flux(
+    plan: &TransportPlan,
+    edges: &FluxEdges,
+    current: &FieldState,
+    next: &mut FieldState,
+    scratch: &mut TransportScratch,
+) -> Result<TransportReport, CoreError> {
+    transport_flux_on(plan, edges, current, next, std::slice::from_mut(scratch))
+}
+
+/// Flux-form doubly-stochastic transport and decay across all `FIELD_PLANES`
+/// planes split over up to `scratches.len()` threads (`V2-09`).
+///
+/// # Errors
+/// As [`transport_flux_range_on`].
+pub fn transport_flux_on(
+    plan: &TransportPlan,
+    edges: &FluxEdges,
+    current: &FieldState,
+    next: &mut FieldState,
+    scratches: &mut [TransportScratch],
+) -> Result<TransportReport, CoreError> {
+    let planes = usize::try_from(FIELD_PLANES).map_err(|_| overflow())?;
+    transport_flux_range_on(
+        plan,
+        edges,
+        current,
+        next,
+        0..planes,
+        Some(ENERGY_PLANE as usize),
+        scratches,
+    )?
+    .ok_or_else(missing_plane)
+}
+
+fn validate_flux_inputs(
+    plan: &TransportPlan,
+    edges: &FluxEdges,
+    current: &FieldState,
+    next: &FieldState,
+    plane_range: &Range<usize>,
+    scratches: &[TransportScratch],
+) -> Result<usize, CoreError> {
+    if *current.grid() != plan.grid || *next.grid() != plan.grid || edges.grid != plan.grid {
+        return Err(mismatch(
+            "flux transport inputs do not share the transport plan's grid".into(),
+        ));
+    }
+    let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+    if cells == 0 {
+        return Err(missing_plane());
+    }
+    let source_all = current.as_slice();
+    let target_all = next.as_slice();
+    if source_all.len() != target_all.len() || !source_all.len().is_multiple_of(cells) {
+        return Err(missing_plane());
+    }
+    let total_planes = source_all.len() / cells;
+    if plane_range.start > plane_range.end || plane_range.end > total_planes {
+        return Err(mismatch(format!(
+            "plane range {plane_range:?} is outside 0..{total_planes}"
+        )));
+    }
+    if edges.edge_x.len() != cells || edges.edge_y.len() != cells {
+        return Err(mismatch(format!(
+            "flux edges ({}, {}) do not match {cells} grid cells",
+            edges.edge_x.len(),
+            edges.edge_y.len()
+        )));
+    }
+    let (r_x, r_y) = plan.ratios();
+    for (axis, values, bound) in [
+        ("flux edge_x", &edges.edge_x, r_x),
+        ("flux edge_y", &edges.edge_y, r_y),
+    ] {
+        if let Some((cell, &conductance)) = values
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite() || **v < 0.0 || **v > bound)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: axis,
+                detail: format!(
+                    "cell {cell} conductance {conductance:?} is outside [0, {bound:?}]"
+                ),
+            });
+        }
+    }
+    for scratch in scratches {
+        if scratch.cells != scratch.first.len()
+            || scratch.cells != scratch.second.len()
+            || scratch.cells != cells
+        {
+            return Err(mismatch(format!(
+                "transport scratch for {} cells on a grid of {}",
+                scratch.cells,
+                plan.grid.cell_count()
+            )));
+        }
+    }
+    Ok(cells)
+}
+
+/// Flux-form doubly-stochastic transport and decay over `plane_range`
+/// (reusable by `V2-09` tight junctions, `V2-14` vascular fields, and `V2-15`
+/// 34-plane dual-carrier splits).
+///
+/// Evaluates every cell in the exact IEEE-754 order shared with
+/// `field.metal::field_stencil_flux`:
+/// `center = (1.0 - (r_w + r_e)) - (r_s + r_n)`
+/// `next = ((center * u_c + (r_w * u_w + r_e * u_e)) + (r_s * u_s + r_n * u_n)) as f32`.
+///
+/// Returns `Some(TransportReport)` when `energy_plane` lies inside
+/// `plane_range`, else `None`.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] for mismatched grids, buffers, or an
+/// out-of-range `plane_range`; [`CoreError::NumericalInvalid`] if any edge
+/// conductance is nonfinite, negative, or exceeds `(r_x, r_y)`;
+/// [`CoreError::StateConflict`] for empty `scratches` or a panicked worker.
+pub fn transport_flux_range_on(
+    plan: &TransportPlan,
+    edges: &FluxEdges,
+    current: &FieldState,
+    next: &mut FieldState,
+    plane_range: Range<usize>,
+    energy_plane: Option<usize>,
+    scratches: &mut [TransportScratch],
+) -> Result<Option<TransportReport>, CoreError> {
+    let cells = validate_flux_inputs(plan, edges, current, next, &plane_range, scratches)?;
+    let planes = plane_range.len();
+    if planes == 0 {
+        return Ok(None);
+    }
+    let source_all = current.as_slice();
+    let target_all = next.as_mut_slice();
+    let first_plane_index = plane_range.start;
+    let slice_range = first_plane_index * cells..plane_range.end * cells;
+    let source = &source_all[slice_range.clone()];
+    let target = &mut target_all[slice_range];
+    let energy_before = energy_plane
+        .filter(|p| plane_range.contains(p))
+        .map(|p| sum(&source_all[p * cells..(p + 1) * cells]));
+
+    let width = usize::try_from(plan.grid.cells_x()).map_err(|_| overflow())?;
+    let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
+    let flux = FluxCoefficients {
+        edge_x: &edges.edge_x,
+        edge_y: &edges.edge_y,
+        width,
+        height,
+    };
+    let used = scratches.len().min(planes);
+    let per = planes.div_ceil(used.max(1));
+    let run = |first_plane: usize,
+               source: &[f32],
+               target: &mut [f32],
+               scratch: &mut TransportScratch|
+     -> Option<EnergyTerms> {
+        let mut energy = None;
+        for (offset, (source, target)) in source
+            .chunks_exact(cells)
+            .zip(target.chunks_exact_mut(cells))
+            .enumerate()
+        {
+            let is_energy = energy_plane == Some(first_plane + offset);
+            if let Some(terms) =
+                transport_flux_plane(&flux, plan, source, target, scratch, is_energy)
+            {
+                energy = Some(terms);
+            }
+        }
+        energy
+    };
+    let Some((head_scratch, others)) = scratches.split_first_mut() else {
+        return Err(CoreError::StateConflict {
+            operation: "flux transport",
+            detail: "no transport scratch".to_owned(),
+        });
+    };
+    let mut sources = source.chunks(per * cells);
+    let mut targets = target.chunks_mut(per * cells);
+    let (Some(head_source), Some(head_target)) = (sources.next(), targets.next()) else {
+        return Err(missing_plane());
+    };
+    let run = &run;
+    let energy = std::thread::scope(|scope| {
+        let workers: Vec<_> = sources
+            .zip(targets)
+            .zip(others.iter_mut())
+            .enumerate()
+            .map(|(index, ((source, target), scratch))| {
+                scope.spawn(move || {
+                    run(
+                        first_plane_index + (index + 1) * per,
+                        source,
+                        target,
+                        scratch,
+                    )
+                })
+            })
+            .collect();
+        let mut energy = run(first_plane_index, head_source, head_target, head_scratch);
+        for worker in workers {
+            match worker.join() {
+                Ok(terms) => energy = energy.or(terms),
+                Err(_) => {
+                    return Err(CoreError::StateConflict {
+                        operation: "flux transport",
+                        detail: "a transport worker panicked".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(energy)
+    })?;
+    Ok(energy_before.and_then(|before| energy.map(|terms| report(plan, before, terms))))
+}
+
+struct FluxCoefficients<'a> {
+    edge_x: &'a [f64],
+    edge_y: &'a [f64],
+    width: usize,
+    height: usize,
+}
+
+fn transport_flux_plane(
+    flux: &FluxCoefficients<'_>,
+    plan: &TransportPlan,
+    source: &[f32],
+    target: &mut [f32],
+    scratch: &mut TransportScratch,
+    is_energy: bool,
+) -> Option<EnergyTerms> {
+    diffuse_flux(flux, plan.substeps, source, target, scratch);
+    if is_energy {
+        return Some(energy_terms(plan.decay_factor, target));
+    }
+    if plan.decay_factor != 1.0 {
+        decay(target, plan.decay_factor);
+    }
+    None
+}
+
+fn diffuse_flux(
+    flux: &FluxCoefficients<'_>,
+    substeps: u32,
+    source: &[f32],
+    target: &mut [f32],
+    scratch: &mut TransportScratch,
+) {
+    if substeps <= 1 {
+        stencil_flux(flux, source, target);
+        return;
+    }
+    stencil_flux(flux, source, &mut scratch.first);
+    let mut latest_in_first = true;
+    for _ in 2..substeps {
+        if latest_in_first {
+            stencil_flux(flux, &scratch.first, &mut scratch.second);
+        } else {
+            stencil_flux(flux, &scratch.second, &mut scratch.first);
+        }
+        latest_in_first = !latest_in_first;
+    }
+    let last = if latest_in_first {
+        &scratch.first
+    } else {
+        &scratch.second
+    };
+    stencil_flux(flux, last, target);
+}
+
+#[inline]
+fn flux_cell(values: [f32; 5], rates: [f64; 4]) -> f32 {
+    let [u_c, u_w, u_e, u_s, u_n] = values;
+    let [r_w, r_e, r_s, r_n] = rates;
+    let center = (1.0 - (r_w + r_e)) - (r_s + r_n);
+    ((center * f64::from(u_c) + (r_w * f64::from(u_w) + r_e * f64::from(u_e)))
+        + (r_s * f64::from(u_s) + r_n * f64::from(u_n))) as f32
+}
+
+fn stencil_flux(flux: &FluxCoefficients<'_>, source: &[f32], target: &mut [f32]) {
+    let FluxCoefficients {
+        edge_x,
+        edge_y,
+        width,
+        height,
+    } = *flux;
+    match width.checked_mul(height) {
+        Some(cells)
+            if width > 0
+                && source.len() == cells
+                && target.len() == cells
+                && edge_x.len() == cells
+                && edge_y.len() == cells =>
+        {
+            stencil_flux_rows(flux, source, target);
+        }
+        _ => stencil_flux_checked(flux, source, target),
+    }
+}
+
+fn stencil_flux_rows(flux: &FluxCoefficients<'_>, source: &[f32], target: &mut [f32]) {
+    let FluxCoefficients {
+        edge_x,
+        edge_y,
+        width,
+        height,
+    } = *flux;
+    for (y, out) in target.chunks_exact_mut(width).enumerate() {
+        let south = if y == 0 { height - 1 } else { y - 1 };
+        let north = if y + 1 == height { 0 } else { y + 1 };
+        let row = &source[y * width..][..width];
+        let row_south = &source[south * width..][..width];
+        let row_north = &source[north * width..][..width];
+        let ex_row = &edge_x[y * width..][..width];
+        let ey_row = &edge_y[y * width..][..width];
+        let ey_south = &edge_y[south * width..][..width];
+        let edge = |x: usize| {
+            let west = if x == 0 { width - 1 } else { x - 1 };
+            let east = if x + 1 == width { 0 } else { x + 1 };
+            flux_cell(
+                [row[x], row[west], row[east], row_south[x], row_north[x]],
+                [ex_row[west], ex_row[x], ey_south[x], ey_row[x]],
+            )
+        };
+        out[0] = edge(0);
+        if width > 1 {
+            out[width - 1] = edge(width - 1);
+        }
+        if width > 2 {
+            let inner = 1..width - 1;
+            for x in inner {
+                out[x] = flux_cell(
+                    [row[x], row[x - 1], row[x + 1], row_south[x], row_north[x]],
+                    [ex_row[x - 1], ex_row[x], ey_south[x], ey_row[x]],
+                );
+            }
+        }
+    }
+}
+
+fn stencil_flux_checked(flux: &FluxCoefficients<'_>, source: &[f32], target: &mut [f32]) {
+    let FluxCoefficients {
+        edge_x,
+        edge_y,
+        width,
+        height,
+    } = *flux;
+    let at_f32 = |index: usize| source.get(index).copied().unwrap_or(0.0);
+    let at_ex = |index: usize| edge_x.get(index).copied().unwrap_or(0.0);
+    let at_ey = |index: usize| edge_y.get(index).copied().unwrap_or(0.0);
+    for y in 0..height {
+        let south = if y == 0 { height - 1 } else { y - 1 };
+        let north = if y + 1 == height { 0 } else { y + 1 };
+        let (row, row_south, row_north) = (y * width, south * width, north * width);
+        for x in 0..width {
+            let west = if x == 0 { width - 1 } else { x - 1 };
+            let east = if x + 1 == width { 0 } else { x + 1 };
+            let value = flux_cell(
+                [
+                    at_f32(row + x),
+                    at_f32(row + west),
+                    at_f32(row + east),
+                    at_f32(row_south + x),
+                    at_f32(row_north + x),
+                ],
+                [
+                    at_ex(row + west),
+                    at_ex(row + x),
+                    at_ey(row_south + x),
+                    at_ey(row + x),
+                ],
+            );
+            if let Some(slot) = target.get_mut(row + x) {
+                *slot = value;
+            }
+        }
+    }
+}
+
 fn missing_plane() -> CoreError {
     CoreError::LayoutMismatch {
         buffer: BUFFER,
@@ -614,7 +1308,10 @@ fn missing_plane() -> CoreError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Coefficients, stencil_checked, stencil_rows};
+    use super::{
+        Coefficients, FluxCoefficients, stencil_checked, stencil_flux_checked, stencil_flux_rows,
+        stencil_rows,
+    };
 
     /// A deterministic plane with every magnitude class the field holds.
     fn plane(cells: usize, seed: u64) -> Vec<f32> {
@@ -649,6 +1346,33 @@ mod tests {
             let fast: Vec<u32> = fast.iter().map(|v| v.to_bits()).collect();
             let checked: Vec<u32> = checked.iter().map(|v| v.to_bits()).collect();
             assert_eq!(fast, checked, "{width} x {height}");
+        }
+    }
+
+    #[test]
+    fn the_flux_row_stencil_is_the_checked_stencil_bit_for_bit() {
+        for (width, height) in [(1, 1), (1, 4), (2, 1), (2, 3), (3, 3), (7, 5), (32, 32)] {
+            let cells = width * height;
+            let source = plane(cells, (width * 41 + height) as u64);
+            let edge_x: Vec<f64> = (0..cells)
+                .map(|c| 0.01 + 0.14 * ((c % 7) as f64 / 6.0))
+                .collect();
+            let edge_y: Vec<f64> = (0..cells)
+                .map(|c| 0.01 + 0.14 * (((c * 3) % 5) as f64 / 4.0))
+                .collect();
+            let flux = FluxCoefficients {
+                edge_x: &edge_x,
+                edge_y: &edge_y,
+                width,
+                height,
+            };
+            let mut fast = vec![f32::NAN; cells];
+            let mut checked = vec![f32::NAN; cells];
+            stencil_flux_rows(&flux, &source, &mut fast);
+            stencil_flux_checked(&flux, &source, &mut checked);
+            let fast: Vec<u32> = fast.iter().map(|v| v.to_bits()).collect();
+            let checked: Vec<u32> = checked.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(fast, checked, "flux {width} x {height}");
         }
     }
 }

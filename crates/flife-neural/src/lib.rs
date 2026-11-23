@@ -35,8 +35,9 @@ pub mod sensors;
 pub mod weights;
 
 pub use actions::{
-    ACTION_WIDTH, ActionDecoding, ActionLayout, DecodedActions, Emission, MAX_ACTION_WIDTH,
-    MAX_CONTROLLER_OUTPUT_WIDTH, decode, decode_slice,
+    ACTION_WIDTH, ActionDecoding, ActionLayout, BuddingSteering, DecodedActions, EMT_GATE_OUTPUTS,
+    Emission, MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH, MotorSteering, SO2_BUDDING_OUTPUTS,
+    SO2_MOTOR_OUTPUTS, WAKE_PUMP_OUTPUTS, decode, decode_slice, decode_with_layout,
 };
 pub use arena::{ArenaSlot, F16_SLOT_ALIGNMENT_ELEMENTS, Placement, ShardGeometry};
 pub use backend::{BackendBudget, ControllerBackend, ControllerJob};

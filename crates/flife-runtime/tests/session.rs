@@ -1315,9 +1315,15 @@ fn close_during_first_held_step_prevents_second_held_step_from_publishing() {
                 );
                 assert!(out_a.is_none() && out_b.is_none(), "both steps are held");
 
-                // Queue release and close back-to-back so close hits StepA's
-                // cancellation boundary (or before StepA starts), and wait
-                // for all three to settle.
+                // Yield so the owner finishes its post-inspect control drain
+                // and parks in `next_inbound`, then enqueue `release` and
+                // `close` in the same poll before yielding: the owner pops
+                // `release` from `next_inbound`, starts `step_a` in
+                // `release_held`, hits `step_a`'s cancellation boundary where
+                // it drains `close`, and must break before `step_b` runs.
+                for _ in 0..4 {
+                    yield_now().await;
+                }
                 let mut release = std::pin::pin!(handle.release(&cx));
                 let mut close = std::pin::pin!(handle.close(&cx));
                 let mut released = None;
@@ -1328,8 +1334,7 @@ fn close_during_first_held_step_prevents_second_held_step_from_publishing() {
                     {
                         released = Some(v);
                     }
-                    if released.is_some()
-                        && closed_at.is_none()
+                    if closed_at.is_none()
                         && let Poll::Ready(v) = close.as_mut().poll(context)
                     {
                         closed_at = Some(v);

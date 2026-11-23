@@ -47,12 +47,21 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
     and `tanh(ΔE/change_scale)`;
   - `gradients`: the unsaturated `[∂/∂x, ∂/∂y]` of `q` and each `Z_k`, with `∂q = R_scale ∂R/(R + R_scale)²`
     and `∂Z = (∂M − Z ∂R)/(R + R_floor)`. These are what motion uses (§5.4).
-- `decode` returns `DecodedActions`:
+- `decode` / `decode_slice` return `DecodedActions` for the baseline 36 outputs (`motor`, `budding`, `emt_gate`,
+  `wake_pump` all `None`):
   - `attempt_rate = λ_max σ(o_0)` and `attempt_probability = 1 − e^(−λΔt)`;
   - `child_fraction = β_min + (β_max − β_min) σ(o_1)`, clamped to `[β_min, β_max]` as computed;
   - `emission_gate = σ(o_2)`;
   - `emission`: a unit direction from `o_3..o_34` and `spend_fraction = 1 − e^(−r_max σ(o_35) Δt)`, present only
     when the gate is open and the direction is valid.
+- `decode_with_layout` additionally decodes every active `field-ecology-v2` action slot declared by `ActionLayout`:
+  - `motor` (`ActionLayout::motor_slots()`, `V2-05` `so2-motor`): `MotorSteering` decoded via host-independent
+    `flife_core::numerics::tanh` (`m_e, m_c, m_perp, m_prop ∈ [-1, 1]`);
+  - `budding` (`ActionLayout::budding_slots()`, `V2-06` `so2-budding`): `BuddingSteering` decoded from
+    `[tanh(o_rad), tanh(o_tan)]` and radially clamped to exact left-fold unit-disk norm `<= 1.0` via
+    `flife_core::numerics::shrink_to_left_fold_norm_limit`;
+  - `emt_gate` (`ActionLayout::emt_slot()`, `V2-08`): `σ(o_adh) ∈ [0, 1]`;
+  - `wake_pump` (`ActionLayout::pump_slot()`, `V2-04`): `tanh(o_pump) ∈ [-1, 1]`.
 - Index constants for every ABI slot (`VALUES`, `X_DERIVATIVES`, …, `EMISSION_SPEND`), with `SENSOR_WIDTH = 104`,
   `ACTION_WIDTH = 36`, and V2-01 variable-width ceilings `MAX_SENSOR_WIDTH = 128`, `MAX_ACTION_WIDTH = 48`, and
   `MAX_CONTROLLER_OUTPUT_WIDTH = 80`.

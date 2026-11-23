@@ -34,8 +34,9 @@ history and its animation are three views of the same committed state.
 > **Inspiration, not a port.** The visual and mechanical target comes from screenshots of Fraser Price's
 > Neural-Kimchi-4B and its description: about 400,000 particles, each with a distinct untrained, randomly mutated
 > network of roughly 10,000 parameters, interacting only through a 1,000 × 1,000 × 32 field. The screenshots do
-> not give the equations. FrankenLife is therefore an original, explicit rule set (**FieldEcologyV1**) built from
-> the described primitives. It is not affiliated with that project and claims no numerical parity with it.
+> not give the equations. FrankenLife is therefore an original, explicit rule set (**FieldEcologyV1**, extended
+> modularly by **FieldEcologyV2**) built from the described primitives. It is not affiliated with that project
+> and claims no numerical parity with it.
 
 ---
 
@@ -155,6 +156,21 @@ that produced the output it holds, recomputed on the reference and checked again
 and introduction brushes: a click becomes a world-space command the session applies at its next open boundary, reported with
 the tick it applied at and the energy it moved; the host's brush path has not been run in a window here.**
 
+**Modular `field-ecology-v2` (M6 extension) & Cinema export:** `V2-01` adds a 21-slug feature registry
+(`flife --list-features`), default-on per bundle (Bundle A `tissue`: 14 defaults with `[contact]`; Bundle B
+`supercolony`: 13 defaults, strictly `INV-08` pure-field) and founding-only CLI overrides (`--disable`,
+`--enable`, `--v1-compat`, refused on `resume`, `step` and `render --run-dir` per `INV-14`); every
+`field-ecology-v1*` configuration leaves `[v2]` absent so v1 hashes and checkpoints remain byte-identical.
+**Observed:** `V2-02` (`oases`), `V2-06` (`so2-budding`) and `V2-09` (`tight-junctions`) are verified and closed
+alongside `flife-field` (86/86 tests) and `flife-neural` (35/35 tests) at commit `d6352a0`; `V2-16` adds pure
+read-only (`INV-09`) visual mappings (`cell-state-v1`, `polarity-v1`, `trail-carrier`, `vascular-conductance`)
+and Studio keys `8`, `9` and `C` with zero overhead on v1; `FL-050` wires 1080p/4K Cinema export options
+(`--export-size`, `--export-every-ticks`, `--export-camera`) into `flife-studio`; `V2-10` preregistered quickie
+configs (`experiments/v2-quickies/`) and `V2-17` presets (`presets/morphogenesis-tissue-v2.toml`,
+`presets/supercolony-v2.toml`) are authored. Remaining Wave-1b/Wave-2 engine modules (`V2-08`, `V2-11`,
+`V2-12..15`) are in flight, and Stage-2 `V2-10`/`V2-17` multi-seed campaigns have not run yet — **no visual
+(`G5`) or ecological (`G9`) claims are made for `field-ecology-v2` yet.**
+
 | Question | Answer |
 |---|---|
 | Is there a design? | **Yes.** [`COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md`](COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md) (about 2,400 lines, §1–§28 plus Appendices A–E) covers the equations, the tick, data layout, accelerator design, the runtime protocol, rendering, checkpoints, 15 invariants, 11 gates, a complete starter configuration and 17 hand-computable fixtures. Its statements are labelled **Observed**, **Derived**, **Target** or **Hypothesis**; anything unlabelled is a proposed design |
@@ -226,8 +242,9 @@ and is evidence for none of the four.
   inputs.
 - **Brain.** The default network is `104 → 64 → 32 → 36` (9,988 parameters), `tanh` hidden layers and a linear
   output layer. A topology catalog lets offspring move between networks of 1,164 and 29,316 parameters.
-- **Decisions.** The 36 outputs are a reproduction hazard, a child energy share, an emission gate, a 32-dimensional
-  emission direction and an emission spending rate. There is no motor output: motion comes from chemistry.
+- **Decisions.** The 36 baseline outputs are a reproduction hazard, a child energy share, an emission gate, a
+  32-dimensional emission direction and an emission spending rate. There is no motor output in baseline
+  FieldEcologyV1: motion comes from chemistry.
 - **Uptake.** Organisms request energy from the cells under them, and a contended cell grants proportionally in a
   two-pass demand/grant step. No cell is overdrawn, and thread order cannot decide who eats.
 - **Chemistry.** Each granted packet is evaluated separately. A heritable affinity direction `a` decides whether
@@ -262,6 +279,29 @@ internal moves. No correction may silently add energy to make the equation balan
 | 10 | Validate the invariants and publish state, event cursor and accounting together |
 
 Cancellation before phase 10 discards the candidate tick; the last committed world stays authoritative.
+
+### Modular extension: FieldEcologyV2
+
+`field-ecology-v2` layers 21 individually toggleable mechanisms onto the same ten-phase tick and energy ledger
+(`crates/flife-core/src/v2.rs`, `flife --list-features`). Every `field-ecology-v1*` configuration omits `[v2]`
+and stays byte-identical. On `field-ecology-v2`, overrides materialize into explicit `enabled = true/false`
+fields before hashing and are locked at founding time (`INV-14`): `validate`, `capabilities --config`, `run`,
+`render CONFIG`, `experiment` and `transplant` accept ordered `--disable`, `--enable` and `--v1-compat`
+(with convenience aliases `all-v2`, `bundle-a`, `bundle-b`), while `resume`, `step` and `render --run-dir`
+refuse them.
+
+| Group | Slugs (`flife --list-features`) | Boundary |
+|---|---|---|
+| Shared defaults (Bundles A + B) | `senescence`, `surplus-emission`, `wake-offset`, `so2-motor`, `tight-junctions`, `lysis-recycling`, `v2-visual-mappings` | `INV-08` pure-field (`v2-visual-mappings` is `INV-09` display-only) |
+| Bundle A (`tissue`, 14 defaults) | Shared + `hippo-crowding`, `pcp-polarity`, `symplectic-waste`, `epigenetic-recurrence`, `notch-delta`, `trophallaxis`, `cadherin-4d` | Uses `[contact]` (`inv08_pure_field = false`; `hippo-crowding` is mode-dependent) |
+| Bundle B (`supercolony`, 13 defaults) | Shared + `oases`, `excitable-relay`, `so2-budding`, `vascular-field`, `dual-carrier-trails` | Strictly `INV-08` pure-field (no `[contact]`, 34 field planes with dual-carrier trails) |
+| Opt-in (disabled by default) | `emt-gate`, `velocity-alignment` | Uses `[contact]` |
+
+`v2-visual-mappings` (`V2-16`) exposes four pure read-only (`INV-09`) projections with zero overhead on v1:
+`cell-state-v1` (`--color cell-state`, key `8`), `polarity-v1` (`--color polarity`, key `9`, plus bulk apical
+orientation ticks in sphere mode), `trail-carrier` (`--field-mapping trail-carrier`, key `C`) and
+`vascular-conductance` (`--field-mapping vascular-conductance`, key `C`). Stage-2 empirical verification
+(`V2-10` quickies, `V2-17` presets) has not yet run.
 
 ---
 
@@ -397,7 +437,7 @@ FFI sit in reviewed upstream boundary crates), and the project does not claim it
 | **M3** Qualified acceleration | CPU/Metal parity, persistent buffers, fused population inference, variable topology and births | G4 |
 | **M4** Screenshot-scale world | 400k independent networks near 10k parameters on a 1024² field, rendered interactively with honest clocks | G7, G8 |
 | **M5** Scientific and visual release | A seed gallery, ablations, experiment reports, reliable Cinema export, extension examples | G9, G10 |
-| **M6** Additional model families | Recurrent controllers, multi-carrier chemistry or physical boundaries, each with a demonstrated need | Per extension |
+| **M6** Additional model families | Modular `field-ecology-v2` (21 toggleable mechanisms, Bundles A & B): registry, verified field/neural modules (`V2-02`, `V2-06`, `V2-09`), `V2-16` visuals and quickie harness landed; remaining engine modules in flight; empirical verification pending | Per extension |
 
 The gates: **G0** stack compiles at one lockset and its probes pass · **G1** hand fixtures and arithmetic ·
 **G2** a first world that lives, renders and pauses · **G3** checkpoint replay and crash/retry recovery ·
@@ -419,9 +459,13 @@ then live:
 
 ```bash
 cargo run --release -p flife-cli -- capabilities
+cargo run --release -p flife-cli -- --list-features
 cargo run --release -p flife-cli -- validate presets/reference-small-world.toml
+cargo run --release -p flife-cli -- validate presets/supercolony-v2.toml
 cargo run --release -p flife-cli -- run presets/reference-small-world.toml --ticks 1024 --every 128 \
     --metrics-every 128
+cargo run --release -p flife-cli -- run presets/supercolony-v2.toml --ticks 1024 --disable vascular-field
+cargo run --release -p flife-cli -- run presets/morphogenesis-tissue-v2.toml --ticks 1024 --v1-compat
 cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 2560 --every 4 \
     --width 1080 --height 1080 --out frames --video world.mp4
 cargo run --release -p flife-cli -- render presets/reference-small-world.toml --ticks 1200 --every 1200 \
@@ -430,11 +474,11 @@ cargo run --release -p flife-studio -- presets/reference-small-world.toml --widt
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --offscreen 20 --offscreen-zooms
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --timeline session.ndjson
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --export session.ndjson --out export \
-    --export-mp4
+    --export-size 4k --export-fps 60 --export-mp4
 cargo run --release -p flife-studio -- presets/reference-small-world.toml --run studio-run
 cargo run --release -p flife-cli -- resume studio-run --until 20000
 cargo run --release -p flife-cli -- render --run-dir studio-run --ticks 1200 --every 4 \
-    --width 1080 --height 1080 --out frames-run --video run.mp4
+    --width 2160 --height 2160 --fps 60 --out frames-run --video run-4k60.mp4
 ```
 
 Run these from the repository root. The Studio draws through Metal into an AppKit window, so it must be built
@@ -465,7 +509,7 @@ lineage colour by its own energy (`--color lineage-energy`), so well-fed patches
 dark. Against the corrected image statistic of the reference screenshots it scores 0.74 on seed 42 and 0.81–1.57 on three seeds the search
 never saw. Scored the same way, `tissue-world` scores 1.03 and 1.82–2.25, and `contact-world` 1.93 and
 1.92–2.68. `experiments/showcase/README.md` (stage E) has every trial and what the choice does not show.
-The Studio opens it from its 10,954 founders, drawn as the film draws it (keys 1 to 7, R and F change that):
+The Studio opens it from its 10,954 founders, drawn as the film draws it (keys 1 to 7, plus 8 and 9 on v2, R and F change that):
 `cargo run --release -p flife-studio -- presets/confluent-world.toml --color lineage-energy --look sphere --no-field`.
 
 `presets/contact-world.toml` is `tissue-world`, below, under a different model, `field-ecology-v1-contact`.
@@ -507,6 +551,15 @@ the search's first choice: membranes, rings and crescents, which inherited chemi
 networks. `experiments/showcase/README.md` states every selection, every sample's score and the held-out
 seeds.
 
+Two authored `field-ecology-v2` presets (`V2-17` Stage-2 candidates; **awaiting `V2-10`/`V2-17` multi-seed
+verification — not yet verified ecological results**) sit beside them:
+- `presets/morphogenesis-tissue-v2.toml` (Bundle A, `tissue`, `[contact]`): 10,954 founders, ceiling 262,144,
+  320 × 320 × 33 field on an 80-unit torus, 14 active features (108 inputs, 40 actions, 44 raw outputs), drawn in
+  `cell-state-v1`.
+- `presets/supercolony-v2.toml` (Bundle B, `supercolony`, strictly `INV-08` pure-field, no `[contact]`):
+  16,384 founders, ceiling 262,144, 320 × 320 × 34 dual-carrier field with Murray vascular conductances,
+  11 active showcase features (108 inputs, 40 actions).
+
 The Studio opens running (`--paused` to start paused). Space runs or pauses, → or `.` steps one tick while paused,
 and Esc or ⌘W closes. It prints `frankenlife.studio.v1` NDJSON (status changes, a per-second frame summary, a `view`
 record per style change and the closing world digest). With `[presentation] show_clock_telemetry` set, as in the
@@ -526,10 +579,11 @@ while running or paused, and change only the picture:
 | Key | View |
 |---|---|
 | 1 to 7 | colour by lineage, energy (dark to bright), generation (logarithmic), motion (hue for heading, strength for speed), topology (catalog member), chemical affinity (grey for none; like chemistry, like colour) or lineage lit by energy (the lineage's colour, black with no energy, white with about 1.8 times what a birth needs) |
+| 8, 9 | on `field-ecology-v2` with `v2-visual-mappings` enabled: colour by recurrent cell state (`cell-state-v1`) or apical-basal polarity (`polarity-v1`, plus apical ticks in sphere mode); no-op on v1 or when disabled |
 | R | the next look: glow, then raw (no halos, linear grey field), then sphere (raw, each dot shaded as a sphere) |
 | D | density per screen bin instead of dots |
 | F | show or hide the field |
-| C | the field's chemical composition instead of its energy (hue for chemistry, in the affinity mapping's colours, brightness for energy), then its chosen component, then its energy again |
+| C | cycle the field overlay: energy, chemical composition (hue for chemistry, brightness for energy), then chosen component; on `field-ecology-v2` with `v2-visual-mappings` enabled, also cycles `trail-carrier` (Carrier-1 pheromones) and `vascular-conductance` (Murray vessels) |
 | `[` or `]` | the field's chosen component: one moment channel per unit energy, blue (against) through pale to red (along), brightness for energy; again, the previous or next of its 32 channels |
 
 E arms the energy brush, X the removal brush, M the material brush and I the introduction brush (the same key
@@ -584,10 +638,13 @@ Studio rendered. The frames on a constant clock (`--export-fps`, the preset's 30
 on the `PATH` also encodes that video as H.264 into `capture.mp4`, which plays where y4m does not. The samples are
 tagged with what they hold, not converted, and an ffmpeg without libx264 is refused before anything is written. A
 `manifest.json` gives the timeline's and configuration's hashes, the ticks shown, the closing digest, the ffmpeg
-that encoded the MP4 and each file's SHA-256. An export that
-reaches another world than the Studio's is refused, and neither command writes over a file. Plan §13.8's other
-export modes are the command line's: `flife render` draws a configuration on simulation time, and `flife render
---run-dir` draws a kept run from where it would resume. Cinema qualification (FL-050) is later work.
+that encoded the MP4 and each file's SHA-256. An export that reaches another world than the Studio's is refused,
+and neither command writes over a file. FL-050 adds Cinema export controls directly onto `--export`:
+`--export-size 1080p|4k|WxH` (admitted up front against `maximum_total_bytes` per FL-043/INV-15),
+`--export-every-ticks N` (exact simulation-time sampling with zero dropped or repeated slots), and
+`--export-camera FILE` (smooth torus-seam JSON keyframe path). Plan §13.8's other export modes are the command
+line's: `flife render` draws a configuration on simulation time, and `flife render --run-dir` draws a kept run from
+where it would resume. Gate G10 remains open until central verification closes FL-050.
 
 `--run DIR` keeps the Studio's session in a new run directory (FL-024), as `flife run --run-dir` keeps a run: the
 configuration, the command journal (every brush applied is a journaled command under `write-ahead-before-apply`)
@@ -603,8 +660,9 @@ reaches exactly the world an uninterrupted session would. `flife-studio --resume
 where it closed. With `--timeline`, the timeline names the checkpoint it resumed from, which stays pinned in DIR,
 and `--export` (given `DIR/config.toml`) replays it from there.
 
-`render` and `flife-studio` take the same choices as `--color`, `--look glow|raw`, `--density`, `--no-field` and
-`--field-mapping energy|composition|component-C` (C from 0 to 31).
+`render` and `flife-studio` take the same choices as `--color` (v1's seven mappings plus `cell-state` and
+`polarity` on v2), `--look glow|raw|sphere`, `--density`, `--no-field` and `--field-mapping`
+(`energy`, `composition`, `component-C` for C from 0 to 31, plus `trail-carrier` and `vascular-conductance` on v2).
 Every style renders the same world: nine styles of one 1,200-tick render all end at the same digest.
 
 `--controllers metal` evaluates the organisms' controllers on the Mac's GPU, `torch` on FrankenTorch's serial CPU
@@ -666,20 +724,32 @@ at 1,280², 32–34 against 30–41 ms at 2,160²), and its frame differs from t
 bytes, so it would change the written frames (`cargo run --release -p flife-cli --example frame_routes`). The full surface, as planned:
 
 ```bash
-flife validate <config>     # range-check a config; report real memory and the worst admitted allocation (exists)
+flife --list-features       # print all 21 field-ecology-v2 feature slugs, bundle defaults, INV-08 status and ABI impact (exists)
+flife validate <config>     # range-check a config (with optional founding V2 toggles); report memory admission (exists)
 flife capabilities          # what this machine and build can run, each route run against the reference, with explicit refusals (exists)
-flife run <config>          # a headless run (exists)
-flife step <run-dir>        # advance a run N ticks (default 1) past its newest durable tick, its journal replayed first (exists)
+flife run <config>          # a headless run; accepts founding --disable/--enable/--v1-compat (exists)
+flife step <run-dir>        # advance a run N ticks (default 1) past its newest durable tick, its journal replayed first (exists; refuses V2 toggles, INV-14)
 flife inspect               # a run directory's committed world at one checkpoint, every organism and cell (exists)
-flife run --run-dir | resume  # durable, verified world state and exact resumption (exists)
+flife run --run-dir | resume  # durable, verified world state and exact resumption (exists; resume refuses V2 toggles, INV-14)
 flife branch                # control and intervention branches from one checkpoint (exists)
 flife experiment            # seed ensembles, sweeps and ablations against a control, every run cataloged (exists)
 flife discover              # a pinned discovery bundle: reference, selection, thumbnail, full-world export, local package (exists)
 flife transplant            # a local package grafted into a founded host, as a run that resumes (exists)
 flife analyze <dir> <dir>…  # experiments' cataloged effects pooled by condition, refused unless comparable (exists)
-flife render | export       # simulation-time frames and video through FrankenManim; render --run-dir continues a run, branch or transplant from its checkpoint (render exists)
-flife-studio <preset>       # the interactive microscope (exists, macOS)
+flife render | export       # simulation-time frames and video through FrankenManim (including 4K60 and V2 overlays); render --run-dir continues from checkpoint (render exists)
+flife-studio <preset>       # the interactive microscope + headless 1080p/4K Cinema --export (exists, macOS)
 ```
+
+For offline packaging and fresh-install capability verification (plan §20.5, FL-051), `scripts/package-offline.sh`
+stages a self-contained offline bundle (CLI, macOS `FrankenLife Studio.app` bundle, validated presets, license and
+stack notices, live `capabilities.json` and `features.json`, and SHA-256 `MANIFEST.json`) and verifies it in a
+sanitized `env -i` fresh-install environment, including explicit missing-encoder and typed-error refusals.
+
+For the website's 60 fps 4K video pipeline (`web/`), `bun run media:4k60` renders square (`2160 × 2160`) or
+widescreen (`3840 × 2160`) 60 fps films, splits automatically at camera shot boundaries into `<= 22 MiB` closed-GOP
+segments so Cloudflare Workers' 25 MiB per-asset limit never starves bitrate, plays them seamlessly through a
+preloaded dual-`<video>` player with a unified scrubber and tick readout, and optionally writes one unconstrained
+archival 4K60 master outside `public/media/` (`web/README.md`).
 
 Machine output is versioned JSON or NDJSON with stable identifiers and typed errors. Missing accelerator capability,
 budget exhaustion, schema mismatch, incompatible checkpoints, numerical invalidity and cancellation are distinct
@@ -734,11 +804,13 @@ crates/flife-manim/                                   FL-018 FrankenManim adapte
 crates/flife-studio/                                  FL-018 native Studio: typed input controls, session thread, Metal presentation, live e2e test
 crates/flife-backend-cpu/                             FL-025 FrankenTorch CPU controller route: the serial population kernel on the world's lanes, bit-identical to the reference; FL-026 per-topology packed shards
 crates/flife-backend-metal/                           FL-030 fused Metal controller kernel, bit-identical to the reference; FL-026 per-topology parameter shards, each genome uploaded once, behind the engine's controller port; FL-031–FL-032 field step, sensor pyramid, uptake and settle phases behind the engine's ports
-presets/                                              FL-015 reference-small-world: Appendix A plus a declared viability tuning; FL-034's Interactive and Desktop worlds; the showcase worlds (experiments/showcase)
+presets/                                              FL-015 reference-small-world, FL-034 Interactive and Desktop worlds, showcase worlds (experiments/showcase), and authored V2-17 presets (morphogenesis-tissue-v2, supercolony-v2; awaiting verification)
+experiments/v2-quickies/                              V2-10 preregistered Arm 1 (neural agency) and Arm 2 (tissue morphogenesis + H4) verification configs and runner
+scripts/                                              local macOS Studio launcher (studio.sh) and FL-051 offline app/CLI packager & capability smoke verifier (package-offline.sh)
 crates/flife-genome/                                  FL-009 topology catalog, immutable genomes, genome quotas, width/depth transition maps; FL-010 founders and mutation; FL-026 arena slots
 crates/flife-neural/                                  FL-007 104-input sensor encoding and 36-output action decoding; FL-008 reference controller; FL-030 controller backend port
 crates/flife-probes/                                  FL-001 capability probes and the flife-probe binary
-web/                                                  the project's website (Next.js, Cloudflare), showing a film flife render drew; the media stay out of git (web/README.md)
+web/                                                  the project's website (Next.js, Cloudflare), showing a film flife render drew, with 4K60 multi-segment <=25 MiB splitting & dual-<video> playback (web/README.md)
 .beads/                                               the work graph: 61 beads (FL-001 … FL-058 plus 3 follow-on items; JSONL is truth)
 ```
 

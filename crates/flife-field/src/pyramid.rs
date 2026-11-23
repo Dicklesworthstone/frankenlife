@@ -29,7 +29,7 @@ use flife_core::{CoreError, ValidatedConfig};
 
 use crate::exchange::split;
 use crate::footprint::BufferLimits;
-use crate::grid::{FIELD_PLANES, FieldGrid};
+use crate::grid::{DUAL_CARRIER_PLANES, FIELD_PLANES, FieldGrid, field_planes_for_config};
 use crate::numerics::log2;
 use crate::state::FieldState;
 
@@ -39,8 +39,12 @@ pub const POSITIVE_BOX_V1: &str = "positive-box-v1";
 /// The scale blend this module implements.
 pub const LOG_LINEAR_V1: &str = "log-linear-v1";
 
-/// Planes per level: energy density, then 32 moment densities.
+/// Planes per single-carrier level: energy density, then 32 moment densities.
 pub const PLANES: usize = FIELD_PLANES as usize;
+
+/// Planes per 34-plane dual-carrier level (`V2-15`, `FL-055`):
+/// Carrier 0 (`e_0` + 24 moments) + Carrier 1 (`e_1` + 8 trail moments).
+pub const MAX_PLANES: usize = DUAL_CARRIER_PLANES as usize;
 
 const BUFFER: &str = "sensor pyramid level bytes";
 
@@ -57,17 +61,19 @@ pub struct LevelGrid {
     pub spacing_y: f64,
 }
 
-/// Reusable storage for the coarse levels of one grid's pyramid.
+/// Reusable storage for the coarse levels of one grid's pyramid (`33` planes
+/// single-carrier or `34` planes dual-carrier, `V2-15`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SensorPyramid {
     grid: FieldGrid,
+    planes: usize,
     levels: u32,
     /// `coarse[l − 1]` holds level `l` as planar `[plane, y, x]` densities.
     coarse: Vec<Vec<f64>>,
 }
 
 impl SensorPyramid {
-    /// Storage for `levels` coarse levels above `grid`.
+    /// Storage for `levels` coarse levels above `grid` (33 planes single-carrier).
     ///
     /// # Errors
     /// - [`CoreError::NumericalInvalid`] for 32 or more levels, or a grid
@@ -75,6 +81,27 @@ impl SensorPyramid {
     /// - [`CoreError::BudgetExhausted`] for a level above `limits`.
     /// - [`CoreError::AllocationFailed`] if the host refuses.
     pub fn new(grid: FieldGrid, levels: u32, limits: &BufferLimits) -> Result<Self, CoreError> {
+        Self::new_with_planes(grid, levels, PLANES, limits)
+    }
+
+    /// Storage for `levels` coarse levels above `grid` with `planes` (`33` or
+    /// `34`, `V2-15`).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for an unsupported plane count; otherwise
+    /// as [`SensorPyramid::new`].
+    pub fn new_with_planes(
+        grid: FieldGrid,
+        levels: u32,
+        planes: usize,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
+        if planes != PLANES && planes != MAX_PLANES {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor pyramid",
+                detail: format!("{planes} planes where {PLANES} or {MAX_PLANES} are supported"),
+            });
+        }
         let invalid = |detail: String| CoreError::NumericalInvalid {
             quantity: "sensor pyramid levels",
             detail,
@@ -94,7 +121,7 @@ impl SensorPyramid {
         }
         let mut coarse = Vec::new();
         for level in 1..=levels {
-            let elements = PLANES
+            let elements = planes
                 * usize::try_from(grid.cells_x() >> level).map_err(|_| overflow())?
                 * usize::try_from(grid.cells_y() >> level).map_err(|_| overflow())?;
             let bytes = u64::try_from(elements)
@@ -114,18 +141,19 @@ impl SensorPyramid {
         }
         Ok(Self {
             grid,
+            planes,
             levels,
             coarse,
         })
     }
 
-    /// The pyramid a validated configuration needs: its grid and
-    /// `pyramid_levels`.
+    /// The pyramid a validated configuration needs: its grid, plane count
+    /// (`33` single-carrier or `34` dual-carrier) and `pyramid_levels`.
     ///
     /// # Errors
     /// [`CoreError::UnknownAlgorithm`] for another pyramid filter or scale
     /// blend; otherwise as [`FieldGrid::from_config`] and
-    /// [`SensorPyramid::new`].
+    /// [`SensorPyramid::new_with_planes`].
     pub fn from_config(config: &ValidatedConfig, limits: &BufferLimits) -> Result<Self, CoreError> {
         let sensors = &config.config().sensors;
         if sensors.pyramid_filter != POSITIVE_BOX_V1 {
@@ -140,9 +168,11 @@ impl SensorPyramid {
                 name: sensors.pyramid_scale_blend.clone(),
             });
         }
-        Self::new(
+        let planes = field_planes_for_config(config) as usize;
+        Self::new_with_planes(
             FieldGrid::from_config(config)?,
             config.report().pyramid_levels,
+            planes,
             limits,
         )
     }
@@ -151,6 +181,12 @@ impl SensorPyramid {
     #[must_use]
     pub const fn grid(&self) -> &FieldGrid {
         &self.grid
+    }
+
+    /// Planes stored per level (`33` single-carrier or `34` dual-carrier).
+    #[must_use]
+    pub const fn planes(&self) -> usize {
+        self.planes
     }
 
     /// The number of coarse levels `L`; levels run from 0 to `L`.
@@ -226,13 +262,23 @@ impl SensorPyramid {
                 ),
             });
         }
+        let planes = self.planes;
+        if field.planes() as usize != planes {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor pyramid",
+                detail: format!(
+                    "built for {planes} planes, offered a {}-plane field",
+                    field.planes()
+                ),
+            });
+        }
         let area = self.grid.cell_area();
         let inv_area = exact_reciprocal(area);
         let cells_x = usize::try_from(self.grid.cells_x()).map_err(|_| overflow())?;
         let cells_y = usize::try_from(self.grid.cells_y()).map_err(|_| overflow())?;
         let base_cells = cells_x.checked_mul(cells_y).ok_or_else(overflow)?;
         let field_slice = field.as_slice();
-        if self.levels > 0 && field_slice.len() < PLANES.saturating_mul(base_cells) {
+        if self.levels > 0 && field_slice.len() < planes.saturating_mul(base_cells) {
             return Err(CoreError::LayoutMismatch {
                 buffer: "sensor pyramid",
                 detail: "the field does not hold every plane".to_owned(),
@@ -241,7 +287,7 @@ impl SensorPyramid {
         let used = if self.levels == 0 || base_cells < 16_384 {
             1
         } else {
-            workers.clamp(1, PLANES)
+            workers.clamp(1, planes)
         };
         if used == 1 {
             for level in 1..=self.levels {
@@ -271,14 +317,14 @@ impl SensorPyramid {
             // Split each coarse level into disjoint whole-plane slices per
             // worker so all levels `1..=L` of each plane run in one thread
             // scope while staying hot in L2 cache.
-            let per = PLANES.div_ceil(used);
+            let per = planes.div_ceil(used);
             let mut per_worker: Vec<(usize, usize, Vec<&mut [f64]>)> = Vec::with_capacity(used);
             for w in 0..used {
                 let first = w * per;
-                if first >= PLANES {
+                if first >= planes {
                     break;
                 }
-                let count = (PLANES - first).min(per);
+                let count = (planes - first).min(per);
                 per_worker.push((first, count, Vec::with_capacity(self.coarse.len())));
             }
             for (level_idx, level_buf) in self.coarse.iter_mut().enumerate() {
@@ -466,6 +512,27 @@ pub trait SensorBackend: std::fmt::Debug + Send {
         queries: &[SensorQuery],
         samples: &mut Vec<RawSample>,
     ) -> Result<(), CoreError>;
+
+    /// Dual-carrier (`34`-plane, `V2-15`) raw sampling on another device:
+    /// `samples[i]` must equal [`PyramidView::sample_dual`] bit for bit.
+    ///
+    /// Backends that do not override this return [`CoreError::MissingCapability`]
+    /// so the world falls back cleanly to the CPU reference.
+    ///
+    /// # Errors
+    /// [`CoreError::MissingCapability`] when unimplemented, or as
+    /// [`SensorBackend::sample`].
+    fn sample_dual(
+        &mut self,
+        _pyramid: &SensorPyramid,
+        _field: &FieldState,
+        _queries: &[SensorQuery],
+        _samples: &mut Vec<DualRawSample>,
+    ) -> Result<(), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "34-plane dual-carrier sensor sampling".into(),
+        })
+    }
 }
 
 /// `target[y][x] = ¼((a + b) + (c + d))` over the 2×2 block of `source`
@@ -509,6 +576,22 @@ pub struct RawSample {
     pub dy: [f64; PLANES],
 }
 
+/// Raw blended densities and their physical derivatives at one position for a
+/// 34-plane dual-carrier hybrid field (`V2-15`, `FL-055`):
+/// - Plane `0`: `R_0` (Carrier 0 energy density)
+/// - Planes `1..=24`: `M^{(0)}_{0..23}` (Carrier 0 moments)
+/// - Plane `25`: `R_1` (Carrier 1 trail energy density)
+/// - Planes `26..=33`: `M^{(1)}_{0..7}` (Carrier 1 trail moments)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualRawSample {
+    /// All 34 plane densities.
+    pub values: [f64; MAX_PLANES],
+    /// `∂/∂x` of each plane, per world-length.
+    pub dx: [f64; MAX_PLANES],
+    /// `∂/∂y` of each plane, per world-length.
+    pub dy: [f64; MAX_PLANES],
+}
+
 impl PyramidView<'_> {
     /// The pyramid.
     #[must_use]
@@ -521,7 +604,7 @@ impl PyramidView<'_> {
     #[must_use]
     pub fn density(&self, level: u32, plane: usize, x: u32, y: u32) -> Option<f64> {
         let geometry = self.pyramid.level_grid(level)?;
-        if x >= geometry.cells_x || y >= geometry.cells_y || plane >= PLANES {
+        if x >= geometry.cells_x || y >= geometry.cells_y || plane >= self.pyramid.planes {
             return None;
         }
         let cells =
@@ -553,6 +636,15 @@ impl PyramidView<'_> {
     /// [`CoreError::NumericalInvalid`] for a level above the coarsest, a
     /// nonfinite position or a nonfinite result.
     pub fn sample_level(&self, level: u32, position: [f64; 2]) -> Result<RawSample, CoreError> {
+        if self.pyramid.planes != PLANES {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor pyramid",
+                detail: format!(
+                    "sample requires {PLANES} planes, found {}; use sample_dual for 34-plane fields",
+                    self.pyramid.planes
+                ),
+            });
+        }
         let Corners {
             geometry,
             columns: [x0, x1],
@@ -703,6 +795,15 @@ impl PyramidView<'_> {
         queries: &[SensorQuery],
         out: &mut [RawSample],
     ) -> Result<(), CoreError> {
+        if self.pyramid.planes != PLANES {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor pyramid",
+                detail: format!(
+                    "sample_batch requires {PLANES} planes, found {}; use sample_dual_batch for 34-plane fields",
+                    self.pyramid.planes
+                ),
+            });
+        }
         if queries.len() != out.len() {
             return Err(CoreError::LayoutMismatch {
                 buffer: "sensor samples",
@@ -970,6 +1071,201 @@ impl PyramidView<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Raw densities and derivatives of all 34 planes of `level` at `position`
+    /// on a dual-carrier pyramid (`V2-15`).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if this pyramid does not hold 34 planes,
+    /// or as [`PyramidView::sample_level`].
+    pub fn sample_dual_level(
+        &self,
+        level: u32,
+        position: [f64; 2],
+    ) -> Result<DualRawSample, CoreError> {
+        if self.pyramid.planes != MAX_PLANES {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor pyramid",
+                detail: format!(
+                    "sample_dual requires {MAX_PLANES} planes, found {}",
+                    self.pyramid.planes
+                ),
+            });
+        }
+        let Corners {
+            geometry,
+            columns: [x0, x1],
+            rows: [y0, y1],
+            fx,
+            fy,
+        } = self.pyramid.corners(level, position)?;
+        let mut sample = DualRawSample {
+            values: [0.0; MAX_PLANES],
+            dx: [0.0; MAX_PLANES],
+            dy: [0.0; MAX_PLANES],
+        };
+        let missing = || CoreError::LayoutMismatch {
+            buffer: "sensor pyramid",
+            detail: format!("level {level} is missing a corner cell"),
+        };
+        let cx = usize::try_from(geometry.cells_x).map_err(|_| missing())?;
+        let cy = usize::try_from(geometry.cells_y).map_err(|_| missing())?;
+        let cells = cx.checked_mul(cy).ok_or_else(missing)?;
+        let (x0, x1, y0, y1) = (x0 as usize, x1 as usize, y0 as usize, y1 as usize);
+        if x0 >= cx || x1 >= cx || y0 >= cy || y1 >= cy {
+            return Err(missing());
+        }
+        let i00 = y0 * cx + x0;
+        let i10 = y0 * cx + x1;
+        let i01 = y1 * cx + x0;
+        let i11 = y1 * cx + x1;
+        let total_needed = MAX_PLANES.checked_mul(cells).ok_or_else(missing)?;
+        let spacing_x = geometry.spacing_x;
+        let spacing_y = geometry.spacing_y;
+        let inv_sx = exact_reciprocal(spacing_x);
+        let inv_sy = exact_reciprocal(spacing_y);
+        let mut all_finite = true;
+
+        if level == 0 {
+            let data = self.field.as_slice();
+            if data.len() < total_needed {
+                return Err(missing());
+            }
+            let area = self.area;
+            let inv_area = exact_reciprocal(area);
+            for plane in 0..MAX_PLANES {
+                let base = plane * cells;
+                let v00 = div_exact(f64::from(data[base + i00]), area, inv_area);
+                let v10 = div_exact(f64::from(data[base + i10]), area, inv_area);
+                let v01 = div_exact(f64::from(data[base + i01]), area, inv_area);
+                let v11 = div_exact(f64::from(data[base + i11]), area, inv_area);
+                let across_lower = v10 - v00;
+                let across_upper = v11 - v01;
+                let up_left = v01 - v00;
+                let up_right = v11 - v10;
+                let lower = v00 + fx * across_lower;
+                let upper = v01 + fx * across_upper;
+                let value = lower + fy * (upper - lower);
+                let dx = div_exact(
+                    across_lower + fy * (across_upper - across_lower),
+                    spacing_x,
+                    inv_sx,
+                );
+                let dy = div_exact(up_left + fx * (up_right - up_left), spacing_y, inv_sy);
+                all_finite &= value.is_finite() & dx.is_finite() & dy.is_finite();
+                sample.values[plane] = value;
+                sample.dx[plane] = dx;
+                sample.dy[plane] = dy;
+            }
+        } else {
+            let stored = self
+                .pyramid
+                .coarse
+                .get(usize::try_from(level - 1).map_err(|_| missing())?)
+                .ok_or_else(missing)?;
+            if stored.len() < total_needed {
+                return Err(missing());
+            }
+            for plane in 0..MAX_PLANES {
+                let base = plane * cells;
+                let v00 = stored[base + i00];
+                let v10 = stored[base + i10];
+                let v01 = stored[base + i01];
+                let v11 = stored[base + i11];
+                let across_lower = v10 - v00;
+                let across_upper = v11 - v01;
+                let up_left = v01 - v00;
+                let up_right = v11 - v10;
+                let lower = v00 + fx * across_lower;
+                let upper = v01 + fx * across_upper;
+                let value = lower + fy * (upper - lower);
+                let dx = div_exact(
+                    across_lower + fy * (across_upper - across_lower),
+                    spacing_x,
+                    inv_sx,
+                );
+                let dy = div_exact(up_left + fx * (up_right - up_left), spacing_y, inv_sy);
+                all_finite &= value.is_finite() & dx.is_finite() & dy.is_finite();
+                sample.values[plane] = value;
+                sample.dx[plane] = dx;
+                sample.dy[plane] = dy;
+            }
+        }
+        if all_finite {
+            Ok(sample)
+        } else {
+            Err(CoreError::NumericalInvalid {
+                quantity: "sensor sample",
+                detail: "interpolation produced a nonfinite value".into(),
+            })
+        }
+    }
+
+    /// Raw blended densities and derivatives of all 34 planes at `position`
+    /// for sensing scale `scale` on a dual-carrier pyramid (`V2-15`).
+    ///
+    /// # Errors
+    /// As [`PyramidView::blend`] and [`PyramidView::sample_dual_level`].
+    pub fn sample_dual(&self, position: [f64; 2], scale: f64) -> Result<DualRawSample, CoreError> {
+        let (level, t) = self.blend(scale)?;
+        let lower = self.sample_dual_level(level, position)?;
+        if t == 0.0 {
+            return Ok(lower);
+        }
+        let upper = self.sample_dual_level(level + 1, position)?;
+        let lerp = |a: &[f64; MAX_PLANES], b: &[f64; MAX_PLANES]| {
+            let mut out = [0.0; MAX_PLANES];
+            for ((slot, low), high) in out.iter_mut().zip(a).zip(b) {
+                *slot = low + t * (high - low);
+            }
+            out
+        };
+        finite_dual(DualRawSample {
+            values: lerp(&lower.values, &upper.values),
+            dx: lerp(&lower.dx, &upper.dx),
+            dy: lerp(&lower.dy, &upper.dy),
+        })
+    }
+
+    /// Sample a batch of queries into `out` on a 34-plane dual-carrier pyramid
+    /// (`V2-15`), bit-identical to [`PyramidView::sample_dual`] per query.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if `out.len() != queries.len()`, or as
+    /// [`PyramidView::sample_dual`].
+    pub fn sample_dual_batch(
+        &self,
+        queries: &[SensorQuery],
+        out: &mut [DualRawSample],
+    ) -> Result<(), CoreError> {
+        if queries.len() != out.len() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "sensor samples",
+                detail: format!("{} outputs for {} queries", out.len(), queries.len()),
+            });
+        }
+        for (query, sample) in queries.iter().zip(out.iter_mut()) {
+            *sample = self.sample_dual(query.position, query.scale)?;
+        }
+        Ok(())
+    }
+}
+
+fn finite_dual(sample: DualRawSample) -> Result<DualRawSample, CoreError> {
+    let mut all = true;
+    for plane in 0..MAX_PLANES {
+        all &= sample.values[plane].is_finite()
+            & sample.dx[plane].is_finite()
+            & sample.dy[plane].is_finite();
+    }
+    if all {
+        Ok(sample)
+    } else {
+        Err(CoreError::NumericalInvalid {
+            quantity: "sensor sample",
+            detail: "interpolation produced a nonfinite value".into(),
+        })
     }
 }
 

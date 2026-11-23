@@ -70,8 +70,12 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
 - `DenseTopology`: generalized `(input_width <= 128, raw_output_width <= 80)` via `with_io`, `with_io_recurrent`, and
   `from_layouts` alongside `new` and `new_recurrent`; hidden widths, `parameter_count` (`P`, weights plus biases, the
   figure maintenance charges), and each layer's `LayerShape`.
-- `RawOutputs` (inline `Copy` up to 80 F32s) and shared `update_recurrent_state(state, raw_tail, gate_bias, next_state)`
-  so Reference, FrankenTorch CPU, and Metal F16/F32 share one bit-exact gated recurrent transition.
+- `RawOutputs` (inline `Copy` up to 80 F32s), shared `update_recurrent_state(state, raw_tail, gate_bias, next_state)`
+  (`gate_k = sigmoid(f64::from(raw_tail[S + k]) - gate_bias) as f32` with `gate_bias = 0.0` passing `z_g` unmodified
+  for v1 bit-exactness and `b_epi = 2.5` closing the gate to `σ(-2.5) ≈ 0.076`), and pure `rotate_epigenetic_affinity`
+  (`a_eff(h_0) = cos((π/2) h_0) a + sin((π/2) h_0) J a` via `normalize_turns` + `sin_cos_turns` + `symplectic_rotate_channels`
+  + `shrink_to_left_fold_norm_limit`) so Reference, FrankenTorch CPU, and Metal F16/F32 share one bit-exact recurrent
+  transition and clonal caste rotation.
 - `ShardGeometry` (Trap A defense-in-depth): `new_for_dtype` and `fitting_for_dtype` pad F16 `slot_stride_elements`
   to `parameters.next_multiple_of(4)`, guaranteeing 0 F16 Metal alignment deferrals even for odd-output topologies.
 - `ReferenceController::evaluate` (baseline 104/36), `evaluate_raw` (dynamic up to 128/80), `evaluate_recurrent`,

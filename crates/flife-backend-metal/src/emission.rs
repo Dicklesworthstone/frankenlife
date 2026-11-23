@@ -32,7 +32,7 @@ pub const EMISSION_MSL: &str = concat!(
 );
 
 /// `emission.metal`'s layouts, in words.
-const PARAMS: usize = 13;
+const PARAMS: usize = 15;
 const ORGANISM: usize = 9 + 2 * CHANNELS;
 const DIRECTION: usize = 9;
 const OUTCOME: usize = 27;
@@ -143,11 +143,39 @@ impl MetalEmission {
         organisms: &[EmissionOrganism],
         out: &mut Vec<EmissionOutcome>,
     ) -> Result<(), CoreError> {
+        self.settle_with_floor(grid, efficiency, 0.0, organisms, out)
+    }
+
+    /// Settle every organism's emission on `grid` with transfer `efficiency`
+    /// and a `V2-04` (`surplus-emission`) `energy_floor`: each organism spends
+    /// its fraction only out of `max(available - energy_floor, 0)`. When
+    /// `energy_floor == 0.0`, this is bit-identical to [`MetalEmission::settle`].
+    ///
+    /// # Errors
+    /// - [`CoreError::NumericalInvalid`] for an efficiency outside `[0, 1]` or
+    ///   a negative/nonfinite `energy_floor`.
+    /// - Otherwise as [`MetalEmission::settle`].
+    ///
+    /// On error `out` is left empty.
+    pub fn settle_with_floor(
+        &mut self,
+        grid: &FieldGrid,
+        efficiency: f64,
+        energy_floor: f64,
+        organisms: &[EmissionOrganism],
+        out: &mut Vec<EmissionOutcome>,
+    ) -> Result<(), CoreError> {
         out.clear();
         if !(0.0..=1.0).contains(&efficiency) {
             return Err(CoreError::NumericalInvalid {
                 quantity: "emission.transfer_efficiency",
                 detail: format!("{efficiency} is outside [0, 1]"),
+            });
+        }
+        if !energy_floor.is_finite() || energy_floor < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.emission.surplus_floor.energy_floor",
+                detail: format!("{energy_floor} is not a finite nonnegative energy"),
             });
         }
         if grid.cell_count() > u64::from(u32::MAX) {
@@ -166,6 +194,7 @@ impl MetalEmission {
             (7, grid.world_height()),
             (9, grid.cell_width()),
             (11, grid.cell_height()),
+            (13, energy_floor + 0.0),
         ] {
             put(&mut params, at, constant);
         }

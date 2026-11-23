@@ -366,6 +366,10 @@ impl ExperimentCatalog {
 
 impl Drop for ExperimentCatalog {
     fn drop(&mut self) {
-        block_on_inline(self.connection.close_best_effort_in_place());
+        block_on_inline(async {
+            if self.connection.close_in_place().await.is_err() {
+                self.connection.close_best_effort_in_place().await;
+            }
+        });
     }
 }

@@ -44,6 +44,7 @@ use flife_genome::GenomeQuota;
 
 use super::crop::reseal;
 use super::{World, organism_total};
+use crate::emission::INITIAL_SECRETORY_READINESS;
 use crate::intervention::Intervention;
 use crate::lifecycle::Disposition;
 use crate::measure::cell_in_disk;
@@ -289,6 +290,8 @@ impl World {
                         held: HeldOutput::INVALID,
                         phase: stable_phase(id, self.rules.interval)?,
                         cooldown_deadline,
+                        secretory_readiness: INITIAL_SECRETORY_READINESS,
+                        emission_cooldown_deadline: Tick::new(0),
                     },
                     genome,
                 });

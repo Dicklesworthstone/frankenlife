@@ -975,20 +975,23 @@ fn t_asks_to_track_the_selection() {
     assert_eq!(controls.style(), style);
 }
 
-/// FL-019: the digit keys 1 to 7 (`kVK_ANSI_1` … `kVK_ANSI_7`, whose codes
-/// are not in order) choose the seven mappings in order, R cycles the look
-/// (glow, raw, sphere), D and F switch the particles and the field, C cycles
-/// the field's mapping (energy, composition, then the chosen component),
-/// none of them makes an intent, and auto-repeat and ⌘ change nothing.
+/// FL-019 & V2-16: the digit keys 1 to 9 (`kVK_ANSI_1` … `kVK_ANSI_9`, whose
+/// codes are not in order) map 1:1 to `ColorMapping::ALL` (with 8 and 9 gated
+/// on `v2-visual-mappings`), R cycles the look (glow, raw, sphere), D and F
+/// switch the particles and the field, C cycles the field's mapping (energy,
+/// composition, then the chosen component on v1), none of them makes an
+/// intent, and auto-repeat and ⌘ change nothing.
 #[test]
 fn style_keys_choose_the_mapping_look_particles_and_field() {
-    assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22, 26]);
+    assert_eq!(KEY_DIGITS, [18, 19, 20, 21, 23, 22, 26, 28, 25]);
     assert_eq!(ColorMapping::ALL.len(), KEY_DIGITS.len());
     assert_eq!(ColorMapping::ALL[5], ColorMapping::Affinity);
     assert_eq!(ColorMapping::ALL[6], ColorMapping::LineageEnergy);
+    assert_eq!(ColorMapping::ALL[7], ColorMapping::CellState);
+    assert_eq!(ColorMapping::ALL[8], ColorMapping::Polarity);
     let mut controls = Controls::new();
     assert_eq!(controls.style(), Style::default());
-    for (&code, mapping) in KEY_DIGITS.iter().zip(ColorMapping::ALL).rev() {
+    for (&code, mapping) in KEY_DIGITS[..7].iter().zip(ColorMapping::V1_ALL).rev() {
         assert!(tap(&mut controls, code).is_empty());
         assert_eq!(controls.style().mapping, mapping, "key {code}");
     }
@@ -1209,30 +1212,26 @@ fn non_finite_pointer_motion_never_triggers_drag_or_corrupts_click() {
 }
 
 /// V2-16: keys 8 (`cell-state-v1`), 9 (`polarity-v1`), and the extended `C`
-/// field overlay cycle (`trail-carrier`, `vascular-conductance`) are strictly
-/// gated on `v2-visual-mappings` (no-ops on v1 / when disabled), ignore
-/// auto-repeat and `⌘`, and clear cleanly on keys `1..7` or `[`/`]`.
+/// field overlay cycle (`trail-carrier`, `vascular-conductance`) act directly
+/// on [`Style`] when `v2-visual-mappings` is enabled, are no-ops / 3-way v1
+/// cycle when disabled, ignore auto-repeat and `⌘`, and clear cleanly on keys
+/// `1..7`, `[`/`]`, or disabling `v2-visual-mappings`.
 #[test]
 fn v2_visual_keys_8_9_and_c_cycle_gate_cleanly_on_feature_flag() {
-    use flife_studio::{FieldOverlayKind, KEY_8, KEY_9, KEY_V2_DIGITS, V2ColorMapping};
+    use flife_studio::{KEY_8, KEY_9, KEY_V2_DIGITS};
 
     assert_eq!(KEY_8, 28, "kVK_ANSI_8");
     assert_eq!(KEY_9, 25, "kVK_ANSI_9");
     assert_eq!(KEY_V2_DIGITS, [KEY_8, KEY_9]);
-    assert_eq!(V2ColorMapping::ALL.len(), KEY_V2_DIGITS.len());
+    assert_eq!(&KEY_DIGITS[7..], KEY_V2_DIGITS.as_slice());
 
     // Default (`v2_visual_enabled == false`, v1 or `--disable v2-visual-mappings`):
-    // 8 and 9 are no-ops, setters stay None, and C runs the 3-way v1 cycle.
+    // 8 and 9 are no-ops and C runs the 3-way v1 cycle.
     let mut v1 = Controls::new();
     assert!(!v1.v2_visual_enabled());
     assert!(tap(&mut v1, KEY_8).is_empty());
     assert!(tap(&mut v1, KEY_9).is_empty());
-    assert_eq!(v1.v2_mapping(), None);
-    assert_eq!(v1.field_overlay(), None);
-    v1.set_v2_mapping(Some(V2ColorMapping::CellState));
-    v1.set_field_overlay(Some(FieldOverlayKind::TrailCarrier));
-    assert_eq!(v1.v2_mapping(), None);
-    assert_eq!(v1.field_overlay(), None);
+    assert_eq!(v1.style().mapping, ColorMapping::Lineage);
     for expected in [
         FieldMapping::Composition,
         FieldMapping::Component(FieldComponent::default()),
@@ -1240,7 +1239,6 @@ fn v2_visual_keys_8_9_and_c_cycle_gate_cleanly_on_feature_flag() {
     ] {
         assert!(tap(&mut v1, KEY_C).is_empty());
         assert_eq!(v1.style().field_mapping, expected);
-        assert_eq!(v1.field_overlay(), None);
     }
 
     // Enabled (`v2-visual-mappings` active):
@@ -1257,52 +1255,46 @@ fn v2_visual_keys_8_9_and_c_cycle_gate_cleanly_on_feature_flag() {
     v2.apply(&key(KEY_8, true, false, command));
     v2.apply(&key(KEY_9, true, true, Modifiers::NONE));
     v2.apply(&key(KEY_9, true, false, command));
-    assert_eq!(v2.v2_mapping(), None);
+    assert_eq!(v2.style().mapping, ColorMapping::Lineage);
 
-    // Keys 8 and 9 select CellState and Polarity; keys 1..7 clear back to v1 mapping.
+    // Keys 8 and 9 select CellState and Polarity directly on Style; 1..7 switch back.
     assert!(tap(&mut v2, KEY_8).is_empty());
-    assert_eq!(v2.v2_mapping(), Some(V2ColorMapping::CellState));
+    assert_eq!(v2.style().mapping, ColorMapping::CellState);
     assert!(tap(&mut v2, KEY_9).is_empty());
-    assert_eq!(v2.v2_mapping(), Some(V2ColorMapping::Polarity));
+    assert_eq!(v2.style().mapping, ColorMapping::Polarity);
     assert!(tap(&mut v2, KEY_DIGITS[1]).is_empty());
-    assert_eq!(v2.v2_mapping(), None);
     assert_eq!(v2.style().mapping, ColorMapping::Energy);
 
-    // Extended 5-way C cycle: Energy -> Composition -> Component -> TrailCarrier -> VascularConductance -> Energy.
+    // Extended 5-way C cycle directly on Style::field_mapping.
     let expected_cycle = [
-        (FieldMapping::Composition, None),
-        (FieldMapping::Component(FieldComponent::default()), None),
-        (FieldMapping::Energy, Some(FieldOverlayKind::TrailCarrier)),
-        (
-            FieldMapping::Energy,
-            Some(FieldOverlayKind::VascularConductance),
-        ),
-        (FieldMapping::Energy, None),
+        FieldMapping::Composition,
+        FieldMapping::Component(FieldComponent::default()),
+        FieldMapping::TrailCarrier,
+        FieldMapping::VascularConductance,
+        FieldMapping::Energy,
     ];
-    for (mapping, overlay) in expected_cycle {
+    for expected in expected_cycle {
         assert!(tap(&mut v2, KEY_C).is_empty());
-        assert_eq!(v2.style().field_mapping, mapping);
-        assert_eq!(v2.field_overlay(), overlay);
+        assert_eq!(v2.style().field_mapping, expected);
     }
 
-    // Pressing `[` or `]` while on a v2 overlay clears the overlay and selects Component.
+    // Pressing `[` or `]` while on a v2 overlay selects Component cleanly.
     for _ in 0..3 {
         tap(&mut v2, KEY_C);
     }
-    assert_eq!(v2.field_overlay(), Some(FieldOverlayKind::TrailCarrier));
+    assert_eq!(v2.style().field_mapping, FieldMapping::TrailCarrier);
     assert!(tap(&mut v2, KEY_RIGHT_BRACKET).is_empty());
-    assert_eq!(v2.field_overlay(), None);
     assert_eq!(
         v2.style().field_mapping,
         FieldMapping::Component(FieldComponent::default())
     );
 
-    // Disabling v2-visual-mappings clears active v2 selections immediately.
+    // Disabling v2-visual-mappings resets active v2 selections back to v1 defaults.
     tap(&mut v2, KEY_8);
     tap(&mut v2, KEY_C);
-    assert_eq!(v2.v2_mapping(), Some(V2ColorMapping::CellState));
-    assert_eq!(v2.field_overlay(), Some(FieldOverlayKind::TrailCarrier));
+    assert_eq!(v2.style().mapping, ColorMapping::CellState);
+    assert_eq!(v2.style().field_mapping, FieldMapping::TrailCarrier);
     v2.set_v2_visual_enabled(false);
-    assert_eq!(v2.v2_mapping(), None);
-    assert_eq!(v2.field_overlay(), None);
+    assert_eq!(v2.style().mapping, ColorMapping::Lineage);
+    assert_eq!(v2.style().field_mapping, FieldMapping::Energy);
 }

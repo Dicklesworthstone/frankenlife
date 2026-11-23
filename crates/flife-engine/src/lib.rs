@@ -64,8 +64,12 @@ pub use ancestry::{
 pub use chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, settle_efficiencies,
 };
-pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement};
-pub use emission::{EmissionPolicy, EmissionSettlement, NEXT_TICK_VISIBILITY, POST_MOTION};
+pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement, senescence_multiplier};
+pub use emission::{
+    EmissionContext, EmissionOffsetRule, EmissionPlan, EmissionPolicy, EmissionSettlement,
+    EmissionV2Rules, ExcitableMode, INITIAL_SECRETORY_READINESS, NEXT_TICK_VISIBILITY, OffsetMode,
+    POST_MOTION, PumpDirection, SurplusFloorRule,
+};
 pub use inspect::{
     Activations, ControllerWeights, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS,
     ReproductionOutcome, Sensed, Transactions,
@@ -78,7 +82,9 @@ pub use lifecycle::{
     GENETIC_AFFINITY, Recycling, TinyEnergyPolicy, Vitality,
 };
 pub use measure::RegionMeasurement;
-pub use motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
+pub use motion::{
+    HEADING_EPS, Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio,
+};
 pub use population::{
     Arrangement, Ascending, Collected, Entrant, HeldOutput, Organism, POPULATION_DIGEST_SCHEMA,
     Population,
@@ -88,13 +94,14 @@ pub use reproduction::{
     CapacityPolicy, CapacityShortfall, Identities, NEXT_TICK_ACTIVATION, Newborn, Offspring,
     ParentState, PopulationQuota, REFUSE_EXCESS_BIRTHS, RefusedBirth, RejectedBirth, Reproduction,
     ReproductionProposal, ReproductionRules, Split, Unviable, Viability, admission_key,
-    resolve_births, resolve_births_with, resolve_births_with_workers,
+    hippo_attempt_probability, hippo_crowding_sensor, hippo_gate, resolve_births,
+    resolve_births_with, resolve_births_with_workers,
 };
 pub use world::{
-    Advance, BirthEvent, CPU_REFERENCE, Candidate, CarrierSpec, ControllerReport, FieldReport,
-    Footprint, Graft, IntroductionEvent, ModelVariant, NumericalFault, NumericalProfile,
-    PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SensorReport, SettleReport,
-    Stepped, TickReport, UNIFORM_POSITIONS, UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS,
-    WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION,
-    World, ZERO_VELOCITY, founder_position,
+    Advance, BirthEvent, BuddingRules, CPU_REFERENCE, Candidate, CarrierSpec, ControllerReport,
+    CrowdingMode, CrowdingRules, FieldReport, Footprint, Graft, IntroductionEvent, ModelVariant,
+    NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, QUALIFIED_REFERENCE, STOP_AND_PRESERVE,
+    SenescenceRules, SensorReport, SettleReport, Stepped, TickReport, UNIFORM_POSITIONS,
+    UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS, WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA,
+    WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION, World, ZERO_VELOCITY, founder_position,
 };

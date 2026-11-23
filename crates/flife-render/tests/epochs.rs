@@ -11,8 +11,8 @@ mod common;
 use std::num::NonZeroUsize;
 
 use common::{ecology, found, step};
-use flife_core::CoreError;
 use flife_core::ids::OrganismId;
+use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, World};
 use flife_render::{
     AFFINITY_AXES, AffinityProjection, Bounds, COMPONENT_STEPS, Dtype, Epoch, FIELD_TEXELS_MAX,
@@ -1256,11 +1256,17 @@ fn projected_epoch_refreshes_speed_limit_and_attempt_energy() {
     assert_shows(&lease, &offered);
 }
 
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helper: a failure here is a test failure"
+)]
 fn v2_ecology(
     overrides: &[(&str, &str, &str)],
     with_contact: bool,
     features: &[flife_core::FeatureOverride],
 ) -> ValidatedConfig {
+    const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
     let mut lines: Vec<String> = PRESET.lines().map(str::to_owned).collect();
     let mut all_overrides = vec![
         ("world", "width", "32.0"),

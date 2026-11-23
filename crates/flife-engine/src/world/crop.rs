@@ -31,8 +31,8 @@ use flife_genome::{Genome, GenomeQuota, WeightsMut};
 use flife_neural::Weights;
 
 use super::{
-    Controllers, Fields, Rules, Scratch, Sensors, Settle, Uptake, Watch, World, initial_sources,
-    organism_total,
+    Controllers, Fields, Rules, Scratch, Sensors, Settle, Uptake, Watch, World,
+    initial_source_kernels, initial_sources, organism_total,
 };
 use crate::intervention::Intervention;
 use crate::lifecycle::Disposition;
@@ -204,7 +204,8 @@ impl World {
         let holdings = Holdings::new(field.current().energy_total(), organism_total(&population))?;
         let ledger = EnergyLedger::new(holdings, rules.profile.residual);
         let sources = initial_sources(&self.config, &rules)?;
-        let scratch = Scratch::new(&self.config, &rules, sources.len())?;
+        let source_kernels = initial_source_kernels(&rules, &sources)?;
+        let scratch = Scratch::new(&self.config, &rules, sources.len(), &source_kernels)?;
         Ok((
             Self {
                 config: self.config.clone(),
@@ -215,6 +216,7 @@ impl World {
                 field,
                 population,
                 sources,
+                source_kernels,
                 paths: self.paths.clone(),
                 identities: self.identities.clone(),
                 quota,

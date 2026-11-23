@@ -47,8 +47,9 @@ use flife_neural::{ACTION_WIDTH, MAX_ACTION_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH
 
 use super::{
     Controllers, Fields, NumericalProfile, Rules, Scratch, Sensors, Settle, Uptake, Watch, World,
-    initial_sources, organism_total,
+    initial_source_kernels, initial_sources, organism_total,
 };
+use crate::emission::INITIAL_SECRETORY_READINESS;
 use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
 
@@ -235,6 +236,12 @@ impl World {
                         out.f64(value);
                     }
                 }
+                if is_v2 {
+                    out.u64(items(self.source_kernels.len()));
+                    for kernel in &self.source_kernels {
+                        out.f64(kernel.sigma());
+                    }
+                }
                 Ok(())
             },
         )?;
@@ -377,6 +384,10 @@ impl World {
                         for value in state {
                             out.f32(*value);
                         }
+                    }
+                    if is_v2 {
+                        out.f32(organism.secretory_readiness);
+                        out.u64(organism.emission_cooldown_deadline.get());
                     }
                 }
                 Ok(())
@@ -553,6 +564,8 @@ impl World {
 
         // Environment and lifecycle.
         let model = config.config();
+        let initial_source_list = initial_sources(&config, &rules)?;
+        let source_kernels = initial_source_kernels(&rules, &initial_source_list)?;
         let chunk = reader.versioned(ChunkFamily::Environment, version)?;
         let mut input = ByteReader::new(chunk.bytes, "environment chunk");
         let tick = Tick::new(input.u64()?);
@@ -585,6 +598,24 @@ impl World {
                 )
                 .map_err(|error| refuse(format!("source {source}'s path: {error}")))?,
             );
+        }
+        if is_v2_chunk {
+            let kernel_count = input.count(sources, 8)?;
+            if kernel_count != source_kernels.len() {
+                return Err(refuse(format!(
+                    "{kernel_count} source sigmas where {} are due",
+                    source_kernels.len()
+                )));
+            }
+            for (index, expected) in source_kernels.iter().enumerate() {
+                let recorded_sigma = input.f64()?;
+                if recorded_sigma.to_bits() != expected.sigma().to_bits() {
+                    return Err(refuse(format!(
+                        "source {index} sigma {recorded_sigma:?} does not match seeded {:?}",
+                        expected.sigma()
+                    )));
+                }
+            }
         }
         input.finish()?;
         counted(chunk.items, ChunkFamily::Environment, paths.len())?;
@@ -895,6 +926,18 @@ impl World {
                     None => HeldOutput::INVALID,
                 }
             };
+            let (secretory_readiness, emission_cooldown_deadline) = if is_v2_chunk {
+                let readiness = held.f32()?;
+                if !readiness.is_finite() || !(0.0_f32..=1.0_f32).contains(&readiness) {
+                    return Err(refuse(format!(
+                        "{id} has secretory readiness {readiness}, outside [0, 1]"
+                    )));
+                }
+                let deadline = Tick::new(held.u64()?);
+                (readiness, deadline)
+            } else {
+                (INITIAL_SECRETORY_READINESS, Tick::new(0))
+            };
             entrants.push(Entrant {
                 organism: Organism {
                     id,
@@ -918,6 +961,8 @@ impl World {
                     held: held_output,
                     phase,
                     cooldown_deadline,
+                    secretory_readiness,
+                    emission_cooldown_deadline,
                 },
                 genome,
             });
@@ -993,8 +1038,8 @@ impl World {
             )));
         }
 
-        let sources = initial_sources(&config, &rules)?;
-        let scratch = Scratch::new(&config, &rules, sources.len())?;
+        let sources = initial_source_list;
+        let scratch = Scratch::new(&config, &rules, sources.len(), &source_kernels)?;
         Ok(Self {
             config,
             rules,
@@ -1004,6 +1049,7 @@ impl World {
             field,
             population,
             sources,
+            source_kernels,
             paths,
             identities,
             quota,

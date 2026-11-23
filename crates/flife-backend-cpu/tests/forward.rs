@@ -775,3 +775,270 @@ fn variable_width_reference_and_torch_bit_exact() -> Result<(), CoreError> {
     assert_eq!(torch_next.map(f32::to_bits), ref_next.map(f32::to_bits));
     Ok(())
 }
+
+/// V2-05 (`so2-motor`, 40 outputs) & V2-06 (`so2-motor` + `so2-budding`, 42 outputs):
+/// FrankenTorch CPU (`CpuBackend`, 1 vs 4 lanes, F32 & F16) matches the scalar
+/// reference bit-for-bit all the way through `decode_with_layout` (`MotorSteering`
+/// & `BuddingSteering`).
+#[test]
+fn flife_backend_cpu_40_output_motor_and_42_output_budding_match_reference() -> Result<(), CoreError>
+{
+    use flife_core::TimeStep;
+    use flife_core::binary16::F16;
+    use flife_neural::{ActionDecoding, ActionLayout, decode_with_layout};
+
+    let decoding = ActionDecoding::new(0.8, [0.25, 0.75], 0.355, 0.5, 1.0e-6)?;
+    let step = TimeStep::new(1, 32)?;
+    let mut draws = Draws(0x2026_0506);
+
+    let specs = [
+        (104_u32, ActionLayout::new(true, false, false, false, 0)?),
+        (108_u32, ActionLayout::new(true, true, false, false, 0)?),
+    ];
+
+    for (in_w, layout) in specs {
+        let out_w = layout.action_width() as u32;
+        let topology = DenseTopology::with_io(in_w, &[64, 32], out_w)?;
+        let count = 24_usize;
+        let mut f32_params = Vec::with_capacity(count);
+        let mut f16_params = Vec::with_capacity(count);
+        let mut inputs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let p32: Vec<f32> = (0..topology.parameter_count())
+                .map(|_| (draws.symmetric() * 0.25) as f32)
+                .collect();
+            let p16: Vec<F16> = p32.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+            let inp: Vec<f64> = (0..in_w as usize)
+                .map(|_| draws.symmetric() * 1.5)
+                .collect();
+            f32_params.push(p32);
+            f16_params.push(p16);
+            inputs.push(inp);
+        }
+
+        let f32_jobs: Vec<ControllerJob<'_>> = (0..count)
+            .map(|i| {
+                Ok(ControllerJob {
+                    genome: GenomeId::new(1_000 + i as u64),
+                    slot: ArenaSlot::new(0, i as u64, 1),
+                    controller: ReferenceController::new(&topology, &f32_params[i], BOUND)?,
+                    inputs: &inputs[i],
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+        let f16_jobs: Vec<ControllerJob<'_>> = (0..count)
+            .map(|i| {
+                Ok(ControllerJob {
+                    genome: GenomeId::new(2_000 + i as u64),
+                    slot: ArenaSlot::new(1, i as u64, 1),
+                    controller: ReferenceController::new(&topology, &f16_params[i], BOUND)?,
+                    inputs: &inputs[i],
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+
+        let mut scratch = ControllerScratch::new(&topology)?;
+        for (label, jobs) in [("F32", &f32_jobs), ("F16", &f16_jobs)] {
+            let mut want_actions = Vec::with_capacity(count);
+            for job in jobs {
+                let raw = job.controller.evaluate_raw(job.inputs, &mut scratch)?;
+                let raw64: Vec<f64> = raw.iter().map(|&v| f64::from(v)).collect();
+                want_actions.push(decode_with_layout(&raw64, step, &decoding, &layout)?);
+            }
+            for lane_count in [1, 4] {
+                let mut backend = CpuBackend::new(lanes(lane_count));
+                let mut out = Vec::new();
+                backend.evaluate(jobs, &mut out)?;
+                assert_eq!(out.len(), count);
+                for (idx, (got_opt, want)) in out.iter().zip(&want_actions).enumerate() {
+                    let raw = got_opt.expect("CpuBackend evaluated job");
+                    assert_eq!(raw.len(), out_w as usize);
+                    let raw64: Vec<f64> = raw.iter().map(|&v| f64::from(v)).collect();
+                    let got = decode_with_layout(&raw64, step, &decoding, &layout)?;
+                    assert_eq!(
+                        got, *want,
+                        "{label} ({in_w}, {out_w}) lanes={lane_count} job={idx}"
+                    );
+                    assert!(got.motor.is_some());
+                    assert_eq!(got.budding.is_some(), layout.budding_slots().is_some());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// V2-12 (`epigenetic-recurrence`): 1,024 organisms across all 5 catalog hidden
+/// shapes for BOTH `S = 2` (`108/44`, Bundle A) and `S = 4` (`108/44`, FL-054),
+/// plus unaligned `(107/41, [5])` and max-state `S = 16` (`120/68`), match
+/// `ReferenceController::evaluate_recurrent_slice` bit-for-bit on `CpuBackend`
+/// (F32 & F16, 1 and 4 lanes) through shared `update_recurrent_state` for both
+/// `b_epi = 2.5` (V2-12 slow epigenetic bias) and `b_epi = 0.0` (v1 bit-exact).
+#[test]
+fn recurrent_reference_torch_f16_f32_bit_exact() -> Result<(), CoreError> {
+    let mut draws = Draws(0x2026_0012);
+
+    // 1,024 organisms distributed across all 5 catalog hidden shapes for S=2 (108/44)
+    // and S=4 (108/44).
+    let suites: [(&str, u32, u32, u32, &[&[u32]], usize); 4] = [
+        ("S=2 108/44 (Bundle A)", 106, 40, 2, &TOPOLOGIES, 1_024),
+        ("S=4 108/44 (FL-054)", 104, 36, 4, &TOPOLOGIES, 1_024),
+        ("S=2 107/41 odd", 105, 37, 2, &[&[5], &[8]], 32),
+        ("S=16 120/68 max-state", 104, 36, 16, &[&[32]], 32),
+    ];
+
+    for (suite_idx, &(label, sensor_w, action_w, state_w, hiddens, count)) in
+        suites.iter().enumerate()
+    {
+        let topologies: Vec<DenseTopology> = hiddens
+            .iter()
+            .map(|h| DenseTopology::with_io_recurrent(sensor_w, h, action_w, state_w))
+            .collect::<Result<_, _>>()?;
+        let s = state_w as usize;
+        let a = action_w as usize;
+        let raw_w = a + 2 * s;
+        let in_w = sensor_w as usize + s;
+
+        let mut f32_params = Vec::with_capacity(count);
+        let mut f16_params = Vec::with_capacity(count);
+        let mut sensor_vecs = Vec::with_capacity(count);
+        let mut state_vecs = Vec::with_capacity(count);
+        let mut combined_vecs = Vec::with_capacity(count);
+        let mut topo_ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let t = i % topologies.len();
+            let topo = &topologies[t];
+            assert_eq!(topo.input_width(), in_w);
+            assert_eq!(topo.raw_output_width(), raw_w);
+            let mut p32 = vec![0.0_f32; topo.parameter_count()];
+            for layer in topo.layers() {
+                let scale = 1.0 / (layer.inputs as f64).sqrt();
+                for v in &mut p32[layer.weights..layer.biases + layer.outputs] {
+                    *v = (draws.symmetric() * scale) as f32;
+                }
+            }
+            let p16: Vec<F16> = p32.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+            let sensors: Vec<f64> = (0..sensor_w as usize)
+                .map(|_| draws.symmetric() * 1.5)
+                .collect();
+            let state: Vec<f32> = (0..s).map(|_| (draws.symmetric() * 0.95) as f32).collect();
+            let mut combined = Vec::with_capacity(in_w);
+            combined.extend_from_slice(&sensors);
+            combined.extend(state.iter().map(|&h| f64::from(h)));
+            f32_params.push(p32);
+            f16_params.push(p16);
+            sensor_vecs.push(sensors);
+            state_vecs.push(state);
+            combined_vecs.push(combined);
+            topo_ids.push(t);
+        }
+
+        let mut next_slot = vec![0_u64; topologies.len()];
+        let mut f32_jobs = Vec::with_capacity(count);
+        let mut f16_jobs = Vec::with_capacity(count);
+        for i in 0..count {
+            let t = topo_ids[i];
+            let slot = next_slot[t];
+            next_slot[t] += 1;
+            let bucket = (suite_idx * 8 + t) as u32;
+            f32_jobs.push(ControllerJob {
+                genome: GenomeId::new((suite_idx as u64 + 1) * 100_000 + i as u64),
+                slot: ArenaSlot::new(bucket, slot, 1),
+                controller: ReferenceController::new(&topologies[t], &f32_params[i], BOUND)?,
+                inputs: &combined_vecs[i],
+            });
+            f16_jobs.push(ControllerJob {
+                genome: GenomeId::new((suite_idx as u64 + 1) * 200_000 + i as u64),
+                slot: ArenaSlot::new(bucket, slot, 1),
+                controller: ReferenceController::new(&topologies[t], &f16_params[i], BOUND)?,
+                inputs: &combined_vecs[i],
+            });
+        }
+
+        let mut scratch = ControllerScratch::new(topologies.last().expect("topology"))?;
+        for (dtype_label, jobs) in [("F32", &f32_jobs), ("F16", &f16_jobs)] {
+            let mut want_actions = Vec::with_capacity(count);
+            let mut want_next_epi = Vec::with_capacity(count);
+            let mut want_next_v1 = Vec::with_capacity(count);
+            for (i, job) in jobs.iter().enumerate() {
+                let mut h_epi = vec![0.0_f32; s];
+                let mut h_v1 = vec![0.0_f32; s];
+                let acts_epi = job.controller.evaluate_recurrent_slice(
+                    &sensor_vecs[i],
+                    &state_vecs[i],
+                    2.5,
+                    &mut scratch,
+                    &mut h_epi,
+                )?;
+                let acts_v1 = job.controller.evaluate_recurrent_slice(
+                    &sensor_vecs[i],
+                    &state_vecs[i],
+                    0.0,
+                    &mut scratch,
+                    &mut h_v1,
+                )?;
+                assert_eq!(
+                    acts_epi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    acts_v1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                );
+                want_actions.push(acts_epi);
+                want_next_epi.push(h_epi);
+                want_next_v1.push(h_v1);
+            }
+
+            for lane_count in [1, 4] {
+                let mut backend = CpuBackend::new(lanes(lane_count));
+                let mut out = Vec::new();
+                backend.evaluate(jobs, &mut out)?;
+                assert_eq!(out.len(), count);
+                assert!(
+                    out.iter().all(Option::is_some),
+                    "{label} {dtype_label} lanes={lane_count}: unexpected deferral"
+                );
+                let mut got_epi = vec![0.0_f32; s];
+                let mut got_v1 = vec![0.0_f32; s];
+                for (i, got_opt) in out.iter().enumerate() {
+                    let raw = got_opt.expect("evaluated");
+                    assert_eq!(raw.len(), raw_w);
+                    assert_eq!(
+                        raw[..a].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want_actions[i]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "{label} {dtype_label} lanes={lane_count} org={i} actions"
+                    );
+                    flife_neural::update_recurrent_state(
+                        &state_vecs[i],
+                        &raw[a..raw_w],
+                        2.5,
+                        &mut got_epi,
+                    )?;
+                    flife_neural::update_recurrent_state(
+                        &state_vecs[i],
+                        &raw[a..raw_w],
+                        0.0,
+                        &mut got_v1,
+                    )?;
+                    assert_eq!(
+                        got_epi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want_next_epi[i]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "{label} {dtype_label} lanes={lane_count} org={i} h_next(b_epi=2.5)"
+                    );
+                    assert_eq!(
+                        got_v1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        want_next_v1[i]
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "{label} {dtype_label} lanes={lane_count} org={i} h_next(b_epi=0.0)"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}

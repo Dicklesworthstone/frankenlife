@@ -60,18 +60,27 @@ pub mod transport;
 pub mod uptake;
 
 pub use bins::Bins;
-pub use deposit::{DepositReduction, DepositSummary, Deposits, apply_deposits, apply_deposits_on};
+pub use deposit::{
+    DepositReduction, DepositSummary, Deposits, DualCarrierEmissionSplit, apply_deposits,
+    apply_deposits_on, apply_deposits_to_carrier, apply_deposits_to_carrier_on,
+    split_dual_carrier_emission,
+};
 pub use exchange::{
     ExchangeKernel, ExchangeScratch, ExchangeStencil, FIXED_WORLD_GAUSSIAN_CUTOFF_SIGMA,
     FIXED_WORLD_GAUSSIAN_V1, GRID_CIC_V1, MAXIMUM_EXCHANGE_CELLS, check_request,
     saturating_request,
 };
 pub use footprint::{BufferLimits, FieldFootprint};
-pub use grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
+pub use grid::{
+    CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE,
+    CARRIER1_MOMENT_CHANNELS, CarrierLayout, DUAL_CARRIER_PLANES, ENERGY_PLANE, FIELD_PLANES,
+    FieldGrid, field_planes_for_config,
+};
 pub use invariants::{ConeTolerance, FieldScan, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
 pub use pyramid::{
-    Corners, LevelGrid, PyramidView, RawSample, SensorBackend, SensorPyramid, SensorQuery,
+    Corners, DualRawSample, LevelGrid, MAX_PLANES, PyramidView, RawSample, SensorBackend,
+    SensorPyramid, SensorQuery,
 };
 pub use seeding::{
     SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, chemical_direction, initial_center,
@@ -89,15 +98,19 @@ pub use sources::{
     DepositReport, OasisSchedule, PathSegment, Source, SourceKernel, SourceSupport,
     TRUNCATED_GAUSSIAN_FUSED_V1, TRUNCATED_GAUSSIAN_V1, deposit_energy, deposit_energy_fused,
 };
-pub use state::{Cell, FieldPair, FieldState, FieldView, InitialEnergy, relayout};
+pub use state::{
+    Cell, FieldPair, FieldState, FieldView, InitialEnergy, VASCULAR_INITIAL_CONDUCTANCE, relayout,
+};
 pub use step::{
-    FieldBackend, FieldStepOptions, FieldStepReport, FieldWork, advance_field, advance_field_on,
-    advance_field_v2_on, reduce_field_on, step_report,
+    FieldBackend, FieldStepOptions, FieldStepPhase2, FieldStepReport, FieldWork, advance_field,
+    advance_field_on, advance_field_v2_on, advance_field_wave2_on, reduce_dual_carrier_field_on,
+    reduce_field_on, step_report,
 };
 pub use transport::{
-    BarrierMode, FluxEdges, HARMONIC_V1, MIN_V1, TightJunctions, TransportPlan, TransportReport,
-    TransportScratch, count_cell_occupancy, energy_report, transport_flux, transport_flux_on,
-    transport_flux_range_on, transport_on,
+    BarrierMode, DualCarrierRules, FluxEdges, HARMONIC_V1, MIN_V1, TightJunctions, TransportPlan,
+    TransportReport, TransportScratch, VascularField, combine_transport_reports,
+    count_cell_occupancy, energy_report, transport_flux, transport_flux_on,
+    transport_flux_range_on, transport_on, transport_range_on,
 };
 pub use uptake::{
     CellDebit, Demand, GrantDebit, GrantPacket, Grants, RequestRule, UptakeBackend, UptakeCell,

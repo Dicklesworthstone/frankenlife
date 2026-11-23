@@ -83,10 +83,33 @@ target/release/flife run presets/confluent-world.toml --ticks 2400 --cpu-workers
 # to where you run it; keep WORK (several hundred MB of PNGs) outside the repository.
 bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
   --ticks 3200 --every 8 --field none --look sphere --color lineage --zooms 1.6,3,2.2,5,2.6 --cpu-workers 24
+
+# 60 fps 4K (square 2160 × 2160 or 16:9 3840 × 2160), keeping the deployed web MP4 <= 25 MiB for
+# Cloudflare Workers while writing an unconstrained archival 4K60 master outside public/media/:
+bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
+  --ticks 2400 --every 4 --width 2160 --height 2160 --fps 60 --crf 24 \
+  --master-out ../exports/film-4k60-master.mp4 --master-crf 16 \
+  --field none --look sphere --color lineage-energy --cpu-workers 24
+
+# Widescreen 16:9 4K60 from a fresh field-ecology-v2 preset with V2-16 overlays and founding toggles:
+bun run media --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \
+  --ticks 2400 --every 4 --width 3840 --height 2160 --fps 60 \
+  --field vascular-conductance --look glow --color lineage \
+  --disable oases --master-out ../exports/supercolony-4k60-master.mp4
 ```
 
 Without `--cpu-workers`, both renders run on the preset's `[execution] cpu_workers`, one thread for the
 showcase presets. No result depends on the count.
+
+`scripts/media.ts` accepts either `--run-dir DIR` (resuming from its newest checkpoint, matching `flife render --run-dir`)
+or `--config PATH` (founding a fresh configuration). Founding-only `field-ecology-v2` toggles (`--disable`, `--enable`,
+`--v1-compat`, validated against the 21 canonical slugs plus `all-v2`, `bundle-a`, `bundle-b`) are passed in exact CLI
+order with `--config` and refused with `--run-dir` per `INV-14`. Both `--size S` (square) and independent `--width W
+--height H` (e.g. `2160 × 2160` or `3840 × 2160`, even integers for 4:2:0) are supported alongside arbitrary positive
+`--fps` (including `--fps 60`). The web MP4 automatically computes a `-maxrate`/`-bufsize` ceiling so the deployed file
+stays within Cloudflare's 25 MiB static asset limit; `--master-out PATH` (which must resolve outside `public/media/`)
+encodes an unconstrained high-quality archival master from the exact same PNG frames and records its digest in
+`lib/media.json`.
 
 `presets/confluent-world.toml` was chosen by outer searches against image statistics of the reference
 screenshots and by eye, under the registered contact model, and `../experiments/showcase/README.md` states
@@ -100,8 +123,9 @@ units on any torus of 128 units or more: the zooms are written for a 256-unit to
 run's, never below 1.25. The rule is stated in
 `director.ts` and recorded in the manifest with every key. The camera is presentation only, and the script
 checks that the preview and the film end on the same world digest. `--camera none` films the whole torus.
-`--field energy|composition|none` and `--look glow|raw|sphere` choose how the frames are drawn;
-`--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many
+`--field energy|composition|component-C|trail-carrier|vascular-conductance|none`, `--look glow|raw|sphere`
+and `--color lineage|lineage-energy|affinity|energy|generation|motion|topology|cell-state|polarity` choose
+how the frames are drawn; `--zooms` lists the shots' zooms on the run's torus instead. The film's shots, at 1.6, 3 and 2.2, show as many
 organisms as the reference screenshots' views at zooms 3–6: a screenshot's zoom over 1.95.
 
 `scripts/media.ts` refuses a dirty `crates/`, `presets/`, `Cargo.toml` or `Cargo.lock`, since the manifest
@@ -154,8 +178,8 @@ look, lineage lit by energy. `lib/controls.json` is their committed manifest; th
 
 ```bash
 # From web/; WORK outside the repository. About 13 minutes for each full world on 8 workers of an
-# M5 Ultra (two at once), under a minute for the inheritance control.
-bun scripts/controls.ts --flife ../target/release/flife --work WORK --cpu-workers 8
+# M5 Ultra (two at once), under a minute for the inheritance control. Pass --size 2160 for 4K stills.
+bun scripts/controls.ts --flife ../target/release/flife --work WORK --cpu-workers 8 [--size 2160]
 ```
 
 The script refuses unless each world's digest and live count at tick 2,400 equal the ones

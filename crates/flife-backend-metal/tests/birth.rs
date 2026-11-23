@@ -760,6 +760,36 @@ fn rates_the_reference_refuses_are_refused() {
     inside.layers[0].biases -= 1;
     let mut longer = fine;
     longer.parameters += 1;
+    let zero_inputs = MutationBirth {
+        depth: 1,
+        parameters: 4,
+        layers: [
+            MutationLayer {
+                inputs: 0,
+                outputs: 4,
+                weights: 0,
+                biases: 0,
+            },
+            MutationLayer::default(),
+            MutationLayer::default(),
+        ],
+        ..fine
+    };
+    let zero_outputs = MutationBirth {
+        depth: 1,
+        parameters: 0,
+        layers: [
+            MutationLayer {
+                inputs: 4,
+                outputs: 0,
+                weights: 0,
+                biases: 0,
+            },
+            MutationLayer::default(),
+            MutationLayer::default(),
+        ],
+        ..fine
+    };
     for misshapen in [
         MutationBirth {
             depth: 0,
@@ -773,6 +803,8 @@ fn rates_the_reference_refuses_are_refused() {
         gap,
         inside,
         longer,
+        zero_inputs,
+        zero_outputs,
     ] {
         let mut values = vec![0.25_f32; misshapen.parameters];
         let result = birth.mutate(&valid, &[misshapen], &mut values, &mut counts);

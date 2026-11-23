@@ -1,0 +1,31 @@
+schema = "frankenlife.experiment.v1"
+name = "v2-quickie-arm1-neural-agency-smoke64"
+hypothesis = """V2-10 Quickie Arm 1 CI smoke specification (64x64, 256 ticks, 1 discovery + \
+1 held-out seed): verifies that the exact Arm 1 treatment and all three implemented \
+controls (fixed-controller, chemistry-only, no-oases) execute cleanly end-to-end through \
+flife experiment with zero invariant faults. Smoke mode establishes implementation/rules \
+execution only, never ecological H2 support."""
+base = "../arm1-neural-agency-smoke64.toml"
+ticks = 256
+metrics_every = 128
+control = "treatment"
+selection = "No selection: CI smoke mode runs every condition on 1 discovery and 1 held-out seed and catalogs every ending."
+
+[seeds]
+discovery = [101]
+held_out = [2101]
+
+[[conditions]]
+name = "treatment"
+
+[[conditions]]
+name = "fixed-controller"
+ablation = "fixed-controller"
+
+[[conditions]]
+name = "chemistry-only"
+ablation = "chemistry-only"
+
+[[conditions]]
+name = "no-oases"
+set = { "v2.oases.enabled" = false }

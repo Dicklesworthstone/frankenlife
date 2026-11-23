@@ -80,10 +80,13 @@ pub use controls::{
     scroll_zoom,
 };
 pub use export::{
-    ENCODED_FILE, EXPORT_SCHEMA, ExportManifest, ExportOptions, ExportedEncoding, ExportedFrame,
-    ExportedVideo, MANIFEST_FILE, VIDEO_FILE, export, slot_counts,
+    CINEMA_4K, CINEMA_1080P, CinemaOptions, ENCODED_FILE, EXPORT_SCHEMA, ExportManifest,
+    ExportMode, ExportOptions, ExportedEncoding, ExportedFrame, ExportedVideo, MANIFEST_FILE,
+    SimulationSample, VIDEO_FILE, export, export_cinema, parse_cinema_resolution,
+    plan_simulation_samples, slot_counts,
 };
 pub use flife_backend_metal::ControllerChoice;
+pub use flife_cli::{CameraKey, CameraPath, CameraView};
 pub use flife_manim::{
     ColorMapping, FieldComponent, FieldMapping, FieldOverlayKind, Look, Motion, Particles, Style,
     V2ColorMapping,
@@ -99,16 +102,16 @@ pub use keep::Keeping;
 pub use measure::{Disk, MeasurePreview};
 pub use overlay::{
     BrushPreview, Inspected, Measuring, OverlayState, PANEL_ANCESTORS, Recent, Telemetry,
-    active_field_key, field_key, inspector_lines, legends, measuring_lines, overlay_text,
-    preview_line, recent, telemetry_lines, v2_legends,
+    field_key, inspector_lines, legends, measuring_lines, overlay_text, preview_line, recent,
+    telemetry_lines,
 };
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{
-    AppliedCommand, Exact, REPLAY_SLOTS, ReplayFrame, Replayed, TIMELINE_SCHEMA,
+    AppliedCommand, Exact, PlannedDraw, REPLAY_SLOTS, ReplayFrame, Replayed, TIMELINE_SCHEMA,
     TimelineCheckpoint, TimelineIntervention, TimelineProjection, TimelineRecord, TimelineRegion,
-    TimelineStart, TimelineStyle, peak_observer_bytes, read_timeline, replay,
-    write_timeline_record,
+    TimelineStart, TimelineStyle, ValidatedTimeline, peak_observer_bytes, peak_observer_bytes_for,
+    read_timeline, replay, validate_timeline, validate_v2_style, write_timeline_record,
 };
 
 /// The schema of the Studio's NDJSON records.

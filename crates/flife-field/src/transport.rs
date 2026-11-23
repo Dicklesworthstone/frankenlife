@@ -25,13 +25,14 @@
 use std::ops::Range;
 
 use flife_core::memory::capacity_bytes;
+use flife_core::numerics::pow_positive;
 use flife_core::{CoreError, TimeStep, V2Feature, ValidatedConfig};
 
 use crate::footprint::BufferLimits;
 use crate::grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 use crate::layout::{BUFFER, mismatch, overflow};
 use crate::numerics::exp_neg;
-use crate::state::FieldState;
+use crate::state::{FieldState, VASCULAR_INITIAL_CONDUCTANCE};
 
 /// The transport scheme this module implements.
 pub const POSITIVE_FIVE_POINT_V1: &str = "positive-five-point-v1";
@@ -395,6 +396,169 @@ pub fn transport_on(
         energy.ok_or_else(missing_plane)
     })?;
     Ok(report(plan, energy_before, energy))
+}
+
+/// Uniform five-point transport and decay over `plane_range` split across up
+/// to `scratches.len()` threads (`V2-15` dual-carrier splits when flux edges
+/// are not active on that carrier).
+///
+/// Returns `Some(TransportReport)` when `energy_plane` lies inside
+/// `plane_range`, else `None`.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] for mismatched grids, buffers, or an
+/// out-of-range `plane_range`; [`CoreError::StateConflict`] for empty
+/// `scratches` or a panicked worker.
+pub fn transport_range_on(
+    plan: &TransportPlan,
+    current: &FieldState,
+    next: &mut FieldState,
+    plane_range: Range<usize>,
+    energy_plane: Option<usize>,
+    scratches: &mut [TransportScratch],
+) -> Result<Option<TransportReport>, CoreError> {
+    if *current.grid() != plan.grid || *next.grid() != plan.grid {
+        return Err(mismatch(
+            "transport inputs do not share the transport plan's grid".into(),
+        ));
+    }
+    let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+    if cells == 0 {
+        return Err(missing_plane());
+    }
+    let source_all = current.as_slice();
+    let target_all = next.as_slice();
+    if source_all.len() != target_all.len() || !source_all.len().is_multiple_of(cells) {
+        return Err(missing_plane());
+    }
+    let total_planes = source_all.len() / cells;
+    if plane_range.start > plane_range.end || plane_range.end > total_planes {
+        return Err(mismatch(format!(
+            "plane range {plane_range:?} is outside 0..{total_planes}"
+        )));
+    }
+    for scratch in scratches.iter() {
+        if scratch.cells != scratch.first.len()
+            || scratch.cells != scratch.second.len()
+            || scratch.cells != cells
+        {
+            return Err(mismatch(format!(
+                "transport scratch for {} cells on a grid of {}",
+                scratch.cells,
+                plan.grid.cell_count()
+            )));
+        }
+    }
+    let planes = plane_range.len();
+    if planes == 0 {
+        return Ok(None);
+    }
+    let source_all = current.as_slice();
+    let target_all = next.as_mut_slice();
+    let first_plane_index = plane_range.start;
+    let slice_range = first_plane_index * cells..plane_range.end * cells;
+    let source = &source_all[slice_range.clone()];
+    let target = &mut target_all[slice_range];
+    let energy_before = energy_plane
+        .filter(|p| plane_range.contains(p))
+        .map(|p| sum(&source_all[p * cells..(p + 1) * cells]));
+
+    let width = usize::try_from(plan.grid.cells_x()).map_err(|_| overflow())?;
+    let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
+    let coefficients = Coefficients {
+        center: plan.center,
+        r_x: plan.r_x,
+        r_y: plan.r_y,
+        width,
+        height,
+    };
+    let used = scratches.len().min(planes);
+    let per = planes.div_ceil(used.max(1));
+    let run = |first_plane: usize,
+               source: &[f32],
+               target: &mut [f32],
+               scratch: &mut TransportScratch|
+     -> Option<EnergyTerms> {
+        let mut energy = None;
+        for (offset, (source, target)) in source
+            .chunks_exact(cells)
+            .zip(target.chunks_exact_mut(cells))
+            .enumerate()
+        {
+            let is_energy = energy_plane == Some(first_plane + offset);
+            if let Some(terms) =
+                transport_plane(&coefficients, plan, source, target, scratch, is_energy)
+            {
+                energy = Some(terms);
+            }
+        }
+        energy
+    };
+    let Some((head_scratch, others)) = scratches.split_first_mut() else {
+        return Err(CoreError::StateConflict {
+            operation: "transport",
+            detail: "no transport scratch".to_owned(),
+        });
+    };
+    let mut sources = source.chunks(per * cells);
+    let mut targets = target.chunks_mut(per * cells);
+    let (Some(head_source), Some(head_target)) = (sources.next(), targets.next()) else {
+        return Err(missing_plane());
+    };
+    let run = &run;
+    let energy = std::thread::scope(|scope| {
+        let workers: Vec<_> = sources
+            .zip(targets)
+            .zip(others.iter_mut())
+            .enumerate()
+            .map(|(index, ((source, target), scratch))| {
+                scope.spawn(move || {
+                    run(
+                        first_plane_index + (index + 1) * per,
+                        source,
+                        target,
+                        scratch,
+                    )
+                })
+            })
+            .collect();
+        let mut energy = run(first_plane_index, head_source, head_target, head_scratch);
+        for worker in workers {
+            match worker.join() {
+                Ok(terms) => energy = energy.or(terms),
+                Err(_) => {
+                    return Err(CoreError::StateConflict {
+                        operation: "transport",
+                        detail: "a transport worker panicked".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(energy)
+    })?;
+    Ok(energy_before.and_then(|before| energy.map(|terms| report(plan, before, terms))))
+}
+
+/// Combine Carrier 0 and Carrier 1 [`TransportReport`]s into one ledger-closed
+/// report for a 34-plane dual-carrier tick (`V2-15`): both carriers' decay
+/// totals book into `Flow::Decay`.
+#[must_use]
+pub fn combine_transport_reports(
+    carrier0: TransportReport,
+    carrier1: TransportReport,
+) -> TransportReport {
+    let energy_before = carrier0.energy_before + carrier1.energy_before;
+    let energy_transported = carrier0.energy_transported + carrier1.energy_transported;
+    let energy_after = carrier0.energy_after + carrier1.energy_after;
+    let decay_removed = carrier0.decay_removed + carrier1.decay_removed;
+    TransportReport {
+        substeps: carrier0.substeps.max(carrier1.substeps),
+        energy_before,
+        energy_transported,
+        energy_after,
+        decay_removed,
+        transport_residual: energy_transported - energy_before,
+    }
 }
 
 /// The energy plane's part of [`transport`], for an accelerator that
@@ -927,8 +1091,8 @@ pub fn transport_flux(
     transport_flux_on(plan, edges, current, next, std::slice::from_mut(scratch))
 }
 
-/// Flux-form doubly-stochastic transport and decay across all `FIELD_PLANES`
-/// planes split over up to `scratches.len()` threads (`V2-09`).
+/// Flux-form doubly-stochastic transport and decay across all planes of
+/// `current` split over up to `scratches.len()` threads (`V2-09`).
 ///
 /// # Errors
 /// As [`transport_flux_range_on`].
@@ -939,7 +1103,7 @@ pub fn transport_flux_on(
     next: &mut FieldState,
     scratches: &mut [TransportScratch],
 ) -> Result<TransportReport, CoreError> {
-    let planes = usize::try_from(FIELD_PLANES).map_err(|_| overflow())?;
+    let planes = usize::try_from(current.planes()).map_err(|_| overflow())?;
     transport_flux_range_on(
         plan,
         edges,
@@ -1296,6 +1460,476 @@ fn stencil_flux_checked(flux: &FluxCoefficients<'_>, source: &[f32], target: &mu
                 *slot = value;
             }
         }
+    }
+}
+
+/// 4-neighbor flux-reinforced Murray / *Physarum* self-carving vascular field
+/// (`V2-14`, slug `vascular-field`, 100% pure field-mediated `INV-08`).
+///
+/// Reuses `V2-09`'s precomputed `(edge_x, edge_y)` doubly-stochastic 5-point
+/// flux stencil (`transport_flux*` / `field.metal::field_stencil_flux`),
+/// composing multiplicatively with tight-junction permeability when both are
+/// enabled and updating ping-pong F32 edge conductances `g_e ∈ [g_min, 1.0]`
+/// from pre-transport substep-invariant Carrier-0 energy flux `|F_e|`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VascularField {
+    minimum_conductance_ratio: f64,
+    maximum_diffusion: f64,
+    reinforcement_rate_per_second: f64,
+    pruning_rate_per_second: f64,
+    flux_half_saturation: f64,
+    flux_exponent: f64,
+}
+
+impl VascularField {
+    /// Construct a Murray / *Physarum* vascular field rule.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `minimum_conductance_ratio ∈ (0.01, 1.0]`
+    /// and all remaining parameters are finite and strictly positive.
+    pub fn new(
+        minimum_conductance_ratio: f64,
+        maximum_diffusion: f64,
+        reinforcement_rate_per_second: f64,
+        pruning_rate_per_second: f64,
+        flux_half_saturation: f64,
+        flux_exponent: f64,
+    ) -> Result<Self, CoreError> {
+        if !minimum_conductance_ratio.is_finite()
+            || minimum_conductance_ratio <= 0.01
+            || minimum_conductance_ratio > 1.0
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.vascular.minimum_conductance_ratio",
+                detail: format!("{minimum_conductance_ratio:?} is outside (0.01, 1.0]"),
+            });
+        }
+        for (quantity, value) in [
+            ("v2.vascular.maximum_diffusion", maximum_diffusion),
+            (
+                "v2.vascular.reinforcement_rate_per_second",
+                reinforcement_rate_per_second,
+            ),
+            (
+                "v2.vascular.pruning_rate_per_second",
+                pruning_rate_per_second,
+            ),
+            ("v2.vascular.flux_half_saturation", flux_half_saturation),
+            ("v2.vascular.flux_exponent", flux_exponent),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity,
+                    detail: format!("{value:?} is not finite and positive"),
+                });
+            }
+        }
+        Ok(Self {
+            minimum_conductance_ratio,
+            maximum_diffusion,
+            reinforcement_rate_per_second,
+            pruning_rate_per_second,
+            flux_half_saturation,
+            flux_exponent,
+        })
+    }
+
+    /// Resolve `[v2.vascular]` from a validated configuration: `None` on `v1`
+    /// or when `V2Feature::VascularField` is disabled.
+    ///
+    /// # Errors
+    /// As [`VascularField::new`].
+    pub fn from_config(config: &ValidatedConfig) -> Result<Option<Self>, CoreError> {
+        let Some(v2) = config.config().v2.as_ref() else {
+            return Ok(None);
+        };
+        if !v2.is_enabled(V2Feature::VascularField) {
+            return Ok(None);
+        }
+        let v = &v2.vascular;
+        let max_diffusion = v
+            .maximum_diffusion
+            .unwrap_or_else(|| 10.0 * config.config().world.diffusion);
+        Self::new(
+            v.minimum_conductance_ratio,
+            max_diffusion,
+            v.reinforcement_rate_per_second,
+            v.pruning_rate_per_second,
+            v.flux_half_saturation,
+            v.flux_exponent,
+        )
+        .map(Some)
+    }
+
+    /// Minimum conductance ratio `g_min ∈ (0.01, 1.0]`.
+    #[must_use]
+    pub const fn minimum_conductance_ratio(&self) -> f64 {
+        self.minimum_conductance_ratio
+    }
+
+    /// Peak diffusivity `D_max > 0` achieved when `g_e = 1.0`.
+    #[must_use]
+    pub const fn maximum_diffusion(&self) -> f64 {
+        self.maximum_diffusion
+    }
+
+    /// Reinforcement rate `α_v > 0` per simulation-second.
+    #[must_use]
+    pub const fn reinforcement_rate_per_second(&self) -> f64 {
+        self.reinforcement_rate_per_second
+    }
+
+    /// Pruning rate `γ_v > 0` per simulation-second.
+    #[must_use]
+    pub const fn pruning_rate_per_second(&self) -> f64 {
+        self.pruning_rate_per_second
+    }
+
+    /// Flux half-saturation scale `J_0 > 0`.
+    #[must_use]
+    pub const fn flux_half_saturation(&self) -> f64 {
+        self.flux_half_saturation
+    }
+
+    /// Murray flux exponent `μ > 0` (`1.5` superlinear branching, `0.7` sublinear control).
+    #[must_use]
+    pub const fn flux_exponent(&self) -> f64 {
+        self.flux_exponent
+    }
+
+    /// Initial F32 edge conductance (`0.25` clamped into `[g_min, 1.0]`).
+    #[must_use]
+    pub fn initial_conductance(&self) -> f32 {
+        f64::from(VASCULAR_INITIAL_CONDUCTANCE).clamp(self.minimum_conductance_ratio, 1.0) as f32
+    }
+
+    /// Construct the Carrier-0 [`TransportPlan`] at `D_max` (`maximum_diffusion`).
+    ///
+    /// # Errors
+    /// As [`TransportPlan::new`].
+    pub fn transport_plan(
+        &self,
+        grid: &FieldGrid,
+        step: TimeStep,
+        decay_per_second: f64,
+    ) -> Result<TransportPlan, CoreError> {
+        TransportPlan::new(grid, step, self.maximum_diffusion, decay_per_second)
+    }
+
+    /// Precompute Carrier-0 face conductances `edges` for `plan` (at `D_max`)
+    /// from committed vascular edge ratios `(edge_x_cond, edge_y_cond)`,
+    /// multiplicatively composed with `barrier` (`V2-09`) when `Some`.
+    ///
+    /// Exact F64 evaluation order (shared with `field.metal`):
+    /// - Without barrier: `edge_x[c] = (r_max_x * f64::from(g_x[c])).min(r_max_x)`
+    /// - With barrier: `edge_x[c] = ((r_max_x * f64::from(g_x[c])) * phi_tj_x).min(r_max_x)`
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for mismatched grid/buffer sizes, or
+    /// [`CoreError::NumericalInvalid`] if any conductance is nonfinite or
+    /// outside `[0, 1]`.
+    pub fn fill_edges(
+        &self,
+        plan: &TransportPlan,
+        edge_x_cond: &[f32],
+        edge_y_cond: &[f32],
+        barrier: Option<(&TightJunctions, &[u32])>,
+        edges: &mut FluxEdges,
+    ) -> Result<(), CoreError> {
+        if edges.grid != plan.grid {
+            return Err(mismatch(
+                "flux edges belong to a different grid than the transport plan".into(),
+            ));
+        }
+        let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+        if edge_x_cond.len() != cells
+            || edge_y_cond.len() != cells
+            || edges.edge_x.len() != cells
+            || edges.edge_y.len() != cells
+        {
+            return Err(mismatch(format!(
+                "vascular edge buffers ({}, {}, {}, {}) do not match {cells} grid cells",
+                edge_x_cond.len(),
+                edge_y_cond.len(),
+                edges.edge_x.len(),
+                edges.edge_y.len()
+            )));
+        }
+        if let Some((_, occ)) = barrier
+            && occ.len() != cells
+        {
+            return Err(mismatch(format!(
+                "occupancy buffer ({}) does not match {cells} grid cells",
+                occ.len()
+            )));
+        }
+        let width = usize::try_from(plan.grid.cells_x()).map_err(|_| overflow())?;
+        let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
+        let (r_x, r_y) = plan.ratios();
+        for y in 0..height {
+            let row = y * width;
+            let north_row = if y + 1 == height { 0 } else { (y + 1) * width };
+            for x in 0..width {
+                let east = if x + 1 == width { 0 } else { x + 1 };
+                let c = row + x;
+                let gx = f64::from(edge_x_cond[c]);
+                let gy = f64::from(edge_y_cond[c]);
+                if !gx.is_finite() || !(0.0..=1.0).contains(&gx) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "vascular edge_x_cond",
+                        detail: format!("cell {c} conductance {gx:?} is outside [0, 1]"),
+                    });
+                }
+                if !gy.is_finite() || !(0.0..=1.0).contains(&gy) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "vascular edge_y_cond",
+                        detail: format!("cell {c} conductance {gy:?} is outside [0, 1]"),
+                    });
+                }
+                let (fx, fy) = match barrier {
+                    Some((tj, occ)) => {
+                        let phi_c = tj.cell_permeability(occ[c]);
+                        let phi_e = tj.cell_permeability(occ[row + east]);
+                        let phi_n = tj.cell_permeability(occ[north_row + x]);
+                        let (tj_x, tj_y) = match tj.mode() {
+                            BarrierMode::HarmonicV1 => (
+                                (2.0 * (phi_c * phi_e)) / (phi_c + phi_e),
+                                (2.0 * (phi_c * phi_n)) / (phi_c + phi_n),
+                            ),
+                            BarrierMode::MinV1 => (phi_c.min(phi_e), phi_c.min(phi_n)),
+                        };
+                        ((r_x * gx) * tj_x, (r_y * gy) * tj_y)
+                    }
+                    None => (r_x * gx, r_y * gy),
+                };
+                edges.edge_x[c] = fx.min(r_x);
+                edges.edge_y[c] = fy.min(r_y);
+            }
+        }
+        Ok(())
+    }
+
+    /// Compute one edge's updated F32 conductance under the exact Murray /
+    /// *Physarum* rule (`V2-14`), with overflow guard (`ratio > 1e100 -> sat = 1.0`),
+    /// `μ == 1.5` fast path (`ratio * ratio.sqrt()`), and general `μ > 0` via
+    /// host-independent [`pow_positive`].
+    #[must_use]
+    pub fn update_conductance(&self, prev: f32, flux_magnitude: f64, dt: f64) -> f32 {
+        let ratio = flux_magnitude / self.flux_half_saturation;
+        let sat = if !ratio.is_finite() || ratio > 1.0e100 {
+            if ratio.is_nan() { 0.0 } else { 1.0 }
+        } else if ratio <= 0.0 {
+            0.0
+        } else if self.flux_exponent == 1.5 {
+            let r_mu = ratio * ratio.sqrt();
+            if r_mu.is_finite() {
+                r_mu / (1.0 + r_mu)
+            } else {
+                1.0
+            }
+        } else {
+            match pow_positive(ratio, self.flux_exponent) {
+                Some(r_mu) if r_mu.is_finite() => r_mu / (1.0 + r_mu),
+                _ => {
+                    if ratio >= 1.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+            }
+        };
+        let g = f64::from(prev);
+        let reinforce = (self.reinforcement_rate_per_second * sat) * (1.0 - g);
+        let prune = self.pruning_rate_per_second * (g - self.minimum_conductance_ratio);
+        let updated = g + dt * (reinforce - prune);
+        updated.clamp(self.minimum_conductance_ratio, 1.0) as f32
+    }
+
+    /// Advance committed vascular edge conductances `(prev_x, prev_y)` into
+    /// candidate buffers `(next_x, next_y)` from pre-transport Carrier-0
+    /// `energy_before` and precomputed `edges` (`V2-14`, `C.8` cancel-safe).
+    ///
+    /// Uses substep-invariant flux magnitude:
+    /// `|F_e| = (edge[c] * substeps as f64) * |f64::from(e[c]) - f64::from(e[nbr])|`.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if buffer lengths or grids disagree.
+    pub fn update_edges(
+        &self,
+        plan: &TransportPlan,
+        step: TimeStep,
+        edges: &FluxEdges,
+        energy_before: &[f32],
+        prev: (&[f32], &[f32]),
+        next: (&mut [f32], &mut [f32]),
+    ) -> Result<(), CoreError> {
+        if edges.grid != plan.grid {
+            return Err(mismatch(
+                "flux edges belong to a different grid than the transport plan".into(),
+            ));
+        }
+        let cells = usize::try_from(plan.grid.cell_count()).map_err(|_| overflow())?;
+        let (prev_x, prev_y) = prev;
+        let (next_x, next_y) = next;
+        if energy_before.len() != cells
+            || prev_x.len() != cells
+            || prev_y.len() != cells
+            || next_x.len() != cells
+            || next_y.len() != cells
+            || edges.edge_x.len() != cells
+            || edges.edge_y.len() != cells
+        {
+            return Err(mismatch(format!(
+                "vascular update buffers do not match {cells} grid cells"
+            )));
+        }
+        let width = usize::try_from(plan.grid.cells_x()).map_err(|_| overflow())?;
+        let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
+        let substeps_f64 = f64::from(plan.substeps());
+        let dt = f64::from(step.numerator()) / f64::from(step.denominator());
+        for y in 0..height {
+            let row = y * width;
+            let north_row = if y + 1 == height { 0 } else { (y + 1) * width };
+            for x in 0..width {
+                let east = if x + 1 == width { 0 } else { x + 1 };
+                let c = row + x;
+                let ec = f64::from(energy_before[c]);
+                let ee = f64::from(energy_before[row + east]);
+                let en = f64::from(energy_before[north_row + x]);
+                let flux_x = (edges.edge_x[c] * substeps_f64) * (ec - ee).abs();
+                let flux_y = (edges.edge_y[c] * substeps_f64) * (ec - en).abs();
+                next_x[c] = self.update_conductance(prev_x[c], flux_x, dt);
+                next_y[c] = self.update_conductance(prev_y[c], flux_y, dt);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolved 34-plane dual-carrier hybrid trail rules (`V2-15`, slug
+/// `dual-carrier-trails`, realizing `FL-055`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualCarrierRules {
+    trail_diffusion: f64,
+    trail_decay_per_second: f64,
+    trail_emission_share: f64,
+    trail_energy_density_scale: f64,
+}
+
+impl DualCarrierRules {
+    /// Construct dual-carrier trail rules.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `trail_diffusion >= 0`,
+    /// `trail_decay_per_second >= 0`, `trail_emission_share ∈ (0, 0.5]`, and
+    /// `trail_energy_density_scale > 0` are finite.
+    pub fn new(
+        trail_diffusion: f64,
+        trail_decay_per_second: f64,
+        trail_emission_share: f64,
+        trail_energy_density_scale: f64,
+    ) -> Result<Self, CoreError> {
+        if !trail_diffusion.is_finite() || trail_diffusion < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.carriers.trail_diffusion",
+                detail: format!("{trail_diffusion:?} is not finite and nonnegative"),
+            });
+        }
+        if !trail_decay_per_second.is_finite() || trail_decay_per_second < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.carriers.trail_decay_per_second",
+                detail: format!("{trail_decay_per_second:?} is not finite and nonnegative"),
+            });
+        }
+        if !trail_emission_share.is_finite()
+            || trail_emission_share <= 0.0
+            || trail_emission_share > 0.5
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.carriers.trail_emission_share",
+                detail: format!("{trail_emission_share:?} is outside (0, 0.5]"),
+            });
+        }
+        if !trail_energy_density_scale.is_finite() || trail_energy_density_scale <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.carriers.trail_energy_density_scale",
+                detail: format!("{trail_energy_density_scale:?} is not finite and positive"),
+            });
+        }
+        Ok(Self {
+            trail_diffusion,
+            trail_decay_per_second,
+            trail_emission_share,
+            trail_energy_density_scale,
+        })
+    }
+
+    /// Resolve `[v2.carriers]` from a validated configuration: `None` on `v1`
+    /// or when `V2Feature::DualCarrierTrails` is disabled.
+    ///
+    /// # Errors
+    /// As [`DualCarrierRules::new`].
+    pub fn from_config(config: &ValidatedConfig) -> Result<Option<Self>, CoreError> {
+        let Some(v2) = config.config().v2.as_ref() else {
+            return Ok(None);
+        };
+        if !v2.is_enabled(V2Feature::DualCarrierTrails) {
+            return Ok(None);
+        }
+        let c = &v2.carriers;
+        let world = &config.config().world;
+        let trail_diffusion = c.trail_diffusion.unwrap_or(0.01 * world.diffusion);
+        let trail_decay = c
+            .trail_decay_per_second
+            .unwrap_or(0.05 * world.decay_per_second);
+        let trail_scale = c
+            .trail_energy_density_scale
+            .unwrap_or(config.config().sensors.energy_density_scale);
+        Self::new(
+            trail_diffusion,
+            trail_decay,
+            c.trail_emission_share,
+            trail_scale,
+        )
+        .map(Some)
+    }
+
+    /// Carrier 1 trail diffusivity `D_1 >= 0`.
+    #[must_use]
+    pub const fn trail_diffusion(&self) -> f64 {
+        self.trail_diffusion
+    }
+
+    /// Carrier 1 trail decay rate `λ_1 >= 0` per simulation-second.
+    #[must_use]
+    pub const fn trail_decay_per_second(&self) -> f64 {
+        self.trail_decay_per_second
+    }
+
+    /// Fraction `p_1 ∈ (0, 0.5]` of paid surplus emission directed to Carrier 1.
+    #[must_use]
+    pub const fn trail_emission_share(&self) -> f64 {
+        self.trail_emission_share
+    }
+
+    /// Sensor normalization scale `R_scale_1 > 0` for Carrier 1 energy density.
+    #[must_use]
+    pub const fn trail_energy_density_scale(&self) -> f64 {
+        self.trail_energy_density_scale
+    }
+
+    /// Build Carrier 1's independent [`TransportPlan`] (`D_1`, `λ_1`).
+    ///
+    /// # Errors
+    /// As [`TransportPlan::new`].
+    pub fn trail_plan(&self, grid: &FieldGrid, step: TimeStep) -> Result<TransportPlan, CoreError> {
+        TransportPlan::new(
+            grid,
+            step,
+            self.trail_diffusion,
+            self.trail_decay_per_second,
+        )
     }
 }
 

@@ -64,6 +64,77 @@ pub const DEVICE_BYTES_PER_PIXEL: u64 = 8 + 4 + 3 * 4;
 /// word.
 const TILE: u64 = 16;
 
+/// Extra host bytes held by the y4m video writer for one even `size` frame
+/// (FL-043, FL-050): one tight NV12 buffer (`3/2` bytes per pixel) plus one
+/// serialized y4m `FRAME\n` record buffer (`6 + 3/2` bytes per pixel).
+#[must_use]
+pub fn video_scratch_bytes(size: [u32; 2]) -> u64 {
+    let [width, height] = size.map(u64::from);
+    let pixels = width.saturating_mul(height);
+    let nv12 = pixels.saturating_mul(3) / 2;
+    nv12.saturating_mul(2).saturating_add(6)
+}
+
+/// Host encoder working-set bytes held while exporting frames at `size`
+/// (FL-043, FL-050, INV-15): one PNG encoder working set
+/// (`flife_cli::encoding_bytes(size, 1)`) plus, when writing y4m video
+/// (`with_video`), [`video_scratch_bytes(size)`].
+#[must_use]
+pub fn export_scratch_bytes(size: [u32; 2], with_video: bool) -> u64 {
+    let png = flife_cli::encoding_bytes(size, 1);
+    if with_video {
+        png.saturating_add(video_scratch_bytes(size))
+    } else {
+        png
+    }
+}
+
+/// Admit a Studio timeline export (FL-043, FL-050, INV-15) against
+/// `[execution] maximum_total_bytes` before creating the export directory or
+/// allocating the renderer or encoder buffers. Charges peak observer bytes
+/// across the timeline's rendered geometry (or `target_resolution` when
+/// overriding to e.g. 1080p or 4K Cinema) plus [`export_scratch_bytes`] at
+/// the peak exported frame size.
+///
+/// # Errors
+/// - [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+///   density;
+/// - [`World::admit_memory`]'s [`CoreError::BudgetExhausted`] refusal when
+///   the export's world, observer and encoder buffers exceed the budget.
+pub fn admit_export(
+    world: &World,
+    restored: &Epoch,
+    view: &WorldView,
+    initial_size: [u32; 2],
+    records: &[crate::TimelineRecord],
+    target_resolution: Option<([u32; 2], f64)>,
+    with_video: bool,
+) -> Result<MemoryAdmission, CoreError> {
+    let peak_observers = crate::timeline::peak_observer_bytes_for(
+        world,
+        restored,
+        view,
+        initial_size,
+        records,
+        target_resolution,
+    )?;
+    let peak_export_scratch = match target_resolution {
+        Some((size, _)) => export_scratch_bytes(size, with_video),
+        None => {
+            let mut drawable = initial_size;
+            let mut max_scratch = export_scratch_bytes(drawable, with_video);
+            for record in records {
+                if let crate::TimelineRecord::Resize { drawable: resized } = record {
+                    drawable = *resized;
+                    max_scratch = max_scratch.max(export_scratch_bytes(drawable, with_video));
+                }
+            }
+            max_scratch
+        }
+    };
+    world.admit_memory(false, 0, peak_observers.saturating_add(peak_export_scratch))
+}
+
 /// The Studio's observer bytes for `world` (see the [module
 /// documentation](self)): its feed sized by `founding`, a standalone epoch
 /// of the world, `view` and its frames at `drawable` pixels.

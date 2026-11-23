@@ -33,6 +33,10 @@ use std::str::FromStr;
 use std::sync::LazyLock;
 
 use flife_core::CoreError;
+pub use flife_render::{
+    CELL_STATE_STEPS, POLARITY_ANGLE_SCALE, POLARITY_UNPOLARIZED, quantize_cell_state,
+    quantize_polarity,
+};
 use fmn_core::color::{LinearRgba, Srgb, srgb_to_oklab};
 use fmn_render::{SurfaceDraw, SurfaceMesh, SurfaceVertex, Texture, ThreeDDraw};
 
@@ -61,10 +65,6 @@ pub const TRAIL_CARRIER_NAME: &str = "trail-carrier";
 /// Field overlay name for Murray/Physarum mean incident conductance (`g_e`, `V2-14`/`V2-16`).
 pub const VASCULAR_CONDUCTANCE_NAME: &str = "vascular-conductance";
 
-/// Quantization step count for `h_0 ∈ [-1, 1]` in `Epoch::cell_states` (`-127..=127`),
-/// matching [`flife_render::COMPONENT_STEPS`].
-pub const CELL_STATE_STEPS: i8 = 127;
-
 /// OKLab lightness endpoints `[L_low, L_high]` for `cell-state-v1` at `h_0 = -1`
 /// and `h_0 = +1`, delivering >50 CIE L* separation within every founder lineage
 /// while staying visible on a dark canvas.
@@ -77,14 +77,6 @@ pub const CELL_STATE_HUE_TWIST_RADIANS: f64 = 0.30;
 
 /// Sample quantized `h_0` states shown in [`cell_state_legend`].
 pub const LEGEND_CELL_STATES: [i8; 5] = [-127, -64, 0, 64, 127];
-
-/// Quantization scale for world polarity angles `atan2(p_y, p_x) ∈ [-π, π]`
-/// mapped onto `-32767..=32767`.
-pub const POLARITY_ANGLE_SCALE: i16 = i16::MAX;
-
-/// Explicit `i16` sentinel for an unpolarized, zero-magnitude, or EMT-detached
-/// organism (`i16::MIN = -32768`): draws neutral grey with no apical tick.
-pub const POLARITY_UNPOLARIZED: i16 = i16::MIN;
 
 /// Neutral sRGB colour for unpolarized organisms ([`POLARITY_UNPOLARIZED`]).
 pub const POLARITY_UNPOLARIZED_COLOR: [u8; 3] = [0x58, 0x5E, 0x6E];
@@ -145,10 +137,10 @@ pub const VASCULAR_CONDUCTANCE_PALETTE: [[u8; 3]; 6] = [
 ];
 
 /// Number of quantized `cell_state` steps in `-127..=127`.
-const CELL_STATE_LUT_LEN: usize = 2 * (CELL_STATE_STEPS as usize) + 1;
+pub(crate) const CELL_STATE_LUT_LEN: usize = 2 * (CELL_STATE_STEPS as usize) + 1;
 
 /// Power-of-two cyclic lookup table length for `polarity-v1` (`0.35°` per step).
-const POLARITY_LUT_LEN: usize = 1024;
+pub(crate) const POLARITY_LUT_LEN: usize = 1024;
 
 /// The `V2-16` particle colour mappings (`cell-state-v1` and `polarity-v1`),
 /// pure read-only (`INV-09`) extensions of [`crate::ColorMapping`].
@@ -230,18 +222,6 @@ impl FromStr for V2ColorMapping {
     }
 }
 
-/// Quantize a continuous cell-state value `h_0 ∈ [-1, 1]` to `i8` in
-/// `-127..=127` (`CELL_STATE_STEPS`). Non-finite inputs map to `0`.
-#[must_use]
-pub fn quantize_cell_state(h0: f32) -> i8 {
-    let h0 = f64::from(h0);
-    if !h0.is_finite() {
-        return 0;
-    }
-    let scaled = (h0.clamp(-1.0, 1.0) * f64::from(CELL_STATE_STEPS)).round();
-    (scaled as i32).clamp(-i32::from(CELL_STATE_STEPS), i32::from(CELL_STATE_STEPS)) as i8
-}
-
 /// Decode a quantized `Epoch::cell_states` value back to `[-1.0, 1.0]`.
 /// `i8::MIN` (`-128`) clamps cleanly to `-1.0`.
 #[must_use]
@@ -250,10 +230,16 @@ pub fn decode_cell_state(quantized: i8) -> f64 {
 }
 
 #[inline]
-fn cell_state_index(quantized: i8) -> usize {
+pub(crate) fn cell_state_index(quantized: i8) -> usize {
     let clamped =
         i16::from(quantized).clamp(-i16::from(CELL_STATE_STEPS), i16::from(CELL_STATE_STEPS));
     usize::try_from(clamped + i16::from(CELL_STATE_STEPS)).unwrap_or(0)
+}
+
+#[inline]
+pub(crate) fn linear_cell_state_shades()
+-> &'static [[LinearRgba; CELL_STATE_LUT_LEN]; LINEAGE_PALETTE.len()] {
+    &LINEAR_CELL_STATE_SHADES
 }
 
 /// Precomputed `12 × 255` sRGB shade table for `cell-state-v1`.
@@ -374,26 +360,6 @@ pub fn lower_cell_state_colors(
     Ok(())
 }
 
-/// Quantize a 2-D apical polarity vector `[p_x, p_y]` in world coordinates
-/// (x east, y down) to `i16` (`-32767..=32767` for `atan2(p_y, p_x)`), or
-/// [`POLARITY_UNPOLARIZED`] (`i16::MIN`) for zero or non-finite vectors.
-#[must_use]
-pub fn quantize_polarity(direction: [f32; 2]) -> i16 {
-    let [x, y] = direction.map(f64::from);
-    if !(x.is_finite() && y.is_finite()) || (x == 0.0 && y == 0.0) {
-        return POLARITY_UNPOLARIZED;
-    }
-    let angle = y.atan2(x);
-    if !angle.is_finite() {
-        return POLARITY_UNPOLARIZED;
-    }
-    let scaled = (angle / PI * f64::from(POLARITY_ANGLE_SCALE)).round();
-    (scaled as i32).clamp(
-        -i32::from(POLARITY_ANGLE_SCALE),
-        i32::from(POLARITY_ANGLE_SCALE),
-    ) as i16
-}
-
 /// Decode a quantized `Epoch::polarities` entry back to world-coordinate
 /// radians `atan2(p_y, p_x) ∈ [-π, π]`, or `None` for [`POLARITY_UNPOLARIZED`].
 #[must_use]
@@ -447,10 +413,20 @@ static POLARITY_UNPOLARIZED_LINEAR: LazyLock<LinearRgba> =
     LazyLock::new(|| linear(POLARITY_UNPOLARIZED_COLOR));
 
 #[inline]
-fn polarity_lut_index(turn: f64) -> usize {
+pub(crate) fn polarity_lut_index(turn: f64) -> usize {
     let wrapped = turn.rem_euclid(1.0);
     let step = (wrapped * (POLARITY_LUT_LEN as f64)).round() as usize;
     step & (POLARITY_LUT_LEN - 1)
+}
+
+#[inline]
+pub(crate) fn polarity_wheel_linear() -> &'static [LinearRgba; POLARITY_LUT_LEN] {
+    &POLARITY_WHEEL_LINEAR
+}
+
+#[inline]
+pub(crate) fn polarity_unpolarized_linear() -> LinearRgba {
+    *POLARITY_UNPOLARIZED_LINEAR
 }
 
 /// Cyclic OKLab perceptual wheel colour at counter-clockwise screen turn
@@ -695,6 +671,124 @@ pub fn apical_ticks_mesh(
             vertices.extend_from_slice(&quad_verts);
             indices.extend(quad_idx.map(|i| base + i));
         }
+    }
+    SurfaceMesh::new(vertices, indices)
+        .map(Some)
+        .map_err(|error| CoreError::NumericalInvalid {
+            quantity: "apical ticks",
+            detail: error.to_string(),
+        })
+}
+
+/// Build one bounded bulk [`SurfaceMesh`] of apical orientation ticks from
+/// [`crate::WorldView`]'s drawn `f64` world positions, `shown` visibility flags
+/// and quantized `polarities`, with optional conservative frustum culling
+/// `(half_fw, half_fh, focal)` at `zoom > 1`.
+pub(crate) fn apical_ticks_mesh_from_drawn(
+    viewport: &Viewport,
+    positions: &[[f64; 2]],
+    shown: &[bool],
+    polarities: &[i16],
+    dot_radius: f64,
+    color: LinearRgba,
+    cull: Option<(f64, f64, f64)>,
+) -> Result<Option<SurfaceMesh>, CoreError> {
+    if positions.len() != polarities.len() || shown.len() != polarities.len() {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "apical ticks",
+            detail: format!(
+                "{} positions, {} visibilities for {} polarities",
+                positions.len(),
+                shown.len(),
+                polarities.len()
+            ),
+        });
+    }
+    if !(dot_radius.is_finite()
+        && dot_radius > 0.0
+        && (dot_radius * APICAL_TICK_END_RATIO).is_finite())
+    {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "apical tick radius",
+            detail: format!("dot radius {dot_radius} must be finite, positive and non-overflowing"),
+        });
+    }
+    let (start, extent, half) = viewport.scene_transform();
+    let reach = 1.5 * dot_radius * APICAL_TICK_END_RATIO;
+    let visible = |center: [f64; 3]| -> bool {
+        let Some((half_fw, half_fh, focal)) = cull else {
+            return true;
+        };
+        if !focal.is_finite() || focal <= 0.0 || reach >= focal {
+            return true;
+        }
+        let margin = 1.0 + reach / focal;
+        center[0].abs() <= half_fw * margin + reach && center[1].abs() <= half_fh * margin + reach
+    };
+    let mut emitted = 0_usize;
+    for ((&position, &is_shown), &polarity) in positions.iter().zip(shown).zip(polarities) {
+        if !is_shown || polarity == POLARITY_UNPOLARIZED {
+            continue;
+        }
+        if !position.iter().all(|c| c.is_finite()) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "apical tick position",
+                detail: format!("position {position:?} must be finite"),
+            });
+        }
+        let center = Viewport::scene_point_with(start, extent, half, position);
+        if visible(center) {
+            emitted += 1;
+        }
+    }
+    if emitted == 0 {
+        return Ok(None);
+    }
+    let vertex_count = emitted.checked_mul(4).ok_or(CoreError::Overflow {
+        quantity: "apical tick vertices",
+    })?;
+    if u32::try_from(vertex_count).is_err() {
+        return Err(CoreError::Overflow {
+            quantity: "apical tick vertices",
+        });
+    }
+    let index_count = emitted.checked_mul(6).ok_or(CoreError::Overflow {
+        quantity: "apical tick indices",
+    })?;
+    let mut vertices = Vec::new();
+    vertices
+        .try_reserve_exact(vertex_count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "apical tick vertices",
+            bytes: u64::try_from(vertex_count.saturating_mul(size_of::<SurfaceVertex>()))
+                .unwrap_or(u64::MAX),
+        })?;
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(index_count)
+        .map_err(|_| CoreError::AllocationFailed {
+            buffer: "apical tick indices",
+            bytes: u64::try_from(index_count.saturating_mul(size_of::<u32>())).unwrap_or(u64::MAX),
+        })?;
+    for ((&position, &is_shown), &polarity) in positions.iter().zip(shown).zip(polarities) {
+        if !is_shown || polarity == POLARITY_UNPOLARIZED {
+            continue;
+        }
+        let center = Viewport::scene_point_with(start, extent, half, position);
+        if !visible(center) {
+            continue;
+        }
+        if let Some((quad_verts, quad_idx)) = apical_tick_quad(center, dot_radius, polarity, color)
+        {
+            let base = u32::try_from(vertices.len()).map_err(|_| CoreError::Overflow {
+                quantity: "apical tick vertices",
+            })?;
+            vertices.extend_from_slice(&quad_verts);
+            indices.extend(quad_idx.map(|i| base + i));
+        }
+    }
+    if vertices.is_empty() {
+        return Ok(None);
     }
     SurfaceMesh::new(vertices, indices)
         .map(Some)

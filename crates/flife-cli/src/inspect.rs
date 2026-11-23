@@ -28,9 +28,9 @@
 
 use std::path::Path;
 
-use flife_core::CoreError;
 use flife_core::checkpoint::ChunkFamily;
 use flife_core::ids::OrganismId;
+use flife_core::{CoreError, V2Feature};
 use flife_engine::{ControllerWeights, NumericalProfile, World};
 use flife_store::{ChunkStore, Durability};
 use serde::Serialize;
@@ -143,6 +143,11 @@ pub struct InspectedOrganism {
     /// exactly), and the tick they were evaluated at; none for a newborn
     /// that has not been evaluated yet.
     pub held: Option<InspectedHeld>,
+    /// Secretory readiness `r_i ∈ [0, 1]` when `V2-04` `excitable-relay` is
+    /// enabled; omitted on `field-ecology-v1*` and whenever `excitable-relay`
+    /// is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secretory_readiness: Option<f64>,
 }
 
 /// An organism's held controller outputs.
@@ -335,6 +340,12 @@ fn of(
     world: &World,
     options: &InspectOptions,
 ) -> Result<Inspection, CoreError> {
+    let excitable_active = world
+        .config()
+        .config()
+        .v2
+        .as_ref()
+        .is_some_and(|v2| v2.is_enabled(V2Feature::ExcitableRelay));
     let population = world.population();
     let mut organisms = Vec::new();
     let mut organism_energy = 0.0;
@@ -372,6 +383,7 @@ fn of(
                             .then(|| state.iter().map(|&value| f64::from(value)).collect()),
                     }
                 }),
+            secretory_readiness: excitable_active.then(|| f64::from(organism.secretory_readiness)),
         });
     }
     let state = world.field();

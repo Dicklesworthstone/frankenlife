@@ -42,8 +42,8 @@ use std::ops::Range;
 use flife_field::settle::{
     ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction, EmissionOrganism,
     EmissionOutcome, ExhaustedAt, MUTATION_LAYERS, MotionConstants, MotionOrganism, MotionOutcome,
-    MutationBirth, MutationConstants, MutationCounts, MutationLayer, MutationValues,
-    ProposalOrganism, ProposalOutcome, SettleBackend,
+    MotionV2Extras, MotorSteeringInputs, MutationBirth, MutationConstants, MutationCounts,
+    MutationLayer, MutationValues, ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 use flife_field::state::CHANNELS;
 use flife_field::{Bins, Deposits, FieldState, GrantPacket};
@@ -80,6 +80,7 @@ pub(super) struct SettleWork {
     packets: Vec<ChemistryPacket>,
     chemistry_out: Vec<ChemistryOutcome>,
     motion: Vec<MotionOrganism>,
+    motion_extras: Vec<MotionV2Extras>,
     motion_out: Vec<MotionOutcome>,
     emission: Vec<EmissionOrganism>,
     emission_out: Vec<EmissionOutcome>,
@@ -100,7 +101,7 @@ impl SettleWork {
     ///
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the host refuses the room.
-    pub(super) fn reserve(&mut self, rows: usize) -> Result<(), CoreError> {
+    pub(super) fn reserve(&mut self, rows: usize, needs_motion_v2: bool) -> Result<(), CoreError> {
         fit(&mut self.chemistry, rows, "phase 6 chemistry rows")?;
         fit(
             &mut self.packets,
@@ -109,6 +110,11 @@ impl SettleWork {
         )?;
         fit(&mut self.chemistry_out, rows, "phase 6 chemistry outcomes")?;
         fit(&mut self.motion, rows, "phase 6 motion rows")?;
+        if needs_motion_v2 {
+            fit(&mut self.motion_extras, rows, "phase 6 motion v2 extras")?;
+        } else {
+            self.motion_extras = Vec::new();
+        }
         fit(&mut self.motion_out, rows, "phase 6 motion outcomes")?;
         fit(&mut self.emission, rows, "phase 6 emission rows")?;
         fit(&mut self.emission_out, rows, "phase 6 emission outcomes")?;
@@ -126,6 +132,7 @@ impl SettleWork {
             capacity_bytes(&self.packets),
             capacity_bytes(&self.chemistry_out),
             capacity_bytes(&self.motion),
+            capacity_bytes(&self.motion_extras),
             capacity_bytes(&self.motion_out),
             capacity_bytes(&self.emission),
             capacity_bytes(&self.emission_out),
@@ -227,12 +234,15 @@ fn settle_on(
         });
     }
     let motion_constants = motion_constants(rules)?;
+    let needs_motion_v2 = rules.v2.needs_motion_v2();
+    let motor_constants = rules.v2.motor();
     let (by_demand, granted) = grants;
     let SettleWork {
         chemistry,
         packets,
         chemistry_out,
         motion,
+        motion_extras,
         motion_out,
         emission,
         emission_out,
@@ -245,6 +255,7 @@ fn settle_on(
     chemistry.clear();
     packets.clear();
     motion.clear();
+    motion_extras.clear();
     emission.clear();
     emitters.clear();
     proposal.clear();
@@ -286,6 +297,15 @@ fn settle_on(
             response: *traits.motion_response(),
             gradients: organism.gradients,
         });
+        if needs_motion_v2 {
+            motion_extras.push(MotionV2Extras {
+                basal_multiplier: organism.basal_multiplier,
+                motor: organism
+                    .actions
+                    .motor
+                    .map_or_else(MotorSteeringInputs::default, MotorSteeringInputs::from),
+            });
+        }
     }
 
     device.chemistry(
@@ -301,26 +321,69 @@ fn settle_on(
         row.exhausted = outcome.exhausted;
         row.absorbed = outcome.absorbed;
     }
-    device.motion(&motion_constants, motion, motion_out)?;
+    if needs_motion_v2 {
+        device.motion_v2(
+            &motion_constants,
+            motor_constants.as_ref(),
+            motion,
+            motion_extras,
+            motion_out,
+        )?;
+    } else {
+        device.motion(&motion_constants, motion, motion_out)?;
+    }
     expect_outcomes("motion", motion_out.len(), working.len())?;
+    let emission_v2_active = rules.v2.emission().any_enabled();
     for (organism, outcome) in working.iter().zip(motion_out.iter()) {
         if outcome.died.is_some() {
             emitters.push(usize::MAX);
         } else {
             emitters.push(emission.len());
+            let (deposit_position, effective_emission) = if emission_v2_active {
+                let ctx =
+                    rules.emission_context(organism, outcome.position, outcome.velocity, from)?;
+                let plan = rules.v2.emission().plan(
+                    &rules.grid,
+                    rules.step,
+                    outcome.remaining,
+                    false,
+                    organism.actions.emission.as_ref(),
+                    &ctx,
+                )?;
+                (
+                    plan.deposit_position,
+                    plan.effective_emission.map(EmissionAction::from),
+                )
+            } else {
+                (
+                    outcome.position,
+                    organism.actions.emission.map(EmissionAction::from),
+                )
+            };
             emission.push(EmissionOrganism {
                 remaining: outcome.remaining,
-                position: outcome.position,
-                emission: organism.actions.emission.map(EmissionAction::from),
+                position: deposit_position,
+                emission: effective_emission,
             });
         }
     }
-    device.emission(
-        &rules.grid,
-        rules.emission.efficiency(),
-        emission,
-        emission_out,
-    )?;
+    let energy_floor = rules.v2.emission().energy_floor();
+    if energy_floor > 0.0 {
+        device.emission_with_floor(
+            &rules.grid,
+            rules.emission.efficiency(),
+            energy_floor,
+            emission,
+            emission_out,
+        )?;
+    } else {
+        device.emission(
+            &rules.grid,
+            rules.emission.efficiency(),
+            emission,
+            emission_out,
+        )?;
+    }
     expect_outcomes("emission", emission_out.len(), emission.len())?;
     for (organism, &at) in working.iter().zip(emitters.iter()) {
         match emission_out.get(at) {
@@ -332,7 +395,7 @@ fn settle_on(
                     cooldown_deadline: organism.cooldown_deadline.get(),
                     remaining: outcome.remaining,
                     exhausted: false,
-                    attempt_probability: organism.actions.attempt_probability,
+                    attempt_probability: rules.effective_attempt_probability(organism)?,
                     child_fraction: organism.actions.child_fraction,
                 });
             }
@@ -675,13 +738,16 @@ impl Stages for Device<'_> {
         &mut self,
         rules: &Rules,
         organism: &Working,
-        _position: [f64; 2],
+        position: [f64; 2],
+        velocity: [f64; 2],
+        from: Tick,
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
-    ) -> Result<EmissionSettlement, CoreError> {
+    ) -> Result<(EmissionSettlement, f32, Tick), CoreError> {
         // EmissionPolicy::emit, its request and offer recomputed here, its
         // footprint split the backend's (at the position the backend moved
-        // the organism to, which `displace` checked).
+        // the organism to, which `displace` checked, or the V2-04 offset
+        // position computed identically on host).
         let outcome = self
             .emission
             .ok_or_else(|| differ("the backend did not settle emission".into()))?;
@@ -700,13 +766,38 @@ impl Stages for Device<'_> {
                 outcome.available
             )));
         }
-        let Some(action) = organism.actions.emission.as_ref() else {
+        let (effective_emission, energy_floor, next_readiness, next_cooldown_deadline) =
+            if rules.v2.emission().any_enabled() {
+                let ctx = rules.emission_context(organism, position, velocity, from)?;
+                let plan = rules.v2.emission().plan(
+                    &rules.grid,
+                    rules.step,
+                    available,
+                    budget.is_exhausted(),
+                    organism.actions.emission.as_ref(),
+                    &ctx,
+                )?;
+                (
+                    plan.effective_emission,
+                    plan.energy_floor,
+                    plan.next_readiness,
+                    plan.next_cooldown_deadline,
+                )
+            } else {
+                (
+                    organism.actions.emission,
+                    0.0,
+                    organism.secretory_readiness,
+                    organism.emission_cooldown_deadline,
+                )
+            };
+        let Some(action) = effective_emission.as_ref() else {
             return if outcome.staged {
                 Err(differ(
                     "emission staged for an organism that does not emit".into(),
                 ))
             } else {
-                Ok(nothing)
+                Ok((nothing, next_readiness, next_cooldown_deadline))
             };
         };
         let fraction = action.spend_fraction;
@@ -716,16 +807,21 @@ impl Stages for Device<'_> {
                 detail: format!("{fraction} is outside [0, 1]"),
             });
         }
+        let surplus = if energy_floor == 0.0 {
+            available
+        } else {
+            (available - energy_floor).max(0.0)
+        };
         let requested = if budget.is_exhausted() {
             0.0
         } else {
-            (fraction * available).min(available)
+            (fraction * surplus).min(available)
         };
         if requested == 0.0 {
             return if outcome.staged {
                 Err(differ("emission staged a zero request".into()))
             } else {
-                Ok(nothing)
+                Ok((nothing, next_readiness, next_cooldown_deadline))
             };
         }
         let offered = rules.emission.efficiency() * requested;
@@ -748,11 +844,15 @@ impl Stages for Device<'_> {
         let cost = budget.pay(requested)?;
         check_paid("emission", cost.paid, outcome.paid)?;
         check_balance("emission", budget, outcome.remaining, outcome.exhausted)?;
-        Ok(EmissionSettlement {
-            available,
-            cost,
-            offered,
-        })
+        Ok((
+            EmissionSettlement {
+                available,
+                cost,
+                offered,
+            },
+            next_readiness,
+            next_cooldown_deadline,
+        ))
     }
 
     fn propose(
@@ -781,7 +881,7 @@ impl Stages for Device<'_> {
                 Err(unexpected())
             };
         }
-        check_probability(organism.actions.attempt_probability)?;
+        check_probability(rules.effective_attempt_probability(organism)?)?;
         match outcome {
             ProposalOutcome::NoAttempt => Ok(ReproductionProposal::NoAttempt),
             ProposalOutcome::Exhausted | ProposalOutcome::CoolingDown => Err(unexpected()),

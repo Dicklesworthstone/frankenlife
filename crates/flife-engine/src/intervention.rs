@@ -73,6 +73,7 @@ use flife_field::state::CHANNELS;
 use flife_field::{Deposits, ExchangeKernel, FieldGrid, FieldState};
 use flife_genome::{GenomeQuota, TopologyCatalog, TraitLimits, founder};
 
+use crate::emission::INITIAL_SECRETORY_READINESS;
 use crate::lifecycle::{Death, Disposition, Recycling};
 use crate::population::{Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
@@ -574,6 +575,8 @@ fn stage_introduction(
                 held: HeldOutput::INVALID,
                 phase: stable_phase(id, founding.interval)?,
                 cooldown_deadline,
+                secretory_readiness: INITIAL_SECRETORY_READINESS,
+                emission_cooldown_deadline: Tick::new(0),
             },
             genome,
         });

@@ -6,11 +6,12 @@
 //! Arithmetic is F64 over the exact F32 values: squares are summed in channel
 //! order, and the energy total is summed in cell-index order.
 
+use std::ops::Range;
+
 use flife_core::CoreError;
 
-use crate::grid::FIELD_PLANES;
+use crate::grid::{CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE};
 use crate::state::FieldState;
-use std::ops::Range;
 
 /// The cone residual a committed cell may carry:
 /// `residual ≤ absolute + relative × e_c`. It is part of a declared
@@ -125,7 +126,7 @@ impl FieldState {
         workers: usize,
     ) -> Result<FieldSummary, CoreError> {
         let grid = *self.grid();
-        let planes = self.planes();
+        let planes = self.plane_slices();
         let Some((energy, moments)) = planes.split_first() else {
             return Ok(FieldSummary {
                 energy_total: 0.0,
@@ -134,13 +135,32 @@ impl FieldState {
                 empty_cells: 0,
             });
         };
+        let dual = self.is_dual_carrier();
+        let (c0_moments, c1): (&[&[f32]], Option<(&[f32], &[&[f32]])>) = if dual {
+            let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
+            let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
+            let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
+            (
+                moments.get(..c0_end).unwrap_or(&[]),
+                moments
+                    .get(c1_e_idx)
+                    .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
+            )
+        } else {
+            (moments, None)
+        };
         let width = u64::from(grid.cells_x());
         let cells = energy.len();
         let ranges = workers.min(cells / CELLS_PER_RANGE).max(1);
         let check = |range: usize| {
             let start = cells / ranges * range + cells % ranges * range / ranges;
             let end = cells / ranges * (range + 1) + cells % ranges * (range + 1) / ranges;
-            check_range(energy, moments, start..end, tolerance, width)
+            match c1 {
+                None => check_range(energy, c0_moments, start..end, tolerance, width),
+                Some((e1, m1)) => {
+                    check_range_dual(energy, c0_moments, e1, m1, start..end, tolerance, width)
+                }
+            }
         };
         let check = &check;
         let checked = std::thread::scope(|scope| {
@@ -171,9 +191,7 @@ impl FieldState {
             }
             summary.empty_cells += range.empty_cells;
         }
-        for &cell_energy in energy.iter() {
-            summary.energy_total += f64::from(cell_energy);
-        }
+        summary.energy_total = self.energy_total();
         Ok(summary)
     }
 }
@@ -191,9 +209,9 @@ pub struct FieldScan {
 }
 
 impl FieldState {
-    /// The field's planes: the energy plane first, then the moment planes.
-    fn planes(&self) -> Vec<&[f32]> {
-        (0..FIELD_PLANES)
+    /// The field's planes as slices: plane 0 first, then the remaining planes.
+    fn plane_slices(&self) -> Vec<&[f32]> {
+        (0..self.planes())
             .filter_map(|plane| self.plane(plane))
             .collect()
     }
@@ -201,10 +219,11 @@ impl FieldState {
     /// The reference's scan for a backend's phase 10 (FL-032): each cell in
     /// cell-index order through [`FieldState::check_invariants`]'s
     /// arithmetic, stopping at the first that fails, else the first cell
-    /// with the largest positive cone residual.
+    /// with the largest positive cone residual. In 34-plane dual-carrier mode
+    /// (`V2-15`), checks BOTH Carrier 0 and Carrier 1 cones independently.
     #[must_use]
     pub fn scan_invariants(&self, tolerance: ConeTolerance) -> FieldScan {
-        let planes = self.planes();
+        let planes = self.plane_slices();
         let mut scan = FieldScan {
             offending: None,
             largest: None,
@@ -212,9 +231,29 @@ impl FieldState {
         let Some((energy, moments)) = planes.split_first() else {
             return scan;
         };
+        let dual = self.is_dual_carrier();
+        let (c0_moments, c1): (&[&[f32]], Option<(&[f32], &[&[f32]])>) = if dual {
+            let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
+            let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
+            let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
+            (
+                moments.get(..c0_end).unwrap_or(&[]),
+                moments
+                    .get(c1_e_idx)
+                    .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
+            )
+        } else {
+            (moments, None)
+        };
         let width = u64::from(self.grid().cells_x());
         for index in 0..energy.len() {
-            match check_cell(energy, moments, index, tolerance, width) {
+            let checked = match c1 {
+                None => check_cell(energy, c0_moments, index, tolerance, width),
+                Some((e1, m1)) => {
+                    check_cell_dual(energy, c0_moments, e1, m1, index, tolerance, width)
+                }
+            };
+            match checked {
                 Err(_) => {
                     return FieldScan {
                         offending: Some(index),
@@ -253,7 +292,7 @@ impl FieldState {
             operation: "field check backend",
             detail,
         };
-        let planes = self.planes();
+        let planes = self.plane_slices();
         let mut summary = FieldSummary {
             energy_total: 0.0,
             max_cone_residual: 0.0,
@@ -262,6 +301,20 @@ impl FieldState {
         };
         let Some((energy, moments)) = planes.split_first() else {
             return Ok(Some(summary));
+        };
+        let dual = self.is_dual_carrier();
+        let (c0_moments, c1): (&[&[f32]], Option<(&[f32], &[&[f32]])>) = if dual {
+            let c0_end = CARRIER0_MOMENT_CHANNELS as usize;
+            let c1_e_idx = (CARRIER1_ENERGY_PLANE - 1) as usize;
+            let c1_m_start = (CARRIER1_FIRST_MOMENT_PLANE - 1) as usize;
+            (
+                moments.get(..c0_end).unwrap_or(&[]),
+                moments
+                    .get(c1_e_idx)
+                    .map(|&e1| (e1, moments.get(c1_m_start..).unwrap_or(&[]))),
+            )
+        } else {
+            (moments, None)
         };
         let width = u64::from(self.grid().cells_x());
         if let Some(index) = scan.offending {
@@ -274,8 +327,13 @@ impl FieldState {
             return Ok(None);
         }
         if let Some((index, residual)) = scan.largest {
-            let own = check_cell(energy, moments, index, tolerance, width)
-                .map_err(|error| conflict(format!("its largest cell {index}: {error}")))?;
+            let own = match c1 {
+                None => check_cell(energy, c0_moments, index, tolerance, width),
+                Some((e1, m1)) => {
+                    check_cell_dual(energy, c0_moments, e1, m1, index, tolerance, width)
+                }
+            }
+            .map_err(|error| conflict(format!("its largest cell {index}: {error}")))?;
             if own <= 0.0 || own.to_bits() != residual.to_bits() {
                 return Err(conflict(format!(
                     "cell {index}'s residual is {own:e}, not {residual:e}"
@@ -284,15 +342,31 @@ impl FieldState {
             summary.max_cone_residual = residual;
             summary.max_cone_residual_cell = Some(locate(index, width));
         }
+        let mut total_c0 = 0.0_f64;
         for (index, &cell_energy) in energy.iter().enumerate() {
             let e = f64::from(cell_energy);
             if !e.is_finite() || e < 0.0 {
                 return Err(conflict(format!("cell {index} holds {cell_energy:?}")));
             }
-            summary.energy_total += e;
+            total_c0 += e;
             if e == 0.0 {
                 summary.empty_cells += 1;
             }
+        }
+        if let Some((e1, _)) = c1 {
+            let mut total_c1 = 0.0_f64;
+            for (index, &cell_energy) in e1.iter().enumerate() {
+                let e = f64::from(cell_energy);
+                if !e.is_finite() || e < 0.0 {
+                    return Err(conflict(format!(
+                        "carrier 1 cell {index} holds {cell_energy:?}"
+                    )));
+                }
+                total_c1 += e;
+            }
+            summary.energy_total = total_c0 + total_c1;
+        } else {
+            summary.energy_total = total_c0;
         }
         Ok(Some(summary))
     }
@@ -346,6 +420,49 @@ fn check_cell(
         });
     }
     Ok(residual)
+}
+
+/// Check cell `index` on a 34-plane dual-carrier field (`V2-15`): Carrier 0
+/// (`e_0`, `m^(0)`) then Carrier 1 (`e_1`, `m^(1)`), returning the larger
+/// cone residual.
+fn check_cell_dual(
+    e0: &[f32],
+    m0: &[&[f32]],
+    e1: &[f32],
+    m1: &[&[f32]],
+    index: usize,
+    tolerance: ConeTolerance,
+    width: u64,
+) -> Result<f64, CoreError> {
+    let r0 = check_cell(e0, m0, index, tolerance, width)?;
+    let r1 = check_cell(e1, m1, index, tolerance, width)?;
+    Ok(r0.max(r1))
+}
+
+/// Check cells `range` on a 34-plane dual-carrier field in cell-index order,
+/// stopping at the first offending cell across either carrier.
+fn check_range_dual(
+    e0: &[f32],
+    m0: &[&[f32]],
+    e1: &[f32],
+    m1: &[&[f32]],
+    range: Range<usize>,
+    tolerance: ConeTolerance,
+    width: u64,
+) -> Result<RangeSummary, CoreError> {
+    let mut summary = RangeSummary::default();
+    let end = range.end.min(e0.len());
+    for index in range.start..end {
+        let residual = check_cell_dual(e0, m0, e1, m1, index, tolerance, width)?;
+        if residual > summary.max_cone_residual {
+            summary.max_cone_residual = residual;
+            summary.max_cone_residual_cell = Some(locate(index, width));
+        }
+        if e0.get(index).is_some_and(|&v| f64::from(v) == 0.0) {
+            summary.empty_cells += 1;
+        }
+    }
+    Ok(summary)
 }
 
 /// Cells checked per cache-friendly plane-major block in [`check_range`].

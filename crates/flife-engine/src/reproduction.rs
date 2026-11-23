@@ -269,14 +269,137 @@ impl Reproduction {
         parent: OrganismId,
         tick: Tick,
     ) -> Result<[f64; 2], CoreError> {
+        self.child_offset_with_radius(rng, parent, tick, self.rules.offset_radius)
+    }
+
+    /// Uniform-by-area disk offset of radius `radius` using the canonical
+    /// `(Stream::Birth, parent, tick, LaneKind::Position)` draws.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `radius` is negative or nonfinite or
+    /// if a draw leaves the unit interval.
+    pub fn child_offset_with_radius(
+        &self,
+        rng: &SemanticRng,
+        parent: OrganismId,
+        tick: Tick,
+        radius: f64,
+    ) -> Result<[f64; 2], CoreError> {
+        if !radius.is_finite() || radius < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "child offset radius",
+                detail: format!("{radius} is not finite and nonnegative"),
+            });
+        }
         let [first, second, ..] = birth_block(rng, parent, tick, LaneKind::Position)?;
-        let radius = self.rules.offset_radius * half_open_unit(first).sqrt();
+        let r = radius * half_open_unit(first).sqrt();
         let (sin, cos) =
             sin_cos_turns(half_open_unit(second)).ok_or_else(|| CoreError::NumericalInvalid {
                 quantity: "child offset angle",
                 detail: format!("word {second:#018x} left the unit interval"),
             })?;
-        Ok([radius * cos, radius * sin])
+        Ok([r * cos, r * sin])
+    }
+
+    /// Compute the `V2-06` (`so2-budding`) child placement offset, composing
+    /// cleanly with `V2-08` (`pcp-polarity` lateral mitosis):
+    ///
+    /// - Basis `e_1 = ∇q / ‖∇q‖₂` if `‖∇q‖₂ > 1e-12`, else `v / ‖v‖₂` if
+    ///   `‖v‖₂ > 1e-12`, else deterministic Philox unit angle from word 2 of
+    ///   `(Stream::Birth, parent, tick, LaneKind::Position)`; `e_2 = [-e_1.y, e_1.x]`.
+    /// - `u_world = u_local.radial * e_1 + u_local.tangential * e_2`.
+    /// - `Δx_base = (1 - λ_epi) * (r_base * ξ_disk) + λ_epi * lateral_offset`,
+    ///   where `r_base = r_local` when `so2-budding` is active else `R_max`.
+    /// - `Δx_child = Δx_base + (1 - λ_epi) * (R_max - r_local) * u_world`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for nonfinite inputs or invalid radii.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "V2-06 SO(2) budding and V2-08 lateral mitosis composition inputs"
+    )]
+    pub fn budding_child_offset(
+        &self,
+        rng: &SemanticRng,
+        parent: OrganismId,
+        tick: Tick,
+        local_offset_radius: Option<f64>,
+        steering: Option<flife_neural::BuddingSteering>,
+        energy_gradient: [f64; 2],
+        velocity: [f64; 2],
+        lambda_epi: f64,
+        lateral_offset: [f64; 2],
+    ) -> Result<[f64; 2], CoreError> {
+        if !lambda_epi.is_finite() || !(0.0..=1.0).contains(&lambda_epi) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "epithelial lock lambda_epi",
+                detail: format!("{lambda_epi} is outside [0, 1]"),
+            });
+        }
+        if !energy_gradient[0].is_finite()
+            || !energy_gradient[1].is_finite()
+            || !velocity[0].is_finite()
+            || !velocity[1].is_finite()
+            || !lateral_offset[0].is_finite()
+            || !lateral_offset[1].is_finite()
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "budding kinematics",
+                detail: "gradient, velocity, or lateral offset is not finite".to_owned(),
+            });
+        }
+        let r_max = self.rules.offset_radius;
+        let r_base = match local_offset_radius {
+            Some(r_local) => {
+                if !r_local.is_finite() || r_local < 0.0 || r_local > r_max {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "v2.budding.local_offset_radius",
+                        detail: format!("{r_local} is outside [0, {r_max}]"),
+                    });
+                }
+                r_local
+            }
+            None => r_max,
+        };
+        let disk = self.child_offset_with_radius(rng, parent, tick, r_base)?;
+        let free = 1.0 - lambda_epi;
+        let base = [
+            free * disk[0] + lambda_epi * lateral_offset[0],
+            free * disk[1] + lambda_epi * lateral_offset[1],
+        ];
+        let Some(r_local) = local_offset_radius else {
+            return Ok(base);
+        };
+        let steer = steering.unwrap_or(flife_neural::BuddingSteering::ZERO);
+        if steer.is_zero() || free == 0.0 || r_max <= r_local {
+            return Ok(base);
+        }
+        const AXIS_EPS: f64 = 1.0e-12;
+        let g_norm = energy_gradient[0].hypot(energy_gradient[1]);
+        let e1 = if g_norm > AXIS_EPS {
+            [energy_gradient[0] / g_norm, energy_gradient[1] / g_norm]
+        } else {
+            let v_norm = velocity[0].hypot(velocity[1]);
+            if v_norm > AXIS_EPS {
+                [velocity[0] / v_norm, velocity[1] / v_norm]
+            } else {
+                let [_, _, third, _] = birth_block(rng, parent, tick, LaneKind::Position)?;
+                let (sin, cos) = sin_cos_turns(half_open_unit(third)).ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "budding fallback angle",
+                        detail: format!("word {third:#018x} left the unit interval"),
+                    }
+                })?;
+                [cos, sin]
+            }
+        };
+        let e2 = [-e1[1], e1[0]];
+        let u_world = [
+            steer.radial * e1[0] + steer.tangential * e2[0],
+            steer.radial * e1[1] + steer.tangential * e2[1],
+        ];
+        let reach = free * (r_max - r_local);
+        Ok([base[0] + reach * u_world[0], base[1] + reach * u_world[1]])
     }
 
     /// The split of `available`, the post-emission budget, at child share
@@ -351,6 +474,32 @@ impl Reproduction {
         actions: &DecodedActions,
         budget: &EnergyBudget,
     ) -> Result<ReproductionProposal, CoreError> {
+        self.propose_with_probability(
+            rng,
+            parent,
+            tick,
+            actions.attempt_probability,
+            actions.child_fraction,
+            budget,
+        )
+    }
+
+    /// Phase 7's reproduction proposal for `parent` using an explicit
+    /// `attempt_probability` and `child_fraction` (e.g., Hippo-YAP crowding
+    /// gated `p_eff` under `V2-07`). Nothing changes.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for an invalid probability or share,
+    /// and [`CoreError::Overflow`] for a child generation past `u32::MAX`.
+    pub fn propose_with_probability(
+        &self,
+        rng: &SemanticRng,
+        parent: &ParentState,
+        tick: Tick,
+        attempt_probability: f64,
+        child_fraction: f64,
+        budget: &EnergyBudget,
+    ) -> Result<ReproductionProposal, CoreError> {
         if budget.is_exhausted() {
             return Ok(ReproductionProposal::Exhausted);
         }
@@ -359,10 +508,10 @@ impl Reproduction {
                 deadline: parent.cooldown_deadline,
             });
         }
-        if !self.attempts(rng, parent.id, tick, actions.attempt_probability)? {
+        if !self.attempts(rng, parent.id, tick, attempt_probability)? {
             return Ok(ReproductionProposal::NoAttempt);
         }
-        self.attempted(parent, tick, actions.child_fraction, budget)
+        self.attempted(parent, tick, child_fraction, budget)
     }
 
     /// The proposal of an attempt that the draw made: the split of the
@@ -388,6 +537,7 @@ impl Reproduction {
                 tick,
                 position: parent.position,
                 split,
+                budding_offset: None,
             })),
         }
     }
@@ -406,6 +556,65 @@ pub(crate) fn check_probability(probability: f64) -> Result<(), CoreError> {
             detail: format!("{probability} is outside [0, 1]"),
         })
     }
+}
+
+/// Smooth Hippo-YAP contact-inhibition-of-proliferation gate (`V2-07`):
+/// `g_hippo = clamp(1 - local_neighbors / arrest_threshold, 0, 1)`.
+#[must_use]
+pub fn hippo_gate(local_neighbors: u32, arrest_threshold: f64) -> f64 {
+    if !arrest_threshold.is_finite() || arrest_threshold <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - f64::from(local_neighbors) / arrest_threshold).clamp(0.0, 1.0)
+}
+
+/// Effective reproduction attempt probability under Hippo-YAP local crowding
+/// arrest (`V2-07`): `p_eff = 1 - exp(-(attempt_rate * g_hippo) * Δt)`, exact
+/// `0.0` when `g_hippo == 0.0`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `attempt_rate` is negative or nonfinite,
+/// `arrest_threshold` is nonfinite or `< 2.0`, or `expm1_neg` rejects the
+/// scaled product.
+pub fn hippo_attempt_probability(
+    attempt_rate: f64,
+    step: flife_core::TimeStep,
+    local_neighbors: u32,
+    arrest_threshold: f64,
+) -> Result<f64, CoreError> {
+    if !attempt_rate.is_finite() || attempt_rate < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "reproduction attempt rate",
+            detail: format!("{attempt_rate} is not finite and nonnegative"),
+        });
+    }
+    if !arrest_threshold.is_finite() || arrest_threshold < 2.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.crowding.arrest_threshold",
+            detail: format!("{arrest_threshold} must be finite and >= 2.0"),
+        });
+    }
+    let gate = hippo_gate(local_neighbors, arrest_threshold);
+    if gate == 0.0 || attempt_rate == 0.0 {
+        return Ok(0.0);
+    }
+    flife_core::numerics::expm1_neg(attempt_rate * gate * step.seconds_per_tick()).ok_or_else(
+        || CoreError::NumericalInvalid {
+            quantity: "hippo attempt probability",
+            detail: format!(
+                "attempt_rate={attempt_rate}, gate={gate}, dt={} out of range",
+                step.seconds_per_tick()
+            ),
+        },
+    )
+}
+
+/// Optional Hippo-YAP crowding sensor value `c_den = N_loc / (N_loc + 4)`
+/// (`V2-07`), bounded in `[0, 1)`.
+#[must_use]
+pub fn hippo_crowding_sensor(local_neighbors: u32) -> f64 {
+    let n = f64::from(local_neighbors);
+    n / (n + 4.0)
 }
 
 fn birth_block(
@@ -540,6 +749,10 @@ pub struct BirthIntent {
     pub position: [f64; 2],
     /// The energy split.
     pub split: Split,
+    /// Optional pre-resolved child offset for `V2-06` (`so2-budding`) / `V2-08`
+    /// (`pcp-polarity` lateral mitosis). `None` uses baseline uniform disk
+    /// placement [`Reproduction::child_offset`] bit-identically.
+    pub budding_offset: Option<[f64; 2]>,
 }
 
 /// One birth for phase 8: an intent and its parent's genome.
@@ -1500,9 +1713,12 @@ fn stage_detached(
             available: population.available().saturating_sub(staged),
         });
     }
-    let offset = context
-        .reproduction
-        .child_offset(context.rng, intent.parent, intent.tick)?;
+    let offset = match intent.budding_offset {
+        Some(offset) => offset,
+        None => context
+            .reproduction
+            .child_offset(context.rng, intent.parent, intent.tick)?,
+    };
     let position = context.grid.wrap_position([
         intent.position[0] + offset[0],
         intent.position[1] + offset[1],
@@ -1668,9 +1884,12 @@ fn stage(
             available: population.available().saturating_sub(staged),
         });
     }
-    let offset = context
-        .reproduction
-        .child_offset(context.rng, intent.parent, intent.tick)?;
+    let offset = match intent.budding_offset {
+        Some(offset) => offset,
+        None => context
+            .reproduction
+            .child_offset(context.rng, intent.parent, intent.tick)?,
+    };
     let position = context.grid.wrap_position([
         intent.position[0] + offset[0],
         intent.position[1] + offset[1],
@@ -1838,6 +2057,7 @@ mod tests {
                 tick: Tick::new(5),
                 position: [1.0 + *i as f64, 2.0],
                 split,
+                budding_offset: None,
             })
             .collect();
         let requests: Vec<BirthRequest<'_>> = intents

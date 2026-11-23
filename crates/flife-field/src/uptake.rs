@@ -55,7 +55,6 @@
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, add_down};
 use flife_core::memory::{bytes_for, capacity_bytes, total};
-use flife_core::model::MOMENT_CHANNELS;
 use flife_core::{CoreError, TimeStep};
 
 use crate::bins::Bins;
@@ -64,7 +63,7 @@ use crate::exchange::{
 };
 use crate::footprint::BufferLimits;
 use crate::grid::FieldGrid;
-use crate::state::{CHANNELS, FieldState};
+use crate::state::FieldState;
 
 /// The most packets one organism's request becomes: its exchange footprint
 /// has at most four cells.
@@ -351,14 +350,18 @@ impl Grants {
                 )));
             }
         }
-        if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
+        let carrier0_moments = field.carrier0().moment_count;
+        if (0..carrier0_moments).any(|channel| field.moment(channel).is_none()) {
             return Err(conflict("a moment plane is missing".into()));
         }
         let cells =
             usize::try_from(field.grid().cell_count()).map_err(|_| CoreError::Overflow {
                 quantity: "field cells",
             })?;
-        if field.as_slice().len().checked_sub(cells) != Some(cells.saturating_mul(CHANNELS)) {
+        let expected_planes = usize::try_from(field.planes()).map_err(|_| CoreError::Overflow {
+            quantity: "field planes",
+        })?;
+        if field.as_slice().len() != cells.saturating_mul(expected_planes) {
             return Err(conflict("the moment planes are not whole".into()));
         }
         Ok(cells)
@@ -1193,8 +1196,9 @@ pub fn apply_grants_on(
             flush(planes, &batch[..batch_len]);
         }
     };
-    let used = workers.clamp(1, CHANNELS);
-    let per = CHANNELS.div_ceil(used);
+    let active_moments = field.carrier0_moments_count();
+    let used = workers.clamp(1, active_moments);
+    let per = active_moments.div_ceil(used);
     let mut runs = field.moments_mut().chunks_mut(per * cells.max(1));
     let head = runs.next().unwrap_or_default();
     let scale = &scale;

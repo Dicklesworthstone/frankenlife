@@ -72,6 +72,12 @@ fn check_layers(birth: &MutationBirth) -> Result<(), CoreError> {
     }
     let mut end = 0_usize;
     for (layer, shape) in birth.layers().iter().enumerate() {
+        if shape.inputs == 0 || shape.outputs == 0 {
+            return Err(misshapen(format!(
+                "layer {layer} has zero width ({} -> {})",
+                shape.inputs, shape.outputs
+            )));
+        }
         let weights = shape
             .inputs
             .checked_mul(shape.outputs)

@@ -19,10 +19,11 @@
 #   - selects the toolchain pinned in rust-toolchain.toml, which rustup would
 #     otherwise choose from the current directory;
 #   - keeps this one build local with the shim's per-build escape hatch
-#     (RCH_SHIM_LOCAL_IDE=1; the shim caps local jobs at RCH_LOCAL_MAX_JOBS,
-#     default 8);
+#     (unsets RCH_REQUIRE_REMOTE and sets RCH_SHIM_LOCAL_IDE=1; the shim caps
+#     local jobs at RCH_LOCAL_MAX_JOBS, default 8);
 #   - builds into ${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}/flife-studio (AGENTS.md),
-#     unless CARGO_TARGET_DIR is set.
+#     normalizing any trailing slash on TMPDIR/RCH_TARGET_BASE, unless
+#     CARGO_TARGET_DIR is set.
 set -euo pipefail
 
 if [ "$(uname -s)" != Darwin ]; then
@@ -52,8 +53,14 @@ for arg in "$@"; do
   args+=("$arg")
 done
 
+target_base="${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}"
+while [[ "$target_base" == */ ]]; do
+  target_base="${target_base%/}"
+done
+
 export RUSTUP_TOOLCHAIN="$toolchain"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${RCH_TARGET_BASE:-${TMPDIR:-/tmp}}/flife-studio}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${target_base}/flife-studio}"
+unset RCH_REQUIRE_REMOTE
 export RCH_SHIM_LOCAL_IDE=1
 
 exec cargo run --release --manifest-path "$repo/Cargo.toml" -p flife-studio -- ${args[@]+"${args[@]}"}

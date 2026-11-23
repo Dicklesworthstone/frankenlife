@@ -184,6 +184,8 @@ fn founder_row(organism: u64, energy: f64) -> Organism {
         held: HeldOutput::INVALID,
         phase: (organism % 4) as u32,
         cooldown_deadline: Tick::new(COOLDOWN),
+        secretory_readiness: flife_engine::INITIAL_SECRETORY_READINESS,
+        emission_cooldown_deadline: Tick::new(0),
     }
 }
 
@@ -206,6 +208,8 @@ fn child_row(organism: u64, parent: &Organism, tick: u64, energy: f64) -> Organi
         held: HeldOutput::INVALID,
         phase: (organism % 4) as u32,
         cooldown_deadline: Tick::new(tick + COOLDOWN),
+        secretory_readiness: flife_engine::INITIAL_SECRETORY_READINESS,
+        emission_cooldown_deadline: Tick::new(0),
     }
 }
 
@@ -315,6 +319,7 @@ fn sure_attempt(child_fraction: f64) -> DecodedActions {
         child_fraction,
         emission_gate: 0.0,
         emission: None,
+        ..DecodedActions::default()
     }
 }
 

@@ -451,7 +451,6 @@ fn atomic_refit_surface_and_timeline_peak_admission_avoid_phantom_1x_retina_spik
 /// multiplied by `render_queue_capacity`, and drops that delta to exactly zero
 /// when `--disable v2-visual-mappings` is set.
 #[test]
-#[expect(clippy::expect_used, reason = "test: a failure here is a test failure")]
 fn v2_visual_mappings_observer_bytes_account_honestly_and_drop_to_zero_when_disabled() {
     use flife_core::FeatureOverride;
 

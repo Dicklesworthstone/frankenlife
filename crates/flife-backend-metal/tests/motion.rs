@@ -13,7 +13,8 @@
 
 use flife_backend_metal::{
     ExhaustedAt, MOTION_OPS_WORDS, MOTION_TERMS, MaintenanceOutcome, MetalMotion, MotionConstants,
-    MotionOrganism, MotionOutcome, MovementOutcome,
+    MotionOrganism, MotionOutcome, MotionV2Extras, MotorSteeringConstants, MotorSteeringInputs,
+    MovementOutcome,
 };
 use flife_core::ledger::EnergyBudget;
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
@@ -988,5 +989,452 @@ fn motion_the_reference_refuses_is_refused() -> Result<(), CoreError> {
             "{result:?}"
         );
     }
+    Ok(())
+}
+
+/// Independent scalar binary64 oracle for `V2-03` (`senescence`) maintenance
+/// and `V2-05` (`so2-motor`) steered motion, following the exact documented
+/// operation order.
+fn reference_v2(
+    rules: &Rules,
+    motor_constants: Option<&MotorSteeringConstants>,
+    organism: &MotionOrganism,
+    extra: &MotionV2Extras,
+) -> Result<MotionOutcome, CoreError> {
+    let mut budget = EnergyBudget::new(organism.remaining)?;
+    assert_eq!(budget.is_exhausted(), organism.exhausted);
+    let mut vitality = Vitality::new();
+    let mut outcome = MotionOutcome {
+        maintenance: None,
+        movement: None,
+        velocity: organism.velocity,
+        position: organism.position,
+        remaining: 0.0,
+        exhausted: false,
+        died: None,
+    };
+    let finish = |mut outcome: MotionOutcome, budget: &EnergyBudget, vitality: &Vitality| {
+        outcome.remaining = budget.remaining();
+        outcome.exhausted = budget.is_exhausted();
+        outcome.died = vitality.died_at().map(|stage| match stage {
+            BudgetStage::Chemistry => ExhaustedAt::Chemistry,
+            BudgetStage::Maintenance => ExhaustedAt::Maintenance,
+            _ => ExhaustedAt::Motion,
+        });
+        Ok(outcome)
+    };
+    if !vitality.check(BudgetStage::Chemistry, &budget)? {
+        return finish(outcome, &budget, &vitality);
+    }
+    if !extra.basal_multiplier.is_finite() || extra.basal_multiplier < 1.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "basal multiplier",
+            detail: format!("{}", extra.basal_multiplier),
+        });
+    }
+    let maintenance = rules
+        .costs
+        .bill_with_basal_multiplier(
+            rules.step,
+            organism.sensing_scale,
+            organism.parameters,
+            organism.evaluated,
+            extra.basal_multiplier,
+        )?
+        .settle(&mut budget)?;
+    outcome.maintenance = Some(MaintenanceOutcome {
+        requested: maintenance.cost.requested,
+        paid: maintenance.cost.paid,
+        basal: maintenance.paid.basal,
+        sensor: maintenance.paid.sensor,
+        controller: maintenance.paid.controller,
+    });
+    if !vitality.check(BudgetStage::Maintenance, &budget)? {
+        return finish(outcome, &budget, &vitality);
+    }
+
+    let ratio = uptake_ratio(organism.absorbed, rules.step, rules.capacity)?;
+    let response = MotionResponse::new(organism.response, &rules.motion)?;
+    let m = extra.motor;
+    for component in [
+        m.energy_gradient,
+        m.chemical_gradient,
+        m.chiral_contour,
+        m.heading_propulsion,
+    ] {
+        if !component.is_finite() || !(-1.0..=1.0).contains(&component) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "motor steering",
+                detail: format!("{component}"),
+            });
+        }
+    }
+    let acceleration = if m.is_zero() {
+        rules
+            .motion
+            .acceleration(ratio, &response, &organism.gradients)?
+    } else {
+        let mc = motor_constants.ok_or_else(|| CoreError::StateConflict {
+            operation: "reference v2 motion",
+            detail: "missing motor constants".into(),
+        })?;
+        for gradient in &organism.gradients {
+            if !gradient[0].is_finite() || !gradient[1].is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "sensor gradient",
+                    detail: format!("{gradient:?}"),
+                });
+            }
+        }
+        let coeff = response.coefficients();
+        let ge = [
+            coeff[0] * organism.gradients[0][0],
+            coeff[0] * organism.gradients[0][1],
+        ];
+        let mut gc = [0.0_f64; 2];
+        for t in 1..MOTION_TERMS {
+            gc[0] += coeff[t] * organism.gradients[t][0];
+            gc[1] += coeff[t] * organism.gradients[t][1];
+        }
+        let gsum = [ge[0] + gc[0], ge[1] + gc[1]];
+        let gperp = [-gsum[1], gsum[0]];
+        if !organism.velocity[0].is_finite() || !organism.velocity[1].is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "velocity",
+                detail: format!("{:?}", organism.velocity),
+            });
+        }
+        let v_norm = (organism.velocity[0] * organism.velocity[0]
+            + organism.velocity[1] * organism.velocity[1])
+            .sqrt();
+        let h = if v_norm > 1.0e-12 {
+            [organism.velocity[0] / v_norm, organism.velocity[1] / v_norm]
+        } else {
+            let g_norm = (gsum[0] * gsum[0] + gsum[1] * gsum[1]).sqrt();
+            if g_norm > 1.0e-12 {
+                [gsum[0] / g_norm, gsum[1] / g_norm]
+            } else {
+                [0.0, 0.0]
+            }
+        };
+        let w_e = 1.0 + mc.energy_gradient_gain * m.energy_gradient;
+        let w_c = 1.0 + mc.chemical_gradient_gain * m.chemical_gradient;
+        let w_perp = mc.chiral_contour_gain * m.chiral_contour;
+        let chem = [
+            (w_e * ge[0] + w_c * gc[0]) + w_perp * gperp[0],
+            (w_e * ge[1] + w_c * gc[1]) + w_perp * gperp[1],
+        ];
+        let grad = [ratio * chem[0], ratio * chem[1]];
+        let rem = budget.remaining();
+        let energy_gate = rem / (rem + mc.internal_energy_scale);
+        let prop_mag = ((mc.heading_propulsion_fraction * rules.constants.maximum_acceleration)
+            * energy_gate)
+            * m.heading_propulsion;
+        let raw = [grad[0] + prop_mag * h[0], grad[1] + prop_mag * h[1]];
+        clamp_radius_oracle(raw, rules.constants.maximum_acceleration)
+    };
+    let proposed = rules.motion.propose(organism.velocity, acceleration)?;
+    let moved = rules.motion.settle(proposed, &mut budget)?;
+    outcome.movement = Some(MovementOutcome {
+        proposed: moved.proposed,
+        velocity: moved.velocity,
+        requested: moved.cost.requested,
+        paid: moved.cost.paid,
+        scaled: moved.scaled,
+    });
+    outcome.velocity = moved.velocity;
+    outcome.position = rules
+        .motion
+        .displace(&rules.grid, organism.position, moved.velocity)?;
+    vitality.check(BudgetStage::Motion, &budget)?;
+    finish(outcome, &budget, &vitality)
+}
+
+fn clamp_radius_oracle(v: [f64; 2], limit: f64) -> [f64; 2] {
+    let bound = limit * limit;
+    let squared = v[0] * v[0] + v[1] * v[1];
+    if squared <= bound {
+        return v;
+    }
+    let scale = limit / squared.sqrt();
+    let mut clamped = [v[0] * scale, v[1] * scale];
+    let shrink = 1.0 - f64::EPSILON / 2.0;
+    while clamped[0] * clamped[0] + clamped[1] * clamped[1] > bound {
+        clamped = [clamped[0] * shrink, clamped[1] * shrink];
+    }
+    clamped
+}
+
+/// V2-03 (`senescence`) + V2-05 (`so2-motor`) on Metal:
+/// - 1,024+ mixed organisms match the independent F64 oracle bit-for-bit;
+/// - zero motor outputs recover baseline `device.settle` bit-for-bit (0 ulp);
+/// - SO(2) rotations of `(∇q, ∇Z, v)` rotate proposed velocities equivariantly
+///   within `1e-13`;
+/// - `v = 0` falls back to `g_sum`, `v = g_sum = 0` yields zero propulsion,
+///   unaffordable propulsion scales the whole velocity cleanly, and invalid V2
+///   inputs/constants are refused without disturbing dead-at-chemistry rows.
+#[test]
+fn metal_v2_senescence_and_so2_motor_bit_exact_and_so2_equivariant() -> Result<(), CoreError> {
+    use flife_neural::MotorSteering;
+
+    let Some(mut device) = metal() else {
+        return Ok(());
+    };
+    let rules = preset_rules();
+    let motor_constants = MotorSteeringConstants {
+        energy_gradient_gain: 2.0,
+        chemical_gradient_gain: 2.0,
+        chiral_contour_gain: 1.0,
+        heading_propulsion_fraction: 0.5,
+        internal_energy_scale: 1.5,
+    };
+
+    // 1. 1,536 organisms spanning senescence multipliers [1, 64], zero motor
+    // fast-path, active steering, v=0 fallback, v=g_sum=0 fallback, and
+    // unaffordable full-thrust propulsion.
+    let mut rng = Rng(0x2026_0305);
+    let mut organisms = Vec::new();
+    let mut extras = Vec::new();
+    let mut want = Vec::new();
+    while organisms.len() < 1_536 {
+        let mut org = organism(&rules, &mut rng);
+        let idx = organisms.len();
+        let basal_multiplier = match idx % 6 {
+            0 => 1.0,
+            1 => 1.0 + 0.25 * rng.unit(),
+            2 => 1.0 + 15.0 * rng.unit(),
+            3 => 64.0,
+            _ => 1.0 + 63.0 * rng.unit(),
+        };
+        let motor = match idx % 8 {
+            // Exact zero fast-path (including -0.0).
+            0 => MotorSteeringInputs {
+                energy_gradient: 0.0,
+                chemical_gradient: -0.0,
+                chiral_contour: 0.0,
+                heading_propulsion: -0.0,
+            },
+            // v = 0 fallback to g_sum.
+            1 => {
+                org.velocity = [0.0, 0.0];
+                MotorSteering::decode([
+                    rng.signed() * 3.0,
+                    rng.signed() * 3.0,
+                    rng.signed() * 3.0,
+                    2.5,
+                ])?
+                .into()
+            }
+            // v = 0 AND g_sum = 0 fallback -> h_hat = [0, 0].
+            2 => {
+                org.velocity = [0.0, 0.0];
+                org.gradients = [[0.0; 2]; MOTION_TERMS];
+                MotorSteering::decode([1.0, -1.0, 0.5, 4.0])?.into()
+            }
+            // Unaffordable full-thrust propulsion with low post-maintenance E.
+            3 => {
+                org.remaining = 0.015;
+                org.exhausted = false;
+                org.velocity = [0.4, -0.3];
+                MotorSteering::decode([2.0, 2.0, 1.0, 25.0])?.into()
+            }
+            _ => MotorSteering::decode([
+                rng.signed() * 4.0,
+                rng.signed() * 4.0,
+                rng.signed() * 4.0,
+                rng.signed() * 4.0,
+            ])?
+            .into(),
+        };
+        let extra = MotionV2Extras {
+            basal_multiplier,
+            motor,
+        };
+        if let Ok(outcome) = reference_v2(&rules, Some(&motor_constants), &org, &extra) {
+            organisms.push(org);
+            extras.push(extra);
+            want.push(outcome);
+        }
+    }
+    let mut got = Vec::new();
+    device.settle_v2(
+        &rules.constants,
+        Some(&motor_constants),
+        &organisms,
+        &extras,
+        &mut got,
+    )?;
+    assert_same_outcomes(&got, &want);
+    assert!(
+        want.iter().any(|o| o.movement.is_some_and(|m| m.scaled)),
+        "expected unaffordable propulsion cases"
+    );
+    assert!(
+        want.iter()
+            .any(|o| o.died == Some(ExhaustedAt::Maintenance)),
+        "expected senescence maintenance deaths"
+    );
+
+    // 2. Zero motor outputs + basal_multiplier == 1.0 match baseline `settle`
+    // bit-for-bit (0 ulp drift, verifying single-loop fast-path).
+    let identity_extras = vec![MotionV2Extras::IDENTITY; organisms.len()];
+    let mut got_v1 = Vec::new();
+    let mut got_v2_zero = Vec::new();
+    device.settle(&rules.constants, &organisms, &mut got_v1)?;
+    device.settle_v2(
+        &rules.constants,
+        Some(&motor_constants),
+        &organisms,
+        &identity_extras,
+        &mut got_v2_zero,
+    )?;
+    assert_same_outcomes(&got_v2_zero, &got_v1);
+
+    // 3. SO(2) rotational equivariance on Metal GPU across 90°, 180°, 270°, 37°.
+    let base = plain(&rules);
+    let active_extra = MotionV2Extras {
+        basal_multiplier: 1.75,
+        motor: MotorSteering::decode([0.85, -1.1, 0.65, 0.9])?.into(),
+    };
+    let rotate = |v: [f64; 2], c: f64, s: f64| [c * v[0] - s * v[1], s * v[0] + c * v[1]];
+    let mut base_out = Vec::new();
+    device.settle_v2(
+        &rules.constants,
+        Some(&motor_constants),
+        &[base],
+        &[active_extra],
+        &mut base_out,
+    )?;
+    let base_prop = base_out[0].movement.expect("base moved").proposed;
+    let base_vel = base_out[0].velocity;
+    for degrees in [90.0_f64, 180.0, 270.0, 37.0] {
+        let theta = degrees.to_radians();
+        let (s, c) = theta.sin_cos();
+        let mut rot_org = base;
+        rot_org.velocity = rotate(base.velocity, c, s);
+        for (slot, &g) in rot_org.gradients.iter_mut().zip(&base.gradients) {
+            *slot = rotate(g, c, s);
+        }
+        let mut rot_out = Vec::new();
+        device.settle_v2(
+            &rules.constants,
+            Some(&motor_constants),
+            &[rot_org],
+            &[active_extra],
+            &mut rot_out,
+        )?;
+        let got_prop = rot_out[0].movement.expect("rotated moved").proposed;
+        let want_prop = rotate(base_prop, c, s);
+        let err_prop = (got_prop[0] - want_prop[0]).hypot(got_prop[1] - want_prop[1]);
+        assert!(
+            err_prop <= 1.0e-13,
+            "SO(2) proposed velocity error {err_prop:e} at {degrees} deg"
+        );
+        let want_vel = rotate(base_vel, c, s);
+        let err_vel =
+            (rot_out[0].velocity[0] - want_vel[0]).hypot(rot_out[0].velocity[1] - want_vel[1]);
+        assert!(
+            err_vel <= 1.0e-13,
+            "SO(2) applied velocity error {err_vel:e} at {degrees} deg"
+        );
+    }
+
+    // 4. Negative & boundary refusals (and dead-at-chemistry untouched).
+    assert!(matches!(
+        device.settle_v2(
+            &rules.constants,
+            Some(&motor_constants),
+            &[base],
+            &[],
+            &mut Vec::new()
+        ),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    for bad_mc in [
+        MotorSteeringConstants {
+            energy_gradient_gain: -0.1,
+            ..motor_constants
+        },
+        MotorSteeringConstants {
+            heading_propulsion_fraction: 1.01,
+            ..motor_constants
+        },
+        MotorSteeringConstants {
+            internal_energy_scale: 0.0,
+            ..motor_constants
+        },
+        MotorSteeringConstants {
+            chiral_contour_gain: f64::NAN,
+            ..motor_constants
+        },
+    ] {
+        assert!(matches!(
+            device.settle_v2(&rules.constants, Some(&bad_mc), &[], &[], &mut Vec::new()),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
+    // Non-zero motor without MotorSteeringConstants is refused on live organism.
+    assert!(refused_by_device(&device.settle_v2(
+        &rules.constants,
+        None,
+        &[base],
+        &[active_extra],
+        &mut Vec::new(),
+    )));
+    // Invalid basal_multiplier or out-of-range motor refused on live organism.
+    for bad_extra in [
+        MotionV2Extras {
+            basal_multiplier: 0.99,
+            ..MotionV2Extras::IDENTITY
+        },
+        MotionV2Extras {
+            basal_multiplier: f64::NAN,
+            ..MotionV2Extras::IDENTITY
+        },
+        MotionV2Extras {
+            basal_multiplier: 1.0,
+            motor: MotorSteeringInputs {
+                energy_gradient: 1.01,
+                ..MotorSteeringInputs::default()
+            },
+        },
+        MotionV2Extras {
+            basal_multiplier: 1.0,
+            motor: MotorSteeringInputs {
+                heading_propulsion: f64::NAN,
+                ..MotorSteeringInputs::default()
+            },
+        },
+    ] {
+        assert!(refused_by_device(&device.settle_v2(
+            &rules.constants,
+            Some(&motor_constants),
+            &[base],
+            &[bad_extra],
+            &mut Vec::new(),
+        )));
+    }
+    // Dead-at-chemistry ignores invalid V2 extras (matching reference).
+    let dead = MotionOrganism {
+        remaining: 0.0,
+        exhausted: true,
+        ..base
+    };
+    let bad_dead_extra = MotionV2Extras {
+        basal_multiplier: f64::NAN,
+        motor: MotorSteeringInputs {
+            energy_gradient: f64::NAN,
+            ..MotorSteeringInputs::default()
+        },
+    };
+    let mut dead_out = Vec::new();
+    device.settle_v2(
+        &rules.constants,
+        Some(&motor_constants),
+        &[dead],
+        &[bad_dead_extra],
+        &mut dead_out,
+    )?;
+    assert_eq!(dead_out[0].died, Some(ExhaustedAt::Chemistry));
     Ok(())
 }

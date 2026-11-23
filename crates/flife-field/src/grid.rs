@@ -4,14 +4,101 @@
 //! `G_x × G_y` grid of cells `h_x = L_x / G_x` wide and `h_y = L_y / G_y`
 //! high. Cells are numbered row-major: `x` varies fastest.
 
-use flife_core::model::MOMENT_CHANNELS;
-use flife_core::{CoreError, ValidatedConfig};
+use std::ops::Range;
 
-/// Planes per field: one energy plane and 32 moment planes (§4.2, §9.3).
+use flife_core::model::MOMENT_CHANNELS;
+use flife_core::{CoreError, V2Feature, ValidatedConfig};
+
+/// Planes per single-carrier field: one energy plane and 32 moment planes
+/// (§4.2, §9.3).
 pub const FIELD_PLANES: u32 = 1 + MOMENT_CHANNELS;
+
+/// Planes per dual-carrier hybrid field (`V2-15`, `FL-055`):
+/// Carrier 0 (`e_0` + 24 moments = 25 planes) plus Carrier 1 (`e_1` + 8 trail
+/// moments = 9 planes) = 34 planes.
+pub const DUAL_CARRIER_PLANES: u32 = 34;
+
+/// Carrier 0 moment channels in dual-carrier mode (`planes 1..=24`).
+pub const CARRIER0_MOMENT_CHANNELS: u32 = 24;
+
+/// Carrier 1 trail energy plane index in dual-carrier mode (`plane 25`).
+pub const CARRIER1_ENERGY_PLANE: u32 = 25;
+
+/// First Carrier 1 trail moment plane index in dual-carrier mode (`plane 26`).
+pub const CARRIER1_FIRST_MOMENT_PLANE: u32 = 26;
+
+/// Carrier 1 trail moment channels in dual-carrier mode (`planes 26..=33`).
+pub const CARRIER1_MOMENT_CHANNELS: u32 = 8;
 
 /// The energy plane's index. Moment channel `k` is plane `k + 1`.
 pub const ENERGY_PLANE: u32 = 0;
+
+/// Plane layout of one carrier inside a planar field buffer (`V2-15`, `FL-055`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CarrierLayout {
+    /// Energy plane index (`0` for Carrier 0, `25` for Carrier 1).
+    pub energy_plane: u32,
+    /// First moment plane index (`1` for Carrier 0, `26` for Carrier 1).
+    pub first_moment_plane: u32,
+    /// Number of contiguous moment planes belonging to this carrier.
+    pub moment_count: u32,
+}
+
+impl CarrierLayout {
+    /// Single-carrier 33-plane layout (`e` at plane 0, 32 moments at `1..=32`).
+    pub const SINGLE_CARRIER: Self = Self {
+        energy_plane: ENERGY_PLANE,
+        first_moment_plane: 1,
+        moment_count: MOMENT_CHANNELS,
+    };
+
+    /// Dual-carrier Carrier 0 (`e_0` at plane 0, 24 moments at `1..=24`).
+    pub const CARRIER_0: Self = Self {
+        energy_plane: ENERGY_PLANE,
+        first_moment_plane: 1,
+        moment_count: CARRIER0_MOMENT_CHANNELS,
+    };
+
+    /// Dual-carrier Carrier 1 (`e_1` at plane 25, 8 trail moments at `26..=33`).
+    pub const CARRIER_1: Self = Self {
+        energy_plane: CARRIER1_ENERGY_PLANE,
+        first_moment_plane: CARRIER1_FIRST_MOMENT_PLANE,
+        moment_count: CARRIER1_MOMENT_CHANNELS,
+    };
+
+    /// Contiguous range of planes owned by this carrier (assuming energy plane
+    /// immediately precedes its moments, as in all canonical layouts).
+    #[must_use]
+    pub const fn plane_range(self) -> Range<usize> {
+        let start = self.energy_plane as usize;
+        let end = (self.first_moment_plane + self.moment_count) as usize;
+        start..end
+    }
+
+    /// Contiguous range of moment planes owned by this carrier.
+    #[must_use]
+    pub const fn moment_range(self) -> Range<usize> {
+        let start = self.first_moment_plane as usize;
+        let end = (self.first_moment_plane + self.moment_count) as usize;
+        start..end
+    }
+}
+
+/// Number of field planes declared by `config`: `34` when
+/// [`V2Feature::DualCarrierTrails`] is enabled, otherwise `33` ([`FIELD_PLANES`]).
+#[must_use]
+pub fn field_planes_for_config(config: &ValidatedConfig) -> u32 {
+    if config
+        .config()
+        .v2
+        .as_ref()
+        .is_some_and(|v2| v2.is_enabled(V2Feature::DualCarrierTrails))
+    {
+        DUAL_CARRIER_PLANES
+    } else {
+        FIELD_PLANES
+    }
+}
 
 /// The only boundary `field-ecology-v1` defines (§4.1).
 pub const PERIODIC: &str = "periodic";

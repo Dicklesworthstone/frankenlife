@@ -9,9 +9,9 @@ use std::num::NonZeroUsize;
 use flife_core::memory::{capacity_bytes, total};
 use flife_core::{CoreError, TimeStep};
 
-use crate::deposit::{DepositSummary, Deposits, apply_deposits_on};
+use crate::deposit::{DepositSummary, Deposits, apply_deposits_on, apply_deposits_to_carrier_on};
 use crate::footprint::BufferLimits;
-use crate::grid::{FIELD_PLANES, FieldGrid};
+use crate::grid::{CARRIER1_ENERGY_PLANE, ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 use crate::invariants::{ConeTolerance, FieldScan};
 use crate::layout::overflow;
 use crate::sources::{
@@ -20,8 +20,9 @@ use crate::sources::{
 };
 use crate::state::{FieldPair, FieldState};
 use crate::transport::{
-    FluxEdges, TightJunctions, TransportPlan, TransportReport, TransportScratch,
-    count_cell_occupancy, sum, transport, transport_flux_on, transport_on,
+    FluxEdges, TightJunctions, TransportPlan, TransportReport, TransportScratch, VascularField,
+    combine_transport_reports, count_cell_occupancy, transport, transport_flux_on,
+    transport_flux_range_on, transport_on, transport_range_on,
 };
 use crate::uptake::{Grants, apply_grants_on};
 
@@ -78,7 +79,7 @@ pub fn advance_field(
     }
     let mut accum = Vec::new();
     let deposits = deposit_energy_fused(next, sources, step, &mut supports, &mut accum)?;
-    let channels = usize::try_from(FIELD_PLANES - 1).map_err(|_| overflow())?;
+    let channels = next.carrier0_moments_count();
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
     let moments = next.moments_mut();
     if cells == 0 || moments.len() != cells * channels {
@@ -107,7 +108,7 @@ pub fn step_report(
         injected_declared += report.declared;
         injected_applied += report.applied;
     }
-    let energy_after = sum(next.energy());
+    let energy_after = next.energy_total();
     let residual =
         (energy_after - transport.energy_before) - (injected_declared - transport.decay_removed);
     FieldStepReport {
@@ -145,6 +146,57 @@ impl FieldStepOptions<'_> {
     #[must_use]
     pub const fn is_baseline(&self) -> bool {
         self.source_kernels.is_none() && self.flux_edges.is_none()
+    }
+}
+
+/// Extended Wave-2 Phase 2 plan composing `V2-02` (`oases`), `V2-09`
+/// (`tight-junctions`), `V2-14` (`vascular-field`), and `V2-15`
+/// (`dual-carrier-trails`) without breaking [`FieldStepOptions`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FieldStepPhase2<'a> {
+    /// Per-source [`SourceKernel`]s (`V2-02` heterogeneous `σ_j`).
+    pub source_kernels: Option<&'a [SourceKernel]>,
+    /// Precomputed Carrier-0 symmetric face conductances (`V2-09` tight
+    /// junctions and/or `V2-14` vascular arteries).
+    pub carrier0_edges: Option<&'a FluxEdges>,
+    /// Murray / *Physarum* vascular update rule (`V2-14`). When `Some`, updates
+    /// candidate `edge_x_cond, edge_y_cond` from committed Carrier-0 `e_0` and
+    /// `carrier0_edges`.
+    pub vascular: Option<&'a VascularField>,
+    /// Carrier-1 slow trail transport plan (`V2-15`, required when `pair` is
+    /// 34-plane dual-carrier).
+    pub trail_plan: Option<&'a TransportPlan>,
+    /// Carrier-1 tight-junction-only face conductances (`V2-15` + `V2-09`;
+    /// never accelerated by `V2-14` vascular arteries).
+    pub trail_edges: Option<&'a FluxEdges>,
+}
+
+impl<'a> FieldStepPhase2<'a> {
+    /// Exact `v1` baseline plan.
+    pub const BASELINE: Self = Self {
+        source_kernels: None,
+        carrier0_edges: None,
+        vascular: None,
+        trail_plan: None,
+        trail_edges: None,
+    };
+
+    /// Lift Wave-1 [`FieldStepOptions`] into [`FieldStepPhase2`].
+    #[must_use]
+    pub const fn from_options(options: FieldStepOptions<'a>) -> Self {
+        Self {
+            source_kernels: options.source_kernels,
+            carrier0_edges: options.flux_edges,
+            vascular: None,
+            trail_plan: None,
+            trail_edges: None,
+        }
+    }
+
+    /// Whether only Wave-1 options (33-plane `V2-02` / `V2-09`) are set.
+    #[must_use]
+    pub const fn is_wave1_only(&self) -> bool {
+        self.vascular.is_none() && self.trail_plan.is_none() && self.trail_edges.is_none()
     }
 }
 
@@ -200,11 +252,55 @@ pub trait FieldBackend: std::fmt::Debug + Send {
         step: TimeStep,
         options: FieldStepOptions<'_>,
     ) -> Result<FieldStepReport, CoreError> {
-        if options.is_baseline() && sources.iter().all(|source| source.power() > 0.0) {
+        if !pair.current().is_dual_carrier()
+            && !pair.current().has_vascular()
+            && options.is_baseline()
+            && sources.iter().all(|source| source.power() > 0.0)
+        {
             return self.advance(pair, plan, kernel, sources, step);
         }
         Err(CoreError::MissingCapability {
             capability: "v2 field advance (oases / tight-junctions)".into(),
+        })
+    }
+
+    /// [`advance_field_wave2_on`]'s step composing `V2-02`, `V2-09`, `V2-14`
+    /// (`vascular-field`), and `V2-15` (`dual-carrier-trails`).
+    ///
+    /// Delegates to [`FieldBackend::advance_v2`] when no Wave-2 feature
+    /// (`vascular` / `dual-carrier`) is active, and otherwise returns
+    /// [`CoreError::MissingCapability`] until overridden by a device backend.
+    ///
+    /// # Errors
+    /// [`CoreError::MissingCapability`] when unimplemented for active Wave-2
+    /// features, or as [`FieldBackend::advance_v2`].
+    fn advance_wave2(
+        &mut self,
+        pair: &mut FieldPair,
+        plan: &TransportPlan,
+        kernel: &SourceKernel,
+        sources: &[Source],
+        step: TimeStep,
+        phase2: FieldStepPhase2<'_>,
+    ) -> Result<FieldStepReport, CoreError> {
+        if !pair.current().is_dual_carrier()
+            && !pair.current().has_vascular()
+            && phase2.is_wave1_only()
+        {
+            return self.advance_v2(
+                pair,
+                plan,
+                kernel,
+                sources,
+                step,
+                FieldStepOptions {
+                    source_kernels: phase2.source_kernels,
+                    flux_edges: phase2.carrier0_edges,
+                },
+            );
+        }
+        Err(CoreError::MissingCapability {
+            capability: "v2 wave-2 field advance (vascular-field / dual-carrier-trails)".into(),
         })
     }
 
@@ -224,6 +320,26 @@ pub trait FieldBackend: std::fmt::Debug + Send {
         grants: &mut Grants,
         deposits: [&mut Deposits; 2],
     ) -> Result<[DepositSummary; 2], CoreError>;
+
+    /// Dual-carrier (`34`-plane, `V2-15`) phase 9 reduction: debits `grants`
+    /// strictly from Carrier 0, reduces `carrier0_deposits` (`[emissions_0,
+    /// recycling]`) into Carrier 0 `(0, 1, 24)`, and reduces `trail_deposits`
+    /// into Carrier 1 `(25, 26, 8)`.
+    ///
+    /// # Errors
+    /// [`CoreError::MissingCapability`] by default until overridden, or as
+    /// [`reduce_dual_carrier_field_on`].
+    fn reduce_dual_carrier(
+        &mut self,
+        _field: &mut FieldState,
+        _grants: &mut Grants,
+        _carrier0_deposits: [&mut Deposits; 2],
+        _trail_deposits: &mut Deposits,
+    ) -> Result<([DepositSummary; 2], DepositSummary), CoreError> {
+        Err(CoreError::MissingCapability {
+            capability: "34-plane dual-carrier phase 9 reduction".into(),
+        })
+    }
 
     /// Phase 10's scan of INV-01 and INV-02 on `field`, the tick's
     /// candidate, at `tolerance` (FL-032): [`FieldState::scan_invariants`],
@@ -262,6 +378,37 @@ pub fn reduce_field_on(
     ])
 }
 
+/// Phase 9 for a 34-plane dual-carrier field (`V2-15`): debits `grants`
+/// strictly from Carrier 0 (leaving Carrier 1 bit-for-bit untouched), reduces
+/// `carrier0_deposits` (`[emissions_0, recycling]`) onto Carrier 0 `(0, 1, 24)`,
+/// and reduces `trail_deposits` onto Carrier 1 `(25, 26, 8)`.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if `field` is not dual-carrier, or as
+/// [`apply_grants_on`] and [`apply_deposits_to_carrier_on`].
+pub fn reduce_dual_carrier_field_on(
+    field: &mut FieldState,
+    grants: &mut Grants,
+    carrier0_deposits: [&mut Deposits; 2],
+    trail_deposits: &mut Deposits,
+    workers: usize,
+) -> Result<([DepositSummary; 2], DepositSummary), CoreError> {
+    let Some(carrier1) = field.carrier1() else {
+        return Err(crate::layout::mismatch(
+            "reduce_dual_carrier_field_on requires a 34-plane dual-carrier field".into(),
+        ));
+    };
+    let carrier0 = field.carrier0();
+    apply_grants_on(field, grants, workers)?;
+    let [emissions_0, recycling] = carrier0_deposits;
+    let c0_summaries = [
+        apply_deposits_to_carrier_on(field, emissions_0, carrier0, workers)?,
+        apply_deposits_to_carrier_on(field, recycling, carrier0, workers)?,
+    ];
+    let c1_summary = apply_deposits_to_carrier_on(field, trail_deposits, carrier1, workers)?;
+    Ok((c0_summaries, c1_summary))
+}
+
 /// Reusable scratch for [`advance_field_on`]: one transport scratch per CPU
 /// worker and one support per source.
 #[derive(Debug)]
@@ -278,9 +425,13 @@ pub struct FieldWork {
     /// Reusable per-cell organism occupancy scratch (`V2-09` tight junctions).
     /// Empty (0 bytes) when disabled.
     cell_occupancy: Vec<u32>,
-    /// Reusable precomputed symmetric face conductances (`V2-09` tight
-    /// junctions). `None` (0 bytes) when disabled.
+    /// Reusable precomputed Carrier-0 symmetric face conductances (`V2-09`
+    /// tight junctions and/or `V2-14` vascular field). `None` (0 bytes) when
+    /// disabled.
     flux_edges: Option<FluxEdges>,
+    /// Reusable precomputed Carrier-1 tight-junction-only face conductances
+    /// (`V2-15` + `V2-09`). `None` (0 bytes) when disabled.
+    trail_flux_edges: Option<FluxEdges>,
 }
 
 impl FieldWork {
@@ -302,6 +453,7 @@ impl FieldWork {
             fused: false,
             cell_occupancy: Vec::new(),
             flux_edges: None,
+            trail_flux_edges: None,
         };
         work.set_workers(workers)?;
         Ok(work)
@@ -447,14 +599,87 @@ impl FieldWork {
         &self.cell_occupancy
     }
 
-    /// The last computed flux edges, if `V2-09` scratch is active.
+    /// The last computed Carrier-0 flux edges, if `V2-09` / `V2-14` scratch is active.
     #[must_use]
     pub fn flux_edges(&self) -> Option<&FluxEdges> {
         self.flux_edges.as_ref()
     }
 
-    /// Bytes its transport scratch, source supports, and optional `V2-09` flux
-    /// scratch hold (FL-043).
+    /// Reserve reusable Carrier-1 `FluxEdges` scratch for `V2-15` + `V2-09`
+    /// tight-junction trail transport (`0 B` unless called).
+    ///
+    /// # Errors
+    /// As [`FluxEdges::new`].
+    pub fn reserve_trail_flux(&mut self) -> Result<(), CoreError> {
+        self.trail_flux_edges = Some(FluxEdges::new(&self.grid, &self.limits)?);
+        Ok(())
+    }
+
+    /// Recompute Carrier-0 `flux_edges` from `vascular` (`V2-14`), committed
+    /// `(edge_x_cond, edge_y_cond)`, and optional `V2-09` `(barrier, positions)`.
+    ///
+    /// # Errors
+    /// As [`FieldWork::reserve_flux`], [`count_cell_occupancy`], and
+    /// [`VascularField::fill_edges`].
+    pub fn prepare_vascular_edges(
+        &mut self,
+        vascular: &VascularField,
+        plan: &TransportPlan,
+        edge_x_cond: &[f32],
+        edge_y_cond: &[f32],
+        barrier: Option<(&TightJunctions, &[[f64; 2]])>,
+    ) -> Result<&FluxEdges, CoreError> {
+        if self.flux_edges.is_none() {
+            self.reserve_flux()?;
+        }
+        let barrier_occ = if let Some((tj, positions)) = barrier {
+            count_cell_occupancy(&self.grid, positions, &mut self.cell_occupancy)?;
+            Some((tj, self.cell_occupancy.as_slice()))
+        } else {
+            None
+        };
+        let Some(edges) = self.flux_edges.as_mut() else {
+            return Err(CoreError::StateConflict {
+                operation: "prepare vascular edges",
+                detail: "flux edge scratch was not initialized".into(),
+            });
+        };
+        vascular.fill_edges(plan, edge_x_cond, edge_y_cond, barrier_occ, edges)?;
+        Ok(&*edges)
+    }
+
+    /// Recompute Carrier-1 tight-junction-only `trail_flux_edges` from already
+    /// computed `cell_occupancy` (`V2-15` + `V2-09`, never accelerated by
+    /// `V2-14` vascular arteries).
+    ///
+    /// # Errors
+    /// As [`FieldWork::reserve_trail_flux`] and [`TightJunctions::fill_edges`].
+    pub fn prepare_trail_tight_junctions(
+        &mut self,
+        barrier: &TightJunctions,
+        trail_plan: &TransportPlan,
+    ) -> Result<&FluxEdges, CoreError> {
+        if self.trail_flux_edges.is_none() {
+            self.reserve_trail_flux()?;
+        }
+        let Some(edges) = self.trail_flux_edges.as_mut() else {
+            return Err(CoreError::StateConflict {
+                operation: "prepare trail tight junctions",
+                detail: "trail flux edge scratch was not initialized".into(),
+            });
+        };
+        barrier.fill_edges(trail_plan, &self.cell_occupancy, edges)?;
+        Ok(&*edges)
+    }
+
+    /// The last computed Carrier-1 trail flux edges, if active.
+    #[must_use]
+    pub fn trail_flux_edges(&self) -> Option<&FluxEdges> {
+        self.trail_flux_edges.as_ref()
+    }
+
+    /// Bytes its transport scratch, source supports, and optional `V2-09` /
+    /// `V2-14` / `V2-15` flux scratch hold (FL-043).
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
         total(
@@ -464,6 +689,9 @@ impl FieldWork {
                 capacity_bytes(&self.fused_accum),
                 capacity_bytes(&self.cell_occupancy),
                 self.flux_edges
+                    .as_ref()
+                    .map_or(0, FluxEdges::allocated_bytes),
+                self.trail_flux_edges
                     .as_ref()
                     .map_or(0, FluxEdges::allocated_bytes),
             ]
@@ -603,7 +831,40 @@ pub fn advance_field_v2_on(
     options: FieldStepOptions<'_>,
     work: &mut FieldWork,
 ) -> Result<FieldStepReport, CoreError> {
-    if let Some(kernels) = options.source_kernels {
+    advance_field_wave2_on(
+        pair,
+        plan,
+        kernel,
+        sources,
+        step,
+        FieldStepPhase2::from_options(options),
+        work,
+    )
+}
+
+/// [`advance_field_on`] composing all Wave-1 & Wave-2 Phase 2 mechanisms:
+/// `V2-02` (`oases`), `V2-09` (`tight-junctions`), `V2-14` (`vascular-field`),
+/// and `V2-15` (`dual-carrier-trails`).
+///
+/// With [`FieldStepPhase2::BASELINE`] on a 33-plane field without vascular
+/// state, executes the exact `v1` baseline operators bit for bit.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] for mismatched `source_kernels`, missing
+/// `trail_plan` on a 34-plane field, or missing vascular buffers on `pair`;
+/// [`CoreError::StateConflict`] if per-source kernels mix fused modes,
+/// `vascular` is set without `carrier0_edges`, or a worker panics; or as
+/// [`transport_on`] / [`transport_flux_range_on`] / [`VascularField::update_edges`].
+pub fn advance_field_wave2_on(
+    pair: &mut FieldPair,
+    plan: &TransportPlan,
+    kernel: &SourceKernel,
+    sources: &[Source],
+    step: TimeStep,
+    phase2: FieldStepPhase2<'_>,
+    work: &mut FieldWork,
+) -> Result<FieldStepReport, CoreError> {
+    if let Some(kernels) = phase2.source_kernels {
         if kernels.len() != sources.len() {
             return Err(CoreError::LayoutMismatch {
                 buffer: "per-source kernels",
@@ -624,10 +885,89 @@ pub fn advance_field_v2_on(
         ..
     } = work;
     let (current, next) = pair.stage();
-    let transported = match options.flux_edges {
-        Some(edges) => transport_flux_on(plan, edges, current, next, scratches)?,
-        None => transport_on(plan, current, next, scratches)?,
+    if current.is_dual_carrier() != next.is_dual_carrier() {
+        return Err(crate::layout::mismatch(
+            "current and candidate field states disagree on carrier layout".into(),
+        ));
+    }
+    let transported = if let Some(carrier1) = current.carrier1() {
+        let Some(trail_plan) = phase2.trail_plan else {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "dual-carrier trail transport plan",
+                detail: "34-plane dual-carrier advance requires phase2.trail_plan".into(),
+            });
+        };
+        let c0_range = current.carrier0().plane_range();
+        let c1_range = carrier1.plane_range();
+        let r0 = match phase2.carrier0_edges {
+            Some(edges) => transport_flux_range_on(
+                plan,
+                edges,
+                current,
+                next,
+                c0_range,
+                Some(ENERGY_PLANE as usize),
+                scratches,
+            )?,
+            None => transport_range_on(
+                plan,
+                current,
+                next,
+                c0_range,
+                Some(ENERGY_PLANE as usize),
+                scratches,
+            )?,
+        }
+        .ok_or_else(|| {
+            crate::layout::mismatch("carrier 0 transport produced no energy report".into())
+        })?;
+        let r1 = match phase2.trail_edges {
+            Some(edges) => transport_flux_range_on(
+                trail_plan,
+                edges,
+                current,
+                next,
+                c1_range,
+                Some(CARRIER1_ENERGY_PLANE as usize),
+                scratches,
+            )?,
+            None => transport_range_on(
+                trail_plan,
+                current,
+                next,
+                c1_range,
+                Some(CARRIER1_ENERGY_PLANE as usize),
+                scratches,
+            )?,
+        }
+        .ok_or_else(|| {
+            crate::layout::mismatch("carrier 1 transport produced no energy report".into())
+        })?;
+        combine_transport_reports(r0, r1)
+    } else {
+        match phase2.carrier0_edges {
+            Some(edges) => transport_flux_on(plan, edges, current, next, scratches)?,
+            None => transport_on(plan, current, next, scratches)?,
+        }
     };
+
+    if let Some(vascular) = phase2.vascular {
+        let Some(edges) = phase2.carrier0_edges else {
+            return Err(CoreError::StateConflict {
+                operation: "advance vascular field",
+                detail: "phase2.vascular requires precomputed phase2.carrier0_edges".into(),
+            });
+        };
+        let (Some(prev_edges), Some(next_edges)) =
+            (current.vascular_edges(), next.vascular_edges_mut())
+        else {
+            return Err(crate::layout::mismatch(
+                "phase2.vascular requires vascular edge buffers enabled on FieldPair".into(),
+            ));
+        };
+        vascular.update_edges(plan, step, edges, current.energy(), prev_edges, next_edges)?;
+    }
+
     if supports.len() < sources.len() {
         supports.resize_with(sources.len(), SourceSupport::new);
     }
@@ -635,7 +975,7 @@ pub fn advance_field_v2_on(
     let grid = *next.grid();
     let refused = supports_on(
         kernel,
-        options.source_kernels,
+        phase2.source_kernels,
         &grid,
         sources,
         supports,
@@ -643,7 +983,7 @@ pub fn advance_field_v2_on(
     )?;
     let supported = refused.as_ref().map_or(sources.len(), |(index, _)| *index);
     let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
-    let channels = usize::try_from(FIELD_PLANES - 1).map_err(|_| overflow())?;
+    let channels = next.carrier0_moments_count();
     let fused = kernel.is_fused();
 
     let deposits = if fused {

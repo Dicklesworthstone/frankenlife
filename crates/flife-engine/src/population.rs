@@ -54,10 +54,11 @@ use std::iter::Peekable;
 use flife_core::clock::Tick;
 use flife_core::ids::{Generation, GenomeId, LineageId, OrganismId};
 use flife_core::memory::{capacity_bytes, total};
-use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
+use flife_core::{CoreError, Sha256Digest, V2Feature, ValidatedConfig};
 use flife_genome::{Genome, GenomeArena, GenomeQuota, MutationRecord};
 use flife_neural::{ACTION_WIDTH, ArenaSlot, MAX_ACTION_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH};
 
+use crate::emission::INITIAL_SECRETORY_READINESS;
 use crate::lifecycle::Death;
 use crate::reproduction::{Birth, Newborn};
 
@@ -295,6 +296,12 @@ pub struct Organism {
     pub phase: u32,
     /// The first attempt tick at which it may reproduce.
     pub cooldown_deadline: Tick,
+    /// Dimensionless secretory readiness `r_i ∈ [0, 1]` for `V2-04`
+    /// `excitable-relay` (`vesicle-readiness-v1`). Holds zero energy (`INV-03`).
+    pub secretory_readiness: f32,
+    /// The first tick at which it may fire a burst under `V2-04`
+    /// `excitable-relay` (`tick-cooldown-v1`).
+    pub emission_cooldown_deadline: Tick,
 }
 
 impl Organism {
@@ -316,6 +323,8 @@ impl Organism {
             held: HeldOutput::INVALID,
             phase: newborn.phase,
             cooldown_deadline: newborn.cooldown_deadline,
+            secretory_readiness: INITIAL_SECRETORY_READINESS,
+            emission_cooldown_deadline: Tick::new(0),
         }
     }
 
@@ -342,6 +351,17 @@ impl Organism {
                 detail: format!(
                     "{}: {} is not finite and strictly positive",
                     self.id, self.energy
+                ),
+            });
+        }
+        if !self.secretory_readiness.is_finite()
+            || !(0.0_f32..=1.0_f32).contains(&self.secretory_readiness)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "organism secretory readiness",
+                detail: format!(
+                    "{}: {} is outside [0, 1]",
+                    self.id, self.secretory_readiness
                 ),
             });
         }
@@ -493,6 +513,12 @@ pub struct Population {
     held: Vec<HeldOutput>,
     phases: Vec<u32>,
     cooldown_deadlines: Vec<Tick>,
+    /// Whether `V2-04` excitable-relay columns are active and allocated.
+    /// When `false` (`field-ecology-v1*` or `excitable-relay` disabled), the
+    /// two columns below stay empty (0 bytes) and reads return default values.
+    tracks_excitable: bool,
+    secretory_readiness: Vec<f32>,
+    emission_cooldown_deadlines: Vec<Tick>,
     genomes: Vec<Option<Genome>>,
     /// Each slot's genome's arena slot, beside `genomes`.
     arena_slots: Vec<Option<ArenaSlot>>,
@@ -591,6 +617,25 @@ impl Population {
     /// # Errors
     /// [`CoreError::AllocationFailed`] when the host refuses a column.
     pub fn new(arrangement: Arrangement, capacity: usize) -> Result<Self, CoreError> {
+        Self::new_with_excitable(arrangement, capacity, false)
+    }
+
+    /// An empty population of at most `capacity` organisms, optionally
+    /// allocating the `V2-04` excitable-relay columns (`secretory_readiness`
+    /// and `emission_cooldown_deadlines`) up front (`INV-15`).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses a column.
+    pub fn new_with_excitable(
+        arrangement: Arrangement,
+        capacity: usize,
+        tracks_excitable: bool,
+    ) -> Result<Self, CoreError> {
+        let (secretory_readiness, emission_cooldown_deadlines) = if tracks_excitable {
+            (reserve(capacity)?, reserve(capacity)?)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Ok(Self {
             arrangement,
             capacity,
@@ -607,6 +652,9 @@ impl Population {
             held: reserve(capacity)?,
             phases: reserve(capacity)?,
             cooldown_deadlines: reserve(capacity)?,
+            tracks_excitable,
+            secretory_readiness,
+            emission_cooldown_deadlines,
             genomes: reserve(capacity)?,
             arena_slots: reserve(capacity)?,
             arena: GenomeArena::new(),
@@ -628,7 +676,12 @@ impl Population {
         let capacity = usize::try_from(maximum).map_err(|_| CoreError::Overflow {
             quantity: "population.maximum_count",
         })?;
-        Self::new(arrangement, capacity)
+        let tracks_excitable = config
+            .config()
+            .v2
+            .as_ref()
+            .is_some_and(|v2| v2.is_enabled(V2Feature::ExcitableRelay));
+        Self::new_with_excitable(arrangement, capacity, tracks_excitable)
     }
 
     /// The arrangement.
@@ -659,6 +712,8 @@ impl Population {
             capacity_bytes(&self.held),
             capacity_bytes(&self.phases),
             capacity_bytes(&self.cooldown_deadlines),
+            capacity_bytes(&self.secretory_readiness),
+            capacity_bytes(&self.emission_cooldown_deadlines),
             capacity_bytes(&self.genomes),
             capacity_bytes(&self.arena_slots),
         ])
@@ -1126,6 +1181,11 @@ impl Population {
             }
             bytes.extend_from_slice(&organism.phase.to_le_bytes());
             bytes.extend_from_slice(&organism.cooldown_deadline.get().to_le_bytes());
+            if self.tracks_excitable {
+                bytes.push(4);
+                bytes.extend_from_slice(&organism.secretory_readiness.to_bits().to_le_bytes());
+                bytes.extend_from_slice(&organism.emission_cooldown_deadline.get().to_le_bytes());
+            }
         }
         Sha256Digest::of(&bytes)
     }
@@ -1264,6 +1324,14 @@ impl Population {
     }
 
     fn read(&self, slot: usize) -> Organism {
+        let (secretory_readiness, emission_cooldown_deadline) = if self.tracks_excitable {
+            (
+                self.secretory_readiness[slot],
+                self.emission_cooldown_deadlines[slot],
+            )
+        } else {
+            (INITIAL_SECRETORY_READINESS, Tick::new(0))
+        };
         Organism {
             id: self.occupants[slot].unwrap_or(OrganismId::new(u64::MAX)),
             genome: self.genome_ids[slot],
@@ -1278,6 +1346,8 @@ impl Population {
             held: self.held[slot],
             phase: self.phases[slot],
             cooldown_deadline: self.cooldown_deadlines[slot],
+            secretory_readiness,
+            emission_cooldown_deadline,
         }
     }
 
@@ -1296,6 +1366,10 @@ impl Population {
         self.held[slot] = organism.held;
         self.phases[slot] = organism.phase;
         self.cooldown_deadlines[slot] = organism.cooldown_deadline;
+        if self.tracks_excitable {
+            self.secretory_readiness[slot] = organism.secretory_readiness;
+            self.emission_cooldown_deadlines[slot] = organism.emission_cooldown_deadline;
+        }
     }
 
     /// Append a slot, within the reserved capacity.
@@ -1313,6 +1387,11 @@ impl Population {
         self.held.push(organism.held);
         self.phases.push(organism.phase);
         self.cooldown_deadlines.push(organism.cooldown_deadline);
+        if self.tracks_excitable {
+            self.secretory_readiness.push(organism.secretory_readiness);
+            self.emission_cooldown_deadlines
+                .push(organism.emission_cooldown_deadline);
+        }
     }
 
     /// Move slot `from` down to the free slot `to`.
@@ -1356,6 +1435,10 @@ impl Population {
         self.held.truncate(length);
         self.phases.truncate(length);
         self.cooldown_deadlines.truncate(length);
+        if self.tracks_excitable {
+            self.secretory_readiness.truncate(length);
+            self.emission_cooldown_deadlines.truncate(length);
+        }
         self.genomes.truncate(length);
         self.arena_slots.truncate(length);
     }

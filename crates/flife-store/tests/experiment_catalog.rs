@@ -134,7 +134,7 @@ fn a_catalog_of_another_experiment_or_format_is_refused_unchanged() {
 }
 
 /// Regression: dropping `ExperimentCatalog` must run FrankenSQLite's clean
-/// close and WAL checkpoint (matching `CommandJournal::drop`), so the main
+/// close and WAL checkpoint (`Connection::close_in_place`), so the main
 /// database file itself contains all committed rows without needing the WAL
 /// sidecar.
 #[test]

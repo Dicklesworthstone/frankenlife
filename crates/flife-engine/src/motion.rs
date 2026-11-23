@@ -32,10 +32,15 @@ use flife_core::ledger::{EnergyBudget, Payment};
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
 use flife_field::FieldGrid;
 use flife_field::numerics::{exp_neg, expm1_neg};
+use flife_field::settle::{MotorSteeringConstants, MotorSteeringInputs};
 use flife_field::state::CHANNELS;
 
 /// The number of motion-response coefficients: energy plus 32 channels.
 pub const RESPONSE_TERMS: usize = 1 + CHANNELS;
+
+/// Minimum speed or gradient magnitude for `V2-05` (`so2-motor`) guarded
+/// heading normalization (`0x3D719799812DEA11` in `motion.metal`).
+pub const HEADING_EPS: f64 = 1.0e-12;
 
 /// The per-run motion constants (§5.4).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -196,6 +201,155 @@ impl Motion {
             [uptake_ratio * sum[0], uptake_ratio * sum[1]],
             self.maximum_acceleration,
         ))
+    }
+
+    /// `V2-05` (`so2-motor`) SO(2)-equivariant neural acceleration: splits
+    /// `g_E = χ_e ∇q` and `g_C = Σ_{k=1..33} χ_k ∇Z_k`, applies chiral contour
+    /// `g_perp = [-g_sum.y, g_sum.x]` and energy-scaled guarded heading
+    /// propulsion `prop_mag * h_hat`, then clamps radially to `a_max`.
+    ///
+    /// When `motor.is_zero()`, takes the exact baseline single-loop fast-path
+    /// ([`Motion::acceleration`]) for 0-ulp bit-identity with `field-ecology-v1`
+    /// and `chemistry-only`, matching `motion.metal` bit-for-bit.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for out-of-range inputs or nonfinite
+    /// intermediates.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "V2-05 motion acceleration requires post-maintenance budget, velocity, constants, and steering"
+    )]
+    pub fn acceleration_v2(
+        &self,
+        uptake_ratio: f64,
+        response: &MotionResponse,
+        gradients: &[[f64; 2]; RESPONSE_TERMS],
+        velocity: [f64; 2],
+        remaining: f64,
+        constants: &MotorSteeringConstants,
+        motor: MotorSteeringInputs,
+    ) -> Result<[f64; 2], CoreError> {
+        for (name, value) in [
+            ("motor.energy_gradient", motor.energy_gradient),
+            ("motor.chemical_gradient", motor.chemical_gradient),
+            ("motor.chiral_contour", motor.chiral_contour),
+            ("motor.heading_propulsion", motor.heading_propulsion),
+        ] {
+            if !value.is_finite() || value.abs() > 1.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: name,
+                    detail: format!("{value} is outside [-1, 1]"),
+                });
+            }
+        }
+        if motor.is_zero() {
+            return self.acceleration(uptake_ratio, response, gradients);
+        }
+        if !(0.0..=1.0).contains(&uptake_ratio) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "uptake ratio",
+                detail: format!("{uptake_ratio} is outside [0, 1]"),
+            });
+        }
+        if !velocity[0].is_finite() || !velocity[1].is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "organism velocity",
+                detail: format!("{velocity:?} is not finite"),
+            });
+        }
+        if !remaining.is_finite() || remaining < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "post-maintenance energy",
+                detail: format!("{remaining} is not finite and nonnegative"),
+            });
+        }
+        if !constants.internal_energy_scale.is_finite() || constants.internal_energy_scale <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensors.internal_energy_scale",
+                detail: format!(
+                    "{} must be finite and positive",
+                    constants.internal_energy_scale
+                ),
+            });
+        }
+
+        let g0 = gradients[0];
+        if !g0[0].is_finite() || !g0[1].is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensor gradient",
+                detail: format!("{g0:?} is not finite"),
+            });
+        }
+        let ge_x = response.0[0] * g0[0];
+        let ge_y = response.0[0] * g0[1];
+
+        let mut gc_x = 0.0_f64;
+        let mut gc_y = 0.0_f64;
+        for (&coefficient, &gradient) in response.0[1..].iter().zip(&gradients[1..]) {
+            if !gradient[0].is_finite() || !gradient[1].is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "sensor gradient",
+                    detail: format!("{gradient:?} is not finite"),
+                });
+            }
+            gc_x += coefficient * gradient[0];
+            gc_y += coefficient * gradient[1];
+        }
+
+        let gsum_x = ge_x + gc_x;
+        let gsum_y = ge_y + gc_y;
+        let gperp_x = -gsum_y;
+        let gperp_y = gsum_x;
+
+        let v_sq = velocity[0] * velocity[0] + velocity[1] * velocity[1];
+        if !v_sq.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "organism velocity",
+                detail: format!("{velocity:?} norm squared overflowed"),
+            });
+        }
+        let v_norm = v_sq.sqrt();
+        let (hx, hy) = if HEADING_EPS < v_norm {
+            (velocity[0] / v_norm, velocity[1] / v_norm)
+        } else {
+            let g_sq = gsum_x * gsum_x + gsum_y * gsum_y;
+            if !g_sq.is_finite() {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "chemical gradient sum",
+                    detail: format!("[{gsum_x}, {gsum_y}] norm squared overflowed"),
+                });
+            }
+            let g_norm = g_sq.sqrt();
+            if HEADING_EPS < g_norm {
+                (gsum_x / g_norm, gsum_y / g_norm)
+            } else {
+                (0.0, 0.0)
+            }
+        };
+
+        let w_e = 1.0 + constants.energy_gradient_gain * motor.energy_gradient;
+        let w_c = 1.0 + constants.chemical_gradient_gain * motor.chemical_gradient;
+        let w_perp = constants.chiral_contour_gain * motor.chiral_contour;
+
+        let chem_x = (w_e * ge_x + w_c * gc_x) + w_perp * gperp_x;
+        let chem_y = (w_e * ge_y + w_c * gc_y) + w_perp * gperp_y;
+        let grad_x = uptake_ratio * chem_x;
+        let grad_y = uptake_ratio * chem_y;
+
+        let e_denom = remaining + constants.internal_energy_scale;
+        if !e_denom.is_finite() || e_denom == 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "energy gate denominator",
+                detail: format!("{e_denom} is invalid"),
+            });
+        }
+        let energy_gate = remaining / e_denom;
+        let prop_mag = ((constants.heading_propulsion_fraction * self.maximum_acceleration)
+            * energy_gate)
+            * motor.heading_propulsion;
+        let ax = grad_x + prop_mag * hx;
+        let ay = grad_y + prop_mag * hy;
+        Ok(clamp_radius([ax, ay], self.maximum_acceleration))
     }
 
     /// The proposed velocity `v* = e^(−γΔt) v + coefficient · f`, clamped to

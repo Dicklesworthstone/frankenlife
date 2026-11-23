@@ -738,6 +738,305 @@ pub fn relax(
     })
 }
 
+/// Reusable post-Phase-1 crowding buffers for `V2-07` (`hippo-crowding`).
+///
+/// Empty (0 bytes) when `hippo-crowding` is disabled or on `field-ecology-v1*`.
+/// Pre-reserved to population capacity at founding so stepping never allocates
+/// (`FL-043`, `INV-15`).
+#[derive(Debug, Default)]
+pub struct CrowdingWork {
+    /// Post-Phase-1 local neighbor count `N_loc` per row in `rows` order.
+    counts: Vec<u32>,
+    /// Contiguous copy of post-Phase-1 wrapped positions (avoids per-tick alloc
+    /// and improves spatial-scan cache locality).
+    positions: Vec<[f64; 2]>,
+    /// Spatial counting-sort buffers used only by `local-neighbors-v1`.
+    bins: Vec<usize>,
+    starts: Vec<usize>,
+    members: Vec<usize>,
+    /// Cell occupancy buffers used only by `cell-occupancy-v1`.
+    cell_counts: Vec<u32>,
+    cells: Vec<usize>,
+}
+
+impl CrowdingWork {
+    /// Pre-allocate buffers for `local-neighbors-v1` over at most `rows`
+    /// organisms at crowding `radius` on `grid`.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when a reservation fails, or
+    /// [`CoreError::NumericalInvalid`] if `radius` is not finite and positive.
+    pub fn with_capacity_local_neighbors(
+        grid: &FieldGrid,
+        radius: f64,
+        rows: usize,
+    ) -> Result<Self, CoreError> {
+        if !radius.is_finite() || radius <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.crowding.radius_world_units",
+                detail: format!("{radius} must be finite and positive"),
+            });
+        }
+        let bins = bins_along(grid.world_width(), radius) * bins_along(grid.world_height(), radius);
+        let mut work = Self::default();
+        reserve(&mut work.counts, rows, "crowding counts")?;
+        reserve(&mut work.positions, rows, "crowding positions")?;
+        reserve(&mut work.bins, rows, "crowding bins")?;
+        reserve(&mut work.starts, bins + 1, "crowding bin starts")?;
+        reserve(&mut work.members, rows, "crowding members")?;
+        Ok(work)
+    }
+
+    /// Pre-allocate buffers for `cell-occupancy-v1` over at most `rows`
+    /// organisms on `grid`.
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when a reservation fails.
+    pub fn with_capacity_cell_occupancy(grid: &FieldGrid, rows: usize) -> Result<Self, CoreError> {
+        let cell_count = usize::try_from(grid.cell_count()).map_err(|_| CoreError::Overflow {
+            quantity: "grid cells",
+        })?;
+        let mut work = Self::default();
+        reserve(&mut work.counts, rows, "crowding counts")?;
+        reserve(&mut work.positions, rows, "crowding positions")?;
+        reserve(&mut work.cell_counts, cell_count, "cell occupancy")?;
+        reserve(&mut work.cells, rows, "organism crowding cells")?;
+        Ok(work)
+    }
+
+    /// Host bytes held by all crowding buffers (0 when disabled).
+    #[must_use]
+    pub fn allocated_bytes(&self) -> u64 {
+        [
+            bytes(&self.counts),
+            bytes(&self.positions),
+            bytes(&self.bins),
+            bytes(&self.starts),
+            bytes(&self.members),
+            bytes(&self.cell_counts),
+            bytes(&self.cells),
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add)
+    }
+
+    /// Most recently computed per-row local crowding counts `N_loc`.
+    #[must_use]
+    pub fn counts(&self) -> &[u32] {
+        &self.counts
+    }
+
+    /// Mutable access to the pre-reserved position scratch buffer.
+    pub fn positions_mut(&mut self) -> &mut Vec<[f64; 2]> {
+        &mut self.positions
+    }
+
+    /// Clear `counts` without releasing reserved capacity.
+    pub fn clear(&mut self) {
+        self.counts.clear();
+        self.positions.clear();
+    }
+
+    /// Count `local-neighbors-v1` over the positions buffered in
+    /// [`Self::positions_mut`].
+    ///
+    /// # Errors
+    /// As [`Self::count_local_neighbors`].
+    pub fn count_buffered_local_neighbors(
+        &mut self,
+        grid: &FieldGrid,
+        radius: f64,
+        workers: usize,
+    ) -> Result<&[u32], CoreError> {
+        let positions = core::mem::take(&mut self.positions);
+        let outcome = self
+            .count_local_neighbors(grid, radius, &positions, workers)
+            .map(|_| ());
+        self.positions = positions;
+        outcome.map(|()| self.counts.as_slice())
+    }
+
+    /// Count `cell-occupancy-v1` over the positions buffered in
+    /// [`Self::positions_mut`].
+    ///
+    /// # Errors
+    /// As [`Self::count_cell_occupancy`].
+    pub fn count_buffered_cell_occupancy(&mut self, grid: &FieldGrid) -> Result<&[u32], CoreError> {
+        let positions = core::mem::take(&mut self.positions);
+        let outcome = self.count_cell_occupancy(grid, &positions).map(|_| ());
+        self.positions = positions;
+        outcome.map(|()| self.counts.as_slice())
+    }
+
+    /// Count exact integer neighbors within `d_ij < radius` on the torus for
+    /// each position in `positions` (`local-neighbors-v1`, `V2-07`), using up
+    /// to `workers` threads.
+    ///
+    /// Integer counting is associative and commutative, so the output is
+    /// bit-identical at every worker count (`INV-11`).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a non-positive/non-finite `radius`
+    /// or an unwrapped position.
+    pub fn count_local_neighbors(
+        &mut self,
+        grid: &FieldGrid,
+        radius: f64,
+        positions: &[[f64; 2]],
+        workers: usize,
+    ) -> Result<&[u32], CoreError> {
+        if !radius.is_finite() || radius <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.crowding.radius_world_units",
+                detail: format!("{radius} must be finite and positive"),
+            });
+        }
+        let count = positions.len();
+        self.counts.clear();
+        self.counts.resize(count, 0);
+        if count == 0 {
+            return Ok(&self.counts);
+        }
+        let (width, height) = (grid.world_width(), grid.world_height());
+        let (bins_x, bins_y) = (bins_along(width, radius), bins_along(height, radius));
+        self.starts.clear();
+        self.starts.resize(bins_x * bins_y + 1, 0);
+        self.bins.clear();
+        for &[x, y] in positions {
+            if !(0.0..width).contains(&x) || !(0.0..height).contains(&y) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "crowding position",
+                    detail: format!("[{x:?}, {y:?}] is not wrapped"),
+                });
+            }
+            let bin = bin_of(y, height, bins_y) * bins_x + bin_of(x, width, bins_x);
+            self.bins.push(bin);
+            self.starts[bin + 1] += 1;
+        }
+        for bin in 0..bins_x * bins_y {
+            self.starts[bin + 1] += self.starts[bin];
+        }
+        self.members.clear();
+        self.members.resize(count, 0);
+        for (index, &bin) in self.bins.iter().enumerate().rev() {
+            self.starts[bin + 1] -= 1;
+            self.members[self.starts[bin + 1]] = index;
+        }
+        self.starts.remove(0);
+        self.starts.push(count);
+
+        let beyond = radius * radius * (1.0 + 1e-9);
+        let (half_width, half_height) = (0.5 * width, 0.5 * height);
+        let (starts, members, bins) = (&*self.starts, &*self.members, &*self.bins);
+        let neighbors_for = |index: usize| -> u32 {
+            let here = positions[index];
+            let bin = bins[index];
+            let (bx, by) = (bin % bins_x, bin / bins_x);
+            let (rows, row_count) = neighbours(by, bins_y);
+            let (columns, column_count) = neighbours(bx, bins_x);
+            let mut n = 0_u32;
+            for &row in &rows[..row_count] {
+                for &column in &columns[..column_count] {
+                    let neighbour = row * bins_x + column;
+                    for &other in &members[starts[neighbour]..starts[neighbour + 1]] {
+                        if other == index {
+                            continue;
+                        }
+                        let there = positions[other];
+                        let dx = image(there[0], here[0], width, half_width);
+                        let dy = image(there[1], here[1], height, half_height);
+                        if dx * dx + dy * dy > beyond {
+                            continue;
+                        }
+                        if dx.hypot(dy) < radius {
+                            n = n.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            n
+        };
+        let fill = |first: usize, out: &mut [u32]| {
+            for (offset, slot) in out.iter_mut().enumerate() {
+                *slot = neighbors_for(first + offset);
+            }
+        };
+        let used = workers
+            .max(1)
+            .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
+            .max(1);
+        if used == 1 {
+            fill(0, &mut self.counts);
+            return Ok(&self.counts);
+        }
+        let length = count.div_ceil(used);
+        let mut chunks = self.counts.chunks_mut(length);
+        let head = chunks.next().unwrap_or_default();
+        let fill = &fill;
+        std::thread::scope(|scope| {
+            let others: Vec<_> = chunks
+                .enumerate()
+                .map(|(index, chunk)| scope.spawn(move || fill((index + 1) * length, chunk)))
+                .collect();
+            fill(0, head);
+            let mut result = Ok(());
+            for other in others {
+                if other.join().is_err() && result.is_ok() {
+                    result = Err(CoreError::StateConflict {
+                        operation: "crowding",
+                        detail: "a crowding worker panicked".to_owned(),
+                    });
+                }
+            }
+            result
+        })?;
+        Ok(&self.counts)
+    }
+
+    /// Count pure-field grid-cell co-occupants `N_loc = n_c[cell] - 1` for
+    /// each position in `positions` (`cell-occupancy-v1`, `V2-07`, `INV-08`).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for an unwrapped position.
+    pub fn count_cell_occupancy(
+        &mut self,
+        grid: &FieldGrid,
+        positions: &[[f64; 2]],
+    ) -> Result<&[u32], CoreError> {
+        let count = positions.len();
+        self.counts.clear();
+        self.counts.resize(count, 0);
+        if count == 0 {
+            return Ok(&self.counts);
+        }
+        let (width, height) = (grid.world_width(), grid.world_height());
+        let (cells_x, cells_y) = (grid.cells_x() as usize, grid.cells_y() as usize);
+        let cell_count = usize::try_from(grid.cell_count()).map_err(|_| CoreError::Overflow {
+            quantity: "grid cells",
+        })?;
+        self.cell_counts.clear();
+        self.cell_counts.resize(cell_count, 0);
+        self.cells.clear();
+        for &[x, y] in positions {
+            if !(0.0..width).contains(&x) || !(0.0..height).contains(&y) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "crowding position",
+                    detail: format!("[{x:?}, {y:?}] is not wrapped"),
+                });
+            }
+            let cx = bin_of(x, width, cells_x);
+            let cy = bin_of(y, height, cells_y);
+            let cell = cy * cells_x + cx;
+            self.cells.push(cell);
+            self.cell_counts[cell] = self.cell_counts[cell].saturating_add(1);
+        }
+        for (slot, &cell) in self.counts.iter_mut().zip(&self.cells) {
+            *slot = self.cell_counts[cell].saturating_sub(1);
+        }
+        Ok(&self.counts)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

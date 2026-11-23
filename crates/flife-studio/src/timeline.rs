@@ -28,11 +28,13 @@
 //! window composited it.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::Path;
 
+use flife_cli::CameraPath;
 use flife_core::ids::OrganismId;
-use flife_core::{CoreError, Tick, ValidatedConfig};
+use flife_core::memory::MemoryAdmission;
+use flife_core::{CoreError, Tick, V2Feature, ValidatedConfig};
 use flife_engine::{Disposition, Intervention, MATERIAL_CHANNELS, Stepped, World};
 use flife_manim::{
     ColorMapping, FieldMapping, HudFont, Look, Particles, Region, RegionEffect, RegionShape, Style,
@@ -711,14 +713,343 @@ pub fn write_timeline_record(
 /// One frame a replay drew.
 #[derive(Debug)]
 pub struct ReplayFrame<'a> {
-    /// Its index among the frames the Studio drew.
+    /// Its index among the frames the Studio drew (or sampled in Cinema
+    /// simulation-time export).
     pub frame: u64,
     /// The tick shown.
     pub tick: Tick,
-    /// When the Studio drew it, in wall seconds since it opened.
+    /// When the Studio drew it, in wall seconds since it opened (or
+    /// `frame / fps` in simulation-time export).
     pub wall_seconds: f64,
     /// The frame, tight RGBA8 at the drawable's size.
     pub pixels: &'a FrameBuffer,
+    /// The active presentation style rendered for this frame.
+    pub style: Style,
+    /// The rendered viewport center in world units.
+    pub camera_center: [f64; 2],
+    /// The rendered viewport zoom.
+    pub camera_zoom: f64,
+}
+
+/// Verified header, closing state, and planned live-capture draw records of a
+/// Studio timeline ([`validate_timeline`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedTimeline {
+    /// The configuration's name from the header.
+    pub name: String,
+    /// The configuration's seed from the header.
+    pub seed: u64,
+    /// The view's opening size in points.
+    pub size: [u32; 2],
+    /// The opening style, already validated against `config`.
+    pub initial_style: Style,
+    /// Where a resumed Studio started, if any.
+    pub from: Option<TimelineStart>,
+    /// The committed tick the session opened at (`from.tick` or `0`).
+    pub opened: u64,
+    /// The committed tick the session closed on.
+    pub end_tick: u64,
+    /// Number of applied commands recorded in `End`.
+    pub applied_commands: usize,
+    /// Every recorded `Draw` in strict sequential frame order.
+    pub draws: Vec<PlannedDraw>,
+}
+
+/// One validated `TimelineRecord::Draw` in a Studio timeline.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlannedDraw {
+    /// Sequential frame index (`0, 1, 2, ...`).
+    pub frame: u64,
+    /// Shown epoch tick (non-decreasing, `opened <= tick <= end_tick`).
+    pub tick: u64,
+    /// Wall seconds since Studio opened (finite, non-negative, non-decreasing).
+    pub wall_seconds: f64,
+    /// Active drawable size at this draw.
+    pub drawable: [u32; 2],
+    /// Active presentation style at this draw.
+    pub style: Style,
+}
+
+/// Refuse `V2-16` colour mappings (`cell-state`, `polarity`) and field
+/// overlays (`trail-carrier`, `vascular-conductance`) when `config` does not
+/// enable `v2-visual-mappings` (`INV-09`).
+///
+/// # Errors
+/// [`CoreError::StateConflict`] naming the disallowed v2 visual mapping.
+pub fn validate_v2_style(config: &ValidatedConfig, style: Style) -> Result<(), CoreError> {
+    if config.is_v2_feature_enabled(V2Feature::V2VisualMappings) {
+        return Ok(());
+    }
+    if style.mapping.is_v2() {
+        return Err(conflict(format!(
+            "style colour mapping `{}` requires a field-ecology-v2 configuration with \
+             `v2-visual-mappings` enabled",
+            style.mapping.name()
+        )));
+    }
+    if style.field_mapping.is_v2_overlay() {
+        return Err(conflict(format!(
+            "style field mapping `{}` requires a field-ecology-v2 configuration with \
+             `v2-visual-mappings` enabled",
+            style.field_mapping.name()
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a timeline's structure, configuration identity, projection,
+/// command book agreement, V2-16 style gating, tick monotonicity, and
+/// wall-time monotonicity without touching disk or requiring a Metal device
+/// (FL-023, FL-050, G10).
+///
+/// # Errors
+/// [`CoreError::StateConflict`] or [`CoreError::NumericalInvalid`] naming the
+/// first inconsistency.
+pub fn validate_timeline(
+    config: &ValidatedConfig,
+    records: &[TimelineRecord],
+) -> Result<ValidatedTimeline, CoreError> {
+    let Some(TimelineRecord::Header {
+        schema,
+        config_hash,
+        name,
+        seed,
+        size,
+        style,
+        projection,
+        from,
+    }) = records.first()
+    else {
+        return Err(conflict("a timeline opens with its header".into()));
+    };
+    if schema != TIMELINE_SCHEMA {
+        return Err(conflict(format!("`{schema}` is not {TIMELINE_SCHEMA}")));
+    }
+    if *config_hash != config.config_hash().to_hex() {
+        return Err(conflict(format!(
+            "the timeline ran configuration {config_hash}, not {}",
+            config.config_hash().to_hex()
+        )));
+    }
+    let fixed = TimelineProjection::from(AffinityProjection::fixed());
+    if let Some(recorded) = projection
+        && **recorded != fixed
+    {
+        return Err(conflict(format!(
+            "the timeline drew affinity through rows {:?} of the Hadamard matrix over {}, not \
+             rows {:?} over {}",
+            recorded.rows, recorded.divisor.0, fixed.rows, fixed.divisor.0
+        )));
+    }
+    if size[0] == 0 || size[1] == 0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "timeline header size",
+            detail: format!("opening size {size:?} must be non-zero"),
+        });
+    }
+    let initial_style = style.style()?;
+    validate_v2_style(config, initial_style)?;
+    let Some(TimelineRecord::End {
+        tick: end_tick,
+        applied,
+        ..
+    }) = records.last()
+    else {
+        return Err(conflict(
+            "a timeline closes with its end: the Studio did not close".into(),
+        ));
+    };
+    let opened = from.as_ref().map_or(0, |start| start.tick);
+    if opened > *end_tick {
+        return Err(conflict(format!(
+            "session opened at tick {opened}, after its closing tick {end_tick}"
+        )));
+    }
+
+    let mut book_ticks: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    for command in applied {
+        let _ = command.intervention.intervention()?;
+        if command.tick > *end_tick {
+            return Err(conflict(format!(
+                "applied command {} at tick {} is past closing tick {end_tick}",
+                command.command, command.tick
+            )));
+        }
+        if book_ticks
+            .insert(command.command, (command.tick, command.published))
+            .is_some()
+        {
+            return Err(conflict(format!(
+                "applied command {} appears more than once in the timeline end record",
+                command.command
+            )));
+        }
+    }
+
+    let last_index = records.len().saturating_sub(1);
+    let mut showing = opened;
+    let mut cur_drawable = *size;
+    let mut cur_style = initial_style;
+    let mut last_wall: Option<f64> = None;
+    let mut draws = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        match record {
+            TimelineRecord::Header { .. } if index > 0 => {
+                return Err(conflict(format!(
+                    "duplicate timeline header at record {index}"
+                )));
+            }
+            TimelineRecord::End { .. } if index < last_index => {
+                return Err(conflict(format!(
+                    "timeline end record at index {index} before final record {last_index}"
+                )));
+            }
+            TimelineRecord::Applied {
+                command,
+                tick,
+                published,
+            } => {
+                if book_ticks.get(command) != Some(&(*tick, *published)) {
+                    return Err(conflict(format!(
+                        "command {command} was reported applied at tick {tick}, which its book \
+                         does not record"
+                    )));
+                }
+            }
+            TimelineRecord::Resize { drawable } => {
+                if drawable[0] == 0 || drawable[1] == 0 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "timeline resize drawable",
+                        detail: format!("drawable {drawable:?} must be non-zero"),
+                    });
+                }
+                cur_drawable = *drawable;
+            }
+            TimelineRecord::Density { pixels_per_point } => {
+                if !pixels_per_point.0.is_finite() || pixels_per_point.0 <= 0.0 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "timeline pixel density",
+                        detail: format!(
+                            "density {} must be finite and positive",
+                            pixels_per_point.0
+                        ),
+                    });
+                }
+            }
+            TimelineRecord::Style { style } => {
+                let parsed = style.style()?;
+                validate_v2_style(config, parsed)?;
+                cur_style = parsed;
+            }
+            TimelineRecord::Region { region } => {
+                if let Some(region) = region {
+                    let _ = Region::try_from(*region)?;
+                }
+            }
+            TimelineRecord::Show {
+                prior,
+                current,
+                fraction,
+            }
+            | TimelineRecord::Place {
+                prior,
+                current,
+                fraction,
+            }
+            | TimelineRecord::Advance {
+                prior,
+                current,
+                fraction,
+            } => {
+                if !fraction.0.is_finite() || !(0.0..=1.0).contains(&fraction.0) {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "timeline display fraction",
+                        detail: format!("fraction {} is outside [0, 1]", fraction.0),
+                    });
+                }
+                if let Some(prior_tick) = prior
+                    && (*prior_tick < opened || *prior_tick > *current)
+                {
+                    return Err(conflict(format!(
+                        "prior epoch tick {prior_tick} is outside [{opened}, {current}]"
+                    )));
+                }
+                if *current < showing || *current > *end_tick {
+                    return Err(conflict(format!(
+                        "shown epoch tick {current} is outside [{showing}, {end_tick}]"
+                    )));
+                }
+                showing = *current;
+            }
+            TimelineRecord::Draw {
+                frame,
+                tick,
+                wall_seconds,
+            } => {
+                let expected_frame = draws.len() as u64;
+                if *frame != expected_frame {
+                    return Err(conflict(format!(
+                        "draw frame index {frame} is out of sequence (expected {expected_frame})"
+                    )));
+                }
+                if *tick != showing {
+                    return Err(conflict(format!(
+                        "frame {frame} was recorded showing tick {tick}, but the view shows tick \
+                         {showing}"
+                    )));
+                }
+                let wall = wall_seconds.0;
+                if !wall.is_finite() || wall < 0.0 {
+                    return Err(conflict(
+                        "the frames' wall times are not finite and in order".into(),
+                    ));
+                }
+                if let Some(prev) = last_wall
+                    && wall < prev
+                {
+                    return Err(conflict(
+                        "the frames' wall times are not finite and in order".into(),
+                    ));
+                }
+                last_wall = Some(wall);
+                draws.push(PlannedDraw {
+                    frame: *frame,
+                    tick: *tick,
+                    wall_seconds: wall,
+                    drawable: cur_drawable,
+                    style: cur_style,
+                });
+            }
+            TimelineRecord::Header { .. }
+            | TimelineRecord::Overlay { .. }
+            | TimelineRecord::View { .. }
+            | TimelineRecord::Select { .. }
+            | TimelineRecord::Submitted { .. }
+            | TimelineRecord::End { .. } => {}
+        }
+    }
+
+    Ok(ValidatedTimeline {
+        name: name.clone(),
+        seed: *seed,
+        size: *size,
+        initial_style,
+        from: from.clone(),
+        opened,
+        end_tick: *end_tick,
+        applied_commands: applied.len(),
+        draws,
+    })
+}
+
+/// Controls for [`replay_with`] (used internally by Cinema export and
+/// [`replay`]).
+pub(crate) struct ReplayConfig<'a> {
+    pub cpu_workers: Option<NonZeroUsize>,
+    pub target_resolution: Option<([u32; 2], f64)>,
+    pub extra_render_bytes: u64,
+    pub camera: Option<&'a CameraPath>,
+    pub sample_every_ticks: Option<(NonZeroU64, std::num::NonZeroU32)>,
 }
 
 /// What a replay reached.
@@ -767,37 +1098,30 @@ pub fn replay(
     cpu_workers: Option<NonZeroUsize>,
     mut drawn: impl FnMut(ReplayFrame<'_>) -> Result<(), CoreError>,
 ) -> Result<Replayed, CoreError> {
-    let Some(TimelineRecord::Header {
-        schema,
-        config_hash,
-        size,
-        style,
-        projection,
-        from,
-        ..
-    }) = records.first()
-    else {
-        return Err(conflict("a timeline opens with its header".into()));
+    let cfg = ReplayConfig {
+        cpu_workers,
+        target_resolution: None,
+        extra_render_bytes: 0,
+        camera: None,
+        sample_every_ticks: None,
     };
-    if schema != TIMELINE_SCHEMA {
-        return Err(conflict(format!("`{schema}` is not {TIMELINE_SCHEMA}")));
-    }
-    if *config_hash != config.config_hash().to_hex() {
-        return Err(conflict(format!(
-            "the timeline ran configuration {config_hash}, not {}",
-            config.config_hash().to_hex()
-        )));
-    }
-    let fixed = TimelineProjection::from(AffinityProjection::fixed());
-    if let Some(recorded) = projection
-        && **recorded != fixed
-    {
-        return Err(conflict(format!(
-            "the timeline drew affinity through rows {:?} of the Hadamard matrix over {}, not \
-             rows {:?} over {}",
-            recorded.rows, recorded.divisor.0, fixed.rows, fixed.divisor.0
-        )));
-    }
+    let (replayed, _admitted, ()) =
+        replay_with(config, records, &cfg, |_| Ok(()), |(), frame| drawn(frame))?;
+    Ok(replayed)
+}
+
+/// Replay `records` under `options`, invoking `on_admitted` once the world is
+/// restored and FL-043 memory admission passes (before the first frame is
+/// rendered, so export directory creation never runs on a refused replay),
+/// passing the initialized state `S` and each rendered frame to `drawn`.
+pub(crate) fn replay_with<S>(
+    config: &ValidatedConfig,
+    records: &[TimelineRecord],
+    options: &ReplayConfig<'_>,
+    on_admitted: impl FnOnce(&MemoryAdmission) -> Result<S, CoreError>,
+    mut drawn: impl FnMut(&mut S, ReplayFrame<'_>) -> Result<(), CoreError>,
+) -> Result<(Replayed, MemoryAdmission, S), CoreError> {
+    let validated = validate_timeline(config, records)?;
     let Some(TimelineRecord::End {
         tick: end,
         digest,
@@ -808,41 +1132,11 @@ pub fn replay(
             "a timeline closes with its end: the Studio did not close".into(),
         ));
     };
-    // The book's commands by the boundary they applied at, in the order
-    // applied; the statuses must agree with it.
     let mut at: BTreeMap<u64, Vec<Intervention>> = BTreeMap::new();
-    let mut ticks: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
     for command in applied {
         at.entry(command.tick)
             .or_default()
             .push(command.intervention.intervention()?);
-        ticks.insert(command.command, (command.tick, command.published));
-    }
-    for record in records {
-        if let TimelineRecord::Applied {
-            command,
-            tick,
-            published,
-        } = record
-            && ticks.get(command) != Some(&(*tick, *published))
-        {
-            return Err(conflict(format!(
-                "command {command} was reported applied at tick {tick}, which its book does not \
-                 record"
-            )));
-        }
-    }
-    // The last record that shows each epoch: it is kept until then.
-    let mut last_use: BTreeMap<u64, usize> = BTreeMap::new();
-    for (index, record) in records.iter().enumerate() {
-        if let TimelineRecord::Show { prior, current, .. }
-        | TimelineRecord::Place { prior, current, .. }
-        | TimelineRecord::Advance { prior, current, .. } = record
-        {
-            for tick in prior.iter().chain([current]) {
-                last_use.insert(*tick, index);
-            }
-        }
     }
 
     let model = config.config();
@@ -858,7 +1152,8 @@ pub fn replay(
     }
     // The world the Studio's session was opened on: its configuration's
     // founding world, or the checkpoint a resumed run restored.
-    let mut world = match from
+    let mut world = match validated
+        .from
         .as_ref()
         .and_then(|start| Some((start, start.checkpoint.as_ref()?)))
     {
@@ -879,33 +1174,49 @@ pub fn replay(
             }
             world
         }
-        None => flife_cli::found_on(config, cpu_workers)?,
+        None => flife_cli::found_on(config, options.cpu_workers)?,
     };
-    if let Some(workers) = cpu_workers {
+    if let Some(workers) = options.cpu_workers {
         world.set_cpu_workers(workers)?;
     }
-    // FL-043: admit the replay world and its observer buffers across the
-    // peak rendered `(drawable, pixels_per_point)` state recorded in the
-    // timeline BEFORE allocating the 4-slot publisher or Metal renderer
-    // (INV-15).
+    // FL-043: admit the replay world, its peak observer buffers (across the
+    // timeline or target Cinema resolution), and any extra export encoder
+    // scratch BEFORE allocating the 4-slot publisher, Metal renderer, or
+    // output directory (INV-15).
     let standalone = flife_render::Epoch::standalone(&world)?;
-    // As `Studio::open` makes it: for the world restored, before a resumed
-    // run's command journal replays past it.
-    let mut view =
-        crate::host::studio_view(config, &standalone, *size, style.style()?, background)?;
-    let peak_observers = peak_observer_bytes(&world, &standalone, &view, *size, records)?;
-    world.admit_memory(false, 0, peak_observers)?;
+    let mut view = crate::host::studio_view(
+        config,
+        &standalone,
+        validated.size,
+        validated.initial_style,
+        background,
+    )?;
+    let peak_observers = peak_observer_bytes_for(
+        &world,
+        &standalone,
+        &view,
+        validated.size,
+        records,
+        options.target_resolution,
+    )?;
+    let admitted = world.admit_memory(
+        false,
+        0,
+        peak_observers.saturating_add(options.extra_render_bytes),
+    )?;
     drop(standalone);
     let mut renderer = MetalRenderer::new().map_err(|error| CoreError::MissingCapability {
         capability: format!("a Metal renderer to replay a studio timeline: {error}"),
     })?;
+    // Notify caller only after validation, restore, admission, and Metal
+    // initialization all succeeded.
+    let mut sink = on_admitted(&admitted)?;
+
     // A prior, a current and one being written, and one to spare.
     let mut publisher = Publisher::new(&world, REPLAY_SLOTS, || {})?;
     let viewer = publisher.feed().viewer(3)?;
     let restored = viewer.latest()?;
-    // The epoch the session opened on: the restored world's, or the one the
-    // journal's commands reached, which the book records applied.
-    let opened = from.as_ref().map_or(0, |start| start.tick);
+    let opened = validated.opened;
     let opening = if opened == restored.tick().get() {
         restored
     } else {
@@ -914,123 +1225,289 @@ pub fn replay(
     };
     view.show(&opening)?;
     let font = HudFont::bundled()?;
-    let mut epochs: BTreeMap<u64, Lease> = BTreeMap::new();
-    epochs.insert(opened, opening);
-    // The tick of the epoch the view was last given: each frame's.
-    let mut showing = opened;
-    let mut frames = 0;
-    // Coalesce adjacent Resize / Density records so Retina refits perform a
-    // single atomic `refit_surface` (matching `Studio::frame` and
-    // `peak_observer_bytes`) instead of allocating phantom 1x density bins.
-    let mut pending_drawable = *size;
-    let mut pending_scale = 1.0_f64;
-    let mut geometry_dirty = false;
-    for (index, record) in records.iter().enumerate() {
-        if geometry_dirty && flushes_geometry(record) {
-            view.refit_surface(pending_drawable, pending_scale)?;
-            geometry_dirty = false;
+    if let Some((drawable, scale)) = options.target_resolution {
+        view.refit_surface(drawable, scale)?;
+    }
+
+    let mut frames = 0_u64;
+    if let Some((every_ticks, fps)) = options.sample_every_ticks {
+        // Simulation-time export (plan §13.8, FL-050): sample exact integer
+        // ticks `opened + k * every_ticks <= end`, applying recorded
+        // presentation changes (style, camera, overlay, selection, region) in
+        // committed-tick order up to each sample tick.
+        let samples = crate::export::plan_simulation_samples(
+            opened,
+            *end,
+            every_ticks,
+            config.report().timestep.seconds_per_tick(),
+            fps,
+        )?;
+        // Group recorded presentation events by the committed tick active when
+        // they occurred.
+        let mut events_by_tick: Vec<(u64, &TimelineRecord)> = Vec::new();
+        let mut rec_tick = opened;
+        for record in records {
+            match record {
+                TimelineRecord::Show { current, .. }
+                | TimelineRecord::Place { current, .. }
+                | TimelineRecord::Advance { current, .. } => rec_tick = *current,
+                TimelineRecord::Resize { .. }
+                | TimelineRecord::Density { .. }
+                | TimelineRecord::Overlay { .. }
+                | TimelineRecord::Style { .. }
+                | TimelineRecord::View { .. }
+                | TimelineRecord::Select { .. }
+                | TimelineRecord::Region { .. } => events_by_tick.push((rec_tick, record)),
+                _ => {}
+            }
         }
-        match record {
-            TimelineRecord::Resize { drawable } => {
-                view.viewport().resized(*drawable)?;
-                pending_drawable = *drawable;
-                geometry_dirty = true;
-            }
-            TimelineRecord::Density { pixels_per_point } => {
-                view.viewport().with_pixels_per_point(pixels_per_point.0)?;
-                pending_scale = pixels_per_point.0;
-                geometry_dirty = true;
-            }
-            TimelineRecord::Overlay { text, swatches } => {
-                crate::host::lay_out_overlay(&mut view, &font, text, swatches)?;
-            }
-            TimelineRecord::Style { style } => view.set_style(style.style()?),
-            TimelineRecord::View { center, zoom } => {
-                let viewport = view
-                    .viewport()
-                    .with_view([center[0].0, center[1].0], zoom.0)?;
-                view.set_view(viewport)?;
-                let taken = view.viewport();
-                if [taken.center()[0], taken.center()[1], taken.zoom()].map(Exact)
-                    != [center[0], center[1], *zoom]
+        let mut event_cursor = 0_usize;
+        let mut pending_drawable = validated.size;
+        let mut pending_scale = 1.0_f64;
+        let mut geometry_dirty = false;
+        let mut current_epoch = Some(opening);
+        for sample in samples {
+            // Apply all presentation updates recorded at or before sample.tick.
+            while event_cursor < events_by_tick.len()
+                && events_by_tick[event_cursor].0 <= sample.tick
+            {
+                let record = events_by_tick[event_cursor].1;
+                event_cursor += 1;
+                if options.target_resolution.is_none() && geometry_dirty && flushes_geometry(record)
                 {
-                    return Err(conflict(format!(
-                        "the view took {:?} at zoom {} for the recorded {center:?} at {zoom:?}",
-                        taken.center(),
-                        taken.zoom()
-                    )));
+                    view.refit_surface(pending_drawable, pending_scale)?;
+                    geometry_dirty = false;
+                }
+                match record {
+                    TimelineRecord::Resize { drawable } if options.target_resolution.is_none() => {
+                        view.viewport().resized(*drawable)?;
+                        pending_drawable = *drawable;
+                        geometry_dirty = true;
+                    }
+                    TimelineRecord::Density { pixels_per_point }
+                        if options.target_resolution.is_none() =>
+                    {
+                        view.viewport().with_pixels_per_point(pixels_per_point.0)?;
+                        pending_scale = pixels_per_point.0;
+                        geometry_dirty = true;
+                    }
+                    TimelineRecord::Overlay { text, swatches } => {
+                        crate::host::lay_out_overlay(&mut view, &font, text, swatches)?;
+                    }
+                    TimelineRecord::Style { style } => view.set_style(style.style()?),
+                    TimelineRecord::View { center, zoom } if options.camera.is_none() => {
+                        let viewport = view
+                            .viewport()
+                            .with_view([center[0].0, center[1].0], zoom.0)?;
+                        view.set_view(viewport)?;
+                    }
+                    TimelineRecord::Select { organism } => {
+                        view.select(organism.map(OrganismId::new))?;
+                    }
+                    TimelineRecord::Region { region } => {
+                        view.set_region(region.map(Region::try_from).transpose()?)?;
+                    }
+                    _ => {}
                 }
             }
-            TimelineRecord::Select { organism } => {
-                view.select(organism.map(OrganismId::new))?;
+            if options.target_resolution.is_none() && geometry_dirty {
+                view.refit_surface(pending_drawable, pending_scale)?;
+                geometry_dirty = false;
             }
-            TimelineRecord::Region { region } => {
-                view.set_region(region.map(Region::try_from).transpose()?)?;
+            if !current_epoch
+                .as_ref()
+                .is_some_and(|held| held.tick().get() == sample.tick)
+            {
+                drop(current_epoch.take());
+                current_epoch = Some(publish_at(
+                    &mut world,
+                    sample.tick,
+                    &at,
+                    &mut publisher,
+                    &viewer,
+                )?);
             }
-            TimelineRecord::Show {
-                prior,
-                current,
-                fraction,
+            let epoch = current_epoch
+                .as_ref()
+                .ok_or_else(|| conflict("missing published epoch".into()))?;
+            if let Some(camera) = options.camera {
+                let (viewport, _) = camera.viewport(view.viewport(), sample.tick)?;
+                view.set_view(viewport)?;
             }
-            | TimelineRecord::Place {
-                prior,
-                current,
-                fraction,
-            }
-            | TimelineRecord::Advance {
-                prior,
-                current,
-                fraction,
-            } => {
+            view.show(epoch)?;
+            let job = view.job()?;
+            let (pixels, _) = renderer
+                .render_three_d_rgba8(&job)
+                .map_err(|error| conflict(format!("render frame {}: {error}", sample.frame)))?;
+            let vp = view.viewport();
+            drawn(
+                &mut sink,
+                ReplayFrame {
+                    frame: sample.frame,
+                    tick: Tick::new(sample.tick),
+                    wall_seconds: sample.video_seconds,
+                    pixels: &pixels,
+                    style: view.style(),
+                    camera_center: vp.center(),
+                    camera_zoom: vp.zoom(),
+                },
+            )?;
+            frames += 1;
+        }
+        drop(current_epoch);
+    } else {
+        // Live-capture replay (FL-023, plus optional target Cinema resolution
+        // or CameraPath override).
+        let mut last_use: BTreeMap<u64, usize> = BTreeMap::new();
+        for (index, record) in records.iter().enumerate() {
+            if let TimelineRecord::Show { prior, current, .. }
+            | TimelineRecord::Place { prior, current, .. }
+            | TimelineRecord::Advance { prior, current, .. } = record
+            {
                 for tick in prior.iter().chain([current]) {
-                    if !epochs.contains_key(tick) {
-                        let lease = publish_at(&mut world, *tick, &at, &mut publisher, &viewer)?;
-                        epochs.insert(*tick, lease);
+                    last_use.insert(*tick, index);
+                }
+            }
+        }
+        let mut epochs: BTreeMap<u64, Lease> = BTreeMap::new();
+        epochs.insert(opened, opening);
+        let mut showing = opened;
+        let mut pending_drawable = validated.size;
+        let mut pending_scale = 1.0_f64;
+        let mut geometry_dirty = false;
+        for (index, record) in records.iter().enumerate() {
+            if options.target_resolution.is_none() && geometry_dirty && flushes_geometry(record) {
+                view.refit_surface(pending_drawable, pending_scale)?;
+                geometry_dirty = false;
+            }
+            match record {
+                TimelineRecord::Resize { drawable } => {
+                    if options.target_resolution.is_none() {
+                        view.viewport().resized(*drawable)?;
+                        pending_drawable = *drawable;
+                        geometry_dirty = true;
                     }
                 }
-                let shown = &epochs[current];
-                let from = prior.map(|tick| &*epochs[&tick]);
-                match record {
-                    TimelineRecord::Show { .. } => view.show_between(from, shown, fraction.0)?,
-                    TimelineRecord::Place { .. } => view.place_between(from, shown, fraction.0)?,
-                    _ => view.advance(from, shown, fraction.0)?,
-                };
-                showing = *current;
-                epochs.retain(|tick, _| last_use.get(tick).is_some_and(|&last| last > index));
-            }
-            TimelineRecord::Draw {
-                frame,
-                tick,
-                wall_seconds,
-            } => {
-                if *tick != showing {
-                    return Err(conflict(format!(
-                        "frame {frame} was recorded showing tick {tick}, but the view shows tick \
-                         {showing}"
-                    )));
+                TimelineRecord::Density { pixels_per_point } => {
+                    if options.target_resolution.is_none() {
+                        view.viewport().with_pixels_per_point(pixels_per_point.0)?;
+                        pending_scale = pixels_per_point.0;
+                        geometry_dirty = true;
+                    }
                 }
-                let job = view.job()?;
-                let (pixels, _) = renderer
-                    .render_three_d_rgba8(&job)
-                    .map_err(|error| conflict(format!("render frame {frame}: {error}")))?;
-                drawn(ReplayFrame {
-                    frame: *frame,
-                    tick: Tick::new(*tick),
-                    wall_seconds: wall_seconds.0,
-                    pixels: &pixels,
-                })?;
-                frames += 1;
+                TimelineRecord::Overlay { text, swatches } => {
+                    crate::host::lay_out_overlay(&mut view, &font, text, swatches)?;
+                }
+                TimelineRecord::Style { style } => view.set_style(style.style()?),
+                TimelineRecord::View { center, zoom } => {
+                    if options.camera.is_none() {
+                        let viewport = view
+                            .viewport()
+                            .with_view([center[0].0, center[1].0], zoom.0)?;
+                        view.set_view(viewport)?;
+                        let taken = view.viewport();
+                        if [taken.center()[0], taken.center()[1], taken.zoom()].map(Exact)
+                            != [center[0], center[1], *zoom]
+                        {
+                            return Err(conflict(format!(
+                                "the view took {:?} at zoom {} for the recorded {center:?} at \
+                                 {zoom:?}",
+                                taken.center(),
+                                taken.zoom()
+                            )));
+                        }
+                    }
+                }
+                TimelineRecord::Select { organism } => {
+                    view.select(organism.map(OrganismId::new))?;
+                }
+                TimelineRecord::Region { region } => {
+                    view.set_region(region.map(Region::try_from).transpose()?)?;
+                }
+                TimelineRecord::Show {
+                    prior,
+                    current,
+                    fraction,
+                }
+                | TimelineRecord::Place {
+                    prior,
+                    current,
+                    fraction,
+                }
+                | TimelineRecord::Advance {
+                    prior,
+                    current,
+                    fraction,
+                } => {
+                    for tick in prior.iter().chain([current]) {
+                        if !epochs.contains_key(tick) {
+                            let lease =
+                                publish_at(&mut world, *tick, &at, &mut publisher, &viewer)?;
+                            epochs.insert(*tick, lease);
+                        }
+                    }
+                    let shown = &epochs[current];
+                    let from = prior.map(|tick| &*epochs[&tick]);
+                    match record {
+                        TimelineRecord::Show { .. } => {
+                            view.show_between(from, shown, fraction.0)?;
+                        }
+                        TimelineRecord::Place { .. } => {
+                            view.place_between(from, shown, fraction.0)?;
+                        }
+                        _ => {
+                            view.advance(from, shown, fraction.0)?;
+                        }
+                    }
+                    showing = *current;
+                    epochs.retain(|tick, _| last_use.get(tick).is_some_and(|&last| last > index));
+                }
+                TimelineRecord::Draw {
+                    frame,
+                    tick,
+                    wall_seconds,
+                } => {
+                    if *tick != showing {
+                        return Err(conflict(format!(
+                            "frame {frame} was recorded showing tick {tick}, but the view shows \
+                             tick {showing}"
+                        )));
+                    }
+                    if let Some(camera) = options.camera {
+                        let (viewport, _) = camera.viewport(view.viewport(), *tick)?;
+                        view.set_view(viewport)?;
+                    }
+                    let job = view.job()?;
+                    let (pixels, _) = renderer
+                        .render_three_d_rgba8(&job)
+                        .map_err(|error| conflict(format!("render frame {frame}: {error}")))?;
+                    let vp = view.viewport();
+                    drawn(
+                        &mut sink,
+                        ReplayFrame {
+                            frame: *frame,
+                            tick: Tick::new(*tick),
+                            wall_seconds: wall_seconds.0,
+                            pixels: &pixels,
+                            style: view.style(),
+                            camera_center: vp.center(),
+                            camera_zoom: vp.zoom(),
+                        },
+                    )?;
+                    frames += 1;
+                }
+                TimelineRecord::Header { .. }
+                | TimelineRecord::Submitted { .. }
+                | TimelineRecord::Applied { .. }
+                | TimelineRecord::End { .. } => {}
             }
-            TimelineRecord::Header { .. }
-            | TimelineRecord::Submitted { .. }
-            | TimelineRecord::Applied { .. }
-            | TimelineRecord::End { .. } => {}
         }
+        if options.target_resolution.is_none() && geometry_dirty {
+            view.refit_surface(pending_drawable, pending_scale)?;
+        }
+        drop(epochs);
     }
-    if geometry_dirty {
-        view.refit_surface(pending_drawable, pending_scale)?;
-    }
-    drop(epochs);
+
     step_to(&mut world, *end, &at)?;
     let reached = world.digest().to_hex();
     if reached != *digest {
@@ -1038,12 +1515,16 @@ pub fn replay(
             "the replay reached {reached} at tick {end}, not the Studio's {digest}"
         )));
     }
-    Ok(Replayed {
-        frames,
-        tick: world.tick(),
-        digest: reached,
-        commands: applied.len(),
-    })
+    Ok((
+        Replayed {
+            frames,
+            tick: world.tick(),
+            digest: reached,
+            commands: applied.len(),
+        },
+        admitted,
+        sink,
+    ))
 }
 
 /// Whether `record` depends on the view's current `(drawable,
@@ -1074,11 +1555,29 @@ const fn flushes_geometry(record: &TimelineRecord) -> bool {
 /// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
 /// density in `records`.
 pub fn peak_observer_bytes(
+    world: &World,
+    restored: &flife_render::Epoch,
+    view: &flife_manim::WorldView,
+    initial_size: [u32; 2],
+    records: &[TimelineRecord],
+) -> Result<u64, CoreError> {
+    peak_observer_bytes_for(world, restored, view, initial_size, records, None)
+}
+
+/// As [`peak_observer_bytes`], optionally charging a fixed Cinema target
+/// `(drawable, pixels_per_point)` (such as 1080p or 4K) instead of the
+/// timeline's recorded window resizes (FL-043, FL-050).
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
+/// density.
+pub fn peak_observer_bytes_for(
     _world: &World,
     restored: &flife_render::Epoch,
     view: &flife_manim::WorldView,
     initial_size: [u32; 2],
     records: &[TimelineRecord],
+    target_resolution: Option<([u32; 2], f64)>,
 ) -> Result<u64, CoreError> {
     let feed_bytes = restored
         .reserved_bytes()
@@ -1088,6 +1587,15 @@ pub fn peak_observer_bytes(
     let mut geometry_dirty = false;
     let mut peak =
         crate::memory::observer_bytes_for_resize(feed_bytes, view, cur_drawable, cur_scale)?;
+    if let Some((target_drawable, target_scale)) = target_resolution {
+        let target_bytes = crate::memory::observer_bytes_for_resize(
+            feed_bytes,
+            view,
+            target_drawable,
+            target_scale,
+        )?;
+        return Ok(peak.max(target_bytes));
+    }
     for record in records {
         if geometry_dirty && flushes_geometry(record) {
             let required = crate::memory::observer_bytes_for_resize(

@@ -252,26 +252,26 @@ impl DensityLayer {
             let base = bin_row * columns;
             match normalized_look {
                 Look::Raw | Look::Sphere => {
-                    for col in 0..columns {
+                    for (col, slot) in out.iter_mut().enumerate().take(columns) {
                         let level = if valid_scale {
                             (f64::from(self.counts[base + col]) / scale).clamp(0.0, 1.0)
                         } else {
                             0.0
                         };
-                        out[col] = [level, level, level, 1.0];
+                        *slot = [level, level, level, 1.0];
                     }
                 }
                 Look::Glow => {
-                    for col in 0..columns {
+                    for (col, slot) in out.iter_mut().enumerate().take(columns) {
                         let cell = base + col;
                         let count = self.counts[cell];
                         if count == 0 || !valid_scale {
-                            out[col] = [0.0; 4];
+                            *slot = [0.0; 4];
                         } else {
                             let c = f64::from(count);
                             let level = (c.ln_1p() / scale_ln1p).clamp(0.0, 1.0);
                             let sum = self.sums[cell];
-                            out[col] = [
+                            *slot = [
                                 (sum[0] / c) * level,
                                 (sum[1] / c) * level,
                                 (sum[2] / c) * level,

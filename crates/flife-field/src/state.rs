@@ -8,16 +8,24 @@
 //! Converting to another arrangement goes through [`relayout`], which copies
 //! each value to its semantic index.
 
+use flife_core::memory::capacity_bytes;
 use flife_core::model::MOMENT_CHANNELS;
-use flife_core::{CoreError, ValidatedConfig};
+use flife_core::{CoreError, V2Feature, ValidatedConfig};
 use fnp_dtype::ArrayStorage;
 
 use crate::footprint::BufferLimits;
-use crate::grid::{ENERGY_PLANE, FIELD_PLANES, FieldGrid};
+use crate::grid::{
+    CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE,
+    CARRIER1_MOMENT_CHANNELS, CarrierLayout, DUAL_CARRIER_PLANES, ENERGY_PLANE, FIELD_PLANES,
+    FieldGrid, field_planes_for_config,
+};
 use crate::layout::{BUFFER, FieldLayout, HOST_ALIGNMENT, mismatch, overflow};
 
 /// Moment channels per cell, as an array length.
 pub const CHANNELS: usize = MOMENT_CHANNELS as usize;
+
+/// Default initial edge conductance `g_0` for `V2-14` (`vascular-field`).
+pub const VASCULAR_INITIAL_CONDUCTANCE: f32 = 0.25;
 
 /// One cell's values: its energy `e` and energy-weighted moment `m`
 /// (§4.2).
@@ -72,38 +80,71 @@ impl InitialEnergy {
 pub struct FieldState {
     layout: FieldLayout,
     data: Vec<f32>,
+    /// Optional `V2-14` (`vascular-field`) east-face conductances `g^E_c ∈ [g_min, 1.0]`.
+    /// Empty (`0 B`) when disabled. Stored on both `FieldPair` buffers for `C.8` cancel-safety.
+    edge_x_cond: Vec<f32>,
+    /// Optional `V2-14` (`vascular-field`) north-face conductances `g^N_c ∈ [g_min, 1.0]`.
+    /// Empty (`0 B`) when disabled.
+    edge_y_cond: Vec<f32>,
 }
 
 impl FieldState {
-    /// An all-zero field on `grid`. The buffer is admitted against `limits`
-    /// before it is allocated, and a refused allocation is reported, not
-    /// aborted.
+    /// An all-zero 33-plane single-carrier field on `grid`. The buffer is
+    /// admitted against `limits` before it is allocated, and a refused
+    /// allocation is reported, not aborted.
     ///
     /// # Errors
     /// [`CoreError::BudgetExhausted`] above `limits`;
     /// [`CoreError::AllocationFailed`] if the host refuses;
     /// [`CoreError::Overflow`] past the address space.
     pub fn zeroed(grid: FieldGrid, limits: &BufferLimits) -> Result<Self, CoreError> {
-        let layout = FieldLayout::planar(grid)?;
+        Self::zeroed_with_planes(grid, FIELD_PLANES, limits)
+    }
+
+    /// An all-zero field on `grid` with `planes` (`33` single-carrier or `34`
+    /// dual-carrier, `V2-15` / `FL-055`). Vascular edge storage starts empty
+    /// (`0 B`) until [`FieldState::enable_vascular`] is called.
+    ///
+    /// # Errors
+    /// As [`FieldLayout::planar_with_planes`] and [`FieldState::zeroed`].
+    pub fn zeroed_with_planes(
+        grid: FieldGrid,
+        planes: u32,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
+        let layout = FieldLayout::planar_with_planes(grid, planes)?;
         limits.admit("field buffer bytes", layout.byte_length())?;
         let data = zeroed_f32(&layout)?;
-        Ok(Self { layout, data })
+        Ok(Self {
+            layout,
+            data,
+            edge_x_cond: Vec::new(),
+            edge_y_cond: Vec::new(),
+        })
+    }
+
+    /// An all-zero 34-plane dual-carrier hybrid field on `grid` (`V2-15`).
+    ///
+    /// # Errors
+    /// As [`FieldState::zeroed_with_planes`].
+    pub fn zeroed_dual_carrier(grid: FieldGrid, limits: &BufferLimits) -> Result<Self, CoreError> {
+        Self::zeroed_with_planes(grid, DUAL_CARRIER_PLANES, limits)
     }
 
     /// The initial field a validated configuration declares
     /// (`[field_initialization]`, §4.2, §4.4): `energy_per_cell` in every
     /// cell and, for the `zero` composition, no chemical moment.
     ///
-    /// The configured energy is stored in F32. The returned
-    /// [`InitialEnergy`] carries the stored value, and its exact total is the
-    /// declared external injection for the ledger. Rounding to F32 is
-    /// recorded there rather than hidden.
+    /// Resolves `34` planes when `V2Feature::DualCarrierTrails` is enabled
+    /// (seeding Carrier 0's `e_0` while Carrier 1 starts at zero) and enables
+    /// vascular edge storage (`0 B` when disabled) when `V2Feature::VascularField`
+    /// is enabled.
     ///
     /// # Errors
     /// [`CoreError::MissingCapability`] for an unimplemented grid or
     /// composition; [`CoreError::NumericalInvalid`] for an energy that is
     /// negative, nonfinite or beyond F32; and the errors of
-    /// [`FieldState::zeroed`].
+    /// [`FieldState::zeroed_with_planes`] / [`FieldState::enable_vascular`].
     pub fn initial(
         config: &ValidatedConfig,
         limits: &BufferLimits,
@@ -125,8 +166,16 @@ impl FieldState {
             });
         }
         let grid = FieldGrid::from_config(config)?;
-        let mut state = Self::zeroed(grid, limits)?;
+        let planes = field_planes_for_config(config);
+        let mut state = Self::zeroed_with_planes(grid, planes, limits)?;
         state.energy_mut().fill(stored);
+        if let Some(v2) = config.config().v2.as_ref()
+            && v2.is_enabled(V2Feature::VascularField)
+        {
+            let g_min = v2.vascular.minimum_conductance_ratio;
+            let initial = f64::from(VASCULAR_INITIAL_CONDUCTANCE).clamp(g_min, 1.0) as f32;
+            state.enable_vascular(initial, limits)?;
+        }
         let energy = InitialEnergy::new(declared, stored, grid.cell_count());
         Ok((state, energy))
     }
@@ -143,22 +192,68 @@ impl FieldState {
         self.layout.grid()
     }
 
+    /// Number of planes (`33` single-carrier or `34` dual-carrier).
+    #[must_use]
+    pub const fn planes(&self) -> u32 {
+        self.layout.planes()
+    }
+
+    /// Whether this field uses the 34-plane dual-carrier hybrid layout (`V2-15`).
+    #[must_use]
+    pub const fn is_dual_carrier(&self) -> bool {
+        self.layout.is_dual_carrier()
+    }
+
+    /// Carrier 0's plane layout (`(0, 1, 32)` on 33-plane or `(0, 1, 24)` on 34-plane).
+    #[must_use]
+    pub const fn carrier0(&self) -> CarrierLayout {
+        if self.is_dual_carrier() {
+            CarrierLayout::CARRIER_0
+        } else {
+            CarrierLayout::SINGLE_CARRIER
+        }
+    }
+
+    /// Carrier 1's plane layout (`Some((25, 26, 8))` on 34-plane, else `None`).
+    #[must_use]
+    pub const fn carrier1(&self) -> Option<CarrierLayout> {
+        if self.is_dual_carrier() {
+            Some(CarrierLayout::CARRIER_1)
+        } else {
+            None
+        }
+    }
+
+    /// Number of moment channels on Carrier 0 (`32` single-carrier, `24` dual-carrier).
+    #[must_use]
+    pub const fn carrier0_moments_count(&self) -> usize {
+        if self.is_dual_carrier() {
+            CARRIER0_MOMENT_CHANNELS as usize
+        } else {
+            CHANNELS
+        }
+    }
+
     /// Every value, in planar order.
     #[must_use]
     pub fn as_slice(&self) -> &[f32] {
         &self.data
     }
 
-    /// Bytes the allocation holds: its capacity times `size_of::<f32>()`.
+    /// Bytes the allocation holds: planar data plus optional `V2-14` vascular
+    /// edge buffers (`0 B` when disabled).
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
-        u64::try_from(self.data.capacity())
+        let field_bytes = u64::try_from(self.data.capacity())
             .ok()
             .and_then(|elements| elements.checked_mul(HOST_ALIGNMENT))
-            .unwrap_or(u64::MAX)
+            .unwrap_or(u64::MAX);
+        field_bytes
+            .saturating_add(capacity_bytes(&self.edge_x_cond))
+            .saturating_add(capacity_bytes(&self.edge_y_cond))
     }
 
-    /// Plane `plane` as a row-major image, or `None` past plane 32.
+    /// Plane `plane` as a row-major image, or `None` past the last plane.
     #[must_use]
     pub fn plane(&self, plane: u32) -> Option<&[f32]> {
         let range = self.plane_range(plane)?;
@@ -171,11 +266,13 @@ impl FieldState {
         &mut self.data
     }
 
-    /// The moment planes, channels 0 to 31 in order, writable. The length
-    /// is fixed, so the layout cannot change through it.
+    /// Carrier 0's moment planes (`0..32` on single-carrier, `0..24` on
+    /// dual-carrier), writable. Never includes Carrier 1's planes (`25..34`).
     pub fn moments_mut(&mut self) -> &mut [f32] {
         let cells = usize::try_from(self.grid().cell_count()).unwrap_or(usize::MAX);
-        self.data.get_mut(cells..).unwrap_or(&mut [])
+        let moments = self.carrier0_moments_count();
+        let end = cells.saturating_mul(1 + moments);
+        self.data.get_mut(cells..end).unwrap_or(&mut [])
     }
 
     /// Plane `plane`, writable.
@@ -185,61 +282,146 @@ impl FieldState {
         self.data.get_mut(range)
     }
 
-    /// The energy plane.
+    /// Carrier 0's energy plane (`e_0`).
     #[must_use]
     pub fn energy(&self) -> &[f32] {
         self.plane(ENERGY_PLANE).unwrap_or(&[])
     }
 
-    /// `Σ e_c` in F64, summed in cell-index order: the field's holdings for
-    /// the energy ledger.
+    /// Carrier 1's trail energy plane (`e_1`, plane 25) on a 34-plane field, or
+    /// `None` on a 33-plane single-carrier field.
     #[must_use]
-    pub fn energy_total(&self) -> f64 {
-        crate::transport::sum(self.energy())
+    pub fn trail_energy(&self) -> Option<&[f32]> {
+        if self.is_dual_carrier() {
+            self.plane(CARRIER1_ENERGY_PLANE)
+        } else {
+            None
+        }
     }
 
-    /// The energy plane, writable.
+    /// Carrier 1's trail energy plane (`e_1`, plane 25), writable.
+    #[must_use]
+    pub fn trail_energy_mut(&mut self) -> Option<&mut [f32]> {
+        if self.is_dual_carrier() {
+            self.plane_mut(CARRIER1_ENERGY_PLANE)
+        } else {
+            None
+        }
+    }
+
+    /// Carrier 1's trail moment channel `channel` (`0..8`, planes `26..=33`) on
+    /// a 34-plane field.
+    #[must_use]
+    pub fn trail_moment(&self, channel: u32) -> Option<&[f32]> {
+        if !self.is_dual_carrier() || channel >= CARRIER1_MOMENT_CHANNELS {
+            return None;
+        }
+        self.plane(CARRIER1_FIRST_MOMENT_PLANE.checked_add(channel)?)
+    }
+
+    /// Carrier 1's trail moment channel `channel` (`0..8`, planes `26..=33`),
+    /// writable.
+    #[must_use]
+    pub fn trail_moment_mut(&mut self, channel: u32) -> Option<&mut [f32]> {
+        if !self.is_dual_carrier() || channel >= CARRIER1_MOMENT_CHANNELS {
+            return None;
+        }
+        self.plane_mut(CARRIER1_FIRST_MOMENT_PLANE.checked_add(channel)?)
+    }
+
+    /// `Σ e_c` in F64, summed in cell-index order: the field's holdings for
+    /// the energy ledger. In 34-plane dual-carrier mode, sums `Σ e_0 + Σ e_1`
+    /// so `INV-03` closes identically across both carriers.
+    #[must_use]
+    pub fn energy_total(&self) -> f64 {
+        let base = crate::transport::sum(self.energy());
+        match self.trail_energy() {
+            Some(trail) => base + crate::transport::sum(trail),
+            None => base,
+        }
+    }
+
+    /// Carrier 0's energy plane (`e_0`), writable.
     #[must_use]
     pub fn energy_mut(&mut self) -> &mut [f32] {
         self.plane_mut(ENERGY_PLANE).unwrap_or(&mut [])
     }
 
-    /// Moment channel `channel`, or `None` past channel 31.
+    /// Carrier 0 moment channel `channel` (`0..32` on single-carrier, `0..24` on
+    /// dual-carrier), or `None` past Carrier 0's channels.
     #[must_use]
     pub fn moment(&self, channel: u32) -> Option<&[f32]> {
-        self.plane(
-            channel
-                .checked_add(1)
-                .filter(|&plane| plane < FIELD_PLANES)?,
-        )
+        let limit = self.carrier0().moment_count;
+        if channel >= limit {
+            return None;
+        }
+        self.plane(channel.checked_add(1)?)
     }
 
-    /// Moment channel `channel`, writable.
+    /// Carrier 0 moment channel `channel`, writable.
     #[must_use]
     pub fn moment_mut(&mut self, channel: u32) -> Option<&mut [f32]> {
-        self.plane_mut(
-            channel
-                .checked_add(1)
-                .filter(|&plane| plane < FIELD_PLANES)?,
-        )
+        let limit = self.carrier0().moment_count;
+        if channel >= limit {
+            return None;
+        }
+        self.plane_mut(channel.checked_add(1)?)
     }
 
-    /// Cell `(x, y)`, or `None` outside the grid.
+    /// Carrier 0 cell `(x, y)`, or `None` outside the grid. On a 34-plane
+    /// dual-carrier field, `moments[24..32]` are left `0.0` (read Carrier 1 via
+    /// [`FieldState::trail_cell`]).
     #[must_use]
     pub fn cell(&self, x: u32, y: u32) -> Option<Cell> {
         let index = self.grid().cell_index(x, y)?;
         let mut cell = Cell::EMPTY;
         cell.energy = *self.energy().get(index)?;
-        for (channel, value) in (0_u32..).zip(cell.moments.iter_mut()) {
+        let active = self.carrier0_moments_count();
+        for (channel, value) in (0_u32..).zip(cell.moments.iter_mut().take(active)) {
             *value = *self.moment(channel)?.get(index)?;
         }
         Some(cell)
     }
 
-    /// Cell `index`, row-major as [`FieldGrid::cell_index`] numbers cells,
-    /// or `None` outside the grid: [`FieldState::cell`] by index, each
-    /// plane read once at its offset in the planar data (plane `p` holds
-    /// `p × cells .. (p + 1) × cells`) rather than looked up per channel.
+    /// Carrier 1 cell `(x, y)` as `(e_1, [m^(1)_0, …, m^(1)_7])`, or `None` on
+    /// a 33-plane field or outside the grid.
+    #[must_use]
+    pub fn trail_cell(&self, x: u32, y: u32) -> Option<(f32, [f32; 8])> {
+        if !self.is_dual_carrier() {
+            return None;
+        }
+        let index = self.grid().cell_index(x, y)?;
+        let energy = *self.trail_energy()?.get(index)?;
+        let mut moments = [0.0_f32; 8];
+        for (channel, slot) in (0_u32..).zip(moments.iter_mut()) {
+            *slot = *self.trail_moment(channel)?.get(index)?;
+        }
+        Some((energy, moments))
+    }
+
+    /// Overwrite Carrier 1 cell `(x, y)`; `None` on a 33-plane field or outside
+    /// the grid.
+    #[must_use]
+    pub fn set_trail_cell(
+        &mut self,
+        x: u32,
+        y: u32,
+        energy: f32,
+        moments: &[f32; 8],
+    ) -> Option<()> {
+        if !self.is_dual_carrier() {
+            return None;
+        }
+        let index = self.grid().cell_index(x, y)?;
+        *self.trail_energy_mut()?.get_mut(index)? = energy;
+        for (channel, &value) in (0_u32..).zip(moments.iter()) {
+            *self.trail_moment_mut(channel)?.get_mut(index)? = value;
+        }
+        Some(())
+    }
+
+    /// Carrier 0 cell `index`, row-major as [`FieldGrid::cell_index`] numbers
+    /// cells, or `None` outside the grid: [`FieldState::cell`] by index.
     #[must_use]
     pub fn cell_at(&self, index: usize) -> Option<Cell> {
         let cells = usize::try_from(self.grid().cell_count()).ok()?;
@@ -248,24 +430,129 @@ impl FieldState {
         }
         let mut cell = Cell::EMPTY;
         cell.energy = *self.data.get(index)?;
+        let active = self.carrier0_moments_count();
         let mut at = index;
-        for value in &mut cell.moments {
+        for value in cell.moments.iter_mut().take(active) {
             at = at.checked_add(cells)?;
             *value = *self.data.get(at)?;
         }
         Some(cell)
     }
 
-    /// Overwrite cell `(x, y)`; `None` outside the grid, leaving the field
-    /// unchanged.
+    /// Overwrite Carrier 0 cell `(x, y)`; `None` outside the grid, leaving the
+    /// field unchanged. On a 34-plane field, writes `e_0` and `moments[0..24]`,
+    /// leaving Carrier 1 untouched.
     #[must_use]
     pub fn set_cell(&mut self, x: u32, y: u32, cell: &Cell) -> Option<()> {
         let index = self.grid().cell_index(x, y)?;
         *self.energy_mut().get_mut(index)? = cell.energy;
-        for (channel, &value) in (0_u32..).zip(cell.moments.iter()) {
+        let active = self.carrier0_moments_count();
+        for (channel, &value) in (0_u32..).zip(cell.moments.iter().take(active)) {
             *self.moment_mut(channel)?.get_mut(index)? = value;
         }
         Some(())
+    }
+
+    /// Enable and initialize `V2-14` (`vascular-field`) orthogonal east/north
+    /// edge conductance buffers on this state (`8 B/cell`), admitted against
+    /// `limits` (INV-15).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] unless `initial ∈ (0, 1]` is finite;
+    /// [`CoreError::BudgetExhausted`], [`CoreError::AllocationFailed`], or
+    /// [`CoreError::Overflow`]; leaves the state unchanged on error.
+    pub fn enable_vascular(
+        &mut self,
+        initial: f32,
+        limits: &BufferLimits,
+    ) -> Result<(), CoreError> {
+        if !initial.is_finite() || initial <= 0.0 || initial > 1.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "vascular initial conductance",
+                detail: format!("{initial:?} is outside (0, 1]"),
+            });
+        }
+        let cells = usize::try_from(self.grid().cell_count()).map_err(|_| overflow())?;
+        let per_axis = self
+            .grid()
+            .cell_count()
+            .checked_mul(HOST_ALIGNMENT)
+            .ok_or_else(overflow)?;
+        let total_bytes = per_axis.checked_mul(2).ok_or_else(overflow)?;
+        limits.admit("vascular edge conductance bytes", total_bytes)?;
+        let mut edge_x = Vec::new();
+        edge_x
+            .try_reserve_exact(cells)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "vascular east edge conductances",
+                bytes: per_axis,
+            })?;
+        edge_x.resize(cells, initial);
+        let mut edge_y = Vec::new();
+        edge_y
+            .try_reserve_exact(cells)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "vascular north edge conductances",
+                bytes: per_axis,
+            })?;
+        edge_y.resize(cells, initial);
+        self.edge_x_cond = edge_x;
+        self.edge_y_cond = edge_y;
+        Ok(())
+    }
+
+    /// Whether `V2-14` vascular edge conductance buffers are allocated on this
+    /// state.
+    #[must_use]
+    pub fn has_vascular(&self) -> bool {
+        !self.edge_x_cond.is_empty()
+    }
+
+    /// Read-only slices `(edge_x_cond, edge_y_cond)` when `V2-14` vascular
+    /// storage is enabled, or `None` when disabled (`0 B`).
+    #[must_use]
+    pub fn vascular_edges(&self) -> Option<(&[f32], &[f32])> {
+        if self.edge_x_cond.is_empty() {
+            None
+        } else {
+            Some((&self.edge_x_cond, &self.edge_y_cond))
+        }
+    }
+
+    /// Mutable slices `(edge_x_cond, edge_y_cond)` when `V2-14` vascular
+    /// storage is enabled, or `None` when disabled.
+    #[must_use]
+    pub fn vascular_edges_mut(&mut self) -> Option<(&mut [f32], &mut [f32])> {
+        if self.edge_x_cond.is_empty() {
+            None
+        } else {
+            Some((&mut self.edge_x_cond, &mut self.edge_y_cond))
+        }
+    }
+
+    /// Overwrite `V2-14` vascular edge buffers (for checkpoint restore, crop,
+    /// or graft).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if vascular storage is disabled or slice
+    /// lengths do not match `grid.cell_count()`.
+    pub fn set_vascular_edges(&mut self, edge_x: &[f32], edge_y: &[f32]) -> Result<(), CoreError> {
+        if self.edge_x_cond.is_empty() {
+            return Err(mismatch(
+                "vascular edge storage is not enabled on this field state".into(),
+            ));
+        }
+        if edge_x.len() != self.edge_x_cond.len() || edge_y.len() != self.edge_y_cond.len() {
+            return Err(mismatch(format!(
+                "vascular edges ({}, {}) do not match {} cells",
+                edge_x.len(),
+                edge_y.len(),
+                self.edge_x_cond.len()
+            )));
+        }
+        self.edge_x_cond.copy_from_slice(edge_x);
+        self.edge_y_cond.copy_from_slice(edge_y);
+        Ok(())
     }
 
     /// A read-only view.
@@ -277,13 +564,25 @@ impl FieldState {
         }
     }
 
-    /// Overwrite this state with `source`, which must have the same layout.
+    /// Overwrite this state with `source`, which must have the same layout and
+    /// matching vascular storage state.
     ///
     /// # Errors
-    /// [`CoreError::LayoutMismatch`] for a different layout.
+    /// [`CoreError::LayoutMismatch`] for a different layout or vascular state.
     pub fn copy_from(&mut self, source: &Self) -> Result<(), CoreError> {
         self.layout.ensure_compatible(&source.layout)?;
+        if self.edge_x_cond.len() != source.edge_x_cond.len()
+            || self.edge_y_cond.len() != source.edge_y_cond.len()
+        {
+            return Err(mismatch(
+                "source and destination field states disagree on vascular edge storage".into(),
+            ));
+        }
         self.data.copy_from_slice(&source.data);
+        if !self.edge_x_cond.is_empty() {
+            self.edge_x_cond.copy_from_slice(&source.edge_x_cond);
+            self.edge_y_cond.copy_from_slice(&source.edge_y_cond);
+        }
         Ok(())
     }
 
@@ -305,7 +604,7 @@ impl FieldState {
         storage: ArrayStorage,
         layout: &FieldLayout,
     ) -> Result<Self, CoreError> {
-        let expected = FieldLayout::planar(*layout.grid())?;
+        let expected = FieldLayout::planar_with_planes(*layout.grid(), layout.planes())?;
         expected.ensure_compatible(layout)?;
         let ArrayStorage::F32(data) = storage else {
             return Err(mismatch(format!(
@@ -324,11 +623,13 @@ impl FieldState {
         Ok(Self {
             layout: expected,
             data,
+            edge_x_cond: Vec::new(),
+            edge_y_cond: Vec::new(),
         })
     }
 
     fn plane_range(&self, plane: u32) -> Option<std::ops::Range<usize>> {
-        if plane >= FIELD_PLANES {
+        if plane >= self.layout.planes() {
             return None;
         }
         let cells = usize::try_from(self.grid().cell_count()).ok()?;
@@ -410,11 +711,12 @@ impl<'a> FieldView<'a> {
 /// source grid; [`CoreError::AllocationFailed`] if the host refuses.
 pub fn relayout(source: &FieldView<'_>, target: &FieldLayout) -> Result<Vec<f32>, CoreError> {
     let grid = *source.layout().grid();
-    FieldLayout::new(grid, target.arrangement())?.ensure_compatible(target)?;
+    let planes = source.layout().planes();
+    FieldLayout::new_with_planes(grid, target.arrangement(), planes)?.ensure_compatible(target)?;
     let mut out = zeroed_f32(target)?;
     for y in 0..grid.cells_y() {
         for x in 0..grid.cells_x() {
-            for plane in 0..FIELD_PLANES {
+            for plane in 0..planes {
                 let moved = source.get(plane, x, y).and_then(|value| {
                     let slot = out.get_mut(target.element_index(plane, x, y)?)?;
                     *slot = value;
@@ -443,15 +745,66 @@ pub struct FieldPair {
 }
 
 impl FieldPair {
-    /// Two all-zero states on `grid`, each admitted against `limits`.
+    /// Two all-zero 33-plane states on `grid`, each admitted against `limits`.
     ///
     /// # Errors
     /// As [`FieldState::zeroed`].
     pub fn zeroed(grid: FieldGrid, limits: &BufferLimits) -> Result<Self, CoreError> {
+        Self::zeroed_with_planes(grid, FIELD_PLANES, limits)
+    }
+
+    /// Two all-zero states on `grid` with `planes` (`33` single-carrier or `34`
+    /// dual-carrier, `V2-15`), each admitted against `limits`.
+    ///
+    /// # Errors
+    /// As [`FieldState::zeroed_with_planes`].
+    pub fn zeroed_with_planes(
+        grid: FieldGrid,
+        planes: u32,
+        limits: &BufferLimits,
+    ) -> Result<Self, CoreError> {
         Ok(Self {
-            current: FieldState::zeroed(grid, limits)?,
-            next: FieldState::zeroed(grid, limits)?,
+            current: FieldState::zeroed_with_planes(grid, planes, limits)?,
+            next: FieldState::zeroed_with_planes(grid, planes, limits)?,
         })
+    }
+
+    /// Pair an already-initialized committed `current` state with a matching
+    /// candidate `next` state.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if layouts or vascular storage disagree.
+    pub fn from_states(current: FieldState, next: FieldState) -> Result<Self, CoreError> {
+        current.layout().ensure_compatible(next.layout())?;
+        if current.has_vascular() != next.has_vascular() {
+            return Err(mismatch(
+                "current and next field states disagree on vascular edge storage".into(),
+            ));
+        }
+        Ok(Self { current, next })
+    }
+
+    /// Enable `V2-14` vascular edge conductance buffers on BOTH `current` and
+    /// `next` atomically (`C.8` cancel-safe ping-pong storage).
+    ///
+    /// # Errors
+    /// As [`FieldState::enable_vascular`]; leaves both states unchanged on error.
+    pub fn enable_vascular(
+        &mut self,
+        initial: f32,
+        limits: &BufferLimits,
+    ) -> Result<(), CoreError> {
+        let mut next_copy = self.next.clone();
+        next_copy.enable_vascular(initial, limits)?;
+        self.current.enable_vascular(initial, limits)?;
+        self.next = next_copy;
+        Ok(())
+    }
+
+    /// Whether `V2-14` vascular edge storage is enabled on this pair.
+    #[must_use]
+    pub fn has_vascular(&self) -> bool {
+        self.current.has_vascular()
     }
 
     /// The committed field.

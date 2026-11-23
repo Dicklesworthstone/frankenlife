@@ -10,9 +10,9 @@
 use flife_core::CoreError;
 use flife_field::settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionOrganism,
-    EmissionOutcome, MotionConstants, MotionOrganism, MotionOutcome, MutationBirth,
-    MutationConstants, MutationCounts, MutationValues, ProposalConstants, ProposalOrganism,
-    ProposalOutcome, SettleBackend,
+    EmissionOutcome, MotionConstants, MotionOrganism, MotionOutcome, MotionV2Extras,
+    MotorSteeringConstants, MutationBirth, MutationConstants, MutationCounts, MutationValues,
+    ProposalConstants, ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 use flife_field::{FieldGrid, FieldState};
 
@@ -98,6 +98,18 @@ impl SettleBackend for MetalSettle {
         self.motion.settle(constants, organisms, out)
     }
 
+    fn motion_v2(
+        &mut self,
+        constants: &MotionConstants,
+        motor_constants: Option<&MotorSteeringConstants>,
+        organisms: &[MotionOrganism],
+        extras: &[MotionV2Extras],
+        out: &mut Vec<MotionOutcome>,
+    ) -> Result<(), CoreError> {
+        self.motion
+            .settle_v2(constants, motor_constants, organisms, extras, out)
+    }
+
     fn emission(
         &mut self,
         grid: &FieldGrid,
@@ -106,6 +118,18 @@ impl SettleBackend for MetalSettle {
         out: &mut Vec<EmissionOutcome>,
     ) -> Result<(), CoreError> {
         self.emission.settle(grid, efficiency, organisms, out)
+    }
+
+    fn emission_with_floor(
+        &mut self,
+        grid: &FieldGrid,
+        efficiency: f64,
+        energy_floor: f64,
+        organisms: &[EmissionOrganism],
+        out: &mut Vec<EmissionOutcome>,
+    ) -> Result<(), CoreError> {
+        self.emission
+            .settle_with_floor(grid, efficiency, energy_floor, organisms, out)
     }
 
     fn proposal(

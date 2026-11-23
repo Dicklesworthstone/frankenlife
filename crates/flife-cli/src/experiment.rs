@@ -991,11 +991,18 @@ pub struct Host {
     pub os: Option<String>,
 }
 
-fn command_line(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .ok()?;
+#[derive(Clone, Copy)]
+enum HostProbe {
+    Sysctl,
+    SwVers,
+}
+
+fn host_probe(probe: HostProbe, args: &[&str]) -> Option<String> {
+    let mut command = match probe {
+        HostProbe::Sysctl => std::process::Command::new("sysctl"),
+        HostProbe::SwVers => std::process::Command::new("sw_vers"),
+    };
+    let output = command.args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1025,11 +1032,11 @@ impl Host {
         let logical_cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
         if cfg!(target_os = "macos") {
             Self {
-                cpu: command_line("sysctl", &["-n", "machdep.cpu.brand_string"]),
+                cpu: host_probe(HostProbe::Sysctl, &["-n", "machdep.cpu.brand_string"]),
                 logical_cores,
-                memory_bytes: command_line("sysctl", &["-n", "hw.memsize"])
+                memory_bytes: host_probe(HostProbe::Sysctl, &["-n", "hw.memsize"])
                     .and_then(|bytes| bytes.parse().ok()),
-                os: command_line("sw_vers", &["-productVersion"])
+                os: host_probe(HostProbe::SwVers, &["-productVersion"])
                     .map(|version| format!("macOS {version}")),
             }
         } else {

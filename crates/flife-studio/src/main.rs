@@ -70,14 +70,14 @@
 #![forbid(unsafe_code)]
 
 use std::io::{BufWriter, Write};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use flife_backend_metal::ControllerChoice;
-use flife_cli::{CheckpointAdmission, InspectedLayer, InspectedWeights};
+use flife_cli::{CameraPath, CheckpointAdmission, InspectedLayer, InspectedWeights};
 use flife_core::memory::MemoryAdmission;
 use flife_core::schema::Scope;
 use flife_core::{
@@ -88,11 +88,11 @@ use flife_engine::{Followed, OrganismSnapshot, ReproductionOutcome};
 use flife_render::{AffinityProjection, Metrics};
 use flife_runtime::Outcome;
 use flife_studio::{
-    Brush, BrushPreview, ClockMeter, ClockReading, ColorMapping, End, ExportManifest,
-    ExportOptions, FieldMapping, FieldOverlayKind, FrameTimeSummary, FrameTimes, Inspected, Intent,
+    Brush, BrushPreview, CinemaOptions, ClockMeter, ClockReading, ColorMapping, End,
+    ExportManifest, ExportMode, FieldMapping, FrameTimeSummary, FrameTimes, Inspected, Intent,
     Look, Measuring, MoveLatencyBound, OverlayState, Particles, Resumed, STUDIO_SCHEMA, Status,
-    Stroke, Studio, StudioOptions, Style, Surface, Telemetry, TimelineRecord, V2ColorMapping,
-    active_field_key, legends, overlay_text, v2_legends, write_timeline_record,
+    Stroke, Studio, StudioOptions, Style, Surface, Telemetry, TimelineRecord, legends,
+    overlay_text, parse_cinema_resolution, write_timeline_record,
 };
 use fmn_render::metal::{InputEvent, LogicalPoint, Modifiers, ScrollUnit};
 use serde::Serialize;
@@ -138,9 +138,11 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     controllers: ControllerChoice,
     /// What the organisms' colour means: `lineage`, `energy`, `generation`,
-    /// `motion`, `topology`, `affinity` or `lineage-energy` (or a registered
-    /// name such as `founder-lineage-v1`). The default is the configuration's
-    /// `[presentation] color_mapping`. Keys 1 to 7 change it.
+    /// `motion`, `topology`, `affinity`, `lineage-energy`, `cell-state`, or
+    /// `polarity` (or a registered name such as `founder-lineage-v1`,
+    /// `cell-state-v1`, or `polarity-v1`). The default is the configuration's
+    /// `[presentation] color_mapping`. Keys 1 to 9 change it (`8` and `9`
+    /// require `field-ecology-v2` with `v2-visual-mappings`).
     #[arg(long)]
     color: Option<ColorMapping>,
     /// `glow` (the default), `raw`: no halos and a linear grey field, or
@@ -155,9 +157,10 @@ struct Cli {
     no_field: bool,
     /// What the field's colour means: `energy` (the default),
     /// `composition`, its mean chemical composition coloured as the
-    /// affinity mapping colours organisms, or `component-C`, moment channel
-    /// C (0 to 31) per unit energy from blue (-1) to red (+1); the last two
-    /// as bright as its energy. C switches, `[` and `]` choose the channel.
+    /// affinity mapping colours organisms, `component-C`, moment channel
+    /// C (0 to 31) per unit energy from blue (-1) to red (+1), or (when
+    /// `v2-visual-mappings` is enabled) `trail-carrier` or
+    /// `vascular-conductance`. C switches, `[` and `]` choose the channel.
     #[arg(long, default_value = "energy")]
     field_mapping: FieldMapping,
     /// Run for SECONDS wall seconds with no window, then close: each frame
@@ -201,6 +204,19 @@ struct Cli {
     /// before anything is written.
     #[arg(long, requires = "export")]
     export_mp4: bool,
+    /// Override the exported Cinema frame resolution (`1080p`, `4k`, or
+    /// `WIDTHxHEIGHT`, FL-050). Admitted up front against
+    /// `[execution] maximum_total_bytes` (FL-043, INV-15).
+    #[arg(long, value_name = "1080p|4k|WxH", requires = "export", value_parser = parse_cinema_resolution)]
+    export_size: Option<[u32; 2]>,
+    /// Export in exact simulation-time mode (FL-050, plan §13.8): sample one
+    /// frame every N committed ticks (0 dropped, 0 repeated video slots).
+    #[arg(long, value_name = "TICKS", requires = "export")]
+    export_every_ticks: Option<NonZeroU64>,
+    /// JSON camera keyframe path (`flife render --camera` format) evaluated
+    /// smoothly across integer ticks during Cinema export (FL-050, G10).
+    #[arg(long, value_name = "FILE", requires = "export")]
+    export_camera: Option<PathBuf>,
     /// Keep the session in run directory DIR (FL-024), which must be
     /// absent or empty: `flife resume`, `branch` and `inspect` take it.
     #[arg(long, value_name = "DIR", conflicts_with = "export")]
@@ -333,15 +349,39 @@ fn export_timeline(config: &ValidatedConfig, cli: &Cli, timeline: &Path, out: &P
             return fail(error.kind(), error.to_string(), 2);
         }
     };
+    let camera = match &cli.export_camera {
+        Some(path) => {
+            let json = match std::fs::read_to_string(path) {
+                Ok(json) => json,
+                Err(error) => {
+                    let error = storage("read the export camera path", path, &error);
+                    return fail(error.kind(), error.to_string(), 2);
+                }
+            };
+            match CameraPath::from_json(&json) {
+                Ok(camera) => Some(camera),
+                Err(error) => return fail(error.kind(), error.to_string(), 2),
+            }
+        }
+        None => None,
+    };
     let configured = config.config().presentation.frames_per_second;
-    let options = ExportOptions {
+    let options = CinemaOptions {
         frames_per_second: cli
             .export_fps
             .unwrap_or_else(|| NonZeroU32::new(configured).unwrap_or(NonZeroU32::MIN)),
         cpu_workers: Some(cli.cpu_workers),
         mp4: cli.export_mp4,
+        mode: cli
+            .export_every_ticks
+            .map_or(ExportMode::LiveCapture, |every_ticks| {
+                ExportMode::SimulationTime { every_ticks }
+            }),
+        resolution: cli.export_size,
+        pixels_per_point: None,
+        camera,
     };
-    match flife_studio::export(config, &text, options, out) {
+    match flife_studio::export_cinema(config, &text, &options, out) {
         Ok(manifest) => {
             print(&export_record(&manifest, out));
             ExitCode::SUCCESS
@@ -987,6 +1027,9 @@ fn main() -> ExitCode {
         Ok(mapping) => mapping,
         Err(error) => return fail(error.kind(), error.to_string(), 2),
     };
+    if let Err(error) = validate_v2_visual_style(&config, mapping, cli.field_mapping) {
+        return fail(error.kind(), error.to_string(), 2);
+    }
     let options = StudioOptions {
         size: cli
             .width
@@ -1123,7 +1166,7 @@ fn main() -> ExitCode {
     let mut inspected = None;
     // The last measurement's answer (plan §14.3's measurement region).
     let mut measurement = None;
-    // Every colour mapping's key (FL-019's legend and V2-16's optional keys).
+    // Every colour mapping's key (FL-019 and V2-16).
     let keys = match legends(&config) {
         Ok(keys) => keys,
         Err(error) => {
@@ -1132,7 +1175,6 @@ fn main() -> ExitCode {
             return code;
         }
     };
-    let v2_keys = v2_legends();
     let (mut times, mut latency, mut bounds) =
         match FrameTimes::new().and_then(|a| Ok((a, FrameTimes::new()?, FrameTimes::new()?))) {
             Ok(all) => all,
@@ -1230,18 +1272,14 @@ fn main() -> ExitCode {
         }
         if frame.restyled {
             let style = studio.view().style();
-            let v2_mapping = studio.controls().v2_mapping();
-            let field_overlay = studio.controls().field_overlay();
             print(&Record::View {
                 schema: STUDIO_SCHEMA,
-                mapping: v2_mapping.map_or_else(|| style.mapping.name(), V2ColorMapping::name),
-                meaning: v2_mapping
-                    .map_or_else(|| style.mapping.meaning(), V2ColorMapping::meaning),
+                mapping: style.mapping.name(),
+                meaning: style.mapping.meaning(),
                 look: style.look.name(),
                 particles: style.particles.name(),
                 field: style.field,
-                field_mapping: field_overlay
-                    .map_or_else(|| style.field_mapping.name(), FieldOverlayKind::name),
+                field_mapping: style.field_mapping.name(),
                 shown_tick: frame.shown.map(|shown| shown.tick.get()),
             });
         }
@@ -1323,17 +1361,11 @@ fn main() -> ExitCode {
         }
         let style = studio.view().style();
         let mapping = style.mapping;
-        let v2_mapping = studio.controls().v2_mapping();
-        let field_key = active_field_key(style, studio.controls().field_overlay());
-        let legend = if let Some(v2) = v2_mapping {
-            v2_keys
-                .iter()
-                .find_map(|(key, legend)| (*key == v2).then_some(legend))
-        } else {
-            keys.iter()
-                .find_map(|(key, legend)| (*key == mapping).then_some(legend))
-        };
-        let Some(legend) = legend else {
+        let field_key = flife_studio::field_key(style);
+        let Some(legend) = keys
+            .iter()
+            .find_map(|(key, legend)| (*key == mapping).then_some(legend))
+        else {
             let code = fail("internal", format!("no key for the {mapping} mapping"), 1);
             let _ = studio.close();
             return code;
@@ -1904,6 +1936,38 @@ fn load_toml(text: &str, overrides: &[FeatureOverride]) -> Result<ValidatedConfi
     flife_core::validate(parsed)
 }
 
+/// Refuse `V2-16` colour mappings (`cell-state`, `polarity`) and field
+/// overlays (`trail-carrier`, `vascular-conductance`) on v1 models or when
+/// `v2-visual-mappings` is disabled.
+fn validate_v2_visual_style(
+    config: &ValidatedConfig,
+    mapping: ColorMapping,
+    field_mapping: FieldMapping,
+) -> Result<(), CoreError> {
+    if config.is_v2_feature_enabled(V2Feature::V2VisualMappings) {
+        return Ok(());
+    }
+    if mapping.is_v2() {
+        return Err(CoreError::InvalidConfig(vec![flife_core::ConfigIssue {
+            path: "presentation.color_mapping".into(),
+            problem: format!(
+                "`{}` requires a field-ecology-v2 model with `v2-visual-mappings` enabled",
+                mapping.name()
+            ),
+        }]));
+    }
+    if field_mapping.is_v2_overlay() {
+        return Err(CoreError::InvalidConfig(vec![flife_core::ConfigIssue {
+            path: "presentation.field_mapping".into(),
+            problem: format!(
+                "`{}` requires a field-ecology-v2 model with `v2-visual-mappings` enabled",
+                field_mapping.name()
+            ),
+        }]));
+    }
+    Ok(())
+}
+
 fn load(path: &Path, overrides: &[FeatureOverride]) -> Result<ValidatedConfig, ExitCode> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| fail("io", format!("{}: {error}", path.display()), 2))?;
@@ -1942,11 +2006,11 @@ mod tests {
     //! And FL-024's offscreen arguments, on the parser alone.
 
     use clap::Parser;
-    use flife_core::Tick;
     use flife_core::ids::{CommandId, ResourceEpoch};
+    use flife_core::{Tick, ValidatedConfig};
     use flife_engine::Disposition;
     use flife_runtime::{CancelReason, Outcome};
-    use flife_studio::{Status, Stroke};
+    use flife_studio::{ColorMapping, FieldMapping, Status, Stroke};
     use serde_json::{Value, json};
 
     #[test]
@@ -2956,5 +3020,114 @@ mod tests {
         assert_eq!(all_off.v2_feature_bitmask(), 0);
         assert_eq!(all_off.v2_abi().action_width, 36);
         assert_ne!(only_so2.config_hash(), all_off.config_hash());
+
+        // `V2-16` CLI `--color` and `--field-mapping` parse and gate cleanly
+        // on `v2-visual-mappings`.
+        let parsed = parse_raw(&[
+            "v2.toml",
+            "--color",
+            "cell-state",
+            "--field-mapping",
+            "trail-carrier",
+        ])
+        .expect("v2 visual CLI flags parse");
+        assert_eq!(parsed.0.color, Some(ColorMapping::CellState));
+        assert_eq!(parsed.0.field_mapping, FieldMapping::TrailCarrier);
+        let v1_cfg = ValidatedConfig::from_toml(v1_toml).expect("v1 config");
+        let v2_vis_on = super::load_toml(&v2_toml, &[]).expect("v2 default has v2-visual-mappings");
+        let v2_vis_off = super::load_toml(
+            &v2_toml,
+            &[FeatureOverride::Disable("v2-visual-mappings".to_owned())],
+        )
+        .expect("v2 with visual mappings disabled");
+        for mapping in [ColorMapping::CellState, ColorMapping::Polarity] {
+            super::validate_v2_visual_style(&v2_vis_on, mapping, FieldMapping::Energy)
+                .expect("v2 visual mapping allowed when enabled");
+            assert!(matches!(
+                super::validate_v2_visual_style(&v1_cfg, mapping, FieldMapping::Energy),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                super::validate_v2_visual_style(&v2_vis_off, mapping, FieldMapping::Energy),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+        }
+        for field_mapping in [
+            FieldMapping::TrailCarrier,
+            FieldMapping::VascularConductance,
+        ] {
+            super::validate_v2_visual_style(&v2_vis_on, ColorMapping::Lineage, field_mapping)
+                .expect("v2 field overlay allowed when enabled");
+            assert!(matches!(
+                super::validate_v2_visual_style(&v1_cfg, ColorMapping::Lineage, field_mapping),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                super::validate_v2_visual_style(&v2_vis_off, ColorMapping::Lineage, field_mapping),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+        }
+
+        // FL-050 Cinema export CLI flags parse cleanly and refuse bad values.
+        let cinema_1080 = parse_raw(&[
+            "v2.toml",
+            "--export",
+            "t.ndjson",
+            "--out",
+            "out-dir",
+            "--export-size",
+            "1080p",
+            "--export-every-ticks",
+            "4",
+            "--export-camera",
+            "cam.json",
+        ])
+        .expect("cinema 1080p CLI parses");
+        assert_eq!(cinema_1080.0.export_size, Some([1920, 1080]));
+        assert_eq!(
+            cinema_1080
+                .0
+                .export_every_ticks
+                .map(std::num::NonZeroU64::get),
+            Some(4)
+        );
+        assert!(cinema_1080.0.export_camera.is_some());
+        let cinema_4k = parse_raw(&[
+            "v2.toml",
+            "--export",
+            "t.ndjson",
+            "--out",
+            "out-dir",
+            "--export-size",
+            "4K",
+        ])
+        .expect("cinema 4K CLI parses");
+        assert_eq!(cinema_4k.0.export_size, Some([3840, 2160]));
+        for bad_cinema in [
+            &[
+                "v2.toml",
+                "--export",
+                "t",
+                "--out",
+                "d",
+                "--export-size",
+                "0x1080",
+            ][..],
+            &[
+                "v2.toml",
+                "--export",
+                "t",
+                "--out",
+                "d",
+                "--export-every-ticks",
+                "0",
+            ][..],
+            &["v2.toml", "--export-size", "1080p"][..],
+        ] {
+            assert!(
+                parse_raw(bad_cinema).is_err(),
+                "{bad_cinema:?} must be refused"
+            );
+        }
     }
 }

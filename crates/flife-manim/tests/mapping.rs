@@ -8,11 +8,12 @@ use flife_manim::HUD_SWATCH;
 use flife_manim::{
     AFFINITY_CHROMA, AFFINITY_GAIN, AFFINITY_LIGHTNESS, BLOOM_SIGMA_POINTS,
     BLOOM_WIDEST_REACH_PIXELS, ColorMapping, DensityLayer, ENERGY_HALF, ENERGY_RAMP,
-    GENERATION_RAMP, GENERATION_SCALE, LEGEND_ATTEMPT_FRACTIONS, LINEAGE_ENERGY_LIGHTNESS,
-    LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL, ParticleCloud, Particles, Style,
-    TOPOLOGY_PALETTE, Traits, Viewport, WorldView, affinity_rgb8, density_bins, density_level,
-    energy_level, generation_level, heading, lineage_energy_rgb8, lineage_slot, linear,
-    mapped_color, mapped_rgb8, mix, ramp, raw_value, speed_level, traits, wheel,
+    GENERATION_RAMP, GENERATION_SCALE, LEGEND_ATTEMPT_FRACTIONS, LEGEND_CELL_STATES,
+    LINEAGE_ENERGY_LIGHTNESS, LINEAGE_PALETTE, Look, MOTION_STILL, MOTION_WHEEL,
+    POLARITY_UNPOLARIZED, ParticleCloud, Particles, Style, TOPOLOGY_PALETTE, Traits, Viewport,
+    WorldView, affinity_rgb8, density_bins, density_level, energy_level, generation_level, heading,
+    lineage_energy_rgb8, lineage_slot, linear, mapped_color, mapped_rgb8, mix, quantize_polarity,
+    ramp, raw_value, speed_level, traits, wheel,
 };
 use flife_render::FieldTexture;
 use fmn_core::color::{LinearRgba, Srgb, srgb_to_oklab};
@@ -68,6 +69,8 @@ fn row(lineage: u64, energy: f32, generation: u32, topology: u8, velocity: [f32;
         velocity,
         affinity: [0.0; 3],
         attempt_energy: 2.0,
+        cell_state: 0,
+        polarity: POLARITY_UNPOLARIZED,
     }
 }
 
@@ -257,6 +260,16 @@ fn every_dot_takes_its_own_rows_colour_in_every_mapping() {
         assert_eq!(
             row.attempt_energy.to_bits(),
             epoch.attempt_energy().to_bits()
+        );
+        assert_eq!(
+            row.cell_state,
+            epoch.cell_states().map_or(0, |states| states[index])
+        );
+        assert_eq!(
+            row.polarity,
+            epoch
+                .polarities()
+                .map_or(POLARITY_UNPOLARIZED, |polarities| polarities[index])
         );
     }
     let mut palettes = Vec::new();
@@ -855,7 +868,7 @@ fn a_colour_is_a_function_of_its_row_alone() {
         !survivors.is_empty(),
         "some founders live through both epochs"
     );
-    let mut compared = [0_usize; 7];
+    let mut compared = [0_usize; ColorMapping::ALL.len()];
     for (slot, mapping) in ColorMapping::ALL.into_iter().enumerate() {
         for &(row, later) in &survivors {
             let (a, b) = (early_rows[row], late_rows[later]);
@@ -875,6 +888,8 @@ fn a_colour_is_a_function_of_its_row_alone() {
                         && a.energy.to_bits() == b.energy.to_bits()
                         && a.attempt_energy.to_bits() == b.attempt_energy.to_bits()
                 }
+                ColorMapping::CellState => a.lineage == b.lineage && a.cell_state == b.cell_state,
+                ColorMapping::Polarity => a.polarity == b.polarity,
             };
             if same {
                 compared[slot] += 1;
@@ -1256,6 +1271,36 @@ fn every_key_swatch_is_the_colour_its_mapping_gives_its_label() {
                     let expected = 60.0 * k as f64;
                     let off = (hue - expected + 180.0).rem_euclid(360.0) - 180.0;
                     assert!(off.abs() < 10.0, "direction {k}: hue {hue}");
+                }
+            }
+            ColorMapping::CellState => {
+                assert_eq!(labels, ["-1", "-0.5", "0", "+0.5", "+1 (h0 in lineage)"]);
+                let first = (0..)
+                    .find(|&lineage| lineage_slot(lineage) == 0)
+                    .expect("a lineage in slot 0");
+                for (&state, &swatch) in LEGEND_CELL_STATES.iter().zip(&legend.swatches) {
+                    let t = Traits {
+                        cell_state: state,
+                        ..row(first, 0.0, 0, 0, [0.0; 2])
+                    };
+                    assert_eq!(swatch, with(mapping, t), "cell_state={state}");
+                }
+            }
+            ColorMapping::Polarity => {
+                let headings = [
+                    ("east", quantize_polarity([1.0, 0.0])),
+                    ("north", quantize_polarity([0.0, -1.0])),
+                    ("west", quantize_polarity([-1.0, 0.0])),
+                    ("south", quantize_polarity([0.0, 1.0])),
+                    ("none (apical)", POLARITY_UNPOLARIZED),
+                ];
+                assert_eq!(labels, headings.map(|(label, _)| label));
+                for ((label, polarity), &swatch) in headings.iter().zip(&legend.swatches) {
+                    let t = Traits {
+                        polarity: *polarity,
+                        ..row(0, 0.0, 0, 0, [0.0; 2])
+                    };
+                    assert_eq!(swatch, with(mapping, t), "{label}");
                 }
             }
         }

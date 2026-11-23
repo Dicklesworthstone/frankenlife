@@ -343,6 +343,7 @@ fn case(rng: &mut Rng, rules: &ReproductionRules, source: &SemanticRng) -> Case 
             child_fraction,
             emission_gate: 0.0,
             emission: None,
+            ..DecodedActions::default()
         },
         budget,
     }
@@ -431,6 +432,7 @@ fn proposals_the_reference_refuses_are_refused() {
             child_fraction: organism.child_fraction,
             emission_gate: 0.0,
             emission: None,
+            ..DecodedActions::default()
         };
         let budget = EnergyBudget::new(organism.remaining)?;
         reproduction

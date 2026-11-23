@@ -8,19 +8,42 @@ import { controls, film } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
 
 const { video, poster, world, render } = film;
-/** The torus's width in world units (the preset's [world], recorded in lib/controls.json). */
-const torusWidth = controls.torus[0];
+/** The torus's extent in world units (the preset's [world], recorded in lib/controls.json). */
+const torusExtent: [number, number] = controls.torus;
+const frameSize: [number, number] = [video.width, video.height];
+const isSquare = video.width === video.height;
 const last = video.frames - 1;
 const secondsPerTick = world.timestep[0] / world.timestep[1];
 // flife render's own words for the colours, up to its colon: "founder lineage".
 const colour = render.meaning.split(":")[0]?.trim() || render.mapping;
 
 /**
- * The frame shown at `time` seconds into the video. A frame's own time reaches the page in whole microseconds (the
- * second frame's as 0.033333), just short of the frame when rounded down, so a thousandth of a frame is allowed.
+ * The frame shown at `time` seconds into the video. A frame's own time reaches the page in whole microseconds (e.g.
+ * 0.033333 at 30 fps or 0.016667 at 60 fps), just short of the frame when rounded down, so a thousandth of a frame is
+ * allowed.
  */
-export function frameAt(time: number): number {
-  return Math.min(last, Math.max(0, Math.floor(time * video.fps + 1e-3)));
+export function frameAt(time: number, fps = video.fps, frames = video.frames): number {
+  const maxFrame = Math.max(0, frames - 1);
+  return Math.min(maxFrame, Math.max(0, Math.floor(time * fps + 1e-3)));
+}
+
+/**
+ * Width of a `barUnits` world-unit scale bar as a percentage of the frame's width (`cqw`).
+ * Matches `flife-manim`'s `Viewport::fit`, which scales by `min(Dw / Tw, Dh / Th)`:
+ * on 1:1 frames (`1080×1080`, `2160×2160`) this is `100 * barUnits * zoom / Tw`, and on
+ * 16:9 frames (`3840×2160`) of a square torus it scales by `H / W` (`9/16`) so the bar
+ * matches the drawn pixels.
+ */
+export function scaleBarWidthCqw(
+  barUnits: number,
+  zoom: number,
+  torus: readonly [number, number] = torusExtent,
+  frame: readonly [number, number] = frameSize,
+): number {
+  const [torusW, torusH] = torus;
+  const [frameW, frameH] = frame;
+  const pixelsPerUnit = zoom * Math.min(frameW / torusW, frameH / torusH);
+  return ((barUnits * pixelsPerUnit) / frameW) * 100;
 }
 
 type Shot = { from: number; to: number; label: string; hold: boolean };
@@ -61,7 +84,7 @@ function readings(frame: number) {
     simulated: `+${((tick - world.from.tick) * secondsPerTick).toFixed(1)} s`,
     live: grouped(world.live[frame] ?? 0),
     view: zoom < 1.05 ? "whole" : `×${zoom.toFixed(1)}`,
-    barWidth: `${(barUnits * zoom * 100) / torusWidth}cqw`,
+    barWidth: `${scaleBarWidthCqw(barUnits, zoom, torusExtent, frameSize)}cqw`,
     barText: `${barUnits} world units`,
     elapsed: (tick - world.from.tick) / span,
     described: `tick ${grouped(tick)}, ${zoom < 1.05 ? "the whole torus" : `zoom ${zoom.toFixed(1)}`}`,
@@ -224,7 +247,10 @@ export function Film({ className, feather = false }: { className?: string; feath
   return (
     <figure className={cn("relative", className)}>
       {/* A container, so the scale bar is sized in the frame's width (cqw), not its padded row's. */}
-      <div className="@container relative aspect-square w-full overflow-hidden bg-black lg:rounded-[2rem]">
+      <div
+        className={cn("@container relative w-full overflow-hidden bg-black lg:rounded-[2rem]", isSquare && "aspect-square")}
+        style={isSquare ? undefined : { aspectRatio: `${video.width} / ${video.height}` }}
+      >
         <video
           ref={ref}
           className={cn("h-full w-full object-cover", feather && "specimen-feather")}
@@ -282,7 +308,8 @@ export function Film({ className, feather = false }: { className?: string; feath
               {FIRST.barText}
             </span>
             <span className="ml-auto hidden font-mono text-[10px] text-slate-400 sm:inline">
-              {grouped(world.founders)} founders · {world.grid[0]}² field · colour = {colour}
+              {grouped(world.founders)} founders ·{" "}
+              {world.grid[0] === world.grid[1] ? `${world.grid[0]}²` : `${world.grid[0]}×${world.grid[1]}`} field · colour = {colour}
             </span>
           </div>
           <div className="relative mt-3 h-8 rounded-md has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-green-400/70">

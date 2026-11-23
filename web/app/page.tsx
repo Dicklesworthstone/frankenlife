@@ -8,10 +8,12 @@ import {
   Equal,
   EqualNot,
   ExternalLink,
+  Layers,
   Map as MapIcon,
   ShieldCheck,
   Terminal,
 } from "lucide-react";
+import type { CSSProperties } from "react";
 
 import { CopyCommand } from "@/components/copy-command";
 import { BrainAnatomy } from "@/components/explain/brain";
@@ -55,6 +57,10 @@ import {
   shortcuts,
   siteConfig,
   stack,
+  type V2FeatureEntry,
+  v2BuildStatus,
+  v2Features,
+  v2VisualMappings,
   type Verdict,
   worldModel,
 } from "@/lib/content";
@@ -74,6 +80,13 @@ const verdictStyle: Record<Verdict, string> = {
   met: "text-green-300 border-green-500/30 bg-green-500/10",
   narrow: "text-amber-200 border-amber-400/30 bg-amber-400/10",
   not: "text-rose-200 border-rose-400/30 bg-rose-400/10",
+};
+
+const v2BoundaryStyle: Record<V2FeatureEntry["boundary"], { label: string; className: string }> = {
+  "pure-field": { label: "pure-field · INV-08", className: "border-green-500/30 bg-green-500/10 text-green-300" },
+  "mode-dependent": { label: "mode-dependent", className: "border-amber-400/30 bg-amber-400/10 text-amber-200" },
+  contact: { label: "[contact]", className: "border-rose-400/30 bg-rose-400/10 text-rose-200" },
+  presentation: { label: "display · INV-09", className: "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" },
 };
 
 const gateById = new Map(gates.map((gate) => [gate.id, gate]));
@@ -122,8 +135,11 @@ export default function Home() {
           <div aria-hidden="true" className="field-light absolute inset-0 -z-10" />
           <div aria-hidden="true" className="lattice absolute inset-0 -z-10" />
           <div className="mx-auto grid max-w-[100rem] grid-cols-1 lg:min-h-[100svh] lg:grid-cols-[minmax(0,0.92fr)_minmax(0,1.08fr)] lg:items-center">
-            <div className="rise-in relative order-1 pt-[4.25rem] [--rise-delay:80ms] lg:order-2 lg:pt-24 lg:pr-8 lg:pb-8 xl:pr-12">
-              <Film feather className="mx-auto w-full lg:max-w-[min(100%,calc(100svh-8rem))]" />
+            <div
+              className="rise-in relative order-1 pt-[4.25rem] [--rise-delay:80ms] lg:order-2 lg:pt-24 lg:pr-8 lg:pb-8 xl:pr-12"
+              style={{ "--film-aspect": video.width / video.height } as CSSProperties}
+            >
+              <Film feather className="mx-auto w-full lg:max-w-[min(100%,calc((100svh-8rem)*var(--film-aspect)))]" />
             </div>
             <div className="rise-in relative z-10 order-2 px-5 pt-9 pb-14 sm:px-8 lg:order-1 lg:py-24 lg:pr-4 lg:pl-12 xl:pl-20">
               <p className="flex items-center gap-3">
@@ -553,6 +569,109 @@ export default function Home() {
               <TickPipeline />
             </Reveal>
           </Section>
+
+          <Section
+            id="v2"
+            index={index("machinery", "v2")}
+            layout="wide"
+            eyebrow="field-ecology-v2 · M6 extension"
+            title="Modular [biology], toggled clean."
+            kicker={
+              <>
+                Every <code className="text-green-300">field-ecology-v1*</code> run omits <code className="text-slate-200">[v2]</code>{" "}
+                and stays byte-identical. On <code className="text-green-300">field-ecology-v2</code>, 21 mechanisms are registered as
+                individually toggleable slugs grouped into two default bundles: Bundle A (<code className="text-slate-200">tissue</code>,
+                14 defaults, <code className="text-slate-200">[contact]</code>) and Bundle B (<code className="text-slate-200">supercolony</code>,
+                13 defaults, strictly <code className="text-slate-200">INV-08</code> pure-field). Every override materializes before
+                hashing and is locked at founding time (<code className="text-slate-200">INV-14</code>).
+              </>
+            }
+          >
+            <div className="space-y-5">
+              <Reveal>
+                <div className="panel relative overflow-hidden rounded-[1.75rem] p-6 sm:p-8">
+                  <Reticle inset={9} size={12} />
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <Layers className="h-4 w-4 text-[color:var(--chapter)]" aria-hidden="true" />
+                      <MicroLabel>21 registered feature slugs · flife --list-features</MicroLabel>
+                    </div>
+                    <span className="font-mono text-[11px] text-slate-400">
+                      --disable / --enable / --v1-compat · aliases: all-v2, bundle-a, bundle-b
+                    </span>
+                  </div>
+                  {/* slop-ok(S12-three-cards): a 21-row ruled catalog wrapping into three columns, not three cards. */}
+                  <ul className="mt-6 grid grid-cols-1 gap-x-8 gap-y-4 md:grid-cols-2 xl:grid-cols-3">
+                    {v2Features.map((feature) => {
+                      const badge = v2BoundaryStyle[feature.boundary];
+                      return (
+                        <li key={feature.slug} className="border-t border-white/[0.06] pt-3.5">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <code className="font-mono text-[13px] font-bold text-white">{feature.slug}</code>
+                            <span
+                              className={cn(
+                                "rounded-full border px-2 py-0.5 font-mono text-[9px] font-medium tracking-[0.08em] uppercase",
+                                badge.className,
+                              )}
+                            >
+                              {badge.label}
+                            </span>
+                          </div>
+                          <p className="mt-1.5 text-xs leading-relaxed text-slate-400">{feature.summary}</p>
+                          <p className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] text-slate-500">
+                            <span>
+                              {feature.bundleA && feature.bundleB
+                                ? "Bundles A + B"
+                                : feature.bundleA
+                                  ? "Bundle A default"
+                                  : feature.bundleB
+                                    ? "Bundle B default"
+                                    : "Opt-in"}
+                            </span>
+                            <span>· ABI: {feature.abi}</span>
+                          </p>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              </Reveal>
+
+              <Reveal>
+                <div className="panel rounded-[1.75rem] p-6 sm:p-8">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <MicroLabel>V2-16 · pure read-only visual mappings (INV-09)</MicroLabel>
+                    <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] text-cyan-200 uppercase">
+                      Zero overhead on v1
+                    </span>
+                  </div>
+                  <dl className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
+                    {v2VisualMappings.map((mapping) => (
+                      <div key={mapping.name} className="rounded-2xl border border-white/[0.06] bg-black/30 p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <dt className="font-mono text-sm font-bold text-white">{mapping.name}</dt>
+                          <span className="font-mono text-[10px] text-cyan-200">
+                            {mapping.kind} · Studio key {mapping.key}
+                          </span>
+                        </div>
+                        <dd className="mt-2 text-sm leading-relaxed text-slate-400">{mapping.body}</dd>
+                        <dd className="mt-2 font-mono text-[11px] text-green-300/90">{mapping.flag}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                  <p className="mt-5 text-xs leading-relaxed text-slate-500">
+                    All four overlays read optional epoch slices and never alter simulation state (INV-09). Absent planes
+                    degrade cleanly without heap allocation, and v1 runs ignore keys 8 and 9. See{" "}
+                    <a className={link} href="#status">
+                      Honest status
+                    </a>{" "}
+                    for which V2 modules are verified versus in flight — no ecological claims are made until V2-10 and
+                    V2-17 multi-seed campaigns run.
+                  </p>
+                </div>
+              </Reveal>
+            </div>
+          </Section>
         </ChapterBlock>
 
         {/* ─── 04 · What it can show ──────────────────────────────────── */}
@@ -846,6 +965,41 @@ export default function Home() {
                 })}
               </ul>
             </Reveal>
+            <Reveal className="mt-5">
+              <div className="panel rounded-[1.75rem] p-6 sm:p-8">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <MicroLabel>field-ecology-v2 · branch status</MicroLabel>
+                  <span className="rounded-full border border-white/15 bg-white/5 px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] text-slate-300 uppercase">
+                    Observed · Four Claims kept apart
+                  </span>
+                </div>
+                <ul className="ruled mt-5">
+                  {v2BuildStatus.map((item) => {
+                    const style = gateStyle[item.tone];
+                    return (
+                      <li
+                        key={item.stage}
+                        className="grid grid-cols-1 gap-x-4 gap-y-2 py-4 first:pt-0 last:pb-0 sm:grid-cols-[11rem_minmax(0,1fr)_auto]"
+                      >
+                        <div>
+                          <p className="text-sm font-bold text-white">{item.stage}</p>
+                          <p className="mt-0.5 font-mono text-[10px] text-slate-500 uppercase">{item.claim}</p>
+                        </div>
+                        <p className="text-sm leading-relaxed text-slate-400">{item.detail}</p>
+                        <span
+                          className={cn(
+                            "inline-flex h-fit items-center gap-1.5 justify-self-start rounded-full border px-2.5 py-0.5 font-mono text-[10px] font-medium tracking-[0.1em] whitespace-nowrap uppercase sm:justify-self-end",
+                            style.className,
+                          )}
+                        >
+                          <style.Icon className="h-3 w-3" aria-hidden="true" /> {style.label}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            </Reveal>
           </Section>
         </ChapterBlock>
 
@@ -856,7 +1010,7 @@ export default function Home() {
             index={index("lab", "worlds")}
             layout="wide"
             eyebrow="Presets"
-            title="Eight [worlds] to open."
+            title="Ten [worlds] to open."
             kicker={
               <>
                 Three are the operating profiles, each sized by a declared experiment. Five were chosen by an outer
@@ -865,7 +1019,8 @@ export default function Home() {
                 <a className={link} href={siteConfig.showcase}>
                   the search states how
                 </a>
-                .
+                . Two are authored <code className="text-slate-200">field-ecology-v2</code> presets (Bundles A and B)
+                awaiting Stage-2 V2-10/V2-17 verification — never presented as verified ecological results.
               </>
             }
           >
@@ -879,7 +1034,9 @@ export default function Home() {
                         "mt-2 self-start rounded-full border px-2 py-0.5 font-mono text-[10px] font-medium tracking-[0.08em] uppercase",
                         preset.kind === "profile"
                           ? "border-green-500/30 bg-green-500/10 text-green-300"
-                          : "border-amber-400/30 bg-amber-400/10 text-amber-200",
+                          : preset.kind === "v2"
+                            ? "border-cyan-400/30 bg-cyan-400/10 text-cyan-200"
+                            : "border-amber-400/30 bg-amber-400/10 text-amber-200",
                       )}
                     >
                       {preset.chosen}
@@ -926,7 +1083,14 @@ export default function Home() {
                   <p className="mt-6 text-xs leading-relaxed text-slate-500">
                     Every command prints versioned NDJSON with stable identifiers and typed errors: a missing
                     accelerator, an exhausted budget, a schema mismatch, an incompatible checkpoint and a numerical fault
-                    are each their own kind.
+                    are each their own kind. Founding commands (<code className="text-slate-400">validate</code>,{" "}
+                    <code className="text-slate-400">capabilities --config</code>, <code className="text-slate-400">run</code>,{" "}
+                    <code className="text-slate-400">render CONFIG</code>, <code className="text-slate-400">experiment</code>,{" "}
+                    <code className="text-slate-400">transplant</code>) accept ordered{" "}
+                    <code className="text-slate-400">--disable</code>, <code className="text-slate-400">--enable</code> and{" "}
+                    <code className="text-slate-400">--v1-compat</code> overrides;{" "}
+                    <code className="text-slate-400">resume</code>, <code className="text-slate-400">step</code> and{" "}
+                    <code className="text-slate-400">render --run-dir</code> refuse them (<code className="text-slate-400">INV-14</code>).
                   </p>
                 </div>
               </Reveal>

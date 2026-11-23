@@ -468,3 +468,132 @@ fn emission_the_reference_refuses_is_refused() -> Result<(), CoreError> {
     );
     Ok(())
 }
+
+/// The reference engine's `V2-04` (`surplus-emission`) `emit_with_floor`
+/// for `organism` on a fresh budget, and the deposit it staged, if any.
+fn reference_with_floor(
+    policy: &EmissionPolicy,
+    energy_floor: f64,
+    grid: &FieldGrid,
+    organism: &EmissionOrganism,
+) -> Result<EmissionOutcome, CoreError> {
+    use flife_field::ExchangeKernel;
+
+    let mut budget = EnergyBudget::new(organism.remaining)?;
+    assert!(!budget.is_exhausted());
+    let mut deposits = Deposits::new();
+    let emission = organism.emission.map(|action| Emission {
+        direction: action.direction,
+        spend_fraction: action.spend_fraction,
+    });
+    let settlement = policy.emit_with_floor(
+        grid,
+        ExchangeKernel::GridCicV1,
+        OrganismId::new(7),
+        organism.position,
+        emission.as_ref(),
+        energy_floor,
+        &mut budget,
+        &mut deposits,
+    )?;
+    let mut packets = [(0, 0.0); 4];
+    let mut packet_count = 0;
+    let staged = deposits.entry(0).is_some();
+    if let Some((_, paid, offered)) = deposits.entry(0) {
+        assert!(same(paid, settlement.cost.requested) && same(offered, settlement.offered));
+        for (slot, packet) in packets.iter_mut().zip(deposits.entry_packets(0)) {
+            *slot = packet;
+            packet_count += 1;
+        }
+        assert_eq!(deposits.entry_packets(0).count(), packet_count);
+    }
+    Ok(EmissionOutcome {
+        available: settlement.available,
+        requested: settlement.cost.requested,
+        paid: settlement.cost.paid,
+        offered: settlement.offered,
+        staged,
+        packets,
+        packet_count,
+        remaining: budget.remaining(),
+        exhausted: budget.is_exhausted(),
+    })
+}
+
+/// V2-04 (`surplus-emission`): `MetalEmission::settle_with_floor` matches the
+/// reference engine's `EmissionPolicy::emit_with_floor` bit-for-bit across
+/// `available < floor`, `available == floor`, `available > floor`, and
+/// `floor == 0.0` (exact v1 parity), and refuses negative or nonfinite floors.
+#[test]
+fn metal_v2_surplus_emission_floor_bit_exact_with_reference() -> Result<(), CoreError> {
+    let Some(mut device) = metal() else {
+        return Ok(());
+    };
+    let config = ValidatedConfig::from_toml(PRESET).expect("the preset validates");
+    let policy = EmissionPolicy::from_config(&config)?;
+    let efficiency = policy.efficiency();
+    let grid = FieldGrid::from_config(&config)?;
+    let mut rng = Rng(0x2026_0404);
+
+    for floor in [0.0_f64, 0.25, 0.85, 2.5] {
+        let mut organisms = Vec::new();
+        let mut want = Vec::new();
+        while organisms.len() < 1_024 {
+            let mut org = organism(&grid, &mut rng);
+            // Force exact coverage of below-floor, at-floor, and just-above-floor.
+            match organisms.len() % 6 {
+                0 if floor > 0.0 => org.remaining = (floor * 0.5).max(f64::MIN_POSITIVE),
+                1 if floor > 0.0 => org.remaining = floor,
+                2 if floor > 0.0 => org.remaining = floor + 1.0e-6,
+                3 => org.remaining = floor + 1.5,
+                _ => {}
+            }
+            if let Ok(outcome) = reference_with_floor(&policy, floor, &grid, &org) {
+                organisms.push(org);
+                want.push(outcome);
+            }
+        }
+        let mut got = Vec::new();
+        device.settle_with_floor(&grid, efficiency, floor, &organisms, &mut got)?;
+        assert_same_outcomes(&got, &want);
+
+        if floor == 0.0 {
+            let mut v1_out = Vec::new();
+            device.settle(&grid, efficiency, &organisms, &mut v1_out)?;
+            assert_same_outcomes(&got, &v1_out);
+        } else {
+            let suppressed = want
+                .iter()
+                .zip(&organisms)
+                .filter(|(o, org)| org.remaining <= floor && org.emission.is_some() && !o.staged)
+                .count();
+            let active = want.iter().filter(|o| o.staged).count();
+            assert!(suppressed > 100, "floor={floor}: suppressed={suppressed}");
+            assert!(active > 100, "floor={floor}: active={active}");
+        }
+    }
+
+    // Below-floor organisms with NaN position/direction are not checked (requested == 0).
+    let below_floor = EmissionOrganism {
+        remaining: 0.5,
+        position: [f64::NAN; 2],
+        emission: Some(EmissionAction {
+            direction: [f64::NAN; CHANNELS],
+            spend_fraction: 1.0,
+        }),
+    };
+    let mut out = Vec::new();
+    device.settle_with_floor(&grid, efficiency, 0.5, &[below_floor], &mut out)?;
+    assert!(
+        !out[0].staged && out[0].paid == 0.0 && out[0].remaining.to_bits() == 0.5_f64.to_bits()
+    );
+
+    // Negative and nonfinite energy floors are refused.
+    for bad_floor in [-1.0e-12, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            device.settle_with_floor(&grid, efficiency, bad_floor, &[], &mut Vec::new()),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
+    Ok(())
+}

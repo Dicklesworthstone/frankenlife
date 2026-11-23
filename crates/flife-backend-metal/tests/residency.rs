@@ -875,3 +875,401 @@ fn variable_width_reference_torch_and_metal_bit_exact() -> Result<(), CoreError>
     }
     Ok(())
 }
+
+/// V2-05 (`so2-motor`, 40 outputs) & V2-06 (`so2-motor` + `so2-budding`, 42 outputs):
+/// 1,024 organisms on Metal F16 + F32 produce 0 alignment deferrals and bit-exact
+/// `MotorSteering` / `BuddingSteering` parity with the scalar reference.
+#[test]
+fn metal_40_output_motor_and_42_output_budding_controllers_bit_exact() -> Result<(), CoreError> {
+    use flife_core::TimeStep;
+    use flife_core::binary16::F16;
+    use flife_neural::{ActionDecoding, ActionLayout, decode_with_layout};
+
+    let Some(mut metal_f16) = backend(8) else {
+        return Ok(());
+    };
+    let Some(mut metal_f32) = backend(8) else {
+        return Ok(());
+    };
+    let decoding = ActionDecoding::new(0.8, [0.25, 0.75], 0.355, 0.5, 1.0e-6)?;
+    let step = TimeStep::new(1, 32)?;
+    let mut draws = Draws(0x2026_0506);
+
+    for (bucket_base, (in_w, layout)) in [
+        (104_u32, ActionLayout::new(true, false, false, false, 0)?),
+        (108_u32, ActionLayout::new(true, true, false, false, 0)?),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out_w = layout.action_width() as u32;
+        let topology = DenseTopology::with_io(in_w, &[64, 32], out_w)?;
+        let count = 1_024_usize;
+        let mut f32_params = Vec::with_capacity(count);
+        let mut f16_params = Vec::with_capacity(count);
+        let mut inputs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut p32 = vec![0.0_f32; topology.parameter_count()];
+            for layer in topology.layers() {
+                let scale = 1.0 / (layer.inputs as f64).sqrt();
+                for v in &mut p32[layer.weights..layer.biases + layer.outputs] {
+                    let raw = draws.symmetric();
+                    let nudged = if raw.abs() < 1.0e-3 { 0.25 } else { raw };
+                    *v = (nudged * scale) as f32;
+                }
+            }
+            let p16: Vec<F16> = p32.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+            let inp: Vec<f64> = (0..in_w as usize)
+                .map(|_| {
+                    let raw = draws.symmetric();
+                    if raw.abs() < 1.0e-3 { 0.5 } else { raw }
+                })
+                .collect();
+            f32_params.push(p32);
+            f16_params.push(p16);
+            inputs.push(inp);
+        }
+
+        let bucket = (bucket_base + 1) as u32;
+        let jobs_f32: Vec<ControllerJob<'_>> = (0..count)
+            .map(|i| {
+                Ok(ControllerJob {
+                    genome: GenomeId::new((bucket as u64) * 100_000 + i as u64),
+                    slot: ArenaSlot::new(bucket, i as u64, 1),
+                    controller: ReferenceController::new(&topology, &f32_params[i], BOUND)?,
+                    inputs: &inputs[i],
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+        let jobs_f16: Vec<ControllerJob<'_>> = (0..count)
+            .map(|i| {
+                Ok(ControllerJob {
+                    genome: GenomeId::new((bucket as u64) * 200_000 + i as u64),
+                    slot: ArenaSlot::new(bucket, i as u64, 1),
+                    controller: ReferenceController::new(&topology, &f16_params[i], BOUND)?,
+                    inputs: &inputs[i],
+                })
+            })
+            .collect::<Result<_, CoreError>>()?;
+
+        let mut scratch = ControllerScratch::new(&topology)?;
+        for (label, jobs, device) in [
+            ("F32", &jobs_f32, &mut metal_f32),
+            ("F16", &jobs_f16, &mut metal_f16),
+        ] {
+            let mut out = Vec::new();
+            device.evaluate(jobs, &mut out)?;
+            let deferred = out.iter().filter(|o| o.is_none()).count();
+            assert_eq!(
+                deferred, 0,
+                "Metal {label} had {deferred} deferrals on ({in_w}, {out_w})"
+            );
+            for (i, (job, got_opt)) in jobs.iter().zip(&out).enumerate() {
+                let got_raw = got_opt.expect("evaluated");
+                let want_raw = job.controller.evaluate_raw(job.inputs, &mut scratch)?;
+                assert_eq!(
+                    got_raw.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want_raw.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "Metal {label} raw mismatch on ({in_w}, {out_w}) org={i}"
+                );
+                let got64: Vec<f64> = got_raw.iter().map(|&v| f64::from(v)).collect();
+                let want64: Vec<f64> = want_raw.iter().map(|&v| f64::from(v)).collect();
+                let got_dec = decode_with_layout(&got64, step, &decoding, &layout)?;
+                let want_dec = decode_with_layout(&want64, step, &decoding, &layout)?;
+                assert_eq!(got_dec, want_dec);
+                assert!(got_dec.motor.is_some());
+                assert_eq!(got_dec.budding.is_some(), layout.budding_slots().is_some());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// V2-12 (`epigenetic-recurrence`): 1,024 organisms across all 5 catalog hidden
+/// shapes (`[8]`, `[32]`, `[64, 32]`, `[96, 64]`, `[128, 96]`) for BOTH
+/// `S = 2` (`108/44`, Bundle A) and `S = 4` (`108/44`, FL-054), plus odd
+/// unaligned `(107/41, [5])`, All-21 `(112/48, [64, 32])`, and max-state
+/// `S = 16` (`120/68, [32]`): verifies **0 alignment deferrals** and bit-exact
+/// raw outputs + shared `update_recurrent_state` `h_next` (`b_epi = 2.5` and
+/// `b_epi = 0.0`) across Reference, FrankenTorch CPU (`CpuBackend` F32/F16),
+/// `MetalControllers` direct `Batch` (F32), and resident `MetalBackend` (F32/F16).
+#[test]
+fn recurrent_reference_torch_and_metal_f16_f32_bit_exact() -> Result<(), CoreError> {
+    use std::num::NonZeroUsize;
+
+    use flife_backend_cpu::CpuBackend;
+    use flife_backend_metal::{Batch, MetalControllers};
+    use flife_neural::update_recurrent_state;
+
+    let mut draws = Draws(0x2026_1212);
+    let metal_direct = match MetalControllers::open() {
+        Ok(controllers) => Some(controllers),
+        Err(CoreError::MissingCapability { .. }) if !cfg!(target_os = "macos") => None,
+        Err(error) => return Err(error),
+    };
+    let mut metal_f32 = backend(64);
+    let mut metal_f16 = backend(64);
+
+    let suites: [(&str, u32, u32, u32, &[&[u32]], usize); 5] = [
+        ("S=2 108/44 (Bundle A)", 106, 40, 2, &TOPOLOGIES, 1_024),
+        ("S=4 108/44 (FL-054)", 104, 36, 4, &TOPOLOGIES, 1_024),
+        ("S=2 107/41 odd-unaligned", 105, 37, 2, &[&[5], &[8]], 32),
+        ("S=2 112/48 (All-21)", 110, 44, 2, &[&[64, 32]], 32),
+        ("S=16 120/68 max-state", 104, 36, 16, &[&[32]], 32),
+    ];
+
+    let lanes = NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN);
+    for (suite_idx, &(label, sensor_w, action_w, state_w, hiddens, count)) in
+        suites.iter().enumerate()
+    {
+        let topos: Vec<DenseTopology> = hiddens
+            .iter()
+            .map(|h| DenseTopology::with_io_recurrent(sensor_w, h, action_w, state_w))
+            .collect::<Result<_, _>>()?;
+        let s = state_w as usize;
+        let a = action_w as usize;
+        let raw_w = a + 2 * s;
+        let in_w = sensor_w as usize + s;
+
+        let mut f32_params = Vec::with_capacity(count);
+        let mut f16_params = Vec::with_capacity(count);
+        let mut sensor_vecs = Vec::with_capacity(count);
+        let mut state_vecs = Vec::with_capacity(count);
+        let mut combined_vecs = Vec::with_capacity(count);
+        let mut topo_ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let t = i % topos.len();
+            let topo = &topos[t];
+            assert_eq!(topo.input_width(), in_w);
+            assert_eq!(topo.raw_output_width(), raw_w);
+            let mut p32 = vec![0.0_f32; topo.parameter_count()];
+            for layer in topo.layers() {
+                let scale = 1.0 / (layer.inputs as f64).sqrt();
+                for v in &mut p32[layer.weights..layer.biases + layer.outputs] {
+                    // Keep operands away from subnormal deferral range (< 2^-78)
+                    // so we prove 0 alignment deferrals on every normal genome.
+                    let raw = draws.symmetric();
+                    let nudged = if raw.abs() < 1.0e-3 { 0.25 } else { raw };
+                    *v = (nudged * scale) as f32;
+                }
+            }
+            let p16: Vec<F16> = p32.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+            let sensors: Vec<f64> = (0..sensor_w as usize)
+                .map(|_| {
+                    let raw = draws.symmetric();
+                    if raw.abs() < 1.0e-3 {
+                        0.5
+                    } else {
+                        raw
+                    }
+                    *1.5
+                })
+                .collect();
+            let state: Vec<f32> = (0..s)
+                .map(|_| {
+                    let raw = draws.symmetric();
+                    (if raw.abs() < 1.0e-3 { 0.25 } else { raw } * 0.95) as f32
+                })
+                .collect();
+            let mut combined = Vec::with_capacity(in_w);
+            combined.extend_from_slice(&sensors);
+            combined.extend(state.iter().map(|&h| f64::from(h)));
+            f32_params.push(p32);
+            f16_params.push(p16);
+            sensor_vecs.push(sensors);
+            state_vecs.push(state);
+            combined_vecs.push(combined);
+            topo_ids.push(t);
+        }
+
+        let mut next_slot = vec![0_u64; topos.len()];
+        let mut jobs_f32 = Vec::with_capacity(count);
+        let mut jobs_f16 = Vec::with_capacity(count);
+        let mut direct_batch = Batch::new();
+        for i in 0..count {
+            let t = topo_ids[i];
+            let slot = next_slot[t];
+            next_slot[t] += 1;
+            let bucket = (suite_idx * 8 + t) as u32;
+            jobs_f32.push(ControllerJob {
+                genome: GenomeId::new((suite_idx as u64 + 1) * 100_000 + i as u64),
+                slot: ArenaSlot::new(bucket, slot, 1),
+                controller: ReferenceController::new(&topos[t], &f32_params[i], BOUND)?,
+                inputs: &combined_vecs[i],
+            });
+            jobs_f16.push(ControllerJob {
+                genome: GenomeId::new((suite_idx as u64 + 1) * 200_000 + i as u64),
+                slot: ArenaSlot::new(bucket, slot, 1),
+                controller: ReferenceController::new(&topos[t], &f16_params[i], BOUND)?,
+                inputs: &combined_vecs[i],
+            });
+            direct_batch.push(&topos[t], &f32_params[i], &combined_vecs[i])?;
+        }
+
+        // 1. Reference oracle: raw outputs + recurrent next state at b_epi=2.5 and b_epi=0.0.
+        let mut scratch = ControllerScratch::new(topos.last().expect("topology"))?;
+        let mut ref_raw_f32 = Vec::with_capacity(count);
+        let mut ref_next_f32_epi = Vec::with_capacity(count);
+        let mut ref_next_f32_v1 = Vec::with_capacity(count);
+        let mut ref_raw_f16 = Vec::with_capacity(count);
+        let mut ref_next_f16_epi = Vec::with_capacity(count);
+        let mut ref_next_f16_v1 = Vec::with_capacity(count);
+        for i in 0..count {
+            let r32 = jobs_f32[i]
+                .controller
+                .evaluate_raw(&combined_vecs[i], &mut scratch)?;
+            let mut h32_epi = vec![0.0_f32; s];
+            let mut h32_v1 = vec![0.0_f32; s];
+            let acts32 = jobs_f32[i].controller.evaluate_recurrent_slice(
+                &sensor_vecs[i],
+                &state_vecs[i],
+                2.5,
+                &mut scratch,
+                &mut h32_epi,
+            )?;
+            let _ = jobs_f32[i].controller.evaluate_recurrent_slice(
+                &sensor_vecs[i],
+                &state_vecs[i],
+                0.0,
+                &mut scratch,
+                &mut h32_v1,
+            )?;
+            assert_eq!(
+                r32[..a].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                acts32.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            ref_raw_f32.push(r32);
+            ref_next_f32_epi.push(h32_epi);
+            ref_next_f32_v1.push(h32_v1);
+
+            let r16 = jobs_f16[i]
+                .controller
+                .evaluate_raw(&combined_vecs[i], &mut scratch)?;
+            let mut h16_epi = vec![0.0_f32; s];
+            let mut h16_v1 = vec![0.0_f32; s];
+            let acts16 = jobs_f16[i].controller.evaluate_recurrent_slice(
+                &sensor_vecs[i],
+                &state_vecs[i],
+                2.5,
+                &mut scratch,
+                &mut h16_epi,
+            )?;
+            let _ = jobs_f16[i].controller.evaluate_recurrent_slice(
+                &sensor_vecs[i],
+                &state_vecs[i],
+                0.0,
+                &mut scratch,
+                &mut h16_v1,
+            )?;
+            assert_eq!(
+                r16[..a].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                acts16.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            ref_raw_f16.push(r16);
+            ref_next_f16_epi.push(h16_epi);
+            ref_next_f16_v1.push(h16_v1);
+        }
+
+        let check_outputs = |route: &str,
+                             got: &[Option<RawOutputs>],
+                             want_raw: &[RawOutputs],
+                             want_epi: &[Vec<f32>],
+                             want_v1: &[Vec<f32>]|
+         -> Result<(), CoreError> {
+            let deferred = got.iter().filter(|o| o.is_none()).count();
+            assert_eq!(
+                deferred, 0,
+                "{label} {route}: expected 0 deferrals, got {deferred}"
+            );
+            let mut got_epi = vec![0.0_f32; s];
+            let mut got_v1 = vec![0.0_f32; s];
+            for (i, got_opt) in got.iter().enumerate() {
+                let raw = got_opt.expect("evaluated");
+                assert_eq!(raw.len(), raw_w);
+                assert_eq!(
+                    raw.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want_raw[i].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{label} {route} org={i} raw outputs differ"
+                );
+                update_recurrent_state(&state_vecs[i], &raw[a..raw_w], 2.5, &mut got_epi)?;
+                update_recurrent_state(&state_vecs[i], &raw[a..raw_w], 0.0, &mut got_v1)?;
+                assert_eq!(
+                    got_epi.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want_epi[i].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{label} {route} org={i} h_next(b_epi=2.5) differs"
+                );
+                assert_eq!(
+                    got_v1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    want_v1[i].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{label} {route} org={i} h_next(b_epi=0.0) differs"
+                );
+            }
+            Ok(())
+        };
+
+        // 2. FrankenTorch CPU (F32 & F16).
+        let mut cpu_f32 = CpuBackend::new(lanes);
+        let mut out_cpu_f32 = Vec::new();
+        cpu_f32.evaluate(&jobs_f32, &mut out_cpu_f32)?;
+        check_outputs(
+            "CpuBackend F32",
+            &out_cpu_f32,
+            &ref_raw_f32,
+            &ref_next_f32_epi,
+            &ref_next_f32_v1,
+        )?;
+
+        let mut cpu_f16 = CpuBackend::new(lanes);
+        let mut out_cpu_f16 = Vec::new();
+        cpu_f16.evaluate(&jobs_f16, &mut out_cpu_f16)?;
+        check_outputs(
+            "CpuBackend F16",
+            &out_cpu_f16,
+            &ref_raw_f16,
+            &ref_next_f16_epi,
+            &ref_next_f16_v1,
+        )?;
+
+        // 3. MetalControllers direct Batch (F32).
+        if let Some(controllers) = metal_direct.as_ref() {
+            let mut out_direct = Vec::new();
+            controllers.evaluate(&direct_batch, &mut out_direct)?;
+            check_outputs(
+                "MetalControllers F32",
+                &out_direct,
+                &ref_raw_f32,
+                &ref_next_f32_epi,
+                &ref_next_f32_v1,
+            )?;
+        }
+
+        // 4. MetalBackend resident (F32 & F16), proving 0 alignment deferrals.
+        if let Some(device_f32) = metal_f32.as_mut() {
+            let uploads_before = device_f32.uploads();
+            let mut out_m32 = Vec::new();
+            device_f32.evaluate(&jobs_f32, &mut out_m32)?;
+            assert_eq!(device_f32.uploads() - uploads_before, count as u64);
+            check_outputs(
+                "MetalBackend F32",
+                &out_m32,
+                &ref_raw_f32,
+                &ref_next_f32_epi,
+                &ref_next_f32_v1,
+            )?;
+        }
+        if let Some(device_f16) = metal_f16.as_mut() {
+            let uploads_before = device_f16.uploads();
+            let mut out_m16 = Vec::new();
+            device_f16.evaluate(&jobs_f16, &mut out_m16)?;
+            assert_eq!(device_f16.uploads() - uploads_before, count as u64);
+            check_outputs(
+                "MetalBackend F16",
+                &out_m16,
+                &ref_raw_f16,
+                &ref_next_f16_epi,
+                &ref_next_f16_v1,
+            )?;
+        }
+    }
+    Ok(())
+}

@@ -30,10 +30,19 @@ use std::sync::LazyLock;
 
 use flife_core::registry::{self, Role};
 use flife_core::{CoreError, ValidatedConfig};
-use flife_render::Epoch;
+use flife_render::{Epoch, POLARITY_UNPOLARIZED};
 use fmn_core::color::{LinearRgba, Oklab, Srgb, oklab_to_srgb, srgb_to_oklab};
 
-/// What a particle's colour means (plan §13.4).
+use crate::v2::{
+    CELL_STATE_LUT_LEN, CELL_STATE_MAPPING_NAME, CELL_STATE_REGISTRY_NAME, FieldOverlayKind,
+    POLARITY_LUT_LEN, POLARITY_MAPPING_NAME, POLARITY_REGISTRY_NAME, TRAIL_CARRIER_NAME,
+    V2ColorMapping, VASCULAR_CONDUCTANCE_NAME, cell_state_color, cell_state_index,
+    cell_state_legend, cell_state_rgb8, linear_cell_state_shades, polarity_color, polarity_legend,
+    polarity_lut_index, polarity_rgb8, polarity_turn, polarity_unpolarized_linear,
+    polarity_wheel_linear,
+};
+
+/// What a particle's colour means (plan §13.4, `V2-16`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ColorMapping {
     /// Founder lineage: one stable categorical colour per lineage.
@@ -53,11 +62,19 @@ pub enum ColorMapping {
     /// Founder lineage and energy: the lineage's colour, as light as the
     /// organism's energy against the energy it needs to attempt a birth.
     LineageEnergy,
+    /// Clonal cell state (`V2-16`, `cell-state-v1`): founder lineage hue
+    /// modulated cleanly in OKLab lightness, chroma and secondary tint by the
+    /// quantized recurrent state `h_0 ∈ [-1, 1]`.
+    CellState,
+    /// Apical-basal polarity (`V2-16`, `polarity-v1`): perceptually uniform
+    /// cyclic OKLab hue wheel by quantized apical angle (grey when unpolarized;
+    /// paired with apical orientation ticks in sphere mode).
+    Polarity,
 }
 
 impl ColorMapping {
-    /// Every mapping, in the Studio's key order (1 to 7).
-    pub const ALL: [Self; 7] = [
+    /// The seven `field-ecology-v1` mappings, in Studio key order (1 to 7).
+    pub const V1_ALL: [Self; 7] = [
         Self::Lineage,
         Self::Energy,
         Self::Generation,
@@ -65,6 +82,20 @@ impl ColorMapping {
         Self::Topology,
         Self::Affinity,
         Self::LineageEnergy,
+    ];
+
+    /// Every mapping, in Studio key order (1 to 9: seven v1 mappings followed
+    /// by `V2-16`'s `CellState` and `Polarity`).
+    pub const ALL: [Self; 9] = [
+        Self::Lineage,
+        Self::Energy,
+        Self::Generation,
+        Self::Motion,
+        Self::Topology,
+        Self::Affinity,
+        Self::LineageEnergy,
+        Self::CellState,
+        Self::Polarity,
     ];
 
     /// The mapping's name, as flags and records spell it.
@@ -78,6 +109,8 @@ impl ColorMapping {
             Self::Topology => "topology",
             Self::Affinity => "affinity",
             Self::LineageEnergy => "lineage-energy",
+            Self::CellState => CELL_STATE_MAPPING_NAME,
+            Self::Polarity => POLARITY_MAPPING_NAME,
         }
     }
 
@@ -93,7 +126,15 @@ impl ColorMapping {
             Self::Topology => "topology-catalog-v1",
             Self::Affinity => "affinity-projection-v1",
             Self::LineageEnergy => "founder-lineage-energy-v1",
+            Self::CellState => CELL_STATE_REGISTRY_NAME,
+            Self::Polarity => POLARITY_REGISTRY_NAME,
         }
+    }
+
+    /// Whether this mapping reads optional `V2-16` epoch views.
+    #[must_use]
+    pub const fn is_v2(self) -> bool {
+        matches!(self, Self::CellState | Self::Polarity)
     }
 
     /// The mapping a registered name stands for.
@@ -140,6 +181,8 @@ impl ColorMapping {
                  the organism holds more of the energy it needs to divide, black with none, white \
                  with 1.8 times it"
             }
+            Self::CellState => V2ColorMapping::CellState.meaning(),
+            Self::Polarity => V2ColorMapping::Polarity.meaning(),
         }
     }
 }
@@ -280,6 +323,8 @@ impl ColorMapping {
                 }
                 text.push_str(" x energy to divide");
             }
+            Self::CellState => return cell_state_legend(),
+            Self::Polarity => return polarity_legend(),
         }
         Legend { text, swatches }
     }
@@ -300,8 +345,8 @@ impl FromStr for ColorMapping {
             .find(|mapping| mapping.name() == text || mapping.registry_name() == text)
             .ok_or_else(|| {
                 format!(
-                    "`{text}` is not a colour mapping: lineage, energy, generation, motion, topology, \
-                     affinity or lineage-energy"
+                    "`{text}` is not a colour mapping: lineage, energy, generation, motion, \
+                     topology, affinity, lineage-energy, cell-state or polarity"
                 )
             })
     }
@@ -443,7 +488,7 @@ impl FieldComponent {
     }
 }
 
-/// What the field's colour means (plan §13.4, "Local field").
+/// What the field's colour means (plan §13.4, "Local field"; `V2-16` overlays).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum FieldMapping {
     /// The texels' mean energy density: the glow look's palette, or the
@@ -463,12 +508,22 @@ pub enum FieldMapping {
     /// from −1 (the channel wholly against the energy) through 0 to +1
     /// (wholly along it), and as bright as the energy density shows.
     Component(FieldComponent),
+    /// Carrier-1 persistent pheromone trail energy density (`e_1`,
+    /// [`flife_render::FieldTexture::trail_energy`], `V2-15`/`V2-16`): through
+    /// [`crate::TRAIL_CARRIER_PALETTE`] on a log perceptual ramp for glow, or
+    /// honest linear grey for raw/sphere.
+    TrailCarrier,
+    /// Murray/Physarum mean incident vascular conductance (`g_e`,
+    /// [`flife_render::FieldTexture::vascular_conductance`], `V2-14`/`V2-16`):
+    /// through [`crate::VASCULAR_CONDUCTANCE_PALETTE`] on a log perceptual
+    /// ramp for glow, or honest linear grey for raw/sphere.
+    VascularConductance,
 }
 
 impl FieldMapping {
-    /// Every field mapping: energy, composition, then each component in
-    /// channel order.
-    pub const ALL: [Self; 2 + FIELD_COMPONENTS as usize] = {
+    /// The 34 `field-ecology-v1` field mappings: energy, composition, then each
+    /// component in channel order.
+    pub const V1_ALL: [Self; 2 + FIELD_COMPONENTS as usize] = {
         let mut all = [Self::Energy; 2 + FIELD_COMPONENTS as usize];
         all[1] = Self::Composition;
         let mut channel = 0;
@@ -479,8 +534,24 @@ impl FieldMapping {
         all
     };
 
+    /// Every field mapping: energy, composition, each component in channel
+    /// order, then `V2-16`'s `TrailCarrier` and `VascularConductance`.
+    pub const ALL: [Self; 4 + FIELD_COMPONENTS as usize] = {
+        let mut all = [Self::Energy; 4 + FIELD_COMPONENTS as usize];
+        all[1] = Self::Composition;
+        let mut channel = 0;
+        while channel < FIELD_COMPONENTS {
+            all[2 + channel as usize] = Self::Component(FieldComponent(channel));
+            channel += 1;
+        }
+        all[2 + FIELD_COMPONENTS as usize] = Self::TrailCarrier;
+        all[3 + FIELD_COMPONENTS as usize] = Self::VascularConductance;
+        all
+    };
+
     /// The mapping's name, as flags and records spell it: `energy`,
-    /// `composition` or `component-C` for channel `C`.
+    /// `composition`, `component-C` for channel `C`, `trail-carrier`, or
+    /// `vascular-conductance`.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -489,18 +560,44 @@ impl FieldMapping {
             Self::Component(component) => {
                 COMPONENT_NAMES[(component.0 % FIELD_COMPONENTS) as usize]
             }
+            Self::TrailCarrier => TRAIL_CARRIER_NAME,
+            Self::VascularConductance => VASCULAR_CONDUCTANCE_NAME,
         }
     }
 
-    /// What the Studio's C key switches to: energy, composition, then
-    /// `component`, then energy again.
+    /// What the Studio's `C` key switches to on `v1` (or with
+    /// `v2-visual-mappings` disabled): energy, composition, then `component`,
+    /// then energy again. Starting from a v2 overlay steps through
+    /// `VascularConductance` back to `Energy`.
     #[must_use]
     pub const fn next(self, component: FieldComponent) -> Self {
         match self {
             Self::Energy => Self::Composition,
             Self::Composition => Self::Component(component),
             Self::Component(_) => Self::Energy,
+            Self::TrailCarrier => Self::VascularConductance,
+            Self::VascularConductance => Self::Energy,
         }
+    }
+
+    /// What the Studio's `C` key switches to when `v2-visual-mappings` is
+    /// enabled: energy → composition → `component` → `trail-carrier` →
+    /// `vascular-conductance` → energy.
+    #[must_use]
+    pub const fn next_v2(self, component: FieldComponent) -> Self {
+        match self {
+            Self::Energy => Self::Composition,
+            Self::Composition => Self::Component(component),
+            Self::Component(_) => Self::TrailCarrier,
+            Self::TrailCarrier => Self::VascularConductance,
+            Self::VascularConductance => Self::Energy,
+        }
+    }
+
+    /// Whether this mapping reads an optional `V2-16` secondary field overlay.
+    #[must_use]
+    pub const fn is_v2_overlay(self) -> bool {
+        matches!(self, Self::TrailCarrier | Self::VascularConductance)
     }
 
     /// The component shown, in a component mapping.
@@ -508,7 +605,9 @@ impl FieldMapping {
     pub const fn component(self) -> Option<FieldComponent> {
         match self {
             Self::Component(component) => Some(component),
-            Self::Energy | Self::Composition => None,
+            Self::Energy | Self::Composition | Self::TrailCarrier | Self::VascularConductance => {
+                None
+            }
         }
     }
 
@@ -516,8 +615,8 @@ impl FieldMapping {
     /// explain: the composition's is the affinity key's colours
     /// ([`legend_affinities`]), `none` and then the six directions, at full
     /// brightness; a component's is [`COMPONENT_PALETTE`](crate::COMPONENT_PALETTE) at −1, −½, 0, ½
-    /// and 1; a texel shows its colour darkened as its energy is lower.
-    /// `None` for energy.
+    /// and 1; `TrailCarrier` and `VascularConductance` show their five-stop
+    /// perceptual overlay keys; `None` for energy.
     #[must_use]
     pub fn legend(self) -> Option<Legend> {
         match self {
@@ -546,6 +645,8 @@ impl FieldMapping {
                     .to_vec();
                 Some(Legend { text, swatches })
             }
+            Self::TrailCarrier => Some(FieldOverlayKind::TrailCarrier.legend()),
+            Self::VascularConductance => Some(FieldOverlayKind::VascularConductance.legend()),
         }
     }
 }
@@ -565,8 +666,8 @@ impl FromStr for FieldMapping {
             .find(|mapping| mapping.name() == text)
             .ok_or_else(|| {
                 format!(
-                    "`{text}` is not a field mapping: energy, composition or component-C for a \
-                     channel C from 0 to {}",
+                    "`{text}` is not a field mapping: energy, composition, trail-carrier, \
+                     vascular-conductance or component-C for a channel C from 0 to {}",
                     FIELD_COMPONENTS - 1
                 )
             })
@@ -630,11 +731,19 @@ pub struct Traits {
     /// The least energy an organism of the world attempts a birth with
     /// ([`Epoch::attempt_energy`]), the same for every row.
     pub attempt_energy: f64,
+    /// Optional `V2-16` quantized recurrent cell state `h_0 ∈ [-127, 127]`
+    /// (`0` when [`Epoch::cell_states`] is `None`).
+    pub cell_state: i8,
+    /// Optional `V2-16` quantized apical-basal polarity angle
+    /// ([`POLARITY_UNPOLARIZED`] when [`Epoch::polarities`] is `None`).
+    pub polarity: i16,
 }
 
 /// Every row of `epoch` as [`Traits`], in identity order.
 pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
     let attempt_energy = epoch.attempt_energy();
+    let cell_states = epoch.cell_states();
+    let polarities = epoch.polarities();
     epoch
         .lineages()
         .iter()
@@ -643,8 +752,18 @@ pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
         .zip(epoch.topologies())
         .zip(epoch.velocities())
         .zip(epoch.affinities())
+        .enumerate()
         .map(
-            move |(((((&lineage, &energy), &generation), &topology), &velocity), &affinity)| {
+            move |(
+                row,
+                (((((&lineage, &energy), &generation), &topology), &velocity), &affinity),
+            )| {
+                let cell_state = cell_states
+                    .and_then(|states| states.get(row).copied())
+                    .unwrap_or(0);
+                let polarity = polarities
+                    .and_then(|angles| angles.get(row).copied())
+                    .unwrap_or(POLARITY_UNPOLARIZED);
                 Traits {
                     lineage,
                     energy,
@@ -653,6 +772,8 @@ pub fn traits(epoch: &Epoch) -> impl Iterator<Item = Traits> + '_ {
                     velocity,
                     affinity,
                     attempt_energy,
+                    cell_state,
+                    polarity,
                 }
             },
         )
@@ -1060,6 +1181,8 @@ pub fn mapped_rgb8(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) -
         ColorMapping::LineageEnergy => {
             lineage_energy_rgb8(traits.lineage, traits.energy, traits.attempt_energy)
         }
+        ColorMapping::CellState => cell_state_rgb8(traits.lineage, traits.cell_state),
+        ColorMapping::Polarity => polarity_rgb8(traits.polarity),
     }
 }
 
@@ -1074,6 +1197,8 @@ pub fn mapped_color(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) 
         ColorMapping::Topology => {
             LINEAR_TOPOLOGY_PALETTE[usize::from(traits.topology) % TOPOLOGY_PALETTE.len()]
         }
+        ColorMapping::CellState => cell_state_color(traits.lineage, traits.cell_state),
+        ColorMapping::Polarity => polarity_color(traits.polarity),
         _ => linear(mapped_rgb8(mapping, traits, maximum_speed)),
     }
 }
@@ -1181,6 +1306,16 @@ pub(crate) enum EpochColors<'a> {
         shades: &'static [[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()],
         linear: &'static [f64; 256],
     },
+    CellState {
+        lineages: &'a [u64],
+        cell_states: Option<&'a [i8]>,
+        shades: &'static [[LinearRgba; CELL_STATE_LUT_LEN]; LINEAGE_PALETTE.len()],
+    },
+    Polarity {
+        polarities: Option<&'a [i16]>,
+        wheel: &'static [LinearRgba; POLARITY_LUT_LEN],
+        unpolarized: LinearRgba,
+    },
 }
 
 impl<'a> EpochColors<'a> {
@@ -1217,6 +1352,16 @@ impl<'a> EpochColors<'a> {
                 attempt_energy: epoch.attempt_energy(),
                 shades: lineage_energy_shades(),
                 linear: linear_table(),
+            },
+            ColorMapping::CellState => Self::CellState {
+                lineages: epoch.lineages(),
+                cell_states: epoch.cell_states(),
+                shades: linear_cell_state_shades(),
+            },
+            ColorMapping::Polarity => Self::Polarity {
+                polarities: epoch.polarities(),
+                wheel: polarity_wheel_linear(),
+                unpolarized: polarity_unpolarized_linear(),
             },
         }
     }
@@ -1264,6 +1409,26 @@ impl<'a> EpochColors<'a> {
                 linear,
                 lineage_energy_rgb8_with(shades, lineages[row], energies[row], *attempt_energy),
             ),
+            Self::CellState {
+                lineages,
+                cell_states,
+                shades,
+            } => {
+                let state = cell_states
+                    .and_then(|states| states.get(row).copied())
+                    .unwrap_or(0);
+                shades[lineage_slot(lineages[row])][cell_state_index(state)]
+            }
+            Self::Polarity {
+                polarities,
+                wheel,
+                unpolarized,
+            } => {
+                let angle = polarities
+                    .and_then(|angles| angles.get(row).copied())
+                    .unwrap_or(POLARITY_UNPOLARIZED);
+                polarity_turn(angle).map_or(*unpolarized, |turn| wheel[polarity_lut_index(turn)])
+            }
         }
     }
 
@@ -1343,6 +1508,60 @@ impl<'a> EpochColors<'a> {
                     );
                 }
             }
+            Self::CellState {
+                lineages,
+                cell_states,
+                shades,
+            } => match cell_states {
+                Some(states) if states.len() >= len => {
+                    for (row, (&lineage, &state)) in
+                        lineages[..len].iter().zip(&states[..len]).enumerate()
+                    {
+                        visit(row, shades[lineage_slot(lineage)][cell_state_index(state)]);
+                    }
+                }
+                Some(states) => {
+                    for (row, &lineage) in lineages[..len].iter().enumerate() {
+                        let state = states.get(row).copied().unwrap_or(0);
+                        visit(row, shades[lineage_slot(lineage)][cell_state_index(state)]);
+                    }
+                }
+                None => {
+                    let zero = cell_state_index(0);
+                    for (row, &lineage) in lineages[..len].iter().enumerate() {
+                        visit(row, shades[lineage_slot(lineage)][zero]);
+                    }
+                }
+            },
+            Self::Polarity {
+                polarities,
+                wheel,
+                unpolarized,
+            } => match polarities {
+                Some(angles) if angles.len() >= len => {
+                    let unpolarized = *unpolarized;
+                    for (row, &angle) in angles[..len].iter().enumerate() {
+                        let color = polarity_turn(angle)
+                            .map_or(unpolarized, |turn| wheel[polarity_lut_index(turn)]);
+                        visit(row, color);
+                    }
+                }
+                Some(angles) => {
+                    let unpolarized = *unpolarized;
+                    for row in 0..len {
+                        let angle = angles.get(row).copied().unwrap_or(POLARITY_UNPOLARIZED);
+                        let color = polarity_turn(angle)
+                            .map_or(unpolarized, |turn| wheel[polarity_lut_index(turn)]);
+                        visit(row, color);
+                    }
+                }
+                None => {
+                    let unpolarized = *unpolarized;
+                    for row in 0..len {
+                        visit(row, unpolarized);
+                    }
+                }
+            },
         }
     }
 }

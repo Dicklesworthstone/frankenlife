@@ -1,12 +1,15 @@
-// Render the site's film from a FrankenLife run directory and write its
-// manifest (lib/media.json).
+// Render the site's film from a FrankenLife run directory (or configuration)
+// and write its manifest (lib/media.json).
 //
-//   bun scripts/media.ts --flife PATH --run-dir DIR --work DIR
-//     [--ticks 9600] [--every 32] [--size 1080] [--fps 30] [--crf 24]
-//     [--camera auto|none] [--field energy|composition|none] [--look glow|raw|sphere]
-//     [--color lineage|lineage-energy|affinity|energy|generation|motion|topology]
-//     [--zooms 2.5,4,6]
-//     [--cpu-workers N] [--preview-from WORK]
+//   bun scripts/media.ts --flife PATH (--run-dir DIR | --config PATH) --work DIR
+//     [--ticks 9600] [--every 32] [--size 1080 | --width 3840 --height 2160]
+//     [--fps 30|60] [--crf 24] [--master-out PATH] [--master-crf 16]
+//     [--camera auto|none]
+//     [--field energy|composition|component-C|trail-carrier|vascular-conductance|none]
+//     [--look glow|raw|sphere]
+//     [--color lineage|lineage-energy|affinity|energy|generation|motion|topology|cell-state|polarity]
+//     [--zooms 2.5,4,6] [--cpu-workers N] [--preview-from WORK]
+//     [--disable SLUGS] [--enable SLUGS] [--v1-compat]
 //
 // - With `--camera auto` (the default) the run is first rendered small, as
 //   raw dots without the field (`--work`/preview), and scripts/director.ts
@@ -21,22 +24,20 @@
 // - `flife render --run-dir` continues the run from its newest checkpoint
 //   that restores, as `flife resume` would, and writes no checkpoint, journal
 //   record or catalog row to the run (FrankenSQLite may rewrite the catalog's
-//   log files when it opens it; flife-cli's CONTRACT.md). Its PNG frames,
-//   its NDJSON records and what made them (render.json) go to `--work`. A
-//   `--work` that already holds a finished render is encoded again without
-//   rendering, with the provenance it recorded (to try another `--crf`).
-// - ffmpeg encodes the frames with flife's own colour chain (render.rs's
-//   PNG_TO_H264: BT.709 limited range, 4:2:0, left chroma), at a CRF chosen
-//   for the web, under a bitrate ceiling that keeps any length within
-//   Cloudflare's limit. Particles that move a few pixels a frame carry
-//   little from one frame to the next: a raw-dot film of 301 frames needed
-//   CRF 24 (23.6 MB; 28 blurred the dots into blobs). The energy field is
-//   smooth and cheap, so the showcase film is CRF 20 at 10.1 MB for 401
-//   frames. The poster is the first frame. The social card, under the
-//   site's share image (app/opengraph-image.tsx), is cut from the middle
-//   frame of the film's closest shot (director.ts's `cardFrame`), where
-//   single bodies show; a film of the whole torus uses its first frame.
-// - Each file is named by its SHA-256 and copied into public/media/, which
+//   log files when it opens it; flife-cli's CONTRACT.md). `--disable`,
+//   `--enable` and `--v1-compat` are founding-only (INV-14) and are refused
+//   with `--run-dir`; use `--config PATH` to render a founded V2 world with
+//   CLI overrides (or bake them when creating `--run-dir`).
+//
+// - Supports both square 4K (`--size 2160` or `--width 2160 --height 2160`)
+//   and 16:9 4K (`--width 3840 --height 2160`) at `--fps 60` (or any positive
+//   fps). ffmpeg encodes the web MP4 with flife's own BT.709 colour chain
+//   under an automatic bitrate ceiling that keeps the deployed asset within
+//   Cloudflare's 25 MiB limit. Pass `--master-out PATH` (outside
+//   `public/media/`) to also encode an unconstrained high-quality archival
+//   4K60 MP4 from the exact same rendered PNG frames.
+//
+// - Each web file is named by its SHA-256 and copied into public/media/, which
 //   is outside git like every FrankenLife recording (AGENTS.md); the
 //   committed manifest records each hash and how it was made.
 // - The Rust sources must be committed: the manifest names the revision, and
@@ -45,7 +46,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -57,29 +58,21 @@ import {
   direct,
   luminance,
 } from "./director";
+import {
+  ASSET_LIMIT,
+  SOCIAL_CROP_VF,
+  buildMasterEncodeArgs,
+  buildWebEncodeArgs,
+  parseMediaArgs,
+} from "./media-options";
 
 const WEB = fileURLToPath(new URL("..", import.meta.url));
 const REPO = resolve(WEB, "..");
-// Cloudflare serves a static asset of at most 25 MiB.
-const ASSET_LIMIT = 25 * 1024 * 1024;
+const PUBLIC_MEDIA = join(WEB, "public", "media");
 
 function fail(message: string): never {
   console.error(`media: ${message}`);
   process.exit(1);
-}
-
-function options(): Map<string, string> {
-  const args = process.argv.slice(2);
-  const found = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith("--") || value === undefined) {
-      fail(`expected --name value pairs, got ${args.join(" ")}`);
-    }
-    found.set(key.slice(2), value);
-  }
-  return found;
 }
 
 function run(command: string, args: string[], stdout?: string): string {
@@ -106,9 +99,8 @@ function publish(path: string, stem: string, extension: string) {
   const bytes = readFileSync(path).length;
   if (bytes > ASSET_LIMIT) fail(`${path} is ${bytes} bytes, above Cloudflare's 25 MiB asset limit`);
   const name = `${stem}-${hash.slice(0, 12)}.${extension}`;
-  const media = join(WEB, "public", "media");
-  mkdirSync(media, { recursive: true });
-  copyFileSync(path, join(media, name));
+  mkdirSync(PUBLIC_MEDIA, { recursive: true });
+  copyFileSync(path, join(PUBLIC_MEDIA, name));
   return { src: `/media/${name}`, sha256: hash, bytes };
 }
 
@@ -122,51 +114,39 @@ type Validation = {
   timestep: [number, number];
 };
 
-const flags = options();
-for (const key of flags.keys()) {
-  if (!["flife", "run-dir", "work", "ticks", "every", "size", "fps", "crf", "camera", "field", "look", "color", "zooms", "cpu-workers", "preview-from"].includes(key)) {
-    fail(`unknown option --${key}`);
-  }
+let opts;
+try {
+  opts = parseMediaArgs(process.argv.slice(2), PUBLIC_MEDIA);
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
 }
-// The paths are the caller's, relative to where it ran; flife and git run from the repository root.
-const path = (key: string) => resolve(flags.get(key) ?? fail(`--${key} is required`));
-const flife = path("flife");
-const runDir = path("run-dir");
-const work = path("work");
-const count = (key: string, fallback: string, least: number) => {
-  const value = flags.get(key) ?? fallback;
-  if (!/^\d+$/.test(value) || Number(value) < least) fail(`--${key} must be an integer of at least ${least}`);
-  return value;
-};
-const ticks = count("ticks", "9600", 0);
-const every = count("every", "32", 1);
-const size = count("size", "1080", 2);
-const fps = count("fps", "30", 1);
-const crf = count("crf", "24", 0);
+
+const {
+  flife,
+  runDir,
+  config,
+  work,
+  ticks,
+  every,
+  width,
+  height,
+  fps,
+  crf,
+  masterOut,
+  masterCrf,
+  cameraMode,
+  field,
+  look,
+  color,
+  zooms,
+  cpuWorkers,
+  previewFrom,
+  featureFlags,
+} = opts;
+
 // The world's threads for both renders, if given (no result depends on them; the run's [execution]
 // cpu_workers otherwise). Not part of the recorded render arguments, which name what was drawn.
-const workers = flags.has("cpu-workers") ? ["--cpu-workers", count("cpu-workers", "1", 1)] : [];
-// 4:2:0 video halves each dimension.
-if (Number(size) % 2 !== 0) fail("--size must be even");
-const choice = (key: string, allowed: string[]) => {
-  const value = flags.get(key) ?? (allowed[0] as string);
-  if (!allowed.includes(value)) fail(`--${key} must be one of ${allowed.join(", ")}`);
-  return value;
-};
-const cameraMode = choice("camera", ["auto", "none"]);
-const field = choice("field", ["energy", "composition", "none"]);
-const look = choice("look", ["glow", "raw", "sphere"]);
-// The shots' zooms on the run's torus, if given: each at least 1.
-const zooms = flags.has("zooms")
-  ? (flags.get("zooms") as string).split(",").map((text) => {
-      const zoom = Number(text);
-      return Number.isFinite(zoom) && zoom >= 1 ? zoom : fail(`--zooms must list zooms of at least 1, got ${text}`);
-    })
-  : null;
-// Without --color, the run's own [presentation] color_mapping.
-const color = flags.has("color")
-  ? choice("color", ["lineage", "lineage-energy", "affinity", "energy", "generation", "motion", "topology"])
-  : null;
+const workers = cpuWorkers !== null ? ["--cpu-workers", String(cpuWorkers)] : [];
 const style = [
   ...(field === "none" ? ["--no-field"] : ["--field-mapping", field]),
   "--look",
@@ -180,6 +160,9 @@ type Provenance = {
   revision: string;
   flife_sha256: string;
   render: string[];
+  features?: string[];
+  source: "run-dir" | "config";
+  founding_digest?: string;
   camera: { rule: string; options: DirectorOptions; keys: CameraKey[] } | null;
   world: Validation;
   preset: string | null;
@@ -188,20 +171,37 @@ type Provenance = {
 const frames = join(work, "frames");
 const records = join(work, "render.ndjson");
 const made = join(work, "render.json");
-const renderArgs = ["--ticks", ticks, "--every", every, "--width", size, "--height", size, ...style];
+const renderArgs = [
+  "--ticks",
+  String(ticks),
+  "--every",
+  String(every),
+  "--width",
+  String(width),
+  "--height",
+  String(height),
+  ...style,
+];
 const cameraFile = join(work, "camera.json");
+const sourceTarget = runDir !== null ? ["--run-dir", runDir] : [config as string, ...featureFlags];
+const sourceConfigPath = runDir !== null ? join(runDir, "config.toml") : (config as string);
+
 let provenance: Provenance;
 if (existsSync(made)) {
   provenance = JSON.parse(readFileSync(made, "utf8"));
   if (provenance.render.join(" ") !== renderArgs.join(" ")) {
     fail(`${work} holds a render with ${provenance.render.join(" ")}, not ${renderArgs.join(" ")}`);
   }
-  console.error(`media: encoding the finished render in ${work} again (its run; --run-dir is not read)`);
+  const savedFeatures = provenance.features ?? [];
+  if (savedFeatures.join(" ") !== featureFlags.join(" ")) {
+    fail(`${work} holds features [${savedFeatures.join(" ")}], not [${featureFlags.join(" ")}]`);
+  }
+  console.error(`media: encoding the finished render in ${work} again (its run; input is not re-simulated)`);
 } else {
   if (existsSync(frames)) fail(`${frames} exists without a finished render; choose another --work`);
   const dirty = run("git", ["status", "--porcelain", "--", "crates", "presets", "Cargo.toml", "Cargo.lock"]);
   if (dirty.trim() !== "") fail(`commit the Rust sources first; uncommitted:\n${dirty}`);
-  const world: Validation = JSON.parse(run(flife, ["validate", join(runDir, "config.toml")]));
+  const world: Validation = JSON.parse(run(flife, ["validate", sourceConfigPath, ...featureFlags]));
   const presetPath = join("presets", `${world.name}.toml`);
   let preset: string | null = null;
   if (existsSync(join(REPO, presetPath))) {
@@ -209,22 +209,35 @@ if (existsSync(made)) {
     if (committed.config_hash === world.config_hash) preset = presetPath;
   }
   mkdirSync(work, { recursive: true });
+  let foundingDigest: string | undefined;
+  if (runDir === null) {
+    // Capture the exact tick-0 founding world digest so world.from always records a verified SHA-256 digest.
+    const zeroRecords = run(flife, ["run", config as string, "--ticks", "0", "--every", "0", ...featureFlags])
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => JSON.parse(line) as { record: string; tick?: number; digest?: string });
+    const zeroEnd = zeroRecords.find((record) => record.record === "end");
+    if (!zeroEnd || zeroEnd.tick !== 0 || typeof zeroEnd.digest !== "string") {
+      fail("could not determine the tick-0 founding digest from `flife run --ticks 0`");
+    }
+    foundingDigest = zeroEnd.digest;
+  }
   let camera: Provenance["camera"] = null;
   if (cameraMode === "auto") {
     const preview = join(work, "preview");
     const previewRecords = join(work, "preview.ndjson");
-    const previewArgs = ["--ticks", ticks, "--every", every, "--width", PREVIEW, "--height", PREVIEW];
-    if (flags.has("preview-from")) {
+    const previewArgs = ["--ticks", String(ticks), "--every", String(every), "--width", PREVIEW, "--height", PREVIEW];
+    if (previewFrom !== null) {
       // Its records name its own frames; the copy is what the digest check below reads.
-      const reused = join(path("preview-from"), "preview.ndjson");
+      const reused = join(previewFrom, "preview.ndjson");
       if (!existsSync(reused)) fail(`${reused} does not exist`);
       copyFileSync(reused, previewRecords);
       console.error(`media: reading the preview in ${reused} for the camera`);
     } else {
-      console.error(`media: previewing ${ticks} ticks of ${runDir} for the camera`);
+      console.error(`media: previewing ${ticks} ticks of ${runDir ?? config} for the camera`);
       run(
         flife,
-        ["render", "--run-dir", runDir, ...previewArgs, ...workers, "--no-field", "--look", "raw", "--out", preview],
+        ["render", ...sourceTarget, ...previewArgs, ...workers, "--no-field", "--look", "raw", "--out", preview],
         previewRecords,
       );
     }
@@ -236,7 +249,7 @@ if (existsSync(made)) {
     const maps = activities(shots.map((record) => luminance(record.path ?? fail("a preview frame without a path"))));
     const frameCount = shots.length;
     // The torus in world units: [world] width and height of the run's configuration.
-    const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(readFileSync(join(runDir, "config.toml"), "utf8"))?.[1] ?? "";
+    const section = /^\[world\]\s*$([\s\S]*?)(?=^\[)/m.exec(readFileSync(sourceConfigPath, "utf8"))?.[1] ?? "";
     const dimension = (key: string) => {
       const value = Number(new RegExp(`^${key}\\s*=\\s*([0-9.eE+-]+)`, "m").exec(section)?.[1]);
       return Number.isFinite(value) && value > 0 ? value : fail(`the run's [world] ${key} is not a positive number`);
@@ -246,7 +259,7 @@ if (existsSync(made)) {
     // same 51–102 world units on any torus of 128 units or more (a 128-unit torus zooms half as far); no zoom
     // goes below 1.25.
     const span = Math.min(...extent) / 256;
-    const options: DirectorOptions = {
+    const directorOptions: DirectorOptions = {
       opening: Math.round(frameCount * 0.08),
       transition: Math.round(frameCount * 0.07),
       dwell: Math.round(frameCount * 0.16),
@@ -257,22 +270,25 @@ if (existsSync(made)) {
       shots.map((record) => record.tick ?? fail("a preview frame without a tick")),
       maps,
       extent,
-      options,
+      directorOptions,
     );
-    camera = { rule: DIRECTOR_RULE, options, keys };
+    camera = { rule: DIRECTOR_RULE, options: directorOptions, keys };
     writeFileSync(cameraFile, `${JSON.stringify({ keys }, null, 2)}\n`);
     console.error(`media: ${keys.length} camera keys`);
   }
-  console.error(`media: rendering ${ticks} ticks of ${runDir}, a frame every ${every}`);
+  console.error(`media: rendering ${ticks} ticks of ${runDir ?? config} at ${width}×${height}, a frame every ${every}`);
   run(
     flife,
-    ["render", "--run-dir", runDir, ...renderArgs, ...workers, ...(camera ? ["--camera", cameraFile] : []), "--out", frames],
+    ["render", ...sourceTarget, ...renderArgs, ...workers, ...(camera ? ["--camera", cameraFile] : []), "--out", frames],
     records,
   );
   provenance = {
     revision: run("git", ["rev-parse", "HEAD"]).trim(),
     flife_sha256: sha256(flife),
     render: renderArgs,
+    ...(featureFlags.length > 0 ? { features: featureFlags } : {}),
+    source: runDir !== null ? "run-dir" : "config",
+    ...(foundingDigest !== undefined ? { founding_digest: foundingDigest } : {}),
     camera,
     world,
     preset,
@@ -289,8 +305,12 @@ const parsed: Record[] = readFileSync(records, "utf8")
 const start = parsed.find((record) => record.record === "start") ?? fail("no start record");
 const end = parsed.find((record) => record.record === "end") ?? fail("no end record");
 const shown = parsed.filter((record) => record.record === "frame");
-const from = start.run as { tick: number; digest: string } | undefined;
-if (!from) fail("the start record names no run");
+const runStart = start.run as { tick: number; digest: string } | undefined;
+const from =
+  runStart ??
+  (provenance.founding_digest !== undefined
+    ? { tick: (shown[0]?.tick as number | undefined) ?? 0, digest: provenance.founding_digest }
+    : fail("the start record names no run and no founding digest was recorded"));
 if (end.frames !== shown.length) fail(`the end record counts ${String(end.frames)} frames, ${shown.length} printed`);
 // The camera is presentation only: the preview and the film reach the same world.
 const previewRecords = join(work, "preview.ndjson");
@@ -304,36 +324,49 @@ if (provenance.camera && existsSync(previewRecords)) {
     fail(`the preview ended at ${String(previewEnd?.digest)}, the film at ${String(end.digest)}`);
   }
 }
-// A bitrate ceiling that keeps the video within Cloudflare's asset limit
-// whatever its length, with a tenth to spare for the container.
-const seconds = shown.length / Number(fps);
-const ceiling = `${Math.floor((0.9 * ASSET_LIMIT * 8) / seconds / 1000)}k`;
 
-const encode = [
-  "-vf",
-  "scale=out_color_matrix=bt709:out_range=tv:out_chroma_loc=left,format=yuv420p," +
-    "setparams=range=tv:color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709",
-  "-c:v",
-  "libx264",
-  "-preset",
-  "slow",
-  "-crf",
-  crf,
-  "-maxrate",
-  ceiling,
-  "-bufsize",
-  ceiling,
-  "-pix_fmt",
-  "yuv420p",
-  "-chroma_sample_location",
-  "left",
-  "-movflags",
-  "+faststart",
-  "-an",
-];
+const encode = buildWebEncodeArgs(crf, shown.length, fps);
 const video = join(work, "film.mp4");
 const first = join(frames, "frame-000000.png");
-run("ffmpeg", ["-y", "-loglevel", "error", "-framerate", fps, "-i", join(frames, "frame-%06d.png"), ...encode, video]);
+run("ffmpeg", [
+  "-y",
+  "-loglevel",
+  "error",
+  "-framerate",
+  String(fps),
+  "-i",
+  join(frames, "frame-%06d.png"),
+  ...encode,
+  video,
+]);
+
+let master:
+  | { path: string; sha256: string; bytes: number; crf: number; encode: string[] }
+  | undefined;
+if (masterOut !== null) {
+  const masterEncode = buildMasterEncodeArgs(masterCrf);
+  mkdirSync(dirname(masterOut), { recursive: true });
+  run("ffmpeg", [
+    "-y",
+    "-loglevel",
+    "error",
+    "-framerate",
+    String(fps),
+    "-i",
+    join(frames, "frame-%06d.png"),
+    ...masterEncode,
+    masterOut,
+  ]);
+  master = {
+    path: masterOut,
+    sha256: sha256(masterOut),
+    bytes: readFileSync(masterOut).length,
+    crf: masterCrf,
+    encode: masterEncode,
+  };
+  console.error(`media: archival master ${masterOut} (${master.bytes} bytes, CRF ${masterCrf})`);
+}
+
 const poster = join(work, "poster.jpg");
 run("ffmpeg", ["-y", "-loglevel", "error", "-i", first, "-q:v", "3", poster]);
 const card = provenance.camera
@@ -345,18 +378,24 @@ const card = provenance.camera
 const cardSource = join(frames, `frame-${String(card).padStart(6, "0")}.png`);
 if (!existsSync(cardSource)) fail(`the social card's frame ${cardSource} is missing`);
 const social = join(work, "social.jpg");
-run("ffmpeg", ["-y", "-loglevel", "error", "-i", cardSource, "-vf", "scale=1200:-1,crop=1200:630", "-q:v", "3", social]);
+run("ffmpeg", ["-y", "-loglevel", "error", "-i", cardSource, "-vf", SOCIAL_CROP_VF, "-q:v", "3", social]);
 
 const controllers = (end.controllers as { backend?: string } | undefined)?.backend ?? "unknown";
+const savedFeatures = provenance.features ?? [];
+const commandSource =
+  provenance.source === "config"
+    ? `${preset ?? "CONFIG"}${savedFeatures.length > 0 ? ` ${savedFeatures.join(" ")}` : ""}`
+    : "--run-dir RUN";
 const manifest = {
   schema: "frankenlife.website-media.v1",
   video: {
     ...publish(video, "film", "mp4"),
-    width: Number(size),
-    height: Number(size),
-    fps: Number(fps),
+    width,
+    height,
+    fps,
     frames: shown.length,
     encode,
+    ...(master ? { master } : {}),
   },
   poster: { ...publish(poster, "poster", "jpg"), frame: 0 },
   social: { ...publish(social, "social", "jpg"), width: 1200, height: 630, frame: card },
@@ -372,11 +411,12 @@ const manifest = {
     from: { tick: from.tick, digest: from.digest },
     ticks: shown.map((record) => record.tick as number),
     live: shown.map((record) => record.live as number),
-    every: Number(every),
+    every,
     to: { tick: end.tick as number, digest: end.digest as string },
   },
   render: {
-    command: `flife render --run-dir RUN ${renderArgs.join(" ")}${provenance.camera ? " --camera CAMERA" : ""} --out FRAMES`,
+    command: `flife render ${commandSource} ${renderArgs.join(" ")}${provenance.camera ? " --camera CAMERA" : ""} --out FRAMES`,
+    ...(savedFeatures.length > 0 ? { features: savedFeatures } : {}),
     camera: provenance.camera,
     // Each frame's zoom as flife render recorded it (1 is the whole torus), for the film's readout.
     zoom: shown.map((record) => {
@@ -395,5 +435,5 @@ const manifest = {
 };
 writeFileSync(join(WEB, "lib", "media.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 console.error(
-  `media: ${shown.length} frames, ticks ${from.tick} to ${String(end.tick)}, video ${manifest.video.bytes} bytes`,
+  `media: ${shown.length} frames at ${width}×${height} ${fps} fps, ticks ${from.tick} to ${String(end.tick)}, video ${manifest.video.bytes} bytes`,
 );

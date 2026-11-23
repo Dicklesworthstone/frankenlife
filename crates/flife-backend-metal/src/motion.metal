@@ -15,8 +15,11 @@
 // [11] the drag decay e^(-gamma dt) and [13] the force coefficient;
 // [15] the maximum speed and [17] acceleration; [19] the motion cost;
 // [21] the response norm limit; [23] the uptake capacity per second;
-// [25] the world's width and [27] height; and [29] the sensor scale cost exponent.
-constant uint M_PARAMS = 31u;
+// [25] the world's width and [27] height; [29] the sensor scale cost exponent;
+// and V2-05 so2-motor constants: [31] energy_gradient_gain,
+// [33] chemical_gradient_gain, [35] chiral_contour_gain,
+// [37] heading_propulsion_fraction, [39] internal_energy_scale.
+constant uint M_PARAMS = 41u;
 
 constant uint M_TERMS = 33u;
 
@@ -24,10 +27,14 @@ constant uint M_TERMS = 33u;
 // the budget is exhausted, [3] whether its controller was evaluated, and
 // [4] its parameter count, as words; then word pairs [5] its sensing scale,
 // [7] its absorbed uptake U, [9] its velocity and [13] position; [17] its
-// 33 motion-response coefficients; [83] its 33 sensor gradients, x then y.
-constant uint M_ORGANISM = 215u;
+// 33 motion-response coefficients; [83] its 33 sensor gradients, x then y;
+// [215] V2-03 basal_multiplier (>= 1.0, 1.0 for v1); [217] V2-05 motor
+// steering controls (m_e, m_c, m_perp, m_prop), 4 word pairs (all 0.0 for v1).
+constant uint M_ORGANISM = 225u;
 constant uint M_RESPONSE = 17u;
 constant uint M_GRADIENTS = 83u;
+constant uint M_BASAL_MULT = 215u;
+constant uint M_MOTOR = 217u;
 
 // An outcome: [0] status; [1] the stage that exhausted the budget (0 none,
 // 1 chemistry, 2 maintenance, 3 motion); word pairs [2] the maintenance
@@ -47,6 +54,7 @@ constant uint STATUS_VELOCITY = 6u;   // a non-finite velocity
 constant uint STATUS_CLAMP = 7u;      // a clamp the device cannot carry
 constant uint STATUS_COST = 8u;       // a motion cost that is not finite
 constant uint STATUS_POSITION = 9u;   // a displaced position that is not finite
+constant uint STATUS_MOTOR = 10u;     // a motor steering control outside [-1, 1] or non-finite
 
 constant uint DIED_CHEMISTRY = 1u;
 constant uint DIED_MAINTENANCE = 2u;
@@ -56,6 +64,8 @@ constant uint DIED_MOTION = 3u;
 // follows before it refuses.
 constant ulong SHRINK = 0x3FEFFFFFFFFFFFFFul;
 constant uint CLAMP_SHRINKS = 64u;
+// 1.0e-12_f64: guarded heading unit-vector norm threshold (V2-05).
+constant ulong HEADING_EPS = 0x3D719799812DEA11ul;
 
 static inline d64 m_load(device const uint *words, uint at) {
     return ulong(words[at]) | (ulong(words[at + 1u]) << 32);
@@ -160,7 +170,15 @@ kernel void motion_settle(
             outcome[0] = STATUS_SCALE;
             return;
         }
+        d64 basal_mult = m_load(organism, M_BASAL_MULT);
+        if (!d_finite(basal_mult) || d_lt(basal_mult, ONE)) {
+            outcome[0] = STATUS_BILL;
+            return;
+        }
         d64 basal = d_mul(seconds, m_load(params, 3u));
+        if (basal_mult != ONE) {
+            basal = d_mul(basal, basal_mult);
+        }
         d64 exponent = m_load(params, 29u);
         d64 factor;
         if (exponent == ONE) {
@@ -243,23 +261,117 @@ kernel void motion_settle(
             return;
         }
 
-        // Motion::acceleration: g_u sum_j chi_j grad_j, energy first, then
-        // the channels, clamped to the maximum acceleration.
-        d64 sx = 0ul;
-        d64 sy = 0ul;
-        for (uint t = 0u; t < M_TERMS; ++t) {
-            d64 coefficient = m_load(organism, M_RESPONSE + 2u * t);
-            d64 gx = m_load(organism, M_GRADIENTS + 4u * t);
-            d64 gy = m_load(organism, M_GRADIENTS + 4u * t + 2u);
-            if (!d_finite(gx) || !d_finite(gy)) {
+        // Motion::acceleration: exact baseline single-loop fast-path when all
+        // four V2-05 motor controls are zero (0-ulp identical to v1); otherwise
+        // split g_E (t=0) and g_C (t=1..33), add chiral contour g_perp and
+        // energy-scaled guarded heading propulsion, then clamp to a_max.
+        d64 m_e = m_load(organism, M_MOTOR);
+        d64 m_c = m_load(organism, M_MOTOR + 2u);
+        d64 m_perp = m_load(organism, M_MOTOR + 4u);
+        d64 m_prop = m_load(organism, M_MOTOR + 6u);
+        if (!d_finite(m_e) || d_lt(ONE, m_e & ~D_SIGN) ||
+            !d_finite(m_c) || d_lt(ONE, m_c & ~D_SIGN) ||
+            !d_finite(m_perp) || d_lt(ONE, m_perp & ~D_SIGN) ||
+            !d_finite(m_prop) || d_lt(ONE, m_prop & ~D_SIGN)) {
+            outcome[0] = STATUS_MOTOR;
+            return;
+        }
+        d64 ax;
+        d64 ay;
+        if (((m_e | m_c | m_perp | m_prop) << 1) == 0ul) {
+            d64 sx = 0ul;
+            d64 sy = 0ul;
+            for (uint t = 0u; t < M_TERMS; ++t) {
+                d64 coefficient = m_load(organism, M_RESPONSE + 2u * t);
+                d64 gx = m_load(organism, M_GRADIENTS + 4u * t);
+                d64 gy = m_load(organism, M_GRADIENTS + 4u * t + 2u);
+                if (!d_finite(gx) || !d_finite(gy)) {
+                    outcome[0] = STATUS_GRADIENT;
+                    return;
+                }
+                sx = d_add(sx, d_mul(coefficient, gx));
+                sy = d_add(sy, d_mul(coefficient, gy));
+            }
+            ax = d_mul(ratio, sx);
+            ay = d_mul(ratio, sy);
+        } else {
+            d64 gx0 = m_load(organism, M_GRADIENTS);
+            d64 gy0 = m_load(organism, M_GRADIENTS + 2u);
+            if (!d_finite(gx0) || !d_finite(gy0)) {
                 outcome[0] = STATUS_GRADIENT;
                 return;
             }
-            sx = d_add(sx, d_mul(coefficient, gx));
-            sy = d_add(sy, d_mul(coefficient, gy));
+            d64 c0 = m_load(organism, M_RESPONSE);
+            d64 ge_x = d_mul(c0, gx0);
+            d64 ge_y = d_mul(c0, gy0);
+
+            d64 gc_x = 0ul;
+            d64 gc_y = 0ul;
+            for (uint t = 1u; t < M_TERMS; ++t) {
+                d64 coefficient = m_load(organism, M_RESPONSE + 2u * t);
+                d64 gx = m_load(organism, M_GRADIENTS + 4u * t);
+                d64 gy = m_load(organism, M_GRADIENTS + 4u * t + 2u);
+                if (!d_finite(gx) || !d_finite(gy)) {
+                    outcome[0] = STATUS_GRADIENT;
+                    return;
+                }
+                gc_x = d_add(gc_x, d_mul(coefficient, gx));
+                gc_y = d_add(gc_y, d_mul(coefficient, gy));
+            }
+
+            d64 gsum_x = d_add(ge_x, gc_x);
+            d64 gsum_y = d_add(ge_y, gc_y);
+            d64 gperp_x = gsum_y ^ D_SIGN;
+            d64 gperp_y = gsum_x;
+
+            if (!d_finite(vx) || !d_finite(vy)) {
+                outcome[0] = STATUS_VELOCITY;
+                return;
+            }
+            d64 v_sq = d_add(d_mul(vx, vx), d_mul(vy, vy));
+            if (!d_finite(v_sq)) {
+                outcome[0] = STATUS_VELOCITY;
+                return;
+            }
+            d64 v_norm = d_sqrt(v_sq);
+            d64 hx = 0ul;
+            d64 hy = 0ul;
+            if (d_lt(HEADING_EPS, v_norm)) {
+                hx = d_div(vx, v_norm);
+                hy = d_div(vy, v_norm);
+            } else {
+                d64 g_sq = d_add(d_mul(gsum_x, gsum_x), d_mul(gsum_y, gsum_y));
+                if (!d_finite(g_sq)) {
+                    outcome[0] = STATUS_CLAMP;
+                    return;
+                }
+                d64 g_norm = d_sqrt(g_sq);
+                if (d_lt(HEADING_EPS, g_norm)) {
+                    hx = d_div(gsum_x, g_norm);
+                    hy = d_div(gsum_y, g_norm);
+                }
+            }
+
+            d64 w_e = d_add(ONE, d_mul(m_load(params, 31u), m_e));
+            d64 w_c = d_add(ONE, d_mul(m_load(params, 33u), m_c));
+            d64 w_perp = d_mul(m_load(params, 35u), m_perp);
+
+            d64 chem_x = d_add(d_add(d_mul(w_e, ge_x), d_mul(w_c, gc_x)), d_mul(w_perp, gperp_x));
+            d64 chem_y = d_add(d_add(d_mul(w_e, ge_y), d_mul(w_c, gc_y)), d_mul(w_perp, gperp_y));
+            d64 grad_x = d_mul(ratio, chem_x);
+            d64 grad_y = d_mul(ratio, chem_y);
+
+            d64 e_denom = d_add(remaining, m_load(params, 39u));
+            if (!d_finite(e_denom) || d_eq(e_denom, 0ul)) {
+                outcome[0] = STATUS_CLAMP;
+                return;
+            }
+            d64 energy_gate = d_div(remaining, e_denom);
+            d64 prop_mag =
+                d_mul(d_mul(d_mul(m_load(params, 37u), m_load(params, 17u)), energy_gate), m_prop);
+            ax = d_add(grad_x, d_mul(prop_mag, hx));
+            ay = d_add(grad_y, d_mul(prop_mag, hy));
         }
-        d64 ax = d_mul(ratio, sx);
-        d64 ay = d_mul(ratio, sy);
         if (!clamp_radius(ax, ay, m_load(params, 17u))) {
             outcome[0] = STATUS_CLAMP;
             return;

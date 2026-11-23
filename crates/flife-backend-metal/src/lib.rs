@@ -59,9 +59,10 @@ pub use field::MetalField;
 pub use flife_field::settle::{
     ChemistryConstants, ChemistryOrganism, ChemistryOutcome, ChemistryPacket, EmissionAction,
     EmissionOrganism, EmissionOutcome, ExhaustedAt, MOTION_TERMS, MUTATION_LAYERS,
-    MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome, MovementOutcome,
-    MutationBirth, MutationConstants, MutationCounts, MutationLayer, MutationValues,
-    ProposalConstants, ProposalOrganism, ProposalOutcome,
+    MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome, MotionV2Extras,
+    MotorSteeringConstants, MotorSteeringInputs, MovementOutcome, MutationBirth, MutationConstants,
+    MutationCounts, MutationLayer, MutationValues, ProposalConstants, ProposalOrganism,
+    ProposalOutcome,
 };
 /// The memory a controller backend may hold (FL-043), for composition
 /// roots that make one through [`ControllerChoice::backend`].

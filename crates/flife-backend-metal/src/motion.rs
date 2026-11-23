@@ -27,7 +27,7 @@
 use flife_core::CoreError;
 use flife_field::settle::{
     ExhaustedAt, MOTION_TERMS, MaintenanceOutcome, MotionConstants, MotionOrganism, MotionOutcome,
-    MovementOutcome,
+    MotionV2Extras, MotorSteeringConstants, MovementOutcome,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -44,10 +44,12 @@ pub const MOTION_MSL: &str = concat!(
 );
 
 /// `motion.metal`'s layouts, in words.
-const PARAMS: usize = 31;
-const ORGANISM: usize = 17 + 6 * MOTION_TERMS;
+const PARAMS: usize = 41;
+const ORGANISM: usize = 17 + 6 * MOTION_TERMS + 10;
 const RESPONSE: usize = 17;
 const GRADIENTS: usize = RESPONSE + 2 * MOTION_TERMS;
+const BASAL_MULT: usize = GRADIENTS + 4 * MOTION_TERMS;
+const MOTOR: usize = BASAL_MULT + 2;
 const OUTCOME: usize = 32;
 /// Words per row of [`MetalMotion::motion_ops`]'s results.
 pub const MOTION_OPS_WORDS: usize = 8;
@@ -73,6 +75,7 @@ fn status_name(status: u32) -> &'static str {
         7 => "a clamp the device cannot carry",
         8 => "a motion cost that is not finite",
         9 => "a displaced position that is not finite",
+        10 => "a motor steering control outside [-1, 1] or non-finite",
         _ => "an unknown status",
     }
 }
@@ -154,8 +157,80 @@ impl MetalMotion {
         organisms: &[MotionOrganism],
         out: &mut Vec<MotionOutcome>,
     ) -> Result<(), CoreError> {
+        self.settle_inner(constants, None, organisms, None, out)
+    }
+
+    /// Settle every organism's maintenance and motion with `field-ecology-v2`
+    /// extensions (`V2-03` `senescence` `basal_multiplier` and `V2-05`
+    /// `so2-motor` steering), matching the reference bit for bit.
+    ///
+    /// # Errors
+    /// - [`CoreError::LayoutMismatch`] if `extras.len() != organisms.len()`.
+    /// - [`CoreError::NumericalInvalid`] for baseline or `so2-motor` constants
+    ///   outside their ranges.
+    /// - [`CoreError::StateConflict`] when `motor_constants` is `None` while a
+    ///   live organism carries nonzero motor steering, or when any organism
+    ///   meets an input the reference refuses or a value the device cannot carry.
+    /// - [`CoreError::Overflow`] for a call too large to describe in `u32`.
+    ///
+    /// On error `out` is left empty.
+    pub fn settle_v2(
+        &mut self,
+        constants: &MotionConstants,
+        motor_constants: Option<&MotorSteeringConstants>,
+        organisms: &[MotionOrganism],
+        extras: &[MotionV2Extras],
+        out: &mut Vec<MotionOutcome>,
+    ) -> Result<(), CoreError> {
+        if organisms.len() != extras.len() {
+            out.clear();
+            return Err(CoreError::LayoutMismatch {
+                buffer: "motion v2 extras",
+                detail: format!("{} extras for {} organisms", extras.len(), organisms.len()),
+            });
+        }
+        self.settle_inner(constants, motor_constants, organisms, Some(extras), out)
+    }
+
+    fn settle_inner(
+        &mut self,
+        constants: &MotionConstants,
+        motor_constants: Option<&MotorSteeringConstants>,
+        organisms: &[MotionOrganism],
+        extras: Option<&[MotionV2Extras]>,
+        out: &mut Vec<MotionOutcome>,
+    ) -> Result<(), CoreError> {
         out.clear();
         check_constants(constants)?;
+        let motor_params = match motor_constants {
+            Some(mc) => {
+                check_motor_constants(mc)?;
+                *mc
+            }
+            None => MotorSteeringConstants {
+                energy_gradient_gain: 0.0,
+                chemical_gradient_gain: 0.0,
+                chiral_contour_gain: 0.0,
+                heading_propulsion_fraction: 0.0,
+                internal_energy_scale: 1.0,
+            },
+        };
+        if motor_constants.is_none()
+            && let Some(extras) = extras
+            && let Some((index, _)) = organisms
+                .iter()
+                .zip(extras)
+                .enumerate()
+                .find(|(_, (organism, extra))| !organism.exhausted && !extra.motor.is_zero())
+        {
+            return Err(CoreError::StateConflict {
+                operation: "metal motion",
+                detail: format!(
+                    "organism {index} supplied non-zero so2-motor steering without \
+                     MotorSteeringConstants"
+                ),
+            });
+        }
         if organisms.is_empty() {
             return Ok(());
         }
@@ -177,6 +252,11 @@ impl MetalMotion {
             (25, constants.world_width),
             (27, constants.world_height),
             (29, constants.sensor_scale_exponent),
+            (31, motor_params.energy_gradient_gain),
+            (33, motor_params.chemical_gradient_gain),
+            (35, motor_params.chiral_contour_gain),
+            (37, motor_params.heading_propulsion_fraction),
+            (39, motor_params.internal_energy_scale),
         ] {
             put(&mut params, at, constant);
         }
@@ -185,7 +265,10 @@ impl MetalMotion {
         host.clear();
         host.try_reserve(organisms.len().saturating_mul(ORGANISM))
             .map_err(|_| overflow())?;
-        for organism in organisms {
+        for (index, organism) in organisms.iter().enumerate() {
+            let extra = extras
+                .and_then(|slice| slice.get(index).copied())
+                .unwrap_or(MotionV2Extras::IDENTITY);
             let mut row = [0_u32; ORGANISM];
             put(&mut row, 0, organism.remaining);
             row[2] = u32::from(organism.exhausted);
@@ -207,6 +290,11 @@ impl MetalMotion {
                 put(&mut row, GRADIENTS + 4 * term, gradient[0]);
                 put(&mut row, GRADIENTS + 4 * term + 2, gradient[1]);
             }
+            put(&mut row, BASAL_MULT, extra.basal_multiplier);
+            put(&mut row, MOTOR, extra.motor.energy_gradient);
+            put(&mut row, MOTOR + 2, extra.motor.chemical_gradient);
+            put(&mut row, MOTOR + 4, extra.motor.chiral_contour);
+            put(&mut row, MOTOR + 6, extra.motor.heading_propulsion);
             host.extend_from_slice(&row);
         }
 
@@ -412,6 +500,52 @@ fn check_constants(constants: &MotionConstants) -> Result<(), CoreError> {
         ("world height", world_height, world_height > 0.0),
     ];
     for (quantity, value, admissible) in checks {
+        if !value.is_finite() || !admissible {
+            return Err(CoreError::NumericalInvalid {
+                quantity,
+                detail: format!("{value} is out of range"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Admitted ranges of `V2-05` (`so2-motor`) steering constants.
+fn check_motor_constants(constants: &MotorSteeringConstants) -> Result<(), CoreError> {
+    let MotorSteeringConstants {
+        energy_gradient_gain,
+        chemical_gradient_gain,
+        chiral_contour_gain,
+        heading_propulsion_fraction,
+        internal_energy_scale,
+    } = *constants;
+    for (quantity, value, admissible) in [
+        (
+            "v2.motor.energy_gradient_gain",
+            energy_gradient_gain,
+            energy_gradient_gain >= 0.0,
+        ),
+        (
+            "v2.motor.chemical_gradient_gain",
+            chemical_gradient_gain,
+            chemical_gradient_gain >= 0.0,
+        ),
+        (
+            "v2.motor.chiral_contour_gain",
+            chiral_contour_gain,
+            chiral_contour_gain >= 0.0,
+        ),
+        (
+            "v2.motor.heading_propulsion_fraction",
+            heading_propulsion_fraction,
+            (0.0..=1.0).contains(&heading_propulsion_fraction),
+        ),
+        (
+            "sensors.internal_energy_scale",
+            internal_energy_scale,
+            internal_energy_scale > 0.0,
+        ),
+    ] {
         if !value.is_finite() || !admissible {
             return Err(CoreError::NumericalInvalid {
                 quantity,

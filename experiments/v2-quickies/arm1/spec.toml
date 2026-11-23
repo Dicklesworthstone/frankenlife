@@ -1,0 +1,36 @@
+schema = "frankenlife.experiment.v1"
+name = "v2-quickie-arm1-neural-agency-128"
+hypothesis = """V2-10 Quickie Arm 1 (Neural Agency H2): on a 128x128 periodic pure-field \
+(INV-08) world with emission disabled (emission.maximum_fractional_rate_per_second = 0.0), \
+combining V2-05 so2-motor, V2-02 ephemeral oases, and V2-03 Gompertz senescence evolves \
+closed-loop neural foraging agency over 4,096 ticks (32 simulated seconds). \
+Exact controls: field-ecology-v2-fixed-controller (traits mutate, weights frozen), \
+field-ecology-v2-chemistry-only (zero-output actions, identical neural cost), and \
+no-oases (v2.oases.enabled = false, uniform source power). \
+Preregistered pass gate: treatment beats fixed-controller by >= 15-20% biomass or >= 25% \
+harvest efficiency AND evolves |corr(m_e, dE/dt)| >= 0.25 (or |corr(m_e, E)| >= 0.25) on \
+>= 3/4 discovery seeds and holds on both held-out seeds."""
+base = "../arm1-neural-agency-128.toml"
+ticks = 4096
+metrics_every = 512
+control = "treatment"
+selection = "No selection: every condition runs on all 4 discovery and 2 held-out seeds; every run (complete, extinct, paused, or failed) is cataloged and reported."
+
+[seeds]
+discovery = [101, 102, 103, 104]
+held_out = [2101, 2102]
+
+[[conditions]]
+name = "treatment"
+
+[[conditions]]
+name = "fixed-controller"
+ablation = "fixed-controller"
+
+[[conditions]]
+name = "chemistry-only"
+ablation = "chemistry-only"
+
+[[conditions]]
+name = "no-oases"
+set = { "v2.oases.enabled" = false }

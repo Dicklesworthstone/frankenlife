@@ -11,8 +11,9 @@
 
 // params: [0] organisms, [1] the grid's columns and [2] rows; then word
 // pairs: [3] the transfer efficiency, [5] the world's width and [7] height,
-// [9] a cell's width and [11] height.
-constant uint E_PARAMS = 13u;
+// [9] a cell's width and [11] height, and [13] V2-04 surplus-emission energy
+// floor (0.0 for v1 / disabled surplus-emission).
+constant uint E_PARAMS = 15u;
 
 // An organism: word pairs [0] its budget's remaining energy; [2] whether
 // it emits, a word; word pairs [3] its spend fraction, [5] its position,
@@ -82,7 +83,9 @@ kernel void emission_settle(
             outcome[0] = STATUS_FRACTION;
             return;
         }
-        d64 requested = d_min(d_mul(fraction, available), available);
+        d64 floor = e_load(params, 13u);
+        d64 surplus = ((floor << 1) == 0ul) ? available : d_max(d_sub(available, floor), 0ul);
+        d64 requested = d_min(d_mul(fraction, surplus), available);
         if (!d_eq(requested, 0ul)) {
             d64 offered = d_mul(e_load(params, 3u), requested);
 

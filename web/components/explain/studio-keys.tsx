@@ -97,9 +97,16 @@ export function StudioKeys() {
             {selected}
           </span>
           <div className="min-w-0">
-            <p className="text-[10px] font-black tracking-[0.2em] uppercase" style={{ color: COLOR[shown.group] }}>
-              {shownGroup?.name}
-            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-[10px] font-black tracking-[0.2em] uppercase" style={{ color: COLOR[shown.group] }}>
+                {shownGroup?.name}
+              </p>
+              {shown.v2 ? (
+                <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 font-mono text-[9px] font-medium tracking-[0.08em] text-cyan-200 uppercase">
+                  V2 · v2-visual-mappings
+                </span>
+              ) : null}
+            </div>
             <p className="mt-1 text-sm leading-relaxed text-slate-200">{shown.action}</p>
           </div>
         </div>
@@ -148,9 +155,17 @@ export function StudioKeys() {
         <p className="flex items-start gap-2 text-xs leading-relaxed text-slate-400">
           <Monitor className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" aria-hidden="true" />
           <span>
-            The Studio is macOS, drawn through Metal. Look, field, camera and selection keys change only the picture:
-            nine styles of one 1,200-tick render all end at the same digest. Brushes are commands: each one is applied by
-            the session at its next open boundary and reported with the tick it applied at and the energy it moved.
+            The Studio is macOS, drawn through Metal. Look, field, camera and selection keys change only the picture
+            (INV-09): nine styles of one 1,200-tick render all end at the same digest, and keys 8, 9 and C&apos;s V2
+            overlays remain read-only with zero cost on v1. Brushes are commands applied at the next open boundary.
+            Headless Cinema export (<code className="text-slate-300">flife-studio --export</code>) replays timelines at{" "}
+            <code className="text-slate-300">--export-size 1080p|4k|WxH</code>, constant{" "}
+            <code className="text-slate-300">--export-fps</code>, exact tick sampling (
+            <code className="text-slate-300">--export-every-ticks</code>) and JSON camera paths (
+            <code className="text-slate-300">--export-camera</code>); founding-only V2 flags (
+            <code className="text-slate-300">--disable</code>, <code className="text-slate-300">--enable</code>,{" "}
+            <code className="text-slate-300">--v1-compat</code>) are refused with{" "}
+            <code className="text-slate-300">--resume</code>.
           </span>
         </p>
       </div>

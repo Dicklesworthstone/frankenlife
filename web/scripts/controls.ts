@@ -1,7 +1,7 @@
 // Render the film's world beside its model's two controls at one tick, and
 // write their manifest (lib/controls.json).
 //
-//   bun scripts/controls.ts --flife PATH --work DIR [--cpu-workers N] [--parallel 2]
+//   bun scripts/controls.ts --flife PATH --work DIR [--size 1080|2160] [--cpu-workers N] [--parallel 2]
 //
 // - The world is presets/confluent-world.toml, the film's (lib/media.json's
 //   world.preset), at its seed. The controls are that preset with only its
@@ -41,15 +41,15 @@ import { arch, cpus, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { parseControlsArgs } from "./media-options";
+
 const WEB = fileURLToPath(new URL("..", import.meta.url));
 const REPO = resolve(WEB, "..");
 const PRESET = "presets/confluent-world.toml";
 const RECORD_JSON = "experiments/showcase/confluent.json";
 const RECORD_README = "experiments/showcase/README.md";
 const TICK = 2400;
-const SIZE = 1080;
 const STYLE = ["--no-field", "--look", "sphere", "--color", "lineage-energy"];
-const RENDER = ["--ticks", String(TICK), "--every", String(TICK), "--width", String(SIZE), "--height", String(SIZE), ...STYLE];
 const JPEG = ["-q:v", "3"];
 
 /** The three conditions, in the order the figure shows them. */
@@ -89,21 +89,6 @@ const CONDITIONS = [
 function fail(message: string): never {
   console.error(`controls: ${message}`);
   process.exit(1);
-}
-
-function options(): Map<string, string> {
-  const args = process.argv.slice(2);
-  const found = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index];
-    const value = args[index + 1];
-    if (!key?.startsWith("--") || value === undefined) fail(`expected --name value pairs, got ${args.join(" ")}`);
-    found.set(key.slice(2), value);
-  }
-  for (const key of found.keys()) {
-    if (!["flife", "work", "cpu-workers", "parallel"].includes(key)) fail(`unknown option --${key}`);
-  }
-  return found;
 }
 
 function run(command: string, args: string[]): string {
@@ -155,11 +140,15 @@ function host(): string {
   return `${cpus()[0]?.model ?? arch()}, ${platform()}`;
 }
 
-const flags = options();
-const flife = resolve(flags.get("flife") ?? fail("--flife is required"));
-const work = resolve(flags.get("work") ?? fail("--work is required"));
-const workers = flags.has("cpu-workers") ? ["--cpu-workers", flags.get("cpu-workers") as string] : [];
-const parallel = Math.max(1, Number(flags.get("parallel") ?? "2") || 1);
+let opts;
+try {
+  opts = parseControlsArgs(process.argv.slice(2));
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
+}
+const { flife, work, size, cpuWorkers, parallel } = opts;
+const RENDER = ["--ticks", String(TICK), "--every", String(TICK), "--width", String(size), "--height", String(size), ...STYLE];
+const workers = cpuWorkers !== null ? ["--cpu-workers", String(cpuWorkers)] : [];
 
 const film = JSON.parse(readFileSync(join(WEB, "lib", "media.json"), "utf8")) as {
   world: { preset: string | null; seed: number; from: { tick: number; digest: string } };
@@ -236,7 +225,7 @@ const stills = CONDITIONS.map((condition) => {
     fail(`${condition.id} was drawn ${String(end.look)}, ${String(end.mapping)}, field ${String(end.field)}; not ${STYLE.join(" ")}`);
   }
   const frame = readFileSync(String(last.path));
-  if (frame.readUInt32BE(16) !== SIZE || frame.readUInt32BE(20) !== SIZE) fail(`${String(last.path)} is not ${SIZE} × ${SIZE}`);
+  if (frame.readUInt32BE(16) !== size || frame.readUInt32BE(20) !== size) fail(`${String(last.path)} is not ${size} × ${size}`);
   const trial = trials.find((each) => each.trial === condition.trial) ?? fail(`${RECORD_JSON} has no trial ${condition.trial}`);
   if (trial.model !== condition.model || trial.seed !== film.world.seed || trial.tick !== TICK) {
     fail(`${condition.trial} is ${trial.model} seed ${trial.seed} at tick ${trial.tick}, not this condition`);
@@ -272,8 +261,8 @@ const stills = CONDITIONS.map((condition) => {
     poster,
     sha256: hash,
     bytes: readFileSync(jpeg).length,
-    width: SIZE,
-    height: SIZE,
+    width: size,
+    height: size,
     tick: TICK,
     live: last.live as number,
     digest: end.digest as string,

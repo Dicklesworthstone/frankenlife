@@ -35,7 +35,10 @@ use std::ops::{Deref, DerefMut};
 
 use flife_core::memory::capacity_bytes;
 use flife_core::model::{MAXIMUM_HIDDEN_LAYERS, dense_parameter_count};
-use flife_core::numerics::{sigmoid, tanh_f32};
+use flife_core::numerics::{
+    normalize_turns, shrink_to_left_fold_norm_limit, sigmoid, sin_cos_turns,
+    symplectic_rotate_channels, tanh_f32,
+};
 use flife_core::{CoreError, ValidatedConfig};
 
 use crate::actions::{ACTION_WIDTH, ActionLayout, MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH};
@@ -260,8 +263,10 @@ impl RawOutputs {
 ///
 /// For each state unit `k ∈ 0..S`:
 /// - `cand_k = tanh_f32(raw_tail[k])`
-/// - `gate_k = sigmoid(f64::from(raw_tail[S + k]) + gate_bias) as f32`
-///   (with `gate_bias == 0.0` passing `f64::from(raw_tail[S + k])` unmodified)
+/// - `gate_k = sigmoid(f64::from(raw_tail[S + k]) - gate_bias) as f32`
+///   (with `gate_bias == 0.0` passing `f64::from(raw_tail[S + k])` unmodified
+///   so `v1` `FL-054` remains bit-exact, and positive `b_epi = 2.5` closing
+///   the gate to `σ(-2.5) ≈ 0.076` at `z_g = 0`)
 /// - `next_state[k] = ((1.0_f32 - gate_k) * state[k] + gate_k * cand_k).clamp(-1.0, 1.0)`
 ///
 /// # Errors
@@ -329,7 +334,7 @@ pub fn update_recurrent_state(
         let gate_arg = if gate_bias == 0.0 {
             f64::from(z_g)
         } else {
-            f64::from(z_g) + gate_bias
+            f64::from(z_g) - gate_bias
         };
         let gate = sigmoid(gate_arg).ok_or_else(|| CoreError::NumericalInvalid {
             quantity: "recurrent gate pre-activation",
@@ -351,6 +356,70 @@ pub fn update_recurrent_state(
         next_state[k] = updated;
     }
     Ok(())
+}
+
+/// Rotate a 32-channel chemical affinity vector `affinity` in the `(a, J a)`
+/// symplectic plane by angle `(π / 2) · h0` for bounded epigenetic state
+/// `h0 ∈ [-1.0, 1.0]` (`V2-12` clonal metabolic caste differentiation):
+///
+/// `a_eff(h0) = cos((π / 2) h0) · a + sin((π / 2) h0) · J a`
+///
+/// Wraps `0.25 * f64::from(h0)` through [`flife_core::numerics::normalize_turns`]
+/// before [`flife_core::numerics::sin_cos_turns`] so negative `h0 ∈ [-1, 0)`
+/// maps cleanly into `[0.75, 1.0)` without triggering `sin_cos_turns`'s
+/// negative-turn refusal. Applies [`flife_core::numerics::symplectic_rotate_channels`]
+/// over `0..active_channels` (`32` single-carrier or `24` Carrier-0 under
+/// `V2-15`; trailing unpaired/Carrier-1 channels are preserved untouched from
+/// `affinity`) and enforces exact left-fold `‖a_eff‖₂² ≤ norm_limit²` via
+/// [`flife_core::numerics::shrink_to_left_fold_norm_limit`].
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `h0` is nonfinite or outside `[-1, 1]`,
+/// `active_channels > 32`, `norm_limit` is nonfinite/nonpositive, any component
+/// of `affinity` is nonfinite, or norm-limit enforcement fails.
+pub fn rotate_epigenetic_affinity(
+    affinity: &[f64; 32],
+    h0: f32,
+    active_channels: usize,
+    norm_limit: f64,
+) -> Result<[f64; 32], CoreError> {
+    if !h0.is_finite() || !(-1.0_f32..=1.0_f32).contains(&h0) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "epigenetic state h0",
+            detail: format!("h0 = {h0} is outside [-1, 1]"),
+        });
+    }
+    let phase =
+        normalize_turns(0.25 * f64::from(h0)).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "epigenetic rotation phase",
+            detail: format!("could not normalize turn angle for h0 = {h0}"),
+        })?;
+    let (sin_a, cos_a) = sin_cos_turns(phase).ok_or_else(|| CoreError::NumericalInvalid {
+        quantity: "epigenetic rotation phase",
+        detail: format!("normalized phase {phase} left [0, 1)"),
+    })?;
+    let ja = symplectic_rotate_channels(affinity, active_channels, norm_limit)?;
+    let rotated_end = (active_channels / 2) * 2;
+    let mut out = *affinity;
+    if sin_a == 0.0 {
+        for (dst, &src) in out[..rotated_end].iter_mut().zip(&affinity[..rotated_end]) {
+            *dst = cos_a * src;
+        }
+    } else if cos_a == 0.0 {
+        for (dst, &j) in out[..rotated_end].iter_mut().zip(&ja[..rotated_end]) {
+            *dst = sin_a * j;
+        }
+    } else {
+        for ((dst, &src), &j) in out[..rotated_end]
+            .iter_mut()
+            .zip(&affinity[..rotated_end])
+            .zip(&ja[..rotated_end])
+        {
+            *dst = cos_a * src + sin_a * j;
+        }
+    }
+    shrink_to_left_fold_norm_limit(&mut out, norm_limit)?;
+    Ok(out)
 }
 
 /// A dense topology `input_width → hidden… → output_width` with one or two

@@ -200,6 +200,40 @@ fn e2e_cli_toggle_boundary_and_checkpoint_provenance() {
     assert_eq!(inspected[0]["model"], "field-ecology-v2");
     assert_eq!(inspected[0]["v2_features"], serde_json::json!(["oases"]));
     assert_eq!(inspected[0]["inv08_pure_field"], true);
+    assert!(
+        inspected[1].get("secretory_readiness").is_none(),
+        "secretory_readiness must be omitted when excitable-relay is disabled"
+    );
+
+    // 5b. With `--enable excitable-relay`, `flife inspect` exposes `secretory_readiness` in [0, 1].
+    let excitable_dir = dir.join("run_excitable");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&v2_path),
+        "--disable",
+        "all-v2",
+        "--enable",
+        "excitable-relay",
+        "--ticks",
+        "8",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&excitable_dir),
+        "--checkpoint-every",
+        "8",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let (status, inspected_ex, err) = flife(&["inspect", text(&excitable_dir)]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let readiness = inspected_ex[1]["secretory_readiness"]
+        .as_f64()
+        .expect("secretory_readiness exposed when excitable-relay enabled");
+    assert!((0.0..=1.0).contains(&readiness));
 
     // Uninterrupted 24-tick oracle with the same toggles.
     let (status, uninterrupted, err) = flife(&[

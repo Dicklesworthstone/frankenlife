@@ -968,6 +968,18 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     },
     AlgorithmEntry {
         status: Status::Implemented {
+            evidence: "test:flife-manim::tests/v2_visual_mappings.rs::cell_state_and_polarity_color_mapping_finite_and_distinct",
+        },
+        ..entry("cell-state-v1", Role::ColorMapping, "V2-16", "V2-16")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-manim::tests/v2_visual_mappings.rs::cell_state_and_polarity_color_mapping_finite_and_distinct",
+        },
+        ..entry("polarity-v1", Role::ColorMapping, "V2-16", "V2-16")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
             evidence: "test:flife-render::tests/interpolation.rs::interpolation_follows_each_organism_on_its_true_path_across_the_seams",
         },
         ..entry(

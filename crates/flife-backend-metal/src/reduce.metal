@@ -117,6 +117,7 @@ kernel void deposits_reduce(
     uint first = offsets[cell];
     uint end = offsets[cell + 1u];
     if (first >= end) {
+        r_store(received, 2u * cell, 0ul);
         return;
     }
     uint before_bits = field[cell];

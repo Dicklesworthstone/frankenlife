@@ -9,7 +9,7 @@
 use flife_core::CoreError;
 use flife_core::model::MOMENT_CHANNELS;
 
-use crate::grid::{FIELD_PLANES, FieldGrid};
+use crate::grid::{DUAL_CARRIER_PLANES, FIELD_PLANES, FieldGrid};
 use crate::layout::HOST_ALIGNMENT;
 
 /// The largest single buffer a backend can allocate or bind.
@@ -75,11 +75,26 @@ pub struct FieldFootprint {
 }
 
 impl FieldFootprint {
-    /// The footprint of `grid`.
+    /// The 33-plane single-carrier footprint of `grid`.
     ///
     /// # Errors
     /// [`CoreError::Overflow`] past `u64::MAX`.
     pub fn of(grid: &FieldGrid) -> Result<Self, CoreError> {
+        Self::of_planes(grid, FIELD_PLANES)
+    }
+
+    /// The footprint of `grid` with `planes` (`33` single-carrier or `34`
+    /// dual-carrier, `V2-15` / `FL-055`).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for an unsupported plane count, or
+    /// [`CoreError::Overflow`] past `u64::MAX`.
+    pub fn of_planes(grid: &FieldGrid, planes: u32) -> Result<Self, CoreError> {
+        if planes != FIELD_PLANES && planes != DUAL_CARRIER_PLANES {
+            return Err(crate::layout::mismatch(format!(
+                "{planes} planes where {FIELD_PLANES} or {DUAL_CARRIER_PLANES} are supported"
+            )));
+        }
         let overflow = || CoreError::Overflow {
             quantity: "field footprint bytes",
         };
@@ -89,7 +104,7 @@ impl FieldFootprint {
             .checked_mul(u64::from(MOMENT_CHANNELS))
             .ok_or_else(overflow)?;
         let state_bytes = energy_plane_bytes
-            .checked_mul(u64::from(FIELD_PLANES))
+            .checked_mul(u64::from(planes))
             .ok_or_else(overflow)?;
         let pair_bytes = state_bytes.checked_mul(2).ok_or_else(overflow)?;
         Ok(Self {
@@ -99,6 +114,21 @@ impl FieldFootprint {
             state_bytes,
             pair_bytes,
         })
+    }
+
+    /// Bytes required by one `FieldState`'s optional `V2-14` vascular edge
+    /// buffers (`edge_x_cond` + `edge_y_cond`, `8 B/cell`; `16 B/cell` across a
+    /// ping-pong `FieldPair`).
+    ///
+    /// # Errors
+    /// [`CoreError::Overflow`] past `u64::MAX`.
+    pub fn vascular_edge_bytes(grid: &FieldGrid) -> Result<u64, CoreError> {
+        grid.cell_count()
+            .checked_mul(HOST_ALIGNMENT)
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or(CoreError::Overflow {
+                quantity: "vascular edge bytes",
+            })
     }
 
     /// Admit one complete field state as a single buffer.

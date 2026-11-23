@@ -1,5 +1,5 @@
-//! The field under the organisms (plan §13.3, §9.5): the epoch's bounded
-//! [`FieldTexture`] drawn as one texture covering the torus (FL-033).
+//! The field under the organisms (plan §13.3, §9.5; `V2-16`): the epoch's
+//! bounded [`FieldTexture`] drawn as one texture covering the torus (FL-033).
 //!
 //! In the energy mapping each texel's energy density maps through a fixed
 //! dark-to-bright palette (the raw look: linear grey). In the composition
@@ -10,7 +10,14 @@
 //! energy is black. A component mapping (§13.4's chosen components) does
 //! the same with one moment channel per unit energy, its texels'
 //! density-weighted mean through the diverging [`COMPONENT_PALETTE`].
-//! The display scale follows the brightest texels with a slow decay, so the
+//! In `V2-16`'s `TrailCarrier` and `VascularConductance` mappings, each corner
+//! averages the optional Carrier-1 trail energy (`FieldTexture::trail_energy`)
+//! or Murray/Physarum conductance (`FieldTexture::vascular_conductance`) across
+//! its four wrapping texels, mapping through a log perceptual ramp and
+//! [`crate::TRAIL_CARRIER_PALETTE`] / [`crate::VASCULAR_CONDUCTANCE_PALETTE`]
+//! for glow, or honest linear grey for raw/sphere, each with its own
+//! independent decaying display scale.
+//! The display scales follow the brightest texels with a slow decay, so the
 //! picture neither flickers nor saturates as the sources wander. The
 //! layer's texture holds the colour of every texel corner, the mean of the
 //! four texels around it, wrapping across the seam, and
@@ -19,7 +26,7 @@
 //! CPU and Metal 3D routes both sample textures. The layer is one scene
 //! object and one draw of two triangles, whatever the field's size.
 //!
-//! The texture depends only on the field's values (and compositions, in
+//! The texture depends only on the active plane's values (and compositions, in
 //! the composition mapping, or the chosen channel's components, in a
 //! component mapping) and texels, the display scale, the look and the
 //! mapping; the viewport moves only the quad. The layer keeps a copy of
@@ -32,7 +39,8 @@ use flife_render::{COMPONENT_STEPS, FieldTexture};
 use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
 use crate::Viewport;
-use crate::mapping::{FieldMapping, Look, affinity_rgb8, linear_table, linear_with_table};
+use crate::mapping::{FieldMapping, Look, affinity_rgb8, linear_table, linear_with_table, ramp};
+use crate::v2::{TRAIL_CARRIER_PALETTE, VASCULAR_CONDUCTANCE_PALETTE, overlay_log_value};
 
 /// The field palette, dark to bright, as sRGB stops evenly spaced in the
 /// mapped value.
@@ -172,11 +180,17 @@ pub struct FieldLayer {
     quad: Option<SurfaceMesh>,
     /// Viewport/grid key `quad` was built for, so unchanged views keep it.
     quad_key: Option<QuadKey>,
+    /// Decaying display scale for Carrier-0 energy density (`values`).
     scale: f64,
+    /// Independent decaying display scale for Carrier-1 trail energy (`V2-16`).
+    trail_scale: f64,
+    /// Independent decaying display scale for vascular conductance (`V2-16`).
+    vascular_scale: f64,
     /// What the texture was built from, apart from the values: the normalized
-    /// look, the mapping, the display scale's bits and the texels.
+    /// look, the mapping, the active display scale's bits and the texels.
     built: Option<(Look, FieldMapping, u64, [u32; 2])>,
-    /// The field values the texture was built from, one `f32` a texel.
+    /// The active scalar plane the texture was built from, one `f32` a texel
+    /// (empty when a v2 overlay mapping rendered an absent optional plane).
     built_values: Vec<f32>,
     /// The compositions it was built from in the composition mapping; empty
     /// in the others.
@@ -186,7 +200,29 @@ pub struct FieldLayer {
     built_component: Vec<i8>,
 }
 
-/// `field`'s values, compositions and components fill its texels.
+/// Snapshot of the three independent field display scales.
+#[derive(Debug, Clone, Copy)]
+struct FieldScales {
+    energy: f64,
+    trail: f64,
+    vascular: f64,
+}
+
+impl FieldScales {
+    #[inline]
+    const fn for_mapping(self, mapping: FieldMapping) -> f64 {
+        match mapping {
+            FieldMapping::TrailCarrier => self.trail,
+            FieldMapping::VascularConductance => self.vascular,
+            FieldMapping::Energy | FieldMapping::Composition | FieldMapping::Component(_) => {
+                self.energy
+            }
+        }
+    }
+}
+
+/// `field`'s values, compositions, components and any optional v2 overlays
+/// fill its texels.
 pub(crate) fn check_layout(field: &FieldTexture) -> Result<(), CoreError> {
     let [columns, rows] = field.texels().map(|n| n as usize);
     let (values, composition, components) =
@@ -206,13 +242,31 @@ pub(crate) fn check_layout(field: &FieldTexture) -> Result<(), CoreError> {
             ),
         });
     }
+    if let Some(trail) = field.trail_energy()
+        && trail.len() != values.len()
+    {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "field layer trail overlay",
+            detail: format!("{} trail values for {columns} x {rows} texels", trail.len()),
+        });
+    }
+    if let Some(vascular) = field.vascular_conductance()
+        && vascular.len() != values.len()
+    {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "field layer vascular overlay",
+            detail: format!(
+                "{} vascular values for {columns} x {rows} texels",
+                vascular.len()
+            ),
+        });
+    }
     Ok(())
 }
 
-/// Display scale updated for `field`'s brightest finite texel.
-fn next_scale(field: &FieldTexture, previous: f64) -> f64 {
-    let brightest = field
-        .values()
+/// Display scale updated for `plane`'s brightest finite texel.
+fn next_plane_scale(plane: &[f32], previous: f64) -> f64 {
+    let brightest = plane
         .iter()
         .copied()
         .filter(|value| value.is_finite())
@@ -266,10 +320,37 @@ impl FieldLayer {
             quad: None,
             quad_key: None,
             scale: 0.0,
+            trail_scale: 0.0,
+            vascular_scale: 0.0,
             built: None,
             built_values: Vec::new(),
             built_composition: Vec::new(),
             built_component: Vec::new(),
+        }
+    }
+
+    #[inline]
+    const fn scales(&self) -> FieldScales {
+        FieldScales {
+            energy: self.scale,
+            trail: self.trail_scale,
+            vascular: self.vascular_scale,
+        }
+    }
+
+    fn next_scales(&self, field: &FieldTexture) -> FieldScales {
+        FieldScales {
+            energy: next_plane_scale(field.values(), self.scale),
+            trail: field
+                .trail_energy()
+                .map_or(self.trail_scale * SCALE_DECAY, |plane| {
+                    next_plane_scale(plane, self.trail_scale)
+                }),
+            vascular: field
+                .vascular_conductance()
+                .map_or(self.vascular_scale * SCALE_DECAY, |plane| {
+                    next_plane_scale(plane, self.vascular_scale)
+                }),
         }
     }
 
@@ -292,31 +373,44 @@ impl FieldLayer {
         self.update_mapped(field, look, FieldMapping::Energy)
     }
 
-    /// Update only the display scale for `field`, without building an unused
+    /// Update only the display scales for `field`, without building an unused
     /// texture when the style does not draw the field.
     pub(crate) fn track_scale(&mut self, field: &FieldTexture) -> Result<(), CoreError> {
         check_layout(field)?;
-        self.scale = next_scale(field, self.scale);
+        let next = self.next_scales(field);
+        self.scale = next.energy;
+        self.trail_scale = next.trail;
+        self.vascular_scale = next.vascular;
         Ok(())
     }
 
     /// Map `field` into the layer's texture by `mapping` in `look`, and let
-    /// the display scale follow its brightest texel. Energy: through the
-    /// square-root palette for the glow look, as linear grey
-    /// ([`raw_value`]) for raw. Composition: each corner the
-    /// [`affinity_rgb8`] colour of its texels' density-weighted mean
-    /// composition, scaled in linear light by the energy's
-    /// [`display_value`] for the glow look or [`raw_value`] for raw. A
-    /// component: each corner the [`component_rgb8`] colour of its texels'
-    /// density-weighted mean channel per unit energy
-    /// ([`corner_component`]), scaled the same way.
+    /// the display scales follow the brightest texel of Carrier-0 energy and
+    /// any present optional v2 overlay planes independently.
+    ///
+    /// - Energy: through the square-root palette for the glow look, as linear
+    ///   grey ([`raw_value`]) for raw/sphere.
+    /// - Composition: each corner the [`affinity_rgb8`] colour of its texels'
+    ///   density-weighted mean composition, scaled in linear light by the
+    ///   energy's [`display_value`] for glow or [`raw_value`] for raw/sphere.
+    /// - Component: each corner the [`component_rgb8`] colour of its texels'
+    ///   density-weighted mean channel per unit energy ([`corner_component`]),
+    ///   scaled the same way.
+    /// - `TrailCarrier` / `VascularConductance` (`V2-16`): each corner the
+    ///   four-texel wrapped mean of `FieldTexture::trail_energy` or
+    ///   `FieldTexture::vascular_conductance` through
+    ///   [`crate::TRAIL_CARRIER_PALETTE`] /
+    ///   [`crate::VASCULAR_CONDUCTANCE_PALETTE`] on a log perceptual ramp for
+    ///   glow, or linear grey for raw/sphere (dark when the optional plane is
+    ///   absent).
     ///
     /// # Errors
-    /// [`CoreError::LayoutMismatch`] for a texture whose values or
-    /// compositions do not fill its texels; [`CoreError::AllocationFailed`]
-    /// when the texels cannot be reserved; [`CoreError::NumericalInvalid`]
-    /// if FrankenManim refuses the texture or the quad. The previous texture,
-    /// quad and display scale are kept on error.
+    /// [`CoreError::LayoutMismatch`] for a texture whose values, compositions,
+    /// components or optional overlay planes do not fill its texels;
+    /// [`CoreError::AllocationFailed`] when the texels cannot be reserved;
+    /// [`CoreError::NumericalInvalid`] if FrankenManim refuses the texture or
+    /// the quad. The previous texture, quad and display scales are kept on
+    /// error.
     pub fn update_mapped(
         &mut self,
         field: &FieldTexture,
@@ -324,8 +418,8 @@ impl FieldLayer {
         mapping: FieldMapping,
     ) -> Result<(), CoreError> {
         check_layout(field)?;
-        let scale = next_scale(field, self.scale);
-        self.place_at_scale(field, look, mapping, scale)
+        let scales = self.next_scales(field);
+        self.place_at_scale(field, look, mapping, scales)
     }
 
     /// Use `viewport` from the next update or placement.
@@ -343,11 +437,11 @@ impl FieldLayer {
     }
 
     /// Place `field` in the layer by `mapping` at the current viewport and
-    /// display scale, which does not move: what a pan or zoom redraws. A
-    /// texture built from bitwise the same values (and, in the composition
-    /// mapping, compositions, or in a component mapping, that channel's
-    /// components), at this scale, in this look and mapping, is kept, and
-    /// only the quad is rebuilt.
+    /// display scales, which do not move: what a pan or zoom redraws. A
+    /// texture built from bitwise the same active values (and, in the
+    /// composition mapping, compositions, or in a component mapping, that
+    /// channel's components), at this scale, in this look and mapping, is
+    /// kept, and only the quad is rebuilt.
     ///
     /// # Errors
     /// As [`FieldLayer::update_mapped`].
@@ -358,7 +452,7 @@ impl FieldLayer {
         mapping: FieldMapping,
     ) -> Result<(), CoreError> {
         check_layout(field)?;
-        self.place_at_scale(field, look, mapping, self.scale)
+        self.place_at_scale(field, look, mapping, self.scales())
     }
 
     fn place_at_scale(
@@ -366,11 +460,19 @@ impl FieldLayer {
         field: &FieldTexture,
         look: Look,
         mapping: FieldMapping,
-        scale: f64,
+        scales: FieldScales,
     ) -> Result<(), CoreError> {
         let cells = field.texels();
         let [columns, rows] = cells.map(|n| n as usize);
         let values = field.values();
+        let active_values = match mapping {
+            FieldMapping::TrailCarrier => field.trail_energy(),
+            FieldMapping::VascularConductance => field.vascular_conductance(),
+            FieldMapping::Energy | FieldMapping::Composition | FieldMapping::Component(_) => {
+                Some(values)
+            }
+        };
+        let scale = scales.for_mapping(mapping);
         let composition = field.composition();
         let composed = mapping == FieldMapping::Composition;
         let channel = mapping
@@ -380,8 +482,12 @@ impl FieldLayer {
         let normalized_look = field_look(look);
         let key = (normalized_look, mapping, scale.to_bits(), cells);
         let want_quad = quad_key(&self.viewport, cells);
+        let same_active_values = match active_values {
+            Some(plane) => same_bits(&self.built_values, plane),
+            None => self.built_values.is_empty(),
+        };
         if self.built == Some(key)
-            && same_bits(&self.built_values, values)
+            && same_active_values
             && (!composed
                 || same_bits(
                     self.built_composition.as_flattened(),
@@ -398,7 +504,9 @@ impl FieldLayer {
                 self.quad = Some(self.viewport.periodic_quad(cells)?);
                 self.quad_key = Some(want_quad);
             }
-            self.scale = scale;
+            self.scale = scales.energy;
+            self.trail_scale = scales.trail;
+            self.vascular_scale = scales.vascular;
             return Ok(());
         }
 
@@ -530,6 +638,59 @@ impl FieldLayer {
                     }
                 }
             }
+            (FieldMapping::TrailCarrier | FieldMapping::VascularConductance, _) => {
+                let glow = normalized_look == Look::Glow;
+                let stops = match mapping {
+                    FieldMapping::TrailCarrier => &TRAIL_CARRIER_PALETTE,
+                    _ => &VASCULAR_CONDUCTANCE_PALETTE,
+                };
+                if let Some(plane) = active_values {
+                    if glow {
+                        for row in 0..rows {
+                            let up_row = if row == 0 { rows - 1 } else { row - 1 };
+                            let up_slice = &plane[up_row * columns..up_row * columns + columns];
+                            let row_slice = &plane[row * columns..row * columns + columns];
+                            for column in 0..columns {
+                                let left = if column == 0 { columns - 1 } else { column - 1 };
+                                let mean = (f64::from(up_slice[left])
+                                    + f64::from(up_slice[column])
+                                    + f64::from(row_slice[left])
+                                    + f64::from(row_slice[column]))
+                                    / 4.0;
+                                let color = linear_with_table(
+                                    linear,
+                                    ramp(stops, overlay_log_value(mean as f32, scale)),
+                                );
+                                texels.push([color.r as f32, color.g as f32, color.b as f32, 1.0]);
+                            }
+                        }
+                    } else {
+                        for row in 0..rows {
+                            let up_row = if row == 0 { rows - 1 } else { row - 1 };
+                            let up_slice = &plane[up_row * columns..up_row * columns + columns];
+                            let row_slice = &plane[row * columns..row * columns + columns];
+                            for column in 0..columns {
+                                let left = if column == 0 { columns - 1 } else { column - 1 };
+                                let mean = (f64::from(up_slice[left])
+                                    + f64::from(up_slice[column])
+                                    + f64::from(row_slice[left])
+                                    + f64::from(row_slice[column]))
+                                    / 4.0;
+                                let grey = raw_value(mean as f32, scale) as f32;
+                                texels.push([grey, grey, grey, 1.0]);
+                            }
+                        }
+                    }
+                } else {
+                    let dark = if glow {
+                        let color = linear_with_table(linear, stops[0]);
+                        [color.r as f32, color.g as f32, color.b as f32, 1.0]
+                    } else {
+                        [0.0, 0.0, 0.0, 1.0]
+                    };
+                    texels.resize(columns * rows, dark);
+                }
+            }
         }
         let refused = |quantity: &'static str, detail: String| CoreError::NumericalInvalid {
             quantity,
@@ -545,14 +706,15 @@ impl FieldLayer {
         // Prepare any resized cache buffers before mutating `self` so an
         // allocation failure leaves the previous texture, quad and cache
         // intact. In steady state (`capacity() == len`) no allocation occurs.
-        let new_values = if self.built_values.capacity() == values.len() {
+        let kept_values = active_values.map_or(0, <[f32]>::len);
+        let new_values = if self.built_values.capacity() == kept_values {
             None
         } else {
             let mut buf = Vec::new();
-            buf.try_reserve_exact(values.len())
+            buf.try_reserve_exact(kept_values)
                 .map_err(|_| CoreError::AllocationFailed {
                     buffer: "field layer values",
-                    bytes: u64::try_from(values.len().saturating_mul(size_of::<f32>()))
+                    bytes: u64::try_from(kept_values.saturating_mul(size_of::<f32>()))
                         .unwrap_or(u64::MAX),
                 })?;
             Some(buf)
@@ -589,13 +751,17 @@ impl FieldLayer {
             self.quad = Some(quad);
             self.quad_key = Some(want_quad);
         }
-        self.scale = scale;
+        self.scale = scales.energy;
+        self.trail_scale = scales.trail;
+        self.vascular_scale = scales.vascular;
         if let Some(buf) = new_values {
             self.built_values = buf;
         } else {
             self.built_values.clear();
         }
-        self.built_values.extend_from_slice(values);
+        if let Some(plane) = active_values {
+            self.built_values.extend_from_slice(plane);
+        }
         if let Some(buf) = new_composition {
             self.built_composition = buf;
         } else {
@@ -617,11 +783,34 @@ impl FieldLayer {
         Ok(())
     }
 
-    /// The current display scale: the energy density shown at full
-    /// brightness.
+    /// The active mapping's current display scale: the density shown at full
+    /// brightness for the texture last built (defaulting to Carrier-0 energy
+    /// scale before any texture is built).
     #[must_use]
     pub const fn scale(&self) -> f64 {
+        match self.built {
+            Some((_, FieldMapping::TrailCarrier, _, _)) => self.trail_scale,
+            Some((_, FieldMapping::VascularConductance, _, _)) => self.vascular_scale,
+            _ => self.scale,
+        }
+    }
+
+    /// The current Carrier-0 energy display scale.
+    #[must_use]
+    pub const fn energy_scale(&self) -> f64 {
         self.scale
+    }
+
+    /// The current Carrier-1 trail overlay display scale (`V2-16`).
+    #[must_use]
+    pub const fn trail_scale(&self) -> f64 {
+        self.trail_scale
+    }
+
+    /// The current vascular conductance overlay display scale (`V2-16`).
+    #[must_use]
+    pub const fn vascular_scale(&self) -> f64 {
+        self.vascular_scale
     }
 
     /// The layer's texture once a field has been shown: one texel per

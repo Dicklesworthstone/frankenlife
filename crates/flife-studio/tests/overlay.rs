@@ -1693,46 +1693,57 @@ fn a_measurement_says_what_its_disk_holds() {
     );
 }
 
-/// V2-16: every `V2ColorMapping` (`cell-state-v1`, `polarity-v1`) paired with
-/// every `FieldOverlayKind` (`trail-carrier`, `vascular-conductance`) plus
-/// worst-case telemetry, clock, brush preview, and full inspector panel fits
+/// V2-16: `ColorMapping::CellState` and `ColorMapping::Polarity` paired with
+/// `FieldMapping::TrailCarrier` and `FieldMapping::VascularConductance` plus
+/// worst-case telemetry, clock, brush preview, and full inspector panel fit
 /// cleanly within FL-024's HUD vertex and triangle caps at both 2× and 3×
 /// scale, with zero refused or left-out glyphs.
 #[test]
 fn v2_legends_and_field_overlays_fit_within_hud_vertex_cap() {
     use flife_manim::Style;
-    use flife_studio::{FieldOverlayKind, V2ColorMapping, active_field_key, v2_legends};
 
-    let v2_keys = v2_legends();
-    assert_eq!(v2_keys.len(), V2ColorMapping::ALL.len());
+    let all_keys = legends(&config()).expect("legends");
+    assert_eq!(all_keys.len(), ColorMapping::ALL.len());
+    let v2_keys: Vec<_> = all_keys
+        .into_iter()
+        .filter(|(mapping, _)| mapping.is_v2())
+        .collect();
+    assert_eq!(v2_keys.len(), 2);
 
-    // `active_field_key` respects `Style::field_drawn()` and falls back to v1 field_key.
-    let hidden = Style {
-        field: false,
-        ..Style::default()
-    };
-    assert_eq!(
-        active_field_key(hidden, Some(FieldOverlayKind::TrailCarrier)),
-        None
-    );
-    let shown = Style::default();
-    assert_eq!(active_field_key(shown, None), None);
-    for kind in FieldOverlayKind::ALL {
-        assert_eq!(active_field_key(shown, Some(kind)), Some(kind.legend()));
+    // `field_key` respects `Style::field_drawn()` for the v2 field overlays.
+    for field_mapping in [
+        FieldMapping::TrailCarrier,
+        FieldMapping::VascularConductance,
+    ] {
+        let hidden = Style {
+            field: false,
+            field_mapping,
+            ..Style::default()
+        };
+        assert_eq!(field_key(hidden), None);
+        let shown = Style {
+            field_mapping,
+            ..Style::default()
+        };
+        assert_eq!(field_key(shown), field_mapping.legend());
+        assert!(field_key(shown).is_some());
     }
 
     let font = HudFont::bundled().expect("bundled HUD font");
     let longest = known();
     let widest = metrics();
-    let memory = admission(999 * GIB, 999 * GIB, 1 * GIB);
+    let memory = admission(999 * GIB, 999 * GIB, GIB);
     let preview = widest_preview(Brush::Removal, BrushSettings::default());
 
     for (mapping, legend) in &v2_keys {
-        for kind in FieldOverlayKind::ALL {
-            let field = kind.legend();
+        for field_mapping in [
+            FieldMapping::TrailCarrier,
+            FieldMapping::VascularConductance,
+        ] {
+            let field = field_mapping.legend().expect("v2 overlay legend");
             assert!(
                 legend.swatches.len() + field.swatches.len() <= HUD_MAX_SWATCHES,
-                "{mapping:?} + {kind:?} exceeds HUD_MAX_SWATCHES"
+                "{mapping:?} + {field_mapping:?} exceeds HUD_MAX_SWATCHES"
             );
             let text = overlay_text(&OverlayState {
                 paused: Some(true),
@@ -1762,32 +1773,46 @@ fn v2_legends_and_field_overlays_fit_within_hud_vertex_cap() {
                 .map(|&rgb| linear(rgb))
                 .collect();
             let glyphs = text.chars().filter(|c| !c.is_whitespace()).count();
-            for scale in [2.0_f32, 3.0_f32] {
+            for scale in [2.0_f64, 3.0_f64] {
                 let laid = font
                     .text_with_swatches(&text, HUD_TEXT_POINTS * scale, &colors)
-                    .unwrap_or_else(|error| panic!("{mapping:?} + {kind:?} @{scale}x: {error}"));
-                assert_eq!(laid.glyphs(), glyphs, "{mapping:?} + {kind:?} @{scale}x");
-                assert_eq!(laid.refused(), 0, "{mapping:?} + {kind:?} @{scale}x");
-                assert_eq!(laid.left_out(), 0, "{mapping:?} + {kind:?} @{scale}x");
+                    .unwrap_or_else(|error| {
+                        panic!("{mapping:?} + {field_mapping:?} @{scale}x: {error}")
+                    });
+                assert_eq!(
+                    laid.glyphs(),
+                    glyphs,
+                    "{mapping:?} + {field_mapping:?} @{scale}x"
+                );
+                assert_eq!(
+                    laid.refused(),
+                    0,
+                    "{mapping:?} + {field_mapping:?} @{scale}x"
+                );
+                assert_eq!(
+                    laid.left_out(),
+                    0,
+                    "{mapping:?} + {field_mapping:?} @{scale}x"
+                );
                 assert!(
                     laid.vertices().len() <= HUD_MAX_VERTICES,
-                    "{mapping:?} + {kind:?} @{scale}x vertices {}",
+                    "{mapping:?} + {field_mapping:?} @{scale}x vertices {}",
                     laid.vertices().len()
                 );
                 assert!(
                     laid.triangles().len() <= HUD_MAX_TRIANGLES,
-                    "{mapping:?} + {kind:?} @{scale}x triangles {}",
+                    "{mapping:?} + {field_mapping:?} @{scale}x triangles {}",
                     laid.triangles().len()
                 );
-                if (scale - 2.0).abs() < f32::EPSILON {
+                if (scale - 2.0).abs() < f64::EPSILON {
                     assert!(
                         laid.vertices().len() * 5 <= HUD_MAX_VERTICES * 4,
-                        "{mapping:?} + {kind:?} @2x vertices {} exceed 80% HUD cap",
+                        "{mapping:?} + {field_mapping:?} @2x vertices {} exceed 80% HUD cap",
                         laid.vertices().len()
                     );
                     assert!(
                         laid.triangles().len() * 5 <= HUD_MAX_TRIANGLES * 4,
-                        "{mapping:?} + {kind:?} @2x triangles {} exceed 80% HUD cap",
+                        "{mapping:?} + {field_mapping:?} @2x triangles {} exceed 80% HUD cap",
                         laid.triangles().len()
                     );
                 }

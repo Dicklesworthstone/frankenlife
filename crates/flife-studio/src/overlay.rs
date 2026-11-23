@@ -17,13 +17,13 @@ use flife_engine::{
     ReproductionOutcome, Sensed, Transactions,
 };
 use flife_genome::TopologyCatalog;
-use flife_manim::{ColorMapping, FieldOverlayKind, Legend, Style, V2ColorMapping};
+use flife_manim::{ColorMapping, Legend, Style};
 use flife_render::Metrics;
 
 use crate::{Brush, ClockReading, Disk, MeasurePreview, Preview, Stroke};
 
-/// The field's key for a frame drawn in `style` (FL-019): the field
-/// mapping's legend when the frame draws the field
+/// The field's key for a frame drawn in `style` (FL-019 and `V2-16`): the
+/// field mapping's legend when the frame draws the field
 /// ([`Style::field_drawn`]), none otherwise. The energy field, which the
 /// field palette explains, has none.
 #[must_use]
@@ -32,29 +32,6 @@ pub fn field_key(style: Style) -> Option<Legend> {
         .field_drawn()
         .then(|| style.field_mapping.legend())
         .flatten()
-}
-
-/// The active field key for a frame drawn in `style` with an optional `V2-16`
-/// secondary field overlay (`trail-carrier` or `vascular-conductance`).
-/// Returns `None` whenever the field is hidden (`!style.field_drawn()`).
-#[must_use]
-pub fn active_field_key(style: Style, overlay: Option<FieldOverlayKind>) -> Option<Legend> {
-    if !style.field_drawn() {
-        return None;
-    }
-    overlay
-        .map(FieldOverlayKind::legend)
-        .or_else(|| style.field_mapping.legend())
-}
-
-/// Every `V2-16` organism colour mapping's compact HUD key, in
-/// [`V2ColorMapping::ALL`] order (`8` = cell state, `9` = polarity).
-#[must_use]
-pub fn v2_legends() -> Vec<(V2ColorMapping, Legend)> {
-    V2ColorMapping::ALL
-        .into_iter()
-        .map(|mapping| (mapping, mapping.legend()))
-        .collect()
 }
 
 /// Every colour mapping's key for the run `config` configures, in

@@ -916,7 +916,8 @@ pub fn deposit(
     let grid = *state.grid();
     kernel.support_into(&grid, source.center, support)?;
     let report = deposit_energy(state, source, step, support)?;
-    for (channel, &component) in (0_u32..).zip(source.direction.iter()) {
+    let active = state.carrier0_moments_count();
+    for (channel, &component) in (0_u32..).zip(source.direction.iter().take(active)) {
         let plane = state.moment_mut(channel).ok_or_else(outside)?;
         deposit_moment(plane, component, support)?;
     }

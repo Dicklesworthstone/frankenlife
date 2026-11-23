@@ -44,7 +44,8 @@ pub use backend::{BackendBudget, ControllerBackend, ControllerJob};
 pub use controller::{
     ControllerScratch, DenseTopology, INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1,
     LayerShape, MAXIMUM_RECURRENT_STATE_WIDTH, RawOutputs, RawTrace, RecurrentTrace,
-    ReferenceController, Trace, update_recurrent_state, widen, widen_slice,
+    ReferenceController, Trace, rotate_epigenetic_affinity, update_recurrent_state, widen,
+    widen_slice,
 };
 pub use sensors::{
     Intrinsic, MAX_SENSOR_WIDTH, Observation, SENSOR_WIDTH, SensorLayout, SensorScales, observe,

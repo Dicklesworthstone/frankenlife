@@ -16,6 +16,15 @@ export type MediaFile = {
   bytes: number;
 };
 
+export type MasterVideo = {
+  /** Path outside public/media/ where the unconstrained archival MP4 was written. */
+  path: string;
+  sha256: string;
+  bytes: number;
+  crf: number;
+  encode: string[];
+};
+
 export type FilmManifest = {
   schema: typeof MEDIA_SCHEMA;
   video: MediaFile & {
@@ -25,6 +34,8 @@ export type FilmManifest = {
     frames: number;
     /** The ffmpeg arguments that encoded it from flife's PNG frames. */
     encode: string[];
+    /** Optional unconstrained archival master (e.g. 4K60) written outside public/media/. */
+    master?: MasterVideo;
   };
   poster: MediaFile & { frame: number };
   /** The social card: a 1200 × 630 crop of film frame `frame` (scripts/media.ts). */
@@ -52,6 +63,8 @@ export type FilmManifest = {
   render: {
     /** The command, with the run directory as RUN and the frames as FRAMES. */
     command: string;
+    /** Founding-only `field-ecology-v2` CLI feature flags (`--disable`/`--enable`/`--v1-compat`), if any. */
+    features?: string[];
     /**
      * The camera path the film follows (CAMERA in the command), the rule
      * that chose it from a whole-world preview, and that rule's timings;
@@ -67,7 +80,7 @@ export type FilmManifest = {
     mapping: string;
     meaning: string;
     look: string;
-    /** `energy` or `composition`, or `none` when the field is not drawn. */
+    /** `energy`, `composition`, `component-C`, `trail-carrier`, `vascular-conductance`, or `none` when hidden. */
     field_mapping: string;
     controllers: string;
     /** `git rev-parse HEAD` of a clean source tree when it rendered. */

@@ -947,6 +947,7 @@ fn actions(attempt_probability: f64, child_fraction: f64) -> DecodedActions {
         child_fraction,
         emission_gate: 0.0,
         emission: None,
+        ..DecodedActions::default()
     }
 }
 

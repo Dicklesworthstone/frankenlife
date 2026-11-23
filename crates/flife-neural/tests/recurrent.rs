@@ -9,13 +9,14 @@
 use flife_core::binary16::F16;
 use flife_core::config::{ContactConfig, RunConfig};
 use flife_core::model::FIELD_ECOLOGY_V2;
-use flife_core::numerics::{sigmoid, tanh};
+use flife_core::numerics::{sigmoid, symplectic_rotate_channels, tanh};
 use flife_core::v2::V2Config;
 use flife_core::{CoreError, ValidatedConfig, validate};
 use flife_neural::{
     ACTION_WIDTH, ActionLayout, ControllerScratch, DenseTopology, INDEPENDENT_RECURRENT_MLP_V1,
     MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH,
-    RawOutputs, ReferenceController, SENSOR_WIDTH, SensorLayout, Weight, update_recurrent_state,
+    RawOutputs, ReferenceController, SENSOR_WIDTH, SensorLayout, Weight,
+    rotate_epigenetic_affinity, update_recurrent_state,
 };
 
 const STARTER_TOML: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -397,10 +398,10 @@ fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
     ));
 
     // 7. Shared `update_recurrent_state` matches independent formula for both
-    //    `gate_bias = 0.0` (FL-054) and negative/positive `gate_bias` (V2-12).
+    //    `gate_bias = 0.0` (FL-054) and positive/negative `gate_bias` (`-b_epi`, V2-12).
     let state = [0.6_f32, -0.5, 0.25];
     let raw_tail = [0.8_f32, -1.25, 0.0, -0.5, 1.0, 0.25];
-    for bias in [0.0_f64, -2.5, 2.5] {
+    for bias in [0.0_f64, 2.5, -2.5] {
         let mut next = [0.0_f32; 3];
         update_recurrent_state(&state, &raw_tail, bias, &mut next).expect("update");
         for k in 0..3 {
@@ -408,7 +409,7 @@ fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
             let gate_arg = if bias == 0.0 {
                 f64::from(raw_tail[3 + k])
             } else {
-                f64::from(raw_tail[3 + k]) + bias
+                f64::from(raw_tail[3 + k]) - bias
             };
             let gate = sigmoid(gate_arg).expect("sigmoid") as f32;
             let expected = ((1.0_f32 - gate) * state[k] + gate * cand).clamp(-1.0_f32, 1.0_f32);
@@ -428,11 +429,11 @@ fn v2_layouts_and_shared_recurrent_state_update_are_canonical() {
     let raw: RawOutputs = ctrl.evaluate_raw(&full_in, &mut scratch).expect("raw");
     assert_eq!(raw.len(), 44);
     let mut via_raw_next = [0.0_f32; 2];
-    update_recurrent_state(&h0, &raw[40..44], -2.5, &mut via_raw_next).expect("update");
+    update_recurrent_state(&h0, &raw[40..44], 2.5, &mut via_raw_next).expect("update");
 
     let mut via_slice_next = [0.0_f32; 2];
     let slice_actions = ctrl
-        .evaluate_recurrent_slice(&sensor_in, &h0, -2.5, &mut scratch, &mut via_slice_next)
+        .evaluate_recurrent_slice(&sensor_in, &h0, 2.5, &mut scratch, &mut via_slice_next)
         .expect("recurrent slice");
     assert_eq!(slice_actions.len(), 40);
     assert_eq!(
@@ -568,4 +569,231 @@ fn v2_validated_configs_resolve_sensor_action_layouts_and_topology() {
     all_cfg.v2 = Some(v2_all);
     let all_cfg = validate(all_cfg).expect("v2 all-21 validates");
     check(&all_cfg, 110, 2, 44);
+}
+
+/// V2-12 (`epigenetic-recurrence`): verify `-b_epi` sign convention
+/// (`b_epi = 2.5` at `z_g = 0` yields `g = σ(-2.5) ≈ 0.075858`, ~13-tick
+/// retention), monotonic slow-down as `b_epi` increases, `b_epi = 0.0`
+/// bit-exactness against `v1` `FL-054` `evaluate_recurrent` (F32 & F16), and
+/// finite/bounds/length refusals.
+#[test]
+fn recurrent_epigenetic_gate_bias_unit() {
+    // 1. Analytic check at z_g = 0, state = 0.0, z_c = 20.0 (tanh(20) == 1.0):
+    //    next_state = (1 - g) * 0 + g * 1 = g = sigmoid(-b_epi) as f32.
+    let state = [0.0_f32, 0.8];
+    let raw_tail = [20.0_f32, -20.0, 0.0, 0.0];
+    let mut next_epi = [0.0_f32; 2];
+    update_recurrent_state(&state, &raw_tail, 2.5, &mut next_epi).expect("b_epi=2.5");
+    let expected_g = (1.0_f64 / (1.0_f64 + 2.5_f64.exp())) as f32; // ≈ 0.07585818
+    assert!(
+        (next_epi[0] - 0.075_858_18_f32).abs() < 1.0e-6,
+        "b_epi=2.5 at z_g=0 must give g ~= 0.075858, got {}",
+        next_epi[0]
+    );
+    assert_eq!(
+        next_epi[0].to_bits(),
+        (sigmoid(-2.5).expect("sigmoid(-2.5)") as f32).to_bits()
+    );
+    let expected_k1 = ((1.0_f32 - expected_g) * 0.8 + expected_g * (-1.0_f32)).clamp(-1.0, 1.0);
+    assert!(
+        (next_epi[1] - expected_k1).abs() < 1.0e-6 && next_epi[1] > 0.65,
+        "slow epigenetic gate must retain most of state[1]=0.8, got {}",
+        next_epi[1]
+    );
+
+    // 2. Monotonic slow-down: higher b_epi -> smaller update gate g -> smaller step |h' - h|.
+    let mut next_zero = [0.0_f32; 2];
+    let mut next_high = [0.0_f32; 2];
+    update_recurrent_state(&state, &raw_tail, 0.0, &mut next_zero).expect("b_epi=0.0");
+    update_recurrent_state(&state, &raw_tail, 4.0, &mut next_high).expect("b_epi=4.0");
+    assert!((next_zero[0] - 0.5_f32).abs() < 1.0e-6);
+    assert!(
+        next_high[0] < next_epi[0] && next_epi[0] < next_zero[0],
+        "expected g(4.0) < g(2.5) < g(0.0): {} vs {} vs {}",
+        next_high[0],
+        next_epi[0],
+        next_zero[0]
+    );
+
+    // 3. b_epi = 0.0 matches v1 FL-054 `evaluate_recurrent` bit-for-bit across F32 & F16.
+    let topo = DenseTopology::new_recurrent(&[32, 16], 4).expect("v1 recurrent");
+    let f32_params = pseudo_values(0x2026_1201, topo.parameter_count(), 0.35);
+    let f16_params: Vec<F16> = f32_params
+        .iter()
+        .map(|&v| F16::from_f64(f64::from(v)))
+        .collect();
+    let mut inputs = [0.0_f64; SENSOR_WIDTH];
+    for (i, slot) in inputs.iter_mut().enumerate() {
+        *slot = ((i as f64) * 0.29).cos() * 1.1;
+    }
+    let h0 = [0.75_f32, -0.4, 0.125, -0.9];
+    let mut full_in = Vec::with_capacity(SENSOR_WIDTH + 4);
+    full_in.extend_from_slice(&inputs);
+    full_in.extend(h0.iter().map(|&v| f64::from(v)));
+
+    let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+    for (label, ctrl) in [
+        (
+            "F32",
+            ReferenceController::new(&topo, &f32_params, 10.0).expect("f32"),
+        ),
+        (
+            "F16",
+            ReferenceController::new(&topo, &f16_params, 10.0).expect("f16"),
+        ),
+    ] {
+        let mut v1_next = [0.0_f32; 4];
+        let v1_out = ctrl
+            .evaluate_recurrent(&inputs, &h0, &mut scratch, &mut v1_next)
+            .expect("v1 eval");
+        let raw = ctrl.evaluate_raw(&full_in, &mut scratch).expect("raw eval");
+        let mut shared_next = [0.0_f32; 4];
+        update_recurrent_state(&h0, &raw[ACTION_WIDTH..], 0.0, &mut shared_next).expect("shared");
+        assert_eq!(
+            raw[..ACTION_WIDTH]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            v1_out.map(f32::to_bits).to_vec(),
+            "{label}: action bits"
+        );
+        assert_eq!(
+            shared_next.map(f32::to_bits),
+            v1_next.map(f32::to_bits),
+            "{label}: b_epi=0.0 next_state must match v1 FL-054 bit-for-bit"
+        );
+    }
+
+    // 4. Finite, range, and layout refusals.
+    let mut out = [0.0_f32; 2];
+    for bad_bias in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(matches!(
+            update_recurrent_state(&state, &raw_tail, bad_bias, &mut out),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
+    for bad_tail in [
+        [f32::NAN, 0.0, 0.0, 0.0],
+        [f32::INFINITY, 0.0, 0.0, 0.0],
+        [0.0, 0.0, f32::NAN, 0.0],
+        [0.0, 0.0, f32::NEG_INFINITY, 0.0],
+    ] {
+        assert!(matches!(
+            update_recurrent_state(&state, &bad_tail, 2.5, &mut out),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
+    assert!(matches!(
+        update_recurrent_state(&[f32::NAN, 0.0], &raw_tail, 2.5, &mut out),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        update_recurrent_state(&[-1.0001, 0.0], &raw_tail, 2.5, &mut out),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        update_recurrent_state(&[0.0; 17], &[0.0; 34], 2.5, &mut [0.0; 17]),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+}
+
+/// V2-12 (`epigenetic-recurrence` metabolic caste rotation): sweeps 101 values
+/// of `h_0 ∈ [-1.0, 1.0]` plus explicit negative boundary values (`-1.0`,
+/// `-0.5`, `-1e-12`, `-0.0`, `0.0`, `1e-12`, `0.5`, `1.0`) over adversarial
+/// unit vectors (`active_channels = 32` single-carrier and `24` Carrier-0),
+/// verifying exact quarter-turns `a_eff(0) == a`, `a_eff(1) == J a`,
+/// `a_eff(-1) == -J a`, exact left-fold `‖a_eff‖₂² <= limit²`, and refusals.
+#[test]
+fn a_eff_orthogonal_rotation_full_signed_range_left_fold_safe() {
+    let left_fold_sq = |v: &[f64; 32]| v.iter().fold(0.0_f64, |t, &c| t + c * c);
+    let dot = |a: &[f64; 32], b: &[f64; 32]| a.iter().zip(b).fold(0.0_f64, |t, (&x, &y)| t + x * y);
+
+    // Build adversarial unit vectors right at the left-fold norm boundary 1.0.
+    let mut vecs: Vec<[f64; 32]> = Vec::new();
+    let mut equal = [1.0_f64 / 32.0_f64.sqrt(); 32];
+    flife_core::numerics::shrink_to_left_fold_norm_limit(&mut equal, 1.0).expect("equal");
+    vecs.push(equal);
+    for seed in [0x1111_u64, 0x2222, 0x3333, 0x4444] {
+        let raw = pseudo_values(seed, 32, 1.0);
+        let mut a = [0.0_f64; 32];
+        for (dst, &src) in a.iter_mut().zip(&raw) {
+            *dst = f64::from(src);
+        }
+        let n = left_fold_sq(&a).sqrt();
+        for c in &mut a {
+            *c /= n;
+        }
+        flife_core::numerics::shrink_to_left_fold_norm_limit(&mut a, 1.0).expect("norm");
+        vecs.push(a);
+    }
+
+    let mut samples: Vec<f32> = (0..=100).map(|i| (i as f32 - 50.0) / 50.0).collect();
+    samples.extend([-1.0_f32, -0.5, -1.0e-12, -0.0, 0.0, 1.0e-12, 0.5, 1.0]);
+
+    // 1. Single-carrier 32-channel rotation.
+    for a in &vecs {
+        let ja = symplectic_rotate_channels(a, 32, 1.0).expect("J a");
+        assert!(dot(a, &ja).abs() < 1.0e-14, "a and J a must be orthogonal");
+
+        let at_zero = rotate_epigenetic_affinity(a, 0.0, 32, 1.0).expect("h0=0");
+        let at_pos1 = rotate_epigenetic_affinity(a, 1.0, 32, 1.0).expect("h0=+1");
+        let at_neg1 = rotate_epigenetic_affinity(a, -1.0, 32, 1.0).expect("h0=-1");
+        assert_eq!(at_zero, *a, "a_eff(0) == a");
+        assert_eq!(at_pos1, ja, "a_eff(+1) == J a");
+        assert_eq!(at_neg1, ja.map(|v| -v), "a_eff(-1) == -J a");
+
+        for &h0 in &samples {
+            let eff = rotate_epigenetic_affinity(a, h0, 32, 1.0).expect("h0 valid");
+            assert!(eff.iter().all(|v| v.is_finite()), "h0={h0}");
+            let sq = left_fold_sq(&eff);
+            assert!(
+                sq <= 1.0_f64,
+                "left-fold ||a_eff({h0})||^2 = {sq:?} exceeded 1.0"
+            );
+            assert!(
+                (sq - left_fold_sq(a)).abs() < 1.0e-12,
+                "rotation must preserve norm at h0={h0}: {sq} vs {}",
+                left_fold_sq(a)
+            );
+        }
+    }
+
+    // 2. Dual-carrier Carrier-0 (24 active channels) preserves Carrier-1 channels 24..32
+    //    and satisfies left-fold norm <= 1.0 across the full signed range.
+    let a_dual = &vecs[1];
+    let ja_24 = symplectic_rotate_channels(a_dual, 24, 1.0).expect("J_24 a");
+    for &h0 in &samples {
+        let eff = rotate_epigenetic_affinity(a_dual, h0, 24, 1.0).expect("dual h0");
+        assert!(left_fold_sq(&eff) <= 1.0_f64);
+        assert!(eff[24..].iter().all(|v| v.is_finite()));
+    }
+    let eff_pos1 = rotate_epigenetic_affinity(a_dual, 1.0, 24, 1.0).expect("dual +1");
+    for k in 0..24 {
+        assert!((eff_pos1[k] - ja_24[k]).abs() < 1.0e-14);
+    }
+    for k in 24..32 {
+        assert!((eff_pos1[k] - a_dual[k]).abs() < 1.0e-14);
+    }
+
+    // 3. Explicit refusals.
+    for bad_h0 in [
+        -1.0001_f32,
+        1.0001,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+    ] {
+        assert!(matches!(
+            rotate_epigenetic_affinity(&vecs[0], bad_h0, 32, 1.0),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
+    assert!(matches!(
+        rotate_epigenetic_affinity(&vecs[0], 0.0, 33, 1.0),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    assert!(matches!(
+        rotate_epigenetic_affinity(&vecs[0], 0.0, 32, 0.0),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
 }

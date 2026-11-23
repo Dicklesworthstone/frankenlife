@@ -147,10 +147,39 @@ impl MaintenanceCosts {
         parameters: u32,
         evaluated: bool,
     ) -> Result<MaintenanceBill, CoreError> {
+        self.bill_with_basal_multiplier(step, sensing_scale, parameters, evaluated, 1.0)
+    }
+
+    /// The mandatory cost of one tick, by ledger flow, scaling the basal term
+    /// by `basal_multiplier` (`1.0` on `field-ecology-v1` and whenever
+    /// `v2.senescence` is disabled; `m_age >= 1.0` under `V2-03`).
+    ///
+    /// Computes `(Δt · c_basal) · basal_multiplier` so that `basal_multiplier ==
+    /// 1.0` is bit-identical to baseline and matches `motion.metal`'s software
+    /// binary64 multiplication order.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonpositive or nonfinite sensing
+    /// scale, a negative or nonfinite `basal_multiplier`, or an overflowing
+    /// basal or sensing-scale term.
+    pub fn bill_with_basal_multiplier(
+        &self,
+        step: TimeStep,
+        sensing_scale: f64,
+        parameters: u32,
+        evaluated: bool,
+        basal_multiplier: f64,
+    ) -> Result<MaintenanceBill, CoreError> {
         if !sensing_scale.is_finite() || sensing_scale <= 0.0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "sensing scale",
                 detail: format!("{sensing_scale} is not a positive length"),
+            });
+        }
+        if !basal_multiplier.is_finite() || basal_multiplier < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "basal maintenance multiplier",
+                detail: format!("{basal_multiplier} is not finite and nonnegative"),
             });
         }
         let factor = if self.sensor_scale_exponent.to_bits() == 1.0_f64.to_bits() {
@@ -183,8 +212,20 @@ impl MaintenanceCosts {
             }
         };
         let seconds = step.seconds_per_tick();
+        let base_basal = seconds * self.basal;
+        let basal = if basal_multiplier.to_bits() == 1.0_f64.to_bits() {
+            base_basal
+        } else {
+            base_basal * basal_multiplier
+        };
+        if !basal.is_finite() || basal < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "basal maintenance",
+                detail: format!("{basal} is not finite and nonnegative"),
+            });
+        }
         Ok(MaintenanceBill {
-            basal: seconds * self.basal,
+            basal,
             sensor: seconds * (self.sensor * factor),
             controller: if evaluated {
                 self.neural * f64::from(parameters)
@@ -193,6 +234,46 @@ impl MaintenanceCosts {
             },
         })
     }
+}
+
+/// Quadratic Gompertz metabolic senescence multiplier (`V2-03`):
+/// `m_age = 1 + min((age_seconds / scale_seconds)^2, maximum_multiplier - 1)`.
+///
+/// Overflow-guarded so arbitrarily large ages clamp cleanly to
+/// `maximum_multiplier` without producing `Inf` or `NaN`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `age_seconds` is nonfinite or negative,
+/// `scale_seconds` is nonfinite or `<= 0`, or `maximum_multiplier` is
+/// nonfinite or `< 1`.
+pub fn senescence_multiplier(
+    age_seconds: f64,
+    scale_seconds: f64,
+    maximum_multiplier: f64,
+) -> Result<f64, CoreError> {
+    if !age_seconds.is_finite() || age_seconds < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "organism age",
+            detail: format!("{age_seconds} is not finite and nonnegative"),
+        });
+    }
+    if !scale_seconds.is_finite() || scale_seconds <= 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.senescence.scale_seconds",
+            detail: format!("{scale_seconds} is not finite and positive"),
+        });
+    }
+    if !maximum_multiplier.is_finite() || maximum_multiplier < 1.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.senescence.maximum_multiplier",
+            detail: format!("{maximum_multiplier} must be finite and >= 1.0"),
+        });
+    }
+    let cap = maximum_multiplier - 1.0;
+    let ratio = age_seconds / scale_seconds;
+    let quad = ratio * ratio;
+    let excess = if quad.is_finite() { quad.min(cap) } else { cap };
+    Ok(1.0 + excess)
 }
 
 /// One tick's mandatory cost, by ledger flow.

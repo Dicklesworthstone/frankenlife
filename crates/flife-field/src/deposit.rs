@@ -41,18 +41,18 @@
 //! and first absorbable, on the next tick, by every organism, its emitter
 //! included.
 
+use std::ops::Range;
+
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, TickLedger, Transfer, add_down, sub_down};
 use flife_core::memory::{capacity_bytes, total};
-use flife_core::model::MOMENT_CHANNELS;
 
 use crate::bins::Bins;
 use crate::exchange::{ExchangeKernel, ExchangeScratch, ExchangeStencil};
 use crate::footprint::BufferLimits;
-use crate::grid::FieldGrid;
+use crate::grid::{CARRIER0_MOMENT_CHANNELS, CARRIER1_MOMENT_CHANNELS, CarrierLayout, FieldGrid};
 use crate::state::{CHANNELS, FieldState};
-use std::ops::Range;
 
 /// The name deposits' scratch refusals carry.
 const DEPOSIT_PACKETS: &str = "deposit packets";
@@ -791,8 +791,104 @@ fn round_down_f32(value: f64) -> f32 {
 /// run costs more to hand to a thread than it saves.
 const PACKETS_PER_RUN: usize = 1_024;
 
-/// Reduce `deposits` into `field`, the next state, and return what was paid,
-/// offered and applied. The deposits are marked applied.
+/// Result of splitting one organism's paid emission across Carrier 0 (`24`
+/// metabolic channels) and Carrier 1 (`8` non-destructive trail channels)
+/// under `V2-15` (`dual-carrier-trails`).
+///
+/// Guarantees `paid_0 + paid_1 <= paid`, `offered_k <= paid_k`, and sub-vector
+/// unit-ball norms `‖direction_0‖₂ ≤ 1`, `‖direction_1‖₂ ≤ 1` without
+/// renormalization (zero `0/0` NaN).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualCarrierEmissionSplit {
+    /// Paid share allocated to Carrier 0.
+    pub paid_0: f64,
+    /// Offered energy for Carrier 0 (`<= paid_0`).
+    pub offered_0: f64,
+    /// Carrier 0 direction (`direction[0..24]` followed by 8 zeros).
+    pub direction_0: [f64; CHANNELS],
+    /// Paid share allocated to Carrier 1 (trail carrier).
+    pub paid_1: f64,
+    /// Offered energy for Carrier 1 (`<= paid_1`).
+    pub offered_1: f64,
+    /// Carrier 1 direction (`direction[24..32]` packed into `[0..8]`, zeros after).
+    pub direction_1: [f64; CHANNELS],
+}
+
+/// Split one paid emission `(paid, efficiency, direction)` between Carrier 0
+/// (`24` channels) and Carrier 1 (`8` trail channels) using configured
+/// `trail_share ∈ [0, 1]` (`V2-15`).
+///
+/// Exact F64 arithmetic:
+/// - `paid_1 = (trail_share * paid).min(paid)`
+/// - `paid_0 = sub_down(paid, paid_1).max(0.0)`
+/// - `offered_0 = (efficiency * paid_0).min(paid_0)`
+/// - `offered_1 = (efficiency * paid_1).min(paid_1)`
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for negative/nonfinite `paid`, `efficiency`
+/// or `trail_share` outside `[0, 1]`, or a direction outside the unit ball.
+pub fn split_dual_carrier_emission(
+    paid: f64,
+    efficiency: f64,
+    trail_share: f64,
+    direction: &[f64; CHANNELS],
+) -> Result<DualCarrierEmissionSplit, CoreError> {
+    if !paid.is_finite() || paid < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "emission payment",
+            detail: format!("{paid:?} is not finite and nonnegative"),
+        });
+    }
+    if !efficiency.is_finite() || !(0.0..=1.0).contains(&efficiency) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "emission efficiency",
+            detail: format!("{efficiency:?} is outside [0, 1]"),
+        });
+    }
+    if !trail_share.is_finite() || !(0.0..=1.0).contains(&trail_share) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.carriers.trail_emission_share",
+            detail: format!("{trail_share:?} is outside [0, 1]"),
+        });
+    }
+    let mut norm_sq = 0.0_f64;
+    for &c in direction {
+        if !c.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "emission direction",
+                detail: format!("nonfinite component {c:?}"),
+            });
+        }
+        norm_sq += c * c;
+    }
+    if !norm_sq.is_finite() || norm_sq > 1.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "emission direction",
+            detail: format!("squared norm {norm_sq:?} exceeds 1"),
+        });
+    }
+    let paid_1 = (trail_share * paid).min(paid);
+    let paid_0 = sub_down(paid, paid_1).max(0.0);
+    let offered_0 = (efficiency * paid_0).min(paid_0);
+    let offered_1 = (efficiency * paid_1).min(paid_1);
+    let mut direction_0 = [0.0_f64; CHANNELS];
+    let c0 = CARRIER0_MOMENT_CHANNELS as usize;
+    direction_0[..c0].copy_from_slice(&direction[..c0]);
+    let mut direction_1 = [0.0_f64; CHANNELS];
+    let c1 = CARRIER1_MOMENT_CHANNELS as usize;
+    direction_1[..c1].copy_from_slice(&direction[c0..c0 + c1]);
+    Ok(DualCarrierEmissionSplit {
+        paid_0,
+        offered_0,
+        direction_0,
+        paid_1,
+        offered_1,
+        direction_1,
+    })
+}
+
+/// Reduce `deposits` into `field`'s Carrier 0, the next state, and return what
+/// was paid, offered and applied. The deposits are marked applied.
 ///
 /// # Errors
 /// [`CoreError::StateConflict`] when the deposits were already applied,
@@ -807,29 +903,51 @@ pub fn apply_deposits(
     apply_deposits_on(field, deposits, 1)
 }
 
-/// [`apply_deposits`] on up to `workers` threads: this one and scoped
-/// workers it joins before returning. The cells are split into contiguous
-/// runs of whole cells holding about equal numbers of packets, at least
-/// 1,024 a run. Each run's thread reduces its cells exactly as
-/// [`apply_deposits`] does and writes their energy and moments, which no
-/// other run touches. This thread then sums what the cells received, in
-/// cell order. Every value is computed as on one thread, so the field and
-/// the summary are the same for every worker count. Zero workers is taken
-/// as one.
+/// Reduce `deposits` into `carrier` of `field` on one thread (`V2-15`).
 ///
 /// # Errors
-/// As [`apply_deposits`]; [`CoreError::StateConflict`] for a worker that
-/// panicked, after which the field may be partly written.
+/// As [`apply_deposits_to_carrier_on`].
+pub fn apply_deposits_to_carrier(
+    field: &mut FieldState,
+    deposits: &mut Deposits,
+    carrier: CarrierLayout,
+) -> Result<DepositSummary, CoreError> {
+    apply_deposits_to_carrier_on(field, deposits, carrier, 1)
+}
+
+/// [`apply_deposits`] on up to `workers` threads targeting `field.carrier0()`.
+///
+/// # Errors
+/// As [`apply_deposits_to_carrier_on`].
 pub fn apply_deposits_on(
     field: &mut FieldState,
     deposits: &mut Deposits,
+    workers: usize,
+) -> Result<DepositSummary, CoreError> {
+    let carrier = field.carrier0();
+    apply_deposits_to_carrier_on(field, deposits, carrier, workers)
+}
+
+/// [`apply_deposits_on`] targeting a specific [`CarrierLayout`] (`V2-15`):
+/// `(0, 1, 32)` on 33-plane single-carrier fields, `(0, 1, 24)` for Carrier 0
+/// or `(25, 26, 8)` for Carrier 1 on 34-plane dual-carrier fields. Leaves all
+/// planes outside `carrier` untouched.
+///
+/// # Errors
+/// As [`apply_deposits`]; [`CoreError::LayoutMismatch`] if `carrier` lies
+/// outside `field`'s planes or overlaps its own energy plane;
+/// [`CoreError::StateConflict`] for a worker that panicked.
+pub fn apply_deposits_to_carrier_on(
+    field: &mut FieldState,
+    deposits: &mut Deposits,
+    carrier: CarrierLayout,
     workers: usize,
 ) -> Result<DepositSummary, CoreError> {
     let conflict = |detail: String| CoreError::StateConflict {
         operation: "apply deposits",
         detail,
     };
-    let (mut summary, buckets) = deposits.prepare(field)?;
+    let (mut summary, buckets) = deposits.prepare_for_carrier(field, carrier)?;
     let Deposits {
         entries,
         packets,
@@ -843,8 +961,6 @@ pub fn apply_deposits_on(
     let order = bins.order();
     let items = order.len();
     let start = |cell: usize| offsets.get(cell).map_or(items, |&at| at as usize);
-    // Run `k` holds the cells from the first one starting at or after
-    // `k / runs` of the packets up to the next run's first cell.
     let runs = workers.min(items / PACKETS_PER_RUN).max(1);
     let bounds: Vec<usize> = (0..=runs)
         .map(|run| {
@@ -860,7 +976,27 @@ pub fn apply_deposits_on(
         .collect();
     received.clear();
     received.resize(items, 0.0);
-    let (mut energy, moments) = values.split_at_mut(buckets);
+
+    let energy_start = (carrier.energy_plane as usize) * buckets;
+    let moments_start = (carrier.first_moment_plane as usize) * buckets;
+    let moment_count = carrier.moment_count as usize;
+    let moments_len = moment_count * buckets;
+    let (mut energy, moments): (&mut [f32], &mut [f32]) = if energy_start < moments_start {
+        let (_, tail) = cut(values, energy_start)?;
+        let (e_slice, after_e) = cut(tail, buckets)?;
+        let gap = moments_start - (energy_start + buckets);
+        let (_, m_tail) = cut(after_e, gap)?;
+        let (m_slice, _) = cut(m_tail, moments_len)?;
+        (e_slice, m_slice)
+    } else {
+        let (_, tail) = cut(values, moments_start)?;
+        let (m_slice, after_m) = cut(tail, moments_len)?;
+        let gap = energy_start - (moments_start + moments_len);
+        let (_, e_tail) = cut(after_m, gap)?;
+        let (e_slice, _) = cut(e_tail, buckets)?;
+        (e_slice, m_slice)
+    };
+
     let mut slots: &mut [f64] = received;
     let mut lanes = Vec::with_capacity(runs);
     for pair in bounds.windows(2) {
@@ -875,17 +1011,20 @@ pub fn apply_deposits_on(
         lanes.push(Run {
             cells,
             energy: head,
+            moment_count,
             moments: std::array::from_fn(|_| <&mut [f32]>::default()),
             received: owned,
         });
     }
-    for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
-        let mut plane = plane;
-        for lane in &mut lanes {
-            let (head, tail) = cut(std::mem::take(&mut plane), lane.cells.len())?;
-            plane = tail;
-            if let Some(slot) = lane.moments.get_mut(channel) {
-                *slot = head;
+    if moment_count > 0 {
+        for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
+            let mut plane = plane;
+            for lane in &mut lanes {
+                let (head, tail) = cut(std::mem::take(&mut plane), lane.cells.len())?;
+                plane = tail;
+                if let Some(slot) = lane.moments.get_mut(channel) {
+                    *slot = head;
+                }
             }
         }
     }
@@ -922,12 +1061,13 @@ pub fn apply_deposits_on(
 }
 
 impl Deposits {
-    /// [`apply_deposits_on`]'s checks and grouping for a reduction into
-    /// `field`: not applied, staged for its grid, no organism twice, every
-    /// plane whole; then the packets grouped by cell in (cell, identity)
-    /// order. Returns the summary's organisms, paid and offered, and the
-    /// grid's cell count. Nothing is applied.
-    fn prepare(&mut self, field: &FieldState) -> Result<(DepositSummary, usize), CoreError> {
+    /// [`apply_deposits_to_carrier_on`]'s checks and grouping for a reduction
+    /// into `carrier` of `field`. Nothing is applied.
+    fn prepare_for_carrier(
+        &mut self,
+        field: &FieldState,
+        carrier: CarrierLayout,
+    ) -> Result<(DepositSummary, usize), CoreError> {
         let conflict = |detail: String| CoreError::StateConflict {
             operation: "apply deposits",
             detail,
@@ -964,7 +1104,30 @@ impl Deposits {
                 )));
             }
         }
-        if (0..MOMENT_CHANNELS).any(|channel| field.moment(channel).is_none()) {
+        let total_planes = field.planes();
+        let moment_end = carrier
+            .first_moment_plane
+            .checked_add(carrier.moment_count)
+            .ok_or_else(|| CoreError::Overflow {
+                quantity: "carrier moment planes",
+            })?;
+        let moment_count = carrier.moment_count as usize;
+        if carrier.energy_plane >= total_planes
+            || moment_end > total_planes
+            || moment_count > CHANNELS
+            || (carrier.energy_plane >= carrier.first_moment_plane
+                && carrier.energy_plane < moment_end)
+        {
+            return Err(CoreError::LayoutMismatch {
+                buffer: crate::layout::BUFFER,
+                detail: format!(
+                    "carrier layout {carrier:?} is invalid for a {total_planes}-plane field"
+                ),
+            });
+        }
+        if field.plane(carrier.energy_plane).is_none()
+            || (carrier.first_moment_plane..moment_end).any(|plane| field.plane(plane).is_none())
+        {
             return Err(conflict("a moment plane is missing".into()));
         }
 
@@ -990,8 +1153,6 @@ impl Deposits {
             });
         }
 
-        // Packets in identity order. An organism's footprint names each cell
-        // at most once, so grouping them by cell gives (cell, identity) order.
         let Self {
             entries,
             packets,
@@ -1008,13 +1169,11 @@ impl Deposits {
         sequence.clear();
         if strictly_ascending {
             for entry in entries.iter() {
-                // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
                 sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
             }
         } else {
             for &(_, index) in identities.iter() {
                 if let Some(entry) = entries.get(index) {
-                    // `packets.len() ≤ 4 organisms ≤ u32::MAX`.
                     sequence.extend((entry.first..entry.first + entry.count).map(|at| at as u32));
                 }
             }
@@ -1030,35 +1189,43 @@ impl Deposits {
                 .map_or(usize::MAX, |packet| packet.cell)
         })?;
 
-        // The grouping refused any cell at or past `buckets`, so a field that
-        // holds `buckets` cells in each of its planes holds every grouped
-        // cell.
         let values = field.as_slice().len();
-        if buckets.checked_mul(CHANNELS + 1) != Some(values) {
+        let planes_usize = usize::try_from(total_planes).map_err(|_| CoreError::Overflow {
+            quantity: DEPOSIT_PACKETS,
+        })?;
+        if buckets.checked_mul(planes_usize) != Some(values) {
             return Err(CoreError::LayoutMismatch {
                 buffer: crate::layout::BUFFER,
                 detail: format!(
-                    "the field holds {values} values, not {buckets} cells in {} planes",
-                    CHANNELS + 1
+                    "the field holds {values} values, not {buckets} cells in {planes_usize} planes"
                 ),
             });
         }
         Ok((summary, buckets))
     }
 
-    /// These deposits checked and grouped for a reduction into `field` on
-    /// another device (FL-032), which reduces each cell as
-    /// [`apply_deposits_on`] does: the cell's packets in
-    /// [`DepositReduction::packet`] order, their amounts summed rounding
-    /// down, each moment the sum of amount times direction component, the
-    /// energy rounded down to F32, and each moment raised by its sum times
-    /// the received fraction.
+    /// These deposits checked and grouped for a reduction into `field`'s
+    /// Carrier 0 on another device (FL-032).
     ///
     /// # Errors
     /// As [`apply_deposits_on`]. Nothing is applied either way until
     /// [`DepositReduction::finish`].
     pub fn reduction(&mut self, field: &FieldState) -> Result<DepositReduction<'_>, CoreError> {
-        let (summary, cells) = self.prepare(field)?;
+        self.reduction_for_carrier(field, field.carrier0())
+    }
+
+    /// These deposits checked and grouped for a reduction into `carrier` of
+    /// `field` on another device (`V2-15`).
+    ///
+    /// # Errors
+    /// As [`apply_deposits_to_carrier_on`]. Nothing is applied either way until
+    /// [`DepositReduction::finish`].
+    pub fn reduction_for_carrier(
+        &mut self,
+        field: &FieldState,
+        carrier: CarrierLayout,
+    ) -> Result<DepositReduction<'_>, CoreError> {
+        let (summary, cells) = self.prepare_for_carrier(field, carrier)?;
         Ok(DepositReduction {
             deposits: self,
             summary,
@@ -1155,6 +1322,7 @@ impl DepositReduction<'_> {
 struct Run<'a> {
     cells: Range<usize>,
     energy: &'a mut [f32],
+    moment_count: usize,
     moments: [&'a mut [f32]; CHANNELS],
     received: &'a mut [f64],
 }
@@ -1167,7 +1335,7 @@ const REDUCE_BATCH: usize = 32;
 
 /// Flush `count` buffered cell updates into `moments`, one plane at a time.
 fn flush_moment_batch(
-    moments: &mut [&mut [f32]; CHANNELS],
+    moments: &mut [&mut [f32]],
     count: usize,
     cell_at: &[usize; REDUCE_BATCH],
     factors: &[f64; REDUCE_BATCH],
@@ -1201,6 +1369,7 @@ fn reduce_run(
     let mut cell_at = [0_usize; REDUCE_BATCH];
     let mut factors = [0.0_f64; REDUCE_BATCH];
     let mut accum = [[0.0_f64; CHANNELS]; REDUCE_BATCH];
+    let moment_count = run.moment_count.min(CHANNELS);
 
     for (at, cell) in run.cells.clone().enumerate() {
         let (Some(&first), Some(&end)) = (offsets.get(cell), offsets.get(cell + 1)) else {
@@ -1226,7 +1395,8 @@ fn reduce_run(
             total = add_down(total, packet.amount);
             if let Some(entry) = entries.get(packet.entry) {
                 let amount = packet.amount;
-                for (slot, &component) in moment.iter_mut().zip(&entry.direction) {
+                for (slot, &component) in moment.iter_mut().zip(&entry.direction).take(moment_count)
+                {
                     *slot += amount * component;
                 }
             }
@@ -1250,13 +1420,25 @@ fn reduce_run(
             accum[batch_len] = moment;
             batch_len += 1;
             if batch_len == REDUCE_BATCH {
-                flush_moment_batch(&mut run.moments, batch_len, &cell_at, &factors, &accum);
+                flush_moment_batch(
+                    &mut run.moments[..moment_count],
+                    batch_len,
+                    &cell_at,
+                    &factors,
+                    &accum,
+                );
                 batch_len = 0;
             }
         }
     }
     if batch_len > 0 {
-        flush_moment_batch(&mut run.moments, batch_len, &cell_at, &factors, &accum);
+        flush_moment_batch(
+            &mut run.moments[..moment_count],
+            batch_len,
+            &cell_at,
+            &factors,
+            &accum,
+        );
     }
     occupied
 }

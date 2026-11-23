@@ -15,8 +15,10 @@ constant uint CHANNELS = 32u;
 
 // One source's descriptor, in 32-bit words. Its candidate cells are the
 // rows × columns of `rows_at`/`columns_at` in the axes buffer, row-major,
-// stored from entry `first` of the weights buffer.
-constant uint DESCRIPTOR = 73u;
+// stored from entry `first` of the weights buffer. Offsets 73..77 hold the
+// per-source kernel constants (r_j^2, 2*sigma_j^2) for V2-02 heterogeneous
+// oases.
+constant uint DESCRIPTOR = 77u;
 constant uint FIRST = 0u;
 constant uint ROWS = 1u;
 constant uint COLUMNS = 2u;
@@ -25,6 +27,8 @@ constant uint COLUMNS_AT = 4u;
 constant uint CENTER_X = 5u;
 constant uint CENTER_Y = 7u;
 constant uint DIRECTION = 9u;
+constant uint RADIUS_SQUARED = 73u;
+constant uint TWO_SIGMA_SQUARED = 75u;
 
 // A candidate beyond the radius, and one whose displacement the reference
 // refuses. Neither is a weight or an amount: both are finite.
@@ -79,6 +83,63 @@ kernel void field_stencil(
     target[id] = d_to_f32_bits(value);
 }
 
+// One periodic flux-form doubly-stochastic substep over `plane_range`
+// (`first_plane..first_plane + plane_count`) for V2-09 tight junctions
+// (and reusable by V2-14 vascular fields and V2-15 dual-carrier splits).
+// Evaluates transport.rs's `flux_cell` in exact IEEE-754 order:
+//   center = (1.0 - (r_w + r_e)) - (r_s + r_n)
+//   next   = ((center * u_c + (r_w * u_w + r_e * u_e)) + (r_s * u_s + r_n * u_n)) as f32
+// params: [0] width, [1] height, [2] cells, [3] first_plane, [4] plane_count.
+// edge_x/edge_y hold `cells` binary64 conductances (two 32-bit words each, low first).
+kernel void field_stencil_flux(
+    device const uint *source [[buffer(0)]],
+    device const uint *params [[buffer(1)]],
+    device const uint *edge_x [[buffer(2)]],
+    device const uint *edge_y [[buffer(3)]],
+    device uint *target [[buffer(4)]],
+    device atomic_uint *fault [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint width = params[0], height = params[1], cells = params[2];
+    uint first_plane = params[3], plane_count = params[4];
+    if (id >= cells * plane_count) {
+        return;
+    }
+    uint plane = first_plane + id / cells;
+    uint cell = id % cells;
+    uint x = cell % width, y = cell / width;
+    uint west = x == 0u ? width - 1u : x - 1u;
+    uint east = x + 1u == width ? 0u : x + 1u;
+    uint south = y == 0u ? height - 1u : y - 1u;
+    uint north = y + 1u == height ? 0u : y + 1u;
+    uint base = plane * cells;
+    uint w_cell = y * width + west;
+    uint e_cell = y * width + east;
+    uint s_cell = south * width + x;
+    uint n_cell = north * width + x;
+    uint u_c = source[base + cell];
+    uint u_w = source[base + w_cell];
+    uint u_e = source[base + e_cell];
+    uint u_s = source[base + s_cell];
+    uint u_n = source[base + n_cell];
+    if (!(f32_finite(u_c) && f32_finite(u_w) && f32_finite(u_e) && f32_finite(u_s) && f32_finite(u_n))) {
+        atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+    }
+    d64 r_w = d_word(edge_x, 2u * w_cell);
+    d64 r_e = d_word(edge_x, 2u * cell);
+    d64 r_s = d_word(edge_y, 2u * s_cell);
+    d64 r_n = d_word(edge_y, 2u * cell);
+    d64 center = d_sub(d_sub(ONE, d_add(r_w, r_e)), d_add(r_s, r_n));
+    d64 x_term = d_add(d_mul(r_w, d_from_f32_bits(u_w)), d_mul(r_e, d_from_f32_bits(u_e)));
+    d64 y_term = d_add(d_mul(r_s, d_from_f32_bits(u_s)), d_mul(r_n, d_from_f32_bits(u_n)));
+    d64 value = d_add(d_add(d_mul(center, d_from_f32_bits(u_c)), x_term), y_term);
+    uint out_bits = d_to_f32_bits(value);
+    if (!f32_finite(out_bits)) {
+        atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+    }
+    target[base + cell] = out_bits;
+}
+
 // grid.rs's `minimum_image(from, to, length)`; sets `refused` where the
 // reference refuses.
 static d64 minimum_image(d64 from, d64 to, d64 length, thread bool &refused) {
@@ -100,9 +161,10 @@ static d64 minimum_image(d64 from, d64 to, d64 length, thread bool &refused) {
     return difference;
 }
 
-// Every candidate cell's raw weight: sources.rs's `SourceKernel::weight`.
-// header: sources, entries, world width, world height, cell width, cell
-// height, r², 2σ² (binary64 as two words from word 2).
+// Every candidate cell's raw weight: sources.rs's `SourceKernel::weight`,
+// reading per-source `(r_j², 2σ_j²)` from the 77-word descriptor.
+// header: sources, entries, world width, world height, cell width, cell height
+// (binary64 as two words from word 2).
 kernel void source_weights(
     device const uint *header [[buffer(0)]],
     device const uint *descriptors [[buffer(1)]],
@@ -119,6 +181,9 @@ kernel void source_weights(
         j += 1u;
     }
     device const uint *d = descriptors + j * DESCRIPTOR;
+    if (d[ROWS] == 0u || d[COLUMNS] == 0u) {
+        return;
+    }
     uint local = id - d[FIRST];
     uint row = axes[d[ROWS_AT] + local / d[COLUMNS]];
     uint column = axes[d[COLUMNS_AT] + local % d[COLUMNS]];
@@ -133,9 +198,9 @@ kernel void source_weights(
     } else {
         // Both squares and their sum are nonnegative, so bits order them.
         d64 distance_squared = d_add(d_mul(dx, dx), d_mul(dy, dy));
-        weight = distance_squared > d_word(header, 10u)
+        weight = distance_squared > d_word(d, RADIUS_SQUARED)
             ? ABSENT
-            : exp_neg(d_div(distance_squared, d_word(header, 12u)));
+            : exp_neg(d_div(distance_squared, d_word(d, TWO_SIGMA_SQUARED)));
     }
     weights[2u * id] = uint(weight & 0xFFFFFFFFul);
     weights[2u * id + 1u] = uint(weight >> 32);
@@ -195,6 +260,9 @@ kernel void source_moments(
                 atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
             }
             bits = d_to_f32_bits(d_add(d_from_f32_bits(bits), delta));
+            if (!f32_finite(bits)) {
+                atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+            }
         }
     } else {
         for (uint j = 0u; j < sources; ++j) {
@@ -216,6 +284,9 @@ kernel void source_moments(
                 atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
             }
             bits = d_to_f32_bits(d_add(d_from_f32_bits(bits), d_mul(amount, component)));
+            if (!f32_finite(bits)) {
+                atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+            }
         }
     }
     moments[id] = bits;

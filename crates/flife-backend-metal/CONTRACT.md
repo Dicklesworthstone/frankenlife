@@ -25,7 +25,12 @@ bit-identical to `flife_field::advance_field_on` (plan §8.1, §10.7, §11.1), i
 `flife_field::FieldBackend`. The device does the per-cell work in `field.metal` on `softfloat64.metal`'s binary64:
 every plane's substeps, every candidate cell's source weight (its `exp`) and every moment value's decay and
 deposits. The host does every sequential F64 sum through flife-field's own functions. The software binary64 moved
-from `controller.metal` into `softfloat64.metal`, which both kernels now share.
+from `controller.metal` into `softfloat64.metal`, which both kernels now share. `MetalField` also implements
+`FieldBackend::advance_v2` and `MetalField::transport_flux_range` for `V2-02` (`oases`: 77-word descriptors carrying
+per-source `(r_j², 2σ_j²)` and clean zero-power source skip on both fused and non-fused kernels) and `V2-09`
+(`tight-junctions`: `field_stencil_flux` evaluating `((1 - (r_w + r_e)) - (r_s + r_n))` in exact IEEE-754 order over a
+parameterized `plane_range`, reusable by `V2-14` and `V2-15`, allocating flux device buffers lazily so v1 uses 0 extra
+bytes).
 
 FL-031, second part: phase 3's sensor pyramid and sampling on Metal, bit-identical to
 `flife_field::PyramidView::sample` (plan §6.1, §8.1, §10.7), in `sensors`. `MetalSensors` is a
@@ -51,14 +56,19 @@ flife-engine's `settle_stages` runs after chemistry, from the exhaustion check a
 motion: `MaintenanceCosts::bill`, `MaintenanceBill::settle`, `uptake_ratio`, `MotionResponse::new`, and `Motion`'s
 `acceleration`, `propose`, `settle` and `displace` (plan §5.4, §5.6, §8.2, §10.7). It takes plain data too: the run's
 constants, and each organism's budget after chemistry, controller evaluation and parameter count, sensing scale,
-absorbed uptake, velocity, position, motion response and sensor gradients.
+absorbed uptake, velocity, position, motion response and sensor gradients. `MetalMotion::settle_v2` (and
+`MetalSettle::motion_v2`) extends the same kernel with `V2-03` (`senescence`) `basal_multiplier >= 1.0` applied in
+exact associativity `(dt * basal) * m_age` and `V2-05` (`so2-motor`) SO(2)-equivariant steering + guarded heading
+propulsion, preserving the exact single-loop baseline fast-path (0 ulp drift) when all four motor controls are zero.
 
 FL-032, third stage: phase 6's emission on Metal, in `emission`. `MetalEmission::settle` runs, for each organism
 alive after motion, `EmissionPolicy::emit` with flife-field's `Deposits::push` (its payment, offer and direction
 checks, `ExchangeStencil::at` and the deposit split) and the budget's payment, then the exhaustion check after
-emission (plan §5.5, §8.2, §10.7). It returns each deposit's packets, cell and amount in stencil order, for the
-caller to stage in identity order. flife-field's `Deposits` gains `entry` and `entry_packets`, read-only, which the
-tests compare the device with.
+emission (plan §5.5, §8.2, §10.7). `MetalEmission::settle_with_floor` (and `MetalSettle::emission_with_floor`) adds
+`V2-04` (`surplus-emission`) `energy_floor >= 0.0`, spending `fraction` only out of `max(available - energy_floor, 0)`
+and matching v1 bit-for-bit at `energy_floor == 0.0`. It returns each deposit's packets, cell and amount in stencil
+order, for the caller to stage in identity order. flife-field's `Deposits` gains `entry` and `entry_packets`,
+read-only, which the tests compare the device with.
 
 FL-032, fourth stage: the three stages in a world. Their plain-data types moved to flife-field's `settle`, the
 port `SettleBackend`, unchanged; this crate re-exports them. `MetalSettle` (`open`, `with_owner`, `device_name`,

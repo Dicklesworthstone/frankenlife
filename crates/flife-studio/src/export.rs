@@ -28,17 +28,29 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 
-use flife_core::{CoreError, Sha256Digest, Sha256Stream, ValidatedConfig};
+use flife_cli::CameraPath;
+use flife_core::model::is_v2_model;
+use flife_core::{CoreError, Sha256Digest, Sha256Stream, V2Feature, ValidatedConfig};
 use flife_render::AffinityProjection;
 use fmn_codec::{CompressionLevel, PngEncoder, Y4mColorspace, append_y4m_frame_nv12, y4m_header};
 use fmn_frame::convert::rgba_to_nv12;
 use fmn_frame::{ChromaSiting, ColorRange, FrameBuffer, FrameLayout, PixelFormat};
 use serde::{Deserialize, Serialize};
 
-use crate::timeline::{TIMELINE_SCHEMA, TimelineProjection, TimelineRecord, read_timeline, replay};
+use crate::memory::export_scratch_bytes;
+use crate::timeline::{
+    ReplayConfig, TIMELINE_SCHEMA, TimelineProjection, TimelineRecord, TimelineStart,
+    read_timeline, replay_with, validate_timeline,
+};
+
+/// Standard Cinema 1080p output resolution (`1920 × 1080`, FL-050).
+pub const CINEMA_1080P: [u32; 2] = [1920, 1080];
+
+/// Standard Cinema 4K UHD output resolution (`3840 × 2160`, FL-050).
+pub const CINEMA_4K: [u32; 2] = [3840, 2160];
 
 /// The schema of an export's manifest.
 pub const EXPORT_SCHEMA: &str = "frankenlife.export.v1";
@@ -52,7 +64,7 @@ pub const VIDEO_FILE: &str = "capture.y4m";
 /// The encoded video's file name in an export's directory.
 pub const ENCODED_FILE: &str = "capture.mp4";
 
-/// How a timeline is exported.
+/// How a timeline is exported in live-capture mode (FL-023).
 #[derive(Debug, Clone, Copy)]
 pub struct ExportOptions {
     /// The video's constant rate.
@@ -65,15 +77,259 @@ pub struct ExportOptions {
     pub mp4: bool,
 }
 
-/// One frame of an export: a frame the Studio drew.
+/// How frames of a timeline are sampled for export (plan §13.8, FL-050).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExportMode {
+    /// Replay every frame the Studio presented at its recorded wall times,
+    /// mapped onto a constant video clock (FL-023).
+    #[default]
+    LiveCapture,
+    /// Sample the replayed world at exact, deterministic integer simulation
+    /// tick intervals (`every_ticks`), independent of wall-clock recording
+    /// jitter (FL-050, G10). Every sampled frame fills exactly 1 video slot
+    /// (`repeated = 0`, `dropped = 0`).
+    SimulationTime {
+        /// Committed simulation ticks between consecutive exported frames.
+        every_ticks: NonZeroU64,
+    },
+}
+
+/// Cinema export options (FL-050, G10): supports both `LiveCapture` and
+/// exact `SimulationTime` sampling, optional 1080p/4K target resolution,
+/// optional keyframed [`CameraPath`], and full FL-043 / INV-15 peak-memory
+/// admission.
+#[derive(Debug, Clone)]
+pub struct CinemaOptions {
+    /// The video's constant rate.
+    pub frames_per_second: NonZeroU32,
+    /// Threads for the replayed world's field and organism phases; no
+    /// result depends on it.
+    pub cpu_workers: Option<NonZeroUsize>,
+    /// Also encode the video as H.264 into `capture.mp4`, with the ffmpeg
+    /// on the `PATH`, which must list libx264.
+    pub mp4: bool,
+    /// Live-capture or exact simulation-time sampling.
+    pub mode: ExportMode,
+    /// Optional target output resolution in pixels (e.g., [`CINEMA_1080P`] or
+    /// [`CINEMA_4K`]). `None` keeps the timeline's recorded drawables.
+    pub resolution: Option<[u32; 2]>,
+    /// Optional pixel density (`pixels_per_point`) paired with `resolution`.
+    /// When `None`, defaults to `2.0` at 4K (`>= 3840 × 2160`) and `1.0`
+    /// otherwise so HUD typography scales cleanly.
+    pub pixels_per_point: Option<f64>,
+    /// Optional torus-aware smoothstep keyframed camera path evaluated at
+    /// each frame's integer committed tick.
+    pub camera: Option<CameraPath>,
+}
+
+impl From<ExportOptions> for CinemaOptions {
+    fn from(options: ExportOptions) -> Self {
+        Self {
+            frames_per_second: options.frames_per_second,
+            cpu_workers: options.cpu_workers,
+            mp4: options.mp4,
+            mode: ExportMode::LiveCapture,
+            resolution: None,
+            pixels_per_point: None,
+            camera: None,
+        }
+    }
+}
+
+impl CinemaOptions {
+    /// Cinema 1080p (`1920 × 1080`, `1.0` pixels/point) simulation-time
+    /// options sampling every `every_ticks` committed ticks.
+    #[must_use]
+    pub const fn cinema_1080p(frames_per_second: NonZeroU32, every_ticks: NonZeroU64) -> Self {
+        Self {
+            frames_per_second,
+            cpu_workers: None,
+            mp4: false,
+            mode: ExportMode::SimulationTime { every_ticks },
+            resolution: Some(CINEMA_1080P),
+            pixels_per_point: Some(1.0),
+            camera: None,
+        }
+    }
+
+    /// Cinema 4K UHD (`3840 × 2160`, `2.0` pixels/point) simulation-time
+    /// options sampling every `every_ticks` committed ticks.
+    #[must_use]
+    pub const fn cinema_4k(frames_per_second: NonZeroU32, every_ticks: NonZeroU64) -> Self {
+        Self {
+            frames_per_second,
+            cpu_workers: None,
+            mp4: false,
+            mode: ExportMode::SimulationTime { every_ticks },
+            resolution: Some(CINEMA_4K),
+            pixels_per_point: Some(2.0),
+            camera: None,
+        }
+    }
+
+    /// Validate and resolve the optional Cinema `(drawable, pixels_per_point)`
+    /// target before touching disk or allocating buffers.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for zero dimensions or non-finite /
+    /// non-positive `pixels_per_point`.
+    pub fn resolved_target(&self) -> Result<Option<([u32; 2], f64)>, CoreError> {
+        if let Some(scale) = self.pixels_per_point
+            && (!scale.is_finite() || scale <= 0.0)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "cinema export pixel density",
+                detail: format!("pixels_per_point {scale} must be finite and positive"),
+            });
+        }
+        let Some(size) = self.resolution else {
+            return Ok(None);
+        };
+        if size[0] == 0 || size[1] == 0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "cinema export resolution",
+                detail: format!("resolution {size:?} must be non-zero"),
+            });
+        }
+        let scale = self.pixels_per_point.unwrap_or_else(|| {
+            if size[0] >= CINEMA_4K[0] || size[1] >= CINEMA_4K[1] {
+                2.0
+            } else {
+                1.0
+            }
+        });
+        Ok(Some((size, scale)))
+    }
+}
+
+/// Parse a Cinema resolution flag: `1080p`, `4k` / `2160p`, or `WxH`.
+///
+/// # Errors
+/// Returns a human-readable explanation if the input is not a positive `WxH`
+/// pair or named Cinema preset.
+pub fn parse_cinema_resolution(text: &str) -> Result<[u32; 2], String> {
+    let trimmed = text.trim();
+    if trimmed.eq_ignore_ascii_case("1080p") {
+        return Ok(CINEMA_1080P);
+    }
+    if trimmed.eq_ignore_ascii_case("4k") || trimmed.eq_ignore_ascii_case("2160p") {
+        return Ok(CINEMA_4K);
+    }
+    let Some((w, h)) = trimmed.split_once(['x', 'X']) else {
+        return Err(format!("`{text}` is not `1080p`, `4k`, or `WIDTHxHEIGHT`"));
+    };
+    let width: u32 = w
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{text}` has an invalid width"))?;
+    let height: u32 = h
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{text}` has an invalid height"))?;
+    if width == 0 || height == 0 {
+        return Err(format!("`{text}` must have positive width and height"));
+    }
+    Ok([width, height])
+}
+
+/// One exact integer-tick sample of a Cinema simulation-time export (FL-050).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimulationSample {
+    /// Sequential exported frame index (`0, 1, 2, ...`).
+    pub frame: u64,
+    /// Exact committed simulation tick.
+    pub tick: u64,
+    /// Exact simulation time in seconds (`tick * seconds_per_tick`).
+    pub sim_seconds: f64,
+    /// Constant-rate output video timestamp (`frame / fps`).
+    pub video_seconds: f64,
+}
+
+/// Plan exact integer-tick simulation-time samples over `[start_tick, end_tick]`
+/// stepping by `every_ticks` (FL-050, plan §13.8). Uses pure integer tick
+/// arithmetic so simulation time never drifts from accumulated floating-point
+/// timesteps.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] if `start_tick > end_tick`, `seconds_per_tick`
+/// is not finite and positive, or the sample count exceeds `u32::MAX`.
+pub fn plan_simulation_samples(
+    start_tick: u64,
+    end_tick: u64,
+    every_ticks: NonZeroU64,
+    seconds_per_tick: f64,
+    fps: NonZeroU32,
+) -> Result<Vec<SimulationSample>, CoreError> {
+    if start_tick > end_tick {
+        return Err(conflict(format!(
+            "simulation-time range [{start_tick}, {end_tick}] is inverted"
+        )));
+    }
+    if !seconds_per_tick.is_finite() || seconds_per_tick <= 0.0 {
+        return Err(conflict(format!(
+            "timestep {seconds_per_tick} must be finite and positive"
+        )));
+    }
+    let step = every_ticks.get();
+    let count = (end_tick - start_tick) / step + 1;
+    if count > u64::from(u32::MAX) {
+        return Err(conflict(format!(
+            "simulation-time export would emit {count} frames, exceeding {}",
+            u32::MAX
+        )));
+    }
+    let count_usize = usize::try_from(count).map_err(|_| CoreError::Overflow {
+        quantity: "cinema simulation-time sample count",
+    })?;
+    let rate = f64::from(fps.get());
+    let mut samples = Vec::with_capacity(count_usize);
+    for frame in 0..count {
+        let tick = start_tick
+            .checked_add(frame.saturating_mul(step))
+            .ok_or_else(|| CoreError::Overflow {
+                quantity: "cinema simulation-time tick",
+            })?;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "tick and frame counts far below 2^53 are exact in f64"
+        )]
+        let (sim_seconds, video_seconds) = (tick as f64 * seconds_per_tick, frame as f64 / rate);
+        samples.push(SimulationSample {
+            frame,
+            tick,
+            sim_seconds,
+            video_seconds,
+        });
+    }
+    Ok(samples)
+}
+
+/// One frame of an export: a frame the Studio drew (or sampled in
+/// simulation-time mode).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExportedFrame {
     /// The Studio's index of the frame.
     pub frame: u64,
     /// The tick of the epoch it shows.
     pub tick: u64,
-    /// When the Studio drew it, in seconds since it opened.
+    /// When the Studio drew it, in seconds since it opened (or `frame / fps`
+    /// in simulation-time export).
     pub wall_seconds: f64,
+    /// Exact simulation time in seconds (`tick * seconds_per_tick`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sim_seconds: Option<f64>,
+    /// Active organism colour mapping rendered on this frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<String>,
+    /// Active field mapping rendered on this frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_mapping: Option<String>,
+    /// Rendered viewport center in world units (G10 camera alignment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_center: Option<[f64; 2]>,
+    /// Rendered viewport zoom (G10 camera alignment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_zoom: Option<f64>,
     /// Its PNG's file name.
     pub file: String,
     /// Its PNG's SHA-256.
@@ -141,12 +397,34 @@ pub struct ExportManifest {
     pub config_hash: String,
     /// The configuration's name.
     pub name: String,
+    /// The run's model identity (e.g., `field-ecology-v1`, `field-ecology-v2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Enabled scientific `field-ecology-v2` feature slugs, sorted; `None` on
+    /// `field-ecology-v1*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_features: Option<Vec<String>>,
+    /// Whether `V2-16` (`v2-visual-mappings`, `INV-09`) was enabled on a
+    /// `field-ecology-v2*` model; `None` on `field-ecology-v1*`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v2_visual_mappings: Option<bool>,
+    /// Checkpoint / run-directory provenance when exported from a resumed
+    /// Studio timeline (`None` for a founding session).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<TimelineStart>,
     /// Its seed.
     pub seed: u64,
     /// The ticks of the first and last frames.
     pub ticks: [u64; 2],
     /// The tick the session closed on.
     pub end_tick: u64,
+    /// Committed ticks between consecutive sampled frames in
+    /// `simulation-time` mode; `None` in `live-capture` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_every_ticks: Option<u64>,
+    /// Keyframe count of the Cinema [`CameraPath`] used, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_keys: Option<usize>,
     /// Simulated seconds a tick.
     pub seconds_per_tick: f64,
     /// The world's digest at `end_tick`, which the replay reached.
@@ -160,6 +438,18 @@ pub struct ExportManifest {
     /// The fixed projection the frames' affinity and composition colours
     /// were drawn through (plan §13.4's recorded matrix and scaling).
     pub projection: TimelineProjection,
+    /// Distinct organism colour mappings rendered across exported frames, in
+    /// first-appearance order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub color_mappings: Vec<String>,
+    /// Distinct field mappings rendered across exported frames, in
+    /// first-appearance order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_mappings: Vec<String>,
+    /// Honest FL-043 / INV-15 peak memory admitted for this export (world +
+    /// observers + PNG/NV12/y4m encoder scratch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_peak_bytes: Option<u64>,
     /// What wrote the frames.
     pub frame_encoder: String,
     /// Wall seconds from the first frame to the last.
@@ -177,7 +467,7 @@ pub struct ExportManifest {
     pub encoded: Option<ExportedEncoding>,
 }
 
-/// One frame the timeline draws, as its records declare it.
+/// One frame the export plans to emit.
 struct Planned {
     frame: u64,
     tick: u64,
@@ -186,60 +476,113 @@ struct Planned {
 }
 
 /// Export the timeline `text` of `config`'s world into the new directory
-/// `out` (see the module documentation), and return its manifest.
+/// `out` in live-capture mode (see the module documentation), and return its
+/// manifest.
 ///
 /// # Errors
-/// - [`CoreError::StorageFailed`] when `out` exists or a file cannot be
-///   written.
-/// - [`CoreError::StateConflict`] for frame times that are not finite and
-///   in order, frame ticks that go backwards, more slots than a `u32`
-///   counts, or a frame of another size than its drawable. Before anything
-///   is written, for an MP4 asked of an export whose video is withheld.
-/// - [`CoreError::MissingCapability`] before anything is written, for an
-///   MP4 asked for without a runnable ffmpeg listing libx264; as
-///   [`flife_cli::encode_y4m`] when its encode fails.
-/// - As [`read_timeline`] and [`replay`].
+/// As [`export_cinema`].
 pub fn export(
     config: &ValidatedConfig,
     text: &str,
     options: ExportOptions,
     out: &Path,
 ) -> Result<ExportManifest, CoreError> {
-    let records = read_timeline(text)?;
-    let Some(TimelineRecord::Header {
-        name, seed, size, ..
-    }) = records.first()
-    else {
-        return Err(conflict("a timeline opens with its header".into()));
-    };
-    let mut drawable = *size;
-    let mut planned = Vec::new();
-    for record in &records {
-        match record {
-            TimelineRecord::Resize { drawable: size } => drawable = *size,
-            TimelineRecord::Draw {
-                frame,
-                tick,
-                wall_seconds,
-            } => planned.push(Planned {
-                frame: *frame,
-                tick: *tick,
-                wall_seconds: wall_seconds.0,
-                drawable,
-            }),
-            _ => {}
-        }
-    }
-    let walls: Vec<f64> = planned.iter().map(|frame| frame.wall_seconds).collect();
-    if walls.iter().any(|wall| !wall.is_finite()) || !walls.is_sorted_by(|a, b| a <= b) {
-        return Err(conflict(
-            "the frames' wall times are not finite and in order".into(),
+    export_cinema(config, text, &CinemaOptions::from(options), out)
+}
+
+/// Export the timeline `text` of `config`'s world into the new directory
+/// `out` under [`CinemaOptions`] (FL-023, FL-050, FL-043, G10): supports
+/// live-capture and exact simulation-time sampling, 1080p/4K target
+/// resolutions, optional keyframed [`CameraPath`], V2-16 visual mapping
+/// propagation, and upfront FL-043 peak-memory admission before creating `out`.
+///
+/// # Errors
+/// - [`CoreError::StorageFailed`] when `out` exists or a file cannot be
+///   written.
+/// - [`CoreError::StateConflict`] for an invalid timeline, disallowed v2
+///   visual styles, non-monotonic ticks or wall times, or an MP4 asked of an
+///   export whose video is withheld.
+/// - [`CoreError::NumericalInvalid`] for invalid resolution or pixel density.
+/// - [`CoreError::BudgetExhausted`] before creating `out` when the export's
+///   world, observers, and encoder scratch exceed `[execution]
+///   maximum_total_bytes` (`INV-15`).
+/// - [`CoreError::MissingCapability`] before creating `out` without a Metal
+///   device or without a runnable ffmpeg listing libx264 (when `mp4` is set).
+pub fn export_cinema(
+    config: &ValidatedConfig,
+    text: &str,
+    options: &CinemaOptions,
+    out: &Path,
+) -> Result<ExportManifest, CoreError> {
+    if out.exists() {
+        return Err(storage(
+            "create the export directory",
+            out,
+            &std::io::Error::from(std::io::ErrorKind::AlreadyExists),
         ));
     }
-    if !planned.is_sorted_by_key(|frame| frame.tick) {
-        return Err(conflict("the frames' ticks are not in order".into()));
-    }
-    let counts = slot_counts(&walls, options.frames_per_second)?;
+    let target_resolution = options.resolved_target()?;
+    let records = read_timeline(text)?;
+    let validated = validate_timeline(config, &records)?;
+    let seconds_per_tick = config.report().timestep.seconds_per_tick();
+
+    let (planned, counts, mode_name, sample_every_ticks) = match options.mode {
+        ExportMode::LiveCapture => {
+            let planned: Vec<Planned> = validated
+                .draws
+                .iter()
+                .map(|draw| Planned {
+                    frame: draw.frame,
+                    tick: draw.tick,
+                    wall_seconds: draw.wall_seconds,
+                    drawable: target_resolution.map_or(draw.drawable, |(size, _)| size),
+                })
+                .collect();
+            let walls: Vec<f64> = planned.iter().map(|frame| frame.wall_seconds).collect();
+            let counts = slot_counts(&walls, options.frames_per_second)?;
+            (planned, counts, "live-capture", None)
+        }
+        ExportMode::SimulationTime { every_ticks } => {
+            let samples = plan_simulation_samples(
+                validated.opened,
+                validated.end_tick,
+                every_ticks,
+                seconds_per_tick,
+                options.frames_per_second,
+            )?;
+            let mut resize_by_tick: Vec<(u64, [u32; 2])> = Vec::new();
+            let mut rec_tick = validated.opened;
+            for record in &records {
+                match record {
+                    TimelineRecord::Show { current, .. }
+                    | TimelineRecord::Place { current, .. }
+                    | TimelineRecord::Advance { current, .. } => rec_tick = *current,
+                    TimelineRecord::Resize { drawable } => {
+                        resize_by_tick.push((rec_tick, *drawable));
+                    }
+                    _ => {}
+                }
+            }
+            let mut cursor = 0_usize;
+            let mut cur_drawable = validated.size;
+            let mut planned = Vec::with_capacity(samples.len());
+            for sample in samples {
+                while cursor < resize_by_tick.len() && resize_by_tick[cursor].0 <= sample.tick {
+                    cur_drawable = resize_by_tick[cursor].1;
+                    cursor += 1;
+                }
+                planned.push(Planned {
+                    frame: sample.frame,
+                    tick: sample.tick,
+                    wall_seconds: sample.video_seconds,
+                    drawable: target_resolution.map_or(cur_drawable, |(size, _)| size),
+                });
+            }
+            let counts = vec![1_u64; planned.len()];
+            (planned, counts, "simulation-time", Some(every_ticks.get()))
+        }
+    };
+
     let withheld = match planned.first() {
         None => Some("no frame was drawn".to_owned()),
         Some(first) => planned
@@ -260,7 +603,7 @@ pub fn export(
                     .then(|| format!("{:?} is not even, as 4:2:0 needs", first.drawable))
             }),
     };
-    // The encoder, before anything is written.
+    // Check external H.264 encoder before creating `out` or running replay.
     let ffmpeg = if options.mp4 {
         if let Some(why) = &withheld {
             return Err(conflict(format!(
@@ -272,61 +615,117 @@ pub fn export(
         None
     };
 
-    std::fs::create_dir(out)
-        .map_err(|error| storage("create the export directory", out, &error))?;
-    let video_path = out.join(VIDEO_FILE);
-    let mut video = match (&withheld, planned.first()) {
-        (None, Some(first)) => Some(Video::create(
-            &video_path,
-            first.drawable,
-            options.frames_per_second,
-        )?),
-        _ => None,
+    let with_video = withheld.is_none();
+    let extra_render_bytes = match target_resolution {
+        Some((size, _)) => export_scratch_bytes(size, with_video),
+        None => planned
+            .iter()
+            .map(|frame| export_scratch_bytes(frame.drawable, with_video))
+            .max()
+            .unwrap_or_else(|| export_scratch_bytes(validated.size, with_video)),
     };
+
+    let video_path = out.join(VIDEO_FILE);
     let mut encoder = PngEncoder::new();
     let mut frames = Vec::with_capacity(planned.len());
-    let replayed = replay(config, &records, options.cpu_workers, |frame| {
-        let index = frames.len();
-        let plan = planned
-            .get(index)
-            .ok_or_else(|| conflict(format!("frame {} was not planned", frame.frame)))?;
-        let layout = frame.pixels.layout();
-        let [width, height] = plan.drawable;
-        let rgba = frame.pixels.as_bytes();
-        if layout.format() != PixelFormat::Rgba8
-            || [layout.width(), layout.height()] != plan.drawable
-            || rgba.len() != width as usize * height as usize * 4
-        {
-            return Err(CoreError::LayoutMismatch {
-                buffer: "exported frame",
-                detail: format!(
-                    "frame {} is {:?} {}x{} in {} bytes; its drawable is {:?}",
-                    frame.frame,
-                    layout.format(),
-                    layout.width(),
-                    layout.height(),
-                    rgba.len(),
-                    plan.drawable
-                ),
+    let mut color_mappings: Vec<String> = Vec::new();
+    let mut field_mappings: Vec<String> = Vec::new();
+
+    let replay_cfg = ReplayConfig {
+        cpu_workers: options.cpu_workers,
+        target_resolution,
+        extra_render_bytes,
+        camera: options.camera.as_ref(),
+        sample_every_ticks: match options.mode {
+            ExportMode::LiveCapture => None,
+            ExportMode::SimulationTime { every_ticks } => {
+                Some((every_ticks, options.frames_per_second))
+            }
+        },
+    };
+    let (replayed, admitted, video) = replay_with(
+        config,
+        &records,
+        &replay_cfg,
+        |_admitted| {
+            std::fs::create_dir(out)
+                .map_err(|error| storage("create the export directory", out, &error))?;
+            if let (None, Some(first)) = (&withheld, planned.first()) {
+                Ok(Some(Video::create(
+                    &video_path,
+                    first.drawable,
+                    options.frames_per_second,
+                )?))
+            } else {
+                Ok(None)
+            }
+        },
+        |video, frame| {
+            let index = frames.len();
+            let plan = planned
+                .get(index)
+                .ok_or_else(|| conflict(format!("frame {} was not planned", frame.frame)))?;
+            let layout = frame.pixels.layout();
+            let [width, height] = plan.drawable;
+            let rgba = frame.pixels.as_bytes();
+            let expected_bytes = u64::from(width)
+                .checked_mul(u64::from(height))
+                .and_then(|pixels| pixels.checked_mul(4))
+                .and_then(|bytes| usize::try_from(bytes).ok());
+            if layout.format() != PixelFormat::Rgba8
+                || [layout.width(), layout.height()] != plan.drawable
+                || expected_bytes != Some(rgba.len())
+            {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "exported frame",
+                    detail: format!(
+                        "frame {} is {:?} {}x{} in {} bytes; its drawable is {:?}",
+                        frame.frame,
+                        layout.format(),
+                        layout.width(),
+                        layout.height(),
+                        rgba.len(),
+                        plan.drawable
+                    ),
+                });
+            }
+            let png = encoder.encode_rgba8(width, height, rgba, CompressionLevel::Fast);
+            let file = format!("frame-{index:06}.png");
+            write_new(&out.join(&file), &png)?;
+            let slots = counts[index];
+            if let Some(video) = video.as_mut() {
+                video.write(frame.pixels, slots)?;
+            }
+            let mapping_name = frame.style.mapping.name().to_owned();
+            if !color_mappings.contains(&mapping_name) {
+                color_mappings.push(mapping_name.clone());
+            }
+            let field_name = frame.style.field_mapping.name().to_owned();
+            if !field_mappings.contains(&field_name) {
+                field_mappings.push(field_name.clone());
+            }
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "tick counts far below 2^53 are exact in f64"
+            )]
+            let sim_seconds = frame.tick.get() as f64 * seconds_per_tick;
+            frames.push(ExportedFrame {
+                frame: frame.frame,
+                tick: frame.tick.get(),
+                wall_seconds: frame.wall_seconds,
+                sim_seconds: Some(sim_seconds),
+                mapping: Some(mapping_name),
+                field_mapping: Some(field_name),
+                camera_center: Some(frame.camera_center),
+                camera_zoom: Some(frame.camera_zoom),
+                file,
+                sha256: Sha256Digest::of(&png).to_hex(),
+                slots,
             });
-        }
-        let png = encoder.encode_rgba8(width, height, rgba, CompressionLevel::Fast);
-        let file = format!("frame-{index:06}.png");
-        write_new(&out.join(&file), &png)?;
-        let slots = counts[index];
-        if let Some(video) = &mut video {
-            video.write(frame.pixels, slots)?;
-        }
-        frames.push(ExportedFrame {
-            frame: frame.frame,
-            tick: frame.tick.get(),
-            wall_seconds: frame.wall_seconds,
-            file,
-            sha256: Sha256Digest::of(&png).to_hex(),
-            slots,
-        });
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
+
     let video = video
         .map(|video| video.finish(options.frames_per_second, &counts))
         .transpose()?;
@@ -357,17 +756,29 @@ pub fn export(
         reason = "a tick count far below 2^53 is exact"
     )]
     let shown = ticks[1].saturating_sub(ticks[0]) as f64;
+    let model_name = config.config().model.clone();
+    let v2_features = config
+        .enabled_v2_features()
+        .map(|slugs| slugs.into_iter().map(str::to_owned).collect());
+    let v2_visual_mappings =
+        is_v2_model(&model_name).then(|| config.is_v2_feature_enabled(V2Feature::V2VisualMappings));
     let manifest = ExportManifest {
         schema: EXPORT_SCHEMA.to_owned(),
-        mode: "live-capture".to_owned(),
+        mode: mode_name.to_owned(),
         timeline_schema: TIMELINE_SCHEMA.to_owned(),
         timeline_sha256: Sha256Digest::of(text.as_bytes()).to_hex(),
         config_hash: config.config_hash().to_hex(),
-        name: name.clone(),
-        seed: *seed,
+        name: validated.name,
+        model: Some(model_name),
+        v2_features,
+        v2_visual_mappings,
+        from: validated.from,
+        seed: validated.seed,
         ticks,
         end_tick: replayed.tick.get(),
-        seconds_per_tick: config.report().timestep.seconds_per_tick(),
+        sample_every_ticks,
+        camera_keys: options.camera.as_ref().map(|path| path.keys.len()),
+        seconds_per_tick,
         digest: replayed.digest,
         commands: replayed.commands,
         renderer: "fmn-render Metal render_three_d_rgba8".to_owned(),
@@ -375,6 +786,9 @@ pub fn export(
                        (fmn-render srgb8_from_f16)"
             .to_owned(),
         projection: AffinityProjection::fixed().into(),
+        color_mappings,
+        field_mappings,
+        admitted_peak_bytes: Some(admitted.peak_bytes),
         frame_encoder: "fmn-codec png, fast".to_owned(),
         wall_seconds,
         ticks_per_wall_second: (wall_seconds > 0.0).then(|| shown / wall_seconds),
@@ -389,7 +803,7 @@ pub fn export(
             detail: error.to_string(),
         })?;
     json.push(b'\n');
-    write_new(&out.join(MANIFEST_FILE), &json)?;
+    write_new_synced(&out.join(MANIFEST_FILE), &json)?;
     Ok(manifest)
 }
 
@@ -404,7 +818,9 @@ pub fn slot_counts(walls: &[f64], fps: NonZeroU32) -> Result<Vec<u64>, CoreError
     let (Some(&first), Some(&last)) = (walls.first(), walls.last()) else {
         return Ok(counts);
     };
-    if walls.iter().any(|wall| !wall.is_finite()) || !walls.is_sorted_by(|a, b| a <= b) {
+    if walls.iter().any(|wall| !wall.is_finite() || *wall < 0.0)
+        || !walls.is_sorted_by(|a, b| a <= b)
+    {
         return Err(conflict(
             "the frames' wall times are not finite and in order".into(),
         ));
@@ -541,6 +957,17 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
         .map_err(|error| storage("write an export file", path, &error))
 }
 
+/// Write `bytes` to a brand-new file and flush it durably (`sync_all`): used
+/// for `manifest.json`, which marks an export complete.
+fn write_new_synced(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
+    let mut file =
+        File::create_new(path).map_err(|error| storage("create an export file", path, &error))?;
+    file.write_all(bytes)
+        .map_err(|error| storage("write an export file", path, &error))?;
+    file.sync_all()
+        .map_err(|error| storage("sync an export file", path, &error))
+}
+
 /// The SHA-256 of the file at `path`, read a block at a time.
 fn file_sha256(path: &Path) -> Result<String, CoreError> {
     let mut file =
@@ -613,21 +1040,36 @@ mod tests {
 
         let backwards_ticks = timeline_text(&[
             header.clone(),
+            TimelineRecord::Show {
+                prior: None,
+                current: 5,
+                fraction: Exact(1.0),
+            },
             TimelineRecord::Draw {
                 frame: 0,
                 tick: 5,
                 wall_seconds: Exact(0.016),
+            },
+            TimelineRecord::Show {
+                prior: Some(5),
+                current: 3,
+                fraction: Exact(1.0),
             },
             TimelineRecord::Draw {
                 frame: 1,
                 tick: 3,
                 wall_seconds: Exact(0.032),
             },
+            TimelineRecord::End {
+                tick: 5,
+                digest: String::new(),
+                applied: Vec::new(),
+            },
         ]);
         let err = export(&config, &backwards_ticks, options, &out)
             .expect_err("backwards frame ticks must be refused without panicking");
         assert!(
-            matches!(err, CoreError::StateConflict { ref detail, .. } if detail.contains("ticks")),
+            matches!(err, CoreError::StateConflict { ref detail, .. } if detail.contains("tick")),
             "expected StateConflict on ticks, got {err:?}"
         );
         assert!(
@@ -637,15 +1079,30 @@ mod tests {
 
         let backwards_walls = timeline_text(&[
             header,
+            TimelineRecord::Show {
+                prior: None,
+                current: 1,
+                fraction: Exact(1.0),
+            },
             TimelineRecord::Draw {
                 frame: 0,
                 tick: 1,
                 wall_seconds: Exact(0.050),
             },
+            TimelineRecord::Show {
+                prior: Some(1),
+                current: 2,
+                fraction: Exact(1.0),
+            },
             TimelineRecord::Draw {
                 frame: 1,
                 tick: 2,
                 wall_seconds: Exact(0.010),
+            },
+            TimelineRecord::End {
+                tick: 2,
+                digest: String::new(),
+                applied: Vec::new(),
             },
         ]);
         let err = export(&config, &backwards_walls, options, &out)
@@ -663,10 +1120,11 @@ mod tests {
             slot_counts(&[0.0, 0.25], fps).expect("three slots"),
             vec![3, 0]
         );
-        // Non-finite, unsorted, overflow-span, and non-advancing wall times
-        // must fail immediately rather than spinning up to u32::MAX slots.
+        // Non-finite, negative, unsorted, overflow-span, and non-advancing wall
+        // times must fail immediately rather than spinning up to u32::MAX slots.
         for bad in [
             &[f64::NAN][..],
+            &[-0.1][..],
             &[1.0, 0.5][..],
             &[0.0, 1.0e12][..],
             &[1.0e20, 1.0e20][..],

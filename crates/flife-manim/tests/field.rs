@@ -707,7 +707,7 @@ fn the_view_draws_the_field_in_the_styles_mapping() {
     );
     let mut view = WorldView::for_epoch(&lease, [96, 96], [0, 0, 0]).expect("view");
     let mut frames = Vec::new();
-    for field_mapping in FieldMapping::ALL {
+    for field_mapping in FieldMapping::V1_ALL {
         view.set_style(Style {
             field_mapping,
             ..Style::default()
@@ -729,6 +729,9 @@ fn the_view_draws_the_field_in_the_styles_mapping() {
                 scale,
                 Look::Glow,
             ),
+            FieldMapping::TrailCarrier | FieldMapping::VascularConductance => {
+                unreachable!("V1_ALL omits v2 overlays")
+            }
         };
         assert_eq!(colours, expected, "{field_mapping}");
         frames.push(view.render_rgba8(2).expect("an offline frame"));
@@ -788,12 +791,17 @@ fn the_view_draws_the_field_in_the_styles_mapping() {
 fn field_mappings_are_named_and_parsed() {
     assert_eq!(FieldMapping::default(), FieldMapping::Energy);
     assert_eq!(Style::default().field_mapping, FieldMapping::Energy);
-    assert_eq!(FieldMapping::ALL.len(), 2 + usize::from(FIELD_COMPONENTS));
+    assert_eq!(
+        FieldMapping::V1_ALL.len(),
+        2 + usize::from(FIELD_COMPONENTS)
+    );
+    assert_eq!(FieldMapping::ALL.len(), 4 + usize::from(FIELD_COMPONENTS));
     assert_eq!(FIELD_COMPONENTS, 32);
-    for (at, mapping) in FieldMapping::ALL.into_iter().enumerate() {
+    for (at, mapping) in FieldMapping::V1_ALL.into_iter().enumerate() {
         assert_eq!(mapping.name().parse::<FieldMapping>(), Ok(mapping));
         assert_eq!(mapping.to_string(), mapping.name());
-        // C cycles energy, composition and the chosen component.
+        assert!(!mapping.is_v2_overlay());
+        // C cycles energy, composition and the chosen component on v1.
         let chosen = mapping.component().unwrap_or_default();
         assert_eq!(mapping.next(chosen).next(chosen).next(chosen), mapping);
         assert_ne!(mapping.next(chosen), mapping);
@@ -806,6 +814,32 @@ fn field_mappings_are_named_and_parsed() {
     }
     assert_eq!(FieldMapping::ALL[0], FieldMapping::Energy);
     assert_eq!(FieldMapping::ALL[1], FieldMapping::Composition);
+    assert_eq!(
+        FieldMapping::ALL[2 + usize::from(FIELD_COMPONENTS)],
+        FieldMapping::TrailCarrier
+    );
+    assert_eq!(
+        FieldMapping::ALL[3 + usize::from(FIELD_COMPONENTS)],
+        FieldMapping::VascularConductance
+    );
+    for overlay in [
+        FieldMapping::TrailCarrier,
+        FieldMapping::VascularConductance,
+    ] {
+        assert!(overlay.is_v2_overlay());
+        assert_eq!(overlay.component(), None);
+        assert_eq!(overlay.name().parse::<FieldMapping>(), Ok(overlay));
+        assert_eq!(overlay.to_string(), overlay.name());
+        assert!(overlay.legend().is_some());
+    }
+    assert_eq!(
+        "trail-carrier".parse::<FieldMapping>(),
+        Ok(FieldMapping::TrailCarrier)
+    );
+    assert_eq!(
+        "vascular-conductance".parse::<FieldMapping>(),
+        Ok(FieldMapping::VascularConductance)
+    );
     let seven = FieldComponent::new(7).expect("a channel");
     assert_eq!(seven.channel(), 7);
     assert_eq!(
@@ -821,6 +855,27 @@ fn field_mappings_are_named_and_parsed() {
         FieldMapping::Component(seven).next(seven),
         FieldMapping::Energy
     );
+    // V2 C-key cycle: energy -> composition -> component -> trail-carrier -> vascular-conductance -> energy.
+    assert_eq!(
+        FieldMapping::Energy.next_v2(seven),
+        FieldMapping::Composition
+    );
+    assert_eq!(
+        FieldMapping::Composition.next_v2(seven),
+        FieldMapping::Component(seven)
+    );
+    assert_eq!(
+        FieldMapping::Component(seven).next_v2(seven),
+        FieldMapping::TrailCarrier
+    );
+    assert_eq!(
+        FieldMapping::TrailCarrier.next_v2(seven),
+        FieldMapping::VascularConductance
+    );
+    assert_eq!(
+        FieldMapping::VascularConductance.next_v2(seven),
+        FieldMapping::Energy
+    );
     assert_eq!(FieldComponent::new(32), None);
     let last = FieldComponent::new(31).expect("the last channel");
     let first = FieldComponent::default();
@@ -829,8 +884,8 @@ fn field_mappings_are_named_and_parsed() {
     assert_eq!((seven.next().channel(), seven.previous().channel()), (8, 6));
     let refused = |text: &str| {
         Err(format!(
-            "`{text}` is not a field mapping: energy, composition or component-C for a channel C \
-             from 0 to 31"
+            "`{text}` is not a field mapping: energy, composition, trail-carrier, \
+             vascular-conductance or component-C for a channel C from 0 to 31"
         ))
     };
     for text in [
@@ -1029,5 +1084,116 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
         m.update_look(&messy, look).expect("messy field");
         assert_eq!(m.scale(), 3.0);
         assert!(m.texture().is_some());
+    }
+}
+
+/// V2-16: `FieldLayer` maps `FieldMapping::TrailCarrier` and
+/// `FieldMapping::VascularConductance` from optional `FieldTexture` overlay
+/// planes with independent decaying display scales, cache-aware placement,
+/// torus-seamless corner wrapping, honest linear grey in `Look::Raw`/`Sphere`,
+/// and dark fallback when the optional plane is absent.
+#[test]
+fn v2_field_layer_overlays_track_independent_scales_and_wrap_cleanly() {
+    let viewport = fit([8.0, 4.0], [160, 80]);
+    let energy: Vec<f32> = (0..32).map(|i| 40.0 + (i % 8) as f32).collect();
+    let mut trail = vec![0.0_f32; 32];
+    trail[31] = 0.04; // wraps across corner (0, 0)
+    let mut vascular = vec![0.0_f32; 32];
+    vascular[0] = 0.8;
+    let mut planes = energy.clone();
+    planes.extend(std::iter::repeat_n(0.0_f32, 32 * 32));
+    let field = FieldTexture::from_planes_with_overlays(
+        [8, 4],
+        [1.0, 1.0],
+        &planes,
+        Some(&trail),
+        Some(&vascular),
+    )
+    .expect("v2 field texture");
+
+    let mut layer = FieldLayer::new(&viewport);
+    layer
+        .update_mapped(&field, Look::Glow, FieldMapping::Energy)
+        .expect("energy");
+    assert_eq!(layer.energy_scale(), 47.0);
+    assert!((layer.trail_scale() - 0.04).abs() < 1e-6);
+    assert!((layer.vascular_scale() - 0.8).abs() < 1e-6);
+    assert_eq!(layer.scale(), 47.0);
+
+    // Switching to TrailCarrier via place_mapped uses the warm independent
+    // trail scale (0.04, not Carrier-0's 47.0!) without decaying any scale.
+    layer
+        .place_mapped(&field, Look::Glow, FieldMapping::TrailCarrier)
+        .expect("trail glow");
+    assert!((layer.scale() - 0.04).abs() < 1e-6);
+    let trail_glow_ptr = layer.texture().expect("trail tex") as *const _;
+    let expected_seam = flife_manim::linear(flife_manim::trail_carrier_rgb8(
+        flife_manim::overlay_log_value(0.01, layer.trail_scale()),
+    ));
+    let seam_texel = layer
+        .texture()
+        .expect("tex")
+        .texel(0, 0)
+        .expect("seam corner");
+    assert!((seam_texel.r - expected_seam.r).abs() < 1e-5);
+    assert!((seam_texel.g - expected_seam.g).abs() < 1e-5);
+    assert!((seam_texel.b - expected_seam.b).abs() < 1e-5);
+
+    // Identical trail plane hits texture cache; changed trail plane rebuilds.
+    layer
+        .place_mapped(&field, Look::Glow, FieldMapping::TrailCarrier)
+        .expect("trail cache hit");
+    assert_eq!(layer.texture().expect("tex") as *const _, trail_glow_ptr);
+    let mut trail_changed = trail.clone();
+    trail_changed[10] = 0.02;
+    let field_changed = FieldTexture::from_planes_with_overlays(
+        [8, 4],
+        [1.0, 1.0],
+        &planes,
+        Some(&trail_changed),
+        Some(&vascular),
+    )
+    .expect("changed trail");
+    layer
+        .place_mapped(&field_changed, Look::Glow, FieldMapping::TrailCarrier)
+        .expect("trail changed");
+    assert_ne!(layer.texture().expect("tex") as *const _, trail_glow_ptr);
+
+    // Raw & Sphere share honest linear grey texture for VascularConductance.
+    layer
+        .place_mapped(&field, Look::Raw, FieldMapping::VascularConductance)
+        .expect("vasc raw");
+    assert!((layer.scale() - 0.8).abs() < 1e-6);
+    let vasc_raw_ptr = layer.texture().expect("vasc raw tex") as *const _;
+    let corner0 = layer.texture().expect("tex").texel(0, 0).expect("corner");
+    assert!((corner0.r - 0.25).abs() < 1e-5);
+    assert_eq!(corner0.r, corner0.g);
+    assert_eq!(corner0.g, corner0.b);
+    layer
+        .place_mapped(&field, Look::Sphere, FieldMapping::VascularConductance)
+        .expect("vasc sphere reuse");
+    assert_eq!(layer.texture().expect("tex") as *const _, vasc_raw_ptr);
+
+    // Absent optional plane (v1 FieldTexture) renders dark cleanly.
+    let v1_field = texture([8, 4], &energy);
+    let mut absent = FieldLayer::new(&viewport);
+    absent
+        .update_mapped(&v1_field, Look::Glow, FieldMapping::TrailCarrier)
+        .expect("absent glow");
+    assert_eq!(absent.trail_scale(), 0.0);
+    assert_eq!(absent.energy_scale(), 47.0);
+    let dark_trail = flife_manim::linear(flife_manim::TRAIL_CARRIER_PALETTE[0]);
+    for col in 0..8 {
+        let px = absent.texture().expect("tex").texel(col, 0).expect("texel");
+        assert!((px.r - dark_trail.r).abs() < 1e-5);
+        assert!((px.g - dark_trail.g).abs() < 1e-5);
+        assert!((px.b - dark_trail.b).abs() < 1e-5);
+    }
+    absent
+        .place_mapped(&v1_field, Look::Raw, FieldMapping::VascularConductance)
+        .expect("absent raw");
+    for col in 0..8 {
+        let px = absent.texture().expect("tex").texel(col, 0).expect("texel");
+        assert_eq!([px.r, px.g, px.b, px.a], [0.0, 0.0, 0.0, 1.0]);
     }
 }

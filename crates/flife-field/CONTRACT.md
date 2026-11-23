@@ -209,6 +209,32 @@
     and `SettleBackend::emission_with_floor` (`settle.rs`): additive Wave-1 seams for `V2-03` (`basal_multiplier`),
     `V2-04` (`energy_floor`), and `V2-05` (`so2-motor`), delegating v1 identity to `motion`/`emission` and
     refusing active v2 parameters with `CoreError::MissingCapability` until a backend overrides them.
+- V2 Wave-2 (`V2-14` `vascular-field` and `V2-15` `dual-carrier-trails`, realizing `FL-055`):
+  - `VascularField` (`transport.rs`) and ping-pong `FieldState`/`FieldPair` vascular storage (`edge_x_cond`,
+    `edge_y_cond`, `8 B/cell` per buffer, `0 B` when disabled, `C.8` cancel-safe via `FieldPair::commit`):
+    composes `edge_x[c] = ((r_max_x * g_x) * phi_tj_x).min(r_max_x)` onto `V2-09`'s `FluxEdges`, computes
+    substep-invariant flux `|F_e| = (edge[c] * substeps) * |e_c - e_n|`, guards overflow (`ratio > 1e100 -> 1.0`),
+    evaluates `μ == 1.5` via `ratio * ratio.sqrt()` and general `μ > 0` via host-independent
+    `flife_core::numerics::pow_positive`, and rounds once to F32 inside `[g_min, 1.0]`.
+  - 34-plane dual-carrier hybrid field (`DUAL_CARRIER_PLANES = 34`, `CarrierLayout::{SINGLE_CARRIER, CARRIER_0,
+    CARRIER_1}`, `field_planes_for_config`, `FieldLayout::{new_with_planes, planar_with_planes, for_config}`,
+    `FieldFootprint::{of_planes, vascular_edge_bytes}`, `FieldState::{zeroed_with_planes, zeroed_dual_carrier,
+    planes, is_dual_carrier, trail_energy*, trail_moment*, trail_cell, set_trail_cell}`):
+    - Carrier 0 (`0..25`: `e_0` + 24 moments) handles external sources, uptake (`apply_grants_on` never mutably
+      borrows Carrier 1), and vascular arteries + tight junctions;
+    - Carrier 1 (`25..34`: `e_1` + 8 trail moments) runs independent `DualCarrierRules::trail_plan` (impeded by
+      tight junctions when enabled, never accelerated by vascular arteries) and books decay to `Flow::Decay` via
+      `combine_transport_reports`.
+    - `FieldState::energy_total()` sums `e_0 + e_1` and `check_invariants_on` / `scan_invariants` /
+      `summarize_scan` verify BOTH Lorentz cones independently.
+    - `split_dual_carrier_emission`, `apply_deposits_to_carrier[_on]`, `Deposits::reduction_for_carrier`, and
+      `reduce_dual_carrier_field_on` guarantee `paid_0 + paid_1 <= paid`, `offered_k <= paid_k`, and zero `0/0`
+      NaN without renormalizing sub-vectors.
+    - `SensorPyramid::new_with_planes(34)` + `DualRawSample` + `PyramidView::{sample_dual_level, sample_dual,
+      sample_dual_batch}` + additive `SensorBackend::sample_dual` leave `RawSample` (`PLANES = 33`) untouched.
+    - `FieldStepPhase2`, `advance_field_wave2_on`, `FieldWork::{reserve_trail_flux, prepare_vascular_edges,
+      prepare_trail_tight_junctions}`, and additive `FieldBackend::{advance_wave2, reduce_dual_carrier}` keep
+      all Wave-1 `FieldStepOptions` / `SettleBackend` / `FieldBackend` signatures 100% unchanged.
 
 **Invariants — representation (FL-003).**
 - Storage is `Vec<f32>`, never an `f64` copy carrying an F32 tag. Moving to or from FrankenNumPy

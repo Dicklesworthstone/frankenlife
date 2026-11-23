@@ -11,22 +11,23 @@ mod common;
 
 use std::f64::consts::PI;
 
-use flife_core::CoreError;
+use flife_core::{CoreError, FeatureOverride};
 use flife_manim::{
     APICAL_TICK_COLOR, APICAL_TICK_END_RATIO, APICAL_TICK_HALF_WIDTH_RATIO,
     APICAL_TICK_START_RATIO, CELL_STATE_MAPPING_NAME, CELL_STATE_REGISTRY_NAME, CELL_STATE_STEPS,
-    FieldOverlayKind, FieldOverlayLayer, HUD_MAX_SWATCHES, HUD_SWATCH, HudFont, LEGEND_CELL_STATES,
-    LINEAGE_PALETTE, Look, OVERLAY_LOG_GAIN, POLARITY_ANGLE_SCALE, POLARITY_MAPPING_NAME,
-    POLARITY_REGISTRY_NAME, POLARITY_UNPOLARIZED, POLARITY_UNPOLARIZED_COLOR, SCALE_DECAY,
-    SPHERE_SHADING, TRAIL_CARRIER_NAME, TRAIL_CARRIER_PALETTE, V2ColorMapping,
-    VASCULAR_CONDUCTANCE_NAME, VASCULAR_CONDUCTANCE_PALETTE, Viewport, apical_tick_draw,
+    ColorMapping, DensityLayer, FieldLayer, FieldMapping, FieldOverlayKind, FieldOverlayLayer,
+    HUD_MAX_SWATCHES, HUD_SWATCH, HudFont, LEGEND_CELL_STATES, LINEAGE_PALETTE, Look,
+    OVERLAY_LOG_GAIN, POLARITY_ANGLE_SCALE, POLARITY_MAPPING_NAME, POLARITY_REGISTRY_NAME,
+    POLARITY_UNPOLARIZED, POLARITY_UNPOLARIZED_COLOR, ParticleCloud, Particles, SCALE_DECAY,
+    SPHERE_SHADING, Style, TRAIL_CARRIER_NAME, TRAIL_CARRIER_PALETTE, V2ColorMapping,
+    VASCULAR_CONDUCTANCE_NAME, VASCULAR_CONDUCTANCE_PALETTE, Viewport, WorldView, apical_tick_draw,
     apical_tick_quad, apical_ticks_mesh, build_composite_overlay_texture, build_overlay_texture,
     cell_state_color, cell_state_legend, cell_state_rgb8, decode_cell_state,
     decode_polarity_radians, display_value, lineage_slot, linear, lower_cell_state_colors,
-    lower_polarity_colors, overlay_blend_linear, overlay_level, overlay_log_value, palette,
-    polarity_color, polarity_legend, polarity_rgb8, polarity_scene_direction, polarity_turn,
-    polarity_wheel_rgb8, quantize_cell_state, quantize_polarity, raw_value, trail_carrier_rgb8,
-    vascular_conductance_rgb8,
+    lower_polarity_colors, mapped_color, overlay_blend_linear, overlay_level, overlay_log_value,
+    palette, polarity_color, polarity_legend, polarity_rgb8, polarity_scene_direction,
+    polarity_turn, polarity_wheel_rgb8, quantize_cell_state, quantize_polarity, raw_value,
+    trail_carrier_rgb8, traits, vascular_conductance_rgb8,
 };
 use fmn_core::color::{LinearRgba, Srgb};
 use fmn_render::{Texture, ThreeDDraw, ThreeDJob, Tiling, TrueDotDraw};
@@ -56,6 +57,10 @@ fn srgb_distance(a: [u8; 3], b: [u8; 3]) -> f64 {
     (dr * dr + dg * dg + db * db).sqrt()
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a failure here is a test failure"
+)]
 fn texels(texture: &Texture) -> Vec<LinearRgba> {
     (0..texture.height())
         .flat_map(|row| {
@@ -268,7 +273,7 @@ fn apical_tick_geometry_winding_and_cpu_pixel_render() {
             apical_tick_quad([1.0, -2.0, 0.0], r, angle, APICAL_TICK_COLOR).expect("quad");
         assert_eq!(idx, [0, 1, 2, 0, 2, 3]);
         let mut signed_area = 0.0_f64;
-        for tri in idx.chunks_exact(3) {
+        for tri in idx.as_chunks::<3>().0 {
             let a = verts[tri[0] as usize].point;
             let b = verts[tri[1] as usize].point;
             let c = verts[tri[2] as usize].point;
@@ -349,7 +354,9 @@ fn apical_tick_geometry_winding_and_cpu_pixel_render() {
     );
     dot.shading = SPHERE_SHADING;
     let draws = [ThreeDDraw::TrueDot(dot), apical_tick_draw(&mesh)];
-    let camera = viewport.camera(Srgb::from_rgb8(0, 0, 0)).expect("camera");
+    let camera = viewport
+        .camera(Srgb::from_rgb8(0, 0, 0).to_linear(1.0))
+        .expect("camera");
     let frame = ThreeDJob::new(&camera, &draws, Tiling::default())
         .expect("job")
         .render(2)
@@ -584,7 +591,9 @@ fn trail_and_vascular_overlay_palettes_log_ramp_blending_and_caching() {
     // Real FrankenManim CPU render across a seam-centered view: Glow vs Raw distinct.
     let seam_view = viewport.with_view([0.0, 0.0], 2.0).expect("seam view");
     let bright = vec![3.0_f32; 16];
-    let camera = seam_view.camera(Srgb::from_rgb8(0, 0, 0)).expect("camera");
+    let camera = seam_view
+        .camera(Srgb::from_rgb8(0, 0, 0).to_linear(1.0))
+        .expect("camera");
     let render_overlay = |look: Look, kind: FieldOverlayKind| -> [u8; 4] {
         let mut l = FieldOverlayLayer::new(&seam_view);
         l.update(grid, &bright, look, kind).expect("update");
@@ -834,4 +843,339 @@ fn inv09_presentation_zero_scientific_feedback() {
         headless.digest(),
         "INV-09 violated: V2-16 presentation primitives altered WorldDigest"
     );
+}
+
+/// V2-16 end-to-end integration on real `field-ecology-v2` (`all-v2`) epochs:
+/// - `ParticleCloud` and `DensityLayer` consume `Epoch::cell_states()` and
+///   `Epoch::polarities()` directly via `ColorMapping::CellState` and
+///   `ColorMapping::Polarity`;
+/// - `FieldLayer` consumes `FieldTexture::trail_energy()` and
+///   `FieldTexture::vascular_conductance()` directly via
+///   `FieldMapping::TrailCarrier` and `FieldMapping::VascularConductance`;
+/// - `WorldView` builds and emits the bulk `apical_ticks_draw()` mesh strictly
+///   in `ColorMapping::Polarity + Look::Sphere + Particles::Points` when
+///   `Epoch::polarities()` is present and polarized, keeping it synchronized
+///   across `resize`, `set_point_radius`, `set_body_radius`, `set_view` +
+///   `place`, and `show_between`;
+/// - Rendering every v2 `ColorMapping` and `FieldMapping` through `WorldView`
+///   every tick preserves bit-exact `WorldDigest` vs a headless control world
+///   (`INV-09`).
+#[test]
+fn v2_world_view_cloud_field_density_and_apical_ticks_end_to_end() {
+    let all_v2 = common::small_v2(true, &[FeatureOverride::Enable("all-v2".to_owned())]);
+    let mut headless = common::found(&all_v2);
+    let mut observed = common::found(&all_v2);
+    common::advance(&mut headless, 20);
+    common::advance(&mut observed, 20);
+
+    let first = common::epoch(&observed);
+    assert!(
+        first.cell_states().is_some(),
+        "all-v2 must expose Epoch::cell_states"
+    );
+    assert!(
+        first.polarities().is_some(),
+        "all-v2 must expose Epoch::polarities"
+    );
+    assert!(
+        first.field().trail_energy().is_some(),
+        "all-v2 must expose FieldTexture::trail_energy"
+    );
+    assert!(
+        first.field().vascular_conductance().is_some(),
+        "all-v2 must expose FieldTexture::vascular_conductance"
+    );
+
+    let viewport = Viewport::fit(first.extent(), [128, 128]).expect("viewport");
+    let rows: Vec<_> = traits(&first).collect();
+    assert_eq!(rows.len(), first.len());
+    let states = first.cell_states().expect("cell states");
+    let polarities = first.polarities().expect("polarities");
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row.cell_state, states[i], "row {i} cell_state");
+        assert_eq!(row.polarity, polarities[i], "row {i} polarity");
+    }
+
+    // ParticleCloud directly reads Epoch::cell_states and Epoch::polarities.
+    let mut cloud = ParticleCloud::for_epoch(&first).expect("cloud");
+    for mapping in [ColorMapping::CellState, ColorMapping::Polarity] {
+        let style = Style {
+            mapping,
+            ..Style::default()
+        };
+        let draws = cloud
+            .update_styled(&first, &viewport, &style)
+            .expect("cloud update");
+        assert_eq!(draws.len(), first.len());
+        for (i, (draw, row)) in draws.iter().zip(&rows).enumerate() {
+            let ThreeDDraw::TrueDot(dot) = draw else {
+                panic!("row {i} is not a dot");
+            };
+            assert_eq!(
+                dot.color,
+                mapped_color(mapping, row, first.maximum_speed()),
+                "{mapping} row {i}"
+            );
+        }
+    }
+
+    // DensityLayer supports both v2 ColorMappings directly.
+    let mut density = DensityLayer::new(&viewport);
+    for mapping in [ColorMapping::CellState, ColorMapping::Polarity] {
+        let style = Style {
+            mapping,
+            particles: Particles::Density,
+            ..Style::default()
+        };
+        density.update(&first, &style).expect("density update");
+        assert!(density.texture().is_some());
+        assert!(density.draw().is_some());
+    }
+
+    // FieldLayer supports TrailCarrier and VascularConductance directly on real v2 FieldTexture.
+    let mut field_layer = FieldLayer::new(&viewport);
+    for field_mapping in [
+        FieldMapping::TrailCarrier,
+        FieldMapping::VascularConductance,
+    ] {
+        field_layer
+            .update_mapped(first.field(), Look::Glow, field_mapping)
+            .expect("field overlay glow");
+        assert!(field_layer.texture().is_some());
+        field_layer
+            .place_mapped(first.field(), Look::Raw, field_mapping)
+            .expect("field overlay raw");
+        for texel in texels(field_layer.texture().expect("raw tex")) {
+            assert_eq!(texel.r, texel.g);
+            assert_eq!(texel.g, texel.b);
+            assert_eq!(texel.a, 1.0);
+        }
+    }
+
+    // WorldView: render across styles, verify apical ticks strictly gated on
+    // Polarity + Sphere + Points, and verify INV-09 bit-exact WorldDigest.
+    let mut view = WorldView::for_epoch(&first, [128, 128], [2, 3, 8]).expect("world view");
+    assert_eq!(
+        view.scene_objects(),
+        6,
+        "v2 polarity-capable view accounts for the bulk apical-tick scene object"
+    );
+    let mut saw_ticks = false;
+    for step in 0..8 {
+        common::advance(&mut headless, 1);
+        common::advance(&mut observed, 1);
+        let epoch = common::epoch(&observed);
+        let polarized_count = epoch
+            .polarities()
+            .expect("polarities")
+            .iter()
+            .filter(|&&p| p != POLARITY_UNPOLARIZED)
+            .count();
+
+        // 1. CellState + TrailCarrier (Glow): no apical ticks.
+        view.set_style(Style {
+            mapping: ColorMapping::CellState,
+            look: Look::Glow,
+            particles: Particles::Points,
+            field: true,
+            field_mapping: FieldMapping::TrailCarrier,
+        });
+        view.show(&epoch).expect("show cell-state");
+        assert!(view.apical_ticks_draw().is_none());
+        let frame_cs = view.render_rgba8(2).expect("render cell-state");
+        assert_eq!(frame_cs.len(), 128 * 128 * 4);
+
+        // 2. Polarity + Glow: no apical ticks (sphere mode only).
+        view.set_style(Style {
+            mapping: ColorMapping::Polarity,
+            look: Look::Glow,
+            particles: Particles::Points,
+            field: true,
+            field_mapping: FieldMapping::VascularConductance,
+        });
+        view.show(&epoch).expect("show polarity glow");
+        assert!(view.apical_ticks_draw().is_none());
+
+        // 3. Polarity + Sphere + Points: apical ticks emitted iff polarized > 0.
+        view.set_style(Style {
+            mapping: ColorMapping::Polarity,
+            look: Look::Sphere,
+            particles: Particles::Points,
+            field: true,
+            field_mapping: FieldMapping::VascularConductance,
+        });
+        view.show(&epoch).expect("show polarity sphere");
+        assert_eq!(view.apical_ticks_draw().is_some(), polarized_count > 0);
+        if polarized_count > 0 {
+            saw_ticks = true;
+            let draws = view.draws().expect("draws");
+            // 1 field + N dots + 1 bulk apical-ticks mesh (no halos in Sphere look).
+            assert_eq!(draws.len(), 1 + epoch.len() + 1);
+            let frame_pol = view.render_rgba8(2).expect("render polarity sphere");
+            assert_eq!(frame_pol.len(), 128 * 128 * 4);
+            assert_ne!(frame_pol, frame_cs);
+
+            // Resize, point radius, body radius, and zoomed placement keep ticks valid.
+            if step == 0 {
+                view.set_point_radius(2.0).expect("point radius");
+                assert!(view.apical_ticks_draw().is_some());
+                view.set_body_radius(0.4).expect("body radius");
+                assert!(view.apical_ticks_draw().is_some());
+                let zoomed = view
+                    .viewport()
+                    .zoomed_about([64.0, 64.0], 2.0)
+                    .expect("zoom");
+                view.set_view(zoomed).expect("set zoomed");
+                view.place(&epoch).expect("place zoomed");
+                let _ = view.render_rgba8(2).expect("render zoomed ticks");
+                let reset = view.viewport().refit();
+                view.set_view(reset).expect("reset");
+            }
+        }
+
+        // 4. Polarity + Sphere + Density: no apical ticks.
+        view.set_style(Style {
+            mapping: ColorMapping::Polarity,
+            look: Look::Sphere,
+            particles: Particles::Density,
+            field: true,
+            field_mapping: FieldMapping::Energy,
+        });
+        view.show(&epoch).expect("show polarity sphere density");
+        assert!(view.apical_ticks_draw().is_none());
+
+        assert_eq!(
+            observed.digest(),
+            headless.digest(),
+            "INV-09 violated at v2 tick {step}"
+        );
+    }
+    assert!(
+        saw_ticks,
+        "all-v2 tissue world must exercise non-empty apical orientation ticks"
+    );
+
+    // Unified ColorMapping/FieldMapping legends match v2 primitives & stay within FL-024 cap.
+    assert_eq!(ColorMapping::CellState.legend(&[]), cell_state_legend());
+    assert_eq!(ColorMapping::Polarity.legend(&[]), polarity_legend());
+    assert_eq!(
+        FieldMapping::TrailCarrier.legend(),
+        Some(FieldOverlayKind::TrailCarrier.legend())
+    );
+    assert_eq!(
+        FieldMapping::VascularConductance.legend(),
+        Some(FieldOverlayKind::VascularConductance.legend())
+    );
+    let font = HudFont::bundled().expect("bundled font");
+    for legend in [
+        ColorMapping::CellState.legend(&[]),
+        ColorMapping::Polarity.legend(&[]),
+        FieldMapping::TrailCarrier.legend().expect("trail legend"),
+        FieldMapping::VascularConductance
+            .legend()
+            .expect("vasc legend"),
+    ] {
+        let lin_swatches: Vec<LinearRgba> = legend.swatches.iter().copied().map(linear).collect();
+        let laid = font
+            .text_with_swatches(&legend.text, 26.0, &lin_swatches)
+            .expect("hud layout");
+        assert_eq!(laid.refused(), 0);
+        assert_eq!(laid.left_out(), 0);
+        assert!(laid.vertices().len() <= 33_792);
+    }
+}
+
+/// V2-16 zero-regression guarantee (`INV-09`, `INV-15`): on `field-ecology-v1`,
+/// `--v1-compat`, and `--disable v2-visual-mappings`, `WorldView` reserves zero
+/// extra bytes, emits zero apical-tick draws, keeps `scene_objects() == 5`, and
+/// renders cleanly even if a user selects a v2 `ColorMapping` or `FieldMapping`.
+#[test]
+fn v1_and_disabled_v2_visual_mappings_incur_zero_overhead_and_fallback_cleanly() {
+    let v1_cfg = common::config(&[
+        ("world", "width", "32.0"),
+        ("world", "height", "32.0"),
+        ("world", "grid_width", "32"),
+        ("world", "grid_height", "32"),
+        ("population", "initial_count", "48"),
+        ("population", "maximum_count", "72"),
+        ("population", "initial_energy", "3.0"),
+        ("execution", "command_durability", "\"volatile-in-memory\""),
+    ]);
+    let v1_world = common::found(&v1_cfg);
+    let v1_epoch = common::epoch(&v1_world);
+    let v1_view = WorldView::for_epoch(&v1_epoch, [128, 128], [0, 0, 0]).expect("v1 view");
+    let baseline = (
+        v1_view.reserved_bytes(),
+        v1_view.preparation_limit(),
+        v1_view.frame_bytes(),
+        v1_view.scene_objects(),
+    );
+    assert_eq!(baseline.3, 5);
+
+    let disabled_cases = [
+        (
+            "v1-compat",
+            common::small_v2(false, &[FeatureOverride::V1Compat]),
+        ),
+        (
+            "all-v2-minus-visual-mappings",
+            common::small_v2(
+                true,
+                &[
+                    FeatureOverride::Enable("all-v2".to_owned()),
+                    FeatureOverride::Disable("v2-visual-mappings".to_owned()),
+                ],
+            ),
+        ),
+    ];
+    for (label, cfg) in disabled_cases {
+        let mut world = common::found(&cfg);
+        common::advance(&mut world, 6);
+        let epoch = common::epoch(&world);
+        assert!(epoch.cell_states().is_none(), "{label}: cell_states");
+        assert!(epoch.polarities().is_none(), "{label}: polarities");
+        assert!(
+            epoch.field().trail_energy().is_none(),
+            "{label}: trail_energy"
+        );
+        assert!(
+            epoch.field().vascular_conductance().is_none(),
+            "{label}: vascular_conductance"
+        );
+
+        let mut view = WorldView::for_epoch(&epoch, [128, 128], [0, 0, 0]).expect("view");
+        assert_eq!(
+            (
+                view.reserved_bytes(),
+                view.preparation_limit(),
+                view.frame_bytes(),
+                view.scene_objects(),
+            ),
+            baseline,
+            "{label}: zero extra WorldView memory or scene objects when disabled"
+        );
+
+        // Selecting Polarity + Sphere + TrailCarrier when disabled falls back cleanly with 0 ticks.
+        view.set_style(Style {
+            mapping: ColorMapping::Polarity,
+            look: Look::Sphere,
+            particles: Particles::Points,
+            field: true,
+            field_mapping: FieldMapping::TrailCarrier,
+        });
+        view.show(&epoch).expect("fallback show");
+        assert!(view.apical_ticks_draw().is_none(), "{label}: no ticks");
+        assert_eq!(
+            view.draws().expect("draws").len(),
+            1 + epoch.len(),
+            "{label}: field + dots only"
+        );
+        assert_eq!(
+            view.reserved_bytes(),
+            baseline.0,
+            "{label}: reserved_bytes unchanged after show"
+        );
+        let rgba = view.render_rgba8(2).expect("fallback render");
+        assert_eq!(rgba.len(), 128 * 128 * 4);
+    }
 }

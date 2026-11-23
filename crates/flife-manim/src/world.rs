@@ -15,7 +15,8 @@ use fmn_render::{
 };
 
 use crate::cloud::check_min_radius_points;
-use crate::mapping::{Look, Particles, Style};
+use crate::mapping::{ColorMapping, Look, Particles, Style};
+use crate::v2::{APICAL_TICK_COLOR, apical_tick_draw, apical_ticks_mesh_from_drawn};
 use crate::{
     DensityLayer, FieldLayer, HUD_MAX_TRIANGLES, HUD_MAX_VERTICES, HudText, ParticleCloud,
     REGION_SEGMENTS, Region, SELECTION_RING_SEGMENTS, Viewport, density_bins, dot_radius_with,
@@ -163,6 +164,13 @@ pub struct WorldView {
     /// When equal to `viewport` at `zoom > 1`, [`WorldView::draws`] culls dots
     /// whose 3D billboards lie strictly outside the camera frustum.
     placed_viewport: Option<Viewport>,
+    /// The shown epoch's optional quantized apical polarities (`V2-16`), kept
+    /// `None` (zero extra bytes) until an epoch carrying polarities is shown.
+    polarities: Option<Vec<i16>>,
+    /// Bulk apical orientation tick mesh drawn over sphere-mode dots when
+    /// `style.mapping == ColorMapping::Polarity && style.look == Look::Sphere`
+    /// (`V2-16`, `None` otherwise).
+    apical_ticks: Option<SurfaceMesh>,
 }
 
 /// Conservative frustum visibility test for a camera-facing `TrueDot` at
@@ -289,6 +297,8 @@ impl WorldView {
             hud: None,
             preparation_threads: NonZeroUsize::MIN,
             placed_viewport: None,
+            polarities: None,
+            apical_ticks: None,
         })
     }
 
@@ -303,7 +313,62 @@ impl WorldView {
     ) -> Result<Self, CoreError> {
         let mut view = Self::new(epoch.extent(), epoch.capacity(), drawable, background)?;
         view.field_texels = epoch.field().texels();
+        if epoch.polarities().is_some() {
+            let mut polarities = Vec::new();
+            polarities
+                .try_reserve_exact(epoch.capacity())
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "world view polarities",
+                    bytes: u64::try_from(epoch.capacity().saturating_mul(size_of::<i16>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+            view.polarities = Some(polarities);
+        }
         Ok(view)
+    }
+
+    /// Whether the current style draws bulk apical orientation ticks over
+    /// sphere-mode dots (`V2-16`).
+    #[inline]
+    const fn wants_apical_ticks(&self) -> bool {
+        matches!(
+            (self.style.mapping, self.style.look, self.style.particles),
+            (ColorMapping::Polarity, Look::Sphere, Particles::Points)
+        )
+    }
+
+    /// Build the bulk apical-tick mesh for `polarities` at `viewport` and
+    /// `dot_radius`, or `Ok(None)` when the style or epoch does not need ticks.
+    fn build_apical_ticks(
+        &self,
+        viewport: &Viewport,
+        camera: &ThreeDCamera,
+        dot_radius: f64,
+        polarities: Option<&[i16]>,
+        placed: bool,
+    ) -> Result<Option<SurfaceMesh>, CoreError> {
+        if !self.wants_apical_ticks() {
+            return Ok(None);
+        }
+        let Some(angles) = polarities else {
+            return Ok(None);
+        };
+        if angles.is_empty() {
+            return Ok(None);
+        }
+        let cull = (placed && viewport.zoom() > 1.0).then(|| {
+            let [fw, fh] = viewport.frame_shape();
+            (0.5 * fw, 0.5 * fh, camera.camera().frame().focal_distance())
+        });
+        apical_ticks_mesh_from_drawn(
+            viewport,
+            &self.between.positions,
+            &self.between.shown,
+            angles,
+            dot_radius,
+            APICAL_TICK_COLOR,
+            cull,
+        )
     }
 
     /// Refit the viewport, camera and dot radius to a new drawable size,
@@ -402,12 +467,9 @@ impl WorldView {
             .bloom_strength
             .map(|strength| bloom_at(strength, &viewport))
             .transpose()?;
+        let dot_radius = self.cloud.radius_on(&viewport);
         let ring = match self.selected_position() {
-            Some(position) => Some(selection_ring_around(
-                &viewport,
-                position,
-                self.cloud.radius_on(&viewport),
-            )?),
+            Some(position) => Some(selection_ring_around(&viewport, position, dot_radius)?),
             None => None,
         };
         let hud = match &self.hud {
@@ -418,10 +480,28 @@ impl WorldView {
             Some((region, _)) => Some((*region, region_outline(&viewport, *region)?)),
             None => None,
         };
+        // Resize and density changes keep center and zoom, so `cloud.refit`
+        // keeps every dot's scene point and radius valid for the new viewport.
+        // A pan or zoom without a following `place` invalidates placed culling.
+        let next_placed = self
+            .placed_viewport
+            .filter(|placed| {
+                placed.center().map(f64::to_bits) == viewport.center().map(f64::to_bits)
+                    && placed.zoom().to_bits() == viewport.zoom().to_bits()
+            })
+            .map(|_| viewport);
+        let apical_ticks = self.build_apical_ticks(
+            &viewport,
+            &camera,
+            dot_radius,
+            self.polarities.as_deref(),
+            next_placed.is_some(),
+        )?;
         self.viewport = viewport;
         self.camera = camera;
         self.ring = ring;
         self.region = region;
+        self.apical_ticks = apical_ticks;
         if let (Some(hud), Some((plate, glyphs))) = (self.hud.as_mut(), hud) {
             hud.plate = plate;
             hud.glyphs = glyphs;
@@ -430,16 +510,7 @@ impl WorldView {
         self.cloud.refit(&self.viewport);
         self.density.refit(&self.viewport);
         self.field.refit(&self.viewport);
-        // Resize and density changes keep center and zoom, so `cloud.refit`
-        // keeps every dot's scene point and radius valid for the new viewport.
-        // A pan or zoom without a following `place` invalidates placed culling.
-        self.placed_viewport = self
-            .placed_viewport
-            .filter(|placed| {
-                placed.center().map(f64::to_bits) == viewport.center().map(f64::to_bits)
-                    && placed.zoom().to_bits() == viewport.zoom().to_bits()
-            })
-            .map(|_| viewport);
+        self.placed_viewport = next_placed;
         Ok(())
     }
 
@@ -501,16 +572,21 @@ impl WorldView {
     /// [`selection_ring_around`]. The view is unchanged on error.
     pub fn set_point_radius(&mut self, points: f64) -> Result<(), CoreError> {
         check_min_radius_points(points)?;
+        let dot_radius = dot_radius_with(&self.viewport, points, self.cloud.body_radius());
         let ring = match self.selected_position() {
-            Some(position) => Some(selection_ring_around(
-                &self.viewport,
-                position,
-                dot_radius_with(&self.viewport, points, self.cloud.body_radius()),
-            )?),
+            Some(position) => Some(selection_ring_around(&self.viewport, position, dot_radius)?),
             None => None,
         };
+        let apical_ticks = self.build_apical_ticks(
+            &self.viewport,
+            &self.camera,
+            dot_radius,
+            self.polarities.as_deref(),
+            self.placed_viewport == Some(self.viewport),
+        )?;
         self.cloud.set_min_radius_points(points, &self.viewport)?;
         self.ring = ring;
+        self.apical_ticks = apical_ticks;
         Ok(())
     }
 
@@ -535,16 +611,21 @@ impl WorldView {
                 detail: format!("{radius:?} world units is not a positive radius"),
             });
         }
+        let dot_radius = dot_radius_with(&self.viewport, self.cloud.min_radius_points(), radius);
         let ring = match self.selected_position() {
-            Some(position) => Some(selection_ring_around(
-                &self.viewport,
-                position,
-                dot_radius_with(&self.viewport, self.cloud.min_radius_points(), radius),
-            )?),
+            Some(position) => Some(selection_ring_around(&self.viewport, position, dot_radius)?),
             None => None,
         };
+        let apical_ticks = self.build_apical_ticks(
+            &self.viewport,
+            &self.camera,
+            dot_radius,
+            self.polarities.as_deref(),
+            self.placed_viewport == Some(self.viewport),
+        )?;
         self.cloud.set_body_radius(radius, &self.viewport);
         self.ring = ring;
+        self.apical_ticks = apical_ticks;
         Ok(())
     }
 
@@ -761,11 +842,13 @@ impl WorldView {
         self.place_between(None, epoch, 1.0).map(|_| ())
     }
 
-    /// Keep `epoch` as the shown one, with its identities, and the
-    /// selection only if the epoch still has that identity drawn.
+    /// Keep `epoch` as the shown one, with its identities, optional polarities
+    /// and apical ticks, and the selection only if the epoch still has that
+    /// identity drawn.
     fn remember(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
-        // Build any new selection ring before updating `shown`/`ids` so an
-        // invalid position leaves the selection state consistent on error.
+        // Build any new selection ring, polarity buffer and apical ticks before
+        // updating `shown`/`ids` so an error leaves the view consistent.
+        let dot_radius = self.cloud.radius_on(&self.viewport);
         let next_selection = match self.selected.and_then(|id| {
             let row = epoch.ids().binary_search(&id.get()).ok()?;
             self.between
@@ -777,23 +860,51 @@ impl WorldView {
         }) {
             Some((id, row)) => {
                 let position = self.between.positions[row];
-                let ring = selection_ring_around(
-                    &self.viewport,
-                    position,
-                    self.cloud.radius_on(&self.viewport),
-                )?;
+                let ring = selection_ring_around(&self.viewport, position, dot_radius)?;
                 Some((id, ring))
             }
             None => None,
         };
+        let new_polarities = if epoch.polarities().is_some() && self.polarities.is_none() {
+            let capacity = self.cloud.capacity();
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(capacity)
+                .map_err(|_| CoreError::AllocationFailed {
+                    buffer: "world view polarities",
+                    bytes: u64::try_from(capacity.saturating_mul(size_of::<i16>()))
+                        .unwrap_or(u64::MAX),
+                })?;
+            Some(buf)
+        } else {
+            None
+        };
+        let next_apical_ticks = self.build_apical_ticks(
+            &self.viewport,
+            &self.camera,
+            dot_radius,
+            epoch.polarities(),
+            true,
+        )?;
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),
         });
         // `lower` has refused an epoch above the ceiling this was reserved
-        // for, so it does not grow.
+        // for, so neither `ids` nor `polarities` grows.
         self.ids.clear();
         self.ids.extend_from_slice(epoch.ids());
+        if let Some(angles) = epoch.polarities() {
+            if let Some(buf) = new_polarities {
+                self.polarities = Some(buf);
+            }
+            if let Some(pol) = self.polarities.as_mut() {
+                pol.clear();
+                pol.extend_from_slice(angles);
+            }
+        } else if let Some(pol) = self.polarities.as_mut() {
+            pol.clear();
+        }
+        self.apical_ticks = next_apical_ticks;
         self.field_texels = epoch.field().texels();
         match next_selection {
             Some((id, ring)) => {
@@ -1005,8 +1116,21 @@ impl WorldView {
         })
     }
 
+    /// The bulk apical orientation ticks draw, while the view is in sphere-mode
+    /// [`ColorMapping::Polarity`] points view on an epoch carrying optional
+    /// polarities (`V2-16`): unlit, over the organism spheres and under the
+    /// brush region and selection ring.
+    #[must_use]
+    pub fn apical_ticks_draw(&self) -> Option<ThreeDDraw<'_>> {
+        if !self.wants_apical_ticks() {
+            return None;
+        }
+        self.apical_ticks.as_ref().map(apical_tick_draw)
+    }
+
     /// The current frame's draws in painter order: the field, then the
-    /// density layer, or every halo and then every dot, then the brush's
+    /// density layer, or every halo and then every dot (and optional bulk
+    /// apical orientation ticks in sphere-mode polarity view), then the brush's
     /// region, then the selection ring, then the overlay's plate and text.
     /// Raw and sphere density are opaque, so the field is left out under them.
     ///
@@ -1017,6 +1141,7 @@ impl WorldView {
         let density = style.particles == Particles::Density;
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
+        let ticks_draw = (!density).then(|| self.apical_ticks_draw()).flatten();
         let cull =
             !density && self.placed_viewport == Some(self.viewport) && self.viewport.zoom() > 1.0;
         let [fw, fh] = self.viewport.frame_shape();
@@ -1038,7 +1163,7 @@ impl WorldView {
             halos.len() + dots.len()
         };
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
-        let fixed = 4 + OVERLAY_DRAWS;
+        let fixed = 4 + OVERLAY_DRAWS + usize::from(ticks_draw.is_some());
         let reserve = fixed + particle_draws;
         draws
             .try_reserve_exact(reserve)
@@ -1064,9 +1189,11 @@ impl WorldView {
                     .copied()
                     .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal)),
             );
+            draws.extend(ticks_draw);
         } else {
             draws.extend_from_slice(halos);
             draws.extend_from_slice(dots);
+            draws.extend(ticks_draw);
         }
         draws.extend(self.region_draw());
         draws.extend(self.selection_draw());
@@ -1139,8 +1266,11 @@ impl WorldView {
     /// the composition mapping, three more (a component mapping's copy of
     /// its channel, a byte a texel, is within them). The field's texture and
     /// values count once the view knows the field: from
-    /// [`WorldView::for_epoch`] or the first shown epoch. A resize or a new
-    /// pixel density changes the density's bins and so these bytes.
+    /// [`WorldView::for_epoch`] or the first shown epoch. When the view has
+    /// observed optional `V2-16` polarities, it also charges the polarity
+    /// buffer and two bulk apical-tick meshes at the population ceiling (zero
+    /// when absent). A resize or a new pixel density changes the density's
+    /// bins and so these bytes.
     #[must_use]
     pub fn reserved_bytes(&self) -> u64 {
         self.reserved_bytes_for(&self.viewport)
@@ -1177,8 +1307,18 @@ impl WorldView {
         } else {
             0
         };
+        // Optional V2-16 polarity buffer + two bulk apical-tick meshes (built
+        // before dropping the replaced mesh); strictly zero on v1 / disabled.
+        let polarities = self.polarities.as_ref().map_or(0, |pol| {
+            let cap = self.cloud.capacity() as u64;
+            total([
+                capacity_bytes(pol),
+                mesh_bytes((cap.saturating_mul(4), cap.saturating_mul(2))).saturating_mul(2),
+            ])
+        });
         total([
             overlay,
+            polarities,
             capacity_bytes(&self.ids),
             capacity_bytes(&self.between.positions),
             capacity_bytes(&self.between.shown),
@@ -1193,8 +1333,9 @@ impl WorldView {
     /// The preparation bytes a frame's job is compiled within (FL-043):
     /// [`PREPARATION_BYTES_PER_DOT`] for a dot and a halo per organism the
     /// view can hold, [`PREPARATION_BYTES_PER_TRIANGLE`] for every triangle
-    /// of the field's and the density's quads, the ring and the brush
-    /// region at its most (a disc), and
+    /// of the field's and the density's quads, the ring, the brush region at
+    /// its most (a disc), and (when optional `V2-16` polarities are present)
+    /// two triangles per organism for bulk apical ticks, and
     /// [`PREPARATION_BYTES_FIXED`], whatever the style, which a host may
     /// change from frame to frame. The layers' texels are not preparation:
     /// a job samples them in place ([`WorldView::texel_bytes`]).
@@ -1208,7 +1349,12 @@ impl WorldView {
         } else {
             0
         };
-        let triangles = total([QUAD.1, QUAD.1, ring, region, overlay]);
+        let apical_ticks = if self.polarities.is_some() {
+            (self.cloud.capacity() as u64).saturating_mul(2)
+        } else {
+            0
+        };
+        let triangles = total([QUAD.1, QUAD.1, ring, region, overlay, apical_ticks]);
         total([
             dots.saturating_mul(PREPARATION_BYTES_PER_DOT),
             triangles.saturating_mul(PREPARATION_BYTES_PER_TRIANGLE),
@@ -1237,18 +1383,20 @@ impl WorldView {
     }
 
     /// The most one frame's [`WorldView::job`] holds (FL-043): its draw
-    /// list, a field, a density, a region and a ring draw and a dot and a halo per
-    /// organism the view can hold, [`JOB_BYTES_PER_DRAW`] for each of those
-    /// draws, and FrankenManim's preparation, within
+    /// list, a field, a density, a region and a ring draw, an optional bulk
+    /// apical-ticks draw when `V2-16` polarities are present, and a dot and a
+    /// halo per organism the view can hold, [`JOB_BYTES_PER_DRAW`] for each
+    /// of those draws, and FrankenManim's preparation, within
     /// [`WorldView::preparation_limit`].
     #[must_use]
     pub fn frame_bytes(&self) -> u64 {
         let overlay = if self.overlay { OVERLAY_DRAWS } else { 0 };
+        let ticks = usize::from(self.polarities.is_some());
         let draws = self
             .cloud
             .capacity()
             .saturating_mul(2)
-            .saturating_add(4 + overlay);
+            .saturating_add(4 + overlay + ticks);
         total([
             bytes_for::<ThreeDDraw<'static>>(draws),
             (draws as u64).saturating_mul(JOB_BYTES_PER_DRAW),
@@ -1348,10 +1496,11 @@ impl WorldView {
 
     /// Scene objects in the view: the field layer, the one particle cloud
     /// however many organisms it draws, its density layer, the brush's
-    /// region and the selection ring.
+    /// region, the selection ring, and (when optional `V2-16` polarities are
+    /// present) the one bulk apical-ticks mesh.
     #[must_use]
     pub const fn scene_objects(&self) -> usize {
-        5
+        if self.polarities.is_some() { 6 } else { 5 }
     }
 
     /// The density layer.

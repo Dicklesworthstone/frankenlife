@@ -100,6 +100,7 @@ export const chapters: Chapter[] = [
       { id: "world", label: "The model" },
       { id: "rules", label: "Check it by hand" },
       { id: "tick", label: "One tick" },
+      { id: "v2", label: "Modular V2 extension" },
     ],
   },
   {
@@ -126,10 +127,10 @@ export const chapters: Chapter[] = [
     label: "Use it",
     title: "Your [laboratory].",
     thesis:
-      "Eight worlds to open, a native Studio to watch and touch them, and a command line that records everything it does.",
+      "Ten worlds to open — eight v1 profiles and showcase worlds plus two authored v2 presets — a native Studio to watch and touch them, and a command line that records everything it does.",
     colour: 7,
     sections: [
-      { id: "worlds", label: "Eight worlds" },
+      { id: "worlds", label: "Ten worlds" },
       { id: "studio", label: "Studio and command line" },
       { id: "stack", label: "The Franken stack" },
       { id: "try", label: "Run it yourself" },
@@ -383,6 +384,251 @@ export const tickPhases = [
   "Validate the invariants and publish state, events and accounting together",
 ];
 
+// Modular `field-ecology-v2` feature registry (crates/flife-core/src/v2.rs, V2Feature::ALL;
+// `flife --list-features`). Every `field-ecology-v1*` config omits `[v2]` so v1 hashes,
+// descriptors and checkpoints stay byte-identical.
+export type V2FeatureEntry = {
+  slug: string;
+  bundleA: boolean;
+  bundleB: boolean;
+  boundary: "pure-field" | "mode-dependent" | "contact" | "presentation";
+  abi: string;
+  summary: string;
+};
+
+export const v2Features: V2FeatureEntry[] = [
+  {
+    slug: "oases",
+    bundleA: false,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Phase-staggered ephemeral oasis resource blooms on the periodic field.",
+  },
+  {
+    slug: "senescence",
+    bundleA: true,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Gompertz metabolic maintenance ramp with organism age.",
+  },
+  {
+    slug: "surplus-emission",
+    bundleA: true,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Surplus-gated emission floor so starving organisms cannot spend down to zero.",
+  },
+  {
+    slug: "excitable-relay",
+    bundleA: false,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Vesicle-readiness refractory pulse relay for propagating chemical waves.",
+  },
+  {
+    slug: "wake-offset",
+    bundleA: true,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "+1 action (neural pump mode)",
+    summary: "Wake-velocity or polarized-pump emission offset behind the emitter.",
+  },
+  {
+    slug: "so2-motor",
+    bundleA: true,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "+4 actions",
+    summary: "4-output SO(2)-equivariant neural chemotaxis, chiral contour and propulsion.",
+  },
+  {
+    slug: "so2-budding",
+    bundleA: false,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "+2 actions",
+    summary: "2-output SO(2)-equivariant oriented offspring budding and dispersal.",
+  },
+  {
+    slug: "hippo-crowding",
+    bundleA: true,
+    bundleB: false,
+    boundary: "mode-dependent",
+    abi: "+1 sensor (if exposed)",
+    summary: "Hippo-YAP local crowding birth arrest (pure-field occupancy or contact neighbours).",
+  },
+  {
+    slug: "pcp-polarity",
+    bundleA: true,
+    bundleB: false,
+    boundary: "contact",
+    abi: "none",
+    summary: "Persistent apical-basal planar cell polarity, wedge curvature and lateral mitosis.",
+  },
+  {
+    slug: "emt-gate",
+    bundleA: false,
+    bundleB: false,
+    boundary: "contact",
+    abi: "+1 action",
+    summary: "Neural epithelial-to-mesenchymal transition gate modulating tissue adhesion.",
+  },
+  {
+    slug: "tight-junctions",
+    bundleA: true,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Passive symmetric flux-form diffusion barrier modulated by local cell density.",
+  },
+  {
+    slug: "lysis-recycling",
+    bundleA: true,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Viability-floor corpse lysis recycling energy and negated affinity back to the field.",
+  },
+  {
+    slug: "symplectic-waste",
+    bundleA: true,
+    bundleB: false,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "Obligate symplectic metabolic byproduct deposited to the field under the ledger.",
+  },
+  {
+    slug: "epigenetic-recurrence",
+    bundleA: true,
+    bundleB: false,
+    boundary: "pure-field",
+    abi: "+S sensors, +2S raw outputs",
+    summary: "Heritable recurrent cell-state vector driving reversible fate differentiation.",
+  },
+  {
+    slug: "notch-delta",
+    bundleA: true,
+    bundleB: false,
+    boundary: "contact",
+    abi: "+1 sensor (neighbor-mean mode)",
+    summary: "Juxtacrine Notch-Delta lateral inhibition coupling adjacent cell states.",
+  },
+  {
+    slug: "trophallaxis",
+    bundleA: true,
+    bundleB: false,
+    boundary: "contact",
+    abi: "none",
+    summary: "Passive exact-quantum kin energy sharing across contacting tissue neighbours.",
+  },
+  {
+    slug: "cadherin-4d",
+    bundleA: true,
+    bundleB: false,
+    boundary: "contact",
+    abi: "none",
+    summary: "Decoupled 4-D heritable cadherin adhesion tag sorting tissues independently of diet.",
+  },
+  {
+    slug: "velocity-alignment",
+    bundleA: false,
+    bundleB: false,
+    boundary: "contact",
+    abi: "none",
+    summary: "Dissipative kin velocity alignment across local tissue neighbours.",
+  },
+  {
+    slug: "vascular-field",
+    bundleA: false,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "none",
+    summary: "4-neighbour Murray/Physarum flux-reinforced vascular pipe conductances.",
+  },
+  {
+    slug: "dual-carrier-trails",
+    bundleA: false,
+    bundleB: true,
+    boundary: "pure-field",
+    abi: "+4 sensors, 34 field planes",
+    summary: "34-plane two-carrier field separating metabolic food from persistent pheromone trails.",
+  },
+  {
+    slug: "v2-visual-mappings",
+    bundleA: true,
+    bundleB: true,
+    boundary: "presentation",
+    abi: "none (INV-09 read-only)",
+    summary: "Pure read-only cell-state, polarity, trail-carrier and vascular-conductance overlays.",
+  },
+];
+
+// V2-16 pure read-only visual mappings (crates/flife-manim/CONTRACT.md).
+export const v2VisualMappings = [
+  {
+    name: "cell-state-v1",
+    flag: "--color cell-state",
+    key: "8",
+    kind: "Organism colour",
+    body: "Preserves founder lineage OKLab hue while modulating lightness ([0.36, 0.93]), chroma and ±0.30 rad hue twist from epigenetic state h₀.",
+  },
+  {
+    name: "polarity-v1",
+    flag: "--color polarity",
+    key: "9",
+    kind: "Organism colour",
+    body: "Cyclic OKLab hue wheel for apical-basal orientation, neutral grey when unpolarized, plus bulk apical orientation ticks in sphere mode.",
+  },
+  {
+    name: "trail-carrier",
+    flag: "--field-mapping trail-carrier",
+    key: "C",
+    kind: "Field overlay",
+    body: "Carrier-1 persistent pheromone trail energy e₁ (log palette in glow look, linear grey in raw/sphere; dark fallback when absent).",
+  },
+  {
+    name: "vascular-conductance",
+    flag: "--field-mapping vascular-conductance",
+    key: "C",
+    kind: "Field overlay",
+    body: "4-neighbour Murray/Physarum mean incident conductance gₑ (log palette in glow look, linear grey in raw/sphere; dark fallback when absent).",
+  },
+];
+
+// Honest branch-level build ledger for `field-ecology-v2` (AGENTS.md Four Claims & Status Labels).
+export const v2BuildStatus: {
+  stage: string;
+  claim: string;
+  tone: GateState;
+  detail: string;
+}[] = [
+  {
+    stage: "Landed and verified",
+    claim: "Rules & Implementation",
+    tone: "built",
+    detail:
+      "V2-01 21-slug config/registry and founding CLI toggles (--list-features, --disable, --enable, --v1-compat, INV-14 resume refusal); flife-field (86/86 tests) and flife-neural (35/35 tests) verified at commit d6352a0; V2-16 pure INV-09 visual mappings and Studio keys 8/9/C; V2-10 preregistered quickie harness and V2-17 Bundle A/B presets authored; FL-050 1080p/4K Cinema export options wired in flife-studio.",
+  },
+  {
+    stage: "In flight",
+    claim: "Implementation",
+    tone: "partial",
+    detail:
+      "Remaining Wave-1b and Wave-2 engine modules in flife-engine: V2-08 (pcp-polarity, emt-gate), V2-11 (lysis-recycling, symplectic-waste) and V2-12..15 (epigenetic recurrence, Notch-Delta, trophallaxis, cadherin-4d, velocity alignment, vascular field, dual-carrier trails).",
+  },
+  {
+    stage: "Not yet established",
+    claim: "Visual & Ecological",
+    tone: "open",
+    detail:
+      "Stage-2 V2-10 multi-seed ablation quickies and V2-17 preset verification/calibration have not yet run. No visual (G5) or ecological (G9) claims are made for field-ecology-v2 presets.",
+  },
+];
+
 export const claims = [
   {
     claim: "Rules",
@@ -563,8 +809,9 @@ export const inheritance = {
 };
 
 // The presets (presets/*.toml; README "Planned command surface"). `kind` says how each was chosen:
-// a profile's world is declared by its experiment; the others were picked by an outer search whose
-// procedure experiments/showcase/README.md states, never presented as arbitrary random starts.
+// a profile's world is declared by its experiment; the search worlds were picked by an outer search whose
+// procedure experiments/showcase/README.md states; the two v2 presets are authored Stage-2 candidates
+// awaiting V2-10/V2-17 multi-seed verification and are never presented as verified ecological results.
 export const presets: {
   file: string;
   model: string;
@@ -573,7 +820,7 @@ export const presets: {
   grid: number;
   torus: number;
   dt: string;
-  kind: "profile" | "search";
+  kind: "profile" | "search" | "v2";
   chosen: string;
   body: string;
 }[] = [
@@ -673,6 +920,30 @@ export const presets: {
     chosen: "Outer search · stage E · the film",
     body: "contact-world on a field four times finer, fed to its ceiling, with children landing up to 2.5 units away: saturated domains of labyrinth, foam and packed spheres.",
   },
+  {
+    file: "morphogenesis-tissue-v2",
+    model: "field-ecology-v2 · Bundle A (contact)",
+    founders: 10954,
+    ceiling: 262144,
+    grid: 320,
+    torus: 80,
+    dt: "1/32",
+    kind: "v2",
+    chosen: "Authored V2 preset · awaiting verify",
+    body: "Bundle A (tissue, 14 active features, [contact]): 108 inputs, 40 actions, 44 raw outputs on a 320² × 33 field, drawn in cell-state-v1. Authored Stage-2 candidate awaiting V2-10/V2-17 multi-seed verification — not yet a verified ecological result.",
+  },
+  {
+    file: "supercolony-v2",
+    model: "field-ecology-v2 · Bundle B (INV-08 pure field)",
+    founders: 16384,
+    ceiling: 262144,
+    grid: 320,
+    torus: 80,
+    dt: "1/32",
+    kind: "v2",
+    chosen: "Authored V2 preset · awaiting verify",
+    body: "Bundle B (supercolony, 11 active features, no [contact]): 108 inputs, 40 actions on a 320² × 34 dual-carrier field with Murray vascular conductances. Authored Stage-2 candidate awaiting V2-10/V2-17 verification — not yet a verified ecological result.",
+  },
 ];
 
 // Plan §22.1 / README "Milestones and gates": evidence gates, not calendar promises.
@@ -683,7 +954,7 @@ export const milestones = [
   { id: "M3", name: "Qualified acceleration", deliverable: "CPU/Metal parity, persistent buffers, fused population inference, variable topology", gates: ["G4"] },
   { id: "M4", name: "Screenshot-scale world", deliverable: "400k independent networks near 10k parameters on a 1024² field, interactive, honest clocks", gates: ["G7", "G8"] },
   { id: "M5", name: "Scientific and visual release", deliverable: "A seed gallery, ablations, experiment reports, reliable Cinema export", gates: ["G9", "G10"] },
-  { id: "M6", name: "Additional model families", deliverable: "Recurrent controllers, multi-carrier chemistry or physical boundaries, each with a demonstrated need", gates: [] },
+  { id: "M6", name: "Additional model families", deliverable: "Modular field-ecology-v2 (21 toggleable mechanisms, Bundles A & B): registry, field/neural crates, V2-16 visuals and harness landed; engine modules in flight; empirical verification pending", gates: [] },
 ];
 
 export const stack = [
@@ -752,23 +1023,43 @@ export const commands = [
     command:
       "for run in my-run control brushed; do cargo run --release -q -p flife-cli -- resume $run --until 1024 | tail -1; done",
   },
+  {
+    comment: "List all 21 modular field-ecology-v2 feature slugs, bundle defaults, INV-08 status and ABI impact",
+    command: "cargo run --release -p flife-cli -- --list-features",
+  },
+  {
+    comment: "Validate or ablate an authored V2 preset at founding time (--disable, --enable, --v1-compat; refused on resume per INV-14)",
+    command: [
+      "cargo run --release -p flife-cli -- validate presets/supercolony-v2.toml",
+      "cargo run --release -p flife-cli -- run presets/supercolony-v2.toml --ticks 1024 --disable vascular-field",
+      "cargo run --release -p flife-cli -- run presets/morphogenesis-tissue-v2.toml --ticks 1024 --v1-compat",
+    ].join("\n"),
+  },
+  {
+    comment: "Render 4K at 60 fps (2160 × 2160 square or 3840 × 2160 widescreen) from a kept run, or export a Studio timeline in 4K Cinema mode",
+    command: [
+      "cargo run --release -p flife-cli -- render --run-dir my-run --ticks 2400 --every 4 --width 2160 --height 2160 --fps 60 --out frames --video world-4k60.mp4",
+      "cargo run --release -p flife-studio -- presets/confluent-world.toml --export timeline.ndjson --out cinema-4k60 --export-size 4k --export-fps 60 --export-mp4",
+    ].join("\n"),
+  },
 ];
 
 // The flife binary's subcommands (crates/flife-cli/src/main.rs; README "Planned command surface").
 export const cliSurface = [
-  { name: "validate", body: "Range-check a configuration and report its memory and worst admitted allocation" },
+  { name: "--list-features", body: "Print all 21 field-ecology-v2 feature slugs, bundle defaults, INV-08 status and ABI impact" },
+  { name: "validate", body: "Range-check a configuration (with optional V2 founding toggles) and report memory admission" },
   { name: "capabilities", body: "Run each controller route against the reference: what this machine can run" },
   { name: "run", body: "A headless run; with --run-dir, durable, journaled and checkpointed" },
-  { name: "resume", body: "Continue a run directory from its newest checkpoint that restores" },
-  { name: "step", body: "Advance a run past its newest durable tick, its journal replayed first" },
+  { name: "resume", body: "Continue a run directory from its newest checkpoint that restores (refuses V2 toggles, INV-14)" },
+  { name: "step", body: "Advance a run past its newest durable tick, its journal replayed first (refuses V2 toggles, INV-14)" },
   { name: "branch", body: "Control and intervention branches from one checkpoint" },
   { name: "inspect", body: "A run's committed world at a checkpoint: every organism and cell, weights included" },
   { name: "experiment", body: "Seed ensembles, sweeps and ablations against a control, every run cataloged" },
   { name: "analyze", body: "Experiments' effects pooled by condition, refused unless comparable" },
   { name: "discover", body: "A pinned discovery: reference, selection, thumbnail, world export, local package" },
   { name: "transplant", body: "Graft a discovered package into a host world, as a new run that resumes" },
-  { name: "render", body: "Frames and MP4 through FrankenManim, from a configuration or a kept run" },
+  { name: "render", body: "Frames and MP4 through FrankenManim (including 4K60 and V2 overlays), from a config or kept run" },
 ];
 
 export const inspiration =
-  "The visual and mechanical target comes from screenshots of Fraser Price's Neural-Kimchi-4B and its description. FrankenLife is an original, explicit rule set (FieldEcologyV1) built from the described primitives. It is not affiliated with that project and claims no numerical parity with it.";
+  "The visual and mechanical target comes from screenshots of Fraser Price's Neural-Kimchi-4B and its description. FrankenLife is an original, explicit rule set (FieldEcologyV1 and its modular FieldEcologyV2 extension) built from the described primitives. It is not affiliated with that project and claims no numerical parity with it.";

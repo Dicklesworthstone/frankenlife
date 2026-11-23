@@ -9,13 +9,13 @@
 use std::fmt;
 use std::fmt::Write as _;
 
-use flife_core::CoreError;
 use flife_core::canonical::{Sha256Digest, canonical_float};
 use flife_core::units::Unit;
+use flife_core::{CoreError, ValidatedConfig};
 use fnp_dtype::DType;
 use fnp_ndarray::{MemoryOrder, NdLayout, ShapeError, contiguous_strides};
 
-use crate::grid::{FIELD_PLANES, FieldGrid};
+use crate::grid::{DUAL_CARRIER_PLANES, FIELD_PLANES, FieldGrid, field_planes_for_config};
 
 /// The schema of a field layout descriptor.
 pub const FIELD_LAYOUT_SCHEMA: &str = "frankenlife.field-layout.v1";
@@ -116,10 +116,12 @@ pub enum Ownership {
     ReadOnlyView,
 }
 
-/// The layout of one complete field state: 33 F32 planes over a grid.
+/// The layout of one complete field state: 33 F32 planes (single-carrier) or
+/// 34 F32 planes (`V2-15` dual-carrier) over a grid.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldLayout {
     grid: FieldGrid,
+    planes: u32,
     arrangement: Arrangement,
     ownership: Ownership,
     shape: [u64; 3],
@@ -128,18 +130,39 @@ pub struct FieldLayout {
 }
 
 impl FieldLayout {
-    /// The contiguous owned layout of `grid` in `arrangement`. FrankenNumPy
-    /// computes the strides and the byte count, and both are checked against
-    /// independent `u64` arithmetic.
+    /// The contiguous owned 33-plane layout of `grid` in `arrangement`.
+    /// FrankenNumPy computes the strides and the byte count, and both are
+    /// checked against independent `u64` arithmetic.
     ///
     /// # Errors
     /// [`CoreError::Overflow`] when the buffer would exceed `isize::MAX`
     /// bytes; [`CoreError::LayoutMismatch`] if FrankenNumPy's layout
     /// disagrees with that arithmetic.
     pub fn new(grid: FieldGrid, arrangement: Arrangement) -> Result<Self, CoreError> {
+        Self::new_with_planes(grid, arrangement, FIELD_PLANES)
+    }
+
+    /// The contiguous owned layout of `grid` in `arrangement` with `planes`
+    /// (`33` single-carrier or `34` dual-carrier, `V2-15` / `FL-055`).
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] for an unsupported plane count or if
+    /// FrankenNumPy's layout disagrees; [`CoreError::Overflow`] when the
+    /// buffer would exceed `isize::MAX` bytes.
+    pub fn new_with_planes(
+        grid: FieldGrid,
+        arrangement: Arrangement,
+        planes: u32,
+    ) -> Result<Self, CoreError> {
+        if planes != FIELD_PLANES && planes != DUAL_CARRIER_PLANES {
+            return Err(mismatch(format!(
+                "{planes} planes where {FIELD_PLANES} (single-carrier) or \
+                 {DUAL_CARRIER_PLANES} (dual-carrier) are supported"
+            )));
+        }
         let item = f32_item_size()?;
         let axes = arrangement.axes();
-        let shape = axes.map(|axis| extent(&grid, axis));
+        let shape = axes.map(|axis| extent(&grid, axis, planes));
         let shape_usize = shape
             .iter()
             .map(|&extent| usize::try_from(extent))
@@ -153,7 +176,7 @@ impl FieldLayout {
         // A Rust slice, like a NumPy array, spans at most `isize::MAX` bytes.
         let byte_length = grid
             .cell_count()
-            .checked_mul(u64::from(FIELD_PLANES))
+            .checked_mul(u64::from(planes))
             .and_then(|elements| elements.checked_mul(HOST_ALIGNMENT))
             .filter(|&bytes| isize::try_from(bytes).is_ok())
             .ok_or_else(overflow)?;
@@ -182,6 +205,7 @@ impl FieldLayout {
         }
         Ok(Self {
             grid,
+            planes,
             arrangement,
             ownership: Ownership::Owned,
             shape,
@@ -190,7 +214,7 @@ impl FieldLayout {
         })
     }
 
-    /// The authoritative host layout of `grid`.
+    /// The authoritative 33-plane host layout of `grid`.
     ///
     /// # Errors
     /// As [`FieldLayout::new`].
@@ -198,10 +222,40 @@ impl FieldLayout {
         Self::new(grid, Arrangement::Planar)
     }
 
+    /// The authoritative planar host layout of `grid` with `planes` (`33` or `34`).
+    ///
+    /// # Errors
+    /// As [`FieldLayout::new_with_planes`].
+    pub fn planar_with_planes(grid: FieldGrid, planes: u32) -> Result<Self, CoreError> {
+        Self::new_with_planes(grid, Arrangement::Planar, planes)
+    }
+
+    /// The authoritative planar host layout declared by `config` (`34` planes
+    /// when `dual-carrier-trails` is enabled, else `33`).
+    ///
+    /// # Errors
+    /// As [`FieldGrid::from_config`] and [`FieldLayout::planar_with_planes`].
+    pub fn for_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
+        let grid = FieldGrid::from_config(config)?;
+        Self::planar_with_planes(grid, field_planes_for_config(config))
+    }
+
     /// The grid.
     #[must_use]
     pub const fn grid(&self) -> &FieldGrid {
         &self.grid
+    }
+
+    /// Number of planes (`33` single-carrier or `34` dual-carrier).
+    #[must_use]
+    pub const fn planes(&self) -> u32 {
+        self.planes
+    }
+
+    /// Whether this layout carries the 34-plane dual-carrier hybrid field (`V2-15`).
+    #[must_use]
+    pub const fn is_dual_carrier(&self) -> bool {
+        self.planes == DUAL_CARRIER_PLANES
     }
 
     /// The arrangement.
@@ -234,7 +288,7 @@ impl FieldLayout {
         self.byte_length
     }
 
-    /// F32 elements in the buffer: `33 G_x G_y`.
+    /// F32 elements in the buffer: `planes × G_x G_y`.
     #[must_use]
     pub const fn element_count(&self) -> u64 {
         self.byte_length / HOST_ALIGNMENT
@@ -243,7 +297,7 @@ impl FieldLayout {
     /// Bytes in one plane: `4 G_x G_y`.
     #[must_use]
     pub const fn plane_bytes(&self) -> u64 {
-        self.byte_length / FIELD_PLANES as u64
+        self.byte_length / self.planes as u64
     }
 
     /// The element dtype: real F32 storage, never widened.
@@ -255,7 +309,7 @@ impl FieldLayout {
     /// The byte offset of `(plane, x, y)`, or `None` outside the buffer.
     #[must_use]
     pub fn element_offset(&self, plane: u32, x: u32, y: u32) -> Option<u64> {
-        if plane >= FIELD_PLANES || x >= self.grid.cells_x() || y >= self.grid.cells_y() {
+        if plane >= self.planes || x >= self.grid.cells_x() || y >= self.grid.cells_y() {
             return None;
         }
         let mut offset = 0_u64;
@@ -447,12 +501,17 @@ impl FieldLayout {
                 .find_map(|(&axis, extent)| (axis == wanted).then_some(extent))
                 .unwrap_or(0)
         };
-        if extent_of(Axis::Plane) != u64::from(FIELD_PLANES) {
+        let declared_planes = extent_of(Axis::Plane);
+        let planes = if declared_planes == u64::from(FIELD_PLANES) {
+            FIELD_PLANES
+        } else if declared_planes == u64::from(DUAL_CARRIER_PLANES) {
+            DUAL_CARRIER_PLANES
+        } else {
             return Err(mismatch(format!(
-                "{} planes where {FIELD_PLANES} (energy and 32 moments) are required",
-                extent_of(Axis::Plane)
+                "{declared_planes} planes where {FIELD_PLANES} (single-carrier) or \
+                 {DUAL_CARRIER_PLANES} (dual-carrier) are required"
             )));
-        }
+        };
         if declared.unit != PLANE_UNIT.name() || declared.measure != CELL_INTEGRATED {
             return Err(mismatch(format!(
                 "planes in `{}` as `{}` where `{}` as `{CELL_INTEGRATED}` is required",
@@ -482,7 +541,7 @@ impl FieldLayout {
             declared.world_width,
             declared.world_height,
         )?;
-        let expected = Self::new(grid, arrangement)?;
+        let expected = Self::new_with_planes(grid, arrangement, planes)?;
 
         // FrankenNumPy's bounds and self-overlap check of the declared view
         // over a flat base of exactly the declared bytes.
@@ -604,9 +663,9 @@ impl DeclaredLayout {
     }
 }
 
-fn extent(grid: &FieldGrid, axis: Axis) -> u64 {
+fn extent(grid: &FieldGrid, axis: Axis, planes: u32) -> u64 {
     match axis {
-        Axis::Plane => u64::from(FIELD_PLANES),
+        Axis::Plane => u64::from(planes),
         Axis::Y => u64::from(grid.cells_y()),
         Axis::X => u64::from(grid.cells_x()),
     }

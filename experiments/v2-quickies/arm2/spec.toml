@@ -1,0 +1,46 @@
+schema = "frankenlife.experiment.v1"
+name = "v2-quickie-arm2-tissue-morphogenesis-128"
+hypothesis = """V2-10 Quickie Arm 2 (Tissue Morphogenesis + H4): on a 32x32 world (128x128 \
+grid, h = D = 0.25, k = 0.75, k_a = 0.35), combining V2-08 pcp-polarity, V2-07 \
+hippo-crowding (c_max = 4.5), and V2-09 tight-junctions (phi_min = 0.04) over 3,200 ticks \
+(100 simulated seconds) produces 1-cell hollow cysts/sheets, regenerative wound-rim \
+proliferation, and > 3x H4 boundary-vs-interior chemical sealing. \
+Exact implemented controls: v1-compat (all v2 features disabled; isotropic contact baseline), \
+no-hippo-crowding (tests the 201% jamming prediction), frozen-polarity \
+(torque_mobility = 0.0, oriented_lateral_mitosis = false), no-tight-junctions \
+(v2.barrier.enabled = false), and uniform-low-diffusion (barrier off + 0.04x diffusion). \
+Preregistered pass gate: stacking < 1.25, <|psi_6|> < 0.55, chain fraction >= 2.5x \
+baseline, wound-rim birth rate >= 3x interior, H4 boundary-vs-interior leak ratio > 3x, \
+and raw + sphere visual inspection."""
+base = "../arm2-tissue-morphogenesis-128.toml"
+ticks = 3200
+metrics_every = 400
+control = "treatment"
+selection = "No selection: every condition runs on all 4 discovery and 2 held-out seeds; every run (complete, extinct, paused, or failed) is cataloged and reported."
+
+[seeds]
+discovery = [201, 202, 203, 204]
+held_out = [2201, 2202]
+
+[[conditions]]
+name = "treatment"
+
+[[conditions]]
+name = "v1-compat"
+set = { "v2.polarity.enabled" = false, "v2.crowding.enabled" = false, "v2.barrier.enabled" = false, "v2.visual.enabled" = false }
+
+[[conditions]]
+name = "no-hippo-crowding"
+set = { "v2.crowding.enabled" = false }
+
+[[conditions]]
+name = "frozen-polarity"
+set = { "v2.polarity.torque_mobility" = 0.0, "v2.polarity.oriented_lateral_mitosis" = false }
+
+[[conditions]]
+name = "no-tight-junctions"
+set = { "v2.barrier.enabled" = false }
+
+[[conditions]]
+name = "uniform-low-diffusion"
+set = { "v2.barrier.enabled" = false, "world.diffusion" = 0.001194868 }

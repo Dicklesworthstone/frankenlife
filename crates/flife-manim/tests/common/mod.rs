@@ -58,6 +58,54 @@ pub(crate) fn small() -> ValidatedConfig {
     ])
 }
 
+/// A small `field-ecology-v2` world with optional contact block and feature
+/// overrides (matching `flife-render`'s V2-16 test configurations).
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helper: a failure here is a test failure"
+)]
+pub(crate) fn small_v2(
+    with_contact: bool,
+    features: &[flife_core::FeatureOverride],
+) -> ValidatedConfig {
+    let mut lines: Vec<String> = appendix_a_toml().lines().map(str::to_owned).collect();
+    for &(section, key, value) in &[
+        ("world", "width", "32.0"),
+        ("world", "height", "32.0"),
+        ("world", "grid_width", "32"),
+        ("world", "grid_height", "32"),
+        ("population", "initial_count", "48"),
+        ("population", "maximum_count", "72"),
+        ("population", "initial_energy", "3.0"),
+        ("execution", "command_durability", "\"volatile-in-memory\""),
+    ] {
+        let header = format!("[{section}]");
+        let start = lines
+            .iter()
+            .position(|line| line.trim() == header)
+            .unwrap_or_else(|| panic!("no section {header}"));
+        let line = lines[start + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with('['))
+            .position(|line| line.split('=').next().map(str::trim) == Some(key))
+            .map(|offset| start + 1 + offset)
+            .unwrap_or_else(|| panic!("no key {key} in {header}"));
+        lines[line] = format!("{key} = {value}");
+    }
+    let mut text = lines.join("\n").replacen(
+        "model = \"field-ecology-v1\"",
+        "model = \"field-ecology-v2\"",
+        1,
+    );
+    if with_contact {
+        text.push_str(
+            "\n[contact]\ndiameter = 0.25\nstiffness = 0.5\nadhesion = 0.25\nadhesion_range = 2.0\n",
+        );
+    }
+    ValidatedConfig::from_toml_with_overrides(&text, features).expect("a valid v2 configuration")
+}
+
 /// A world founded from `config`.
 #[expect(
     clippy::expect_used,

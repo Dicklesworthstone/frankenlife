@@ -14,7 +14,7 @@ export const GROUPS: { id: KeyGroup; name: string; color: string; summary: strin
   { id: "tools", name: "Brushes and measuring", color: "#FF6F59", summary: "Brushes the session applies at its next open boundary; the measuring tool changes nothing." },
 ];
 
-export type StudioKey = { group: KeyGroup; name: string; action: string };
+export type StudioKey = { group: KeyGroup; name: string; action: string; v2?: boolean };
 
 /** By the cap's label on the keyboard drawing. */
 export const KEYS: Record<string, StudioKey> = {
@@ -34,6 +34,20 @@ export const KEYS: Record<string, StudioKey> = {
     name: "7",
     action: "Lineage lit by energy, as the film is: black with none, white with about 1.8 times what a birth needs.",
   },
+  "8": {
+    group: "look",
+    name: "8",
+    v2: true,
+    action:
+      "Colour by recurrent cell state (cell-state-v1): keeps the founder lineage's OKLab hue and modulates lightness, chroma and a slight hue twist from epigenetic state h₀. Active on field-ecology-v2 when v2-visual-mappings is enabled; no-op on v1.",
+  },
+  "9": {
+    group: "look",
+    name: "9",
+    v2: true,
+    action:
+      "Colour by apical-basal polarity (polarity-v1): cyclic OKLab hue wheel for orientation angle, neutral grey when unpolarized, paired with bulk apical orientation ticks in sphere mode. Active on field-ecology-v2 when v2-visual-mappings is enabled; no-op on v1.",
+  },
   R: { group: "look", name: "R", action: "The next look: glow, then raw (no halos, linear grey field), then sphere." },
   D: { group: "look", name: "D", action: "Density per screen bin instead of dots, and back." },
 
@@ -41,7 +55,9 @@ export const KEYS: Record<string, StudioKey> = {
   C: {
     group: "field",
     name: "C",
-    action: "The field's energy, then its chemical composition (hue for chemistry), then its chosen component, in turn.",
+    v2: true,
+    action:
+      "Cycle the field overlay: energy, chemical composition (hue for chemistry), then chosen component. On field-ecology-v2 with v2-visual-mappings enabled, also cycles trail-carrier (Carrier-1 pheromones) and vascular-conductance (Murray vessels).",
   },
   "[": { group: "field", name: "[", action: "Show the field's chosen chemical channel; again, the previous of its 32." },
   "]": { group: "field", name: "]", action: "Show the field's chosen chemical channel; again, the next of its 32." },

@@ -89,33 +89,37 @@ use flife_core::{
     ConfigIssue, CoreError, EnergyBudget, EnergyLedger, Flow, Holdings, LedgerReport,
     ResidualBudget, Sha256Digest, TickClosure, TickLedger, Transfer, ValidatedConfig,
 };
+use flife_field::settle::MotorSteeringInputs;
 use flife_field::{
     Bins, BufferLimits, ConeTolerance, Demand, DepositSummary, Deposits, ExchangeKernel,
-    ExchangeScratch, FieldBackend, FieldGrid, FieldPair, FieldState, FieldStepReport, FieldSummary,
-    FieldWork, GrantPacket, Grants, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
-    SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
-    Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
-    advance_field_on, apply_deposits_on, apply_grants_on, demand_with_scratch, demands_on,
-    initial_source, reduce_field_on, resolve_uptake_on, resolve_uptake_with_on_workers,
-    state::CHANNELS,
+    ExchangeScratch, FieldBackend, FieldGrid, FieldPair, FieldState, FieldStepOptions,
+    FieldStepReport, FieldSummary, FieldWork, FluxEdges, GrantPacket, Grants, PyramidView,
+    RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
+    SensorPyramid, SensorQuery, SettleBackend, Source, SourceKernel, TransportPlan, UptakeBackend,
+    UptakeSummary, UptakeWork, advance_field_on, advance_field_v2_on, apply_deposits_on,
+    apply_grants_on, count_cell_occupancy, demand_with_scratch, demands_on, initial_source,
+    reduce_field_on, resolve_uptake_on, resolve_uptake_with_on_workers, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
     MutationRecord, Mutator, ParameterBuffer, TopologyCatalog, TopologyId, TraitLimits, Traits,
     founder_topology, founder_traits, grow_founder, initial_scale,
 };
+use flife_neural::actions::EMISSION_SPEND;
 use flife_neural::{
     ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch, DecodedActions, Intrinsic,
     MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs,
-    SENSOR_WIDTH, SensorScales, decode_slice, observe_for_controller, update_recurrent_state,
-    widen_slice,
+    SENSOR_WIDTH, SensorLayout, SensorScales, decode_with_layout, observe_for_controller,
+    update_recurrent_state, widen_slice,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
 use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition};
-use crate::contact::{ContactRules, ContactWork, unit_affinity};
+use crate::contact::{ContactRules, ContactWork, CrowdingWork, unit_affinity};
 use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
-use crate::emission::{EmissionPolicy, EmissionSettlement};
+use crate::emission::{
+    EmissionContext, EmissionPolicy, EmissionSettlement, INITIAL_SECRETORY_READINESS,
+};
 use crate::inspect::{
     Activations, ControllerWeights, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS,
     ReproductionOutcome, Sensed, Transactions,
@@ -128,7 +132,8 @@ use crate::population::{Arrangement, CheckedTick, Entrant, HeldOutput, Organism,
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityPolicy,
     CapacityShortfall, Identities, Offspring, ParentState, PopulationQuota, RefusedBirth,
-    RejectedBirth, Reproduction, ReproductionProposal, resolve_births_with_wave_preparer,
+    RejectedBirth, Reproduction, ReproductionProposal, hippo_attempt_probability,
+    hippo_crowding_sensor, resolve_births_with_wave_preparer,
 };
 
 mod admission;
@@ -144,7 +149,7 @@ pub use checkpoint::{
 };
 pub use graft::Graft;
 use settle::{Settle, settle_with};
-pub use v2::{CarrierSpec, V2Rules};
+pub use v2::{BuddingRules, CarrierSpec, CrowdingMode, CrowdingRules, SenescenceRules, V2Rules};
 
 /// The backend this module implements: the scalar CPU reference.
 pub const CPU_REFERENCE: &str = "cpu-reference";
@@ -320,6 +325,8 @@ struct Staged {
     sensed: Option<Sensed>,
     /// Its pre-evaluation recurrent internal state on this step, if any.
     sensed_state: Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
+    /// Its optional Hippo-YAP crowding sensor `c_den` on this step, if active.
+    sensed_crowding: Option<f64>,
     /// The watched organism's transactions in this step, if it settled.
     transactions: Option<Transactions>,
     report: TickReport,
@@ -397,6 +404,7 @@ impl Candidate<'_> {
             if sensed.evaluated {
                 world.watch.evaluated = Some(sensed.clone());
                 world.watch.evaluated_state = staged.sensed_state;
+                world.watch.evaluated_crowding = staged.sensed_crowding;
             }
             world.watch.observed = Some(sensed);
         }
@@ -449,6 +457,8 @@ struct Rules {
     contact: Option<ContactRules>,
     /// Modular `field-ecology-v2*` feature rules and sensor/action layouts.
     v2: V2Rules,
+    /// Configured `sources.power_per_source`, reused by `V2-02` (`oases`).
+    base_source_power: f64,
     initial_scale: f64,
 }
 
@@ -631,6 +641,88 @@ impl Rules {
         })
     }
 
+    /// Effective reproduction attempt probability for `organism`, applying
+    /// `V2-07` Hippo-YAP local crowding arrest when enabled and returning the
+    /// baseline decoded `attempt_probability` bit-identically when disabled.
+    pub(super) fn effective_attempt_probability(
+        &self,
+        organism: &Working,
+    ) -> Result<f64, CoreError> {
+        match self.v2.crowding() {
+            None => Ok(organism.actions.attempt_probability),
+            Some(crowding) => hippo_attempt_probability(
+                organism.actions.attempt_rate,
+                self.step,
+                organism.local_crowding,
+                crowding.arrest_threshold,
+            ),
+        }
+    }
+
+    /// Build the Phase 7 `V2-04` [`EmissionContext`] from `organism`'s held
+    /// controller outputs, post-motion kinematics, and excitable state.
+    pub(super) fn emission_context(
+        &self,
+        organism: &Working,
+        position: [f64; 2],
+        velocity: [f64; 2],
+        from: Tick,
+    ) -> Result<EmissionContext, CoreError> {
+        let outputs = organism
+            .held
+            .outputs()
+            .ok_or_else(|| CoreError::StateConflict {
+                operation: "resolve v2 emission context",
+                detail: format!("{} holds no valid output", organism.committed.id),
+            })?;
+        let raw_spend_logit =
+            if self.variant.decides_from_zero() {
+                0.0
+            } else {
+                f64::from(*outputs.get(EMISSION_SPEND).ok_or_else(|| {
+                    CoreError::LayoutMismatch {
+                        buffer: "held controller output",
+                        detail: format!(
+                            "output width {} misses emission spend slot {EMISSION_SPEND}",
+                            outputs.len()
+                        ),
+                    }
+                })?)
+            };
+        let raw_pump_logit = self
+            .v2
+            .actions()
+            .wake_pump()
+            .map(|slot| {
+                if self.variant.decides_from_zero() {
+                    Ok(0.0)
+                } else {
+                    outputs
+                        .get(slot)
+                        .map(|&value| f64::from(value))
+                        .ok_or_else(|| CoreError::LayoutMismatch {
+                            buffer: "held controller output",
+                            detail: format!(
+                                "output width {} misses wake pump slot {slot}",
+                                outputs.len()
+                            ),
+                        })
+                }
+            })
+            .transpose()?;
+        Ok(EmissionContext {
+            position,
+            velocity,
+            energy_gradient: organism.gradients[0],
+            polarity: None,
+            raw_spend_logit,
+            raw_pump_logit,
+            tick: from,
+            secretory_readiness: organism.secretory_readiness,
+            emission_cooldown_deadline: organism.emission_cooldown_deadline,
+        })
+    }
+
     fn from_config(config: &ValidatedConfig, profile: NumericalProfile) -> Result<Self, CoreError> {
         let model = config.config();
         let named = |role: &'static str, name: &str, implemented: &str| {
@@ -712,6 +804,7 @@ impl Rules {
             variant: ModelVariant::of(&model.model)?,
             contact: contact_rules(config)?,
             v2,
+            base_source_power: model.sources.power_per_source,
             initial_scale: initial_scale(config),
         })
     }
@@ -744,6 +837,20 @@ struct Scratch {
     deaths: Vec<Death>,
     /// The contact models' buffers; empty under every other model.
     contact: ContactWork,
+    /// Post-Phase-1 crowding buffers (`V2-07`); empty (0 bytes) when disabled.
+    crowding: CrowdingWork,
+    /// Scratch for `V2-02` (`oases`) modulated source powers; empty (0 bytes)
+    /// when disabled.
+    oasis_powers: Vec<f64>,
+    /// Scratch positions for `V2-09` (`tight-junctions`) cell occupancy; empty
+    /// (0 bytes) when disabled.
+    barrier_positions: Vec<[f64; 2]>,
+    /// Scratch per-cell occupancy for `V2-09` (`tight-junctions`); empty
+    /// (0 bytes) when disabled.
+    barrier_occupancy: Vec<u32>,
+    /// Precomputed symmetric face conductances for `V2-09` (`tight-junctions`);
+    /// `None` (0 bytes) when disabled.
+    flux_edges: Option<FluxEdges>,
 }
 
 /// Phases 3 and 4 for one organism: what it observed, and its held or newly
@@ -992,6 +1099,9 @@ struct Watch {
     /// Its pre-evaluation recurrent internal state on the newest published
     /// step it evaluated in (`independent-recurrent-mlp-v1`, FL-054).
     evaluated_state: Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
+    /// Its Hippo-YAP crowding sensor `c_den` on the newest published step it
+    /// evaluated in (`V2-07`, when `expose_sensor` is active).
+    evaluated_crowding: Option<f64>,
     /// Its transactions in its last [`RECENT_STEPS`] published steps,
     /// oldest first. Each step's preparation reserves the room, so
     /// publishing never allocates.
@@ -1012,9 +1122,15 @@ struct Working {
     evaluated: bool,
     actions: DecodedActions,
     gradients: [[f64; 2]; RESPONSE_TERMS],
+    /// `V2-03` basal maintenance multiplier (`1.0` when `senescence` is off).
+    basal_multiplier: f64,
+    /// `V2-07` post-Phase-1 local crowding count `N_loc` (`0` when off).
+    local_crowding: u32,
     position: [f64; 2],
     velocity: [f64; 2],
     cooldown_deadline: Tick,
+    secretory_readiness: f32,
+    emission_cooldown_deadline: Tick,
     emitted: bool,
     intent: Option<BirthIntent>,
 }
@@ -1030,6 +1146,9 @@ pub struct World {
     field: FieldPair,
     population: Population,
     sources: Vec<Source>,
+    /// Per-source heterogeneous Gaussian kernels (`V2-02`, `oases`); empty
+    /// (0 bytes) on `v1` or when `oases` is disabled.
+    source_kernels: Vec<SourceKernel>,
     paths: Vec<SeededPath>,
     identities: Identities,
     quota: GenomeQuota,
@@ -1129,6 +1248,7 @@ impl World {
         population.admit(&mut entrants)?;
 
         let sources = initial_sources(config, &rules)?;
+        let source_kernels = initial_source_kernels(&rules, &sources)?;
         let mut paths = Vec::new();
         for index in 0..model.sources.count {
             let id = SourceId::new(index);
@@ -1144,7 +1264,7 @@ impl World {
 
         let holdings = Holdings::new(field.current().energy_total(), organism_total(&population))?;
         let ledger = EnergyLedger::new(holdings, profile.residual);
-        let scratch = Scratch::new(config, &rules, sources.len())?;
+        let scratch = Scratch::new(config, &rules, sources.len(), &source_kernels)?;
         let mut world = Self {
             config: config.clone(),
             rules,
@@ -1154,6 +1274,7 @@ impl World {
             field,
             population,
             sources,
+            source_kernels,
             paths,
             identities,
             quota,
@@ -1422,7 +1543,9 @@ impl World {
         if backend.is_none() {
             return;
         }
-        if let Err(error) = capacity_of(&self.rules).and_then(|rows| settle.work.reserve(rows)) {
+        if let Err(error) = capacity_of(&self.rules)
+            .and_then(|rows| settle.work.reserve(rows, self.rules.v2.needs_motion_v2()))
+        {
             settle.report.failure = Some(error.to_string());
             settle.work = settle::SettleWork::default();
             return;
@@ -1590,6 +1713,7 @@ impl World {
         total([
             population,
             capacity_bytes(&self.sources),
+            capacity_bytes(&self.source_kernels),
             capacity_bytes(&self.paths),
             // Reserved whole when tracing begins (FL-021).
             self.ancestry.as_ref().map_or(0, Ancestry::bytes),
@@ -1633,6 +1757,14 @@ impl World {
                 capacity_bytes(&scratch.survivors),
                 capacity_bytes(&scratch.deaths),
                 scratch.contact.allocated_bytes(),
+                scratch.crowding.allocated_bytes(),
+                capacity_bytes(&scratch.oasis_powers),
+                capacity_bytes(&scratch.barrier_positions),
+                capacity_bytes(&scratch.barrier_occupancy),
+                scratch
+                    .flux_edges
+                    .as_ref()
+                    .map_or(0, FluxEdges::allocated_bytes),
                 capacity_bytes(&self.controllers.outputs),
                 capacity_bytes(&self.controllers.by_row),
                 capacity_bytes(&self.sensors.queries),
@@ -1649,6 +1781,12 @@ impl World {
     #[must_use]
     pub fn paths(&self) -> &[SeededPath] {
         &self.paths
+    }
+
+    /// Per-source heterogeneous kernels (`V2-02` `oases`), empty when disabled.
+    #[must_use]
+    pub fn source_kernels(&self) -> &[SourceKernel] {
+        &self.source_kernels
     }
 
     /// The identity sequences.
@@ -1808,7 +1946,12 @@ impl World {
             Some(outputs) => {
                 let mut raw = [0.0_f64; MAX_ACTION_WIDTH];
                 let slice = raw_outputs(&self.rules, outputs, &mut raw)?;
-                Some(decode_slice(slice, self.rules.step, &self.rules.decoding)?)
+                Some(decode_with_layout(
+                    slice,
+                    self.rules.step,
+                    &self.rules.decoding,
+                    &self.rules.v2.actions(),
+                )?)
             }
             None => None,
         };
@@ -1835,6 +1978,11 @@ impl World {
                 let input_width = sensors.input_width();
                 let mut full_inputs = [0.0_f64; MAX_SENSOR_WIDTH];
                 full_inputs[..SENSOR_WIDTH].copy_from_slice(&recorded.observation.inputs);
+                if let (Some(slot), Some(c_den)) =
+                    (sensors.hippo_crowding(), self.watch.evaluated_crowding)
+                {
+                    full_inputs[slot] = c_den;
+                }
                 let prev_state = self
                     .watch
                     .evaluated_state
@@ -2052,6 +2200,12 @@ impl World {
             bytes.extend_from_slice(&path.source().get().to_le_bytes());
             bytes.extend_from_slice(&path.ordinal().to_le_bytes());
         }
+        if !self.source_kernels.is_empty() {
+            bytes.extend_from_slice(&(self.source_kernels.len() as u64).to_le_bytes());
+            for kernel in &self.source_kernels {
+                bytes.extend_from_slice(&kernel.sigma().to_bits().to_le_bytes());
+            }
+        }
         let holdings = self.ledger.holdings();
         for value in [holdings.field(), holdings.organisms()] {
             bytes.extend_from_slice(&value.to_bits().to_le_bytes());
@@ -2149,6 +2303,7 @@ impl World {
             field,
             population,
             sources,
+            source_kernels,
             paths,
             identities,
             quota,
@@ -2178,6 +2333,11 @@ impl World {
             survivors,
             deaths,
             contact,
+            crowding,
+            oasis_powers,
+            barrier_positions,
+            barrier_occupancy,
+            flux_edges,
         } = scratch;
         let from = *tick;
         let to = from.next()?;
@@ -2212,6 +2372,36 @@ impl World {
             &mut applied,
         )?;
 
+        // V2-07: compute local crowding strictly from post-Phase-1 `rows`
+        // (after `Intervention::RemoveOrganisms`), so wound-rim cells release
+        // on the exact tick of the intervention and `expose_sensor` feeds
+        // Phases 3–4 with zero cross-tick state.
+        let crowding_counts: &[u32] = if let Some(crowding_rules) = rules.v2.crowding() {
+            let positions = crowding.positions_mut();
+            positions.clear();
+            positions.extend(rows.iter().map(|organism| organism.position));
+            match crowding_rules.mode {
+                CrowdingMode::LocalNeighbors { radius_world_units } => crowding
+                    .count_buffered_local_neighbors(&rules.grid, radius_world_units, lanes.len())?,
+                CrowdingMode::CellOccupancy => {
+                    crowding.count_buffered_cell_occupancy(&rules.grid)?
+                }
+            }
+        } else {
+            crowding.clear();
+            &[]
+        };
+
+        // V2-09: compute symmetric tight-junction face conductances strictly
+        // from post-Phase-1 `rows` (after `Intervention::RemoveOrganisms`), so
+        // puncturing a barrier opens flux on the exact tick of the intervention.
+        if let (Some(barrier), Some(edges)) = (rules.v2.tight_junctions(), flux_edges.as_mut()) {
+            barrier_positions.clear();
+            barrier_positions.extend(rows.iter().map(|organism| organism.position));
+            count_cell_occupancy(&rules.grid, barrier_positions, barrier_occupancy)?;
+            barrier.fill_edges(&rules.plan, barrier_occupancy, edges)?;
+        }
+
         // Phase 2: transport, then the sources sampled at mid-tick, then the
         // injections in their sealed order.
         let mut next_paths = paths.clone();
@@ -2228,7 +2418,22 @@ impl World {
             let u = segment.mid_tick(from.get() - start)?;
             sampled.push(source.moved_to(segment.position(&rules.grid, u)?)?);
         }
-        let field_step = advance_field_with(field, rules, sampled, step, field_work, fields)?;
+        if let Some(oases) = rules.v2.oases() {
+            oases.apply_powers(from, step, rules.base_source_power, sampled, oasis_powers)?;
+        }
+        let field_options = FieldStepOptions {
+            source_kernels: (!source_kernels.is_empty()).then_some(source_kernels.as_slice()),
+            flux_edges: flux_edges.as_ref(),
+        };
+        let field_step = advance_field_with(
+            field,
+            rules,
+            sampled,
+            step,
+            field_options,
+            field_work,
+            fields,
+        )?;
         tick_ledger.record(Flow::SourcePower, field_step.injected_declared)?;
         tick_ledger.record(Flow::Decay, field_step.transport.decay_removed)?;
         {
@@ -2250,13 +2455,23 @@ impl World {
             &view,
             sampled,
             rows,
+            crowding_counts,
             [from, to],
             lanes,
             controllers,
         )?;
-        let (sensed, sensed_state) = match watch.organism {
-            Some(id) => watched(rules, population, &view, sampled, rows, id, [from, to])?,
-            None => (None, None),
+        let (sensed, sensed_state, sensed_crowding) = match watch.organism {
+            Some(id) => watched(
+                rules,
+                population,
+                &view,
+                sampled,
+                rows,
+                crowding_counts,
+                id,
+                [from, to],
+            )?,
+            None => (None, None, None),
         };
         // The reference sampled the tick without an error, so a backend that
         // met one failed where the reference does not.
@@ -2267,8 +2482,13 @@ impl World {
         working.clear();
         let mut evaluated = 0;
         let decisions = lanes.iter().flat_map(|lane| lane.decisions.iter());
-        for (&organism, decision) in rows.iter().zip(decisions) {
+        for (row_index, (&organism, decision)) in rows.iter().zip(decisions).enumerate() {
             evaluated += usize::from(decision.evaluated);
+            let basal_multiplier =
+                rules
+                    .v2
+                    .basal_multiplier(organism.birth_tick, from, rules.step)?;
+            let local_crowding = crowding_counts.get(row_index).copied().unwrap_or(0);
             working.push(Working {
                 committed: organism,
                 budget: EnergyBudget::new(organism.energy)?,
@@ -2277,9 +2497,13 @@ impl World {
                 evaluated: decision.evaluated,
                 actions: decision.actions,
                 gradients: decision.gradients,
+                basal_multiplier,
+                local_crowding,
                 position: organism.position,
                 velocity: organism.velocity,
                 cooldown_deadline: organism.cooldown_deadline,
+                secretory_readiness: organism.secretory_readiness,
+                emission_cooldown_deadline: organism.emission_cooldown_deadline,
                 emitted: false,
                 intent: None,
             });
@@ -2518,6 +2742,8 @@ impl World {
                         energy_change_rate: (energy - organism.committed.energy) / seconds,
                         held: organism.held,
                         cooldown_deadline: organism.cooldown_deadline,
+                        secretory_readiness: organism.secretory_readiness,
+                        emission_cooldown_deadline: organism.emission_cooldown_deadline,
                         ..organism.committed
                     });
                 }
@@ -2672,6 +2898,7 @@ impl World {
             paths: next_paths,
             sensed,
             sensed_state,
+            sensed_crowding,
             transactions,
             report,
         })))
@@ -2747,10 +2974,27 @@ fn initial_sources(config: &ValidatedConfig, rules: &Rules) -> Result<Vec<Source
         .collect()
 }
 
+/// Per-source heterogeneous Gaussian kernels when `V2-02` (`oases`) is active;
+/// empty (0 bytes) on `v1` or when `oases` is disabled.
+fn initial_source_kernels(
+    rules: &Rules,
+    sources: &[Source],
+) -> Result<Vec<SourceKernel>, CoreError> {
+    match rules.v2.oases() {
+        Some(oases) => oases.seed_kernels(&rules.rng, &rules.kernel, sources),
+        None => Ok(Vec::new()),
+    }
+}
+
 impl Scratch {
     /// Empty scratch for `sources` sources at the configuration's worker
     /// count.
-    fn new(config: &ValidatedConfig, rules: &Rules, sources: usize) -> Result<Self, CoreError> {
+    fn new(
+        config: &ValidatedConfig,
+        rules: &Rules,
+        sources: usize,
+        source_kernels: &[SourceKernel],
+    ) -> Result<Self, CoreError> {
         let limits = BufferLimits::host();
         let workers_configured = config.config().execution.cpu_workers;
         // Contribution scratch for the largest live population (§9.4): every
@@ -2771,7 +3015,39 @@ impl Scratch {
         // (FL-043), so the footprint taken now bounds every later tick.
         let rows = capacity_of(rules)?;
         let mut field = FieldWork::new(&rules.grid, &limits, workers(workers_configured)?)?;
-        field.reserve_supports(sources, &rules.kernel)?;
+        if source_kernels.is_empty() {
+            field.reserve_supports(sources, &rules.kernel)?;
+        } else {
+            field.reserve_supports_for_kernels(source_kernels)?;
+        }
+        let oasis_powers = if rules.v2.oases().is_some() {
+            reserved(sources, "oasis source powers")?
+        } else {
+            Vec::new()
+        };
+        let (barrier_positions, barrier_occupancy, flux_edges) =
+            if rules.v2.tight_junctions().is_some() {
+                let cells =
+                    usize::try_from(rules.grid.cell_count()).map_err(|_| CoreError::Overflow {
+                        quantity: "grid cells",
+                    })?;
+                let occ_bytes =
+                    rules
+                        .grid
+                        .cell_count()
+                        .checked_mul(4)
+                        .ok_or(CoreError::Overflow {
+                            quantity: "cell occupancy scratch bytes",
+                        })?;
+                limits.admit("cell occupancy scratch bytes", occ_bytes)?;
+                let mut occupancy = reserved(cells, "cell occupancy scratch")?;
+                occupancy.resize(cells, 0);
+                let edges = FluxEdges::new(&rules.grid, &limits)?;
+                let positions = reserved(rows, "tight-junction positions")?;
+                (positions, occupancy, Some(edges))
+            } else {
+                (Vec::new(), Vec::new(), None)
+            };
         Ok(Self {
             field,
             pyramid: SensorPyramid::from_config(config, &limits)?,
@@ -2806,6 +3082,25 @@ impl Scratch {
                 Some(bodies) => ContactWork::with_capacity(&rules.grid, bodies, rows)?,
                 None => ContactWork::default(),
             },
+            crowding: match rules.v2.crowding() {
+                Some(crowding) => match crowding.mode {
+                    CrowdingMode::LocalNeighbors { radius_world_units } => {
+                        CrowdingWork::with_capacity_local_neighbors(
+                            &rules.grid,
+                            radius_world_units,
+                            rows,
+                        )?
+                    }
+                    CrowdingMode::CellOccupancy => {
+                        CrowdingWork::with_capacity_cell_occupancy(&rules.grid, rows)?
+                    }
+                },
+                None => CrowdingWork::default(),
+            },
+            oasis_powers,
+            barrier_positions,
+            barrier_occupancy,
+            flux_edges,
         })
     }
 }
@@ -2981,6 +3276,8 @@ fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, Core
         held: HeldOutput::INVALID,
         phase: stable_phase(id, rules.interval)?,
         cooldown_deadline: founding.cooldown_deadline,
+        secretory_readiness: INITIAL_SECRETORY_READINESS,
+        emission_cooldown_deadline: Tick::new(0),
     };
     Ok(Entrant { organism, genome })
 }
@@ -3113,36 +3410,66 @@ fn fit<T>(vector: &mut Vec<T>, count: usize, buffer: &'static str) -> Result<(),
 }
 
 /// Phase 2 on the world's field backend if it has one. Any error there
-/// hands the step to [`advance_field_on`], which reproduces the reference's
-/// own error or finds none; with none, the backend failed where the
-/// reference does not, and the world stops using it. Either way the step is
-/// the reference's.
+/// hands the step to [`advance_field_on`] / [`advance_field_v2_on`], which
+/// reproduces the reference's own error or finds none; with none, the backend
+/// failed where the reference does not, and the world stops using it. Either
+/// way the step is the reference's.
 fn advance_field_with(
     pair: &mut FieldPair,
     rules: &Rules,
     sources: &[Source],
     step: TimeStep,
+    options: FieldStepOptions<'_>,
     work: &mut FieldWork,
     fields: &mut Fields,
 ) -> Result<FieldStepReport, CoreError> {
+    let baseline = options.is_baseline() && rules.v2.oases().is_none();
     let Fields { backend, report } = fields;
     if let Some(device) = backend.as_deref_mut() {
-        match device.advance(pair, &rules.plan, &rules.kernel, sources, step) {
+        let attempted = if baseline {
+            device.advance(pair, &rules.plan, &rules.kernel, sources, step)
+        } else {
+            device.advance_v2(pair, &rules.plan, &rules.kernel, sources, step, options)
+        };
+        match attempted {
             Ok(stepped) => {
                 report.steps = report.steps.saturating_add(1);
                 return Ok(stepped);
             }
             Err(error) => {
                 report.reference_steps = report.reference_steps.saturating_add(1);
-                let stepped =
-                    advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)?;
+                let stepped = if baseline {
+                    advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)?
+                } else {
+                    advance_field_v2_on(
+                        pair,
+                        &rules.plan,
+                        &rules.kernel,
+                        sources,
+                        step,
+                        options,
+                        work,
+                    )?
+                };
                 report.failure = Some(error.to_string());
                 *backend = None;
                 return Ok(stepped);
             }
         }
     }
-    advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
+    if baseline {
+        advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
+    } else {
+        advance_field_v2_on(
+            pair,
+            &rules.plan,
+            &rules.kernel,
+            sources,
+            step,
+            options,
+            work,
+        )
+    }
 }
 
 /// Phase 9 on the world's field backend if it has one (FL-032), generalized to
@@ -3428,21 +3755,32 @@ fn demands_on_lanes(
 /// exactly as its decision read it: from the backend's sample for its row
 /// when the decisions used the backend's samples, else from the reference
 /// pyramid. `None` when it is not among `rows`, which are in identity order.
+type WatchedObservation = (
+    Option<Sensed>,
+    Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
+    Option<f64>,
+);
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "watched observation mirrors decide_with inputs plus the watched id"
+)]
 fn watched(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
     sampled: Option<&[RawSample]>,
     rows: &[Organism],
+    crowding_counts: &[u32],
     id: OrganismId,
     [from, to]: [Tick; 2],
-) -> Result<(Option<Sensed>, Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>), CoreError> {
+) -> Result<WatchedObservation, CoreError> {
     let Some((row, organism)) = rows
         .binary_search_by_key(&id, |organism| organism.id)
         .ok()
         .and_then(|row| rows.get(row).map(|organism| (row, organism)))
     else {
-        return Ok((None, None));
+        return Ok((None, None, None));
     };
     let raw = blended(
         population,
@@ -3452,6 +3790,12 @@ fn watched(
     )?;
     let prev_state =
         (rules.recurrent_state_width > 0).then(|| organism.held.recurrent_state_array());
+    let c_den = rules
+        .v2
+        .sensors()
+        .hippo_crowding()
+        .and_then(|_| crowding_counts.get(row).copied())
+        .map(hippo_crowding_sensor);
     Ok((
         Some(Sensed {
             tick: from,
@@ -3463,6 +3807,7 @@ fn watched(
             evaluated: due(rules, organism, to),
         }),
         prev_state,
+        c_den,
     ))
 }
 
@@ -3546,9 +3891,21 @@ fn finish(
     Ok(Decision {
         held,
         evaluated,
-        actions: decode_slice(slice, rules.step, &rules.decoding)?,
+        actions: decode_with_layout(slice, rules.step, &rules.decoding, &rules.v2.actions())?,
         gradients: observation.gradients,
     })
+}
+
+/// Populate optional v2 non-recurrent sensor slots (`hippo-crowding` `c_den`,
+/// etc.) into `expanded` beyond the 104 baseline sensor entries.
+fn fill_v2_extra_sensors(
+    sensors: SensorLayout,
+    local_crowding: Option<u32>,
+    expanded: &mut [f64; MAX_SENSOR_WIDTH],
+) {
+    if let (Some(slot), Some(n_loc)) = (sensors.hippo_crowding(), local_crowding) {
+        expanded[slot] = hippo_crowding_sensor(n_loc);
+    }
 }
 
 /// Evaluate one due organism's controller on the scalar reference, handling
@@ -3558,6 +3915,7 @@ fn evaluate_reference_held(
     genome: &Genome,
     organism: &Organism,
     observation: &Observation,
+    local_crowding: Option<u32>,
     to: Tick,
     controller: &mut ControllerScratch,
 ) -> Result<HeldOutput, CoreError> {
@@ -3570,6 +3928,7 @@ fn evaluate_reference_held(
         &observation.inputs
     } else {
         expanded_obs[..SENSOR_WIDTH].copy_from_slice(&observation.inputs);
+        fill_v2_extra_sensors(sensors, local_crowding, &mut expanded_obs);
         &expanded_obs[..obs_width]
     };
     if state_width > 0 {
@@ -3637,13 +3996,22 @@ fn decide_from_raw(
     genome: &Genome,
     organism: &Organism,
     raw: &RawSample,
+    local_crowding: Option<u32>,
     [from, to]: [Tick; 2],
     controller: &mut ControllerScratch,
 ) -> Result<Decision, CoreError> {
     let observation = encode_for_controller(rules, organism, raw, from)?;
     let due = due(rules, organism, to);
     let held = if due {
-        evaluate_reference_held(rules, genome, organism, &observation, to, controller)?
+        evaluate_reference_held(
+            rules,
+            genome,
+            organism,
+            &observation,
+            local_crowding,
+            to,
+            controller,
+        )?
     } else {
         organism.held
     };
@@ -3967,12 +4335,17 @@ fn reserve_for<T>(
 /// Phases 3 and 4 for every row on the reference, each lane's decisions
 /// following its run (see [`in_runs`]). An organism's decision reads only
 /// committed state, so the split cannot change any result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "phases 3 and 4 reference runner inputs including post-Phase-1 crowding"
+)]
 fn decide_all(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
     sampled: Option<&[RawSample]>,
     rows: &[Organism],
+    crowding_counts: &[u32],
     ticks: [Tick; 2],
     lanes: &mut [DecisionLane],
 ) -> Result<(), CoreError> {
@@ -3995,8 +4368,15 @@ fn decide_all(
                     Some(raw) => *raw,
                     None => view.sample(organism.position, genome.traits().sensing_scale())?,
                 };
-                let decision =
-                    decide_from_raw(rules, genome, organism, &raw, ticks, &mut lane.controller)?;
+                let decision = decide_from_raw(
+                    rules,
+                    genome,
+                    organism,
+                    &raw,
+                    crowding_counts.get(start + index).copied(),
+                    ticks,
+                    &mut lane.controller,
+                )?;
                 lane.decisions.push(decision);
             }
             return Ok(());
@@ -4013,8 +4393,9 @@ fn decide_all(
         }; SAMPLE_BATCH];
         let mut raw_samples = [zero_sample; SAMPLE_BATCH];
         let mut batch_genomes: [Option<&Genome>; SAMPLE_BATCH] = [None; SAMPLE_BATCH];
-        for chunk in run.chunks(SAMPLE_BATCH) {
+        for (chunk_idx, chunk) in run.chunks(SAMPLE_BATCH).enumerate() {
             let count = chunk.len();
+            let base = start + chunk_idx * SAMPLE_BATCH;
             for i in 0..count {
                 let organism = &chunk[i];
                 let genome = live
@@ -4040,6 +4421,7 @@ fn decide_all(
                     genome,
                     &chunk[i],
                     &raw_samples[i],
+                    crowding_counts.get(base + i).copied(),
                     ticks,
                     &mut lane.controller,
                 )?;
@@ -4070,7 +4452,7 @@ enum Batched {
 /// finds none), so the result is always the reference's.
 #[expect(
     clippy::too_many_arguments,
-    reason = "phases 3 and 4's inputs, the backend's samples and the controllers"
+    reason = "phases 3 and 4's inputs, the backend's samples, post-Phase-1 crowding, and the controllers"
 )]
 fn decide_with(
     rules: &Rules,
@@ -4078,6 +4460,7 @@ fn decide_with(
     view: &PyramidView<'_>,
     sampled: Option<&[RawSample]>,
     rows: &[Organism],
+    crowding_counts: &[u32],
     ticks: [Tick; 2],
     lanes: &mut [DecisionLane],
     controllers: &mut Controllers,
@@ -4089,10 +4472,29 @@ fn decide_with(
         by_row,
     } = controllers;
     let Some(device) = backend.as_deref_mut() else {
-        return decide_all(rules, population, view, sampled, rows, ticks, lanes);
+        return decide_all(
+            rules,
+            population,
+            view,
+            sampled,
+            rows,
+            crowding_counts,
+            ticks,
+            lanes,
+        );
     };
     let decided = decide_batched(
-        rules, population, view, sampled, rows, ticks, lanes, device, outputs, by_row,
+        rules,
+        population,
+        view,
+        sampled,
+        rows,
+        crowding_counts,
+        ticks,
+        lanes,
+        device,
+        outputs,
+        by_row,
     );
     report.resident_peak_bytes = report.resident_peak_bytes.max(device.resident_bytes());
     match decided {
@@ -4111,11 +4513,29 @@ fn decide_with(
             report.failure = Some(error.to_string());
             *backend = None;
             report.reference_ticks = report.reference_ticks.saturating_add(1);
-            decide_all(rules, population, view, sampled, rows, ticks, lanes)
+            decide_all(
+                rules,
+                population,
+                view,
+                sampled,
+                rows,
+                crowding_counts,
+                ticks,
+                lanes,
+            )
         }
         Err(_) => {
             report.reference_ticks = report.reference_ticks.saturating_add(1);
-            decide_all(rules, population, view, sampled, rows, ticks, lanes)
+            decide_all(
+                rules,
+                population,
+                view,
+                sampled,
+                rows,
+                crowding_counts,
+                ticks,
+                lanes,
+            )
         }
     }
 }
@@ -4125,7 +4545,7 @@ fn decide_with(
 /// device deferred on the reference.
 #[expect(
     clippy::too_many_arguments,
-    reason = "phase 3 and 4's inputs and the backend's two scratch vectors"
+    reason = "phase 3 and 4's inputs, crowding counts, and the backend's two scratch vectors"
 )]
 fn decide_batched(
     rules: &Rules,
@@ -4133,6 +4553,7 @@ fn decide_batched(
     view: &PyramidView<'_>,
     sampled: Option<&[RawSample]>,
     rows: &[Organism],
+    crowding_counts: &[u32],
     [from, to]: [Tick; 2],
     lanes: &mut [DecisionLane],
     device: &mut dyn ControllerBackend,
@@ -4158,10 +4579,14 @@ fn decide_batched(
             reserve_for(&mut lane.controller_inputs, run.len(), "controller inputs")?;
         }
         let mut live = run.first().map(|first| population.ascending_from(first.id));
-        let push_obs = |lane: &mut DecisionLane, organism: &Organism, obs: Observation| {
+        let push_obs = |lane: &mut DecisionLane,
+                        organism: &Organism,
+                        obs: Observation,
+                        local_crowding: Option<u32>| {
             if needs_expanded {
                 let mut full = [0.0_f64; MAX_SENSOR_WIDTH];
                 full[..SENSOR_WIDTH].copy_from_slice(&obs.inputs);
+                fill_v2_extra_sensors(sensors, local_crowding, &mut full);
                 if state_width > 0 {
                     let prev = organism.held.recurrent_state_array();
                     for (slot, &h) in full[obs_width..input_width]
@@ -4189,7 +4614,12 @@ fn decide_batched(
                     None => view.sample(organism.position, genome.traits().sensing_scale())?,
                 };
                 let obs = encode_for_controller(rules, organism, &raw, from)?;
-                push_obs(lane, organism, obs);
+                push_obs(
+                    lane,
+                    organism,
+                    obs,
+                    crowding_counts.get(start + index).copied(),
+                );
             }
             return Ok(());
         }
@@ -4204,8 +4634,9 @@ fn decide_batched(
             scale: 1.0,
         }; SAMPLE_BATCH];
         let mut raw_samples = [zero_sample; SAMPLE_BATCH];
-        for chunk in run.chunks(SAMPLE_BATCH) {
+        for (chunk_idx, chunk) in run.chunks(SAMPLE_BATCH).enumerate() {
             let count = chunk.len();
+            let base = start + chunk_idx * SAMPLE_BATCH;
             for (query, organism) in queries.iter_mut().zip(chunk) {
                 let genome = live
                     .as_mut()
@@ -4220,9 +4651,9 @@ fn decide_batched(
                 };
             }
             view.sample_batch(&queries[..count], &mut raw_samples[..count])?;
-            for (organism, raw) in chunk.iter().zip(&raw_samples[..count]) {
+            for (i, (organism, raw)) in chunk.iter().zip(&raw_samples[..count]).enumerate() {
                 let obs = encode_for_controller(rules, organism, raw, from)?;
-                push_obs(lane, organism, obs);
+                push_obs(lane, organism, obs, crowding_counts.get(base + i).copied());
             }
         }
         Ok(())
@@ -4347,6 +4778,7 @@ fn decide_batched(
                             genome,
                             organism,
                             observation,
+                            crowding_counts.get(start + index).copied(),
                             to,
                             controller,
                         )?
@@ -4529,6 +4961,8 @@ struct Settled {
     vitality: Vitality,
     velocity: [f64; 2],
     position: [f64; 2],
+    secretory_readiness: f32,
+    emission_cooldown_deadline: Tick,
     emitted: bool,
     intent: Option<BirthIntent>,
 }
@@ -4541,6 +4975,8 @@ impl Settled {
             vitality: organism.vitality,
             velocity: organism.velocity,
             position: organism.position,
+            secretory_readiness: organism.secretory_readiness,
+            emission_cooldown_deadline: organism.emission_cooldown_deadline,
             emitted: organism.emitted,
             intent: organism.intent,
         }
@@ -4552,6 +4988,8 @@ impl Settled {
         organism.vitality = self.vitality;
         organism.velocity = self.velocity;
         organism.position = self.position;
+        organism.secretory_readiness = self.secretory_readiness;
+        organism.emission_cooldown_deadline = self.emission_cooldown_deadline;
         organism.emitted = self.emitted;
         organism.intent = self.intent;
     }
@@ -4594,16 +5032,23 @@ trait Stages {
         velocity: [f64; 2],
     ) -> Result<[f64; 2], CoreError>;
 
-    /// Emission at the post-motion `position`: the payment, and the
-    /// deposit staged in `emissions`.
+    /// Emission at the post-motion `position` and `velocity`: the payment,
+    /// deposit staged in `emissions`, and updated excitable state
+    /// `(next_readiness, next_cooldown_deadline)`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Phase 7 emission stage inputs including V2-04 post-motion velocity and tick"
+    )]
     fn emission(
         &mut self,
         rules: &Rules,
         organism: &Working,
         position: [f64; 2],
+        velocity: [f64; 2],
+        from: Tick,
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
-    ) -> Result<EmissionSettlement, CoreError>;
+    ) -> Result<(EmissionSettlement, f32, Tick), CoreError>;
 
     /// Phase 7: `parent`'s reproduction proposal at attempt tick `tick`,
     /// from its post-emission `budget`.
@@ -4647,11 +5092,12 @@ impl Stages for Reference<'_> {
     ) -> Result<MaintenanceSettlement, CoreError> {
         rules
             .costs
-            .bill(
+            .bill_with_basal_multiplier(
                 rules.step,
                 self.traits.sensing_scale(),
                 self.parameters,
                 organism.evaluated,
+                organism.basal_multiplier,
             )?
             .settle(budget)
     }
@@ -4670,9 +5116,20 @@ impl Stages for Reference<'_> {
         } else {
             MotionResponse::new(*self.traits.motion_response(), &rules.motion)?
         };
-        let acceleration = rules
-            .motion
-            .acceleration(ratio, &response, &organism.gradients)?;
+        let acceleration = match (rules.v2.motor(), organism.actions.motor) {
+            (Some(constants), Some(motor)) => rules.motion.acceleration_v2(
+                ratio,
+                &response,
+                &organism.gradients,
+                organism.velocity,
+                budget.remaining(),
+                &constants,
+                MotorSteeringInputs::from(motor),
+            )?,
+            _ => rules
+                .motion
+                .acceleration(ratio, &response, &organism.gradients)?,
+        };
         let proposed = rules.motion.propose(organism.velocity, acceleration)?;
         rules.motion.settle(proposed, budget)
     }
@@ -4693,18 +5150,40 @@ impl Stages for Reference<'_> {
         rules: &Rules,
         organism: &Working,
         position: [f64; 2],
+        velocity: [f64; 2],
+        from: Tick,
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
-    ) -> Result<EmissionSettlement, CoreError> {
-        rules.emission.emit_with(
+    ) -> Result<(EmissionSettlement, f32, Tick), CoreError> {
+        if !rules.v2.emission().any_enabled() {
+            let settlement = rules.emission.emit_with(
+                &rules.grid,
+                rules.exchange,
+                organism.committed.id,
+                position,
+                organism.actions.emission.as_ref(),
+                budget,
+                emissions,
+            )?;
+            return Ok((
+                settlement,
+                organism.secretory_readiness,
+                organism.emission_cooldown_deadline,
+            ));
+        }
+        let ctx = rules.emission_context(organism, position, velocity, from)?;
+        let (settlement, plan) = rules.emission.emit_v2(
             &rules.grid,
             rules.exchange,
+            rules.step,
+            rules.v2.emission(),
             organism.committed.id,
-            position,
             organism.actions.emission.as_ref(),
+            &ctx,
             budget,
             emissions,
-        )
+        )?;
+        Ok((settlement, plan.next_readiness, plan.next_cooldown_deadline))
     }
 
     fn propose(
@@ -4715,9 +5194,15 @@ impl Stages for Reference<'_> {
         tick: Tick,
         budget: &EnergyBudget,
     ) -> Result<ReproductionProposal, CoreError> {
-        rules
-            .reproduction
-            .propose(&rules.rng, parent, tick, &organism.actions, budget)
+        let attempt_probability = rules.effective_attempt_probability(organism)?;
+        rules.reproduction.propose_with_probability(
+            &rules.rng,
+            parent,
+            tick,
+            attempt_probability,
+            organism.actions.child_fraction,
+            budget,
+        )
     }
 }
 
@@ -4863,14 +5348,18 @@ fn settle_stages(
         return Ok(settled);
     }
 
-    let emission = stages.emission(
+    let (emission, next_readiness, next_cooldown_deadline) = stages.emission(
         rules,
         organism,
         settled.position,
+        settled.velocity,
+        from,
         &mut settled.budget,
         emissions,
     )?;
     settled.emitted = emission.emitted();
+    settled.secretory_readiness = next_readiness;
+    settled.emission_cooldown_deadline = next_cooldown_deadline;
     if let Some(record) = record.as_deref_mut() {
         record.emission = Some(emission);
     }
@@ -4900,7 +5389,20 @@ fn settle_stages(
             ReproductionProposal::Exhausted | ReproductionProposal::Intent(_) => None,
         };
     }
-    if let ReproductionProposal::Intent(intent) = proposal {
+    if let ReproductionProposal::Intent(mut intent) = proposal {
+        if let Some(budding) = rules.v2.budding() {
+            intent.budding_offset = Some(rules.reproduction.budding_child_offset(
+                &rules.rng,
+                intent.parent,
+                intent.tick,
+                Some(budding.local_offset_radius),
+                organism.actions.budding,
+                organism.gradients[0],
+                settled.velocity,
+                0.0,
+                [0.0, 0.0],
+            )?);
+        }
         settled.intent = Some(intent);
     }
     Ok(settled)

@@ -16,13 +16,23 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 - `ParticleCloud` is §13.2's `ParticleCloudView`: one bounded cloud lowered from a render epoch onto FrankenManim's
   3D camera route.
 - `FieldLayer` draws the epoch's field under the organisms as one texture on one quad (FL-033): its energy, its
-  chemical composition, or one chosen moment channel (FL-019, plan §13.4's "Local field").
+  chemical composition, one chosen moment channel (FL-019, plan §13.4's "Local field"), or `V2-16`'s optional
+  `trail-carrier` and `vascular-conductance` secondary field overlays with independent decaying display scales.
 - `DensityLayer` counts organisms per screen bin, for worlds denser than their pixels.
-- `Style` holds a frame's drawing choices: the `ColorMapping`, the `Look` (glow or raw), the `Particles` (points or
-  density), whether the field is drawn and its `FieldMapping` (energy, composition or a component). `field_drawn()` is whether a
-  frame draws the field: when it is on, except under raw density, which is opaque.
-- `WorldView` holds all of them, and builds each frame's `ThreeDJob`.
-- `v2` (`V2-16`, `v2-visual-mappings`, `FL-052`): pure read-only (`INV-09`) visual mapping primitives ready to consume optional `Epoch::cell_states() -> Option<&[i8]>`, `Epoch::polarities() -> Option<&[i16]>`, `FieldTexture::trail_energy() -> Option<&[f32]>`, and `FieldTexture::vascular_conductance() -> Option<&[f32]>` slices (`cell-state-v1`, `polarity-v1`, bulk `apical_ticks_mesh` for sphere mode, `FieldOverlayKind` / `FieldOverlayLayer` / linear compositing for `trail-carrier` and `vascular-conductance`, and compact legends strictly within FL-024's `33,792` HUD vertex cap).
+- `Style` holds a frame's drawing choices: the `ColorMapping` (the seven v1 mappings plus `V2-16`'s `CellState` and
+  `Polarity`), the `Look` (glow, raw or sphere), the `Particles` (points or density), whether the field is drawn and
+  its `FieldMapping` (energy, composition, a component, `trail-carrier` or `vascular-conductance`). `field_drawn()` is
+  whether a frame draws the field: when it is on, except under raw or sphere density, which is opaque.
+- `WorldView` holds all of them, and builds each frame's `ThreeDJob` (plus one bulk apical-tick surface mesh in
+  sphere-mode `ColorMapping::Polarity` when the epoch carries optional `Epoch::polarities()`, costing zero bytes and
+  zero draws when absent).
+- `v2` (`V2-16`, `v2-visual-mappings`, `FL-052`): pure read-only (`INV-09`) visual mapping primitives and integrated
+  `ColorMapping` / `FieldMapping` / `FieldLayer` / `ParticleCloud` / `DensityLayer` / `WorldView` wiring consuming
+  optional `Epoch::cell_states() -> Option<&[i8]>`, `Epoch::polarities() -> Option<&[i16]>`,
+  `FieldTexture::trail_energy() -> Option<&[f32]>`, and `FieldTexture::vascular_conductance() -> Option<&[f32]>`
+  slices (`cell-state-v1`, `polarity-v1`, bulk `apical_ticks_mesh` for sphere mode, `FieldOverlayKind` /
+  `FieldOverlayLayer` / linear compositing for `trail-carrier` and `vascular-conductance`, and compact legends
+  strictly within FL-024's `33,792` HUD vertex cap).
 
 **Inputs.**
 - An FL-017 `Epoch`, read only: identity-ordered positions, velocities, energies, lineages, generations,
@@ -103,13 +113,15 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   | `topology` | `topology-catalog-v1` | catalog index `k` | `TOPOLOGY_PALETTE[k mod 8]`; the first five are the catalog members in size order |
   | `affinity` | `affinity-projection-v1` | the epoch's affinity projection `q` (flife-render) | `g = AFFINITY_GAIN · q`, squashed to `s = g / √(1 + ‖g‖²)`; OKLab `L = 0.46 + 0.12 s₃`, `a = 0.26 s₁`, `b = 0.26 s₂` (`AFFINITY_LIGHTNESS`, `AFFINITY_CHROMA`), through FrankenManim's `oklab_to_srgb`; a colour outside the sRGB gamut keeps its lightness and hue and takes the most chroma that fits (bisection) |
   | `lineage-energy` | `founder-lineage-energy-v1` | lineage id, energy `e`, and the epoch's `attempt_energy` `θ` (the world's `reproduction.minimum_parent_energy_before_attempt`) | the lineage's `LINEAGE_PALETTE` colour's OKLab hue and chroma at `L = LINEAGE_ENERGY_LIGHTNESS · e / θ` (0.55), clamped to `[0, 1]` and rounded to one of 256 steps; a shade outside the gamut takes the most chroma that fits, so an organism with no energy is black and one with about 1.8 θ white. The 12 × 256 shades are computed once. A non-finite or nonpositive `θ` leaves the palette colour |
+  | `cell-state` (`V2-16`) | `cell-state-v1` | lineage id and optional `Epoch::cell_states()` (`h_0 ∈ [-127, 127]`, defaults to `0` when absent) | preserves the founder lineage's base OKLab hue from `LINEAGE_PALETTE`, modulating OKLab lightness over `CELL_STATE_LIGHTNESS_RANGE = [0.36, 0.93]` (>50 CIE L* separation), chroma, and a symmetric secondary hue twist `±CELL_STATE_HUE_TWIST_RADIANS` (`±0.30 rad`), gamut-clamped in OKLab |
+  | `polarity` (`V2-16`) | `polarity-v1` | optional `Epoch::polarities()` (`atan2(p_y, p_x)` quantized onto `[-32767, +32767]`, `POLARITY_UNPOLARIZED = i16::MIN` when unpolarized or absent) | perceptually uniform cyclic OKLab hue wheel at constant `POLARITY_WHEEL_LIGHTNESS = 0.74`, `POLARITY_WHEEL_CHROMA = 0.145` (gamut-clamped; branch-cut continuous across `±π`), and neutral grey `POLARITY_UNPOLARIZED_COLOR` (`#585E6E`) when unpolarized; paired with bulk apical orientation ticks in `Look::Sphere` points mode |
 
-  `FromStr` takes either name. The affinity colour is grey for no affinity; organisms with like chemistry have
+  `ColorMapping::V1_ALL` lists the 7 v1 mappings (keys 1–7); `ColorMapping::ALL` lists all 9 (keys 1–9), and `ColorMapping::is_v2` marks `CellState` and `Polarity`. `FromStr` takes either name. The affinity colour is grey for no affinity; organisms with like chemistry have
   like colours, and opposite directions have opposite hues. `AFFINITY_GAIN = √(128/3)` puts the founders, whose
   vectors are at the limit, at a mean gained radius of about 2. About 9% of directions leave the sRGB gamut and
   lose chroma there. The square root is correctly rounded and FrankenManim's sRGB transfer uses its own `fmn_dmath::pow`, not the
   host's, so the colours are the same on every host. Colours are for display only: no metric reads them back.
-- `ColorMapping::legend(topologies)` is the mapping's key (FL-019): one line of text, the mapping's name, then each
+- `ColorMapping::legend(topologies)` is the mapping's key (FL-019, `V2-16`): one line of text, the mapping's name, then each
   swatch (`HUD_SWATCH`, a filled square) and what it stands for. `swatches` holds each square's sRGB colour, the
   colour `mapped_rgb8` gives that value:
   - lineage: the 12 `LINEAGE_PALETTE` colours, then `by founder` (a lineage's colour is a hash of its identity, so
@@ -124,16 +136,22 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     radius (`legend_affinities`), then `like hue, like chemistry`;
   - lineage-energy: the first palette colour (teal) at `LEGEND_ATTEMPT_FRACTIONS` 0.25, 0.5, 1 and 1.5 of the
     attempt energy, then `x energy to divide` (short enough that the longest overlay stays within the HUD's
-    budget).
-- `FieldMapping` (FL-019, plan §13.4's "Local field"): `energy` (the default), `composition` (the fixed
-  projection), or `component-C` (`Component(FieldComponent)`, chosen components: moment channel C, 0 to
-  `FIELD_COMPONENTS` − 1 = 31), by `name()` and `FromStr` (exactly those names: `component-07` and `component-32`
-  are refused). `ALL` is energy, composition, then the 32 components in channel order. `next(component)` is what
-  the Studio's C key switches to: energy, composition, `component`, energy. `FieldComponent::new(c)` is `None`
-  past 31; `next` and `previous` wrap. `FieldMapping::legend()` is the composition's key, `field composition ■ none
-  ■■■■■■ as affinity, darker is less energy`, its swatches the affinity key's colours at full brightness, or a
-  component's, `field channel C / energy ■ -1 ■ ■ 0 ■ ■ +1, darker is less energy`, its swatches
-  `COMPONENT_PALETTE`; the energy field, which the palette explains, has none.
+    budget);
+  - cell-state (`V2-16`, `cell_state_legend()`): the first lineage's five `LEGEND_CELL_STATES` (`-127, -64, 0, 64, 127`) labelled `-1..+1` by `h_0` differentiation state;
+  - polarity (`V2-16`, `polarity_legend()`): four cardinal apical headings (`east`, `north`, `west`, `south`) on the OKLab hue wheel plus `unpolarized` in `POLARITY_UNPOLARIZED_COLOR`.
+- `FieldMapping` (FL-019, plan §13.4's "Local field", `V2-16`): `energy` (the default), `composition` (the fixed
+  projection), `component-C` (`Component(FieldComponent)`, chosen components: moment channel C, 0 to
+  `FIELD_COMPONENTS` − 1 = 31), `trail-carrier` (`TrailCarrier`, Carrier-1 pheromone trail energy `e_1`), or
+  `vascular-conductance` (`VascularConductance`, Murray/Physarum mean incident conductance `g_e`), by `name()` and
+  `FromStr` (exactly those names: `component-07` and `component-32` are refused). `V1_ALL` is the 34 v1 mappings
+  (energy, composition, 32 components); `ALL` is all 36 (appending `TrailCarrier` and `VascularConductance`), and
+  `is_v2_overlay` marks the two v2 overlays. `next(component)` cycles the v1 3-way loop (energy → composition →
+  `component` → energy); `next_v2(component)` cycles the 5-way v2 loop (energy → composition → `component` →
+  `trail-carrier` → `vascular-conductance` → energy). `FieldComponent::new(c)` is `None` past 31; `next` and
+  `previous` wrap. `FieldMapping::legend()` returns the composition key (`field composition ■ none ■■■■■■ as affinity,
+  darker is less energy`), a component key (`field channel C / energy ■ -1 ■ ■ 0 ■ ■ +1, darker is less energy`),
+  or the five-stop perceptual overlay keys for `TrailCarrier` and `VascularConductance` (`trail_carrier_legend()`,
+  `vascular_conductance_legend()`); the energy field, which the palette explains, has none.
 - `ParticleCloud::update_styled(epoch, viewport, style)` (`update` is the default style):
   - one `ThreeDDraw::TrueDot` per row, in identity order;
   - centred on the row's scene point;
@@ -194,6 +212,14 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
     but none of the channel is pale; one with no energy is black. `place_mapped` keeps the texture only for bitwise
     the same values and the same channel's steps, scale, look and mapping; the layer then keeps a copy of that
     channel's steps (a byte a texel, within the composition's 12).
+  - `update_mapped(field, look, FieldMapping::TrailCarrier | FieldMapping::VascularConductance)` (`V2-16`) reads the
+    optional `FieldTexture::trail_energy()` or `FieldTexture::vascular_conductance()` scalar plane, averages each
+    corner over its four wrapping texels, and tracks its own independent decaying display scale (`trail_scale()`,
+    `vascular_scale()`, alongside `energy_scale()` and active `scale()`) using `SCALE_DECAY`. In `Look::Glow`, each
+    corner maps through `overlay_log_value` (`ln(1 + 15x) / ln(16)`) onto `TRAIL_CARRIER_PALETTE` or
+    `VASCULAR_CONDUCTANCE_PALETTE`; in `Look::Raw` and `Look::Sphere`, it maps through honest linear grey
+    (`raw_value`). When the requested optional plane is absent on the epoch, the layer renders a clean dark fallback
+    (zero values) with zero extra heap allocation (reusing `built_values` for cache keys).
 - `DensityLayer::update(epoch, style)`:
   - bins of about `DENSITY_BIN_POINTS = 6` points at the fit, aligned to the world so the torus wraps exactly:
     `ceil(extent · fit_scale / (6 · pixels per point))` per axis, in `1..=DENSITY_BINS_MAX = 512`; the zoom does not change them;
@@ -238,8 +264,11 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - `draws()` is the frame in painter order: the field (when `Style::field_drawn`, in the style's field mapping),
     then the density layer, or every halo and then every dot (at zoom > 1 for a placed viewport, `WorldView::draws`
     conservatively culls dots and halos whose 3D billboards lie strictly outside the camera frustum, preserving
-    bit-exact rendered pixels while `ParticleCloud::draws` keeps every row), then the brush's region, then the
-    selection ring; `job()` wraps it in a `ThreeDJob`;
+    bit-exact rendered pixels while `ParticleCloud::draws` keeps every row), then the optional bulk apical
+    orientation ticks draw (`apical_ticks_draw()`, present strictly in `ColorMapping::Polarity` + `Look::Sphere` +
+    `Particles::Points` when the epoch carries `Epoch::polarities()`, frustum-culled at `zoom > 1`, rebuilt
+    transactionally across view/style/radius updates), then the brush's region, then the selection ring, then the
+    overlay's plate and glyphs; `job()` wraps it in a `ThreeDJob`;
   - `set_point_radius(points)` (FL-019) sets the dots' smallest radius on screen
     (`ParticleCloud::set_min_radius_points`); the shown dots, their halos and the selection ring change at
     once, and the ring is `selection_ring_around` the view's dot at every refit and reselection;
@@ -260,25 +289,31 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
   - FL-043, its bytes: `reserved_bytes()` is the most its own buffers hold (identities, drawn positions, the cloud's
     draws and halos, each reserved at the ceiling; the density bins at the viewport's count; the field's and the
     density's textures, their quads, the ring's mesh and a region's at its most (a disc), twice, since one is built
-    before the one it replaces is dropped; and once, the copy of the field's values its texture was built from, and of its compositions, 16 bytes
-    a texel in all, a component's one-byte copy within them). `texel_bytes()` (FL-033) is the
+    before the one it replaces is dropped; once, the copy of the field's values its texture was built from, and of its
+    compositions, 16 bytes a texel in all, a component's one-byte copy within them; and, strictly when the epoch
+    carries optional `Epoch::polarities()`, the cached `i16` polarities plus double-buffered apical-ticks surface mesh
+    at the ceiling — `0` extra bytes when absent). `texel_bytes()` (FL-033) is the
     layers' textures, 16 bytes a texel: the field's once the view knows it and the density's at the viewport's bins,
     whatever the style; FrankenManim's CPU route samples them in place
     and its Metal route uploads those a frame draws. `preparation_limit()` is `PREPARATION_BYTES_PER_DOT` (1,536)
     for a dot and a halo per organism of the ceiling, `PREPARATION_BYTES_PER_TRIANGLE` (640) for the two quads', the
-    ring's and a disc region's triangles, and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
+    ring's and a disc region's triangles (plus `2 * capacity` triangles when optional `Epoch::polarities()` are
+    present, `0` otherwise), and `PREPARATION_BYTES_FIXED` (1 MiB), whatever the style. `job()` compiles within it
     (FrankenManim's `max_working_bytes`): a tile bin past it is left out, which only slows the frame, and rows past
     it refuse the frame. `set_preparation_threads(threads)` (FL-033) has `job()` compile the frame's dots on up to
     that many threads (FrankenManim's `ThreeDJob::new_with_threads`). The job keeps the count
     (`ThreeDJob::preparation_threads`), and the Metal route flattens and checks its triangle rows, and builds its
     per-tile triangle lists, on as many. One, the default, does all three on the calling thread, and no row, refusal or byte of the accounting depends on it. `frame_bytes()` is the draw list, `JOB_BYTES_PER_DRAW` (1,024) for each draw the view can
     make (FL-033: what FrankenManim's job holds beyond its preparation accounting, measured at 865 to 872 bytes a
-    dot and 1,180 a quad; dots compiled on threads share row blocks since FrankenManim `d670e74e` and hold less),
+    dot and 1,180 a quad; dots compiled on threads share row blocks since FrankenManim `d670e74e` and hold less;
+    plus 1 draw when optional `Epoch::polarities()` are present, `0` otherwise),
     and that limit. `offline_bytes(threads)` is what
     `render_rgba8` adds: the RGBA16F and RGBA8 frames, each thread's tile scratch at the finest sampling, and
     `bloom_bytes` at the drawable. A view
     made `for_epoch` knows its field's texels; one made with `new` learns them from its first epoch.
-  - `scene_objects()` is 5: the field, the cloud, the density layer, the brush's region and the selection ring.
+  - `scene_objects()` is `5` on baseline `v1` or whenever `Epoch::polarities()` is absent (the field, the cloud, the
+    density layer, the brush's region, and the selection ring), and `6` when optional `V2-16` polarities are present
+    (adding the single bulk apical-ticks surface mesh).
 - `hud` (FL-024): the 3D route draws triangles, not text.
   - `HudFont::bundled()` loads FrankenManim's bundled font book (`fmn-text`), once.
   - `HudFont::text_with_swatches(text, em_pixels, swatches)` is `text` with each `HUD_SWATCH` in the next of
@@ -317,7 +352,9 @@ The live ecology enters a FrankenManim scene as a few bulk primitives, never as 
 
 **Invariants.**
 - *Bounded scene objects (§13.2).* The whole population is one scene object, the field another, the density layer a
-  third, the selection ring a fourth, the brush's region a fifth, and a frame one 3D job. There is no mobject or animation handle per organism.
+  third, the selection ring a fourth, the brush's region a fifth, an optional bulk apical-ticks mesh a sixth strictly
+  when `V2-16` polarities are present on the epoch, and a frame one 3D job. There is no mobject or animation handle
+  per organism.
 - *Bounded memory.* The draw buffer is reserved once, with fallible reservation, at the population ceiling. No
   update or refit allocates or moves it: `reserved_bytes` and the buffer's address are constant for the cloud's
   life.
@@ -573,12 +610,30 @@ route.
     the test. A disc replaces the cell; a refused region leaves it; none removes it.
   - On the CPU route: amber just outside a cell's left edge and red just outside a disc's right edge; inside both,
     and where an old outline was, the frame is the frame without them.
+- `tests/v2_visual_mappings.rs` (7 tests, `V2-16` / `FL-052`):
+  - `cell_state_and_polarity_color_mapping_finite_and_distinct`: `cell-state-v1` >50 CIE L* span within every founder
+    lineage, gamut-safe OKLab hues, `polarity-v1` branch-cut continuity across `±π`, and `POLARITY_UNPOLARIZED` neutral
+    grey sentinel;
+  - `apical_tick_geometry_winding_and_cpu_pixel_render`: bulk apical tick quad geometry, clockwise winding, and
+    FrankenManim CPU 3D pixel oracle render;
+  - `trail_and_vascular_overlay_palettes_log_ramp_blending_and_caching`: monotone palettes, `OVERLAY_LOG_GAIN = 15.0`
+    log ramp in `Glow`, linear grey in `Raw`/`Sphere`, independent decaying scales, cache reuse on pan/zoom;
+  - `v2_names_legends_and_fl024_hud_vertex_budget`: every `V2-16` name/registry round-trip and legend text staying
+    strictly within FL-024's HUD vertex and triangle ceilings;
+  - `inv09_presentation_zero_scientific_feedback`: rendering `field-ecology-v2` runs in every `V2-16` colour and field
+    mapping leaves `World::digest()` bit-identical (`INV-09`);
+  - `v2_world_view_cloud_field_density_and_apical_ticks_end_to_end`: end-to-end `WorldView`, `ParticleCloud`,
+    `FieldLayer`, `DensityLayer`, and bulk `apical_ticks_draw()` wired onto real `Epoch` optional views;
+  - `v1_and_disabled_v2_visual_mappings_incur_zero_overhead_and_fallback_cleanly`: baseline `field-ecology-v1`,
+    `--v1-compat`, and `--disable v2-visual-mappings` reserve zero extra bytes (`scene_objects() == 5`,
+    `apical_ticks_draw().is_none()`) and fall back cleanly.
 - In `flife-cli`, `tests/memory_admission.rs` measures a 4K view at 2x with the overlay: the Studio's longest
   overlay, the motion key's swatches and the inspector panel included, laid out twice and shown, and two zooms. Its
   peak heap, the texts' layout included, is 12.21 MiB of its 15.08 MiB reserved.
 
-**Validity domain.** CPU host epochs (FL-017). The FrankenManim 3D camera route at `fmn` rev `d1e1757b`, CPU and Metal. A view shows one image of the torus at zoom 1 to
-4,096.
+**Validity domain.** CPU host epochs (FL-017, both `field-ecology-v1*` baseline views and `field-ecology-v2*` optional
+`V2-16` views when `v2-visual-mappings` is enabled). The FrankenManim 3D camera route at `fmn` rev `d1e1757b`, CPU and
+Metal. A view shows one image of the torus at zoom 1 to 4,096.
 
 **Known gaps.**
 - Lowering is CPU preparation per epoch: FrankenManim's `DotCloud`-equivalent reference route (§13.1). The layers'

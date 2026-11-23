@@ -1096,3 +1096,1042 @@ fn metal_field_flux_stencil_bit_exact_with_cpu() {
         ));
     }
 }
+
+/// `V2-14` (`vascular-field`): 32 ticks on a `64×64` heterogeneous grid for
+/// BOTH `μ = 1.5` (fast path `r * sqrt(r)`) and `μ = 0.7` (Brenner sublinear
+/// control via hoisted `d_pow_positive`), composed multiplicatively with
+/// `V2-02` pulsing heterogeneous oases and `V2-09` tight junctions (`HarmonicV1`
+/// and `MinV1`, multi-substep `D_max`), plus C.8 cancel-safety, extreme flux
+/// overflow guard (`ratio > 1e100 -> sat = 1.0`), zero-flux pruning, 0 B lazy
+/// VRAM when disabled, and negative refusals.
+#[test]
+fn metal_vascular_field_bit_exact_with_cpu_mu_1_5_and_0_7() {
+    use flife_field::{FieldStepPhase2, VascularField, advance_field_wave2_on};
+
+    let Some(mut device) = metal() else {
+        return;
+    };
+    let mut rng = Rng(0x2026_1414);
+    let grid = FieldGrid::new(64, 64, 64.0, 64.0).expect("grid");
+    let step = TimeStep::new(1, 32).expect("step");
+
+    // 0 B extra VRAM when vascular/flux are disabled: fresh MetalField running
+    // baseline v1 advance allocates neither flux nor vascular buffers, and grows
+    // only once vascular is first enabled.
+    let baseline_plan = TransportPlan::new(&grid, step, 0.25, 0.02).expect("baseline plan");
+    let baseline_kernel = SourceKernel::new_fused(2.5, 4.0).expect("baseline kernel");
+    let mut sources: Vec<Source> = [[12.5, 14.25], [50.25, 16.5], [18.0, 50.75], [52.5, 48.25]]
+        .iter()
+        .enumerate()
+        .map(|(index, &center)| {
+            let mut direction = [0.0; 32];
+            for (c, slot) in direction.iter_mut().enumerate() {
+                if (c + index) % 2 == 0 {
+                    *slot = (rng.unit() - 0.5) * 0.25;
+                }
+            }
+            Source::new(SourceId::new(index as u32), center, direction, 110.0).expect("source")
+        })
+        .collect();
+    {
+        let mut fresh = MetalField::open().expect("fresh metal field");
+        let mut pair = random_pair(grid, &mut rng);
+        fresh
+            .advance(&mut pair, &baseline_plan, &baseline_kernel, &sources, step)
+            .expect("v1 advance 1");
+        let v1_bytes = fresh.owner().usage().bytes;
+        fresh
+            .advance(&mut pair, &baseline_plan, &baseline_kernel, &sources, step)
+            .expect("v1 advance 2");
+        assert_eq!(
+            fresh.owner().usage().bytes,
+            v1_bytes,
+            "repeated v1 advance must allocate 0 extra VRAM"
+        );
+
+        let vascular = VascularField::new(0.05, 2.5, 0.8, 0.15, 0.05, 1.5).expect("vascular");
+        let vasc_plan = vascular
+            .transport_plan(&grid, step, 0.02)
+            .expect("vasc plan");
+        pair.enable_vascular(vascular.initial_conductance(), &LIMITS)
+            .expect("enable vascular");
+        let mut edges = FluxEdges::new(&grid, &LIMITS).expect("edges");
+        let (px, py) = pair.current().vascular_edges().expect("edges");
+        vascular
+            .fill_edges(&vasc_plan, px, py, None, &mut edges)
+            .expect("fill edges");
+        fresh
+            .advance_wave2(
+                &mut pair,
+                &vasc_plan,
+                &baseline_kernel,
+                &sources,
+                step,
+                FieldStepPhase2 {
+                    source_kernels: None,
+                    carrier0_edges: Some(&edges),
+                    vascular: Some(&vascular),
+                    trail_plan: None,
+                    trail_edges: None,
+                },
+            )
+            .expect("first vascular advance");
+        let vasc_bytes = fresh.owner().usage().bytes;
+        assert!(
+            vasc_bytes > v1_bytes,
+            "lazy flux + vascular buffers should allocate only on first vascular use"
+        );
+        fresh
+            .advance_wave2(
+                &mut pair,
+                &vasc_plan,
+                &baseline_kernel,
+                &sources,
+                step,
+                FieldStepPhase2 {
+                    source_kernels: None,
+                    carrier0_edges: Some(&edges),
+                    vascular: Some(&vascular),
+                    trail_plan: None,
+                    trail_edges: None,
+                },
+            )
+            .expect("second vascular advance");
+        assert_eq!(
+            fresh.owner().usage().bytes,
+            vasc_bytes,
+            "steady-state vascular advance must allocate 0 extra VRAM"
+        );
+    }
+
+    // Heterogeneous organism cluster positions for multiplicative V2-09 + V2-14 composition.
+    let mut positions = Vec::new();
+    for x in 18..46 {
+        for _ in 0..4 {
+            positions.push([f64::from(x) + 0.5, 18.5]);
+            positions.push([f64::from(x) + 0.5, 45.5]);
+        }
+    }
+    for y in 19..45 {
+        for _ in 0..3 {
+            positions.push([18.5, f64::from(y) + 0.5]);
+            positions.push([45.5, f64::from(y) + 0.5]);
+        }
+    }
+    let schedule = OasisSchedule::new(1.2, 0.0, 1.8, 3.8).expect("oasis");
+    let seed_rng = SemanticRng::new(0x1414_2026);
+    let kernels = schedule
+        .seed_kernels(&seed_rng, &baseline_kernel, &sources)
+        .expect("kernels");
+
+    for (mu, mode, d_max) in [
+        (1.5_f64, BarrierMode::HarmonicV1, 2.5_f64),
+        (0.7_f64, BarrierMode::MinV1, 24.0_f64), // multi-substep + general pow_positive
+    ] {
+        let vascular = VascularField::new(0.05, d_max, 0.9, 0.18, 0.04, mu).expect("vascular");
+        let plan = vascular.transport_plan(&grid, step, 0.02).expect("plan");
+        let barrier = TightJunctions::new(mode, 0.05, 1.1).expect("barrier");
+        let mut work =
+            FieldWork::new(&grid, &LIMITS, NonZeroUsize::new(4).expect("4")).expect("work");
+        work.reserve_supports_for_kernels(&kernels)
+            .expect("reserve supports");
+        work.reserve_flux().expect("reserve flux");
+
+        let mut reference = random_pair(grid, &mut rng);
+        reference
+            .enable_vascular(vascular.initial_conductance(), &LIMITS)
+            .expect("ref vascular");
+        let mut accelerated = FieldPair::zeroed(grid, &LIMITS).expect("pair");
+        accelerated
+            .enable_vascular(vascular.initial_conductance(), &LIMITS)
+            .expect("gpu vascular");
+        accelerated
+            .current_mut()
+            .copy_from(reference.current())
+            .expect("copy");
+
+        let mut power_scratch = Vec::new();
+        for tick in 0..32_u64 {
+            schedule
+                .apply_powers(
+                    Tick::new(tick),
+                    step,
+                    110.0,
+                    &mut sources,
+                    &mut power_scratch,
+                )
+                .expect("apply powers");
+            let (px_before, py_before) = {
+                let (px, py) = accelerated.current().vascular_edges().expect("committed");
+                (px.to_vec(), py.to_vec())
+            };
+            let edges = work
+                .prepare_vascular_edges(
+                    &vascular,
+                    &plan,
+                    &px_before,
+                    &py_before,
+                    Some((&barrier, &positions)),
+                )
+                .expect("prepare vascular edges")
+                .clone();
+
+            let phase2 = FieldStepPhase2 {
+                source_kernels: Some(&kernels),
+                carrier0_edges: Some(&edges),
+                vascular: Some(&vascular),
+                trail_plan: None,
+                trail_edges: None,
+            };
+            let expected = advance_field_wave2_on(
+                &mut reference,
+                &plan,
+                &baseline_kernel,
+                &sources,
+                step,
+                phase2,
+                &mut work,
+            )
+            .expect("cpu vascular step");
+            let got = device
+                .advance_wave2(
+                    &mut accelerated,
+                    &plan,
+                    &baseline_kernel,
+                    &sources,
+                    step,
+                    phase2,
+                )
+                .expect("metal vascular step");
+
+            // C.8 cancel-safety: committed vascular edges are untouched until commit().
+            let (px_still, py_still) = accelerated.current().vascular_edges().expect("committed");
+            assert_eq!(
+                px_still.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                px_before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mu={mu} tick={tick}: committed edge_x mutated before commit"
+            );
+            assert_eq!(
+                py_still.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                py_before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "mu={mu} tick={tick}: committed edge_y mutated before commit"
+            );
+
+            // Bit-exact field planes, reports, and candidate vascular edges.
+            let (want, have) = (
+                reference.stage().1.as_slice(),
+                accelerated.stage().1.as_slice(),
+            );
+            let differing = want
+                .iter()
+                .zip(have)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "mu={mu} mode={mode:?} tick={tick}: {differing} field values differ"
+            );
+            assert_eq!(
+                report_bits(&expected),
+                report_bits(&got),
+                "mu={mu} mode={mode:?} tick={tick}: reports differ"
+            );
+            let (want_x, want_y) = reference.next().vascular_edges().expect("ref next edges");
+            let (got_x, got_y) = accelerated.next().vascular_edges().expect("gpu next edges");
+            let diff_x = want_x
+                .iter()
+                .zip(got_x)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let diff_y = want_y
+                .iter()
+                .zip(got_y)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                diff_x + diff_y,
+                0,
+                "mu={mu} mode={mode:?} tick={tick}: vascular edges differ (x={diff_x}, y={diff_y})"
+            );
+
+            reference.commit();
+            accelerated.commit();
+        }
+
+        // Verify conductances actually evolved away from initial value.
+        let (final_x, _) = accelerated.current().vascular_edges().expect("final edges");
+        assert!(
+            final_x
+                .iter()
+                .any(|&g| g.to_bits() != vascular.initial_conductance().to_bits()),
+            "mu={mu}: expected vascular conductances to evolve"
+        );
+    }
+
+    // Overflow guard (`ratio > 1e100 -> sat = 1.0`) and zero-flux pure pruning
+    // for both μ = 1.5 and μ = 2.4 (where ratio^mu would overflow without guard).
+    for mu in [1.5_f64, 2.4_f64] {
+        let small = FieldGrid::new(8, 8, 8.0, 8.0).expect("small grid");
+        let vascular = VascularField::new(0.05, 1.0, 0.8, 0.2, 1.0e-12, mu).expect("vascular");
+        let plan = vascular.transport_plan(&small, step, 0.0).expect("plan");
+        let mut work =
+            FieldWork::new(&small, &LIMITS, NonZeroUsize::new(2).expect("2")).expect("work");
+        let mut reference = FieldPair::zeroed(small, &LIMITS).expect("pair");
+        // Half the grid has extreme jump (e = 1e35 vs 0) -> ratio >> 1e40 (overflows at mu=2.4)
+        // and cell 0 has ratio > 1e100 via tiny J_0; other cells are uniform (zero flux).
+        reference.current_mut().energy_mut().fill(5.0);
+        reference.current_mut().energy_mut()[0] = 1.0e35_f32;
+        reference.current_mut().energy_mut()[1] = 0.0_f32;
+        reference
+            .enable_vascular(0.5, &LIMITS)
+            .expect("enable vascular");
+        let mut accelerated = reference.clone();
+        let mut edges = FluxEdges::new(&small, &LIMITS).expect("edges");
+        let (px, py) = reference.current().vascular_edges().expect("edges");
+        vascular
+            .fill_edges(&plan, px, py, None, &mut edges)
+            .expect("fill");
+        let phase2 = FieldStepPhase2 {
+            source_kernels: None,
+            carrier0_edges: Some(&edges),
+            vascular: Some(&vascular),
+            trail_plan: None,
+            trail_edges: None,
+        };
+        let expected = advance_field_wave2_on(
+            &mut reference,
+            &plan,
+            &baseline_kernel,
+            &[],
+            step,
+            phase2,
+            &mut work,
+        )
+        .expect("cpu extreme vascular");
+        let got = device
+            .advance_wave2(&mut accelerated, &plan, &baseline_kernel, &[], step, phase2)
+            .expect("metal extreme vascular");
+        assert_eq!(report_bits(&expected), report_bits(&got));
+        let (wx, wy) = reference.next().vascular_edges().expect("ref");
+        let (gx, gy) = accelerated.next().vascular_edges().expect("gpu");
+        assert_eq!(
+            wx.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            gx.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "mu={mu} overflow/zero-flux edge_x mismatch"
+        );
+        assert_eq!(
+            wy.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            gy.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "mu={mu} overflow/zero-flux edge_y mismatch"
+        );
+        // Zero-flux interior edge strictly pruned below 0.5; extreme edge reinforced above 0.5.
+        assert!(gx[0] > 0.5, "mu={mu}: extreme flux edge must reinforce");
+        assert!(gx[27] < 0.5, "mu={mu}: zero flux edge must prune");
+    }
+
+    // Negative refusals: vascular without carrier0_edges (`StateConflict`) and
+    // vascular without enabled FieldPair buffers (`LayoutMismatch`).
+    let vascular = VascularField::new(0.05, 2.5, 0.8, 0.15, 0.05, 1.5).expect("vascular");
+    let vasc_plan = vascular.transport_plan(&grid, step, 0.02).expect("plan");
+    let mut no_vasc_pair = random_pair(grid, &mut rng);
+    let mut dummy_edges = FluxEdges::new(&grid, &LIMITS).expect("edges");
+    dummy_edges.edge_x_mut().fill(vasc_plan.ratios().0 * 0.5);
+    dummy_edges.edge_y_mut().fill(vasc_plan.ratios().1 * 0.5);
+    assert!(matches!(
+        device.advance_wave2(
+            &mut no_vasc_pair,
+            &vasc_plan,
+            &baseline_kernel,
+            &sources,
+            step,
+            FieldStepPhase2 {
+                source_kernels: None,
+                carrier0_edges: Some(&dummy_edges),
+                vascular: Some(&vascular),
+                trail_plan: None,
+                trail_edges: None,
+            },
+        ),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    no_vasc_pair
+        .enable_vascular(vascular.initial_conductance(), &LIMITS)
+        .expect("enable");
+    assert!(matches!(
+        device.advance_wave2(
+            &mut no_vasc_pair,
+            &vasc_plan,
+            &baseline_kernel,
+            &sources,
+            step,
+            FieldStepPhase2 {
+                source_kernels: None,
+                carrier0_edges: None,
+                vascular: Some(&vascular),
+                trail_plan: None,
+                trail_edges: None,
+            },
+        ),
+        Err(CoreError::StateConflict { .. })
+    ));
+}
+
+/// `V2-15` (`34-plane dual-carrier-trails`): bit-exact CPU parity across ALL 6
+/// Metal kernels on a `64×64` 34-plane field:
+/// 1. `field.metal` (`advance_wave2` with V2-02 + V2-09 on both carriers + V2-14 on Carrier 0 only + V2-15);
+/// 2. `sensors.metal` (`MetalSensors::sample_dual` feeding `observe_dual_for_controller`);
+/// 3. `chemistry.metal` (`MetalChemistry::settle` ignoring Carrier-1 planes 25..33);
+/// 4. `reduce.metal` (`grants_debit` leaving Carrier-1 bit-for-bit untouched across 50 feeding organisms + `reduce_dual_carrier`);
+/// 5. `check.metal` (`MetalField::check` catching Carrier-0 and Carrier-1-only cone & negative `e_1` faults);
+/// 6. `controller.metal` (`MetalBackend` F16 & F32 on 108-input Bundle B `108 -> [64, 32] -> 42` with 0 alignment deferrals).
+///
+/// Also checks negative refusals for 33/34-plane mismatches.
+#[test]
+fn metal_dual_carrier_34_planes_all_6_kernels_bit_exact_with_cpu() {
+    use flife_backend_metal::{
+        ChemistryConstants, ChemistryOrganism, ChemistryPacket, MetalBackend, MetalChemistry,
+        MetalSensors,
+    };
+    use flife_core::binary16::F16;
+    use flife_core::ids::{GenomeId, OrganismId};
+    use flife_core::ledger::EnergyBudget;
+    use flife_engine::{Affinity, ChemicalPacket, Chemistry, composition};
+    use flife_field::grid::{
+        CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_MOMENT_CHANNELS,
+        DUAL_CARRIER_PLANES,
+    };
+    use flife_field::{
+        ConeTolerance, Demand, DepositSummary, Deposits, DualCarrierRules, FieldStepPhase2, Grants,
+        SensorBackend, SensorPyramid, SensorQuery, VascularField, advance_field_wave2_on,
+        reduce_dual_carrier_field_on, resolve_uptake, split_dual_carrier_emission,
+    };
+    use flife_neural::{
+        ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology, Intrinsic,
+        ReferenceController, SensorScales, observe_dual_for_controller,
+    };
+
+    let Some(mut field_dev) = metal() else {
+        return;
+    };
+    let mut sensors_dev = MetalSensors::with_owner(field_dev.owner().clone()).expect("sensors");
+    let mut chem_dev = MetalChemistry::with_owner(field_dev.owner().clone()).expect("chemistry");
+    let mut ctrl_f32 = MetalBackend::open().expect("ctrl f32");
+    let mut ctrl_f16 = MetalBackend::open().expect("ctrl f16");
+
+    let mut rng = Rng(0x2026_1515);
+    let grid = FieldGrid::new(64, 64, 64.0, 64.0).expect("grid");
+    let step = TimeStep::new(1, 32).expect("step");
+
+    // Construct a valid 34-plane initial FieldPair with both carriers populated
+    // strictly inside their respective cones (||m^(0)|| <= e_0, ||m^(1)|| <= e_1).
+    let mut reference =
+        FieldPair::zeroed_with_planes(grid, DUAL_CARRIER_PLANES, &LIMITS).expect("34-plane pair");
+    {
+        let cur = reference.current_mut();
+        let cells = grid.cell_count() as usize;
+        for c in 0..cells {
+            let e0 = (0.5 + rng.unit() * 6.0) as f32;
+            cur.energy_mut()[c] = e0;
+            let scale0 = f64::from(e0) * 0.08;
+            for ch in 0..CARRIER0_MOMENT_CHANNELS {
+                cur.moment_mut(ch).expect("c0")[c] = ((rng.unit() * 2.0 - 1.0) * scale0) as f32;
+            }
+            let e1 = (0.2 + rng.unit() * 3.0) as f32;
+            cur.trail_energy_mut().expect("e1")[c] = e1;
+            let scale1 = f64::from(e1) * 0.12;
+            for ch in 0..CARRIER1_MOMENT_CHANNELS {
+                cur.trail_moment_mut(ch).expect("c1")[c] =
+                    ((rng.unit() * 2.0 - 1.0) * scale1) as f32;
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. field.metal: 16 ticks composing V2-02 + V2-09 (C0 & C1) + V2-14 (C0 only) + V2-15.
+    // -------------------------------------------------------------------------
+    let vascular = VascularField::new(0.08, 6.0, 0.85, 0.15, 0.04, 1.5).expect("vascular");
+    let c0_plan = vascular
+        .transport_plan(&grid, step, 0.025)
+        .expect("c0 plan");
+    let trail_rules = DualCarrierRules::new(0.06, 0.002, 0.25, 0.5).expect("trail rules");
+    let trail_plan = trail_rules.trail_plan(&grid, step).expect("trail plan");
+    let barrier = TightJunctions::new(BarrierMode::HarmonicV1, 0.05, 1.0).expect("barrier");
+
+    let mut positions = Vec::with_capacity(64);
+    for i in 0..64 {
+        positions.push([((i % 8) as f64) * 7.5 + 3.25, ((i / 8) as f64) * 7.5 + 4.75]);
+    }
+
+    let mut sources: Vec<Source> = [[14.5, 18.25], [48.75, 14.5], [16.25, 50.0], [50.5, 48.75]]
+        .iter()
+        .enumerate()
+        .map(|(index, &center)| {
+            let mut direction = [0.0; 32];
+            for slot in direction.iter_mut().take(CARRIER0_MOMENT_CHANNELS as usize) {
+                *slot = (rng.unit() - 0.5) * 0.22;
+            }
+            // Deliberately put nonzero direction components on 24..32 to prove
+            // neither CPU nor Metal deposits sources onto Carrier-1 planes.
+            direction[24 + (index % 8)] = 0.05;
+            Source::new(SourceId::new(index as u32), center, direction, 90.0).expect("source")
+        })
+        .collect();
+    let schedule = OasisSchedule::new(1.2, 0.0, 1.6, 3.2).expect("oasis");
+    let seed_rng = SemanticRng::new(0x1515_2026);
+    let base_kernel = SourceKernel::new_fused(2.5, 4.0).expect("fused");
+    let kernels = schedule
+        .seed_kernels(&seed_rng, &base_kernel, &sources)
+        .expect("kernels");
+
+    reference
+        .enable_vascular(vascular.initial_conductance(), &LIMITS)
+        .expect("enable vasc");
+    let mut accelerated = reference.clone();
+    let mut work = FieldWork::new(&grid, &LIMITS, NonZeroUsize::new(4).expect("4")).expect("work");
+    work.reserve_supports_for_kernels(&kernels)
+        .expect("reserve supports");
+    work.reserve_flux().expect("reserve flux");
+    work.reserve_trail_flux().expect("reserve trail flux");
+
+    let mut power_scratch = Vec::new();
+    for tick in 0..16_u64 {
+        schedule
+            .apply_powers(
+                Tick::new(tick),
+                step,
+                90.0,
+                &mut sources,
+                &mut power_scratch,
+            )
+            .expect("apply powers");
+        let (px, py) = {
+            let (x, y) = accelerated.current().vascular_edges().expect("vasc edges");
+            (x.to_vec(), y.to_vec())
+        };
+        let c0_edges = work
+            .prepare_vascular_edges(&vascular, &c0_plan, &px, &py, Some((&barrier, &positions)))
+            .expect("c0 edges")
+            .clone();
+        // Carrier-1 gets tight junctions only (never vascular arteries).
+        let mut c1_edges = FluxEdges::new(&grid, &LIMITS).expect("c1 edges");
+        barrier
+            .fill_edges(&trail_plan, work.cell_occupancy(), &mut c1_edges)
+            .expect("c1 fill edges");
+
+        let phase2 = FieldStepPhase2 {
+            source_kernels: Some(&kernels),
+            carrier0_edges: Some(&c0_edges),
+            vascular: Some(&vascular),
+            trail_plan: Some(&trail_plan),
+            trail_edges: Some(&c1_edges),
+        };
+        let expected = advance_field_wave2_on(
+            &mut reference,
+            &c0_plan,
+            &base_kernel,
+            &sources,
+            step,
+            phase2,
+            &mut work,
+        )
+        .expect("cpu dual-carrier step");
+        let got = field_dev
+            .advance_wave2(
+                &mut accelerated,
+                &c0_plan,
+                &base_kernel,
+                &sources,
+                step,
+                phase2,
+            )
+            .expect("metal dual-carrier step");
+
+        let (want, have) = (
+            reference.stage().1.as_slice(),
+            accelerated.stage().1.as_slice(),
+        );
+        let differing = want
+            .iter()
+            .zip(have)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "dual-carrier tick={tick}: {differing} F32 values differ"
+        );
+        assert_eq!(
+            report_bits(&expected),
+            report_bits(&got),
+            "dual-carrier tick={tick}: reports differ"
+        );
+        reference.commit();
+        accelerated.commit();
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. sensors.metal: 256 dual-carrier queries bit-exact vs PyramidView::sample_dual
+    //    + observe_dual_for_controller feeding 108-input Bundle B controllers.
+    // -------------------------------------------------------------------------
+    let mut pyramid =
+        SensorPyramid::new_with_planes(grid, 4, DUAL_CARRIER_PLANES as usize, &LIMITS)
+            .expect("pyramid");
+    let queries: Vec<SensorQuery> = (0..256)
+        .map(|i| SensorQuery {
+            position: [rng.unit() * 64.0, rng.unit() * 64.0],
+            scale: 1.0 + (i % 7) as f64 * 0.85,
+        })
+        .collect();
+    let mut gpu_samples = Vec::new();
+    sensors_dev
+        .sample_dual(&pyramid, accelerated.current(), &queries, &mut gpu_samples)
+        .expect("metal sample_dual");
+    assert_eq!(gpu_samples.len(), queries.len());
+    let view = pyramid.build(accelerated.current()).expect("build view");
+
+    let scales = SensorScales::new([1.0, 4.0, 0.05, 10.0, 100.0, 2.0, 5.0], 0.5, 16.0)
+        .expect("sensor scales");
+    let intrinsic = Intrinsic {
+        energy: 4.0,
+        age_seconds: 12.0,
+        velocity: [0.3, -0.2],
+        energy_change_per_second: 0.1,
+    };
+    let mut sensor_108: Vec<Vec<f64>> = Vec::with_capacity(64);
+    for (idx, (query, got_sample)) in queries.iter().zip(&gpu_samples).enumerate() {
+        let want_sample = view
+            .sample_dual(query.position, query.scale)
+            .expect("cpu sample_dual");
+        for p in 0..DUAL_CARRIER_PLANES as usize {
+            assert_eq!(
+                want_sample.values[p].to_bits(),
+                got_sample.values[p].to_bits(),
+                "sensor query={idx} plane={p} value differs"
+            );
+            assert_eq!(
+                want_sample.dx[p].to_bits(),
+                got_sample.dx[p].to_bits(),
+                "sensor query={idx} plane={p} dx differs"
+            );
+            assert_eq!(
+                want_sample.dy[p].to_bits(),
+                got_sample.dy[p].to_bits(),
+                "sensor query={idx} plane={p} dy differs"
+            );
+        }
+        if idx < 64 {
+            let dual_obs = observe_dual_for_controller(
+                got_sample,
+                &intrinsic,
+                &scales,
+                trail_rules.trail_energy_density_scale(),
+            )
+            .expect("observe_dual_for_controller");
+            let mut input = Vec::with_capacity(108);
+            input.extend_from_slice(&dual_obs.base.inputs);
+            input.extend_from_slice(&dual_obs.trail_inputs);
+            assert_eq!(input.len(), 108);
+            sensor_108.push(input);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. chemistry.metal: 64 organisms with nonzero affinity[24..32] on a
+    //    34-plane field whose Carrier-1 holds huge e_1 = 1000.0 & nonzero m^(1).
+    // -------------------------------------------------------------------------
+    let mut chem_field = accelerated.current().clone();
+    chem_field.trail_energy_mut().expect("e1").fill(1000.0);
+    for c in 0..CARRIER1_MOMENT_CHANNELS {
+        chem_field
+            .trail_moment_mut(c)
+            .expect("c1")
+            .fill(if c % 2 == 0 { 500.0 } else { -500.0 });
+    }
+    let chem_cpu = Chemistry::new(0.85, 3.0, 0.25, 1.5, 1.0).expect("chemistry");
+    let chem_consts = ChemistryConstants {
+        maximum_efficiency: 0.85,
+        gain: 3.0,
+        threshold: 0.25,
+        toxicity_sensitivity: 1.5,
+        affinity_norm_limit: 1.0,
+    };
+    let cells = grid.cell_count() as usize;
+    let mut chem_orgs = Vec::with_capacity(64);
+    let mut chem_packets = Vec::new();
+    let mut chem_want = Vec::with_capacity(64);
+    for i in 0..64 {
+        let mut aff = [0.0_f64; 32];
+        for (c, slot) in aff.iter_mut().enumerate() {
+            *slot = ((rng.unit() * 2.0 - 1.0) * 0.14) + if c >= 24 { 0.03 } else { 0.0 };
+        }
+        let norm = aff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm > 0.9 {
+            for slot in &mut aff {
+                *slot *= 0.9 / norm;
+            }
+        }
+        let remaining = 0.4 + rng.unit() * 4.0;
+        let first = chem_packets.len();
+        let count = 1 + (i % 4);
+        let mut cpu_pkts = Vec::with_capacity(count);
+        for k in 0..count {
+            let cell = (i * 53 + k * 19) % cells;
+            let granted = 0.02 + rng.unit() * 0.4;
+            chem_packets.push(ChemistryPacket { cell, granted });
+            let z = composition(&chem_field, cell).expect("cpu composition");
+            assert_eq!(
+                &z[CARRIER0_MOMENT_CHANNELS as usize..],
+                &[0.0_f64; 8],
+                "CPU composition must zero channels 24..32 on 34-plane field"
+            );
+            cpu_pkts.push(ChemicalPacket {
+                granted,
+                composition: z,
+            });
+        }
+        let affinity = Affinity::new(aff, &chem_cpu).expect("affinity");
+        let mut budget = EnergyBudget::new(remaining).expect("budget");
+        let settlement = chem_cpu
+            .settle(&affinity, &cpu_pkts, &mut budget)
+            .expect("cpu settle");
+        chem_want.push((
+            settlement.absorbed.to_bits(),
+            settlement.gain.to_bits(),
+            settlement.toxicity.requested.to_bits(),
+            settlement.toxicity.paid.to_bits(),
+            budget.remaining().to_bits(),
+            budget.is_exhausted(),
+        ));
+        chem_orgs.push(ChemistryOrganism {
+            affinity: aff,
+            remaining,
+            exhausted: false,
+            first,
+            packets: count,
+        });
+    }
+    let mut chem_got = Vec::new();
+    chem_dev
+        .settle(
+            &chem_field,
+            &chem_consts,
+            &chem_orgs,
+            &chem_packets,
+            &mut chem_got,
+        )
+        .expect("metal chemistry settle");
+    assert_eq!(chem_got.len(), chem_want.len());
+    for (i, (got, want)) in chem_got.iter().zip(&chem_want).enumerate() {
+        let got_bits = (
+            got.absorbed.to_bits(),
+            got.gain.to_bits(),
+            got.requested_toxicity.to_bits(),
+            got.paid_toxicity.to_bits(),
+            got.remaining.to_bits(),
+            got.exhausted,
+        );
+        assert_eq!(got_bits, *want, "chemistry 34-plane org={i} differs");
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. reduce.metal:
+    //    (a) 50 feeding organisms' grants_debit leaves Carrier-1 (planes 25..34)
+    //        BIT-FOR-BIT UNTOUCHED;
+    //    (b) full reduce_dual_carrier (grants + emissions_0 + recycling + trail)
+    //        matches CPU reduce_dual_carrier_field_on bit-for-bit on all 34 planes
+    //        and all 3 DepositSummary structs.
+    // -------------------------------------------------------------------------
+    let feeding_demands: Vec<Demand> = (0..50)
+        .map(|i| Demand {
+            organism: OrganismId::new(100 + i as u64 * 3),
+            position: [
+                ((i % 10) as f64) * 6.1 + 1.4,
+                ((i / 10) as f64) * 11.3 + 2.7,
+            ],
+            amount: 0.35 + (i % 5) as f64 * 0.2,
+        })
+        .collect();
+    {
+        let mut debit_only_field = accelerated.current().clone();
+        let c1_start = (CARRIER1_ENERGY_PLANE as usize) * cells;
+        let c1_before_bits: Vec<u32> = debit_only_field.as_slice()[c1_start..]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let mut grants = Grants::new();
+        resolve_uptake(&debit_only_field, &feeding_demands, &mut grants).expect("resolve uptake");
+        assert!(
+            grants.summary().granted > 0.0,
+            "expected positive uptake across 50 feeding organisms"
+        );
+        let (mut e0, mut rec, mut tr) = (Deposits::new(), Deposits::new(), Deposits::new());
+        field_dev
+            .reduce_dual_carrier(
+                &mut debit_only_field,
+                &mut grants,
+                [&mut e0, &mut rec],
+                &mut tr,
+            )
+            .expect("metal debit-only dual-carrier");
+        let c1_after_bits: Vec<u32> = debit_only_field.as_slice()[c1_start..]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(
+            c1_before_bits, c1_after_bits,
+            "grants_debit MUST leave Carrier-1 (planes 25..34) bit-for-bit untouched"
+        );
+    }
+
+    let mut cpu_reduced = accelerated.current().clone();
+    let mut gpu_reduced = accelerated.current().clone();
+    let mut cpu_grants = Grants::new();
+    resolve_uptake(&cpu_reduced, &feeding_demands, &mut cpu_grants).expect("resolve uptake");
+    let mut gpu_grants = cpu_grants.clone();
+
+    let mut cpu_e0 = Deposits::new();
+    let mut cpu_rec = Deposits::new();
+    let mut cpu_trail = Deposits::new();
+    for i in 0..40 {
+        let org = OrganismId::new(1_000 + i as u64);
+        let pos = [rng.unit() * 64.0, rng.unit() * 64.0];
+        let mut dir = [0.0_f64; 32];
+        for slot in &mut dir {
+            *slot = (rng.unit() * 2.0 - 1.0) * 0.14;
+        }
+        let paid = 0.2 + rng.unit() * 0.6;
+        let split =
+            split_dual_carrier_emission(paid, 0.85, trail_rules.trail_emission_share(), &dir)
+                .expect("split emission");
+        cpu_e0
+            .push(
+                &grid,
+                org,
+                pos,
+                split.paid_0,
+                split.offered_0,
+                &split.direction_0,
+            )
+            .expect("push e0");
+        cpu_trail
+            .push(
+                &grid,
+                org,
+                pos,
+                split.paid_1,
+                split.offered_1,
+                &split.direction_1,
+            )
+            .expect("push trail");
+        if i % 3 == 0 {
+            let mut rec_dir = [0.0_f64; 32];
+            for slot in rec_dir.iter_mut().take(CARRIER0_MOMENT_CHANNELS as usize) {
+                *slot = (rng.unit() * 2.0 - 1.0) * 0.12;
+            }
+            let rec_paid = 0.3 + rng.unit() * 0.5;
+            cpu_rec
+                .push(&grid, org, pos, rec_paid, rec_paid * 0.9, &rec_dir)
+                .expect("push rec");
+        }
+    }
+    let mut gpu_e0 = cpu_e0.clone();
+    let mut gpu_rec = cpu_rec.clone();
+    let mut gpu_trail = cpu_trail.clone();
+
+    let (want_c0_sum, want_c1_sum) = reduce_dual_carrier_field_on(
+        &mut cpu_reduced,
+        &mut cpu_grants,
+        [&mut cpu_e0, &mut cpu_rec],
+        &mut cpu_trail,
+        4,
+    )
+    .expect("cpu reduce_dual_carrier");
+    let (got_c0_sum, got_c1_sum) = field_dev
+        .reduce_dual_carrier(
+            &mut gpu_reduced,
+            &mut gpu_grants,
+            [&mut gpu_e0, &mut gpu_rec],
+            &mut gpu_trail,
+        )
+        .expect("metal reduce_dual_carrier");
+
+    let summary_bits = |s: DepositSummary| {
+        (
+            s.organisms,
+            s.cells,
+            s.paid.to_bits(),
+            s.offered.to_bits(),
+            s.applied.to_bits(),
+        )
+    };
+    assert_eq!(summary_bits(want_c0_sum[0]), summary_bits(got_c0_sum[0]));
+    assert_eq!(summary_bits(want_c0_sum[1]), summary_bits(got_c0_sum[1]));
+    assert_eq!(summary_bits(want_c1_sum), summary_bits(got_c1_sum));
+    assert!(got_c1_sum.applied > 0.0, "expected positive trail deposits");
+    let reduce_diff = cpu_reduced
+        .as_slice()
+        .iter()
+        .zip(gpu_reduced.as_slice())
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    assert_eq!(
+        reduce_diff, 0,
+        "reduce_dual_carrier: {reduce_diff} values differ across 34 planes"
+    );
+
+    // -------------------------------------------------------------------------
+    // 5. check.metal: valid 34-plane scan, Carrier-0 fault, Carrier-1-only cone
+    //    fault, and Carrier-1-only negative e_1 fault all match CPU bit-for-bit.
+    // -------------------------------------------------------------------------
+    let tolerance = ConeTolerance::new(1.0e-5, 1.0e-5).expect("tolerance");
+    let scan_bits = |s: flife_field::FieldScan| {
+        (
+            s.offending,
+            s.largest.map(|(cell, res)| (cell, res.to_bits())),
+        )
+    };
+    let want_valid = cpu_reduced.scan_invariants(tolerance);
+    let got_valid = field_dev
+        .check(&gpu_reduced, tolerance)
+        .expect("metal check valid 34-plane");
+    assert_eq!(scan_bits(want_valid), scan_bits(got_valid));
+    assert_eq!(got_valid.offending, None);
+    assert_eq!(
+        gpu_reduced
+            .summarize_scan(tolerance, &got_valid)
+            .expect("summarize gpu scan"),
+        Some(cpu_reduced.check_invariants(tolerance).expect("cpu check")),
+    );
+
+    // Carrier-1-only cone violation (Carrier 0 completely valid).
+    let mut c1_cone_fault = gpu_reduced.clone();
+    let bad_cell = 1_337_usize;
+    c1_cone_fault.trail_energy_mut().expect("e1")[bad_cell] = 0.25;
+    c1_cone_fault.trail_moment_mut(0).expect("c1 m0")[bad_cell] = 0.5;
+    let want_c1_cone = c1_cone_fault.scan_invariants(tolerance);
+    let got_c1_cone = field_dev
+        .check(&c1_cone_fault, tolerance)
+        .expect("metal check c1 cone fault");
+    assert_eq!(want_c1_cone.offending, Some(bad_cell));
+    assert_eq!(scan_bits(got_c1_cone), scan_bits(want_c1_cone));
+
+    // Carrier-1-only negative energy violation.
+    let mut c1_neg_fault = gpu_reduced.clone();
+    c1_neg_fault.trail_energy_mut().expect("e1")[777] = -0.01;
+    let want_c1_neg = c1_neg_fault.scan_invariants(tolerance);
+    let got_c1_neg = field_dev
+        .check(&c1_neg_fault, tolerance)
+        .expect("metal check c1 neg fault");
+    assert_eq!(want_c1_neg.offending, Some(777));
+    assert_eq!(scan_bits(got_c1_neg), scan_bits(want_c1_neg));
+
+    // -------------------------------------------------------------------------
+    // 6. controller.metal: 108-input Bundle B (`108 -> [64, 32] -> 42`) F32 & F16
+    //    fed real observe_dual_for_controller inputs -> 0 deferrals, bit-exact.
+    // -------------------------------------------------------------------------
+    let topo = DenseTopology::with_io(108, &[64, 32], 42).expect("bundle B topo");
+    let mut p32_bank = Vec::with_capacity(64);
+    let mut p16_bank = Vec::with_capacity(64);
+    for _ in 0..64 {
+        let mut p32 = vec![0.0_f32; topo.parameter_count()];
+        for layer in topo.layers() {
+            let scale = 1.0 / (layer.inputs as f64).sqrt();
+            for v in &mut p32[layer.weights..layer.biases + layer.outputs] {
+                let raw = rng.unit() * 2.0 - 1.0;
+                let nudged = if raw.abs() < 1.0e-3 { 0.25 } else { raw };
+                *v = (nudged * scale) as f32;
+            }
+        }
+        let p16: Vec<F16> = p32.iter().map(|&v| F16::from_f64(f64::from(v))).collect();
+        p32_bank.push(p32);
+        p16_bank.push(p16);
+    }
+    let mut jobs_f32 = Vec::with_capacity(64);
+    let mut jobs_f16 = Vec::with_capacity(64);
+    for i in 0..64 {
+        jobs_f32.push(ControllerJob {
+            genome: GenomeId::new(10_000 + i as u64),
+            slot: ArenaSlot::new(0, i as u64, 1),
+            controller: ReferenceController::new(&topo, &p32_bank[i], 10.0).expect("ref f32"),
+            inputs: &sensor_108[i],
+        });
+        jobs_f16.push(ControllerJob {
+            genome: GenomeId::new(20_000 + i as u64),
+            slot: ArenaSlot::new(0, i as u64, 1),
+            controller: ReferenceController::new(&topo, &p16_bank[i], 10.0).expect("ref f16"),
+            inputs: &sensor_108[i],
+        });
+    }
+    let mut out_f32 = Vec::new();
+    let mut out_f16 = Vec::new();
+    ctrl_f32
+        .evaluate(&jobs_f32, &mut out_f32)
+        .expect("metal f32");
+    ctrl_f16
+        .evaluate(&jobs_f16, &mut out_f16)
+        .expect("metal f16");
+    let mut scratch = ControllerScratch::new(&topo).expect("scratch");
+    for i in 0..64 {
+        let got32 = out_f32[i].expect("0 F32 deferrals on Bundle B 108->42");
+        let want32 = jobs_f32[i]
+            .controller
+            .evaluate_raw(&sensor_108[i], &mut scratch)
+            .expect("eval f32");
+        assert_eq!(
+            got32.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want32.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "Bundle B F32 controller org={i} differs"
+        );
+        let got16 = out_f16[i].expect("0 F16 deferrals on Bundle B 108->42");
+        let want16 = jobs_f16[i]
+            .controller
+            .evaluate_raw(&sensor_108[i], &mut scratch)
+            .expect("eval f16");
+        assert_eq!(
+            got16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want16.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "Bundle B F16 controller org={i} differs"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Negative refusals for 33/34-plane mismatches.
+    // -------------------------------------------------------------------------
+    assert!(matches!(
+        field_dev.advance_wave2(
+            &mut accelerated,
+            &c0_plan,
+            &base_kernel,
+            &sources,
+            step,
+            FieldStepPhase2::BASELINE,
+        ),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    let mut single_field = FieldState::zeroed(grid, &LIMITS).expect("33-plane");
+    let mut empty_grants = Grants::new();
+    let (mut d0, mut d1, mut dt) = (Deposits::new(), Deposits::new(), Deposits::new());
+    assert!(matches!(
+        field_dev.reduce_dual_carrier(
+            &mut single_field,
+            &mut empty_grants,
+            [&mut d0, &mut d1],
+            &mut dt,
+        ),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    let mut dummy_dual = Vec::new();
+    assert!(matches!(
+        sensors_dev.sample_dual(&pyramid, &single_field, &queries[..4], &mut dummy_dual),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+    let mut dummy_single = Vec::new();
+    assert!(matches!(
+        sensors_dev.sample(
+            &pyramid,
+            accelerated.current(),
+            &queries[..4],
+            &mut dummy_single
+        ),
+        Err(CoreError::LayoutMismatch { .. })
+    ));
+}

@@ -13,8 +13,9 @@
 
 // params: [0] cells, [1] organisms, then the run's constants as word pairs:
 // [2] eta_max, [4] gain k, [6] threshold b, [8] toxicity sensitivity kappa,
-// [10] the affinity norm limit.
-constant uint C_PARAMS = 12u;
+// [10] the affinity norm limit, [12] active Carrier-0 moment channels (32 single-carrier,
+// 24 dual-carrier V2-15).
+constant uint C_PARAMS = 13u;
 
 // An organism: [0..64] its affinity, 32 word pairs; [64] its budget's
 // remaining energy; [66] whether the budget is exhausted; [67] the index of
@@ -68,6 +69,7 @@ kernel void chemistry_settle(
     d64 gain_k = c_load(params, 4u);
     d64 threshold = c_load(params, 6u);
     d64 kappa = c_load(params, 8u);
+    uint active_channels = params[12];
     device const uint *organism = organisms + index * C_ORGANISM;
     device uint *outcome = out + index * C_OUTCOME;
     d64 remaining = c_load(organism, 64u);
@@ -106,14 +108,17 @@ kernel void chemistry_settle(
             outcome[0] = STATUS_CELL;
             return;
         }
-        // composition: z = m / e in F64 from the exact F32 values, the
-        // neutral z = 0 where e is not positive; then a.z in channel order.
+        // composition: z = m / e in F64 from the exact F32 values on
+        // 0..active_channels (0.0 for trailing channels in 34-plane dual-carrier
+        // mode so chemistry never reads Carrier-1 e_1/m^(1)), the neutral z = 0
+        // where e is not positive; then a.z in channel order.
         d64 energy = d_from_f32_bits(field[cell]);
         d64 dot = 0ul;
         if (d_lt(0ul, energy)) {
             for (uint c = 0u; c < C_CHANNELS; ++c) {
-                d64 moment = d_from_f32_bits(field[(c + 1u) * cells + cell]);
-                d64 z = d_div(moment, energy);
+                d64 z = (c < active_channels)
+                    ? d_div(d_from_f32_bits(field[(c + 1u) * cells + cell]), energy)
+                    : 0ul;
                 dot = d_add(dot, d_mul(c_load(organism, 2u * c), z));
             }
         } else {

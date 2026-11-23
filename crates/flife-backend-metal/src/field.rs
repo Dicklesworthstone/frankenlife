@@ -26,12 +26,14 @@
 use std::ops::Range;
 
 use flife_core::{CoreError, TimeStep};
-use flife_field::grid::FIELD_PLANES;
+use flife_field::grid::{
+    CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, DUAL_CARRIER_PLANES, FIELD_PLANES,
+};
 use flife_field::{
     ConeTolerance, DepositSummary, Deposits, FieldBackend, FieldGrid, FieldLayout, FieldPair,
-    FieldScan, FieldState, FieldStepOptions, FieldStepReport, FluxEdges, Grants, Source,
-    SourceKernel, SourceSupport, TransportPlan, TransportReport, deposit_energy,
-    deposit_energy_fused, energy_report, step_report,
+    FieldScan, FieldState, FieldStepOptions, FieldStepPhase2, FieldStepReport, FluxEdges, Grants,
+    Source, SourceKernel, SourceSupport, TransportPlan, TransportReport, combine_transport_reports,
+    deposit_energy, deposit_energy_fused, energy_report, step_report,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -39,14 +41,19 @@ use crate::check::Check;
 use crate::owner::{Binding, DeviceOwner, Kernel, Limits, Owned, Purpose, metal};
 use crate::reduce::Reduce;
 
-/// The field kernel source, with the software binary64 ahead of it.
+/// The field kernel source, with the software binary64, Philox, and shared
+/// numerics (`d_pow_positive` for `V2-14` Murray vascular update) ahead of it.
 pub const FIELD_MSL: &str = concat!(
     include_str!("softfloat64.metal"),
+    include_str!("philox.metal"),
+    include_str!("numerics.metal"),
     include_str!("field.metal")
 );
 
-/// Moment channels.
+/// Moment channels in single-carrier mode (`32`), and Carrier-1 total planes
+/// (`e_1 + 8` trail moments = `9`) in 34-plane dual-carrier mode (`V2-15`).
 const CHANNELS: usize = 32;
+const CARRIER1_TOTAL_PLANES: usize = 9;
 
 /// Words per source descriptor; the offsets are `field.metal`'s (77 words:
 /// 73 baseline words + per-source `r_j²` and `2σ_j²` for `V2-02` oases).
@@ -69,11 +76,14 @@ const REFUSED: u64 = u64::MAX - 1;
 /// A rank-table entry for a row or column that is no candidate.
 const NOT_CANDIDATE: u32 = u32::MAX;
 
-/// Words of the stencil, flux-stencil, weights-header and moments parameters.
-const STENCIL_WORDS: usize = 10;
+/// Words of the stencil, flux-stencil, weights-header, moments, trail-decay,
+/// and vascular-update parameters.
+const STENCIL_WORDS: usize = 11;
 const FLUX_STENCIL_WORDS: usize = 5;
 const HEADER_WORDS: usize = 10;
-const MOMENT_WORDS: usize = 8;
+const MOMENT_WORDS: usize = 9;
+const TRAIL_DECAY_WORDS: usize = 4;
+const VASC_PARAMS_WORDS: usize = 17;
 
 /// Threads per threadgroup.
 const THREADS: usize = 256;
@@ -110,6 +120,27 @@ struct FluxBuffers {
     edge_y: Owned<u32>,
 }
 
+/// Device buffers for `V2-14` Murray / Physarum edge conductance updates,
+/// allocated lazily only when `vascular-field` is active (0 bytes when disabled).
+#[derive(Debug)]
+struct VascularBuffers {
+    params: Owned<u32>,
+    prev_x: Owned<f32>,
+    prev_y: Owned<f32>,
+    next_x: Owned<f32>,
+    next_y: Owned<f32>,
+}
+
+/// Device buffers for `V2-15` 34-plane Carrier-1 trail transport and decay,
+/// allocated lazily only on 34-plane dual-carrier fields (0 bytes on 33-plane).
+#[derive(Debug)]
+struct TrailBuffers {
+    stencil: Owned<u32>,
+    decay_params: Owned<u32>,
+    flux: Option<FluxBuffers>,
+    out: Owned<f32>,
+}
+
 /// The device buffers for one grid, plane count and source count.
 #[derive(Debug)]
 struct Buffers {
@@ -122,6 +153,8 @@ struct Buffers {
     diffused: Owned<f32>,
     stencil: Owned<u32>,
     flux: Option<FluxBuffers>,
+    vascular: Option<VascularBuffers>,
+    trail: Option<TrailBuffers>,
     header: Owned<u32>,
     descriptors: Owned<u32>,
     axes: Owned<u32>,
@@ -139,6 +172,9 @@ struct Host {
     readback: Vec<f32>,
     edge_x: Vec<u32>,
     edge_y: Vec<u32>,
+    trail_edge_x: Vec<u32>,
+    trail_edge_y: Vec<u32>,
+    trail_out: Vec<f32>,
     descriptors: Vec<u32>,
     axes: Vec<u32>,
     ranks: Vec<u32>,
@@ -154,6 +190,8 @@ pub struct MetalField {
     stencil_flux: Pipeline,
     weights: Pipeline,
     moments: Pipeline,
+    trail_decay: Pipeline,
+    vascular_update: Pipeline,
     buffers: Option<Buffers>,
     host: Host,
     reduce: Reduce,
@@ -192,6 +230,8 @@ impl MetalField {
             stencil_flux: pipeline("field_stencil_flux")?,
             weights: pipeline("source_weights")?,
             moments: pipeline("source_moments")?,
+            trail_decay: pipeline("trail_decay")?,
+            vascular_update: pipeline("vascular_update")?,
             reduce: Reduce::new(&owner)?,
             check: Check::new(&owner)?,
             owner,
@@ -214,13 +254,21 @@ impl MetalField {
 
     /// Buffers for `grid`, at least `planes` field planes, and `sources`
     /// sources, allocated on first use and again when any grows/changes; the
-    /// old ones retire when dropped.
+    /// old ones retire when dropped. Optional `flux`, `vascular`, and `trail`
+    /// sub-buffers allocate lazily (0 bytes VRAM when disabled).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "lazy VRAM flags keep disabled V2 features at 0 bytes"
+    )]
     fn ensure_buffers(
         &mut self,
         grid: FieldGrid,
         planes: usize,
         sources: usize,
         need_flux: bool,
+        need_vascular: bool,
+        need_trail: bool,
+        need_trail_flux: bool,
     ) -> Result<(), CoreError> {
         let planes = planes.max(FIELD_PLANES as usize);
         let current = self.buffers.as_ref().is_some_and(|buffers| {
@@ -243,6 +291,8 @@ impl MetalField {
                 diffused: owner.zeroed_owned(values)?,
                 stencil: owner.zeroed_owned(STENCIL_WORDS)?,
                 flux: None,
+                vascular: None,
+                trail: None,
                 header: owner.zeroed_owned(HEADER_WORDS)?,
                 descriptors: owner.zeroed_owned(DESCRIPTOR * sources.max(1))?,
                 axes: owner.zeroed_owned(axis.checked_mul(sources.max(1)).ok_or_else(overflow)?)?,
@@ -260,16 +310,47 @@ impl MetalField {
                 fault: owner.zeroed_owned(1)?,
             });
         }
-        if need_flux
-            && let Some(buffers) = self.buffers.as_mut()
-            && buffers.flux.is_none()
-        {
-            let edge_words = cells.checked_mul(2).ok_or_else(overflow)?;
-            buffers.flux = Some(FluxBuffers {
-                params: self.owner.zeroed_owned(FLUX_STENCIL_WORDS)?,
-                edge_x: self.owner.zeroed_owned(edge_words)?,
-                edge_y: self.owner.zeroed_owned(edge_words)?,
-            });
+        let edge_words = cells.checked_mul(2).ok_or_else(overflow)?;
+        if let Some(buffers) = self.buffers.as_mut() {
+            if need_flux && buffers.flux.is_none() {
+                buffers.flux = Some(FluxBuffers {
+                    params: self.owner.zeroed_owned(FLUX_STENCIL_WORDS)?,
+                    edge_x: self.owner.zeroed_owned(edge_words)?,
+                    edge_y: self.owner.zeroed_owned(edge_words)?,
+                });
+            }
+            if need_vascular && buffers.vascular.is_none() {
+                buffers.vascular = Some(VascularBuffers {
+                    params: self.owner.zeroed_owned(VASC_PARAMS_WORDS)?,
+                    prev_x: self.owner.zeroed_owned(cells)?,
+                    prev_y: self.owner.zeroed_owned(cells)?,
+                    next_x: self.owner.zeroed_owned(cells)?,
+                    next_y: self.owner.zeroed_owned(cells)?,
+                });
+            }
+            if need_trail {
+                if buffers.trail.is_none() {
+                    let trail_values = cells
+                        .checked_mul(CARRIER1_TOTAL_PLANES)
+                        .ok_or_else(overflow)?;
+                    buffers.trail = Some(TrailBuffers {
+                        stencil: self.owner.zeroed_owned(STENCIL_WORDS)?,
+                        decay_params: self.owner.zeroed_owned(TRAIL_DECAY_WORDS)?,
+                        flux: None,
+                        out: self.owner.zeroed_owned(trail_values)?,
+                    });
+                }
+                if need_trail_flux
+                    && let Some(trail) = buffers.trail.as_mut()
+                    && trail.flux.is_none()
+                {
+                    trail.flux = Some(FluxBuffers {
+                        params: self.owner.zeroed_owned(FLUX_STENCIL_WORDS)?,
+                        edge_x: self.owner.zeroed_owned(edge_words)?,
+                        edge_y: self.owner.zeroed_owned(edge_words)?,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -333,7 +414,7 @@ impl MetalField {
 
         let word = |value: usize| u32::try_from(value).map_err(|_| overflow());
         let sources = self.buffers.as_ref().map_or(0, |b| b.sources);
-        self.ensure_buffers(grid, total_planes, sources, true)?;
+        self.ensure_buffers(grid, total_planes, sources, true, false, false, false)?;
         let Self {
             owner,
             stencil_flux,
@@ -507,20 +588,9 @@ impl FieldBackend for MetalField {
         sources: &[Source],
         step: TimeStep,
     ) -> Result<FieldStepReport, CoreError> {
-        self.advance_v2(
-            pair,
-            plan,
-            kernel,
-            sources,
-            step,
-            FieldStepOptions::BASELINE,
-        )
+        self.advance_wave2(pair, plan, kernel, sources, step, FieldStepPhase2::BASELINE)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one step's two commands and the host's part between them, in order"
-    )]
     fn advance_v2(
         &mut self,
         pair: &mut FieldPair,
@@ -530,7 +600,30 @@ impl FieldBackend for MetalField {
         step: TimeStep,
         options: FieldStepOptions<'_>,
     ) -> Result<FieldStepReport, CoreError> {
-        if let Some(kernels) = options.source_kernels {
+        self.advance_wave2(
+            pair,
+            plan,
+            kernel,
+            sources,
+            step,
+            FieldStepPhase2::from_options(options),
+        )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Wave-2 Phase 2 step (V2-02/V2-09/V2-14/V2-15): two device commands and host sums in order"
+    )]
+    fn advance_wave2(
+        &mut self,
+        pair: &mut FieldPair,
+        plan: &TransportPlan,
+        kernel: &SourceKernel,
+        sources: &[Source],
+        step: TimeStep,
+        phase2: FieldStepPhase2<'_>,
+    ) -> Result<FieldStepReport, CoreError> {
+        if let Some(kernels) = phase2.source_kernels {
             if kernels.len() != sources.len() {
                 return Err(CoreError::LayoutMismatch {
                     buffer: "per-source kernels",
@@ -545,26 +638,102 @@ impl FieldBackend for MetalField {
             }
         }
         let grid = *plan.grid();
-        let layout = FieldLayout::planar(grid)?;
-        {
+        let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+        let (is_dual_carrier, total_planes) = {
             let (current, next) = pair.stage();
+            if current.is_dual_carrier() != next.is_dual_carrier()
+                || current.planes() != next.planes()
+            {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "field",
+                    detail: "current and candidate field states disagree on carrier layout".into(),
+                });
+            }
+            let planes = current.planes();
+            if planes != FIELD_PLANES && planes != DUAL_CARRIER_PLANES {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "field",
+                    detail: format!(
+                        "unsupported plane count {planes} (expected {FIELD_PLANES} or {DUAL_CARRIER_PLANES})"
+                    ),
+                });
+            }
+            let layout = FieldLayout::planar_with_planes(grid, planes)?;
             layout.ensure_compatible(current.layout())?;
             layout.ensure_compatible(next.layout())?;
-        }
-        let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
-        if let Some(edges) = options.flux_edges {
+            if phase2.vascular.is_some() {
+                let (Some((px, py)), Some((nx, ny))) =
+                    (current.vascular_edges(), next.vascular_edges())
+                else {
+                    return Err(CoreError::LayoutMismatch {
+                        buffer: "vascular edges",
+                        detail:
+                            "phase2.vascular requires vascular edge buffers enabled on FieldPair"
+                                .into(),
+                    });
+                };
+                if px.len() != cells || py.len() != cells || nx.len() != cells || ny.len() != cells
+                {
+                    return Err(CoreError::LayoutMismatch {
+                        buffer: "vascular edges",
+                        detail: format!("vascular edge buffers do not match {cells} grid cells"),
+                    });
+                }
+            }
+            (current.is_dual_carrier(), planes)
+        };
+        if let Some(edges) = phase2.carrier0_edges {
             validate_flux_edges(plan, edges, cells)?;
         }
+        if phase2.vascular.is_some() && phase2.carrier0_edges.is_none() {
+            return Err(CoreError::StateConflict {
+                operation: "advance vascular field",
+                detail: "phase2.vascular requires precomputed phase2.carrier0_edges".into(),
+            });
+        }
+        let trail_plan = if is_dual_carrier {
+            let Some(tp) = phase2.trail_plan else {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "dual-carrier trail transport plan",
+                    detail: "34-plane dual-carrier advance requires phase2.trail_plan".into(),
+                });
+            };
+            if *tp.grid() != grid {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: "dual-carrier trail transport plan",
+                    detail: "trail transport plan belongs to a different grid".into(),
+                });
+            }
+            if let Some(edges) = phase2.trail_edges {
+                validate_flux_edges(tp, edges, cells)?;
+            }
+            Some(tp)
+        } else {
+            None
+        };
+
         let (width, height) = (grid.cells_x() as usize, grid.cells_y() as usize);
         let axis = width + height;
-        let values = cells * FIELD_PLANES as usize;
+        let moment_channels = if is_dual_carrier {
+            CARRIER0_MOMENT_CHANNELS as usize
+        } else {
+            CHANNELS
+        };
+        let c0_planes = 1 + moment_channels;
+        let c0_values = cells.checked_mul(c0_planes).ok_or_else(overflow)?;
+        let c1_values = cells
+            .checked_mul(CARRIER1_TOTAL_PLANES)
+            .ok_or_else(overflow)?;
         let count = sources.len();
         let word = |value: usize| u32::try_from(value).map_err(|_| overflow());
         self.ensure_buffers(
             grid,
-            FIELD_PLANES as usize,
+            total_planes as usize,
             count,
-            options.flux_edges.is_some(),
+            phase2.carrier0_edges.is_some(),
+            phase2.vascular.is_some(),
+            is_dual_carrier,
+            is_dual_carrier && phase2.trail_edges.is_some(),
         )?;
         let Self {
             owner,
@@ -572,6 +741,8 @@ impl FieldBackend for MetalField {
             stencil_flux: stencil_flux_pipeline,
             weights: weights_pipeline,
             moments: moments_pipeline,
+            trail_decay: trail_decay_pipeline,
+            vascular_update: vascular_update_pipeline,
             buffers,
             host,
             ..
@@ -597,7 +768,7 @@ impl FieldBackend for MetalField {
                 *support = SourceSupport::new();
                 continue;
             }
-            let active_kernel = options
+            let active_kernel = phase2
                 .source_kernels
                 .and_then(|kernels| kernels.get(index))
                 .unwrap_or(kernel);
@@ -653,10 +824,11 @@ impl FieldBackend for MetalField {
         ]);
         put(&mut moment_params, 5, plan.decay_factor());
         moment_params[7] = u32::from(kernel.is_fused());
+        moment_params[8] = word(moment_channels)?;
         owner
             .write(buffers.field.buffer())?
             .write(0, pair.current().as_slice())?;
-        if let Some(edges) = options.flux_edges {
+        if let Some(edges) = phase2.carrier0_edges {
             let flux = buffers.flux.as_ref().ok_or_else(overflow)?;
             pack_flux_edges(edges, &mut host.edge_x, &mut host.edge_y);
             let flux_params = [
@@ -664,24 +836,90 @@ impl FieldBackend for MetalField {
                 grid.cells_y(),
                 word(cells)?,
                 0,
-                FIELD_PLANES,
+                word(c0_planes)?,
             ];
             owner.write(flux.params.buffer())?.write(0, &flux_params)?;
             owner.write(flux.edge_x.buffer())?.write(0, &host.edge_x)?;
             owner.write(flux.edge_y.buffer())?.write(0, &host.edge_y)?;
         } else {
             let mut stencil = [0_u32; STENCIL_WORDS];
-            stencil[..4].copy_from_slice(&[
+            stencil[..5].copy_from_slice(&[
                 grid.cells_x(),
                 grid.cells_y(),
                 word(cells)?,
-                FIELD_PLANES,
+                0,
+                word(c0_planes)?,
             ]);
             let (r_x, r_y) = plan.ratios();
-            put(&mut stencil, 4, plan.center());
-            put(&mut stencil, 6, r_x);
-            put(&mut stencil, 8, r_y);
+            put(&mut stencil, 5, plan.center());
+            put(&mut stencil, 7, r_x);
+            put(&mut stencil, 9, r_y);
             owner.write(buffers.stencil.buffer())?.write(0, &stencil)?;
+        }
+        if let Some(tp) = trail_plan {
+            let trail = buffers.trail.as_ref().ok_or_else(overflow)?;
+            if let Some(edges) = phase2.trail_edges {
+                let flux = trail.flux.as_ref().ok_or_else(overflow)?;
+                pack_flux_edges(edges, &mut host.trail_edge_x, &mut host.trail_edge_y);
+                let flux_params = [
+                    grid.cells_x(),
+                    grid.cells_y(),
+                    word(cells)?,
+                    CARRIER1_ENERGY_PLANE,
+                    word(CARRIER1_TOTAL_PLANES)?,
+                ];
+                owner.write(flux.params.buffer())?.write(0, &flux_params)?;
+                owner
+                    .write(flux.edge_x.buffer())?
+                    .write(0, &host.trail_edge_x)?;
+                owner
+                    .write(flux.edge_y.buffer())?
+                    .write(0, &host.trail_edge_y)?;
+            } else {
+                let mut stencil = [0_u32; STENCIL_WORDS];
+                stencil[..5].copy_from_slice(&[
+                    grid.cells_x(),
+                    grid.cells_y(),
+                    word(cells)?,
+                    CARRIER1_ENERGY_PLANE,
+                    word(CARRIER1_TOTAL_PLANES)?,
+                ]);
+                let (r_x, r_y) = tp.ratios();
+                put(&mut stencil, 5, tp.center());
+                put(&mut stencil, 7, r_x);
+                put(&mut stencil, 9, r_y);
+                owner.write(trail.stencil.buffer())?.write(0, &stencil)?;
+            }
+            let mut decay_params = [0_u32; TRAIL_DECAY_WORDS];
+            decay_params[0] = word(cells)?;
+            decay_params[1] = u32::from(tp.decay_factor() != 1.0);
+            put(&mut decay_params, 2, tp.decay_factor());
+            owner
+                .write(trail.decay_params.buffer())?
+                .write(0, &decay_params)?;
+        }
+        if let Some(vascular) = phase2.vascular {
+            let vasc = buffers.vascular.as_ref().ok_or_else(overflow)?;
+            let (prev_x, prev_y) = pair.current().vascular_edges().ok_or_else(overflow)?;
+            let dt = f64::from(step.numerator()) / f64::from(step.denominator());
+            let mut vasc_params = [0_u32; VASC_PARAMS_WORDS];
+            vasc_params[0] = grid.cells_x();
+            vasc_params[1] = grid.cells_y();
+            vasc_params[2] = word(cells)?;
+            put(&mut vasc_params, 3, f64::from(plan.substeps()));
+            put(&mut vasc_params, 5, dt);
+            put(&mut vasc_params, 7, vascular.minimum_conductance_ratio());
+            put(
+                &mut vasc_params,
+                9,
+                vascular.reinforcement_rate_per_second(),
+            );
+            put(&mut vasc_params, 11, vascular.pruning_rate_per_second());
+            put(&mut vasc_params, 13, vascular.flux_half_saturation());
+            put(&mut vasc_params, 15, vascular.flux_exponent());
+            owner.write(vasc.params.buffer())?.write(0, &vasc_params)?;
+            owner.write(vasc.prev_x.buffer())?.write(0, prev_x)?;
+            owner.write(vasc.prev_y.buffer())?.write(0, prev_y)?;
         }
         owner.write(buffers.header.buffer())?.write(0, &header)?;
         owner
@@ -696,82 +934,183 @@ impl FieldBackend for MetalField {
             .write(0, &moment_params)?;
         owner.write(buffers.fault.buffer())?.write(0, &[0])?;
 
-        // Command one: the substeps (uniform or V2-09 flux-form), ending in
-        // `diffused`, then the candidates' weights.
-        let substeps = plan.substeps().max(1) as usize;
+        // Command one: Carrier-0 substeps (uniform or flux), optional Carrier-1
+        // substeps + trail_decay, optional source_weights, and optional V2-14
+        // vascular_update (reading pre-transport committed e_0).
         let (field, ping, diffused) = (
             buffers.field.buffer(),
             buffers.ping.buffer(),
             buffers.diffused.buffer(),
         );
-        let target = |substep: usize| {
-            if (substeps - substep).is_multiple_of(2) {
+        let substeps_0 = plan.substeps().max(1) as usize;
+        let target_0 = |substep: usize| {
+            if (substeps_0 - substep).is_multiple_of(2) {
                 diffused
             } else {
                 ping
             }
         };
-        let mut uniform_bindings: Vec<[Binding; 4]> = Vec::new();
-        let mut flux_bindings: Vec<[Binding; 6]> = Vec::new();
-        if options.flux_edges.is_some() {
+        let mut c0_uniform_bindings: Vec<[Binding; 4]> = Vec::new();
+        let mut c0_flux_bindings: Vec<[Binding; 6]> = Vec::new();
+        if phase2.carrier0_edges.is_some() {
             let flux = buffers.flux.as_ref().ok_or_else(overflow)?;
-            flux_bindings.reserve(substeps);
-            for substep in 1..=substeps {
+            c0_flux_bindings.reserve(substeps_0);
+            for substep in 1..=substeps_0 {
                 let source = if substep == 1 {
                     field
                 } else {
-                    target(substep - 1)
+                    target_0(substep - 1)
                 };
-                flux_bindings.push([
+                c0_flux_bindings.push([
                     source.reads(),
                     flux.params.buffer().reads(),
                     flux.edge_x.buffer().reads(),
                     flux.edge_y.buffer().reads(),
-                    target(substep).writes(),
+                    target_0(substep).writes(),
                     buffers.fault.buffer().writes(),
                 ]);
             }
         } else {
-            uniform_bindings.reserve(substeps);
-            for substep in 1..=substeps {
+            c0_uniform_bindings.reserve(substeps_0);
+            for substep in 1..=substeps_0 {
                 let source = if substep == 1 {
                     field
                 } else {
-                    target(substep - 1)
+                    target_0(substep - 1)
                 };
-                uniform_bindings.push([
+                c0_uniform_bindings.push([
                     source.reads(),
                     buffers.stencil.buffer().reads(),
-                    target(substep).writes(),
+                    target_0(substep).writes(),
                     buffers.fault.buffer().writes(),
                 ]);
             }
         }
+
+        let mut c1_uniform_bindings: Vec<[Binding; 4]> = Vec::new();
+        let mut c1_flux_bindings: Vec<[Binding; 6]> = Vec::new();
+        let mut trail_decay_bindings: Option<[Binding; 4]> = None;
+        if let Some(tp) = trail_plan {
+            let trail = buffers.trail.as_ref().ok_or_else(overflow)?;
+            let substeps_1 = tp.substeps().max(1) as usize;
+            let target_1 = |substep: usize| {
+                if (substeps_1 - substep).is_multiple_of(2) {
+                    diffused
+                } else {
+                    ping
+                }
+            };
+            if phase2.trail_edges.is_some() {
+                let flux = trail.flux.as_ref().ok_or_else(overflow)?;
+                c1_flux_bindings.reserve(substeps_1);
+                for substep in 1..=substeps_1 {
+                    let source = if substep == 1 {
+                        field
+                    } else {
+                        target_1(substep - 1)
+                    };
+                    c1_flux_bindings.push([
+                        source.reads(),
+                        flux.params.buffer().reads(),
+                        flux.edge_x.buffer().reads(),
+                        flux.edge_y.buffer().reads(),
+                        target_1(substep).writes(),
+                        buffers.fault.buffer().writes(),
+                    ]);
+                }
+            } else {
+                c1_uniform_bindings.reserve(substeps_1);
+                for substep in 1..=substeps_1 {
+                    let source = if substep == 1 {
+                        field
+                    } else {
+                        target_1(substep - 1)
+                    };
+                    c1_uniform_bindings.push([
+                        source.reads(),
+                        trail.stencil.buffer().reads(),
+                        target_1(substep).writes(),
+                        buffers.fault.buffer().writes(),
+                    ]);
+                }
+            }
+            trail_decay_bindings = Some([
+                diffused.reads(),
+                trail.decay_params.buffer().reads(),
+                trail.out.buffer().writes(),
+                buffers.fault.buffer().writes(),
+            ]);
+        }
+
         let weight_bindings = [
             buffers.header.buffer().reads(),
             buffers.descriptors.buffer().reads(),
             buffers.axes.buffer().reads(),
             buffers.weights.buffer().writes(),
         ];
-        let mut kernels: Vec<Kernel<'_>> = if options.flux_edges.is_some() {
-            flux_bindings
+        let vascular_bindings: Option<[Binding; 9]> = if phase2.vascular.is_some() {
+            let flux = buffers.flux.as_ref().ok_or_else(overflow)?;
+            let vasc = buffers.vascular.as_ref().ok_or_else(overflow)?;
+            Some([
+                field.reads(),
+                vasc.params.buffer().reads(),
+                flux.edge_x.buffer().reads(),
+                flux.edge_y.buffer().reads(),
+                vasc.prev_x.buffer().reads(),
+                vasc.prev_y.buffer().reads(),
+                vasc.next_x.buffer().writes(),
+                vasc.next_y.buffer().writes(),
+                buffers.fault.buffer().writes(),
+            ])
+        } else {
+            None
+        };
+
+        let mut kernels: Vec<Kernel<'_>> = if phase2.carrier0_edges.is_some() {
+            c0_flux_bindings
                 .iter()
                 .map(|bindings| Kernel {
                     pipeline: stencil_flux_pipeline,
                     bindings,
-                    grid: Grid::linear(values.div_ceil(THREADS), THREADS),
+                    grid: Grid::linear(c0_values.div_ceil(THREADS), THREADS),
                 })
                 .collect()
         } else {
-            uniform_bindings
+            c0_uniform_bindings
                 .iter()
                 .map(|bindings| Kernel {
                     pipeline: stencil_pipeline,
                     bindings,
-                    grid: Grid::linear(values.div_ceil(THREADS), THREADS),
+                    grid: Grid::linear(c0_values.div_ceil(THREADS), THREADS),
                 })
                 .collect()
         };
+        if trail_plan.is_some() {
+            if phase2.trail_edges.is_some() {
+                for bindings in &c1_flux_bindings {
+                    kernels.push(Kernel {
+                        pipeline: stencil_flux_pipeline,
+                        bindings,
+                        grid: Grid::linear(c1_values.div_ceil(THREADS), THREADS),
+                    });
+                }
+            } else {
+                for bindings in &c1_uniform_bindings {
+                    kernels.push(Kernel {
+                        pipeline: stencil_pipeline,
+                        bindings,
+                        grid: Grid::linear(c1_values.div_ceil(THREADS), THREADS),
+                    });
+                }
+            }
+            if let Some(bindings) = &trail_decay_bindings {
+                kernels.push(Kernel {
+                    pipeline: trail_decay_pipeline,
+                    bindings,
+                    grid: Grid::linear(c1_values.div_ceil(THREADS), THREADS),
+                });
+            }
+        }
         if entries > 0 {
             kernels.push(Kernel {
                 pipeline: weights_pipeline,
@@ -779,15 +1118,30 @@ impl FieldBackend for MetalField {
                 grid: Grid::linear(entries.div_ceil(64), 64),
             });
         }
+        if let Some(bindings) = &vascular_bindings {
+            kernels.push(Kernel {
+                pipeline: vascular_update_pipeline,
+                bindings,
+                grid: Grid::linear(cells.div_ceil(THREADS), THREADS),
+            });
+        }
         owner.submit_batch(&kernels)?;
         check_fault(owner, &buffers.fault)?;
 
-        // The host's part: the energy plane, then each active support, its sum
-        // and its energy deposits.
+        // The host's part: Carrier-0 energy report, optional Carrier-1 energy
+        // report + trail copy, optional vascular candidate readback, then each
+        // active source's support, sum, and Carrier-0 energy deposits.
         host.energy.resize(cells, 0.0);
         owner
             .read(diffused, Purpose::Readback)?
             .read(&mut host.energy)?;
+        if trail_plan.is_some() {
+            let trail = buffers.trail.as_ref().ok_or_else(overflow)?;
+            host.trail_out.resize(c1_values, 0.0);
+            owner
+                .read(trail.out.buffer(), Purpose::Readback)?
+                .read(&mut host.trail_out)?;
+        }
         host.weights.resize(2 * entries, 0);
         if entries > 0 {
             owner
@@ -795,18 +1149,39 @@ impl FieldBackend for MetalField {
                 .read(&mut host.weights)?;
         }
         let (current, next) = pair.stage();
-        let transport = energy_report(
+        let r0 = energy_report(
             plan,
             flife_field::transport::sum(current.energy()),
             &mut host.energy,
         );
         next.energy_mut().copy_from_slice(&host.energy);
+        let transport = if let Some(tp) = trail_plan {
+            let c1_before =
+                flife_field::transport::sum(current.trail_energy().ok_or_else(overflow)?);
+            let r1 = energy_report(tp, c1_before, &mut host.trail_out[..cells]);
+            let c1_start = (CARRIER1_ENERGY_PLANE as usize) * cells;
+            next.as_mut_slice()[c1_start..c1_start + c1_values].copy_from_slice(&host.trail_out);
+            combine_transport_reports(r0, r1)
+        } else {
+            r0
+        };
+        if phase2.vascular.is_some() {
+            let vasc = buffers.vascular.as_ref().ok_or_else(overflow)?;
+            let (next_x, next_y) = next.vascular_edges_mut().ok_or_else(overflow)?;
+            owner
+                .read(vasc.next_x.buffer(), Purpose::Readback)?
+                .read(next_x)?;
+            owner
+                .read(vasc.next_y.buffer(), Purpose::Readback)?
+                .read(next_y)?;
+        }
+
         let deposits = if kernel.is_fused() {
             for (index, (source, support)) in sources.iter().zip(&mut host.supports).enumerate() {
                 if source.power() == 0.0 {
                     continue;
                 }
-                let active_kernel = options
+                let active_kernel = phase2
                     .source_kernels
                     .and_then(|kernels| kernels.get(index))
                     .unwrap_or(kernel);
@@ -872,7 +1247,7 @@ impl FieldBackend for MetalField {
                     deposits.push(deposit_energy(next, source, step, support)?);
                     continue;
                 }
-                let active_kernel = options
+                let active_kernel = phase2
                     .source_kernels
                     .and_then(|kernels| kernels.get(index))
                     .unwrap_or(kernel);
@@ -923,7 +1298,8 @@ impl FieldBackend for MetalField {
             deposits
         };
 
-        // Command two: the moments, decayed and deposited.
+        // Command two: Carrier-0 moments (`32` single-carrier or `24` dual-carrier),
+        // decayed and deposited.
         if entries > 0 {
             owner
                 .write(buffers.weights.buffer())?
@@ -940,7 +1316,7 @@ impl FieldBackend for MetalField {
                 buffers.moments.buffer().writes(),
                 buffers.fault.buffer().writes(),
             ],
-            grid: Grid::linear((cells * CHANNELS).div_ceil(THREADS), THREADS),
+            grid: Grid::linear((cells * moment_channels).div_ceil(THREADS), THREADS),
         }])?;
         check_fault(owner, &buffers.fault)?;
         owner
@@ -956,6 +1332,22 @@ impl FieldBackend for MetalField {
         deposits: [&mut Deposits; 2],
     ) -> Result<[DepositSummary; 2], CoreError> {
         self.reduce.run(&self.owner, field, grants, deposits)
+    }
+
+    fn reduce_dual_carrier(
+        &mut self,
+        field: &mut FieldState,
+        grants: &mut Grants,
+        carrier0_deposits: [&mut Deposits; 2],
+        trail_deposits: &mut Deposits,
+    ) -> Result<([DepositSummary; 2], DepositSummary), CoreError> {
+        self.reduce.run_dual_carrier(
+            &self.owner,
+            field,
+            grants,
+            carrier0_deposits,
+            trail_deposits,
+        )
     }
 
     fn check(

@@ -13,7 +13,7 @@
 //! one upload of the field and one command.
 
 use flife_core::CoreError;
-use flife_field::grid::FIELD_PLANES;
+use flife_field::grid::{DUAL_CARRIER_PLANES, FIELD_PLANES};
 use flife_field::{ConeTolerance, FieldScan, FieldState};
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -27,6 +27,9 @@ pub const CHECK_MSL: &str = concat!(
 
 /// Threads per threadgroup: `check.metal`'s `CHECK_THREADS`.
 const THREADS: usize = 256;
+
+/// Words of `field_check`'s parameter buffer: `[cells, abs(2), rel(2), dual]`.
+const PARAMS: usize = 6;
 
 /// Words per threadgroup's result.
 const GROUP: usize = 4;
@@ -45,10 +48,12 @@ fn words(value: f64) -> [u32; 2] {
     [(bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32]
 }
 
-/// The device buffers for one grid.
+/// The device buffers for one grid and plane count (`33` single-carrier or
+/// `34` dual-carrier).
 #[derive(Debug)]
 struct Buffers {
     cells: usize,
+    planes: usize,
     field: Owned<f32>,
     params: Owned<u32>,
     groups: Owned<u32>,
@@ -84,39 +89,44 @@ impl Check {
         })
     }
 
-    /// Buffers for `cells` cells, allocated on first use and again when the
-    /// grid changes.
-    fn ensure_buffers(&mut self, owner: &DeviceOwner, cells: usize) -> Result<(), CoreError> {
+    /// Buffers for `cells` cells and `planes` planes (`33` or `34`), allocated
+    /// on first use and again when either changes.
+    fn ensure_buffers(
+        &mut self,
+        owner: &DeviceOwner,
+        cells: usize,
+        planes: usize,
+    ) -> Result<(), CoreError> {
         if self
             .buffers
             .as_ref()
-            .is_some_and(|buffers| buffers.cells == cells)
+            .is_some_and(|buffers| buffers.cells == cells && buffers.planes == planes)
         {
             return Ok(());
         }
         self.buffers = None;
-        let values = cells
-            .checked_mul(FIELD_PLANES as usize)
-            .ok_or_else(overflow)?;
+        let values = cells.checked_mul(planes).ok_or_else(overflow)?;
         let groups = cells.div_ceil(THREADS).max(1);
         self.buffers = Some(Buffers {
             cells,
+            planes,
             field: owner.zeroed_owned(values)?,
-            params: owner.zeroed_owned(5)?,
+            params: owner.zeroed_owned(PARAMS)?,
             groups: owner.zeroed_owned(groups.checked_mul(GROUP).ok_or_else(overflow)?)?,
         });
         Ok(())
     }
 
-    /// [`FieldState::scan_invariants`] on the device; see the module
-    /// documentation.
+    /// [`FieldState::scan_invariants`] on the device (both 33-plane single-carrier
+    /// and 34-plane dual-carrier `V2-15` independent Lorentz cones); see the
+    /// module documentation.
     ///
     /// # Errors
     /// [`CoreError::MissingCapability`] for a tolerance whose bound could
     /// overflow binary64 at the largest F32 energy (the device's software
     /// binary64 carries no infinity); [`CoreError::LayoutMismatch`] for a
-    /// field whose planes are not whole; the device's errors; a cell
-    /// outside the field in the device's answer.
+    /// field whose planes are unsupported or not whole; the device's errors;
+    /// a cell outside the field in the device's answer.
     pub(crate) fn run(
         &mut self,
         owner: &DeviceOwner,
@@ -131,12 +141,25 @@ impl Check {
                 ),
             });
         }
-        let cells = usize::try_from(field.grid().cell_count()).map_err(|_| overflow())?;
-        let values = field.as_slice();
-        if Some(values.len()) != cells.checked_mul(FIELD_PLANES as usize) {
+        let plane_count = field.planes();
+        if plane_count != FIELD_PLANES && plane_count != DUAL_CARRIER_PLANES {
             return Err(CoreError::LayoutMismatch {
                 buffer: "metal field check",
-                detail: format!("{} values for {cells} cells", values.len()),
+                detail: format!(
+                    "unsupported plane count {plane_count} (expected {FIELD_PLANES} or {DUAL_CARRIER_PLANES})"
+                ),
+            });
+        }
+        let planes = usize::try_from(plane_count).map_err(|_| overflow())?;
+        let cells = usize::try_from(field.grid().cell_count()).map_err(|_| overflow())?;
+        let values = field.as_slice();
+        if Some(values.len()) != cells.checked_mul(planes) {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal field check",
+                detail: format!(
+                    "{} values for {cells} cells across {planes} planes",
+                    values.len()
+                ),
             });
         }
         if cells == 0 {
@@ -146,7 +169,7 @@ impl Check {
             });
         }
         let cell_words = u32::try_from(cells).map_err(|_| overflow())?;
-        self.ensure_buffers(owner, cells)?;
+        self.ensure_buffers(owner, cells, planes)?;
         let buffers = self.buffers.as_ref().ok_or_else(overflow)?;
         let groups = cells.div_ceil(THREADS);
         owner.write(buffers.field.buffer())?.write(0, values)?;
@@ -160,6 +183,7 @@ impl Check {
                 absolute_high,
                 relative_low,
                 relative_high,
+                u32::from(field.is_dual_carrier()),
             ],
         )?;
         owner.submit(

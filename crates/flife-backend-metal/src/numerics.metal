@@ -89,6 +89,29 @@ static d64 d_ln(d64 x) {
     return d_add(d_mul(n, LN2_HI), d_add(d_mul(n, LN2_LO), natural));
 }
 
+// numerics::pow_positive for finite positive base and finite exponent
+// (shared by motion.metal sensor cost scaling and field.metal V2-14 Murray
+// vascular conductance update): exact on exponent == 0, base == 1,
+// exponent == 1; otherwise exp(exponent * ln(base)).
+static bool d_pow_positive(d64 base, d64 exponent, thread d64 &value) {
+    if (!d_finite(base) || !d_lt(0ul, base) || !d_finite(exponent)) {
+        return false;
+    }
+    if ((exponent << 1) == 0ul || base == ONE) {
+        value = ONE;
+        return true;
+    }
+    if (exponent == ONE) {
+        value = base;
+        return true;
+    }
+    d64 scaled = d_mul(exponent, d_ln(base));
+    if (!d_finite(scaled)) {
+        return false;
+    }
+    return exp_signed(scaled, value);
+}
+
 // numerics::quarter_turn_kernel: (sin x, cos x) for x = (pi/2) r, 0 <= r <= 1/2.
 static void quarter_turn(d64 r, thread d64 &sine, thread d64 &cosine) {
     d64 x = d_mul(r, FRAC_PI_2);

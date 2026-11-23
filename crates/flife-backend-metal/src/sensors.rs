@@ -18,10 +18,10 @@
 //! yet (see the crate contract's known gaps).
 
 use flife_core::CoreError;
-use flife_field::grid::FIELD_PLANES;
+use flife_field::grid::{DUAL_CARRIER_PLANES, FIELD_PLANES};
 use flife_field::{
-    Corners, FieldGrid, FieldLayout, FieldState, RawSample, SensorBackend, SensorPyramid,
-    SensorQuery,
+    Corners, DualRawSample, FieldGrid, FieldLayout, FieldState, RawSample, SensorBackend,
+    SensorPyramid, SensorQuery,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -33,8 +33,9 @@ pub const SENSORS_MSL: &str = concat!(
     include_str!("sensors.metal")
 );
 
-/// Planes per level.
+/// Planes per single-carrier level (`33`) and dual-carrier level (`34`).
 const PLANES: usize = FIELD_PLANES as usize;
+const DUAL_PLANES: usize = DUAL_CARRIER_PLANES as usize;
 
 /// `sensors.metal`'s layouts.
 const QUERY: usize = 20;
@@ -43,11 +44,12 @@ const Q_BLENDS: usize = 1;
 const Q_LOW: usize = 2;
 const Q_HIGH: usize = 10;
 const Q_T: usize = 18;
-const S_HEADER: usize = 4;
+const S_HEADER: usize = 5;
 const S_LEVEL: usize = 7;
-const LEVEL_WORDS: usize = 6;
-/// Words of one query's samples: three arrays of 33 binary64 values.
-const SAMPLE_WORDS: usize = 3 * PLANES * 2;
+const LEVEL_WORDS: usize = 7;
+/// Words of one query's samples: three arrays of `planes` binary64 values.
+const SAMPLE_WORDS_SINGLE: usize = 3 * PLANES * 2;
+const SAMPLE_WORDS_DUAL: usize = 3 * DUAL_PLANES * 2;
 
 /// Threads per threadgroup.
 const THREADS: usize = 256;
@@ -80,10 +82,11 @@ struct Level {
     offset: usize,
 }
 
-/// The device buffers for one pyramid and a query capacity.
+/// The device buffers for one pyramid (`33` or `34` planes) and a query capacity.
 #[derive(Debug)]
 struct Buffers {
     grid: FieldGrid,
+    planes: usize,
     levels: u32,
     capacity: usize,
     field: Owned<f32>,
@@ -123,6 +126,7 @@ impl std::fmt::Debug for MetalSensors {
 
 /// Every level's geometry and offset, level 0 first.
 fn layout(pyramid: &SensorPyramid) -> Result<Vec<Level>, CoreError> {
+    let planes = pyramid.planes();
     let mut levels = Vec::new();
     let mut offset = 0_usize;
     for level in 0..=pyramid.levels() {
@@ -136,7 +140,7 @@ fn layout(pyramid: &SensorPyramid) -> Result<Vec<Level>, CoreError> {
         if level > 0 {
             offset = cells_x
                 .checked_mul(cells_y)
-                .and_then(|cells| cells.checked_mul(PLANES))
+                .and_then(|cells| cells.checked_mul(planes))
                 .and_then(|values| offset.checked_add(values))
                 .ok_or_else(overflow)?;
         }
@@ -193,8 +197,12 @@ impl MetalSensors {
         count: usize,
     ) -> Result<(), CoreError> {
         let grid = *pyramid.grid();
+        let planes = pyramid.planes();
         let current = self.buffers.as_ref().is_some_and(|buffers| {
-            buffers.grid == grid && buffers.levels == pyramid.levels() && buffers.capacity >= count
+            buffers.grid == grid
+                && buffers.planes == planes
+                && buffers.levels == pyramid.levels()
+                && buffers.capacity >= count
         });
         if current {
             return Ok(());
@@ -202,10 +210,11 @@ impl MetalSensors {
         self.buffers = None;
         let capacity = count.max(1).next_power_of_two();
         let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
-        let values = cells.checked_mul(PLANES).ok_or_else(overflow)?;
+        let values = cells.checked_mul(planes).ok_or_else(overflow)?;
+        let sample_words = 3 * planes * 2;
         let coarse = levels.last().map_or(0, |last| {
             if levels.len() > 1 {
-                last.offset + last.cells_x * last.cells_y * PLANES
+                last.offset + last.cells_x * last.cells_y * planes
             } else {
                 0
             }
@@ -217,6 +226,7 @@ impl MetalSensors {
         }
         self.buffers = Some(Buffers {
             grid,
+            planes,
             levels: pyramid.levels(),
             capacity,
             field: owner.zeroed_owned(values)?,
@@ -225,40 +235,25 @@ impl MetalSensors {
             sample_params: owner.zeroed_owned(S_HEADER + S_LEVEL * levels.len())?,
             queries: owner.zeroed_owned(capacity.checked_mul(QUERY).ok_or_else(overflow)?)?,
             samples: owner
-                .zeroed_owned(capacity.checked_mul(SAMPLE_WORDS).ok_or_else(overflow)?)?,
+                .zeroed_owned(capacity.checked_mul(sample_words).ok_or_else(overflow)?)?,
         });
         Ok(())
     }
-}
 
-/// A query's level part: its corner cells and fractions.
-fn put_corners(query: &mut [u32], at: usize, corners: &Corners) {
-    query[at..at + 4].copy_from_slice(&[
-        corners.columns[0],
-        corners.columns[1],
-        corners.rows[0],
-        corners.rows[1],
-    ]);
-    put(query, at + 4, corners.fx);
-    put(query, at + 6, corners.fy);
-}
-
-impl SensorBackend for MetalSensors {
-    fn describe(&self) -> String {
-        format!("metal ({})", self.owner.device_name())
-    }
-
+    /// Build `pyramid`'s coarse levels and sample all `expected_planes` (`33`
+    /// single-carrier or `34` dual-carrier) on the device, leaving the raw
+    /// binary64 word pairs in `self.host.samples`. Returns `queries.len()`.
     #[expect(
         clippy::too_many_lines,
-        reason = "one tick's queries, command and samples, in order"
+        reason = "one tick's queries, command and readback for 33 or 34 planes, in order"
     )]
-    fn sample(
+    fn sample_raw(
         &mut self,
         pyramid: &SensorPyramid,
         field: &FieldState,
         queries: &[SensorQuery],
-        samples: &mut Vec<RawSample>,
-    ) -> Result<(), CoreError> {
+        expected_planes: usize,
+    ) -> Result<usize, CoreError> {
         let grid = *pyramid.grid();
         if field.grid() != &grid {
             return Err(CoreError::LayoutMismatch {
@@ -266,12 +261,21 @@ impl SensorBackend for MetalSensors {
                 detail: format!("built for {grid:?}, offered a field on {:?}", field.grid()),
             });
         }
-        FieldLayout::planar(grid)?.ensure_compatible(field.layout())?;
+        if pyramid.planes() != expected_planes {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal sensor pyramid",
+                detail: format!(
+                    "expected {expected_planes}-plane pyramid, got {}",
+                    pyramid.planes()
+                ),
+            });
+        }
+        FieldLayout::planar_with_planes(grid, word(expected_planes)?)?
+            .ensure_compatible(field.layout())?;
         let levels = layout(pyramid)?;
         let count = queries.len();
-        samples.clear();
         if count == 0 {
-            return Ok(());
+            return Ok(0);
         }
 
         // The host's part: each query's level, weight and corners, through
@@ -306,12 +310,15 @@ impl SensorBackend for MetalSensors {
         let buffers = buffers.as_ref().ok_or_else(overflow)?;
         let area = grid.cell_area();
         let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
+        let planes = expected_planes;
+        let planes_word = word(planes)?;
 
         // The parameters, and the field.
         let mut sample_params = vec![0_u32; S_HEADER + S_LEVEL * levels.len()];
         sample_params[0] = word(count)?;
         sample_params[1] = word(cells)?;
         put(&mut sample_params, 2, area);
+        sample_params[4] = planes_word;
         for (index, level) in levels.iter().enumerate() {
             let geometry = pyramid
                 .level_grid(u32::try_from(index).map_err(|_| overflow())?)
@@ -340,6 +347,7 @@ impl SensorBackend for MetalSensors {
                 words_[4] = word(fine.offset)?;
                 words_[5] = word(coarse.offset)?;
             }
+            words_[6] = planes_word;
             owner.write(params.buffer())?.write(0, &words_)?;
         }
         owner
@@ -381,7 +389,7 @@ impl SensorBackend for MetalSensors {
                 pipeline: first,
                 bindings: &first_bindings,
                 grid: Grid::linear(
-                    (level.cells_x * level.cells_y * PLANES).div_ceil(THREADS),
+                    (level.cells_x * level.cells_y * planes).div_ceil(THREADS),
                     THREADS,
                 ),
             });
@@ -391,7 +399,7 @@ impl SensorBackend for MetalSensors {
                 pipeline: next,
                 bindings,
                 grid: Grid::linear(
-                    (level.cells_x * level.cells_y * PLANES).div_ceil(THREADS),
+                    (level.cells_x * level.cells_y * planes).div_ceil(THREADS),
                     THREADS,
                 ),
             });
@@ -399,16 +407,48 @@ impl SensorBackend for MetalSensors {
         kernels.push(Kernel {
             pipeline: sample,
             bindings: &sample_bindings,
-            grid: Grid::linear((count * PLANES).div_ceil(THREADS), THREADS),
+            grid: Grid::linear((count * planes).div_ceil(THREADS), THREADS),
         });
         owner.submit_batch(&kernels)?;
 
-        // The samples, checked as the reference checks them: a non-finite
-        // field value a sample read made it a NaN (`sensors.metal`).
-        host.samples.resize(count * SAMPLE_WORDS, 0);
+        let sample_words = 3 * planes * 2;
+        host.samples.resize(count * sample_words, 0);
         owner
             .read(buffers.samples.buffer(), Purpose::Readback)?
             .read(&mut host.samples)?;
+        Ok(count)
+    }
+}
+
+/// A query's level part: its corner cells and fractions.
+fn put_corners(query: &mut [u32], at: usize, corners: &Corners) {
+    query[at..at + 4].copy_from_slice(&[
+        corners.columns[0],
+        corners.columns[1],
+        corners.rows[0],
+        corners.rows[1],
+    ]);
+    put(query, at + 4, corners.fx);
+    put(query, at + 6, corners.fy);
+}
+
+impl SensorBackend for MetalSensors {
+    fn describe(&self) -> String {
+        format!("metal ({})", self.owner.device_name())
+    }
+
+    fn sample(
+        &mut self,
+        pyramid: &SensorPyramid,
+        field: &FieldState,
+        queries: &[SensorQuery],
+        samples: &mut Vec<RawSample>,
+    ) -> Result<(), CoreError> {
+        samples.clear();
+        let count = self.sample_raw(pyramid, field, queries, PLANES)?;
+        if count == 0 {
+            return Ok(());
+        }
         samples
             .try_reserve(count)
             .map_err(|_| CoreError::AllocationFailed {
@@ -416,12 +456,58 @@ impl SensorBackend for MetalSensors {
                 bytes: u64::try_from(count.saturating_mul(size_of::<RawSample>()))
                     .unwrap_or(u64::MAX),
             })?;
-        for block in host.samples.as_chunks::<SAMPLE_WORDS>().0 {
+        for block in self.host.samples.as_chunks::<SAMPLE_WORDS_SINGLE>().0 {
             let value = |array: usize, plane: usize| {
                 let at = 2 * (array * PLANES + plane);
                 f64::from_bits(u64::from(block[at]) | (u64::from(block[at + 1]) << 32))
             };
             let raw = RawSample {
+                values: std::array::from_fn(|plane| value(0, plane)),
+                dx: std::array::from_fn(|plane| value(1, plane)),
+                dy: std::array::from_fn(|plane| value(2, plane)),
+            };
+            let finite = raw
+                .values
+                .iter()
+                .chain(&raw.dx)
+                .chain(&raw.dy)
+                .all(|value| value.is_finite());
+            if !finite {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "sensor sample",
+                    detail: "interpolation produced a nonfinite value".into(),
+                });
+            }
+            samples.push(raw);
+        }
+        Ok(())
+    }
+
+    fn sample_dual(
+        &mut self,
+        pyramid: &SensorPyramid,
+        field: &FieldState,
+        queries: &[SensorQuery],
+        samples: &mut Vec<DualRawSample>,
+    ) -> Result<(), CoreError> {
+        samples.clear();
+        let count = self.sample_raw(pyramid, field, queries, DUAL_PLANES)?;
+        if count == 0 {
+            return Ok(());
+        }
+        samples
+            .try_reserve(count)
+            .map_err(|_| CoreError::AllocationFailed {
+                buffer: "metal dual sensor samples",
+                bytes: u64::try_from(count.saturating_mul(size_of::<DualRawSample>()))
+                    .unwrap_or(u64::MAX),
+            })?;
+        for block in self.host.samples.as_chunks::<SAMPLE_WORDS_DUAL>().0 {
+            let value = |array: usize, plane: usize| {
+                let at = 2 * (array * DUAL_PLANES + plane);
+                f64::from_bits(u64::from(block[at]) | (u64::from(block[at + 1]) << 32))
+            };
+            let raw = DualRawSample {
                 values: std::array::from_fn(|plane| value(0, plane)),
                 dx: std::array::from_fn(|plane| value(1, plane)),
                 dy: std::array::from_fn(|plane| value(2, plane)),

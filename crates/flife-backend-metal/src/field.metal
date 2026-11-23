@@ -11,7 +11,10 @@
 // source's weight sum); a sum of thousands of terms in a fixed order is
 // serial, and the host's F64 is far faster at it than one GPU thread.
 
-constant uint CHANNELS = 32u;
+constant ulong VASC_RATIO_CAP = 0x54B249AD2594C37Dul;   // 1.0e100
+constant ulong ONE_POINT_FIVE = 0x3FF8000000000000ul;   // 1.5
+constant uint CARRIER1_ENERGY_PLANE = 25u;
+constant uint CARRIER1_TOTAL_PLANES = 9u;               // e_1 + 8 trail moments
 
 // One source's descriptor, in 32-bit words. Its candidate cells are the
 // rows × columns of `rows_at`/`columns_at` in the axes buffer, row-major,
@@ -46,10 +49,10 @@ static inline bool f32_finite(uint bits) {
     return ((bits >> 23) & 0xFFu) != 0xFFu;
 }
 
-// One periodic five-point substep on every plane: transport.rs's
-// `((c·u + r_x·(u_w + u_e)) + r_y·(u_s + u_n))`, rounded once to F32.
-// params: width, height, cells, planes, center, r_x, r_y (binary64 as two
-// words, low first).
+// One periodic five-point substep on planes `first_plane..first_plane + plane_count`:
+// transport.rs's `((c·u + r_x·(u_w + u_e)) + r_y·(u_s + u_n))`, rounded once to F32.
+// params: [0] width, [1] height, [2] cells, [3] first_plane, [4] plane_count,
+// then binary64 word pairs (low first): [5] center, [7] r_x, [9] r_y.
 kernel void field_stencil(
     device const uint *source [[buffer(0)]],
     device const uint *params [[buffer(1)]],
@@ -57,11 +60,12 @@ kernel void field_stencil(
     device atomic_uint *fault [[buffer(3)]],
     uint id [[thread_position_in_grid]])
 {
-    uint width = params[0], height = params[1], cells = params[2], planes = params[3];
-    if (id >= cells * planes) {
+    uint width = params[0], height = params[1], cells = params[2];
+    uint first_plane = params[3], plane_count = params[4];
+    if (id >= cells * plane_count) {
         return;
     }
-    uint plane = id / cells, cell = id % cells;
+    uint plane = first_plane + id / cells, cell = id % cells;
     uint x = cell % width, y = cell / width;
     uint west = x == 0u ? width - 1u : x - 1u;
     uint east = x + 1u == width ? 0u : x + 1u;
@@ -77,10 +81,10 @@ kernel void field_stencil(
         atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
     }
     d64 value = d_add(
-        d_add(d_mul(d_word(params, 4u), d_from_f32_bits(u)),
-              d_mul(d_word(params, 6u), d_add(d_from_f32_bits(w), d_from_f32_bits(e)))),
-        d_mul(d_word(params, 8u), d_add(d_from_f32_bits(s), d_from_f32_bits(n))));
-    target[id] = d_to_f32_bits(value);
+        d_add(d_mul(d_word(params, 5u), d_from_f32_bits(u)),
+              d_mul(d_word(params, 7u), d_add(d_from_f32_bits(w), d_from_f32_bits(e)))),
+        d_mul(d_word(params, 9u), d_add(d_from_f32_bits(s), d_from_f32_bits(n))));
+    target[base + cell] = d_to_f32_bits(value);
 }
 
 // One periodic flux-form doubly-stochastic substep over `plane_range`
@@ -206,12 +210,12 @@ kernel void source_weights(
     weights[2u * id + 1u] = uint(weight >> 32);
 }
 
-// Every moment value: decayed (transport.rs's `f32(f64(u) × factor)`), then
-// each source's deposit in source order (sources.rs's `deposit_moment`,
-// `f32(f64(m) + q·a)`). The amounts `q` are the host's: `deposit_energy`
-// computes them for the energy plane, and the host writes each over its
-// candidate's weight, leaving the absent ones marked.
-// params: cells, width, height, sources, decays, factor (2 words), fused.
+// Every Carrier-0 moment value: decayed (transport.rs's `f32(f64(u) × factor)`),
+// then each source's deposit in source order (sources.rs's `deposit_moment`,
+// `f32(f64(m) + q·a)`). Runs over `moment_channels` (`32` single-carrier or `24`
+// dual-carrier, leaving Carrier 1 untouched).
+// params: [0] cells, [1] width, [2] height, [3] sources, [4] decays,
+//         [5..7] factor (2 words), [7] fused, [8] moment_channels.
 kernel void source_moments(
     device const uint *diffused [[buffer(0)]],
     device const uint *params [[buffer(1)]],
@@ -223,7 +227,8 @@ kernel void source_moments(
     uint id [[thread_position_in_grid]])
 {
     uint cells = params[0], width = params[1], height = params[2], sources = params[3];
-    if (id >= cells * CHANNELS) {
+    uint moment_channels = params[8];
+    if (id >= cells * moment_channels) {
         return;
     }
     uint channel = id / cells, cell = id % cells;
@@ -290,4 +295,144 @@ kernel void source_moments(
         }
     }
     moments[id] = bits;
+}
+
+// Carrier-1 (`V2-15` dual-carrier-trails) readback staging: copies plane 25
+// (`e_1`, undecayed so host runs exact sequential F64 `energy_report`) into
+// `trail_out[0..cells]` and decays planes 26..34 (8 trail moment planes) into
+// `trail_out[cells..9*cells]` using `trail_plan.decay_factor()`.
+// params: [0] cells, [1] decays, [2..4] factor (2 words).
+kernel void trail_decay(
+    device const uint *diffused [[buffer(0)]],
+    device const uint *params [[buffer(1)]],
+    device uint *trail_out [[buffer(2)]],
+    device atomic_uint *fault [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint cells = params[0];
+    if (id >= cells * CARRIER1_TOTAL_PLANES) {
+        return;
+    }
+    uint plane_offset = id / cells;
+    uint cell = id % cells;
+    uint bits = diffused[(CARRIER1_ENERGY_PLANE + plane_offset) * cells + cell];
+    if (!f32_finite(bits)) {
+        atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+    }
+    if (plane_offset > 0u && params[1] != 0u) {
+        bits = d_to_f32_bits(d_mul(d_from_f32_bits(bits), d_word(params, 2u)));
+        if (!f32_finite(bits)) {
+            atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+        }
+    }
+    trail_out[id] = bits;
+}
+
+// One edge's exact Murray / Physarum conductance update (`V2-14`), matching
+// `VascularField::update_conductance` in transport.rs bit-for-bit on binary64:
+// overflow guard (`ratio > 1e100 -> sat = 1.0`), `mu == 1.5` fast path
+// (`ratio * sqrt(ratio)`), and general `mu > 0` via shared `d_pow_positive`.
+static uint vascular_step(
+    uint prev_bits,
+    d64 flux,
+    d64 dt,
+    d64 g_min,
+    d64 alpha_v,
+    d64 gamma_v,
+    d64 j0,
+    d64 mu,
+    device atomic_uint *fault)
+{
+    d64 sat;
+    if (!d_finite(flux)) {
+        // Finite nonnegative operands only lose finiteness via overflow (+inf).
+        sat = ONE;
+    } else {
+        d64 ratio = d_div(flux, j0);
+        if (!d_finite(ratio) || d_lt(VASC_RATIO_CAP, ratio)) {
+            sat = ONE;
+        } else if (!d_lt(0ul, ratio)) {
+            sat = 0ul;
+        } else if (mu == ONE_POINT_FIVE) {
+            d64 r_mu = d_mul(ratio, d_sqrt(ratio));
+            if (d_finite(r_mu)) {
+                d64 denom = d_add(ONE, r_mu);
+                sat = d_finite(denom) ? d_div(r_mu, denom) : ONE;
+            } else {
+                sat = ONE;
+            }
+        } else {
+            d64 r_mu = 0ul;
+            if (d_pow_positive(ratio, mu, r_mu) && d_finite(r_mu)) {
+                d64 denom = d_add(ONE, r_mu);
+                sat = d_finite(denom) ? d_div(r_mu, denom) : ONE;
+            } else {
+                sat = !d_lt(ratio, ONE) ? ONE : 0ul;
+            }
+        }
+    }
+    d64 g = d_from_f32_bits(prev_bits);
+    d64 reinforce = d_mul(d_mul(alpha_v, sat), d_sub(ONE, g));
+    d64 prune = d_mul(gamma_v, d_sub(g, g_min));
+    d64 updated = d_add(g, d_mul(dt, d_sub(reinforce, prune)));
+    if (!d_finite(updated)) {
+        atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+        return prev_bits;
+    }
+    d64 clamped = d_min(d_max(updated, g_min), ONE);
+    return d_to_f32_bits(clamped);
+}
+
+// 4-neighbor flux-reinforced Murray / Physarum edge conductance update (`V2-14`):
+// one thread per cell updates both east (`next_x[cell]`) and north (`next_y[cell]`)
+// candidate edge conductances from pre-transport committed Carrier-0 energy `e_0`
+// (`field[0..cells]`), precomputed `edge_x`/`edge_y`, and committed `prev_x`/`prev_y`.
+// params: [0] width, [1] height, [2] cells, then binary64 word pairs (low first):
+//         [3] substeps, [5] dt, [7] g_min, [9] alpha_v, [11] gamma_v, [13] j0, [15] mu.
+kernel void vascular_update(
+    device const uint *field [[buffer(0)]],
+    device const uint *params [[buffer(1)]],
+    device const uint *edge_x [[buffer(2)]],
+    device const uint *edge_y [[buffer(3)]],
+    device const uint *prev_x [[buffer(4)]],
+    device const uint *prev_y [[buffer(5)]],
+    device uint *next_x [[buffer(6)]],
+    device uint *next_y [[buffer(7)]],
+    device atomic_uint *fault [[buffer(8)]],
+    uint cell [[thread_position_in_grid]])
+{
+    uint width = params[0], height = params[1], cells = params[2];
+    if (cell >= cells) {
+        return;
+    }
+    uint x = cell % width, y = cell / width;
+    uint east = x + 1u == width ? 0u : x + 1u;
+    uint north = y + 1u == height ? 0u : y + 1u;
+    uint ec_bits = field[cell];
+    uint ee_bits = field[y * width + east];
+    uint en_bits = field[north * width + x];
+    uint px_bits = prev_x[cell];
+    uint py_bits = prev_y[cell];
+    if (!(f32_finite(ec_bits) && f32_finite(ee_bits) && f32_finite(en_bits)
+          && f32_finite(px_bits) && f32_finite(py_bits))) {
+        atomic_fetch_or_explicit(fault, 1u, memory_order_relaxed);
+        return;
+    }
+    d64 substeps = d_word(params, 3u);
+    d64 dt = d_word(params, 5u);
+    d64 g_min = d_word(params, 7u);
+    d64 alpha_v = d_word(params, 9u);
+    d64 gamma_v = d_word(params, 11u);
+    d64 j0 = d_word(params, 13u);
+    d64 mu = d_word(params, 15u);
+
+    d64 ec = d_from_f32_bits(ec_bits);
+    d64 ee = d_from_f32_bits(ee_bits);
+    d64 en = d_from_f32_bits(en_bits);
+    d64 diff_x = d_sub(ec, ee) & ~D_SIGN;
+    d64 diff_y = d_sub(ec, en) & ~D_SIGN;
+    d64 flux_x = d_mul(d_mul(d_word(edge_x, 2u * cell), substeps), diff_x);
+    d64 flux_y = d_mul(d_mul(d_word(edge_y, 2u * cell), substeps), diff_y);
+    next_x[cell] = vascular_step(px_bits, flux_x, dt, g_min, alpha_v, gamma_v, j0, mu, fault);
+    next_y[cell] = vascular_step(py_bits, flux_y, dt, g_min, alpha_v, gamma_v, j0, mu, fault);
 }

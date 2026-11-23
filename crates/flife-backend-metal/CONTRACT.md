@@ -25,19 +25,27 @@ bit-identical to `flife_field::advance_field_on` (plan §8.1, §10.7, §11.1), i
 `flife_field::FieldBackend`. The device does the per-cell work in `field.metal` on `softfloat64.metal`'s binary64:
 every plane's substeps, every candidate cell's source weight (its `exp`) and every moment value's decay and
 deposits. The host does every sequential F64 sum through flife-field's own functions. The software binary64 moved
-from `controller.metal` into `softfloat64.metal`, which both kernels now share. `MetalField` also implements
-`FieldBackend::advance_v2` and `MetalField::transport_flux_range` for `V2-02` (`oases`: 77-word descriptors carrying
-per-source `(r_j², 2σ_j²)` and clean zero-power source skip on both fused and non-fused kernels) and `V2-09`
-(`tight-junctions`: `field_stencil_flux` evaluating `((1 - (r_w + r_e)) - (r_s + r_n))` in exact IEEE-754 order over a
-parameterized `plane_range`, reusable by `V2-14` and `V2-15`, allocating flux device buffers lazily so v1 uses 0 extra
-bytes).
+from `controller.metal` into `softfloat64.metal`, which both kernels now share. `MetalField` also implements:
+- `FieldBackend::advance_v2` and `MetalField::transport_flux_range` for `V2-02` (`oases`: 77-word descriptors
+  carrying per-source `(r_j², 2σ_j²)` and clean zero-power source skip on both fused and non-fused kernels) and
+  `V2-09` (`tight-junctions`: `field_stencil_flux` evaluating `((1 - (r_w + r_e)) - (r_s + r_n))` in exact IEEE-754
+  order over a parameterized `plane_range`, allocating flux device buffers lazily so v1 uses 0 extra bytes);
+- `FieldBackend::advance_wave2` for `V2-14` (`vascular-field`: `d_pow_positive` hoisted from `motion.metal` into
+  shared `numerics.metal`; `vascular_update` kernel reading pre-transport committed `e_0` + precomputed
+  `carrier0_edges` + committed `(prev_x, prev_y)` and writing C.8 cancel-safe candidate `(next_x, next_y)` with
+  `μ == 1.5` fast path `ratio * sqrt(ratio)`, general `μ > 0` via `d_pow_positive`, `ratio > 1e100 -> sat = 1.0`
+  overflow guard, substep-invariant `|F_e|`, and 0 B VRAM when disabled) and `V2-15` (`34-plane dual-carrier-trails`:
+  disjoint Carrier-0 `0..25` and Carrier-1 `25..34` substeps on uniform or flux stencils, `trail_decay` leaving `e_1`
+  undecayed for exact host `energy_report` and decaying planes `26..34`, `source_moments` parameterized by
+  `moment_channels = 32 | 24`, and lazy `TrailBuffers` using 0 B VRAM on 33-plane fields).
 
 FL-031, second part: phase 3's sensor pyramid and sampling on Metal, bit-identical to
-`flife_field::PyramidView::sample` (plan §6.1, §8.1, §10.7), in `sensors`. `MetalSensors` is a
-`flife_field::SensorBackend`. The device builds every coarse level of `positive-box-v1` and samples every
-organism's 33 planes, value and both derivatives, at its one or two levels, blended by `log-linear-v1`, in
-`sensors.metal` on the same `softfloat64.metal`. The host gives each query its level, weight and corner cells
-through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
+`flife_field::PyramidView::sample` and `PyramidView::sample_dual` (plan §6.1, §8.1, §10.7, `V2-15`), in `sensors`.
+`MetalSensors` is a `flife_field::SensorBackend`. The device builds every coarse level of `positive-box-v1` and
+samples every organism's 33 or 34 planes, value and both derivatives, at its one or two levels, blended by
+`log-linear-v1`, in `sensors.metal` on the same `softfloat64.metal`. `SensorBackend::sample` requires a 33-plane
+field and `SensorBackend::sample_dual` requires a 34-plane field; the host gives each query its level, weight and
+corner cells through flife-field's `SensorPyramid::blend` and `SensorPyramid::corners`.
 
 FL-031, last part: phase 5's demands and grants on Metal, bit-identical to `flife_field::demands` and
 `flife_field::resolve_uptake` (plan §5.2, §8.1, §10.7), in `uptake`. `MetalUptake` is a `flife_field::UptakeBackend`.
@@ -49,7 +57,10 @@ flife-field's `demands_on` and `resolve_uptake_on`, and refuses a cell whose qua
 FL-032 (`flife-kf8`), first stage: phase 6's chemistry on Metal, bit-identical to flife-engine's `composition`,
 `Chemistry::settle` and the budget's `credit` and `pay` (plan §5.3, §8.2, §10.7), in `chemistry`.
 `MetalChemistry::settle` takes plain data (the run's constants; each organism's affinity, budget and packet range;
-each packet's cell and grant), because a backend does not depend on the engine (§18.2).
+each packet's cell and grant), because a backend does not depend on the engine (§18.2). For `V2-15` 34-plane
+dual-carrier fields, `chemistry.metal` takes `active_channels = 24` (`32` on 33-plane), uploads only Carrier-0
+planes `0..25`, and zeroes `z[24..32]` so Carrier-1 trail planes `25..33` are never read into uptake chemistry while
+keeping the 32-component `Affinity` norm check unchanged.
 
 FL-032, second stage: phase 6's maintenance and motion on Metal, in `motion`. `MetalMotion::settle` runs what
 flife-engine's `settle_stages` runs after chemistry, from the exhaustion check after chemistry to the one after
@@ -109,29 +120,36 @@ contract). A later candidate, after the no-op check or the seal rejects the firs
 
 FL-032, seventh stage: phase 9 on Metal, in `reduce` (`reduce.metal`): the uptake grants' debit and the
 emission and recycling deposits' reductions into the tick's candidate field, bit for bit
-`flife_field::reduce_field_on` (plan §8.1, §11.1). `MetalField` implements the port's `reduce`, and a world
-given it as its field backend runs phase 9 there. flife-field's own `Grants::debit` and `Deposits::reduction`
-make every check and group each set's packets by (cell, identity) before anything is written. The host sends
-each debit that granted energy (cell, energy before and after, strictly ascending cells), each set's grouped
-packets (amount and deposit index) with its cell offsets, and its deposits' directions. One command then runs
-up to three kernels on a device copy of the field. `grants_debit` (a thread per debit) writes the energy and
-scales each moment by `after / before`, or zeroes a drained cell's. `deposits_reduce` (a thread per cell, once
-per set) sums the cell's amounts rounding down, its moment sums `Σ amount · component`, the energy rounded down
-to the F32 at or below `before + total`, what the cell received, and each moment raised by its sum times
-`received / total` when that is not zero, as `apply_deposits_on` does. Every value is binary64 on
-`softfloat64.metal`, and the field crosses as bits. The host reads back what each occupied cell received and
-sums it in cell order (`DepositReduction::summarize`). It then copies the device's field over the host's, and
-only then marks the grants and deposits applied. A non-finite value a kernel meets or would write raises the
-fault word (softfloat64 cannot carry an infinity), and nothing is written or applied (plan §8.3): the engine
-hands the reduction to the reference.
+`flife_field::reduce_field_on` and `flife_field::reduce_dual_carrier_field_on` (plan §8.1, §11.1, `V2-15`).
+`MetalField` implements both `FieldBackend::reduce` (33 or 34 planes, Carrier 0) and
+`FieldBackend::reduce_dual_carrier` (34-plane dual-carrier), and a world given it as its field backend runs phase 9
+there. flife-field's own `Grants::debit` and `Deposits::reduction` make every check and group each set's packets by
+(cell, identity) before anything is written. The host sends each debit that granted energy (cell, energy before and
+after, strictly ascending cells), each set's grouped packets (amount and deposit index) with its cell offsets, and
+its deposits' directions. One command then runs up to three kernels (four in dual-carrier mode, adding Carrier-1
+`trail_deposits`) on a device copy of the field. `grants_debit` (a thread per debit) writes Carrier-0 energy and
+scales only Carrier-0's moment planes (`32` on 33-plane, `24` on 34-plane) by `after / before`, or zeroes a drained
+cell's, leaving Carrier-1 planes `25..33` strictly untouched. `deposits_reduce` (a thread per cell, parameterized by
+`(energy_plane, first_moment_plane, moment_count)`) sums the cell's amounts rounding down, its moment sums
+`Σ amount · component`, the energy rounded down to the F32 at or below `before + total`, what the cell received, and
+each moment raised by its sum times `received / total` when that is not zero, as `apply_deposits_to_carrier_on` does.
+Carrier-1 staging buffers allocate lazily (`0 B` VRAM on 33-plane fields). Every value is binary64 on
+`softfloat64.metal`, and the field crosses as bits. The host reads back what each occupied cell received and sums it
+in cell order (`DepositReduction::summarize`). It then copies the device's field over the host's, and only then
+marks the grants and deposits applied. A non-finite value a kernel meets or would write raises the fault word
+(softfloat64 cannot carry an infinity), and nothing is written or applied (plan §8.3): the engine hands the
+reduction to the reference.
 
 FL-032, eighth stage: phase 10's field check on Metal, in `check` (`check.metal`): every cell's INV-01 and
-INV-02 check, bit for bit `FieldState::scan_invariants` (plan §4.2, §11.1's validation kernel). `MetalField`
-implements the port's `check`, and a world given it as its field backend checks each candidate field there.
-- The host uploads the field and the tolerance, and one command runs `field_check`.
+INV-02 check, bit for bit `FieldState::scan_invariants` (plan §4.2, §11.1's validation kernel, `V2-15` dual-carrier).
+`MetalField` implements the port's `check`, and a world given it as its field backend checks each candidate field
+there (33-plane single-carrier or 34-plane dual-carrier).
+- The host uploads the field (33 or 34 planes), tolerance, and dual-carrier flag, and one command runs `field_check`.
 - `field_check` uses a thread per cell and 256 per threadgroup. A cell fails when its energy is not finite or is
   below zero (`-0.0` is zero), when a moment is not finite, or when `max(0, sqrt(Σ m²) − e)` exceeds `absolute +
-  relative · e`; the squares are summed in channel order on `softfloat64.metal`'s binary64.
+  relative · e`; the squares are summed in channel order on `softfloat64.metal`'s binary64. In 34-plane dual-carrier
+  mode, Carrier 0 `(0, 1..25)` and Carrier 1 `(25, 26..34)` are checked independently and the cell's residual is
+  `max(r_0, r_1)`.
 - Each threadgroup reduces in a fixed tree to its smallest failing cell and its largest positive residual, ties
   going to the smaller cell. Both are associative, so the tree's shape changes nothing.
 - The host merges the threadgroups in cell order: the first failing cell, else the first cell with the largest

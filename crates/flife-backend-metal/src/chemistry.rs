@@ -38,7 +38,7 @@ pub const CHEMISTRY_MSL: &str = concat!(
 );
 
 /// `chemistry.metal`'s layouts, in words.
-const PARAMS: usize = 12;
+const PARAMS: usize = 13;
 const ORGANISM: usize = 2 * CHANNELS + 5;
 const PACKET: usize = 3;
 const OUTCOME: usize = 12;
@@ -232,6 +232,19 @@ impl MetalChemistry {
             return Ok(());
         }
         let cells = observed.energy().len();
+        let active_channels = observed.carrier0_moments_count();
+        let carrier0_len = cells
+            .checked_mul(1 + active_channels)
+            .ok_or_else(overflow)?;
+        if observed.as_slice().len() < carrier0_len {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "chemistry field",
+                detail: format!(
+                    "field holds {} values, expected at least {carrier0_len} for {active_channels} Carrier-0 channels",
+                    observed.as_slice().len()
+                ),
+            });
+        }
         let mut params = [0_u32; PARAMS];
         params[0] = word(cells)?;
         params[1] = word(organisms.len())?;
@@ -240,6 +253,7 @@ impl MetalChemistry {
         put(&mut params, 6, constants.threshold);
         put(&mut params, 8, constants.toxicity_sensitivity);
         put(&mut params, 10, constants.affinity_norm_limit);
+        params[12] = word(active_channels)?;
 
         let host = &mut self.host;
         host.clear();
@@ -294,7 +308,7 @@ impl MetalChemistry {
             host,
             ..
         } = self;
-        let planes = observed.as_slice();
+        let planes = &observed.as_slice()[..carrier0_len];
         if field.owned.is_none() || field.capacity < planes.len() {
             field.owned = None;
             field.owned = Some(owner.zeroed_owned(planes.len())?);

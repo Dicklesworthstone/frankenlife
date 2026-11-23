@@ -11,7 +11,6 @@
 // directly or through a coarse level, a NaN, and the host refuses that
 // sample as the reference refuses its own non-finite one.
 
-constant uint PLANES = 33u;
 constant d64 QUARTER = 0x3FD0000000000000ul;
 
 // A query's descriptor, in words: its lower level, whether it blends the
@@ -25,11 +24,11 @@ constant uint Q_HIGH = 10u;
 constant uint Q_T = 18u;
 // Within a level's part: x0, x1, y0, y1, fx (two words), fy (two words).
 
-// The sample parameters: queries, the field's cells per plane, the cell
-// area (two words), then per level from 0: cells along x, cells per plane,
-// its offset in the levels buffer in binary64 values, spacing x and y (two
-// words each).
-constant uint S_HEADER = 4u;
+// The sample parameters: [0] queries, [1] field cells per plane, [2..4] cell
+// area (two words), [4] planes (33 single-carrier or 34 dual-carrier V2-15),
+// then per level from 0: cells along x, cells per plane, its offset in the
+// levels buffer in binary64 values, spacing x and y (two words each).
+constant uint S_HEADER = 5u;
 constant uint S_LEVEL = 7u;
 
 static inline d64 d_word(device const uint *words, uint at) {
@@ -48,8 +47,8 @@ static inline d64 quarter_sum(d64 a, d64 b, d64 c, d64 d) {
 }
 
 // Level 1 from the field: each density is f64(u) / area.
-// params: field cells along x, level-1 cells along x, along y, field cells
-// per plane, area (two words).
+// params: [0] field cells along x, [1] level-1 cells along x, [2] along y,
+//         [3] field cells per plane, [4..6] area (two words), [6] planes.
 kernel void pyramid_first(
     device const uint *field [[buffer(0)]],
     device const uint *params [[buffer(1)]],
@@ -57,8 +56,9 @@ kernel void pyramid_first(
     uint id [[thread_position_in_grid]])
 {
     uint fine_x = params[0], coarse_x = params[1], coarse_y = params[2], cells = params[3];
+    uint planes = params[6];
     uint coarse = coarse_x * coarse_y;
-    if (id >= coarse * PLANES) {
+    if (id >= coarse * planes) {
         return;
     }
     uint plane = id / coarse, cell = id % coarse;
@@ -74,17 +74,18 @@ kernel void pyramid_first(
 }
 
 // Level l + 1 from level l, both in the levels buffer.
-// params: level-l cells along x, level-(l+1) cells along x, along y, level-l
-// cells per plane, level l's offset, level l+1's offset (in values).
+// params: [0] level-l cells along x, [1] level-(l+1) cells along x, [2] along y,
+//         [3] level-l cells per plane, [4] level l's offset, [5] level l+1's offset,
+//         [6] planes.
 kernel void pyramid_next(
     device const uint *params [[buffer(0)]],
     device uint *levels [[buffer(1)]],
     uint id [[thread_position_in_grid]])
 {
     uint fine_x = params[0], coarse_x = params[1], coarse_y = params[2], cells = params[3];
-    uint from = params[4], to = params[5];
+    uint from = params[4], to = params[5], planes = params[6];
     uint coarse = coarse_x * coarse_y;
-    if (id >= coarse * PLANES) {
+    if (id >= coarse * planes) {
         return;
     }
     uint plane = id / coarse, cell = id % coarse;
@@ -132,9 +133,9 @@ static void sample_level(
     dy = d_div(d_add(up_left, d_mul(fx, d_sub(up_right, up_left))), d_word(at, 5u));
 }
 
-// `PyramidView::sample`: one query's plane at its lower level, blended with
-// the next level's by t where t is not zero. Each query's samples are its
-// 33 values, then 33 x-derivatives, then 33 y-derivatives.
+// `PyramidView::sample` / `sample_dual`: one query's plane at its lower level,
+// blended with the next level's by t where t is not zero. Each query's samples
+// are its `planes` values, then `planes` x-derivatives, then `planes` y-derivatives.
 kernel void sensor_sample(
     device const uint *field [[buffer(0)]],
     device const uint *levels [[buffer(1)]],
@@ -144,10 +145,11 @@ kernel void sensor_sample(
     uint id [[thread_position_in_grid]])
 {
     uint count = params[0];
-    if (id >= count * PLANES) {
+    uint planes = params[4];
+    if (id >= count * planes) {
         return;
     }
-    uint index = id / PLANES, plane = id % PLANES;
+    uint index = id / planes, plane = id % planes;
     device const uint *query = queries + index * QUERY;
     uint level = query[Q_LEVEL];
     d64 value, dx, dy;
@@ -161,8 +163,8 @@ kernel void sensor_sample(
         dx = d_add(dx, d_mul(t, d_sub(high_dx, dx)));
         dy = d_add(dy, d_mul(t, d_sub(high_dy, dy)));
     }
-    uint base = 2u * (index * 3u * PLANES + plane);
+    uint base = 2u * (index * 3u * planes + plane);
     d_store(samples, base, value);
-    d_store(samples, base + 2u * PLANES, dx);
-    d_store(samples, base + 4u * PLANES, dy);
+    d_store(samples, base + 2u * planes, dx);
+    d_store(samples, base + 4u * planes, dy);
 }

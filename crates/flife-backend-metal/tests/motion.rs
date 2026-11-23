@@ -1250,7 +1250,9 @@ fn metal_v2_senescence_and_so2_motor_bit_exact_and_so2_equivariant() -> Result<(
             basal_multiplier,
             motor,
         };
-        if let Ok(outcome) = reference_v2(&rules, Some(&motor_constants), &org, &extra) {
+        if reference(&rules, &org).is_ok()
+            && let Ok(outcome) = reference_v2(&rules, Some(&motor_constants), &org, &extra)
+        {
             organisms.push(org);
             extras.push(extra);
             want.push(outcome);

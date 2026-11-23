@@ -114,27 +114,6 @@ static bool clamp_radius(thread d64 &x, thread d64 &y, d64 limit) {
     }
 }
 
-// numerics::pow_positive for finite positive base and finite exponent:
-// exact on exponent == 0, base == 1, exponent == 1; otherwise exp(exponent * ln(base)).
-static bool d_pow_positive(d64 base, d64 exponent, thread d64 &value) {
-    if (!d_finite(base) || !d_lt(0ul, base) || !d_finite(exponent)) {
-        return false;
-    }
-    if ((exponent << 1) == 0ul || base == ONE) {
-        value = ONE;
-        return true;
-    }
-    if (exponent == ONE) {
-        value = base;
-        return true;
-    }
-    d64 scaled = d_mul(exponent, d_ln(base));
-    if (!d_finite(scaled)) {
-        return false;
-    }
-    return exp_signed(scaled, value);
-}
-
 kernel void motion_settle(
     device const uint *params [[buffer(0)]],
     device const uint *organisms [[buffer(1)]],

@@ -45,9 +45,12 @@ static uint round_down_f32(d64 value) {
 }
 
 // Each debit that granted energy, one thread each: its cell's energy
-// becomes `after`, and each moment `m` becomes `(m * (after / before)) as
-// f32`, or zero when `after` is zero. The host sends the debits in strictly
-// ascending cell order, so no two threads share a cell.
+// becomes `after`, and each of its `moment_count` Carrier-0 moments (`32`
+// single-carrier, `24` dual-carrier V2-15 — leaving Carrier-1 planes 25..33
+// bit-for-bit untouched!) becomes `(m * (after / before)) as f32`, or zero
+// when `after` is zero. The host sends the debits in strictly ascending cell
+// order, so no two threads share a cell.
+// params: [0] count, [1] cells, [2] carrier0_moments.
 kernel void grants_debit(
     device uint *field [[buffer(0)]],
     device const uint *debits [[buffer(1)]],
@@ -57,26 +60,27 @@ kernel void grants_debit(
 {
     uint count = params[0];
     uint cells = params[1];
+    uint moment_count = params[2];
     if (index >= count) {
         return;
     }
     uint cell = debits[index * DEBIT];
     uint before = debits[index * DEBIT + 1u];
     uint after = debits[index * DEBIT + 2u];
-    if (cell >= cells || !f32_finite(before) || !f32_finite(after)) {
+    if (cell >= cells || moment_count > MOMENTS || !f32_finite(before) || !f32_finite(after)) {
         atomic_store_explicit(fault, 1u, memory_order_relaxed);
         return;
     }
     field[cell] = after;
-    // A drained cell's moments become zero whatever they held.
+    // A drained cell's Carrier-0 moments become zero whatever they held.
     if ((after << 1) == 0u) {
-        for (uint channel = 0u; channel < MOMENTS; ++channel) {
+        for (uint channel = 0u; channel < moment_count; ++channel) {
             field[(channel + 1u) * cells + cell] = 0u;
         }
         return;
     }
     d64 ratio = d_div(d_from_f32_bits(after), d_from_f32_bits(before));
-    for (uint channel = 0u; channel < MOMENTS; ++channel) {
+    for (uint channel = 0u; channel < moment_count; ++channel) {
         uint at = (channel + 1u) * cells + cell;
         uint moment = field[at];
         if (!f32_finite(moment)) {
@@ -93,12 +97,12 @@ kernel void grants_debit(
 }
 
 // Each cell, one thread each: its packets, in (cell, identity) order, are
-// `offsets[cell]..offsets[cell + 1]`. Their amounts are summed rounding
-// down, and each moment sum is `Σ amount * component`. The energy becomes
-// the F32 at or below `before + total` (rounded down), what the cell
-// received is that less `before`, and each moment rises by its sum times
-// `received / total` when that product is not zero. A cell with packets
-// writes what it received to `received`.
+// `offsets[cell]..offsets[cell + 1]`, reduced onto the declared carrier
+// `(energy_plane, first_moment_plane, moment_count)` — `(0, 1, 32)` on
+// 33-plane single-carrier, `(0, 1, 24)` for Carrier 0 or `(25, 26, 8)` for
+// Carrier 1 on 34-plane dual-carrier (`V2-15`). Leaves all other planes
+// untouched.
+// params: [0] cells, [1] deposits, [2] energy_plane, [3] first_moment_plane, [4] moment_count.
 kernel void deposits_reduce(
     device uint *field [[buffer(0)]],
     device const uint *offsets [[buffer(1)]],
@@ -111,7 +115,14 @@ kernel void deposits_reduce(
 {
     uint cells = params[0];
     uint deposits = params[1];
+    uint energy_plane = params[2];
+    uint first_moment_plane = params[3];
+    uint moment_count = params[4];
     if (cell >= cells) {
+        return;
+    }
+    if (moment_count > MOMENTS) {
+        atomic_store_explicit(fault, 1u, memory_order_relaxed);
         return;
     }
     uint first = offsets[cell];
@@ -120,14 +131,15 @@ kernel void deposits_reduce(
         r_store(received, 2u * cell, 0ul);
         return;
     }
-    uint before_bits = field[cell];
+    uint energy_at = energy_plane * cells + cell;
+    uint before_bits = field[energy_at];
     if (!f32_finite(before_bits)) {
         atomic_store_explicit(fault, 1u, memory_order_relaxed);
         return;
     }
     d64 total = 0ul;
     d64 moment[MOMENTS];
-    for (uint channel = 0u; channel < MOMENTS; ++channel) {
+    for (uint channel = 0u; channel < moment_count; ++channel) {
         moment[channel] = 0ul;
     }
     for (uint at = first; at < end; ++at) {
@@ -138,7 +150,7 @@ kernel void deposits_reduce(
             return;
         }
         total = d_add_down(total, amount);
-        for (uint channel = 0u; channel < MOMENTS; ++channel) {
+        for (uint channel = 0u; channel < moment_count; ++channel) {
             d64 component = r_load(directions, deposit * DIRECTION + 2u * channel);
             moment[channel] = d_add(moment[channel], d_mul(amount, component));
         }
@@ -151,8 +163,8 @@ kernel void deposits_reduce(
         atomic_store_explicit(fault, 1u, memory_order_relaxed);
         return;
     }
-    for (uint channel = 0u; channel < MOMENTS; ++channel) {
-        uint at = (channel + 1u) * cells + cell;
+    for (uint channel = 0u; channel < moment_count; ++channel) {
+        uint at = (first_moment_plane + channel) * cells + cell;
         uint value = field[at];
         if (!f32_finite(value) || !d_finite(moment[channel])) {
             atomic_store_explicit(fault, 1u, memory_order_relaxed);
@@ -168,6 +180,6 @@ kernel void deposits_reduce(
             field[at] = raised;
         }
     }
-    field[cell] = after_bits;
+    field[energy_at] = after_bits;
     r_store(received, 2u * cell, gained);
 }

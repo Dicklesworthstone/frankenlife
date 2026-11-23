@@ -517,6 +517,7 @@ fn v2_validated_configs_resolve_sensor_action_layouts_and_topology() {
     let mut v1_rec = starter_config();
     v1_rec.controller.family = INDEPENDENT_RECURRENT_MLP_V1.to_owned();
     v1_rec.controller.recurrent_state_width = Some(4);
+    v1_rec.architecture_mutation.catalog = "recurrent-104-36-catalog-v1".to_owned();
     let v1_rec = validate(v1_rec).expect("v1 recurrent validates");
     check(&v1_rec, 104, 4, 36);
 

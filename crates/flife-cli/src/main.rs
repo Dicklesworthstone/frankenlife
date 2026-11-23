@@ -567,25 +567,26 @@ struct ErrorRecord<'a> {
 
 /// Extract `--disable`, `--enable`, and `--v1-compat` in exact command-line
 /// order so chains like `--disable all-v2 --enable so2-motor` apply cleanly.
+/// Returns an empty list on subcommands that do not define feature flags.
 fn ordered_overrides(matches: &clap::ArgMatches) -> Vec<FeatureOverride> {
     let mut entries: Vec<(usize, FeatureOverride)> = Vec::new();
-    if let (Some(indices), Some(values)) = (
-        matches.indices_of("disable"),
-        matches.get_many::<String>("disable"),
-    ) {
+    if let Ok(Some(values)) = matches.try_get_many::<String>("disable")
+        && let Some(indices) = matches.indices_of("disable")
+    {
         for (idx, value) in indices.zip(values) {
             entries.push((idx, FeatureOverride::Disable(value.clone())));
         }
     }
-    if let (Some(indices), Some(values)) = (
-        matches.indices_of("enable"),
-        matches.get_many::<String>("enable"),
-    ) {
+    if let Ok(Some(values)) = matches.try_get_many::<String>("enable")
+        && let Some(indices) = matches.indices_of("enable")
+    {
         for (idx, value) in indices.zip(values) {
             entries.push((idx, FeatureOverride::Enable(value.clone())));
         }
     }
-    if matches.value_source("v1_compat") == Some(clap::parser::ValueSource::CommandLine)
+    if let Ok(Some(&count)) = matches.try_get_one::<u8>("v1_compat")
+        && count > 0
+        && matches.value_source("v1_compat") == Some(clap::parser::ValueSource::CommandLine)
         && let Some(indices) = matches.indices_of("v1_compat")
     {
         for idx in indices {
@@ -1175,4 +1176,100 @@ fn fail(kind: &str, detail: String) -> ExitCode {
         let _ = writeln!(std::io::stderr().lock(), "{line}");
     }
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_overrides(argv: &[&str]) -> Vec<FeatureOverride> {
+        let matches = Cli::command()
+            .try_get_matches_from(argv)
+            .expect("valid CLI invocation");
+        matches
+            .subcommand()
+            .map_or_else(Vec::new, |(_, sub)| ordered_overrides(sub))
+    }
+
+    #[test]
+    fn ordered_overrides_never_panics_on_any_subcommand() {
+        for argv in [
+            &["flife", "inspect", "run_dir"][..],
+            &["flife", "branch", "parent", "child"][..],
+            &["flife", "analyze", "exp_a", "exp_b"][..],
+            &["flife", "discover", "run_dir", "out_dir"][..],
+            &["flife", "validate", "config.toml"][..],
+            &["flife", "capabilities"][..],
+            &["flife", "run", "config.toml"][..],
+            &["flife", "resume", "run_dir", "--until", "10"][..],
+            &["flife", "step", "run_dir"][..],
+            &["flife", "experiment", "spec.toml", "--out", "out_dir"][..],
+            &[
+                "flife",
+                "transplant",
+                "pkg",
+                "run_dir",
+                "--config",
+                "host.toml",
+                "--at",
+                "1,2",
+            ][..],
+            &["flife", "render", "config.toml", "--out", "frames"][..],
+        ] {
+            assert!(
+                parse_overrides(argv).is_empty(),
+                "expected empty overrides for {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_overrides_preserves_interleaved_cli_order() {
+        assert_eq!(
+            parse_overrides(&[
+                "flife",
+                "validate",
+                "v2.toml",
+                "--disable",
+                "all-v2",
+                "--enable",
+                "oases",
+            ]),
+            vec![
+                FeatureOverride::Disable("all-v2".to_owned()),
+                FeatureOverride::Enable("oases".to_owned()),
+            ]
+        );
+        assert_eq!(
+            parse_overrides(&[
+                "flife",
+                "run",
+                "v2.toml",
+                "--v1-compat",
+                "--enable",
+                "oases",
+                "--disable",
+                "oases",
+            ]),
+            vec![
+                FeatureOverride::V1Compat,
+                FeatureOverride::Enable("oases".to_owned()),
+                FeatureOverride::Disable("oases".to_owned()),
+            ]
+        );
+        assert_eq!(
+            parse_overrides(&[
+                "flife",
+                "validate",
+                "v2.toml",
+                "--enable",
+                "oases",
+                "--v1-compat"
+            ]),
+            vec![
+                FeatureOverride::Enable("oases".to_owned()),
+                FeatureOverride::V1Compat,
+            ]
+        );
+    }
 }

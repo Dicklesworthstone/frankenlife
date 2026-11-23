@@ -1377,3 +1377,87 @@ fn close_during_first_held_step_prevents_second_held_step_from_publishing() {
         assert_eq!(closed.boundary.tick, Tick::new(0), "seed {seed}");
     }
 }
+
+/// Regression: when `Control::Step` is handled inside `SessionOwner::run`'s
+/// `control.try_recv()` loop and a second control message (`Inspect`) arrives
+/// during `tick()`'s cancellation boundary, `tick()` moves that control
+/// message into `self.deferred`. The owner must drain `self.deferred` instead
+/// of parking in `next_inbound()` with the client stranded forever.
+#[test]
+fn control_arriving_during_step_cancellation_boundary_is_not_stranded_in_deferred() {
+    let config = ecology(&[
+        ("execution", "control_queue_capacity", "4"),
+        ("population", "initial_count", "8"),
+    ]);
+    for seed in 1..=8 {
+        let (results, closed) = lab(seed, &config, |handle| {
+            vec![Box::pin(async move {
+                let cx = cx();
+                for _ in 0..4 {
+                    yield_now().await;
+                }
+                // Queue `Inspect` and `Step` together while the owner is
+                // parked in `next_inbound`: the owner handles `Inspect` from
+                // `next_inbound`, then pops `Step` in `control.try_recv()`
+                // and yields at `Step`'s cancellation boundary.
+                let mut inspect_1 = std::pin::pin!(handle.inspect(&cx));
+                let mut step_1 = std::pin::pin!(handle.step(&cx));
+                let mut inspected_1 = None;
+                let mut stepped_1 = None;
+                std::future::poll_fn(|context| {
+                    if inspected_1.is_none()
+                        && let Poll::Ready(v) = inspect_1.as_mut().poll(context)
+                    {
+                        inspected_1 = Some(v);
+                    }
+                    if stepped_1.is_none()
+                        && let Poll::Ready(v) = step_1.as_mut().poll(context)
+                    {
+                        stepped_1 = Some(v);
+                    }
+                    if inspected_1.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert_eq!(
+                    inspected_1.expect("inspect_1").expect("ok").boundary.tick,
+                    Tick::new(0)
+                );
+
+                // Submit `inspect_2` while `step_1` is at its cancellation
+                // boundary so `tick()` moves `inspect_2` into `self.deferred`.
+                let mut inspect_2 = std::pin::pin!(handle.inspect(&cx));
+                let mut inspected_2 = None;
+                std::future::poll_fn(|context| {
+                    if inspected_2.is_none()
+                        && let Poll::Ready(v) = inspect_2.as_mut().poll(context)
+                    {
+                        inspected_2 = Some(v);
+                    }
+                    if stepped_1.is_none()
+                        && let Poll::Ready(v) = step_1.as_mut().poll(context)
+                    {
+                        stepped_1 = Some(v);
+                    }
+                    if inspected_2.is_some() && stepped_1.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                let step = stepped_1.expect("step_1").expect("stepped");
+                let (step_boundary, _, _) = published(&step);
+                assert_eq!(step_boundary.tick, Tick::new(1));
+                let after = inspected_2.expect("inspect_2").expect("ok");
+                assert_eq!(after.boundary.tick, Tick::new(1));
+                handle.close(&cx).await.expect("closed")
+            }) as Client<Boundary>]
+        });
+        assert_eq!(results[0].tick, Tick::new(1), "seed {seed}");
+        assert_eq!(closed.boundary.tick, Tick::new(1), "seed {seed}");
+    }
+}

@@ -29,7 +29,7 @@ use std::time::Duration;
 use asupersync::Cx;
 use asupersync::runtime::{RuntimeBuilder, yield_now};
 use flife_core::canonical::Sha256Digest;
-use flife_core::ids::{CommandId, SessionId};
+use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::{CoreError, Tick, ValidatedConfig};
 use flife_engine::{Arrangement, Intervention, NumericalProfile, Stepped, World};
 use flife_runtime::journal::block_on_inline;
@@ -2037,4 +2037,66 @@ fn held_step_wakes_when_control_consumes_final_journal_receipt() {
         closed.world.digest(),
         reference(&config, 1, &[(0, inject([5, 5], 6.0))]).digest()
     );
+}
+
+/// Regression: dropping `CommandJournal` must run FrankenSQLite's clean close
+/// and WAL checkpoint (`Connection::close_in_place`), so copying the main
+/// `catalog.db` file alone (without `-wal` / `-shm` sidecars) preserves every
+/// committed run, acceptance, outcome, and checkpoint index row.
+#[test]
+fn dropping_command_journal_checkpoints_wal_cleanly() {
+    let dir = fresh("drop-wal-checkpoint");
+    let path = dir.join("catalog.db");
+    let config = ecology();
+    let revision = config.config_hash();
+    let cmd = command(1, at(3), inject([5, 5], 6.0));
+    let acceptance = Accepted {
+        order: 0,
+        effective: Tick::new(3),
+        retargeted: false,
+        durability: flife_runtime::Durability::WriteAhead,
+    };
+    let outcome = Outcome::Applied {
+        tick: Tick::new(3),
+        published: Tick::new(4),
+        epoch: ResourceEpoch::new(4),
+        applied: 6.0,
+        cursor: 0,
+    };
+    let indexed = IndexedCheckpoint {
+        sequence: 1,
+        tick: Tick::new(4),
+        epoch: ResourceEpoch::new(4),
+        digest: Sha256Digest::of(b"checkpoint-4"),
+    };
+    {
+        let mut journal = CommandJournal::open(&path).expect("creates");
+        let existing = journal.open_run(SESSION, revision).expect("opens run");
+        assert!(existing.accepted.is_empty());
+        assert!(existing.outcomes.is_empty());
+        journal
+            .append(&JournalRecord::Accepted {
+                command: cmd,
+                accepted: acceptance,
+            })
+            .expect("appends acceptance");
+        journal
+            .append(&JournalRecord::Ended {
+                id: cmd.id,
+                outcome: outcome.clone(),
+            })
+            .expect("appends outcome");
+        journal
+            .index_checkpoint(indexed.clone())
+            .expect("indexes checkpoint");
+    }
+
+    let standalone = dir.join("standalone.db");
+    fs::copy(&path, &standalone).expect("copies main db file");
+    let mut reopened = CommandJournal::open(&standalone).expect("reopens standalone copy");
+    assert_eq!(reopened.runs().expect("runs"), vec![(SESSION, revision)]);
+    let contents = reopened.open_run(SESSION, revision).expect("opens run");
+    assert_eq!(contents.accepted, vec![(cmd, acceptance)]);
+    assert_eq!(contents.outcomes, vec![(cmd.id, outcome)]);
+    assert_eq!(reopened.checkpoints().expect("checkpoints"), vec![indexed]);
 }

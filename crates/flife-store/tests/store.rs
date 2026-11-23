@@ -22,7 +22,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
-use flife_core::checkpoint::{CheckpointManifest, CheckpointReader, ChunkFamily, ChunkSink};
+use flife_core::checkpoint::{
+    CheckpointManifest, CheckpointReader, CheckpointWriter, ChunkFamily, ChunkSink,
+};
 use flife_core::ids::SessionId;
 use flife_core::{CoreError, Sha256Digest, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
@@ -1580,4 +1582,158 @@ fn retention_by_verification_decides_as_retention_by_restoring() {
             assert_eq!(chunk_files(&intact_root), chunk_files(&decode_root));
         }
     }
+}
+
+/// Regression: `Stream::end` must verify the written temporary file's length
+/// before checking whether the target digest is already stored intact, so a
+/// mismatched length cannot silently succeed as `ChunkShared`.
+#[test]
+fn stream_end_refuses_length_mismatch_even_when_chunk_is_already_shared() {
+    let config = ecology();
+    let (a_world, a_book) = world_at(&config, 4);
+    let whole = checkpoint(&a_world, &a_book).expect("checkpoints");
+    let manifest = CheckpointManifest::parse(&whole).expect("parses");
+    let first = &manifest.entries()[0];
+    assert!(first.length > 1, "first chunk must be non-trivial");
+
+    let root = fresh("stream-shared-length-check");
+    let mut store = open_store(&root, Durability::ProcessCrash).expect("creates");
+    store.publish(&whole).expect("publishes initial");
+
+    let start = manifest.sealed_length() + usize::try_from(first.offset).expect("fits");
+    let mut stream = store.stream().expect("streams");
+    stream.begin(0, first.family).expect("begins");
+    stream
+        .page(&whole[start..start + 1])
+        .expect("writes truncated page");
+    let refused = stream.end(first.length, first.digest);
+    assert!(
+        matches!(refused, Err(CoreError::StateConflict { .. })),
+        "truncated write against shared digest must be refused, got {refused:?}"
+    );
+    drop(stream);
+    assert_eq!(temporaries(&root), 0);
+    assert_eq!(store.load(1).expect("original intact"), whole);
+}
+
+/// V2 compatibility: `ChunkStore` publish, stream/commit, load,
+/// `load_streaming`, `verify`, and `retain_intact` handle `field-ecology-v2`
+/// model identifiers and V2-sized 34-plane dual-carrier + vascular field blobs
+/// with zero hardcoded 33-plane or v1 model-name assumptions.
+#[test]
+fn v2_model_checkpoint_and_stream_round_trip() {
+    // 34 planes × 16×16 f32 (34_816 B) + 2 vascular edge arrays × 16×16 f32 (2_048 B)
+    let field_blob: Vec<u8> = (0..(34 * 256 * 4 + 2 * 256 * 4))
+        .map(|i| u8::try_from((i * 31 + 7) & 0xff).expect("byte"))
+        .collect();
+    let config_blob =
+        b"model = \"field-ecology-v2\"\nfeatures = [\"vascular-field\", \"dual-carrier-trails\"]\n"
+            .to_vec();
+    let genomes_blob: Vec<u8> = (0..(64 * 1024 + 137))
+        .map(|i| u8::try_from((i * 17 + 3) & 0xff).expect("byte"))
+        .collect();
+
+    let mut writer = CheckpointWriter::new("field-ecology-v2");
+    writer
+        .chunk(ChunkFamily::Configuration, 2, 1, config_blob.clone(), &[])
+        .expect("config");
+    writer
+        .chunk(
+            ChunkFamily::Field,
+            3,
+            256,
+            field_blob.clone(),
+            &[ChunkFamily::Configuration],
+        )
+        .expect("field");
+    writer
+        .chunk(
+            ChunkFamily::Genomes,
+            2,
+            32,
+            genomes_blob.clone(),
+            &[ChunkFamily::Configuration],
+        )
+        .expect("genomes");
+    let whole = writer.finish().expect("finishes");
+
+    let root = fresh("v2-model-round-trip");
+    let mut store = open_store(&root, Durability::PowerLoss).expect("creates");
+    let pub_whole = store.publish(&whole).expect("publishes whole");
+
+    let mut stream = store.stream().expect("streams");
+    let mut streaming = CheckpointWriter::streaming("field-ecology-v2", &mut stream);
+    streaming
+        .chunk(ChunkFamily::Configuration, 2, 1, config_blob, &[])
+        .expect("config");
+    streaming
+        .chunk(
+            ChunkFamily::Field,
+            3,
+            256,
+            field_blob.clone(),
+            &[ChunkFamily::Configuration],
+        )
+        .expect("field");
+    streaming
+        .chunk(
+            ChunkFamily::Genomes,
+            2,
+            32,
+            genomes_blob.clone(),
+            &[ChunkFamily::Configuration],
+        )
+        .expect("genomes");
+    let sealed = streaming.seal().expect("seals");
+    let pub_stream = store.commit(stream, &sealed).expect("commits stream");
+    assert_eq!(pub_stream.shared, 3, "all three V2 chunks deduplicated");
+
+    assert_eq!(store.load(pub_whole.sequence).expect("loads whole"), whole);
+    assert_eq!(
+        store.load(pub_stream.sequence).expect("loads streamed"),
+        whole
+    );
+    assert_eq!(
+        store.verify(pub_stream.sequence).expect("verifies"),
+        Sha256Digest::of(&whole)
+    );
+
+    let (held, source) = store
+        .load_streaming(pub_stream.sequence, ChunkFamily::Genomes)
+        .expect("loads streaming");
+    let reader = CheckpointReader::parse_streamed(
+        &held,
+        &[
+            ChunkFamily::Configuration,
+            ChunkFamily::Field,
+            ChunkFamily::Genomes,
+        ],
+        ChunkFamily::Genomes,
+        source.map(|file| Box::new(file) as Box<dyn Read>),
+    )
+    .expect("parses streamed");
+    assert_eq!(reader.model(), "field-ecology-v2");
+    assert_eq!(
+        reader.chunk(ChunkFamily::Field).expect("field chunk").bytes,
+        field_blob.as_slice()
+    );
+    let mut streamed_genomes = Vec::new();
+    let mut genome_stream = reader
+        .stream(ChunkFamily::Genomes, 2)
+        .expect("streams genomes");
+    while genome_stream.remaining() > 0 {
+        genome_stream.fill(4096).expect("fills genome window");
+        let n = genome_stream.window().len();
+        streamed_genomes.extend_from_slice(genome_stream.window());
+        genome_stream.advance(n);
+    }
+    genome_stream
+        .finish()
+        .expect("verifies streamed genome digest");
+    assert_eq!(streamed_genomes, genomes_blob);
+
+    let retained = store.retain_intact(1).expect("retains intact");
+    assert_eq!(retained.valid, vec![pub_stream.sequence]);
+    assert_eq!(retained.removed, vec![pub_whole.sequence]);
+    assert_eq!(temporaries(&root), 0);
 }

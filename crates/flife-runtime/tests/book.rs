@@ -7,14 +7,14 @@
 mod common;
 
 use common::{SESSION, advance, at, command, ecology, found, inject, publish, reference};
-use flife_core::Tick;
 use flife_core::canonical::Sha256Digest;
-use flife_core::ids::{CommandId, SessionId};
+use flife_core::ids::{CommandId, ResourceEpoch, SessionId};
 use flife_core::ledger::Flow;
+use flife_core::{CoreError, Tick};
 use flife_engine::Intervention;
 use flife_runtime::{
-    Admission, CancelReason, Cancellation, CommandBook, CommandStatus, Durability, Outcome,
-    Rejection, Target,
+    Accepted, Admission, CancelReason, Cancellation, CommandBook, CommandStatus, Durability,
+    JournalContents, Outcome, Rejection, Target,
 };
 
 fn book(capacity: usize) -> CommandBook {
@@ -509,4 +509,138 @@ fn admission_refusals_and_closing() {
         stopped.status(CommandId::new(5)),
         Some(CommandStatus::Terminal(Outcome::Failed { cursor: 0, .. }))
     ));
+}
+
+/// Regression: `CommandBook::recover` must leave the book untouched when any
+/// later acceptance or outcome conflicts, and must refuse duplicate or
+/// already-terminal outcomes in the journal's replay tail.
+#[test]
+fn recover_is_atomic_on_conflict_and_rejects_duplicate_or_already_terminal_outcomes() {
+    let config = ecology(&[]);
+    let mut world = found(&config);
+    let grid = *world.field().grid();
+    let mut book = book(8);
+    let first = command(1, at(0), inject(CELL, 1.0));
+    accepted(&book.admit(first, world.tick(), &grid, false));
+    advance(&mut world, &mut book);
+    assert_eq!(world.tick(), Tick::new(1));
+    assert_eq!(book.admitted(), 1);
+    assert_eq!(book.outcome_cursor(), 1);
+    let Some((first_id, first_outcome)) = book.outcome_at(0) else {
+        panic!("first outcome recorded");
+    };
+    let first_outcome = first_outcome.clone();
+    let first_accepted = book.accepted(first_id).expect("first acceptance");
+
+    let second = command(2, at(3), inject(CELL, 2.0));
+    let second_accepted = Accepted {
+        order: 1,
+        effective: Tick::new(3),
+        retargeted: false,
+        durability: Durability::WriteAhead,
+    };
+    let late_third = command(3, at(0), inject(CELL, 3.0));
+    let late_third_accepted = Accepted {
+        order: 2,
+        effective: Tick::new(0),
+        retargeted: false,
+        durability: Durability::WriteAhead,
+    };
+
+    // Case 1: valid acceptance #1 followed by late acceptance #2 must fail
+    // atomically without adding #1 to the book.
+    let partial_fail = JournalContents {
+        accepted: vec![
+            (first, first_accepted),
+            (second, second_accepted),
+            (late_third, late_third_accepted),
+        ],
+        outcomes: vec![(first_id, first_outcome.clone())],
+    };
+    let err = book
+        .recover(&partial_fail, world.tick())
+        .expect_err("late acceptance rejected");
+    assert!(matches!(err, CoreError::StateConflict { .. }), "{err:?}");
+    assert_eq!(book.admitted(), 1, "book must not be partially mutated");
+    assert_eq!(book.status(second.id), None);
+    assert_eq!(book.unfinished(), 0);
+
+    // Case 2: journal appends a second outcome for already-terminal `first`.
+    let already_terminal = JournalContents {
+        accepted: vec![(first, first_accepted), (second, second_accepted)],
+        outcomes: vec![
+            (first_id, first_outcome.clone()),
+            (
+                first_id,
+                Outcome::Cancelled {
+                    boundary: Tick::new(2),
+                    reason: CancelReason::Requested,
+                    cursor: 1,
+                },
+            ),
+        ],
+    };
+    let err = book
+        .recover(&already_terminal, world.tick())
+        .expect_err("outcome for already-terminal command rejected");
+    assert!(matches!(err, CoreError::StateConflict { .. }), "{err:?}");
+    assert_eq!(
+        book.admitted(),
+        1,
+        "book stays untouched on outcome conflict"
+    );
+    assert_eq!(book.status(second.id), None);
+
+    // Case 3: journal repeats two replay outcomes for the same pending `second`.
+    let duplicate_replay = JournalContents {
+        accepted: vec![(first, first_accepted), (second, second_accepted)],
+        outcomes: vec![
+            (first_id, first_outcome.clone()),
+            (
+                second.id,
+                Outcome::Applied {
+                    tick: Tick::new(3),
+                    published: Tick::new(4),
+                    epoch: ResourceEpoch::new(4),
+                    applied: 2.0,
+                    cursor: 1,
+                },
+            ),
+            (
+                second.id,
+                Outcome::Cancelled {
+                    boundary: Tick::new(4),
+                    reason: CancelReason::Requested,
+                    cursor: 2,
+                },
+            ),
+        ],
+    };
+    let err = book
+        .recover(&duplicate_replay, world.tick())
+        .expect_err("duplicate replay outcome rejected");
+    assert!(matches!(err, CoreError::StateConflict { .. }), "{err:?}");
+    assert_eq!(book.admitted(), 1);
+    assert_eq!(book.status(second.id), None);
+
+    // Valid recovery after prior refusals succeeds cleanly.
+    let valid = JournalContents {
+        accepted: vec![(first, first_accepted), (second, second_accepted)],
+        outcomes: vec![
+            (first_id, first_outcome),
+            (
+                second.id,
+                Outcome::Cancelled {
+                    boundary: Tick::new(2),
+                    reason: CancelReason::Requested,
+                    cursor: 1,
+                },
+            ),
+        ],
+    };
+    let replay = book.recover(&valid, world.tick()).expect("valid recovery");
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].0, second.id);
+    assert_eq!(book.admitted(), 2);
+    assert_eq!(book.status(second.id), Some(&CommandStatus::Pending));
 }

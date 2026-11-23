@@ -205,9 +205,9 @@ static float activation(float z, thread uint &fallbacks) {
 // ---------------------------------------------------------------------------
 // Kernels.
 
-constant uint SENSORS = 104;
-constant uint ACTIONS = 36;
 constant uint WIDEST = 128;
+constant uint MAX_INPUTS = 128;
+constant uint MAX_OUTPUTS = 80;
 
 // The organism's word in `faults`: a pre-activation or output that is not
 // finite, or arithmetic near the subnormal range.
@@ -233,10 +233,12 @@ constant uint HALF_TINY_INPUT_BITS = 0x18800000u;
 // One threadgroup per organism, one thread per output neuron in turn. `jobs`
 // holds five words per organism: its row (`slot`) in `inputs`, `outputs` and
 // `faults`, the offset of its parameters in `params` (in elements of `W`),
-// its hidden-layer count (1 or 2) and its hidden widths. One dispatch serves
-// one parameter shard, so the rows of a command's dispatches interleave. A
-// nonzero word in `faults` defers the organism to the host, which evaluates
-// it on the reference controller: for its error, or for its exact value.
+// its hidden-layer count (1 or 2) and its hidden widths. `dims` holds two
+// words: `[input_width, raw_output_width]` (`<= 128`, `<= 80`). One dispatch
+// serves one parameter shard, so the rows of a command's dispatches
+// interleave. A nonzero word in `faults` defers the organism to the host,
+// which evaluates it on the reference controller: for its error, or for its
+// exact value.
 //
 // F32 forward pass using coalesced float4 weight/activation loads when
 // 4-element aligned and branchless unsigned min-tracking for TINY_BITS.
@@ -246,6 +248,7 @@ static void forward_pass_f32(
     device const uint *jobs,
     device float *outputs,
     device uint *faults,
+    device const uint *dims,
     uint organism,
     uint lane,
     uint lanes,
@@ -258,10 +261,18 @@ static void forward_pass_f32(
     if (lane == 0u) {
         atomic_store_explicit(fault, 0u, memory_order_relaxed);
     }
-    threadgroup float *sensed = reinterpret_cast<threadgroup float *>(sensed4);
+    uint input_width = dims[0];
+    uint output_width = dims[1];
     uint slot = jobs[organism * 5u];
-    for (uint i = lane; i < SENSORS; i += lanes) {
-        sensed[i] = inputs[slot * SENSORS + i];
+    if (input_width == 0u || input_width > MAX_INPUTS || output_width == 0u || output_width > MAX_OUTPUTS) {
+        if (lane == 0u) {
+            faults[slot] = FAULT_NONFINITE;
+        }
+        return;
+    }
+    threadgroup float *sensed = reinterpret_cast<threadgroup float *>(sensed4);
+    for (uint i = lane; i < input_width; i += lanes) {
+        sensed[i] = inputs[slot * input_width + i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -269,10 +280,10 @@ static void forward_pass_f32(
     uint hidden = jobs[organism * 5u + 2u];
     uint widths[2] = {jobs[organism * 5u + 3u], jobs[organism * 5u + 4u]};
     threadgroup const float4 *source4 = sensed4;
-    uint fan_in = SENSORS;
+    uint fan_in = input_width;
     for (uint layer = 0u; layer <= hidden; ++layer) {
         bool last = layer == hidden;
-        uint fan_out = last ? ACTIONS : widths[layer];
+        uint fan_out = last ? output_width : widths[layer];
         threadgroup float4 *target4 = (layer == 0u) ? first4 : second4;
         threadgroup float *target = reinterpret_cast<threadgroup float *>(target4);
         threadgroup const float *source = reinterpret_cast<threadgroup const float *>(source4);
@@ -326,7 +337,7 @@ static void forward_pass_f32(
                 atomic_fetch_or_explicit(fault, FAULT_NONFINITE, memory_order_relaxed);
             }
             if (last) {
-                outputs[slot * ACTIONS + o] = z;
+                outputs[slot * output_width + o] = z;
             } else {
                 target[o] = isfinite(z) ? activation(z, fallbacks) : 0.0f;
             }
@@ -351,6 +362,7 @@ static void forward_pass_half(
     device const uint *jobs,
     device float *outputs,
     device uint *faults,
+    device const uint *dims,
     uint organism,
     uint lane,
     uint lanes,
@@ -363,11 +375,19 @@ static void forward_pass_half(
     if (lane == 0u) {
         atomic_store_explicit(fault, 0u, memory_order_relaxed);
     }
-    threadgroup float *sensed = reinterpret_cast<threadgroup float *>(sensed4);
+    uint input_width = dims[0];
+    uint output_width = dims[1];
     uint slot = jobs[organism * 5u];
+    if (input_width == 0u || input_width > MAX_INPUTS || output_width == 0u || output_width > MAX_OUTPUTS) {
+        if (lane == 0u) {
+            faults[slot] = FAULT_NONFINITE;
+        }
+        return;
+    }
+    threadgroup float *sensed = reinterpret_cast<threadgroup float *>(sensed4);
     uint tiny_in = 0u;
-    for (uint i = lane; i < SENSORS; i += lanes) {
-        float x = inputs[slot * SENSORS + i];
+    for (uint i = lane; i < input_width; i += lanes) {
+        float x = inputs[slot * input_width + i];
         sensed[i] = x;
         uint xb = as_type<uint>(x) & 0x7FFFFFFFu;
         tiny_in |= uint(xb - 1u < HALF_TINY_INPUT_BITS - 1u);
@@ -381,10 +401,10 @@ static void forward_pass_half(
     uint hidden = jobs[organism * 5u + 2u];
     uint widths[2] = {jobs[organism * 5u + 3u], jobs[organism * 5u + 4u]};
     threadgroup const float4 *source4 = sensed4;
-    uint fan_in = SENSORS;
+    uint fan_in = input_width;
     for (uint layer = 0u; layer <= hidden; ++layer) {
         bool last = layer == hidden;
-        uint fan_out = last ? ACTIONS : widths[layer];
+        uint fan_out = last ? output_width : widths[layer];
         threadgroup float4 *target4 = (layer == 0u) ? first4 : second4;
         threadgroup float *target = reinterpret_cast<threadgroup float *>(target4);
         threadgroup const float *source = reinterpret_cast<threadgroup const float *>(source4);
@@ -425,7 +445,7 @@ static void forward_pass_half(
                 atomic_fetch_or_explicit(fault, FAULT_NONFINITE, memory_order_relaxed);
             }
             if (last) {
-                outputs[slot * ACTIONS + o] = z;
+                outputs[slot * output_width + o] = z;
             } else {
                 float a = isfinite(z) ? activation(z, fallbacks) : 0.0f;
                 target[o] = a;
@@ -452,15 +472,16 @@ kernel void controller_forward(
     device const uint *jobs [[buffer(2)]],
     device float *outputs [[buffer(3)]],
     device uint *faults [[buffer(4)]],
+    device const uint *dims [[buffer(5)]],
     uint organism [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lanes [[threads_per_threadgroup]])
 {
-    threadgroup float4 sensed4[SENSORS / 4];
+    threadgroup float4 sensed4[WIDEST / 4];
     threadgroup float4 first4[WIDEST / 4];
     threadgroup float4 second4[WIDEST / 4];
     threadgroup atomic_uint fault;
-    forward_pass_f32(params, inputs, jobs, outputs, faults, organism, lane, lanes,
+    forward_pass_f32(params, inputs, jobs, outputs, faults, dims, organism, lane, lanes,
                      sensed4, first4, second4, &fault);
 }
 
@@ -472,15 +493,16 @@ kernel void controller_forward_half(
     device const uint *jobs [[buffer(2)]],
     device float *outputs [[buffer(3)]],
     device uint *faults [[buffer(4)]],
+    device const uint *dims [[buffer(5)]],
     uint organism [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]],
     uint lanes [[threads_per_threadgroup]])
 {
-    threadgroup float4 sensed4[SENSORS / 4];
+    threadgroup float4 sensed4[WIDEST / 4];
     threadgroup float4 first4[WIDEST / 4];
     threadgroup float4 second4[WIDEST / 4];
     threadgroup atomic_uint fault;
-    forward_pass_half(params, inputs, jobs, outputs, faults, organism, lane, lanes,
+    forward_pass_half(params, inputs, jobs, outputs, faults, dims, organism, lane, lanes,
                       sensed4, first4, second4, &fault);
 }
 

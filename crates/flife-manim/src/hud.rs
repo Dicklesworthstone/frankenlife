@@ -173,10 +173,28 @@ impl HudFont {
                 quantity: "overlay text",
                 detail: error.to_string(),
             })?;
-        let mut out = HudText::reserved()?;
         let top = layout.height;
+        let has_ink = layout.glyphs.iter().any(|glyph| !glyph.ch.is_whitespace());
+        if !has_ink {
+            let size = [
+                layout.width * em_pixels,
+                (layout.height + layout.depth) * em_pixels,
+            ];
+            if !size.iter().all(|dimension| dimension.is_finite()) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "overlay em",
+                    detail: format!("{em_pixels} drawable pixels overflows layout size"),
+                });
+            }
+            return Ok(HudText {
+                size,
+                ..HudText::default()
+            });
+        }
+        let mut out = HudText::reserved()?;
         let place = |point: Vec3| [point[0] * em_pixels, (top - point[1]) * em_pixels];
         let mut ink = [0.0_f64, 0.0];
+        let mut scratch = Vec::new();
         let mut colors = swatches.iter().take(HUD_MAX_SWATCHES);
         for (index, glyph) in layout.glyphs.iter().enumerate() {
             if glyph.ch.is_whitespace() {
@@ -195,9 +213,19 @@ impl HudFont {
             let rings: Vec<Vec<[f64; 2]>> = path
                 .subpaths()
                 .into_iter()
-                .map(|subpath| flatten_subpath(subpath, &place))
+                .map(|subpath| flatten_subpath(subpath, &place, &mut scratch))
                 .filter(|ring| ring.len() >= 3)
                 .collect();
+            if rings
+                .iter()
+                .flatten()
+                .any(|vertex| !vertex[0].is_finite() || !vertex[1].is_finite())
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "overlay em",
+                    detail: format!("{em_pixels} drawable pixels overflows glyph coordinates"),
+                });
+            }
             let Some(triangles) = triangulate_rings(&rings) else {
                 out.refused += 1;
                 continue;
@@ -237,6 +265,12 @@ impl HudFont {
             (layout.width * em_pixels).max(ink[0]),
             ((layout.height + layout.depth) * em_pixels).max(ink[1]),
         ];
+        if !out.size.iter().all(|dimension| dimension.is_finite()) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "overlay em",
+                detail: format!("{em_pixels} drawable pixels overflows layout size"),
+            });
+        }
         Ok(out)
     }
 }
@@ -357,9 +391,17 @@ pub fn flatten_quadratic(
     out: &mut Vec<[f64; 2]>,
 ) {
     let bend = (p0[0] - 2.0 * p1[0] + p2[0]).hypot(p0[1] - 2.0 * p1[1] + p2[1]);
-    let wanted = (bend / (4.0 * tolerance)).sqrt().ceil();
-    let segments = if wanted.is_finite() && wanted >= 1.0 {
-        (wanted as usize).min(HUD_MAX_CURVE_SEGMENTS)
+    let segments = if tolerance.is_finite() && tolerance > 0.0 {
+        let wanted = (bend / (4.0 * tolerance)).sqrt().ceil();
+        if wanted.is_finite() && wanted >= 1.0 {
+            (wanted as usize).min(HUD_MAX_CURVE_SEGMENTS)
+        } else if wanted.is_infinite() && wanted.is_sign_positive() {
+            HUD_MAX_CURVE_SEGMENTS
+        } else {
+            1
+        }
+    } else if tolerance == 0.0 && (bend > 0.0 || bend.is_infinite()) {
+        HUD_MAX_CURVE_SEGMENTS
     } else {
         1
     };
@@ -373,18 +415,21 @@ pub fn flatten_quadratic(
 /// One subpath in FrankenManim's shared-anchor layout (anchor, handle,
 /// anchor, ...) as a ring, mapped by `place`: no closing repeat, no
 /// repeated neighbours.
-fn flatten_subpath(subpath: &[Vec3], place: &impl Fn(Vec3) -> [f64; 2]) -> Vec<[f64; 2]> {
+fn flatten_subpath(
+    subpath: &[Vec3],
+    place: &impl Fn(Vec3) -> [f64; 2],
+    points: &mut Vec<[f64; 2]>,
+) -> Vec<[f64; 2]> {
     let mut ring = Vec::new();
     let Some(&first) = subpath.first() else {
         return ring;
     };
     ring.push(place(first));
-    let mut points = Vec::new();
     for curve in 0..subpath.len().saturating_sub(1) / 2 {
         let [p0, p1, p2] = [0, 1, 2].map(|k| place(subpath[2 * curve + k]));
         points.clear();
-        flatten_quadratic(p0, p1, p2, HUD_FLATNESS_PIXELS, &mut points);
-        for &point in &points {
+        flatten_quadratic(p0, p1, p2, HUD_FLATNESS_PIXELS, points);
+        for &point in points.iter() {
             if ring.last() != Some(&point) {
                 ring.push(point);
             }
@@ -398,8 +443,11 @@ fn flatten_subpath(subpath: &[Vec3], place: &impl Fn(Vec3) -> [f64; 2]) -> Vec<[
 
 /// Whether `point` is inside `ring`, by the crossing rule.
 fn contains(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
+    let Some(&last) = ring.last() else {
+        return false;
+    };
     let mut inside = false;
-    let mut previous = ring[ring.len() - 1];
+    let mut previous = last;
     for &vertex in ring {
         if (vertex[1] > point[1]) != (previous[1] > point[1]) {
             let x = vertex[0]
@@ -452,7 +500,10 @@ fn triangulate_rings(rings: &[Vec<[f64; 2]>]) -> Option<Vec<[u32; 3]>> {
             global.extend((0..rings[hole].len()).map(|k| offsets[hole] + k as u32));
         }
         for triangle in local {
-            triangles.push(triangle.map(|corner| global[corner as usize]));
+            let a = *global.get(triangle[0] as usize)?;
+            let b = *global.get(triangle[1] as usize)?;
+            let c = *global.get(triangle[2] as usize)?;
+            triangles.push([a, b, c]);
         }
     }
     Some(triangles)
@@ -554,19 +605,29 @@ pub fn hud_glyphs(viewport: &Viewport, text: &HudText) -> Result<Option<SurfaceM
         return Ok(None);
     }
     let origin = hud_origin(viewport);
+    let [width, height] = viewport.drawable().map(f64::from);
+    let (half_w, half_h) = (width / 2.0, height / 2.0);
+    let scale = viewport.scale();
     let mut vertices = reserve("overlay glyph vertices", text.vertices.len())?;
-    vertices.extend(text.vertices.iter().enumerate().map(|(index, vertex)| {
-        let color = text
-            .swatches
-            .iter()
-            .find(|(range, _)| range.contains(&index))
+    // Swatch ranges are strictly increasing and disjoint in glyph order, so a
+    // single monotonic cursor resolves each vertex's colour in O(1).
+    let mut swatch_cursor = 0_usize;
+    let swatches = text.swatches.as_slice();
+    for (index, vertex) in text.vertices.iter().enumerate() {
+        while swatch_cursor < swatches.len() && index >= swatches[swatch_cursor].0.end {
+            swatch_cursor += 1;
+        }
+        let color = swatches
+            .get(swatch_cursor)
+            .filter(|(range, _)| range.contains(&index))
             .map_or(HUD_TEXT_COLOR, |&(_, color)| color);
-        SurfaceVertex::colored(
-            hud_scene_point(viewport, [origin[0] + vertex[0], origin[1] + vertex[1]]),
-            [0.0, 0.0, 1.0],
-            color,
-        )
-    }));
+        let point = [
+            ((origin[0] + vertex[0]) - half_w) / scale,
+            (half_h - (origin[1] + vertex[1])) / scale,
+            0.0,
+        ];
+        vertices.push(SurfaceVertex::colored(point, [0.0, 0.0, 1.0], color));
+    }
     let mut indices = reserve("overlay glyph indices", 3 * text.triangles.len())?;
     indices.extend(text.triangles.iter().flatten());
     mesh(vertices, indices, "overlay glyphs").map(Some)

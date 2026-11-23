@@ -962,3 +962,55 @@ fn pyramid_build_on_and_sample_batch_match_serial_bit_for_bit() {
         compare(&gotm, &wantm, label);
     }
 }
+
+/// Regression: `Bins::group` and `Bins::range` must not overflow on
+/// `bucket == usize::MAX` (which internal callers use as their out-of-range
+/// sentinel).
+#[test]
+fn bins_handles_usize_max_bucket_without_overflow_panic() {
+    let mut bins = Bins::new("test-bins");
+    let refused = bins.group(4, 1, |_| usize::MAX);
+    assert!(
+        matches!(refused, Err(CoreError::LayoutMismatch { .. })),
+        "expected LayoutMismatch for usize::MAX bucket, got {refused:?}"
+    );
+    assert_eq!(bins.buckets(), 0);
+    assert_eq!(bins.range(usize::MAX), 0..0);
+    assert!(bins.bucket(usize::MAX).is_empty());
+
+    bins.group(4, 2, |item| item).expect("valid grouping");
+    assert_eq!(bins.range(usize::MAX), 0..0);
+    assert!(bins.bucket(usize::MAX).is_empty());
+}
+
+/// Regression: deposits whose total overflows F64 (`CompensatedSum` -> NaN /
+/// Inf) must be refused cleanly by `apply_deposits` without writing `+Inf` or
+/// `NaN` into the field (INV-01).
+#[test]
+#[expect(clippy::expect_used, reason = "test assertion")]
+fn apply_deposits_refuses_f64_overflow_without_mutating_field() {
+    let g = grid(4, 4);
+    let mut state = FieldState::zeroed(g, &BufferLimits::host()).expect("field");
+    let before: Vec<u32> = state.as_slice().iter().map(|v| v.to_bits()).collect();
+    let mut deposits = Deposits::new();
+    let mut dir = [0.0; CHANNELS];
+    dir[0] = 1.0;
+    deposits
+        .push(&g, OrganismId::new(1), [0.5, 0.5], 1.0e308, 1.0e308, &dir)
+        .expect("stages first");
+    deposits
+        .push(&g, OrganismId::new(2), [0.5, 0.5], 1.0e308, 1.0e308, &dir)
+        .expect("stages second");
+
+    let err = apply_deposits(&mut state, &mut deposits)
+        .expect_err("overflowing total must be refused");
+    assert!(
+        matches!(err, CoreError::NumericalInvalid { .. }),
+        "expected NumericalInvalid, got {err:?}"
+    );
+    let after: Vec<u32> = state.as_slice().iter().map(|v| v.to_bits()).collect();
+    assert_eq!(
+        after, before,
+        "refused apply_deposits must leave field state bit-for-bit unchanged"
+    );
+}

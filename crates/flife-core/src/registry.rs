@@ -315,6 +315,45 @@ pub static REGISTRY: &[AlgorithmEntry] = &[
     },
     AlgorithmEntry {
         status: Status::Implemented {
+            evidence: "test:flife-engine::tests/ablation.rs::e2e_v2_disable_all_matches_v1_and_v1_contact_bit_for_bit",
+        },
+        ..entry("field-ecology-v2", Role::Model, "V2-EPIC, §17.2", "V2-01")
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/ablation.rs::v2_chemistry_only_and_fresh_offspring_controls",
+        },
+        ..entry(
+            "field-ecology-v2-chemistry-only",
+            Role::Model,
+            "V2-EPIC, §15.3, §21.6",
+            "V2-01",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/ablation.rs::v2_chemistry_only_and_fresh_offspring_controls",
+        },
+        ..entry(
+            "field-ecology-v2-fresh-offspring",
+            Role::Model,
+            "V2-EPIC, §15.3, §21.6",
+            "V2-01",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
+            evidence: "test:flife-engine::tests/ablation.rs::e2e_v2_fixed_controller_control_mutates_traits_not_weights",
+        },
+        ..entry(
+            "field-ecology-v2-fixed-controller",
+            Role::Model,
+            "V2-EPIC, §15.3, §21.6",
+            "V2-01",
+        )
+    },
+    AlgorithmEntry {
+        status: Status::Implemented {
             evidence: "test:flife-field::tests/field_layout.rs::minimum_image_is_half_open_and_adds_no_rounding",
         },
         ..entry("periodic", Role::Boundary, "§4.1", "FL-003")

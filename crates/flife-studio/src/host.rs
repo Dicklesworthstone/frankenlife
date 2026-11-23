@@ -967,6 +967,7 @@ impl Studio {
                         (&mut self.target, previous_offscreen)
                     {
                         offscreen.metrics = previous;
+                        self.controls.set_metrics(previous);
                     }
                     let key = (desired_drawable, desired_scale.to_bits());
                     if self.refused_resize != Some(key) {
@@ -984,7 +985,13 @@ impl Studio {
                 Err(error) => return Err(error),
             }
         } else {
-            self.refused_resize = None;
+            if self
+                .events
+                .iter()
+                .any(|event| matches!(event, InputEvent::Resized(_)))
+            {
+                self.refused_resize = None;
+            }
             (false, false)
         };
         if redensed && !self.overlay.is_empty() {

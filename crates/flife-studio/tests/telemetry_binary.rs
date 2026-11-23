@@ -336,6 +336,7 @@ fn the_binary_reports_and_draws_the_shown_worlds_telemetry() {
         assert_eq!(number(record, "deaths"), tally.deaths, "{record}");
         assert_eq!(number(record, "evaluations"), tally.evaluations);
         assert_eq!(number(record, "rejected_births"), tally.rejected_births);
+        assert_eq!(number(record, "refused_births"), tally.refused_births);
         assert_eq!(float(record, "uptake").to_bits(), tally.uptake.to_bits());
         let ledger = direct.world.ledger().report();
         assert_eq!(

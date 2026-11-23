@@ -27,6 +27,7 @@
 //! database runs in WAL mode with `synchronous = FULL`, so each commit is
 //! flushed before the append returns.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use flife_core::canonical::Sha256Digest;
@@ -782,6 +783,7 @@ impl CommandJournal {
         if lineage.is_empty() {
             return Err(conflict(format!("{session} has no fork")));
         }
+        let mut accepted_ids = BTreeSet::new();
         for (position, (command, accepted)) in history.accepted.iter().enumerate() {
             let order = u64::try_from(position).unwrap_or(u64::MAX);
             if accepted.order != order
@@ -792,12 +794,29 @@ impl CommandJournal {
                     command.id, command.session, accepted.order
                 )));
             }
+            if !accepted_ids.insert(command.id) {
+                return Err(conflict(format!(
+                    "inherited acceptance {position} repeats {}",
+                    command.id
+                )));
+            }
         }
+        let mut ended_ids = BTreeSet::new();
         for (position, (id, outcome)) in history.outcomes.iter().enumerate() {
             if outcome.cursor() != u64::try_from(position).unwrap_or(u64::MAX) {
                 return Err(conflict(format!(
                     "inherited outcome {position} ({id}) is numbered {}",
                     outcome.cursor()
+                )));
+            }
+            if !accepted_ids.contains(id) {
+                return Err(conflict(format!(
+                    "inherited outcome {position} ({id}) names an unaccepted command"
+                )));
+            }
+            if !ended_ids.insert(*id) {
+                return Err(conflict(format!(
+                    "inherited outcome {position} repeats {id}"
                 )));
             }
         }

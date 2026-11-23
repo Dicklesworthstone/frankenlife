@@ -404,13 +404,30 @@ pub fn slot_counts(walls: &[f64], fps: NonZeroU32) -> Result<Vec<u64>, CoreError
     let (Some(&first), Some(&last)) = (walls.first(), walls.last()) else {
         return Ok(counts);
     };
+    if walls.iter().any(|wall| !wall.is_finite()) || !walls.is_sorted_by(|a, b| a <= b) {
+        return Err(conflict(
+            "the frames' wall times are not finite and in order".into(),
+        ));
+    }
     let rate = f64::from(fps.get());
+    let span = last - first;
+    if !span.is_finite() || span * rate >= f64::from(u32::MAX) {
+        return Err(conflict(format!(
+            "more than {} slots at {fps} a second",
+            u32::MAX
+        )));
+    }
     let mut shown = 0;
     let mut slot: u32 = 0;
     loop {
         let at = first + f64::from(slot) / rate;
         if at > last {
             return Ok(counts);
+        }
+        if slot > 0 && at <= first {
+            return Err(conflict(format!(
+                "frame wall time {first} is too large to advance by 1/{fps} s"
+            )));
         }
         while walls.get(shown + 1).is_some_and(|&wall| wall <= at) {
             shown += 1;
@@ -646,5 +663,18 @@ mod tests {
             slot_counts(&[0.0, 0.25], fps).expect("three slots"),
             vec![3, 0]
         );
+        // Non-finite, unsorted, overflow-span, and non-advancing wall times
+        // must fail immediately rather than spinning up to u32::MAX slots.
+        for bad in [
+            &[f64::NAN][..],
+            &[1.0, 0.5][..],
+            &[0.0, 1.0e12][..],
+            &[1.0e20, 1.0e20][..],
+        ] {
+            assert!(
+                matches!(slot_counts(bad, fps), Err(CoreError::StateConflict { .. })),
+                "expected StateConflict for {bad:?}"
+            );
+        }
     }
 }

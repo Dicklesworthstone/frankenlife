@@ -10,6 +10,7 @@
 use serde::Deserialize;
 
 use crate::error::{ConfigIssue, CoreError};
+use crate::v2::{V2Abi, V2Config, V2Feature};
 
 /// The configuration schema this build reads.
 pub const CONFIG_SCHEMA: &str = "frankenlife.config.v1";
@@ -61,10 +62,16 @@ pub struct RunConfig {
     /// `[persistence]`
     pub persistence: PersistenceConfig,
     /// `[contact]`: required by the contact models and refused by every
-    /// other (plan §5.4). Absent, nothing about a configuration changes,
-    /// its canonical text and hash included.
+    /// other (plan §5.4). Optional on `field-ecology-v2*`. Absent, nothing
+    /// about a v1 configuration changes, its canonical text and hash included.
     #[serde(default)]
     pub contact: Option<ContactConfig>,
+    /// `[v2]`: modular feature configuration for `field-ecology-v2*` models
+    /// (`V2-01`). Refused on all `field-ecology-v1*` models; omitted from
+    /// `schema::fields` when `None` so v1 canonical TOML and hashes stay
+    /// 100% byte-identical.
+    #[serde(default)]
+    pub v2: Option<V2Config>,
 }
 
 /// `[contact]` (plan §5.4): the contact models' body and its adhesion.
@@ -113,6 +120,46 @@ impl RunConfig {
                 problem: error.to_string().trim().to_owned(),
             }])
         })
+    }
+
+    /// Effective pure-scientific controller and field ABI widths for this
+    /// configuration (identical across Reference CPU, FrankenTorch CPU, and Metal).
+    #[must_use]
+    pub fn v2_abi(&self) -> V2Abi {
+        match &self.v2 {
+            Some(v2) => v2.abi(&self.controller),
+            None => {
+                let recurrent = if self.controller.family == "independent-recurrent-mlp-v1" {
+                    self.controller.recurrent_state_width.unwrap_or(0)
+                } else {
+                    0
+                };
+                V2Abi::v1(recurrent)
+            }
+        }
+    }
+
+    /// Whether this configuration satisfies `INV-08` (purely field-mediated interaction).
+    #[must_use]
+    pub fn inv08_pure_field(&self) -> bool {
+        match &self.v2 {
+            Some(v2) => v2.inv08_pure_field(self.contact.is_some()),
+            None => self.contact.is_none(),
+        }
+    }
+
+    /// Whether `feature` is active on this configuration (`false` for all `v1` configs).
+    #[must_use]
+    pub fn is_v2_feature_enabled(&self, feature: V2Feature) -> bool {
+        self.v2
+            .as_ref()
+            .is_some_and(|v2| v2.is_enabled(feature))
+    }
+
+    /// Bitmask of active v2 features (`0` for all `v1` configs).
+    #[must_use]
+    pub fn v2_feature_bitmask(&self) -> u64 {
+        self.v2.as_ref().map_or(0, V2Config::feature_bitmask)
     }
 }
 

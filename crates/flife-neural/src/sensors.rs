@@ -18,10 +18,16 @@
 //! normalizer is a fixed local constant: no population statistic reaches a
 //! controller (A.1).
 
+use std::ops::Range;
+
 use flife_core::numerics::tanh_f64_as_f32;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::numerics::tanh;
 use flife_field::pyramid::{PLANES, RawSample};
+
+use crate::controller::{
+    INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1, MAXIMUM_RECURRENT_STATE_WIDTH,
+};
 
 /// The sensor schema this module implements.
 pub const ENERGY_MOMENT_GRADIENT_104_V1: &str = "energy-moment-gradient-104-v1";
@@ -29,8 +35,230 @@ pub const ENERGY_MOMENT_GRADIENT_104_V1: &str = "energy-moment-gradient-104-v1";
 /// The sensor normalization this module implements.
 pub const FIXED_LOCAL_SCALES_V1: &str = "fixed-local-scales-v1";
 
-/// Controller inputs.
+/// Baseline `field-ecology-v1` controller inputs (`3 * 33 + 5 = 104`).
 pub const SENSOR_WIDTH: usize = 3 * PLANES + INTRINSIC_WIDTH;
+
+/// Maximum controller input width across all `field-ecology-v2` feature
+/// combinations and recurrent state widths (matches `WIDEST_HIDDEN = 128`).
+pub const MAX_SENSOR_WIDTH: usize = 128;
+
+/// Number of extra inputs appended by `dual-carrier-trails`:
+/// `(q_1, tanh(L ∂_x q_1), tanh(L ∂_y q_1), ‖Z^(1)‖_2.min(1.0))`.
+pub const DUAL_CARRIER_TRAIL_INPUTS: usize = 4;
+
+/// Number of extra inputs appended by `hippo-crowding` (`expose_sensor`):
+/// `c_den = N_loc / (N_loc + 4)`.
+pub const HIPPO_CROWDING_INPUTS: usize = 1;
+
+/// Number of extra inputs appended by `notch-delta`
+/// (`mode == "sensor-neighbor-mean-v1"`): `last_neighbor_h0`.
+pub const NOTCH_DELTA_INPUTS: usize = 1;
+
+/// Pure scientific sensor input layout (V2-01).
+///
+/// Computed solely from scientific model configuration and feature flags —
+/// identical on Reference CPU, FrankenTorch CPU, and Metal. Never adds silent
+/// Metal-only padding lanes (AGENTS.md Rule 15).
+///
+/// Fixed slot order:
+/// - `0..104`: baseline `energy-moment-gradient-104-v1` (immutable);
+/// - `+4` if `dual-carrier-trails`;
+/// - `+1` if `hippo-crowding` with `expose_sensor`;
+/// - `+1` if `notch-delta` with `mode == "sensor-neighbor-mean-v1"`;
+/// - trailing `+S` if recurrent / `epigenetic-recurrence` (`h_0..h_{S-1}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SensorLayout {
+    dual_carrier_trails: Option<usize>,
+    hippo_crowding: Option<usize>,
+    notch_delta: Option<usize>,
+    observation_width: usize,
+    recurrent_state_width: usize,
+}
+
+impl SensorLayout {
+    /// Baseline stateless `field-ecology-v1` layout (`104` inputs).
+    #[must_use]
+    pub const fn v1() -> Self {
+        Self {
+            dual_carrier_trails: None,
+            hippo_crowding: None,
+            notch_delta: None,
+            observation_width: SENSOR_WIDTH,
+            recurrent_state_width: 0,
+        }
+    }
+
+    /// `field-ecology-v1` layout with FL-054 recurrent state width `state_width`
+    /// (`104 + S` inputs).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `state_width` exceeds
+    /// [`MAXIMUM_RECURRENT_STATE_WIDTH`].
+    pub fn v1_recurrent(state_width: usize) -> Result<Self, CoreError> {
+        Self::new(false, false, false, state_width)
+    }
+
+    /// Build a canonical pure-scientific [`SensorLayout`] from the active
+    /// layout-affecting feature flags and recurrent state width `S`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `recurrent_state_width` exceeds
+    /// [`MAXIMUM_RECURRENT_STATE_WIDTH`] or the total width exceeds
+    /// [`MAX_SENSOR_WIDTH`].
+    pub fn new(
+        dual_carrier_trails: bool,
+        hippo_crowding_sensor: bool,
+        notch_delta_sensor: bool,
+        recurrent_state_width: usize,
+    ) -> Result<Self, CoreError> {
+        if recurrent_state_width > MAXIMUM_RECURRENT_STATE_WIDTH {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "controller.recurrent_state_width",
+                detail: format!(
+                    "recurrent state width {recurrent_state_width} exceeds maximum \
+                     {MAXIMUM_RECURRENT_STATE_WIDTH}"
+                ),
+            });
+        }
+        let mut cursor = SENSOR_WIDTH;
+        let dual_carrier_trails = if dual_carrier_trails {
+            let start = cursor;
+            cursor += DUAL_CARRIER_TRAIL_INPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let hippo_crowding = if hippo_crowding_sensor {
+            let start = cursor;
+            cursor += HIPPO_CROWDING_INPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let notch_delta = if notch_delta_sensor {
+            let start = cursor;
+            cursor += NOTCH_DELTA_INPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let observation_width = cursor;
+        let total = observation_width + recurrent_state_width;
+        if total > MAX_SENSOR_WIDTH {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "sensors.input_width",
+                detail: format!("sensor input width {total} exceeds maximum {MAX_SENSOR_WIDTH}"),
+            });
+        }
+        Ok(Self {
+            dual_carrier_trails,
+            hippo_crowding,
+            notch_delta,
+            observation_width,
+            recurrent_state_width,
+        })
+    }
+
+    /// Resolve the sensor layout of a validated configuration.
+    ///
+    /// # Errors
+    /// [`CoreError::UnknownAlgorithm`] for an unsupported controller family, or
+    /// [`CoreError::NumericalInvalid`] for an out-of-range recurrent width.
+    pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
+        let controller = &config.config().controller;
+        let recurrent_state_width = match controller.family.as_str() {
+            INDEPENDENT_DENSE_MLP_V1 => 0,
+            INDEPENDENT_RECURRENT_MLP_V1 => {
+                let width = controller.recurrent_state_width.ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "controller.recurrent_state_width",
+                        detail: "independent-recurrent-mlp-v1 requires recurrent_state_width"
+                            .to_owned(),
+                    }
+                })?;
+                if width == 0 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "controller.recurrent_state_width",
+                        detail: format!(
+                            "recurrent state width must lie in 1..={MAXIMUM_RECURRENT_STATE_WIDTH}, \
+                             got 0"
+                        ),
+                    });
+                }
+                usize::try_from(width).map_err(|_| CoreError::Overflow {
+                    quantity: "controller.recurrent_state_width",
+                })?
+            }
+            other => {
+                return Err(CoreError::UnknownAlgorithm {
+                    role: "controller.family",
+                    name: other.to_owned(),
+                });
+            }
+        };
+        Self::new(false, false, false, recurrent_state_width)
+    }
+
+    /// Non-recurrent sensor observation width (`104` + active v2 sensor lanes).
+    #[must_use]
+    pub const fn observation_width(&self) -> usize {
+        self.observation_width
+    }
+
+    /// Trailing recurrent internal state width `S` (`0` when stateless).
+    #[must_use]
+    pub const fn recurrent_state_width(&self) -> usize {
+        self.recurrent_state_width
+    }
+
+    /// Total network Layer-0 input width (`observation_width + S`, `<= 128`).
+    #[must_use]
+    pub const fn input_width(&self) -> usize {
+        self.observation_width + self.recurrent_state_width
+    }
+
+    /// Start index of the 4 `dual-carrier-trails` inputs, if active.
+    #[must_use]
+    pub const fn dual_carrier_trails(&self) -> Option<usize> {
+        self.dual_carrier_trails
+    }
+
+    /// Index of the `hippo-crowding` `c_den` input, if active.
+    #[must_use]
+    pub const fn hippo_crowding(&self) -> Option<usize> {
+        self.hippo_crowding
+    }
+
+    /// Index of the `notch-delta` `last_neighbor_h0` input, if active.
+    #[must_use]
+    pub const fn notch_delta(&self) -> Option<usize> {
+        self.notch_delta
+    }
+
+    /// Start index of the trailing recurrent state inputs `h_0..h_{S-1}`, if
+    /// `S > 0`.
+    #[must_use]
+    pub const fn recurrent_state(&self) -> Option<usize> {
+        if self.recurrent_state_width > 0 {
+            Some(self.observation_width)
+        } else {
+            None
+        }
+    }
+
+    /// Index range of the trailing recurrent state inputs (empty when `S == 0`).
+    #[must_use]
+    pub const fn recurrent_state_range(&self) -> Range<usize> {
+        self.observation_width..self.input_width()
+    }
+
+    /// Whether `input_width()` is a multiple of 4 (eligible for coalesced
+    /// `float4`/`half4` Layer-0 loads on Metal).
+    #[must_use]
+    pub const fn is_aligned4(&self) -> bool {
+        self.input_width().is_multiple_of(4)
+    }
+}
 
 /// Index of `q`; `Z_k` follows at `VALUES + 1 + k`.
 pub const VALUES: usize = 0;

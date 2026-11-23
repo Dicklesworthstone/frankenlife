@@ -10,7 +10,7 @@ use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
-    ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
+    ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology, RawOutputs,
     ReferenceController, SENSOR_WIDTH,
 };
 
@@ -114,12 +114,12 @@ fn jobs<'a>(
         .collect()
 }
 
-type Bits = Vec<Option<[u32; ACTION_WIDTH]>>;
+type Bits = Vec<Option<Vec<u32>>>;
 
-fn bits(outputs: &[Option<[f32; ACTION_WIDTH]>]) -> Bits {
+fn bits(outputs: &[Option<RawOutputs>]) -> Bits {
     outputs
         .iter()
-        .map(|output| output.map(|raw| raw.map(f32::to_bits)))
+        .map(|output| output.map(|raw| raw.iter().map(|v| v.to_bits()).collect()))
         .collect()
 }
 
@@ -130,9 +130,9 @@ fn reference(jobs: &[ControllerJob<'_>]) -> Bits {
         .map(|job| {
             let mut scratch = ControllerScratch::new(job.controller.topology()).expect("scratch");
             job.controller
-                .evaluate(job.inputs, &mut scratch)
+                .evaluate_raw(job.inputs, &mut scratch)
                 .ok()
-                .map(|raw| raw.map(f32::to_bits))
+                .map(|raw| raw.iter().map(|v| v.to_bits()).collect())
         })
         .collect()
 }
@@ -211,9 +211,9 @@ fn a_genome_is_uploaded_once_and_a_later_occupant_takes_its_place() -> Result<()
     assert_eq!(outputs, [None]);
 
     // The owner holds each shard's parameters and job words, and the
-    // inputs, outputs and fault flags, and nothing else.
+    // inputs, outputs, fault flags and dims buffer, and nothing else.
     let usage = backend.owner().usage();
-    assert_eq!(usage.buffers, 2 * backend.shards() + 3, "{usage:?}");
+    assert_eq!(usage.buffers, 2 * backend.shards() + 4, "{usage:?}");
 
     backend.forget();
     assert_eq!(
@@ -433,7 +433,7 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
     assert_eq!(backend.resident_genomes(), 40);
     let peak_resident = backend.resident_bytes();
     let peak_usage = backend.owner().usage();
-    assert_eq!(peak_usage.buffers, 2 * 10 + 3);
+    assert_eq!(peak_usage.buffers, 2 * 10 + 4);
     let initial_uploads = backend.uploads();
 
     // Wrong generation must leave every live slot and shard intact.
@@ -463,7 +463,7 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
     let after_usage = backend.owner().usage();
     assert_eq!(
         after_usage.buffers,
-        2 * 5 + 3,
+        2 * 5 + 4,
         "dropped shards must release both parameter and job device buffers"
     );
     assert!(
@@ -486,7 +486,7 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
         .iter()
         .zip(&first)
         .filter(|(job, _)| job.slot.slot() < 4)
-        .map(|(_, out)| *out)
+        .map(|(_, out)| out.clone())
         .collect();
     assert_eq!(bits(&outputs), expected0);
     assert_eq!(backend.uploads(), initial_uploads);
@@ -496,7 +496,7 @@ fn empty_shards_are_reclaimed_on_device_when_slots_retire() -> Result<(), CoreEr
     backend.release_slots(&shard0_slots);
     assert_eq!(backend.shards(), 0);
     assert_eq!(backend.resident_genomes(), 0);
-    assert_eq!(backend.owner().usage().buffers, 3);
+    assert_eq!(backend.owner().usage().buffers, 4);
     Ok(())
 }
 

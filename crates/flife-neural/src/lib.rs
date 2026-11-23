@@ -34,14 +34,19 @@ pub mod controller;
 pub mod sensors;
 pub mod weights;
 
-pub use actions::{ACTION_WIDTH, ActionDecoding, DecodedActions, Emission, decode};
-pub use arena::{ArenaSlot, Placement, ShardGeometry};
+pub use actions::{
+    ACTION_WIDTH, ActionDecoding, ActionLayout, DecodedActions, Emission,
+    MAX_ACTION_WIDTH, MAX_CONTROLLER_OUTPUT_WIDTH, decode, decode_slice,
+};
+pub use arena::{ArenaSlot, F16_SLOT_ALIGNMENT_ELEMENTS, Placement, ShardGeometry};
 pub use backend::{BackendBudget, ControllerBackend, ControllerJob};
 pub use controller::{
     ControllerScratch, DenseTopology, INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1,
-    LayerShape, MAXIMUM_RECURRENT_STATE_WIDTH, RecurrentTrace, ReferenceController, Trace, widen,
+    LayerShape, MAXIMUM_RECURRENT_STATE_WIDTH, RawOutputs, RawTrace, RecurrentTrace,
+    ReferenceController, Trace, update_recurrent_state, widen, widen_slice,
 };
 pub use sensors::{
-    Intrinsic, Observation, SENSOR_WIDTH, SensorScales, observe, observe_for_controller,
+    Intrinsic, MAX_SENSOR_WIDTH, Observation, SENSOR_WIDTH, SensorLayout, SensorScales, observe,
+    observe_for_controller,
 };
 pub use weights::{Weight, WeightDtype, Weights};

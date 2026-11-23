@@ -78,6 +78,8 @@ pub enum Flow {
     UnrecycledDeath,
     /// A reservoir cleared by the tiny-energy policy.
     TinyReservoir,
+    /// Energy dissipated during passive kin trophallaxis (`V2-13`).
+    TrophallaxisLoss,
 }
 
 /// The number of [`Flow`] kinds.
@@ -85,7 +87,7 @@ pub const FLOW_KINDS: usize = Flow::ALL.len();
 
 impl Flow {
     /// Every flow, in the fixed reporting and summation order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::SourcePower,
         Self::InitialEndowment,
         Self::CommandInjection,
@@ -101,6 +103,7 @@ impl Flow {
         Self::ReproductionLoss,
         Self::UnrecycledDeath,
         Self::TinyReservoir,
+        Self::TrophallaxisLoss,
     ];
 
     /// The class this flow belongs to.
@@ -121,7 +124,8 @@ impl Flow {
             | Self::EmissionLoss
             | Self::ReproductionLoss
             | Self::UnrecycledDeath
-            | Self::TinyReservoir => FlowClass::Dissipation,
+            | Self::TinyReservoir
+            | Self::TrophallaxisLoss => FlowClass::Dissipation,
         }
     }
 
@@ -144,6 +148,7 @@ impl Flow {
             Self::ReproductionLoss => "reproduction-loss",
             Self::UnrecycledDeath => "unrecycled-death",
             Self::TinyReservoir => "tiny-reservoir",
+            Self::TrophallaxisLoss => "trophallaxis-loss",
         }
     }
 
@@ -164,6 +169,10 @@ pub enum Transfer {
     ChildEndowment,
     /// A dead organism's energy returned to the field.
     Recycling,
+    /// Unconverted uptake returned to the field as symplectic metabolic waste (`V2-11`).
+    MetabolicByproduct,
+    /// Passive exact-quantum energy transfer between kin organisms (`V2-13`).
+    Trophallaxis,
 }
 
 /// The number of [`Transfer`] kinds.
@@ -171,21 +180,24 @@ pub const TRANSFER_KINDS: usize = Transfer::ALL.len();
 
 impl Transfer {
     /// Every transfer, in the fixed reporting and summation order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::Uptake,
         Self::Emission,
         Self::ChildEndowment,
         Self::Recycling,
+        Self::MetabolicByproduct,
+        Self::Trophallaxis,
     ];
 
     /// The dissipation flow this transfer's loss is charged to.
     #[must_use]
     pub const fn loss(self) -> Flow {
         match self {
-            Self::Uptake => Flow::UptakeInefficiency,
+            Self::Uptake | Self::MetabolicByproduct => Flow::UptakeInefficiency,
             Self::Emission => Flow::EmissionLoss,
             Self::ChildEndowment => Flow::ReproductionLoss,
             Self::Recycling => Flow::UnrecycledDeath,
+            Self::Trophallaxis => Flow::TrophallaxisLoss,
         }
     }
 
@@ -197,6 +209,8 @@ impl Transfer {
             Self::Emission => "emission",
             Self::ChildEndowment => "child-endowment",
             Self::Recycling => "recycling",
+            Self::MetabolicByproduct => "metabolic-byproduct",
+            Self::Trophallaxis => "trophallaxis",
         }
     }
 

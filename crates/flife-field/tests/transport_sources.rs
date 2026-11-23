@@ -1174,3 +1174,34 @@ fn fused_field_work_set_workers_keeps_accumulators_sized_without_step_allocation
         "fused field step must remain bit-exact after resizing workers"
     );
 }
+
+/// Regression: `deposit_energy_fused` must refuse mismatched `sources` and
+/// `supports` lengths with `CoreError::LayoutMismatch` instead of silently
+/// truncating trailing sources via `.zip()`.
+#[test]
+#[expect(clippy::expect_used, reason = "test assertion")]
+fn deposit_energy_fused_refuses_mismatched_source_and_support_lengths() {
+    let g = grid(8, 8, 8.0, 8.0);
+    let mut state = zeroed(g);
+    let before: Vec<u32> = state.as_slice().iter().map(|v| v.to_bits()).collect();
+    let kernel = SourceKernel::new_fused(1.5, 3.0).expect("kernel");
+    let mut dir = [0.0; CHANNELS];
+    dir[0] = 1.0;
+    let sources = [
+        Source::new(SourceId::new(0), [2.0, 2.0], dir, 10.0).expect("s0"),
+        Source::new(SourceId::new(1), [6.0, 6.0], dir, 10.0).expect("s1"),
+    ];
+    let mut supports = vec![SourceSupport::new()];
+    kernel
+        .support_into(&g, sources[0].center, &mut supports[0])
+        .expect("support 0");
+    let mut accum = Vec::new();
+    let err = flife_field::deposit_energy_fused(&mut state, &sources, tick(), &mut supports, &mut accum)
+        .expect_err("mismatched lengths must be refused");
+    assert!(
+        matches!(err, CoreError::LayoutMismatch { .. }),
+        "expected LayoutMismatch, got {err:?}"
+    );
+    let after: Vec<u32> = state.as_slice().iter().map(|v| v.to_bits()).collect();
+    assert_eq!(after, before, "refused call must not mutate field");
+}

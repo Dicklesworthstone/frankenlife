@@ -561,6 +561,7 @@ enum Record<'a> {
         deaths: Option<u64>,
         evaluations: Option<u64>,
         rejected_births: Option<u64>,
+        refused_births: Option<u64>,
         uptake: Option<f64>,
         injected: f64,
         removed: f64,
@@ -1096,7 +1097,11 @@ fn main() -> ExitCode {
                     paused = Some(false);
                     current_run = Some(*run);
                 }
-                Status::Paused { .. } => paused = Some(true),
+                Status::Paused { .. }
+                | Status::Refused {
+                    intent: Intent::Resume,
+                    ..
+                } => paused = Some(true),
                 // The current run's end leaves the world paused, however it
                 // ended; an earlier run's end can arrive after a later run
                 // started.
@@ -1323,11 +1328,16 @@ fn main() -> ExitCode {
     let last = studio.take_recorded();
     match studio.close() {
         Ok(closed) => {
-            if let Some(timeline) = timeline
-                && let Err(error) =
-                    timeline.finish(last.iter().chain([&TimelineRecord::end(&closed.session)]))
-            {
-                return fail(error.kind(), error.to_string(), 1);
+            if let Some(timeline) = timeline {
+                let closing: Vec<TimelineRecord> = closed
+                    .statuses
+                    .iter()
+                    .filter_map(TimelineRecord::status)
+                    .collect();
+                let end = TimelineRecord::end(&closed.session);
+                if let Err(error) = timeline.finish(last.iter().chain(&closing).chain([&end])) {
+                    return fail(error.kind(), error.to_string(), 1);
+                }
             }
             for status in &closed.statuses {
                 if let Status::Checkpointed { tick, sequence, .. } = status {
@@ -1404,7 +1414,7 @@ fn status_record(status: &Status) -> Record<'static> {
             "resize-refused",
             None,
             None,
-            Some("budget_exhausted"),
+            Some("budget-exhausted"),
             Some(format!(
                 "resize to {}x{} @ {pixels_per_point}x requires {required} observer bytes, \
                  only {available} bytes fit maximum_total_bytes",
@@ -1615,6 +1625,7 @@ fn telemetry_record(
         deaths: tally.map(|tally| tally.deaths),
         evaluations: tally.map(|tally| tally.evaluations),
         rejected_births: tally.map(|tally| tally.rejected_births),
+        refused_births: tally.map(|tally| tally.refused_births),
         uptake: tally.map(|tally| tally.uptake),
         injected: metrics.ledger.injected,
         removed: metrics.ledger.removed,
@@ -2558,12 +2569,82 @@ mod tests {
         });
         assert_eq!(refused["record"], "status");
         assert_eq!(refused["status"], "resize-refused");
-        assert_eq!(refused["why"], "budget_exhausted");
+        assert_eq!(
+            refused["why"],
+            CoreError::BudgetExhausted {
+                budget: "",
+                required: 0,
+                available: 0,
+            }
+            .kind()
+        );
         assert!(
             refused["detail"]
                 .as_str()
                 .is_some_and(|text| text.contains("3840x2160") && text.contains("240000000"))
         );
+
+        let telemetry_metrics = Metrics {
+            tally: Some(flife_render::Tally {
+                since: Tick::ZERO,
+                births: 4,
+                introductions: 1,
+                deaths: 2,
+                evaluations: 100,
+                rejected_births: 3,
+                refused_births: 7,
+                uptake: 1.5,
+            }),
+            ..Metrics {
+                tick: Tick::new(5),
+                live: 10,
+                organism_energy: 20.0,
+                field_energy: 30.0,
+                max_generation: 2,
+                events: 0,
+                parameters: 1024,
+                genome_logical_bytes: 4096,
+                genome_allocated_bytes: 4096,
+                ledger: flife_core::LedgerReport {
+                    initial: 50.0,
+                    final_energy: 50.0,
+                    injected: 0.0,
+                    removed: 0.0,
+                    dissipated: 0.0,
+                    expected: 50.0,
+                    residual: 0.0,
+                    normalized_residual: 0.0,
+                },
+                faulted: false,
+                tally: None,
+            }
+        };
+        let memory = MemoryAdmission {
+            budget_bytes: 1_000_000,
+            logical_parameters: 1024,
+            logical_genome_bytes: 4096,
+            genomes: 4096,
+            state: 1024,
+            field: 1024,
+            scratch: 1024,
+            births: 1024,
+            render: 1024,
+            checkpoint: 0,
+            package: 0,
+            restore: 0,
+            reserve: 1024,
+            backend: 0,
+            peak_bytes: 10_240,
+        };
+        let telemetry = serde_json::to_value(super::telemetry_record(
+            &telemetry_metrics,
+            None,
+            &memory,
+            0,
+        ))
+        .expect("serializes telemetry");
+        assert_eq!(telemetry["rejected_births"], 3);
+        assert_eq!(telemetry["refused_births"], 7);
 
         let recurrent_toml = include_str!("../../../presets/reference-small-world.toml")
             .replace(

@@ -16,6 +16,15 @@
 
 use flife_core::CoreError;
 
+use crate::weights::WeightDtype;
+
+/// Element alignment of each slot inside a compact-F16 parameter shard
+/// (Trap A defense-in-depth, V2-01): rounding every slot stride up to a
+/// multiple of 4 binary16 elements guarantees that (a) slots never share a
+/// packed `u32` word (2 binary16s/word) even when a topology's parameter
+/// count is odd, and (b) every slot begins at an 8-byte `half4` boundary.
+pub const F16_SLOT_ALIGNMENT_ELEMENTS: u64 = 4;
+
 /// A live genome's place in its topology's arena: a name, not memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ArenaSlot {
@@ -71,42 +80,92 @@ pub struct Placement {
 
 /// Fixed-size slots of one topology's parameters, `slots_per_shard` of them
 /// to a shard. Slot `s` is in shard `s / slots_per_shard`, at element
-/// `(s mod slots_per_shard) · parameters` of it.
+/// `(s mod slots_per_shard) · slot_stride_elements` of it, where
+/// `slot_stride_elements >= parameters` is padded to the shard's element
+/// alignment (`1` by default, [`F16_SLOT_ALIGNMENT_ELEMENTS`] = `4` for
+/// compact-F16 Metal shards).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShardGeometry {
     parameters: u64,
+    slot_stride_elements: u64,
     slots_per_shard: u64,
     shard_elements: u64,
 }
 
 impl ShardGeometry {
-    /// Shards of `slots_per_shard` slots of `parameters` elements each.
+    /// Shards of `slots_per_shard` tightly packed slots of `parameters`
+    /// elements each (`slot_stride_elements == parameters`).
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for zero parameters or slots;
     /// [`CoreError::Overflow`] for a shard of more than `u64::MAX` elements.
     pub fn new(parameters: u64, slots_per_shard: u64) -> Result<Self, CoreError> {
-        if parameters == 0 || slots_per_shard == 0 {
+        Self::new_aligned(parameters, 1, slots_per_shard)
+    }
+
+    /// Shards of `slots_per_shard` slots of `parameters` elements each, with
+    /// each slot padded to a multiple of `alignment` elements
+    /// (`slot_stride_elements = parameters.next_multiple_of(alignment)`).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for zero parameters, alignment or slots;
+    /// [`CoreError::Overflow`] if the aligned stride or total shard elements
+    /// exceeds `u64::MAX`.
+    pub fn new_aligned(
+        parameters: u64,
+        alignment: u64,
+        slots_per_shard: u64,
+    ) -> Result<Self, CoreError> {
+        if parameters == 0 || alignment == 0 || slots_per_shard == 0 {
             return Err(CoreError::NumericalInvalid {
                 quantity: "arena shard geometry",
-                detail: format!("{slots_per_shard} slots of {parameters} parameters hold nothing"),
+                detail: format!(
+                    "{slots_per_shard} slots of {parameters} parameters (align {alignment}) hold \
+                     nothing"
+                ),
             });
         }
-        let shard_elements =
+        let slot_stride_elements =
             parameters
+                .checked_next_multiple_of(alignment)
+                .ok_or(CoreError::Overflow {
+                    quantity: "arena slot stride",
+                })?;
+        let shard_elements =
+            slot_stride_elements
                 .checked_mul(slots_per_shard)
                 .ok_or(CoreError::Overflow {
                     quantity: "arena shard elements",
                 })?;
         Ok(Self {
             parameters,
+            slot_stride_elements,
             slots_per_shard,
             shard_elements,
         })
     }
 
-    /// As many slots of `parameters` as fit in a shard of at most
-    /// `maximum_elements`, and at most `maximum_slots`.
+    /// Shards for canonical weight dtype `dtype`: F32 slots pack tightly
+    /// (`alignment = 1`), while F16 slots pad `slot_stride_elements` to
+    /// [`F16_SLOT_ALIGNMENT_ELEMENTS`] (`4`) so every slot starts on a `u32`
+    /// word and `half4` boundary (Trap A defense-in-depth).
+    ///
+    /// # Errors
+    /// As [`ShardGeometry::new_aligned`].
+    pub fn new_for_dtype(
+        parameters: u64,
+        dtype: WeightDtype,
+        slots_per_shard: u64,
+    ) -> Result<Self, CoreError> {
+        let alignment = match dtype {
+            WeightDtype::F32 => 1,
+            WeightDtype::F16 => F16_SLOT_ALIGNMENT_ELEMENTS,
+        };
+        Self::new_aligned(parameters, alignment, slots_per_shard)
+    }
+
+    /// As many tightly packed slots of `parameters` as fit in a shard of at
+    /// most `maximum_elements`, and at most `maximum_slots`.
     ///
     /// # Errors
     /// [`CoreError::BudgetExhausted`] when not one slot fits;
@@ -116,24 +175,76 @@ impl ShardGeometry {
         maximum_elements: u64,
         maximum_slots: u64,
     ) -> Result<Self, CoreError> {
+        Self::fitting_aligned(parameters, 1, maximum_elements, maximum_slots)
+    }
+
+    /// As many `alignment`-padded slots of `parameters` as fit in a shard of
+    /// at most `maximum_elements`, and at most `maximum_slots`.
+    ///
+    /// # Errors
+    /// [`CoreError::BudgetExhausted`] when not one aligned slot fits;
+    /// [`CoreError::NumericalInvalid`] for zero parameters, alignment or slots;
+    /// [`CoreError::Overflow`] if the aligned stride exceeds `u64::MAX`.
+    pub fn fitting_aligned(
+        parameters: u64,
+        alignment: u64,
+        maximum_elements: u64,
+        maximum_slots: u64,
+    ) -> Result<Self, CoreError> {
+        if parameters == 0 || alignment == 0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "arena shard geometry",
+                detail: format!("0 parameters or alignment ({parameters}, {alignment})"),
+            });
+        }
+        let stride = parameters
+            .checked_next_multiple_of(alignment)
+            .ok_or(CoreError::Overflow {
+                quantity: "arena slot stride",
+            })?;
         let fit = maximum_elements
-            .checked_div(parameters)
+            .checked_div(stride)
             .unwrap_or(0)
             .min(maximum_slots);
-        if fit == 0 && parameters > maximum_elements {
+        if fit == 0 && stride > maximum_elements {
             return Err(CoreError::BudgetExhausted {
                 budget: "arena shard elements",
-                required: parameters,
+                required: stride,
                 available: maximum_elements,
             });
         }
-        Self::new(parameters, fit)
+        Self::new_aligned(parameters, alignment, fit)
     }
 
-    /// Elements per slot: the topology's parameter count.
+    /// As [`ShardGeometry::fitting_aligned`], selecting `alignment = 4` for
+    /// [`WeightDtype::F16`] and `alignment = 1` for [`WeightDtype::F32`].
+    ///
+    /// # Errors
+    /// As [`ShardGeometry::fitting_aligned`].
+    pub fn fitting_for_dtype(
+        parameters: u64,
+        dtype: WeightDtype,
+        maximum_elements: u64,
+        maximum_slots: u64,
+    ) -> Result<Self, CoreError> {
+        let alignment = match dtype {
+            WeightDtype::F32 => 1,
+            WeightDtype::F16 => F16_SLOT_ALIGNMENT_ELEMENTS,
+        };
+        Self::fitting_aligned(parameters, alignment, maximum_elements, maximum_slots)
+    }
+
+    /// Logical parameter elements per slot: the topology's parameter count.
     #[must_use]
     pub const fn parameters(&self) -> u64 {
         self.parameters
+    }
+
+    /// Stride in elements between adjacent slots within a shard
+    /// (`>= parameters`; multiple of 4 for F16 shards).
+    #[must_use]
+    pub const fn slot_stride_elements(&self) -> u64 {
+        self.slot_stride_elements
     }
 
     /// Slots per shard.
@@ -142,13 +253,13 @@ impl ShardGeometry {
         self.slots_per_shard
     }
 
-    /// Elements per shard.
+    /// Elements per shard (`slots_per_shard * slot_stride_elements`).
     #[must_use]
     pub const fn shard_elements(&self) -> u64 {
         self.shard_elements
     }
 
-    /// Where slot `slot` sits. It never overflows: the offset is below
+    /// Where slot `slot` sits. It never overflows: `offset + length` is at most
     /// [`ShardGeometry::shard_elements`], which construction checked.
     #[must_use]
     pub const fn locate(&self, slot: u64) -> Placement {
@@ -156,7 +267,7 @@ impl ShardGeometry {
         Placement {
             shard: slot / self.slots_per_shard,
             slot_in_shard,
-            offset: slot_in_shard * self.parameters,
+            offset: slot_in_shard * self.slot_stride_elements,
             length: self.parameters,
         }
     }
@@ -239,5 +350,52 @@ mod tests {
         let device = ShardGeometry::fitting(1 << 20, u64::from(u32::MAX), u64::MAX).expect("fits");
         assert_eq!(device.slots_per_shard(), (1 << 12) - 1);
         assert!(device.shard_elements() <= u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn f16_shards_pad_slot_stride_to_four_elements_without_changing_aligned_topologies() {
+        // Odd and non-4-aligned parameter counts pad up to a multiple of 4 in F16
+        // shards (Trap A defense-in-depth), while F32 stays tightly packed.
+        for (params, expected_f16_stride) in [
+            (741, 744),
+            (742, 744),
+            (743, 744),
+            (744, 744),
+            (9_988, 9_988),
+        ] {
+            let f16 = ShardGeometry::new_for_dtype(params, WeightDtype::F16, 16).expect("f16");
+            assert_eq!(f16.parameters(), params);
+            assert_eq!(f16.slot_stride_elements(), expected_f16_stride);
+            assert_eq!(f16.shard_elements(), expected_f16_stride * 16);
+            assert_eq!(f16.shard_elements() % F16_SLOT_ALIGNMENT_ELEMENTS, 0);
+            for slot in 0..32_u64 {
+                let at = f16.locate(slot);
+                assert_eq!(at.offset % F16_SLOT_ALIGNMENT_ELEMENTS, 0);
+                assert_eq!(at.length, params);
+                assert!(at.offset + at.length <= f16.shard_elements());
+                assert!(at.offset + f16.slot_stride_elements() <= f16.shard_elements());
+            }
+
+            let f32_geom = ShardGeometry::new_for_dtype(params, WeightDtype::F32, 16).expect("f32");
+            assert_eq!(f32_geom.slot_stride_elements(), params);
+        }
+
+        // `fitting_for_dtype` budgets against the padded F16 stride, not raw parameters.
+        assert!(matches!(
+            ShardGeometry::fitting_for_dtype(741, WeightDtype::F16, 743, 16),
+            Err(CoreError::BudgetExhausted {
+                required: 744,
+                available: 743,
+                ..
+            })
+        ));
+        let fit = ShardGeometry::fitting_for_dtype(741, WeightDtype::F16, 744 * 3 + 741, 16)
+            .expect("fits 3 padded slots");
+        assert_eq!(fit.slots_per_shard(), 3);
+        assert_eq!(fit.shard_elements(), 744 * 3);
+        assert!(matches!(
+            ShardGeometry::new_aligned(u64::MAX, 4, 1),
+            Err(CoreError::Overflow { .. })
+        ));
     }
 }

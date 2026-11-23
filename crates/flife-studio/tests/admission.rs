@@ -17,7 +17,7 @@ use flife_studio::memory::{
     DEVICE_BYTES_PER_PIXEL, admit, admit_kept_at, admit_resize, observer_bytes, observer_bytes_at,
     observer_bytes_for_resize, observer_limit,
 };
-use flife_studio::{ControllerChoice, Exact, TimelineRecord, peak_observer_bytes};
+use flife_studio::{ControllerChoice, Exact, REPLAY_SLOTS, TimelineRecord, peak_observer_bytes};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -326,10 +326,13 @@ fn atomic_refit_surface_and_timeline_peak_admission_avoid_phantom_1x_retina_spik
     ];
     let retina_peak = peak_observer_bytes(&world, &founding, &view, [1920, 1080], &retina_records)
         .expect("computes retina peak");
+    let replay_feed_bytes = founding
+        .reserved_bytes()
+        .saturating_mul(REPLAY_SLOTS as u64);
     let expected_2x =
-        observer_bytes_at(&world, &founding, &view, [3840, 2160], 2.0).expect("2x bytes");
+        observer_bytes_for_resize(replay_feed_bytes, &view, [3840, 2160], 2.0).expect("2x bytes");
     let phantom_1x =
-        observer_bytes_at(&world, &founding, &view, [3840, 2160], 1.0).expect("1x bytes");
+        observer_bytes_for_resize(replay_feed_bytes, &view, [3840, 2160], 1.0).expect("1x bytes");
     assert!(
         phantom_1x > expected_2x,
         "4K @ 1x has 4x as many density bins as 4K @ 2x"
@@ -337,6 +340,18 @@ fn atomic_refit_surface_and_timeline_peak_admission_avoid_phantom_1x_retina_spik
     assert_eq!(
         retina_peak, expected_2x,
         "paired Resize + Density before Draw must not overcharge 1x density bins"
+    );
+    // Replay allocates `REPLAY_SLOTS` (4) epoch slots regardless of a smaller
+    // `execution.render_queue_capacity` (3 in the preset), so peak_observer_bytes
+    // must charge all 4 slots rather than undercharging by 1+ slots.
+    let preset_2x =
+        observer_bytes_at(&world, &founding, &view, [3840, 2160], 2.0).expect("preset 2x");
+    assert_eq!(
+        retina_peak - preset_2x,
+        founding.reserved_bytes().saturating_mul(
+            REPLAY_SLOTS as u64 - u64::from(config.config().execution.render_queue_capacity)
+        ),
+        "peak_observer_bytes must charge all REPLAY_SLOTS slots actually allocated by replay"
     );
 
     // Conversely, drawing a frame at 4K @ 1x BEFORE switching to 2x DOES charge 4K @ 1x.

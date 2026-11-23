@@ -81,14 +81,29 @@ impl Viewport {
         }
         let pixels = drawable.map(f64::from);
         let fit_scale = (pixels[0] / extent[0]).min(pixels[1] / extent[1]);
-        Ok(Self::placed(
+        if !fit_scale.is_finite() || fit_scale <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "viewport fit scale",
+                detail: format!("extent {extent:?} in drawable {drawable:?} gives scale {fit_scale}"),
+            });
+        }
+        let viewport = Self::placed(
             extent,
             drawable,
             fit_scale,
             extent.map(|length| length / 2.0),
             1.0,
             1.0,
-        ))
+        );
+        if !viewport.origin.iter().all(|c| c.is_finite())
+            || !viewport.frame_shape().iter().all(|c| c.is_finite())
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "viewport fit scale",
+                detail: format!("extent {extent:?} in drawable {drawable:?} overflows coordinates"),
+            });
+        }
+        Ok(viewport)
     }
 
     fn placed(
@@ -146,14 +161,25 @@ impl Viewport {
             wrap(center[0], self.extent[0]),
             wrap(center[1], self.extent[1]),
         ];
-        Ok(Self::placed(
+        let viewport = Self::placed(
             self.extent,
             self.drawable,
             self.fit_scale,
             center,
             zoom,
             self.pixels_per_point,
-        ))
+        );
+        if !viewport.scale.is_finite()
+            || viewport.scale <= 0.0
+            || !viewport.origin.iter().all(|c| c.is_finite())
+            || !viewport.frame_shape().iter().all(|c| c.is_finite())
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "viewport zoom",
+                detail: format!("zoom {zoom} overflows viewport scale or coordinates"),
+            });
+        }
+        Ok(viewport)
     }
 
     /// The same view in a drawable of `drawable` pixels.
@@ -379,19 +405,59 @@ impl Viewport {
     }
 
     /// The drawable position of a logical window point, given the content
-    /// area's logical size; `None` while the content area is empty.
+    /// area's logical size; `None` while the content area is empty or the
+    /// point or result is not finite.
     #[must_use]
     pub fn logical_to_drawable(&self, point: [f64; 2], logical_size: [f64; 2]) -> Option<[f64; 2]> {
-        if !logical_size
-            .iter()
-            .all(|length| length.is_finite() && *length > 0.0)
+        if !point.iter().all(|coordinate| coordinate.is_finite())
+            || !logical_size
+                .iter()
+                .all(|length| length.is_finite() && *length > 0.0)
         {
             return None;
         }
-        Some([
+        let mapped = [
             point[0] * f64::from(self.drawable[0]) / logical_size[0],
             point[1] * f64::from(self.drawable[1]) / logical_size[1],
-        ])
+        ];
+        mapped
+            .iter()
+            .all(|coordinate| coordinate.is_finite())
+            .then_some(mapped)
+    }
+
+    /// Precomputed constants for repeated [`Viewport::scene_point`] calls over
+    /// one frame: `(window_start, extent, half_extent)`.
+    #[inline]
+    pub(crate) fn scene_transform(&self) -> ([f64; 2], [f64; 2], [f64; 2]) {
+        let half = [self.extent[0] / 2.0, self.extent[1] / 2.0];
+        let start = [self.center[0] - half[0], self.center[1] - half[1]];
+        (start, self.extent, half)
+    }
+
+    /// [`Viewport::scene_point`] using constants from
+    /// [`Viewport::scene_transform`], bit-identical to calling `scene_point`
+    /// per organism.
+    #[inline]
+    pub(crate) fn scene_point_with(
+        start: [f64; 2],
+        extent: [f64; 2],
+        half: [f64; 2],
+        point: [f64; 2],
+    ) -> [f64; 3] {
+        let ox = point[0] - start[0];
+        let ix = if (0.0..=extent[0]).contains(&ox) {
+            ox
+        } else {
+            wrap(ox, extent[0])
+        };
+        let oy = point[1] - start[1];
+        let iy = if (0.0..=extent[1]).contains(&oy) {
+            oy
+        } else {
+            wrap(oy, extent[1])
+        };
+        [ix - half[0], half[1] - iy, 0.0]
     }
 
     /// The scene point FrankenManim draws for a world point: its image,

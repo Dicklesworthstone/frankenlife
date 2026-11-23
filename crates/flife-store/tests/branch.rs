@@ -634,6 +634,14 @@ fn a_branch_catalog_records_its_lineage_and_starts_with_its_inherited_history() 
     wrong.accepted[1].0.session = other;
     let mut misnumbered = history.clone();
     misnumbered.outcomes[0].1 = applied(2, 5);
+    let mut orphan_outcome = history.clone();
+    orphan_outcome.outcomes[0].0 = CommandId::new(99);
+    let mut duplicate_accepted = history.clone();
+    duplicate_accepted.accepted[1].0.id = CommandId::new(1);
+    let mut duplicate_outcome = history.clone();
+    duplicate_outcome
+        .outcomes
+        .push((CommandId::new(1), applied(3, 1)));
     for (index, (lineage, history, why)) in [
         (&[][..], &history, "no fork"),
         (
@@ -642,6 +650,21 @@ fn a_branch_catalog_records_its_lineage_and_starts_with_its_inherited_history() 
             "an inherited acceptance of the branch's session",
         ),
         (&[fork][..], &misnumbered, "an outcome out of turn"),
+        (
+            &[fork][..],
+            &orphan_outcome,
+            "an inherited outcome for an unaccepted command",
+        ),
+        (
+            &[fork][..],
+            &duplicate_accepted,
+            "duplicate inherited accepted command identity",
+        ),
+        (
+            &[fork][..],
+            &duplicate_outcome,
+            "duplicate inherited outcome command identity",
+        ),
     ]
     .into_iter()
     .enumerate()

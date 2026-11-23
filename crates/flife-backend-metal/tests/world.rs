@@ -14,7 +14,7 @@ use flife_backend_metal::{
 use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob};
+use flife_neural::{ControllerBackend, ControllerJob, RawOutputs};
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -116,7 +116,7 @@ impl ControllerBackend for Counted {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.inner.evaluate(jobs, outputs)?;
         let mut seen = self.seen.lock().map_err(|_| CoreError::StateConflict {
@@ -168,8 +168,9 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
     assert!(seen.resident < seen.genomes.len(), "{seen:?}");
     assert_eq!(seen.shards, 1, "{seen:?}");
     // FL-028: after 400 ticks the owner holds exactly the backend's resident
-    // buffers (each shard's parameters and job words; the inputs, outputs
-    // and fault flags), with no lease, command or retiring buffer left over.
+    // buffers (each shard's parameters and job words; the inputs, outputs,
+    // fault flags and dims uniform), with no lease, command or retiring buffer
+    // left over.
     let usage = owner.usage();
     assert_eq!(
         (
@@ -179,7 +180,7 @@ fn the_preset_on_metal_is_the_reference_world_at_every_tick() {
             usage.write_leases,
             usage.running
         ),
-        (2 * seen.shards + 3, 0, [0; 3], 0, 0),
+        (2 * seen.shards + 4, 0, [0; 3], 0, 0),
         "{usage:?}"
     );
     // The one shard is the default's byte budget, not the device's largest
@@ -303,7 +304,7 @@ impl ControllerBackend for Timed {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.inner.evaluate(jobs, outputs)?;
         let mut seconds = self.seconds.lock().map_err(|_| CoreError::StateConflict {
@@ -469,7 +470,7 @@ impl ControllerBackend for Flipped {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.inner.evaluate(jobs, outputs)?;
         self.calls += 1;
@@ -658,7 +659,7 @@ fn deaths_reclaim_emptied_device_shards_in_a_world() {
     let peak_bytes = owner.usage().bytes;
     let peak_buffers = owner.usage().buffers;
     assert!(
-        peak_buffers >= 2 * 3 + 3,
+        peak_buffers >= 2 * 3 + 4,
         "expected 3 shards on device after tick 1, got {peak_buffers} buffers"
     );
 
@@ -675,7 +676,7 @@ fn deaths_reclaim_emptied_device_shards_in_a_world() {
     );
     let after = owner.usage();
     assert_eq!(
-        after.buffers, 3,
+        after.buffers, 4,
         "all 3 emptied shards must drop from device once all occupants die ({after:?})"
     );
     assert!(

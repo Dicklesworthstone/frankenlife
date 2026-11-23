@@ -60,6 +60,18 @@ pub fn selection_ring_around(
     position: [f64; 2],
     dot_radius: f64,
 ) -> Result<SurfaceMesh, CoreError> {
+    if !position.iter().all(|coordinate| coordinate.is_finite()) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "selection ring",
+            detail: format!("position {position:?} must be finite"),
+        });
+    }
+    if !(dot_radius.is_finite() && dot_radius >= 0.0) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "selection ring",
+            detail: format!("dot radius {dot_radius} must be finite and non-negative"),
+        });
+    }
     let pixels = viewport.pixels_per_point();
     let scale = viewport.scale();
     let inner = dot_radius + SELECTION_RING_GAP_POINTS * pixels / scale;

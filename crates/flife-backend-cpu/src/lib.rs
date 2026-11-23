@@ -53,8 +53,8 @@ use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
 use flife_core::numerics::tanh_f32;
 use flife_neural::{
-    ACTION_WIDTH, ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, DenseTopology,
-    SENSOR_WIDTH, ShardGeometry, Weight, Weights,
+    ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, DenseTopology,
+    MAX_CONTROLLER_OUTPUT_WIDTH, MAX_SENSOR_WIDTH, RawOutputs, ShardGeometry, Weight, Weights,
 };
 use ft_kernel_cpu::population_affine_f32_into;
 
@@ -108,10 +108,18 @@ impl Layer {
 fn shape(topology: &DenseTopology, length: usize) -> Option<Vec<Layer>> {
     let layers = topology.layers();
     let (last, _) = layers.split_last()?;
-    if layers.len() > MAXIMUM_HIDDEN_LAYERS + 1 || last.outputs != ACTION_WIDTH {
+    let input_width = topology.input_width();
+    let output_width = topology.raw_output_width();
+    if layers.len() > MAXIMUM_HIDDEN_LAYERS + 1
+        || input_width == 0
+        || input_width > MAX_SENSOR_WIDTH
+        || output_width == 0
+        || output_width > MAX_CONTROLLER_OUTPUT_WIDTH
+        || last.outputs != output_width
+    {
         return None;
     }
-    let mut fan_in = SENSOR_WIDTH;
+    let mut fan_in = input_width;
     let mut packed = Vec::new();
     let mut offset = 0;
     for layer in layers {
@@ -186,15 +194,25 @@ fn pack_as<W: Weight>(
     Ok(())
 }
 
-/// One organism's 36 raw outputs from its packed slot, or `None` where the
+/// One organism's raw linear outputs from its packed slot, or `None` where the
 /// reference would refuse it.
 fn evaluate(
     layers: &[Layer],
+    input_width: usize,
+    output_width: usize,
     values: &[f32],
-    inputs: &[f64; SENSOR_WIDTH],
+    inputs: &[f64],
     scratch: &mut Scratch,
-) -> Result<Option<[f32; ACTION_WIDTH]>, CoreError> {
-    let mut rounded = [0.0_f32; SENSOR_WIDTH];
+) -> Result<Option<RawOutputs>, CoreError> {
+    if inputs.len() != input_width
+        || input_width > MAX_SENSOR_WIDTH
+        || output_width == 0
+        || output_width > MAX_CONTROLLER_OUTPUT_WIDTH
+    {
+        return Ok(None);
+    }
+    let mut rounded = [0.0_f32; MAX_SENSOR_WIDTH];
+    let rounded = &mut rounded[..input_width];
     for (slot, &value) in rounded.iter_mut().zip(inputs) {
         // Rounding each input once to F32 is the declared arithmetic.
         *slot = value as f32;
@@ -202,32 +220,33 @@ fn evaluate(
             return Ok(None);
         }
     }
-    let mut raw = [0.0_f32; ACTION_WIDTH];
+    let mut raw = RawOutputs::zeroed(output_width)?;
+    let out = raw.as_mut_slice();
     let Some((output, hidden)) = layers.split_last() else {
         return Ok(None);
     };
     let Scratch { first, second } = scratch;
     let activated = match hidden {
         [] => {
-            output.apply(values, &rounded, &mut raw)?;
+            output.apply(values, rounded, out)?;
             true
         }
         [one] => {
             let first = &mut first[..one.outputs];
-            one.apply(values, &rounded, first)?;
+            one.apply(values, rounded, first)?;
             activate(first) && {
-                output.apply(values, first, &mut raw)?;
+                output.apply(values, first, out)?;
                 true
             }
         }
         [one, two] => {
             let first = &mut first[..one.outputs];
             let second = &mut second[..two.outputs];
-            one.apply(values, &rounded, first)?;
+            one.apply(values, rounded, first)?;
             activate(first) && {
                 two.apply(values, first, second)?;
                 activate(second) && {
-                    output.apply(values, second, &mut raw)?;
+                    output.apply(values, second, out)?;
                     true
                 }
             }
@@ -305,6 +324,8 @@ struct Shard {
 /// One catalog member's packed slots, in shards.
 #[derive(Debug)]
 struct Packing {
+    input_width: usize,
+    output_width: usize,
     layers: Vec<Layer>,
     widest: usize,
     geometry: ShardGeometry,
@@ -413,7 +434,9 @@ impl Bucket {
     fn serving(&self, job: &ControllerJob<'_>) -> Option<&Packing> {
         let packing = self.packing.as_ref()?;
         let length = job.controller.parameters().len() as u64;
-        (*job.controller.topology() == self.topology && length == packing.geometry.parameters())
+        (*job.controller.topology() == self.topology
+            && length == packing.geometry.parameters()
+            && job.inputs.len() == packing.input_width)
             .then_some(packing)
     }
 }
@@ -543,6 +566,8 @@ impl CpuBackend {
                         hidden.iter().map(|layer| layer.outputs).max().unwrap_or(0)
                     });
                     Some(Packing {
+                        input_width: topology.input_width(),
+                        output_width: topology.raw_output_width(),
                         layers,
                         widest,
                         geometry,
@@ -583,7 +608,7 @@ impl CpuBackend {
 fn run(
     buckets: &[Option<Bucket>],
     jobs: &[ControllerJob<'_>],
-    outputs: &mut [Option<[f32; ACTION_WIDTH]>],
+    outputs: &mut [Option<RawOutputs>],
     scratch: &mut Scratch,
 ) -> Result<(), CoreError> {
     for (job, output) in jobs.iter().zip(outputs) {
@@ -593,7 +618,14 @@ fn run(
             .and_then(Option::as_ref)
             .and_then(|bucket| bucket.serving(job));
         *output = match packing.and_then(|packing| Some((packing, packing.resident(job)?))) {
-            Some((packing, values)) => evaluate(&packing.layers, values, job.inputs, scratch)?,
+            Some((packing, values)) => evaluate(
+                &packing.layers,
+                packing.input_width,
+                packing.output_width,
+                values,
+                job.inputs,
+                scratch,
+            )?,
             None => None,
         };
     }
@@ -665,7 +697,7 @@ impl ControllerBackend for CpuBackend {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.used = 0;
         outputs.clear();

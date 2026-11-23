@@ -6,13 +6,18 @@
 
 use flife_core::canonical::canonical_float;
 use flife_core::clock::{TickSpan, age_seconds, stable_phase};
+use flife_core::config::ContactConfig;
 use flife_core::ids::{Generation, IdSequence, OrganismId, SequentialId};
-use flife_core::model::{dense_parameter_count, genome_bank_bytes};
+use flife_core::model::{
+    FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V2, FIELD_ECOLOGY_V2_CHEMISTRY_ONLY,
+    FIELD_ECOLOGY_V2_FIXED_CONTROLLER, FIELD_ECOLOGY_V2_FRESH_OFFSPRING, dense_parameter_count,
+    genome_bank_bytes,
+};
 use flife_core::registry::{self, REGISTRY, Role, Status};
 use flife_core::schema::{self, Kind};
 use flife_core::{
-    ConfigIssue, CoreError, ModelDescriptor, RunConfig, Sha256Digest, Tick, TimeStep,
-    ValidatedConfig, validate,
+    ConfigIssue, CoreError, FeatureOverride, ModelDescriptor, RunConfig, Sha256Digest, Tick,
+    TimeStep, V2Config, V2Feature, ValidatedConfig, apply_feature_overrides, validate,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -747,9 +752,12 @@ fn registry_names_are_unique_per_role_and_cite_their_owners() {
             entry.role.key()
         );
         assert!(!entry.contract.is_empty(), "{} has no contract", entry.name);
-        let owner_ok = entry.owner.len() == 6
+        let owner_ok = (entry.owner.len() == 6
             && entry.owner.starts_with("FL-0")
-            && entry.owner[3..].chars().all(|c| c.is_ascii_digit());
+            && entry.owner[3..].chars().all(|c| c.is_ascii_digit()))
+            || (entry.owner.len() == 5
+                && entry.owner.starts_with("V2-")
+                && entry.owner[3..].chars().all(|c| c.is_ascii_digit()));
         assert!(owner_ok, "{} has owner {}", entry.name, entry.owner);
         if let Status::Implemented { evidence } = entry.status {
             let cited = evidence.strip_prefix("test:").unwrap();
@@ -948,4 +956,332 @@ fn errors_name_their_class() {
         );
         assert!(kinds.insert(*kind), "{kind} is not distinct");
     }
+}
+
+// --------------------------------------------------- field-ecology-v2 (V2-01)
+
+fn sample_contact() -> ContactConfig {
+    ContactConfig {
+        diameter: 0.25,
+        stiffness: 0.5,
+        adhesion: 0.2,
+        adhesion_range: 1.5,
+        sweeps: None,
+        inhibition: None,
+        repulsion: None,
+    }
+}
+
+#[test]
+fn v1_canonical_toml_and_config_hash_unchanged() {
+    let presets: &[(&str, &str)] = &[
+        (
+            "colony-world.toml",
+            include_str!("../../../presets/colony-world.toml"),
+        ),
+        (
+            "confluent-world.toml",
+            include_str!("../../../presets/confluent-world.toml"),
+        ),
+        (
+            "contact-world.toml",
+            include_str!("../../../presets/contact-world.toml"),
+        ),
+        (
+            "desktop-world.toml",
+            include_str!("../../../presets/desktop-world.toml"),
+        ),
+        (
+            "interactive-world.toml",
+            include_str!("../../../presets/interactive-world.toml"),
+        ),
+        (
+            "reference-small-world.toml",
+            include_str!("../../../presets/reference-small-world.toml"),
+        ),
+        (
+            "showcase-world.toml",
+            include_str!("../../../presets/showcase-world.toml"),
+        ),
+        (
+            "tissue-world.toml",
+            include_str!("../../../presets/tissue-world.toml"),
+        ),
+    ];
+    for (name, toml_text) in presets {
+        let validated = ValidatedConfig::from_toml(toml_text)
+            .unwrap_or_else(|err| panic!("{name} failed validation: {err}"));
+        assert!(
+            validated.config().v2.is_none(),
+            "{name} must keep v2 = None"
+        );
+        let canonical = validated.canonical_toml();
+        assert!(
+            !canonical.contains("[v2"),
+            "{name} canonical TOML must not emit any [v2] section"
+        );
+        let reparsed = ValidatedConfig::from_toml(&canonical)
+            .unwrap_or_else(|err| panic!("{name} canonical TOML failed reparse: {err}"));
+        assert_eq!(reparsed.canonical_toml(), canonical, "{name}");
+        assert_eq!(reparsed.config_hash(), validated.config_hash(), "{name}");
+        let descriptor = ModelDescriptor::of(&validated);
+        assert!(
+            !descriptor.canonical_text().contains("v2_"),
+            "{name} v1 descriptor must not emit v2 lines"
+        );
+        assert_eq!(validated.v2_feature_bitmask(), 0, "{name}");
+    }
+    // Appendix A pins remain bit-for-bit identical.
+    let appendix = ValidatedConfig::from_toml(appendix_a_toml()).unwrap();
+    assert_eq!(appendix.config_hash().to_string(), PINNED_CONFIG_HASH);
+    assert_eq!(
+        ModelDescriptor::of(&appendix).digest().to_string(),
+        PINNED_MODEL_DIGEST
+    );
+}
+
+#[test]
+fn v2_feature_registry_auto_profile_and_validation() {
+    // 1. Exact 21 distinct slugs + aliases.
+    assert_eq!(V2Feature::ALL.len(), 21);
+    assert_eq!(V2Feature::BUNDLE_A_DEFAULTS.len(), 14);
+    assert_eq!(V2Feature::BUNDLE_B_DEFAULTS.len(), 13);
+    let mut slugs = std::collections::BTreeSet::new();
+    for feature in V2Feature::ALL {
+        assert!(slugs.insert(feature.slug()), "duplicate slug {}", feature.slug());
+        assert_eq!(V2Feature::from_slug(feature.slug()), Some(feature));
+        assert_eq!(
+            V2Feature::expand_slug_or_alias(feature.slug()),
+            Some([feature].as_slice())
+        );
+    }
+    assert_eq!(
+        V2Feature::expand_slug_or_alias("all-v2").map(<[V2Feature]>::len),
+        Some(21)
+    );
+    assert_eq!(
+        V2Feature::expand_slug_or_alias("bundle-a").map(<[V2Feature]>::len),
+        Some(14)
+    );
+    assert_eq!(
+        V2Feature::expand_slug_or_alias("bundle-b").map(<[V2Feature]>::len),
+        Some(13)
+    );
+    assert_eq!(V2Feature::expand_slug_or_alias("nonexistent-slug"), None);
+
+    // 2. All 4 v2 model strings are registered and validate cleanly.
+    for model in [
+        FIELD_ECOLOGY_V2,
+        FIELD_ECOLOGY_V2_CHEMISTRY_ONLY,
+        FIELD_ECOLOGY_V2_FRESH_OFFSPRING,
+        FIELD_ECOLOGY_V2_FIXED_CONTROLLER,
+    ] {
+        let mut cfg = starter();
+        cfg.model = model.to_owned();
+        let validated = validate(cfg).unwrap_or_else(|err| panic!("{model}: {err}"));
+        assert!(validated.inv08_pure_field(), "{model} without contact");
+    }
+
+    // 3. `auto` profile split: [contact] absent => Bundle B (pure-field).
+    let mut pure_cfg = starter();
+    pure_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    let pure = validate(pure_cfg).expect("v2 pure-field auto validates");
+    assert!(pure.inv08_pure_field());
+    for feature in V2Feature::ALL {
+        assert_eq!(
+            pure.is_v2_feature_enabled(feature),
+            feature.default_in_bundle_b(),
+            "auto pure-field default mismatch for {}",
+            feature.slug()
+        );
+    }
+    assert_eq!(pure.v2_abi().input_width, 108);
+    assert_eq!(pure.v2_abi().action_width, 42);
+    assert_eq!(pure.v2_abi().raw_output_width, 42);
+    assert_eq!(pure.v2_abi().field_planes, 34);
+    // Canonical TOML round-trips bit-for-bit on materialized v2 configs.
+    let pure_reparsed = ValidatedConfig::from_toml(&pure.canonical_toml()).unwrap();
+    assert_eq!(pure_reparsed.canonical_toml(), pure.canonical_toml());
+    assert_eq!(pure_reparsed.config_hash(), pure.config_hash());
+
+    // 4. `auto` profile split: [contact] present => Bundle A (tissue).
+    let mut tissue_cfg = starter();
+    tissue_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    tissue_cfg.contact = Some(sample_contact());
+    let tissue = validate(tissue_cfg).expect("v2 tissue auto validates");
+    assert!(!tissue.inv08_pure_field());
+    for feature in V2Feature::ALL {
+        assert_eq!(
+            tissue.is_v2_feature_enabled(feature),
+            feature.default_in_bundle_a(),
+            "auto tissue default mismatch for {}",
+            feature.slug()
+        );
+    }
+    // 104 + 1 (notch-delta sensor-neighbor-mean-v1) + 2 (S=2) = 107 (expose_sensor defaults false).
+    assert_eq!(tissue.v2_abi().input_width, 107);
+    assert_eq!(tissue.v2_abi().action_width, 40);
+    assert_eq!(tissue.v2_abi().raw_output_width, 44);
+    assert_eq!(tissue.v2_abi().field_planes, 33);
+
+    // Enabling hippo-crowding expose_sensor reaches exact Bundle A 108/44 ABI.
+    let mut bundle_a_108 = starter();
+    bundle_a_108.model = FIELD_ECOLOGY_V2.to_owned();
+    bundle_a_108.contact = Some(sample_contact());
+    let mut v2_a = V2Config::default();
+    v2_a.crowding.expose_sensor = true;
+    bundle_a_108.v2 = Some(v2_a);
+    let bundle_a_108 = validate(bundle_a_108).expect("Bundle A 108/44 validates");
+    assert_eq!(bundle_a_108.v2_abi().input_width, 108);
+    assert_eq!(bundle_a_108.v2_abi().action_width, 40);
+    assert_eq!(bundle_a_108.v2_abi().raw_output_width, 44);
+
+    // 5. CLI overrides: --disable <slug>, --disable all-v2 --enable <slug>, unknown slug error.
+    let mut toggled = starter();
+    toggled.model = FIELD_ECOLOGY_V2.to_owned();
+    apply_feature_overrides(
+        &mut toggled,
+        &[
+            FeatureOverride::Disable("all-v2".into()),
+            FeatureOverride::Enable("so2-motor".into()),
+        ],
+    )
+    .expect("apply overrides");
+    let toggled = validate(toggled).expect("single feature validates");
+    assert!(toggled.is_v2_feature_enabled(V2Feature::So2Motor));
+    assert!(!toggled.is_v2_feature_enabled(V2Feature::Oases));
+    assert_eq!(toggled.v2_feature_bitmask(), V2Feature::So2Motor.bit());
+    assert_eq!(toggled.v2_abi().input_width, 104);
+    assert_eq!(toggled.v2_abi().action_width, 40);
+
+    let mut bad_slug = starter();
+    bad_slug.model = FIELD_ECOLOGY_V2.to_owned();
+    let err = apply_feature_overrides(
+        &mut bad_slug,
+        &[FeatureOverride::Disable("made-up-feature".into())],
+    )
+    .expect_err("unknown slug refused");
+    assert!(err.to_string().contains("made-up-feature"), "{err}");
+
+    // 6. Refusal of [v2] and overrides on field-ecology-v1*.
+    let mut v1_with_v2 = starter();
+    assert_eq!(v1_with_v2.model, FIELD_ECOLOGY_V1);
+    v1_with_v2.v2 = Some(V2Config::default());
+    let err = validate(v1_with_v2).expect_err("[v2] refused on v1");
+    assert!(err.to_string().contains("[v2] belongs to"), "{err}");
+
+    let mut v1_override = starter();
+    assert!(
+        apply_feature_overrides(&mut v1_override, &[FeatureOverride::V1Compat]).is_err(),
+        "v2 overrides refused on v1"
+    );
+
+    // 7. Refusal of contact features without [contact], EXCEPT hippo-crowding cell-occupancy-v1.
+    for slug in [
+        "pcp-polarity",
+        "emt-gate",
+        "trophallaxis",
+        "cadherin-4d",
+        "velocity-alignment",
+        "hippo-crowding",
+    ] {
+        let mut cfg = starter();
+        cfg.model = FIELD_ECOLOGY_V2.to_owned();
+        apply_feature_overrides(
+            &mut cfg,
+            &[
+                FeatureOverride::V1Compat,
+                FeatureOverride::Enable(slug.into()),
+            ],
+        )
+        .expect("override parses");
+        let err = validate(cfg).expect_err(&format!("{slug} must fail without [contact]"));
+        assert!(
+            err.to_string().contains("[contact]"),
+            "{slug} error should mention [contact]: {err}"
+        );
+    }
+
+    // hippo-crowding with mode = cell-occupancy-v1 IS pure-field INV-08!
+    let mut cell_hippo = starter();
+    cell_hippo.model = FIELD_ECOLOGY_V2.to_owned();
+    let mut v2_hippo = V2Config::default();
+    v2_hippo.profile = "minimal".into();
+    v2_hippo.crowding.enabled = Some(true);
+    v2_hippo.crowding.mode = "cell-occupancy-v1".into();
+    cell_hippo.v2 = Some(v2_hippo);
+    let cell_hippo = validate(cell_hippo).expect("cell-occupancy-v1 hippo validates without contact");
+    assert!(cell_hippo.inv08_pure_field());
+
+    // 8. Refusal of notch-delta without epigenetic-recurrence.
+    let mut bad_notch = starter();
+    bad_notch.model = FIELD_ECOLOGY_V2.to_owned();
+    bad_notch.contact = Some(sample_contact());
+    apply_feature_overrides(
+        &mut bad_notch,
+        &[
+            FeatureOverride::V1Compat,
+            FeatureOverride::Enable("notch-delta".into()),
+        ],
+    )
+    .expect("override parses");
+    let err = validate(bad_notch).expect_err("notch-delta requires epigenetic-recurrence");
+    assert!(err.to_string().contains("epigenetic-recurrence"), "{err}");
+}
+
+#[test]
+fn v2_model_descriptor_differs_when_feature_toggled() {
+    let mut base_cfg = starter();
+    base_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    let base = validate(base_cfg).unwrap();
+    let base_desc = ModelDescriptor::of(&base);
+    assert!(base_desc.canonical_text().contains("v2_feature\toases\n"));
+    assert!(
+        base_desc
+            .canonical_text()
+            .contains("v2_inv08_pure_field\ttrue\n")
+    );
+    assert!(base_desc.canonical_text().contains("v2_abi\t108/42/42/34\n"));
+
+    // Toggling a scientific feature without ABI change (oases) MUST change ModelDescriptor!
+    let mut no_oases_cfg = starter();
+    no_oases_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    apply_feature_overrides(
+        &mut no_oases_cfg,
+        &[FeatureOverride::Disable("oases".into())],
+    )
+    .unwrap();
+    let no_oases = validate(no_oases_cfg).unwrap();
+    let no_oases_desc = ModelDescriptor::of(&no_oases);
+    assert_ne!(no_oases_desc.digest(), base_desc.digest());
+    assert!(!no_oases_desc.canonical_text().contains("v2_feature\toases\n"));
+
+    // Toggling an ABI-changing feature (so2-motor) updates v2_abi and ModelDescriptor!
+    let mut no_motor_cfg = starter();
+    no_motor_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    apply_feature_overrides(
+        &mut no_motor_cfg,
+        &[FeatureOverride::Disable("so2-motor".into())],
+    )
+    .unwrap();
+    let no_motor = validate(no_motor_cfg).unwrap();
+    let no_motor_desc = ModelDescriptor::of(&no_motor);
+    assert_ne!(no_motor_desc.digest(), base_desc.digest());
+    assert!(
+        no_motor_desc
+            .canonical_text()
+            .contains("v2_abi\t108/38/38/34\n")
+    );
+
+    // Toggling v2-visual-mappings (Scope::Presentation) MUST NOT change ModelDescriptor (INV-09)!
+    let mut no_vis_cfg = starter();
+    no_vis_cfg.model = FIELD_ECOLOGY_V2.to_owned();
+    apply_feature_overrides(
+        &mut no_vis_cfg,
+        &[FeatureOverride::Disable("v2-visual-mappings".into())],
+    )
+    .unwrap();
+    let no_vis = validate(no_vis_cfg).unwrap();
+    assert_ne!(no_vis.config_hash(), base.config_hash());
+    assert_eq!(ModelDescriptor::of(&no_vis).digest(), base_desc.digest());
 }

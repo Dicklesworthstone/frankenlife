@@ -302,3 +302,47 @@ fn concurrent_viewers_read_only_complete_unchanging_epochs() {
     assert!(feed.is_closed());
     assert_eq!(feed.latest(), Some(publisher.latest()));
 }
+
+/// Dropping a lease releases its slot `Arc<Epoch>` strictly before
+/// decrementing the viewer's `held` count (Acquire/Release happens-before).
+/// Once a publisher thread observes `viewer.held() == 0` after the previous
+/// slot's lease is dropped on another thread, the 2-slot publisher must find
+/// that slot free and publish — never `Publication::Busy`.
+#[test]
+fn dropped_lease_releases_slot_reference_before_returning_budget() {
+    let config = ecology(&[("population", "initial_count", "8")]);
+    let mut world = found(&config, Arrangement::FreeList);
+    let mut publisher = Publisher::new(&world, 2, || {}).expect("publisher");
+    let viewer = publisher.feed().viewer(1).expect("viewer");
+    let (tx, rx) = std::sync::mpsc::channel::<flife_render::Lease>();
+    let dropper = thread::spawn(move || {
+        while let Ok(lease) = rx.recv() {
+            drop(lease);
+        }
+    });
+    for round in 0..256 {
+        let old = viewer.latest().expect("lease");
+        assert_eq!(viewer.held(), 1);
+        step(&mut world);
+        assert!(
+            matches!(
+                publisher.offer(&world).expect("offer"),
+                Publication::Published { .. }
+            ),
+            "round {round}: second slot must be free"
+        );
+        assert_eq!(publisher.free(), 0, "round {round}: both slots busy");
+        step(&mut world);
+        tx.send(old).expect("send lease to dropper");
+        while viewer.held() != 0 {
+            std::hint::spin_loop();
+        }
+        let outcome = publisher.offer(&world).expect("offer after held == 0");
+        assert!(
+            matches!(outcome, Publication::Published { .. }),
+            "round {round}: slot reference must drop before held decrements to 0, got {outcome:?}"
+        );
+    }
+    drop(tx);
+    dropper.join().expect("dropper");
+}

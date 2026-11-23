@@ -66,8 +66,8 @@ fn exact(value: f64) -> i128 {
 
 #[test]
 fn flows_have_one_class_and_transfers_charge_named_losses() {
-    assert_eq!(FLOW_KINDS, 15);
-    assert_eq!(TRANSFER_KINDS, 4);
+    assert_eq!(FLOW_KINDS, 16);
+    assert_eq!(TRANSFER_KINDS, 6);
     let mut names: Vec<&str> = Flow::ALL.iter().map(|flow| flow.name()).collect();
     names.extend(Transfer::ALL.iter().map(|transfer| transfer.name()));
     let count = names.len();
@@ -94,6 +94,11 @@ fn flows_have_one_class_and_transfers_charge_named_losses() {
     assert_eq!(Transfer::Emission.loss(), Flow::EmissionLoss);
     assert_eq!(Transfer::ChildEndowment.loss(), Flow::ReproductionLoss);
     assert_eq!(Transfer::Recycling.loss(), Flow::UnrecycledDeath);
+    assert_eq!(
+        Transfer::MetabolicByproduct.loss(),
+        Flow::UptakeInefficiency
+    );
+    assert_eq!(Transfer::Trophallaxis.loss(), Flow::TrophallaxisLoss);
 }
 
 /// Appendix C.1's accounting: grants 4 and 6 with efficiencies 0.5 and

@@ -186,6 +186,20 @@ impl Traits {
     pub const fn sensing_scale(&self) -> f64 {
         self.sensing_scale
     }
+
+    /// Revalidate and copy every heritable trait against `limits`, preserving
+    /// all baseline and v2 traits cleanly across crops and transplants (`V2-01`).
+    ///
+    /// # Errors
+    /// As [`Traits::new`].
+    pub fn reseal(&self, limits: &TraitLimits) -> Result<Self, CoreError> {
+        Self::new(
+            self.affinity,
+            self.motion_response,
+            self.sensing_scale,
+            limits,
+        )
+    }
 }
 
 /// `Σ vᵢ²` in index order. Every norm bound in this crate is checked with

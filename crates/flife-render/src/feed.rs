@@ -484,8 +484,8 @@ impl Viewer {
 
     fn lease(&self, epoch: Arc<Epoch>) -> Lease {
         Lease {
-            held: Held {
-                epoch,
+            epoch,
+            _budget: Budget {
                 count: Arc::clone(&self.held),
             },
             _released: Signal {
@@ -500,18 +500,21 @@ impl Viewer {
 /// then returns the budget, then tells the owner.
 #[derive(Debug)]
 pub struct Lease {
-    // Fields drop in order: the reference and the budget, then the signal.
-    held: Held,
+    // Fields drop in declaration order: the slot reference, then the budget,
+    // then the owner notification. Keeping `epoch` outside the `Drop` guard
+    // guarantees `Arc<Epoch>` drops before `Budget::drop` decrements `held`
+    // (a struct's own `Drop::drop` runs before its fields drop).
+    epoch: Arc<Epoch>,
+    _budget: Budget,
     _released: Signal,
 }
 
 #[derive(Debug)]
-struct Held {
-    epoch: Arc<Epoch>,
+struct Budget {
     count: Arc<AtomicUsize>,
 }
 
-impl Drop for Held {
+impl Drop for Budget {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::AcqRel);
     }
@@ -532,7 +535,7 @@ impl Lease {
     /// The leased epoch.
     #[must_use]
     pub fn epoch(&self) -> &Epoch {
-        &self.held.epoch
+        &self.epoch
     }
 }
 

@@ -706,3 +706,42 @@ fn pixels_per_point_changes_no_mapping_and_survives_every_view() {
         );
     }
 }
+
+/// Extreme extents whose scale overflows to infinity and non-finite logical
+/// pointer coordinates must be refused rather than producing infinite/NaN maps.
+#[test]
+fn extreme_extents_and_non_finite_logical_points_are_refused() {
+    assert!(matches!(
+        Viewport::fit([1e-308, 1e-308], [1_000_000, 1_000_000]),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    let tiny = Viewport::fit([1e-306, 1e-306], [100, 100]).expect("finite at 1x");
+    assert!(matches!(
+        tiny.with_view([0.0, 0.0], MAXIMUM_ZOOM),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+
+    let viewport = fit([128.0, 128.0], [1600, 900]);
+    for bad_point in [
+        [f64::NAN, 10.0],
+        [10.0, f64::NAN],
+        [f64::INFINITY, 10.0],
+        [10.0, f64::NEG_INFINITY],
+    ] {
+        assert_eq!(
+            viewport.logical_to_drawable(bad_point, [800.0, 450.0]),
+            None,
+            "{bad_point:?}"
+        );
+        assert_eq!(
+            viewport.logical_to_world(bad_point, [800.0, 450.0]),
+            None,
+            "{bad_point:?}"
+        );
+    }
+    // Overflowing quotient is also rejected rather than returning Some([inf, ..]).
+    assert_eq!(
+        viewport.logical_to_drawable([1e308, 1.0], [1e-10, 1.0]),
+        None
+    );
+}

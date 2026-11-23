@@ -692,8 +692,25 @@ pub fn lineage_slot(lineage: u64) -> usize {
 /// The linear-light colour of a lineage.
 #[must_use]
 pub fn lineage_color(lineage: u64) -> LinearRgba {
-    linear(LINEAGE_PALETTE[lineage_slot(lineage)])
+    LINEAR_LINEAGE_PALETTE[lineage_slot(lineage)]
 }
+
+/// [`LINEAGE_PALETTE`] decoded once to linear light via [`linear`].
+static LINEAR_LINEAGE_PALETTE: LazyLock<[LinearRgba; LINEAGE_PALETTE.len()]> =
+    LazyLock::new(|| LINEAGE_PALETTE.map(linear));
+
+/// [`TOPOLOGY_PALETTE`] decoded once to linear light via [`linear`].
+static LINEAR_TOPOLOGY_PALETTE: LazyLock<[LinearRgba; TOPOLOGY_PALETTE.len()]> =
+    LazyLock::new(|| TOPOLOGY_PALETTE.map(linear));
+
+/// Every generation `0..=GENERATION_SCALE` decoded once to linear light via
+/// [`linear`]`(`[`ramp`]`(&`[`GENERATION_RAMP`]`, `[`generation_level`]`(g)))`.
+static LINEAR_GENERATION_TABLE: LazyLock<[LinearRgba; GENERATION_SCALE as usize + 1]> =
+    LazyLock::new(|| {
+        std::array::from_fn(|generation| {
+            linear(ramp(&GENERATION_RAMP, generation_level(generation as u32)))
+        })
+    });
 
 /// The energy ramp (sRGB stops, evenly spaced): magma from 0.2 to 1.0, so
 /// lightness rises monotonically and even an organism with no energy shows
@@ -1001,10 +1018,15 @@ pub fn wheel(turn: f64) -> [u8; 3] {
     )
 }
 
-/// `a` to `b` by `fraction ∈ [0, 1]`, per sRGB byte, rounded.
+/// `a` to `b` by `fraction ∈ [0, 1]`, per sRGB byte, rounded; a non-finite
+/// `fraction` is `0`.
 #[must_use]
 pub fn mix(a: [u8; 3], b: [u8; 3], fraction: f64) -> [u8; 3] {
-    let fraction = fraction.clamp(0.0, 1.0);
+    let fraction = if fraction.is_finite() {
+        fraction.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let channel =
         |x: u8, y: u8| (f64::from(x) + (f64::from(y) - f64::from(x)) * fraction).round() as u8;
     [
@@ -1044,7 +1066,285 @@ pub fn mapped_rgb8(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) -
 /// [`mapped_rgb8`] as opaque linear light.
 #[must_use]
 pub fn mapped_color(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) -> LinearRgba {
-    linear(mapped_rgb8(mapping, traits, maximum_speed))
+    match mapping {
+        ColorMapping::Lineage => LINEAR_LINEAGE_PALETTE[lineage_slot(traits.lineage)],
+        ColorMapping::Generation => {
+            LINEAR_GENERATION_TABLE[(traits.generation as usize).min(GENERATION_SCALE as usize)]
+        }
+        ColorMapping::Topology => {
+            LINEAR_TOPOLOGY_PALETTE[usize::from(traits.topology) % TOPOLOGY_PALETTE.len()]
+        }
+        _ => linear(mapped_rgb8(mapping, traits, maximum_speed)),
+    }
+}
+
+/// The precomputed sRGB-byte-to-linear table, hoisted out of per-organism and
+/// per-texel hot loops.
+#[inline]
+pub(crate) fn linear_table() -> &'static [f64; 256] {
+    &LINEAR_BYTES
+}
+
+/// [`linear`] using a caller-hoisted [`linear_table`].
+#[inline]
+pub(crate) fn linear_with_table(table: &[f64; 256], [r, g, b]: [u8; 3]) -> LinearRgba {
+    LinearRgba {
+        r: table[usize::from(r)],
+        g: table[usize::from(g)],
+        b: table[usize::from(b)],
+        a: 1.0,
+    }
+}
+
+/// Hoisted linear-palette lookup for `ColorMapping::Lineage`.
+#[inline]
+pub(crate) fn linear_lineage_palette() -> &'static [LinearRgba; LINEAGE_PALETTE.len()] {
+    &LINEAR_LINEAGE_PALETTE
+}
+
+/// Hoisted linear-palette lookup for `ColorMapping::Topology`.
+#[inline]
+pub(crate) fn linear_topology_palette() -> &'static [LinearRgba; TOPOLOGY_PALETTE.len()] {
+    &LINEAR_TOPOLOGY_PALETTE
+}
+
+/// Hoisted linear-generation table for `ColorMapping::Generation`.
+#[inline]
+pub(crate) fn linear_generation_table() -> &'static [LinearRgba; GENERATION_SCALE as usize + 1] {
+    &LINEAR_GENERATION_TABLE
+}
+
+/// Hoisted lineage-energy shade table for `ColorMapping::LineageEnergy`.
+#[inline]
+pub(crate) fn lineage_energy_shades()
+-> &'static [[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()] {
+    &LINEAGE_ENERGY_SHADES
+}
+
+/// [`lineage_energy_rgb8`] using a caller-hoisted shade table.
+#[inline]
+pub(crate) fn lineage_energy_rgb8_with(
+    shades: &[[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()],
+    lineage: u64,
+    energy: f32,
+    attempt_energy: f64,
+) -> [u8; 3] {
+    let slot = lineage_slot(lineage);
+    if !(attempt_energy.is_finite() && attempt_energy > 0.0) {
+        return LINEAGE_PALETTE[slot];
+    }
+    let energy = f64::from(energy);
+    let energy = if energy.is_finite() {
+        energy.max(0.0)
+    } else {
+        0.0
+    };
+    let lightness = (LINEAGE_ENERGY_LIGHTNESS * energy / attempt_energy).clamp(0.0, 1.0);
+    let step = (lightness * (LINEAGE_ENERGY_STEPS - 1) as f64).round() as usize;
+    shades[slot][step.min(LINEAGE_ENERGY_STEPS - 1)]
+}
+
+/// Column-specialized colour mapper for one [`Epoch`] and [`ColorMapping`]:
+/// borrows only the epoch column(s) the active mapping reads and hoists static
+/// lookup tables out of per-organism loops. Every row's colour is bit-identical
+/// to [`mapped_color`].
+pub(crate) enum EpochColors<'a> {
+    Lineage {
+        lineages: &'a [u64],
+        palette: &'static [LinearRgba; LINEAGE_PALETTE.len()],
+    },
+    Energy {
+        energies: &'a [f32],
+        linear: &'static [f64; 256],
+    },
+    Generation {
+        generations: &'a [u32],
+        table: &'static [LinearRgba; GENERATION_SCALE as usize + 1],
+    },
+    Motion {
+        velocities: &'a [[f32; 2]],
+        max_speed: f64,
+        linear: &'static [f64; 256],
+    },
+    Topology {
+        topologies: &'a [u8],
+        palette: &'static [LinearRgba; TOPOLOGY_PALETTE.len()],
+    },
+    Affinity {
+        affinities: &'a [[f32; 3]],
+        linear: &'static [f64; 256],
+    },
+    LineageEnergy {
+        lineages: &'a [u64],
+        energies: &'a [f32],
+        attempt_energy: f64,
+        shades: &'static [[[u8; 3]; LINEAGE_ENERGY_STEPS]; LINEAGE_PALETTE.len()],
+        linear: &'static [f64; 256],
+    },
+}
+
+impl<'a> EpochColors<'a> {
+    pub(crate) fn new(mapping: ColorMapping, epoch: &'a Epoch) -> Self {
+        match mapping {
+            ColorMapping::Lineage => Self::Lineage {
+                lineages: epoch.lineages(),
+                palette: linear_lineage_palette(),
+            },
+            ColorMapping::Energy => Self::Energy {
+                energies: epoch.energies(),
+                linear: linear_table(),
+            },
+            ColorMapping::Generation => Self::Generation {
+                generations: epoch.generations(),
+                table: linear_generation_table(),
+            },
+            ColorMapping::Motion => Self::Motion {
+                velocities: epoch.velocities(),
+                max_speed: epoch.maximum_speed(),
+                linear: linear_table(),
+            },
+            ColorMapping::Topology => Self::Topology {
+                topologies: epoch.topologies(),
+                palette: linear_topology_palette(),
+            },
+            ColorMapping::Affinity => Self::Affinity {
+                affinities: epoch.affinities(),
+                linear: linear_table(),
+            },
+            ColorMapping::LineageEnergy => Self::LineageEnergy {
+                lineages: epoch.lineages(),
+                energies: epoch.energies(),
+                attempt_energy: epoch.attempt_energy(),
+                shades: lineage_energy_shades(),
+                linear: linear_table(),
+            },
+        }
+    }
+
+    /// Colour of `row` (`row < epoch.len()`), bit-identical to [`mapped_color`].
+    #[inline]
+    pub(crate) fn color_at(&self, row: usize) -> LinearRgba {
+        match self {
+            Self::Lineage { lineages, palette } => palette[lineage_slot(lineages[row])],
+            Self::Energy { energies, linear } => {
+                linear_with_table(linear, ramp(&ENERGY_RAMP, energy_level(energies[row])))
+            }
+            Self::Generation { generations, table } => {
+                table[(generations[row] as usize).min(GENERATION_SCALE as usize)]
+            }
+            Self::Motion {
+                velocities,
+                max_speed,
+                linear,
+            } => {
+                let velocity = velocities[row];
+                let rgb = heading(velocity).map_or(MOTION_STILL, |turn| {
+                    mix(
+                        MOTION_STILL,
+                        wheel(turn),
+                        speed_level(velocity, *max_speed).sqrt(),
+                    )
+                });
+                linear_with_table(linear, rgb)
+            }
+            Self::Topology {
+                topologies,
+                palette,
+            } => palette[usize::from(topologies[row]) % palette.len()],
+            Self::Affinity { affinities, linear } => {
+                linear_with_table(linear, affinity_rgb8(affinities[row]))
+            }
+            Self::LineageEnergy {
+                lineages,
+                energies,
+                attempt_energy,
+                shades,
+                linear,
+            } => linear_with_table(
+                linear,
+                lineage_energy_rgb8_with(shades, lineages[row], energies[row], *attempt_energy),
+            ),
+        }
+    }
+
+    /// Visit `0..len` with a hoisted mapping branch so the inner loop reads
+    /// only the active mapping's column(s).
+    #[inline]
+    pub(crate) fn for_each(&self, len: usize, mut visit: impl FnMut(usize, LinearRgba)) {
+        match self {
+            Self::Lineage { lineages, palette } => {
+                for (row, &lineage) in lineages[..len].iter().enumerate() {
+                    visit(row, palette[lineage_slot(lineage)]);
+                }
+            }
+            Self::Energy { energies, linear } => {
+                for (row, &energy) in energies[..len].iter().enumerate() {
+                    visit(
+                        row,
+                        linear_with_table(linear, ramp(&ENERGY_RAMP, energy_level(energy))),
+                    );
+                }
+            }
+            Self::Generation { generations, table } => {
+                for (row, &generation) in generations[..len].iter().enumerate() {
+                    visit(
+                        row,
+                        table[(generation as usize).min(GENERATION_SCALE as usize)],
+                    );
+                }
+            }
+            Self::Motion {
+                velocities,
+                max_speed,
+                linear,
+            } => {
+                let max_speed = *max_speed;
+                for (row, &velocity) in velocities[..len].iter().enumerate() {
+                    let rgb = heading(velocity).map_or(MOTION_STILL, |turn| {
+                        mix(
+                            MOTION_STILL,
+                            wheel(turn),
+                            speed_level(velocity, max_speed).sqrt(),
+                        )
+                    });
+                    visit(row, linear_with_table(linear, rgb));
+                }
+            }
+            Self::Topology {
+                topologies,
+                palette,
+            } => {
+                for (row, &topology) in topologies[..len].iter().enumerate() {
+                    visit(row, palette[usize::from(topology) % palette.len()]);
+                }
+            }
+            Self::Affinity { affinities, linear } => {
+                for (row, &affinity) in affinities[..len].iter().enumerate() {
+                    visit(row, linear_with_table(linear, affinity_rgb8(affinity)));
+                }
+            }
+            Self::LineageEnergy {
+                lineages,
+                energies,
+                attempt_energy,
+                shades,
+                linear,
+            } => {
+                let attempt_energy = *attempt_energy;
+                for (row, (&lineage, &energy)) in
+                    lineages[..len].iter().zip(&energies[..len]).enumerate()
+                {
+                    visit(
+                        row,
+                        linear_with_table(
+                            linear,
+                            lineage_energy_rgb8_with(shades, lineage, energy, attempt_energy),
+                        ),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Opaque linear light from sRGB bytes: exactly
@@ -1056,13 +1356,7 @@ pub fn mapped_color(mapping: ColorMapping, traits: &Traits, maximum_speed: f64) 
 /// organism, and a field update one for every texel).
 #[must_use]
 pub fn linear([r, g, b]: [u8; 3]) -> LinearRgba {
-    let table = &*LINEAR_BYTES;
-    LinearRgba {
-        r: table[usize::from(r)],
-        g: table[usize::from(g)],
-        b: table[usize::from(b)],
-        a: 1.0,
-    }
+    linear_with_table(&LINEAR_BYTES, [r, g, b])
 }
 
 /// Each sRGB byte's linear value, as [`Srgb::to_linear`] decodes it.

@@ -1059,3 +1059,43 @@ fn tick_ledgers_need_no_run_ledger_for_single_fixtures() {
             .is_ok_and(|closure| closure.residual() == 0.0)
     }));
 }
+
+/// Regression: if a cell's combined uptake demand overflows F64 (turning
+/// `CompensatedSum` into `NaN`), `resolve_uptake` must return
+/// `CoreError::NumericalInvalid` instead of overflowing `floors` or entering
+/// an unbounded surplus adjustment loop.
+#[test]
+#[expect(clippy::expect_used, reason = "test assertion")]
+fn resolve_uptake_refuses_f64_overflowing_cell_demand_without_hanging() {
+    let g = grid(4, 4, 4.0, 4.0);
+    let mut state = zeroed(g);
+    state
+        .set_cell(
+            0,
+            0,
+            &Cell {
+                energy: 1.0,
+                moments: [0.0; CHANNELS],
+            },
+        )
+        .expect("sets cell");
+    let demands = [
+        Demand {
+            organism: OrganismId::new(1),
+            position: [0.5, 0.5],
+            requested: 1.0e308,
+        },
+        Demand {
+            organism: OrganismId::new(2),
+            position: [0.5, 0.5],
+            requested: 1.0e308,
+        },
+    ];
+    let mut grants = Grants::new();
+    let err = resolve_uptake(&state, &demands, &mut grants)
+        .expect_err("overflowing cell demand must be refused");
+    assert!(
+        matches!(err, CoreError::NumericalInvalid { .. }),
+        "expected NumericalInvalid, got {err:?}"
+    );
+}

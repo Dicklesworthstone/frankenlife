@@ -1091,6 +1091,8 @@ impl Epoch {
         self.resource = world.epoch();
         self.prior = prior;
         self.step = world.step_size();
+        self.maximum_speed = world.maximum_speed();
+        self.attempt_energy = world.minimum_attempt_energy();
         self.affinity_limit = affinity_limit;
         self.metrics = Metrics {
             tick: world.tick(),

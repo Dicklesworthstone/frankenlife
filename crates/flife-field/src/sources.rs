@@ -693,6 +693,16 @@ pub fn deposit_energy_fused(
     supports: &mut [SourceSupport],
     accum: &mut Vec<f64>,
 ) -> Result<Vec<DepositReport>, CoreError> {
+    if sources.len() != supports.len() {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "fused source supports",
+            detail: format!(
+                "{} source supports for {} sources",
+                supports.len(),
+                sources.len()
+            ),
+        });
+    }
     let energy = state.energy_mut();
     let cells = energy.len();
     if accum.len() < cells {
@@ -759,6 +769,16 @@ pub(crate) fn deposit_moments_fused(
     supports: &[SourceSupport],
     accum: &mut Vec<f64>,
 ) -> Result<(), CoreError> {
+    if sources.len() != supports.len() {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "fused source supports",
+            detail: format!(
+                "{} source supports for {} sources",
+                supports.len(),
+                sources.len()
+            ),
+        });
+    }
     let cells = plane.len();
     if accum.len() < cells {
         let extra = cells - accum.len();

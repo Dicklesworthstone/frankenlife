@@ -28,7 +28,7 @@ use flife_core::CoreError;
 use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
-    ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
+    ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology, RawOutputs,
     ReferenceController, SENSOR_WIDTH,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
@@ -99,10 +99,10 @@ fn reference(
     topology: &DenseTopology,
     genomes: &[Vec<f32>],
     observations: &[[f64; SENSOR_WIDTH]],
-) -> Result<Vec<Option<[f32; ACTION_WIDTH]>>, CoreError> {
+) -> Result<Vec<Option<RawOutputs>>, CoreError> {
     let threads = std::thread::available_parallelism().map_or(8, usize::from);
     let length = genomes.len().div_ceil(threads).max(1);
-    let parts: Vec<Result<Vec<Option<[f32; ACTION_WIDTH]>>, CoreError>> =
+    let parts: Vec<Result<Vec<Option<RawOutputs>>, CoreError>> =
         std::thread::scope(|scope| {
             let handles: Vec<_> = genomes
                 .chunks(length)
@@ -115,7 +115,7 @@ fn reference(
                             .zip(observations)
                             .map(|(genome, inputs)| {
                                 Ok(ReferenceController::new(topology, genome, BOUND)?
-                                    .evaluate(inputs, &mut scratch)
+                                    .evaluate_raw(inputs, &mut scratch)
                                     .ok())
                             })
                             .collect()
@@ -187,19 +187,19 @@ impl Stream {
 }
 
 /// Whether every dispatched output is the reference's, bit for bit.
-fn identical(
-    outputs: &[Option<[f32; ACTION_WIDTH]>],
-    expected: &[Option<[f32; ACTION_WIDTH]>],
-) -> bool {
+fn identical(outputs: &[Option<RawOutputs>], expected: &[Option<RawOutputs>]) -> bool {
     outputs.len() == expected.len()
         && outputs
             .iter()
             .zip(expected)
             .all(|(got, want)| match (got, want) {
-                (Some(got), Some(want)) => got
-                    .iter()
-                    .zip(want)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                (Some(got), Some(want)) => {
+                    got.len() == want.len()
+                        && got
+                            .iter()
+                            .zip(want.iter())
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                }
                 (None, _) => true,
                 (Some(_), None) => false,
             })

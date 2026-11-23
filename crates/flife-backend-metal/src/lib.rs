@@ -31,8 +31,8 @@ use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_neural::{
-    ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, DenseTopology, SENSOR_WIDTH,
-    ShardGeometry, WeightDtype, Weights,
+    ArenaSlot, ControllerBackend, ControllerJob, DenseTopology, MAX_CONTROLLER_OUTPUT_WIDTH,
+    MAX_SENSOR_WIDTH, RawOutputs, ShardGeometry, WeightDtype, Weights,
 };
 use ft_kernel_metal::compute::{Grid, MathMode, Pipeline};
 
@@ -99,9 +99,11 @@ pub const BINARY64_RESULT_WORDS: usize = 12;
 
 /// A batch of controller evaluations, packed for the kernel: every
 /// organism's parameters back to back, its inputs rounded once to F32 as the
-/// reference rounds them, and its topology.
+/// reference rounds them, its topology, and the batch's shared
+/// `(input_width, raw_output_width)` dimensions.
 #[derive(Debug, Default, Clone)]
 pub struct Batch {
+    dims: Option<(usize, usize)>,
     parameters: Vec<f32>,
     inputs: Vec<f32>,
     jobs: Vec<u32>,
@@ -112,6 +114,7 @@ impl Batch {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            dims: None,
             parameters: Vec::new(),
             inputs: Vec::new(),
             jobs: Vec::new(),
@@ -132,29 +135,82 @@ impl Batch {
 
     /// Empty the batch, keeping its storage.
     pub fn clear(&mut self) {
+        self.dims = None;
         self.parameters.clear();
         self.inputs.clear();
         self.jobs.clear();
     }
 
     /// Add one organism: its controller's topology and parameters, and its
-    /// observation's inputs.
+    /// inputs (length `topology.input_width()`, up to [`MAX_SENSOR_WIDTH`]).
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for an input that is not finite in
     /// F32, exactly as the reference refuses it;
     /// [`CoreError::LayoutMismatch`] for parameters that do not fill the
-    /// topology, or a topology outside the kernel's shape (one or two
-    /// hidden layers, each at most [`WIDEST_HIDDEN`] wide);
+    /// topology, mismatched input length or batch dimensions, or a topology
+    /// outside the kernel's shape (one or two hidden layers, each at most
+    /// [`WIDEST_HIDDEN`] wide, inputs `<= 128`, outputs `<= 80`);
     /// [`CoreError::AllocationFailed`] if the batch cannot grow. The batch is
     /// unchanged on error.
     pub fn push(
         &mut self,
         topology: &DenseTopology,
         parameters: &[f32],
-        inputs: &[f64; SENSOR_WIDTH],
+        inputs: &[f64],
     ) -> Result<(), CoreError> {
-        let mut rounded = [0.0_f32; SENSOR_WIDTH];
+        let input_width = topology.input_width();
+        let output_width = topology.raw_output_width();
+        if inputs.len() != input_width {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: format!("expected {input_width} inputs, got {}", inputs.len()),
+            });
+        }
+        if let Some((batch_in, batch_out)) = self.dims
+            && (batch_in, batch_out) != (input_width, output_width)
+        {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: format!(
+                    "batch dims ({batch_in}, {batch_out}) do not match topology \
+                     ({input_width}, {output_width})"
+                ),
+            });
+        }
+        let job = job_words(
+            topology,
+            parameters.len(),
+            self.parameters.len(),
+            self.len(),
+        )?;
+        let next_organisms = self
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: "organism count overflows".to_owned(),
+            })?;
+        let in_end = next_organisms
+            .checked_mul(input_width)
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: "input staging count overflows".to_owned(),
+            })?;
+        let out_end = next_organisms
+            .checked_mul(output_width)
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: "output staging count overflows".to_owned(),
+            })?;
+        if u32::try_from(in_end).is_err() || u32::try_from(out_end).is_err() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: "staging index exceeds u32".to_owned(),
+            });
+        }
+        let mut rounded = [0.0_f32; MAX_SENSOR_WIDTH];
+        let rounded = &mut rounded[..input_width];
         for (index, (slot, &value)) in rounded.iter_mut().zip(inputs).enumerate() {
             let narrowed = value as f32;
             if !narrowed.is_finite() {
@@ -165,17 +221,12 @@ impl Batch {
             }
             *slot = narrowed;
         }
-        let job = job_words(
-            topology,
-            parameters.len(),
-            self.parameters.len(),
-            self.len(),
-        )?;
         reserve(&mut self.parameters, parameters.len(), "batch parameters")?;
-        reserve(&mut self.inputs, SENSOR_WIDTH, "batch inputs")?;
+        reserve(&mut self.inputs, input_width, "batch inputs")?;
         reserve(&mut self.jobs, JOB_WORDS, "batch jobs")?;
+        self.dims = Some((input_width, output_width));
         self.parameters.extend_from_slice(parameters);
-        self.inputs.extend_from_slice(&rounded);
+        self.inputs.extend_from_slice(rounded);
         self.jobs.extend_from_slice(&job);
         Ok(())
     }
@@ -194,6 +245,18 @@ fn job_words(
         buffer: "metal controller batch",
         detail,
     };
+    let input_width = topology.input_width();
+    let output_width = topology.raw_output_width();
+    if input_width == 0
+        || input_width > MAX_SENSOR_WIDTH
+        || output_width == 0
+        || output_width > MAX_CONTROLLER_OUTPUT_WIDTH
+    {
+        return Err(mismatch(format!(
+            "controller dims ({input_width}, {output_width}) outside (1..={MAX_SENSOR_WIDTH}, \
+             1..={MAX_CONTROLLER_OUTPUT_WIDTH})"
+        )));
+    }
     if length != topology.parameter_count() {
         return Err(mismatch(format!(
             "{length} parameters for a topology of {}",
@@ -208,11 +271,11 @@ fn job_words(
         return Err(mismatch(format!("hidden widths {widths:?}")));
     }
     let mut at = 0;
-    let mut fan_in = SENSOR_WIDTH;
+    let mut fan_in = input_width;
     for (index, layer) in topology.layers().iter().enumerate() {
         let fan_out = widths
             .get(index)
-            .map_or(ACTION_WIDTH, |&width| width as usize);
+            .map_or(output_width, |&width| width as usize);
         if layer.inputs != fan_in
             || layer.outputs != fan_out
             || layer.weights != at
@@ -255,15 +318,17 @@ fn reserve<T>(
         })
 }
 
-/// A batch on the device: its parameters, inputs and jobs, and room for its
-/// outputs. Its buffers are retired when it is dropped.
+/// A batch on the device: its parameters, inputs, jobs, dimensions, and room
+/// for its outputs. Its buffers are retired when it is dropped.
 pub struct Resident {
     organisms: usize,
+    output_width: usize,
     parameters: Owned<f32>,
     inputs: Owned<f32>,
     jobs: Owned<u32>,
     raw: Owned<f32>,
     faults: Owned<u32>,
+    dims: Owned<u32>,
 }
 
 impl std::fmt::Debug for Resident {
@@ -344,26 +409,43 @@ impl MetalControllers {
     /// [`CoreError::AllocationFailed`] if the device refuses a buffer.
     pub fn upload(&self, batch: &Batch) -> Result<Resident, CoreError> {
         let organisms = batch.len();
+        let Some((input_width, output_width)) = batch.dims else {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "metal controller batch",
+                detail: "an empty batch".to_owned(),
+            });
+        };
         if organisms == 0 {
             return Err(CoreError::LayoutMismatch {
                 buffer: "metal controller batch",
                 detail: "an empty batch".to_owned(),
             });
         }
+        let dims = [
+            u32::try_from(input_width).map_err(|_| CoreError::Overflow {
+                quantity: "metal controller input width",
+            })?,
+            u32::try_from(output_width).map_err(|_| CoreError::Overflow {
+                quantity: "metal controller output width",
+            })?,
+        ];
         Ok(Resident {
             organisms,
+            output_width,
             parameters: self.owner.upload_owned(&batch.parameters)?,
             inputs: self.owner.upload_owned(&batch.inputs)?,
             jobs: self.owner.upload_owned(&batch.jobs)?,
-            raw: self.owner.zeroed_owned(organisms * ACTION_WIDTH)?,
+            raw: self.owner.zeroed_owned(organisms * output_width)?,
             faults: self.owner.zeroed_owned(organisms)?,
+            dims: self.owner.upload_owned(&dims)?,
         })
     }
 
     /// Evaluate every organism of an uploaded batch, in its order. Each
-    /// entry is the organism's 36 raw outputs, bit-identical to the
-    /// reference controller's, or `None` for a deferred organism (see the
-    /// crate documentation): evaluate that one on the reference controller.
+    /// entry is the organism's raw linear outputs (length `raw_output_width`),
+    /// bit-identical to `ReferenceController::evaluate_raw`, or `None` for a
+    /// deferred organism (see the crate documentation): evaluate that one on
+    /// the reference controller.
     ///
     /// # Errors
     /// [`CoreError::StateConflict`] if the dispatch fails;
@@ -371,10 +453,11 @@ impl MetalControllers {
     pub fn run(
         &self,
         resident: &Resident,
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         outputs.clear();
         let organisms = resident.organisms;
+        let output_width = resident.output_width;
         reserve(outputs, organisms, "metal controller outputs")?;
         self.owner.submit(
             &self.forward,
@@ -384,15 +467,20 @@ impl MetalControllers {
                 resident.jobs.buffer().reads(),
                 resident.raw.buffer().writes(),
                 resident.faults.buffer().writes(),
+                resident.dims.buffer().reads(),
             ],
             Grid::linear(organisms, FORWARD_THREADS),
         )?;
-        let mut values = vec![0.0_f32; organisms * ACTION_WIDTH];
+        let mut values = vec![0.0_f32; organisms * output_width];
         self.owner.read_back(resident.raw.buffer(), &mut values)?;
         let mut flags = vec![0_u32; organisms];
         self.owner.read_back(resident.faults.buffer(), &mut flags)?;
-        for (row, &flag) in values.as_chunks::<ACTION_WIDTH>().0.iter().zip(&flags) {
-            outputs.push((flag == 0).then_some(*row));
+        for (row, &flag) in values.chunks_exact(output_width).zip(&flags) {
+            outputs.push(if flag == 0 {
+                Some(RawOutputs::from_slice(row)?)
+            } else {
+                None
+            });
         }
         Ok(())
     }
@@ -404,7 +492,7 @@ impl MetalControllers {
     pub fn evaluate(
         &self,
         batch: &Batch,
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         if batch.is_empty() {
             outputs.clear();
@@ -548,9 +636,11 @@ const SHARD_HOST_BYTES: u64 = 256;
 
 /// The most a batch's staging holds, device and host, for at most
 /// `organisms` jobs over `shards` shards (FL-043): the per-organism device
-/// buffers, a power of two of at least 256 rows; each shard's job words, a
-/// power of two of at least 64 jobs; and the host's staged inputs, outputs,
-/// fault flags, dispatch lists and job words, which grow by doubling.
+/// buffers (bounded by [`MAX_SENSOR_WIDTH`] and [`MAX_CONTROLLER_OUTPUT_WIDTH`]),
+/// a power of two of at least 256 rows; the 2-word `dims` uniform buffer;
+/// each shard's job words, a power of two of at least 64 jobs; and the host's
+/// staged inputs, outputs, fault flags, dispatch lists and job words, which
+/// grow by doubling.
 #[must_use]
 pub const fn staging_bytes(organisms: u64, shards: u64) -> u64 {
     let rows = match organisms.checked_next_power_of_two() {
@@ -558,14 +648,18 @@ pub const fn staging_bytes(organisms: u64, shards: u64) -> u64 {
         Some(rows) => rows,
         None => u64::MAX,
     };
-    let row = ((SENSOR_WIDTH + ACTION_WIDTH + 1) * size_of::<f32>()) as u64;
+    let row = ((MAX_SENSOR_WIDTH + MAX_CONTROLLER_OUTPUT_WIDTH + 1) * size_of::<f32>()) as u64;
     let words = (JOB_WORDS * size_of::<u32>()) as u64;
-    let device = rows.saturating_mul(row).saturating_add(
-        organisms
-            .saturating_mul(2)
-            .saturating_add(shards.saturating_mul(64))
-            .saturating_mul(words),
-    );
+    let dims = (2 * size_of::<u32>()) as u64;
+    let device = rows
+        .saturating_mul(row)
+        .saturating_add(dims)
+        .saturating_add(
+            organisms
+                .saturating_mul(2)
+                .saturating_add(shards.saturating_mul(64))
+                .saturating_mul(words),
+        );
     let host = organisms
         .saturating_mul(2)
         .saturating_mul(row + words + 2 * size_of::<usize>() as u64);
@@ -576,8 +670,9 @@ pub const fn staging_bytes(organisms: u64, shards: u64) -> u64 {
 enum ShardParameters {
     F32(Owned<f32>),
     /// Binary16 values two to a word, the even element in the low half: the
-    /// kernel reads the buffer as `half`. A slot holds an even number of
-    /// elements, so no word is shared by two slots.
+    /// kernel reads the buffer as `half`. `ShardGeometry::fitting_for_dtype`
+    /// pads every F16 slot stride to a multiple of 4 elements, so slots never
+    /// share a word and always start at a `half4` boundary (Trap A).
     F16(Owned<u32>),
 }
 
@@ -721,11 +816,15 @@ pub struct MetalBackend {
     shard_count: u64,
     held: u64,
     buckets: Vec<Option<DeviceBucket>>,
-    /// Per-organism buffers, sized for `organisms`.
-    organisms: usize,
+    /// Per-organism buffers and their element capacities.
+    input_capacity: usize,
+    output_capacity: usize,
+    fault_capacity: usize,
     inputs: Option<Owned<f32>>,
     raw: Option<Owned<f32>>,
     faults: Option<Owned<u32>>,
+    /// Two-word `[input_width, raw_output_width]` uniform buffer.
+    dims: Option<Owned<u32>>,
     /// Host staging, reused.
     staged_inputs: Vec<f32>,
     input_finite: Vec<u8>,
@@ -803,10 +902,13 @@ impl MetalBackend {
             shard_count: 0,
             held: 0,
             buckets: Vec::new(),
-            organisms: 0,
+            input_capacity: 0,
+            output_capacity: 0,
+            fault_capacity: 0,
             inputs: None,
             raw: None,
             faults: None,
+            dims: None,
             staged_inputs: Vec::new(),
             input_finite: Vec::new(),
             dispatched: Vec::new(),
@@ -893,23 +995,27 @@ impl MetalBackend {
                 .min(SHARD_BYTES)
                 .min(share)
                 / dtype.bytes();
-            // Binary16 slots start on a word: an odd parameter count would
-            // share one with the next slot, so such a member is deferred.
-            let packs = dtype == WeightDtype::F32 || length.is_multiple_of(2);
             let shape_words = usize::try_from(length)
                 .ok()
                 .and_then(|len| job_words(topology, len, 0, 0).ok())
                 .map(|words| [words[2], words[3], words[4]]);
+            // Trap A defense-in-depth: `fitting_for_dtype` pads F16 slot stride
+            // to a multiple of 4 elements, guaranteeing zero F16 alignment
+            // deferrals even for odd-parameter topologies.
             DeviceBucket {
                 topology: topology.clone(),
                 dtype,
                 shape_words,
-                geometry: (packs && shape_words.is_some())
-                    .then(|| {
-                        ShardGeometry::fitting(length, limit.min(u64::from(u32::MAX)), shard_slots)
-                            .ok()
-                    })
-                    .flatten(),
+                geometry: shape_words
+                    .and_then(|_| {
+                        ShardGeometry::fitting_for_dtype(
+                            length,
+                            dtype,
+                            limit.min(u64::from(u32::MAX)),
+                            shard_slots,
+                        )
+                        .ok()
+                    }),
                 shards: ShardTable::default(),
             }
         });
@@ -922,11 +1028,11 @@ impl MetalBackend {
         Ok(serves.then_some(bucket))
     }
 
-    /// Place every finite, shaped job into its resident device shard and stage
-    /// per-shard job words in a single pass when no live slot is overwritten
-    /// mid-batch; falls back to the two-pass reconciliation when an existing
-    /// occupant is overwritten (handling duplicate slots in one batch
-    /// identically to the reference contract).
+    /// Place every finite, shaped job matching `batch_dims` into its resident
+    /// device shard and stage per-shard job words in a single pass when no live
+    /// slot is overwritten mid-batch; falls back to the two-pass reconciliation
+    /// when an existing occupant is overwritten (handling duplicate slots in
+    /// one batch identically to the reference contract).
     #[expect(
         clippy::too_many_lines,
         reason = "single-pass placement and staging with duplicate-slot fallback"
@@ -934,6 +1040,7 @@ impl MetalBackend {
     fn place_and_stage(
         &mut self,
         jobs: &[ControllerJob<'_>],
+        batch_dims: (usize, usize),
     ) -> Result<(Vec<(usize, u64)>, bool), CoreError> {
         let owner = self.controllers.owner.clone();
         let mut uploads = 0;
@@ -956,6 +1063,11 @@ impl MetalBackend {
         let mut all_dispatched = true;
         for (index, job) in jobs.iter().enumerate() {
             if self.input_finite.get(index).copied().unwrap_or(0) == 0 {
+                all_dispatched = false;
+                continue;
+            }
+            let job_topo = job.controller.topology();
+            if (job_topo.input_width(), job_topo.raw_output_width()) != batch_dims {
                 all_dispatched = false;
                 continue;
             }
@@ -1003,7 +1115,8 @@ impl MetalBackend {
                     WeightDtype::F32 => owner
                         .zeroed_owned::<f32>(elements)
                         .map(ShardParameters::F32),
-                    // Slots of an even count fill whole words.
+                    // F16 slot stride is a multiple of 4 elements, so `elements`
+                    // is always even and fills whole `u32` words.
                     WeightDtype::F16 => owner
                         .zeroed_owned::<u32>(elements / 2)
                         .map(ShardParameters::F16),
@@ -1058,14 +1171,22 @@ impl MetalBackend {
                     (ShardParameters::F32(buffer), Weights::F32(values)) => {
                         owner.write(buffer.buffer())?.write(offset, values)?;
                     }
-                    // Two binary16 values a word, the even one low; the slot's
-                    // first word is its even offset halved.
+                    // Two binary16 values a word, the even one low; F16 slot
+                    // stride is a multiple of 4 elements, so `offset` is always
+                    // even (and 4-aligned). An odd `values.len()` writes its
+                    // trailing element into the low 16 bits of the last word
+                    // with zero high-half padding inside this slot's stride.
                     (ShardParameters::F16(words), Weights::F16(values)) => {
                         packed.clear();
-                        reserve(&mut packed, values.len() / 2, "metal binary16 words")?;
-                        packed.extend(values.as_chunks::<2>().0.iter().map(|[low, high]| {
+                        let word_count = values.len().div_ceil(2);
+                        reserve(&mut packed, word_count, "metal binary16 words")?;
+                        let (pairs, remainder) = values.as_chunks::<2>();
+                        packed.extend(pairs.iter().map(|[low, high]| {
                             u32::from(low.to_bits()) | (u32::from(high.to_bits()) << 16)
                         }));
+                        if let Some(&last) = remainder.first() {
+                            packed.push(u32::from(last.to_bits()));
+                        }
                         owner.write(words.buffer())?.write(offset / 2, &packed)?;
                     }
                     // A bucket serves only its own dtype (`bucket`).
@@ -1177,32 +1298,76 @@ impl MetalBackend {
         Ok((touched, all_dispatched))
     }
 
-    /// Grow the per-organism buffers to hold `count` organisms.
-    fn hold(&mut self, count: usize) -> Result<(), CoreError> {
-        if count <= self.organisms && self.inputs.is_some() {
+    /// Grow the per-organism buffers to hold `count` organisms of
+    /// `(input_width, output_width)` and allocate the 2-word `dims` uniform
+    /// buffer on first use.
+    fn hold(
+        &mut self,
+        count: usize,
+        input_width: usize,
+        output_width: usize,
+    ) -> Result<(), CoreError> {
+        let need_inputs = count.checked_mul(input_width).ok_or(CoreError::Overflow {
+            quantity: "metal controller input elements",
+        })?;
+        let need_outputs = count.checked_mul(output_width).ok_or(CoreError::Overflow {
+            quantity: "metal controller output elements",
+        })?;
+        if u32::try_from(need_inputs).is_err() || u32::try_from(need_outputs).is_err() {
+            return Err(CoreError::Overflow {
+                quantity: "metal controller staging index",
+            });
+        }
+        if self.dims.is_none() {
+            self.dims = Some(self.controllers.owner.zeroed_owned::<u32>(2)?);
+        }
+        if count <= self.fault_capacity
+            && need_inputs <= self.input_capacity
+            && need_outputs <= self.output_capacity
+            && self.inputs.is_some()
+            && self.raw.is_some()
+            && self.faults.is_some()
+        {
             return Ok(());
         }
         let organisms = count.next_power_of_two().max(256);
+        let in_elems = organisms
+            .checked_mul(input_width)
+            .ok_or(CoreError::Overflow {
+                quantity: "metal controller input elements",
+            })?
+            .max(need_inputs);
+        let out_elems = organisms
+            .checked_mul(output_width)
+            .ok_or(CoreError::Overflow {
+                quantity: "metal controller output elements",
+            })?
+            .max(need_outputs);
         // Retire the old buffers first, so their bytes are free again.
         (self.inputs, self.raw, self.faults) = (None, None, None);
         let owner = &self.controllers.owner;
-        self.inputs = Some(owner.zeroed_owned(organisms * SENSOR_WIDTH)?);
-        self.raw = Some(owner.zeroed_owned(organisms * ACTION_WIDTH)?);
+        self.inputs = Some(owner.zeroed_owned(in_elems)?);
+        self.raw = Some(owner.zeroed_owned(out_elems)?);
         self.faults = Some(owner.zeroed_owned(organisms)?);
-        self.organisms = organisms;
+        self.input_capacity = in_elems;
+        self.output_capacity = out_elems;
+        self.fault_capacity = organisms;
         Ok(())
     }
 }
 
-/// Narrow all `jobs`' sensor inputs (`f64 -> f32`) into `staged` and record
-/// per-job finiteness in `finite` in a single pass (parallelized for large
-/// batches).
+/// Narrow all `jobs`' sensor inputs (`f64 -> f32`) of width `input_width` into
+/// `staged` and record per-job finiteness/width-validity in `finite` in a
+/// single pass (parallelized for large batches).
 fn narrow_inputs(
     jobs: &[ControllerJob<'_>],
+    input_width: usize,
     staged: &mut Vec<f32>,
     finite: &mut Vec<u8>,
 ) -> Result<(), CoreError> {
-    let total_inputs = jobs.len().saturating_mul(SENSOR_WIDTH);
+    let total_inputs = jobs.len().checked_mul(input_width).ok_or(CoreError::Overflow {
+        quantity: "metal inputs",
+    })?;
     if staged.len() < total_inputs {
         reserve(staged, total_inputs - staged.len(), "metal inputs")?;
         staged.resize(total_inputs, 0.0);
@@ -1216,9 +1381,13 @@ fn narrow_inputs(
     let narrow_chunk = |jobs: &[ControllerJob<'_>], out: &mut [f32], flags: &mut [u8]| {
         for ((job, dst), flag) in jobs
             .iter()
-            .zip(out.as_chunks_mut::<SENSOR_WIDTH>().0.iter_mut())
+            .zip(out.chunks_exact_mut(input_width))
             .zip(flags)
         {
+            if job.inputs.len() != input_width {
+                *flag = 0;
+                continue;
+            }
             let mut ok = true;
             for (slot, &value) in dst.iter_mut().zip(job.inputs) {
                 let narrowed = value as f32;
@@ -1238,7 +1407,7 @@ fn narrow_inputs(
         let chunk = jobs.len().div_ceil(threads);
         std::thread::scope(|scope| {
             let mut job_chunks = jobs.chunks(chunk);
-            let mut out_chunks = out.chunks_mut(chunk * SENSOR_WIDTH);
+            let mut out_chunks = out.chunks_mut(chunk * input_width);
             let mut flag_chunks = flags.chunks_mut(chunk);
             let head = (job_chunks.next(), out_chunks.next(), flag_chunks.next());
             let mut handles = Vec::with_capacity(threads.saturating_sub(1));
@@ -1331,7 +1500,7 @@ impl ControllerBackend for MetalBackend {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         outputs.clear();
         reserve(outputs, jobs.len(), "metal controller outputs")?;
@@ -1339,20 +1508,29 @@ impl ControllerBackend for MetalBackend {
         if jobs.is_empty() {
             return Ok(());
         }
-        narrow_inputs(jobs, &mut self.staged_inputs, &mut self.input_finite)?;
-        let (touched, all_dispatched) = self.place_and_stage(jobs)?;
+        let Some((input_width, output_width)) = jobs.iter().find_map(|job| {
+            let topo = job.controller.topology();
+            let len = job.controller.parameters().len();
+            (job.inputs.len() == topo.input_width() && job_words(topo, len, 0, 0).is_ok())
+                .then_some((topo.input_width(), topo.raw_output_width()))
+        }) else {
+            outputs.resize(jobs.len(), None);
+            return Ok(());
+        };
+        narrow_inputs(jobs, input_width, &mut self.staged_inputs, &mut self.input_finite)?;
+        let (touched, all_dispatched) = self.place_and_stage(jobs, (input_width, output_width))?;
         let count = self.dispatched.len();
         if count > 0 {
             if !all_dispatched {
                 for (row, &index) in self.dispatched.iter().enumerate() {
                     if row != index {
-                        let src = index * SENSOR_WIDTH;
+                        let src = index * input_width;
                         self.staged_inputs
-                            .copy_within(src..src + SENSOR_WIDTH, row * SENSOR_WIDTH);
+                            .copy_within(src..src + input_width, row * input_width);
                     }
                 }
             }
-            self.hold(count)?;
+            self.hold(count, input_width, output_width)?;
             let owner = self.controllers.owner.clone();
             for &(topology, key) in &touched {
                 let Some(shard) = self
@@ -1374,19 +1552,29 @@ impl ControllerBackend for MetalBackend {
                     owner.write(words.buffer())?.write(0, &shard.staged)?;
                 }
             }
-            let (Some(inputs), Some(raw), Some(faults)) = (
+            let (Some(inputs), Some(raw), Some(faults), Some(dims)) = (
                 self.inputs.as_ref().map(Owned::buffer),
                 self.raw.as_ref().map(Owned::buffer),
                 self.faults.as_ref().map(Owned::buffer),
+                self.dims.as_ref().map(Owned::buffer),
             ) else {
                 return Err(CoreError::StateConflict {
                     operation: "metal controller residency",
                     detail: "buffers missing".to_owned(),
                 });
             };
+            let dims_words = [
+                u32::try_from(input_width).map_err(|_| CoreError::Overflow {
+                    quantity: "metal controller input width",
+                })?,
+                u32::try_from(output_width).map_err(|_| CoreError::Overflow {
+                    quantity: "metal controller output width",
+                })?,
+            ];
+            owner.write(dims)?.write(0, &dims_words)?;
             owner
                 .write(inputs)?
-                .write(0, &self.staged_inputs[..count * SENSOR_WIDTH])?;
+                .write(0, &self.staged_inputs[..count * input_width])?;
             let mut bindings = Vec::new();
             reserve(&mut bindings, touched.len(), "metal controller kernels")?;
             for &(topology, key) in &touched {
@@ -1419,6 +1607,7 @@ impl ControllerBackend for MetalBackend {
                         words.reads(),
                         raw.writes(),
                         faults.writes(),
+                        dims.reads(),
                     ],
                     staged,
                 ));
@@ -1433,7 +1622,7 @@ impl ControllerBackend for MetalBackend {
                 .collect();
             let receipt = owner.submit_batch(&kernels)?;
             self.last_command = Some((receipt.kernels, receipt.device_seconds));
-            let need_values = count * ACTION_WIDTH;
+            let need_values = count * output_width;
             if self.values.len() < need_values {
                 let extra = need_values - self.values.len();
                 reserve(&mut self.values, extra, "metal controller outputs")?;
@@ -1448,27 +1637,31 @@ impl ControllerBackend for MetalBackend {
             owner.read_back(faults, &mut self.flags[..count])?;
         }
         if count == jobs.len() {
-            for (row, &flag) in self.values[..count * ACTION_WIDTH]
-                .as_chunks::<ACTION_WIDTH>()
-                .0
-                .iter()
+            for (row, &flag) in self.values[..count * output_width]
+                .chunks_exact(output_width)
                 .zip(&self.flags[..count])
             {
-                outputs.push((flag == 0).then_some(*row));
+                outputs.push(if flag == 0 {
+                    Some(RawOutputs::from_slice(row)?)
+                } else {
+                    None
+                });
             }
         } else {
             let mut dispatched = self.dispatched.iter().zip(
-                self.values[..count * ACTION_WIDTH]
-                    .as_chunks::<ACTION_WIDTH>()
-                    .0
-                    .iter()
+                self.values[..count * output_width]
+                    .chunks_exact(output_width)
                     .zip(&self.flags[..count]),
             );
             let mut next = dispatched.next();
             for index in 0..jobs.len() {
                 match next {
                     Some((&at, (row, &flag))) if at == index => {
-                        outputs.push((flag == 0).then_some(*row));
+                        outputs.push(if flag == 0 {
+                            Some(RawOutputs::from_slice(row)?)
+                        } else {
+                            None
+                        });
                         next = dispatched.next();
                     }
                     _ => outputs.push(None),

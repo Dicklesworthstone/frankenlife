@@ -1220,3 +1220,38 @@ fn the_recorded_projection_is_the_one_every_epoch_takes() {
         );
     }
 }
+
+/// A preallocated publisher offered a world with a different speed limit or
+/// birth-attempt threshold updates both fields on projection instead of
+/// keeping stale metadata from the world that allocated the slots.
+#[test]
+fn projected_epoch_refreshes_speed_limit_and_attempt_energy() {
+    let initial = found(
+        &ecology(&[
+            ("physics", "maximum_speed", "2.0"),
+            (
+                "reproduction",
+                "minimum_parent_energy_before_attempt",
+                "3.0",
+            ),
+        ]),
+        Arrangement::FreeList,
+    );
+    let mut offered = found(
+        &ecology(&[
+            ("physics", "maximum_speed", "8.0"),
+            (
+                "reproduction",
+                "minimum_parent_energy_before_attempt",
+                "5.5",
+            ),
+        ]),
+        Arrangement::FreeList,
+    );
+    let mut publisher = publisher(&initial);
+    step(&mut offered);
+    let lease = offer_and_lease(&mut publisher, &offered);
+    assert_eq!(lease.maximum_speed(), offered.maximum_speed());
+    assert_eq!(lease.attempt_energy(), offered.minimum_attempt_energy());
+    assert_shows(&lease, &offered);
+}

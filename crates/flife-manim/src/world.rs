@@ -159,6 +159,45 @@ pub struct WorldView {
     hud: Option<Hud>,
     /// The threads [`WorldView::job`] compiles the frame's dots on (FL-033).
     preparation_threads: NonZeroUsize,
+    /// The viewport `cloud`'s current dot positions and radii were lowered for.
+    /// When equal to `viewport` at `zoom > 1`, [`WorldView::draws`] culls dots
+    /// whose 3D billboards lie strictly outside the camera frustum.
+    placed_viewport: Option<Viewport>,
+}
+
+/// Conservative frustum visibility test for a camera-facing `TrueDot` at
+/// `z = 0` under our identity-orientation perspective camera.
+///
+/// Every billboard corner `center + i·right + j·up` (`i, j ∈ {-1, +1}`) lies
+/// within Euclidean distance `√2 · radius` of `center`, so `|pz| ≤ √2 · r` and
+/// `w = 1 − pz / f ≤ 1 + √2 · r / f`. Using `reach = 1.5 · r` (>6% above `√2 · r`)
+/// guarantees that any rejected dot has all four corners strictly outside a
+/// single homogeneous clip plane (`|clip.x| > clip.w` or `|clip.y| > clip.w`,
+/// with `clip.w > 0`), so FrankenManim would clip both of its triangles empty.
+/// Non-finite or non-standard draws are never culled so validation stays intact.
+#[inline]
+fn dot_possibly_visible(draw: &ThreeDDraw<'_>, half_fw: f64, half_fh: f64, focal: f64) -> bool {
+    let ThreeDDraw::TrueDot(dot) = draw else {
+        return true;
+    };
+    let [cx, cy, cz] = dot.center;
+    let r = dot.radius;
+    if !cx.is_finite()
+        || !cy.is_finite()
+        || cz != 0.0
+        || !r.is_finite()
+        || r < 0.0
+        || !focal.is_finite()
+        || focal <= 0.0
+    {
+        return true;
+    }
+    let reach = 1.5 * r;
+    if reach >= focal {
+        return true;
+    }
+    let margin = 1.0 + reach / focal;
+    cx.abs() <= half_fw * margin + reach && cy.abs() <= half_fh * margin + reach
 }
 
 /// Text over the world and its meshes at the view's viewport (FL-024).
@@ -249,6 +288,7 @@ impl WorldView {
             overlay: false,
             hud: None,
             preparation_threads: NonZeroUsize::MIN,
+            placed_viewport: None,
         })
     }
 
@@ -390,6 +430,16 @@ impl WorldView {
         self.cloud.refit(&self.viewport);
         self.density.refit(&self.viewport);
         self.field.refit(&self.viewport);
+        // Resize and density changes keep center and zoom, so `cloud.refit`
+        // keeps every dot's scene point and radius valid for the new viewport.
+        // A pan or zoom without a following `place` invalidates placed culling.
+        self.placed_viewport = self
+            .placed_viewport
+            .filter(|placed| {
+                placed.center().map(f64::to_bits) == viewport.center().map(f64::to_bits)
+                    && placed.zoom().to_bits() == viewport.zoom().to_bits()
+            })
+            .map(|_| viewport);
         Ok(())
     }
 
@@ -516,8 +566,8 @@ impl WorldView {
     }
 
     /// Lower `epoch` in the current style and remember it as shown. The
-    /// field is mapped even while hidden, so its display scale keeps
-    /// following the world.
+    /// field's display scale keeps following the world even while hidden,
+    /// without building an unused texture.
     ///
     /// # Errors
     /// As [`ParticleCloud::update_styled`], [`DensityLayer::update`] and
@@ -552,13 +602,18 @@ impl WorldView {
         current: &Epoch,
         fraction: f64,
     ) -> Result<Option<Motion>, CoreError> {
+        crate::field::check_layout(current.field())?;
         let style = self.style;
         let motion = self.lower(prior, current, fraction)?;
         if style.particles == Particles::Density {
             self.density.update(current, &style)?;
         }
-        self.field
-            .update_mapped(current.field(), style.look, style.field_mapping)?;
+        if style.field_drawn() {
+            self.field
+                .update_mapped(current.field(), style.look, style.field_mapping)?;
+        } else {
+            self.field.track_scale(current.field())?;
+        }
         Ok(motion)
     }
 
@@ -575,13 +630,16 @@ impl WorldView {
         current: &Epoch,
         fraction: f64,
     ) -> Result<Option<Motion>, CoreError> {
+        crate::field::check_layout(current.field())?;
         let style = self.style;
         let motion = self.lower(prior, current, fraction)?;
         if style.particles == Particles::Density {
             self.density.place(&style)?;
         }
-        self.field
-            .place_mapped(current.field(), style.look, style.field_mapping)?;
+        if style.field_drawn() {
+            self.field
+                .place_mapped(current.field(), style.look, style.field_mapping)?;
+        }
         Ok(motion)
     }
 
@@ -656,6 +714,14 @@ impl WorldView {
         match pair {
             Some((prior, _)) => {
                 interpolate(prior, current, fraction, &mut self.between)?;
+                self.cloud.update_between(
+                    Some(prior),
+                    current,
+                    &self.between,
+                    fraction,
+                    &self.viewport,
+                    &self.style,
+                )?;
             }
             None => {
                 self.between.positions.clear();
@@ -666,17 +732,11 @@ impl WorldView {
                 self.between.shown.resize(current.len(), true);
                 self.between.fading.clear();
                 self.between.snapped = false;
+                self.cloud
+                    .update_styled(current, &self.viewport, &self.style)?;
             }
         }
-        let shown_fraction = if pair.is_some() { fraction } else { 1.0 };
-        self.cloud.update_between(
-            pair.map(|(prior, _)| prior),
-            current,
-            &self.between,
-            shown_fraction,
-            &self.viewport,
-            &self.style,
-        )?;
+        self.placed_viewport = Some(self.viewport);
         self.motion = pair.map(|(prior, gap)| Motion {
             prior: Prior {
                 id: prior.id(),
@@ -704,6 +764,28 @@ impl WorldView {
     /// Keep `epoch` as the shown one, with its identities, and the
     /// selection only if the epoch still has that identity drawn.
     fn remember(&mut self, epoch: &Epoch) -> Result<(), CoreError> {
+        // Build any new selection ring before updating `shown`/`ids` so an
+        // invalid position leaves the selection state consistent on error.
+        let next_selection = match self.selected.and_then(|id| {
+            let row = epoch.ids().binary_search(&id.get()).ok()?;
+            self.between
+                .shown
+                .get(row)
+                .copied()
+                .unwrap_or(false)
+                .then_some((id, row))
+        }) {
+            Some((id, row)) => {
+                let position = self.between.positions[row];
+                let ring = selection_ring_around(
+                    &self.viewport,
+                    position,
+                    self.cloud.radius_on(&self.viewport),
+                )?;
+                Some((id, ring))
+            }
+            None => None,
+        };
         self.shown = Some(Prior {
             id: epoch.id(),
             tick: epoch.tick(),
@@ -713,13 +795,28 @@ impl WorldView {
         self.ids.clear();
         self.ids.extend_from_slice(epoch.ids());
         self.field_texels = epoch.field().texels();
-        self.reselect(self.selected)
+        match next_selection {
+            Some((id, ring)) => {
+                self.selected = Some(id);
+                self.ring = Some(ring);
+            }
+            None => {
+                self.selected = None;
+                self.ring = None;
+            }
+        }
+        Ok(())
     }
 
     /// The row of `organism` in the shown epoch, if it is drawn.
     fn drawn_row(&self, organism: OrganismId) -> Option<usize> {
         let row = self.ids.binary_search(&organism.get()).ok()?;
-        self.between.shown[row].then_some(row)
+        self.between
+            .shown
+            .get(row)
+            .copied()
+            .unwrap_or(false)
+            .then_some(row)
     }
 
     fn reselect(&mut self, organism: Option<OrganismId>) -> Result<(), CoreError> {
@@ -920,22 +1017,52 @@ impl WorldView {
         let density = style.particles == Particles::Density;
         let halos = self.cloud.halos();
         let dots = self.cloud.draws();
+        let cull = !density && self.placed_viewport == Some(self.viewport) && self.viewport.zoom() > 1.0;
+        let [fw, fh] = self.viewport.frame_shape();
+        let (half_fw, half_fh) = (0.5 * fw, 0.5 * fh);
+        let focal = self.camera.camera().frame().focal_distance();
+        let particle_draws = if density {
+            0
+        } else if cull {
+            let visible_halos = halos
+                .iter()
+                .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal))
+                .count();
+            let visible_dots = dots
+                .iter()
+                .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal))
+                .count();
+            visible_halos + visible_dots
+        } else {
+            halos.len() + dots.len()
+        };
         let mut draws: Vec<ThreeDDraw<'_>> = Vec::new();
         let fixed = 4 + OVERLAY_DRAWS;
+        let reserve = fixed + particle_draws;
         draws
-            .try_reserve_exact(fixed + halos.len() + dots.len())
+            .try_reserve_exact(reserve)
             .map_err(|_| CoreError::AllocationFailed {
                 buffer: "world view frame draws",
-                bytes: u64::try_from(
-                    (fixed + halos.len() + dots.len()).saturating_mul(size_of::<ThreeDDraw<'_>>()),
-                )
-                .unwrap_or(u64::MAX),
+                bytes: u64::try_from(reserve.saturating_mul(size_of::<ThreeDDraw<'_>>()))
+                    .unwrap_or(u64::MAX),
             })?;
         if style.field_drawn() {
             draws.extend(self.field.draw());
         }
         if density {
             draws.extend(self.density.draw());
+        } else if cull {
+            draws.extend(
+                halos
+                    .iter()
+                    .copied()
+                    .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal)),
+            );
+            draws.extend(
+                dots.iter()
+                    .copied()
+                    .filter(|draw| dot_possibly_visible(draw, half_fw, half_fh, focal)),
+            );
         } else {
             draws.extend_from_slice(halos);
             draws.extend_from_slice(dots);
@@ -1168,11 +1295,13 @@ impl WorldView {
             .render(threads.max(1))
             .map_err(|error| refused(error.to_string()))?;
         let [width, height] = self.viewport.drawable();
-        let bytes = usize::try_from(u64::from(width) * u64::from(height) * 4).map_err(|_| {
-            CoreError::Overflow {
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|total| usize::try_from(total).ok())
+            .ok_or(CoreError::Overflow {
                 quantity: "offline frame bytes",
-            }
-        })?;
+            })?;
         let mut rgba = Vec::new();
         rgba.try_reserve_exact(bytes)
             .map_err(|_| CoreError::AllocationFailed {

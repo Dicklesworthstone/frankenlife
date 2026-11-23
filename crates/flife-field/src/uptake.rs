@@ -1004,6 +1004,12 @@ fn resolve_cell(
         demand.add(packet.requested);
     }
     let demanded = demand.value();
+    if !demanded.is_finite() || demanded < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "cell uptake demand",
+            detail: format!("cell {cell} demand sum {demanded} is not finite and nonnegative"),
+        });
+    }
     let at = cell_target(energy, demanded);
     if at.quanta == 0 {
         return Ok(debit_of(cell, energy, demanded, &at));

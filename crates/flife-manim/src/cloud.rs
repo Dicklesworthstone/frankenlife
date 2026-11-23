@@ -24,7 +24,7 @@ use fmn_core::color::LinearRgba;
 use fmn_render::{ThreeDDraw, TrueDotDraw};
 
 use crate::Viewport;
-use crate::mapping::{Look, Particles, Style, Traits, mapped_color, traits};
+use crate::mapping::{EpochColors, Look, Particles, Style};
 
 /// Dot radius in world units.
 pub const DOT_RADIUS: f64 = 0.35;
@@ -216,10 +216,60 @@ impl ParticleCloud {
         if style.particles == Particles::Density {
             return Ok(&self.draws);
         }
-        let speed = epoch.maximum_speed();
-        for (position, traits) in epoch.positions().iter().zip(traits(epoch)) {
-            let world = [f64::from(position[0]), f64::from(position[1])];
-            self.push(viewport.scene_point(world), &traits, speed, style, 1.0);
+        let (start, extent, half) = viewport.scene_transform();
+        let positions = epoch.positions();
+        let colors = EpochColors::new(style.mapping, epoch);
+        let radius = self.radius;
+        match style.look {
+            Look::Glow => {
+                let energies = epoch.energies();
+                colors.for_each(positions.len(), |row, color| {
+                    let position = positions[row];
+                    let center = Viewport::scene_point_with(
+                        start,
+                        extent,
+                        half,
+                        [f64::from(position[0]), f64::from(position[1])],
+                    );
+                    self.draws
+                        .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
+                    self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                        center,
+                        radius * halo_factor(energies[row]),
+                        LinearRgba {
+                            a: HALO_ALPHA,
+                            ..color
+                        },
+                    )));
+                });
+            }
+            Look::Raw => {
+                colors.for_each(positions.len(), |row, color| {
+                    let position = positions[row];
+                    let center = Viewport::scene_point_with(
+                        start,
+                        extent,
+                        half,
+                        [f64::from(position[0]), f64::from(position[1])],
+                    );
+                    self.draws
+                        .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
+                });
+            }
+            Look::Sphere => {
+                colors.for_each(positions.len(), |row, color| {
+                    let position = positions[row];
+                    let center = Viewport::scene_point_with(
+                        start,
+                        extent,
+                        half,
+                        [f64::from(position[0]), f64::from(position[1])],
+                    );
+                    let mut dot = TrueDotDraw::new(center, radius, color);
+                    dot.shading = SPHERE_SHADING;
+                    self.draws.push(ThreeDDraw::TrueDot(dot));
+                });
+            }
         }
         Ok(&self.draws)
     }
@@ -300,30 +350,95 @@ impl ParticleCloud {
         if style.particles == Particles::Density {
             return Ok(&self.draws);
         }
+        let (start, extent, half) = viewport.scene_transform();
+        let radius = self.radius;
         if let Some(prior) = prior.filter(|_| fading > 0) {
-            // Fading rows are in identity order, so increasing rows: one
-            // pass over the prior epoch's traits finds them all.
-            let speed = prior.maximum_speed();
-            let mut rows = between.fading.iter().copied().peekable();
-            for (row, (position, traits)) in prior.positions().iter().zip(traits(prior)).enumerate()
-            {
-                if rows.peek() != Some(&row) {
-                    continue;
+            // Direct-index only the fading rows in O(fading) instead of
+            // scanning every row of `prior`; every row was validated against
+            // `prior.len()` above.
+            let prior_positions = prior.positions();
+            let prior_colors = EpochColors::new(style.mapping, prior);
+            let prior_energies = prior.energies();
+            let halo_alpha = HALO_ALPHA * fade;
+            for &row in &between.fading {
+                let position = prior_positions[row];
+                let center = Viewport::scene_point_with(
+                    start,
+                    extent,
+                    half,
+                    [f64::from(position[0]), f64::from(position[1])],
+                );
+                let color = prior_colors.color_at(row);
+                let mut dot = TrueDotDraw::new(
+                    center,
+                    radius,
+                    LinearRgba {
+                        a: color.a * fade,
+                        ..color
+                    },
+                );
+                match style.look {
+                    Look::Glow => {
+                        self.draws.push(ThreeDDraw::TrueDot(dot));
+                        self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                            center,
+                            radius * halo_factor(prior_energies[row]),
+                            LinearRgba {
+                                a: halo_alpha,
+                                ..color
+                            },
+                        )));
+                    }
+                    Look::Raw => {
+                        self.draws.push(ThreeDDraw::TrueDot(dot));
+                    }
+                    Look::Sphere => {
+                        dot.shading = SPHERE_SHADING;
+                        self.draws.push(ThreeDDraw::TrueDot(dot));
+                    }
                 }
-                rows.next();
-                let world = [f64::from(position[0]), f64::from(position[1])];
-                self.push(viewport.scene_point(world), &traits, speed, style, fade);
             }
         }
-        let speed = current.maximum_speed();
-        for ((position, &shown), traits) in between
-            .positions
-            .iter()
-            .zip(&between.shown)
-            .zip(traits(current))
-        {
-            if shown {
-                self.push(viewport.scene_point(*position), &traits, speed, style, 1.0);
+        let current_colors = EpochColors::new(style.mapping, current);
+        let positions = between.positions.as_slice();
+        let shown = between.shown.as_slice();
+        match style.look {
+            Look::Glow => {
+                let energies = current.energies();
+                current_colors.for_each(positions.len(), |row, color| {
+                    if shown[row] {
+                        let center = Viewport::scene_point_with(start, extent, half, positions[row]);
+                        self.draws
+                            .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
+                        self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
+                            center,
+                            radius * halo_factor(energies[row]),
+                            LinearRgba {
+                                a: HALO_ALPHA,
+                                ..color
+                            },
+                        )));
+                    }
+                });
+            }
+            Look::Raw => {
+                current_colors.for_each(positions.len(), |row, color| {
+                    if shown[row] {
+                        let center = Viewport::scene_point_with(start, extent, half, positions[row]);
+                        self.draws
+                            .push(ThreeDDraw::TrueDot(TrueDotDraw::new(center, radius, color)));
+                    }
+                });
+            }
+            Look::Sphere => {
+                current_colors.for_each(positions.len(), |row, color| {
+                    if shown[row] {
+                        let center = Viewport::scene_point_with(start, extent, half, positions[row]);
+                        let mut dot = TrueDotDraw::new(center, radius, color);
+                        dot.shading = SPHERE_SHADING;
+                        self.draws.push(ThreeDDraw::TrueDot(dot));
+                    }
+                });
             }
         }
         Ok(&self.draws)
@@ -334,42 +449,6 @@ impl ParticleCloud {
         self.radius = self.radius_on(viewport);
         self.draws.clear();
         self.halos.clear();
-    }
-
-    /// One organism's dot, and its halo for the glow look, at `center`,
-    /// with every alpha multiplied by `opacity`.
-    fn push(
-        &mut self,
-        center: [f64; 3],
-        traits: &Traits,
-        maximum_speed: f64,
-        style: &Style,
-        opacity: f64,
-    ) {
-        let color = mapped_color(style.mapping, traits, maximum_speed);
-        let radius = self.radius;
-        let mut dot = TrueDotDraw::new(
-            center,
-            radius,
-            LinearRgba {
-                a: color.a * opacity,
-                ..color
-            },
-        );
-        if style.look == Look::Sphere {
-            dot.shading = SPHERE_SHADING;
-        }
-        self.draws.push(ThreeDDraw::TrueDot(dot));
-        if style.look == Look::Glow {
-            self.halos.push(ThreeDDraw::TrueDot(TrueDotDraw::glow(
-                center,
-                radius * halo_factor(traits.energy),
-                LinearRgba {
-                    a: HALO_ALPHA * opacity,
-                    ..color
-                },
-            )));
-        }
     }
 
     /// The radius a dot takes in world units on `viewport`: the body radius
@@ -386,8 +465,12 @@ impl ParticleCloud {
     }
 
     /// Draw organisms at `body` world units in radius, refitting the
-    /// current draws to `viewport`. The caller checks `body` is positive.
+    /// current draws to `viewport`. Non-finite or non-positive radii are
+    /// ignored.
     pub fn set_body_radius(&mut self, body: f64, viewport: &Viewport) {
+        if !(body.is_finite() && body > 0.0) {
+            return;
+        }
         self.body = body;
         self.refit(viewport);
     }
@@ -423,16 +506,25 @@ impl ParticleCloud {
     /// can change.
     pub fn refit(&mut self, viewport: &Viewport) {
         let radius = self.radius_on(viewport);
-        let ratio = radius / self.radius;
+        if radius.to_bits() == self.radius.to_bits() {
+            return;
+        }
+        let ratio = if self.radius.is_finite() && self.radius > 0.0 {
+            radius / self.radius
+        } else {
+            1.0
+        };
         self.radius = radius;
         for draw in &mut self.draws {
             if let ThreeDDraw::TrueDot(dot) = draw {
                 dot.radius = radius;
             }
         }
-        for halo in &mut self.halos {
-            if let ThreeDDraw::TrueDot(dot) = halo {
-                dot.radius *= ratio;
+        if ratio.is_finite() && ratio > 0.0 {
+            for halo in &mut self.halos {
+                if let ThreeDDraw::TrueDot(dot) = halo {
+                    dot.radius *= ratio;
+                }
             }
         }
     }

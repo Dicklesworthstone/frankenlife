@@ -29,11 +29,10 @@
 
 use flife_core::CoreError;
 use flife_render::{COMPONENT_STEPS, FieldTexture};
-use fmn_core::color::LinearRgba;
 use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
 use crate::Viewport;
-use crate::mapping::{FieldMapping, Look, affinity_rgb8, linear};
+use crate::mapping::{FieldMapping, Look, affinity_rgb8, linear_table, linear_with_table};
 
 /// The field palette, dark to bright, as sRGB stops evenly spaced in the
 /// mapped value.
@@ -143,15 +142,39 @@ pub fn palette(t: f64) -> [u8; 3] {
     [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])]
 }
 
+/// Look class that affects field texels (`Look::Raw` and `Look::Sphere` produce
+/// identical linear grey / linear brightness texels).
+#[inline]
+const fn field_look(look: Look) -> Look {
+    match look {
+        Look::Glow => Look::Glow,
+        Look::Raw | Look::Sphere => Look::Raw,
+    }
+}
+
+/// Key identifying the geometry and UVs of a cached [`Viewport::periodic_quad`].
+type QuadKey = ([u64; 2], [u64; 2], [u32; 2]);
+
+#[inline]
+fn quad_key(viewport: &Viewport, cells: [u32; 2]) -> QuadKey {
+    (
+        viewport.window_start().map(f64::to_bits),
+        viewport.extent().map(f64::to_bits),
+        cells,
+    )
+}
+
 /// The field layer: a texture of the field's corner colours on one quad.
 #[derive(Debug)]
 pub struct FieldLayer {
     viewport: Viewport,
     texture: Option<Texture>,
     quad: Option<SurfaceMesh>,
+    /// Viewport/grid key `quad` was built for, so unchanged views keep it.
+    quad_key: Option<QuadKey>,
     scale: f64,
-    /// What the texture was built from, apart from the values: the look,
-    /// the mapping, the display scale's bits and the texels.
+    /// What the texture was built from, apart from the values: the normalized
+    /// look, the mapping, the display scale's bits and the texels.
     built: Option<(Look, FieldMapping, u64, [u32; 2])>,
     /// The field values the texture was built from, one `f32` a texel.
     built_values: Vec<f32>,
@@ -164,7 +187,7 @@ pub struct FieldLayer {
 }
 
 /// `field`'s values, compositions and components fill its texels.
-fn check(field: &FieldTexture) -> Result<(), CoreError> {
+pub(crate) fn check_layout(field: &FieldTexture) -> Result<(), CoreError> {
     let [columns, rows] = field.texels().map(|n| n as usize);
     let (values, composition, components) =
         (field.values(), field.composition(), field.components());
@@ -184,6 +207,17 @@ fn check(field: &FieldTexture) -> Result<(), CoreError> {
         });
     }
     Ok(())
+}
+
+/// Display scale updated for `field`'s brightest finite texel.
+fn next_scale(field: &FieldTexture, previous: f64) -> f64 {
+    let brightest = field
+        .values()
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f32, f32::max);
+    f64::from(brightest).max(previous * SCALE_DECAY)
 }
 
 /// The mean composition of a corner's `texels`, each `(density,
@@ -230,6 +264,7 @@ impl FieldLayer {
             viewport: *viewport,
             texture: None,
             quad: None,
+            quad_key: None,
             scale: 0.0,
             built: None,
             built_values: Vec::new(),
@@ -257,6 +292,14 @@ impl FieldLayer {
         self.update_mapped(field, look, FieldMapping::Energy)
     }
 
+    /// Update only the display scale for `field`, without building an unused
+    /// texture when the style does not draw the field.
+    pub(crate) fn track_scale(&mut self, field: &FieldTexture) -> Result<(), CoreError> {
+        check_layout(field)?;
+        self.scale = next_scale(field, self.scale);
+        Ok(())
+    }
+
     /// Map `field` into the layer's texture by `mapping` in `look`, and let
     /// the display scale follow its brightest texel. Energy: through the
     /// square-root palette for the glow look, as linear grey
@@ -272,24 +315,17 @@ impl FieldLayer {
     /// [`CoreError::LayoutMismatch`] for a texture whose values or
     /// compositions do not fill its texels; [`CoreError::AllocationFailed`]
     /// when the texels cannot be reserved; [`CoreError::NumericalInvalid`]
-    /// if FrankenManim refuses the texture or the quad. The previous texture
-    /// and quad are kept on error.
+    /// if FrankenManim refuses the texture or the quad. The previous texture,
+    /// quad and display scale are kept on error.
     pub fn update_mapped(
         &mut self,
         field: &FieldTexture,
         look: Look,
         mapping: FieldMapping,
     ) -> Result<(), CoreError> {
-        check(field)?;
-        let values = field.values();
-        let brightest = values
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .fold(0.0_f32, f32::max);
-        self.scale = f64::from(brightest).max(self.scale * SCALE_DECAY);
-
-        self.place_scaled(field, look, mapping)
+        check_layout(field)?;
+        let scale = next_scale(field, self.scale);
+        self.place_at_scale(field, look, mapping, scale)
     }
 
     /// Use `viewport` from the next update or placement.
@@ -321,15 +357,16 @@ impl FieldLayer {
         look: Look,
         mapping: FieldMapping,
     ) -> Result<(), CoreError> {
-        check(field)?;
-        self.place_scaled(field, look, mapping)
+        check_layout(field)?;
+        self.place_at_scale(field, look, mapping, self.scale)
     }
 
-    fn place_scaled(
+    fn place_at_scale(
         &mut self,
         field: &FieldTexture,
         look: Look,
         mapping: FieldMapping,
+        scale: f64,
     ) -> Result<(), CoreError> {
         let cells = field.texels();
         let [columns, rows] = cells.map(|n| n as usize);
@@ -340,8 +377,9 @@ impl FieldLayer {
             .component()
             .map(|component| component.channel() as usize);
         let steps = |texel: &[i8; 32]| channel.map_or(0, |channel| texel[channel]);
-        let scale = self.scale;
-        let key = (look, mapping, scale.to_bits(), cells);
+        let normalized_look = field_look(look);
+        let key = (normalized_look, mapping, scale.to_bits(), cells);
+        let want_quad = quad_key(&self.viewport, cells);
         if self.built == Some(key)
             && same_bits(&self.built_values, values)
             && (!composed
@@ -356,48 +394,14 @@ impl FieldLayer {
                     .copied()
                     .eq(field.components().iter().map(steps)))
         {
-            self.quad = Some(self.viewport.periodic_quad(cells)?);
+            if self.quad.is_none() || self.quad_key != Some(want_quad) {
+                self.quad = Some(self.viewport.periodic_quad(cells)?);
+                self.quad_key = Some(want_quad);
+            }
+            self.scale = scale;
             return Ok(());
         }
-        // The copy is reserved before the texture is built, at exactly the
-        // field's size, so the layer never holds two.
-        self.built = None;
-        self.built_values.clear();
-        if self.built_values.capacity() != values.len() {
-            self.built_values = Vec::new();
-        }
-        self.built_values
-            .try_reserve_exact(values.len())
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "field layer values",
-                bytes: u64::try_from(values.len().saturating_mul(size_of::<f32>()))
-                    .unwrap_or(u64::MAX),
-            })?;
-        let kept = if composed { composition.len() } else { 0 };
-        self.built_composition.clear();
-        if self.built_composition.capacity() != kept {
-            self.built_composition = Vec::new();
-        }
-        self.built_composition
-            .try_reserve_exact(kept)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "field layer compositions",
-                bytes: u64::try_from(kept.saturating_mul(size_of::<[f32; 3]>()))
-                    .unwrap_or(u64::MAX),
-            })?;
-        let kept = if channel.is_some() { values.len() } else { 0 };
-        self.built_component.clear();
-        if self.built_component.capacity() != kept {
-            self.built_component = Vec::new();
-        }
-        self.built_component
-            .try_reserve_exact(kept)
-            .map_err(|_| CoreError::AllocationFailed {
-                buffer: "field layer components",
-                bytes: u64::try_from(kept).unwrap_or(u64::MAX),
-            })?;
-        let index = |column: usize, row: usize| (row % rows) * columns + column % columns;
-        let texel = |column: usize, row: usize| values[index(column, row)];
+
         let mut texels = Vec::new();
         texels
             .try_reserve_exact(columns * rows)
@@ -406,67 +410,125 @@ impl FieldLayer {
                 bytes: u64::try_from((columns * rows).saturating_mul(size_of::<[f32; 4]>()))
                     .unwrap_or(u64::MAX),
             })?;
-        for row in 0..rows {
-            for column in 0..columns {
-                // Texel (column, row) is the corner between field texels
-                // (column - 1, row - 1) and (column, row), wrapping.
-                let (left, up) = (column + columns - 1, row + rows - 1);
-                let mean = (f64::from(texel(left, up))
-                    + f64::from(texel(column, up))
-                    + f64::from(texel(left, row))
-                    + f64::from(texel(column, row)))
-                    / 4.0;
-                let color = match (mapping, look) {
-                    (FieldMapping::Energy, Look::Glow) => {
-                        linear(palette(display_value(mean as f32, scale)))
+        let linear = linear_table();
+        // Hoist the mapping/look dispatch and row/column wrap out of the inner
+        // loop so each corner avoids integer divisions while preserving the
+        // exact corner sum and colour arithmetic bit for bit.
+        match (mapping, normalized_look) {
+            (FieldMapping::Energy, Look::Glow) => {
+                for row in 0..rows {
+                    let up_row = if row == 0 { rows - 1 } else { row - 1 };
+                    let up_slice = &values[up_row * columns..up_row * columns + columns];
+                    let row_slice = &values[row * columns..row * columns + columns];
+                    for column in 0..columns {
+                        let left = if column == 0 { columns - 1 } else { column - 1 };
+                        let mean = (f64::from(up_slice[left])
+                            + f64::from(up_slice[column])
+                            + f64::from(row_slice[left])
+                            + f64::from(row_slice[column]))
+                            / 4.0;
+                        let color =
+                            linear_with_table(linear, palette(display_value(mean as f32, scale)));
+                        texels.push([color.r as f32, color.g as f32, color.b as f32, 1.0]);
                     }
-                    (FieldMapping::Energy, Look::Raw | Look::Sphere) => {
-                        let grey = raw_value(mean as f32, scale);
-                        LinearRgba {
-                            r: grey,
-                            g: grey,
-                            b: grey,
-                            a: 1.0,
-                        }
+                }
+            }
+            (FieldMapping::Energy, Look::Raw | Look::Sphere) => {
+                for row in 0..rows {
+                    let up_row = if row == 0 { rows - 1 } else { row - 1 };
+                    let up_slice = &values[up_row * columns..up_row * columns + columns];
+                    let row_slice = &values[row * columns..row * columns + columns];
+                    for column in 0..columns {
+                        let left = if column == 0 { columns - 1 } else { column - 1 };
+                        let mean = (f64::from(up_slice[left])
+                            + f64::from(up_slice[column])
+                            + f64::from(row_slice[left])
+                            + f64::from(row_slice[column]))
+                            / 4.0;
+                        let grey = raw_value(mean as f32, scale) as f32;
+                        texels.push([grey, grey, grey, 1.0]);
                     }
-                    (FieldMapping::Composition, _) => {
-                        let corners = [(left, up), (column, up), (left, row), (column, row)]
-                            .map(|(column, row)| index(column, row));
-                        let level = match look {
-                            Look::Glow => display_value(mean as f32, scale),
-                            Look::Raw | Look::Sphere => raw_value(mean as f32, scale),
+                }
+            }
+            (FieldMapping::Composition, _) => {
+                let glow = normalized_look == Look::Glow;
+                for row in 0..rows {
+                    let up_row = if row == 0 { rows - 1 } else { row - 1 };
+                    let up_base = up_row * columns;
+                    let row_base = row * columns;
+                    for column in 0..columns {
+                        let left = if column == 0 { columns - 1 } else { column - 1 };
+                        let corners = [
+                            up_base + left,
+                            up_base + column,
+                            row_base + left,
+                            row_base + column,
+                        ];
+                        let mean = (f64::from(values[corners[0]])
+                            + f64::from(values[corners[1]])
+                            + f64::from(values[corners[2]])
+                            + f64::from(values[corners[3]]))
+                            / 4.0;
+                        let level = if glow {
+                            display_value(mean as f32, scale)
+                        } else {
+                            raw_value(mean as f32, scale)
                         };
-                        let hue = linear(affinity_rgb8(corner_composition(
-                            corners.map(|at| (values[at], composition[at])),
-                        )));
-                        LinearRgba {
-                            r: hue.r * level,
-                            g: hue.g * level,
-                            b: hue.b * level,
-                            a: 1.0,
-                        }
+                        let hue = linear_with_table(
+                            linear,
+                            affinity_rgb8(corner_composition(
+                                corners.map(|at| (values[at], composition[at])),
+                            )),
+                        );
+                        texels.push([
+                            (hue.r * level) as f32,
+                            (hue.g * level) as f32,
+                            (hue.b * level) as f32,
+                            1.0,
+                        ]);
                     }
-                    (FieldMapping::Component(_), _) => {
-                        let corners = [(left, up), (column, up), (left, row), (column, row)]
-                            .map(|(column, row)| index(column, row));
-                        let level = match look {
-                            Look::Glow => display_value(mean as f32, scale),
-                            Look::Raw | Look::Sphere => raw_value(mean as f32, scale),
+                }
+            }
+            (FieldMapping::Component(component), _) => {
+                let glow = normalized_look == Look::Glow;
+                let ch = usize::from(component.channel());
+                let components = field.components();
+                for row in 0..rows {
+                    let up_row = if row == 0 { rows - 1 } else { row - 1 };
+                    let up_base = up_row * columns;
+                    let row_base = row * columns;
+                    for column in 0..columns {
+                        let left = if column == 0 { columns - 1 } else { column - 1 };
+                        let corners = [
+                            up_base + left,
+                            up_base + column,
+                            row_base + left,
+                            row_base + column,
+                        ];
+                        let mean = (f64::from(values[corners[0]])
+                            + f64::from(values[corners[1]])
+                            + f64::from(values[corners[2]])
+                            + f64::from(values[corners[3]]))
+                            / 4.0;
+                        let level = if glow {
+                            display_value(mean as f32, scale)
+                        } else {
+                            raw_value(mean as f32, scale)
                         };
-                        let components = field.components();
-                        let hue = linear(component_rgb8(corner_component(
-                            corners.map(|at| (values[at], steps(&components[at]))),
-                        )));
-                        LinearRgba {
-                            r: hue.r * level,
-                            g: hue.g * level,
-                            b: hue.b * level,
-                            a: 1.0,
-                        }
+                        let hue = linear_with_table(
+                            linear,
+                            component_rgb8(corner_component(
+                                corners.map(|at| (values[at], components[at][ch])),
+                            )),
+                        );
+                        texels.push([
+                            (hue.r * level) as f32,
+                            (hue.g * level) as f32,
+                            (hue.b * level) as f32,
+                            1.0,
+                        ]);
                     }
-                };
-                // Opaque, so premultiplied is straight.
-                texels.push([color.r as f32, color.g as f32, color.b as f32, 1.0]);
+                }
             }
         }
         let refused = |quantity: &'static str, detail: String| CoreError::NumericalInvalid {
@@ -475,12 +537,80 @@ impl FieldLayer {
         };
         let texture = Texture::from_premultiplied_linear(cells[0], cells[1], texels)
             .map_err(|error| refused("field layer texture", error.to_string()))?;
-        let quad = self.viewport.periodic_quad(cells)?;
+        let new_quad = if self.quad.is_none() || self.quad_key != Some(want_quad) {
+            Some(self.viewport.periodic_quad(cells)?)
+        } else {
+            None
+        };
+        // Prepare any resized cache buffers before mutating `self` so an
+        // allocation failure leaves the previous texture, quad and cache
+        // intact. In steady state (`capacity() == len`) no allocation occurs.
+        let mut new_values = if self.built_values.capacity() == values.len() {
+            None
+        } else {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(values.len()).map_err(|_| {
+                CoreError::AllocationFailed {
+                    buffer: "field layer values",
+                    bytes: u64::try_from(values.len().saturating_mul(size_of::<f32>()))
+                        .unwrap_or(u64::MAX),
+                }
+            })?;
+            Some(buf)
+        };
+        let kept_comp = if composed { composition.len() } else { 0 };
+        let mut new_composition = if self.built_composition.capacity() == kept_comp {
+            None
+        } else {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(kept_comp).map_err(|_| {
+                CoreError::AllocationFailed {
+                    buffer: "field layer compositions",
+                    bytes: u64::try_from(kept_comp.saturating_mul(size_of::<[f32; 3]>()))
+                        .unwrap_or(u64::MAX),
+                }
+            })?;
+            Some(buf)
+        };
+        let kept_channel = if channel.is_some() { values.len() } else { 0 };
+        let mut new_component = if self.built_component.capacity() == kept_channel {
+            None
+        } else {
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(kept_channel).map_err(|_| {
+                CoreError::AllocationFailed {
+                    buffer: "field layer components",
+                    bytes: u64::try_from(kept_channel).unwrap_or(u64::MAX),
+                }
+            })?;
+            Some(buf)
+        };
+
+        // Commit atomically: nothing below can fail.
         self.texture = Some(texture);
-        self.quad = Some(quad);
+        if let Some(quad) = new_quad {
+            self.quad = Some(quad);
+            self.quad_key = Some(want_quad);
+        }
+        self.scale = scale;
+        if let Some(buf) = new_values.take() {
+            self.built_values = buf;
+        } else {
+            self.built_values.clear();
+        }
         self.built_values.extend_from_slice(values);
+        if let Some(buf) = new_composition.take() {
+            self.built_composition = buf;
+        } else {
+            self.built_composition.clear();
+        }
         if composed {
             self.built_composition.extend_from_slice(composition);
+        }
+        if let Some(buf) = new_component.take() {
+            self.built_component = buf;
+        } else {
+            self.built_component.clear();
         }
         if channel.is_some() {
             self.built_component

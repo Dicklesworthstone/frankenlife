@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 
 use crate::canonical::Sha256Digest;
 use crate::config::CONFIG_SCHEMA;
+use crate::model::is_v2_model;
 use crate::registry::{self, AlgorithmEntry};
 use crate::schema::{self, Kind, Scope, Value};
 use crate::validate::ValidatedConfig;
@@ -35,6 +36,7 @@ impl ModelDescriptor {
     pub fn of(config: &ValidatedConfig) -> Self {
         let mut canonical = String::with_capacity(8 * 1024);
         let mut components = Vec::new();
+        let v2_model = is_v2_model(&config.config().model);
         let _ = writeln!(canonical, "{DESCRIPTOR_SCHEMA}");
         let _ = writeln!(canonical, "model\t{}", config.config().model);
         let _ = writeln!(canonical, "config-schema\t{CONFIG_SCHEMA}");
@@ -65,11 +67,29 @@ impl ModelDescriptor {
                 (Kind::IntList(unit), _) => {
                     let _ = writeln!(canonical, "parameter\t{path}\tinteger-list\t{unit}");
                 }
-                (Kind::Bool, _) => {
-                    let _ = writeln!(canonical, "parameter\t{path}\tbool\tswitch");
+                (Kind::Bool, Value::Bool(value)) => {
+                    if v2_model {
+                        let _ = writeln!(canonical, "parameter\t{path}\tbool\t{value}");
+                    } else {
+                        let _ = writeln!(canonical, "parameter\t{path}\tbool\tswitch");
+                    }
+                }
+                (Kind::Text, Value::Str(text))
+                    if v2_model && path.starts_with("v2.") && path != "v2.profile" =>
+                {
+                    let _ = writeln!(canonical, "v2_mode\t{path}\t{text}");
                 }
                 _ => {}
             }
+        }
+        if v2_model {
+            if let Some(v2) = config.config().v2.as_ref() {
+                for slug in v2.enabled_scientific_slugs_sorted() {
+                    let _ = writeln!(canonical, "v2_feature\t{slug}");
+                }
+            }
+            let _ = writeln!(canonical, "v2_inv08_pure_field\t{}", config.inv08_pure_field());
+            let _ = writeln!(canonical, "v2_abi\t{}", config.v2_abi().descriptor_tag());
         }
         let digest = Sha256Digest::of(canonical.as_bytes());
         Self {

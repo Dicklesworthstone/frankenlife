@@ -88,6 +88,35 @@ pub const FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY: &str =
 pub const FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING: &str =
     "field-ecology-v1-contact-sorting-fresh-offspring";
 
+/// Modular emergent animal-tissue & eusocial super-colony model family
+/// (`V2-01`). Every modular feature defaults via `v2.profile = "auto"` and is
+/// independently toggleable via TOML or founding CLI flags; disabling all v2
+/// features reproduces `field-ecology-v1` (or `field-ecology-v1-contact` when
+/// `[contact]` is present) bit-for-bit.
+pub const FIELD_ECOLOGY_V2: &str = "field-ecology-v2";
+
+/// [`FIELD_ECOLOGY_V2`] with all-zero raw controller outputs (chemistry-only control).
+pub const FIELD_ECOLOGY_V2_CHEMISTRY_ONLY: &str = "field-ecology-v2-chemistry-only";
+
+/// [`FIELD_ECOLOGY_V2`] with founder-drawn newborn genomes (inheritance control).
+pub const FIELD_ECOLOGY_V2_FRESH_OFFSPRING: &str = "field-ecology-v2-fresh-offspring";
+
+/// [`FIELD_ECOLOGY_V2`] with fixed controller weights and topology across births
+/// while chemistry, motion, sensing, and v2 heritable traits mutate normally.
+pub const FIELD_ECOLOGY_V2_FIXED_CONTROLLER: &str = "field-ecology-v2-fixed-controller";
+
+/// Whether `model` names one of the four `field-ecology-v2*` models.
+#[must_use]
+pub fn is_v2_model(model: &str) -> bool {
+    matches!(
+        model,
+        FIELD_ECOLOGY_V2
+            | FIELD_ECOLOGY_V2_CHEMISTRY_ONLY
+            | FIELD_ECOLOGY_V2_FRESH_OFFSPRING
+            | FIELD_ECOLOGY_V2_FIXED_CONTROLLER
+    )
+}
+
 /// The most contact sweeps a tick may run.
 pub const MAXIMUM_CONTACT_SWEEPS: u32 = 16;
 
@@ -105,12 +134,21 @@ pub const SENSOR_WIDTH: u32 = 3 * (1 + MOMENT_CHANNELS) + INTRINSIC_INPUTS;
 /// Raw controller outputs (§6.3).
 pub const ACTION_WIDTH: u32 = 36;
 
+/// Maximum sensor + recurrent input width admitted by `field-ecology-v2` (`V2-01`).
+pub const MAX_SENSOR_WIDTH: u32 = 128;
+
+/// Maximum held action output width stored per organism in `HeldOutput` (`V2-01`).
+pub const MAX_ACTION_WIDTH: u32 = 48;
+
 /// Hidden layers the dense catalog admits: one or two (§6.4).
 pub const MAXIMUM_HIDDEN_LAYERS: usize = 2;
 
 /// Maximum per-organism recurrent internal state width admitted by
 /// `independent-recurrent-mlp-v1` (plan §25.2; FL-054).
 pub const MAXIMUM_RECURRENT_STATE_WIDTH: u32 = 16;
+
+/// Maximum raw controller output width including `2 * S` trailing recurrent logits (`V2-01`).
+pub const MAX_CONTROLLER_OUTPUT_WIDTH: u32 = MAX_ACTION_WIDTH + 2 * MAXIMUM_RECURRENT_STATE_WIDTH;
 
 /// Parameters, weights plus biases, of a dense network
 /// `input → hidden… → output` (§6.2).

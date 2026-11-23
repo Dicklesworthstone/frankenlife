@@ -387,3 +387,34 @@ fn the_world_view_selects_by_identity_and_drops_a_dead_selection() {
     };
     assert_ring(ring.mesh, view_.viewport(), moved);
 }
+
+/// `selection_ring_around` refuses negative or non-finite dot radii and
+/// non-finite positions cleanly instead of emitting an inverted or NaN mesh.
+#[test]
+fn selection_ring_refuses_non_finite_position_and_invalid_radius() {
+    let viewport = view([32.0, 32.0], [320, 320], [16.0, 16.0], 1.0);
+    for bad_radius in [-1.0, -1e-9, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(
+            matches!(
+                flife_manim::selection_ring_around(&viewport, [16.0, 16.0], bad_radius),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "bad_radius={bad_radius}"
+        );
+    }
+    for bad_pos in [
+        [f64::NAN, 16.0],
+        [16.0, f64::INFINITY],
+        [f64::NEG_INFINITY, 16.0],
+    ] {
+        assert!(
+            matches!(
+                flife_manim::selection_ring_around(&viewport, bad_pos, 0.5),
+                Err(CoreError::NumericalInvalid { .. })
+            ),
+            "bad_pos={bad_pos:?}"
+        );
+    }
+    // Zero dot radius is valid (gap + width still give a positive annulus).
+    assert!(flife_manim::selection_ring_around(&viewport, [16.0, 16.0], 0.0).is_ok());
+}

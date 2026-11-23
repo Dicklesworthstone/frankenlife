@@ -23,14 +23,269 @@
 //! decoded again every tick against that tick's budget; this module returns
 //! fractions, never amounts.
 
+use std::ops::Range;
+
 use flife_core::numerics::{expm1_neg, sigmoid};
 use flife_core::{CoreError, TimeStep, ValidatedConfig};
 use flife_field::settle::EmissionAction;
 use flife_field::sources::unit_direction;
 use flife_field::state::CHANNELS;
 
-/// Controller outputs.
+use crate::controller::{
+    INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1, MAXIMUM_RECURRENT_STATE_WIDTH,
+};
+
+/// Baseline `field-ecology-v1` controller outputs (`4 + 32 = 36`).
 pub const ACTION_WIDTH: usize = 4 + CHANNELS;
+
+/// Maximum action outputs stored in `HeldOutput.outputs` across all
+/// `field-ecology-v2` feature combinations.
+pub const MAX_ACTION_WIDTH: usize = 48;
+
+/// Maximum total linear output width of a controller, including up to
+/// `2 * MAXIMUM_RECURRENT_STATE_WIDTH` (`32`) trailing recurrent candidate and
+/// gate logits (`48 + 32 = 80`).
+pub const MAX_CONTROLLER_OUTPUT_WIDTH: usize = MAX_ACTION_WIDTH + 2 * MAXIMUM_RECURRENT_STATE_WIDTH;
+
+/// Number of extra outputs appended by `so2-motor`: `(m_e, m_c, m_perp, m_prop)`.
+pub const SO2_MOTOR_OUTPUTS: usize = 4;
+
+/// Number of extra outputs appended by `so2-budding`: `(o_rad, o_tan)`.
+pub const SO2_BUDDING_OUTPUTS: usize = 2;
+
+/// Number of extra outputs appended by `emt-gate`: `o_adh`.
+pub const EMT_GATE_OUTPUTS: usize = 1;
+
+/// Number of extra outputs appended by `wake-offset` (`polarized-pump-v1` +
+/// `neural-output-v1`): `o_pump`.
+pub const WAKE_PUMP_OUTPUTS: usize = 1;
+
+/// Pure scientific action and raw controller output layout (V2-01).
+///
+/// Fixed slot order:
+/// - `0..36`: baseline `field-ecology-v1` action logits (immutable);
+/// - `+4` if `so2-motor`: `(m_e, m_c, m_perp, m_prop)`;
+/// - `+2` if `so2-budding`: `(o_rad, o_tan)`;
+/// - `+1` if `emt-gate`: `o_adh`;
+/// - `+1` if `wake-offset` (`polarized-pump-v1` + `neural-output-v1`): `o_pump`;
+/// - trailing `+2*S` if recurrent / `epigenetic-recurrence` (consumed into
+///   `HeldOutput.state`, not stored in `HeldOutput.outputs`):
+///   `cand[0..S]`, `gate[0..S]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActionLayout {
+    so2_motor: Option<usize>,
+    so2_budding: Option<usize>,
+    emt_gate: Option<usize>,
+    wake_pump: Option<usize>,
+    action_width: usize,
+    recurrent_state_width: usize,
+}
+
+impl ActionLayout {
+    /// Baseline stateless `field-ecology-v1` layout (`36` actions, `36` raw outputs).
+    #[must_use]
+    pub const fn v1() -> Self {
+        Self {
+            so2_motor: None,
+            so2_budding: None,
+            emt_gate: None,
+            wake_pump: None,
+            action_width: ACTION_WIDTH,
+            recurrent_state_width: 0,
+        }
+    }
+
+    /// `field-ecology-v1` layout with FL-054 recurrent state width `state_width`
+    /// (`36` actions, `36 + 2S` raw outputs).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `state_width` exceeds
+    /// [`MAXIMUM_RECURRENT_STATE_WIDTH`].
+    pub fn v1_recurrent(state_width: usize) -> Result<Self, CoreError> {
+        Self::new(false, false, false, false, state_width)
+    }
+
+    /// Build a canonical [`ActionLayout`] from the active layout-affecting
+    /// feature flags and recurrent state width `S`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `recurrent_state_width` exceeds
+    /// [`MAXIMUM_RECURRENT_STATE_WIDTH`], `action_width` exceeds
+    /// [`MAX_ACTION_WIDTH`], or `raw_output_width` exceeds
+    /// [`MAX_CONTROLLER_OUTPUT_WIDTH`].
+    pub fn new(
+        so2_motor: bool,
+        so2_budding: bool,
+        emt_gate: bool,
+        wake_pump: bool,
+        recurrent_state_width: usize,
+    ) -> Result<Self, CoreError> {
+        if recurrent_state_width > MAXIMUM_RECURRENT_STATE_WIDTH {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "controller.recurrent_state_width",
+                detail: format!(
+                    "recurrent state width {recurrent_state_width} exceeds maximum \
+                     {MAXIMUM_RECURRENT_STATE_WIDTH}"
+                ),
+            });
+        }
+        let mut cursor = ACTION_WIDTH;
+        let so2_motor = if so2_motor {
+            let start = cursor;
+            cursor += SO2_MOTOR_OUTPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let so2_budding = if so2_budding {
+            let start = cursor;
+            cursor += SO2_BUDDING_OUTPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let emt_gate = if emt_gate {
+            let start = cursor;
+            cursor += EMT_GATE_OUTPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let wake_pump = if wake_pump {
+            let start = cursor;
+            cursor += WAKE_PUMP_OUTPUTS;
+            Some(start)
+        } else {
+            None
+        };
+        let action_width = cursor;
+        if action_width > MAX_ACTION_WIDTH {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "controller.action_width",
+                detail: format!("action width {action_width} exceeds maximum {MAX_ACTION_WIDTH}"),
+            });
+        }
+        let raw_output_width = action_width + 2 * recurrent_state_width;
+        if raw_output_width > MAX_CONTROLLER_OUTPUT_WIDTH {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "controller.output_width",
+                detail: format!(
+                    "raw output width {raw_output_width} exceeds maximum \
+                     {MAX_CONTROLLER_OUTPUT_WIDTH}"
+                ),
+            });
+        }
+        Ok(Self {
+            so2_motor,
+            so2_budding,
+            emt_gate,
+            wake_pump,
+            action_width,
+            recurrent_state_width,
+        })
+    }
+
+    /// Resolve the action layout of a validated configuration.
+    ///
+    /// # Errors
+    /// [`CoreError::UnknownAlgorithm`] for an unsupported controller family, or
+    /// [`CoreError::NumericalInvalid`] for an out-of-range recurrent width.
+    pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
+        let controller = &config.config().controller;
+        let recurrent_state_width = match controller.family.as_str() {
+            INDEPENDENT_DENSE_MLP_V1 => 0,
+            INDEPENDENT_RECURRENT_MLP_V1 => {
+                let width = controller.recurrent_state_width.ok_or_else(|| {
+                    CoreError::NumericalInvalid {
+                        quantity: "controller.recurrent_state_width",
+                        detail: "independent-recurrent-mlp-v1 requires recurrent_state_width"
+                            .to_owned(),
+                    }
+                })?;
+                if width == 0 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "controller.recurrent_state_width",
+                        detail: format!(
+                            "recurrent state width must lie in 1..={MAXIMUM_RECURRENT_STATE_WIDTH}, \
+                             got 0"
+                        ),
+                    });
+                }
+                usize::try_from(width).map_err(|_| CoreError::Overflow {
+                    quantity: "controller.recurrent_state_width",
+                })?
+            }
+            other => {
+                return Err(CoreError::UnknownAlgorithm {
+                    role: "controller.family",
+                    name: other.to_owned(),
+                });
+            }
+        };
+        Self::new(false, false, false, false, recurrent_state_width)
+    }
+
+    /// Number of action logits stored in `HeldOutput.outputs` (`36..=48`).
+    #[must_use]
+    pub const fn action_width(&self) -> usize {
+        self.action_width
+    }
+
+    /// Recurrent internal state width `S` (`0..=16`).
+    #[must_use]
+    pub const fn recurrent_state_width(&self) -> usize {
+        self.recurrent_state_width
+    }
+
+    /// Total linear output width of the controller (`action_width + 2 * S`, `<= 80`).
+    #[must_use]
+    pub const fn raw_output_width(&self) -> usize {
+        self.action_width + 2 * self.recurrent_state_width
+    }
+
+    /// Start index of the 4 `so2-motor` outputs `(m_e, m_c, m_perp, m_prop)`,
+    /// if active.
+    #[must_use]
+    pub const fn so2_motor(&self) -> Option<usize> {
+        self.so2_motor
+    }
+
+    /// Start index of the 2 `so2-budding` outputs `(o_rad, o_tan)`, if active.
+    #[must_use]
+    pub const fn so2_budding(&self) -> Option<usize> {
+        self.so2_budding
+    }
+
+    /// Index of the `emt-gate` output `o_adh`, if active.
+    #[must_use]
+    pub const fn emt_gate(&self) -> Option<usize> {
+        self.emt_gate
+    }
+
+    /// Index of the `wake-offset` neural pump output `o_pump`, if active.
+    #[must_use]
+    pub const fn wake_pump(&self) -> Option<usize> {
+        self.wake_pump
+    }
+
+    /// Range of the `S` recurrent candidate pre-activations `cand[0..S]`.
+    #[must_use]
+    pub const fn recurrent_candidates(&self) -> Range<usize> {
+        self.action_width..(self.action_width + self.recurrent_state_width)
+    }
+
+    /// Range of the `S` recurrent update-gate pre-activations `gate[0..S]`.
+    #[must_use]
+    pub const fn recurrent_gates(&self) -> Range<usize> {
+        (self.action_width + self.recurrent_state_width)..self.raw_output_width()
+    }
+
+    /// Range of the full `2 * S` recurrent output tail `[cand..., gate...]`.
+    #[must_use]
+    pub const fn recurrent_tail(&self) -> Range<usize> {
+        self.action_width..self.raw_output_width()
+    }
+}
 
 /// Index of the reproduction output.
 pub const REPRODUCTION: usize = 0;
@@ -184,8 +439,8 @@ pub struct DecodedActions {
     pub emission: Option<Emission>,
 }
 
-/// Decode `raw`, the linear outputs of one controller evaluation, for a
-/// tick of `step`.
+/// Decode `raw`, the 36 baseline linear outputs of one controller evaluation,
+/// for a tick of `step`.
 ///
 /// # Errors
 /// [`CoreError::NumericalInvalid`] for a nonfinite output, or a direction
@@ -195,6 +450,28 @@ pub fn decode(
     step: TimeStep,
     decoding: &ActionDecoding,
 ) -> Result<DecodedActions, CoreError> {
+    decode_slice(raw, step, decoding)
+}
+
+/// Decode the baseline `0..36` actions from a variable-width slice `raw`
+/// (`raw.len() >= ACTION_WIDTH`) while checking finiteness across every entry
+/// in `raw`.
+///
+/// # Errors
+/// [`CoreError::LayoutMismatch`] if `raw.len() < ACTION_WIDTH`;
+/// [`CoreError::NumericalInvalid`] for any nonfinite output, or an emission
+/// direction whose norm overflows.
+pub fn decode_slice(
+    raw: &[f64],
+    step: TimeStep,
+    decoding: &ActionDecoding,
+) -> Result<DecodedActions, CoreError> {
+    if raw.len() < ACTION_WIDTH {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "controller outputs",
+            detail: format!("expected at least {ACTION_WIDTH} outputs, got {}", raw.len()),
+        });
+    }
     if let Some((index, value)) = raw.iter().enumerate().find(|(_, value)| !value.is_finite()) {
         return Err(CoreError::NumericalInvalid {
             quantity: "controller output",

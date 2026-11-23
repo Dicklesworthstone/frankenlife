@@ -446,3 +446,100 @@ fn a_body_radius_sizes_every_dot_and_the_sphere_look_lights_them() -> Result<(),
     assert!(view.frame_bloom().is_none(), "no bloom");
     Ok(())
 }
+
+/// FL-033 bug regression: `ParticleCloud::update_between` must emit every
+/// fading row even if `between.fading` is not sorted ascending, `set_body_radius`
+/// must ignore non-positive/non-finite radii, and zero-population (extinct)
+/// worlds must render cleanly with and without the field.
+#[test]
+fn update_between_handles_out_of_order_fading_and_zero_population() -> Result<(), CoreError> {
+    use flife_engine::{Disposition, Intervention, Stepped};
+    use flife_render::Interpolation;
+
+    let config = common::small();
+    let mut world = common::found(&config);
+    let prior = common::epoch(&world);
+    // Wipe out the population to produce a real extinct epoch (0 organisms).
+    let ext = prior.extent();
+    match world.step_with(&[Intervention::RemoveOrganisms {
+        center: [ext[0] / 2.0, ext[1] / 2.0],
+        radius: ext[0].hypot(ext[1]),
+        disposition: Disposition::Remove,
+    }])? {
+        Stepped::Published(_) => {}
+        Stepped::Paused(shortfall) => panic!("paused: {shortfall:?}"),
+    }
+    let empty = common::epoch(&world);
+    assert_eq!(empty.len(), 0, "extinct epoch");
+
+    let viewport = fit(prior.extent(), [128, 128]);
+    let mut cloud = ParticleCloud::for_epoch(&prior)?;
+    // Out-of-order fading rows: the old peekable scan silently dropped 2 and 9.
+    let between = Interpolation {
+        positions: Vec::new(),
+        shown: Vec::new(),
+        fading: vec![15, 2, 9],
+        snapped: false,
+    };
+    let draws = dots(cloud.update_between(
+        Some(&prior),
+        &empty,
+        &between,
+        0.25,
+        &viewport,
+        &Style::default(),
+    )?);
+    assert_eq!(draws.len(), 3, "every fading row must be emitted");
+    assert_eq!(cloud.halos().len(), 3);
+    for (dot, &row) in draws.iter().zip(&between.fading) {
+        let [x, y] = prior.positions()[row];
+        assert_eq!(
+            dot.center,
+            viewport.scene_point([f64::from(x), f64::from(y)])
+        );
+        assert_eq!(dot.color.a, 0.75);
+    }
+
+    // set_body_radius ignores invalid values instead of corrupting self.body.
+    let valid_body = cloud.body_radius();
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        cloud.set_body_radius(bad, &viewport);
+        assert_eq!(cloud.body_radius(), valid_body, "{bad}");
+    }
+
+    // Zero-population WorldView renders cleanly in every style (including 0 draws).
+    for style in [
+        Style::default(),
+        Style {
+            field: false,
+            ..Style::default()
+        },
+        Style {
+            look: Look::Raw,
+            field: false,
+            ..Style::default()
+        },
+        Style {
+            look: Look::Sphere,
+            field: false,
+            ..Style::default()
+        },
+        Style {
+            particles: flife_manim::Particles::Density,
+            ..Style::default()
+        },
+        Style {
+            particles: flife_manim::Particles::Density,
+            look: Look::Raw,
+            ..Style::default()
+        },
+    ] {
+        let mut view = WorldView::for_epoch(&empty, [64, 64], [10, 20, 30])?;
+        view.set_style(style);
+        view.show(&empty)?;
+        assert_eq!(view.cloud().draws().len(), 0);
+        let rgba = view.render_rgba8(1)?;
+        assert_eq!(rgba.len(), 64 * 64 * 4);
+    }
+    Ok(())
+}

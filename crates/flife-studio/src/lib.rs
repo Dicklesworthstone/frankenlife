@@ -101,9 +101,10 @@ pub use overlay::{
 pub use pacing::{ARRIVAL_SMOOTHING, MOTION_MAX, Pacer};
 pub use session::{End, INTENT_CAPACITY, OUTCOME_POLL, SessionThread, Status};
 pub use timeline::{
-    AppliedCommand, Exact, ReplayFrame, Replayed, TIMELINE_SCHEMA, TimelineCheckpoint,
-    TimelineIntervention, TimelineProjection, TimelineRecord, TimelineRegion, TimelineStart,
-    TimelineStyle, peak_observer_bytes, read_timeline, replay, write_timeline_record,
+    AppliedCommand, Exact, REPLAY_SLOTS, ReplayFrame, Replayed, TIMELINE_SCHEMA,
+    TimelineCheckpoint, TimelineIntervention, TimelineProjection, TimelineRecord, TimelineRegion,
+    TimelineStart, TimelineStyle, peak_observer_bytes, read_timeline, replay,
+    write_timeline_record,
 };
 
 /// The schema of the Studio's NDJSON records.

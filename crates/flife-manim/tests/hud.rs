@@ -586,3 +586,51 @@ fn swatches_are_drawn_in_their_colours() {
         assert!(checked > 400, "{checked} pixels of a square checked");
     }
 }
+
+/// Regression: `flatten_quadratic` caps zero-tolerance or huge-bend curves at
+/// `HUD_MAX_CURVE_SEGMENTS` rather than collapsing to 1 segment; overflowing
+/// `em_pixels` is refused cleanly; and multi-swatch `hud_glyphs` colours every
+/// vertex of every swatch accurately with the O(1) cursor.
+#[test]
+fn flatten_quadratic_caps_infinite_bend_and_hud_refuses_overflowing_em() {
+    let mut zero_tol = Vec::new();
+    flatten_quadratic([0.0, 0.0], [10.0, 20.0], [20.0, 0.0], 0.0, &mut zero_tol);
+    assert_eq!(zero_tol.len(), HUD_MAX_CURVE_SEGMENTS);
+
+    let mut huge_bend = Vec::new();
+    flatten_quadratic(
+        [0.0, 0.0],
+        [1e308, 0.0],
+        [0.0, 0.0],
+        HUD_FLATNESS_PIXELS,
+        &mut huge_bend,
+    );
+    assert_eq!(huge_bend.len(), HUD_MAX_CURVE_SEGMENTS);
+
+    let font = font();
+    assert!(font.text("A", 1e308).is_err());
+    assert!(font.text("   ", 1e308).is_err());
+
+    let palette = [
+        linear([0xFF, 0x00, 0x00]),
+        linear([0x00, 0xFF, 0x00]),
+        linear([0x00, 0x00, 0xFF]),
+        linear([0xFF, 0xFF, 0x00]),
+    ];
+    let text = font
+        .text_with_swatches("■a■b■c■d■", 20.0, &palette)
+        .expect("multi-swatch text");
+    assert_eq!(text.swatches().len(), 4);
+    let viewport = Viewport::fit([32.0, 18.0], [480, 270]).expect("viewport");
+    let mesh = hud_glyphs(&viewport, &text)
+        .expect("mesh")
+        .expect("non-empty");
+    for (index, vertex) in mesh.vertices().iter().enumerate() {
+        let expected = text
+            .swatches()
+            .iter()
+            .find(|(range, _)| range.contains(&index))
+            .map_or(HUD_TEXT_COLOR, |&(_, color)| color);
+        assert_eq!(vertex.color, expected, "vertex {index}");
+    }
+}

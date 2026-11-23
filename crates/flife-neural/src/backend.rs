@@ -15,7 +15,7 @@ use std::fmt::Debug;
 use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 
-use crate::{ACTION_WIDTH, ArenaSlot, ReferenceController, SENSOR_WIDTH};
+use crate::{ArenaSlot, RawOutputs, ReferenceController};
 
 /// One due organism's controller evaluation.
 #[derive(Debug, Clone, Copy)]
@@ -31,8 +31,10 @@ pub struct ControllerJob<'a> {
     pub slot: ArenaSlot,
     /// The organism's controller, admitted under the run's limits.
     pub controller: ReferenceController<'a>,
-    /// Its observation's 104 inputs.
-    pub inputs: &'a [f64; SENSOR_WIDTH],
+    /// Its controller inputs (`inputs.len() == controller.topology().input_width()`,
+    /// up to [`crate::MAX_SENSOR_WIDTH`] = `128`). For recurrent topologies,
+    /// the caller appends the current internal state `h[0..S]` at the tail.
+    pub inputs: &'a [f64],
 }
 
 /// The memory a controller backend may hold for one world (FL-043, plan
@@ -85,8 +87,9 @@ pub trait ControllerBackend: Debug + Send {
     }
 
     /// Evaluate `jobs` in order. `outputs` becomes one entry per job: its
-    /// 36 raw outputs, bit-identical to
-    /// `job.controller.evaluate(job.inputs, _)`, or `None` where the
+    /// raw linear outputs (length `job.controller.topology().raw_output_width()`,
+    /// up to [`crate::MAX_CONTROLLER_OUTPUT_WIDTH`] = `80`), bit-identical to
+    /// `job.controller.evaluate_raw(job.inputs, _)`, or `None` where the
     /// backend defers that job to the reference. Every job the reference
     /// refuses must be deferred.
     ///
@@ -96,6 +99,6 @@ pub trait ControllerBackend: Debug + Send {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError>;
 }

@@ -998,3 +998,41 @@ fn listing(dir: &Path) -> Vec<String> {
     names.sort();
     names
 }
+
+/// Dropping a running kept `SessionThread` without calling `close()` must
+/// still request closure, join the session thread synchronously, and release
+/// the chunk store lock and catalog so the run directory can be recovered
+/// immediately with no detached background task.
+#[test]
+fn dropping_a_running_kept_session_joins_and_releases_the_run_directory() {
+    let config = configured("write-ahead-before-apply", &[]);
+    let run = fresh("drop-join");
+    let keeping = Keeping::new(&run, &config).expect("kept");
+    let (owner, handle, kept) = keeping
+        .open(found(&config), &config, STUDIO_SESSION)
+        .expect("opens");
+    let session = SessionThread::spawn_kept(owner, handle, Some(kept)).expect("starts");
+    session.send(Intent::Resume).expect("resumes");
+    let mut statuses = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !statuses
+        .iter()
+        .any(|status| matches!(status, Status::Running { .. }))
+    {
+        assert!(Instant::now() < deadline, "never started: {statuses:?}");
+        statuses.extend(session.statuses());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Drop directly without calling `close()`: `Drop` must join cleanly.
+    drop(session);
+
+    // Reopening immediately succeeds only if `flife-session` joined and
+    // released `store/LOCK` and `catalog.db`.
+    let recovered = flife_cli::recover(&run, |_| {}).expect("recovers right after drop");
+    let (owner, handle) =
+        flife_cli::open_session(recovered.world, recovered.book, recovered.limits, &run)
+            .expect("reopens immediately after drop");
+    let reopened =
+        SessionThread::spawn_kept(owner, handle, Some(recovered.checkpoints)).expect("restarts");
+    reopened.close().expect("closes cleanly");
+}

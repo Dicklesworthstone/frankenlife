@@ -50,6 +50,10 @@ use crate::Status;
 /// The schema of a Studio timeline's records.
 pub const TIMELINE_SCHEMA: &str = "frankenlife.timeline.v1";
 
+/// The render-epoch slots [`replay`] allocates for its publisher: a prior, a
+/// current, one being written, and one to spare.
+pub const REPLAY_SLOTS: usize = 4;
+
 /// A number written as its IEEE 754 bits, in 16 hexadecimal digits: read
 /// back, it is exactly the number written.
 #[derive(Debug, Clone, Copy)]
@@ -852,9 +856,6 @@ pub fn replay(
             capability: "a Metal device to replay a studio timeline".into(),
         });
     }
-    let mut renderer = MetalRenderer::new().map_err(|error| CoreError::MissingCapability {
-        capability: format!("a Metal renderer to replay a studio timeline: {error}"),
-    })?;
     // The world the Studio's session was opened on: its configuration's
     // founding world, or the checkpoint a resumed run restored.
     let mut world = match from
@@ -883,18 +884,25 @@ pub fn replay(
     if let Some(workers) = cpu_workers {
         world.set_cpu_workers(workers)?;
     }
-    // A prior, a current and one being written, and one to spare.
-    let mut publisher = Publisher::new(&world, 4, || {})?;
-    let viewer = publisher.feed().viewer(3)?;
-    let restored = viewer.latest()?;
-    // As `Studio::open` makes it: for the world restored, before a resumed
-    // run's command journal replays past it.
-    let mut view = crate::host::studio_view(config, &restored, *size, style.style()?, background)?;
     // FL-043: admit the replay world and its observer buffers across the
     // peak rendered `(drawable, pixels_per_point)` state recorded in the
-    // timeline before stepping or rendering any frames.
-    let peak_observers = peak_observer_bytes(&world, &restored, &view, *size, records)?;
+    // timeline BEFORE allocating the 4-slot publisher or Metal renderer
+    // (INV-15).
+    let standalone = flife_render::Epoch::standalone(&world)?;
+    // As `Studio::open` makes it: for the world restored, before a resumed
+    // run's command journal replays past it.
+    let mut view =
+        crate::host::studio_view(config, &standalone, *size, style.style()?, background)?;
+    let peak_observers = peak_observer_bytes(&world, &standalone, &view, *size, records)?;
     world.admit_memory(false, 0, peak_observers)?;
+    drop(standalone);
+    let mut renderer = MetalRenderer::new().map_err(|error| CoreError::MissingCapability {
+        capability: format!("a Metal renderer to replay a studio timeline: {error}"),
+    })?;
+    // A prior, a current and one being written, and one to spare.
+    let mut publisher = Publisher::new(&world, REPLAY_SLOTS, || {})?;
+    let viewer = publisher.feed().viewer(3)?;
+    let restored = viewer.latest()?;
     // The epoch the session opened on: the restored world's, or the one the
     // journal's commands reached, which the book records applied.
     let opened = from.as_ref().map_or(0, |start| start.tick);
@@ -1066,21 +1074,28 @@ const fn flushes_geometry(record: &TimelineRecord) -> bool {
 /// [`CoreError::NumericalInvalid`] for an invalid drawable size or pixel
 /// density in `records`.
 pub fn peak_observer_bytes(
-    world: &World,
+    _world: &World,
     restored: &flife_render::Epoch,
     view: &flife_manim::WorldView,
     initial_size: [u32; 2],
     records: &[TimelineRecord],
 ) -> Result<u64, CoreError> {
+    let feed_bytes = restored
+        .reserved_bytes()
+        .saturating_mul(REPLAY_SLOTS as u64);
     let mut cur_drawable = initial_size;
     let mut cur_scale = 1.0_f64;
     let mut geometry_dirty = false;
     let mut peak =
-        crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+        crate::memory::observer_bytes_for_resize(feed_bytes, view, cur_drawable, cur_scale)?;
     for record in records {
         if geometry_dirty && flushes_geometry(record) {
-            let required =
-                crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+            let required = crate::memory::observer_bytes_for_resize(
+                feed_bytes,
+                view,
+                cur_drawable,
+                cur_scale,
+            )?;
             peak = peak.max(required);
             geometry_dirty = false;
         }
@@ -1100,7 +1115,7 @@ pub fn peak_observer_bytes(
     }
     if geometry_dirty {
         let final_bytes =
-            crate::memory::observer_bytes_at(world, restored, view, cur_drawable, cur_scale)?;
+            crate::memory::observer_bytes_for_resize(feed_bytes, view, cur_drawable, cur_scale)?;
         peak = peak.max(final_bytes);
     }
     Ok(peak)

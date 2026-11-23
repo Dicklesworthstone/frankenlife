@@ -121,7 +121,7 @@ fn scope_of(section: &str, key: &str) -> Scope {
         ("", _) => Scope::Run,
         ("execution", "determinism" | "math_mode") => Scope::Numerics,
         ("execution", _) => Scope::Execution,
-        ("presentation" | "recording" | "persistence", _) => Scope::Presentation,
+        ("presentation" | "recording" | "persistence" | "v2.visual", _) => Scope::Presentation,
         _ => Scope::Model,
     }
 }
@@ -1141,6 +1141,543 @@ pub fn fields(config: &RunConfig) -> Vec<Field<'_>> {
         U::Ticks,
         AtLeastOne,
     );
+
+    if let Some(v2) = &config.v2 {
+        r.text("v2", "profile", &v2.profile);
+
+        if let Some(enabled) = v2.oases.enabled {
+            r.boolean("v2.oases", "enabled", enabled);
+        }
+        r.float(
+            "v2.oases",
+            "bloom_period_seconds",
+            v2.oases.bloom_period_seconds,
+            U::SimulationSeconds,
+            Positive,
+        );
+        r.float(
+            "v2.oases",
+            "minimum_power_fraction",
+            v2.oases.minimum_power_fraction,
+            U::Dimensionless,
+            UnitClosed,
+        );
+        if let Some(s_min) = v2.oases.sigma_min_world_units {
+            r.float(
+                "v2.oases",
+                "sigma_min_world_units",
+                s_min,
+                U::WorldLength,
+                Positive,
+            );
+        }
+        if let Some(s_max) = v2.oases.sigma_max_world_units {
+            r.float(
+                "v2.oases",
+                "sigma_max_world_units",
+                s_max,
+                U::WorldLength,
+                Positive,
+            );
+        }
+
+        if let Some(enabled) = v2.senescence.enabled {
+            r.boolean("v2.senescence", "enabled", enabled);
+        }
+        r.float(
+            "v2.senescence",
+            "scale_seconds",
+            v2.senescence.scale_seconds,
+            U::SimulationSeconds,
+            Positive,
+        );
+        r.float(
+            "v2.senescence",
+            "maximum_multiplier",
+            v2.senescence.maximum_multiplier,
+            U::Dimensionless,
+            Positive,
+        );
+
+        let sf = &v2.emission.surplus_floor;
+        if let Some(enabled) = sf.enabled {
+            r.boolean("v2.emission.surplus_floor", "enabled", enabled);
+        }
+        if let Some(floor) = sf.energy_floor {
+            r.float(
+                "v2.emission.surplus_floor",
+                "energy_floor",
+                floor,
+                U::Energy,
+                NonNegative,
+            );
+        }
+
+        let ex = &v2.emission.excitable;
+        if let Some(enabled) = ex.enabled {
+            r.boolean("v2.emission.excitable", "enabled", enabled);
+        }
+        r.text("v2.emission.excitable", "mode", &ex.mode);
+        r.float(
+            "v2.emission.excitable",
+            "fire_readiness_threshold",
+            ex.fire_readiness_threshold,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        r.float(
+            "v2.emission.excitable",
+            "depletion_fraction",
+            ex.depletion_fraction,
+            U::Dimensionless,
+            UnitClosed,
+        );
+        r.float(
+            "v2.emission.excitable",
+            "burst_rate_multiplier",
+            ex.burst_rate_multiplier,
+            U::Dimensionless,
+            Positive,
+        );
+        r.float(
+            "v2.emission.excitable",
+            "recovery_time_seconds",
+            ex.recovery_time_seconds,
+            U::SimulationSeconds,
+            Positive,
+        );
+        r.int(
+            "v2.emission.excitable",
+            "refractory_cooldown_ticks",
+            ex.refractory_cooldown_ticks,
+            U::Ticks,
+            AtLeastOne,
+        );
+
+        let off = &v2.emission.offset;
+        if let Some(enabled) = off.enabled {
+            r.boolean("v2.emission.offset", "enabled", enabled);
+        }
+        r.text("v2.emission.offset", "mode", &off.mode);
+        r.text(
+            "v2.emission.offset",
+            "pump_direction_mode",
+            &off.pump_direction_mode,
+        );
+        r.float(
+            "v2.emission.offset",
+            "pump_sign",
+            off.pump_sign,
+            U::Dimensionless,
+            FloatBound::Finite,
+        );
+        if let Some(distance) = off.distance_world_units {
+            r.float(
+                "v2.emission.offset",
+                "distance_world_units",
+                distance,
+                U::WorldLength,
+                NonNegative,
+            );
+        }
+
+        if let Some(enabled) = v2.motor.enabled {
+            r.boolean("v2.motor", "enabled", enabled);
+        }
+        r.float(
+            "v2.motor",
+            "energy_gradient_gain",
+            v2.motor.energy_gradient_gain,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.float(
+            "v2.motor",
+            "chemical_gradient_gain",
+            v2.motor.chemical_gradient_gain,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.float(
+            "v2.motor",
+            "chiral_contour_gain",
+            v2.motor.chiral_contour_gain,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.float(
+            "v2.motor",
+            "heading_propulsion_fraction",
+            v2.motor.heading_propulsion_fraction,
+            U::Dimensionless,
+            UnitClosed,
+        );
+
+        if let Some(enabled) = v2.budding.enabled {
+            r.boolean("v2.budding", "enabled", enabled);
+        }
+        if let Some(radius) = v2.budding.local_offset_radius {
+            r.float(
+                "v2.budding",
+                "local_offset_radius",
+                radius,
+                U::WorldLength,
+                NonNegative,
+            );
+        }
+
+        if let Some(enabled) = v2.crowding.enabled {
+            r.boolean("v2.crowding", "enabled", enabled);
+        }
+        r.text("v2.crowding", "mode", &v2.crowding.mode);
+        if let Some(radius) = v2.crowding.radius_world_units {
+            r.float(
+                "v2.crowding",
+                "radius_world_units",
+                radius,
+                U::WorldLength,
+                Positive,
+            );
+        }
+        r.float(
+            "v2.crowding",
+            "arrest_threshold",
+            v2.crowding.arrest_threshold,
+            U::Count,
+            Positive,
+        );
+        r.boolean("v2.crowding", "expose_sensor", v2.crowding.expose_sensor);
+
+        if let Some(enabled) = v2.polarity.enabled {
+            r.boolean("v2.polarity", "enabled", enabled);
+        }
+        r.float(
+            "v2.polarity",
+            "torque_mobility",
+            v2.polarity.torque_mobility,
+            U::PerSimulationSecond,
+            NonNegative,
+        );
+        r.float(
+            "v2.polarity",
+            "gradient_cue_strength",
+            v2.polarity.gradient_cue_strength,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.float(
+            "v2.polarity",
+            "initial_polarity_strength_max",
+            v2.polarity.initial_polarity_strength_max,
+            U::Dimensionless,
+            UnitClosed,
+        );
+        r.float(
+            "v2.polarity",
+            "maximum_wedge_curvature",
+            v2.polarity.maximum_wedge_curvature,
+            U::Dimensionless,
+            UnitClosed,
+        );
+        r.float(
+            "v2.polarity",
+            "polarity_mutation_std",
+            v2.polarity.polarity_mutation_std,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.boolean(
+            "v2.polarity",
+            "oriented_lateral_mitosis",
+            v2.polarity.oriented_lateral_mitosis,
+        );
+        if let Some(enabled) = v2.polarity.emt_gate_enabled {
+            r.boolean("v2.polarity", "emt_gate_enabled", enabled);
+        }
+
+        if let Some(enabled) = v2.barrier.enabled {
+            r.boolean("v2.barrier", "enabled", enabled);
+        }
+        r.text("v2.barrier", "mode", &v2.barrier.mode);
+        r.float(
+            "v2.barrier",
+            "minimum_permeability",
+            v2.barrier.minimum_permeability,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        r.float(
+            "v2.barrier",
+            "occupancy_impedance",
+            v2.barrier.occupancy_impedance,
+            U::Dimensionless,
+            NonNegative,
+        );
+
+        let ly = &v2.metabolism.lysis;
+        if let Some(enabled) = ly.enabled {
+            r.boolean("v2.metabolism.lysis", "enabled", enabled);
+        }
+        if let Some(floor) = ly.viability_energy_floor {
+            r.float(
+                "v2.metabolism.lysis",
+                "viability_energy_floor",
+                floor,
+                U::Energy,
+                NonNegative,
+            );
+        }
+        r.text(
+            "v2.metabolism.lysis",
+            "corpse_direction",
+            &ly.corpse_direction,
+        );
+
+        let wa = &v2.metabolism.waste;
+        if let Some(enabled) = wa.enabled {
+            r.boolean("v2.metabolism.waste", "enabled", enabled);
+        }
+        r.float(
+            "v2.metabolism.waste",
+            "byproduct_recycle_fraction",
+            wa.byproduct_recycle_fraction,
+            U::Dimensionless,
+            UnitClosed,
+        );
+
+        let df = &v2.differentiation;
+        if let Some(enabled) = df.enabled {
+            r.boolean("v2.differentiation", "enabled", enabled);
+        }
+        r.int(
+            "v2.differentiation",
+            "state_width",
+            df.state_width,
+            U::Count,
+            AtLeastOne,
+        );
+        r.float(
+            "v2.differentiation",
+            "epigenetic_gate_bias",
+            df.epigenetic_gate_bias,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.text(
+            "v2.differentiation",
+            "state_inheritance",
+            &df.state_inheritance,
+        );
+        r.float(
+            "v2.differentiation",
+            "inheritance_retention",
+            df.inheritance_retention,
+            U::Dimensionless,
+            UnitClosed,
+        );
+        r.float(
+            "v2.differentiation",
+            "inheritance_jitter",
+            df.inheritance_jitter,
+            U::Dimensionless,
+            NonNegative,
+        );
+        r.float(
+            "v2.differentiation",
+            "stem_asymmetry",
+            df.stem_asymmetry,
+            U::Dimensionless,
+            FloatBound::Finite,
+        );
+        r.boolean(
+            "v2.differentiation",
+            "affinity_rotation_enabled",
+            df.affinity_rotation_enabled,
+        );
+        r.boolean(
+            "v2.differentiation",
+            "emt_adhesion_enabled",
+            df.emt_adhesion_enabled,
+        );
+
+        let nd = &df.notch_delta;
+        if let Some(enabled) = nd.enabled {
+            r.boolean("v2.differentiation.notch_delta", "enabled", enabled);
+        }
+        r.text("v2.differentiation.notch_delta", "mode", &nd.mode);
+        r.float(
+            "v2.differentiation.notch_delta",
+            "inhibition_gain",
+            nd.inhibition_gain,
+            U::Dimensionless,
+            UnitClosed,
+        );
+
+        let tr = &v2.trophallaxis;
+        if let Some(enabled) = tr.enabled {
+            r.boolean("v2.trophallaxis", "enabled", enabled);
+        }
+        r.float(
+            "v2.trophallaxis",
+            "conductance_per_second",
+            tr.conductance_per_second,
+            U::PerSimulationSecond,
+            NonNegative,
+        );
+        r.float(
+            "v2.trophallaxis",
+            "transfer_efficiency",
+            tr.transfer_efficiency,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        if let Some(reserve) = tr.reserve_energy {
+            r.float(
+                "v2.trophallaxis",
+                "reserve_energy",
+                reserve,
+                U::Energy,
+                NonNegative,
+            );
+        }
+        r.float(
+            "v2.trophallaxis",
+            "maximum_export_fraction",
+            tr.maximum_export_fraction,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        r.int(
+            "v2.trophallaxis",
+            "kin_cosine_exponent",
+            tr.kin_cosine_exponent,
+            U::Count,
+            AtLeastOne,
+        );
+        r.float(
+            "v2.trophallaxis",
+            "kin_threshold",
+            tr.kin_threshold,
+            U::Dimensionless,
+            UnitClosed,
+        );
+
+        let cad = &v2.contact.cadherin;
+        if let Some(enabled) = cad.enabled {
+            r.boolean("v2.contact.cadherin", "enabled", enabled);
+        }
+        r.float(
+            "v2.contact.cadherin",
+            "mutation_std",
+            cad.mutation_std,
+            U::Dimensionless,
+            NonNegative,
+        );
+
+        let va = &v2.contact.velocity_alignment;
+        if let Some(enabled) = va.enabled {
+            r.boolean("v2.contact.velocity_alignment", "enabled", enabled);
+        }
+        r.float(
+            "v2.contact.velocity_alignment",
+            "strength",
+            va.strength,
+            U::Dimensionless,
+            UnitClosed,
+        );
+
+        let vas = &v2.vascular;
+        if let Some(enabled) = vas.enabled {
+            r.boolean("v2.vascular", "enabled", enabled);
+        }
+        r.float(
+            "v2.vascular",
+            "minimum_conductance_ratio",
+            vas.minimum_conductance_ratio,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        if let Some(max_d) = vas.maximum_diffusion {
+            r.float(
+                "v2.vascular",
+                "maximum_diffusion",
+                max_d,
+                U::Diffusion,
+                Positive,
+            );
+        }
+        r.float(
+            "v2.vascular",
+            "reinforcement_rate_per_second",
+            vas.reinforcement_rate_per_second,
+            U::PerSimulationSecond,
+            Positive,
+        );
+        r.float(
+            "v2.vascular",
+            "pruning_rate_per_second",
+            vas.pruning_rate_per_second,
+            U::PerSimulationSecond,
+            Positive,
+        );
+        r.float(
+            "v2.vascular",
+            "flux_half_saturation",
+            vas.flux_half_saturation,
+            U::EnergyPerSecond,
+            Positive,
+        );
+        r.float(
+            "v2.vascular",
+            "flux_exponent",
+            vas.flux_exponent,
+            U::Dimensionless,
+            Positive,
+        );
+
+        let car = &v2.carriers;
+        if let Some(enabled) = car.enabled {
+            r.boolean("v2.carriers", "enabled", enabled);
+        }
+        if let Some(d1) = car.trail_diffusion {
+            r.float(
+                "v2.carriers",
+                "trail_diffusion",
+                d1,
+                U::Diffusion,
+                NonNegative,
+            );
+        }
+        if let Some(l1) = car.trail_decay_per_second {
+            r.float(
+                "v2.carriers",
+                "trail_decay_per_second",
+                l1,
+                U::PerSimulationSecond,
+                NonNegative,
+            );
+        }
+        r.float(
+            "v2.carriers",
+            "trail_emission_share",
+            car.trail_emission_share,
+            U::Dimensionless,
+            UnitPositive,
+        );
+        if let Some(scale) = car.trail_energy_density_scale {
+            r.float(
+                "v2.carriers",
+                "trail_energy_density_scale",
+                scale,
+                U::EnergyDensity,
+                Positive,
+            );
+        }
+
+        if let Some(enabled) = v2.visual.enabled {
+            r.boolean("v2.visual", "enabled", enabled);
+        }
+    }
 
     r.0
 }

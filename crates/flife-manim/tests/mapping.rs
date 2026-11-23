@@ -1383,3 +1383,77 @@ fn lineage_energy_keeps_the_lineage_hue_and_lightens_with_energy() {
         })
     );
 }
+
+/// Regression: `mix` treats non-finite fractions as 0 (matching `ramp`/`wheel`)
+/// instead of returning black, and `DensityLayer` reuses its texture across
+/// `Look::Raw`/`Look::Sphere` and handles zero-population epochs cleanly.
+#[test]
+fn mix_non_finite_and_density_sphere_reuse_and_zero_population() {
+    let a = [10, 20, 30];
+    let b = [200, 210, 220];
+    assert_eq!(mix(a, b, f64::NAN), a);
+    assert_eq!(mix(a, b, f64::INFINITY), a);
+    assert_eq!(mix(a, b, f64::NEG_INFINITY), a);
+
+    let config = common::small();
+    let mut world = common::found(&config);
+    common::advance(&mut world, 12);
+    let epoch = common::epoch(&world);
+    let viewport = fit(epoch.extent(), [128, 128]);
+    let mut layer = DensityLayer::new(&viewport);
+    let raw_style = Style {
+        particles: Particles::Density,
+        look: Look::Raw,
+        ..Style::default()
+    };
+    layer.update(&epoch, &raw_style).expect("raw density");
+    let raw_ptr = layer.texture().expect("texture") as *const _;
+    let sphere_style = Style {
+        look: Look::Sphere,
+        ..raw_style
+    };
+    layer.place(&sphere_style).expect("sphere density");
+    assert_eq!(
+        layer.texture().expect("texture") as *const _,
+        raw_ptr,
+        "Sphere must reuse identical Raw density texture"
+    );
+
+    // Zero-population density layer produces all-clear glow and all-black raw.
+    let ext = epoch.extent();
+    assert!(matches!(
+        world
+            .step_with(&[flife_engine::Intervention::RemoveOrganisms {
+                center: [ext[0] / 2.0, ext[1] / 2.0],
+                radius: ext[0].hypot(ext[1]),
+                disposition: flife_engine::Disposition::Remove,
+            }])
+            .expect("step"),
+        flife_engine::Stepped::Published(_)
+    ));
+    let empty = common::epoch(&world);
+    assert_eq!(empty.len(), 0);
+    let mut empty_layer = DensityLayer::new(&viewport);
+    empty_layer
+        .update(
+            &empty,
+            &Style {
+                particles: Particles::Density,
+                look: Look::Glow,
+                ..Style::default()
+            },
+        )
+        .expect("empty glow density");
+    assert_eq!(empty_layer.scale(), 0.0);
+    assert!(
+        texels(empty_layer.texture().expect("tex"))
+            .iter()
+            .all(|t| t.a == 0.0)
+    );
+    empty_layer.place(&raw_style).expect("empty raw density");
+    assert!(
+        texels(empty_layer.texture().expect("tex"))
+            .iter()
+            .all(|t| t.r == 0.0 && t.g == 0.0 && t.b == 0.0 && t.a == 1.0)
+    );
+}

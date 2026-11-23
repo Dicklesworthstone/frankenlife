@@ -22,12 +22,14 @@ use crate::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, FIELD_ECOLOGY_V1_CONTACT_SORTING,
     FIELD_ECOLOGY_V1_CONTACT_SORTING_CHEMISTRY_ONLY,
-    FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS,
-    MAXIMUM_HIDDEN_LAYERS, MAXIMUM_RECURRENT_STATE_WIDTH, MOMENT_CHANNELS, SENSOR_WIDTH,
-    dense_parameter_count, genome_bank_bytes,
+    FIELD_ECOLOGY_V1_CONTACT_SORTING_FRESH_OFFSPRING, FIELD_ECOLOGY_V2_FIXED_CONTROLLER,
+    INTRINSIC_INPUTS, MAXIMUM_CONTACT_SWEEPS, MAXIMUM_HIDDEN_LAYERS,
+    MAXIMUM_RECURRENT_STATE_WIDTH, MOMENT_CHANNELS, SENSOR_WIDTH, dense_parameter_count,
+    genome_bank_bytes, is_v2_model,
 };
 use crate::registry::{self, REGISTRY};
 use crate::schema::{self, FloatBound, IntBound, Kind, Value};
+use crate::v2::{self, V2Abi, V2Feature};
 
 /// Quantities derived while validating (plan A.2).
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +107,30 @@ impl ValidatedConfig {
     #[must_use]
     pub fn config_hash(&self) -> Sha256Digest {
         Sha256Digest::of(self.canonical_toml().as_bytes())
+    }
+
+    /// Effective pure-scientific controller and field ABI widths.
+    #[must_use]
+    pub fn v2_abi(&self) -> V2Abi {
+        self.config.v2_abi()
+    }
+
+    /// Whether this configuration satisfies `INV-08` (purely field-mediated interaction).
+    #[must_use]
+    pub fn inv08_pure_field(&self) -> bool {
+        self.config.inv08_pure_field()
+    }
+
+    /// Whether `feature` is active on this configuration (`false` on all `v1` models).
+    #[must_use]
+    pub fn is_v2_feature_enabled(&self, feature: V2Feature) -> bool {
+        self.config.is_v2_feature_enabled(feature)
+    }
+
+    /// Bitmask of active v2 features (`0` on all `v1` models).
+    #[must_use]
+    pub fn v2_feature_bitmask(&self) -> u64 {
+        self.config.v2_feature_bitmask()
     }
 }
 
@@ -221,6 +247,11 @@ fn check_text(path: &str, text: &str, issues: &mut Issues) {
                 );
             }
         }
+        p if p.starts_with("v2.") => {
+            if let Some(problem) = v2::validate_v2_text(p, text) {
+                issues.add(path, problem);
+            }
+        }
         _ => issues.add(path, "has no text format rule"),
     }
 }
@@ -229,12 +260,14 @@ fn check_text(path: &str, text: &str, issues: &mut Issues) {
 ///
 /// # Errors
 /// [`CoreError::InvalidConfig`] listing every issue found.
-pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
+pub fn validate(mut config: RunConfig) -> Result<ValidatedConfig, CoreError> {
     let mut issues = Issues::default();
+    v2::prepare_v2(&mut config, &mut issues.0);
     check_generic(&config, &mut issues);
     check_contact(&config, &mut issues);
     check_exchange(&config, &mut issues);
     check_controller(&config, &mut issues);
+    v2::validate_v2(&config, &mut issues.0);
     let report = check_model(&config, &mut issues);
     match report {
         Some(report) if issues.0.is_empty() => Ok(ValidatedConfig { config, report }),
@@ -250,9 +283,33 @@ pub fn validate(config: RunConfig) -> Result<ValidatedConfig, CoreError> {
 /// `[contact]` belongs to the contact models, which need it (plan §5.4), and
 /// adhesion begins where bodies touch. `sweeps` and `inhibition` belong to
 /// the contact-inhibition models, and `repulsion` to the contact-sorting
-/// models, which need them.
+/// models, which need them. On `field-ecology-v2*` models, `[contact]` and
+/// its relaxation fields are optional (contact-dependent v2 features enforce
+/// its presence in `v2::validate_v2`).
 fn check_contact(config: &RunConfig, issues: &mut Issues) {
     let model = config.model.as_str();
+    if is_v2_model(model) {
+        if let Some(contact) = &config.contact {
+            if let Some(sweeps) = contact.sweeps
+                && sweeps > MAXIMUM_CONTACT_SWEEPS
+            {
+                issues.add(
+                    "contact.sweeps",
+                    format!("must be <= {MAXIMUM_CONTACT_SWEEPS}, got {sweeps}"),
+                );
+            }
+            if contact.adhesion_range < 1.0 {
+                issues.add(
+                    "contact.adhesion_range",
+                    format!(
+                        "must be >= 1, got {}: adhesion reaches from touching outwards",
+                        contact.adhesion_range
+                    ),
+                );
+            }
+        }
+        return;
+    }
     let inhibiting = [
         FIELD_ECOLOGY_V1_CONTACT_INHIBITION,
         FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
@@ -531,21 +588,30 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
             ),
         );
     }
-    let recurrent_width = match (controller.family.as_str(), controller.recurrent_state_width) {
-        ("independent-recurrent-mlp-v1", Some(width))
-            if (1..=MAXIMUM_RECURRENT_STATE_WIDTH).contains(&width) =>
-        {
-            width
-        }
-        _ => 0,
+    let default_parameter_count = if is_v2_model(&config.model) {
+        let abi = config.v2_abi();
+        dense_parameter_count(
+            abi.input_width,
+            &controller.hidden_widths,
+            abi.raw_output_width,
+        )
+    } else {
+        let recurrent_width = match (controller.family.as_str(), controller.recurrent_state_width) {
+            ("independent-recurrent-mlp-v1", Some(width))
+                if (1..=MAXIMUM_RECURRENT_STATE_WIDTH).contains(&width) =>
+            {
+                width
+            }
+            _ => 0,
+        };
+        dense_parameter_count(
+            controller.input_width.saturating_add(recurrent_width),
+            &controller.hidden_widths,
+            controller
+                .output_width
+                .saturating_add(recurrent_width.saturating_mul(2)),
+        )
     };
-    let default_parameter_count = dense_parameter_count(
-        controller.input_width.saturating_add(recurrent_width),
-        &controller.hidden_widths,
-        controller
-            .output_width
-            .saturating_add(recurrent_width.saturating_mul(2)),
-    );
     if let Err(error) = &default_parameter_count {
         issues.add("controller.hidden_widths", error.to_string());
     }
@@ -643,12 +709,19 @@ fn check_model(config: &RunConfig, issues: &mut Issues) -> Option<ValidationRepo
     // A strict no-op rule with no mutation source can never produce a child (A.2).
     let mutation = &config.mutation;
     let architecture = &config.architecture_mutation;
-    let any_mutation = (mutation.weight_probability > 0.0
-        && mutation.weight_standard_deviation > 0.0)
-        || mutation.replacement_probability > 0.0
+    let fixed_controller = config.model == FIELD_ECOLOGY_V2_FIXED_CONTROLLER;
+    let any_controller_mutation = !fixed_controller
+        && ((mutation.weight_probability > 0.0 && mutation.weight_standard_deviation > 0.0)
+            || mutation.replacement_probability > 0.0
+            || (architecture.enabled && architecture.probability_per_birth > 0.0));
+    let any_v2_trait_mutation = config.v2.as_ref().is_some_and(|v2| {
+        (v2.is_enabled(V2Feature::PcpPolarity) && v2.polarity.polarity_mutation_std > 0.0)
+            || (v2.is_enabled(V2Feature::Cadherin4d) && v2.contact.cadherin.mutation_std > 0.0)
+    });
+    let any_mutation = any_controller_mutation
         || mutation.chemistry_standard_deviation > 0.0
         || mutation.sensing_log_scale_standard_deviation > 0.0
-        || (architecture.enabled && architecture.probability_per_birth > 0.0);
+        || any_v2_trait_mutation;
     if mutation.reject_effective_noop && !any_mutation {
         issues.add(
             "mutation.reject_effective_noop",

@@ -363,3 +363,9 @@ impl ExperimentCatalog {
         }
     }
 }
+
+impl Drop for ExperimentCatalog {
+    fn drop(&mut self) {
+        block_on_inline(self.connection.close_best_effort_in_place());
+    }
+}

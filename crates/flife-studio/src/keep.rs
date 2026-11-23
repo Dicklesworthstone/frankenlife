@@ -411,6 +411,12 @@ pub(crate) async fn keep(
             // A stopped world changes no more: nothing more to keep.
             _ => return,
         }
+        // Close may have paused the session and released the previous hold
+        // while the checkpoint ran; never install a fresh hold or emit a
+        // spurious `Status::Unkept` on a closing session.
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
         let Some(next) = hold_after(cx, handle, every, at.get(), report).await else {
             give_up(cx, handle, &mut chain).await;
             return;
@@ -418,8 +424,10 @@ pub(crate) async fn keep(
         drop(chain);
         holding = next;
         // Seen after the new hold was set, so a close that released the
-        // hold before it never leaves this waiting on it.
+        // hold before it never leaves this waiting on it or leaves a hold
+        // active on the closing session.
         if stop.load(Ordering::Acquire) {
+            let _ = handle.release(cx).await;
             return;
         }
     }

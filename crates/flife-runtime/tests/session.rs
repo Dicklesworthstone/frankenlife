@@ -1212,3 +1212,164 @@ fn queued_requests_behind_suspend_report_honest_shutdown_outcomes() {
     );
     assert!(!closed.book.is_closed());
 }
+
+/// Regression: a `Step` pushed into `self.held` while held at tick 0 must wake
+/// immediately when `Hold::release` is drained in the same control loop,
+/// without requiring another control message to unpark `SessionOwner`.
+#[test]
+fn held_step_wakes_immediately_when_hold_is_released_without_further_control() {
+    let config = ecology(&[("execution", "control_queue_capacity", "4")]);
+    for seed in 1..=8 {
+        let (results, closed) = bounded_lab(seed, &config, 200_000, |handle| {
+            vec![Box::pin(async move {
+                let cx = cx();
+                let hold = handle.hold(&cx, Tick::new(0)).await.expect("hold");
+                assert_eq!(hold.reached(&cx).await.expect("at 0").tick, Tick::new(0));
+                // Queue Step then release back-to-back in one poll before
+                // yielding so the owner parks Step in `self.held` and drains
+                // `Hold { tick: None }` in `control.try_recv()`.
+                let mut step_fut = std::pin::pin!(handle.step(&cx));
+                let mut release_fut = std::pin::pin!(hold.release(&cx));
+                let mut step_out = None;
+                let mut release_out = None;
+                std::future::poll_fn(|context| {
+                    if step_out.is_none()
+                        && let Poll::Ready(v) = step_fut.as_mut().poll(context)
+                    {
+                        step_out = Some(v);
+                    }
+                    if release_out.is_none()
+                        && let Poll::Ready(v) = release_fut.as_mut().poll(context)
+                    {
+                        release_out = Some(v);
+                    }
+                    if step_out.is_some() && release_out.is_some() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                let released = release_out.expect("release").expect("released");
+                assert_eq!(released.tick, Tick::new(0));
+                let stepped = step_out.expect("step").expect("stepped");
+                let (boundary, applied, from) = published(&stepped);
+                assert_eq!((boundary.tick, from), (Tick::new(1), Tick::new(0)));
+                assert!(applied.is_empty());
+                handle.close(&cx).await.expect("close")
+            }) as Client<Boundary>]
+        });
+        assert_eq!(results[0].tick, Tick::new(1), "seed {seed}");
+        assert_eq!(closed.boundary.tick, Tick::new(1), "seed {seed}");
+    }
+}
+
+/// Regression: when two `Step` requests sit in `self.held` and `Close` arrives
+/// at the first step's cancellation boundary, `release_held` must stop
+/// immediately and never let the second held `Step` publish a tick.
+#[test]
+fn close_during_first_held_step_prevents_second_held_step_from_publishing() {
+    let config = ecology(&[("execution", "control_queue_capacity", "4")]);
+    for seed in 1..=8 {
+        let (results, closed) = bounded_lab(seed, &config, 200_000, |handle| {
+            let h_a = handle.clone();
+            let h_b = handle.clone();
+            vec![
+                Box::pin(async move {
+                    let cx = cx();
+                    let hold = handle.hold(&cx, Tick::new(0)).await.expect("hold");
+                    assert_eq!(hold.reached(&cx).await.expect("at 0").tick, Tick::new(0));
+                    // Poll both steps onto the control lane, then confirm via
+                    // FIFO `inspect` that both have been parked in `self.held`.
+                    let mut step_a = std::pin::pin!(h_a.step(&cx));
+                    let mut step_b = std::pin::pin!(h_b.step(&cx));
+                    let mut inspect = std::pin::pin!(handle.inspect(&cx));
+                    let mut out_a = None;
+                    let mut out_b = None;
+                    let mut inspected = None;
+                    std::future::poll_fn(|context| {
+                        if out_a.is_none()
+                            && let Poll::Ready(v) = step_a.as_mut().poll(context)
+                        {
+                            out_a = Some(v);
+                        }
+                        if out_b.is_none()
+                            && let Poll::Ready(v) = step_b.as_mut().poll(context)
+                        {
+                            out_b = Some(v);
+                        }
+                        if inspected.is_none()
+                            && let Poll::Ready(v) = inspect.as_mut().poll(context)
+                        {
+                            inspected = Some(v);
+                        }
+                        if inspected.is_some() {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    assert_eq!(
+                        inspected.expect("inspected").expect("ok").boundary.tick,
+                        Tick::new(0)
+                    );
+                    assert!(out_a.is_none() && out_b.is_none(), "both steps are held");
+
+                    // Queue release and close back-to-back so close hits StepA's
+                    // cancellation boundary (or before StepA starts), and wait
+                    // for all three to settle.
+                    let mut release = std::pin::pin!(hold.release(&cx));
+                    let mut close = std::pin::pin!(handle.close(&cx));
+                    let mut released = None;
+                    let mut closed_at = None;
+                    std::future::poll_fn(|context| {
+                        if released.is_none()
+                            && let Poll::Ready(v) = release.as_mut().poll(context)
+                        {
+                            released = Some(v);
+                        }
+                        if released.is_some()
+                            && closed_at.is_none()
+                            && let Poll::Ready(v) = close.as_mut().poll(context)
+                        {
+                            closed_at = Some(v);
+                        }
+                        if out_a.is_none()
+                            && let Poll::Ready(v) = step_a.as_mut().poll(context)
+                        {
+                            out_a = Some(v);
+                        }
+                        if out_b.is_none()
+                            && let Poll::Ready(v) = step_b.as_mut().poll(context)
+                        {
+                            out_b = Some(v);
+                        }
+                        if released.is_some()
+                            && closed_at.is_some()
+                            && out_a.is_some()
+                            && out_b.is_some()
+                        {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    released.expect("release").expect("released");
+                    let boundary = closed_at.expect("close").expect("closed");
+                    assert_eq!(boundary.tick, Tick::new(0), "neither held step published");
+                    for (label, step) in [("step_a", out_a.expect("a")), ("step_b", out_b.expect("b"))] {
+                        assert!(
+                            !matches!(step, Ok(StepOutcome::Published { .. })),
+                            "{label} must not publish after close: {step:?}"
+                        );
+                    }
+                    boundary
+                }) as Client<Boundary>,
+            ]
+        });
+        assert_eq!(results[0].tick, Tick::new(0), "seed {seed}");
+        assert_eq!(closed.boundary.tick, Tick::new(0), "seed {seed}");
+    }
+}

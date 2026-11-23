@@ -1806,3 +1806,235 @@ fn opening_an_experiment_catalog_as_a_run_journal_refuses_without_mutating_table
         ExperimentCatalog::open(&path, "exp-1", "design-hash").expect("reopens experiment");
     drop(reopened);
 }
+
+/// Regression: `Control::Checkpoint` and `Control::Take` must refuse with the
+/// journal's failure error instead of serializing uncertain `WriteAhead`
+/// command-book entries that the journal never persisted (INV-14).
+#[test]
+fn checkpoint_and_take_refuse_after_journal_failure() {
+    let config = ecology();
+    let (open, gate) = std_mpsc::channel::<()>();
+    let appended = Arc::new(Mutex::new(Vec::new()));
+    let records = Arc::clone(&appended);
+    let (owner, handle) = journaled(
+        &config,
+        move || {
+            Ok(Box::new(FailsFirst {
+                gate,
+                fails: flife_runtime::JOURNAL_ATTEMPTS,
+                appended: records,
+            }) as Box<dyn Journal>)
+        },
+        found(&config),
+        book(&config),
+    );
+    let cmd = command(1, at(5), inject([1, 1], 1.0));
+    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+    let spawner = runtime.handle();
+    let closed = runtime.block_on(async move {
+        let owner = spawner
+            .try_spawn(async move { owner.run(&cx()).await })
+            .expect("owner");
+        let cx = cx();
+        let submitter = handle.clone();
+        let submitted = spawner
+            .try_spawn(async move {
+                submitter
+                    .submit(&Cx::current().expect("a task context"), cmd)
+                    .await
+            })
+            .expect("submitter");
+        loop {
+            if handle.inspect(&cx).await.expect("inspect").admitted == 1 {
+                break;
+            }
+            yield_now().await;
+        }
+        // Queue both `checkpoint` and `checkpoint_with` (`Control::Take`) while
+        // the failing append is still waiting in the journal writer so both
+        // enter `self.held`.
+        let cp_handle = handle.clone();
+        let cp_held = spawner
+            .try_spawn(async move {
+                cp_handle
+                    .checkpoint(&Cx::current().expect("a task context"))
+                    .await
+            })
+            .expect("cp_held");
+        let take_handle = handle.clone();
+        let take_held = spawner
+            .try_spawn(async move {
+                take_handle
+                    .checkpoint_with(&Cx::current().expect("a task context"), |_, _, b| Ok(b))
+                    .await
+            })
+            .expect("take_held");
+        // Confirm via FIFO `inspect` that both requests reached the owner.
+        let waiting = handle.inspect(&cx).await.expect("inspect");
+        assert_eq!(waiting.journal.expect("journaled").waiting, 1);
+        // Release the failing journal so every retry fails.
+        drop(open);
+        assert!(matches!(
+            submitted.await,
+            Err(CoreError::StorageFailed { .. })
+        ));
+        let cp_held_res = cp_held.await;
+        assert!(
+            matches!(cp_held_res, Err(CoreError::StorageFailed { .. })),
+            "held checkpoint must refuse after journal failure, got {cp_held_res:?}"
+        );
+        let take_held_res = take_held.await;
+        assert!(
+            matches!(take_held_res, Err(CoreError::StorageFailed { .. })),
+            "held checkpoint_with must refuse after journal failure, got {take_held_res:?}"
+        );
+        // Fresh checkpoint/take calls after `journal.failed` is already set
+        // must also refuse rather than emitting an unrecoverable checkpoint.
+        let cp_after = handle.checkpoint(&cx).await;
+        assert!(
+            matches!(cp_after, Err(CoreError::StorageFailed { .. })),
+            "post-failure checkpoint must refuse, got {cp_after:?}"
+        );
+        let take_after = handle.checkpoint_with(&cx, |_, _, b| Ok(b)).await;
+        assert!(
+            matches!(take_after, Err(CoreError::StorageFailed { .. })),
+            "post-failure checkpoint_with must refuse, got {take_after:?}"
+        );
+        handle.close(&cx).await.expect("closes");
+        owner.await
+    });
+    assert!(appended.lock().expect("records").is_empty());
+    assert!(closed.journal.expect("journaled").failed.is_some());
+}
+
+/// Regression: if a control message (`Checkpoint`) consumes the final pending
+/// journal receipt inside `handle()` while a `Step` is already parked in
+/// `self.held`, `SessionOwner` must wake the held `Step` instead of parking
+/// forever with `receipts = None`.
+#[test]
+fn held_step_wakes_when_control_consumes_final_journal_receipt() {
+    struct NotifyingGated {
+        inner: CommandJournal,
+        gate: std_mpsc::Receiver<()>,
+        done: std_mpsc::Sender<()>,
+    }
+    impl Journal for NotifyingGated {
+        fn open_run(
+            &mut self,
+            session: SessionId,
+            revision: Sha256Digest,
+        ) -> Result<JournalContents, CoreError> {
+            self.inner.open_run(session, revision)
+        }
+        fn append(&mut self, record: &JournalRecord) -> Result<Watermarks, CoreError> {
+            let _ = self.gate.recv();
+            let result = self.inner.append(record);
+            let _ = self.done.send(());
+            result
+        }
+    }
+
+    let config = ecology_with(&[("execution", "control_queue_capacity", "4")]);
+    let dir = fresh("held-step-receipt-consumed");
+    let catalog = dir.join("catalog.db");
+    let path = catalog.clone();
+    let (open, gate) = std_mpsc::channel::<()>();
+    let (done_tx, done_rx) = std_mpsc::channel::<()>();
+    let (owner, handle) = journaled(
+        &config,
+        move || {
+            Ok(Box::new(NotifyingGated {
+                inner: CommandJournal::open(&path)?,
+                gate,
+                done: done_tx,
+            }) as Box<dyn Journal>)
+        },
+        found(&config),
+        book(&config),
+    );
+    let cmd = command(1, at(0), inject([5, 5], 6.0));
+    let runtime = RuntimeBuilder::current_thread().build().expect("runtime");
+    let spawner = runtime.handle();
+    let closed = runtime.block_on(async move {
+        let owner = spawner
+            .try_spawn(async move { owner.run(&cx()).await })
+            .expect("owner");
+        let cx = cx();
+        let submitter = handle.clone();
+        let submitted = spawner
+            .try_spawn(async move {
+                submitter
+                    .submit(&Cx::current().expect("a task context"), cmd)
+                    .await
+            })
+            .expect("submitter");
+        loop {
+            if handle.inspect(&cx).await.expect("inspect").admitted == 1 {
+                break;
+            }
+            yield_now().await;
+        }
+        let stepper = handle.clone();
+        let stepped = spawner
+            .try_spawn(async move { stepper.step(&Cx::current().expect("a task context")).await })
+            .expect("stepper");
+        // FIFO inspect confirms `Step` reached the owner and is parked in `self.held`.
+        let held = handle.inspect(&cx).await.expect("inspect");
+        assert_eq!(held.boundary.tick, Tick::new(0));
+        assert_eq!(held.journal.expect("journaled").waiting, 1);
+
+        // Let the acceptance write complete so its receipt sits in `receipts`,
+        // then queue `Inspect` + `Checkpoint` back-to-back so `Checkpoint`
+        // drains in `control.try_recv()` and settles the receipt while `Step`
+        // is still in `self.held`.
+        open.send(()).expect("open acceptance");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("acceptance wrote");
+        // Allow the writer thread's immediate `receipt_sender.send` to complete.
+        std::thread::sleep(Duration::from_millis(5));
+        let mut inspect_fut = std::pin::pin!(handle.inspect(&cx));
+        let mut cp_fut = std::pin::pin!(handle.checkpoint(&cx));
+        let mut inspect_out = None;
+        let mut cp_out = None;
+        std::future::poll_fn(|context| {
+            if inspect_out.is_none()
+                && let std::task::Poll::Ready(v) = inspect_fut.as_mut().poll(context)
+            {
+                inspect_out = Some(v);
+            }
+            if cp_out.is_none()
+                && let std::task::Poll::Ready(v) = cp_fut.as_mut().poll(context)
+            {
+                cp_out = Some(v);
+            }
+            if inspect_out.is_some() && cp_out.is_some() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        inspect_out.expect("inspect").expect("ok");
+        cp_out.expect("checkpoint").expect("ok");
+        accepted(&submitted.await.expect("durable"));
+        // Open gate for the Applied outcome written when `Step` publishes tick 1.
+        open.send(()).expect("open outcome");
+        let step = stepped.await.expect("stepped");
+        let StepOutcome::Published {
+            boundary, applied, ..
+        } = step
+        else {
+            panic!("expected published step, got {step:?}");
+        };
+        assert_eq!(boundary.tick, Tick::new(1));
+        assert_eq!(applied, [cmd.id]);
+        drop(open);
+        handle.close(&cx).await.expect("closes");
+        owner.await
+    });
+    assert_eq!(
+        closed.world.digest(),
+        reference(&config, 1, &[(0, inject([5, 5], 6.0))]).digest()
+    );
+}

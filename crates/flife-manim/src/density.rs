@@ -19,10 +19,9 @@
 
 use flife_core::CoreError;
 use flife_render::Epoch;
-use fmn_core::color::LinearRgba;
 use fmn_render::{SurfaceDraw, SurfaceMesh, Texture, ThreeDDraw};
 
-use crate::mapping::{Look, Style, mapped_color, traits};
+use crate::mapping::{EpochColors, Look, Style};
 use crate::{SCALE_DECAY, Viewport};
 
 /// The target bin width in points (drawable pixels at one pixel per point).
@@ -65,6 +64,28 @@ pub fn density_level(count: u32, scale: f64, look: Look) -> f64 {
     level.clamp(0.0, 1.0)
 }
 
+/// Look class that affects density texels (`Look::Raw` and `Look::Sphere`
+/// produce identical opaque grey texels).
+#[inline]
+const fn density_look(look: Look) -> Look {
+    match look {
+        Look::Glow => Look::Glow,
+        Look::Raw | Look::Sphere => Look::Raw,
+    }
+}
+
+/// Key identifying the geometry and UVs of a cached [`Viewport::periodic_quad`].
+type QuadKey = ([u64; 2], [u64; 2], [u32; 2]);
+
+#[inline]
+fn quad_key(viewport: &Viewport, bins: [u32; 2]) -> QuadKey {
+    (
+        viewport.window_start().map(f64::to_bits),
+        viewport.extent().map(f64::to_bits),
+        bins,
+    )
+}
+
 /// Organism counts and mean colours per screen bin, as one texture.
 #[derive(Debug)]
 pub struct DensityLayer {
@@ -73,11 +94,12 @@ pub struct DensityLayer {
     counts: Vec<u32>,
     sums: Vec<[f64; 3]>,
     texture: Option<Texture>,
-    /// The look `texture` was built for from the binned counts, colours and
-    /// scale; `None` while it does not show them (before the first build,
-    /// and from the start of each update until its build succeeds).
+    /// The normalized look `texture` was built for from the binned counts,
+    /// colours and scale; `None` while it does not show them (before the first
+    /// build, and from the start of each update until its build succeeds).
     built: Option<Look>,
     quad: Option<SurfaceMesh>,
+    quad_key: Option<QuadKey>,
     scale: f64,
 }
 
@@ -93,6 +115,7 @@ impl DensityLayer {
             texture: None,
             built: None,
             quad: None,
+            quad_key: None,
             scale: 0.0,
         }
     }
@@ -129,7 +152,10 @@ impl DensityLayer {
         let bins = density_bins(&self.viewport);
         let [columns, rows] = bins.map(|n| n as usize);
         let cells = columns * rows;
-        if bins != self.bins {
+        let base_scale = if bins != self.bins {
+            // Reset `self.bins` before clearing so an allocation failure never
+            // leaves a nonzero grid size pointing at empty buffers.
+            self.bins = [0; 2];
             self.counts.clear();
             self.sums.clear();
             self.counts
@@ -141,10 +167,12 @@ impl DensityLayer {
             self.counts.resize(cells, 0);
             self.sums.resize(cells, [0.0; 3]);
             self.scale = 0.0;
+            0.0
         } else {
             self.counts.fill(0);
             self.sums.fill([0.0; 3]);
-        }
+            self.scale
+        };
 
         let [width, height] = self.viewport.extent();
         let bin = |value: f32, extent: f64, count: usize| {
@@ -155,20 +183,21 @@ impl DensityLayer {
                 0
             }
         };
-        let speed = epoch.maximum_speed();
-        for (position, traits) in epoch.positions().iter().zip(traits(epoch)) {
+        let positions = epoch.positions();
+        let colors = EpochColors::new(style.mapping, epoch);
+        colors.for_each(positions.len(), |row, color| {
+            let position = positions[row];
             let cell = bin(position[1], height, rows) * columns + bin(position[0], width, columns);
-            let color = mapped_color(style.mapping, &traits, speed);
-            self.counts[cell] += 1;
+            self.counts[cell] = self.counts[cell].saturating_add(1);
             let sum = &mut self.sums[cell];
             sum[0] += color.r;
             sum[1] += color.g;
             sum[2] += color.b;
-        }
+        });
         let fullest = self.counts.iter().copied().max().unwrap_or(0);
-        self.scale = f64::from(fullest).max(self.scale * SCALE_DECAY);
+        let next_scale = f64::from(fullest).max(base_scale * SCALE_DECAY);
         self.bins = bins;
-        self.place_binned(style)
+        self.place_binned_at(next_scale, style)
     }
 
     /// Re-place the last binned epoch in the layer at the current viewport
@@ -183,78 +212,124 @@ impl DensityLayer {
         if self.bins == [0, 0] {
             return Ok(());
         }
-        if self.built == Some(style.look) {
-            self.quad = Some(self.viewport.periodic_quad(self.bins)?);
+        let want_look = density_look(style.look);
+        if self.built == Some(want_look) {
+            let want_quad = quad_key(&self.viewport, self.bins);
+            if self.quad.is_none() || self.quad_key != Some(want_quad) {
+                self.quad = Some(self.viewport.periodic_quad(self.bins)?);
+                self.quad_key = Some(want_quad);
+            }
             return Ok(());
         }
-        self.place_binned(style)
+        self.place_binned_at(self.scale, style)
     }
 
-    fn place_binned(&mut self, style: &Style) -> Result<(), CoreError> {
+    fn place_binned_at(&mut self, scale: f64, style: &Style) -> Result<(), CoreError> {
         let [columns, rows] = self.bins.map(|n| n as usize);
-        // Each bin's straight colour: the mean mapped colour at the glow
-        // opacity, or opaque grey for raw.
-        let shown = |cell: usize| -> LinearRgba {
-            let count = self.counts[cell];
-            let level = density_level(count, self.scale, style.look);
-            match style.look {
-                Look::Raw | Look::Sphere => LinearRgba {
-                    r: level,
-                    g: level,
-                    b: level,
-                    a: 1.0,
-                },
-                Look::Glow if count == 0 => LinearRgba {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                },
+        let cells = columns.saturating_mul(rows);
+        if columns == 0
+            || rows == 0
+            || columns > DENSITY_BINS_MAX as usize
+            || self.counts.len() != cells
+            || self.sums.len() != cells
+        {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "density layer bins",
+                detail: format!(
+                    "{} counts and {} sums for {columns} x {rows} bins",
+                    self.counts.len(),
+                    self.sums.len()
+                ),
+            });
+        }
+        let normalized_look = density_look(style.look);
+        let valid_scale = scale.is_finite() && scale > 0.0;
+        let scale_ln1p = if valid_scale { scale.ln_1p() } else { 0.0 };
+        // Compute each bin's premultiplied RGBA once per bin into a two-row
+        // stack ring (zero heap allocation, zero per-corner `%` division, and
+        // 4x fewer `ln_1p` calls), matching the corner blend bit for bit.
+        let fill_row = |bin_row: usize, out: &mut [[f64; 4]]| {
+            let base = bin_row * columns;
+            match normalized_look {
+                Look::Raw | Look::Sphere => {
+                    for col in 0..columns {
+                        let level = if valid_scale {
+                            (f64::from(self.counts[base + col]) / scale).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        out[col] = [level, level, level, 1.0];
+                    }
+                }
                 Look::Glow => {
-                    let [r, g, b] = self.sums[cell].map(|sum| sum / f64::from(count));
-                    LinearRgba { r, g, b, a: level }
+                    for col in 0..columns {
+                        let cell = base + col;
+                        let count = self.counts[cell];
+                        if count == 0 || !valid_scale {
+                            out[col] = [0.0; 4];
+                        } else {
+                            let c = f64::from(count);
+                            let level = (c.ln_1p() / scale_ln1p).clamp(0.0, 1.0);
+                            let sum = self.sums[cell];
+                            out[col] = [
+                                (sum[0] / c) * level,
+                                (sum[1] / c) * level,
+                                (sum[2] / c) * level,
+                                level,
+                            ];
+                        }
+                    }
                 }
             }
         };
         let mut texels = Vec::new();
-        texels.try_reserve_exact(columns * rows).map_err(|_| {
-            allocation(
-                "density layer texels",
-                columns * rows,
-                size_of::<[f32; 4]>(),
-            )
+        texels.try_reserve_exact(cells).map_err(|_| {
+            allocation("density layer texels", cells, size_of::<[f32; 4]>())
         })?;
+        let mut ring = [[[0.0_f64; 4]; DENSITY_BINS_MAX as usize]; 2];
+        fill_row(rows - 1, &mut ring[0][..columns]);
+        let mut prev = 0_usize;
         for row in 0..rows {
+            let cur = 1 - prev;
+            fill_row(row, &mut ring[cur][..columns]);
+            let up_row = &ring[prev][..columns];
+            let cur_row = &ring[cur][..columns];
             for column in 0..columns {
                 // Texel (column, row) is the corner between bins
                 // (column - 1, row - 1) and (column, row), wrapping: their
                 // premultiplied mean.
-                let (left, up) = ((column + columns - 1) % columns, (row + rows - 1) % rows);
-                let mut sum = [0.0; 4];
-                for cell in [
-                    up * columns + left,
-                    up * columns + column,
-                    row * columns + left,
-                    row * columns + column,
-                ] {
-                    let color = shown(cell);
-                    sum[0] += color.r * color.a;
-                    sum[1] += color.g * color.a;
-                    sum[2] += color.b * color.a;
-                    sum[3] += color.a;
-                }
-                texels.push(sum.map(|component| (component / 4.0) as f32));
+                let left = if column == 0 { columns - 1 } else { column - 1 };
+                let a = up_row[left];
+                let b = up_row[column];
+                let c = cur_row[left];
+                let d = cur_row[column];
+                texels.push([
+                    ((a[0] + b[0] + c[0] + d[0]) / 4.0) as f32,
+                    ((a[1] + b[1] + c[1] + d[1]) / 4.0) as f32,
+                    ((a[2] + b[2] + c[2] + d[2]) / 4.0) as f32,
+                    ((a[3] + b[3] + c[3] + d[3]) / 4.0) as f32,
+                ]);
             }
+            prev = cur;
         }
         let texture = Texture::from_premultiplied_linear(self.bins[0], self.bins[1], texels)
             .map_err(|error| CoreError::NumericalInvalid {
                 quantity: "density layer texture",
                 detail: error.to_string(),
             })?;
-        let quad = self.viewport.periodic_quad(self.bins)?;
+        let want_quad = quad_key(&self.viewport, self.bins);
+        let new_quad = if self.quad.is_none() || self.quad_key != Some(want_quad) {
+            Some(self.viewport.periodic_quad(self.bins)?)
+        } else {
+            None
+        };
         self.texture = Some(texture);
-        self.built = Some(style.look);
-        self.quad = Some(quad);
+        self.built = Some(normalized_look);
+        if let Some(quad) = new_quad {
+            self.quad = Some(quad);
+            self.quad_key = Some(want_quad);
+        }
+        self.scale = scale;
         Ok(())
     }
 

@@ -132,3 +132,33 @@ fn a_catalog_of_another_experiment_or_format_is_refused_unchanged() {
     let journal = CommandJournal::open(&journal_path).expect("still a run catalog");
     assert!(journal.runs().expect("reads").is_empty());
 }
+
+/// Regression: dropping `ExperimentCatalog` must run FrankenSQLite's clean
+/// close and WAL checkpoint (matching `CommandJournal::drop`), so the main
+/// database file itself contains all committed rows without needing the WAL
+/// sidecar.
+#[test]
+fn dropping_experiment_catalog_checkpoints_wal_cleanly() {
+    let directory = scratch("drop-wal-checkpoint");
+    let path = directory.join("experiment.sqlite");
+    let expected = [
+        row(1, "control", "discovery", 1, "reached"),
+        row(2, "control", "held-out", 2, "reached"),
+    ];
+    {
+        let mut catalog = ExperimentCatalog::open(&path, IDENTITY, DESIGN).expect("creates");
+        for item in &expected {
+            catalog.record(item).expect("catalogs");
+        }
+    }
+    // Copy only the main database file (no `-wal` / `-shm` sidecar) and verify
+    // `ExperimentCatalog::read` observes every committed row.
+    let standalone = directory.join("standalone.sqlite");
+    fs::copy(&path, &standalone).expect("copies main db file");
+    let reader = ExperimentCatalog::read(&standalone).expect("reads standalone copy");
+    assert_eq!(
+        reader.runs().expect("reads runs"),
+        expected,
+        "dropping ExperimentCatalog must checkpoint WAL frames into the main database file"
+    );
+}

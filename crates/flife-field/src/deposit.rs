@@ -774,8 +774,11 @@ fn add_up(a: f64, b: f64) -> f64 {
     -add_down(-a, -b)
 }
 
-/// The largest F32 value at or below `value`, for finite `value ≥ 0`.
+/// The largest F32 value at or below `value`, for `value ≥ 0`.
 fn round_down_f32(value: f64) -> f32 {
+    if value >= f64::from(f32::MAX) {
+        return f32::MAX;
+    }
     let nearest = value as f32;
     if f64::from(nearest) > value {
         nearest.next_down()
@@ -977,6 +980,15 @@ impl Deposits {
         }
         summary.paid = paid.value();
         summary.offered = offered.value();
+        if !summary.paid.is_finite() || !summary.offered.is_finite() {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "deposit total",
+                detail: format!(
+                    "staged deposits overflow F64 (paid={}, offered={})",
+                    summary.paid, summary.offered
+                ),
+            });
+        }
 
         // Packets in identity order. An organism's footprint names each cell
         // at most once, so grouping them by cell gives (cell, identity) order.
@@ -1221,7 +1233,11 @@ fn reduce_run(
         }
         let after = round_down_f32(add_down(f64::from(before), total));
         let received = f64::from(after) - f64::from(before);
-        let factor = if total > 0.0 { received / total } else { 0.0 };
+        let factor = if total > 0.0 && total.is_finite() {
+            received / total
+        } else {
+            0.0
+        };
         *energy = after;
         if let Some(slot) = run.received.get_mut(occupied) {
             *slot = received;

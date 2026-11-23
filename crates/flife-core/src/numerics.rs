@@ -9,6 +9,8 @@
 //! conforming host computes the same bits. Square root is correctly rounded
 //! by IEEE-754 and may be used directly.
 
+use crate::error::CoreError;
+
 /// Arguments are halved until they are at most this, then a series runs.
 const REDUCED: f64 = 1.0 / 16.0;
 
@@ -582,4 +584,131 @@ fn reduce(x: f64) -> (f64, u32) {
         halvings += 1;
     }
     (y, halvings)
+}
+
+/// Wrap any finite turn angle `u` into `[0.0, 1.0)` for [`sin_cos_turns`]
+/// (`V2-01` Trap D guard).
+///
+/// Eliminates both negative-angle `None` refusals and the IEEE-754 edge case
+/// `(-1e-17_f64).rem_euclid(1.0) == 1.0` by folding `rem >= 1.0` to `0.0`.
+/// Returns `None` for nonfinite `u`.
+#[must_use]
+pub fn normalize_turns(u: f64) -> Option<f64> {
+    if !u.is_finite() {
+        return None;
+    }
+    let rem = u.rem_euclid(1.0);
+    Some(if rem >= 1.0 || rem == 0.0 { 0.0 } else { rem })
+}
+
+/// Shrink `v` so its exact left-fold squared norm
+/// `v.iter().fold(0.0, |t, &c| t + c * c)` satisfies `<= limit * limit`
+/// (`V2-01` Trap D guard).
+///
+/// Leaves `v` bit-for-bit untouched when it is already within the bound.
+/// Otherwise scales radially if far outside and multiplies by
+/// `1.0 - f64::EPSILON / 2.0` in a bounded loop (`<= 64` steps) until the
+/// exact left-fold sum passes.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a nonfinite or nonpositive `limit`,
+/// a nonfinite component, overflowing norm, or a vector that cannot be
+/// brought within `limit` in 64 steps.
+pub fn shrink_to_left_fold_norm_limit<const N: usize>(
+    v: &mut [f64; N],
+    limit: f64,
+) -> Result<(), CoreError> {
+    if !limit.is_finite() || limit <= 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "norm limit",
+            detail: format!("{limit} is not a positive finite norm limit"),
+        });
+    }
+    if let Some((index, &value)) = v.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "vector component",
+            detail: format!("component {index} is {value}"),
+        });
+    }
+    let limit_sq = limit * limit;
+    if !limit_sq.is_finite() || limit_sq == 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "norm limit",
+            detail: format!("{limit}² is not a positive finite squared norm limit"),
+        });
+    }
+    let left_fold_sq = |values: &[f64; N]| {
+        values
+            .iter()
+            .fold(0.0_f64, |total, &component| total + component * component)
+    };
+    let initial_sq = left_fold_sq(v);
+    if !initial_sq.is_finite() {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "vector squared norm",
+            detail: "squared norm overflows".into(),
+        });
+    }
+    if initial_sq <= limit_sq {
+        return Ok(());
+    }
+    let norm = initial_sq.sqrt();
+    if norm > limit * (1.0 + 16.0 * f64::EPSILON) {
+        let scale = limit / norm;
+        for component in v.iter_mut() {
+            *component *= scale;
+        }
+    }
+    let shrink = 1.0 - f64::EPSILON / 2.0;
+    for _ in 0..64 {
+        if left_fold_sq(v) <= limit_sq {
+            return Ok(());
+        }
+        for component in v.iter_mut() {
+            *component *= shrink;
+        }
+    }
+    Err(CoreError::NumericalInvalid {
+        quantity: "vector norm",
+        detail: format!("could not bring left-fold squared norm within {limit}²"),
+    })
+}
+
+/// Apply the canonical 2D-block symplectic rotation `J` over
+/// `0..active_channels` of a 32-channel chemical direction (`V2-01` Trap D):
+/// `(J a)_{2k} = -a_{2k+1}`, `(J a)_{2k+1} = a_{2k}` for `2k + 1 < active_channels`,
+/// zeroing channels `active_channels..32` (serving both 32-channel single-carrier
+/// `V2-11`/`V2-12` and 24-channel Carrier-0 `V2-15`), then enforce the exact
+/// left-fold norm bound `limit` via [`shrink_to_left_fold_norm_limit`].
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `active_channels > 32`, `a` holds a
+/// nonfinite component, or [`shrink_to_left_fold_norm_limit`] refuses the result.
+pub fn symplectic_rotate_channels(
+    a: &[f64; 32],
+    active_channels: usize,
+    limit: f64,
+) -> Result<[f64; 32], CoreError> {
+    if active_channels > 32 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "active chemical channels",
+            detail: format!("{active_channels} exceeds 32"),
+        });
+    }
+    if let Some((index, &value)) = a.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "chemical direction",
+            detail: format!("component {index} is {value}"),
+        });
+    }
+    let mut rotated = [0.0_f64; 32];
+    let pairs = active_channels / 2;
+    for pair in 0..pairs {
+        let even = 2 * pair;
+        let odd = even + 1;
+        rotated[even] = -a[odd];
+        rotated[odd] = a[even];
+    }
+    shrink_to_left_fold_norm_limit(&mut rotated, limit)?;
+    Ok(rotated)
 }

@@ -1151,6 +1151,35 @@ fn moves_are_kept_in_order_until_taken() {
 }
 
 #[test]
+fn command_modified_space_and_step_keys_do_not_act() {
+    let mut controls = Controls::new();
+    let command = Modifiers {
+        command: true,
+        ..Modifiers::NONE
+    };
+    assert_eq!(
+        controls.apply(&key(KEY_SPACE, true, false, command)),
+        None,
+        "Command+Space must not toggle running"
+    );
+    assert!(!controls.running());
+    assert_eq!(
+        controls.apply(&key(KEY_RIGHT, true, false, command)),
+        None,
+        "Command+Right must not step"
+    );
+    assert_eq!(
+        controls.apply(&key(KEY_PERIOD, true, false, command)),
+        None,
+        "Command+Period must not step"
+    );
+    // Unmodified keys still work as expected.
+    assert_eq!(tap(&mut controls, KEY_PERIOD), [Intent::Step]);
+    assert_eq!(tap(&mut controls, KEY_SPACE), [Intent::Resume]);
+    assert!(controls.running());
+}
+
+#[test]
 fn non_finite_pointer_motion_never_triggers_drag_or_corrupts_click() {
     let mut controls = Controls::new();
     tap(&mut controls, KEY_X);

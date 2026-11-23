@@ -150,6 +150,7 @@ fn every_topology_matches_the_reference_bit_for_bit_in_one_mixed_batch() -> Resu
         let reference = ReferenceController::new(topology, parameters, BOUND)?;
         match (reference.evaluate(inputs, &mut scratch), got) {
             (Ok(want), Some(got)) => {
+                assert_eq!(got.len(), ACTION_WIDTH);
                 let differs = (0..ACTION_WIDTH).find(|&k| want[k].to_bits() != got[k].to_bits());
                 assert!(
                     differs.is_none(),

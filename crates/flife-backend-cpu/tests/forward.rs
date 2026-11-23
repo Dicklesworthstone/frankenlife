@@ -13,7 +13,7 @@ use flife_core::binary16::F16;
 use flife_core::ids::GenomeId;
 use flife_neural::{
     ACTION_WIDTH, ArenaSlot, ControllerBackend, ControllerJob, ControllerScratch, DenseTopology,
-    ReferenceController, SENSOR_WIDTH,
+    RawOutputs, ReferenceController, SENSOR_WIDTH,
 };
 use rayon::prelude::*;
 
@@ -193,12 +193,12 @@ fn lanes(count: usize) -> NonZeroUsize {
     NonZeroUsize::new(count).expect("nonzero")
 }
 
-type Outputs = Vec<Option<[f32; ACTION_WIDTH]>>;
+type Outputs = Vec<Option<RawOutputs>>;
 
-fn bits(outputs: &Outputs) -> Vec<Option<[u32; ACTION_WIDTH]>> {
+fn bits(outputs: &Outputs) -> Vec<Option<Vec<u32>>> {
     outputs
         .iter()
-        .map(|output| output.map(|raw| raw.map(f32::to_bits)))
+        .map(|output| output.map(|raw| raw.iter().map(|v| v.to_bits()).collect()))
         .collect()
 }
 
@@ -323,9 +323,9 @@ fn every_topology_in_f16_matches_the_reference_bit_for_bit() -> Result<(), CoreE
         let mut scratch = ControllerScratch::new(job.controller.topology())?;
         want.push(
             job.controller
-                .evaluate(job.inputs, &mut scratch)
+                .evaluate_raw(job.inputs, &mut scratch)
                 .ok()
-                .map(|raw| raw.map(f32::to_bits)),
+                .map(|raw| raw.iter().map(|v| v.to_bits()).collect::<Vec<_>>()),
         );
     }
     for count in [1, 4] {
@@ -385,8 +385,8 @@ fn a_genome_is_packed_once_and_a_later_occupant_takes_its_place() -> Result<(), 
         .controller
         .evaluate(&cases[0].inputs, &mut scratch)
         .ok()
-        .map(|raw| raw.map(f32::to_bits));
-    assert_eq!(outputs[0].map(|raw| raw.map(f32::to_bits)), want);
+        .map(|raw| raw.into_iter().map(f32::to_bits).collect::<Vec<_>>());
+    assert_eq!(bits(&outputs)[0], want);
     assert_ne!(bits(&outputs)[0], first[0]);
     assert_eq!(bits(&outputs)[1..], first[1..]);
     assert_eq!((backend.resident(), backend.packs()), (300, 301));
@@ -402,7 +402,7 @@ fn a_genome_is_packed_once_and_a_later_occupant_takes_its_place() -> Result<(), 
     let mut renamed = changed[0];
     renamed.slot = jobs[0].slot;
     backend.evaluate(&[renamed], &mut outputs)?;
-    assert_eq!(outputs[0].map(|raw| raw.map(f32::to_bits)), want);
+    assert_eq!(bits(&outputs)[0], want);
 
     // A job naming a bucket made for another topology is deferred.
     let other = cases
@@ -591,7 +591,7 @@ fn empty_shards_are_reclaimed_when_slots_retire() -> Result<(), CoreError> {
         .iter()
         .zip(&first)
         .filter(|(job, _)| job.slot.slot() < 4)
-        .map(|(_, out)| *out)
+        .map(|(_, out)| out.clone())
         .collect();
     assert_eq!(bits(&outputs), expected0);
     assert_eq!(backend.packs(), initial_packs);

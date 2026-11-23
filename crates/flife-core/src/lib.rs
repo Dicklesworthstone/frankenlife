@@ -44,6 +44,7 @@ pub mod registry;
 pub mod rng;
 pub mod schema;
 pub mod units;
+pub mod v2;
 pub mod validate;
 
 pub use canonical::{Sha256Digest, Sha256Stream};
@@ -55,4 +56,5 @@ pub use ledger::{
     CompensatedSum, EnergyBudget, EnergyLedger, Flow, FlowClass, Holdings, Ledger, LedgerLog,
     LedgerReport, LedgerState, Payment, ResidualBudget, TickClosure, TickLedger, Transfer,
 };
+pub use v2::{FeatureOverride, V2Abi, V2Config, V2Feature, V2Profile, apply_feature_overrides};
 pub use validate::{ValidatedConfig, ValidationReport, validate};

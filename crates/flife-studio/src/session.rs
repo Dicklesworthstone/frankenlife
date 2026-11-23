@@ -244,7 +244,7 @@ pub enum Status {
 /// The session owner and its controller on their own thread.
 #[derive(Debug)]
 pub struct SessionThread {
-    intents: lane::Sender<Intent>,
+    intents: Option<lane::Sender<Intent>>,
     statuses: mpsc::Receiver<Status>,
     feed: Feed,
     thread: Option<std::thread::JoinHandle<Result<SessionClosed, CoreError>>>,
@@ -278,7 +278,7 @@ impl SessionThread {
             .spawn(move || serve(owner, handle, intake, report, checkpoints))
             .map_err(|error| missing(format!("the session thread: {error}")))?;
         Ok(Self {
-            intents,
+            intents: Some(intents),
             statuses,
             feed,
             thread: Some(thread),
@@ -297,7 +297,12 @@ impl SessionThread {
     /// [`CoreError::BudgetExhausted`] when the lane is full, and
     /// [`CoreError::QueueClosed`] once the session thread has gone.
     pub fn send(&self, intent: Intent) -> Result<(), CoreError> {
-        self.intents.try_send(intent).map_err(|error| match error {
+        let Some(intents) = self.intents.as_ref() else {
+            return Err(CoreError::QueueClosed {
+                queue: "studio intents",
+            });
+        };
+        intents.try_send(intent).map_err(|error| match error {
             lane::SendError::Full(_) => CoreError::BudgetExhausted {
                 budget: "studio intents",
                 required: 1,
@@ -330,19 +335,14 @@ impl SessionThread {
     ///
     /// # Errors
     /// As [`SessionThread::close`].
-    pub fn close_reporting(self) -> Result<(SessionClosed, Vec<Status>), CoreError> {
-        let Self {
-            intents,
-            statuses,
-            feed,
-            thread,
-        } = self;
+    pub fn close_reporting(mut self) -> Result<(SessionClosed, Vec<Status>), CoreError> {
         // A full lane still drains: the controller handles intents in turn,
         // and dropping the sender below closes the lane once it is empty.
-        let _ = intents.try_send(Intent::Close);
-        drop(intents);
-        drop(feed);
-        let closed = match thread {
+        if let Some(intents) = self.intents.take() {
+            let _ = intents.try_send(Intent::Close);
+            drop(intents);
+        }
+        let closed = match self.thread.take() {
             Some(thread) => thread
                 .join()
                 .map_err(|_| missing("a session thread that did not panic".into()))?,
@@ -351,7 +351,22 @@ impl SessionThread {
                 detail: "already closed".into(),
             }),
         }?;
-        Ok((closed, statuses.try_iter().collect()))
+        Ok((closed, self.statuses.try_iter().collect()))
+    }
+}
+
+impl Drop for SessionThread {
+    fn drop(&mut self) {
+        // Never leave the session thread detached on an early-return drop:
+        // request closure and close the intent lane before joining so a full
+        // lane drains and exits cleanly.
+        if let Some(intents) = self.intents.take() {
+            let _ = intents.try_send(Intent::Close);
+            drop(intents);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

@@ -3,8 +3,9 @@
 //! `libm`, and the domain and symmetry each function promises.
 
 use flife_core::numerics::{
-    exp, exp_neg, expm1_neg, ln, log2, pow_positive, sigmoid, sin_cos_turns, tanh, tanh_f32,
-    tanh_f64_as_f32,
+    exp, exp_neg, expm1_neg, ln, log2, normalize_turns, pow_positive,
+    shrink_to_left_fold_norm_limit, sigmoid, sin_cos_turns, symplectic_rotate_channels, tanh,
+    tanh_f32, tanh_f64_as_f32,
 };
 
 /// A total order on finite `f64` in which adjacent values differ by one.
@@ -820,4 +821,83 @@ fn pow_positive_is_host_independent_exact_on_identities_and_tracks_libm() {
         pow_positive(3.0, 2.0).expect("3^2").to_bits(),
         exp(2.0 * ln(3.0).expect("ln")).expect("exp").to_bits()
     );
+}
+
+#[test]
+fn numerics_normalize_turns_shrink_and_symplectic_channels() {
+    // 1. normalize_turns handles negative, boundary, and IEEE-754 -1e-17 traps.
+    assert_eq!(normalize_turns(-1.0e-17), Some(0.0));
+    assert_eq!(normalize_turns(-0.25), Some(0.75));
+    assert_eq!(normalize_turns(1.0), Some(0.0));
+    assert_eq!(normalize_turns(-0.0), Some(0.0));
+    assert_eq!(normalize_turns(2.25), Some(0.25));
+    assert_eq!(normalize_turns(-3.75), Some(0.25));
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(normalize_turns(bad), None);
+    }
+    for u in [-1.0e-17, -0.25, -0.5, 0.0, 0.5, 1.0, 3.125, -7.875] {
+        let wrapped = normalize_turns(u).expect("finite angle normalizes");
+        assert!((0.0..1.0).contains(&wrapped), "{u} -> {wrapped}");
+        assert!(sin_cos_turns(wrapped).is_some(), "sin_cos_turns({wrapped})");
+    }
+
+    // 2. shrink_to_left_fold_norm_limit fixes adversarial 32-D left-fold 1.0 + 2 ulp.
+    let left_fold_sq = |values: &[f64; 32]| values.iter().fold(0.0_f64, |t, &c| t + c * c);
+    let base = (1.0_f64 / 32.0).sqrt();
+    let mut adv = [base; 32];
+    while left_fold_sq(&adv) <= 1.0 {
+        adv[0] = adv[0].next_up();
+    }
+    // Bump one extra ulp so left-fold is strictly 1.0 + >=2 ulp.
+    adv[1] = adv[1].next_up();
+    let before = left_fold_sq(&adv);
+    assert!(before > 1.0, "adversarial setup must exceed 1.0: {before:?}");
+    shrink_to_left_fold_norm_limit(&mut adv, 1.0).expect("shrink brings inside unit ball");
+    let after = left_fold_sq(&adv);
+    assert!(after <= 1.0, "left-fold squared norm {after:?} > 1.0");
+    assert!(after > 1.0 - 1.0e-12, "shrink should be minimal: {after:?}");
+
+    // Already-valid vectors stay bit-identical.
+    let snapshot = adv.map(f64::to_bits);
+    shrink_to_left_fold_norm_limit(&mut adv, 1.0).expect("idempotent");
+    assert_eq!(adv.map(f64::to_bits), snapshot);
+
+    // Invalid inputs are refused.
+    assert!(shrink_to_left_fold_norm_limit(&mut adv, 0.0).is_err());
+    assert!(shrink_to_left_fold_norm_limit(&mut adv, -1.0).is_err());
+    assert!(shrink_to_left_fold_norm_limit(&mut adv, f64::NAN).is_err());
+    let mut nan_v = [0.0; 32];
+    nan_v[7] = f64::NAN;
+    assert!(shrink_to_left_fold_norm_limit(&mut nan_v, 1.0).is_err());
+
+    // 3. symplectic_rotate_channels on active_channels = 32 and 24.
+    let mut a = [0.0_f64; 32];
+    for (idx, slot) in a.iter_mut().enumerate() {
+        *slot = ((idx as f64) * 0.37 - 5.2).sin();
+    }
+    shrink_to_left_fold_norm_limit(&mut a, 1.0).expect("normalize a");
+
+    for active in [32_usize, 24_usize] {
+        let ja = symplectic_rotate_channels(&a, active, 1.0).expect("symplectic rotate");
+        assert!(
+            left_fold_sq(&ja) <= 1.0,
+            "active={active} left-fold norm exceeded 1.0"
+        );
+        let dot: f64 = a.iter().zip(ja.iter()).map(|(x, y)| x * y).sum();
+        assert!(
+            dot.abs() < 1.0e-15,
+            "active={active}: a · J a = {dot:e} is not orthogonal"
+        );
+        for &tail in &ja[active..] {
+            assert_eq!(tail, 0.0, "active={active} tail channels must be zero");
+        }
+        // Check exact 2D symplectic pair structure (up to uniform shrink factor <= 1).
+        for pair in 0..(active / 2) {
+            let even = 2 * pair;
+            let odd = even + 1;
+            let cross = a[even] * ja[even] + a[odd] * ja[odd];
+            assert!(cross.abs() < 1.0e-15, "pair {pair} cross = {cross:e}");
+        }
+    }
+    assert!(symplectic_rotate_channels(&a, 33, 1.0).is_err());
 }

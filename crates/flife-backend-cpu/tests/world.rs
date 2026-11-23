@@ -16,7 +16,7 @@ use flife_backend_cpu::{CpuBackend, SHARD_SLOTS};
 use flife_core::ids::GenomeId;
 use flife_core::{CoreError, ValidatedConfig};
 use flife_engine::{Arrangement, NumericalProfile, Stepped, World};
-use flife_neural::{ACTION_WIDTH, BackendBudget, ControllerBackend, ControllerJob};
+use flife_neural::{BackendBudget, ControllerBackend, ControllerJob, RawOutputs};
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
 
@@ -190,7 +190,7 @@ impl ControllerBackend for Flipped {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.inner.evaluate(jobs, outputs)?;
         self.calls += 1;
@@ -240,7 +240,7 @@ impl ControllerBackend for Counted {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.inner.evaluate(jobs, outputs)?;
         let mut seen = self.seen.lock().map_err(|_| CoreError::StateConflict {

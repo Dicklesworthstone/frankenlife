@@ -160,9 +160,12 @@ impl Bins {
         self.offsets.resize(buckets + 1, 0);
         for item in 0..items {
             let bucket = bucket_of(item);
-            match self.offsets.get_mut(bucket + 1) {
-                Some(count) if bucket < buckets => *count += 1,
-                _ => return Err(outside(item, bucket)),
+            if bucket >= buckets {
+                return Err(outside(item, bucket));
+            }
+            match bucket.checked_add(1).and_then(|next| self.offsets.get_mut(next)) {
+                Some(count) => *count += 1,
+                None => return Err(outside(item, bucket)),
             }
         }
         // 2. Exclusive prefix sum: `offsets[b]` becomes bucket b's start and
@@ -232,7 +235,10 @@ impl Bins {
     /// or out-of-range bucket.
     #[must_use]
     pub fn range(&self, bucket: usize) -> Range<usize> {
-        match (self.offsets.get(bucket), self.offsets.get(bucket + 1)) {
+        match (
+            self.offsets.get(bucket),
+            bucket.checked_add(1).and_then(|next| self.offsets.get(next)),
+        ) {
             (Some(&start), Some(&end)) => start as usize..end as usize,
             _ => 0..0,
         }

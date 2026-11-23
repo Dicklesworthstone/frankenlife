@@ -915,3 +915,119 @@ fn a_frame_draws_the_field_then_the_halos_then_the_dots() {
         .count();
     assert!(lit > 96 * 96 / 4, "only {lit} lit pixels");
 }
+
+/// FL-033: when the field is hidden (`!style.field_drawn()`), `WorldView::show`
+/// keeps tracking the display scale without building an unused texture (and
+/// its SHA-256). Switching between `Look::Raw` and `Look::Sphere` reuses the
+/// existing texture, an unchanged viewport reuses the quad, and an error leaves
+/// previous scale, texture and quad untouched.
+#[test]
+fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() {
+    let config = common::small();
+    let mut world = common::found(&config);
+    let first = common::epoch(&world);
+    common::advance(&mut world, 10);
+    let second = common::epoch(&world);
+    assert_ne!(first.field().values(), second.field().values());
+
+    // Reference view with field drawn tracks scale normally.
+    let mut reference = WorldView::for_epoch(&first, [96, 96], [0, 0, 0]).expect("view");
+    reference.show(&first).expect("show first");
+    reference.show(&second).expect("show second");
+
+    // View with field drawn once, then hidden on the second epoch:
+    // scale must match reference bit-for-bit, and texture pointer must NOT change.
+    let mut hidden = WorldView::for_epoch(&first, [96, 96], [0, 0, 0]).expect("view");
+    hidden.show(&first).expect("show first");
+    let tex_ptr = hidden.field().texture().expect("texture") as *const _;
+    hidden.set_style(Style {
+        field: false,
+        ..Style::default()
+    });
+    hidden.show(&second).expect("show second hidden");
+    assert_eq!(
+        hidden.field().scale().to_bits(),
+        reference.field().scale().to_bits(),
+        "hidden field must keep tracking display scale"
+    );
+    assert_eq!(
+        hidden.field().texture().expect("kept texture") as *const _,
+        tex_ptr,
+        "hidden field must not rebuild an unused texture"
+    );
+    // Turning the field back on builds the current epoch's texture immediately.
+    hidden.set_style(Style::default());
+    hidden.place(&second).expect("place unhidden");
+    assert_ne!(
+        hidden.field().texture().expect("rebuilt") as *const _,
+        tex_ptr
+    );
+    assert_eq!(drawn(hidden.field()), drawn(reference.field()));
+
+    // Raw <-> Sphere reuse the exact same texture pointer and quad pointer.
+    let mut layer = FieldLayer::new(&fit([8.0, 4.0], [160, 80]));
+    let plane: Vec<f32> = (0..32).map(|i| (i % 8) as f32).collect();
+    let field = texture([8, 4], &plane);
+    layer.update_look(&field, Look::Raw).expect("raw");
+    let raw_tex = layer.texture().expect("raw tex") as *const _;
+    let raw_quad = match layer.draw().expect("draw") {
+        ThreeDDraw::Surface(s) => s.mesh as *const _,
+        _ => panic!("not surface"),
+    };
+    layer.place(&field, Look::Sphere).expect("sphere");
+    assert_eq!(
+        layer.texture().expect("sphere tex") as *const _,
+        raw_tex,
+        "Sphere must reuse identical Raw field texture without rehashing"
+    );
+    let sphere_quad = match layer.draw().expect("draw") {
+        ThreeDDraw::Surface(s) => s.mesh as *const _,
+        _ => panic!("not surface"),
+    };
+    assert_eq!(
+        sphere_quad, raw_quad,
+        "unchanged viewport must reuse cached periodic quad"
+    );
+
+    // Zero-field and non-finite texels produce valid finite textures in all mappings.
+    let zeros = texture([4, 4], &[0.0; 16]);
+    for mapping in [
+        FieldMapping::Energy,
+        FieldMapping::Composition,
+        FieldMapping::Component(FieldComponent::default()),
+    ] {
+        for look in [Look::Glow, Look::Raw, Look::Sphere] {
+            let mut z = FieldLayer::new(&fit([4.0, 4.0], [40, 40]));
+            z.update_mapped(&zeros, look, mapping).expect("zero field");
+            assert_eq!(z.scale(), 0.0);
+            assert!(z.texture().is_some());
+        }
+    }
+    let messy = texture(
+        [4, 4],
+        &[
+            f32::NAN,
+            f32::INFINITY,
+            -1.0,
+            2.0,
+            0.0,
+            1.0,
+            0.5,
+            0.25,
+            f32::NEG_INFINITY,
+            0.0,
+            3.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+    );
+    for look in [Look::Glow, Look::Raw] {
+        let mut m = FieldLayer::new(&fit([4.0, 4.0], [40, 40]));
+        m.update_look(&messy, look).expect("messy field");
+        assert_eq!(m.scale(), 3.0);
+        assert!(m.texture().is_some());
+    }
+}

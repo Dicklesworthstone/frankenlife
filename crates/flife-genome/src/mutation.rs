@@ -126,15 +126,25 @@ impl MutationParameters {
                 });
             }
         }
+        let fixed_controller =
+            model.model == flife_core::model::FIELD_ECOLOGY_V2_FIXED_CONTROLLER;
         let parameters = Self {
-            topology_change_probability: if architecture.enabled {
+            topology_change_probability: if architecture.enabled && !fixed_controller {
                 architecture.probability_per_birth
             } else {
                 0.0
             },
-            weight_probability: mutation.weight_probability,
+            weight_probability: if fixed_controller {
+                0.0
+            } else {
+                mutation.weight_probability
+            },
             weight_standard_deviation: mutation.weight_standard_deviation,
-            replacement_probability: mutation.replacement_probability,
+            replacement_probability: if fixed_controller {
+                0.0
+            } else {
+                mutation.replacement_probability
+            },
             chemistry_standard_deviation: mutation.chemistry_standard_deviation,
             sensing_log_scale_standard_deviation: mutation.sensing_log_scale_standard_deviation,
             reject_effective_noop: mutation.reject_effective_noop,

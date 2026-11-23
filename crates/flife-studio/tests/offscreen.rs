@@ -1837,6 +1837,11 @@ fn oversize_live_resize_is_refused_without_exceeding_maximum_total_bytes() {
     assert!(!refused_frame.refitted, "oversize resize must not refit");
     assert_eq!(studio.view().viewport().drawable(), admitted_drawable);
     assert_eq!(studio.surface_metrics().expect("metrics"), admitted_metrics);
+    assert_eq!(
+        studio.controls().metrics(),
+        Some(admitted_metrics),
+        "controls metrics must roll back on offscreen resize refusal"
+    );
     let statuses: Vec<_> = studio.take_statuses().collect();
     assert!(
         statuses.iter().any(|s| matches!(
@@ -1851,8 +1856,38 @@ fn oversize_live_resize_is_refused_without_exceeding_maximum_total_bytes() {
         "expected Status::ResizeRefused, got {statuses:?}"
     );
 
-    // Repeating frames without a new resize must not spam ResizeRefused.
-    let _ = studio.frame().expect("next frame");
+    // Hovering at the admitted logical center after refusal must still map
+    // to the world center (not be mis-scaled by the refused 8192x8192 size),
+    // and repeating frames without a new resize must not spam ResizeRefused.
+    hover(
+        &mut studio,
+        [
+            admitted_metrics.logical_width / 2.0,
+            admitted_metrics.logical_height / 2.0,
+        ],
+    );
+    let after_refusal = studio.frame().expect("next frame");
+    let extent = studio.view().viewport().extent();
+    let hovered = after_refusal
+        .hover
+        .expect("center hover must still land inside the world after refused resize");
+    assert!(
+        (hovered[0] - extent[0] / 2.0).abs() < 1e-6 && (hovered[1] - extent[1] / 2.0).abs() < 1e-6,
+        "expected world center {:?}, got {hovered:?}",
+        [extent[0] / 2.0, extent[1] / 2.0]
+    );
+    assert!(
+        !studio
+            .take_statuses()
+            .any(|s| matches!(s, Status::ResizeRefused { .. }))
+    );
+
+    // Repeating the same refused resize before an admitted resize must stay
+    // deduplicated.
+    studio
+        .post_input(InputEvent::Resized(huge))
+        .expect("posts duplicate huge resize");
+    let _ = studio.frame().expect("frame after duplicate huge resize");
     assert!(
         !studio
             .take_statuses()

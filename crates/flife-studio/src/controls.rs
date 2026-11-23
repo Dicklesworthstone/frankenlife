@@ -409,7 +409,7 @@ impl Controls {
                     return None;
                 }
                 match *code {
-                    KEY_SPACE if !*repeat => {
+                    KEY_SPACE if !*repeat && !modifiers.command => {
                         self.running = !self.running;
                         Some(if self.running {
                             Intent::Resume
@@ -417,7 +417,9 @@ impl Controls {
                             Intent::Pause
                         })
                     }
-                    KEY_RIGHT | KEY_PERIOD if !self.running => Some(Intent::Step),
+                    KEY_RIGHT | KEY_PERIOD if !self.running && !modifiers.command => {
+                        Some(Intent::Step)
+                    }
                     KEY_ESCAPE => self.request_close(),
                     KEY_W if modifiers.command => self.request_close(),
                     _ if *repeat || modifiers.command => None,
@@ -801,6 +803,13 @@ impl Controls {
     #[must_use]
     pub const fn metrics(&self) -> Option<SurfaceMetrics> {
         self.metrics
+    }
+
+    /// Restore the admitted surface geometry after an offscreen resize refusal
+    /// so pointer, camera, brush and measurement coordinates stay aligned with
+    /// the admitted surface.
+    pub(crate) const fn set_metrics(&mut self, metrics: SurfaceMetrics) {
+        self.metrics = Some(metrics);
     }
 
     /// Every event seen, by kind.

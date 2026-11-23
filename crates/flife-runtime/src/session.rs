@@ -1649,10 +1649,47 @@ impl SessionOwner {
         }
     }
 
+    /// Whether any held control message can now make progress without
+    /// waiting for another inbound message.
+    fn has_ready_held(&self) -> bool {
+        let committed = self.world.tick();
+        self.held.iter().any(|message| match message {
+            Control::Step(_) => {
+                self.run.is_some()
+                    || self.stopped()
+                    || (!self.held_here()
+                        && self.journal.as_ref().is_none_or(|journal| {
+                            journal.failed.is_some() || !journal.holds(committed)
+                        }))
+            }
+            Control::Checkpoint(_) | Control::Take(_) => self
+                .journal
+                .as_ref()
+                .is_none_or(|journal| journal.failed.is_some() || journal.waiting.is_empty()),
+            Control::DurableOutcome { id, .. } => {
+                let Some(journal) = &self.journal else {
+                    return true;
+                };
+                if journal.failed.is_some() {
+                    return true;
+                }
+                !matches!(
+                    self.book.status(*id),
+                    Some(CommandStatus::Terminal(outcome))
+                        if outcome.cursor() >= journal.durable.outcomes
+                )
+            }
+            _ => true,
+        })
+    }
+
     /// Handle again every step and checkpoint that waited for the journal;
     /// one still blocked waits again.
     async fn release_held(&mut self, cx: &Cx) {
         for _ in 0..self.held.len() {
+            if !self.closing.is_empty() || cx.checkpoint().is_err() {
+                break;
+            }
             let Some(message) = self.held.pop_front() else {
                 break;
             };
@@ -1785,6 +1822,14 @@ impl SessionOwner {
             }
             Control::Checkpoint(reply) => {
                 self.settle_receipts();
+                if let Some(error) = self
+                    .journal
+                    .as_ref()
+                    .and_then(|journal| journal.failed.as_ref())
+                {
+                    let _ = reply.send_blocking(Err(error.clone()));
+                    return;
+                }
                 if self
                     .journal
                     .as_ref()
@@ -1803,6 +1848,14 @@ impl SessionOwner {
             }
             Control::Take(take) => {
                 self.settle_receipts();
+                if let Some(error) = self
+                    .journal
+                    .as_ref()
+                    .and_then(|journal| journal.failed.as_ref())
+                {
+                    take(Err(error.clone()));
+                    return;
+                }
                 if self
                     .journal
                     .as_ref()
@@ -1857,7 +1910,7 @@ impl SessionOwner {
     /// boundary.
     async fn tick(&mut self, cx: &Cx) -> Ticked {
         loop {
-            if cx.checkpoint().is_err() {
+            if !self.closing.is_empty() || cx.checkpoint().is_err() {
                 return Ticked::Closing;
             }
             if self.held_here() {
@@ -1938,7 +1991,10 @@ impl SessionOwner {
                     other => deferred.push_back(other),
                 }
             }
-            if closing.is_empty() {
+            if cx.checkpoint().is_err() {
+                discard = true;
+            }
+            if closing.is_empty() && cx.checkpoint().is_ok() {
                 while journal.as_ref().is_none_or(Durable::room)
                     && let Ok(submission) = science.try_recv()
                 {
@@ -1958,7 +2014,7 @@ impl SessionOwner {
                 for reply in pause {
                     deferred.push_front(Control::Pause(reply));
                 }
-                if !closing.is_empty() {
+                if !closing.is_empty() || cx.checkpoint().is_err() {
                     return Ticked::Closing;
                 }
                 continue;
@@ -2062,9 +2118,12 @@ impl SessionOwner {
             self.reach_hold();
             self.settle_receipts();
             self.release_held(cx).await;
+            if !self.closing.is_empty() || cx.checkpoint().is_err() {
+                break 'session;
+            }
             while let Some(message) = self.deferred.pop_front() {
                 self.handle(cx, message).await;
-                if !self.closing.is_empty() {
+                if !self.closing.is_empty() || cx.checkpoint().is_err() {
                     break 'session;
                 }
             }
@@ -2073,7 +2132,7 @@ impl SessionOwner {
                 match self.control.try_recv() {
                     Ok(message) => {
                         self.handle(cx, message).await;
-                        if !self.closing.is_empty() {
+                        if !self.closing.is_empty() || cx.checkpoint().is_err() {
                             break 'session;
                         }
                     }
@@ -2128,8 +2187,14 @@ impl SessionOwner {
                     continue;
                 }
             }
-            // A step handled above may have reached the hold.
+            // A step handled above may have reached the hold, and control
+            // handled above may have released a hold or settled the last
+            // journal receipt needed by a held request or active run.
             self.reach_hold();
+            self.settle_receipts();
+            if self.has_ready_held() || (self.run.is_some() && !self.holding()) {
+                continue 'session;
+            }
             let room = self.room();
             let Self {
                 control,
@@ -2147,7 +2212,7 @@ impl SessionOwner {
             match inbound {
                 Inbound::Control(message) => {
                     self.handle(cx, message).await;
-                    if !self.closing.is_empty() {
+                    if !self.closing.is_empty() || cx.checkpoint().is_err() {
                         break 'session;
                     }
                 }

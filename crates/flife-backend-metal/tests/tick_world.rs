@@ -30,7 +30,7 @@ use flife_field::{
     UptakeBackend, UptakeCell,
 };
 use flife_genome::Genome;
-use flife_neural::{ACTION_WIDTH, ControllerBackend, ControllerJob};
+use flife_neural::{ControllerBackend, ControllerJob, RawOutputs};
 use std::num::NonZeroUsize;
 
 const PRESET: &str = include_str!("../../../presets/reference-small-world.toml");
@@ -284,7 +284,7 @@ impl ControllerBackend for Failing<MetalBackend> {
     fn evaluate(
         &mut self,
         jobs: &[ControllerJob<'_>],
-        outputs: &mut Vec<Option<[f32; ACTION_WIDTH]>>,
+        outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.inner.evaluate(jobs, outputs)?;
         if self.fails(Stage::Evaluate) {

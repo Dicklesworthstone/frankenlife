@@ -278,3 +278,136 @@ fn a_frame_prepared_on_threads_is_the_frame_prepared_on_one() {
     }
     assert_eq!(compared, 2 * 4);
 }
+
+/// FL-033: conservative frustum culling in `WorldView::draws()` at zoom > 1
+/// drops offscreen dots and halos without changing a single byte of the
+/// rendered frame (including bloom, halos straddling the viewport edge, seam
+/// views, and all three looks), while unplaced `set_view` leaves the draw list
+/// intact.
+#[test]
+fn zoomed_offscreen_culling_is_bit_identical_to_unculled_rendering() {
+    let config = common::config(&[
+        ("population", "initial_count", "1024"),
+        ("population", "maximum_count", "1024"),
+    ]);
+    let mut world = common::found(&config);
+    common::advance(&mut world, 8);
+    let epoch = common::epoch(&world);
+    let drawable = [320, 180];
+
+    for (look, bloom) in [
+        (Look::Glow, Some(0.15)),
+        (Look::Glow, None),
+        (Look::Raw, None),
+        (Look::Sphere, None),
+    ] {
+        let style = Style {
+            look,
+            ..Style::default()
+        };
+        for (center, zoom) in [
+            ([12.0, 20.0], 2.0),
+            ([0.1, 31.9], 4.0),
+            ([16.0, 16.0], 16.0),
+        ] {
+            let mut view = WorldView::for_epoch(&epoch, drawable, [2, 3, 8]).expect("a view");
+            view.set_style(style);
+            view.set_bloom(bloom).expect("bloom");
+            view.show(&epoch).expect("show");
+
+            // Unplaced `set_view` must not cull stale positions.
+            let unplaced_count = view.draws().expect("draws").len();
+            let zoomed = view.viewport().with_view(center, zoom).expect("zoomed");
+            view.set_view(zoomed).expect("set_view");
+            assert_eq!(
+                view.draws().expect("unplaced draws").len(),
+                unplaced_count,
+                "unplaced set_view must keep all draws"
+            );
+
+            // Placing into the zoomed view activates frustum culling.
+            view.place(&epoch).expect("place");
+            let first = flife_core::ids::OrganismId::new(epoch.ids()[0]);
+            view.select(Some(first)).expect("select");
+            let culled_draws = view.draws().expect("culled draws");
+            let full_particles = view.cloud().halos().len() + view.cloud().draws().len();
+            let culled_particles = culled_draws
+                .iter()
+                .filter(|d| matches!(d, fmn_render::ThreeDDraw::TrueDot(_)))
+                .count();
+            if zoom >= 4.0 {
+                assert!(
+                    culled_particles * 4 < full_particles,
+                    "{look:?} zoom {zoom}: expected >75% culled, kept {culled_particles}/{full_particles}"
+                );
+            }
+            if zoom >= 16.0 {
+                assert!(
+                    culled_particles * 20 < full_particles,
+                    "{look:?} zoom {zoom}: expected >95% culled, kept {culled_particles}/{full_particles}"
+                );
+            }
+            // Build an unculled reference job directly from every cloud halo & dot.
+            let mut unculled = Vec::new();
+            unculled.extend(view.field().draw());
+            unculled.extend_from_slice(view.cloud().halos());
+            unculled.extend_from_slice(view.cloud().draws());
+            unculled.extend(view.region_draw());
+            unculled.extend(view.selection_draw());
+            let mut ref_job =
+                ThreeDJob::new(view.camera().camera(), &unculled, Tiling::default())
+                    .expect("reference job");
+            if let Some(b) = view.frame_bloom() {
+                ref_job = ref_job.with_bloom(b.clone());
+            }
+            let ref_frame = ref_job.render(2).expect("reference frame");
+            let mut ref_rgba = vec![0u8; (drawable[0] * drawable[1] * 4) as usize];
+            fmn_frame::convert::rgba16f_to_rgba8_slice(&ref_frame, &mut ref_rgba)
+                .expect("convert reference");
+
+            let culled_rgba = view.render_rgba8(2).expect("culled frame");
+            assert_eq!(
+                culled_rgba, ref_rgba,
+                "{look:?} bloom {bloom:?} center {center:?} zoom {zoom}: culled frame differs from unculled"
+            );
+        }
+    }
+}
+
+/// Planted-negative edge-straddling test: an organism whose center sits outside
+/// the viewport while its glow halo reaches inside must NEVER be culled, and
+/// must render byte-identically to the unculled frame.
+#[test]
+fn offscreen_center_with_onscreen_halo_is_preserved_bit_for_bit() {
+    let config = common::small();
+    let world = common::found(&config);
+    let epoch = common::epoch(&world);
+    let pos = epoch.positions()[0].map(f64::from);
+    let drawable = [160, 160];
+    let mut view = WorldView::for_epoch(&epoch, drawable, [0, 0, 0]).expect("view");
+    // Zoom 8x: frame width is 32 / 8 = 4 world units (half-width = 2.0).
+    // Place the viewport center 2.15 world units east of organism 0 so its
+    // center is outside the left edge (-2.15 < -2.0), while its glow halo
+    // (radius ~0.35 * 3.5 = 1.225) reaches well inside the frame!
+    let center = [(pos[0] + 2.15).rem_euclid(32.0), pos[1]];
+    let zoomed = view.viewport().with_view(center, 8.0).expect("zoomed");
+    view.set_view(zoomed).expect("set_view");
+    view.show(&epoch).expect("show");
+
+    let mut unculled = Vec::new();
+    unculled.extend(view.field().draw());
+    unculled.extend_from_slice(view.cloud().halos());
+    unculled.extend_from_slice(view.cloud().draws());
+    let ref_frame = ThreeDJob::new(view.camera().camera(), &unculled, Tiling::default())
+        .expect("ref job")
+        .render(2)
+        .expect("ref frame");
+    let mut ref_rgba = vec![0u8; (drawable[0] * drawable[1] * 4) as usize];
+    fmn_frame::convert::rgba16f_to_rgba8_slice(&ref_frame, &mut ref_rgba).expect("convert");
+
+    let culled_rgba = view.render_rgba8(2).expect("culled frame");
+    assert_eq!(
+        culled_rgba, ref_rgba,
+        "edge-straddling halo must render byte-identically"
+    );
+}

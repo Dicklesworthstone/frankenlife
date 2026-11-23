@@ -119,7 +119,8 @@ export default function Home() {
     render.command.replace("FRAMES", "frames"),
     ...(render.camera ? ["# CAMERA: lib/media.json's render.camera keys, as {\"keys\": [...]}"] : []),
   ];
-  const crf = video.encode[video.encode.indexOf("-crf") + 1];
+  const crfAt = video.encode.indexOf("-crf");
+  const crf = crfAt >= 0 ? video.encode[crfAt + 1] : undefined;
 
   return (
     <>
@@ -428,6 +429,15 @@ export default function Home() {
                   <dl className="ruled mt-5 text-sm">
                     <Row label="Ticks" value={`${grouped(world.from.tick)} → ${grouped(world.to.tick)}, a frame every ${world.every}`} />
                     <Row label="Frames" value={`${video.frames} at ${video.fps} fps, ${video.width} × ${video.height}`} />
+                    {video.segments && video.segments.length > 1 ? (
+                      <Row
+                        label="Segments"
+                        value={`${video.segments.length} × ≤25 MiB (${(
+                          video.segments.reduce((sum, seg) => sum + seg.bytes, 0) /
+                          (1024 * 1024)
+                        ).toFixed(1)} MiB total, preloaded sequentially)`}
+                      />
+                    ) : null}
                     <Row label="Colour" value={render.meaning} />
                     <Row
                       label="Field"
@@ -437,6 +447,9 @@ export default function Home() {
                       label="Camera"
                       value={render.camera ? `${render.camera.keys.length} keys, chosen from the run` : "the whole torus, still"}
                     />
+                    {render.features && render.features.length > 0 ? (
+                      <Row label="V2 toggles" value={render.features.join(" ")} mono />
+                    ) : null}
                     <Row label="First digest" value={world.from.digest} mono />
                     <Row label="Last digest" value={world.to.digest} mono />
                   </dl>
@@ -475,7 +488,12 @@ export default function Home() {
                   {grouped(firstLive)} organisms and the last {grouped(lastLive)}; the render&apos;s{" "}
                   <code className="text-slate-300">end</code> record names the last digest above. The PNG frames are
                   flife&apos;s; this page&apos;s video encodes them with flife&apos;s own BT.709 colour chain at CRF{" "}
-                  {crf} for the web, and its SHA-256 is <code className="break-all text-slate-300">{video.sha256}</code>.
+                  {crf} for the web
+                  {video.segments && video.segments.length > 1
+                    ? ` across ${video.segments.length} preloaded segments (each ≤25 MiB, first SHA-256 `
+                    : ", and its SHA-256 is "}
+                  <code className="break-all text-slate-300">{video.sha256}</code>
+                  {video.segments && video.segments.length > 1 ? ")." : "."}
                 </p>
               </div>
             </Reveal>
@@ -591,13 +609,13 @@ export default function Home() {
               <Reveal>
                 <div className="panel relative overflow-hidden rounded-[1.75rem] p-6 sm:p-8">
                   <Reticle inset={9} size={12} />
-                  <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2 sm:gap-3">
                     <div className="flex items-center gap-2">
-                      <Layers className="h-4 w-4 text-[color:var(--chapter)]" aria-hidden="true" />
+                      <Layers className="h-4 w-4 shrink-0 text-[color:var(--chapter)]" aria-hidden="true" />
                       <MicroLabel>21 registered feature slugs · flife --list-features</MicroLabel>
                     </div>
-                    <span className="font-mono text-[11px] text-slate-400">
-                      --disable / --enable / --v1-compat · aliases: all-v2, bundle-a, bundle-b
+                    <span className="font-mono text-[11px] leading-snug text-slate-400">
+                      Bundle A (14) · Bundle B (13) · --disable / --enable / --v1-compat · aliases: all-v2, bundle-a, bundle-b
                     </span>
                   </div>
                   {/* slop-ok(S12-three-cards): a 21-row ruled catalog wrapping into three columns, not three cards. */}
@@ -605,9 +623,9 @@ export default function Home() {
                     {v2Features.map((feature) => {
                       const badge = v2BoundaryStyle[feature.boundary];
                       return (
-                        <li key={feature.slug} className="border-t border-white/[0.06] pt-3.5">
+                        <li key={feature.slug} className="min-w-0 border-t border-white/[0.06] pt-3.5">
                           <div className="flex flex-wrap items-center justify-between gap-2">
-                            <code className="font-mono text-[13px] font-bold text-white">{feature.slug}</code>
+                            <code className="font-mono text-[13px] font-bold break-words text-white">{feature.slug}</code>
                             <span
                               className={cn(
                                 "rounded-full border px-2 py-0.5 font-mono text-[9px] font-medium tracking-[0.08em] uppercase",

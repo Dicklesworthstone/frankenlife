@@ -84,16 +84,19 @@ target/release/flife run presets/confluent-world.toml --ticks 2400 --cpu-workers
 bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK \
   --ticks 3200 --every 8 --field none --look sphere --color lineage --zooms 1.6,3,2.2,5,2.6 --cpu-workers 24
 
-# 60 fps 4K (square 2160 × 2160 or 16:9 3840 × 2160), keeping the deployed web MP4 <= 25 MiB for
-# Cloudflare Workers while writing an unconstrained archival 4K60 master outside public/media/:
-bun run media --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
-  --ticks 2400 --every 4 --width 2160 --height 2160 --fps 60 --crf 24 \
-  --master-out ../exports/film-4k60-master.mp4 --master-crf 16 \
-  --field none --look sphere --color lineage-energy --cpu-workers 24
+# Turnkey true 60 fps 4K re-render of confluent-world (`bun run media:4k60` sets --ticks 3200
+# --every 4 -> 801 distinct frames from tick 2,400 to 5,600 = 13.35 s at true 60 fps, matching
+# the 30 fps film's 13.37 s pacing with zero frame duplication, 2160 × 2160, CRF 19,
+# --segments auto, --segment-max-mib 22 so every segment stays <= 25 MiB for Cloudflare Workers,
+# snapped at camera cuts, plus one unconstrained archival 4K60 master outside public/media/;
+# pass --width 3840 --height 2160 to override to 16:9 4K60):
+bun run media:4k60 -- --flife ../target/release/flife --run-dir ../RUN --work WORK-4K60 \
+  --field none --look sphere --color lineage-energy \
+  --zooms 1.6,3,2.2,5,2.6 --master-out ../exports/film-4k60-master.mp4 --cpu-workers 24
 
 # Widescreen 16:9 4K60 from a fresh field-ecology-v2 preset with V2-16 overlays and founding toggles:
-bun run media --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \
-  --ticks 2400 --every 4 --width 3840 --height 2160 --fps 60 \
+bun run media:4k60 -- --flife ../target/release/flife --config ../presets/supercolony-v2.toml --work WORK-V2 \
+  --width 3840 --height 2160 --ticks 3200 --every 4 \
   --field vascular-conductance --look glow --color lineage \
   --disable oases --master-out ../exports/supercolony-4k60-master.mp4
 ```
@@ -106,10 +109,13 @@ or `--config PATH` (founding a fresh configuration). Founding-only `field-ecolog
 `--v1-compat`, validated against the 21 canonical slugs plus `all-v2`, `bundle-a`, `bundle-b`) are passed in exact CLI
 order with `--config` and refused with `--run-dir` per `INV-14`. Both `--size S` (square) and independent `--width W
 --height H` (e.g. `2160 × 2160` or `3840 × 2160`, even integers for 4:2:0) are supported alongside arbitrary positive
-`--fps` (including `--fps 60`). The web MP4 automatically computes a `-maxrate`/`-bufsize` ceiling so the deployed file
-stays within Cloudflare's 25 MiB static asset limit; `--master-out PATH` (which must resolve outside `public/media/`)
-encodes an unconstrained high-quality archival master from the exact same PNG frames and records its digest in
-`lib/media.json`.
+`--fps` (including `--fps 60`). With `--segments auto` (the default) or `--segments N` (`N >= 2`), any film whose full-CRF
+encode exceeds `--segment-max-mib` (default `22` MiB, strictly below Cloudflare's `25 MiB` static asset limit) is split
+at natural camera shot boundaries into closed-GOP segments (`film-seg00-<hash>.mp4`, …) — recursively subdivided if any
+individual shot still exceeds the cap — and played seamlessly through `<Film>`'s dual-`<video>` preloader with a single
+unified scrubber, tick readout, and Cloudflare Worker 206 Range serving. Pass `--segments 1` to force a single bitrate-capped
+web MP4, and `--master-out PATH` (outside `public/media/`) to also encode one unconstrained archival 4K60 MP4 from the
+exact same PNG frames.
 
 `presets/confluent-world.toml` was chosen by outer searches against image statistics of the reference
 screenshots and by eye, under the registered contact model, and `../experiments/showcase/README.md` states
@@ -172,14 +178,18 @@ at tick 2,400, the tick the showcase scored: `field-ecology-v1-contact-chemistry
 and are charged but whose actions decode from an all-zero output, and
 `field-ecology-v1-contact-fresh-offspring`, whose newborns get a founder's genome instead of their
 parent's. Each is `presets/confluent-world.toml` with only its `model` (and `name`) changed, run from
-tick 0 inside `flife render` and drawn as the film is: 1080 × 1080, the whole torus, no field, the sphere
+tick 0 inside `flife render` and drawn as the film is: at the film's square size (1080 × 1080, or
+2160 × 2160 with `--size 2160` / `bun run controls:4k`), the whole torus, no field, the sphere
 look, lineage lit by energy. `lib/controls.json` is their committed manifest; the stills live in
 `public/media/` beside the film, outside git, and `bun run build` checks them the same way.
 
 ```bash
 # From web/; WORK outside the repository. About 13 minutes for each full world on 8 workers of an
-# M5 Ultra (two at once), under a minute for the inheritance control. Pass --size 2160 for 4K stills.
-bun scripts/controls.ts --flife ../target/release/flife --work WORK --cpu-workers 8 [--size 2160]
+# M5 Ultra (two at once), under a minute for the inheritance control.
+bun scripts/controls.ts --flife ../target/release/flife --work WORK --cpu-workers 8
+
+# Matching 4K (2160 × 2160) stills beside a 2160 × 2160 `media:4k60` film (reuses the 4K poster byte for byte):
+bun run controls:4k -- --flife ../target/release/flife --work WORK-4K --cpu-workers 8
 ```
 
 The script refuses unless each world's digest and live count at tick 2,400 equal the ones

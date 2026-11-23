@@ -65,7 +65,7 @@ export function posterPlacement(film: FilmManifest): Placement & { tick: number 
     y0: view.center[1] - span / 2,
     width: span,
     height: span,
-    px: [FRAME_PX, FRAME_PX],
+    px: [film.video.width, film.video.height],
     tick,
   };
 }
@@ -75,13 +75,15 @@ export function cardPlacement(film: FilmManifest): Placement & { tick: number; z
   const tick = film.world.ticks[film.social.frame] ?? film.world.from.tick;
   const view = cameraAt(film.render.camera?.keys ?? [], tick);
   const span = TORUS / view.zoom;
-  const height = span * (CARD_H / CARD_W);
+  const cardW = film.social.width || CARD_W;
+  const cardH = film.social.height || CARD_H;
+  const height = span * (cardH / cardW);
   return {
     x0: view.center[0] - span / 2,
     y0: view.center[1] - height / 2,
     width: span,
     height,
-    px: [CARD_W, CARD_H],
+    px: [cardW, cardH],
     tick,
     zoom: view.zoom,
     center: view.center,

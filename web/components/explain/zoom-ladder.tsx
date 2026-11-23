@@ -806,8 +806,8 @@ export function ZoomLadder({ index }: { index?: string }) {
                   ref={posterRef}
                   src={film.poster.src}
                   alt={`The film's first frame: the whole torus at tick ${grouped(POSTER.tick)}, ${grouped(LIVE_POSTER)} organisms coloured by founder lineage.`}
-                  width={1080}
-                  height={1080}
+                  width={film.video.width}
+                  height={film.video.height}
                   decoding="async"
                   draggable={false}
                   className="absolute top-0 left-0 w-full max-w-none origin-top-left will-change-transform"
@@ -818,8 +818,8 @@ export function ZoomLadder({ index }: { index?: string }) {
                   ref={cardRef}
                   src={film.social.src}
                   alt={`A patch of the film's closest shot at tick ${grouped(CARD.tick)}: single bodies, each a sphere, coloured by lineage.`}
-                  width={1200}
-                  height={630}
+                  width={film.social.width}
+                  height={film.social.height}
                   loading="lazy"
                   decoding="async"
                   draggable={false}

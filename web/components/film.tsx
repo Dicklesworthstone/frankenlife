@@ -3,6 +3,15 @@
 import { Pause, Play } from "lucide-react";
 import { type Ref, useCallback, useEffect, useRef, useState } from "react";
 
+import {
+  type SlotIndex,
+  globalFrameFromSegmentTime,
+  nextSegmentIndex,
+  planSlotAdvance,
+  planSlotSeek,
+  resolveSegments,
+  segmentLocationForGlobalFrame,
+} from "@/components/film-segments";
 import { Reticle } from "@/components/franken";
 import { controls, film } from "@/lib/media";
 import { cn, grouped } from "@/lib/utils";
@@ -12,15 +21,17 @@ const { video, poster, world, render } = film;
 const torusExtent: [number, number] = controls.torus;
 const frameSize: [number, number] = [video.width, video.height];
 const isSquare = video.width === video.height;
+const SEGMENTS = resolveSegments(video, world);
+const MULTI_SEGMENT = SEGMENTS.length > 1;
 const last = video.frames - 1;
 const secondsPerTick = world.timestep[0] / world.timestep[1];
 // flife render's own words for the colours, up to its colon: "founder lineage".
 const colour = render.meaning.split(":")[0]?.trim() || render.mapping;
 
 /**
- * The frame shown at `time` seconds into the video. A frame's own time reaches the page in whole microseconds (e.g.
- * 0.033333 at 30 fps or 0.016667 at 60 fps), just short of the frame when rounded down, so a thousandth of a frame is
- * allowed.
+ * The frame shown at `time` seconds into a single-file video. A frame's own time reaches the page in whole microseconds
+ * (e.g. 0.033333 at 30 fps or 0.016667 at 60 fps), just short of the frame when rounded down, so a thousandth of a
+ * frame is allowed.
  */
 export function frameAt(time: number, fps = video.fps, frames = video.frames): number {
   const maxFrame = Math.max(0, frames - 1);
@@ -105,14 +116,31 @@ const SEEK_EVERY_MS = 250;
  * tick, the simulated time since the film's first frame and the organisms
  * alive, each from flife render's own record of that frame.
  *
+ * Supports both single-file films (`loop`) and multi-segment `<= 25 MiB`
+ * Cloudflare-safe films via two stacked `<video>` slots (active + preloaded
+ * next segment) so transitions happen with zero black flash and zero layout
+ * shift across one unified timeline and scrubber.
+ *
  * The readout changes with every frame, so it is written to the page directly
- * (`show`), never through a React render: React only ever renders frame 0.
+ * (`show`), never through a React render: React only renders slot state changes.
  */
 export function Film({ className, feather = false }: { className?: string; feather?: boolean }) {
-  const ref = useRef<HTMLVideoElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const slotRefs = useRef<[HTMLVideoElement | null, HTMLVideoElement | null]>([null, null]);
   const [playing, setPlaying] = useState(false);
   // Whether the film's own frames drive the readout and the live dot (`requestVideoFrameCallback`).
   const [perFrame, setPerFrame] = useState(false);
+  // For multi-segment playback: which of the two stacked <video> slots is on top,
+  // and which segment index each slot currently holds (slot src updates are driven
+  // imperatively in primeSlot so React re-renders never reset a buffered <video>).
+  const [activeSlot, setActiveSlot] = useState<SlotIndex>(0);
+  const activeSlotRef = useRef<SlotIndex>(0);
+  const slotSegmentsRef = useRef<[number, number]>([
+    0,
+    MULTI_SEGMENT ? nextSegmentIndex(0, SEGMENTS.length) : 0,
+  ]);
+  // Monotonic per-slot generation counter so rapid seeks cancel stale loadedmetadata listeners.
+  const slotGenRef = useRef<[number, number]>([0, 0]);
 
   const shown = useRef(0);
   const dotRef = useRef<HTMLSpanElement>(null);
@@ -127,6 +155,7 @@ export function Film({ className, feather = false }: { className?: string; feath
   const holdRefs = useRef<(HTMLSpanElement | null)[]>([]);
   const seekRef = useRef<HTMLInputElement>(null);
   const seekAt = useRef(0);
+  const pausedOffScreen = useRef(false);
 
   /** Bring the seek control up to the frame on screen: late while the film plays, at once before it is used. */
   const syncSeek = useCallback(() => {
@@ -166,27 +195,105 @@ export function Film({ className, feather = false }: { className?: string; feath
     [syncSeek],
   );
 
+  /** Upgrade both multi-segment slots to preload="auto" once playback is wanted (respects saveData/reduced-motion until then). */
+  const enablePreload = useCallback(() => {
+    if (!MULTI_SEGMENT) return;
+    for (const el of slotRefs.current) {
+      if (el && el.preload !== "auto") el.preload = "auto";
+    }
+  }, []);
+
+  /**
+   * Prime `slot` with segment `segIndex` at `localTime` seconds so it is decoded before becoming active.
+   * Uses `slotGenRef` to cancel any superseded `loadedmetadata` listener under rapid scrubbing.
+   */
+  const primeSlot = useCallback((slot: SlotIndex, segIndex: number, localTime = 0, playWhenReady = false) => {
+    const el = slotRefs.current[slot];
+    const seg = SEGMENTS[segIndex];
+    if (!el || !seg) return;
+    const gen = ++slotGenRef.current[slot];
+    const prevSeg = slotSegmentsRef.current[slot];
+    if (prevSeg !== segIndex) {
+      slotSegmentsRef.current[slot] = segIndex;
+      el.src = seg.src;
+      el.load();
+    }
+    const seekAndPlay = () => {
+      if (slotGenRef.current[slot] !== gen) return;
+      if (Math.abs(el.currentTime - localTime) > 1e-3 || el.ended) el.currentTime = localTime;
+      if (playWhenReady && activeSlotRef.current === slot) el.play().catch(() => {});
+    };
+    if (el.readyState >= 1) {
+      seekAndPlay();
+    } else {
+      el.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+    }
+  }, []);
+
+  /**
+   * Seamless segment handoff when the active slot ends: update active slot ref first so
+   * pausing the retired slot never flickers `playing`, start the already-buffered standby
+   * slot, then preload `(target + 1) % N` into the retired slot.
+   */
+  const advanceSegment = useCallback(
+    (endedSlot: SlotIndex) => {
+      const plan = planSlotAdvance(
+        { activeSlot: activeSlotRef.current, slotSegments: slotSegmentsRef.current },
+        endedSlot,
+        SEGMENTS.length,
+      );
+      if (!plan) return;
+      const nextSlot = plan.nextState.activeSlot;
+      const oldVideo = slotRefs.current[endedSlot];
+      const nextVideo = slotRefs.current[nextSlot];
+      if (!nextVideo) return;
+
+      enablePreload();
+      activeSlotRef.current = nextSlot;
+      setActiveSlot(nextSlot);
+      show(SEGMENTS[plan.activeSegment]?.startFrame ?? 0, true);
+
+      primeSlot(nextSlot, plan.activeSegment, 0, true);
+      if (oldVideo && !oldVideo.paused) oldVideo.pause();
+      primeSlot(plan.standbySlot, plan.standbySegment, 0, false);
+    },
+    [enablePreload, primeSlot, show],
+  );
+
+  // Initial autoplay check (respects reduced motion and saveData) + standby preload activation.
   useEffect(() => {
-    const element = ref.current;
+    const element = slotRefs.current[0];
     if (!element) return;
-    // The film is over 20 MB: a reader who asks for less motion or less data gets the poster and the button.
+    // The film can be > 20 MiB: a reader who asks for less motion or less data gets the poster and the button.
     const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const saving = (navigator as { connection?: { saveData?: boolean } }).connection?.saveData === true;
     if (!still && !saving) {
+      enablePreload();
       element.play().catch(() => {
         // Autoplay refused (a data saver, say): the poster stays, and the button plays it.
       });
     }
+  }, [enablePreload]);
+
+  // Frame-accurate readout synced to whichever <video> slot is currently active.
+  useEffect(() => {
+    const element = slotRefs.current[activeSlot];
+    if (!element) return;
+    const still = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let handle = 0;
     let stopped = false;
     const dot = dotRef.current;
+
+    const currentGlobalFrame = (mediaTime: number) =>
+      globalFrameFromSegmentTime(SEGMENTS, slotSegmentsRef.current[activeSlot], mediaTime, video.fps);
+
     // Older Safari and Firefox have no per-frame callback; `timeupdate` is coarser but correct.
     const supported =
       typeof (element as { requestVideoFrameCallback?: unknown }).requestVideoFrameCallback === "function";
     if (supported) {
       setPerFrame(true);
       const onFrame = (now: number, metadata: VideoFrameCallbackMetadata) => {
-        show(frameAt(metadata.mediaTime), element.paused);
+        show(currentGlobalFrame(metadata.mediaTime), element.paused);
         // On the film's frames, not a CSS animation of its own: that would redraw the film at the display's rate.
         if (dot && !still && !element.paused) dot.style.opacity = pulse(now).toFixed(3);
         if (!stopped) handle = element.requestVideoFrameCallback(onFrame);
@@ -197,79 +304,139 @@ export function Film({ className, feather = false }: { className?: string; feath
         element.cancelVideoFrameCallback(handle);
       };
     }
-    const onTime = () => show(frameAt(element.currentTime));
+    const onTime = () => show(currentGlobalFrame(element.currentTime));
     element.addEventListener("timeupdate", onTime);
     return () => element.removeEventListener("timeupdate", onTime);
-  }, [show]);
+  }, [activeSlot, show]);
 
   // Off screen the film pauses, so it decodes and redraws nothing while the reader is elsewhere; it plays on
   // when it comes back, but only if it was playing when it left (a reader's own pause stays).
-  const pausedOffScreen = useRef(false);
   useEffect(() => {
-    const element = ref.current;
-    if (!element || typeof IntersectionObserver === "undefined") return;
+    const container = containerRef.current;
+    if (!container || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver(([entry]) => {
       if (!entry) return;
+      const active = slotRefs.current[activeSlotRef.current];
+      if (!active) return;
       if (!entry.isIntersecting) {
-        if (!element.paused) {
+        if (!active.paused) {
           pausedOffScreen.current = true;
-          element.pause();
+          active.pause();
         }
       } else if (pausedOffScreen.current) {
         pausedOffScreen.current = false;
-        element.play().catch(() => {});
+        active.play().catch(() => {});
       }
     });
-    observer.observe(element);
+    observer.observe(container);
     return () => observer.disconnect();
   }, []);
 
   const toggle = () => {
-    const element = ref.current;
+    const element = slotRefs.current[activeSlotRef.current];
     if (!element) return;
     pausedOffScreen.current = false;
     if (element.paused) {
+      enablePreload();
+      if (MULTI_SEGMENT && element.ended) {
+        advanceSegment(activeSlotRef.current);
+        return;
+      }
       element.play().catch(() => {});
     } else {
       element.pause();
     }
   };
 
-  /** Show frame `target`, playing or not. */
+  /** Show global frame `target`, playing or not, across any segment. */
   const seek = (target: number) => {
-    const element = ref.current;
     const clamped = Math.min(last, Math.max(0, target));
+    const { segmentIndex, localTime } = segmentLocationForGlobalFrame(SEGMENTS, clamped, video.fps);
     show(clamped, true);
-    // The middle of the frame's interval, so rounding never lands on its neighbour.
-    if (element) element.currentTime = (clamped + 0.5) / video.fps;
+
+    const curSlot = activeSlotRef.current;
+    const curVideo = slotRefs.current[curSlot];
+    const wasPlaying = curVideo !== null && !curVideo.paused;
+    const plan = planSlotSeek(
+      { activeSlot: curSlot, slotSegments: slotSegmentsRef.current },
+      segmentIndex,
+      wasPlaying,
+      SEGMENTS.length,
+    );
+
+    if (!plan.changedSlot) {
+      primeSlot(curSlot, plan.activeSegment, localTime, false);
+      return;
+    }
+
+    const nextSlot = plan.nextState.activeSlot;
+    const nextVideo = slotRefs.current[nextSlot];
+    if (!nextVideo) return;
+
+    // Flip activeSlotRef BEFORE pausing the retired slot so onPause never flickers `playing`.
+    enablePreload();
+    activeSlotRef.current = nextSlot;
+    setActiveSlot(nextSlot);
+    if (curVideo && !curVideo.paused) curVideo.pause();
+    primeSlot(nextSlot, plan.activeSegment, localTime, plan.shouldPlay);
+    primeSlot(plan.standbySlot, plan.standbySegment, 0, false);
+  };
+
+  const label = `The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour}${render.field_mapping === "none" ? "" : ` over the field's ${render.field_mapping}`}`;
+
+  const renderSlot = (slot: SlotIndex) => {
+    const isActive = !MULTI_SEGMENT || activeSlot === slot;
+    // Constant initial src per slot so SSR names segments 0 and 1 immediately and React
+    // never rewrites the DOM src attribute on slot flips (primeSlot owns swaps for >2 segments).
+    const initialSeg = SEGMENTS[slot === 0 ? 0 : nextSegmentIndex(0, SEGMENTS.length)] ?? SEGMENTS[0]!;
+    return (
+      <video
+        key={slot}
+        ref={(el) => {
+          slotRefs.current[slot] = el;
+        }}
+        className={cn(
+          "h-full w-full object-cover",
+          MULTI_SEGMENT && "absolute inset-0",
+          MULTI_SEGMENT && (isActive ? "z-[2] opacity-100" : "pointer-events-none z-[1] opacity-0"),
+          feather && "specimen-feather",
+        )}
+        src={initialSeg.src}
+        poster={slot === 0 ? poster.src : undefined}
+        width={video.width}
+        height={video.height}
+        muted
+        loop={!MULTI_SEGMENT}
+        playsInline
+        preload="metadata"
+        aria-hidden={!isActive ? true : undefined}
+        tabIndex={!isActive ? -1 : undefined}
+        onPlay={() => {
+          if (activeSlotRef.current === slot) setPlaying(true);
+        }}
+        onPause={() => {
+          if (activeSlotRef.current === slot) {
+            setPlaying(false);
+            syncSeek();
+            if (dotRef.current) dotRef.current.style.opacity = "";
+          }
+        }}
+        onEnded={() => advanceSegment(slot)}
+        aria-label={isActive ? label : undefined}
+      />
+    );
   };
 
   return (
     <figure className={cn("relative", className)}>
       {/* A container, so the scale bar is sized in the frame's width (cqw), not its padded row's. */}
       <div
+        ref={containerRef}
         className={cn("@container relative w-full overflow-hidden bg-black lg:rounded-[2rem]", isSquare && "aspect-square")}
         style={isSquare ? undefined : { aspectRatio: `${video.width} / ${video.height}` }}
       >
-        <video
-          ref={ref}
-          className={cn("h-full w-full object-cover", feather && "specimen-feather")}
-          src={video.src}
-          poster={poster.src}
-          width={video.width}
-          height={video.height}
-          muted
-          loop
-          playsInline
-          preload="metadata"
-          onPlay={() => setPlaying(true)}
-          onPause={() => {
-            setPlaying(false);
-            syncSeek();
-            if (dotRef.current) dotRef.current.style.opacity = "";
-          }}
-          aria-label={`The ${world.name} preset, seed ${world.seed}, from tick ${grouped(world.from.tick)} to ${grouped(world.to.tick)}: organisms coloured by ${colour}${render.field_mapping === "none" ? "" : ` over the field's ${render.field_mapping}`}`}
-        />
+        {renderSlot(0)}
+        {MULTI_SEGMENT ? renderSlot(1) : null}
         <Reticle inset={14} size={18} />
 
         {/* What this is, on its face. */}

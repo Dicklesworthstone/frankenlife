@@ -14,8 +14,9 @@
 //   on it.)
 // - Each runs from tick 0 inside `flife render CONFIG` and is drawn at tick 0
 //   and at the tick the showcase scored (2,400), with the film's settings:
-//   1080 × 1080, the whole torus, no field, the sphere look, coloured by
-//   founder lineage lit by energy. The still is the last frame.
+//   `--size` × `--size` (default 1080; 2160 for 4K), the whole torus, no
+//   field, the sphere look, coloured by founder lineage lit by energy. The
+//   still is the last frame.
 // - The guard is the record: each world's digest at that tick must equal the
 //   digest experiments/showcase/confluent.json records for the trial it
 //   repeats (w80-o25, cw-chem, cw-fresh), and the full world's must equal the
@@ -41,7 +42,7 @@ import { arch, cpus, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { parseControlsArgs } from "./media-options";
+import { ASSET_LIMIT, parseControlsArgs } from "./media-options";
 
 const WEB = fileURLToPath(new URL("..", import.meta.url));
 const REPO = resolve(WEB, "..");
@@ -151,11 +152,21 @@ const RENDER = ["--ticks", String(TICK), "--every", String(TICK), "--width", Str
 const workers = cpuWorkers !== null ? ["--cpu-workers", String(cpuWorkers)] : [];
 
 const film = JSON.parse(readFileSync(join(WEB, "lib", "media.json"), "utf8")) as {
+  video?: { width?: number; height?: number };
   world: { preset: string | null; seed: number; from: { tick: number; digest: string } };
   poster: { src: string; sha256: string };
 };
 if (film.world.preset !== PRESET) fail(`the film's world is ${film.world.preset}, not ${PRESET}`);
 if (film.world.from.tick !== TICK) fail(`the film starts at tick ${film.world.from.tick}, not ${TICK}`);
+if (
+  film.video?.width !== undefined &&
+  film.video.width === film.video.height &&
+  film.video.width !== size
+) {
+  console.error(
+    `controls: warning: rendering ${size}×${size} stills while lib/media.json is ${film.video.width}×${film.video.height}; pass --size ${film.video.width} to match and reuse the poster byte for byte`,
+  );
+}
 const trials = (JSON.parse(readFileSync(join(REPO, RECORD_JSON), "utf8")) as {
   trials: { trial: string; model: string; seed: number; tick: number; live: number; distance: number; digest: string }[];
 }).trials;
@@ -244,6 +255,10 @@ const stills = CONDITIONS.map((condition) => {
   const png = String(last.path);
   const jpeg = join(dir, "still.jpg");
   run("ffmpeg", ["-y", "-loglevel", "error", "-i", png, ...JPEG, jpeg]);
+  const bytes = readFileSync(jpeg).length;
+  if (bytes > ASSET_LIMIT) {
+    fail(`${jpeg} is ${bytes} bytes, above Cloudflare's 25 MiB asset limit`);
+  }
   const hash = sha256(jpeg);
   // The film's world at the film's first tick, drawn and encoded as the poster was, is the poster byte for
   // byte; the page then serves (and the reader has cached) one file, not two.
@@ -260,7 +275,7 @@ const stills = CONDITIONS.map((condition) => {
     src: poster ? film.poster.src : `/media/${name}`,
     poster,
     sha256: hash,
-    bytes: readFileSync(jpeg).length,
+    bytes,
     width: size,
     height: size,
     tick: TICK,

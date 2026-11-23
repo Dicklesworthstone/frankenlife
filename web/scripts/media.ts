@@ -3,7 +3,8 @@
 //
 //   bun scripts/media.ts --flife PATH (--run-dir DIR | --config PATH) --work DIR
 //     [--ticks 9600] [--every 32] [--size 1080 | --width 3840 --height 2160]
-//     [--fps 30|60] [--crf 24] [--master-out PATH] [--master-crf 16]
+//     [--fps 30|60] [--crf 24] [--segments auto|N] [--segment-max-mib 22]
+//     [--master-out PATH] [--master-crf 16]
 //     [--camera auto|none]
 //     [--field energy|composition|component-C|trail-carrier|vascular-conductance|none]
 //     [--look glow|raw|sphere]
@@ -61,9 +62,14 @@ import {
 import {
   ASSET_LIMIT,
   SOCIAL_CROP_VF,
+  type SegmentRange,
   buildMasterEncodeArgs,
+  buildSegmentEncodeArgs,
   buildWebEncodeArgs,
+  cloudflareCeilingKbps,
   parseMediaArgs,
+  planSegmentRanges,
+  splitSegmentRange,
 } from "./media-options";
 
 const WEB = fileURLToPath(new URL("..", import.meta.url));
@@ -132,6 +138,8 @@ const {
   height,
   fps,
   crf,
+  segments: segmentMode,
+  segmentMaxBytes,
   masterOut,
   masterCrf,
   cameraMode,
@@ -325,20 +333,171 @@ if (provenance.camera && existsSync(previewRecords)) {
   }
 }
 
-const encode = buildWebEncodeArgs(crf, shown.length, fps);
-const video = join(work, "film.mp4");
+const ticksList = shown.map((record) => record.tick as number);
 const first = join(frames, "frame-000000.png");
-run("ffmpeg", [
-  "-y",
-  "-loglevel",
-  "error",
-  "-framerate",
-  String(fps),
-  "-i",
-  join(frames, "frame-%06d.png"),
-  ...encode,
-  video,
-]);
+
+type EncodedSegment = {
+  src: string;
+  sha256: string;
+  bytes: number;
+  start_frame: number;
+  frames: number;
+  start_tick: number;
+  end_tick: number;
+};
+
+/**
+ * Encode one segment range at full CRF quality (closed GOP, faststart). If the
+ * resulting segment still exceeds `segmentMaxBytes` (or 24 MiB), recursively
+ * subdivide at an interior camera boundary (or midpoint) so 4K60 never starves
+ * bitrate to cram into Cloudflare's 25 MiB per-asset limit.
+ */
+const HARD_SEGMENT_LIMIT = Math.min(segmentMaxBytes, 24 * 1024 * 1024);
+const MIN_SUBDIVIDE_FRAMES = Math.max(2, Math.min(fps, 15));
+const segmentWorkDir = join(work, "segments");
+let segmentSeq = 0;
+
+function encodeRangeChecked(
+  range: SegmentRange,
+  outSegments: { path: string; range: SegmentRange; encode: string[] }[],
+): void {
+  mkdirSync(segmentWorkDir, { recursive: true });
+  const tempPath = join(segmentWorkDir, `seg-${String(segmentSeq).padStart(4, "0")}.mp4`);
+  segmentSeq += 1;
+  const segEncode = buildSegmentEncodeArgs(crf, fps);
+  run("ffmpeg", [
+    "-y",
+    "-loglevel",
+    "error",
+    "-framerate",
+    String(fps),
+    "-start_number",
+    String(range.startFrame),
+    "-i",
+    join(frames, "frame-%06d.png"),
+    "-frames:v",
+    String(range.frames),
+    ...segEncode,
+    tempPath,
+  ]);
+  const bytes = readFileSync(tempPath).length;
+  if (bytes <= HARD_SEGMENT_LIMIT) {
+    outSegments.push({ path: tempPath, range, encode: segEncode });
+    return;
+  }
+  if (range.frames >= MIN_SUBDIVIDE_FRAMES * 2) {
+    console.error(
+      `media: segment [${range.startFrame}..${range.startFrame + range.frames}) was ${(bytes / (1024 * 1024)).toFixed(2)} MiB > ${(HARD_SEGMENT_LIMIT / (1024 * 1024)).toFixed(1)} MiB; subdividing`,
+    );
+    const [left, right] = splitSegmentRange(range, ticksList, provenance.camera?.keys);
+    encodeRangeChecked(left, outSegments);
+    encodeRangeChecked(right, outSegments);
+    return;
+  }
+  if (bytes <= ASSET_LIMIT) {
+    outSegments.push({ path: tempPath, range, encode: segEncode });
+    return;
+  }
+  // Last-resort clamp for an extraordinarily dense short segment so ASSET_LIMIT is never violated.
+  const fallbackKbps = cloudflareCeilingKbps(range.frames, fps, ASSET_LIMIT);
+  const clampedEncode = buildSegmentEncodeArgs(crf, fps, fallbackKbps);
+  run("ffmpeg", [
+    "-y",
+    "-loglevel",
+    "error",
+    "-framerate",
+    String(fps),
+    "-start_number",
+    String(range.startFrame),
+    "-i",
+    join(frames, "frame-%06d.png"),
+    "-frames:v",
+    String(range.frames),
+    ...clampedEncode,
+    tempPath,
+  ]);
+  outSegments.push({ path: tempPath, range, encode: clampedEncode });
+}
+
+let encode: string[];
+let primaryVideo: { src: string; sha256: string; bytes: number };
+let publishedSegments: EncodedSegment[] | undefined;
+
+if (segmentMode === 1) {
+  encode = buildWebEncodeArgs(crf, shown.length, fps);
+  const video = join(work, "film.mp4");
+  run("ffmpeg", [
+    "-y",
+    "-loglevel",
+    "error",
+    "-framerate",
+    String(fps),
+    "-i",
+    join(frames, "frame-%06d.png"),
+    ...encode,
+    video,
+  ]);
+  primaryVideo = publish(video, "film", "mp4");
+} else if (segmentMode === "auto") {
+  // Encode cleanly at CRF without starving bitrate first; if it fits in one Cloudflare-safe file,
+  // keep a single file, otherwise split across natural camera cuts at full quality.
+  const probeEncode = buildSegmentEncodeArgs(crf, fps);
+  const video = join(work, "film.mp4");
+  run("ffmpeg", [
+    "-y",
+    "-loglevel",
+    "error",
+    "-framerate",
+    String(fps),
+    "-i",
+    join(frames, "frame-%06d.png"),
+    ...probeEncode,
+    video,
+  ]);
+  const wholeBytes = readFileSync(video).length;
+  if (wholeBytes <= HARD_SEGMENT_LIMIT) {
+    encode = probeEncode;
+    primaryVideo = publish(video, "film", "mp4");
+  } else {
+    const targetCount = Math.max(2, Math.ceil(wholeBytes / HARD_SEGMENT_LIMIT));
+    console.error(
+      `media: single CRF ${crf} file is ${(wholeBytes / (1024 * 1024)).toFixed(2)} MiB > ${(HARD_SEGMENT_LIMIT / (1024 * 1024)).toFixed(1)} MiB; splitting into ~${targetCount} Cloudflare-safe segments`,
+    );
+    const planned = planSegmentRanges(shown.length, ticksList, provenance.camera?.keys, targetCount);
+    const encoded: { path: string; range: SegmentRange; encode: string[] }[] = [];
+    for (const range of planned) encodeRangeChecked(range, encoded);
+    encode = encoded[0]?.encode ?? probeEncode;
+    publishedSegments = encoded.map((item, idx) => {
+      const pub = publish(item.path, `film-seg${String(idx).padStart(2, "0")}`, "mp4");
+      return {
+        ...pub,
+        start_frame: item.range.startFrame,
+        frames: item.range.frames,
+        start_tick: ticksList[item.range.startFrame]!,
+        end_tick: ticksList[item.range.startFrame + item.range.frames - 1]!,
+      };
+    });
+    const head = publishedSegments[0]!;
+    primaryVideo = { src: head.src, sha256: head.sha256, bytes: head.bytes };
+  }
+} else {
+  const planned = planSegmentRanges(shown.length, ticksList, provenance.camera?.keys, segmentMode);
+  const encoded: { path: string; range: SegmentRange; encode: string[] }[] = [];
+  for (const range of planned) encodeRangeChecked(range, encoded);
+  encode = encoded[0]?.encode ?? buildSegmentEncodeArgs(crf, fps);
+  publishedSegments = encoded.map((item, idx) => {
+    const pub = publish(item.path, `film-seg${String(idx).padStart(2, "0")}`, "mp4");
+    return {
+      ...pub,
+      start_frame: item.range.startFrame,
+      frames: item.range.frames,
+      start_tick: ticksList[item.range.startFrame]!,
+      end_tick: ticksList[item.range.startFrame + item.range.frames - 1]!,
+    };
+  });
+  const head = publishedSegments[0]!;
+  primaryVideo = { src: head.src, sha256: head.sha256, bytes: head.bytes };
+}
 
 let master:
   | { path: string; sha256: string; bytes: number; crf: number; encode: string[] }
@@ -369,12 +528,7 @@ if (masterOut !== null) {
 
 const poster = join(work, "poster.jpg");
 run("ffmpeg", ["-y", "-loglevel", "error", "-i", first, "-q:v", "3", poster]);
-const card = provenance.camera
-  ? cardFrame(
-      provenance.camera.keys,
-      shown.map((record) => record.tick as number),
-    )
-  : 0;
+const card = provenance.camera ? cardFrame(provenance.camera.keys, ticksList) : 0;
 const cardSource = join(frames, `frame-${String(card).padStart(6, "0")}.png`);
 if (!existsSync(cardSource)) fail(`the social card's frame ${cardSource} is missing`);
 const social = join(work, "social.jpg");
@@ -389,12 +543,13 @@ const commandSource =
 const manifest = {
   schema: "frankenlife.website-media.v1",
   video: {
-    ...publish(video, "film", "mp4"),
+    ...primaryVideo,
     width,
     height,
     fps,
     frames: shown.length,
     encode,
+    ...(publishedSegments && publishedSegments.length > 1 ? { segments: publishedSegments } : {}),
     ...(master ? { master } : {}),
   },
   poster: { ...publish(poster, "poster", "jpg"), frame: 0 },
@@ -409,7 +564,7 @@ const manifest = {
     timestep: world.timestep,
     model: world.model,
     from: { tick: from.tick, digest: from.digest },
-    ticks: shown.map((record) => record.tick as number),
+    ticks: ticksList,
     live: shown.map((record) => record.live as number),
     every,
     to: { tick: end.tick as number, digest: end.digest as string },
@@ -434,6 +589,11 @@ const manifest = {
   },
 };
 writeFileSync(join(WEB, "lib", "media.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+const totalBytes = publishedSegments
+  ? publishedSegments.reduce((sum, seg) => sum + seg.bytes, 0)
+  : manifest.video.bytes;
 console.error(
-  `media: ${shown.length} frames at ${width}×${height} ${fps} fps, ticks ${from.tick} to ${String(end.tick)}, video ${manifest.video.bytes} bytes`,
+  `media: ${shown.length} frames at ${width}×${height} ${fps} fps${
+    publishedSegments && publishedSegments.length > 1 ? ` in ${publishedSegments.length} segments` : ""
+  }, ticks ${from.tick} to ${String(end.tick)}, video ${totalBytes} bytes`,
 );

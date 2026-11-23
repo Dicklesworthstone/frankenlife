@@ -497,9 +497,12 @@ export function BrainAnatomy() {
           <div className="rounded-2xl border border-amber-300/20 bg-amber-300/[0.04] p-4">
             <p className="text-[10px] font-black tracking-[0.2em] text-amber-200/80 uppercase">No motor output</p>
             <p className="mt-2 text-xs leading-relaxed text-slate-300">
-              Nothing here steers. An organism moves by inherited responses to the same energy and chemical
-              gradients, scaled by how much it was just granted to eat (plan §5.4). The network decides when to
-              split, what to give the child, and what to write into the field.
+              In baseline FieldEcologyV1 nothing here steers: an organism moves by inherited responses to the same
+              energy and chemical gradients, scaled by how much it was just granted to eat (plan §5.4). The network
+              decides when to split, what to give the child, and what to write into the field. Optional neural steering
+              (<code className="text-amber-100">so2-motor</code>) and oriented budding (
+              <code className="text-amber-100">so2-budding</code>) live in modular{" "}
+              <code className="text-amber-100">field-ecology-v2</code> (§03.5).
             </p>
           </div>
         </div>

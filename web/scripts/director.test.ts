@@ -88,6 +88,26 @@ describe("direct", () => {
       expect(distance(firsts[i]!, firsts[i - 1]!)).toBeGreaterThan(64);
     }
   });
+  test("801-frame true-60fps cadence (ticks 2,400..5,600, every 4) keeps exact 3-shot wall-clock parity with 401f/30fps", () => {
+    const frameCount = 801;
+    const ticks = Array.from({ length: frameCount }, (_, f) => 2400 + 4 * f);
+    const frames = Array.from({ length: frameCount }, (_, t) => disc([(10 + Math.floor(t / 2)) % GRID, 64]));
+    const opts60 = {
+      opening: Math.round(frameCount * 0.08), // 64 frames = 1.07s at 60fps
+      transition: Math.round(frameCount * 0.07), // 56 frames = 0.93s
+      dwell: Math.round(frameCount * 0.16), // 128 frames = 2.13s
+      closing: Math.round(frameCount * 0.06), // 48 frames = 0.80s
+      zooms: [1.6, 3, 2.2, 5, 2.6],
+    };
+    const keys = direct(ticks, activities(frames), [80, 80], opts60);
+    // 10 keys: open(0..64), shot0(120..248), shot1(304..432), shot2(488..616), close(672..800).
+    expect(keys).toHaveLength(10);
+    expect(keys.map((k) => k.tick)).toEqual([2400, 2656, 2880, 3392, 3616, 4128, 4352, 4864, 5088, 5600]);
+    expect(keys.map((k) => k.zoom)).toEqual([1, 1, 1.6, 1.6, 3, 3, 2.2, 2.2, 1, 1]);
+    // Closest shot is zoom=3 across ticks 3616..4128 -> middle tick 3872 is frame 368 (exact match to 30fps frame 184!).
+    expect(cardFrame(keys, ticks)).toBe(368);
+    expect(ticks[cardFrame(keys, ticks)]).toBe(3872);
+  });
 });
 
 describe("cardFrame", () => {

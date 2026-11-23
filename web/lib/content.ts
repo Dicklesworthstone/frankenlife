@@ -343,7 +343,7 @@ export const worldModel = [
   },
   {
     name: "Decisions",
-    body: "36 outputs: a reproduction hazard, a child's energy share, an emission gate, a 32-dimensional emission direction and a spending rate. No motor output.",
+    body: "36 baseline outputs: a reproduction hazard, a child's energy share, an emission gate, a 32-dimensional emission direction and a spending rate, with no motor output on v1 (modular field-ecology-v2 appends optional SO(2) motor, budding, EMT and recurrent channels; §03.5).",
   },
   {
     name: "Uptake",
@@ -611,7 +611,7 @@ export const v2BuildStatus: {
     claim: "Rules & Implementation",
     tone: "built",
     detail:
-      "V2-01 21-slug config/registry and founding CLI toggles (--list-features, --disable, --enable, --v1-compat, INV-14 resume refusal); flife-field (86/86 tests) and flife-neural (35/35 tests) verified at commit d6352a0; V2-16 pure INV-09 visual mappings and Studio keys 8/9/C; V2-10 preregistered quickie harness and V2-17 Bundle A/B presets authored; FL-050 1080p/4K Cinema export options wired in flife-studio.",
+      "V2-01 21-slug config/registry and founding CLI toggles (--list-features, --disable, --enable, --v1-compat, INV-14 resume refusal); V2-02 (oases), V2-06 (so2-budding) and V2-09 (tight-junctions) verified and closed alongside flife-field (86/86 tests) and flife-neural (35/35 tests) at commit d6352a0; V2-16 pure INV-09 visual mappings and Studio keys 8/9/C; V2-10 preregistered quickie harness and V2-17 Bundle A/B presets authored; FL-050 1080p/4K Cinema export options wired in flife-studio.",
   },
   {
     stage: "In flight",

@@ -196,6 +196,19 @@ impl Stream {
             operation: "stream checkpoint",
             detail: "a chunk ended that never began".into(),
         })?;
+        let written = file
+            .metadata()
+            .map_err(|error| storage("inspect temporary file", &temporary, &error))?
+            .len();
+        if written != length {
+            return Err(CoreError::StateConflict {
+                operation: "stream checkpoint",
+                detail: format!(
+                    "chunk {} ended at {length} bytes, its file holds {written}",
+                    family.name()
+                ),
+            });
+        }
         let flushes = matches!(self.durability, Durability::PowerLoss);
         let target = chunk_path_in(&self.root, &digest);
         match stored_as(&target, length, &digest)? {
@@ -210,19 +223,6 @@ impl Stream {
             }
             Stored::Absent => self.publication.written += 1,
             Stored::Damaged => self.publication.repaired += 1,
-        }
-        let written = file
-            .metadata()
-            .map_err(|error| storage("inspect temporary file", &temporary, &error))?
-            .len();
-        if written != length {
-            return Err(CoreError::StateConflict {
-                operation: "stream checkpoint",
-                detail: format!(
-                    "chunk {} ended at {length} bytes, its file holds {written}",
-                    family.name()
-                ),
-            });
         }
         // The donor's intact copy replaces the pages written, as
         // `publish_sharing` links one rather than writing it.

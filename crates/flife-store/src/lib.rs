@@ -435,10 +435,16 @@ impl ChunkStore {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let foreign = fs::read_dir(&root)
-                    .map_err(|error| storage("list store", &root, &error))?
-                    .filter_map(Result::ok)
-                    .any(|entry| entry.file_name() != LOCK);
+                let mut foreign = false;
+                for entry in
+                    fs::read_dir(&root).map_err(|error| storage("list store", &root, &error))?
+                {
+                    let entry = entry.map_err(|error| storage("list store", &root, &error))?;
+                    if entry.file_name() != LOCK {
+                        foreign = true;
+                        break;
+                    }
+                }
                 if foreign {
                     return Err(CoreError::StateConflict {
                         operation: "create checkpoint store",
@@ -773,7 +779,12 @@ impl ChunkStore {
                     entry.family.name()
                 )));
             }
-            offset = offset.saturating_add(entry.length);
+            offset = offset.checked_add(entry.length).ok_or_else(|| {
+                refuse(format!(
+                    "chunk {} overflows payload offset",
+                    entry.family.name()
+                ))
+            })?;
             let path = self.chunk_path(digest);
             let present = fs::symlink_metadata(&path)
                 .is_ok_and(|metadata| metadata.is_file() && metadata.len() == *length);
@@ -897,7 +908,12 @@ impl ChunkStore {
         for (index, entry) in manifest.entries().iter().enumerate() {
             let bytes = usize::try_from(entry.offset)
                 .ok()
-                .zip(usize::try_from(entry.offset.saturating_add(entry.length)).ok())
+                .zip(
+                    entry
+                        .offset
+                        .checked_add(entry.length)
+                        .and_then(|end| usize::try_from(end).ok()),
+                )
                 .and_then(|(start, end)| payload.get(start..end))
                 .ok_or_else(|| {
                     refuse(format!(
@@ -1055,11 +1071,15 @@ impl ChunkStore {
             .entries()
             .iter()
             .filter(|entry| Some(entry.family) == streamed)
-            .map(|entry| entry.length)
-            .sum::<u64>();
+            .try_fold(0_u64, |sum, entry| sum.checked_add(entry.length))
+            .ok_or_else(|| refuse(format!("checkpoint {sequence} is too large for this host")))?;
+        let held_payload = manifest
+            .payload_length()
+            .checked_sub(left)
+            .ok_or_else(|| refuse(format!("checkpoint {sequence} is too large for this host")))?;
         let total = u64::try_from(prefix.len())
             .ok()
-            .and_then(|sealed| sealed.checked_add(manifest.payload_length().saturating_sub(left)))
+            .and_then(|sealed| sealed.checked_add(held_payload))
             .and_then(|total| usize::try_from(total).ok())
             .ok_or_else(|| refuse(format!("checkpoint {sequence} is too large for this host")))?;
         let mut bytes = Vec::new();

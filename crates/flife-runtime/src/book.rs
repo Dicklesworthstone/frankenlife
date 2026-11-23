@@ -543,16 +543,17 @@ impl CommandBook {
             operation: "recover command book",
             detail,
         };
+        let mut staged = self.clone();
         for (position, (command, accepted)) in journal.accepted.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
-            if accepted.order != position || command.session != self.admitted_by(position) {
+            if accepted.order != position || command.session != staged.admitted_by(position) {
                 return Err(conflict(format!(
                     "journal acceptance {position} is {} of session {} in order {}",
                     command.id, command.session, accepted.order
                 )));
             }
             let content = command.content_hash();
-            if let Some(record) = self.records.get(&command.id) {
+            if let Some(record) = staged.records.get(&command.id) {
                 if record.content != content
                     || record.accepted.order != accepted.order
                     || record.accepted.effective != accepted.effective
@@ -565,10 +566,10 @@ impl CommandBook {
                 }
                 continue;
             }
-            if accepted.order != self.next_order {
+            if accepted.order != staged.next_order {
                 return Err(conflict(format!(
                     "journal acceptance {} ({}) is not in the checkpoint, which admitted {}",
-                    accepted.order, command.id, self.next_order
+                    accepted.order, command.id, staged.next_order
                 )));
             }
             if accepted.effective < committed {
@@ -579,9 +580,10 @@ impl CommandBook {
                     committed.get()
                 )));
             }
-            self.pending
+            staged
+                .pending
                 .insert((accepted.effective, accepted.order), command.id);
-            self.records.insert(
+            staged.records.insert(
                 command.id,
                 Record {
                     content,
@@ -593,23 +595,27 @@ impl CommandBook {
                     status: CommandStatus::Pending,
                 },
             );
-            self.next_order += 1;
+            staged.next_order = staged
+                .next_order
+                .checked_add(1)
+                .ok_or_else(|| conflict("admission order overflow".into()))?;
         }
         let journaled = u64::try_from(journal.accepted.len()).unwrap_or(u64::MAX);
-        if journaled < self.next_order {
+        if journaled < staged.next_order {
             return Err(conflict(format!(
                 "the journal holds {journaled} acceptances; the checkpoint admitted {}",
-                self.next_order
+                staged.next_order
             )));
         }
-        if journal.outcomes.len() < self.outcomes.len() {
+        if journal.outcomes.len() < staged.outcomes.len() {
             return Err(conflict(format!(
                 "the journal holds {} outcomes; the checkpoint's stream {}",
                 journal.outcomes.len(),
-                self.outcomes.len()
+                staged.outcomes.len()
             )));
         }
         let mut replay = Vec::new();
+        let mut replayed = BTreeSet::new();
         for (cursor, (id, outcome)) in journal.outcomes.iter().enumerate() {
             let at = u64::try_from(cursor).unwrap_or(u64::MAX);
             if outcome.cursor() != at {
@@ -618,8 +624,8 @@ impl CommandBook {
                     outcome.cursor()
                 )));
             }
-            if let Some(&recorded) = self.outcomes.get(cursor) {
-                if recorded != *id || self.outcome_at(at).map(|(_, held)| held) != Some(outcome) {
+            if let Some(&recorded) = staged.outcomes.get(cursor) {
+                if recorded != *id || staged.outcome_at(at).map(|(_, held)| held) != Some(outcome) {
                     return Err(conflict(format!(
                         "outcome {at} differs between the journal and the checkpoint"
                     )));
@@ -631,7 +637,16 @@ impl CommandBook {
                 Outcome::Cancelled { boundary, .. } => *boundary < committed,
                 Outcome::Failed { .. } => false,
             };
-            if passed || !self.records.contains_key(id) {
+            let Some(record) = staged.records.get(id) else {
+                return Err(conflict(format!(
+                    "journal outcome {at} for {id} cannot be reached from tick {}",
+                    committed.get()
+                )));
+            };
+            if passed
+                || matches!(record.status, CommandStatus::Terminal(_))
+                || !replayed.insert(*id)
+            {
                 return Err(conflict(format!(
                     "journal outcome {at} for {id} cannot be reached from tick {}",
                     committed.get()
@@ -639,6 +654,7 @@ impl CommandBook {
             }
             replay.push((*id, outcome.clone()));
         }
+        *self = staged;
         Ok(replay)
     }
 
@@ -954,13 +970,26 @@ impl CommandBook {
             let status = match input.u8()? {
                 0 => CommandStatus::Pending,
                 1 => CommandStatus::Sealed,
-                2 => CommandStatus::Terminal(Outcome::Applied {
-                    tick: Tick::new(input.u64()?),
-                    published: Tick::new(input.u64()?),
-                    epoch: ResourceEpoch::new(input.u64()?),
-                    applied: input.f64()?,
-                    cursor: input.u64()?,
-                }),
+                2 => {
+                    let tick = Tick::new(input.u64()?);
+                    let published = Tick::new(input.u64()?);
+                    let epoch = ResourceEpoch::new(input.u64()?);
+                    let applied = input.f64()?;
+                    let cursor = input.u64()?;
+                    if !applied.is_finite() {
+                        return Err(refuse(format!(
+                            "{} holds a non-finite applied amount {applied}",
+                            command.id
+                        )));
+                    }
+                    CommandStatus::Terminal(Outcome::Applied {
+                        tick,
+                        published,
+                        epoch,
+                        applied,
+                        cursor,
+                    })
+                }
                 3 => CommandStatus::Terminal(Outcome::Cancelled {
                     boundary: Tick::new(input.u64()?),
                     reason: match input.u8()? {

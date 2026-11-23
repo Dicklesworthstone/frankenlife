@@ -2011,7 +2011,7 @@ impl SessionOwner {
             }
             if discard {
                 candidate.cancel();
-                for reply in pause {
+                for reply in pause.into_iter().rev() {
                     deferred.push_front(Control::Pause(reply));
                 }
                 if !closing.is_empty() || cx.checkpoint().is_err() {
@@ -2021,11 +2021,19 @@ impl SessionOwner {
             }
             let report = match candidate.publish() {
                 Ok(report) => report,
-                Err(error) => return Ticked::Failed(error),
+                Err(error) => {
+                    for reply in pause.into_iter().rev() {
+                        deferred.push_front(Control::Pause(reply));
+                    }
+                    return Ticked::Failed(error);
+                }
             };
             let applied = sealed.iter().map(|&(id, _)| id).collect();
             let from = book.outcome_cursor();
             if let Err(error) = book.published(&report, &sealed) {
+                for reply in pause.into_iter().rev() {
+                    deferred.push_front(Control::Pause(reply));
+                }
                 return Ticked::Failed(error);
             }
             if let Some(journal) = journal {
@@ -2135,6 +2143,12 @@ impl SessionOwner {
                         if !self.closing.is_empty() || cx.checkpoint().is_err() {
                             break 'session;
                         }
+                        // A `Step` handled here can defer newer control
+                        // messages at its cancellation boundary; drain them
+                        // before popping further control messages or parking.
+                        if !self.deferred.is_empty() {
+                            continue 'session;
+                        }
                     }
                     Err(mpsc::RecvError::Disconnected) => {
                         abandoned = true;
@@ -2192,7 +2206,10 @@ impl SessionOwner {
             // journal receipt needed by a held request or active run.
             self.reach_hold();
             self.settle_receipts();
-            if self.has_ready_held() || (self.run.is_some() && !self.holding()) {
+            if !self.deferred.is_empty()
+                || self.has_ready_held()
+                || (self.run.is_some() && !self.holding())
+            {
                 continue 'session;
             }
             let room = self.room();

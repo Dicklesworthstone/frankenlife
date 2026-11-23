@@ -482,20 +482,24 @@ pub(crate) async fn close(
 ) -> Result<Boundary, CoreError> {
     if let Some(shared) = shared
         && let Ok(mut chain) = OwnedMutexGuard::lock(Arc::clone(shared), cx).await
-        && let Some(kept) = chain.as_mut()
     {
-        match paused {
-            Ok(_) => {
-                if let Ok(at) = committed(cx, handle).await
-                    && !at.stopped
-                    && !kept.closes(&at)
-                {
-                    let _ = take(cx, handle, kept, report).await;
+        if let Some(kept) = chain.as_mut() {
+            match paused {
+                Ok(_) => {
+                    if let Ok(at) = committed(cx, handle).await
+                        && !at.stopped
+                        && !kept.closes(&at)
+                    {
+                        let _ = take(cx, handle, kept, report).await;
+                    }
                 }
+                Err(error) => unkept(&error, report),
             }
-            Err(error) => unkept(&error, report),
+            let _ = drain(cx, handle, &mut kept.checkpoints, report).await;
         }
-        let _ = drain(cx, handle, &mut kept.checkpoints, report).await;
+        // Explicitly drop `Checkpoints` (releasing the chunk-store writer lock)
+        // before suspending the session or awaiting watcher teardown.
+        *chain = None;
     }
     handle.suspend(cx).await
 }

@@ -26,8 +26,10 @@ decodes. The FrankenTorch population adapter is FL-025 and the Metal kernels are
 initialization are FL-009. Applying decoded actions (emission, reproduction) is FL-011.
 
 **Inputs.**
-- A `flife_field::RawSample`: the blended raw densities `R`, `M_0..M_31` and their physical derivatives along x
-  and y, per world-length, taken from a `PyramidView` built from this tick's observation snapshot.
+- A `flife_field::RawSample` (33-plane single-carrier) or `flife_field::DualRawSample` (`V2-15` 34-plane
+  dual-carrier): the blended raw densities `R` (`R_0`, `R_1`), moments (`M_0..M_31` or `M^(0)_0..23` + `M^(1)_0..7`)
+  and their physical derivatives along x and y, per world-length, taken from a `PyramidView` built from this tick's
+  observation snapshot.
 - An organism's `Intrinsic` state: internal energy, age in simulated seconds, velocity, and the committed energy
   change rate of the last tick.
 - `SensorScales` (`[sensors]`): `R_scale`, `L_gradient`, `R_floor`, `E_scale`, the age, velocity and
@@ -47,6 +49,13 @@ initialization are FL-009. Applying decoded actions (emission, reproduction) is 
     and `tanh(ΔE/change_scale)`;
   - `gradients`: the unsaturated `[∂/∂x, ∂/∂y]` of `q` and each `Z_k`, with `∂q = R_scale ∂R/(R + R_scale)²`
     and `∂Z = (∂M − Z ∂R)/(R + R_floor)`. These are what motion uses (§5.4).
+- `observe_dual` / `observe_dual_for_controller` (`V2-15` `dual-carrier-trails`) return a `DualObservation`:
+  - `base`: an `Observation` whose `inputs[0]` / `gradients[0]` come from Carrier 0 `R_0`, whose `Z_{0..23}` and
+    `gradients[1..25]` normalize Carrier-0 moments by `R_0 + R_floor`, and whose `Z_{24..31}` and `gradients[25..33]`
+    normalize Carrier-1 trail moments independently by `R_1 + R_floor` (decoupled from `R_0`);
+  - `trail_inputs[4]`: `[q_1, tanh(L_gradient ∂_x q_1), tanh(L_gradient ∂_y q_1), ||Z^(1)||_2.min(1.0)]` where
+    `q_1 = R_1 / (R_1 + R_scale_1)` and `∂q_1 = R_scale_1 ∂R_1 / (R_1 + R_scale_1)²`, appended to the 4
+    `SensorLayout::trail_slots()` slots (`V2-15` / Bundle B 108 inputs).
 - `decode` / `decode_slice` return `DecodedActions` for the baseline 36 outputs (`motor`, `budding`, `emt_gate`,
   `wake_pump` all `None`):
   - `attempt_rate = λ_max σ(o_0)` and `attempt_probability = 1 − e^(−λΔt)`;

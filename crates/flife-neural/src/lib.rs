@@ -48,7 +48,7 @@ pub use controller::{
     widen_slice,
 };
 pub use sensors::{
-    Intrinsic, MAX_SENSOR_WIDTH, Observation, SENSOR_WIDTH, SensorLayout, SensorScales, observe,
-    observe_for_controller,
+    DualObservation, Intrinsic, MAX_SENSOR_WIDTH, Observation, SENSOR_WIDTH, SensorLayout,
+    SensorScales, observe, observe_dual, observe_dual_for_controller, observe_for_controller,
 };
 pub use weights::{Weight, WeightDtype, Weights};

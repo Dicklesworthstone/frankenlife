@@ -90,8 +90,13 @@ fn timeline_text(records: &[TimelineRecord]) -> String {
 /// `CoreError::BudgetExhausted`.
 #[test]
 fn fl043_cinema_1080p_and_4k_export_admission_accounts_buffers_and_refuses_tight_budgets() {
+    // A full 16,384-organism Reference world (1.125 GiB genome quota) exporting
+    // lossless 4K PNG + y4m honestly requires ~2.33 GiB (exceeding the default
+    // 2 GiB Reference preset budget), so use a 4 GiB Cinema headroom budget
+    // here and explicitly verify below that the 2 GiB Reference preset admits
+    // 1080p while refusing 4K with `CoreError::BudgetExhausted`.
     let base_toml = preset_with(
-        &[("maximum_total_bytes", "2147483648")],
+        &[("maximum_total_bytes", "4294967296")],
         "field-ecology-v1",
         false,
     );
@@ -187,9 +192,49 @@ fn fl043_cinema_1080p_and_4k_export_admission_accounts_buffers_and_refuses_tight
         );
     }
 
+    // Default 2 GiB Reference preset honestly admits 1080p Cinema export while
+    // refusing 4K Cinema export (~2.33 GiB peak) with BudgetExhausted.
+    let ref_2gib_cfg = ValidatedConfig::from_toml(PRESET).expect("valid 2 GiB preset");
+    let ref_world = found(&ref_2gib_cfg);
+    let ref_epoch = Epoch::standalone(&ref_world).expect("epoch");
+    let mut ref_view = WorldView::for_epoch(&ref_epoch, [320, 200], [0, 0, 0]).expect("view");
+    ref_view.enable_overlay();
+    let ref_records = [
+        TimelineRecord::header(&ref_2gib_cfg, [320, 200], Style::default()),
+        TimelineRecord::End {
+            tick: 0,
+            digest: ref_world.digest().to_hex(),
+            applied: Vec::new(),
+        },
+    ];
+    admit_export(
+        &ref_world,
+        &ref_epoch,
+        &ref_view,
+        [320, 200],
+        &ref_records,
+        Some((CINEMA_1080P, 1.0)),
+        true,
+    )
+    .expect("2 GiB Reference preset admits 1080p export");
+    let ref_4k_err = admit_export(
+        &ref_world,
+        &ref_epoch,
+        &ref_view,
+        [320, 200],
+        &ref_records,
+        Some((CINEMA_4K, 2.0)),
+        true,
+    )
+    .expect_err("2 GiB Reference preset must honestly refuse 4K export");
+    assert!(
+        matches!(ref_4k_err, CoreError::BudgetExhausted { .. }),
+        "expected BudgetExhausted at 4K on 2 GiB Reference preset, got {ref_4k_err:?}"
+    );
+
     // V2-16 optional Epoch buffers scale honestly by REPLAY_SLOTS in 4K export admission.
     let v2_toml = preset_with(
-        &[("maximum_total_bytes", "2147483648")],
+        &[("maximum_total_bytes", "4294967296")],
         "field-ecology-v2",
         true,
     );
@@ -234,9 +279,19 @@ fn fl043_cinema_1080p_and_4k_export_admission_accounts_buffers_and_refuses_tight
         true,
     )
     .expect("v2 off 4K admits");
-    let expected_delta = (e_on.reserved_bytes() - e_off.reserved_bytes()) * REPLAY_SLOTS as u64;
-    assert!(expected_delta > 0);
-    assert_eq!(a_on.render - a_off.render, expected_delta);
+    let vp_4k = v_on
+        .viewport()
+        .resized(CINEMA_4K)
+        .expect("4K vp")
+        .with_pixels_per_point(2.0)
+        .expect("2x");
+    let epoch_delta = (e_on.reserved_bytes() - e_off.reserved_bytes()) * REPLAY_SLOTS as u64;
+    let view_delta = (v_on.reserved_bytes_for(&vp_4k) - v_off.reserved_bytes_for(&vp_4k))
+        + (v_on.frame_bytes() - v_off.frame_bytes())
+        + 2 * (v_on.preparation_limit() - v_off.preparation_limit());
+    assert!(epoch_delta > 0);
+    assert!(view_delta > 0);
+    assert_eq!(a_on.render - a_off.render, epoch_delta + view_delta);
 }
 
 /// FL-050 (G10): exact integer-tick simulation-time sampling has zero
@@ -335,10 +390,16 @@ fn fl050_simulation_time_sampling_and_camera_timeline_stability() {
         assert!(c1.zoom >= prev_zoom && c1.zoom <= MAXIMUM_ZOOM);
         prev_zoom = c1.zoom;
     }
-    // Midpoint crosses seam cleanly at x = 2.0 (250 + 6 = 256 -> 0, +2 -> 2.0) and geometric zoom = 2.0.
+    // Midpoint crosses seam cleanly at x = 0.0 (250 + 0.5 * 12 = 256 ≡ 0.0 mod 256)
+    // and geometric zoom = 2.0; tick 75 (smoothstep 0.84375) lands at 4.125 past the seam.
     let mid = camera.at(50, extent);
-    assert!((mid.center[0] - 2.0).abs() < 1e-12, "mid = {mid:?}");
+    assert!((mid.center[0] - 0.0).abs() < 1e-12, "mid = {mid:?}");
     assert!((mid.zoom - 2.0).abs() < 1e-12, "mid = {mid:?}");
+    let past_seam = camera.at(75, extent);
+    assert!(
+        (past_seam.center[0] - 4.125).abs() < 1e-12,
+        "past_seam = {past_seam:?}"
+    );
 }
 
 /// G10: `validate_timeline` and `export_cinema` reject corrupted timelines and
@@ -495,6 +556,22 @@ fn g10_validate_timeline_catches_corruption_and_enforces_v2_visual_gate_before_w
         ));
         assert!(matches!(
             validate_v2_style(&v2_off, style),
+            Err(CoreError::StateConflict { .. })
+        ));
+        // Library `Studio::open` enforces the same gate before opening any surface.
+        let bad_studio_opts = StudioOptions {
+            style,
+            surface: Surface::Offscreen {
+                scale: NonZeroU32::MIN,
+            },
+            ..StudioOptions::default()
+        };
+        assert!(matches!(
+            Studio::open(&v1_cfg, &bad_studio_opts),
+            Err(CoreError::StateConflict { .. })
+        ));
+        assert!(matches!(
+            Studio::open(&v2_off, &bad_studio_opts),
             Err(CoreError::StateConflict { .. })
         ));
 
@@ -667,7 +744,7 @@ fn g10_cinema_1080p_and_4k_simulation_time_export_with_v2_mappings_and_camera() 
             ("grid_height", "32"),
             ("initial_count", "48"),
             ("maximum_count", "256"),
-            ("maximum_total_bytes", "2147483648"),
+            ("maximum_total_bytes", "4294967296"),
         ],
         "field-ecology-v2",
         true,

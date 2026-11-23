@@ -381,4 +381,67 @@ ablation = "fixed-controller"
         exp.configuration(3, 1).expect("fixed").config().model,
         "field-ecology-v2-fixed-controller"
     );
+
+    // 8. `flife inspect --field` exposes `trail_energy` (V2-15) and
+    //    `vascular_conductance` (V2-14) on default `field-ecology-v2`, and
+    //    omits both when disabled (`--disable all-v2`).
+    let wave2_dir = dir.join("wave2_run");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&v2_path),
+        "--disable",
+        "all-v2",
+        "--enable",
+        "vascular-field,dual-carrier-trails",
+        "--ticks",
+        "8",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&wave2_dir),
+        "--checkpoint-every",
+        "8",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let (status, inspected_wave2, err) = flife(&["inspect", text(&wave2_dir), "--field"]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let field_rec = inspected_wave2
+        .iter()
+        .find(|record| record["record"] == "field")
+        .expect("field record");
+    let cells_x = field_rec["cells"][0].as_u64().expect("cells_x") as usize;
+    let cells_y = field_rec["cells"][1].as_u64().expect("cells_y") as usize;
+    let total_cells = cells_x * cells_y;
+    let trail = field_rec["trail_energy"]
+        .as_array()
+        .expect("trail_energy exposed when dual-carrier-trails enabled");
+    assert_eq!(trail.len(), total_cells);
+    let vascular = field_rec["vascular_conductance"]
+        .as_array()
+        .expect("vascular_conductance exposed when vascular-field enabled");
+    assert_eq!(vascular.len(), total_cells);
+    assert!(
+        vascular
+            .iter()
+            .all(|v| v.as_f64().is_some_and(|g| (0.01..=1.0).contains(&g)))
+    );
+
+    let (status, inspected_v1_field, err) = flife(&["inspect", text(&run_dir), "--field"]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let oases_only_field = inspected_v1_field
+        .iter()
+        .find(|record| record["record"] == "field")
+        .expect("field record");
+    assert!(
+        oases_only_field.get("trail_energy").is_none(),
+        "trail_energy must be omitted when dual-carrier-trails is disabled"
+    );
+    assert!(
+        oases_only_field.get("vascular_conductance").is_none(),
+        "vascular_conductance must be omitted when vascular-field is disabled"
+    );
 }

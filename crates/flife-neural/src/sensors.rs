@@ -22,8 +22,12 @@ use std::ops::Range;
 
 use flife_core::numerics::tanh_f64_as_f32;
 use flife_core::{CoreError, V2Abi, ValidatedConfig};
+use flife_field::grid::{
+    CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE,
+    CARRIER1_MOMENT_CHANNELS,
+};
 use flife_field::numerics::tanh;
-use flife_field::pyramid::{PLANES, RawSample};
+use flife_field::pyramid::{DualRawSample, PLANES, RawSample};
 
 use crate::controller::{
     INDEPENDENT_DENSE_MLP_V1, INDEPENDENT_RECURRENT_MLP_V1, MAXIMUM_RECURRENT_STATE_WIDTH,
@@ -584,4 +588,193 @@ fn observe_with(
         }
     }
     Ok(Observation { inputs, gradients })
+}
+
+/// One organism's encoded observation on a 34-plane dual-carrier hybrid field
+/// (`V2-15` `dual-carrier-trails`).
+///
+/// `base` holds the 104 baseline controller inputs (with `Z_{0..23}` normalized
+/// by `R_0 + R_floor` and `Z_{24..31}` normalized by `R_1 + R_floor` so trails
+/// never wash out near bright food) plus the exact 33 unsaturated motion
+/// gradients `[∂q_0, ∂Z_0..∂Z_31]`; `trail_inputs` holds the 4 appended
+/// Carrier-1 signals `[q_1, tanh(L ∂_x q_1), tanh(L ∂_y q_1), ||Z^(1)||_2.min(1.0)]`
+/// placed at [`SensorLayout::dual_carrier_trails`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DualObservation {
+    /// Base 104 controller inputs and 33 unsaturated motion gradients.
+    pub base: Observation,
+    /// Appended 4 Carrier-1 trail sensor channels (`q_1`, `tanh(L ∂_x q_1)`,
+    /// `tanh(L ∂_y q_1)`, `‖Z^(1)‖_2.min(1.0)`).
+    pub trail_inputs: [f64; DUAL_CARRIER_TRAIL_INPUTS],
+}
+
+/// Encode a 34-plane [`DualRawSample`] and `intrinsic` using `scales` and
+/// Carrier-1 energy density scale `trail_energy_density_scale` (`V2-15`).
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a nonpositive/nonfinite
+/// `trail_energy_density_scale`, negative or nonfinite densities (`R_0`, `R_1`),
+/// negative energy/age, or any nonfinite output.
+pub fn observe_dual(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+) -> Result<DualObservation, CoreError> {
+    observe_dual_with(raw, intrinsic, scales, trail_energy_density_scale, tanh)
+}
+
+/// [`observe_dual`] with `tanh_f64_as_f32` saturation matching an F32-input
+/// controller bit-for-bit.
+///
+/// # Errors
+/// As [`observe_dual`].
+pub fn observe_dual_for_controller(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+) -> Result<DualObservation, CoreError> {
+    observe_dual_with(raw, intrinsic, scales, trail_energy_density_scale, |v| {
+        tanh_f64_as_f32(v).map(f64::from)
+    })
+}
+
+fn observe_dual_with(
+    raw: &DualRawSample,
+    intrinsic: &Intrinsic,
+    scales: &SensorScales,
+    trail_energy_density_scale: f64,
+    saturate_fn: impl Fn(f64) -> Option<f64>,
+) -> Result<DualObservation, CoreError> {
+    let invalid =
+        |quantity: &'static str, detail: String| CoreError::NumericalInvalid { quantity, detail };
+    if !trail_energy_density_scale.is_finite() || trail_energy_density_scale <= 0.0 {
+        return Err(invalid(
+            "v2.carriers.trail_energy_density_scale",
+            format!("{trail_energy_density_scale} is not a positive scale"),
+        ));
+    }
+    let density0 = raw.values[0];
+    let density0_x = raw.dx[0];
+    let density0_y = raw.dy[0];
+    let c1_e = CARRIER1_ENERGY_PLANE as usize;
+    let density1 = raw.values[c1_e];
+    let density1_x = raw.dx[c1_e];
+    let density1_y = raw.dy[c1_e];
+    if !density0.is_finite() || density0 < 0.0 {
+        return Err(invalid(
+            "sensed energy density",
+            format!("{density0} is not a density"),
+        ));
+    }
+    if !density1.is_finite() || density1 < 0.0 {
+        return Err(invalid(
+            "sensed trail energy density",
+            format!("{density1} is not a density"),
+        ));
+    }
+    if !intrinsic.energy.is_finite() || intrinsic.energy < 0.0 {
+        return Err(invalid(
+            "internal energy",
+            format!("{} is not an energy", intrinsic.energy),
+        ));
+    }
+    if !intrinsic.age_seconds.is_finite() || intrinsic.age_seconds < 0.0 {
+        return Err(invalid(
+            "age",
+            format!("{} is not an age", intrinsic.age_seconds),
+        ));
+    }
+
+    let mut values = [0.0; PLANES];
+    let mut gradients = [[0.0; 2]; PLANES];
+    let shifted0 = density0 + scales.energy_density;
+    let slope0 = scales.energy_density / (shifted0 * shifted0);
+    values[0] = density0 / shifted0;
+    gradients[0] = [slope0 * density0_x, slope0 * density0_y];
+
+    let reg0 = density0 + scales.composition_floor;
+    let c0_count = CARRIER0_MOMENT_CHANNELS as usize;
+    for k in 0..c0_count {
+        let p = 1 + k;
+        let z = raw.values[p] / reg0;
+        values[p] = z;
+        gradients[p] = [
+            (raw.dx[p] - z * density0_x) / reg0,
+            (raw.dy[p] - z * density0_y) / reg0,
+        ];
+    }
+
+    let reg1 = density1 + scales.composition_floor;
+    let c1_first = CARRIER1_FIRST_MOMENT_PLANE as usize;
+    let c1_count = CARRIER1_MOMENT_CHANNELS as usize;
+    let mut z1_sq = 0.0_f64;
+    for j in 0..c1_count {
+        let src = c1_first + j;
+        let dst = 1 + c0_count + j;
+        let z = raw.values[src] / reg1;
+        z1_sq += z * z;
+        values[dst] = z;
+        gradients[dst] = [
+            (raw.dx[src] - z * density1_x) / reg1,
+            (raw.dy[src] - z * density1_y) / reg1,
+        ];
+    }
+
+    let saturate = |value: f64| {
+        saturate_fn(value)
+            .ok_or_else(|| invalid("sensor input", format!("tanh({value}) is undefined")))
+    };
+    let mut inputs = [0.0; SENSOR_WIDTH];
+    let (observed, own) = inputs.split_at_mut(3 * PLANES);
+    let (value_slots, derivative_slots) = observed.split_at_mut(PLANES);
+    let (x_slots, y_slots) = derivative_slots.split_at_mut(PLANES);
+    value_slots.copy_from_slice(&values);
+    for ((x_slot, y_slot), gradient) in x_slots.iter_mut().zip(y_slots.iter_mut()).zip(&gradients) {
+        *x_slot = saturate(scales.gradient_length * gradient[0])?;
+        *y_slot = saturate(scales.gradient_length * gradient[1])?;
+    }
+    own.copy_from_slice(&[
+        intrinsic.energy / (intrinsic.energy + scales.internal_energy),
+        intrinsic.age_seconds / (intrinsic.age_seconds + scales.age_seconds),
+        saturate(intrinsic.velocity[0] / scales.velocity)?,
+        saturate(intrinsic.velocity[1] / scales.velocity)?,
+        saturate(intrinsic.energy_change_per_second / scales.energy_change_per_second)?,
+    ]);
+
+    let shifted1 = density1 + trail_energy_density_scale;
+    let slope1 = trail_energy_density_scale / (shifted1 * shifted1);
+    let q1 = density1 / shifted1;
+    let dq1_x = slope1 * density1_x;
+    let dq1_y = slope1 * density1_y;
+    let z1_norm = if z1_sq.is_finite() {
+        z1_sq.sqrt().min(1.0)
+    } else {
+        f64::NAN
+    };
+    let trail_inputs = [
+        q1,
+        saturate(scales.gradient_length * dq1_x)?,
+        saturate(scales.gradient_length * dq1_y)?,
+        z1_norm,
+    ];
+
+    for &value in inputs.iter().chain(&trail_inputs) {
+        if !value.is_finite() {
+            return Err(invalid("sensor input", format!("{value} is not finite")));
+        }
+    }
+    for &[gx, gy] in &gradients {
+        if !gx.is_finite() {
+            return Err(invalid("sensor input", format!("{gx} is not finite")));
+        }
+        if !gy.is_finite() {
+            return Err(invalid("sensor input", format!("{gy} is not finite")));
+        }
+    }
+    Ok(DualObservation {
+        base: Observation { inputs, gradients },
+        trail_inputs,
+    })
 }

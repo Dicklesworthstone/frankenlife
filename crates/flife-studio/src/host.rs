@@ -555,6 +555,7 @@ impl Studio {
         kept: Kept,
         found: impl FnOnce() -> Result<World, CoreError>,
     ) -> Result<Self, CoreError> {
+        crate::timeline::validate_v2_style(config, options.style)?;
         let model = config.config();
         let background =
             hex_rgb(&model.presentation.background).ok_or_else(|| CoreError::NumericalInvalid {

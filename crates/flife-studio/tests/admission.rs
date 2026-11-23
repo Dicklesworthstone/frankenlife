@@ -505,9 +505,18 @@ fn v2_visual_mappings_observer_bytes_account_honestly_and_drop_to_zero_when_disa
     view_off.enable_overlay();
 
     let slots = u64::from(enabled_cfg.config().execution.render_queue_capacity);
+    let epoch_delta = slots * expected_slot_delta;
+    let view_delta = (view_on.reserved_bytes() - view_off.reserved_bytes())
+        + (view_on.frame_bytes() - view_off.frame_bytes())
+        + 2 * (view_on.preparation_limit() - view_off.preparation_limit());
+    assert!(epoch_delta > 0, "v2 epoch slots must charge optional views");
+    assert!(
+        view_delta > 0,
+        "v2 WorldView must charge optional polarity apical-tick buffers"
+    );
     let obs_on = observer_bytes(&world_on, &founding_on, &view_on, [2560, 1440]);
     let obs_off = observer_bytes(&world_off, &founding_off, &view_off, [2560, 1440]);
-    assert_eq!(obs_on - obs_off, slots * expected_slot_delta);
+    assert_eq!(obs_on - obs_off, epoch_delta + view_delta);
 
     let admitted_on = admit(
         &world_on,
@@ -527,6 +536,6 @@ fn v2_visual_mappings_observer_bytes_account_honestly_and_drop_to_zero_when_disa
     .expect("admits v2 off");
     assert_eq!(
         admitted_on.render - admitted_off.render,
-        slots * expected_slot_delta
+        epoch_delta + view_delta
     );
 }

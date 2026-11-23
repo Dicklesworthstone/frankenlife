@@ -550,7 +550,7 @@ pub fn apical_tick_quad(
     let start = dot_radius * APICAL_TICK_START_RATIO;
     let end = dot_radius * APICAL_TICK_END_RATIO;
     let half_w = dot_radius * APICAL_TICK_HALF_WIDTH_RATIO;
-    if !(start.is_finite() && end.is_finite() && half_w.is_finite()) {
+    if !(start.is_finite() && end.is_finite() && half_w.is_finite() && (end as f32).is_finite()) {
         return None;
     }
     // Left perpendicular (90° CCW from direction) in scene XY (y up):
@@ -567,10 +567,14 @@ pub fn apical_tick_quad(
         [ex + lx * half_w, ey + ly * half_w, cz],
         [ex - lx * half_w, ey - ly * half_w, cz],
     ];
-    if !corners
-        .iter()
-        .all(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite())
-    {
+    if !corners.iter().all(|p| {
+        p[0].is_finite()
+            && p[1].is_finite()
+            && p[2].is_finite()
+            && (p[0] as f32).is_finite()
+            && (p[1] as f32).is_finite()
+            && (p[2] as f32).is_finite()
+    }) {
         return None;
     }
     let normal = [0.0, 0.0, 1.0];
@@ -610,7 +614,7 @@ pub fn apical_ticks_mesh(
     }
     if !(dot_radius.is_finite()
         && dot_radius > 0.0
-        && (dot_radius * APICAL_TICK_END_RATIO).is_finite())
+        && ((dot_radius * APICAL_TICK_END_RATIO) as f32).is_finite())
     {
         return Err(CoreError::NumericalInvalid {
             quantity: "apical tick radius",
@@ -706,7 +710,7 @@ pub(crate) fn apical_ticks_mesh_from_drawn(
     }
     if !(dot_radius.is_finite()
         && dot_radius > 0.0
-        && (dot_radius * APICAL_TICK_END_RATIO).is_finite())
+        && ((dot_radius * APICAL_TICK_END_RATIO) as f32).is_finite())
     {
         return Err(CoreError::NumericalInvalid {
             quantity: "apical tick radius",

@@ -1,6 +1,11 @@
 //! V2-05 (`so2-motor`) and V2-06 (`so2-budding`) action layout and decoding
 //! tests, plus V2-04 (`wake-offset` pump) and V2-08 (`emt-gate`) slot decoding.
 
+#![allow(
+    clippy::expect_used,
+    reason = "test helpers: a failure in one is a test failure"
+)]
+
 use flife_core::numerics::{sigmoid, tanh};
 use flife_core::{CoreError, TimeStep};
 use flife_neural::{

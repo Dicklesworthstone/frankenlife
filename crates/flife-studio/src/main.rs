@@ -393,11 +393,14 @@ fn export_timeline(config: &ValidatedConfig, cli: &Cli, timeline: &Path, out: &P
 fn export_record<'a>(manifest: &'a ExportManifest, out: &Path) -> Record<'a> {
     Record::Export {
         schema: STUDIO_SCHEMA,
+        mode: &manifest.mode,
         out: out.display().to_string(),
         timeline_sha256: &manifest.timeline_sha256,
         frames: manifest.frames.len(),
         ticks: manifest.ticks,
         end_tick: manifest.end_tick,
+        sample_every_ticks: manifest.sample_every_ticks,
+        admitted_peak_bytes: manifest.admitted_peak_bytes,
         digest: &manifest.digest,
         commands: manifest.commands,
         frames_per_second: manifest.video.as_ref().map(|video| video.frames_per_second),
@@ -745,12 +748,19 @@ enum Record<'a> {
     },
     Export {
         schema: &'static str,
+        mode: &'a str,
         out: String,
         timeline_sha256: &'a str,
         frames: usize,
         /// The ticks of the first and last frames.
         ticks: [u64; 2],
         end_tick: u64,
+        /// Committed ticks between consecutive samples in `simulation-time` mode.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sample_every_ticks: Option<u64>,
+        /// FL-043 peak memory admitted for this export.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        admitted_peak_bytes: Option<u64>,
         digest: &'a str,
         commands: usize,
         /// The video's rate, slots, repeats and drops; absent when withheld.

@@ -1228,7 +1228,7 @@ fn the_recorded_projection_is_the_one_every_epoch_takes() {
 fn projected_epoch_refreshes_speed_limit_and_attempt_energy() {
     let initial = found(
         &ecology(&[
-            ("physics", "maximum_speed", "2.0"),
+            ("chemistry", "maximum_speed", "2.0"),
             (
                 "reproduction",
                 "minimum_parent_energy_before_attempt",
@@ -1239,7 +1239,7 @@ fn projected_epoch_refreshes_speed_limit_and_attempt_energy() {
     );
     let mut offered = found(
         &ecology(&[
-            ("physics", "maximum_speed", "8.0"),
+            ("chemistry", "maximum_speed", "8.0"),
             (
                 "reproduction",
                 "minimum_parent_energy_before_attempt",
@@ -1440,7 +1440,57 @@ fn v2_optional_views_accounting_and_slot_order_invariance_c7() {
             a.polarities(),
             Some(vec![flife_render::POLARITY_UNPOLARIZED; a.len()].as_slice())
         );
+        // Verify live Carrier-1 trail_energy and periodic incident vascular_conductance oracles.
+        let grid = compact.field().grid();
+        let cell_area = grid.cell_area();
+        let trail_src = compact.field().trail_energy().expect("34-plane trail");
+        let expected_trail: Vec<f32> = trail_src
+            .iter()
+            .map(|&e| (f64::from(e) / cell_area) as f32)
+            .collect();
+        assert_eq!(a.field().trail_energy(), Some(expected_trail.as_slice()));
+        let (ex, ey) = compact.field().vascular_edges().expect("vascular edges");
+        let (w, h) = (grid.cells_x() as usize, grid.cells_y() as usize);
+        let mut expected_vascular = Vec::with_capacity(w * h);
+        for y in 0..h {
+            let yp = if y == 0 { h - 1 } else { y - 1 };
+            for x in 0..w {
+                let xp = if x == 0 { w - 1 } else { x - 1 };
+                let incident = 0.25
+                    * (f64::from(ex[y * w + x])
+                        + f64::from(ex[y * w + xp])
+                        + f64::from(ey[y * w + x])
+                        + f64::from(ey[yp * w + x]));
+                expected_vascular.push(incident as f32);
+            }
+        }
+        assert_eq!(
+            a.field().vascular_conductance(),
+            Some(expected_vascular.as_slice())
+        );
+        assert!(
+            expected_vascular.iter().all(|&g| g > 0.0),
+            "live vascular conductance must be strictly positive"
+        );
     }
+    // 34-plane dual-carrier slice also projects cleanly via FieldTexture::from_planes_on
+    // bit-identically across 1 and 4 workers.
+    let grid = compact.field().grid();
+    let tex_1 = FieldTexture::from_planes_on(
+        [grid.cells_x(), grid.cells_y()],
+        [grid.cell_width(), grid.cell_height()],
+        compact.field().as_slice(),
+        1,
+    )
+    .expect("34-plane serial texture");
+    let tex_4 = FieldTexture::from_planes_on(
+        [grid.cells_x(), grid.cells_y()],
+        [grid.cell_width(), grid.cell_height()],
+        compact.field().as_slice(),
+        4,
+    )
+    .expect("34-plane parallel texture");
+    assert_eq!(tex_1, tex_4);
 }
 
 /// V2-16 (`INV-09`): enabling, publishing, leasing, or disabling

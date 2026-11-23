@@ -90,8 +90,16 @@ fn coordinates(dots: [f64; 3], channels: usize, limit: f64) -> [f32; 3] {
     })
 }
 
-/// Moment channels per cell, as an array length.
+/// Moment channels per cell on a 33-plane single-carrier field, as an array length.
 const CHANNELS: usize = MOMENT_CHANNELS as usize;
+
+/// Total planes in a 34-plane `field-ecology-v2` dual-carrier field (`V2-15`):
+/// plane 0 (`e_0`), planes `1..=24` (Carrier-0 moments), plane 25 (`e_1` trail
+/// energy), planes `26..=33` (Carrier-1 trail moments).
+const DUAL_CARRIER_PLANES: usize = 34;
+
+/// Carrier-0 moment channels on a 34-plane dual-carrier field (`m_0..m_23`).
+const CARRIER0_MOMENT_CHANNELS: usize = 24;
 
 /// A field component's display step: a texel's moment channel per unit
 /// energy, in `[−1, 1]`, is held as the nearest multiple of `1 / 127`, an
@@ -496,19 +504,20 @@ impl FieldTexture {
         workers: usize,
     ) -> Result<Self, CoreError> {
         let mut texture = Self::sized(cells, cell_size)?;
-        let expected = usize::try_from(cells[0])
-            .ok()
-            .and_then(|x| {
-                usize::try_from(cells[1])
-                    .ok()
-                    .and_then(|y| x.checked_mul(y))
-            })
-            .and_then(|cells| cells.checked_mul(1 + CHANNELS));
-        if expected != Some(planes.len()) {
+        let cell_count = usize::try_from(cells[0]).ok().and_then(|x| {
+            usize::try_from(cells[1])
+                .ok()
+                .and_then(|y| x.checked_mul(y))
+        });
+        let valid = cell_count.is_some_and(|n| {
+            n.checked_mul(1 + CHANNELS) == Some(planes.len())
+                || n.checked_mul(DUAL_CARRIER_PLANES) == Some(planes.len())
+        });
+        if !valid {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!(
-                    "{} values are not the {} planes of a {} × {} grid",
+                    "{} values are not the {} or {DUAL_CARRIER_PLANES} planes of a {} × {} grid",
                     planes.len(),
                     1 + MOMENT_CHANNELS,
                     cells[0],
@@ -557,19 +566,20 @@ impl FieldTexture {
             trail_plane.is_some(),
             vascular_plane.is_some(),
         )?;
-        let expected = usize::try_from(cells[0])
-            .ok()
-            .and_then(|x| {
-                usize::try_from(cells[1])
-                    .ok()
-                    .and_then(|y| x.checked_mul(y))
-            })
-            .and_then(|cells| cells.checked_mul(1 + CHANNELS));
-        if expected != Some(planes.len()) {
+        let cell_count = usize::try_from(cells[0]).ok().and_then(|x| {
+            usize::try_from(cells[1])
+                .ok()
+                .and_then(|y| x.checked_mul(y))
+        });
+        let valid = cell_count.is_some_and(|n| {
+            n.checked_mul(1 + CHANNELS) == Some(planes.len())
+                || n.checked_mul(DUAL_CARRIER_PLANES) == Some(planes.len())
+        });
+        if !valid {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!(
-                    "{} values are not the {} planes of a {} × {} grid",
+                    "{} values are not the {} or {DUAL_CARRIER_PLANES} planes of a {} × {} grid",
                     planes.len(),
                     1 + MOMENT_CHANNELS,
                     cells[0],
@@ -788,8 +798,9 @@ impl FieldTexture {
     }
 
     /// Refill optional `V2-16` overlay buffers in place without reallocating.
-    /// When a buffer is reserved but its backing plane is not yet supplied by
-    /// the field state, it is zero-filled cleanly.
+    /// Validates both offered planes upfront so a refusal leaves neither buffer
+    /// mutated. When a buffer is reserved but its backing plane is not yet
+    /// supplied by the field state, it is zero-filled cleanly.
     fn project_overlays_on(
         &mut self,
         trail_plane: Option<&[f32]>,
@@ -800,6 +811,26 @@ impl FieldTexture {
         let cells = self.cells.map(|n| n as usize);
         let block = self.block.map(|n| n as usize);
         let texels = self.texels.map(|n| n as usize);
+        if self.trail_energy.is_some() {
+            if let Some(plane) = trail_plane {
+                validate_scalar_plane(plane, cells, "render field trail energy")?;
+            }
+        } else if trail_plane.is_some() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render field trail energy",
+                detail: "trail plane offered to a texture without a trail buffer".to_owned(),
+            });
+        }
+        if self.vascular_conductance.is_some() {
+            if let Some(plane) = vascular_plane {
+                validate_scalar_plane(plane, cells, "render field vascular conductance")?;
+            }
+        } else if vascular_plane.is_some() {
+            return Err(CoreError::LayoutMismatch {
+                buffer: "render field vascular conductance",
+                detail: "vascular plane offered to a texture without a vascular buffer".to_owned(),
+            });
+        }
         if let Some(out) = &mut self.trail_energy {
             if let Some(plane) = trail_plane {
                 let grid = ScalarOverlayGrid {
@@ -808,16 +839,11 @@ impl FieldTexture {
                     texels,
                     divisor: cell_area,
                 };
-                project_scalar_plane_on(plane, grid, workers, "render field trail energy", out)?;
+                project_validated_scalar_plane_on(plane, grid, workers, out)?;
             } else {
                 out.clear();
                 out.resize(texels[0] * texels[1], 0.0);
             }
-        } else if trail_plane.is_some() {
-            return Err(CoreError::LayoutMismatch {
-                buffer: "render field trail energy",
-                detail: "trail plane offered to a texture without a trail buffer".to_owned(),
-            });
         }
         if let Some(out) = &mut self.vascular_conductance {
             if let Some(plane) = vascular_plane {
@@ -827,32 +853,79 @@ impl FieldTexture {
                     texels,
                     divisor: 1.0,
                 };
-                project_scalar_plane_on(
-                    plane,
-                    grid,
-                    workers,
-                    "render field vascular conductance",
-                    out,
-                )?;
+                project_validated_scalar_plane_on(plane, grid, workers, out)?;
             } else {
                 out.clear();
                 out.resize(texels[0] * texels[1], 0.0);
             }
-        } else if vascular_plane.is_some() {
-            return Err(CoreError::LayoutMismatch {
-                buffer: "render field vascular conductance",
-                detail: "vascular plane offered to a texture without a vascular buffer".to_owned(),
-            });
+        }
+        Ok(())
+    }
+
+    /// Refill optional `V2-16` overlay buffers from a live committed world
+    /// (`trail_energy` Carrier-1 plane and `(edge_x, edge_y)` vascular face
+    /// conductances) in place without reallocating (`INV-15`). Validates both
+    /// inputs upfront so a refusal leaves neither overlay buffer mutated.
+    fn project_overlays_from_world_on(
+        &mut self,
+        trail_plane: Option<&[f32]>,
+        vascular_edges: Option<(&[f32], &[f32])>,
+        cell_area: f64,
+        workers: usize,
+    ) -> Result<(), CoreError> {
+        let cells = self.cells.map(|n| n as usize);
+        let block = self.block.map(|n| n as usize);
+        let texels = self.texels.map(|n| n as usize);
+        if self.trail_energy.is_some()
+            && let Some(plane) = trail_plane
+        {
+            validate_scalar_plane(plane, cells, "render field trail energy")?;
+        }
+        if self.vascular_conductance.is_some()
+            && let Some((edge_x, edge_y)) = vascular_edges
+        {
+            validate_vascular_edges(edge_x, edge_y, cells)?;
+        }
+        if let Some(out) = &mut self.trail_energy {
+            if let Some(plane) = trail_plane {
+                let grid = ScalarOverlayGrid {
+                    cells,
+                    block,
+                    texels,
+                    divisor: cell_area,
+                };
+                project_validated_scalar_plane_on(plane, grid, workers, out)?;
+            } else {
+                out.clear();
+                out.resize(texels[0] * texels[1], 0.0);
+            }
+        }
+        if let Some(out) = &mut self.vascular_conductance {
+            if let Some((edge_x, edge_y)) = vascular_edges {
+                let grid = ScalarOverlayGrid {
+                    cells,
+                    block,
+                    texels,
+                    divisor: 1.0,
+                };
+                project_validated_vascular_edges_on(edge_x, edge_y, grid, workers, out)?;
+            } else {
+                out.clear();
+                out.resize(texels[0] * texels[1], 0.0);
+            }
         }
         Ok(())
     }
 
     /// Refill from row-major `planes` of `cell_area` cells: an energy plane
-    /// alone, or the field's 33 planes in their planar order. Each texel
-    /// sums its block's energy in F64, rows then columns, and divides it by
-    /// the block's area; with moments, it sums each channel the same way,
-    /// projects the sums over the energy's ([`FieldTexture::composition`])
-    /// and holds each over the energy's ([`FieldTexture::components`]).
+    /// alone, the 33 planes of a single-carrier field, or the 34 planes of a
+    /// `field-ecology-v2` dual-carrier field (projecting Carrier-0's `e_0` and
+    /// 24 moment channels `m_0..m_23`, while Carrier-1's `e_1` projects via
+    /// `trail_energy`). Each texel sums its block's energy in F64, rows then
+    /// columns, and divides it by the block's area; with moments, it sums each
+    /// channel the same way, projects the sums over the energy's
+    /// ([`FieldTexture::composition`]) and holds each over the energy's
+    /// ([`FieldTexture::components`]).
     ///
     /// The texel rows are split into contiguous runs on at most `workers`
     /// threads, the calling thread's first, each with at least
@@ -876,14 +949,20 @@ impl FieldTexture {
                 .ok()
                 .and_then(|y| x.checked_mul(y))
         });
-        let with_moments = cells
+        let single_carrier = cells
             .and_then(|cells| cells.checked_mul(1 + CHANNELS))
             .is_some_and(|total| planes.len() == total);
-        let Some(cells) = cells.filter(|&cells| planes.len() == cells || with_moments) else {
+        let dual_carrier = cells
+            .and_then(|cells| cells.checked_mul(DUAL_CARRIER_PLANES))
+            .is_some_and(|total| planes.len() == total);
+        let Some(cells) =
+            cells.filter(|&cells| planes.len() == cells || single_carrier || dual_carrier)
+        else {
             return Err(CoreError::LayoutMismatch {
                 buffer: "render field texture",
                 detail: format!(
-                    "{} values for an energy plane or the {} planes of a {} × {} grid",
+                    "{} values for an energy plane, {} single-carrier planes, or \
+                     {DUAL_CARRIER_PLANES} dual-carrier planes of a {} × {} grid",
                     planes.len(),
                     1 + CHANNELS,
                     self.cells[0],
@@ -891,7 +970,14 @@ impl FieldTexture {
                 ),
             });
         };
-        let (energy, moments) = planes.split_at(cells);
+        let (energy, moments) = if dual_carrier {
+            (
+                &planes[..cells],
+                &planes[cells..cells * (1 + CARRIER0_MOMENT_CHANNELS)],
+            )
+        } else {
+            planes.split_at(cells)
+        };
         let [width, height] = self.texels.map(|n| n as usize);
         let count = width * height;
         // The buffers' capacity is the texture's, so this never allocates.
@@ -1173,17 +1259,14 @@ struct ScalarOverlayGrid {
     divisor: f64,
 }
 
-/// Project one row-major scalar `plane` into `out` in place (zero allocation
-/// once reserved), summing each block in F64 rows-then-columns on at most
-/// `workers` threads, bit-identical to `workers = 1`.
-fn project_scalar_plane_on(
+/// Validate that `plane` has exact cell count `cells[0] * cells[1]` and every
+/// cell is finite and nonnegative.
+fn validate_scalar_plane(
     plane: &[f32],
-    grid: ScalarOverlayGrid,
-    workers: usize,
+    cells: [usize; 2],
     buffer: &'static str,
-    out: &mut Vec<f32>,
 ) -> Result<(), CoreError> {
-    let [cells_x, cells_y] = grid.cells;
+    let [cells_x, cells_y] = cells;
     let expected = cells_x.checked_mul(cells_y);
     if expected != Some(plane.len()) {
         return Err(CoreError::LayoutMismatch {
@@ -1196,6 +1279,65 @@ fn project_scalar_plane_on(
             ),
         });
     }
+    if let Some((cell, &value)) = plane
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || **value < 0.0)
+    {
+        return Err(CoreError::NumericalInvalid {
+            quantity: buffer,
+            detail: format!("cell {cell} value {value} is not finite and >= 0"),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that `(edge_x, edge_y)` have exact cell count `cells[0] * cells[1]`
+/// and every face conductance is finite and nonnegative.
+fn validate_vascular_edges(
+    edge_x: &[f32],
+    edge_y: &[f32],
+    cells: [usize; 2],
+) -> Result<(), CoreError> {
+    let [cells_x, cells_y] = cells;
+    let expected = cells_x.checked_mul(cells_y);
+    if expected != Some(edge_x.len()) || expected != Some(edge_y.len()) {
+        return Err(CoreError::LayoutMismatch {
+            buffer: "render field vascular conductance",
+            detail: format!(
+                "vascular edge buffers ({}, {}) do not match a {} × {} grid",
+                edge_x.len(),
+                edge_y.len(),
+                cells_x,
+                cells_y
+            ),
+        });
+    }
+    for (axis, edges) in [("east", edge_x), ("north", edge_y)] {
+        if let Some((cell, &value)) = edges
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || **value < 0.0)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "render field vascular conductance",
+                detail: format!("{axis} edge at cell {cell} value {value} is not finite and >= 0"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Project one validated row-major scalar `plane` into `out` in place (zero
+/// allocation once reserved), summing each block in F64 rows-then-columns on at
+/// most `workers` threads, bit-identical to `workers = 1`.
+fn project_validated_scalar_plane_on(
+    plane: &[f32],
+    grid: ScalarOverlayGrid,
+    workers: usize,
+    out: &mut Vec<f32>,
+) -> Result<(), CoreError> {
+    let [cells_x, cells_y] = grid.cells;
     let [width, height] = grid.texels;
     let count = width * height;
     out.clear();
@@ -1223,7 +1365,7 @@ fn project_scalar_plane_on(
                     }
                 }
                 let denom = (rows.len() * cols.len()) as f64 * grid.divisor;
-                *out_value = saturate(sum / denom);
+                *out_value = saturate_nonnegative(sum / denom);
             }
         }
     };
@@ -1239,6 +1381,78 @@ fn project_scalar_plane_on(
                 joined = Err(CoreError::StateConflict {
                     operation: "project render field overlay",
                     detail: "an overlay texture worker panicked".to_owned(),
+                });
+            }
+        }
+        joined
+    })
+}
+
+/// Project validated periodic `(edge_x, edge_y)` vascular face conductances
+/// into `out` in place (zero allocation once reserved): each cell `(x, y)`
+/// takes the mean of its four incident periodic faces `(east, west, north,
+/// south)` in F64, averaged over each texel's block rows-then-columns,
+/// bit-identical across worker counts.
+fn project_validated_vascular_edges_on(
+    edge_x: &[f32],
+    edge_y: &[f32],
+    grid: ScalarOverlayGrid,
+    workers: usize,
+    out: &mut Vec<f32>,
+) -> Result<(), CoreError> {
+    let [cells_x, cells_y] = grid.cells;
+    let [width, height] = grid.texels;
+    let count = width * height;
+    out.clear();
+    out.resize(count, 0.0);
+    let used = workers
+        .min(height.div_ceil(MINIMUM_TEXEL_ROWS_PER_WORKER))
+        .max(1);
+    let per = height.div_ceil(used).max(1);
+    let chunk = per * width;
+    let mut runs = out.chunks_mut(chunk);
+    let Some(first_run) = runs.next() else {
+        return Ok(());
+    };
+    let project_run = |first_row: usize, slice: &mut [f32]| {
+        let [block_x, block_y] = grid.block;
+        for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
+            let texel_y = first_row + offset;
+            let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
+            for (texel_x, out_value) in row_values.iter_mut().enumerate() {
+                let cols = texel_x * block_x..((texel_x + 1) * block_x).min(cells_x);
+                let mut sum = 0.0_f64;
+                for y in rows.clone() {
+                    let y_prev = if y == 0 { cells_y - 1 } else { y - 1 };
+                    let row_cur = y * cells_x;
+                    let row_prev = y_prev * cells_x;
+                    for x in cols.clone() {
+                        let x_prev = if x == 0 { cells_x - 1 } else { x - 1 };
+                        let incident = 0.25
+                            * (f64::from(edge_x[row_cur + x])
+                                + f64::from(edge_x[row_cur + x_prev])
+                                + f64::from(edge_y[row_cur + x])
+                                + f64::from(edge_y[row_prev + x]));
+                        sum += incident;
+                    }
+                }
+                let denom = (rows.len() * cols.len()) as f64;
+                *out_value = saturate_nonnegative(sum / denom);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = runs
+            .enumerate()
+            .map(|(index, run)| scope.spawn(move || project_run((index + 1) * per, run)))
+            .collect();
+        project_run(0, first_run);
+        let mut joined = Ok(());
+        for handle in handles {
+            if handle.join().is_err() {
+                joined = Err(CoreError::StateConflict {
+                    operation: "project render field vascular overlay",
+                    detail: "a vascular overlay texture worker panicked".to_owned(),
                 });
             }
         }
@@ -1324,6 +1538,16 @@ pub(crate) fn reserved<T>(count: usize, buffer: &'static str) -> Result<Vec<T>, 
 /// `value` rounded to the nearest F32, saturating at the largest finite one.
 fn saturate(value: f64) -> f32 {
     (value as f32).clamp(-f32::MAX, f32::MAX)
+}
+
+/// Nonnegative finite `value` rounded to the nearest F32 in `[0.0, f32::MAX]`,
+/// saturating finite overflow at `f32::MAX` and avoiding `-0.0`.
+fn saturate_nonnegative(value: f64) -> f32 {
+    if !value.is_finite() || value <= 0.0 {
+        0.0
+    } else {
+        (value as f32).min(f32::MAX)
+    }
 }
 
 /// A coordinate in `[0, length)` rounded to F32 and kept half-open: one
@@ -1522,10 +1746,26 @@ impl Epoch {
             grid.cell_area(),
             world.cpu_workers(),
         )?;
-        // Until V2-15 / V2-14 expose Carrier-1 and incident conductance planes
-        // on `FieldState`, reserved overlay slots are zero-filled in place.
-        self.field
-            .project_overlays_on(None, None, grid.cell_area(), world.cpu_workers())?;
+        // Project live V2-16 overlay planes (Carrier-1 trail energy density and
+        // incident vascular edge conductance) when reserved by this slot.
+        let trail_plane = self
+            .field
+            .trail_energy
+            .is_some()
+            .then(|| world.field().trail_energy())
+            .flatten();
+        let vascular_edges = self
+            .field
+            .vascular_conductance
+            .is_some()
+            .then(|| world.field().vascular_edges())
+            .flatten();
+        self.field.project_overlays_from_world_on(
+            trail_plane,
+            vascular_edges,
+            grid.cell_area(),
+            world.cpu_workers(),
+        )?;
         self.id = id;
         self.tick = world.tick();
         self.resource = world.epoch();
@@ -2107,5 +2347,145 @@ mod tests {
         let mut bad = clean;
         bad.field.trail_energy.as_mut().expect("trail").pop();
         assert!(matches!(bad.check(), Err(CoreError::LayoutMismatch { .. })));
+    }
+
+    #[test]
+    fn dual_carrier_and_vascular_edge_projection_edge_cases() {
+        // 1. 1x1 grid with zero Carrier-0 energy, non-zero Carrier-1 trail, and
+        //    periodic self-wrapping vascular edges.
+        let mut one = vec![0.0_f32; DUAL_CARRIER_PLANES];
+        one[25] = 2.5; // Carrier-1 trail energy e_1
+        one[26] = 1.0; // Carrier-1 trail moment (must not bleed into Carrier-0 components)
+        let mut tex_1x1 =
+            FieldTexture::sized_with_v2([1, 1], [0.5, 0.5], true, true).expect("1x1 texture");
+        tex_1x1.project_on(&one, 0.25, 4).expect("1x1 34-plane");
+        tex_1x1
+            .project_overlays_from_world_on(Some(&[2.5]), Some((&[0.2], &[0.8])), 0.25, 4)
+            .expect("1x1 overlays");
+        assert_eq!(tex_1x1.values(), &[0.0]);
+        assert_eq!(tex_1x1.composition(), &[[0.0; 3]]);
+        assert_eq!(tex_1x1.components(), &[[0_i8; CHANNELS]]);
+        assert_eq!(tex_1x1.trail_energy(), Some(&[10.0_f32][..])); // 2.5 / 0.25
+        assert_eq!(tex_1x1.vascular_conductance(), Some(&[0.5_f32][..])); // (0.2+0.2+0.8+0.8)/4
+
+        // 2. Thin non-square grids (1x7 and 7x1) and downsampled asymmetric
+        //    1025x513 grid (3x2 blocks with partial edge blocks): exact F64
+        //    incident-edge oracle + 1-vs-4 worker bit-identity.
+        for cells in [[1_u32, 7], [7, 1], [513, 515], [1025, 513]] {
+            let (w, h) = (cells[0] as usize, cells[1] as usize);
+            let n = w * h;
+            let mut ex = vec![0.0_f32; n];
+            let mut ey = vec![0.0_f32; n];
+            let mut trail = vec![0.0_f32; n];
+            for y in 0..h {
+                for x in 0..w {
+                    let idx = y * w + x;
+                    ex[idx] = 0.1 + ((x * 5 + y * 11) % 37) as f32 * 0.02;
+                    ey[idx] = 0.2 + ((x * 13 + y * 3) % 29) as f32 * 0.02;
+                    trail[idx] = ((x * 7 + y * 17) % 53) as f32 * 0.01;
+                }
+            }
+            let cell_size = [0.5_f64, 0.25_f64];
+            let cell_area = cell_size[0] * cell_size[1];
+            let mut t1 = FieldTexture::sized_with_v2(cells, cell_size, true, true).expect("t1");
+            let mut t4 = FieldTexture::sized_with_v2(cells, cell_size, true, true).expect("t4");
+            t1.project_overlays_from_world_on(Some(&trail), Some((&ex, &ey)), cell_area, 1)
+                .expect("1 worker");
+            t4.project_overlays_from_world_on(Some(&trail), Some((&ex, &ey)), cell_area, 4)
+                .expect("4 workers");
+            assert_eq!(t1.trail_energy(), t4.trail_energy(), "{cells:?} trail");
+            assert_eq!(
+                t1.vascular_conductance(),
+                t4.vascular_conductance(),
+                "{cells:?} vascular"
+            );
+
+            // Independent F64 oracle for vascular conductance.
+            let [bx, by] = t1.block().map(|v| v as usize);
+            let [tx, ty] = t1.texels().map(|v| v as usize);
+            let mut expected = Vec::with_capacity(tx * ty);
+            for row in 0..ty {
+                let ys = row * by..((row + 1) * by).min(h);
+                for col in 0..tx {
+                    let xs = col * bx..((col + 1) * bx).min(w);
+                    let mut sum = 0.0_f64;
+                    for y in ys.clone() {
+                        let yp = if y == 0 { h - 1 } else { y - 1 };
+                        for x in xs.clone() {
+                            let xp = if x == 0 { w - 1 } else { x - 1 };
+                            sum += 0.25
+                                * (f64::from(ex[y * w + x])
+                                    + f64::from(ex[y * w + xp])
+                                    + f64::from(ey[y * w + x])
+                                    + f64::from(ey[yp * w + x]));
+                        }
+                    }
+                    expected.push((sum / (ys.len() * xs.len()) as f64) as f32);
+                }
+            }
+            assert_eq!(
+                t1.vascular_conductance(),
+                Some(expected.as_slice()),
+                "{cells:?} oracle"
+            );
+        }
+
+        // 3. Non-finite and negative overlay/edge values refuse with NumericalInvalid
+        //    atomically without mutating EITHER previously projected overlay buffer.
+        let before_trail = tex_1x1.trail_energy().expect("trail").to_vec();
+        let before_vasc = tex_1x1.vascular_conductance().expect("vasc").to_vec();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01] {
+            assert!(matches!(
+                tex_1x1.project_overlays_from_world_on(Some(&[bad]), None, 0.25, 1),
+                Err(CoreError::NumericalInvalid { .. })
+            ));
+            assert_eq!(tex_1x1.trail_energy(), Some(before_trail.as_slice()));
+            assert_eq!(tex_1x1.vascular_conductance(), Some(before_vasc.as_slice()));
+
+            assert!(matches!(
+                tex_1x1.project_overlays_from_world_on(None, Some((&[bad], &[0.5])), 0.25, 1),
+                Err(CoreError::NumericalInvalid { .. })
+            ));
+            assert_eq!(tex_1x1.trail_energy(), Some(before_trail.as_slice()));
+            assert_eq!(tex_1x1.vascular_conductance(), Some(before_vasc.as_slice()));
+
+            assert!(matches!(
+                tex_1x1.project_overlays_from_world_on(None, Some((&[0.5], &[bad])), 0.25, 1),
+                Err(CoreError::NumericalInvalid { .. })
+            ));
+            assert_eq!(tex_1x1.trail_energy(), Some(before_trail.as_slice()));
+            assert_eq!(tex_1x1.vascular_conductance(), Some(before_vasc.as_slice()));
+
+            assert!(matches!(
+                tex_1x1.project_overlays_on(Some(&[1.0]), Some(&[bad]), 0.25, 1),
+                Err(CoreError::NumericalInvalid { .. })
+            ));
+            assert_eq!(tex_1x1.trail_energy(), Some(before_trail.as_slice()));
+            assert_eq!(tex_1x1.vascular_conductance(), Some(before_vasc.as_slice()));
+        }
+
+        // 4. 34-plane dual-carrier with zero-energy Carrier-0 cell beside a populated
+        //    cell: Carrier-0 channels 0..24 project cleanly, 24..32 stay 0, zero NaNs.
+        let mut planes_34 = vec![0.0_f32; 2 * DUAL_CARRIER_PLANES];
+        // Cell 0: e_0 = 0, e_1 = 3.0; Cell 1: e_0 = 2.0, m_0 = 1.0, e_1 = 0.0.
+        planes_34[25 * 2] = 3.0;
+        planes_34[1] = 2.0;
+        planes_34[2 + 1] = 1.0;
+        let tex_34 = FieldTexture::from_planes_with_overlays_on(
+            [2, 1],
+            [1.0, 1.0],
+            &planes_34,
+            Some(&planes_34[25 * 2..26 * 2]),
+            Some(&[0.25, 0.75]),
+            2,
+        )
+        .expect("34-plane with zero-energy cell");
+        assert_eq!(tex_34.values(), &[0.0, 2.0]);
+        assert_eq!(tex_34.composition()[0], [0.0; 3]);
+        assert_eq!(tex_34.components()[0], [0_i8; CHANNELS]);
+        assert_eq!(tex_34.components()[1][0], 64); // round(127 * 0.5)
+        assert!(tex_34.components()[1][24..].iter().all(|&c| c == 0));
+        assert_eq!(tex_34.trail_energy(), Some(&[3.0, 0.0][..]));
+        assert_eq!(tex_34.vascular_conductance(), Some(&[0.25, 0.75][..]));
     }
 }

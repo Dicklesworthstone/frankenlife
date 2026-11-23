@@ -239,6 +239,19 @@ enum Stored {
     Damaged,
 }
 
+/// Exclusive writer lock on `store/lock`. Explicitly unlocks on drop so a
+/// concurrent `fork`/`posix_spawn` in another thread (e.g. host probes or
+/// helper subprocesses) that transiently duplicated the open file description
+/// cannot leave `flock` held past `ChunkStore` drop.
+#[derive(Debug)]
+struct StoreLock(File);
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// An open checkpoint store, held by its one writer.
 #[derive(Debug)]
 pub struct ChunkStore {
@@ -247,7 +260,7 @@ pub struct ChunkStore {
     next: u64,
     swept: usize,
     preserve_pinned: bool,
-    _lock: File,
+    _lock: StoreLock,
 }
 
 fn storage(operation: &'static str, path: &Path, error: &io::Error) -> CoreError {
@@ -410,8 +423,8 @@ impl ChunkStore {
             .write(true)
             .open(&lock_path)
             .map_err(|error| storage("open store lock", &lock_path, &error))?;
-        match lock.try_lock() {
-            Ok(()) => {}
+        let lock = match lock.try_lock() {
+            Ok(()) => StoreLock(lock),
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(CoreError::StateConflict {
                     operation: "open checkpoint store",
@@ -421,7 +434,7 @@ impl ChunkStore {
             Err(fs::TryLockError::Error(error)) => {
                 return Err(storage("lock store", &lock_path, &error));
             }
-        }
+        };
 
         let marker = root.join(MARKER);
         let expected = format!("{STORE_FORMAT}\n");
@@ -1424,5 +1437,65 @@ fn stored_as(path: &Path, length: u64, digest: &Sha256Digest) -> Result<Stored, 
                 Stored::Damaged
             })
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    reason = "unit test: an assertion failure here is a test failure"
+)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Regression: `StoreLock::drop` must explicitly `unlock()` the lock file
+    /// before closing the descriptor. Otherwise a duplicated descriptor on the
+    /// same open file description (such as one transiently inherited by a
+    /// concurrent `fork`/`posix_spawn` in another thread) keeps `flock` held
+    /// after `ChunkStore` drops, causing an immediate reopen to fail with
+    /// `"another writer holds ..."`.
+    #[test]
+    fn dropping_store_unlocks_even_with_duplicated_descriptor() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = TempDir(std::env::temp_dir().join(format!(
+            "flife-store-lock-unlock-{}-{nanos}",
+            std::process::id()
+        )));
+
+        let store = ChunkStore::open(&dir.0, Durability::ProcessCrash).expect("opens store");
+        let duplicated = store._lock.0.try_clone().expect("duplicates lock fd");
+
+        // While `store` is live, a second writer is still strictly refused.
+        let busy = ChunkStore::open(&dir.0, Durability::ProcessCrash);
+        assert!(
+            matches!(
+                busy,
+                Err(CoreError::StateConflict {
+                    operation: "open checkpoint store",
+                    ..
+                })
+            ),
+            "second writer while open must be refused, got {busy:?}"
+        );
+
+        // Dropping `store` explicitly unlocks the open file description even
+        // though `duplicated` still holds a live descriptor to it.
+        drop(store);
+        let reopened = ChunkStore::open(&dir.0, Durability::ProcessCrash)
+            .expect("reopens immediately after drop despite duplicated descriptor");
+        drop(reopened);
+        drop(duplicated);
     }
 }

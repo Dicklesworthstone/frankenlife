@@ -15,8 +15,10 @@ A slow consumer can therefore cost display freshness, never the world.
 
 **Inputs.**
 - `&World`, read only: the committed tick and resource epoch, the population rows, each genome's topology and
-  affinity vector and the world's `affinity_norm_limit` (FL-019), the field's 33 planes (energy and the 32 moment
-  channels) and grid, the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
+  affinity vector and the world's `affinity_norm_limit` (FL-019), the field's planar state (33 single-carrier planes
+  or 34 `field-ecology-v2` dual-carrier planes: Carrier-0 `e_0` + 24 moments `m_0..m_23`, Carrier-1 `e_1` + 8 trail
+  moments `m_24..m_31`), optional `V2-14` periodic vascular face conductances `(edge_x_cond, edge_y_cond)`, the grid,
+  the timestep, the speed limit (`World::maximum_speed`, added by FL-017) and the
   event cursor. FL-024: each genome's parameter count, the genome quota's logical and allocated bytes, the run
   ledger's report and whether a numerical fault stopped the run.
 - FL-024: `Publisher::count(&TickReport)`. The owner gives every report it publishes, in order, before offering the
@@ -61,7 +63,7 @@ A slow consumer can therefore cost display freshness, never the world.
   | `field-trail-energy` (`FieldTexture::trail_energy`) | `f32` × 1 (`4 B/texel`) | finite, ≥ 0 | `v2-visual-mappings` ∧ `dual-carrier-trails` |
   | `field-vascular-conductance` (`FieldTexture::vascular_conductance`) | `f32` × 1 (`4 B/texel`) | finite, ≥ 0 | `v2-visual-mappings` ∧ `vascular-field` |
 
-  `Epoch::layouts()` retains the 11 always-present baseline layouts; `Epoch::optional_layouts()` and `Epoch::all_layouts()` report present optional layouts; `Epoch::reserved_bytes()` accounts for every preallocated optional buffer (`INV-15`), and `Epoch::check()` validates every present optional view's length and bounds. `cell_states` projects live `organism.held.recurrent_state()[0]` via `quantize_cell_state`; `polarities` reports `POLARITY_UNPOLARIZED` until `V2-08` adds organism polarity vectors; `trail_energy` and `vascular_conductance` zero-fill preallocated slots until `V2-15` / `V2-14` expose Carrier-1 and incident conductance planes on `FieldState`, and `FieldTexture::from_planes_with_overlays(_on)` projects explicit scalar planes through the same multi-worker deterministic F64 block-mean pipeline.
+  `Epoch::layouts()` retains the 11 always-present baseline layouts; `Epoch::optional_layouts()` and `Epoch::all_layouts()` report present optional layouts; `Epoch::reserved_bytes()` accounts for every preallocated optional buffer (`INV-15`), and `Epoch::check()` validates every present optional view's length and bounds. `cell_states` projects live `organism.held.recurrent_state()[0]` via `quantize_cell_state`; `polarities` reports `POLARITY_UNPOLARIZED` until `V2-08` adds organism polarity vectors. On 34-plane dual-carrier fields, `FieldTexture` projects Carrier-0 (`e_0` and `m_0..m_23`, preserving `‖m‖₂ ≤ e_0` while leaving channels `24..32` zero; 33-plane v1 projection is bit-unchanged), `Epoch::project` projects live `FieldState::trail_energy()` (`e_1 / cell_area`) into `FieldTexture::trail_energy` and live periodic 4-neighbor mean incident conductance (`0.25 · (g^E + g^W + g^N + g^S)`) from `FieldState::vascular_edges()` into `FieldTexture::vascular_conductance` in place with zero heap allocation, and `FieldTexture::from_planes_with_overlays(_on)` projects explicit scalar planes through the same multi-worker deterministic F64 block-mean pipeline. Non-finite or negative overlay/edge values refuse with `CoreError::NumericalInvalid` before mutating buffers.
 - The affinity view (FL-019, `affinity_projection`) is a fixed projection of each organism's 32 affinity terms
   `a`: `q_k = (Σ_j H[r_k][j] a_j) / (√32 · L)` for the rows `r = AFFINITY_AXES = [7, 14, 25]` of the 32 × 32
   Sylvester Hadamard matrix `H[r][j] = (−1)^popcount(r & j)`, with `L` the world's `affinity_norm_limit`. The rows
@@ -263,8 +265,7 @@ identities are sequential, so a deterministic sequence of offers and lease drops
   quota allocates exactly `P x 4` bytes a genome, so the two are equal in every world (15,341,568 both in the
   Studio's crowded run).
 
-**Validity domain.** CPU host memory; one publisher per world; any number of consumers on any threads; the
-`field-ecology-v1` energy plane.
+**Validity domain.** CPU host memory; one publisher per world; any number of consumers on any threads; `field-ecology-v1` (33-plane) and `field-ecology-v2` (33-plane single-carrier and 34-plane dual-carrier + optional vascular edges).
 
 **Known gaps.**
 - No device residency. Leases are host `Arc`s. Typed Metal buffers and safe leases are FL-028's. The shared-device

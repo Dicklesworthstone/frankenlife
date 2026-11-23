@@ -488,7 +488,10 @@ fn serve(
                     if let Some(task) = keeper {
                         task.await;
                     }
-                    keep::close(&cx, &handle, shared.as_ref(), paused, &report).await
+                    let boundary =
+                        keep::close(&cx, &handle, shared.as_ref(), paused, &report).await;
+                    drop(shared.take());
+                    boundary
                 } else {
                     handle.close(&cx).await
                 };

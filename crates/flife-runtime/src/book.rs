@@ -643,10 +643,12 @@ impl CommandBook {
                     committed.get()
                 )));
             };
-            if passed
-                || matches!(record.status, CommandStatus::Terminal(_))
-                || !replayed.insert(*id)
-            {
+            if matches!(record.status, CommandStatus::Terminal(_)) || !replayed.insert(*id) {
+                return Err(conflict(format!(
+                    "journal outcome {at} for {id} cannot be replayed: {id} already ended"
+                )));
+            }
+            if passed {
                 return Err(conflict(format!(
                     "journal outcome {at} for {id} cannot be reached from tick {}",
                     committed.get()

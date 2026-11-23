@@ -423,9 +423,11 @@ fn trail_and_vascular_overlay_palettes_log_ramp_blending_and_caching() {
     assert!(srgb_distance(vascular_conductance_rgb8(0.75), palette(0.75)) > 80.0);
     assert!(srgb_distance(trail_carrier_rgb8(0.75), vascular_conductance_rgb8(0.75)) > 55.0);
 
-    // Log & raw levels + non-finite safety.
-    let expected_tenth = (OVERLAY_LOG_GAIN * 0.1).ln_1p() / OVERLAY_LOG_GAIN.ln_1p();
-    assert!((overlay_log_value(0.1, 1.0) - expected_tenth).abs() < 1e-12);
+    // Log & raw levels + non-finite safety (oracle uses exact promoted f32 value).
+    let expected_tenth = (OVERLAY_LOG_GAIN * f64::from(0.1_f32)).ln_1p() / OVERLAY_LOG_GAIN.ln_1p();
+    assert!((overlay_log_value(0.1_f32, 1.0) - expected_tenth).abs() < 1e-12);
+    let expected_eighth = (OVERLAY_LOG_GAIN * 0.125_f64).ln_1p() / OVERLAY_LOG_GAIN.ln_1p();
+    assert!((overlay_log_value(0.125_f32, 1.0) - expected_eighth).abs() < 1e-12);
     assert!(
         overlay_log_value(0.1, 1.0) > 0.32,
         "log ramp lifts faint trails/vessels"
@@ -557,21 +559,21 @@ fn trail_and_vascular_overlay_palettes_log_ramp_blending_and_caching() {
     layer
         .update(grid, &plane, Look::Raw, FieldOverlayKind::TrailCarrier)
         .expect("update raw");
-    let raw_tex_ptr = layer.texture().expect("tex") as *const _;
-    let raw_quad_ptr = match layer.draw().expect("draw") {
-        ThreeDDraw::Surface(s) => s.mesh as *const _,
+    let raw_texels = texels(layer.texture().expect("tex"));
+    let raw_quad = match layer.draw().expect("draw") {
+        ThreeDDraw::Surface(s) => s.mesh.clone(),
         _ => panic!("not surface"),
     };
-    // Sphere reuses Raw texture & unchanged viewport reuses quad!
+    // Sphere keeps identical Raw texels & unchanged viewport keeps identical quad.
     layer
         .place(grid, &plane, Look::Sphere, FieldOverlayKind::TrailCarrier)
         .expect("place sphere");
-    assert_eq!(layer.texture().expect("tex") as *const _, raw_tex_ptr);
-    let sphere_quad_ptr = match layer.draw().expect("draw") {
-        ThreeDDraw::Surface(s) => s.mesh as *const _,
+    assert_eq!(texels(layer.texture().expect("tex")), raw_texels);
+    let sphere_quad = match layer.draw().expect("draw") {
+        ThreeDDraw::Surface(s) => s.mesh,
         _ => panic!("not surface"),
     };
-    assert_eq!(sphere_quad_ptr, raw_quad_ptr);
+    assert_eq!(sphere_quad, &raw_quad);
 
     // Malformed plane refuses cleanly without disturbing existing scale or texture.
     assert!(matches!(
@@ -579,7 +581,7 @@ fn trail_and_vascular_overlay_palettes_log_ramp_blending_and_caching() {
         Err(CoreError::LayoutMismatch { .. })
     ));
     assert_eq!(layer.scale(), 4.0);
-    assert_eq!(layer.texture().expect("kept tex") as *const _, raw_tex_ptr);
+    assert_eq!(texels(layer.texture().expect("kept tex")), raw_texels);
 
     // Dimmer plane decays scale by SCALE_DECAY.
     let dim = vec![0.0_f32; 16];

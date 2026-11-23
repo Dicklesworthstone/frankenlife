@@ -1356,8 +1356,8 @@ fn recovery_refuses_a_journal_that_disagrees_with_its_starting_point() {
     );
     conflict(
         open(checkpointed(), &impossible),
-        "replay command journal",
-        "not reproduced",
+        "recover command book",
+        "already ended",
     );
 }
 
@@ -1927,9 +1927,16 @@ fn held_step_wakes_when_control_consumes_final_journal_receipt() {
             self.inner.open_run(session, revision)
         }
         fn append(&mut self, record: &JournalRecord) -> Result<Watermarks, CoreError> {
-            let _ = self.gate.recv();
+            // Only gate acceptances: outcome appends from the awakened `Step`
+            // must proceed freely so a concurrent `Checkpoint` never deadlocks
+            // waiting for an outcome receipt behind the same manual gate.
+            if matches!(record, JournalRecord::Accepted { .. }) {
+                let _ = self.gate.recv();
+            }
             let result = self.inner.append(record);
-            let _ = self.done.send(());
+            if matches!(record, JournalRecord::Accepted { .. }) {
+                let _ = self.done.send(());
+            }
             result
         }
     }
@@ -1978,48 +1985,33 @@ fn held_step_wakes_when_control_consumes_final_journal_receipt() {
         let stepped = spawner
             .try_spawn(async move { stepper.step(&Cx::current().expect("a task context")).await })
             .expect("stepper");
+        // Let `stepper` run and enqueue `Step` ahead of the FIFO `inspect`.
+        for _ in 0..4 {
+            yield_now().await;
+        }
         // FIFO inspect confirms `Step` reached the owner and is parked in `self.held`.
         let held = handle.inspect(&cx).await.expect("inspect");
         assert_eq!(held.boundary.tick, Tick::new(0));
         assert_eq!(held.journal.expect("journaled").waiting, 1);
+        // Yield so the owner returns to `next_inbound` before releasing the gate.
+        for _ in 0..4 {
+            yield_now().await;
+        }
 
-        // Let the acceptance write complete so its receipt sits in `receipts`,
-        // then queue `Inspect` + `Checkpoint` back-to-back so `Checkpoint`
-        // drains in `control.try_recv()` and settles the receipt while `Step`
-        // is still in `self.held`.
+        // Let the acceptance write complete so its receipt sits in `receipts`
+        // while the single-threaded runtime holds the owner parked in
+        // `next_inbound`, then send `Checkpoint`: `next_inbound` prioritizes
+        // `control` over `receipts`, so `Checkpoint::handle` consumes the final
+        // receipt via `settle_receipts()` while `Step` is parked in `self.held`.
         open.send(()).expect("open acceptance");
         done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("acceptance wrote");
         // Allow the writer thread's immediate `receipt_sender.send` to complete.
         std::thread::sleep(Duration::from_millis(5));
-        let mut inspect_fut = std::pin::pin!(handle.inspect(&cx));
-        let mut cp_fut = std::pin::pin!(handle.checkpoint(&cx));
-        let mut inspect_out = None;
-        let mut cp_out = None;
-        std::future::poll_fn(|context| {
-            if inspect_out.is_none()
-                && let std::task::Poll::Ready(v) = inspect_fut.as_mut().poll(context)
-            {
-                inspect_out = Some(v);
-            }
-            if cp_out.is_none()
-                && let std::task::Poll::Ready(v) = cp_fut.as_mut().poll(context)
-            {
-                cp_out = Some(v);
-            }
-            if inspect_out.is_some() && cp_out.is_some() {
-                std::task::Poll::Ready(())
-            } else {
-                std::task::Poll::Pending
-            }
-        })
-        .await;
-        inspect_out.expect("inspect").expect("ok");
-        cp_out.expect("checkpoint").expect("ok");
+        let cp = handle.checkpoint(&cx).await.expect("checkpoint");
+        assert_eq!(cp.boundary.tick, Tick::new(0));
         accepted(&submitted.await.expect("durable"));
-        // Open gate for the Applied outcome written when `Step` publishes tick 1.
-        open.send(()).expect("open outcome");
         let step = stepped.await.expect("stepped");
         let StepOutcome::Published {
             boundary, applied, ..

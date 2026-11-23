@@ -164,15 +164,24 @@ pub struct InspectedHeld {
     pub recurrent_state: Option<Vec<f64>>,
 }
 
-/// The field's energy plane.
+/// The field's energy plane (plus optional `field-ecology-v2` trail energy and
+/// vascular conductance planes when enabled).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct InspectedField {
     /// `field`.
     pub record: &'static str,
     /// The grid's cells, `[x, y]`.
     pub cells: [u32; 2],
-    /// Each cell's energy, row-major: cell `(x, y)` at `y · cells_x + x`.
+    /// Each cell's Carrier-0 energy, row-major: cell `(x, y)` at `y · cells_x + x`.
     pub energy: Vec<f64>,
+    /// Each cell's Carrier-1 trail energy (`e_1`), row-major, when `V2-15`
+    /// (`dual-carrier-trails`) is enabled; omitted on single-carrier runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trail_energy: Option<Vec<f64>>,
+    /// Each cell's mean incident vascular edge conductance `g_e`, row-major,
+    /// when `V2-14` (`vascular-field`) is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vascular_conductance: Option<Vec<f64>>,
 }
 
 /// One organism's whole controller (plan §14.2's on-demand weight dump):
@@ -407,10 +416,38 @@ fn of(
         field_energy: state.energy_total(),
         organism_energy,
     };
-    let field = options.field.then(|| InspectedField {
-        record: "field",
-        cells,
-        energy: state.energy().iter().map(|&cell| f64::from(cell)).collect(),
+    let field = options.field.then(|| {
+        let trail_energy = state
+            .trail_energy()
+            .map(|plane| plane.iter().map(|&cell| f64::from(cell)).collect());
+        let vascular_conductance = state.vascular_edges().map(|(gx, gy)| {
+            let nx = grid.cells_x() as usize;
+            let ny = grid.cells_y() as usize;
+            let mut out = Vec::with_capacity(nx.saturating_mul(ny));
+            for y in 0..ny {
+                let south_y = if y == 0 { ny - 1 } else { y - 1 };
+                for x in 0..nx {
+                    let west_x = if x == 0 { nx - 1 } else { x - 1 };
+                    let c = y * nx + x;
+                    let west = y * nx + west_x;
+                    let south = south_y * nx + x;
+                    let mean = 0.25
+                        * (f64::from(gx[c])
+                            + f64::from(gx[west])
+                            + f64::from(gy[c])
+                            + f64::from(gy[south]));
+                    out.push(mean);
+                }
+            }
+            out
+        });
+        InspectedField {
+            record: "field",
+            cells,
+            energy: state.energy().iter().map(|&cell| f64::from(cell)).collect(),
+            trail_energy,
+            vascular_conductance,
+        }
     });
     let weights = options
         .weights

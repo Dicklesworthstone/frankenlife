@@ -922,3 +922,210 @@ fn decoding_constants_are_checked() {
     assert_eq!(decoded.attempt_probability, 0.0);
     assert_eq!(decoded.emission.map(|e| e.spend_fraction), Some(0.0));
 }
+
+#[test]
+fn observe_dual_normalizes_carriers_independently_and_appends_4_trail_sensors() {
+    use flife_core::numerics::tanh_f64_as_f32;
+    use flife_field::grid::{
+        CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE,
+        CARRIER1_MOMENT_CHANNELS, DUAL_CARRIER_PLANES,
+    };
+    use flife_field::pyramid::DualRawSample;
+    use flife_neural::{observe_dual, observe_dual_for_controller};
+
+    let cfg = appendix_a();
+    let scales = scales();
+    let trail_scale = 0.75_f64;
+    let intrinsic = Intrinsic {
+        energy: 3.5,
+        age_seconds: 18.0,
+        velocity: [0.4, -0.25],
+        energy_change_per_second: 0.15,
+    };
+
+    // 1. Exact formula verification on a heterogeneous DualRawSample.
+    let mut raw = DualRawSample {
+        values: [0.0; DUAL_CARRIER_PLANES as usize],
+        dx: [0.0; DUAL_CARRIER_PLANES as usize],
+        dy: [0.0; DUAL_CARRIER_PLANES as usize],
+    };
+    raw.values[0] = 2.4;
+    raw.dx[0] = 0.6;
+    raw.dy[0] = -0.3;
+    for k in 0..CARRIER0_MOMENT_CHANNELS as usize {
+        raw.values[1 + k] = (k as f64 - 11.5) * 0.04;
+        raw.dx[1 + k] = (k as f64 + 1.0) * 0.01;
+        raw.dy[1 + k] = -(k as f64 + 1.0) * 0.008;
+    }
+    let c1_e = CARRIER1_ENERGY_PLANE as usize;
+    let c1_m = CARRIER1_FIRST_MOMENT_PLANE as usize;
+    raw.values[c1_e] = 0.35;
+    raw.dx[c1_e] = -0.12;
+    raw.dy[c1_e] = 0.28;
+    for j in 0..CARRIER1_MOMENT_CHANNELS as usize {
+        raw.values[c1_m + j] = if j % 2 == 0 { 0.05 } else { -0.04 } * (j as f64 + 1.0);
+        raw.dx[c1_m + j] = 0.015 * (j as f64 - 3.0);
+        raw.dy[c1_m + j] = -0.02 * (j as f64 - 2.0);
+    }
+
+    let obs = observe_dual(&raw, &intrinsic, &scales, trail_scale).expect("observe_dual");
+    let ctrl = observe_dual_for_controller(&raw, &intrinsic, &scales, trail_scale)
+        .expect("observe_dual_for_controller");
+
+    // Verify Carrier-0 energy & moments (0..24) normalize against R_0.
+    let r_scale = cfg.config().sensors.energy_density_scale;
+    let l_grad = scales.gradient_length();
+    let r_floor = scales.composition_floor();
+    let expected_q0 = raw.values[0] / (raw.values[0] + r_scale);
+    assert_eq!(obs.base.inputs[VALUES].to_bits(), expected_q0.to_bits());
+    let reg0 = raw.values[0] + r_floor;
+    for k in 0..CARRIER0_MOMENT_CHANNELS as usize {
+        let want_z = raw.values[1 + k] / reg0;
+        let want_gx = (raw.dx[1 + k] - want_z * raw.dx[0]) / reg0;
+        let want_gy = (raw.dy[1 + k] - want_z * raw.dy[0]) / reg0;
+        assert_eq!(obs.base.inputs[VALUES + 1 + k].to_bits(), want_z.to_bits());
+        assert_eq!(obs.base.gradients[1 + k][0].to_bits(), want_gx.to_bits());
+        assert_eq!(obs.base.gradients[1 + k][1].to_bits(), want_gy.to_bits());
+        assert_eq!(
+            ctrl.base.inputs[X_DERIVATIVES + 1 + k].to_bits(),
+            f64::from(tanh_f64_as_f32(l_grad * want_gx).expect("tanh")).to_bits()
+        );
+        assert_eq!(
+            ctrl.base.inputs[Y_DERIVATIVES + 1 + k].to_bits(),
+            f64::from(tanh_f64_as_f32(l_grad * want_gy).expect("tanh")).to_bits()
+        );
+    }
+
+    // Verify Carrier-1 trail moments (24..32) normalize against R_1, NOT R_0,
+    // and check the 4 appended trail sensor channels.
+    let reg1 = raw.values[c1_e] + r_floor;
+    let mut z1_sq = 0.0;
+    for j in 0..CARRIER1_MOMENT_CHANNELS as usize {
+        let dst = 1 + CARRIER0_MOMENT_CHANNELS as usize + j;
+        let want_z = raw.values[c1_m + j] / reg1;
+        z1_sq += want_z * want_z;
+        let want_gx = (raw.dx[c1_m + j] - want_z * raw.dx[c1_e]) / reg1;
+        let want_gy = (raw.dy[c1_m + j] - want_z * raw.dy[c1_e]) / reg1;
+        assert_eq!(obs.base.inputs[VALUES + dst].to_bits(), want_z.to_bits());
+        assert_eq!(obs.base.gradients[dst][0].to_bits(), want_gx.to_bits());
+        assert_eq!(obs.base.gradients[dst][1].to_bits(), want_gy.to_bits());
+    }
+    let shifted1 = raw.values[c1_e] + trail_scale;
+    let slope1 = trail_scale / (shifted1 * shifted1);
+    let want_q1 = raw.values[c1_e] / shifted1;
+    let want_dq1_x = slope1 * raw.dx[c1_e];
+    let want_dq1_y = slope1 * raw.dy[c1_e];
+    assert_eq!(obs.trail_inputs[0].to_bits(), want_q1.to_bits());
+    assert_eq!(
+        obs.trail_inputs[1].to_bits(),
+        tanh(l_grad * want_dq1_x).expect("tanh").to_bits()
+    );
+    assert_eq!(
+        obs.trail_inputs[2].to_bits(),
+        tanh(l_grad * want_dq1_y).expect("tanh").to_bits()
+    );
+    assert_eq!(
+        obs.trail_inputs[3].to_bits(),
+        z1_sq.sqrt().min(1.0).to_bits()
+    );
+    assert_eq!(ctrl.trail_inputs[0].to_bits(), want_q1.to_bits());
+    assert_eq!(
+        ctrl.trail_inputs[1].to_bits(),
+        f64::from(tanh_f64_as_f32(l_grad * want_dq1_x).expect("tanh")).to_bits()
+    );
+    assert_eq!(
+        ctrl.trail_inputs[2].to_bits(),
+        f64::from(tanh_f64_as_f32(l_grad * want_dq1_y).expect("tanh")).to_bits()
+    );
+    assert_eq!(
+        ctrl.trail_inputs[3].to_bits(),
+        obs.trail_inputs[3].to_bits()
+    );
+
+    // 2. Carrier decoupling: jumping Carrier-0 energy density by 1,000x leaves
+    // Z_{24..31}, gradients[25..33], and all 4 trail_inputs bit-for-bit identical.
+    let mut boosted = raw;
+    boosted.values[0] *= 1_000.0;
+    boosted.dx[0] *= 1_000.0;
+    boosted.dy[0] *= 1_000.0;
+    let obs_boosted = observe_dual(&boosted, &intrinsic, &scales, trail_scale).expect("boosted");
+    for dst in (1 + CARRIER0_MOMENT_CHANNELS as usize)..PLANES {
+        assert_eq!(
+            obs.base.inputs[VALUES + dst].to_bits(),
+            obs_boosted.base.inputs[VALUES + dst].to_bits(),
+            "Carrier-1 composition Z[{dst}] must not depend on R_0"
+        );
+        assert_eq!(
+            obs.base.gradients[dst][0].to_bits(),
+            obs_boosted.base.gradients[dst][0].to_bits()
+        );
+        assert_eq!(
+            obs.base.gradients[dst][1].to_bits(),
+            obs_boosted.base.gradients[dst][1].to_bits()
+        );
+    }
+    for i in 0..4 {
+        assert_eq!(
+            obs.trail_inputs[i].to_bits(),
+            obs_boosted.trail_inputs[i].to_bits(),
+            "trail_inputs[{i}] must not depend on R_0"
+        );
+    }
+
+    // 3. ||Z^(1)||_2 clamps at 1.0 when trail moments exceed R_1 + R_floor.
+    let mut loud_trail = raw;
+    loud_trail.values[c1_m] = 10.0 * (loud_trail.values[c1_e] + r_floor);
+    let obs_loud = observe_dual(&loud_trail, &intrinsic, &scales, trail_scale).expect("loud");
+    assert_eq!(obs_loud.trail_inputs[3].to_bits(), 1.0_f64.to_bits());
+
+    // 4. Real 34-plane uniform SensorPyramid -> zero gradients on both carriers.
+    let grid = FieldGrid::new(16, 16, 16.0, 16.0).expect("grid");
+    let limits = BufferLimits::new(1 << 24);
+    let mut uniform =
+        FieldState::zeroed_with_planes(grid, DUAL_CARRIER_PLANES, &limits).expect("34-plane field");
+    uniform.energy_mut().fill(2.0);
+    for c in 0..CARRIER0_MOMENT_CHANNELS {
+        uniform.moment_mut(c).expect("c0").fill(0.05);
+    }
+    uniform.trail_energy_mut().expect("e1").fill(0.6);
+    for c in 0..CARRIER1_MOMENT_CHANNELS {
+        uniform.trail_moment_mut(c).expect("c1").fill(-0.03);
+    }
+    let mut pyramid =
+        SensorPyramid::new_with_planes(grid, 3, DUAL_CARRIER_PLANES as usize, &limits)
+            .expect("pyramid");
+    let view = pyramid.build(&uniform).expect("build");
+    let sample_fine = view.sample_dual([4.3, 9.7], 1.0).expect("fine");
+    let sample_coarse = view.sample_dual([11.2, 2.8], 3.5).expect("coarse");
+    let obs_fine = observe_dual(&sample_fine, &intrinsic, &scales, trail_scale).expect("fine obs");
+    let obs_coarse =
+        observe_dual(&sample_coarse, &intrinsic, &scales, trail_scale).expect("coarse obs");
+    assert_eq!(obs_fine.trail_inputs[1], 0.0);
+    assert_eq!(obs_fine.trail_inputs[2], 0.0);
+    for g in obs_fine.base.gradients {
+        assert_eq!(g, [0.0, 0.0]);
+    }
+    for i in 0..4 {
+        assert!((obs_fine.trail_inputs[i] - obs_coarse.trail_inputs[i]).abs() <= 1.0e-12);
+    }
+
+    // 5. Negative refusals.
+    for bad_scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            observe_dual(&raw, &intrinsic, &scales, bad_scale),
+            Err(CoreError::NumericalInvalid { .. })
+        ));
+    }
+    let mut neg_r1 = raw;
+    neg_r1.values[c1_e] = -0.1;
+    assert!(matches!(
+        observe_dual(&neg_r1, &intrinsic, &scales, trail_scale),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+    let mut nan_m1 = raw;
+    nan_m1.values[c1_m + 3] = f64::NAN;
+    assert!(matches!(
+        observe_dual(&nan_m1, &intrinsic, &scales, trail_scale),
+        Err(CoreError::NumericalInvalid { .. })
+    ));
+}

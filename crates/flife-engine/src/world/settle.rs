@@ -46,7 +46,7 @@ use flife_field::settle::{
     MutationLayer, MutationValues, ProposalOrganism, ProposalOutcome, SettleBackend,
 };
 use flife_field::state::CHANNELS;
-use flife_field::{Bins, Deposits, FieldState, GrantPacket};
+use flife_field::{Bins, Deposits, FieldState, GrantPacket, split_dual_carrier_emission};
 use flife_genome::{BirthAttempt, Mutator, ParameterValues, Prepared, TopologyId};
 use flife_neural::{DenseTopology, WeightDtype, Weights};
 
@@ -413,6 +413,13 @@ fn settle_on(
     for lane in lanes.iter_mut() {
         lane.flows.clear();
         lane.emissions.clear();
+        if let Some(trail) = lane.trail_emissions.as_mut() {
+            trail.clear();
+        }
+        if let Some(byproducts) = lane.byproducts.as_mut() {
+            byproducts.clear();
+        }
+        lane.emission_paid = flife_core::CompensatedSum::ZERO;
         lane.transactions = None;
     }
     settled.extend(working.iter().map(Settled::of));
@@ -434,6 +441,9 @@ fn settle_on(
                 let DecisionLane {
                     flows,
                     emissions,
+                    trail_emissions,
+                    byproducts,
+                    emission_paid,
                     transactions,
                     ..
                 } = lane;
@@ -441,6 +451,7 @@ fn settle_on(
                     let index = start + offset;
                     let missing = || differ(format!("no outcome for row {index}"));
                     let organism = rows.get(index).ok_or_else(missing)?;
+                    let traits = genome_of(population, organism.committed.id)?.traits();
                     let mut stages = Device {
                         chemistry: chemistry_out.get(index).ok_or_else(missing)?,
                         motion: motion_out.get(index).ok_or_else(missing)?,
@@ -452,10 +463,14 @@ fn settle_on(
                     *slot = settle_stages(
                         rules,
                         organism,
+                        traits,
                         &mut stages,
                         from,
                         flows,
                         emissions,
+                        trail_emissions.as_mut(),
+                        byproducts.as_mut(),
+                        emission_paid,
                         record,
                     )?;
                     stages.check_fate(organism.committed.id, &slot.vitality)?;
@@ -743,6 +758,7 @@ impl Stages for Device<'_> {
         from: Tick,
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
+        trail_emissions: Option<&mut Deposits>,
     ) -> Result<(EmissionSettlement, f32, Tick), CoreError> {
         // EmissionPolicy::emit, its request and offer recomputed here, its
         // footprint split the backend's (at the position the backend moved
@@ -766,31 +782,38 @@ impl Stages for Device<'_> {
                 outcome.available
             )));
         }
-        let (effective_emission, energy_floor, next_readiness, next_cooldown_deadline) =
-            if rules.v2.emission().any_enabled() {
-                let ctx = rules.emission_context(organism, position, velocity, from)?;
-                let plan = rules.v2.emission().plan(
-                    &rules.grid,
-                    rules.step,
-                    available,
-                    budget.is_exhausted(),
-                    organism.actions.emission.as_ref(),
-                    &ctx,
-                )?;
-                (
-                    plan.effective_emission,
-                    plan.energy_floor,
-                    plan.next_readiness,
-                    plan.next_cooldown_deadline,
-                )
-            } else {
-                (
-                    organism.actions.emission,
-                    0.0,
-                    organism.secretory_readiness,
-                    organism.emission_cooldown_deadline,
-                )
-            };
+        let (
+            deposit_position,
+            effective_emission,
+            energy_floor,
+            next_readiness,
+            next_cooldown_deadline,
+        ) = if rules.v2.emission().any_enabled() {
+            let ctx = rules.emission_context(organism, position, velocity, from)?;
+            let plan = rules.v2.emission().plan(
+                &rules.grid,
+                rules.step,
+                available,
+                budget.is_exhausted(),
+                organism.actions.emission.as_ref(),
+                &ctx,
+            )?;
+            (
+                plan.deposit_position,
+                plan.effective_emission,
+                plan.energy_floor,
+                plan.next_readiness,
+                plan.next_cooldown_deadline,
+            )
+        } else {
+            (
+                position,
+                organism.actions.emission,
+                0.0,
+                organism.secretory_readiness,
+                organism.emission_cooldown_deadline,
+            )
+        };
         let Some(action) = effective_emission.as_ref() else {
             return if outcome.staged {
                 Err(differ(
@@ -833,14 +856,44 @@ impl Stages for Device<'_> {
                 outcome.requested, outcome.offered
             )));
         }
-        emissions.push_split(
-            &rules.grid,
-            organism.committed.id,
-            requested,
-            offered,
-            &action.direction,
-            outcome.packets(),
-        )?;
+        let settlement_offered =
+            if let (Some(dc), Some(trail_deposits)) = (rules.v2.dual_carrier(), trail_emissions) {
+                let split = split_dual_carrier_emission(
+                    requested,
+                    rules.emission.efficiency(),
+                    dc.trail_emission_share(),
+                    &action.direction,
+                )?;
+                emissions.push_with(
+                    &rules.grid,
+                    rules.exchange,
+                    organism.committed.id,
+                    deposit_position,
+                    split.paid_0,
+                    split.offered_0,
+                    &split.direction_0,
+                )?;
+                trail_deposits.push_with(
+                    &rules.grid,
+                    rules.exchange,
+                    organism.committed.id,
+                    deposit_position,
+                    split.paid_1,
+                    split.offered_1,
+                    &split.direction_1,
+                )?;
+                split.offered_0 + split.offered_1
+            } else {
+                emissions.push_split(
+                    &rules.grid,
+                    organism.committed.id,
+                    requested,
+                    offered,
+                    &action.direction,
+                    outcome.packets(),
+                )?;
+                offered
+            };
         let cost = budget.pay(requested)?;
         check_paid("emission", cost.paid, outcome.paid)?;
         check_balance("emission", budget, outcome.remaining, outcome.exhausted)?;
@@ -848,7 +901,7 @@ impl Stages for Device<'_> {
             EmissionSettlement {
                 available,
                 cost,
-                offered,
+                offered: settlement_offered,
             },
             next_readiness,
             next_cooldown_deadline,

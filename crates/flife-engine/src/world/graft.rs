@@ -168,6 +168,17 @@ impl World {
                 "the package's genomes are of another topology catalog or parameter type",
             ));
         }
+        if self.field.current().planes() != package.field.current().planes()
+            || self.field.current().has_vascular() != package.field.current().has_vascular()
+        {
+            return Err(refuse(format!(
+                "the package's field ({} planes, vascular={}) does not match the host ({} planes, vascular={})",
+                package.field.current().planes(),
+                package.field.current().has_vascular(),
+                self.field.current().planes(),
+                self.field.current().has_vascular(),
+            )));
+        }
         package.measure_region(center, radius)?;
         let target = host.wrap_position([
             center[0] + offset[0] as f64 * host.cell_width(),
@@ -191,19 +202,29 @@ impl World {
         }
 
         // The field: each package cell in the disk to its host cell.
-        let mut field = FieldPair::zeroed(host, &BufferLimits::host())?;
+        let limits = BufferLimits::host();
+        let mut field =
+            FieldPair::zeroed_with_planes(host, self.field.current().planes(), &limits)?;
+        if let Some(vascular) = self.rules.v2.vascular() {
+            field.enable_vascular(vascular.initial_conductance(), &limits)?;
+        }
         field.current_mut().copy_from(self.field.current())?;
         let mut landed = BTreeSet::new();
         let mut displaced_field = 0.0;
+        let pkg_field = package.field.current();
         for y in 0..source.cells_y() {
             for x in 0..source.cells_x() {
-                let cell = package
-                    .field
-                    .current()
+                let cell = pkg_field
                     .cell(x, y)
                     .ok_or_else(|| refuse(format!("the package holds no cell ({x}, {y})")))?;
+                let trail = pkg_field.trail_cell(x, y);
                 if !cell_in_disk(&source, center, radius, x, y)? {
-                    if cell.energy != 0.0 || cell.moments.iter().any(|value| *value != 0.0) {
+                    let trail_nonzero = trail
+                        .is_some_and(|(e1, m1)| e1 != 0.0 || m1.iter().any(|value| *value != 0.0));
+                    if cell.energy != 0.0
+                        || cell.moments.iter().any(|value| *value != 0.0)
+                        || trail_nonzero
+                    {
                         return Err(refuse(format!(
                             "the package's cell ({x}, {y}) lies outside its disk and is not empty"
                         )));
@@ -231,10 +252,43 @@ impl World {
                     .cell(hx, hy)
                     .ok_or_else(|| refuse(format!("the host holds no cell ({hx}, {hy})")))?;
                 displaced_field += f64::from(replaced.energy);
+                if let Some((replaced_e1, _)) = field.current().trail_cell(hx, hy) {
+                    displaced_field += f64::from(replaced_e1);
+                }
                 field
                     .current_mut()
                     .set_cell(hx, hy, &cell)
                     .ok_or_else(|| refuse(format!("the host holds no cell ({hx}, {hy})")))?;
+                if let Some((e1, m1)) = trail {
+                    field
+                        .current_mut()
+                        .set_trail_cell(hx, hy, e1, &m1)
+                        .ok_or_else(|| {
+                            refuse(format!("the host holds no trail cell ({hx}, {hy})"))
+                        })?;
+                }
+                if let (
+                    Some((src_gx, src_gy)),
+                    Some((dst_gx, dst_gy)),
+                    Some(src_idx),
+                    Some(dst_idx),
+                ) = (
+                    pkg_field.vascular_edges(),
+                    field.current_mut().vascular_edges_mut(),
+                    source.cell_index(x, y),
+                    host.cell_index(hx, hy),
+                ) {
+                    if let (Some(&vx), Some(slot_x)) =
+                        (src_gx.get(src_idx), dst_gx.get_mut(dst_idx))
+                    {
+                        *slot_x = vx;
+                    }
+                    if let (Some(&vy), Some(slot_y)) =
+                        (src_gy.get(src_idx), dst_gy.get_mut(dst_idx))
+                    {
+                        *slot_y = vy;
+                    }
+                }
             }
         }
 

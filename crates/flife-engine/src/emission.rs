@@ -29,7 +29,7 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, Payment};
 use flife_core::numerics::{expm1_neg, sigmoid, tanh};
 use flife_core::{CoreError, TimeStep, V2Feature, ValidatedConfig};
-use flife_field::{Deposits, ExchangeKernel, FieldGrid};
+use flife_field::{Deposits, ExchangeKernel, FieldGrid, split_dual_carrier_emission};
 use flife_neural::Emission;
 
 /// The emission position this module implements.
@@ -755,6 +755,144 @@ impl EmissionPolicy {
             plan.energy_floor,
             budget,
             deposits,
+        )?;
+        Ok((settlement, plan))
+    }
+
+    /// Dual-carrier (`V2-15`) variant of [`EmissionPolicy::emit_with_floor`]:
+    /// splits the single paid emission `requested` between Carrier 0 (`24`
+    /// metabolic channels, `deposits`) and Carrier 1 (`8` non-destructive trail
+    /// channels, `trail_deposits`) via [`split_dual_carrier_emission`].
+    ///
+    /// # Errors
+    /// As [`EmissionPolicy::emit_with_floor`] and [`split_dual_carrier_emission`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors emit_with_floor plus dual-carrier trail share and trail deposits"
+    )]
+    pub fn emit_dual_with_floor(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        organism: OrganismId,
+        position: [f64; 2],
+        emission: Option<&Emission>,
+        energy_floor: f64,
+        trail_share: f64,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+        trail_deposits: &mut Deposits,
+    ) -> Result<EmissionSettlement, CoreError> {
+        if !energy_floor.is_finite() || energy_floor < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "emission energy floor",
+                detail: format!("{energy_floor} is not finite and nonnegative"),
+            });
+        }
+        let available = budget.remaining();
+        let nothing = EmissionSettlement {
+            available,
+            cost: Payment {
+                requested: 0.0,
+                paid: 0.0,
+            },
+            offered: 0.0,
+        };
+        let Some(emission) = emission else {
+            return Ok(nothing);
+        };
+        let fraction = emission.spend_fraction;
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "emission spending fraction",
+                detail: format!("{fraction} is outside [0, 1]"),
+            });
+        }
+        if budget.is_exhausted() {
+            return Ok(nothing);
+        }
+        let surplus = if energy_floor == 0.0 {
+            available
+        } else {
+            (available - energy_floor).max(0.0)
+        };
+        let requested = (fraction * surplus).min(available);
+        if requested == 0.0 {
+            return Ok(nothing);
+        }
+        let split = split_dual_carrier_emission(
+            requested,
+            self.efficiency,
+            trail_share,
+            &emission.direction,
+        )?;
+        deposits.push_with(
+            grid,
+            exchange,
+            organism,
+            position,
+            split.paid_0,
+            split.offered_0,
+            &split.direction_0,
+        )?;
+        trail_deposits.push_with(
+            grid,
+            exchange,
+            organism,
+            position,
+            split.paid_1,
+            split.offered_1,
+            &split.direction_1,
+        )?;
+        let cost = budget.pay(requested)?;
+        Ok(EmissionSettlement {
+            available,
+            cost,
+            offered: split.offered_0 + split.offered_1,
+        })
+    }
+
+    /// Dual-carrier (`V2-15`) variant of [`EmissionPolicy::emit_v2`].
+    ///
+    /// # Errors
+    /// As [`EmissionV2Rules::plan`] and [`EmissionPolicy::emit_dual_with_floor`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Phase 7 dual-carrier emission stage inputs plus V2-04 rules and context"
+    )]
+    pub fn emit_v2_dual(
+        &self,
+        grid: &FieldGrid,
+        exchange: ExchangeKernel,
+        step: TimeStep,
+        v2: &EmissionV2Rules,
+        organism: OrganismId,
+        emission: Option<&Emission>,
+        ctx: &EmissionContext,
+        trail_share: f64,
+        budget: &mut EnergyBudget,
+        deposits: &mut Deposits,
+        trail_deposits: &mut Deposits,
+    ) -> Result<(EmissionSettlement, EmissionPlan), CoreError> {
+        let plan = v2.plan(
+            grid,
+            step,
+            budget.remaining(),
+            budget.is_exhausted(),
+            emission,
+            ctx,
+        )?;
+        let settlement = self.emit_dual_with_floor(
+            grid,
+            exchange,
+            organism,
+            plan.deposit_position,
+            plan.effective_emission.as_ref(),
+            plan.energy_floor,
+            trail_share,
+            budget,
+            deposits,
+            trail_deposits,
         )?;
         Ok((settlement, plan))
     }

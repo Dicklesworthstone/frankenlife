@@ -142,7 +142,11 @@ impl World {
         let rules = Rules::from_config(&self.config, self.rules.profile)?;
         let grid = rules.grid;
 
-        let mut field = FieldPair::zeroed(grid, &BufferLimits::host())?;
+        let limits = BufferLimits::host();
+        let mut field = FieldPair::zeroed_with_planes(grid, rules.v2.field_planes(), &limits)?;
+        if let Some(vascular) = rules.v2.vascular() {
+            field.enable_vascular(vascular.initial_conductance(), &limits)?;
+        }
         let source = self.field.current();
         for y in 0..grid.cells_y() {
             for x in 0..grid.cells_x() {
@@ -156,6 +160,26 @@ impl World {
                     .current_mut()
                     .set_cell(x, y, &cell)
                     .ok_or_else(|| refuse(format!("the crop holds no cell ({x}, {y})")))?;
+                if let Some((e1, m1)) = source.trail_cell(x, y) {
+                    field
+                        .current_mut()
+                        .set_trail_cell(x, y, e1, &m1)
+                        .ok_or_else(|| {
+                            refuse(format!("the crop holds no trail cell ({x}, {y})"))
+                        })?;
+                }
+                if let (Some((src_gx, src_gy)), Some((dst_gx, dst_gy)), Some(index)) = (
+                    source.vascular_edges(),
+                    field.current_mut().vascular_edges_mut(),
+                    grid.cell_index(x, y),
+                ) {
+                    if let (Some(&vx), Some(slot_x)) = (src_gx.get(index), dst_gx.get_mut(index)) {
+                        *slot_x = vx;
+                    }
+                    if let (Some(&vy), Some(slot_y)) = (src_gy.get(index), dst_gy.get_mut(index)) {
+                        *slot_y = vy;
+                    }
+                }
             }
         }
 

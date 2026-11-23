@@ -368,7 +368,8 @@ pub(crate) fn apply(
                 ref direction,
             } => {
                 let (index, energy) = inject_energy(field, cell, amount)?;
-                for (channel, &component) in (0_u32..).zip(direction.iter()) {
+                let active = field.carrier0_moments_count();
+                for (channel, &component) in (0_u32..).zip(direction.iter().take(active)) {
                     if component == 0.0 {
                         continue;
                     }
@@ -744,7 +745,7 @@ mod tests {
         set_moment(&mut expected, 0, 2.3);
         set_moment(&mut expected, 3, -2.65);
         let bits = |field: &FieldState| -> Vec<u32> {
-            (0..flife_field::FIELD_PLANES)
+            (0..field.planes())
                 .flat_map(|plane| field.plane(plane).expect("plane").to_vec())
                 .map(f32::to_bits)
                 .collect()

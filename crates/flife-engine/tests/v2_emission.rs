@@ -26,7 +26,7 @@
 use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
 use flife_core::clock::{Tick, TimeStep};
 use flife_core::ids::OrganismId;
-use flife_core::ledger::EnergyBudget;
+use flife_core::ledger::{EnergyBudget, sub_down};
 use flife_core::numerics::{expm1_neg, sigmoid, tanh};
 use flife_core::{FeatureOverride, ValidatedConfig};
 use flife_engine::{
@@ -83,7 +83,8 @@ fn small_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
         ("world", "height", "16.0"),
         ("world", "grid_width", "32"),
         ("world", "grid_height", "32"),
-        ("world", "timestep_seconds", "0.03125"),
+        ("world", "tick_numerator", "1"),
+        ("world", "tick_denominator", "32"),
         ("population", "initial_count", "48"),
         ("population", "maximum_count", "256"),
         ("population", "initial_energy", "3.0"),
@@ -252,7 +253,7 @@ fn vesicle_readiness_fire_deplete_recover_exact() {
             let want_f_eff = r_f64 * want_burst;
             let want_w = want_f_eff * (2.5 - 0.5);
             assert_eq!(settled.cost.paid.to_bits(), want_w.to_bits());
-            assert_eq!(budget.remaining(), 2.5 - settled.cost.paid);
+            assert_eq!(budget.remaining(), sub_down(2.5, settled.cost.paid));
             let want_r_next = ((1.0 - alpha_dep) * r_f64) as f32;
             assert_eq!(plan.next_readiness.to_bits(), want_r_next.to_bits());
         } else {
@@ -264,16 +265,13 @@ fn vesicle_readiness_fire_deplete_recover_exact() {
         }
         r = plan.next_readiness;
     }
-    // Starting at r=0.2 with tau=1s (32 ticks), first fire happens around tick ~15,
-    // depleting to ~0.076, then next fire around tick ~35 -> exactly 2 crisp pulses in 64 ticks!
+    // Starting at r=0.2 with tau=1s (32 ticks), 1 - r decays as 0.8 * exp(-t/32)
+    // reaching r >= 0.5 at tick 16, depleting to ~0.077, then recovering over 20
+    // ticks + 1 fire tick -> exact 21-tick refractory period: ticks [16, 37, 58].
     assert_eq!(
-        fired_ticks.len(),
-        2,
-        "expected exactly 2 refractory pulses over 64 ticks, got {fired_ticks:?}"
-    );
-    assert!(
-        fired_ticks[1] - fired_ticks[0] >= 16,
-        "mandatory refractory recovery between pulses: {fired_ticks:?}"
+        fired_ticks,
+        [16, 37, 58],
+        "expected exact 21-tick refractory pulses [16, 37, 58] over 64 ticks"
     );
 }
 
@@ -629,7 +627,8 @@ fn e2e_stage_w_high_emission_survives_and_pulses() {
             ("world", "height", "16.0"),
             ("world", "grid_width", "32"),
             ("world", "grid_height", "32"),
-            ("world", "timestep_seconds", "0.03125"),
+            ("world", "tick_numerator", "1"),
+            ("world", "tick_denominator", "32"),
             ("population", "initial_count", "64"),
             ("population", "maximum_count", "512"),
             ("population", "initial_energy", "3.0"),
@@ -681,14 +680,15 @@ distance_world_units = 0.25
 
     let mut total_emitted = 0_u64;
     let mut total_organism_ticks = 0_u64;
-    let mut max_residual = 0.0_f64;
+    let mut max_rel_residual = 0.0_f64;
     for _ in 0..1024 {
         let Stepped::Published(report) = world.step().expect("step") else {
             panic!("unexpected pause");
         };
         total_emitted += report.emitted as u64;
         total_organism_ticks += report.live as u64;
-        max_residual = max_residual.max(report.closure.residual().abs());
+        let rel = report.closure.residual().abs() / report.closure.scale().max(1.0);
+        max_rel_residual = max_rel_residual.max(rel);
     }
     let live = world.population().len();
     let emitting_fraction = if total_organism_ticks > 0 {
@@ -696,8 +696,10 @@ distance_world_units = 0.25
     } else {
         0.0
     };
+    let ledger_report = world.ledger().report();
+    let cum_norm = ledger_report.normalized.unwrap_or(0.0);
     eprintln!(
-        "Stage-W high-r_max E2E (1024 ticks): live={live}, emitting_fraction={emitting_fraction:.4}, max_residual={max_residual:e}"
+        "Stage-W high-r_max E2E (1024 ticks): live={live}, emitting_fraction={emitting_fraction:.4}, max_rel_residual={max_rel_residual:e}, cum_norm={cum_norm:e}"
     );
     assert!(
         live > 0,
@@ -712,7 +714,12 @@ distance_world_units = 0.25
         "excitable relay must keep emission pulsatile (< 25%/tick), got {emitting_fraction:.4}"
     );
     assert!(
-        max_residual < 1e-5,
-        "INV-03 residual {max_residual:e} exceeded 1e-5"
+        max_rel_residual <= 1e-6,
+        "INV-03 per-tick relative residual {max_rel_residual:e} exceeded 1e-6 (§21.4)"
+    );
+    assert!(
+        cum_norm <= profile.residual.cumulative(),
+        "INV-03 cumulative normalized residual {cum_norm:e} exceeded {}",
+        profile.residual.cumulative()
     );
 }

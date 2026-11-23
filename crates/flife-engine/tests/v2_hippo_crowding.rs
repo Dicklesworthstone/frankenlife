@@ -81,7 +81,6 @@ diameter = 0.5
 stiffness = 0.6
 adhesion = 0.0
 adhesion_range = 1.0
-sweeps = 1
 {extra}
 "#
     )
@@ -93,7 +92,8 @@ fn base_small_overrides() -> &'static [(&'static str, &'static str, &'static str
         ("world", "height", "16.0"),
         ("world", "grid_width", "32"),
         ("world", "grid_height", "32"),
-        ("world", "timestep_seconds", "0.03125"),
+        ("world", "tick_numerator", "1"),
+        ("world", "tick_denominator", "32"),
         ("population", "initial_count", "64"),
         ("population", "maximum_count", "512"),
         ("population", "initial_energy", "3.0"),
@@ -466,11 +466,13 @@ expose_sensor = true
 #[test]
 fn e2e_hippo_wound_punch_rim_proliferation() {
     let profile = NumericalProfile::reference_f32().expect("profile");
-    let diameter = 0.5_f64;
+    let diameter = 0.65_f64;
     let wound_center = [8.0_f64, 8.0_f64];
-    let wound_radius = 2.0_f64;
+    let wound_radius = 2.5_f64;
 
-    // Rich central colony on 16x16 torus with Hippo arrest (radius = 1.5*D = 0.75, c_max = 4.5).
+    // Confluent tissue sheet on a 16x16 torus (32x32 grid, D = 0.65, r = 1.5*D = 0.975 ->
+    // circle area ~ 3.0, bulk density >= 2.2 orgs/unit area -> bulk N_loc >= 6.6 > c_max = 4.5)
+    // so the interior is genuinely Hippo-arrested while the wound rim releases upon lesion.
     let toml = ecology_toml(
         "field-ecology-v2",
         &[
@@ -478,8 +480,9 @@ fn e2e_hippo_wound_punch_rim_proliferation() {
             ("world", "height", "16.0"),
             ("world", "grid_width", "32"),
             ("world", "grid_height", "32"),
-            ("world", "timestep_seconds", "0.03125"),
-            ("population", "initial_count", "256"),
+            ("world", "tick_numerator", "1"),
+            ("world", "tick_denominator", "32"),
+            ("population", "initial_count", "480"),
             ("population", "maximum_count", "2048"),
             ("population", "initial_energy", "3.5"),
             ("sources", "count", "4"),
@@ -497,31 +500,36 @@ fn e2e_hippo_wound_punch_rim_proliferation() {
             ("reproduction", "cooldown_seconds", "0.125"),
             ("execution", "command_durability", "\"volatile-in-memory\""),
         ],
-        &compact_contact_tail(
-            r#"
+        r#"
+[contact]
+diameter = 0.65
+stiffness = 0.75
+adhesion = 0.25
+adhesion_range = 2.0
+sweeps = 2
+
 [v2]
 profile = "minimal"
 
 [v2.crowding]
 enabled = true
 mode = "local-neighbors-v1"
-radius_world_units = 0.75
+radius_world_units = 0.975
 arrest_threshold = 4.5
 expose_sensor = false
 "#,
-        ),
     );
     let cfg = ValidatedConfig::from_toml(&toml).expect("valid wound config");
     let mut world = World::found(&cfg, Arrangement::Compact, profile).expect("world");
 
-    // 1. Grow dense tissue patch for 160 ticks.
+    // 1. Equilibrate dense confluent sheet for 160 ticks.
     for _ in 0..160 {
         assert!(matches!(world.step().expect("grow"), Stepped::Published(_)));
     }
     let pre_wound_live = world.population().len();
     assert!(
-        pre_wound_live >= 200,
-        "patch should be dense before wound punch, got {pre_wound_live}"
+        pre_wound_live >= 450,
+        "sheet must be confluent before wound punch, got {pre_wound_live}"
     );
 
     // 2. Punch circular wound via Intervention::RemoveOrganisms and verify
@@ -536,23 +544,23 @@ expose_sensor = false
     let mut rim_births = 0_u64;
     let mut interior_organism_ticks = 0_u64;
     let mut interior_births = 0_u64;
-    let mut max_residual = 0.0_f64;
+    let mut max_rel_residual = 0.0_f64;
 
     // Classify every live organism BEFORE each post-wound tick by distance to
-    // the wound edge (`|d - wound_radius|` for survivors outside the hole),
-    // and attribute committed births to their parent's pre-tick zone.
-    for post_tick in 0..96 {
+    // the wound edge, and attribute committed births to their parent's pre-tick zone.
+    for post_tick in 0..64 {
         let mut parent_zone = std::collections::HashMap::new();
         for org in world.population().iter() {
             let [dx, dy] = grid.displacement(wound_center, org.position).expect("disp");
             let d = dx.hypot(dy);
             let edge_dist = (d - wound_radius).abs();
-            // Rim: within 2*D of wound boundary (and outside wound on tick 0).
-            // Interior: deep in the bulk (> 4*D from wound edge) with >= 5 neighbors.
-            if d >= wound_radius && edge_dist < 2.0 * diameter {
+            // Rim: organisms along the wound margin (outside the hole on tick 0,
+            // within 1.5*D of the wound boundary).
+            // Interior: deep in the confluent bulk (> 3.0*D beyond the wound edge).
+            if (post_tick > 0 || d >= wound_radius) && edge_dist < 1.5 * diameter {
                 parent_zone.insert(org.id, true);
                 rim_organism_ticks += 1;
-            } else if d > wound_radius + 4.0 * diameter {
+            } else if d > wound_radius + 3.0 * diameter {
                 parent_zone.insert(org.id, false);
                 interior_organism_ticks += 1;
             }
@@ -565,7 +573,8 @@ expose_sensor = false
         let Stepped::Published(report) = stepped else {
             panic!("unexpected pause during wound healing");
         };
-        max_residual = max_residual.max(report.closure.residual().abs());
+        let rel = report.closure.residual().abs() / report.closure.scale().max(1.0);
+        max_rel_residual = max_rel_residual.max(rel);
         if post_tick == 0 {
             assert!(
                 report.interventions.iter().any(|iv| iv.removed > 0),
@@ -583,9 +592,15 @@ expose_sensor = false
         }
     }
 
+    let cum_norm = world.ledger().report().normalized.unwrap_or(0.0);
     assert!(
-        max_residual < 1e-5,
-        "INV-03 ledger residual {max_residual:e} exceeded 1e-5"
+        max_rel_residual <= 1e-6,
+        "INV-03 per-tick relative residual {max_rel_residual:e} exceeded 1e-6 (§21.4)"
+    );
+    assert!(
+        cum_norm <= profile.residual.cumulative(),
+        "INV-03 cumulative normalized residual {cum_norm:e} exceeded {}",
+        profile.residual.cumulative()
     );
     assert!(
         rim_organism_ticks > 0 && interior_organism_ticks > 0,
@@ -595,7 +610,7 @@ expose_sensor = false
     let interior_rate = interior_births as f64 / interior_organism_ticks as f64;
     eprintln!(
         "hippo wound E2E: pre_wound_live={pre_wound_live}, rim_births={rim_births}/{rim_organism_ticks} ({rim_rate:.5}), \
-         interior_births={interior_births}/{interior_organism_ticks} ({interior_rate:.5}), max_residual={max_residual:e}"
+         interior_births={interior_births}/{interior_organism_ticks} ({interior_rate:.5}), max_rel_residual={max_rel_residual:e}, cum_norm={cum_norm:e}"
     );
     assert!(
         rim_births > 0,

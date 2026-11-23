@@ -109,6 +109,7 @@ pub(crate) fn measure(
     let lineages = distinct_lineages(grid, population, &disk, organisms)?;
 
     let energy = field.energy();
+    let trail_energy = field.trail_energy();
     let mut cells = 0_u64;
     let mut field_energy = 0.0;
     for y in 0..grid.cells_y() {
@@ -116,15 +117,21 @@ pub(crate) fn measure(
             if !cell_in_disk(grid, center, radius, x, y)? {
                 continue;
             }
-            let value = grid
+            let index = grid
                 .cell_index(x, y)
-                .and_then(|index| energy.get(index))
                 .ok_or_else(|| CoreError::StateConflict {
                     operation: "measure region",
-                    detail: format!("the field holds no energy for cell ({x}, {y})"),
+                    detail: format!("cell ({x}, {y}) is outside the grid"),
                 })?;
+            let value = energy.get(index).ok_or_else(|| CoreError::StateConflict {
+                operation: "measure region",
+                detail: format!("the field holds no energy for cell ({x}, {y})"),
+            })?;
             cells += 1;
             field_energy += f64::from(*value);
+            if let Some(trail) = trail_energy.and_then(|plane| plane.get(index)) {
+                field_energy += f64::from(*trail);
+            }
         }
     }
 

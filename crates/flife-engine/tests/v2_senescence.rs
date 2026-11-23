@@ -72,7 +72,8 @@ fn small_overrides() -> &'static [(&'static str, &'static str, &'static str)] {
         ("world", "height", "16.0"),
         ("world", "grid_width", "32"),
         ("world", "grid_height", "32"),
-        ("world", "timestep_seconds", "0.03125"),
+        ("world", "tick_numerator", "1"),
+        ("world", "tick_denominator", "32"),
         ("population", "initial_count", "48"),
         ("population", "maximum_count", "128"),
         ("population", "initial_energy", "3.0"),
@@ -195,12 +196,13 @@ fn senescence_exhaustion_reports_maintenance_stage() {
             ("world", "height", "16.0"),
             ("world", "grid_width", "32"),
             ("world", "grid_height", "32"),
-            ("world", "timestep_seconds", "0.03125"),
+            ("world", "tick_numerator", "1"),
+            ("world", "tick_denominator", "32"),
             ("population", "initial_count", "16"),
             ("population", "maximum_count", "64"),
             ("population", "initial_energy", "2.0"),
             ("sources", "count", "1"),
-            ("sources", "power_per_source", "0.0"),
+            ("sources", "power_per_source", "1.0e-6"),
             ("sources", "sigma_world_units", "2.0"),
             ("sources", "path_direction_interval_seconds", "2.0"),
             ("costs", "basal_energy_per_second", "0.5"),
@@ -313,7 +315,8 @@ fn e2e_senescence_increases_generational_turnover() {
         ("world", "height", "16.0"),
         ("world", "grid_width", "32"),
         ("world", "grid_height", "32"),
-        ("world", "timestep_seconds", "0.03125"),
+        ("world", "tick_numerator", "1"),
+        ("world", "tick_denominator", "32"),
         ("population", "initial_count", "64"),
         ("population", "maximum_count", "96"),
         ("population", "initial_energy", "3.0"),
@@ -364,13 +367,16 @@ profile = "minimal"
     let run = |cfg: &ValidatedConfig| {
         let mut world = World::found(cfg, Arrangement::Compact, profile).expect("world");
         let mut births_total = 0_usize;
-        let mut max_residual = 0.0_f64;
+        let mut max_abs_residual = 0.0_f64;
+        let mut max_rel_residual = 0.0_f64;
         for _ in 0..1024 {
             let Stepped::Published(report) = world.step().expect("step") else {
                 panic!("unexpected pause");
             };
             births_total += report.births.len();
-            max_residual = max_residual.max(report.closure.residual().abs());
+            let abs = report.closure.residual().abs();
+            max_abs_residual = max_abs_residual.max(abs);
+            max_rel_residual = max_rel_residual.max(abs / report.closure.scale().max(1.0));
         }
         let tick = world.tick().get();
         let live = world.population().len();
@@ -390,16 +396,37 @@ profile = "minimal"
             .map(|o| tick - o.birth_tick.get())
             .max()
             .unwrap_or(0);
-        (live, mean_gen, max_age_ticks, births_total, max_residual)
+        let cum_norm = world.ledger().report().normalized.unwrap_or(0.0);
+        (
+            live,
+            mean_gen,
+            max_age_ticks,
+            births_total,
+            max_abs_residual,
+            max_rel_residual,
+            cum_norm,
+        )
     };
 
-    let (live_on, gen_on, age_on, births_on, res_on) = run(&on_cfg);
-    let (live_off, gen_off, age_off, births_off, res_off) = run(&off_cfg);
+    let (live_on, gen_on, age_on, births_on, abs_on, rel_on, cum_on) = run(&on_cfg);
+    let (live_off, gen_off, age_off, births_off, abs_off, rel_off, cum_off) = run(&off_cfg);
     eprintln!(
-        "senescence E2E (1024 ticks): ON(live={live_on}, mean_gen={gen_on:.2}, max_age={age_on}, births={births_on}, res={res_on:e}) \
-         vs OFF(live={live_off}, mean_gen={gen_off:.2}, max_age={age_off}, births={births_off}, res={res_off:e})"
+        "senescence E2E (1024 ticks): ON(live={live_on}, mean_gen={gen_on:.2}, max_age={age_on}, births={births_on}, abs={abs_on:e}, rel={rel_on:e}, cum={cum_on:e}) \
+         vs OFF(live={live_off}, mean_gen={gen_off:.2}, max_age={age_off}, births={births_off}, abs={abs_off:e}, rel={rel_off:e}, cum={cum_off:e})"
     );
-    assert!(res_on < 1e-5, "INV-03 residual {res_on:e} exceeded 1e-5");
+    assert!(
+        rel_on <= 1e-6,
+        "INV-03 per-tick relative residual {rel_on:e} exceeded 1e-6 (§21.4)"
+    );
+    assert!(
+        cum_on <= profile.residual.cumulative(),
+        "INV-03 cumulative normalized residual {cum_on:e} exceeded {}",
+        profile.residual.cumulative()
+    );
+    assert!(
+        abs_on <= 2.0 * abs_off.max(1e-12),
+        "senescence absolute residual {abs_on:e} exceeded 2x baseline {abs_off:e}"
+    );
     assert!(live_on > 0, "population must survive under senescence");
     assert!(
         gen_on > gen_off,

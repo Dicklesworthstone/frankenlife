@@ -41,7 +41,7 @@ use flife_core::rng::FNP_PHILOX_SEMANTIC_V1;
 use flife_core::{
     CompensatedSum, CoreError, EnergyLedger, Holdings, LedgerState, ResidualBudget, ValidatedConfig,
 };
-use flife_field::{ConeTolerance, FIELD_PLANES, FieldPair, SeededPath};
+use flife_field::{ConeTolerance, FieldPair, SeededPath};
 use flife_genome::{Genome, GenomeQuota, Traits, WeightsMut};
 use flife_neural::{ACTION_WIDTH, MAX_ACTION_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, Weights};
 
@@ -264,7 +264,8 @@ impl World {
 
         let field = self.field.current();
         let grid = field.grid();
-        let values: usize = (0..FIELD_PLANES)
+        let planes = field.planes();
+        let values: usize = (0..planes)
             .map(|plane| field.plane(plane).map_or(0, <[f32]>::len))
             .sum();
         writer.chunk_with(
@@ -275,10 +276,23 @@ impl World {
             |out| {
                 out.u32(grid.cells_x());
                 out.u32(grid.cells_y());
-                out.u32(FIELD_PLANES);
-                for plane in 0..FIELD_PLANES {
+                out.u32(planes);
+                for plane in 0..planes {
                     for value in field.plane(plane).unwrap_or(&[]) {
                         out.f32(*value);
+                    }
+                }
+                if is_v2 {
+                    if let Some((gx, gy)) = field.vascular_edges() {
+                        out.u8(1);
+                        for &value in gx {
+                            out.f32(value);
+                        }
+                        for &value in gy {
+                            out.f32(value);
+                        }
+                    } else {
+                        out.u8(0);
                     }
                 }
                 Ok(())
@@ -632,19 +646,21 @@ impl World {
         counted(chunk.items, ChunkFamily::Lifecycle, 1)?;
 
         // The field.
-        let mut field = FieldPair::zeroed(rules.grid, &flife_field::BufferLimits::host())?;
+        let limits = flife_field::BufferLimits::host();
+        let expected_planes = rules.v2.field_planes();
+        let mut field = FieldPair::zeroed_with_planes(rules.grid, expected_planes, &limits)?;
         let chunk = reader.versioned(ChunkFamily::Field, version)?;
         let mut input = ByteReader::new(chunk.bytes, "field chunk");
         let shape = [input.u32()?, input.u32()?, input.u32()?];
-        if shape != [rules.grid.cells_x(), rules.grid.cells_y(), FIELD_PLANES] {
+        if shape != [rules.grid.cells_x(), rules.grid.cells_y(), expected_planes] {
             return Err(refuse(format!(
-                "a {shape:?} field for a {} × {} grid of {FIELD_PLANES} planes",
+                "a {shape:?} field for a {} × {} grid of {expected_planes} planes",
                 rules.grid.cells_x(),
                 rules.grid.cells_y()
             )));
         }
         let state = field.current_mut();
-        for plane in 0..FIELD_PLANES {
+        for plane in 0..expected_planes {
             let values = state
                 .plane_mut(plane)
                 .ok_or_else(|| CoreError::LayoutMismatch {
@@ -657,6 +673,34 @@ impl World {
                     return Err(refuse(format!("field plane {plane} holds {read}")));
                 }
                 *value = read;
+            }
+        }
+        if is_v2_chunk {
+            let has_vascular = input.u8()?;
+            let expected_vascular = u8::from(rules.v2.vascular().is_some());
+            if has_vascular != expected_vascular {
+                return Err(refuse(format!(
+                    "field chunk vascular flag {has_vascular} does not match configuration {expected_vascular}"
+                )));
+            }
+            if let Some(vascular) = rules.v2.vascular() {
+                let cells =
+                    usize::try_from(rules.grid.cell_count()).map_err(|_| CoreError::Overflow {
+                        quantity: "grid cells",
+                    })?;
+                field.enable_vascular(vascular.initial_conductance(), &limits)?;
+                let mut gx = Vec::with_capacity(cells);
+                let mut gy = Vec::with_capacity(cells);
+                for _ in 0..cells {
+                    gx.push(input.f32()?);
+                }
+                for _ in 0..cells {
+                    gy.push(input.f32()?);
+                }
+                field
+                    .current_mut()
+                    .set_vascular_edges(&gx, &gy)
+                    .map_err(|error| refuse(format!("vascular edges: {error}")))?;
             }
         }
         input.finish()?;

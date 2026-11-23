@@ -72,7 +72,7 @@ use flife_core::clock::{Tick, TimeStep, age_seconds, stable_phase};
 use flife_core::ids::{
     Generation, GenomeId, IdSequence, LineageId, OrganismId, ResourceEpoch, SourceId,
 };
-use flife_core::ledger::{CompensatedSum, Ledger, LedgerLog};
+use flife_core::ledger::{CompensatedSum, Ledger, LedgerLog, sub_down};
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::{
     FIELD_ECOLOGY_V1, FIELD_ECOLOGY_V1_CHEMISTRY_ONLY, FIELD_ECOLOGY_V1_CONTACT,
@@ -91,14 +91,17 @@ use flife_core::{
 };
 use flife_field::settle::MotorSteeringInputs;
 use flife_field::{
-    Bins, BufferLimits, ConeTolerance, Demand, DepositSummary, Deposits, ExchangeKernel,
-    ExchangeScratch, FieldBackend, FieldGrid, FieldPair, FieldState, FieldStepOptions,
-    FieldStepReport, FieldSummary, FieldWork, FluxEdges, GrantPacket, Grants, PyramidView,
-    RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend,
-    SensorPyramid, SensorQuery, SettleBackend, Source, SourceKernel, TransportPlan, UptakeBackend,
-    UptakeSummary, UptakeWork, advance_field_on, advance_field_v2_on, apply_deposits_on,
+    Bins, BufferLimits, CARRIER0_MOMENT_CHANNELS, CARRIER1_FIRST_MOMENT_PLANE,
+    CARRIER1_MOMENT_CHANNELS, ConeTolerance, Demand, DepositSummary, Deposits, DualRawSample,
+    ExchangeKernel, ExchangeScratch, FieldBackend, FieldGrid, FieldPair, FieldState,
+    FieldStepOptions, FieldStepPhase2, FieldStepReport, FieldSummary, FieldWork, FluxEdges,
+    GrantPacket, Grants, MAX_PLANES, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
+    SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
+    Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
+    advance_field_on, advance_field_v2_on, advance_field_wave2_on, apply_deposits_to_carrier_on,
     apply_grants_on, count_cell_occupancy, demand_with_scratch, demands_on, initial_source,
-    reduce_field_on, resolve_uptake_on, resolve_uptake_with_on_workers, state::CHANNELS,
+    reduce_dual_carrier_field_on, reduce_field_on, resolve_uptake_on,
+    resolve_uptake_with_on_workers, state::CHANNELS,
 };
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
@@ -107,14 +110,17 @@ use flife_genome::{
 };
 use flife_neural::actions::EMISSION_SPEND;
 use flife_neural::{
-    ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch, DecodedActions, Intrinsic,
-    MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH, Observation, RawOutputs,
-    SENSOR_WIDTH, SensorLayout, SensorScales, decode_with_layout, observe_for_controller,
-    update_recurrent_state, widen_slice,
+    ActionDecoding, ControllerBackend, ControllerJob, ControllerScratch, DecodedActions,
+    DualObservation, Intrinsic, MAX_ACTION_WIDTH, MAX_SENSOR_WIDTH, MAXIMUM_RECURRENT_STATE_WIDTH,
+    Observation, RawOutputs, SENSOR_WIDTH, SensorLayout, SensorScales, decode_with_layout,
+    observe_dual_for_controller, observe_for_controller, update_recurrent_state, widen_slice,
 };
 
 use crate::ancestry::{Ancestry, AncestryHeld, Followed};
-use crate::chemistry::{Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition};
+use crate::chemistry::{
+    Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
+    effective_affinity, symplectic_waste_direction,
+};
 use crate::contact::{ContactRules, ContactWork, CrowdingWork, unit_affinity};
 use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
 use crate::emission::{
@@ -149,7 +155,10 @@ pub use checkpoint::{
 };
 pub use graft::Graft;
 use settle::{Settle, settle_with};
-pub use v2::{BuddingRules, CarrierSpec, CrowdingMode, CrowdingRules, SenescenceRules, V2Rules};
+pub use v2::{
+    BuddingRules, CarrierSpec, CorpseDirection, CrowdingMode, CrowdingRules, LysisRules,
+    SenescenceRules, V2Rules, WasteRules,
+};
 
 /// The backend this module implements: the scalar CPU reference.
 pub const CPU_REFERENCE: &str = "cpu-reference";
@@ -325,6 +334,8 @@ struct Staged {
     sensed: Option<Sensed>,
     /// Its pre-evaluation recurrent internal state on this step, if any.
     sensed_state: Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
+    /// Its optional `V2-15` dual-carrier trail sensor channels on this step.
+    sensed_trail: Option<[f64; 4]>,
     /// Its optional Hippo-YAP crowding sensor `c_den` on this step, if active.
     sensed_crowding: Option<f64>,
     /// The watched organism's transactions in this step, if it settled.
@@ -404,6 +415,7 @@ impl Candidate<'_> {
             if sensed.evaluated {
                 world.watch.evaluated = Some(sensed.clone());
                 world.watch.evaluated_state = staged.sensed_state;
+                world.watch.evaluated_trail = staged.sensed_trail;
                 world.watch.evaluated_crowding = staged.sensed_crowding;
             }
             world.watch.observed = Some(sensed);
@@ -774,13 +786,18 @@ impl Rules {
         let catalog = TopologyCatalog::from_config(config)?;
         let v2 = V2Rules::from_config(config)?;
         let recurrent_state_width = v2.sensors().recurrent_state_width();
+        let step = config.report().timestep;
+        let plan = match v2.vascular() {
+            Some(vascular) => vascular.transport_plan(&grid, step, model.world.decay_per_second)?,
+            None => TransportPlan::from_config(config)?,
+        };
         Ok(Self {
-            step: config.report().timestep,
+            step,
             grid,
             exchange,
             max_exchange_cells,
             rng: SemanticRng::from_config(config)?,
-            plan: TransportPlan::from_config(config)?,
+            plan,
             kernel: SourceKernel::from_config(config)?,
             chemistry: Chemistry::from_config(config)?,
             costs: MaintenanceCosts::from_config(config)?,
@@ -832,6 +849,13 @@ struct Scratch {
     /// four a row, and as long as the most packets a tick has had.
     compositions: Vec<[f64; CHANNELS]>,
     emissions: Deposits,
+    /// Carrier-1 trail emissions (`V2-15` `dual-carrier-trails`); `None` (0 bytes)
+    /// when disabled.
+    trail_emissions: Option<Deposits>,
+    /// Obligate symplectic metabolic waste deposits (`V2-11` `symplectic-waste`);
+    /// `None` (0 bytes) when disabled. Dedicated stream prevents Trap C
+    /// double-deposit conflicts with `emissions`.
+    byproducts: Option<Deposits>,
     recycling: Deposits,
     survivors: Vec<Organism>,
     deaths: Vec<Death>,
@@ -848,9 +872,12 @@ struct Scratch {
     /// Scratch per-cell occupancy for `V2-09` (`tight-junctions`); empty
     /// (0 bytes) when disabled.
     barrier_occupancy: Vec<u32>,
-    /// Precomputed symmetric face conductances for `V2-09` (`tight-junctions`);
-    /// `None` (0 bytes) when disabled.
+    /// Precomputed symmetric face conductances for `V2-09` (`tight-junctions`)
+    /// and/or `V2-14` (`vascular-field`); `None` (0 bytes) when disabled.
     flux_edges: Option<FluxEdges>,
+    /// Precomputed Carrier-1 tight-junction face conductances (`V2-15` + `V2-09`);
+    /// `None` (0 bytes) when disabled.
+    trail_flux_edges: Option<FluxEdges>,
 }
 
 /// Phases 3 and 4 for one organism: what it observed, and its held or newly
@@ -884,6 +911,16 @@ struct DecisionLane {
     packets: Vec<ChemicalPacket>,
     flows: LedgerLog,
     emissions: Deposits,
+    /// Dedicated Carrier-1 trail emission staging (`V2-15`); `None` (0 bytes)
+    /// when disabled.
+    trail_emissions: Option<Deposits>,
+    /// Dedicated symplectic metabolic waste staging (`V2-11`); `None` (0 bytes)
+    /// when disabled.
+    byproducts: Option<Deposits>,
+    /// Compensated sum of exact emission payments `Σ paid` settled by this
+    /// lane, so combined dual-carrier `Transfer::Emission` debits the exact
+    /// energy deducted from organisms.
+    emission_paid: CompensatedSum,
     transactions: Option<Transactions>,
 }
 
@@ -1030,6 +1067,8 @@ struct Sensors {
     report: SensorReport,
     queries: Vec<SensorQuery>,
     samples: Vec<RawSample>,
+    /// 34-plane dual-carrier samples (`V2-15`); empty (`0 B`) on 33-plane runs.
+    dual_samples: Vec<DualRawSample>,
 }
 
 /// What the world's uptake backend did, for run records (FL-031). Not
@@ -1099,6 +1138,9 @@ struct Watch {
     /// Its pre-evaluation recurrent internal state on the newest published
     /// step it evaluated in (`independent-recurrent-mlp-v1`, FL-054).
     evaluated_state: Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
+    /// Its `V2-15` dual-carrier trail sensor channels on the newest published
+    /// step it evaluated in, when `dual-carrier-trails` is active.
+    evaluated_trail: Option<[f64; 4]>,
     /// Its Hippo-YAP crowding sensor `c_den` on the newest published step it
     /// evaluated in (`V2-07`, when `expose_sensor` is active).
     evaluated_crowding: Option<f64>,
@@ -1132,6 +1174,9 @@ struct Working {
     secretory_readiness: f32,
     emission_cooldown_deadline: Tick,
     emitted: bool,
+    /// Residual energy captured by `V2-11` viability-floor lysis in Phase 8
+    /// `clear_tiny`, handed to `Recycling` without `Flow::TinyReservoir`.
+    lysed_residual: f64,
     intent: Option<BirthIntent>,
 }
 
@@ -1215,10 +1260,12 @@ impl World {
         let rules = Rules::from_config(config, profile)?;
         let model = config.config();
         let limits = BufferLimits::host();
-        let mut field = FieldPair::zeroed(rules.grid, &limits)?;
         let (initial, _) = FieldState::initial(config, &limits)?;
-        field.current_mut().copy_from(&initial)?;
-        drop(initial);
+        let mut next = FieldState::zeroed_with_planes(rules.grid, initial.planes(), &limits)?;
+        if let Some(vascular) = rules.v2.vascular() {
+            next.enable_vascular(vascular.initial_conductance(), &limits)?;
+        }
+        let field = FieldPair::from_states(initial, next)?;
 
         let mut quota = GenomeQuota::from_config(config)?;
         let mut identities = Identities {
@@ -1454,17 +1501,29 @@ impl World {
         } else {
             Ok(0)
         };
+        let dual_carrier = self.rules.v2.dual_carrier().is_some();
         let sensors = &mut self.sensors;
         sensors.report.backend = backend.as_ref().map(|backend| backend.describe());
         sensors.report.failure = None;
         let reserved = rows.and_then(|rows| {
             fit(&mut sensors.queries, rows, "sensor queries")?;
-            fit(&mut sensors.samples, rows, "sensor samples")
+            if dual_carrier {
+                sensors.samples = Vec::new();
+                fit(
+                    &mut sensors.dual_samples,
+                    rows,
+                    "dual-carrier sensor samples",
+                )
+            } else {
+                sensors.dual_samples = Vec::new();
+                fit(&mut sensors.samples, rows, "sensor samples")
+            }
         });
         if let Err(error) = reserved {
             sensors.report.failure = Some(error.to_string());
             sensors.queries = Vec::new();
             sensors.samples = Vec::new();
+            sensors.dual_samples = Vec::new();
             sensors.backend = None;
             return;
         }
@@ -1740,6 +1799,12 @@ impl World {
                 capacity_bytes(&lane.packets),
                 lane.flows.allocated_bytes(),
                 lane.emissions.allocated_bytes(),
+                lane.trail_emissions
+                    .as_ref()
+                    .map_or(0, Deposits::allocated_bytes),
+                lane.byproducts
+                    .as_ref()
+                    .map_or(0, Deposits::allocated_bytes),
             ])
         });
         total(
@@ -1753,6 +1818,14 @@ impl World {
                 scratch.by_demand.allocated_bytes(),
                 capacity_bytes(&scratch.compositions),
                 scratch.emissions.allocated_bytes(),
+                scratch
+                    .trail_emissions
+                    .as_ref()
+                    .map_or(0, Deposits::allocated_bytes),
+                scratch
+                    .byproducts
+                    .as_ref()
+                    .map_or(0, Deposits::allocated_bytes),
                 scratch.recycling.allocated_bytes(),
                 capacity_bytes(&scratch.survivors),
                 capacity_bytes(&scratch.deaths),
@@ -1765,10 +1838,15 @@ impl World {
                     .flux_edges
                     .as_ref()
                     .map_or(0, FluxEdges::allocated_bytes),
+                scratch
+                    .trail_flux_edges
+                    .as_ref()
+                    .map_or(0, FluxEdges::allocated_bytes),
                 capacity_bytes(&self.controllers.outputs),
                 capacity_bytes(&self.controllers.by_row),
                 capacity_bytes(&self.sensors.queries),
                 capacity_bytes(&self.sensors.samples),
+                capacity_bytes(&self.sensors.dual_samples),
                 self.uptake.work.allocated_bytes(),
                 self.settle.work.allocated_bytes(),
             ]
@@ -1978,6 +2056,11 @@ impl World {
                 let input_width = sensors.input_width();
                 let mut full_inputs = [0.0_f64; MAX_SENSOR_WIDTH];
                 full_inputs[..SENSOR_WIDTH].copy_from_slice(&recorded.observation.inputs);
+                if let (Some(start), Some(trail)) =
+                    (sensors.dual_carrier_trails(), self.watch.evaluated_trail)
+                {
+                    full_inputs[start..start + trail.len()].copy_from_slice(&trail);
+                }
                 if let (Some(slot), Some(c_den)) =
                     (sensors.hippo_crowding(), self.watch.evaluated_crowding)
                 {
@@ -2176,6 +2259,11 @@ impl World {
         for value in field {
             bytes.extend_from_slice(&value.to_bits().to_le_bytes());
         }
+        if let Some((gx, gy)) = self.field.current().vascular_edges() {
+            for &value in gx.iter().chain(gy.iter()) {
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
         bytes.extend_from_slice(self.population.digest().as_bytes());
         for next in [
             self.identities.organisms.next_raw(),
@@ -2329,6 +2417,8 @@ impl World {
             by_demand,
             compositions,
             emissions,
+            trail_emissions,
+            byproducts,
             recycling,
             survivors,
             deaths,
@@ -2338,6 +2428,7 @@ impl World {
             barrier_positions,
             barrier_occupancy,
             flux_edges,
+            trail_flux_edges,
         } = scratch;
         let from = *tick;
         let to = from.next()?;
@@ -2347,6 +2438,12 @@ impl World {
             })?);
         let step = rules.step;
         emissions.clear();
+        if let Some(trail) = trail_emissions.as_mut() {
+            trail.clear();
+        }
+        if let Some(waste) = byproducts.as_mut() {
+            waste.clear();
+        }
         recycling.clear();
 
         // Phase 1 sealed `interventions` at this boundary. The removals take
@@ -2392,14 +2489,40 @@ impl World {
             &[]
         };
 
-        // V2-09: compute symmetric tight-junction face conductances strictly
-        // from post-Phase-1 `rows` (after `Intervention::RemoveOrganisms`), so
-        // puncturing a barrier opens flux on the exact tick of the intervention.
-        if let (Some(barrier), Some(edges)) = (rules.v2.tight_junctions(), flux_edges.as_mut()) {
+        // V2-09 / V2-14 / V2-15: compute symmetric face conductances strictly
+        // from post-Phase-1 `rows` (after `Intervention::RemoveOrganisms`) and
+        // committed vascular conductances, before Phase 2 transport.
+        let tight_junctions = rules.v2.tight_junctions();
+        let vascular = rules.v2.vascular();
+        if tight_junctions.is_some() {
             barrier_positions.clear();
             barrier_positions.extend(rows.iter().map(|organism| organism.position));
             count_cell_occupancy(&rules.grid, barrier_positions, barrier_occupancy)?;
+        }
+        if let (Some(vasc), Some(edges)) = (vascular.as_ref(), flux_edges.as_mut()) {
+            let (gx, gy) =
+                field
+                    .current()
+                    .vascular_edges()
+                    .ok_or_else(|| CoreError::StateConflict {
+                        operation: "prepare vascular edges",
+                        detail: "vascular field enabled without edge buffers on FieldState"
+                            .to_owned(),
+                    })?;
+            let barrier_pair = tight_junctions
+                .as_ref()
+                .map(|tj| (tj, barrier_occupancy.as_slice()));
+            vasc.fill_edges(&rules.plan, gx, gy, barrier_pair, edges)?;
+        } else if let (Some(barrier), Some(edges)) = (tight_junctions.as_ref(), flux_edges.as_mut())
+        {
             barrier.fill_edges(&rules.plan, barrier_occupancy, edges)?;
+        }
+        if let (Some(barrier), Some(trail_plan), Some(t_edges)) = (
+            tight_junctions.as_ref(),
+            rules.v2.trail_plan(),
+            trail_flux_edges.as_mut(),
+        ) {
+            barrier.fill_edges(trail_plan, barrier_occupancy, t_edges)?;
         }
 
         // Phase 2: transport, then the sources sampled at mid-tick, then the
@@ -2421,16 +2544,19 @@ impl World {
         if let Some(oases) = rules.v2.oases() {
             oases.apply_powers(from, step, rules.base_source_power, sampled, oasis_powers)?;
         }
-        let field_options = FieldStepOptions {
+        let field_phase2 = FieldStepPhase2 {
             source_kernels: (!source_kernels.is_empty()).then_some(source_kernels.as_slice()),
-            flux_edges: flux_edges.as_ref(),
+            carrier0_edges: flux_edges.as_ref(),
+            vascular: vascular.as_ref(),
+            trail_plan: rules.v2.trail_plan(),
+            trail_edges: trail_flux_edges.as_ref(),
         };
         let field_step = advance_field_with(
             field,
             rules,
             sampled,
             step,
-            field_options,
+            field_phase2,
             field_work,
             fields,
         )?;
@@ -2460,7 +2586,7 @@ impl World {
             lanes,
             controllers,
         )?;
-        let (sensed, sensed_state, sensed_crowding) = match watch.organism {
+        let (sensed, sensed_state, sensed_trail, sensed_crowding) = match watch.organism {
             Some(id) => watched(
                 rules,
                 population,
@@ -2471,7 +2597,7 @@ impl World {
                 id,
                 [from, to],
             )?,
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
         // The reference sampled the tick without an error, so a backend that
         // met one failed where the reference does not.
@@ -2505,6 +2631,7 @@ impl World {
                 secretory_readiness: organism.secretory_readiness,
                 emission_cooldown_deadline: organism.emission_cooldown_deadline,
                 emitted: false,
+                lysed_residual: 0.0,
                 intent: None,
             });
         }
@@ -2565,9 +2692,19 @@ impl World {
             lanes,
             settle_state,
         )?;
+        let mut total_emission_paid = CompensatedSum::ZERO;
         for lane in lanes.iter_mut() {
             lane.flows.replay(&mut tick_ledger)?;
             emissions.append(&mut lane.emissions)?;
+            if let (Some(dst), Some(src)) =
+                (trail_emissions.as_mut(), lane.trail_emissions.as_mut())
+            {
+                dst.append(src)?;
+            }
+            if let (Some(dst), Some(src)) = (byproducts.as_mut(), lane.byproducts.as_mut()) {
+                dst.append(src)?;
+            }
+            total_emission_paid.add(lane.emission_paid.value());
             if let Some(record) = lane.transactions.take() {
                 transactions = Some(record);
             }
@@ -2825,27 +2962,44 @@ impl World {
         // the world has one (FL-032), else on the field's workers.
         let (_, next) = field.stage();
         let workers = field_work.workers();
-        let mut summaries = [None; 2];
-        reduce_field_with(
-            next,
-            grants,
-            &mut [
-                (emissions, CarrierSpec::Carrier0),
-                (recycling, CarrierSpec::Carrier0),
-            ],
-            &mut summaries,
-            workers,
-            fields,
-        )?;
-        let [Some(emitted_summary), Some(recycled_summary)] = summaries else {
-            return Err(CoreError::StateConflict {
-                operation: "reduce field deposits",
-                detail: "missing deposit reduction summaries for emissions and recycling"
-                    .to_owned(),
-            });
-        };
-        emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
-        recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
+        if let Some(trail_deposits) = trail_emissions.as_mut().filter(|_| next.is_dual_carrier()) {
+            let ([emitted_c0, recycled_summary], emitted_c1) = reduce_dual_carrier_with(
+                next,
+                grants,
+                [emissions, recycling],
+                trail_deposits,
+                workers,
+                fields,
+            )?;
+            let debited = total_emission_paid
+                .value()
+                .max(emitted_c0.paid + emitted_c1.paid);
+            let credited = (emitted_c0.applied + emitted_c1.applied).min(debited);
+            tick_ledger.transfer(Transfer::Emission, debited, credited)?;
+            recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
+        } else {
+            let mut summaries = [None; 2];
+            reduce_field_with(
+                next,
+                grants,
+                &mut [
+                    (emissions, CarrierSpec::Carrier0),
+                    (recycling, CarrierSpec::Carrier0),
+                ],
+                &mut summaries,
+                workers,
+                fields,
+            )?;
+            let [Some(emitted_summary), Some(recycled_summary)] = summaries else {
+                return Err(CoreError::StateConflict {
+                    operation: "reduce field deposits",
+                    detail: "missing deposit reduction summaries for emissions and recycling"
+                        .to_owned(),
+                });
+            };
+            emitted_summary.record(&mut tick_ledger, Transfer::Emission)?;
+            recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
+        }
 
         // Phase 10: invariants, accounting and the population's commit. The
         // field's check runs on the field backend if the world has one
@@ -2898,6 +3052,7 @@ impl World {
             paths: next_paths,
             sensed,
             sensed_state,
+            sensed_trail,
             sensed_crowding,
             transactions,
             report,
@@ -3025,28 +3180,36 @@ impl Scratch {
         } else {
             Vec::new()
         };
-        let (barrier_positions, barrier_occupancy, flux_edges) =
-            if rules.v2.tight_junctions().is_some() {
-                let cells =
-                    usize::try_from(rules.grid.cell_count()).map_err(|_| CoreError::Overflow {
-                        quantity: "grid cells",
-                    })?;
-                let occ_bytes =
-                    rules
-                        .grid
-                        .cell_count()
-                        .checked_mul(4)
-                        .ok_or(CoreError::Overflow {
-                            quantity: "cell occupancy scratch bytes",
-                        })?;
-                limits.admit("cell occupancy scratch bytes", occ_bytes)?;
-                let mut occupancy = reserved(cells, "cell occupancy scratch")?;
-                occupancy.resize(cells, 0);
-                let edges = FluxEdges::new(&rules.grid, &limits)?;
-                let positions = reserved(rows, "tight-junction positions")?;
-                (positions, occupancy, Some(edges))
+        let (barrier_positions, barrier_occupancy) = if rules.v2.tight_junctions().is_some() {
+            let cells =
+                usize::try_from(rules.grid.cell_count()).map_err(|_| CoreError::Overflow {
+                    quantity: "grid cells",
+                })?;
+            let occ_bytes = rules
+                .grid
+                .cell_count()
+                .checked_mul(4)
+                .ok_or(CoreError::Overflow {
+                    quantity: "cell occupancy scratch bytes",
+                })?;
+            limits.admit("cell occupancy scratch bytes", occ_bytes)?;
+            let mut occupancy = reserved(cells, "cell occupancy scratch")?;
+            occupancy.resize(cells, 0);
+            let positions = reserved(rows, "tight-junction positions")?;
+            (positions, occupancy)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let flux_edges = if rules.v2.tight_junctions().is_some() || rules.v2.vascular().is_some() {
+            Some(FluxEdges::new(&rules.grid, &limits)?)
+        } else {
+            None
+        };
+        let trail_flux_edges =
+            if rules.v2.dual_carrier().is_some() && rules.v2.tight_junctions().is_some() {
+                Some(FluxEdges::new(&rules.grid, &limits)?)
             } else {
-                (Vec::new(), Vec::new(), None)
+                None
             };
         Ok(Self {
             field,
@@ -3070,6 +3233,16 @@ impl Scratch {
                 rules.exchange,
                 &limits,
             )?,
+            trail_emissions: if rules.v2.dual_carrier().is_some() {
+                Some(Deposits::with_capacity_for(
+                    &rules.grid,
+                    organisms,
+                    rules.exchange,
+                    &limits,
+                )?)
+            } else {
+                None
+            },
             recycling: Deposits::with_capacity_for(
                 &rules.grid,
                 organisms,
@@ -3101,6 +3274,7 @@ impl Scratch {
             barrier_positions,
             barrier_occupancy,
             flux_edges,
+            trail_flux_edges,
         })
     }
 }
@@ -3371,6 +3545,13 @@ fn fit_lanes(
         lane.flows.fit(rows.saturating_mul(FLOWS_PER_ORGANISM))?;
         lane.emissions
             .fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+        if rules.v2.dual_carrier().is_some() {
+            let trail = lane.trail_emissions.get_or_insert_with(Deposits::new);
+            trail.fit_staging_for_kernel(&rules.grid, rows, rules.exchange)?;
+        } else {
+            lane.trail_emissions = None;
+        }
+        lane.emission_paid = CompensatedSum::ZERO;
         lane.transactions = None;
         if batched {
             fit(&mut lane.observed, rows, "observations")?;
@@ -3410,26 +3591,35 @@ fn fit<T>(vector: &mut Vec<T>, count: usize, buffer: &'static str) -> Result<(),
 }
 
 /// Phase 2 on the world's field backend if it has one. Any error there
-/// hands the step to [`advance_field_on`] / [`advance_field_v2_on`], which
-/// reproduces the reference's own error or finds none; with none, the backend
-/// failed where the reference does not, and the world stops using it. Either
-/// way the step is the reference's.
+/// hands the step to [`advance_field_on`] / [`advance_field_v2_on`] /
+/// [`advance_field_wave2_on`], which reproduces the reference's own error or
+/// finds none; with none, the backend failed where the reference does not, and
+/// the world stops using it. Either way the step is the reference's.
 fn advance_field_with(
     pair: &mut FieldPair,
     rules: &Rules,
     sources: &[Source],
     step: TimeStep,
-    options: FieldStepOptions<'_>,
+    phase2: FieldStepPhase2<'_>,
     work: &mut FieldWork,
     fields: &mut Fields,
 ) -> Result<FieldStepReport, CoreError> {
-    let baseline = options.is_baseline() && rules.v2.oases().is_none();
+    let wave1_only = phase2.is_wave1_only()
+        && !pair.current().is_dual_carrier()
+        && !pair.current().has_vascular();
+    let options = FieldStepOptions {
+        source_kernels: phase2.source_kernels,
+        flux_edges: phase2.carrier0_edges,
+    };
+    let baseline = wave1_only && options.is_baseline() && rules.v2.oases().is_none();
     let Fields { backend, report } = fields;
     if let Some(device) = backend.as_deref_mut() {
         let attempted = if baseline {
             device.advance(pair, &rules.plan, &rules.kernel, sources, step)
-        } else {
+        } else if wave1_only {
             device.advance_v2(pair, &rules.plan, &rules.kernel, sources, step, options)
+        } else {
+            device.advance_wave2(pair, &rules.plan, &rules.kernel, sources, step, phase2)
         };
         match attempted {
             Ok(stepped) => {
@@ -3440,7 +3630,7 @@ fn advance_field_with(
                 report.reference_steps = report.reference_steps.saturating_add(1);
                 let stepped = if baseline {
                     advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)?
-                } else {
+                } else if wave1_only {
                     advance_field_v2_on(
                         pair,
                         &rules.plan,
@@ -3448,6 +3638,16 @@ fn advance_field_with(
                         sources,
                         step,
                         options,
+                        work,
+                    )?
+                } else {
+                    advance_field_wave2_on(
+                        pair,
+                        &rules.plan,
+                        &rules.kernel,
+                        sources,
+                        step,
+                        phase2,
                         work,
                     )?
                 };
@@ -3459,7 +3659,7 @@ fn advance_field_with(
     }
     if baseline {
         advance_field_on(pair, &rules.plan, &rules.kernel, sources, step, work)
-    } else {
+    } else if wave1_only {
         advance_field_v2_on(
             pair,
             &rules.plan,
@@ -3467,6 +3667,16 @@ fn advance_field_with(
             sources,
             step,
             options,
+            work,
+        )
+    } else {
+        advance_field_wave2_on(
+            pair,
+            &rules.plan,
+            &rules.kernel,
+            sources,
+            step,
+            phase2,
             work,
         )
     }
@@ -3529,19 +3739,70 @@ fn reduce_field_with(
         out[1] = Some(recycled);
         return Ok(());
     }
-    if deposits
-        .iter()
-        .any(|(_, carrier)| *carrier == CarrierSpec::Carrier1)
-    {
-        return Err(CoreError::MissingCapability {
-            capability: "dual-carrier Carrier 1 field reduction (V2-15)".to_owned(),
-        });
-    }
     apply_grants_on(next, grants, workers)?;
-    for ((deposit, _), slot) in deposits.iter_mut().zip(out.iter_mut()) {
-        *slot = Some(apply_deposits_on(next, deposit, workers)?);
+    for ((deposit, carrier), slot) in deposits.iter_mut().zip(out.iter_mut()) {
+        let layout = match carrier {
+            CarrierSpec::Carrier0 => next.carrier0(),
+            CarrierSpec::Carrier1 => next.carrier1().ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: "field",
+                detail: "Carrier1 deposit offered to a 33-plane single-carrier field".to_owned(),
+            })?,
+        };
+        *slot = Some(apply_deposits_to_carrier_on(
+            next, deposit, layout, workers,
+        )?);
     }
     Ok(())
+}
+
+/// Phase 9 for a 34-plane dual-carrier field (`V2-15`): debits `grants`
+/// strictly from Carrier 0, reduces `carrier0_deposits` (`[emissions_0,
+/// recycling]`) into Carrier 0 `(0, 1, 24)`, and reduces `trail_deposits` into
+/// Carrier 1 `(25, 26, 8)` on the field backend if present, falling back to
+/// [`reduce_dual_carrier_field_on`] cleanly on error.
+fn reduce_dual_carrier_with(
+    next: &mut FieldState,
+    grants: &mut Grants,
+    carrier0_deposits: [&mut Deposits; 2],
+    trail_deposits: &mut Deposits,
+    workers: usize,
+    fields: &mut Fields,
+) -> Result<([DepositSummary; 2], DepositSummary), CoreError> {
+    let [emissions, recycling] = carrier0_deposits;
+    let Fields { backend, report } = fields;
+    if let Some(device) = backend.as_deref_mut() {
+        match device.reduce_dual_carrier(
+            next,
+            grants,
+            [&mut *emissions, &mut *recycling],
+            &mut *trail_deposits,
+        ) {
+            Ok(summaries) => {
+                report.reductions = report.reductions.saturating_add(1);
+                return Ok(summaries);
+            }
+            Err(error) => {
+                report.reference_reductions = report.reference_reductions.saturating_add(1);
+                let summaries = reduce_dual_carrier_field_on(
+                    next,
+                    grants,
+                    [emissions, recycling],
+                    trail_deposits,
+                    workers,
+                )?;
+                report.failure = Some(error.to_string());
+                *backend = None;
+                return Ok(summaries);
+            }
+        }
+    }
+    reduce_dual_carrier_field_on(
+        next,
+        grants,
+        [emissions, recycling],
+        trail_deposits,
+        workers,
+    )
 }
 
 /// Phase 10's check of the next field (INV-01, INV-02 at `tolerance`), on
@@ -3586,6 +3847,14 @@ fn check_field_with(
     next.check_invariants_on(tolerance, workers)
 }
 
+/// Phase 3 raw samples returned by a [`SensorBackend`], matching the field's
+/// carrier layout (`33` single-carrier or `34` dual-carrier).
+#[derive(Clone, Copy)]
+enum Sampled<'a> {
+    Single(&'a [RawSample]),
+    Dual(&'a [DualRawSample]),
+}
+
 /// Phase 3's raw samples on the world's sensor backend, if it has one and
 /// it succeeds; `None` leaves each organism's sampling to the reference, in
 /// its observation. The second value is the backend's error, if it met one:
@@ -3597,24 +3866,38 @@ fn sample_with<'a>(
     view: &PyramidView<'_>,
     field: &FieldState,
     sensors: &'a mut Sensors,
-) -> (Option<&'a [RawSample]>, Option<String>) {
+) -> (Option<Sampled<'a>>, Option<String>) {
     let Sensors {
         backend,
         report,
         queries,
         samples,
+        dual_samples,
     } = sensors;
     let Some(device) = backend.as_deref_mut() else {
         return (None, None);
     };
-    match sample_on(device, population, rows, view, field, queries, samples) {
-        Ok(()) => {
-            report.ticks = report.ticks.saturating_add(1);
-            (Some(samples.as_slice()), None)
+    if field.is_dual_carrier() {
+        match sample_dual_on(device, population, rows, view, field, queries, dual_samples) {
+            Ok(()) => {
+                report.ticks = report.ticks.saturating_add(1);
+                (Some(Sampled::Dual(dual_samples.as_slice())), None)
+            }
+            Err(error) => {
+                report.reference_ticks = report.reference_ticks.saturating_add(1);
+                (None, Some(error.to_string()))
+            }
         }
-        Err(error) => {
-            report.reference_ticks = report.reference_ticks.saturating_add(1);
-            (None, Some(error.to_string()))
+    } else {
+        match sample_on(device, population, rows, view, field, queries, samples) {
+            Ok(()) => {
+                report.ticks = report.ticks.saturating_add(1);
+                (Some(Sampled::Single(samples.as_slice())), None)
+            }
+            Err(error) => {
+                report.reference_ticks = report.reference_ticks.saturating_add(1);
+                (None, Some(error.to_string()))
+            }
         }
     }
 }
@@ -3641,6 +3924,34 @@ fn sample_on(
     if samples.len() != rows.len() {
         return Err(CoreError::StateConflict {
             operation: "sensor samples",
+            detail: format!("{} samples for {} organisms", samples.len(), rows.len()),
+        });
+    }
+    Ok(())
+}
+
+/// Every row's query, then the device's 34-plane dual-carrier samples, one per row.
+fn sample_dual_on(
+    device: &mut dyn SensorBackend,
+    population: &Population,
+    rows: &[Organism],
+    view: &PyramidView<'_>,
+    field: &FieldState,
+    queries: &mut Vec<SensorQuery>,
+    samples: &mut Vec<DualRawSample>,
+) -> Result<(), CoreError> {
+    queries.clear();
+    reserve_for(queries, rows.len(), "sensor queries")?;
+    for organism in rows {
+        queries.push(SensorQuery {
+            position: organism.position,
+            scale: genome_of(population, organism.id)?.traits().sensing_scale(),
+        });
+    }
+    device.sample_dual(view.pyramid(), field, queries, samples)?;
+    if samples.len() != rows.len() {
+        return Err(CoreError::StateConflict {
+            operation: "dual-carrier sensor samples",
             detail: format!("{} samples for {} organisms", samples.len(), rows.len()),
         });
     }
@@ -3758,6 +4069,7 @@ fn demands_on_lanes(
 type WatchedObservation = (
     Option<Sensed>,
     Option<[f32; MAXIMUM_RECURRENT_STATE_WIDTH]>,
+    Option<[f64; 4]>,
     Option<f64>,
 );
 
@@ -3769,7 +4081,7 @@ fn watched(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
-    sampled: Option<&[RawSample]>,
+    sampled: Option<Sampled<'_>>,
     rows: &[Organism],
     crowding_counts: &[u32],
     id: OrganismId,
@@ -3780,14 +4092,9 @@ fn watched(
         .ok()
         .and_then(|row| rows.get(row).map(|organism| (row, organism)))
     else {
-        return Ok((None, None, None));
+        return Ok((None, None, None, None));
     };
-    let raw = blended(
-        population,
-        view,
-        organism,
-        sampled.and_then(|samples| samples.get(row)),
-    )?;
+    let scale = genome_of(population, id)?.traits().sensing_scale();
     let prev_state =
         (rules.recurrent_state_width > 0).then(|| organism.held.recurrent_state_array());
     let c_den = rules
@@ -3796,10 +4103,37 @@ fn watched(
         .hippo_crowding()
         .and_then(|_| crowding_counts.get(row).copied())
         .map(hippo_crowding_sensor);
+    if rules.v2.dual_carrier().is_some() {
+        let dual_raw = match sampled {
+            Some(Sampled::Dual(samples)) => match samples.get(row) {
+                Some(&sample) => sample,
+                None => view.sample_dual(organism.position, scale)?,
+            },
+            _ => view.sample_dual(organism.position, scale)?,
+        };
+        let dual_obs = encode_dual_for_controller(rules, organism, &dual_raw, from)?;
+        return Ok((
+            Some(Sensed {
+                tick: from,
+                scale,
+                raw: dual_to_raw_sample(&dual_raw),
+                observation: dual_obs.base,
+                evaluated: due(rules, organism, to),
+            }),
+            prev_state,
+            Some(dual_obs.trail_inputs),
+            c_den,
+        ));
+    }
+    let single = match sampled {
+        Some(Sampled::Single(samples)) => samples.get(row),
+        _ => None,
+    };
+    let raw = blended(population, view, organism, single)?;
     Ok((
         Some(Sensed {
             tick: from,
-            scale: genome_of(population, id)?.traits().sensing_scale(),
+            scale,
             // The controller's encoding (2482af0), so the record is the job's
             // inputs bit for bit, not only after their narrowing to F32.
             observation: encode_for_controller(rules, organism, &raw, from)?,
@@ -3807,8 +4141,28 @@ fn watched(
             evaluated: due(rules, organism, to),
         }),
         prev_state,
+        None,
         c_den,
     ))
+}
+
+/// Project a 34-plane [`DualRawSample`] into a 33-plane [`RawSample`] for the
+/// watched inspector summary (`[R_0, M^(0)_{0..23}, M^(1)_{0..7}]`).
+fn dual_to_raw_sample(dual: &DualRawSample) -> RawSample {
+    let mut values = [0.0; RESPONSE_TERMS];
+    let mut dx = [0.0; RESPONSE_TERMS];
+    let mut dy = [0.0; RESPONSE_TERMS];
+    let c0_planes = 1 + CARRIER0_MOMENT_CHANNELS as usize;
+    let c1_first = CARRIER1_FIRST_MOMENT_PLANE as usize;
+    let c1_count = CARRIER1_MOMENT_CHANNELS as usize;
+    values[..c0_planes].copy_from_slice(&dual.values[..c0_planes]);
+    dx[..c0_planes].copy_from_slice(&dual.dx[..c0_planes]);
+    dy[..c0_planes].copy_from_slice(&dual.dy[..c0_planes]);
+    values[c0_planes..c0_planes + c1_count]
+        .copy_from_slice(&dual.values[c1_first..c1_first + c1_count]);
+    dx[c0_planes..c0_planes + c1_count].copy_from_slice(&dual.dx[c1_first..c1_first + c1_count]);
+    dy[c0_planes..c0_planes + c1_count].copy_from_slice(&dual.dy[c1_first..c1_first + c1_count]);
+    RawSample { values, dx, dy }
 }
 
 /// The organism's raw sample at its sensing scale: the backend's `raw` if
@@ -3844,6 +4198,34 @@ fn encode_for_controller(
         energy_change_per_second: organism.energy_change_rate,
     };
     observe_for_controller(raw, &intrinsic, &rules.scales)
+}
+
+/// Encode a 34-plane [`DualRawSample`] into a [`DualObservation`] (`V2-15`).
+fn encode_dual_for_controller(
+    rules: &Rules,
+    organism: &Organism,
+    raw: &DualRawSample,
+    from: Tick,
+) -> Result<DualObservation, CoreError> {
+    let dual = rules
+        .v2
+        .dual_carrier()
+        .ok_or_else(|| CoreError::StateConflict {
+            operation: "encode dual-carrier sensors",
+            detail: "dual-carrier encoding invoked without v2.carriers enabled".to_owned(),
+        })?;
+    let intrinsic = Intrinsic {
+        energy: organism.energy,
+        age_seconds: age_seconds(organism.birth_tick, from, rules.step)?,
+        velocity: organism.velocity,
+        energy_change_per_second: organism.energy_change_rate,
+    };
+    observe_dual_for_controller(
+        raw,
+        &intrinsic,
+        &rules.scales,
+        dual.trail_energy_density_scale(),
+    )
 }
 
 /// Whether the organism evaluates its controller for tick `to`: due on its
@@ -3896,13 +4278,18 @@ fn finish(
     })
 }
 
-/// Populate optional v2 non-recurrent sensor slots (`hippo-crowding` `c_den`,
-/// etc.) into `expanded` beyond the 104 baseline sensor entries.
+/// Populate optional v2 non-recurrent sensor slots (`dual-carrier-trails`,
+/// `hippo-crowding` `c_den`, etc.) into `expanded` beyond the 104 baseline
+/// sensor entries.
 fn fill_v2_extra_sensors(
     sensors: SensorLayout,
+    trail_inputs: Option<[f64; 4]>,
     local_crowding: Option<u32>,
     expanded: &mut [f64; MAX_SENSOR_WIDTH],
 ) {
+    if let (Some(start), Some(trail)) = (sensors.dual_carrier_trails(), trail_inputs) {
+        expanded[start..start + trail.len()].copy_from_slice(&trail);
+    }
     if let (Some(slot), Some(n_loc)) = (sensors.hippo_crowding(), local_crowding) {
         expanded[slot] = hippo_crowding_sensor(n_loc);
     }
@@ -3910,11 +4297,16 @@ fn fill_v2_extra_sensors(
 
 /// Evaluate one due organism's controller on the scalar reference, handling
 /// dynamic sensor/action layouts and optional gated recurrent state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reference controller evaluation inputs including optional v2 trail and crowding sensors"
+)]
 fn evaluate_reference_held(
     rules: &Rules,
     genome: &Genome,
     organism: &Organism,
     observation: &Observation,
+    trail_inputs: Option<[f64; 4]>,
     local_crowding: Option<u32>,
     to: Tick,
     controller: &mut ControllerScratch,
@@ -3928,7 +4320,7 @@ fn evaluate_reference_held(
         &observation.inputs
     } else {
         expanded_obs[..SENSOR_WIDTH].copy_from_slice(&observation.inputs);
-        fill_v2_extra_sensors(sensors, local_crowding, &mut expanded_obs);
+        fill_v2_extra_sensors(sensors, trail_inputs, local_crowding, &mut expanded_obs);
         &expanded_obs[..obs_width]
     };
     if state_width > 0 {
@@ -4008,6 +4400,7 @@ fn decide_from_raw(
             genome,
             organism,
             &observation,
+            None,
             local_crowding,
             to,
             controller,
@@ -4016,6 +4409,35 @@ fn decide_from_raw(
         organism.held
     };
     finish(rules, organism, held, due, &observation)
+}
+
+/// Phases 3 and 4 for one organism on a 34-plane dual-carrier field (`V2-15`).
+fn decide_from_dual_raw(
+    rules: &Rules,
+    genome: &Genome,
+    organism: &Organism,
+    raw: &DualRawSample,
+    local_crowding: Option<u32>,
+    [from, to]: [Tick; 2],
+    controller: &mut ControllerScratch,
+) -> Result<Decision, CoreError> {
+    let dual_obs = encode_dual_for_controller(rules, organism, raw, from)?;
+    let due = due(rules, organism, to);
+    let held = if due {
+        evaluate_reference_held(
+            rules,
+            genome,
+            organism,
+            &dual_obs.base,
+            Some(dual_obs.trail_inputs),
+            local_crowding,
+            to,
+            controller,
+        )?
+    } else {
+        organism.held
+    };
+    finish(rules, organism, held, due, &dual_obs.base)
 }
 
 /// Run `work` over `rows` on at most `lanes.len()` threads: this one and
@@ -4139,6 +4561,10 @@ fn settle_all(
     for lane in lanes.iter_mut() {
         lane.flows.clear();
         lane.emissions.clear();
+        if let Some(trail) = lane.trail_emissions.as_mut() {
+            trail.clear();
+        }
+        lane.emission_paid = CompensatedSum::ZERO;
         lane.transactions = None;
     }
     in_runs_mut(working, lanes, "settle", &|start, run, lane| {
@@ -4146,6 +4572,8 @@ fn settle_all(
             packets,
             flows,
             emissions,
+            trail_emissions,
+            emission_paid,
             transactions,
             ..
         } = lane;
@@ -4176,8 +4604,18 @@ fn settle_all(
                 packets,
             };
             let record = (watched == Some(organism.committed.id)).then_some(&mut *transactions);
-            settle_stages(rules, organism, &mut stages, from, flows, emissions, record)?
-                .apply(organism);
+            settle_stages(
+                rules,
+                organism,
+                &mut stages,
+                from,
+                flows,
+                emissions,
+                trail_emissions.as_mut(),
+                emission_paid,
+                record,
+            )?
+            .apply(organism);
         }
         Ok(())
     })
@@ -4215,7 +4653,9 @@ fn compositions_into(
     let energy_plane = observed.energy();
     let total_cells = energy_plane.len();
     let all_data = observed.as_slice();
-    let planar_ok = all_data.len() == (CHANNELS + 1).saturating_mul(total_cells);
+    let planes = observed.planes() as usize;
+    let active_channels = observed.carrier0_moments_count();
+    let planar_ok = all_data.len() == planes.saturating_mul(total_cells);
     let run = |packets: &[GrantPacket], slots: &mut [[f64; CHANNELS]]| -> Result<(), CoreError> {
         if !planar_ok {
             let mut previous: Option<(usize, [f64; CHANNELS])> = None;
@@ -4270,7 +4710,7 @@ fn compositions_into(
                 for (channel, plane) in all_data[total_cells..]
                     .chunks_exact(total_cells)
                     .enumerate()
-                    .take(CHANNELS)
+                    .take(active_channels)
                 {
                     for b in 0..count {
                         batch[b][channel] = f64::from(plane[cells[b]]) / energies[b];
@@ -4343,19 +4783,98 @@ fn decide_all(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
-    sampled: Option<&[RawSample]>,
+    sampled: Option<Sampled<'_>>,
     rows: &[Organism],
     crowding_counts: &[u32],
     ticks: [Tick; 2],
     lanes: &mut [DecisionLane],
 ) -> Result<(), CoreError> {
+    let dual_carrier = rules.v2.dual_carrier().is_some();
     for lane in lanes.iter_mut() {
         lane.decisions.clear();
     }
     in_runs(rows, lanes, &|start, run, lane| {
         reserve_for(&mut lane.decisions, run.len(), "decisions")?;
         let mut live = run.first().map(|first| population.ascending_from(first.id));
-        if let Some(samples) = sampled {
+        if dual_carrier {
+            if let Some(Sampled::Dual(samples)) = sampled {
+                for (index, organism) in run.iter().enumerate() {
+                    let genome = live
+                        .as_mut()
+                        .and_then(|walk| walk.next(organism.id).0)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.id),
+                        })?;
+                    let raw = match samples.get(start + index) {
+                        Some(raw) => *raw,
+                        None => {
+                            view.sample_dual(organism.position, genome.traits().sensing_scale())?
+                        }
+                    };
+                    let decision = decide_from_dual_raw(
+                        rules,
+                        genome,
+                        organism,
+                        &raw,
+                        crowding_counts.get(start + index).copied(),
+                        ticks,
+                        &mut lane.controller,
+                    )?;
+                    lane.decisions.push(decision);
+                }
+                return Ok(());
+            }
+            const SAMPLE_BATCH: usize = 32;
+            let zero_dual = DualRawSample {
+                values: [0.0; MAX_PLANES],
+                dx: [0.0; MAX_PLANES],
+                dy: [0.0; MAX_PLANES],
+            };
+            let mut queries = [SensorQuery {
+                position: [0.0, 0.0],
+                scale: 1.0,
+            }; SAMPLE_BATCH];
+            let mut raw_samples = [zero_dual; SAMPLE_BATCH];
+            let mut batch_genomes: [Option<&Genome>; SAMPLE_BATCH] = [None; SAMPLE_BATCH];
+            for (chunk_idx, chunk) in run.chunks(SAMPLE_BATCH).enumerate() {
+                let count = chunk.len();
+                let base = start + chunk_idx * SAMPLE_BATCH;
+                for i in 0..count {
+                    let organism = &chunk[i];
+                    let genome = live
+                        .as_mut()
+                        .and_then(|walk| walk.next(organism.id).0)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.id),
+                        })?;
+                    batch_genomes[i] = Some(genome);
+                    queries[i] = SensorQuery {
+                        position: organism.position,
+                        scale: genome.traits().sensing_scale(),
+                    };
+                }
+                view.sample_dual_batch(&queries[..count], &mut raw_samples[..count])?;
+                for i in 0..count {
+                    let Some(genome) = batch_genomes[i] else {
+                        continue;
+                    };
+                    let decision = decide_from_dual_raw(
+                        rules,
+                        genome,
+                        &chunk[i],
+                        &raw_samples[i],
+                        crowding_counts.get(base + i).copied(),
+                        ticks,
+                        &mut lane.controller,
+                    )?;
+                    lane.decisions.push(decision);
+                }
+            }
+            return Ok(());
+        }
+        if let Some(Sampled::Single(samples)) = sampled {
             for (index, organism) in run.iter().enumerate() {
                 let genome = live
                     .as_mut()
@@ -4458,7 +4977,7 @@ fn decide_with(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
-    sampled: Option<&[RawSample]>,
+    sampled: Option<Sampled<'_>>,
     rows: &[Organism],
     crowding_counts: &[u32],
     ticks: [Tick; 2],
@@ -4551,7 +5070,7 @@ fn decide_batched(
     rules: &Rules,
     population: &Population,
     view: &PyramidView<'_>,
-    sampled: Option<&[RawSample]>,
+    sampled: Option<Sampled<'_>>,
     rows: &[Organism],
     crowding_counts: &[u32],
     [from, to]: [Tick; 2],
@@ -4567,6 +5086,7 @@ fn decide_batched(
     let state_width = rules.recurrent_state_width;
     let raw_output_width = actions.raw_output_width();
     let needs_expanded = input_width > SENSOR_WIDTH;
+    let dual_carrier = rules.v2.dual_carrier().is_some();
 
     for lane in lanes.iter_mut() {
         lane.observed.clear();
@@ -4582,11 +5102,12 @@ fn decide_batched(
         let push_obs = |lane: &mut DecisionLane,
                         organism: &Organism,
                         obs: Observation,
+                        trail_inputs: Option<[f64; 4]>,
                         local_crowding: Option<u32>| {
             if needs_expanded {
                 let mut full = [0.0_f64; MAX_SENSOR_WIDTH];
                 full[..SENSOR_WIDTH].copy_from_slice(&obs.inputs);
-                fill_v2_extra_sensors(sensors, local_crowding, &mut full);
+                fill_v2_extra_sensors(sensors, trail_inputs, local_crowding, &mut full);
                 if state_width > 0 {
                     let prev = organism.held.recurrent_state_array();
                     for (slot, &h) in full[obs_width..input_width]
@@ -4600,7 +5121,75 @@ fn decide_batched(
             }
             lane.observed.push(obs);
         };
-        if let Some(samples) = sampled {
+        if dual_carrier {
+            if let Some(Sampled::Dual(samples)) = sampled {
+                for (index, organism) in run.iter().enumerate() {
+                    let genome = live
+                        .as_mut()
+                        .and_then(|walk| walk.next(organism.id).0)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.id),
+                        })?;
+                    let raw = match samples.get(start + index) {
+                        Some(raw) => *raw,
+                        None => {
+                            view.sample_dual(organism.position, genome.traits().sensing_scale())?
+                        }
+                    };
+                    let dual_obs = encode_dual_for_controller(rules, organism, &raw, from)?;
+                    push_obs(
+                        lane,
+                        organism,
+                        dual_obs.base,
+                        Some(dual_obs.trail_inputs),
+                        crowding_counts.get(start + index).copied(),
+                    );
+                }
+                return Ok(());
+            }
+            const SAMPLE_BATCH: usize = 32;
+            let zero_dual = DualRawSample {
+                values: [0.0; MAX_PLANES],
+                dx: [0.0; MAX_PLANES],
+                dy: [0.0; MAX_PLANES],
+            };
+            let mut queries = [SensorQuery {
+                position: [0.0, 0.0],
+                scale: 1.0,
+            }; SAMPLE_BATCH];
+            let mut raw_samples = [zero_dual; SAMPLE_BATCH];
+            for (chunk_idx, chunk) in run.chunks(SAMPLE_BATCH).enumerate() {
+                let count = chunk.len();
+                let base = start + chunk_idx * SAMPLE_BATCH;
+                for (query, organism) in queries.iter_mut().zip(chunk) {
+                    let genome = live
+                        .as_mut()
+                        .and_then(|walk| walk.next(organism.id).0)
+                        .ok_or_else(|| CoreError::StateConflict {
+                            operation: "read genome",
+                            detail: format!("{} has no genome", organism.id),
+                        })?;
+                    *query = SensorQuery {
+                        position: organism.position,
+                        scale: genome.traits().sensing_scale(),
+                    };
+                }
+                view.sample_dual_batch(&queries[..count], &mut raw_samples[..count])?;
+                for (i, (organism, raw)) in chunk.iter().zip(&raw_samples[..count]).enumerate() {
+                    let dual_obs = encode_dual_for_controller(rules, organism, raw, from)?;
+                    push_obs(
+                        lane,
+                        organism,
+                        dual_obs.base,
+                        Some(dual_obs.trail_inputs),
+                        crowding_counts.get(base + i).copied(),
+                    );
+                }
+            }
+            return Ok(());
+        }
+        if let Some(Sampled::Single(samples)) = sampled {
             for (index, organism) in run.iter().enumerate() {
                 let genome = live
                     .as_mut()
@@ -4618,6 +5207,7 @@ fn decide_batched(
                     lane,
                     organism,
                     obs,
+                    None,
                     crowding_counts.get(start + index).copied(),
                 );
             }
@@ -4653,7 +5243,13 @@ fn decide_batched(
             view.sample_batch(&queries[..count], &mut raw_samples[..count])?;
             for (i, (organism, raw)) in chunk.iter().zip(&raw_samples[..count]).enumerate() {
                 let obs = encode_for_controller(rules, organism, raw, from)?;
-                push_obs(lane, organism, obs, crowding_counts.get(base + i).copied());
+                push_obs(
+                    lane,
+                    organism,
+                    obs,
+                    None,
+                    crowding_counts.get(base + i).copied(),
+                );
             }
         }
         Ok(())
@@ -4762,6 +5358,7 @@ fn decide_batched(
         let DecisionLane {
             controller,
             observed,
+            controller_inputs,
             decisions,
             ..
         } = lane;
@@ -4773,11 +5370,17 @@ fn decide_batched(
                     Some(raw) => held_from_raw(rules, organism, to, &raw)?,
                     None => {
                         let genome = genome_of(population, organism.id)?;
+                        let trail_inputs = sensors.dual_carrier_trails().and_then(|slot| {
+                            controller_inputs.get(index).map(|full| {
+                                [full[slot], full[slot + 1], full[slot + 2], full[slot + 3]]
+                            })
+                        });
                         evaluate_reference_held(
                             rules,
                             genome,
                             organism,
                             observation,
+                            trail_inputs,
                             crowding_counts.get(start + index).copied(),
                             to,
                             controller,
@@ -4964,6 +5567,9 @@ struct Settled {
     secretory_readiness: f32,
     emission_cooldown_deadline: Tick,
     emitted: bool,
+    /// Residual energy captured by `V2-11` viability-floor lysis in Phase 8
+    /// `clear_tiny`, handed to `Recycling` without `Flow::TinyReservoir`.
+    lysed_residual: f64,
     intent: Option<BirthIntent>,
 }
 
@@ -5033,11 +5639,12 @@ trait Stages {
     ) -> Result<[f64; 2], CoreError>;
 
     /// Emission at the post-motion `position` and `velocity`: the payment,
-    /// deposit staged in `emissions`, and updated excitable state
+    /// deposit staged in `emissions` (plus `trail_emissions` when `V2-15`
+    /// dual-carrier is active), and updated excitable state
     /// `(next_readiness, next_cooldown_deadline)`.
     #[expect(
         clippy::too_many_arguments,
-        reason = "Phase 7 emission stage inputs including V2-04 post-motion velocity and tick"
+        reason = "Phase 7 emission stage inputs including V2-04 post-motion velocity, tick, and V2-15 trail deposits"
     )]
     fn emission(
         &mut self,
@@ -5048,6 +5655,7 @@ trait Stages {
         from: Tick,
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
+        trail_emissions: Option<&mut Deposits>,
     ) -> Result<(EmissionSettlement, f32, Tick), CoreError>;
 
     /// Phase 7: `parent`'s reproduction proposal at attempt tick `tick`,
@@ -5154,7 +5762,45 @@ impl Stages for Reference<'_> {
         from: Tick,
         budget: &mut EnergyBudget,
         emissions: &mut Deposits,
+        trail_emissions: Option<&mut Deposits>,
     ) -> Result<(EmissionSettlement, f32, Tick), CoreError> {
+        if let (Some(dc), Some(trail_deposits)) = (rules.v2.dual_carrier(), trail_emissions) {
+            let trail_share = dc.trail_emission_share();
+            if !rules.v2.emission().any_enabled() {
+                let settlement = rules.emission.emit_dual_with_floor(
+                    &rules.grid,
+                    rules.exchange,
+                    organism.committed.id,
+                    position,
+                    organism.actions.emission.as_ref(),
+                    0.0,
+                    trail_share,
+                    budget,
+                    emissions,
+                    trail_deposits,
+                )?;
+                return Ok((
+                    settlement,
+                    organism.secretory_readiness,
+                    organism.emission_cooldown_deadline,
+                ));
+            }
+            let ctx = rules.emission_context(organism, position, velocity, from)?;
+            let (settlement, plan) = rules.emission.emit_v2_dual(
+                &rules.grid,
+                rules.exchange,
+                rules.step,
+                rules.v2.emission(),
+                organism.committed.id,
+                organism.actions.emission.as_ref(),
+                &ctx,
+                trail_share,
+                budget,
+                emissions,
+                trail_deposits,
+            )?;
+            return Ok((settlement, plan.next_readiness, plan.next_cooldown_deadline));
+        }
         if !rules.v2.emission().any_enabled() {
             let settlement = rules.emission.emit_with(
                 &rules.grid,
@@ -5289,6 +5935,10 @@ fn contact_displacements(
 /// `record` is filled with each stage's settlement as the ledger is given
 /// it. The organism's row is read, not written: the caller applies the
 /// returned [`Settled`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "ordered phases 6 and 7 stage runner including optional V2-15 trail deposits and paid accumulator"
+)]
 fn settle_stages(
     rules: &Rules,
     organism: &Working,
@@ -5296,6 +5946,8 @@ fn settle_stages(
     from: Tick,
     ledger: &mut impl Ledger,
     emissions: &mut Deposits,
+    trail_emissions: Option<&mut Deposits>,
+    emission_paid: &mut CompensatedSum,
     record: Option<&mut Option<Transactions>>,
 ) -> Result<Settled, CoreError> {
     let mut settled = Settled::of(organism);
@@ -5356,7 +6008,11 @@ fn settle_stages(
         from,
         &mut settled.budget,
         emissions,
+        trail_emissions,
     )?;
+    if emission.cost.paid > 0.0 {
+        emission_paid.add(emission.cost.paid);
+    }
     settled.emitted = emission.emitted();
     settled.secretory_readiness = next_readiness;
     settled.emission_cooldown_deadline = next_cooldown_deadline;

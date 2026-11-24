@@ -29,13 +29,17 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, sub_down};
 use flife_core::numerics::{expm1_neg, sigmoid, tanh};
 use flife_core::{FeatureOverride, ValidatedConfig};
+use flife_engine::emission::CachedFootprint;
 use flife_engine::{
     Advance, Arrangement, EmissionContext, EmissionOffsetRule, EmissionPolicy, EmissionV2Rules,
     ExcitableMode, INITIAL_SECRETORY_READINESS, Intervention, NumericalProfile, OffsetMode,
     PumpDirection, Stepped, SurplusFloorRule, WORLD_CHECKPOINT_CHUNKS, World,
 };
 use flife_field::state::CHANNELS;
-use flife_field::{BufferLimits, Deposits, ExchangeKernel, FieldGrid};
+use flife_field::{
+    BufferLimits, Deposits, ExchangeKernel, ExchangeScratch, FieldGrid, FieldState,
+    apply_deposits_to_carrier_on,
+};
 use flife_neural::Emission;
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -722,4 +726,166 @@ distance_world_units = 0.25
         "INV-03 cumulative normalized residual {cum_norm:e} exceeded {}",
         profile.residual.cumulative()
     );
+}
+
+#[test]
+fn round2_hoisted_recovery_alpha_and_shared_footprint_match_reference_bit_for_bit() {
+    let grid = FieldGrid::new(32, 32, 32.0, 32.0).expect("grid");
+    let step = TimeStep::new(1, 20).expect("step");
+    let rules = EmissionV2Rules {
+        surplus_floor: Some(SurplusFloorRule { energy_floor: 0.4 }),
+        excitable: Some(ExcitableMode::VesicleReadiness {
+            fire_readiness_threshold: 0.5,
+            depletion_fraction: 0.85,
+            burst_rate_multiplier: 4.0,
+            recovery_time_seconds: 1.25,
+        }),
+        offset: Some(EmissionOffsetRule {
+            mode: OffsetMode::WakeVelocity,
+            distance_world_units: 0.2,
+        }),
+        max_spend_rate: 0.4,
+    };
+    let hoisted_alpha = rules.recovery_alpha(step).expect("alpha");
+    assert!(hoisted_alpha.is_some());
+
+    let mut dir = [0.0_f64; CHANNELS];
+    dir[2] = 0.6;
+    dir[26] = 0.8;
+    let emission = Emission {
+        direction: dir,
+        spend_fraction: 0.15,
+    };
+
+    for (readiness, available, exhausted) in [
+        (0.2_f32, 2.0, false),
+        (0.75_f32, 2.0, false),
+        (0.75_f32, 0.3, false),
+        (0.75_f32, 2.0, true),
+    ] {
+        let ctx = EmissionContext {
+            position: [12.3, 19.7],
+            velocity: [0.4, -0.3],
+            energy_gradient: [0.1, 0.2],
+            polarity: None,
+            raw_spend_logit: 0.8,
+            raw_pump_logit: None,
+            tick: Tick::new(10),
+            secretory_readiness: readiness,
+            emission_cooldown_deadline: Tick::new(0),
+        };
+        let want = rules
+            .plan(&grid, step, available, exhausted, Some(&emission), &ctx)
+            .expect("plan");
+        let got = rules
+            .plan_with_recovery_alpha(
+                &grid,
+                step,
+                available,
+                exhausted,
+                Some(&emission),
+                &ctx,
+                hoisted_alpha,
+            )
+            .expect("plan hoisted");
+        assert_eq!(got, want, "readiness={readiness} available={available}");
+    }
+
+    // Shared CachedFootprint across byproducts + dual-carrier emissions must
+    // match independent Deposits::push_with bit-for-bit on both kernels.
+    let policy = EmissionPolicy::new(0.85).expect("policy");
+    for exchange in [
+        ExchangeKernel::GridCicV1,
+        ExchangeKernel::fixed_world_gaussian(1.5).expect("gauss"),
+    ] {
+        let mut scratch = ExchangeScratch::for_kernel(exchange, &grid).expect("scratch");
+        let scratch_bytes = scratch.allocated_bytes();
+        let mut fp = CachedFootprint::new();
+
+        let mut d0_cached =
+            Deposits::with_capacity_for(&grid, 4, exchange, &BufferLimits::host()).expect("d0c");
+        let mut d1_cached =
+            Deposits::with_capacity_for(&grid, 4, exchange, &BufferLimits::host()).expect("d1c");
+        let mut bp_cached =
+            Deposits::with_capacity_for(&grid, 4, exchange, &BufferLimits::host()).expect("bpc");
+
+        let mut d0_ref =
+            Deposits::with_capacity_for(&grid, 4, exchange, &BufferLimits::host()).expect("d0r");
+        let mut d1_ref =
+            Deposits::with_capacity_for(&grid, 4, exchange, &BufferLimits::host()).expect("d1r");
+        let mut bp_ref =
+            Deposits::with_capacity_for(&grid, 4, exchange, &BufferLimits::host()).expect("bpr");
+
+        let pos = [14.25, 9.85];
+        let org = OrganismId::new(42);
+        let mut waste_dir = [0.0_f64; CHANNELS];
+        waste_dir[1] = 1.0;
+
+        fp.push_deposit(
+            &mut bp_cached,
+            &grid,
+            exchange,
+            org,
+            pos,
+            0.12,
+            0.12,
+            &waste_dir,
+            &mut scratch,
+        )
+        .expect("bp cached");
+        bp_ref
+            .push_with(&grid, exchange, org, pos, 0.12, 0.12, &waste_dir)
+            .expect("bp ref");
+
+        let mut b_cached = EnergyBudget::new(3.0).expect("bc");
+        let mut b_ref = EnergyBudget::new(3.0).expect("br");
+        let s_cached = policy
+            .emit_dual_with_floor_reusing_footprint(
+                &grid,
+                exchange,
+                org,
+                pos,
+                Some(&emission),
+                0.4,
+                0.25,
+                &mut b_cached,
+                &mut d0_cached,
+                &mut d1_cached,
+                &mut scratch,
+                &mut fp,
+            )
+            .expect("dual cached");
+        let s_ref = policy
+            .emit_dual_with_floor(
+                &grid,
+                exchange,
+                org,
+                pos,
+                Some(&emission),
+                0.4,
+                0.25,
+                &mut b_ref,
+                &mut d0_ref,
+                &mut d1_ref,
+            )
+            .expect("dual ref");
+        assert_eq!(s_cached, s_ref);
+        assert_eq!(b_cached.remaining().to_bits(), b_ref.remaining().to_bits());
+        assert_eq!(scratch.allocated_bytes(), scratch_bytes);
+
+        let mut f_cached =
+            FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("fc");
+        let mut f_ref = FieldState::zeroed_dual_carrier(grid, &BufferLimits::host()).expect("fr");
+        let c0 = f_cached.carrier0();
+        let c1 = f_cached.carrier1().expect("c1");
+        apply_deposits_to_carrier_on(&mut f_cached, &mut d0_cached, c0, 1).expect("fc d0");
+        apply_deposits_to_carrier_on(&mut f_cached, &mut bp_cached, c0, 1).expect("fc bp");
+        apply_deposits_to_carrier_on(&mut f_cached, &mut d1_cached, c1, 1).expect("fc d1");
+        apply_deposits_to_carrier_on(&mut f_ref, &mut d0_ref, c0, 1).expect("fr d0");
+        apply_deposits_to_carrier_on(&mut f_ref, &mut bp_ref, c0, 1).expect("fr bp");
+        apply_deposits_to_carrier_on(&mut f_ref, &mut d1_ref, c1, 1).expect("fr d1");
+        let got_bits: Vec<u32> = f_cached.as_slice().iter().map(|v| v.to_bits()).collect();
+        let want_bits: Vec<u32> = f_ref.as_slice().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(got_bits, want_bits, "exchange={}", exchange.name());
+    }
 }

@@ -11,9 +11,11 @@ use flife_core::ids::OrganismId;
 use flife_field::pyramid::PLANES;
 use flife_field::state::CHANNELS;
 use flife_field::{
-    Bins, BufferLimits, Cell, Demand, DepositSummary, Deposits, ExchangeStencil, FieldGrid,
-    FieldState, Grants, RawSample, SensorPyramid, SensorQuery, apply_deposits, apply_deposits_on,
-    apply_grants, apply_grants_on, resolve_uptake, resolve_uptake_on_workers,
+    Bins, BufferLimits, Cell, Demand, DepositSummary, Deposits, ExchangeKernel, ExchangeScratch,
+    ExchangeStencil, FieldGrid, FieldState, Grants, RawSample, SensorPyramid, SensorQuery,
+    apply_deposit_streams_to_carrier_on, apply_deposits, apply_deposits_on,
+    apply_deposits_to_carrier_on, apply_grants, apply_grants_on, resolve_uptake,
+    resolve_uptake_on_workers,
 };
 
 #[expect(
@@ -1128,5 +1130,266 @@ fn pyramid_mixed_scale_chunks_match_scalar_bit_for_bit_single_and_dual() {
                 "{label} dual dy[{i}]"
             );
         }
+    }
+}
+
+/// Round-2 regression: 256-query 8x8 tile-sorted spatial batching in
+/// `PyramidView::sample_batch` / `sample_dual_batch`, fused multi-stream
+/// `apply_deposit_streams_to_carrier_on` (including contiguous identity-sequence
+/// skip), and hoisted `exp_neg_4` `FixedWorldGaussianV1::footprint_into` must
+/// all match their scalar oracles bit-for-bit.
+#[test]
+fn round2_spatial_pyramid_256_batch_fused_streams_and_exp_neg_4_footprint_are_bit_exact() {
+    use flife_field::{DualRawSample, MAX_PLANES};
+
+    // 1. 320-query pyramid batch (full 256-query tile-sorted block + 64 tail).
+    let g = FieldGrid::new(32, 32, 32.0, 32.0).expect("grid");
+    let snap = field(g, 909);
+    let mut pyr = SensorPyramid::new(g, 3, &BufferLimits::host()).expect("pyr");
+    let view = pyr.build_on(&snap, 4).expect("build");
+    let mut rng = lcg(202_611);
+    let mut queries = Vec::with_capacity(320);
+    for i in 0..320 {
+        let position = [rng() * 32.0, rng() * 32.0];
+        let scale = match i % 5 {
+            0 | 1 => 1.0,                // level 0 (> 32 queries -> triggers tile sort)
+            2 | 3 => 1.0 + rng() * 0.99, // level 0/1 blend (> 32 queries -> triggers tile sort)
+            _ => 2.1 + rng() * 5.0,      // coarse levels (> 8 queries -> triggers tile sort)
+        };
+        queries.push(SensorQuery { position, scale });
+    }
+    let zero_single = RawSample {
+        values: [0.0; PLANES],
+        dx: [0.0; PLANES],
+        dy: [0.0; PLANES],
+    };
+    let mut got = vec![zero_single; queries.len()];
+    view.sample_batch(&queries, &mut got).expect("batch 320");
+    for (i, (q, g_s)) in queries.iter().zip(&got).enumerate() {
+        let w_s = view.sample(q.position, q.scale).expect("scalar");
+        assert_eq!(
+            g_s.values.map(f64::to_bits),
+            w_s.values.map(f64::to_bits),
+            "v[{i}]"
+        );
+        assert_eq!(
+            g_s.dx.map(f64::to_bits),
+            w_s.dx.map(f64::to_bits),
+            "dx[{i}]"
+        );
+        assert_eq!(
+            g_s.dy.map(f64::to_bits),
+            w_s.dy.map(f64::to_bits),
+            "dy[{i}]"
+        );
+    }
+
+    let mut dual_state =
+        FieldState::zeroed_dual_carrier(g, &BufferLimits::host()).expect("dual field");
+    let mut fill_rng = lcg(777);
+    for slot in dual_state.as_mut_slice() {
+        *slot = (fill_rng() * 2.5) as f32;
+    }
+    let mut dual_pyr =
+        SensorPyramid::new_with_planes(g, 3, dual_state.planes() as usize, &BufferLimits::host())
+            .expect("dual pyr");
+    let dual_view = dual_pyr.build_on(&dual_state, 4).expect("dual build");
+    let zero_dual = DualRawSample {
+        values: [0.0; MAX_PLANES],
+        dx: [0.0; MAX_PLANES],
+        dy: [0.0; MAX_PLANES],
+    };
+    let mut got_dual = vec![zero_dual; queries.len()];
+    dual_view
+        .sample_dual_batch(&queries, &mut got_dual)
+        .expect("dual batch 320");
+    for (i, (q, g_s)) in queries.iter().zip(&got_dual).enumerate() {
+        let w_s = dual_view
+            .sample_dual(q.position, q.scale)
+            .expect("dual scalar");
+        assert_eq!(
+            g_s.values.map(f64::to_bits),
+            w_s.values.map(f64::to_bits),
+            "dv[{i}]"
+        );
+        assert_eq!(
+            g_s.dx.map(f64::to_bits),
+            w_s.dx.map(f64::to_bits),
+            "ddx[{i}]"
+        );
+        assert_eq!(
+            g_s.dy.map(f64::to_bits),
+            w_s.dy.map(f64::to_bits),
+            "ddy[{i}]"
+        );
+    }
+
+    // 2. Fused 3-stream `apply_deposit_streams_to_carrier_on` vs sequential
+    //    `apply_deposits_to_carrier_on` across workers 1 & 4.
+    let build_streams = |empty_third: bool| -> [Deposits; 3] {
+        let mut s0 = Deposits::with_capacity(&g, 600, &BufferLimits::host()).expect("s0");
+        let mut s1 = Deposits::with_capacity(&g, 600, &BufferLimits::host()).expect("s1");
+        let mut s2 = Deposits::with_capacity(&g, 600, &BufferLimits::host()).expect("s2");
+        let mut r = lcg(12345);
+        // s0: strictly ascending IDs (exercises identity_sequence fast path).
+        for id in 0..500_u64 {
+            let mut dir = [0.0_f64; CHANNELS];
+            dir[(id as usize) % CHANNELS] = 0.75;
+            s0.push(
+                &g,
+                OrganismId::new(id + 1),
+                [r() * 32.0, r() * 32.0],
+                0.25,
+                0.2,
+                &dir,
+            )
+            .expect("push s0");
+        }
+        // s1: descending IDs (exercises non-identity sequence path).
+        for id in (0..250_u64).rev() {
+            let mut dir = [0.0_f64; CHANNELS];
+            dir[(id as usize + 5) % CHANNELS] = -0.6;
+            s1.push(
+                &g,
+                OrganismId::new(id + 10_000),
+                [r() * 32.0, r() * 32.0],
+                0.15,
+                0.12,
+                &dir,
+            )
+            .expect("push s1");
+        }
+        if !empty_third {
+            for id in 0..400_u64 {
+                let mut dir = [0.0_f64; CHANNELS];
+                dir[(id as usize + 11) % CHANNELS] = 0.5;
+                s2.push(
+                    &g,
+                    OrganismId::new(id + 20_000),
+                    [r() * 32.0, r() * 32.0],
+                    0.1,
+                    0.1,
+                    &dir,
+                )
+                .expect("push s2");
+            }
+        }
+        [s0, s1, s2]
+    };
+
+    for empty_third in [false, true] {
+        let mut seq_field = snap.clone();
+        let [mut a0, mut a1, mut a2] = build_streams(empty_third);
+        let c0 = seq_field.carrier0();
+        let w0 = apply_deposits_to_carrier_on(&mut seq_field, &mut a0, c0, 1).expect("a0");
+        let w1 = apply_deposits_to_carrier_on(&mut seq_field, &mut a1, c0, 1).expect("a1");
+        let w2 = apply_deposits_to_carrier_on(&mut seq_field, &mut a2, c0, 1).expect("a2");
+        let want_summaries = [w0, w1, w2];
+
+        for workers in [1, 4] {
+            let mut fused_field = snap.clone();
+            let [mut f0, mut f1, mut f2] = build_streams(empty_third);
+            let mut out = [None; 3];
+            apply_deposit_streams_to_carrier_on(
+                &mut fused_field,
+                &mut [&mut f0, &mut f1, &mut f2],
+                c0,
+                workers,
+                &mut out,
+            )
+            .expect("fused");
+            for (idx, (got_s, want_s)) in out.iter().zip(&want_summaries).enumerate() {
+                let got_s = got_s.expect("summary");
+                assert_eq!(
+                    got_s.organisms, want_s.organisms,
+                    "stream {idx} w={workers}"
+                );
+                assert_eq!(got_s.cells, want_s.cells, "stream {idx} w={workers}");
+                assert_eq!(
+                    got_s.paid.to_bits(),
+                    want_s.paid.to_bits(),
+                    "paid stream {idx} w={workers}"
+                );
+                assert_eq!(
+                    got_s.offered.to_bits(),
+                    want_s.offered.to_bits(),
+                    "offered stream {idx} w={workers}"
+                );
+                assert_eq!(
+                    got_s.applied.to_bits(),
+                    want_s.applied.to_bits(),
+                    "applied stream {idx} w={workers}"
+                );
+            }
+            let got_bits: Vec<u32> = fused_field.as_slice().iter().map(|v| v.to_bits()).collect();
+            let want_bits: Vec<u32> = seq_field.as_slice().iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                got_bits, want_bits,
+                "field bits w={workers} empty={empty_third}"
+            );
+        }
+    }
+
+    // 3. `FixedWorldGaussianV1::footprint_into` (interior fast path + hoisted
+    //    dx_sq/dy_sq + exp_neg_4) vs independent scalar minimum-image oracle.
+    let g_gauss = FieldGrid::new(32, 24, 16.0, 12.0).expect("gauss grid");
+    for radius in [0.75, 1.5, 3.25] {
+        let kernel = ExchangeKernel::fixed_world_gaussian(radius).expect("kernel");
+        let sigma = kernel.sigma().expect("sigma");
+        let mut scratch = ExchangeScratch::for_kernel(kernel, &g_gauss).expect("scratch");
+        let before_bytes = scratch.allocated_bytes();
+        let test_positions = [
+            [8.0, 6.0],     // interior
+            [0.05, 0.05],   // corner seam wrap
+            [15.99, 11.99], // upper corner seam wrap
+            [0.1, 6.13],    // left edge wrap
+            [7.37, 11.95],  // top edge wrap
+            [3.25, 4.75],   // exact cell corner
+        ];
+        for pos in test_positions {
+            kernel
+                .footprint_into(&g_gauss, pos, &mut scratch)
+                .expect("footprint");
+            let center = g_gauss.wrap_position(pos).expect("wrap");
+            let r2 = radius * radius;
+            let two_s2 = 2.0 * sigma * sigma;
+            let mut oracle: Vec<(usize, f64)> = Vec::new();
+            let mut sum = 0.0;
+            for row in 0..g_gauss.cells_y() {
+                let cy = (f64::from(row) + 0.5) * g_gauss.cell_height();
+                for col in 0..g_gauss.cells_x() {
+                    let cx = (f64::from(col) + 0.5) * g_gauss.cell_width();
+                    let [dx, dy] = g_gauss.displacement(center, [cx, cy]).expect("disp");
+                    let d2 = dx * dx + dy * dy;
+                    if d2 > r2 {
+                        continue;
+                    }
+                    let raw = flife_field::numerics::exp_neg(d2 / two_s2).expect("exp");
+                    if raw > 0.0 {
+                        let cell = g_gauss.cell_index(col, row).expect("cell");
+                        oracle.push((cell, raw));
+                        sum += raw;
+                    }
+                }
+            }
+            for (_, w) in &mut oracle {
+                *w /= sum;
+            }
+            oracle.retain(|&(_, w)| w > 0.0);
+            assert_eq!(
+                scratch.cells().len(),
+                oracle.len(),
+                "radius={radius} pos={pos:?}"
+            );
+            for (got_c, want_c) in scratch.cells().iter().zip(&oracle) {
+                assert_eq!(got_c.0, want_c.0, "cell idx radius={radius} pos={pos:?}");
+                assert_eq!(
+                    got_c.1.to_bits(),
+                    want_c.1.to_bits(),
+                    "weight bits radius={radius} pos={pos:?}"
+                );
+            }
+        }
+        assert_eq!(scratch.allocated_bytes(), before_bytes, "scratch grew");
     }
 }

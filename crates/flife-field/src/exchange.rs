@@ -284,8 +284,7 @@ impl ExchangeKernel {
                 let stride = cells_x as usize;
                 let mut weight_sum = 0.0;
                 const STACK_COLS: usize = 64;
-                if scratch.columns.len() <= STACK_COLS
-                    && usize::try_from(grid.cell_count()).is_ok()
+                if scratch.columns.len() <= STACK_COLS && usize::try_from(grid.cell_count()).is_ok()
                 {
                     let mut col_dx_sq = [0.0_f64; STACK_COLS];
                     let col_len = scratch.columns.len();

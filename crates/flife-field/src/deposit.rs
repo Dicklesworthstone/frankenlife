@@ -1118,24 +1118,24 @@ pub fn apply_deposit_streams_to_carrier_on(
             }
             stream.received.resize(occ.len(), 0.0);
             let seq = (!stream.identity_sequence).then_some(stream.sequence.as_slice());
-            let mut run = Run {
-                cell_base: 0,
-                occupied_cells: occ,
-                energy,
-                moment_count,
-                moments: field_moments,
-                received: stream.received.as_mut_slice(),
+            let count = {
+                let mut run = Run {
+                    cell_base: 0,
+                    occupied_cells: occ,
+                    energy: &mut *energy,
+                    moment_count,
+                    moments: field_moments.each_mut().map(|m| &mut **m),
+                    received: stream.received.as_mut_slice(),
+                };
+                reduce_run(
+                    &mut run,
+                    stream.bins.offsets(),
+                    stream.bins.order(),
+                    seq,
+                    &stream.packets,
+                    &stream.entries,
+                )
             };
-            let count = reduce_run(
-                &mut run,
-                stream.bins.offsets(),
-                stream.bins.order(),
-                seq,
-                &stream.packets,
-                &stream.entries,
-            );
-            energy = run.energy;
-            field_moments = run.moments;
             let mut applied = CompensatedSum::ZERO;
             for &value in stream.received.get(..count).unwrap_or(&[]) {
                 applied.add(value);
@@ -1257,11 +1257,6 @@ pub fn apply_deposit_streams_to_carrier_on(
 
     let reads: &[StreamRead<'_>] = &stream_reads;
     let process_lane = |field_lane: &mut FieldSlice<'_>, lane_work: &mut [StreamLane<'_>]| {
-        let mut lane_energy = std::mem::take(&mut field_lane.energy);
-        let mut lane_moments = std::mem::replace(
-            &mut field_lane.moments,
-            std::array::from_fn(|_| <&mut [f32]>::default()),
-        );
         for (s_read, s_lane) in reads.iter().zip(lane_work.iter_mut()) {
             if s_lane.occupied_cells.is_empty() {
                 s_lane.count = 0;
@@ -1270,12 +1265,12 @@ pub fn apply_deposit_streams_to_carrier_on(
             let mut run = Run {
                 cell_base: field_lane.cell_base,
                 occupied_cells: s_lane.occupied_cells,
-                energy: lane_energy,
+                energy: &mut *field_lane.energy,
                 moment_count,
-                moments: lane_moments,
-                received: s_lane.received,
+                moments: field_lane.moments.each_mut().map(|m| &mut **m),
+                received: &mut *s_lane.received,
             };
-            let count = reduce_run(
+            s_lane.count = reduce_run(
                 &mut run,
                 s_read.offsets,
                 s_read.order,
@@ -1283,12 +1278,7 @@ pub fn apply_deposit_streams_to_carrier_on(
                 s_read.packets,
                 s_read.entries,
             );
-            s_lane.count = count;
-            lane_energy = run.energy;
-            lane_moments = run.moments;
         }
-        field_lane.energy = lane_energy;
-        field_lane.moments = lane_moments;
     };
     let process_lane = &process_lane;
     flife_core::pool::scope_workers(workers, "apply deposits", |scope| {

@@ -29,6 +29,7 @@ use flife_core::ids::OrganismId;
 use flife_core::ledger::{EnergyBudget, Payment};
 use flife_core::numerics::{expm1_neg, sigmoid, tanh};
 use flife_core::{CoreError, TimeStep, V2Feature, ValidatedConfig};
+use flife_field::state::CHANNELS;
 use flife_field::{
     Deposits, ExchangeKernel, ExchangeScratch, ExchangeStencil, FieldGrid,
     split_dual_carrier_emission,
@@ -271,12 +272,11 @@ impl EmissionV2Rules {
             return Ok(None);
         };
         let dt = step.seconds_per_tick();
-        let alpha = expm1_neg(dt / recovery_time_seconds).ok_or_else(|| {
-            CoreError::NumericalInvalid {
+        let alpha =
+            expm1_neg(dt / recovery_time_seconds).ok_or_else(|| CoreError::NumericalInvalid {
                 quantity: "excitable recovery rate",
                 detail: format!("dt={dt}, tau={recovery_time_seconds} out of range"),
-            }
-        })?;
+            })?;
         Ok(Some(alpha))
     }
 
@@ -355,7 +355,9 @@ impl EmissionV2Rules {
                         None => expm1_neg(dt / recovery_time_seconds).ok_or_else(|| {
                             CoreError::NumericalInvalid {
                                 quantity: "excitable recovery rate",
-                                detail: format!("dt={dt}, tau={recovery_time_seconds} out of range"),
+                                detail: format!(
+                                    "dt={dt}, tau={recovery_time_seconds} out of range"
+                                ),
                             }
                         })?,
                     };
@@ -629,7 +631,7 @@ impl CachedFootprint {
         position: [f64; 2],
         paid: f64,
         offered: f64,
-        direction: &[f64],
+        direction: &[f64; CHANNELS],
         scratch: &mut ExchangeScratch,
     ) -> Result<(), CoreError> {
         let bits = [position[0].to_bits(), position[1].to_bits()];
@@ -644,7 +646,7 @@ impl CachedFootprint {
                         stencil
                     }
                 };
-                deposits.push_stencil(&stencil, organism, paid, offered, direction)
+                deposits.push_stencil(grid, organism, paid, offered, direction, &stencil)
             }
             ExchangeKernel::FixedWorldGaussianV1 { .. } => {
                 if self.position_bits != Some(bits) {
@@ -652,7 +654,7 @@ impl CachedFootprint {
                     self.position_bits = Some(bits);
                     self.stencil = None;
                 }
-                deposits.push_footprint(scratch.cells(), organism, paid, offered, direction)
+                deposits.push_footprint(grid, organism, paid, offered, direction, scratch.cells())
             }
         }
     }

@@ -1326,7 +1326,11 @@ impl PyramidView<'_> {
             // coarse L1 locality and hoisting coarse slices outside `0..P`.
             if n_other > 0 {
                 let indices = if n_other > 8 {
-                    sort_by_tile(&other_idx[..n_other], &prepared, &mut other_sorted[..n_other]);
+                    sort_by_tile(
+                        &other_idx[..n_other],
+                        &prepared,
+                        &mut other_sorted[..n_other],
+                    );
                     &other_sorted[..n_other]
                 } else {
                     &other_idx[..n_other]

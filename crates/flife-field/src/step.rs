@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 use flife_core::memory::{capacity_bytes, total};
 use flife_core::{CoreError, TimeStep};
 
-use crate::deposit::{DepositSummary, Deposits, apply_deposits_on, apply_deposits_to_carrier_on};
+use crate::deposit::{DepositSummary, Deposits, apply_deposits_to_carrier_on};
 use crate::footprint::BufferLimits;
 use crate::grid::{CARRIER1_ENERGY_PLANE, ENERGY_PLANE, FIELD_PLANES, FieldGrid};
 use crate::invariants::{ConeTolerance, FieldScan};

@@ -39,7 +39,8 @@ use flife_core::CoreError;
 use flife_core::ids::ResourceEpoch;
 use ft_kernel_metal::Error as MetalError;
 use ft_kernel_metal::compute::{
-    Argument, Gateway, Grid, Input, Library, MathMode, Output, Pipeline, SharedBuffer,
+    Argument, Batch as GatewayBatch, Gateway, Grid, Input, Library, MAX_ARGUMENTS, MathMode,
+    Output, Pipeline, SharedBuffer,
 };
 
 /// An element type a device buffer holds: `f32` or `u32`.
@@ -861,16 +862,292 @@ impl ReleaseOutcome {
     }
 }
 
+/// Unique buffers per command served from stack storage without heap
+/// allocation (`MetalField`, `MetalSensors`, `MetalUptake`, `MetalSettle`, and
+/// up to 14-shard `MetalBackend` batches all stay well within 32 buffers).
+const INLINE_BOUND: usize = 32;
+
+/// Total buffer bindings across all kernels of a command served from stack
+/// storage without heap allocation.
+const INLINE_BINDINGS: usize = 64;
+
+/// Placeholder value for unused slots of an inline `UsesBuf` array.
+const DUMMY_USE: (Binding, bool) = (
+    Binding {
+        handle: Handle {
+            owner: 0,
+            index: 0,
+            generation: 0,
+        },
+        access: Access::Read,
+    },
+    false,
+);
+
+/// Stack-backed deduplicated buffer-use list with transparent heap fallback for
+/// commands touching more than [`INLINE_BOUND`] distinct buffers.
+enum UsesBuf {
+    Inline {
+        data: [(Binding, bool); INLINE_BOUND],
+        len: usize,
+    },
+    Heap(Vec<(Binding, bool)>),
+}
+
+impl UsesBuf {
+    const fn new() -> Self {
+        Self::Inline {
+            data: [DUMMY_USE; INLINE_BOUND],
+            len: 0,
+        }
+    }
+
+    const fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(items) => items.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[(Binding, bool)] {
+        match self {
+            Self::Inline { data, len } => &data[..*len],
+            Self::Heap(items) => items.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [(Binding, bool)] {
+        match self {
+            Self::Inline { data, len } => &mut data[..*len],
+            Self::Heap(items) => items.as_mut_slice(),
+        }
+    }
+
+    fn push(&mut self, item: (Binding, bool)) {
+        match self {
+            Self::Inline { data, len } => {
+                if *len < INLINE_BOUND {
+                    data[*len] = item;
+                    *len += 1;
+                } else {
+                    let mut heap = Vec::with_capacity(INLINE_BOUND * 2);
+                    heap.extend_from_slice(data);
+                    heap.push(item);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(items) => items.push(item),
+        }
+    }
+}
+
+/// Stack-backed `usize` list with transparent heap fallback.
+enum IndexBuf<const N: usize> {
+    Inline { data: [usize; N], len: usize },
+    Heap(Vec<usize>),
+}
+
+impl<const N: usize> IndexBuf<N> {
+    fn with_expected(expected: usize) -> Self {
+        if expected <= N {
+            Self::Inline {
+                data: [0; N],
+                len: 0,
+            }
+        } else {
+            Self::Heap(Vec::with_capacity(expected))
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Inline { data, len } => &data[..*len],
+            Self::Heap(items) => items.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [usize] {
+        match self {
+            Self::Inline { data, len } => &mut data[..*len],
+            Self::Heap(items) => items.as_mut_slice(),
+        }
+    }
+
+    fn push(&mut self, value: usize) {
+        match self {
+            Self::Inline { data, len } => {
+                if *len < N {
+                    data[*len] = value;
+                    *len += 1;
+                } else {
+                    let mut heap = Vec::with_capacity(N * 2);
+                    heap.extend_from_slice(data);
+                    heap.push(value);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(items) => items.push(value),
+        }
+    }
+}
+
+/// Stack-backed bound-buffer storage held by [`CommandGuard`] until verified
+/// completion or unwind.
+enum BoundList {
+    Inline {
+        data: [Option<Bound>; INLINE_BOUND],
+        len: usize,
+    },
+    Heap(Vec<Bound>),
+}
+
+impl BoundList {
+    fn with_exact_capacity(count: usize) -> Self {
+        if count <= INLINE_BOUND {
+            Self::Inline {
+                data: [const { None }; INLINE_BOUND],
+                len: 0,
+            }
+        } else {
+            Self::Heap(Vec::with_capacity(count))
+        }
+    }
+
+    const fn len(&self) -> usize {
+        match self {
+            Self::Inline { len, .. } => *len,
+            Self::Heap(items) => items.len(),
+        }
+    }
+
+    fn get(&self, index: usize) -> Option<&Bound> {
+        match self {
+            Self::Inline { data, len } => {
+                if index < *len {
+                    data[index].as_ref()
+                } else {
+                    None
+                }
+            }
+            Self::Heap(items) => items.get(index),
+        }
+    }
+
+    fn push(&mut self, bound: Bound) {
+        match self {
+            Self::Inline { data, len } => {
+                if *len < INLINE_BOUND {
+                    data[*len] = Some(bound);
+                    *len += 1;
+                } else {
+                    let mut heap = Vec::with_capacity(INLINE_BOUND * 2);
+                    for entry in data.iter_mut() {
+                        if let Some(existing) = entry.take() {
+                            heap.push(existing);
+                        }
+                    }
+                    heap.push(bound);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(items) => items.push(bound),
+        }
+    }
+
+    fn for_each(&self, mut f: impl FnMut(&Bound)) {
+        match self {
+            Self::Inline { data, len } => {
+                for entry in &data[..*len] {
+                    if let Some(bound) = entry.as_ref() {
+                        f(bound);
+                    }
+                }
+            }
+            Self::Heap(items) => {
+                for bound in items {
+                    f(bound);
+                }
+            }
+        }
+    }
+}
+
+/// Stack-backed `RwLock` guard list held across a command's submission.
+enum HeldBuf<'a> {
+    Inline {
+        data: [Option<(usize, Held<'a>)>; INLINE_BOUND],
+        len: usize,
+    },
+    Heap(Vec<(usize, Held<'a>)>),
+}
+
+impl<'a> HeldBuf<'a> {
+    fn with_exact_capacity(count: usize) -> Self {
+        if count <= INLINE_BOUND {
+            Self::Inline {
+                data: [const { None }; INLINE_BOUND],
+                len: 0,
+            }
+        } else {
+            Self::Heap(Vec::with_capacity(count))
+        }
+    }
+
+    fn push(&mut self, item: (usize, Held<'a>)) {
+        match self {
+            Self::Inline { data, len } => {
+                if *len < INLINE_BOUND {
+                    data[*len] = Some(item);
+                    *len += 1;
+                } else {
+                    let mut heap = Vec::with_capacity(INLINE_BOUND * 2);
+                    for entry in data.iter_mut() {
+                        if let Some(existing) = entry.take() {
+                            heap.push(existing);
+                        }
+                    }
+                    heap.push(item);
+                    *self = Self::Heap(heap);
+                }
+            }
+            Self::Heap(items) => items.push(item),
+        }
+    }
+
+    fn register<'h>(&'h mut self, batch: &mut GatewayBatch<'h>, slots: &mut [Option<Slot>]) {
+        match self {
+            Self::Inline { data, len } => {
+                for entry in &mut data[..*len] {
+                    if let Some((at, lock)) = entry.as_mut() {
+                        slots[*at] = Some(match lock {
+                            Held::Read(memory) => Slot::Input(batch.input(memory)),
+                            Held::Write(memory) => Slot::Output(batch.output(memory)),
+                        });
+                    }
+                }
+            }
+            Self::Heap(entries) => {
+                for (at, lock) in entries.iter_mut() {
+                    slots[*at] = Some(match lock {
+                        Held::Read(memory) => Slot::Input(batch.input(memory)),
+                        Held::Write(memory) => Slot::Output(batch.output(memory)),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// RAII guard ensuring a command's bound buffers and `table.running` counter
 /// are always released even if encoding, submission, or allocation unwinds.
 struct CommandGuard<'a> {
     owner: &'a DeviceOwner,
-    bound: Vec<Bound>,
+    bound: BoundList,
     released: bool,
 }
 
 impl<'a> CommandGuard<'a> {
-    const fn new(owner: &'a DeviceOwner, bound: Vec<Bound>) -> Self {
+    const fn new(owner: &'a DeviceOwner, bound: BoundList) -> Self {
         Self {
             owner,
             bound,
@@ -917,66 +1194,114 @@ impl DeviceOwner {
     /// bindings are released: buffers the command wrote are undefined if its
     /// command buffer failed, and unchanged if the gateway refused a kernel
     /// before anything was encoded.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "zero-allocation inline staging with strict lock ordering and unwind safety"
+    )]
     pub fn submit_batch(&self, kernels: &[Kernel<'_>]) -> Result<Receipt, CoreError> {
-        let lists: Vec<&[Binding]> = kernels.iter().map(|kernel| kernel.bindings).collect();
-        let guard = CommandGuard::new(self, self.bind(&lists)?);
+        let (bound, binding_map) = self.bind_kernels(kernels)?;
+        let guard = CommandGuard::new(self, bound);
         let outcome = {
             // Lock-ordering invariant: `self.shared.table()` (Level 1) is never
             // held while acquiring any buffer `memory` RwLock (Level 2), and
             // multiple `memory` locks are always acquired in strictly ascending
             // `handle.index` order to eliminate any multi-buffer cycle.
-            let mut order: Vec<usize> = (0..guard.bound.len()).collect();
-            order.sort_unstable_by_key(|&at| guard.bound[at].handle.index);
-            let mut held: Vec<(usize, Held<'_>)> = order
-                .into_iter()
-                .map(|at| {
-                    let buffer = &guard.bound[at];
-                    let lock = if buffer.written {
-                        Held::Write(
-                            buffer
-                                .memory
-                                .write()
-                                .unwrap_or_else(PoisonError::into_inner),
-                        )
-                    } else {
-                        Held::Read(buffer.memory.read().unwrap_or_else(PoisonError::into_inner))
-                    };
-                    (at, lock)
-                })
-                .collect();
-            let mut batch = self.shared.gateway.batch();
-            let mut slots: Vec<Option<Slot>> = vec![None; guard.bound.len()];
-            for (at, lock) in &mut held {
-                slots[*at] = Some(match lock {
-                    Held::Read(memory) => Slot::Input(batch.input(memory)),
-                    Held::Write(memory) => Slot::Output(batch.output(memory)),
-                });
+            let n = guard.bound.len();
+            let mut order = IndexBuf::<INLINE_BOUND>::with_expected(n);
+            for at in 0..n {
+                order.push(at);
             }
-            let mut encoded = Ok(());
-            for kernel in kernels {
-                let arguments: Option<Vec<Argument>> = kernel
-                    .bindings
-                    .iter()
-                    .map(|binding| {
-                        let at = guard
-                            .bound
-                            .iter()
-                            .position(|buffer| buffer.handle == binding.handle)?;
-                        match (slots.get(at)?.as_ref()?, binding.access) {
-                            (Slot::Output(output), Access::Write) => Some(output.write()),
-                            (Slot::Output(output), Access::Read) => Some(output.read()),
-                            (Slot::Input(input), Access::Read) => Some(input.read()),
-                            (Slot::Input(_), Access::Write) => None,
-                        }
-                    })
-                    .collect();
-                let Some(arguments) = arguments else {
-                    encoded = Err(MetalError::Kernel(
-                        "a binding does not match what its buffer was bound for".to_owned(),
-                    ));
-                    break;
+            order.as_mut_slice().sort_unstable_by_key(|&at| {
+                guard.bound.get(at).map_or(u32::MAX, |b| b.handle.index)
+            });
+            let mut held = HeldBuf::with_exact_capacity(n);
+            for &at in order.as_slice() {
+                let Some(buffer) = guard.bound.get(at) else {
+                    continue;
                 };
-                encoded = batch.dispatch(kernel.pipeline, &arguments, kernel.grid);
+                let lock = if buffer.written {
+                    Held::Write(
+                        buffer
+                            .memory
+                            .write()
+                            .unwrap_or_else(PoisonError::into_inner),
+                    )
+                } else {
+                    Held::Read(buffer.memory.read().unwrap_or_else(PoisonError::into_inner))
+                };
+                held.push((at, lock));
+            }
+            let mut batch = self.shared.gateway.batch();
+            let mut slots_inline = [None; INLINE_BOUND];
+            let mut slots_heap = if n <= INLINE_BOUND {
+                Vec::new()
+            } else {
+                vec![None; n]
+            };
+            let slots: &mut [Option<Slot>] = if n <= INLINE_BOUND {
+                &mut slots_inline[..n]
+            } else {
+                &mut slots_heap
+            };
+            held.register(&mut batch, slots);
+            let mut encoded = Ok(());
+            let map_slice = binding_map.as_slice();
+            let mut map_cursor = 0_usize;
+            for kernel in kernels {
+                let arg_count = kernel.bindings.len();
+                let arg_indices = &map_slice[map_cursor..map_cursor + arg_count];
+                map_cursor += arg_count;
+                let resolve = |idx: usize, access: Access| -> Option<Argument> {
+                    match (slots.get(idx)?.as_ref()?, access) {
+                        (Slot::Output(output), Access::Write) => Some(output.write()),
+                        (Slot::Output(output), Access::Read) => Some(output.read()),
+                        (Slot::Input(input), Access::Read) => Some(input.read()),
+                        (Slot::Input(_), Access::Write) => None,
+                    }
+                };
+                if arg_count == 0 {
+                    encoded = batch.dispatch(kernel.pipeline, &[], kernel.grid);
+                } else if arg_count <= MAX_ARGUMENTS {
+                    let Some(first) = resolve(arg_indices[0], kernel.bindings[0].access) else {
+                        encoded = Err(MetalError::Kernel(
+                            "a binding does not match what its buffer was bound for".to_owned(),
+                        ));
+                        break;
+                    };
+                    let mut arg_buf = [first; MAX_ARGUMENTS];
+                    let mut valid = true;
+                    for (dst, (&idx, binding)) in arg_buf[1..arg_count].iter_mut().zip(
+                        arg_indices[1..arg_count]
+                            .iter()
+                            .zip(&kernel.bindings[1..arg_count]),
+                    ) {
+                        let Some(arg) = resolve(idx, binding.access) else {
+                            valid = false;
+                            break;
+                        };
+                        *dst = arg;
+                    }
+                    if !valid {
+                        encoded = Err(MetalError::Kernel(
+                            "a binding does not match what its buffer was bound for".to_owned(),
+                        ));
+                        break;
+                    }
+                    encoded = batch.dispatch(kernel.pipeline, &arg_buf[..arg_count], kernel.grid);
+                } else {
+                    let arguments: Option<Vec<Argument>> = arg_indices
+                        .iter()
+                        .zip(kernel.bindings)
+                        .map(|(&idx, binding)| resolve(idx, binding.access))
+                        .collect();
+                    let Some(arguments) = arguments else {
+                        encoded = Err(MetalError::Kernel(
+                            "a binding does not match what its buffer was bound for".to_owned(),
+                        ));
+                        break;
+                    };
+                    encoded = batch.dispatch(kernel.pipeline, &arguments, kernel.grid);
+                }
                 if encoded.is_err() {
                     break;
                 }
@@ -998,14 +1323,35 @@ impl DeviceOwner {
     }
 
     /// Check every kernel's bindings as one command, then mark every buffer
-    /// it binds, returning them in order of first binding.
-    fn bind(&self, kernels: &[&[Binding]]) -> Result<Vec<Bound>, CoreError> {
-        if kernels.is_empty() {
+    /// it binds, returning both the deduplicated buffers in order of first
+    /// binding and the flat per-binding index map into that list.
+    fn bind_kernels(
+        &self,
+        kernels: &[Kernel<'_>],
+    ) -> Result<(BoundList, IndexBuf<INLINE_BINDINGS>), CoreError> {
+        let total_bindings: usize = kernels.iter().map(|kernel| kernel.bindings.len()).sum();
+        self.bind_iter(
+            kernels.len(),
+            total_bindings,
+            kernels.iter().map(|kernel| kernel.bindings),
+        )
+    }
+
+    fn bind_iter<'a>(
+        &self,
+        kernel_count: usize,
+        total_bindings: usize,
+        kernels: impl Iterator<Item = &'a [Binding]>,
+    ) -> Result<(BoundList, IndexBuf<INLINE_BINDINGS>), CoreError> {
+        if kernel_count == 0 {
             return Err(conflict("a command of no kernels".to_owned()));
         }
         // Each buffer once: whether any kernel writes it, and whether its
-        // first binding reads it.
-        let mut uses: Vec<(Binding, bool)> = Vec::new();
+        // first binding reads it, plus the flat index of every kernel binding
+        // into `uses` so `submit_batch` resolves arguments in O(1) without
+        // re-scanning.
+        let mut uses = UsesBuf::new();
+        let mut binding_map = IndexBuf::<INLINE_BINDINGS>::with_expected(total_bindings);
         for bindings in kernels {
             for (at, binding) in bindings.iter().enumerate() {
                 let aliased = bindings[..at].iter().any(|earlier| {
@@ -1018,17 +1364,27 @@ impl DeviceOwner {
                         binding.handle.index
                     )));
                 }
-                match uses
+                let existing = uses
+                    .as_mut_slice()
                     .iter_mut()
-                    .find(|(first, _)| first.handle == binding.handle)
-                {
-                    Some((_, written)) => *written |= binding.access == Access::Write,
-                    None => uses.push((*binding, binding.access == Access::Write)),
-                }
+                    .enumerate()
+                    .find(|(_, (first, _))| first.handle == binding.handle);
+                let bound_idx = match existing {
+                    Some((idx, (_, written))) => {
+                        *written |= binding.access == Access::Write;
+                        idx
+                    }
+                    None => {
+                        let idx = uses.len();
+                        uses.push((*binding, binding.access == Access::Write));
+                        idx
+                    }
+                };
+                binding_map.push(bound_idx);
             }
         }
         let mut table = self.shared.table();
-        for &(first, written) in &uses {
+        for &(first, written) in uses.as_slice() {
             let resident = table.resident(self.shared.id, first.handle)?;
             let name = || format!("buffer #{} ({})", first.handle.index, resident.element);
             if resident.retiring {
@@ -1057,8 +1413,8 @@ impl DeviceOwner {
                 )));
             }
         }
-        let mut bound = Vec::with_capacity(uses.len());
-        for (first, written) in uses {
+        let mut bound = BoundList::with_exact_capacity(uses.len());
+        for &(first, written) in uses.as_slice() {
             let resident = table.resident(self.shared.id, first.handle)?;
             if written {
                 resident.writer = Some(Writer::Command);
@@ -1072,15 +1428,19 @@ impl DeviceOwner {
             });
         }
         table.running += 1;
-        Ok(bound)
+        Ok((bound, binding_map))
     }
 
     /// Release a command's buffers once its outcome is known, returning the
     /// epochs of the buffers it wrote.
-    fn release(&self, bound: &[Bound], outcome: ReleaseOutcome) -> Vec<ResourceEpoch> {
+    fn release(&self, bound: &BoundList, outcome: ReleaseOutcome) -> Vec<ResourceEpoch> {
+        let mut written_count = 0_usize;
+        bound.for_each(|buffer| {
+            written_count += usize::from(buffer.written);
+        });
         let mut table = self.shared.table();
-        let mut written = Vec::new();
-        for buffer in bound {
+        let mut written = Vec::with_capacity(written_count);
+        bound.for_each(|buffer| {
             if let Ok(resident) = table.resident(self.shared.id, buffer.handle) {
                 if buffer.written {
                     resident.writer = None;
@@ -1101,7 +1461,7 @@ impl DeviceOwner {
                 }
             }
             table.settle(buffer.handle);
-        }
+        });
         table.running = table.running.saturating_sub(1);
         written
     }
@@ -1159,7 +1519,7 @@ impl DeviceOwner {
         bindings: &[Binding],
         outcome: &Result<(), MetalError>,
     ) -> Result<(), CoreError> {
-        let bound = self.bind(&[bindings])?;
+        let (bound, _) = self.bind_iter(1, bindings.len(), std::iter::once(bindings))?;
         self.release(
             &bound,
             ReleaseOutcome::from_result(outcome.as_ref().copied()),
@@ -1401,5 +1761,49 @@ mod tests {
         assert_eq!(owner.epoch(output).map(|epoch| epoch.get()).ok(), Some(3));
         assert_eq!(owner.state(output).ok(), Some(ResourceState::Committed));
         assert_eq!(owner.usage().running, 0);
+    }
+
+    #[test]
+    fn bind_iter_handles_inline_and_heap_spill_buffers_identically() {
+        let Ok(owner) = DeviceOwner::open(Limits::UNBOUNDED) else {
+            return;
+        };
+        let count = super::INLINE_BOUND + 8;
+        let buffers: Vec<_> = (0..count)
+            .map(|i| owner.upload(&[i as f32; 4]).expect("uploads"))
+            .collect();
+        let mut bindings = Vec::with_capacity(count + 2);
+        // Bind first 32+8 buffers: last two written, earlier read, plus a duplicate read.
+        for &buf in &buffers[..count - 2] {
+            bindings.push(buf.reads());
+        }
+        bindings.push(buffers[0].reads());
+        bindings.push(buffers[count - 2].writes());
+        bindings.push(buffers[count - 1].writes());
+
+        let (bound, map) = owner
+            .bind_iter(1, bindings.len(), std::iter::once(bindings.as_slice()))
+            .expect("heap-spill bind succeeds");
+        assert_eq!(bound.len(), count);
+        assert_eq!(map.as_slice().len(), bindings.len());
+        assert_eq!(
+            map.as_slice()[count - 2],
+            0,
+            "duplicate read maps to slot 0"
+        );
+        assert_eq!(owner.usage().running, 1);
+
+        let written = owner.release(&bound, super::ReleaseOutcome::Completed);
+        assert_eq!(written.len(), 2);
+        assert_eq!(owner.usage().running, 0);
+        assert_eq!(
+            owner.epoch(buffers[count - 2]).ok().map(|e| e.get()),
+            Some(2)
+        );
+        assert_eq!(
+            owner.epoch(buffers[count - 1]).ok().map(|e| e.get()),
+            Some(2)
+        );
+        assert_eq!(owner.epoch(buffers[0]).ok().map(|e| e.get()), Some(1));
     }
 }

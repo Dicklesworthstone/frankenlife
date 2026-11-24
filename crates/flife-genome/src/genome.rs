@@ -547,12 +547,28 @@ impl TraitLimits {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Traits {
     affinity: [f64; AFFINITY_TERMS],
+    unit_affinity: [f32; AFFINITY_TERMS],
     motion_response: [f64; MOTION_RESPONSE_TERMS],
     sensing_scale: f64,
     polarity_strength: f64,
     wedge_curvature: f64,
     cadherin_tag: [f64; CADHERIN_TERMS],
     cohesiveness: f64,
+}
+
+/// Compute the cached F32 unit affinity direction `a / ‖a‖₂` (all zeros when
+/// `‖a‖₂ == 0` or nonfinite), bit-identical to `flife_engine::contact::unit_affinity`.
+fn compute_unit_affinity(affinity: &[f64; AFFINITY_TERMS]) -> [f32; AFFINITY_TERMS] {
+    let norm = affinity
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if norm.is_finite() && norm > 0.0 {
+        affinity.map(|value| (value / norm) as f32)
+    } else {
+        [0.0; AFFINITY_TERMS]
+    }
 }
 
 impl Traits {
@@ -664,8 +680,10 @@ impl Traits {
             }
             None => ([0.0; CADHERIN_TERMS], NO_CADHERIN_COHESIVENESS),
         };
+        let unit_affinity = compute_unit_affinity(&affinity);
         Ok(Self {
             affinity,
+            unit_affinity,
             motion_response,
             sensing_scale,
             polarity_strength,
@@ -728,6 +746,13 @@ impl Traits {
     #[must_use]
     pub const fn affinity(&self) -> &[f64; AFFINITY_TERMS] {
         &self.affinity
+    }
+
+    /// Cached F32 unit affinity direction `a / ‖a‖₂` (all zeros when `a == 0`),
+    /// bit-identical to `flife_engine::contact::unit_affinity(self.affinity())`.
+    #[must_use]
+    pub const fn unit_affinity(&self) -> &[f32; AFFINITY_TERMS] {
+        &self.unit_affinity
     }
 
     /// The motion response `χ`: energy first, then each channel.
@@ -1352,6 +1377,59 @@ impl Genome {
                 self.parameters(),
                 limits.maximum_absolute_parameter,
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_affinity_tests {
+    use super::*;
+
+    #[test]
+    fn cached_unit_affinity_matches_exact_f32_normalization() {
+        let limits = TraitLimits::new(1.0, 10.0, [0.25, 4.0], 4.0).expect("limits");
+        let mut affinity = [0.0_f64; AFFINITY_TERMS];
+        affinity[0] = 0.3;
+        affinity[5] = -0.4;
+        affinity[17] = 0.25;
+        affinity[31] = -0.15;
+
+        let traits = Traits::new(affinity, [0.0; MOTION_RESPONSE_TERMS], 1.0, &limits)
+            .expect("valid traits");
+        let norm = affinity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let expected = affinity.map(|v| (v / norm) as f32);
+        for (got, exp) in traits.unit_affinity().iter().zip(&expected) {
+            assert_eq!(got.to_bits(), exp.to_bits());
+        }
+
+        // Zero affinity caches exact +0.0 across all channels.
+        let zero_traits = Traits::new(
+            [0.0; AFFINITY_TERMS],
+            [0.0; MOTION_RESPONSE_TERMS],
+            1.0,
+            &limits,
+        )
+        .expect("zero affinity");
+        for &v in zero_traits.unit_affinity() {
+            assert_eq!(v.to_bits(), 0.0_f32.to_bits());
+        }
+
+        // Preserved across v2 polarity/cadherin builders.
+        let with_v2 = traits
+            .with_polarity_traits(
+                Some(
+                    PolarityTraits::new(0.5, 0.1, limits.effective_wedge_curvature_bound())
+                        .expect("pol"),
+                ),
+                &limits,
+            )
+            .expect("polarity")
+            .with_cadherin_traits(Some(
+                CadherinTraits::new([1.0, 0.0, 0.0, 0.0], 0.8).expect("cad"),
+            ))
+            .expect("cadherin");
+        for (got, exp) in with_v2.unit_affinity().iter().zip(&expected) {
+            assert_eq!(got.to_bits(), exp.to_bits());
         }
     }
 }

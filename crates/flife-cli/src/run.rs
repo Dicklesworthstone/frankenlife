@@ -827,7 +827,11 @@ where
                     if committed >= until {
                         break Stop::Reached;
                     }
-                    match handle.step(&cx).await? {
+                    let next_tick = committed.saturating_add(1);
+                    let need_render = metrics
+                        .as_ref()
+                        .is_some_and(|tracker| tracker.due(next_tick) || next_tick == until);
+                    match handle.step_with_render(&cx, need_render).await? {
                         StepOutcome::Published { report, .. } => {
                             tally.record(&report);
                             committed = report.tick.get();

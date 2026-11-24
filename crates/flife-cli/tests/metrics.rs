@@ -1245,3 +1245,48 @@ fn spatial_statistics_guard_zero_bins_overflow_and_non_finite_inputs() {
     assert_eq!(top_decile_share(&[-1.0, 2.0, 3.0]), None);
     assert_eq!(top_decile_share(&[-0.0, 1.0]), Some(1.0));
 }
+
+/// Headless `--metrics-every N` projects render epochs ONLY on due metrics
+/// ticks and the final tick (skipping intermediate ticks while keeping
+/// bit-identical sampled metrics, zero lag, and identical world digest).
+#[test]
+fn headless_metrics_projects_render_epochs_only_on_due_and_final_ticks() {
+    let (sparse_end, sparse_records) = run_ecology(25, 10);
+    let (dense_end, dense_records) = run_ecology(25, 1);
+    let (quiet_end, _) = run_ecology(25, 0);
+
+    // INV-09: world digest is bit-identical across metrics_every = 0, 1, 10.
+    let sparse_digest = sparse_end.closed.world.digest();
+    assert_eq!(sparse_digest, dense_end.closed.world.digest());
+    assert_eq!(sparse_digest, quiet_end.closed.world.digest());
+
+    let sparse = metrics_of(&sparse_records);
+    let dense = metrics_of(&dense_records);
+    let sparse_ticks: Vec<u64> = sparse.iter().map(|m| m.tick).collect();
+    assert_eq!(sparse_ticks, [10, 20, 25]);
+
+    // Only 3 render epochs are projected after founding (ticks 10, 20, 25)
+    // instead of 25: each consecutive sample advances `sampled.epoch` by 1.
+    assert_eq!(sparse[1].sampled.epoch - sparse[0].sampled.epoch, 1);
+    assert_eq!(sparse[2].sampled.epoch - sparse[1].sampled.epoch, 1);
+    assert!(
+        sparse[2].sampled.epoch < dense[24].sampled.epoch,
+        "sparse run must project far fewer render epochs ({}) than dense ({})",
+        sparse[2].sampled.epoch,
+        dense[24].sampled.epoch
+    );
+
+    // Every sparse sample has lag 0 and bit-identical sampled figures to the
+    // dense per-tick reference at the same committed tick.
+    for sample in &sparse {
+        assert_eq!(sample.sampled.source_tick, sample.tick);
+        assert_eq!(sample.sampled.lag, 0);
+        let reference = dense
+            .iter()
+            .find(|m| m.tick == sample.tick)
+            .expect("dense run sampled this tick");
+        assert_eq!(sample.sampled.motility, reference.sampled.motility);
+        assert_eq!(sample.sampled.dispersion, reference.sampled.dispersion);
+        assert_eq!(sample.sampled.resources, reference.sampled.resources);
+    }
+}

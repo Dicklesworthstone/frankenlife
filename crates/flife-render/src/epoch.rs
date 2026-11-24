@@ -12,8 +12,8 @@
 //! bounds. A slot's buffers are allocated once, at the world's population
 //! ceiling and its texture size, and each projection refills them in place.
 //! Publishing therefore never grows them. The field texture's rows are
-//! projected on the world's CPU workers (scoped threads, as the world's own
-//! phases use), bit for bit as on one.
+//! projected on the world's CPU workers (cached private pool via
+//! `flife_core::pool`, as the world's own phases use), bit for bit as on one.
 //!
 //! Rows follow identity order, never storage-slot order. Two storage
 //! arrangements of one world project the same epoch (C.7), and a consumer
@@ -55,6 +55,9 @@ pub const AFFINITY_AXES: [usize; 3] = [7, 14, 25];
 /// a coordinate that is not finite.
 #[must_use]
 pub fn affinity_projection(affinity: &[f64], limit: f64) -> [f32; 3] {
+    if let Ok(fixed) = <&[f64; CHANNELS]>::try_from(affinity) {
+        return affinity_projection_32(fixed, (CHANNELS as f64).sqrt() * limit);
+    }
     let dots = AFFINITY_AXES.map(|row| {
         affinity
             .iter()
@@ -67,16 +70,47 @@ pub fn affinity_projection(affinity: &[f64], limit: f64) -> [f32; 3] {
                 }
             })
     });
-    coordinates(dots, affinity.len(), limit)
+    coordinates_with_sqrt(dots, (affinity.len() as f64).sqrt(), limit)
+}
+
+/// Fast path for the canonical 32-channel affinity vector with precomputed
+/// `scale = √32 × limit`: single pass over `[f64; CHANNELS]` using the
+/// compile-time [`AXIS_SIGNS`] table (zero branches, zero `popcount`, zero
+/// `sqrt`, bit-identical to [`affinity_projection`]).
+#[inline]
+fn affinity_projection_32(affinity: &[f64; CHANNELS], scale: f64) -> [f32; 3] {
+    if !(scale.is_finite() && scale > 0.0) {
+        return [0.0; 3];
+    }
+    let (mut d0, mut d1, mut d2) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (((&v, &w0), &w1), &w2) in affinity
+        .iter()
+        .zip(&AXIS_SIGNS[0])
+        .zip(&AXIS_SIGNS[1])
+        .zip(&AXIS_SIGNS[2])
+    {
+        d0 += w0 * v;
+        d1 += w1 * v;
+        d2 += w2 * v;
+    }
+    [d0, d1, d2].map(|dot| {
+        let coordinate = dot / scale;
+        if coordinate.is_finite() {
+            coordinate.clamp(-1.0, 1.0) as f32
+        } else {
+            0.0
+        }
+    })
 }
 
 /// The display coordinates of the three dot products `dots` of
-/// [`affinity_projection`] over `channels` channels: each over
-/// `√(channels) × limit`, clamped and rounded to F32; `[0; 3]` for a
-/// nonpositive or non-finite scale and `0` for a coordinate that is not
-/// finite.
-fn coordinates(dots: [f64; 3], channels: usize, limit: f64) -> [f32; 3] {
-    let scale = (channels as f64).sqrt() * limit;
+/// [`affinity_projection`] over `channels` channels with precomputed
+/// `sqrt_channels = √(channels)`: each over `sqrt_channels × limit`, clamped
+/// and rounded to F32; `[0; 3]` for a nonpositive or non-finite scale and `0`
+/// for a coordinate that is not finite.
+#[inline]
+fn coordinates_with_sqrt(dots: [f64; 3], sqrt_channels: f64, limit: f64) -> [f32; 3] {
+    let scale = sqrt_channels * limit;
     if !(scale.is_finite() && scale > 0.0) {
         return [0.0; 3];
     }
@@ -983,13 +1017,13 @@ impl FieldTexture {
         validate_scalar_plane(energy, [cells_x, cells_y], "render field energy")?;
         let [width, height] = self.texels.map(|n| n as usize);
         let count = width * height;
-        // The buffers' capacity is the texture's, so this never allocates.
-        self.values.clear();
-        self.values.resize(count, 0.0);
-        self.composition.clear();
-        self.composition.resize(count, [0.0; 3]);
-        self.components.clear();
-        self.components.resize(count, [0; CHANNELS]);
+        // The buffers' capacity is the texture's, so resizing once never
+        // allocates; steady-state reused slots keep `len == count` and skip
+        // ~5 MiB of redundant single-threaded zeroing per epoch (`Rows::project`
+        // unconditionally writes every texel in parallel).
+        resize_len(&mut self.values, count, 0.0);
+        resize_len(&mut self.composition, count, [0.0; 3]);
+        resize_len(&mut self.components, count, [0; CHANNELS]);
         let rows = Rows {
             energy,
             moments,
@@ -1001,6 +1035,15 @@ impl FieldTexture {
         let used = workers
             .min(height.div_ceil(MINIMUM_TEXEL_ROWS_PER_WORKER))
             .max(1);
+        if used == 1 {
+            rows.project(
+                0,
+                &mut self.values,
+                &mut self.composition,
+                &mut self.components,
+            );
+            return Ok(());
+        }
         let per = height.div_ceil(used).max(1);
         let texels = per * width;
         let mut runs = self
@@ -1011,27 +1054,150 @@ impl FieldTexture {
         let Some(((values, composition), components)) = runs.next() else {
             return Ok(());
         };
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = runs
-                .enumerate()
-                .map(|(index, ((values, composition), components))| {
-                    scope.spawn(move || {
-                        rows.project((index + 1) * per, values, composition, components)
-                    })
-                })
-                .collect();
-            rows.project(0, values, composition, components);
-            let mut joined = Ok(());
-            for worker in workers {
-                if worker.join().is_err() {
-                    joined = Err(CoreError::StateConflict {
-                        operation: "project render field texture",
-                        detail: "a texture worker panicked".to_owned(),
-                    });
-                }
+        // Pass the caller's configured `workers` budget (not clamped `used`)
+        // so render and engine phases reuse one cached private pool.
+        flife_core::pool::scope_workers(workers, "project render field texture", |scope| {
+            for (index, ((values, composition), components)) in runs.enumerate() {
+                scope.spawn(move || {
+                    rows.project((index + 1) * per, values, composition, components);
+                });
             }
-            joined
+            rows.project(0, values, composition, components);
         })
+    }
+}
+
+/// Resize `vec` to `len` without zeroing an already-initialized prefix.
+#[inline]
+fn resize_len<T: Copy>(vec: &mut Vec<T>, len: usize, fill: T) {
+    if vec.len() < len {
+        vec.resize(len, fill);
+    } else {
+        vec.truncate(len);
+    }
+}
+
+/// Exact reciprocal `1.0 / d` when `d` is a positive power of two in normal
+/// range (`[2^-500, 2^500]`), so `sum * inv` is bit-identical to `sum / d`
+/// (pure exponent shift, zero rounding) for every finite `f64` summed from
+/// `f32` cells.
+#[inline]
+fn exact_power_of_two_recip(d: f64) -> Option<f64> {
+    if d.is_finite() && d > 0.0 {
+        let bits = d.to_bits();
+        let mantissa = bits & ((1_u64 << 52) - 1);
+        let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+        if mantissa == 0 && (-500..=500).contains(&exp) {
+            return Some(1.0 / d);
+        }
+    }
+    None
+}
+
+/// Half-integer safety margin for precomputed `127.0 / energy` multiplication:
+/// `|fl(m * fl(127 / e)) - fl(fl(m / e) * 127)| < 6e-14 << 1e-10`, so any value
+/// at least `1e-10` from every half-integer `k + 0.5` has a provably identical
+/// `.round()` result; anything closer (or non-finite / out of `[-127, 127]`)
+/// falls back to exact [`component_step`].
+const FAST_ROUND_MARGIN: f64 = 0.499_999_999_9;
+
+/// Single-pass fused dot-product accumulation and quantized component-step
+/// projection for one whole-cell (`1×1`) moment channel row.
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hot inner loop takes disjoint pre-sliced row buffers directly"
+)]
+fn project_channel_f32(
+    run: &[f32],
+    energies: &[f64],
+    scales: &[f64],
+    signs: [f64; 3],
+    d0s: &mut [f64],
+    d1s: &mut [f64],
+    d2s: &mut [f64],
+    steps: &mut [i8],
+) {
+    let [s0, s1, s2] = signs;
+    let mut fallback = 0_u8;
+    for (((((d0, d1), d2), step_out), &scale), &raw_m) in d0s
+        .iter_mut()
+        .zip(d1s.iter_mut())
+        .zip(d2s.iter_mut())
+        .zip(steps.iter_mut())
+        .zip(scales)
+        .zip(run)
+    {
+        let m = f64::from(raw_m);
+        *d0 += s0 * m;
+        *d1 += s1 * m;
+        *d2 += s2 * m;
+        let scaled = m * scale;
+        let rounded = scaled.round();
+        let ok = (rounded.abs() <= 127.0) & ((scaled - rounded).abs() < FAST_ROUND_MARGIN);
+        fallback |= u8::from(!ok);
+        *step_out = rounded as i8;
+    }
+    if fallback != 0 {
+        for ((step_out, &raw_m), (&scale, &energy)) in
+            steps.iter_mut().zip(run).zip(scales.iter().zip(energies))
+        {
+            let m = f64::from(raw_m);
+            let scaled = m * scale;
+            let rounded = scaled.round();
+            if !((rounded.abs() <= 127.0) && ((scaled - rounded).abs() < FAST_ROUND_MARGIN)) {
+                *step_out = component_step(m, energy);
+            }
+        }
+    }
+}
+
+/// Single-pass fused dot-product accumulation and quantized component-step
+/// projection for one pre-summed (`block > 1`) moment channel row.
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "hot inner loop takes disjoint pre-sliced row buffers directly"
+)]
+fn project_channel_f64(
+    sums: &[f64],
+    energies: &[f64],
+    scales: &[f64],
+    signs: [f64; 3],
+    d0s: &mut [f64],
+    d1s: &mut [f64],
+    d2s: &mut [f64],
+    steps: &mut [i8],
+) {
+    let [s0, s1, s2] = signs;
+    let mut fallback = 0_u8;
+    for (((((d0, d1), d2), step_out), &scale), &m) in d0s
+        .iter_mut()
+        .zip(d1s.iter_mut())
+        .zip(d2s.iter_mut())
+        .zip(steps.iter_mut())
+        .zip(scales)
+        .zip(sums)
+    {
+        *d0 += s0 * m;
+        *d1 += s1 * m;
+        *d2 += s2 * m;
+        let scaled = m * scale;
+        let rounded = scaled.round();
+        let ok = (rounded.abs() <= 127.0) & ((scaled - rounded).abs() < FAST_ROUND_MARGIN);
+        fallback |= u8::from(!ok);
+        *step_out = rounded as i8;
+    }
+    if fallback != 0 {
+        for ((step_out, &m), (&scale, &energy)) in
+            steps.iter_mut().zip(sums).zip(scales.iter().zip(energies))
+        {
+            let scaled = m * scale;
+            let rounded = scaled.round();
+            if !((rounded.abs() <= 127.0) && ((scaled - rounded).abs() < FAST_ROUND_MARGIN)) {
+                *step_out = component_step(m, energy);
+            }
+        }
     }
 }
 
@@ -1060,7 +1226,8 @@ struct Rows<'a> {
 impl Rows<'_> {
     /// Project texel rows `first..`, as many whole rows as `values` holds,
     /// into `values`, `composition` and `components`, which hold the same
-    /// count of texels; the last two are zeros on entry.
+    /// count of texels; every texel in all three buffers is written
+    /// unconditionally, bit-identical to the independent block oracle.
     fn project(
         self,
         first: usize,
@@ -1072,24 +1239,27 @@ impl Rows<'_> {
         let [block_x, block_y] = self.block;
         let width = self.width;
         let whole = block_x == 1 && block_y == 1;
-        let columns = |texel_x: usize| texel_x * block_x..((texel_x + 1) * block_x).min(cells_x);
-        let block_sum = |plane: &[f32], rows: &std::ops::Range<usize>, texel_x: usize| {
-            let columns = columns(texel_x);
-            let mut sum = 0.0_f64;
-            for y in rows.clone() {
-                for &value in &plane[y * cells_x + columns.start..y * cells_x + columns.end] {
-                    sum += f64::from(value);
-                }
-            }
-            sum
+        let plane_cells = cells_x * cells_y;
+        let num_channels = if plane_cells > 0 {
+            self.moments.len() / plane_cells
+        } else {
+            0
         };
-        // A texel row at a time: each texel's energy sum, then its three
-        // dot products channel by channel, so each plane is read in one run
-        // per row. Per texel these are the same sums in the same order as
-        // `affinity_projection` of the block's channel sums.
+        let full_x = cells_x / block_x;
+        let inv_cell_area = exact_power_of_two_recip(self.cell_area);
+        let sqrt_channels = (CHANNELS as f64).sqrt();
+
+        // A texel row at a time: each plane is read in one contiguous run per
+        // row (avoiding 32-way L1D set conflicts on power-of-two/320² planes),
+        // accumulating the three Hadamard dot products and contiguous quantized
+        // component rows in a single fused pass, then transposing 8×32 tiles
+        // sequentially into `row_components`.
         let mut energies = [0.0_f64; ROW];
+        let mut scales_127 = [0.0_f64; ROW];
         let mut sums = [0.0_f64; ROW];
         let mut dots = [[0.0_f64; ROW]; 3];
+        let mut channel_steps = [[0_i8; ROW]; CHANNELS];
+
         let rows_out = values
             .chunks_exact_mut(width)
             .zip(composition.chunks_exact_mut(width))
@@ -1097,70 +1267,240 @@ impl Rows<'_> {
         for (row, ((row_values, row_composition), row_components)) in rows_out.enumerate() {
             let texel_y = first + row;
             let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
-            for (texel_x, (total, value)) in energies[..width]
-                .iter_mut()
-                .zip(row_values.iter_mut())
-                .enumerate()
-            {
-                let sum = block_sum(self.energy, &rows, texel_x);
-                let area = (rows.len() * columns(texel_x).len()) as f64 * self.cell_area;
-                *total = sum;
-                *value = saturate_nonnegative(sum / area);
-            }
-            if self.moments.is_empty() {
-                continue;
-            }
-            for axis in &mut dots {
-                axis[..width].fill(0.0);
-            }
-            for (channel, plane) in self.moments.chunks_exact(cells_x * cells_y).enumerate() {
-                let signs = [0, 1, 2].map(|axis| AXIS_SIGNS[axis][channel]);
-                if whole {
-                    // A texel is a cell: the row's run is the texels'.
-                    let run = &plane[texel_y * cells_x..][..width];
-                    for (axis, sign) in dots.iter_mut().zip(signs) {
-                        for (dot, &value) in axis.iter_mut().zip(run) {
-                            *dot += sign * f64::from(value);
-                        }
-                    }
-                    for ((texel, &value), &energy) in
-                        row_components.iter_mut().zip(run).zip(&energies[..width])
+
+            if whole {
+                let energy_row = &self.energy[texel_y * cells_x..][..width];
+                if let Some(inv_area) = inv_cell_area {
+                    for ((total, value), &raw) in energies[..width]
+                        .iter_mut()
+                        .zip(row_values.iter_mut())
+                        .zip(energy_row)
                     {
-                        texel[channel] = component_step(f64::from(value), energy);
+                        let sum = f64::from(raw);
+                        *total = sum;
+                        *value = saturate_nonnegative(sum * inv_area);
                     }
                 } else {
-                    // Each block's sum, rows then columns as `block_sum`
-                    // makes it, for the whole row of texels.
-                    let sums = &mut sums[..width];
-                    sums.fill(0.0);
+                    let cell_area = self.cell_area;
+                    for ((total, value), &raw) in energies[..width]
+                        .iter_mut()
+                        .zip(row_values.iter_mut())
+                        .zip(energy_row)
+                    {
+                        let sum = f64::from(raw);
+                        *total = sum;
+                        *value = saturate_nonnegative(sum / cell_area);
+                    }
+                }
+            } else {
+                let row_energies = &mut energies[..width];
+                row_energies.fill(0.0);
+                for y in rows.clone() {
+                    let line = &self.energy[y * cells_x..(y + 1) * cells_x];
+                    for (sum, chunk) in row_energies[..full_x]
+                        .iter_mut()
+                        .zip(line[..full_x * block_x].chunks_exact(block_x))
+                    {
+                        for &value in chunk {
+                            *sum += f64::from(value);
+                        }
+                    }
+                    if width > full_x {
+                        let rem = &mut row_energies[full_x];
+                        for &value in &line[full_x * block_x..cells_x] {
+                            *rem += f64::from(value);
+                        }
+                    }
+                }
+                let full_area = (rows.len() * block_x) as f64 * self.cell_area;
+                if let Some(inv_area) = exact_power_of_two_recip(full_area) {
+                    for (&sum, value) in row_energies[..full_x]
+                        .iter()
+                        .zip(row_values[..full_x].iter_mut())
+                    {
+                        *value = saturate_nonnegative(sum * inv_area);
+                    }
+                } else {
+                    for (&sum, value) in row_energies[..full_x]
+                        .iter()
+                        .zip(row_values[..full_x].iter_mut())
+                    {
+                        *value = saturate_nonnegative(sum / full_area);
+                    }
+                }
+                if width > full_x {
+                    let rem_area =
+                        (rows.len() * (cells_x - full_x * block_x)) as f64 * self.cell_area;
+                    row_values[full_x] = saturate_nonnegative(row_energies[full_x] / rem_area);
+                }
+            }
+
+            if num_channels == 0 {
+                row_composition.fill([0.0; 3]);
+                row_components.fill([0; CHANNELS]);
+                continue;
+            }
+
+            // Compute `127.0 / energy` once per texel (32× fewer fdivs) and
+            // locate the active span `[first_nz, last_nz)` with positive energy.
+            let mut first_nz = width;
+            let mut last_nz = 0_usize;
+            for (x, (&energy, scale)) in energies[..width]
+                .iter()
+                .zip(scales_127[..width].iter_mut())
+                .enumerate()
+            {
+                if energy > 0.0 {
+                    if first_nz == width {
+                        first_nz = x;
+                    }
+                    last_nz = x + 1;
+                    *scale = if (1.0e-100..=1.0e100).contains(&energy) {
+                        f64::from(COMPONENT_STEPS) / energy
+                    } else {
+                        f64::NAN
+                    };
+                } else {
+                    *scale = 0.0;
+                }
+            }
+            if first_nz == width {
+                row_composition.fill([0.0; 3]);
+                row_components.fill([0; CHANNELS]);
+                continue;
+            }
+            if first_nz > 0 {
+                row_composition[..first_nz].fill([0.0; 3]);
+                row_components[..first_nz].fill([0; CHANNELS]);
+            }
+            if last_nz < width {
+                row_composition[last_nz..].fill([0.0; 3]);
+                row_components[last_nz..].fill([0; CHANNELS]);
+            }
+
+            let active_len = last_nz - first_nz;
+            let energies_act = &energies[first_nz..last_nz];
+            let scales_act = &scales_127[first_nz..last_nz];
+            let [d0_all, d1_all, d2_all] = &mut dots;
+            let d0s = &mut d0_all[..active_len];
+            let d1s = &mut d1_all[..active_len];
+            let d2s = &mut d2_all[..active_len];
+            d0s.fill(0.0);
+            d1s.fill(0.0);
+            d2s.fill(0.0);
+
+            if whole {
+                let row_offset = texel_y * cells_x + first_nz;
+                for (channel, (plane, steps_buf)) in self
+                    .moments
+                    .chunks_exact(plane_cells)
+                    .zip(channel_steps.iter_mut())
+                    .enumerate()
+                {
+                    let signs = [
+                        AXIS_SIGNS[0][channel],
+                        AXIS_SIGNS[1][channel],
+                        AXIS_SIGNS[2][channel],
+                    ];
+                    let run = &plane[row_offset..row_offset + active_len];
+                    project_channel_f32(
+                        run,
+                        energies_act,
+                        scales_act,
+                        signs,
+                        d0s,
+                        d1s,
+                        d2s,
+                        &mut steps_buf[..active_len],
+                    );
+                }
+            } else {
+                let full_end = last_nz.min(full_x);
+                let has_full = first_nz < full_end;
+                let has_rem = last_nz > full_x;
+                let full_count = full_end.saturating_sub(first_nz);
+                let active_sums = &mut sums[..active_len];
+                for (channel, (plane, steps_buf)) in self
+                    .moments
+                    .chunks_exact(plane_cells)
+                    .zip(channel_steps.iter_mut())
+                    .enumerate()
+                {
+                    let signs = [
+                        AXIS_SIGNS[0][channel],
+                        AXIS_SIGNS[1][channel],
+                        AXIS_SIGNS[2][channel],
+                    ];
+                    active_sums.fill(0.0);
                     for y in rows.clone() {
                         let line = &plane[y * cells_x..(y + 1) * cells_x];
-                        for (texel_x, sum) in sums.iter_mut().enumerate() {
-                            for &value in &line[columns(texel_x)] {
-                                *sum += f64::from(value);
+                        if has_full {
+                            let active_line = &line[first_nz * block_x..full_end * block_x];
+                            for (sum, chunk) in active_sums[..full_count]
+                                .iter_mut()
+                                .zip(active_line.chunks_exact(block_x))
+                            {
+                                for &value in chunk {
+                                    *sum += f64::from(value);
+                                }
+                            }
+                        }
+                        if has_rem {
+                            let rem = &mut active_sums[full_x - first_nz];
+                            for &value in &line[full_x * block_x..cells_x] {
+                                *rem += f64::from(value);
                             }
                         }
                     }
-                    for (axis, sign) in dots.iter_mut().zip(signs) {
-                        for (dot, &sum) in axis.iter_mut().zip(sums.iter()) {
-                            *dot += sign * sum;
-                        }
-                    }
-                    for ((texel, &sum), &energy) in row_components
-                        .iter_mut()
-                        .zip(sums.iter())
-                        .zip(&energies[..width])
-                    {
-                        texel[channel] = component_step(sum, energy);
-                    }
+                    project_channel_f64(
+                        active_sums,
+                        energies_act,
+                        scales_act,
+                        signs,
+                        d0s,
+                        d1s,
+                        d2s,
+                        &mut steps_buf[..active_len],
+                    );
                 }
             }
-            for (texel_x, (out, &sum)) in row_composition
+
+            // Blocked 8×32 cache-line transpose from `channel_steps` into
+            // `row_components` (channels `num_channels..CHANNELS` stay zeroed
+            // on 24-channel dual-carrier fields automatically).
+            let out_active = &mut row_components[first_nz..last_nz];
+            let mut chunks = out_active.chunks_exact_mut(8);
+            let mut base = 0_usize;
+            for out_block in chunks.by_ref() {
+                let mut tile = [[0_i8; CHANNELS]; 8];
+                for (channel, src_row) in channel_steps[..num_channels].iter().enumerate() {
+                    let src = &src_row[base..base + 8];
+                    for (dst, &val) in tile.iter_mut().zip(src) {
+                        dst[channel] = val;
+                    }
+                }
+                out_block.copy_from_slice(&tile);
+                base += 8;
+            }
+            let rem = chunks.into_remainder();
+            if !rem.is_empty() {
+                for (offset, texel) in rem.iter_mut().enumerate() {
+                    let mut col = [0_i8; CHANNELS];
+                    for (channel, src_row) in channel_steps[..num_channels].iter().enumerate() {
+                        col[channel] = src_row[base + offset];
+                    }
+                    *texel = col;
+                }
+            }
+
+            for ((((out, &energy), &d0), &d1), &d2) in row_composition[first_nz..last_nz]
                 .iter_mut()
-                .zip(&energies[..width])
-                .enumerate()
+                .zip(energies_act)
+                .zip(d0s.iter())
+                .zip(d1s.iter())
+                .zip(d2s.iter())
             {
-                *out = coordinates([0, 1, 2].map(|axis| dots[axis][texel_x]), CHANNELS, sum);
+                *out = coordinates_with_sqrt([d0, d1, d2], sqrt_channels, energy);
             }
         }
     }
@@ -1282,6 +1622,15 @@ fn validate_scalar_plane(
             ),
         });
     }
+    // `value >= 0.0 && value < f32::INFINITY` is equivalent to
+    // `value.is_finite() && value >= 0.0` (NaN and ±Inf fail) and vectorizes
+    // cleanly across 4 f32 lanes without `enumerate()` tracking on the happy path.
+    if plane
+        .iter()
+        .all(|&value| value >= 0.0 && value < f32::INFINITY)
+    {
+        return Ok(());
+    }
     if let Some((cell, &value)) = plane
         .iter()
         .enumerate()
@@ -1317,6 +1666,12 @@ fn validate_vascular_edges(
         });
     }
     for (axis, edges) in [("east", edge_x), ("north", edge_y)] {
+        if edges
+            .iter()
+            .all(|&value| value >= 0.0 && value < f32::INFINITY)
+        {
+            continue;
+        }
         if let Some((cell, &value)) = edges
             .iter()
             .enumerate()
@@ -1343,19 +1698,33 @@ fn project_validated_scalar_plane_on(
     let [cells_x, cells_y] = grid.cells;
     let [width, height] = grid.texels;
     let count = width * height;
-    out.clear();
-    out.resize(count, 0.0);
+    resize_len(out, count, 0.0);
     let used = workers
         .min(height.div_ceil(MINIMUM_TEXEL_ROWS_PER_WORKER))
         .max(1);
-    let per = height.div_ceil(used).max(1);
-    let chunk = per * width;
-    let mut runs = out.chunks_mut(chunk);
-    let Some(first_run) = runs.next() else {
-        return Ok(());
-    };
+    let [block_x, block_y] = grid.block;
+    let whole = block_x == 1 && block_y == 1;
+    let inv_divisor = exact_power_of_two_recip(grid.divisor);
     let project_run = |first_row: usize, slice: &mut [f32]| {
-        let [block_x, block_y] = grid.block;
+        if whole {
+            if let Some(inv) = inv_divisor {
+                for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
+                    let row = &plane[(first_row + offset) * cells_x..][..width];
+                    for (out_value, &value) in row_values.iter_mut().zip(row) {
+                        *out_value = saturate_nonnegative(f64::from(value) * inv);
+                    }
+                }
+            } else {
+                let divisor = grid.divisor;
+                for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
+                    let row = &plane[(first_row + offset) * cells_x..][..width];
+                    for (out_value, &value) in row_values.iter_mut().zip(row) {
+                        *out_value = saturate_nonnegative(f64::from(value) / divisor);
+                    }
+                }
+            }
+            return;
+        }
         for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
             let texel_y = first_row + offset;
             let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
@@ -1372,22 +1741,22 @@ fn project_validated_scalar_plane_on(
             }
         }
     };
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = runs
-            .enumerate()
-            .map(|(index, run)| scope.spawn(move || project_run((index + 1) * per, run)))
-            .collect();
-        project_run(0, first_run);
-        let mut joined = Ok(());
-        for handle in handles {
-            if handle.join().is_err() {
-                joined = Err(CoreError::StateConflict {
-                    operation: "project render field overlay",
-                    detail: "an overlay texture worker panicked".to_owned(),
-                });
-            }
+    if used == 1 {
+        project_run(0, out);
+        return Ok(());
+    }
+    let per = height.div_ceil(used).max(1);
+    let chunk = per * width;
+    let mut runs = out.chunks_mut(chunk);
+    let Some(first_run) = runs.next() else {
+        return Ok(());
+    };
+    let project_run = &project_run;
+    flife_core::pool::scope_workers(workers, "project render field overlay", |scope| {
+        for (index, run) in runs.enumerate() {
+            scope.spawn(move || project_run((index + 1) * per, run));
         }
-        joined
+        project_run(0, first_run);
     })
 }
 
@@ -1406,19 +1775,47 @@ fn project_validated_vascular_edges_on(
     let [cells_x, cells_y] = grid.cells;
     let [width, height] = grid.texels;
     let count = width * height;
-    out.clear();
-    out.resize(count, 0.0);
+    resize_len(out, count, 0.0);
     let used = workers
         .min(height.div_ceil(MINIMUM_TEXEL_ROWS_PER_WORKER))
         .max(1);
-    let per = height.div_ceil(used).max(1);
-    let chunk = per * width;
-    let mut runs = out.chunks_mut(chunk);
-    let Some(first_run) = runs.next() else {
-        return Ok(());
-    };
+    let [block_x, block_y] = grid.block;
+    let whole = block_x == 1 && block_y == 1;
     let project_run = |first_row: usize, slice: &mut [f32]| {
-        let [block_x, block_y] = grid.block;
+        if whole {
+            for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
+                let y = first_row + offset;
+                let y_prev = if y == 0 { cells_y - 1 } else { y - 1 };
+                let row_cur = y * cells_x;
+                let row_prev = y_prev * cells_x;
+                // Column 0 wraps `x_prev = cells_x - 1`; columns `1..width`
+                // zip four contiguous slices cleanly with zero per-cell branch.
+                let ex_row = &edge_x[row_cur..row_cur + width];
+                let ey_cur = &edge_y[row_cur..row_cur + width];
+                let ey_prev = &edge_y[row_prev..row_prev + width];
+                row_values[0] = saturate_nonnegative(
+                    0.25 * (f64::from(ex_row[0])
+                        + f64::from(ex_row[width - 1])
+                        + f64::from(ey_cur[0])
+                        + f64::from(ey_prev[0])),
+                );
+                for ((((out_value, &east), &west), &north), &south) in row_values[1..]
+                    .iter_mut()
+                    .zip(&ex_row[1..])
+                    .zip(&ex_row[..width - 1])
+                    .zip(&ey_cur[1..])
+                    .zip(&ey_prev[1..])
+                {
+                    *out_value = saturate_nonnegative(
+                        0.25 * (f64::from(east)
+                            + f64::from(west)
+                            + f64::from(north)
+                            + f64::from(south)),
+                    );
+                }
+            }
+            return;
+        }
         for (offset, row_values) in slice.chunks_exact_mut(width).enumerate() {
             let texel_y = first_row + offset;
             let rows = texel_y * block_y..((texel_y + 1) * block_y).min(cells_y);
@@ -1444,22 +1841,22 @@ fn project_validated_vascular_edges_on(
             }
         }
     };
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = runs
-            .enumerate()
-            .map(|(index, run)| scope.spawn(move || project_run((index + 1) * per, run)))
-            .collect();
-        project_run(0, first_run);
-        let mut joined = Ok(());
-        for handle in handles {
-            if handle.join().is_err() {
-                joined = Err(CoreError::StateConflict {
-                    operation: "project render field vascular overlay",
-                    detail: "a vascular overlay texture worker panicked".to_owned(),
-                });
-            }
+    if used == 1 {
+        project_run(0, out);
+        return Ok(());
+    }
+    let per = height.div_ceil(used).max(1);
+    let chunk = per * width;
+    let mut runs = out.chunks_mut(chunk);
+    let Some(first_run) = runs.next() else {
+        return Ok(());
+    };
+    let project_run = &project_run;
+    flife_core::pool::scope_workers(workers, "project render field vascular overlay", |scope| {
+        for (index, run) in runs.enumerate() {
+            scope.spawn(move || project_run((index + 1) * per, run));
         }
-        joined
+        project_run(0, first_run);
     })
 }
 
@@ -1674,27 +2071,51 @@ impl Epoch {
             });
         }
         let width = extent.map(|length| length as f32);
-        self.ids.clear();
-        self.positions.clear();
-        self.velocities.clear();
-        self.energies.clear();
-        self.lineages.clear();
-        self.generations.clear();
-        self.topologies.clear();
-        self.affinities.clear();
+        // Steady-state reused slots keep `len == live` without zero-clearing
+        // already-initialized buffers, and writing into exact-length slices
+        // eliminates 8–10 `Vec::push` grow checks + len updates per organism.
+        resize_len(&mut self.ids, live, 0);
+        resize_len(&mut self.positions, live, [0.0; 2]);
+        resize_len(&mut self.velocities, live, [0.0; 2]);
+        resize_len(&mut self.energies, live, 0.0);
+        resize_len(&mut self.lineages, live, 0);
+        resize_len(&mut self.generations, live, 0);
+        resize_len(&mut self.topologies, live, 0);
+        resize_len(&mut self.affinities, live, [0.0; 3]);
         if let Some(states) = &mut self.cell_states {
-            states.clear();
+            resize_len(states, live, 0);
         }
         if let Some(polarities) = &mut self.polarities {
-            polarities.clear();
+            resize_len(polarities, live, 0);
         }
         let affinity_limit = world.trait_limits().affinity_norm();
+        let affinity_scale = (CHANNELS as f64).sqrt() * affinity_limit;
         let v2_rules = world.v2_rules();
         let affinity_rotation = v2_rules.affinity_rotation_enabled();
         let mut organism_energy = 0.0_f64;
         let mut max_generation = 0_u32;
         let mut parameters = 0_u64;
-        for (organism, genome) in population.iter_with_genomes() {
+        let mut cell_states_it = self.cell_states.as_deref_mut().map(|s| s.iter_mut());
+        let mut polarities_it = self.polarities.as_deref_mut().map(|s| s.iter_mut());
+        let mut written = 0_usize;
+        let dst = self
+            .ids
+            .iter_mut()
+            .zip(self.positions.iter_mut())
+            .zip(self.velocities.iter_mut())
+            .zip(self.energies.iter_mut())
+            .zip(self.lineages.iter_mut())
+            .zip(self.generations.iter_mut())
+            .zip(self.topologies.iter_mut())
+            .zip(self.affinities.iter_mut());
+        for (
+            (
+                ((((((id_out, pos_out), vel_out), energy_out), lineage_out), gen_out), topo_out),
+                aff_out,
+            ),
+            (organism, genome),
+        ) in dst.zip(population.iter_with_genomes())
+        {
             let genome = genome.ok_or_else(|| CoreError::StateConflict {
                 operation: "project render epoch",
                 detail: format!("{} has no genome", organism.id),
@@ -1703,20 +2124,19 @@ impl Epoch {
                 u8::try_from(genome.topology().index()).map_err(|_| CoreError::Overflow {
                     quantity: "render topology index",
                 })?;
-            self.ids.push(organism.id.get());
-            self.positions.push([
+            *id_out = organism.id.get();
+            *pos_out = [
                 fold(organism.position[0], width[0]),
                 fold(organism.position[1], width[1]),
-            ]);
+            ];
             // Every committed component is within the speed limit, and
             // rounding to nearest is monotone, so each F32 component is
             // within the F32 limit.
-            self.velocities
-                .push([organism.velocity[0] as f32, organism.velocity[1] as f32]);
-            self.energies.push(saturate_nonnegative(organism.energy));
-            self.lineages.push(organism.lineage.get());
-            self.generations.push(organism.generation.get());
-            self.topologies.push(topology);
+            *vel_out = [organism.velocity[0] as f32, organism.velocity[1] as f32];
+            *energy_out = saturate_nonnegative(organism.energy);
+            *lineage_out = organism.lineage.get();
+            *gen_out = organism.generation.get();
+            *topo_out = topology;
             // Live primary recurrent cell state `h_0` (matches `World::cell_states()`
             // without allocating a temporary Vec per published epoch).
             let h0 = organism
@@ -1735,23 +2155,36 @@ impl Epoch {
                     v2_rules,
                     affinity_limit,
                 )?;
-                self.affinities
-                    .push(affinity_projection(&effective, affinity_limit));
+                *aff_out = affinity_projection_32(&effective, affinity_scale);
             } else {
-                self.affinities.push(affinity_projection(
-                    genome.traits().affinity(),
-                    affinity_limit,
-                ));
+                *aff_out = affinity_projection_32(genome.traits().affinity(), affinity_scale);
             }
-            if let Some(states) = &mut self.cell_states {
-                states.push(quantize_cell_state(h0));
+            if let Some(slot) = cell_states_it.as_mut().and_then(Iterator::next) {
+                *slot = quantize_cell_state(h0);
             }
-            if let Some(polarities) = &mut self.polarities {
-                polarities.push(quantize_polarity_f64(organism.polarity));
+            if let Some(slot) = polarities_it.as_mut().and_then(Iterator::next) {
+                *slot = quantize_polarity_f64(organism.polarity);
             }
             organism_energy += organism.energy;
             max_generation = max_generation.max(organism.generation.get());
             parameters += genome.parameters().len() as u64;
+            written += 1;
+        }
+        if written != live {
+            self.ids.truncate(written);
+            self.positions.truncate(written);
+            self.velocities.truncate(written);
+            self.energies.truncate(written);
+            self.lineages.truncate(written);
+            self.generations.truncate(written);
+            self.topologies.truncate(written);
+            self.affinities.truncate(written);
+            if let Some(states) = &mut self.cell_states {
+                states.truncate(written);
+            }
+            if let Some(polarities) = &mut self.polarities {
+                polarities.truncate(written);
+            }
         }
         // Between ticks the world's workers are idle: the texture's rows
         // are projected on them.
@@ -2577,6 +3010,291 @@ mod tests {
             assert_eq!(live.values(), before_values.as_slice());
             assert_eq!(live.composition(), before_comp.as_slice());
             assert_eq!(live.components(), before_ch.as_slice());
+        }
+    }
+
+    #[test]
+    fn optimized_field_and_affinity_projections_match_independent_scalar_oracles_bit_for_bit() {
+        // Independent naive scalar oracle for `affinity_projection`.
+        let naive_affinity = |affinity: &[f64], limit: f64| -> [f32; 3] {
+            let scale = (affinity.len() as f64).sqrt() * limit;
+            if !(scale.is_finite() && scale > 0.0) {
+                return [0.0; 3];
+            }
+            AFFINITY_AXES.map(|row| {
+                let dot = affinity
+                    .iter()
+                    .enumerate()
+                    .fold(0.0_f64, |sum, (channel, &value)| {
+                        if (row & channel).count_ones().is_multiple_of(2) {
+                            sum + value
+                        } else {
+                            sum - value
+                        }
+                    });
+                let c = dot / scale;
+                if c.is_finite() {
+                    c.clamp(-1.0, 1.0) as f32
+                } else {
+                    0.0
+                }
+            })
+        };
+
+        // 1. 32-channel `affinity_projection` fast path matches naive popcount oracle bit-for-bit.
+        let mut aff = [0.0_f64; CHANNELS];
+        for (i, slot) in aff.iter_mut().enumerate() {
+            *slot = ((i as f64 * 1.37).sin()) * 0.25;
+        }
+        for limit in [1.0, 0.37, 2.5, 0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                affinity_projection(&aff, limit).map(f32::to_bits),
+                naive_affinity(&aff, limit).map(f32::to_bits),
+                "affinity_projection mismatch for limit {limit}"
+            );
+        }
+        let mut aff_edge = [-0.0_f64; CHANNELS];
+        aff_edge[7] = f64::NAN;
+        assert_eq!(
+            affinity_projection(&aff_edge, 1.0).map(f32::to_bits),
+            naive_affinity(&aff_edge, 1.0).map(f32::to_bits)
+        );
+
+        // 2. Adversarial half-integer (`k + 0.5`), ±1 ULP neighbor, cone-overshoot,
+        //    non-finite moment, zero/subnormal/extreme energy test on `project_channel_f32`
+        //    and `FieldTexture::from_planes_on`.
+        let energies_probe = [
+            0.0_f32,
+            -0.0_f32,
+            0.3_f32,
+            1.7_f32,
+            2.0_f32,
+            3.141_592_7_f32,
+            137.0_f32,
+            254.0_f32,
+            1.0e-35_f32,
+            1.0e35_f32,
+        ];
+        // Build a 10 × 17 grid covering every half-integer `k + 0.5` across channels and cells.
+        let (gx, gy) = (10_usize, 17_usize);
+        let n = gx * gy;
+        let mut planes = vec![0.0_f32; n * (1 + CHANNELS)];
+        for y in 0..gy {
+            for x in 0..gx {
+                let idx = y * gx + x;
+                let e = if y == 0 || y == 8 {
+                    // Empty rows to exercise whole-row skipping.
+                    0.0_f32
+                } else {
+                    energies_probe[x]
+                };
+                planes[idx] = e;
+                for c in 0..CHANNELS {
+                    let k = ((y * 32 + c) % 127) as f64;
+                    let sign = if (x + y + c).is_multiple_of(2) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    let raw = match (y + c) % 7 {
+                        0 => (sign * (k + 0.5) / 127.0 * f64::from(e)) as f32,
+                        1 => ((sign * (k + 0.5) / 127.0 * f64::from(e)) as f32).next_up(),
+                        2 => ((sign * (k + 0.5) / 127.0 * f64::from(e)) as f32).next_down(),
+                        3 => (sign * 1.003 * f64::from(e)) as f32,
+                        4 => (sign * 1.5 * f64::from(e)) as f32,
+                        5 if x == 3 && c == 11 => f32::NAN,
+                        5 if x == 4 && c == 12 => f32::INFINITY,
+                        5 if x == 5 && c == 13 => f32::NEG_INFINITY,
+                        _ => (sign * (k + 0.25) / 127.0 * f64::from(e)) as f32,
+                    };
+                    planes[(1 + c) * n + idx] = raw;
+                }
+            }
+        }
+
+        // Compare against independent scalar oracle on both power-of-2 and non-power-of-2 cell areas.
+        for cell_size in [[0.25, 0.25], [0.3, 0.7]] {
+            let area = cell_size[0] * cell_size[1];
+            let tex_1 = FieldTexture::from_planes_on([gx as u32, gy as u32], cell_size, &planes, 1)
+                .expect("1-worker texture");
+            let tex_4 = FieldTexture::from_planes_on([gx as u32, gy as u32], cell_size, &planes, 4)
+                .expect("4-worker texture");
+            assert_eq!(tex_1, tex_4, "pool parity for cell_size {cell_size:?}");
+            for idx in 0..n {
+                let e = f64::from(planes[idx]);
+                let want_val = saturate_nonnegative(e / area);
+                assert_eq!(
+                    tex_1.values()[idx].to_bits(),
+                    want_val.to_bits(),
+                    "energy value mismatch at cell {idx}"
+                );
+                let mut m = [0.0_f64; CHANNELS];
+                for (c, (m_slot, &got_step)) in
+                    m.iter_mut().zip(&tex_1.components()[idx]).enumerate()
+                {
+                    *m_slot = f64::from(planes[(1 + c) * n + idx]);
+                    let want_step = component_step(*m_slot, e);
+                    assert_eq!(
+                        got_step, want_step,
+                        "component_step mismatch at cell {idx} ch {c} (e={e}, m={})",
+                        *m_slot
+                    );
+                }
+                let want_comp = naive_affinity(&m, e);
+                assert_eq!(
+                    tex_1.composition()[idx].map(f32::to_bits),
+                    want_comp.map(f32::to_bits),
+                    "composition mismatch at cell {idx}"
+                );
+            }
+        }
+
+        // 3. Reused-slot transitions: dense 32-ch -> sparse prefix/suffix ->
+        //    24-ch dual-carrier (channels 24..32 MUST zero) -> energy-only (all zero) -> dense.
+        let mut slot = FieldTexture::from_planes([gx as u32, gy as u32], [0.25, 0.25], &planes)
+            .expect("initial dense 32-ch");
+        assert!(slot.components().iter().any(|t| t[31] != 0));
+
+        // 3a. Sparse: only middle columns `x ∈ 4..7` on rows `y ∈ 2..4` have energy.
+        let mut sparse = vec![0.0_f32; n * (1 + CHANNELS)];
+        for y in 2..4 {
+            for x in 4..7 {
+                let idx = y * gx + x;
+                sparse[idx] = 2.0;
+                sparse[(1 + 31) * n + idx] = 1.0;
+            }
+        }
+        slot.project_on(&sparse, 0.0625, 4)
+            .expect("sparse reuse succeeds");
+        for y in 0..gy {
+            for x in 0..gx {
+                let idx = y * gx + x;
+                if (2..4).contains(&y) && (4..7).contains(&x) {
+                    assert_eq!(slot.components()[idx][31], 64);
+                } else {
+                    assert_eq!(slot.composition()[idx], [0.0; 3]);
+                    assert_eq!(slot.components()[idx], [0; CHANNELS]);
+                }
+            }
+        }
+
+        // 3b. Dual-carrier (34 planes, 24 Carrier-0 channels) onto a slot previously holding ch 31 != 0.
+        slot.project_on(&planes, 0.0625, 4)
+            .expect("refill dense 32-ch");
+        assert!(slot.components().iter().any(|t| t[31] != 0));
+        let mut dual = vec![0.0_f32; n * DUAL_CARRIER_PLANES];
+        for idx in 0..n {
+            dual[idx] = 4.0;
+            for c in 0..CARRIER0_MOMENT_CHANNELS {
+                dual[(1 + c) * n + idx] = if c.is_multiple_of(2) { 2.0 } else { -2.0 };
+            }
+        }
+        slot.project_on(&dual, 0.0625, 4)
+            .expect("dual-carrier reuse succeeds");
+        for (idx, texel) in slot.components().iter().enumerate() {
+            for (c, &got) in texel[..CARRIER0_MOMENT_CHANNELS].iter().enumerate() {
+                assert_eq!(got, if c.is_multiple_of(2) { 64 } else { -64 });
+            }
+            for (offset, &got) in texel[CARRIER0_MOMENT_CHANNELS..].iter().enumerate() {
+                let c = CARRIER0_MOMENT_CHANNELS + offset;
+                assert_eq!(
+                    got, 0,
+                    "stale dual-carrier trailing channel {c} at cell {idx}"
+                );
+            }
+        }
+
+        // 3c. Energy-only onto a slot previously holding non-zero composition & components.
+        slot.project_on(&dual[..n], 0.0625, 4)
+            .expect("energy-only reuse succeeds");
+        assert!(slot.composition().iter().all(|&c| c == [0.0; 3]));
+        assert!(slot.components().iter().all(|&t| t == [0; CHANNELS]));
+
+        // 4. Partial-block `!whole` grid (515 × 17, block = [2, 1], width = 258,
+        //    full_x = 257, trailing 1-cell column) including sparse active span
+        //    hitting ONLY the last partial column.
+        let (px, py) = (515_usize, 17_usize);
+        let pn = px * py;
+        let mut partial_planes = vec![0.0_f32; pn * (1 + CHANNELS)];
+        // Row 0: energy ONLY in trailing partial cell x = 514.
+        partial_planes[514] = 2.0;
+        partial_planes[(1 + 5) * pn + 514] = 1.0;
+        // Row 3: energy across prefix, middle, and trailing partial cell.
+        for x in [0_usize, 1, 100, 101, 514] {
+            partial_planes[3 * px + x] = 3.0;
+            partial_planes[(1 + 17) * pn + 3 * px + x] = -1.5;
+        }
+        let partial_1 =
+            FieldTexture::from_planes_on([px as u32, py as u32], [0.5, 0.5], &partial_planes, 1)
+                .expect("partial 1-worker");
+        let partial_4 =
+            FieldTexture::from_planes_on([px as u32, py as u32], [0.5, 0.5], &partial_planes, 4)
+                .expect("partial 4-worker");
+        assert_eq!(partial_1, partial_4);
+        let tw = partial_1.texels()[0] as usize;
+        assert_eq!(tw, 258);
+        assert_eq!(partial_1.values()[257], 8.0); // 2.0 / (1 * 0.25)
+        assert_eq!(partial_1.components()[257][5], 64);
+        assert_eq!(partial_1.components()[3 * tw][17], -64);
+        assert_eq!(partial_1.components()[3 * tw + 50][17], -64);
+        assert_eq!(partial_1.components()[3 * tw + 257][17], -64);
+
+        // 5. Vascular `1×1` fast path (including `1×1` edge case & prime `17×13` grid)
+        //    and scalar trail overlay match naive periodic scalar oracles bit-for-bit.
+        for (vx, vy) in [(1_usize, 1_usize), (17, 13)] {
+            let vn = vx * vy;
+            let ex: Vec<f32> = (0..vn)
+                .map(|i| ((i * 73 + 11) % 97) as f32 * 0.01)
+                .collect();
+            let ey: Vec<f32> = (0..vn).map(|i| ((i * 59 + 7) % 89) as f32 * 0.01).collect();
+            let mut out_1 = Vec::new();
+            let mut out_4 = Vec::new();
+            let grid = ScalarOverlayGrid {
+                cells: [vx, vy],
+                block: [1, 1],
+                texels: [vx, vy],
+                divisor: 1.0,
+            };
+            project_validated_vascular_edges_on(&ex, &ey, grid, 1, &mut out_1)
+                .expect("vascular 1-worker");
+            project_validated_vascular_edges_on(&ex, &ey, grid, 4, &mut out_4)
+                .expect("vascular 4-worker");
+            assert_eq!(out_1, out_4);
+            for y in 0..vy {
+                let y_prev = if y == 0 { vy - 1 } else { y - 1 };
+                for x in 0..vx {
+                    let x_prev = if x == 0 { vx - 1 } else { x - 1 };
+                    let want = saturate_nonnegative(
+                        0.25 * (f64::from(ex[y * vx + x])
+                            + f64::from(ex[y * vx + x_prev])
+                            + f64::from(ey[y * vx + x])
+                            + f64::from(ey[y_prev * vx + x])),
+                    );
+                    assert_eq!(
+                        out_1[y * vx + x].to_bits(),
+                        want.to_bits(),
+                        "vascular mismatch at ({x},{y}) on {vx}×{vy}"
+                    );
+                }
+            }
+
+            let mut trail_1 = Vec::new();
+            let mut trail_4 = Vec::new();
+            let trail_grid = ScalarOverlayGrid {
+                cells: [vx, vy],
+                block: [1, 1],
+                texels: [vx, vy],
+                divisor: 0.0625,
+            };
+            project_validated_scalar_plane_on(&ex, trail_grid, 1, &mut trail_1)
+                .expect("trail 1-worker");
+            project_validated_scalar_plane_on(&ex, trail_grid, 4, &mut trail_4)
+                .expect("trail 4-worker");
+            assert_eq!(trail_1, trail_4);
+            for (&raw, &got) in ex.iter().zip(&trail_1) {
+                let want = saturate_nonnegative(f64::from(raw) / 0.0625);
+                assert_eq!(got.to_bits(), want.to_bits());
+            }
         }
     }
 }

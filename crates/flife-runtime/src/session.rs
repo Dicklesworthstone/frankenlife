@@ -314,7 +314,10 @@ enum Control {
         started: oneshot::Sender<Result<Boundary, CoreError>>,
         ended: Option<oneshot::Sender<RunEnd>>,
     },
-    Step(oneshot::Sender<Result<StepOutcome, CoreError>>),
+    Step {
+        publish_render: bool,
+        reply: oneshot::Sender<Result<StepOutcome, CoreError>>,
+    },
     Cancel {
         id: CommandId,
         reply: CancelReply,
@@ -391,7 +394,7 @@ impl std::fmt::Debug for Control {
         f.write_str(match self {
             Self::Pause(_) => "Pause",
             Self::Resume { .. } => "Resume",
-            Self::Step(_) => "Step",
+            Self::Step { .. } => "Step",
             Self::Cancel { .. } => "Cancel",
             Self::Status { .. } => "Status",
             Self::DurableOutcome { .. } => "DurableOutcome",
@@ -628,13 +631,41 @@ impl SessionHandle {
     }
 
     /// Authorize exactly one candidate advancement of a paused session and
-    /// report whether it committed.
+    /// report whether it committed, publishing the committed tick to the render
+    /// feed.
+    ///
+    /// Equivalent to [`SessionHandle::step_with_render`]`(cx, true)`.
     ///
     /// # Errors
     /// As [`SessionHandle::submit`]; [`CoreError::StateConflict`] while the
     /// session is running or once the run has stopped.
     pub async fn step(&self, cx: &Cx) -> Result<StepOutcome, CoreError> {
-        self.control(cx, Control::Step).await?
+        self.step_with_render(cx, true).await
+    }
+
+    /// Authorize exactly one candidate advancement of a paused session and
+    /// report whether it committed, choosing whether to publish the committed
+    /// tick to the render feed.
+    ///
+    /// When `publish_render` is `false`, the session still advances the world
+    /// identically and counts the committed [`TickReport`] into the render
+    /// publisher's cumulative tally, while skipping render-epoch projection for
+    /// this tick. Scientific state is bit-identical regardless of
+    /// `publish_render` (INV-09).
+    ///
+    /// # Errors
+    /// As [`SessionHandle::submit`]; [`CoreError::StateConflict`] while the
+    /// session is running or once the run has stopped.
+    pub async fn step_with_render(
+        &self,
+        cx: &Cx,
+        publish_render: bool,
+    ) -> Result<StepOutcome, CoreError> {
+        self.control(cx, |reply| Control::Step {
+            publish_render,
+            reply,
+        })
+        .await?
     }
 
     /// The owner's state at its committed boundary.
@@ -1191,6 +1222,9 @@ pub struct SessionOwner {
     book: CommandBook,
     grid: FieldGrid,
     render: Publisher,
+    /// Whether the current committed boundary should be offered to the render
+    /// feed (set from `publish_render` on each published tick).
+    render_wanted: bool,
     control: mpsc::Receiver<Control>,
     science: mpsc::Receiver<Submission>,
     released: mpsc::Receiver<()>,
@@ -1521,6 +1555,7 @@ fn build(
         book,
         grid,
         render,
+        render_wanted: true,
         control,
         science,
         released,
@@ -1622,11 +1657,13 @@ impl SessionOwner {
         }
     }
 
-    /// Offer the committed state to the render feed. A busy feed leaves the
-    /// boundary pending, and a failure is recorded in its counters; neither
-    /// touches the world.
+    /// Offer the committed state to the render feed when the latest committed
+    /// tick requested publication. A busy feed leaves the boundary pending, and
+    /// a failure is recorded in its counters; neither touches the world.
     fn offer_render(&mut self) {
-        let _ = self.render.offer(&self.world);
+        if self.render_wanted {
+            let _ = self.render.offer(&self.world);
+        }
     }
 
     fn admit(&mut self, submission: Submission, committed: Tick, stopped: bool) {
@@ -1654,7 +1691,7 @@ impl SessionOwner {
     fn has_ready_held(&self) -> bool {
         let committed = self.world.tick();
         self.held.iter().any(|message| match message {
-            Control::Step(_) => {
+            Control::Step { .. } => {
                 self.run.is_some()
                     || self.stopped()
                     || (!self.held_here()
@@ -1726,7 +1763,10 @@ impl SessionOwner {
                 }
                 self.run = Some(Run { until, ended });
             }
-            Control::Step(reply) => {
+            Control::Step {
+                publish_render,
+                reply,
+            } => {
                 if self.run.is_some() {
                     let _ = reply.send_blocking(Err(CoreError::StateConflict {
                         operation: "step session",
@@ -1738,9 +1778,12 @@ impl SessionOwner {
                     let _ = reply.send_blocking(Err(stopped_error(&self.world)));
                     return;
                 }
-                let outcome = match self.tick(cx).await {
+                let outcome = match self.tick(cx, publish_render).await {
                     Ticked::Held => {
-                        self.held.push_back(Control::Step(reply));
+                        self.held.push_back(Control::Step {
+                            publish_render,
+                            reply,
+                        });
                         return;
                     }
                     Ticked::Published(report, applied) => StepOutcome::Published {
@@ -1748,15 +1791,27 @@ impl SessionOwner {
                         applied,
                         report,
                     },
-                    Ticked::Paused(shortfall) => StepOutcome::Paused {
-                        boundary: self.boundary(),
-                        shortfall,
-                    },
-                    Ticked::Failed(error) => StepOutcome::Failed {
-                        boundary: self.boundary(),
-                        error,
-                        stopped: self.stopped(),
-                    },
+                    Ticked::Paused(shortfall) => {
+                        if !self.render_wanted {
+                            self.render_wanted = true;
+                            self.offer_render();
+                        }
+                        StepOutcome::Paused {
+                            boundary: self.boundary(),
+                            shortfall,
+                        }
+                    }
+                    Ticked::Failed(error) => {
+                        if !self.render_wanted {
+                            self.render_wanted = true;
+                            self.offer_render();
+                        }
+                        StepOutcome::Failed {
+                            boundary: self.boundary(),
+                            error,
+                            stopped: self.stopped(),
+                        }
+                    }
                     Ticked::Closing => StepOutcome::Failed {
                         boundary: self.boundary(),
                         error: closed(),
@@ -1908,7 +1963,7 @@ impl SessionOwner {
     /// Prepare, check and publish one candidate. Between preparation and
     /// publication it yields and drains the control lane: the cancellation
     /// boundary.
-    async fn tick(&mut self, cx: &Cx) -> Ticked {
+    async fn tick(&mut self, cx: &Cx, publish_render: bool) -> Ticked {
         loop {
             if !self.closing.is_empty() || cx.checkpoint().is_err() {
                 return Ticked::Closing;
@@ -1936,6 +1991,7 @@ impl SessionOwner {
                 book,
                 grid,
                 render,
+                render_wanted,
                 control,
                 science,
                 closing,
@@ -2047,9 +2103,14 @@ impl SessionOwner {
             }
             // Before anyone hears of the boundary: a viewer that is told of
             // a published tick finds its epoch unless every slot is busy,
-            // and every epoch carries the tally through its tick.
+            // and every epoch carries the tally through its tick. When
+            // `publish_render` is false (headless stepping between sample
+            // windows), keep the tally continuous without projecting an epoch.
             render.count(&report);
-            let _ = render.offer(world);
+            *render_wanted = publish_render;
+            if publish_render {
+                let _ = render.offer(world);
+            }
             if !pause.is_empty() {
                 let boundary = Boundary {
                     tick: world.tick(),
@@ -2183,7 +2244,7 @@ impl SessionOwner {
                 // A held boundary waits below for its receipt, with control
                 // live.
                 if !self.holding() {
-                    match self.tick(cx).await {
+                    match self.tick(cx, true).await {
                         Ticked::Published(..) | Ticked::Held => {}
                         Ticked::Paused(shortfall) => {
                             let boundary = self.boundary();
@@ -2308,7 +2369,7 @@ impl SessionOwner {
                         let _ = ended.send_blocking(RunEnd::Closed(boundary));
                     }
                 }
-                Control::Step(reply) => {
+                Control::Step { reply, .. } => {
                     let _ = reply.send_blocking(Err(closed()));
                 }
                 Control::Checkpoint(reply) => {

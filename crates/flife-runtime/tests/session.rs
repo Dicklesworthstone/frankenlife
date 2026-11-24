@@ -1548,3 +1548,186 @@ fn resume_then_pause_at_cancellation_boundary_leaves_session_paused() {
         assert_eq!(closed.boundary, paused_at, "seed {seed}");
     }
 }
+
+/// `SessionHandle::step_with_render(&cx, false)` skips render-epoch projection
+/// while advancing scientific state bit-identically (INV-09) and preserving a
+/// continuous cumulative tally for later `publish_render = true` steps.
+#[test]
+fn step_with_render_false_skips_projection_and_matches_digest_bit_for_bit() {
+    let config = ecology(&[("population", "initial_count", "8")]);
+
+    let (ref_results, ref_closed) = lab(1, &config, |handle| {
+        vec![Box::pin(async move {
+            let cx = cx();
+            let mut reports = Vec::new();
+            for _ in 0..6 {
+                let outcome = handle.step(&cx).await.expect("step");
+                let (_, _, report) = published(&outcome);
+                reports.push((
+                    report.tick,
+                    report.live,
+                    report.births.len(),
+                    report.deaths.len(),
+                ));
+            }
+            let snap = handle.inspect(&cx).await.expect("inspect");
+            let latest_tick = handle.feed().latest().expect("latest").tick;
+            assert_eq!(latest_tick, Tick::new(6));
+            assert_eq!(snap.render.published, 7);
+            handle.close(&cx).await.expect("close");
+            (reports, snap.digest)
+        })
+            as Client<(
+                Vec<(Tick, usize, usize, usize)>,
+                flife_core::canonical::Sha256Digest,
+            )>]
+    });
+
+    let (opt_results, opt_closed) = lab(1, &config, |handle| {
+        vec![Box::pin(async move {
+            let cx = cx();
+            let viewer = handle
+                .feed()
+                .viewer(flife_render::DISPLAY_PAIR)
+                .expect("viewer");
+            let mut reports = Vec::new();
+            // Ticks 1..=4: headless steps without render projection.
+            for expected_tick in 1..=4_u64 {
+                let outcome = handle
+                    .step_with_render(&cx, false)
+                    .await
+                    .expect("step false");
+                let (boundary, _, report) = published(&outcome);
+                assert_eq!(boundary.tick, Tick::new(expected_tick));
+                reports.push((
+                    report.tick,
+                    report.live,
+                    report.births.len(),
+                    report.deaths.len(),
+                ));
+            }
+            let snap_4 = handle.inspect(&cx).await.expect("inspect 4");
+            assert_eq!(
+                snap_4.render.published, 1,
+                "only founding epoch 1 published"
+            );
+            assert_eq!(
+                handle.feed().latest().expect("founding").tick,
+                Tick::new(0),
+                "feed stays on founding tick while publish_render is false"
+            );
+
+            // Tick 5: request render projection; tally must still cover ticks 1..=5.
+            let outcome_5 = handle.step_with_render(&cx, true).await.expect("step true");
+            let (b5, _, r5) = published(&outcome_5);
+            assert_eq!(b5.tick, Tick::new(5));
+            reports.push((r5.tick, r5.live, r5.births.len(), r5.deaths.len()));
+            let snap_5 = handle.inspect(&cx).await.expect("inspect 5");
+            assert_eq!(snap_5.render.published, 2, "tick 5 projected once");
+            let epoch_5 = viewer.latest().expect("epoch 5");
+            assert_eq!(epoch_5.tick(), Tick::new(5));
+            assert!(
+                epoch_5.metrics().tally.is_some(),
+                "render tally must stay unbroken across skipped render ticks"
+            );
+            drop(epoch_5);
+
+            // Tick 6: skip render projection again, including through close().
+            let outcome_6 = handle
+                .step_with_render(&cx, false)
+                .await
+                .expect("step 6 false");
+            let (b6, _, r6) = published(&outcome_6);
+            assert_eq!(b6.tick, Tick::new(6));
+            reports.push((r6.tick, r6.live, r6.births.len(), r6.deaths.len()));
+            let snap_6 = handle.inspect(&cx).await.expect("inspect 6");
+            assert_eq!(snap_6.render.published, 2, "tick 6 not projected");
+            assert_eq!(
+                handle.feed().latest().expect("still tick 5").tick,
+                Tick::new(5)
+            );
+
+            handle.close(&cx).await.expect("close");
+            (reports, snap_6.digest)
+        })
+            as Client<(
+                Vec<(Tick, usize, usize, usize)>,
+                flife_core::canonical::Sha256Digest,
+            )>]
+    });
+
+    assert_eq!(
+        opt_results[0], ref_results[0],
+        "reports and digests must match bit-for-bit"
+    );
+    assert_eq!(opt_closed.boundary, ref_closed.boundary);
+    assert_eq!(opt_closed.world.digest(), ref_closed.world.digest());
+    assert_eq!(
+        opt_closed.snapshot.render.published, 2,
+        "shutdown must not project a skipped boundary"
+    );
+}
+
+/// Edge case (#37838): if quiet `step_with_render(&cx, false)` ticks advance to
+/// tick `k` and the next quiet step pauses (capacity shortfall) or fails, the
+/// owner automatically offers the last committed boundary `k` to the render
+/// feed before returning so callers flushing a final metrics window see tick
+/// `k` with an unbroken tally.
+#[test]
+fn quiet_step_auto_offers_render_epoch_on_early_pause() {
+    let config = ecology(&[("population", "maximum_count", "48")]);
+    let pause = first_capacity_pause(&config);
+    assert!(pause > 0, "pause should occur after at least one tick");
+
+    let (results, closed) = lab(4, &config, |handle| {
+        vec![Box::pin(async move {
+            let cx = cx();
+            let viewer = handle
+                .feed()
+                .viewer(flife_render::DISPLAY_PAIR)
+                .expect("viewer");
+            for expected in 1..=pause {
+                let outcome = handle
+                    .step_with_render(&cx, false)
+                    .await
+                    .expect("quiet step");
+                let (boundary, _, _) = published(&outcome);
+                assert_eq!(boundary.tick, Tick::new(expected));
+            }
+            let before_pause = handle.inspect(&cx).await.expect("inspect before pause");
+            assert_eq!(
+                before_pause.render.published, 1,
+                "quiet steps before pause must not project render epochs"
+            );
+            assert_eq!(handle.feed().latest().expect("founding").tick, Tick::new(0));
+
+            let outcome = handle
+                .step_with_render(&cx, false)
+                .await
+                .expect("paused step");
+            let StepOutcome::Paused { boundary, .. } = outcome else {
+                panic!("expected StepOutcome::Paused at tick {pause}, got {outcome:?}");
+            };
+            assert_eq!(boundary.tick, Tick::new(pause));
+
+            let epoch = viewer.latest().expect("auto-offered final epoch");
+            assert_eq!(
+                epoch.tick(),
+                Tick::new(pause),
+                "early pause must auto-offer the last committed boundary"
+            );
+            assert!(
+                epoch.metrics().tally.is_some(),
+                "auto-offered epoch must carry the continuous cumulative tally"
+            );
+            drop(epoch);
+
+            let after_pause = handle.inspect(&cx).await.expect("inspect after pause");
+            assert_eq!(after_pause.render.published, 2);
+            handle.close(&cx).await.expect("close")
+        }) as Client<Boundary>]
+    });
+    assert_eq!(results[0].tick, Tick::new(pause));
+    let expected = reference(&config, pause, &[]);
+    assert_eq!(closed.world.digest(), expected.digest());
+}

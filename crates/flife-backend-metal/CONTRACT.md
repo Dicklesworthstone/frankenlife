@@ -13,12 +13,16 @@ and `MetalBackend` now allocate, write, dispatch and read back only through thei
 FL-029 (`flife-g81`) adds batched submission (plan §10.4, §22.4). `DeviceOwner::submit_batch` runs several ordered
 kernels as one command: one command buffer and one serial compute encoder, committed once and waited for once, encoded
 by FrankenTorch `71bbe52e`'s `compute::Batch`. The command holds every buffer it binds from its first kernel until its
-last has verifiably completed: written buffers exclusively, read-only ones shared. Its receipt gives the epochs it
-wrote, the kernels it ran and its device time. `submit` is now a batch of one kernel. While building this, FrankenTorch's
-`Gateway::dispatch` turned out to have no autorelease pool: a thread that never exits kept every command buffer it
-dispatched, about 1.8 KiB each (+368 MB over 200,000 dispatches on an M5 Ultra). The owner's single-kernel `submit`
-went through it, so a long run with Metal controllers grew by that much per tick. `71bbe52e` fixes `dispatch`, and
-the batch drains a pool per submission.
+last has verifiably completed: written buffers exclusively, read-only ones shared. An RAII `CommandGuard` guarantees
+bound buffers and `table.running` are released even on unwind, and `submit_batch` acquires per-buffer `RwLock`s in
+strictly ascending `handle.index` order after releasing `table` (two-level lock hierarchy with zero AB-BA cycles). Its
+receipt gives the epochs it wrote, the kernels it ran and its device time. `submit` is now a batch of one kernel. While
+building this, FrankenTorch's `Gateway::dispatch` turned out to have no autorelease pool: a thread that never exits kept
+every command buffer it dispatched, about 1.8 KiB each (+368 MB over 200,000 dispatches on an M5 Ultra). The owner's
+single-kernel `submit` went through it, so a long run with Metal controllers grew by that much per tick. `71bbe52e`
+fixes `dispatch`, and the batch drains a pool per submission. `MetalControllers::with_owner` and
+`MetalBackend::with_owner` let a world attach all five Metal backends (`MetalField`, `MetalSensors`, `MetalUptake`,
+`MetalBackend`, `MetalSettle`) onto one shared `DeviceOwner`.
 
 FL-031 (`flife-8le`), first part: phase 2 of the tick (transport, decay and the external sources) on Metal,
 bit-identical to `flife_field::advance_field_on` (plan §8.1, §10.7, §11.1), in `field`. `MetalField` is a

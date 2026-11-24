@@ -40,20 +40,23 @@ pub use catalog::{
     TopologyId,
 };
 pub use founder::{
-    CADHERIN_COHESIVENESS_LANE, CADHERIN_TAG_LANE_BASE, founder, founder_cadherin_traits,
+    CADHERIN_COHESIVENESS_LANE, CADHERIN_TAG_LANE_BASE, POLARITY_STRENGTH_LANE,
+    POLARITY_WEDGE_LANE, founder, founder_cadherin_traits, founder_polarity_traits,
     founder_topology, founder_traits, founder_traits_v2, founder_v2, grow_founder, initial_scale,
 };
 pub use genome::{
     AFFINITY_TERMS, BASELINE_GENOME_HEADER_BYTES, CADHERIN_CHECKPOINT_BYTES, CADHERIN_TERMS,
-    CadherinTraits, Genome, MOTION_RESPONSE_TERMS, SharedParameters, TraitLimits, Traits, Unsealed,
-    cadherin_checkpoint_bytes, genome_header_bytes,
+    CadherinTraits, Genome, MAXIMUM_WEDGE_CURVATURE_CAP, MOTION_RESPONSE_TERMS,
+    POLARITY_CHECKPOINT_BYTES, PolarityTraits, SharedParameters, TraitLimits, Traits, Unsealed,
+    cadherin_checkpoint_bytes, genome_header_bytes, genome_header_bytes_v2,
+    polarity_checkpoint_bytes,
 };
 pub use init::{FAN_IN_SCALED_SYMMETRIC_V1, WeightAddress, fan_in_draw, fan_in_weight, initialize};
 pub use mutation::{
     BirthAttempt, CandidateRejection, DetachedProposal, MAXIMUM_CANDIDATES, MutationParameters,
     MutationRecord, Mutator, Prepared, Proposal, REJECT_BIRTH_NO_CHARGE, RejectionReason,
-    TopologyChange, UNIFORM_OTHER_CATALOG_MEMBER, mutate_cadherin_traits, perturb, perturb_weight,
-    reflect_log_scale, reflect_unit_interval,
+    TopologyChange, UNIFORM_OTHER_CATALOG_MEMBER, mutate_cadherin_traits, mutate_polarity_traits,
+    perturb, perturb_weight, reflect_interval, reflect_log_scale, reflect_unit_interval,
 };
 pub use quota::{
     ALLOCATED_GENOME_BYTES, GenomeQuota, LOGICAL_GENOME_BYTES, ParameterBuffer, ParameterValues,

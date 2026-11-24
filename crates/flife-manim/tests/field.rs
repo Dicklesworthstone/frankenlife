@@ -991,10 +991,16 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
     reference.show(&second).expect("show second");
 
     // View with field drawn once, then hidden on the second epoch:
-    // scale must match reference bit-for-bit, and texture pointer must NOT change.
+    // scale must match reference bit-for-bit, and texture texels must remain
+    // on the first epoch without rebuilding for the second.
     let mut hidden = WorldView::for_epoch(&first, [96, 96], [0, 0, 0]).expect("view");
     hidden.show(&first).expect("show first");
-    let tex_ptr = hidden.field().texture().expect("texture") as *const _;
+    let first_drawn = drawn(hidden.field());
+    assert_ne!(
+        first_drawn,
+        drawn(reference.field()),
+        "second epoch must differ from first epoch's field texture"
+    );
     hidden.set_style(Style {
         field: false,
         ..Style::default()
@@ -1006,42 +1012,43 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
         "hidden field must keep tracking display scale"
     );
     assert_eq!(
-        hidden.field().texture().expect("kept texture") as *const _,
-        tex_ptr,
-        "hidden field must not rebuild an unused texture"
+        drawn(hidden.field()),
+        first_drawn,
+        "hidden field must keep the first epoch's texture without rebuilding"
     );
-    // Turning the field back on builds the current epoch's texture immediately.
+    // Turning the field back on rebuilds the current epoch's texture immediately.
     hidden.set_style(Style::default());
     hidden.place(&second).expect("place unhidden");
     assert_ne!(
-        hidden.field().texture().expect("rebuilt") as *const _,
-        tex_ptr
+        drawn(hidden.field()),
+        first_drawn,
+        "unhiding field must rebuild texture for the current epoch"
     );
     assert_eq!(drawn(hidden.field()), drawn(reference.field()));
 
-    // Raw <-> Sphere reuse the exact same texture pointer and quad pointer.
+    // Raw <-> Sphere produce identical linear field texels and keep the cached periodic quad.
     let mut layer = FieldLayer::new(&fit([8.0, 4.0], [160, 80]));
     let plane: Vec<f32> = (0..32).map(|i| (i % 8) as f32).collect();
     let field = texture([8, 4], &plane);
     layer.update_look(&field, Look::Raw).expect("raw");
-    let raw_tex = layer.texture().expect("raw tex") as *const _;
+    let raw_drawn = drawn(&layer);
     let raw_quad = match layer.draw().expect("draw") {
-        ThreeDDraw::Surface(s) => s.mesh as *const _,
+        ThreeDDraw::Surface(s) => s.mesh.clone(),
         _ => panic!("not surface"),
     };
     layer.place(&field, Look::Sphere).expect("sphere");
     assert_eq!(
-        layer.texture().expect("sphere tex") as *const _,
-        raw_tex,
-        "Sphere must reuse identical Raw field texture without rehashing"
+        drawn(&layer),
+        raw_drawn,
+        "Sphere must preserve identical Raw field texels"
     );
     let sphere_quad = match layer.draw().expect("draw") {
-        ThreeDDraw::Surface(s) => s.mesh as *const _,
+        ThreeDDraw::Surface(s) => s.mesh,
         _ => panic!("not surface"),
     };
     assert_eq!(
-        sphere_quad, raw_quad,
-        "unchanged viewport must reuse cached periodic quad"
+        sphere_quad, &raw_quad,
+        "unchanged viewport must keep identical periodic quad"
     );
 
     // Zero-field and non-finite texels produce valid finite textures in all mappings.
@@ -1058,18 +1065,20 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
             assert!(z.texture().is_some());
         }
     }
-    let messy = texture(
+    // NaN and negative texels are ignored by display-scale tracking, leaving
+    // the largest finite positive value (3.0) as the scale and producing all
+    // finite texels.
+    let messy_nan_neg = texture(
         [4, 4],
         &[
             f32::NAN,
-            f32::INFINITY,
             -1.0,
             2.0,
             0.0,
             1.0,
             0.5,
             0.25,
-            f32::NEG_INFINITY,
+            -4.0,
             0.0,
             3.0,
             0.0,
@@ -1077,13 +1086,53 @@ fn hidden_field_tracks_scale_without_rebuilding_and_sphere_reuses_raw_texture() 
             0.0,
             0.0,
             1.0,
+            f32::NAN,
         ],
     );
     for look in [Look::Glow, Look::Raw] {
         let mut m = FieldLayer::new(&fit([4.0, 4.0], [40, 40]));
-        m.update_look(&messy, look).expect("messy field");
+        m.update_look(&messy_nan_neg, look).expect("messy field");
         assert_eq!(m.scale(), 3.0);
-        assert!(m.texture().is_some());
+        let (colours, dims) = drawn(&m);
+        assert_eq!(dims, [4, 4]);
+        assert!(
+            colours.iter().flatten().all(|c| c.is_finite()),
+            "all texels must stay finite"
+        );
+    }
+    // `FieldTexture::from_plane` saturates ±inf into ±f32::MAX, so display
+    // scale tracks `f64::from(f32::MAX)` while every rendered texel stays finite.
+    let saturated_inf = texture(
+        [4, 4],
+        &[
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            3.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+    );
+    for look in [Look::Glow, Look::Raw] {
+        let mut m = FieldLayer::new(&fit([4.0, 4.0], [40, 40]));
+        m.update_look(&saturated_inf, look).expect("saturated inf");
+        assert_eq!(m.scale(), f64::from(f32::MAX));
+        let (colours, dims) = drawn(&m);
+        assert_eq!(dims, [4, 4]);
+        assert!(
+            colours.iter().flatten().all(|c| c.is_finite()),
+            "saturated-inf texels must stay finite"
+        );
     }
 }
 
@@ -1126,7 +1175,7 @@ fn v2_field_layer_overlays_track_independent_scales_and_wrap_cleanly() {
         .place_mapped(&field, Look::Glow, FieldMapping::TrailCarrier)
         .expect("trail glow");
     assert!((layer.scale() - 0.04).abs() < 1e-6);
-    let trail_glow_ptr = layer.texture().expect("trail tex") as *const _;
+    let trail_drawn = drawn(&layer);
     let expected_seam = flife_manim::linear(flife_manim::trail_carrier_rgb8(
         flife_manim::overlay_log_value(0.01, layer.trail_scale()),
     ));
@@ -1139,13 +1188,13 @@ fn v2_field_layer_overlays_track_independent_scales_and_wrap_cleanly() {
     assert!((seam_texel.g - expected_seam.g).abs() < 1e-5);
     assert!((seam_texel.b - expected_seam.b).abs() < 1e-5);
 
-    // Identical trail plane hits texture cache; changed trail plane rebuilds.
+    // Identical trail plane keeps exact texels; changed trail plane rebuilds them.
     layer
         .place_mapped(&field, Look::Glow, FieldMapping::TrailCarrier)
         .expect("trail cache hit");
-    assert_eq!(layer.texture().expect("tex") as *const _, trail_glow_ptr);
+    assert_eq!(drawn(&layer), trail_drawn);
     let mut trail_changed = trail.clone();
-    trail_changed[10] = 0.02;
+    trail_changed[10] = 0.02; // cell (2, 1) -> corner (2, 1) mean is 0.02 / 4 = 0.005
     let field_changed = FieldTexture::from_planes_with_overlays(
         [8, 4],
         [1.0, 1.0],
@@ -1157,14 +1206,29 @@ fn v2_field_layer_overlays_track_independent_scales_and_wrap_cleanly() {
     layer
         .place_mapped(&field_changed, Look::Glow, FieldMapping::TrailCarrier)
         .expect("trail changed");
-    assert_ne!(layer.texture().expect("tex") as *const _, trail_glow_ptr);
+    assert_ne!(
+        drawn(&layer),
+        trail_drawn,
+        "changed trail plane must rebuild texture texels"
+    );
+    let expected_changed = flife_manim::linear(flife_manim::trail_carrier_rgb8(
+        flife_manim::overlay_log_value(0.005, layer.trail_scale()),
+    ));
+    let changed_texel = layer
+        .texture()
+        .expect("tex")
+        .texel(2, 1)
+        .expect("changed corner");
+    assert!((changed_texel.r - expected_changed.r).abs() < 1e-5);
+    assert!((changed_texel.g - expected_changed.g).abs() < 1e-5);
+    assert!((changed_texel.b - expected_changed.b).abs() < 1e-5);
 
     // Raw & Sphere share honest linear grey texture for VascularConductance.
     layer
         .place_mapped(&field, Look::Raw, FieldMapping::VascularConductance)
         .expect("vasc raw");
     assert!((layer.scale() - 0.8).abs() < 1e-6);
-    let vasc_raw_ptr = layer.texture().expect("vasc raw tex") as *const _;
+    let vasc_raw_drawn = drawn(&layer);
     let corner0 = layer.texture().expect("tex").texel(0, 0).expect("corner");
     assert!((corner0.r - 0.25).abs() < 1e-5);
     assert_eq!(corner0.r, corner0.g);
@@ -1172,7 +1236,7 @@ fn v2_field_layer_overlays_track_independent_scales_and_wrap_cleanly() {
     layer
         .place_mapped(&field, Look::Sphere, FieldMapping::VascularConductance)
         .expect("vasc sphere reuse");
-    assert_eq!(layer.texture().expect("tex") as *const _, vasc_raw_ptr);
+    assert_eq!(drawn(&layer), vasc_raw_drawn);
 
     // Absent optional plane (v1 FieldTexture) renders dark cleanly.
     let v1_field = texture([8, 4], &energy);

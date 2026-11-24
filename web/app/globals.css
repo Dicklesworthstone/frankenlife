@@ -425,6 +425,10 @@ body::before {
     animation: none;
   }
 
+  .reveal.is-shown {
+    transition: none;
+  }
+
   .life-arc {
     stroke-dashoffset: 0;
   }

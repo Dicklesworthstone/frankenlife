@@ -34,7 +34,7 @@ Tailwind's slate-500 to meet WCAG AA contrast on the ink.
 
 | Badge | Meaning | Figures |
 |---|---|---|
-| The rule, computed here | The model's rule recomputed in the browser on hand-sized numbers, beside its plausible wrong version; it starts at an Appendix C fixture's numbers and says when the answer matches the plan's | `fixture-bench.tsx` (C.1, C.3, C.2, C.9, C.11, C.15, C.5) |
+| The rule, computed here | The model's rule recomputed in the browser on hand-sized numbers, beside its plausible wrong version; it starts at an Appendix C fixture's numbers and says when the answer matches the plan's; also the deterministic `field-ecology-v2` ABI & CLI toggle calculator | `fixture-bench.tsx` (C.1, C.3, C.2, C.9, C.11, C.15, C.5), `v2-explorer.tsx` |
 | Derived · arithmetic, not a benchmark | Arithmetic from stated assumptions | `scale.tsx` (README "Why the scale is hard") |
 | From the record | Figures an experiment or contract records | inside `weights.tsx` and `scale.tsx` |
 | Diagram · not simulation output | How the software is organised | `life-cycle.tsx`, `brain.tsx`, `weights.tsx` (seeded illustrative weights), `tick-pipeline.tsx`, `branches.tsx` (toy digests), `studio-keys.tsx`, the zoom ladder's last two rungs |

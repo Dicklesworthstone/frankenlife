@@ -120,7 +120,11 @@ impl Slot {
     ) -> Result<&Owned<u32>, CoreError> {
         if self.owned.is_none() || self.capacity < len {
             self.owned = None;
-            let capacity = len.max(1).next_power_of_two();
+            self.capacity = 0;
+            let capacity = len
+                .max(1)
+                .checked_next_power_of_two()
+                .ok_or_else(overflow)?;
             self.owned = Some(owner.zeroed_owned(capacity)?);
             self.capacity = capacity;
         }
@@ -311,6 +315,7 @@ impl MetalChemistry {
         let planes = &observed.as_slice()[..carrier0_len];
         if field.owned.is_none() || field.capacity < planes.len() {
             field.owned = None;
+            field.capacity = 0;
             field.owned = Some(owner.zeroed_owned(planes.len())?);
             field.capacity = planes.len();
         }

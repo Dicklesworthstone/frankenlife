@@ -8,7 +8,6 @@ import {
   Equal,
   EqualNot,
   ExternalLink,
-  Layers,
   Map as MapIcon,
   ShieldCheck,
   Terminal,
@@ -25,6 +24,7 @@ import { Miniature } from "@/components/explain/miniature";
 import { ScaleCalculator } from "@/components/explain/scale";
 import { StudioKeys } from "@/components/explain/studio-keys";
 import { TickPipeline } from "@/components/explain/tick-pipeline";
+import { V2Explorer } from "@/components/explain/v2-explorer";
 import { IndependentWeights } from "@/components/explain/weights";
 import { ZoomLadder } from "@/components/explain/zoom-ladder";
 import { Film } from "@/components/film";
@@ -57,9 +57,7 @@ import {
   shortcuts,
   siteConfig,
   stack,
-  type V2FeatureEntry,
   v2BuildStatus,
-  v2Features,
   v2VisualMappings,
   type Verdict,
   worldModel,
@@ -80,13 +78,6 @@ const verdictStyle: Record<Verdict, string> = {
   met: "text-green-300 border-green-500/30 bg-green-500/10",
   narrow: "text-amber-200 border-amber-400/30 bg-amber-400/10",
   not: "text-rose-200 border-rose-400/30 bg-rose-400/10",
-};
-
-const v2BoundaryStyle: Record<V2FeatureEntry["boundary"], { label: string; className: string }> = {
-  "pure-field": { label: "pure-field · INV-08", className: "border-green-500/30 bg-green-500/10 text-green-300" },
-  "mode-dependent": { label: "mode-dependent", className: "border-amber-400/30 bg-amber-400/10 text-amber-200" },
-  contact: { label: "[contact]", className: "border-rose-400/30 bg-rose-400/10 text-rose-200" },
-  presentation: { label: "display · INV-09", className: "border-cyan-400/30 bg-cyan-400/10 text-cyan-200" },
 };
 
 const gateById = new Map(gates.map((gate) => [gate.id, gate]));
@@ -607,52 +598,7 @@ export default function Home() {
           >
             <div className="space-y-5">
               <Reveal>
-                <div className="panel relative overflow-hidden rounded-[1.75rem] p-6 sm:p-8">
-                  <Reticle inset={9} size={12} />
-                  <div className="flex flex-wrap items-center justify-between gap-2 sm:gap-3">
-                    <div className="flex items-center gap-2">
-                      <Layers className="h-4 w-4 shrink-0 text-[color:var(--chapter)]" aria-hidden="true" />
-                      <MicroLabel>21 registered feature slugs · flife --list-features</MicroLabel>
-                    </div>
-                    <span className="font-mono text-[11px] leading-snug text-slate-400">
-                      Bundle A (14) · Bundle B (13) · --disable / --enable / --v1-compat · aliases: all-v2, bundle-a, bundle-b
-                    </span>
-                  </div>
-                  {/* slop-ok(S12-three-cards): a 21-row ruled catalog wrapping into three columns, not three cards. */}
-                  <ul className="mt-6 grid grid-cols-1 gap-x-8 gap-y-4 md:grid-cols-2 xl:grid-cols-3">
-                    {v2Features.map((feature) => {
-                      const badge = v2BoundaryStyle[feature.boundary];
-                      return (
-                        <li key={feature.slug} className="min-w-0 border-t border-white/[0.06] pt-3.5">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <code className="font-mono text-[13px] font-bold break-words text-white">{feature.slug}</code>
-                            <span
-                              className={cn(
-                                "rounded-full border px-2 py-0.5 font-mono text-[9px] font-medium tracking-[0.08em] uppercase",
-                                badge.className,
-                              )}
-                            >
-                              {badge.label}
-                            </span>
-                          </div>
-                          <p className="mt-1.5 text-xs leading-relaxed text-slate-400">{feature.summary}</p>
-                          <p className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 font-mono text-[10px] text-slate-500">
-                            <span>
-                              {feature.bundleA && feature.bundleB
-                                ? "Bundles A + B"
-                                : feature.bundleA
-                                  ? "Bundle A default"
-                                  : feature.bundleB
-                                    ? "Bundle B default"
-                                    : "Opt-in"}
-                            </span>
-                            <span>· ABI: {feature.abi}</span>
-                          </p>
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </div>
+                <V2Explorer />
               </Reveal>
 
               <Reveal>

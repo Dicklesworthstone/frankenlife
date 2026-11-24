@@ -42,18 +42,25 @@ commit's inserts and releases allocation-free. The slots are physical, not scien
   `founder` at its allocation: `founder_topology` (the catalog's default member) and `grow_founder` (the weights
   drawn into a buffer a quota allocated, sealed with the traits; an `Unsealed` with the buffer on failure), so a
   world can allocate founders' buffers in identity order and grow them on several workers.
-- `V2-13` (`cadherin-4d`, additive):
+- `V2-08` (`pcp-polarity`, additive) and `V2-13` (`cadherin-4d`, additive):
+  - `PolarityTraits` (`polarity_strength: f64 ∈ [0, 1]`, `wedge_curvature: f64 ∈ [-β_max, β_max]` with
+    `β_max <= MAXIMUM_WEDGE_CURVATURE_CAP = 0.4`, `hash_into`, and 16-byte checkpoint encode/decode);
   - `CadherinTraits` (`tag: [f64; 4]` with `0 < left_fold_sq(tag) <= 1.0` via `shrink_to_left_fold_norm_limit`,
     `cohesiveness: f64 ∈ [0, 1]`, symmetric `pair_adhesion_weight`, `hash_into`, and 40-byte checkpoint encode/decode);
-  - optional cadherin fields on `Traits` (`cadherin`, `cohesiveness`, `cadherin_traits`, `has_cadherin`,
-    `with_cadherin`, `with_cadherin_traits`, `reseal` preservation, `write_checkpoint_fields`, `write_bytes`,
-    `read_checkpoint_fields`);
-  - dynamic `genome_header_bytes(cadherin_enabled)` / `TraitLimits::genome_header_bytes` (`553` bytes when disabled,
-    `+40` = `593` bytes when enabled; `0` extra checkpoint bytes when disabled);
-  - `TraitLimits::from_config` & `with_cadherin` carrying `cadherin_enabled` and `cadherin_mutation_std`;
-  - semantic Philox initialization (`founder_cadherin_traits`, `founder_traits_v2`, `founder_v2`) and mutation
-    (`mutate_cadherin_traits`, `reflect_unit_interval`) on `LaneKind::Direction` indices `0x1300..0x1301` (tag) and
-    `0x1310` (cohesiveness), zero draws and bit-exact baseline behavior when disabled or when `mutation_std == 0`.
+  - optional v2 fields on `Traits` (`polarity_strength`, `wedge_curvature`, `polarity_traits`, `has_polarity`,
+    `with_polarity`, `with_polarity_traits`, `cadherin`, `cohesiveness`, `cadherin_traits`, `has_cadherin`,
+    `with_cadherin`, `with_cadherin_traits`, `with_v2_traits`, `reseal` preservation of both,
+    `write_checkpoint_fields[_v2]`, `write_bytes[_v2]`, `read_checkpoint_fields[_v2]`);
+  - dynamic `genome_header_bytes_v2(polarity_enabled, cadherin_enabled)` / `TraitLimits::genome_header_bytes`
+    (`553` bytes baseline, `+16` with `pcp-polarity`, `+40` with `cadherin-4d`, `609` with both; `0` extra
+    checkpoint bytes for any disabled feature);
+  - `TraitLimits::from_config`, `with_polarity`, and `with_cadherin` carrying enablement, bounds, and mutation
+    standard deviations;
+  - semantic Philox initialization (`founder_polarity_traits`, `founder_cadherin_traits`, `founder_traits_v2`,
+    `founder_v2`) and mutation (`mutate_polarity_traits`, `mutate_cadherin_traits`, `reflect_interval`,
+    `reflect_unit_interval`) on `LaneKind::Direction` indices `0x0800..0x0801` (polarity strength & wedge curvature)
+    and `0x1300..0x1301`, `0x1310` (cadherin tag & cohesiveness), with zero draws and bit-exact baseline behavior
+    when disabled or when `mutation_std == 0`.
 - FL-043: `GenomeArena::allocated_bytes` (its buckets' capacities) and `GenomeArena::bound_bytes(topologies,
   live)`, the most it holds for `live` genomes over at most `topologies` topologies: three slots' records for each
   genome in each topology, since a bucket grown by pushing holds at most twice its length and three times while it

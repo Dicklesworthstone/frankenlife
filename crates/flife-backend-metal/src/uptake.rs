@@ -101,7 +101,11 @@ impl<T: Element> Slot<T> {
     fn ensure(&mut self, owner: &DeviceOwner, len: usize) -> Result<Buffer<T>, CoreError> {
         if self.owned.is_none() || self.capacity < len {
             self.owned = None;
-            let capacity = len.max(1).next_power_of_two();
+            self.capacity = 0;
+            let capacity = len
+                .max(1)
+                .checked_next_power_of_two()
+                .ok_or_else(overflow)?;
             self.owned = Some(owner.zeroed_owned(capacity)?);
             self.capacity = capacity;
         }

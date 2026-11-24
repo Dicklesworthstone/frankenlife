@@ -65,6 +65,11 @@ pub use chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
     effective_affinity, settle_efficiencies, symplectic_waste_direction,
 };
+pub use contact::{
+    ContactRules, ContactScratch, ContactWork, CrowdingWork, MAX_POLARITY_DTHETA_RAD,
+    PcpSweepParams, Sweep1Context, Sweep1Output, pcp_lateral_wedge_weight, pcp_pair_torque_term,
+    relax, relax_sweep1_with_context, rotate_unit_polarity, unit_affinity,
+};
 pub use costs::{MaintenanceBill, MaintenanceCosts, MaintenanceSettlement, senescence_multiplier};
 pub use emission::{
     EmissionContext, EmissionOffsetRule, EmissionPlan, EmissionPolicy, EmissionSettlement,
@@ -87,8 +92,8 @@ pub use motion::{
     HEADING_EPS, Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio,
 };
 pub use population::{
-    Arrangement, Ascending, Collected, Entrant, HeldOutput, Organism, POPULATION_DIGEST_SCHEMA,
-    Population,
+    Arrangement, Ascending, Collected, DEFAULT_POLARITY, Entrant, HeldOutput, Organism,
+    POPULATION_DIGEST_SCHEMA, Population,
 };
 pub use reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, Capacity,
@@ -101,9 +106,9 @@ pub use reproduction::{
 pub use world::{
     Advance, BirthEvent, BuddingRules, CPU_REFERENCE, Candidate, CarrierSpec, ControllerReport,
     CorpseDirection, CrowdingMode, CrowdingRules, FieldReport, Footprint, Graft, IntroductionEvent,
-    LysisRules, ModelVariant, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT,
+    LysisRules, ModelVariant, NumericalFault, NumericalProfile, PAUSE_BEFORE_COMMIT, PolarityRules,
     QUALIFIED_REFERENCE, STOP_AND_PRESERVE, SenescenceRules, SensorReport, SettleReport, Stepped,
     TickReport, UNIFORM_POSITIONS, UptakeReport, V2Rules, WORLD_CHECKPOINT_CHUNKS,
     WORLD_CHUNK_VERSION, WORLD_DIGEST_SCHEMA, WORLD_RECURRENT_HELD_VERSION, WORLD_V2_CHUNK_VERSION,
-    WasteRules, World, ZERO_VELOCITY, founder_position,
+    WasteRules, World, ZERO_VELOCITY, founder_polarity, founder_position,
 };

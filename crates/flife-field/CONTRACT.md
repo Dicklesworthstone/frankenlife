@@ -2,9 +2,10 @@
 
 **Purpose.**
 - FL-003 (`flife-82g`) covers the field representation of plan §4.2, §9.3 and §19.3. The field is 33 typed F32
-  planes (energy plus 32 chemical moments) on a periodic grid. It comes with a semantic layout descriptor that
-  FrankenNumPy supplies and checks, per-buffer limits (INV-15), the configured initial field, and the INV-01 and
-  INV-02 checks.
+  planes (energy plus 32 chemical moments) on a periodic grid, extended in `V2-15` (`FL-055`) to 34 typed F32 planes
+  (Carrier 0 energy + 24 moments, Carrier 1 trail energy + 8 moments) with optional `V2-14` vascular face
+  conductances. It comes with a semantic layout descriptor that FrankenNumPy supplies and checks, per-buffer limits
+  (INV-15), the configured initial field, and the INV-01 and INV-02 checks.
 - FL-004 (`flife-03d`) covers phase 2 of the tick (§4.5, §8.1, §11.5, A.3 items 7–9). That is
   `positive-five-point-v1` transport with `subcycle` stability, exponential decay, and `fixed-total-power`
   deposits through the `normalized-truncated-minimum-image-gaussian-v1` kernel with `fixed-per-source`
@@ -54,9 +55,12 @@
   direction, and the next field after that tick's uptake debits.
 
 **Outputs.**
-- `FieldState`: one planar `[plane, y, x]` buffer of `33 G_x G_y` real `f32` values. Plane 0 holds energy;
-  plane `k + 1` holds moment channel `k`. Every plane is a cell amount in `ecological-energy`; divide by
-  `cell_area` for a density. `energy_total` gives the field's holdings for the ledger.
+- `FieldState`: one planar `[plane, y, x]` buffer of `P G_x G_y` real `f32` values (`P = 33` single-carrier or
+  `P = 34` `V2-15` dual-carrier), plus optional `V2-14` vascular face conductances `(edge_x_cond, edge_y_cond)`
+  (`0 B` when disabled). Plane 0 holds Carrier-0 energy; planes `1..33` (or `1..25`) hold Carrier-0 moment channels,
+  and when `P = 34`, plane 25 holds Carrier-1 trail energy and planes `26..34` hold Carrier-1 trail moments. Every
+  plane is a cell amount in `ecological-energy`; divide by `cell_area` for a density. `energy_total` gives the
+  field's total holdings (`e_0` or `e_0 + e_1`) for the ledger.
 - `FieldLayout`, `FieldView`, `relayout`, and `FieldPair` (current/next; `commit` swaps without reallocating;
   `next` reads the candidate buffer, which FL-013's `Candidate::field` exposes before publication).
 - `FieldFootprint`, `InitialEnergy` and `FieldSummary`.
@@ -244,10 +248,10 @@
 - A reader states the layout it needs. Arrangement, grid, world size (and therefore cell size and energy
   density), shape, strides and length must all agree. Equal byte lengths never make two layouts compatible.
 - A declared layout is admitted before allocation (Appendix B.2). It must name this schema and dtype `f32`
-  with 4-byte items. Its axis names must match the arrangement, and it must have 33 planes, an
-  `ecological-energy` `cell-integrated` unit and 4-byte alignment. FrankenNumPy checks that the view stays
-  inside the declared bytes and does not overlap itself. The strides must be the canonical contiguous ones, and
-  the byte length must be exact.
+  with 4-byte items. Its axis names must match the arrangement, and it must have 33 (`FIELD_PLANES`, single-carrier)
+  or 34 (`DUAL_CARRIER_PLANES`, `V2-15` dual-carrier) planes, an `ecological-energy` `cell-integrated` unit and
+  4-byte alignment. FrankenNumPy checks that the view stays inside the declared bytes and does not overlap itself.
+  The strides must be the canonical contiguous ones, and the byte length must be exact.
 - Every count is checked. Buffers are admitted against `BufferLimits` and `isize::MAX` before they are
   allocated. The allocation itself uses `try_reserve_exact`, so a refusal is reported as an error instead of
   aborting the process.
@@ -439,17 +443,29 @@
   `u32` index range (`BudgetExhausted`); a grouping with more buckets or items than declared
   (`BudgetExhausted`), or an item outside its buckets (`LayoutMismatch`); more demands, or more deposits staged,
   than declared (`BudgetExhausted`, named `uptake packets` or `deposit packets`).
-- Invariants: the first cell that violates INV-01 or INV-02.
+- Fixed-world exchange (`FL-053`) and `V2` extensions (`V2-02`, `V2-09`, `V2-14`, `V2-15`): a fixed-world exchange
+  support exceeding `MAXIMUM_EXCHANGE_CELLS` (4,096) or nonpositive radius; an `OasisSchedule` with `M < 3` and
+  `min_frac == 0` or invalid period/phase inputs; an unknown `BarrierMode` or non-finite/out-of-range tight-junction
+  or vascular conductance parameter; applying vascular transport to a `FieldState` without allocated vascular edges;
+  any plane-count (`33` vs `34`), carrier-range, or layout mismatch on dual-carrier operations.
+- Invariants: the first cell that violates INV-01 or INV-02 (in either carrier cone for a 34-plane field).
 
-**Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps, no parallel
-reduction, and no platform `libm` in model arithmetic. Random words come only from semantic blocks in `seeding`.
+**Determinism.** Pure functions of their inputs with fixed iteration orders. No hash maps and no platform `libm` in
+model arithmetic. Deterministic parallel-by-plane/run operators (`advance_field_on`, `advance_field_v2_on`,
+`advance_field_wave2_on`, `transport_flux_on`, `apply_grants_on`, `apply_deposits_on`,
+`reduce_dual_carrier_field_on`, `check_invariants_on`) partition independent planes or cell ranges with fixed-order
+final merges and are bit-identical to serial execution at any worker count. Random words come only from semantic
+blocks in `seeding`.
 
 **Validity domain.**
-- Implemented here: `field-ecology-v1` with `periodic`, `f32`, `zero`, `positive-five-point-v1`, `subcycle`,
-  `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1` and its `-fused-v1`, `fixed-per-source`,
-  `grid-cic-v1`, `positive-box-v1`, `log-linear-v1`, `seeded-unit-vectors` and `seeded-smooth-torus-v1` (the last
-  two with FL-010's draws).
-- Host buffers in layout schema `frankenlife.field-layout.v1`.
+- Implemented here: `field-ecology-v1` and `field-ecology-v2*` with `periodic`, `f32`, `zero`,
+  `positive-five-point-v1`, `subcycle`, `fixed-total-power`, `normalized-truncated-minimum-image-gaussian-v1` and
+  its `-fused-v1`, `fixed-per-source`, `grid-cic-v1`, `fixed-world-gaussian-v1` (`FL-053`), `positive-box-v1`,
+  `log-linear-v1`, `seeded-unit-vectors`, `seeded-smooth-torus-v1` (with FL-010's draws), `V2-02` `oases`
+  (heterogeneous `σ_j` + phase-staggered constant-total-power modulation), `V2-09` `tight-junctions` (`harmonic-v1`
+  and `min-v1` face-conductance barriers), `V2-14` `vascular-field` (Murray/Physarum adaptive face conductances),
+  and `V2-15` `dual-carrier-trails` (34-plane Carrier-0/Carrier-1 hybrid field and `DualRawSample` pyramid).
+- Host buffers in layout schema `frankenlife.field-layout.v1` (33 or 34 planes).
 
 **Independent tests.**
 - `tests/field_layout.rs`: NumPy strides, a `shasum` digest, and the §19.3 byte counts measured on the real
@@ -546,6 +562,17 @@ reduction, and no platform `libm` in model arithmetic. Random words come only fr
   emission that stages it. They cover C.4 exactly; shared bilinear weights for energy and moment; push-order
   independence, including an adversarial F32 boundary; ledger closure; no energy created at efficiency 1; and
   every refusal.
+- `tests/fixed_footprint.rs` (3 tests, `FL-053`): `fixed-world-gaussian-v1` kernel normalization, minimum-image
+  wrapping, `MAXIMUM_EXCHANGE_CELLS` refusal, conservative multi-cell deposit splits, and worker-count parity.
+- `tests/v2_oases_and_tight_junctions.rs` (8 tests, `V2-02` + `V2-09`): `OasisSchedule` exact constant total power,
+  `M < 3 && min_frac == 0` guard, heterogeneous `source_sigma` determinism, dormant-oasis zero-deposit accounting,
+  `TightJunctions` (`harmonic-v1` / `min-v1`) conservation/cone/worker-count invariance, and exact v1 bit-identity
+  when disabled.
+- `tests/v2_vascular_and_dual_carrier.rs` (8 tests, `V2-14` + `V2-15`): Murray/Physarum artery emergence,
+  substep-invariant flux, overflow/clamp guards, cancel-safe `FieldPair` ping-pong vascular edges, 34-plane
+  Carrier-0/Carrier-1 independent cone & conservation invariants, dual-carrier emission splitting (`paid_0 + paid_1
+  ≤ paid`, zero `0/0` NaN), `DualRawSample` pyramid parity, and `1` vs `4` worker bit-identity.
+- `src/transport.rs` (2 unit tests): direct transport helper invariants (94 integration tests + 2 unit tests total).
 
 **Known gaps.**
 - FL-013's tick carries each `SeededPath` and moves a source's center to its mid-tick position every tick.

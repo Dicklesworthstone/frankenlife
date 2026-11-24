@@ -1436,9 +1436,30 @@ fn v2_optional_views_accounting_and_slot_order_invariance_c7() {
             })
             .collect();
         assert_eq!(a.cell_states(), Some(expected_states.as_slice()));
-        assert_eq!(
-            a.polarities(),
-            Some(vec![flife_render::POLARITY_UNPOLARIZED; a.len()].as_slice())
+        let expected_polarities: Vec<i16> = compact
+            .population()
+            .iter_with_genomes()
+            .map(|(org, _)| {
+                let [px, py] = org.polarity;
+                if !(px.is_finite() && py.is_finite()) || (px == 0.0 && py == 0.0) {
+                    flife_render::POLARITY_UNPOLARIZED
+                } else {
+                    ((py.atan2(px) / std::f64::consts::PI)
+                        * f64::from(flife_render::POLARITY_ANGLE_SCALE))
+                    .round()
+                    .clamp(
+                        -f64::from(flife_render::POLARITY_ANGLE_SCALE),
+                        f64::from(flife_render::POLARITY_ANGLE_SCALE),
+                    ) as i16
+                }
+            })
+            .collect();
+        assert_eq!(a.polarities(), Some(expected_polarities.as_slice()));
+        assert!(
+            expected_polarities
+                .iter()
+                .all(|&p| p != flife_render::POLARITY_UNPOLARIZED),
+            "pcp-polarity organisms carry finite live polarity vectors"
         );
         // Verify live Carrier-1 trail_energy and periodic incident vascular_conductance oracles.
         let grid = compact.field().grid();

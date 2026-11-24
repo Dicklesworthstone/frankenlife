@@ -137,8 +137,9 @@ inherits every command and outcome, records the fork, and from then on admits on
   - A cancellation of a sealed command there wins. The candidate is discarded and rebuilt from the same committed
     state without it, so no published epoch contains a cancelled intervention.
   - A cancellation after publication is `TooLate` and names the applied outcome.
-  - A pause there takes effect at the boundary publication reaches, which is reported. A close there discards the
-    candidate.
+  - A pause there takes effect at the boundary publication reaches, which is reported. Deferred control requests
+    arriving during a `Control::Step` cancellation boundary are drained in FIFO order before the owner sleeps, and
+    a deferred `Control::Pause` is still answered if `tick()` fails. A close there discards the candidate.
 - A candidate borrows the world mutably, so nothing else can read or write the world until it is published or
   dropped. The owner is the only task that holds the world.
 
@@ -253,12 +254,15 @@ inherits every command and outcome, records the fork, and from then on admits on
   identities are remembered, the run stops and new commands are refused, while control and close still work. A
   retry of an uncertain identity is refused in that session; a reopened session reconciles it from what the journal
   actually holds, by identity.
-- `open_journaled` merges the journal into the starting book (`CommandBook::recover`): acceptances numbered from
-  zero, those the book holds identical in content and admission, new ones due at or after the committed tick, a
-  journal never behind the book, and outcomes contiguous by cursor, the prefix equal to the book's. Every outcome
-  the book does not hold is replayed: the world advances through the same boundaries with the same commands, each
-  journaled cancellation is applied at its boundary, and every outcome must be reproduced exactly. The session
-  then starts at the boundary the replay reached, with every later acceptance pending and nothing journaled twice.
+- `open_journaled` merges the journal into the starting book (`CommandBook::recover`): `recover` stages into a
+  clone and swaps atomically on success (so any refusal leaves the starting book unchanged), requires acceptances
+  numbered from zero with those the book holds identical in content and admission, new ones due at or after the
+  committed tick, a journal never behind the book, outcomes contiguous by cursor with the prefix equal to the
+  book's, finite `Outcome::Applied::applied` energies, and refuses duplicate or already-terminal replay outcomes
+  (`already ended`). Every outcome the book does not hold is replayed: the world advances through the same
+  boundaries with the same commands, each journaled cancellation is applied at its boundary, and every outcome
+  must be reproduced exactly. The session then starts at the boundary the replay reached, with every later
+  acceptance pending and nothing journaled twice.
 - `replay_journal(world, book, journal)` is that merge and replay without a session: it brings a restored world
   and its book to the boundary `open_journaled` would start at, and writes nothing. `open_journaled` calls it.
   `flife render --run-dir` uses it to read a write-ahead run as its owner would continue it. It refuses
@@ -286,8 +290,11 @@ inherits every command and outcome, records the fork, and from then on admits on
   context is cancelled.
 - `World::advance_with` checks every intervention before preparing and refuses an invalid one without stopping the
   run. An `InjectEnergy` is refused for a cell outside the grid, or an amount that is not finite, not strictly
-  positive or above `f32::MAX`. A `RemoveOrganisms` is refused for a centre outside the world, or a radius that
-  is not finite, not strictly positive or above half the shorter world side.
+  positive or above `f32::MAX`. An `InjectMaterial` applies the same cell and amount checks and refuses a direction
+  with nonfinite components or `||direction||₂ > 1`. A `RemoveOrganisms` is refused for a centre outside the world,
+  or a radius that is not finite, not strictly positive or above half the shorter world side. An
+  `IntroduceOrganisms` is refused for a cell outside the grid, a zero count, or an energy that is not finite or not
+  strictly positive.
 - `Command::from_canonical_bytes` refuses (`IncompatibleCheckpoint`) an unknown payload or disposition tag, a tag
   longer than 32 bytes, and trailing or missing bytes.
 - FL-039: `CommandBook::branch` refuses (`StateConflict`) the book's own session or one in its lineage.
@@ -300,7 +307,7 @@ time. Interventions apply in sealed order, and an applied world is identical to 
 same interventions at the same ticks. Lab runs replay exactly by seed.
 
 **Independent tests.**
-- `tests/book.rs` (7 tests), driven directly against a real world; the expected worlds are stepped directly:
+- `tests/book.rs` (8 tests), driven directly against a real world; the expected worlds are stepped directly:
   - exact effective ticks, with late and retargeted targets and the ordered schedule;
   - idempotent retries before and after application, refused conflicting reuse (payload, cell, target or
     revision), and a full queue that records nothing;
@@ -310,10 +317,14 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     publication record;
   - energy reconciliation: the injection applies at exactly its tick, never above the request, and is recorded as
     `command-injection` and closed by the ledger;
-  - every admission refusal, closing, and failing every unfinished command when the run stops.
-- `tests/session.rs` (16 tests; until FL-024's hold it had 15, though this list counted 13 and named neither the
-  started run nor `open_restored`'s refusals), with the owner and clients as separate Asupersync Lab tasks,
-  quiescent and invariant-clean under each seed:
+  - every admission refusal, closing, and failing every unfinished command when the run stops;
+  - `recover_is_atomic_on_conflict_and_rejects_duplicate_or_already_terminal_outcomes`: proves `CommandBook::recover`
+    leaves the book untouched on conflict, rejects duplicate/already-terminal replay outcomes, and refuses
+    non-finite applied energy.
+- `tests/session.rs` (20 tests), with the owner and clients as separate Asupersync Lab tasks,
+  quiescent and invariant-clean under each seed (including
+  `control_arriving_during_step_cancellation_boundary_is_not_stranded_in_deferred` and held-step close/wake
+  regressions):
   - `volatile-in-memory` admitted, and `write-ahead-before-apply` refused by `open` with a pointer to
     `open_journaled`;
   - C.14's full scientific queue while paused, with inspect, step, run, pause, resume and close still served;
@@ -444,10 +455,25 @@ same interventions at the same ticks. Lab runs replay exactly by seed.
     edited, and an unedited rewrite reproduces it byte for byte. Each of these is refused: a repeated session;
     the book's own session as a parent; a fork past the admissions; forks out of admission or tick order; a
     lineage that gives an inherited command to the branch; a version 2 chunk with no fork; and version 3.
+- `tests/removal.rs` (3 tests, FL-022): an injection's record against one written out by hand, and a removal's
+  round trip for each disposition, three distinct content hashes; unknown, unterminated, trailing and truncated
+  records refused; and the book admitting a removal for tick 20 and applying it there, its applied outcome the
+  removed organisms' energy (1e-12) and the world equal to one stepped directly with the same removal.
+- `tests/material.rs` (3 tests, FL-022): a material's record ends with its tag, cell, amount and all 32
+  components' bits written out by hand, shares the injection's prefix and round-trips; swapped components, a
+  `-0.0` component and a zero-direction material against an injection give distinct content hashes; a record one
+  byte short, one byte long or with a misspelled tag is refused; the book refuses a direction of norm above one,
+  admits one inside for tick 9 and applies it there, its outcome the reported energy's bits and the world equal
+  to one stepped directly with the same material.
+- `tests/introduction.rs` (3 tests, FL-022): an introduction's record ends with its tag, cell, count and energy
+  written out by hand, shares the injection's prefix and round-trips, and a different cell, count or energy gives
+  another content hash; a record one byte short, one byte long or with a misspelled tag is refused; the book
+  refuses an introduction of no organisms, admits seven at 2.25 for tick 9 and applies them there, its outcome
+  `7 × 2.25` bit for bit and the world equal to one stepped directly with the same introduction.
 
 **Validity domain.** `volatile-in-memory` and `write-ahead-before-apply` durability; `cpu-reference` and
 `qualified-reference`; one owner task on any Asupersync runtime, plus the journal's writer thread for a journaled
-session; `InjectEnergy` and `RemoveOrganisms` as the interventions.
+session; `InjectEnergy`, `InjectMaterial`, `RemoveOrganisms` and `IntroduceOrganisms` as the interventions.
 
 **Known gaps.**
 - `volatile-in-memory` sessions still lose everything since opening when the process ends; that is the profile.
@@ -464,21 +490,6 @@ session; `InjectEnergy` and `RemoveOrganisms` as the interventions.
 - Area brushes, source edits and the native input mapping are FL-022. Single-cell `InjectEnergy` (FL-014),
   `InjectMaterial` and `IntroduceOrganisms` (FL-022) and disk `RemoveOrganisms` (FL-022) are the canonical
   payloads so far.
-- `tests/removal.rs` (3 tests, FL-022): an injection's record against one written out by hand, and a removal's
-  round trip for each disposition, three distinct content hashes; unknown, unterminated, trailing and truncated
-  records refused; and the book admitting a removal for tick 20 and applying it there, its applied outcome the
-  removed organisms' energy (1e-12) and the world equal to one stepped directly with the same removal.
-- `tests/material.rs` (3 tests, FL-022): a material's record ends with its tag, cell, amount and all 32
-  components' bits written out by hand, shares the injection's prefix and round-trips; swapped components, a
-  `-0.0` component and a zero-direction material against an injection give distinct content hashes; a record one
-  byte short, one byte long or with a misspelled tag is refused; the book refuses a direction of norm above one,
-  admits one inside for tick 9 and applies it there, its outcome the reported energy's bits and the world equal
-  to one stepped directly with the same material.
-- `tests/introduction.rs` (3 tests, FL-022): an introduction's record ends with its tag, cell, count and energy
-  written out by hand, shares the injection's prefix and round-trips, and a different cell, count or energy gives
-  another content hash; a record one byte short, one byte long or with a misspelled tag is refused; the book
-  refuses an introduction of no organisms, admits seven at 2.25 for tick 9 and applies them there, its outcome
-  `7 × 2.25` bit for bit and the world equal to one stepped directly with the same introduction.
 - The tick runs on the owner task. Admitting it as bounded compute work with cancellation between tiles is later,
   with the CPU worker budget (§12.5) and accelerated backends. Responsiveness while running is one tick.
 - Branching (FL-039) is a library operation on a book at a checkpoint (`flife branch` in `flife-cli`), not a session

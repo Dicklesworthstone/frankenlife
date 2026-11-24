@@ -57,32 +57,39 @@ fn words(value: f64) -> [u32; 2] {
     [(bits & 0xFFFF_FFFF) as u32, (bits >> 32) as u32]
 }
 
-/// A buffer of words that grows to what a reduction needs.
+/// A buffer of words that grows to what a reduction needs, retiring the old
+/// buffer before allocating a larger one so peak VRAM never doubles under a
+/// tight [`DeviceOwner`] budget.
 #[derive(Debug)]
 struct Growing {
-    buffer: Owned<u32>,
+    buffer: Option<Owned<u32>>,
     len: usize,
 }
 
 impl Growing {
     fn new(owner: &DeviceOwner) -> Result<Self, CoreError> {
         Ok(Self {
-            buffer: owner.zeroed_owned(1)?,
+            buffer: Some(owner.zeroed_owned(1)?),
             len: 1,
         })
     }
 
-    /// At least `needed` words (one when none): replaced by a buffer twice
-    /// as large, or as large as needed, when it is short. The old one
-    /// retires when dropped.
+    /// At least `needed` words (one when none): retires the old buffer first,
+    /// then allocates one twice as large or as large as needed.
     fn room(&mut self, owner: &DeviceOwner, needed: usize) -> Result<(), CoreError> {
         let needed = needed.max(1);
-        if self.len < needed {
+        if self.buffer.is_none() || self.len < needed {
             let len = needed.max(self.len.saturating_mul(2));
-            self.buffer = owner.zeroed_owned(len)?;
+            self.buffer = None;
+            self.len = 0;
+            self.buffer = Some(owner.zeroed_owned(len)?);
             self.len = len;
         }
         Ok(())
+    }
+
+    fn buffer(&self) -> Result<crate::owner::Buffer<u32>, CoreError> {
+        self.buffer.as_ref().map(Owned::buffer).ok_or_else(overflow)
     }
 }
 
@@ -278,23 +285,33 @@ impl Reduce {
 
         // The device's copy of the field and every word, then one command.
         let mut kernels = Vec::with_capacity(3);
+        let debits_buf = buffers.debits.buffer()?;
         let debit_bindings = [
             buffers.field.buffer().writes(),
-            buffers.debits.buffer.buffer().reads(),
+            debits_buf.reads(),
             buffers.debit_params.buffer().reads(),
             buffers.fault.buffer().writes(),
         ];
-        let set_bindings = buffers.sets.each_ref().map(|set| {
+        let set_bindings = [
             [
                 buffers.field.buffer().writes(),
-                set.offsets.buffer().reads(),
-                set.packets.buffer.buffer().reads(),
-                set.directions.buffer.buffer().reads(),
-                set.params.buffer().reads(),
-                set.received.buffer().writes(),
+                buffers.sets[0].offsets.buffer().reads(),
+                buffers.sets[0].packets.buffer()?.reads(),
+                buffers.sets[0].directions.buffer()?.reads(),
+                buffers.sets[0].params.buffer().reads(),
+                buffers.sets[0].received.buffer().writes(),
                 buffers.fault.buffer().writes(),
-            ]
-        });
+            ],
+            [
+                buffers.field.buffer().writes(),
+                buffers.sets[1].offsets.buffer().reads(),
+                buffers.sets[1].packets.buffer()?.reads(),
+                buffers.sets[1].directions.buffer()?.reads(),
+                buffers.sets[1].params.buffer().reads(),
+                buffers.sets[1].received.buffer().writes(),
+                buffers.fault.buffer().writes(),
+            ],
+        ];
         if debits > 0 {
             kernels.push(Kernel {
                 pipeline: debit_pipeline,
@@ -316,9 +333,7 @@ impl Reduce {
                 .write(buffers.field.buffer())?
                 .write(0, field.as_slice())?;
             if debits > 0 {
-                owner
-                    .write(buffers.debits.buffer.buffer())?
-                    .write(0, &host.debits)?;
+                owner.write(debits_buf)?.write(0, &host.debits)?;
                 owner
                     .write(buffers.debit_params.buffer())?
                     .write(0, &[word(debits)?, word(cells)?, carrier0.moment_count])?;
@@ -430,28 +445,38 @@ impl Reduce {
             .room(owner, host.trail_set.directions.len())?;
 
         let trail_buf = buffers.trail_set.as_ref().ok_or_else(overflow)?;
+        let debits_buf = buffers.debits.buffer()?;
         let debit_bindings: [Binding; 4] = [
             buffers.field.buffer().writes(),
-            buffers.debits.buffer.buffer().reads(),
+            debits_buf.reads(),
             buffers.debit_params.buffer().reads(),
             buffers.fault.buffer().writes(),
         ];
-        let set_bindings: [[Binding; 7]; 2] = buffers.sets.each_ref().map(|set| {
+        let set_bindings: [[Binding; 7]; 2] = [
             [
                 buffers.field.buffer().writes(),
-                set.offsets.buffer().reads(),
-                set.packets.buffer.buffer().reads(),
-                set.directions.buffer.buffer().reads(),
-                set.params.buffer().reads(),
-                set.received.buffer().writes(),
+                buffers.sets[0].offsets.buffer().reads(),
+                buffers.sets[0].packets.buffer()?.reads(),
+                buffers.sets[0].directions.buffer()?.reads(),
+                buffers.sets[0].params.buffer().reads(),
+                buffers.sets[0].received.buffer().writes(),
                 buffers.fault.buffer().writes(),
-            ]
-        });
+            ],
+            [
+                buffers.field.buffer().writes(),
+                buffers.sets[1].offsets.buffer().reads(),
+                buffers.sets[1].packets.buffer()?.reads(),
+                buffers.sets[1].directions.buffer()?.reads(),
+                buffers.sets[1].params.buffer().reads(),
+                buffers.sets[1].received.buffer().writes(),
+                buffers.fault.buffer().writes(),
+            ],
+        ];
         let trail_bindings: [Binding; 7] = [
             buffers.field.buffer().writes(),
             trail_buf.offsets.buffer().reads(),
-            trail_buf.packets.buffer.buffer().reads(),
-            trail_buf.directions.buffer.buffer().reads(),
+            trail_buf.packets.buffer()?.reads(),
+            trail_buf.directions.buffer()?.reads(),
             trail_buf.params.buffer().reads(),
             trail_buf.received.buffer().writes(),
             buffers.fault.buffer().writes(),
@@ -487,9 +512,7 @@ impl Reduce {
                 .write(buffers.field.buffer())?
                 .write(0, field.as_slice())?;
             if debits > 0 {
-                owner
-                    .write(buffers.debits.buffer.buffer())?
-                    .write(0, &host.debits)?;
+                owner.write(debits_buf)?.write(0, &host.debits)?;
                 owner
                     .write(buffers.debit_params.buffer())?
                     .write(0, &[word(debits)?, word(cells)?, carrier0.moment_count])?;
@@ -611,10 +634,10 @@ fn upload_set(
         .write(set.offsets.buffer())?
         .write(0, reduction.offsets())?;
     owner
-        .write(set.packets.buffer.buffer())?
+        .write(set.packets.buffer()?)?
         .write(0, &words.packets)?;
     owner
-        .write(set.directions.buffer.buffer())?
+        .write(set.directions.buffer()?)?
         .write(0, &words.directions)?;
     owner.write(set.params.buffer())?.write(
         0,

@@ -838,7 +838,64 @@ impl DeviceOwner {
             grid,
         }])
     }
+}
 
+/// How a command ended when releasing its bound buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseOutcome {
+    /// Completed normally on the device: written buffers become defined at the next epoch.
+    Completed,
+    /// Failed or unwound after submission may have started: written buffers become undefined.
+    FailedCommandBuffer,
+    /// Refused before submission: written buffers keep their prior contents and epoch.
+    Unchanged,
+}
+
+impl ReleaseOutcome {
+    const fn from_result(outcome: Result<(), &MetalError>) -> Self {
+        match outcome {
+            Ok(()) => Self::Completed,
+            Err(MetalError::CommandBuffer(_)) => Self::FailedCommandBuffer,
+            Err(_) => Self::Unchanged,
+        }
+    }
+}
+
+/// RAII guard ensuring a command's bound buffers and `table.running` counter
+/// are always released even if encoding, submission, or allocation unwinds.
+struct CommandGuard<'a> {
+    owner: &'a DeviceOwner,
+    bound: Vec<Bound>,
+    released: bool,
+}
+
+impl<'a> CommandGuard<'a> {
+    const fn new(owner: &'a DeviceOwner, bound: Vec<Bound>) -> Self {
+        Self {
+            owner,
+            bound,
+            released: false,
+        }
+    }
+
+    fn finish(mut self, outcome: Result<(), &MetalError>) -> Vec<ResourceEpoch> {
+        self.released = true;
+        self.owner
+            .release(&self.bound, ReleaseOutcome::from_result(outcome))
+    }
+}
+
+impl Drop for CommandGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self
+                .owner
+                .release(&self.bound, ReleaseOutcome::FailedCommandBuffer);
+        }
+    }
+}
+
+impl DeviceOwner {
     /// Run `kernels` in order as one command: one command buffer, committed
     /// once, its completion verified once. Each kernel reads what earlier
     /// ones wrote. The command keeps every buffer it binds from the first
@@ -862,12 +919,19 @@ impl DeviceOwner {
     /// before anything was encoded.
     pub fn submit_batch(&self, kernels: &[Kernel<'_>]) -> Result<Receipt, CoreError> {
         let lists: Vec<&[Binding]> = kernels.iter().map(|kernel| kernel.bindings).collect();
-        let bound = self.bind(&lists)?;
+        let guard = CommandGuard::new(self, self.bind(&lists)?);
         let outcome = {
-            let mut held: Vec<Held<'_>> = bound
-                .iter()
-                .map(|buffer| {
-                    if buffer.written {
+            // Lock-ordering invariant: `self.shared.table()` (Level 1) is never
+            // held while acquiring any buffer `memory` RwLock (Level 2), and
+            // multiple `memory` locks are always acquired in strictly ascending
+            // `handle.index` order to eliminate any multi-buffer cycle.
+            let mut order: Vec<usize> = (0..guard.bound.len()).collect();
+            order.sort_unstable_by_key(|&at| guard.bound[at].handle.index);
+            let mut held: Vec<(usize, Held<'_>)> = order
+                .into_iter()
+                .map(|at| {
+                    let buffer = &guard.bound[at];
+                    let lock = if buffer.written {
                         Held::Write(
                             buffer
                                 .memory
@@ -876,27 +940,29 @@ impl DeviceOwner {
                         )
                     } else {
                         Held::Read(buffer.memory.read().unwrap_or_else(PoisonError::into_inner))
-                    }
+                    };
+                    (at, lock)
                 })
                 .collect();
             let mut batch = self.shared.gateway.batch();
-            let slots: Vec<Slot> = held
-                .iter_mut()
-                .map(|guard| match guard {
+            let mut slots: Vec<Option<Slot>> = vec![None; guard.bound.len()];
+            for (at, lock) in &mut held {
+                slots[*at] = Some(match lock {
                     Held::Read(memory) => Slot::Input(batch.input(memory)),
                     Held::Write(memory) => Slot::Output(batch.output(memory)),
-                })
-                .collect();
+                });
+            }
             let mut encoded = Ok(());
             for kernel in kernels {
                 let arguments: Option<Vec<Argument>> = kernel
                     .bindings
                     .iter()
                     .map(|binding| {
-                        let at = bound
+                        let at = guard
+                            .bound
                             .iter()
                             .position(|buffer| buffer.handle == binding.handle)?;
-                        match (slots.get(at)?, binding.access) {
+                        match (slots.get(at)?.as_ref()?, binding.access) {
                             (Slot::Output(output), Access::Write) => Some(output.write()),
                             (Slot::Output(output), Access::Read) => Some(output.read()),
                             (Slot::Input(input), Access::Read) => Some(input.read()),
@@ -917,7 +983,7 @@ impl DeviceOwner {
             }
             encoded.and_then(|()| batch.submit())
         };
-        let written = self.release(&bound, outcome.as_ref().map(|_| ()));
+        let written = guard.finish(outcome.as_ref().map(|_| ()));
         outcome.map_err(metal).map(|completed| {
             self.shared.commands.fetch_add(1, Ordering::Relaxed);
             self.shared
@@ -978,6 +1044,12 @@ impl DeviceOwner {
             if !written && resident.writer.is_some() {
                 return Err(conflict(format!("{} is being written", name())));
             }
+            if !written && resident.computing == u32::MAX {
+                return Err(conflict(format!(
+                    "{} reached maximum concurrent readers",
+                    name()
+                )));
+            }
             if first.access == Access::Read && resident.contents == Contents::Undefined {
                 return Err(conflict(format!(
                     "{} is undefined: a command failed while writing it",
@@ -1005,7 +1077,7 @@ impl DeviceOwner {
 
     /// Release a command's buffers once its outcome is known, returning the
     /// epochs of the buffers it wrote.
-    fn release(&self, bound: &[Bound], outcome: Result<(), &MetalError>) -> Vec<ResourceEpoch> {
+    fn release(&self, bound: &[Bound], outcome: ReleaseOutcome) -> Vec<ResourceEpoch> {
         let mut table = self.shared.table();
         let mut written = Vec::new();
         for buffer in bound {
@@ -1013,15 +1085,15 @@ impl DeviceOwner {
                 if buffer.written {
                     resident.writer = None;
                     match outcome {
-                        Ok(()) => {
+                        ReleaseOutcome::Completed => {
                             resident.contents = Contents::Defined;
                             resident.epoch = resident.epoch.saturating_add(1);
                         }
-                        Err(MetalError::CommandBuffer(_)) => {
+                        ReleaseOutcome::FailedCommandBuffer => {
                             resident.contents = Contents::Undefined;
                             resident.epoch = resident.epoch.saturating_add(1);
                         }
-                        Err(_) => {}
+                        ReleaseOutcome::Unchanged => {}
                     }
                     written.push(ResourceEpoch::new(resident.epoch));
                 } else {
@@ -1088,7 +1160,10 @@ impl DeviceOwner {
         outcome: &Result<(), MetalError>,
     ) -> Result<(), CoreError> {
         let bound = self.bind(&[bindings])?;
-        self.release(&bound, outcome.as_ref().copied());
+        self.release(
+            &bound,
+            ReleaseOutcome::from_result(outcome.as_ref().copied()),
+        );
         Ok(())
     }
 }

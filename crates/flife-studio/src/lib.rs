@@ -80,9 +80,9 @@ pub use controls::{
     scroll_zoom,
 };
 pub use export::{
-    CINEMA_4K, CINEMA_1080P, CinemaOptions, ENCODED_FILE, EXPORT_SCHEMA, ExportManifest,
-    ExportMode, ExportOptions, ExportedEncoding, ExportedFrame, ExportedVideo, MANIFEST_FILE,
-    SimulationSample, VIDEO_FILE, export, export_cinema, parse_cinema_resolution,
+    CINEMA_4K, CINEMA_4K_SQUARE, CINEMA_1080P, CinemaOptions, ENCODED_FILE, EXPORT_SCHEMA,
+    ExportManifest, ExportMode, ExportOptions, ExportedEncoding, ExportedFrame, ExportedVideo,
+    MANIFEST_FILE, SimulationSample, VIDEO_FILE, export, export_cinema, parse_cinema_resolution,
     plan_simulation_samples, slot_counts,
 };
 pub use flife_backend_metal::ControllerChoice;

@@ -97,6 +97,24 @@ pub struct WasteRules {
     pub byproduct_recycle_fraction: f64,
 }
 
+/// Resolved persistent apical-basal PCP polarity parameters (`V2-08`,
+/// `pcp-polarity`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolarityRules {
+    /// Angular torque mobility `μ_θ >= 0` (`0.0` freezes polarity vectors).
+    pub torque_mobility: f64,
+    /// Basal-apical energy-gradient cue strength `k_cue >= 0`.
+    pub gradient_cue_strength: f64,
+    /// Founder polarity strength ceiling `∈ [0.0, 1.0]`.
+    pub initial_polarity_strength_max: f64,
+    /// Maximum heritable wedge curvature `β_max ∈ [0.0, 0.4]`.
+    pub maximum_wedge_curvature: f64,
+    /// Heritable polarity trait mutation std `>= 0.0`.
+    pub polarity_mutation_std: f64,
+    /// Whether epithelial division aligns daughters laterally along `±p_i^⊥`.
+    pub oriented_lateral_mitosis: bool,
+}
+
 /// Run-constant `field-ecology-v2` rules resolved from a [`ValidatedConfig`].
 ///
 /// For `field-ecology-v1*` worlds, `config` is `None`, `feature_bitmask` is
@@ -123,6 +141,8 @@ pub struct V2Rules {
     crowding: Option<CrowdingRules>,
     lysis: Option<LysisRules>,
     waste: Option<WasteRules>,
+    polarity: Option<PolarityRules>,
+    emt_gate: bool,
     config: Option<V2Config>,
 }
 
@@ -247,11 +267,12 @@ impl V2Rules {
             .as_ref()
             .filter(|v2| v2.is_enabled(V2Feature::LysisRecycling))
         {
-            let limit = config
-                .config()
-                .reproduction
-                .minimum_child_energy
-                .min(config.config().reproduction.minimum_parent_energy_after_split);
+            let limit = config.config().reproduction.minimum_child_energy.min(
+                config
+                    .config()
+                    .reproduction
+                    .minimum_parent_energy_after_split,
+            );
             let floor = v2
                 .metabolism
                 .lysis
@@ -298,6 +319,62 @@ impl V2Rules {
         } else {
             None
         };
+        let polarity = if let Some(v2) = v2_config
+            .as_ref()
+            .filter(|v2| v2.is_enabled(V2Feature::PcpPolarity))
+        {
+            let pol = &v2.polarity;
+            if !pol.torque_mobility.is_finite() || pol.torque_mobility < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.polarity.torque_mobility",
+                    detail: format!("{} must be finite and >= 0", pol.torque_mobility),
+                });
+            }
+            if !pol.gradient_cue_strength.is_finite() || pol.gradient_cue_strength < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.polarity.gradient_cue_strength",
+                    detail: format!("{} must be finite and >= 0", pol.gradient_cue_strength),
+                });
+            }
+            if !pol.initial_polarity_strength_max.is_finite()
+                || !(0.0..=1.0).contains(&pol.initial_polarity_strength_max)
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.polarity.initial_polarity_strength_max",
+                    detail: format!(
+                        "{} must lie in [0.0, 1.0]",
+                        pol.initial_polarity_strength_max
+                    ),
+                });
+            }
+            if !pol.maximum_wedge_curvature.is_finite()
+                || !(0.0..=0.4).contains(&pol.maximum_wedge_curvature)
+            {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.polarity.maximum_wedge_curvature",
+                    detail: format!("{} must lie in [0.0, 0.4]", pol.maximum_wedge_curvature),
+                });
+            }
+            if !pol.polarity_mutation_std.is_finite() || pol.polarity_mutation_std < 0.0 {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "v2.polarity.polarity_mutation_std",
+                    detail: format!("{} must be finite and >= 0", pol.polarity_mutation_std),
+                });
+            }
+            Some(PolarityRules {
+                torque_mobility: pol.torque_mobility + 0.0,
+                gradient_cue_strength: pol.gradient_cue_strength + 0.0,
+                initial_polarity_strength_max: pol.initial_polarity_strength_max + 0.0,
+                maximum_wedge_curvature: pol.maximum_wedge_curvature + 0.0,
+                polarity_mutation_std: pol.polarity_mutation_std + 0.0,
+                oriented_lateral_mitosis: pol.oriented_lateral_mitosis,
+            })
+        } else {
+            None
+        };
+        let emt_gate = v2_config
+            .as_ref()
+            .is_some_and(|v2| v2.is_enabled(V2Feature::EmtGate));
         Ok(Self {
             abi,
             sensors,
@@ -318,6 +395,8 @@ impl V2Rules {
             crowding,
             lysis,
             waste,
+            polarity,
+            emt_gate,
             config: v2_config,
         })
     }
@@ -476,6 +555,18 @@ impl V2Rules {
     #[must_use]
     pub const fn waste(&self) -> Option<WasteRules> {
         self.waste
+    }
+
+    /// Resolved persistent apical-basal PCP polarity rules (`V2-08`), if enabled.
+    #[must_use]
+    pub const fn polarity(&self) -> Option<PolarityRules> {
+        self.polarity
+    }
+
+    /// Whether the neural EMT adhesion gate (`V2-08`, `emt-gate`) is enabled.
+    #[must_use]
+    pub const fn emt_gate(&self) -> bool {
+        self.emt_gate
     }
 
     /// Number of active Carrier-0 chemical channels (`24` under `V2-15`

@@ -21,10 +21,11 @@ use flife_genome::{
     AFFINITY_TERMS, BASELINE_GENOME_HEADER_BYTES, BirthAttempt, CADHERIN_CHECKPOINT_BYTES,
     CADHERIN_COHESIVENESS_LANE, CADHERIN_TAG_LANE_BASE, CADHERIN_TERMS, CadherinTraits,
     DetachedProposal, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MOTION_RESPONSE_TERMS,
-    MutationParameters, Mutator, Proposal, RejectionReason, TopologyCatalog, TraitLimits, Traits,
-    WeightDtype, WeightsMut, cadherin_checkpoint_bytes, founder, founder_cadherin_traits,
-    founder_traits, founder_traits_v2, founder_v2, genome_header_bytes, initial_scale,
-    mutate_cadherin_traits, reflect_unit_interval,
+    MutationParameters, Mutator, POLARITY_CHECKPOINT_BYTES, Proposal, RejectionReason,
+    TopologyCatalog, TraitLimits, Traits, WeightDtype, WeightsMut, cadherin_checkpoint_bytes,
+    founder, founder_cadherin_traits, founder_traits, founder_traits_v2, founder_v2,
+    genome_header_bytes, genome_header_bytes_v2, initial_scale, mutate_cadherin_traits,
+    reflect_unit_interval,
 };
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -93,13 +94,25 @@ fn cadherin_disabled_matches_v1_bit_exact_with_zero_extra_checkpoint_bytes() {
     let v2_disabled = v2_contact_config(
         "field-ecology-v2",
         "",
+        &[
+            FeatureOverride::Disable("cadherin-4d".into()),
+            FeatureOverride::Disable("pcp-polarity".into()),
+        ],
+    );
+    let v2_cad_only_disabled = v2_contact_config(
+        "field-ecology-v2",
+        "",
         &[FeatureOverride::Disable("cadherin-4d".into())],
     );
 
     let limits_v1 = TraitLimits::from_config(&v1).expect("v1 limits");
     let limits_v2_off = TraitLimits::from_config(&v2_disabled).expect("v2 disabled limits");
+    let limits_cad_off =
+        TraitLimits::from_config(&v2_cad_only_disabled).expect("v2 cad-only off limits");
     assert!(!limits_v1.cadherin_enabled());
     assert!(!limits_v2_off.cadherin_enabled());
+    assert!(!limits_cad_off.cadherin_enabled());
+    assert!(limits_cad_off.polarity_enabled());
     assert_eq!(limits_v1.cadherin_mutation_std(), 0.0);
     assert_eq!(limits_v2_off.cadherin_mutation_std(), 0.0);
     assert_eq!(genome_header_bytes(false), BASELINE_GENOME_HEADER_BYTES);
@@ -107,6 +120,10 @@ fn cadherin_disabled_matches_v1_bit_exact_with_zero_extra_checkpoint_bytes() {
     assert_eq!(cadherin_checkpoint_bytes(false), 0);
     assert_eq!(limits_v1.genome_header_bytes(), 553);
     assert_eq!(limits_v2_off.genome_header_bytes(), 553);
+    assert_eq!(
+        limits_cad_off.genome_header_bytes(),
+        BASELINE_GENOME_HEADER_BYTES + POLARITY_CHECKPOINT_BYTES
+    );
 
     let rng = SemanticRng::new(77);
     let scale = initial_scale(&v1);
@@ -379,12 +396,15 @@ fn founder_cadherin_philox_determinism_order_invariance_and_isotropy() {
     let v2 = v2_contact_config("field-ecology-v2", "", &[]);
     let limits = TraitLimits::from_config(&v2).expect("v2 limits");
     assert!(limits.cadherin_enabled());
+    assert!(limits.polarity_enabled());
     assert!((limits.cadherin_mutation_std() - 0.05).abs() <= 1e-15);
     assert_eq!(
         limits.genome_header_bytes(),
-        BASELINE_GENOME_HEADER_BYTES + CADHERIN_CHECKPOINT_BYTES
+        BASELINE_GENOME_HEADER_BYTES + POLARITY_CHECKPOINT_BYTES + CADHERIN_CHECKPOINT_BYTES
     );
-    assert_eq!(limits.genome_header_bytes(), 593);
+    assert_eq!(limits.genome_header_bytes(), 609);
+    assert_eq!(genome_header_bytes_v2(false, true), 593);
+    assert_eq!(genome_header_bytes(true), 593);
 
     let rng = SemanticRng::new(12345);
     let scale = initial_scale(&v2);
@@ -513,7 +533,7 @@ fn cadherin_mutation_philox_determinism_zero_rate_and_noop_rules() {
     // `field-ecology-v2-fixed-controller` with chemistry=0, sensing=0,
     // reject_effective_noop=true, and cadherin.mutation_std=0.05 validates and
     // mutates ONLY cadherin while keeping weights/affinity/motion/scale exact!
-    let tail = "\n[v2.contact.cadherin]\nenabled = true\nmutation_std = 0.05\n";
+    let tail = "\n[v2.polarity]\nenabled = false\n\n[v2.contact.cadherin]\nenabled = true\nmutation_std = 0.05\n";
     let mut raw_toml = appendix_a_toml()
         .replace(
             "model = \"field-ecology-v1\"",
@@ -708,7 +728,11 @@ fn cadherin_mutation_philox_determinism_zero_rate_and_noop_rules() {
 /// corrupted cadherin bytes.
 #[test]
 fn traits_reseal_preserves_cadherin_and_checkpoint_v3_round_trip() {
-    let v2 = v2_contact_config("field-ecology-v2", "", &[]);
+    let v2 = v2_contact_config(
+        "field-ecology-v2",
+        "",
+        &[FeatureOverride::Disable("pcp-polarity".into())],
+    );
     let limits = TraitLimits::from_config(&v2).expect("v2 limits");
     let rng = SemanticRng::new(555);
     let original = founder_traits_v2(&rng, OrganismId::new(42), &limits, initial_scale(&v2))

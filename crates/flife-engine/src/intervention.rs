@@ -71,13 +71,13 @@ use flife_core::{CoreError, Tick};
 use flife_field::sources::squared_norm;
 use flife_field::state::CHANNELS;
 use flife_field::{Deposits, ExchangeKernel, FieldGrid, FieldState};
-use flife_genome::{GenomeQuota, TopologyCatalog, TraitLimits, founder};
+use flife_genome::{GenomeQuota, TopologyCatalog, TraitLimits, founder_v2};
 
 use crate::emission::INITIAL_SECRETORY_READINESS;
 use crate::lifecycle::{Death, Disposition, Recycling};
-use crate::population::{Entrant, HeldOutput, Organism, Population};
+use crate::population::{DEFAULT_POLARITY, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
-use crate::world::founder_draws;
+use crate::world::{founder_draws, founder_polarity};
 
 /// The components of a material brush's direction: one per moment channel
 /// of the field.
@@ -431,6 +431,9 @@ pub(crate) struct Founding<'a> {
     pub cooldown: TickSpan,
     /// `population.maximum_count`.
     pub maximum_population: u64,
+    /// Whether `V2-08` (`pcp-polarity`) is active (initializes unit polarity
+    /// vectors from semantic Philox; `false` uses [`DEFAULT_POLARITY`] with 0 draws).
+    pub pcp_polarity: bool,
 }
 
 /// Phase 8, after the births: each of `interventions`' introductions in
@@ -541,7 +544,7 @@ fn stage_introduction(
     for _ in 0..count {
         let id = trial_identities.organisms.issue()?;
         let genome_id = trial_identities.genomes.issue()?;
-        let genome = match founder(
+        let genome = match founder_v2(
             founding.rng,
             id,
             genome_id,
@@ -561,6 +564,11 @@ fn stage_introduction(
             (f64::from(cell[0]) + u) * grid.cell_width(),
             (f64::from(cell[1]) + v) * grid.cell_height(),
         ])?;
+        let polarity = if founding.pcp_polarity {
+            founder_polarity(founding.rng, id)?
+        } else {
+            DEFAULT_POLARITY
+        };
         staged.push(Entrant {
             organism: Organism {
                 id,
@@ -578,6 +586,7 @@ fn stage_introduction(
                 cooldown_deadline,
                 secretory_readiness: INITIAL_SECRETORY_READINESS,
                 emission_cooldown_deadline: Tick::new(0),
+                polarity,
             },
             genome,
         });

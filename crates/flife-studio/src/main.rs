@@ -204,10 +204,11 @@ struct Cli {
     /// before anything is written.
     #[arg(long, requires = "export")]
     export_mp4: bool,
-    /// Override the exported Cinema frame resolution (`1080p`, `4k`, or
-    /// `WIDTHxHEIGHT`, FL-050). Admitted up front against
-    /// `[execution] maximum_total_bytes` (FL-043, INV-15).
-    #[arg(long, value_name = "1080p|4k|WxH", requires = "export", value_parser = parse_cinema_resolution)]
+    /// Override the exported Cinema frame resolution (`1080p`, `4k`
+    /// (`3840x2160`), `4k-square` (`2160x2160`), or `WIDTHxHEIGHT`, FL-050).
+    /// Admitted up front against `[execution] maximum_total_bytes` (FL-043,
+    /// INV-15).
+    #[arg(long, value_name = "1080p|4k|4k-square|WxH", requires = "export", value_parser = parse_cinema_resolution)]
     export_size: Option<[u32; 2]>,
     /// Export in exact simulation-time mode (FL-050, plan §13.8): sample one
     /// frame every N committed ticks (0 dropped, 0 repeated video slots).
@@ -3110,9 +3111,37 @@ mod tests {
             "out-dir",
             "--export-size",
             "4K",
+            "--export-fps",
+            "60",
         ])
-        .expect("cinema 4K CLI parses");
+        .expect("cinema 4K 60fps CLI parses");
         assert_eq!(cinema_4k.0.export_size, Some([3840, 2160]));
+        assert_eq!(
+            cinema_4k.0.export_fps.map(std::num::NonZeroU32::get),
+            Some(60)
+        );
+        for (flag, expected) in [
+            ("2160x2160", [2160, 2160]),
+            ("4k-square", [2160, 2160]),
+            ("3840x2160", [3840, 2160]),
+        ] {
+            let parsed = parse_raw(&[
+                "v2.toml",
+                "--export",
+                "t.ndjson",
+                "--out",
+                "out-dir",
+                "--export-size",
+                flag,
+                "--export-fps",
+                "60",
+                "--export-every-ticks",
+                "2",
+            ])
+            .expect("cinema 60fps resolution CLI parses");
+            assert_eq!(parsed.0.export_size, Some(expected), "{flag}");
+            assert_eq!(parsed.0.export_fps.map(std::num::NonZeroU32::get), Some(60));
+        }
         for bad_cinema in [
             &[
                 "v2.toml",

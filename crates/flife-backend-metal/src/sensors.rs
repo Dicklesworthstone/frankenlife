@@ -208,7 +208,10 @@ impl MetalSensors {
             return Ok(());
         }
         self.buffers = None;
-        let capacity = count.max(1).next_power_of_two();
+        let capacity = count
+            .max(1)
+            .checked_next_power_of_two()
+            .ok_or_else(overflow)?;
         let cells = usize::try_from(grid.cell_count()).map_err(|_| overflow())?;
         let values = cells.checked_mul(planes).ok_or_else(overflow)?;
         let sample_words = 3 * planes * 2;
@@ -473,6 +476,7 @@ impl SensorBackend for MetalSensors {
                 .chain(&raw.dy)
                 .all(|value| value.is_finite());
             if !finite {
+                samples.clear();
                 return Err(CoreError::NumericalInvalid {
                     quantity: "sensor sample",
                     detail: "interpolation produced a nonfinite value".into(),
@@ -519,6 +523,7 @@ impl SensorBackend for MetalSensors {
                 .chain(&raw.dy)
                 .all(|value| value.is_finite());
             if !finite {
+                samples.clear();
                 return Err(CoreError::NumericalInvalid {
                     quantity: "sensor sample",
                     detail: "interpolation produced a nonfinite value".into(),

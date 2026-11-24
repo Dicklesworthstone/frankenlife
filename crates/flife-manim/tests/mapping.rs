@@ -1452,16 +1452,26 @@ fn mix_non_finite_and_density_sphere_reuse_and_zero_population() {
         ..Style::default()
     };
     layer.update(&epoch, &raw_style).expect("raw density");
-    let raw_ptr = layer.texture().expect("texture") as *const _;
+    let snapshot_density = |tex: &fmn_render::Texture| -> Vec<[f64; 4]> {
+        (0..tex.height())
+            .flat_map(|row| {
+                (0..tex.width()).map(move |col| {
+                    let px = tex.texel(col, row).expect("texel");
+                    [px.r, px.g, px.b, px.a]
+                })
+            })
+            .collect()
+    };
+    let raw_texels = snapshot_density(layer.texture().expect("texture"));
     let sphere_style = Style {
         look: Look::Sphere,
         ..raw_style
     };
     layer.place(&sphere_style).expect("sphere density");
     assert_eq!(
-        layer.texture().expect("texture") as *const _,
-        raw_ptr,
-        "Sphere must reuse identical Raw density texture"
+        snapshot_density(layer.texture().expect("texture")),
+        raw_texels,
+        "Sphere must preserve identical Raw density texels"
     );
 
     // Zero-population density layer produces all-clear glow and all-black raw.

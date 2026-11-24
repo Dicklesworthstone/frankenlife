@@ -22,11 +22,19 @@ use flife_core::{CoreError, ValidatedConfig};
 use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
 use crate::genome::{
-    AFFINITY_TERMS, CADHERIN_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, TraitLimits,
-    Traits, Unsealed, rescale,
+    AFFINITY_TERMS, CADHERIN_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, PolarityTraits,
+    TraitLimits, Traits, Unsealed, rescale,
 };
 use crate::init::{WeightAddress, initialize};
 use crate::quota::{GenomeQuota, ParameterBuffer, WeightsMut};
+
+/// Index on [`LaneKind::Direction`] (`0x0800`) for initializing and mutating
+/// a `V2-08` `pcp-polarity` strength `α_pol ∈ [0, 1]`.
+pub const POLARITY_STRENGTH_LANE: u64 = 0x0800;
+
+/// Index on [`LaneKind::Direction`] (`0x0801`) for initializing and mutating
+/// a `V2-08` `pcp-polarity` spontaneous apical wedge curvature `β ∈ [-β_max, β_max]`.
+pub const POLARITY_WEDGE_LANE: u64 = 0x0801;
 
 /// Base index on [`LaneKind::Direction`] for the two Box–Muller pairs
 /// (`0x1300`, `0x1301`) that initialize and mutate a `V2-13` 4-D cadherin tag.
@@ -154,9 +162,10 @@ pub fn founder_traits(
     Traits::new(affinity, motion_response, initial_scale, limits)
 }
 
-/// A founder's genome with `V2-13` trait initialization governed by `limits`
-/// ([`founder_traits_v2`]). Bit-identical to [`founder`] with zero extra
-/// Philox draws when `!limits.cadherin_enabled()`.
+/// A founder's genome with `V2-08` polarity and/or `V2-13` cadherin trait
+/// initialization governed by `limits` ([`founder_traits_v2`]). Bit-identical
+/// to [`founder`] with zero extra Philox draws when neither v2 trait feature
+/// is enabled.
 ///
 /// # Errors
 /// As [`founder`].
@@ -176,6 +185,41 @@ pub fn founder_v2(
         quota.abandon(unsealed.buffer)?;
         Err(unsealed.error)
     })
+}
+
+/// A founder's `V2-08` apical-basal polarity strength `α_pol ∈ [0, initial_strength_max]`
+/// and wedge curvature `β ∈ [-maximum_wedge_curvature, maximum_wedge_curvature]`
+/// from semantic Philox lanes `(Stream::Founders, organism, 0, Direction, 0x0800)`
+/// and `(Stream::Founders, organism, 0, Direction, 0x0801)`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] or [`CoreError::Overflow`] if a bound, draw,
+/// or lane is out of range.
+pub fn founder_polarity_traits(
+    rng: &SemanticRng,
+    organism: OrganismId,
+    initial_strength_max: f64,
+    maximum_wedge_curvature: f64,
+) -> Result<PolarityTraits, CoreError> {
+    if !initial_strength_max.is_finite() || !(0.0..=1.0).contains(&initial_strength_max) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.polarity.initial_polarity_strength_max",
+            detail: format!("{initial_strength_max} is outside [0, 1]"),
+        });
+    }
+    let strength_lane = Lane::new(0, LaneKind::Direction, POLARITY_STRENGTH_LANE)?;
+    let u_strength = half_open_unit(rng.block(address(organism, strength_lane))[0]);
+    let polarity_strength = (u_strength * initial_strength_max).clamp(0.0, initial_strength_max);
+
+    let wedge_lane = Lane::new(0, LaneKind::Direction, POLARITY_WEDGE_LANE)?;
+    let u_wedge = half_open_unit(rng.block(address(organism, wedge_lane))[0]);
+    let wedge_curvature = if maximum_wedge_curvature == 0.0 {
+        0.0
+    } else {
+        ((2.0 * u_wedge - 1.0) * maximum_wedge_curvature)
+            .clamp(-maximum_wedge_curvature, maximum_wedge_curvature)
+    };
+    PolarityTraits::new(polarity_strength, wedge_curvature, maximum_wedge_curvature)
 }
 
 /// A founder's `V2-13` 4-D cadherin unit tag and cohesiveness from semantic
@@ -205,24 +249,35 @@ pub fn founder_cadherin_traits(
     CadherinTraits::normalized(tag, cohesiveness)
 }
 
-/// A founder's traits including `V2-13` cadherin when `limits.cadherin_enabled()`.
-/// Bit-identical to [`founder_traits`] with zero extra Philox draws when
-/// `!limits.cadherin_enabled()`.
+/// A founder's traits including `V2-08` polarity when
+/// `limits.polarity_enabled()` and/or `V2-13` cadherin when
+/// `limits.cadherin_enabled()`. Bit-identical to [`founder_traits`] with zero
+/// extra Philox draws for any disabled feature.
 ///
 /// # Errors
-/// As [`founder_traits`] and [`founder_cadherin_traits`].
+/// As [`founder_traits`], [`founder_polarity_traits`], and
+/// [`founder_cadherin_traits`].
 pub fn founder_traits_v2(
     rng: &SemanticRng,
     organism: OrganismId,
     limits: &TraitLimits,
     initial_scale: f64,
 ) -> Result<Traits, CoreError> {
-    let base = founder_traits(rng, organism, limits, initial_scale)?;
-    if !limits.cadherin_enabled() {
-        return Ok(base);
+    let mut traits = founder_traits(rng, organism, limits, initial_scale)?;
+    if limits.polarity_enabled() {
+        let polarity = founder_polarity_traits(
+            rng,
+            organism,
+            limits.initial_polarity_strength_max(),
+            limits.maximum_wedge_curvature(),
+        )?;
+        traits = traits.with_polarity_traits(Some(polarity), limits)?;
     }
-    let cadherin = founder_cadherin_traits(rng, organism)?;
-    base.with_cadherin_traits(Some(cadherin))
+    if limits.cadherin_enabled() {
+        let cadherin = founder_cadherin_traits(rng, organism)?;
+        traits = traits.with_cadherin_traits(Some(cadherin))?;
+    }
+    Ok(traits)
 }
 
 /// The configured initial sensing scale (`sensors.initial_scale_world_units`).

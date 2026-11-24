@@ -444,4 +444,84 @@ ablation = "fixed-controller"
         oases_only_field.get("vascular_conductance").is_none(),
         "vascular_conductance must be omitted when vascular-field is disabled"
     );
+
+    // 9. `flife inspect` exposes `polarity`, `polarity_strength`, and
+    //    `wedge_curvature` when `V2-08` `pcp-polarity` is enabled, and omits
+    //    all three when disabled (plus exercises `V2-11` lysis + waste CLI run).
+    let pcp_path = dir.join("v2_pcp.toml");
+    fs::write(
+        &pcp_path,
+        ecology_toml(
+            "field-ecology-v2",
+            r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.35
+adhesion_range = 2.0
+sweeps = 2
+
+[v2]
+profile = "minimal"
+
+[v2.polarity]
+enabled = true
+maximum_wedge_curvature = 0.25
+
+[v2.metabolism.lysis]
+enabled = true
+
+[v2.metabolism.waste]
+enabled = true
+"#,
+        ),
+    )
+    .expect("pcp toml");
+    let pcp_dir = dir.join("pcp_run");
+    let (status, _, err) = flife(&[
+        "run",
+        text(&pcp_path),
+        "--ticks",
+        "8",
+        "--every",
+        "0",
+        "--controllers",
+        "cpu",
+        "--run-dir",
+        text(&pcp_dir),
+        "--checkpoint-every",
+        "8",
+        "--checkpoint-durability",
+        "process-crash",
+    ]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let (status, inspected_pcp, err) = flife(&["inspect", text(&pcp_dir)]);
+    assert_eq!(status, Some(0), "{err:?}");
+    let org_pcp = inspected_pcp
+        .iter()
+        .find(|record| record["record"] == "organism")
+        .expect("organism record");
+    let pol = org_pcp["polarity"]
+        .as_array()
+        .expect("polarity exposed when pcp-polarity enabled");
+    assert_eq!(pol.len(), 2);
+    let px = pol[0].as_f64().expect("px");
+    let py = pol[1].as_f64().expect("py");
+    assert!((px.hypot(py) - 1.0).abs() <= 1e-12);
+    let alpha = org_pcp["polarity_strength"]
+        .as_f64()
+        .expect("polarity_strength exposed");
+    assert!((0.0..=1.0).contains(&alpha));
+    let beta = org_pcp["wedge_curvature"]
+        .as_f64()
+        .expect("wedge_curvature exposed");
+    assert!((-0.25..=0.25).contains(&beta));
+
+    let org_no_pcp = inspected_v1_field
+        .iter()
+        .find(|record| record["record"] == "organism")
+        .expect("non-pcp organism");
+    assert!(org_no_pcp.get("polarity").is_none());
+    assert!(org_no_pcp.get("polarity_strength").is_none());
+    assert!(org_no_pcp.get("wedge_curvature").is_none());
 }

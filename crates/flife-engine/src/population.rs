@@ -267,6 +267,10 @@ impl HeldOutput {
     }
 }
 
+/// Default unit apical-basal polarity vector when `V2-08` `pcp-polarity` is
+/// disabled (`[1.0, 0.0]`).
+pub const DEFAULT_POLARITY: [f64; 2] = [1.0, 0.0];
+
 /// One live organism's state, as a row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Organism {
@@ -302,6 +306,10 @@ pub struct Organism {
     /// The first tick at which it may fire a burst under `V2-04`
     /// `excitable-relay` (`tick-cooldown-v1`).
     pub emission_cooldown_deadline: Tick,
+    /// Persistent unit apical-basal polarity axis `p_i ∈ S^1` for `V2-08`
+    /// (`pcp-polarity`). Holds [`DEFAULT_POLARITY`] (`0 B` storage in
+    /// [`Population`]) when `pcp-polarity` is disabled.
+    pub polarity: [f64; 2],
 }
 
 impl Organism {
@@ -325,6 +333,7 @@ impl Organism {
             cooldown_deadline: newborn.cooldown_deadline,
             secretory_readiness: INITIAL_SECRETORY_READINESS,
             emission_cooldown_deadline: Tick::new(0),
+            polarity: newborn.polarity,
         }
     }
 
@@ -334,14 +343,25 @@ impl Organism {
             .position
             .iter()
             .chain(&self.velocity)
+            .chain(&self.polarity)
             .chain([&self.energy_change_rate])
             .all(|value| value.is_finite());
         if !finite {
             return Err(CoreError::NumericalInvalid {
                 quantity: "organism state",
                 detail: format!(
-                    "{}: position {:?}, velocity {:?}, energy change rate {}",
-                    self.id, self.position, self.velocity, self.energy_change_rate
+                    "{}: position {:?}, velocity {:?}, polarity {:?}, energy change rate {}",
+                    self.id, self.position, self.velocity, self.polarity, self.energy_change_rate
+                ),
+            });
+        }
+        let pol_sq = self.polarity[0] * self.polarity[0] + self.polarity[1] * self.polarity[1];
+        if !(pol_sq.is_finite() && (pol_sq - 1.0).abs() <= 1.0e-6) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "organism polarity",
+                detail: format!(
+                    "{}: polarity {:?} is not a unit vector",
+                    self.id, self.polarity
                 ),
             });
         }
@@ -519,6 +539,11 @@ pub struct Population {
     tracks_excitable: bool,
     secretory_readiness: Vec<f32>,
     emission_cooldown_deadlines: Vec<Tick>,
+    /// Whether `V2-08` PCP polarity column is active and allocated.
+    /// When `false` (`field-ecology-v1*` or `pcp-polarity` disabled),
+    /// `polarities` stays empty (0 bytes) and reads return [`DEFAULT_POLARITY`].
+    tracks_polarity: bool,
+    polarities: Vec<[f64; 2]>,
     genomes: Vec<Option<Genome>>,
     /// Each slot's genome's arena slot, beside `genomes`.
     arena_slots: Vec<Option<ArenaSlot>>,
@@ -631,10 +656,30 @@ impl Population {
         capacity: usize,
         tracks_excitable: bool,
     ) -> Result<Self, CoreError> {
+        Self::new_with_v2(arrangement, capacity, tracks_excitable, false)
+    }
+
+    /// An empty population of at most `capacity` organisms, conditionally
+    /// allocating `V2-04` excitable-relay and/or `V2-08` polarity SoA columns
+    /// up front (`INV-15`; `0 B` for any disabled column).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when the host refuses a column.
+    pub fn new_with_v2(
+        arrangement: Arrangement,
+        capacity: usize,
+        tracks_excitable: bool,
+        tracks_polarity: bool,
+    ) -> Result<Self, CoreError> {
         let (secretory_readiness, emission_cooldown_deadlines) = if tracks_excitable {
             (reserve(capacity)?, reserve(capacity)?)
         } else {
             (Vec::new(), Vec::new())
+        };
+        let polarities = if tracks_polarity {
+            reserve(capacity)?
+        } else {
+            Vec::new()
         };
         Ok(Self {
             arrangement,
@@ -655,6 +700,8 @@ impl Population {
             tracks_excitable,
             secretory_readiness,
             emission_cooldown_deadlines,
+            tracks_polarity,
+            polarities,
             genomes: reserve(capacity)?,
             arena_slots: reserve(capacity)?,
             arena: GenomeArena::new(),
@@ -681,7 +728,18 @@ impl Population {
             .v2
             .as_ref()
             .is_some_and(|v2| v2.is_enabled(V2Feature::ExcitableRelay));
-        Self::new_with_excitable(arrangement, capacity, tracks_excitable)
+        let tracks_polarity = config
+            .config()
+            .v2
+            .as_ref()
+            .is_some_and(|v2| v2.is_enabled(V2Feature::PcpPolarity));
+        Self::new_with_v2(arrangement, capacity, tracks_excitable, tracks_polarity)
+    }
+
+    /// Whether this population stores live `V2-08` PCP polarity vectors.
+    #[must_use]
+    pub const fn tracks_polarity(&self) -> bool {
+        self.tracks_polarity
     }
 
     /// The arrangement.
@@ -714,6 +772,7 @@ impl Population {
             capacity_bytes(&self.cooldown_deadlines),
             capacity_bytes(&self.secretory_readiness),
             capacity_bytes(&self.emission_cooldown_deadlines),
+            capacity_bytes(&self.polarities),
             capacity_bytes(&self.genomes),
             capacity_bytes(&self.arena_slots),
         ])
@@ -1127,7 +1186,7 @@ impl Population {
         bytes.extend_from_slice(POPULATION_DIGEST_SCHEMA.as_bytes());
         bytes.push(b'\n');
         bytes.extend_from_slice(&(self.len() as u64).to_le_bytes());
-        for organism in self.iter() {
+        for (organism, genome) in self.iter_with_genomes() {
             bytes.extend_from_slice(&organism.id.get().to_le_bytes());
             bytes.extend_from_slice(&organism.genome.get().to_le_bytes());
             match organism.parent {
@@ -1185,6 +1244,18 @@ impl Population {
                 bytes.push(4);
                 bytes.extend_from_slice(&organism.secretory_readiness.to_bits().to_le_bytes());
                 bytes.extend_from_slice(&organism.emission_cooldown_deadline.get().to_le_bytes());
+            }
+            if self.tracks_polarity {
+                bytes.push(5);
+                bytes.extend_from_slice(&organism.polarity[0].to_bits().to_le_bytes());
+                bytes.extend_from_slice(&organism.polarity[1].to_bits().to_le_bytes());
+                if let Some(pol) = genome.and_then(|g| g.traits().polarity_traits()) {
+                    bytes.push(1);
+                    bytes.extend_from_slice(&pol.polarity_strength().to_bits().to_le_bytes());
+                    bytes.extend_from_slice(&pol.wedge_curvature().to_bits().to_le_bytes());
+                } else {
+                    bytes.push(0);
+                }
             }
         }
         Sha256Digest::of(&bytes)
@@ -1332,6 +1403,11 @@ impl Population {
         } else {
             (INITIAL_SECRETORY_READINESS, Tick::new(0))
         };
+        let polarity = if self.tracks_polarity {
+            self.polarities[slot]
+        } else {
+            DEFAULT_POLARITY
+        };
         Organism {
             id: self.occupants[slot].unwrap_or(OrganismId::new(u64::MAX)),
             genome: self.genome_ids[slot],
@@ -1348,6 +1424,7 @@ impl Population {
             cooldown_deadline: self.cooldown_deadlines[slot],
             secretory_readiness,
             emission_cooldown_deadline,
+            polarity,
         }
     }
 
@@ -1370,6 +1447,9 @@ impl Population {
             self.secretory_readiness[slot] = organism.secretory_readiness;
             self.emission_cooldown_deadlines[slot] = organism.emission_cooldown_deadline;
         }
+        if self.tracks_polarity {
+            self.polarities[slot] = organism.polarity;
+        }
     }
 
     /// Append a slot, within the reserved capacity.
@@ -1391,6 +1471,9 @@ impl Population {
             self.secretory_readiness.push(organism.secretory_readiness);
             self.emission_cooldown_deadlines
                 .push(organism.emission_cooldown_deadline);
+        }
+        if self.tracks_polarity {
+            self.polarities.push(organism.polarity);
         }
     }
 
@@ -1438,6 +1521,9 @@ impl Population {
         if self.tracks_excitable {
             self.secretory_readiness.truncate(length);
             self.emission_cooldown_deadlines.truncate(length);
+        }
+        if self.tracks_polarity {
+            self.polarities.truncate(length);
         }
         self.genomes.truncate(length);
         self.arena_slots.truncate(length);

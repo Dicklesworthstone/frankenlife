@@ -94,17 +94,19 @@ use std::sync::{Barrier, mpsc};
 use flife_core::clock::{Tick, TickSpan, stable_phase};
 use flife_core::ids::{Generation, GenomeId, IdSequence, LineageId, OrganismId};
 use flife_core::ledger::{EnergyBudget, TickLedger, Transfer, sub_down};
-use flife_core::numerics::sin_cos_turns;
+use flife_core::numerics::{normalize_turns, sin_cos_turns};
 use flife_core::rng::{
-    Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, half_open_unit,
+    Address, Block, Lane, LaneKind, SemanticRng, Stream, bernoulli, box_muller, half_open_unit,
 };
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::{FieldGrid, ProposalConstants};
 use flife_genome::{
     BirthAttempt, CandidateRejection, DetachedProposal, Genome, GenomeQuota, LOGICAL_GENOME_BYTES,
-    MutationRecord, Mutator, Prepared, Proposal, TopologyCatalog, TraitLimits, founder,
+    MutationRecord, Mutator, Prepared, Proposal, TopologyCatalog, TraitLimits, founder_v2,
 };
 use flife_neural::DecodedActions;
+
+use crate::population::DEFAULT_POLARITY;
 
 /// Fewest admitted inherited births before spawning parallel proposal workers
 /// (`flife-s0t`). Below this, proposing on the main thread avoids sync cost.
@@ -402,6 +404,98 @@ impl Reproduction {
         Ok([base[0] + reach * u_world[0], base[1] + reach * u_world[1]])
     }
 
+    /// `V2-08` (`pcp-polarity`) lateral mitotic offset: places the daughter at
+    /// `1.05 * diameter` along `s * p_i^⊥` (`s ∈ {-1, +1}` from `SemanticRng`)
+    /// perturbed by Gaussian angular jitter `σ_θ = π (1 - 0.9 α_pol)` through
+    /// host-independent [`sin_cos_turns`] + [`normalize_turns`].
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for invalid inputs or nonfinite RNG
+    /// draws; [`CoreError::Overflow`] for lane construction.
+    pub fn lateral_mitosis_offset(
+        rng: &SemanticRng,
+        parent: OrganismId,
+        tick: Tick,
+        parent_polarity: [f64; 2],
+        diameter: f64,
+        polarity_strength: f64,
+    ) -> Result<[f64; 2], CoreError> {
+        if !(diameter.is_finite() && diameter > 0.0) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "contact.diameter",
+                detail: format!("{diameter} must be finite and positive"),
+            });
+        }
+        if !(polarity_strength.is_finite() && (0.0..=1.0).contains(&polarity_strength)) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "polarity_strength",
+                detail: format!("{polarity_strength} is outside [0, 1]"),
+            });
+        }
+        let norm = parent_polarity[0].hypot(parent_polarity[1]);
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "parent polarity",
+                detail: format!("{parent_polarity:?} has zero norm"),
+            });
+        }
+        let px = parent_polarity[0] / norm;
+        let py = parent_polarity[1] / norm;
+        let [w_side, w_u1, w_u2, _] = rng.block(Address {
+            stream: Stream::Birth,
+            entity: parent.get(),
+            ordinal: tick.get(),
+            lane: Lane::new(0, LaneKind::Position, 2)?,
+            draw: 0,
+        });
+        let side = if w_side & 1 == 0 { 1.0 } else { -1.0 };
+        let base_x = -py * side;
+        let base_y = px * side;
+        let [z0, _] = box_muller(w_u1, w_u2)?;
+        let sigma_theta = core::f64::consts::PI * (1.0 - 0.9 * polarity_strength);
+        let dtheta = (sigma_theta * z0).clamp(-core::f64::consts::PI, core::f64::consts::PI);
+        let turns = normalize_turns(dtheta / core::f64::consts::TAU).ok_or_else(|| {
+            CoreError::NumericalInvalid {
+                quantity: "lateral mitosis jitter",
+                detail: format!("dtheta {dtheta:?} failed turn normalization"),
+            }
+        })?;
+        let (sin_d, cos_d) = sin_cos_turns(turns).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "lateral mitosis jitter",
+            detail: format!("turns {turns:?} left [0, 1)"),
+        })?;
+        let rx = cos_d * base_x - sin_d * base_y;
+        let ry = sin_d * base_x + cos_d * base_y;
+        let dist = 1.05 * diameter;
+        Ok([dist * rx, dist * ry])
+    }
+
+    /// `V2-08` (`pcp-polarity`) newborn polarity inheritance: starts from
+    /// `parent_polarity` rotated by small semantic-Philox angular jitter
+    /// (`σ = 0.05 rad`, clamped to `±0.25 rad`) and renormalized to unit
+    /// length (`INV-06`, `INV-11`).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for an invalid parent polarity or draw;
+    /// [`CoreError::Overflow`] for lane construction.
+    pub fn inherit_polarity(
+        rng: &SemanticRng,
+        parent: OrganismId,
+        tick: Tick,
+        parent_polarity: [f64; 2],
+    ) -> Result<[f64; 2], CoreError> {
+        let [w1, w2, ..] = rng.block(Address {
+            stream: Stream::Birth,
+            entity: parent.get(),
+            ordinal: tick.get(),
+            lane: Lane::new(0, LaneKind::Direction, 0x0802)?,
+            draw: 0,
+        });
+        let [z0, _] = box_muller(w1, w2)?;
+        let jitter = (0.05 * z0).clamp(-0.25, 0.25);
+        crate::contact::rotate_unit_polarity(parent_polarity, jitter)
+    }
+
     /// The split of `available`, the post-emission budget, at child share
     /// `β`, or why no viable birth fits it.
     ///
@@ -538,6 +632,7 @@ impl Reproduction {
                 position: parent.position,
                 split,
                 budding_offset: None,
+                newborn_polarity: None,
             })),
         }
     }
@@ -753,6 +848,10 @@ pub struct BirthIntent {
     /// (`pcp-polarity` lateral mitosis). `None` uses baseline uniform disk
     /// placement [`Reproduction::child_offset`] bit-identically.
     pub budding_offset: Option<[f64; 2]>,
+    /// Optional inherited newborn apical-basal polarity `p_child ∈ S^1` for
+    /// `V2-08` (`pcp-polarity`). `None` uses [`DEFAULT_POLARITY`] when
+    /// `pcp-polarity` is disabled.
+    pub newborn_polarity: Option<[f64; 2]>,
 }
 
 /// One birth for phase 8: an intent and its parent's genome.
@@ -973,6 +1072,9 @@ pub struct Newborn {
     pub phase: u32,
     /// `n + 1 + ⌈cooldown/Δt⌉`.
     pub cooldown_deadline: Tick,
+    /// Its initial unit apical-basal polarity (`V2-08`, [`DEFAULT_POLARITY`]
+    /// when disabled).
+    pub polarity: [f64; 2],
 }
 
 /// One staged birth: identity, genome, slot and energy together (INV-06).
@@ -1780,6 +1882,7 @@ fn stage_detached(
                     held_output_valid: false,
                     phase,
                     cooldown_deadline: deadline,
+                    polarity: intent.newborn_polarity.unwrap_or(DEFAULT_POLARITY),
                 },
                 genome,
                 record,
@@ -1917,7 +2020,7 @@ fn stage(
             catalog,
             limits,
             initial_scale,
-        } => founder(
+        } => founder_v2(
             context.rng,
             child,
             genome_id,
@@ -1978,6 +2081,7 @@ fn stage(
                     held_output_valid: false,
                     phase,
                     cooldown_deadline: deadline,
+                    polarity: intent.newborn_polarity.unwrap_or(DEFAULT_POLARITY),
                 },
                 genome,
                 record,
@@ -2058,6 +2162,7 @@ mod tests {
                 position: [1.0 + *i as f64, 2.0],
                 split,
                 budding_offset: None,
+                newborn_polarity: None,
             })
             .collect();
         let requests: Vec<BirthRequest<'_>> = intents

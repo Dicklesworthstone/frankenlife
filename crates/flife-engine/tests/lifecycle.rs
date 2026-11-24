@@ -186,6 +186,7 @@ fn founder_row(organism: u64, energy: f64) -> Organism {
         cooldown_deadline: Tick::new(COOLDOWN),
         secretory_readiness: flife_engine::INITIAL_SECRETORY_READINESS,
         emission_cooldown_deadline: Tick::new(0),
+        polarity: flife_engine::DEFAULT_POLARITY,
     }
 }
 
@@ -210,6 +211,7 @@ fn child_row(organism: u64, parent: &Organism, tick: u64, energy: f64) -> Organi
         cooldown_deadline: Tick::new(tick + COOLDOWN),
         secretory_readiness: flife_engine::INITIAL_SECRETORY_READINESS,
         emission_cooldown_deadline: Tick::new(0),
+        polarity: flife_engine::DEFAULT_POLARITY,
     }
 }
 

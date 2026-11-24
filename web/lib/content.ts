@@ -496,7 +496,7 @@ export const v2Features: V2FeatureEntry[] = [
   {
     slug: "symplectic-waste",
     bundleA: true,
-    bundleB: false,
+    bundleB: true,
     boundary: "pure-field",
     abi: "none",
     summary: "Obligate symplectic metabolic byproduct deposited to the field under the ledger.",
@@ -611,21 +611,21 @@ export const v2BuildStatus: {
     claim: "Rules & Implementation",
     tone: "built",
     detail:
-      "V2-01 21-slug config/registry and founding CLI toggles (--list-features, --disable, --enable, --v1-compat, INV-14 resume refusal); V2-02 (oases), V2-06 (so2-budding) and V2-09 (tight-junctions) verified and closed alongside flife-field (86/86 tests) and flife-neural (35/35 tests) at commit d6352a0; V2-16 pure INV-09 visual mappings and Studio keys 8/9/C; V2-10 preregistered quickie harness and V2-17 Bundle A/B presets authored; FL-050 1080p/4K Cinema export options wired in flife-studio.",
+      "10 of 18 V2 beads verified and closed: V2-01 (21-slug config/registry, --list-features, --disable/--enable/--v1-compat, INV-14 resume refusal), V2-02 (oases), V2-03 (senescence), V2-04 (surplus-emission, excitable-relay, wake-offset), V2-05 (so2-motor), V2-06 (so2-budding), V2-07 (hippo-crowding), V2-09 (tight-junctions), V2-14 (vascular-field), and V2-15 (dual-carrier-trails), alongside FL-043 peak-memory admission closed; V2-10 quickies, V2-17 Stage-2 harness and presets, and FL-050 1080p/4K Cinema export authored.",
   },
   {
     stage: "In flight",
     claim: "Implementation",
     tone: "partial",
     detail:
-      "Remaining Wave-1b and Wave-2 engine modules in flife-engine: V2-08 (pcp-polarity, emt-gate), V2-11 (lysis-recycling, symplectic-waste) and V2-12..15 (epigenetic recurrence, Notch-Delta, trophallaxis, cadherin-4d, velocity alignment, vascular field, dual-carrier trails).",
+      "Remaining Wave-1b/Wave-2 modules: V2-08 (pcp-polarity, emt-gate), V2-11 (lysis-recycling, symplectic-waste), V2-12 (epigenetic-recurrence, notch-delta), V2-13 (trophallaxis, cadherin-4d, velocity-alignment), and V2-16 (v2-visual-mappings live V2-08 polarity gate).",
   },
   {
     stage: "Not yet established",
     claim: "Visual & Ecological",
     tone: "open",
     detail:
-      "Stage-2 V2-10 multi-seed ablation quickies and V2-17 preset verification/calibration have not yet run. No visual (G5) or ecological (G9) claims are made for field-ecology-v2 presets.",
+      "V2-10 multi-seed ablation quickies and V2-17 Stage-2 preset verification/calibration have not yet run. No visual (G5) or ecological (G9) claims are made for field-ecology-v2 presets.",
   },
 ];
 

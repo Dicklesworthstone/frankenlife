@@ -1359,19 +1359,29 @@ pub(crate) fn replay_with<S>(
         // Live-capture replay (FL-023, plus optional target Cinema resolution
         // or CameraPath override).
         let mut last_use: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut pending_display: (Option<u64>, u64) = (None, opened);
         for (index, record) in records.iter().enumerate() {
-            if let TimelineRecord::Show { prior, current, .. }
-            | TimelineRecord::Place { prior, current, .. }
-            | TimelineRecord::Advance { prior, current, .. } = record
-            {
-                for tick in prior.iter().chain([current]) {
-                    last_use.insert(*tick, index);
+            match record {
+                TimelineRecord::Show { prior, current, .. }
+                | TimelineRecord::Place { prior, current, .. }
+                | TimelineRecord::Advance { prior, current, .. } => {
+                    pending_display = (*prior, *current);
+                    for tick in prior.iter().chain([current]) {
+                        last_use.insert(*tick, index);
+                    }
                 }
+                TimelineRecord::Draw { .. } if options.camera.is_some() => {
+                    for tick in pending_display.0.iter().chain([&pending_display.1]) {
+                        last_use.insert(*tick, index);
+                    }
+                }
+                _ => {}
             }
         }
         let mut epochs: BTreeMap<u64, Lease> = BTreeMap::new();
         epochs.insert(opened, opening);
         let mut showing = opened;
+        let mut last_display: (Option<u64>, u64, f64) = (None, opened, 1.0);
         let mut pending_drawable = validated.size;
         let mut pending_scale = 1.0_f64;
         let mut geometry_dirty = false;
@@ -1460,6 +1470,7 @@ pub(crate) fn replay_with<S>(
                         }
                     }
                     showing = *current;
+                    last_display = (*prior, *current, fraction.0);
                     epochs.retain(|tick, _| last_use.get(tick).is_some_and(|&last| last > index));
                 }
                 TimelineRecord::Draw {
@@ -1475,7 +1486,28 @@ pub(crate) fn replay_with<S>(
                     }
                     if let Some(camera) = options.camera {
                         let (viewport, _) = camera.viewport(view.viewport(), *tick)?;
-                        view.set_view(viewport)?;
+                        if view.set_view(viewport)? {
+                            let (prior_tick, current_tick, fraction) = last_display;
+                            let shown = epochs.get(&current_tick).ok_or_else(|| {
+                                conflict(format!(
+                                    "missing epoch for tick {current_tick} during camera export"
+                                ))
+                            })?;
+                            let from = prior_tick
+                                .map(|prior| {
+                                    epochs.get(&prior).map(std::ops::Deref::deref).ok_or_else(
+                                        || {
+                                            conflict(format!(
+                                                "missing prior epoch for tick {prior} during \
+                                                 camera export"
+                                            ))
+                                        },
+                                    )
+                                })
+                                .transpose()?;
+                            view.place_between(from, shown, fraction)?;
+                        }
+                        epochs.retain(|t, _| last_use.get(t).is_some_and(|&last| last > index));
                     }
                     let job = view.job()?;
                     let (pixels, _) = renderer

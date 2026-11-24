@@ -24,10 +24,11 @@ use flife_manim::{MAXIMUM_ZOOM, Viewport, WorldView};
 use flife_render::Epoch;
 use flife_studio::memory::{admit_export, export_scratch_bytes, video_scratch_bytes};
 use flife_studio::{
-    CINEMA_4K, CINEMA_1080P, CameraKey, CameraPath, CinemaOptions, ColorMapping, ControllerChoice,
-    EXPORT_SCHEMA, Exact, ExportManifest, ExportMode, FieldMapping, KEY_8, KEY_9, KEY_C, KEY_E,
-    KEY_PERIOD, Look, MANIFEST_FILE, REPLAY_SLOTS, Status, Studio, StudioOptions, Style, Surface,
-    TimelineCheckpoint, TimelineRecord, TimelineStart, TimelineStyle, VIDEO_FILE, export_cinema,
+    CINEMA_4K, CINEMA_4K_SQUARE, CINEMA_1080P, CameraKey, CameraPath, CinemaOptions, ColorMapping,
+    ControllerChoice, EXPORT_SCHEMA, Exact, ExportManifest, ExportMode, FieldMapping, KEY_8, KEY_9,
+    KEY_C, KEY_E, KEY_PERIOD, Look, MANIFEST_FILE, OverlayState, REPLAY_SLOTS, Status, Studio,
+    StudioOptions, Style, Surface, TimelineCheckpoint, TimelineRecord, TimelineStart,
+    TimelineStyle, VIDEO_FILE, export_cinema, field_key, legends, overlay_text,
     parse_cinema_resolution, peak_observer_bytes_for, plan_simulation_samples, read_timeline,
     validate_timeline, validate_v2_style, write_timeline_record,
 };
@@ -115,8 +116,13 @@ fn fl043_cinema_1080p_and_4k_export_admission_accounts_buffers_and_refuses_tight
         },
     ];
 
-    // Check exact byte accounting at 1080p (1x) and 4K (2x), with and without y4m video.
-    for (size, scale) in [(CINEMA_1080P, 1.0), (CINEMA_4K, 2.0)] {
+    // Check exact byte accounting at 1080p (1x), 4K square (2x), and 4K UHD (2x),
+    // with and without y4m video.
+    for (size, scale) in [
+        (CINEMA_1080P, 1.0),
+        (CINEMA_4K_SQUARE, 2.0),
+        (CINEMA_4K, 2.0),
+    ] {
         let peak_obs = peak_observer_bytes_for(
             &world,
             &founding,
@@ -334,6 +340,22 @@ fn fl050_simulation_time_sampling_and_camera_timeline_stability() {
     assert_eq!(parse_cinema_resolution("4K").expect("4K"), CINEMA_4K);
     assert_eq!(parse_cinema_resolution("2160p").expect("2160p"), CINEMA_4K);
     assert_eq!(
+        parse_cinema_resolution("3840x2160").expect("3840x2160"),
+        CINEMA_4K
+    );
+    assert_eq!(
+        parse_cinema_resolution("2160x2160").expect("2160x2160"),
+        CINEMA_4K_SQUARE
+    );
+    assert_eq!(
+        parse_cinema_resolution("4k-square").expect("4k-square"),
+        CINEMA_4K_SQUARE
+    );
+    assert_eq!(
+        parse_cinema_resolution("square-4k").expect("square-4k"),
+        CINEMA_4K_SQUARE
+    );
+    assert_eq!(
         parse_cinema_resolution("1280x720").expect("720p"),
         [1280, 720]
     );
@@ -357,6 +379,24 @@ fn fl050_simulation_time_sampling_and_camera_timeline_stability() {
     assert_eq!(
         opts_4k_preset.resolved_target().expect("4K target"),
         Some((CINEMA_4K, 2.0))
+    );
+    let opts_4k_square_preset = CinemaOptions::cinema_4k_square(fps, every);
+    assert_eq!(
+        opts_4k_square_preset.mode,
+        ExportMode::SimulationTime { every_ticks: every }
+    );
+    assert_eq!(
+        opts_4k_square_preset
+            .resolved_target()
+            .expect("4K square target"),
+        Some((CINEMA_4K_SQUARE, 2.0))
+    );
+    // Automatic density promotion for explicit 2160x2160 when pixels_per_point is None.
+    let mut auto_square = opts_4k_square_preset;
+    auto_square.pixels_per_point = None;
+    assert_eq!(
+        auto_square.resolved_target().expect("auto 2x square"),
+        Some((CINEMA_4K_SQUARE, 2.0))
     );
 
     // Camera timeline stability across a torus seam and across 1080p vs 4K viewports.
@@ -998,5 +1038,273 @@ fn g10_cinema_1080p_and_4k_simulation_time_export_with_v2_mappings_and_camera() 
     assert!(
         !tight_out.exists(),
         "refused 4K export must not create out/"
+    );
+}
+
+/// End-to-end Metal verification of:
+/// 1. Live `C`-key full 5-way overlay cycling (`Energy -> Composition ->
+///    Component -> TrailCarrier -> VascularConductance -> Energy`) + `8`/`9`
+///    (`CellState`/`Polarity`) + live HUD `set_overlay` on a 34-plane
+///    (`dual-carrier-trails`) + `vascular-field` world;
+/// 2. 60fps (`F60:1`) **4K Square (`2160×2160`)** `SimulationTime` Cinema export
+///    with a torus-spanning `CameraPath`;
+/// 3. 60fps `LiveCapture` Cinema export with `CameraPath` verifying live-capture
+///    camera override re-places the view on every `Draw` frame without exhausting
+///    replay leases.
+#[test]
+fn g10_cinema_60fps_square_4k_and_live_v2_overlay_cycling() {
+    if !MetalRenderer::is_available() {
+        println!("no Metal device: skipped");
+        return;
+    }
+    let v2_toml = preset_with(
+        &[
+            ("width", "32.0"),
+            ("height", "32.0"),
+            ("grid_width", "32"),
+            ("grid_height", "32"),
+            ("initial_count", "48"),
+            ("maximum_count", "256"),
+            ("maximum_total_bytes", "4294967296"),
+        ],
+        "field-ecology-v2",
+        true,
+    );
+    let config = ValidatedConfig::from_toml_with_overrides(
+        &v2_toml,
+        &[FeatureOverride::Enable("all-v2".to_owned())],
+    )
+    .expect("valid all-v2 config");
+    let keys = legends(&config).expect("legends");
+
+    let mut studio = Studio::open(
+        &config,
+        &StudioOptions {
+            size: Some([160, 160]),
+            cpu_workers: NonZeroUsize::new(2),
+            controllers: ControllerChoice::Cpu,
+            surface: Surface::Offscreen {
+                scale: NonZeroU32::MIN,
+            },
+            record: true,
+            ..StudioOptions::default()
+        },
+    )
+    .expect("opens all-v2 studio");
+
+    let mut records = Vec::new();
+    let mut statuses = Vec::new();
+    let tap = |studio: &mut Studio, code: u16| {
+        for pressed in [true, false] {
+            studio
+                .post_input(InputEvent::Key {
+                    code,
+                    text: String::new(),
+                    pressed,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                })
+                .expect("posts key");
+        }
+    };
+    let refresh_hud_and_frame =
+        |studio: &mut Studio, records: &mut Vec<TimelineRecord>, statuses: &mut Vec<Status>| {
+            let frame = studio.frame().expect("frame");
+            let style = studio.view().style();
+            let fk = field_key(style);
+            let (_, legend) = keys
+                .iter()
+                .find(|(m, _)| *m == style.mapping)
+                .expect("legend for active mapping");
+            let text = overlay_text(&OverlayState {
+                paused: Some(true),
+                shown: frame.shown.map(|s| s.tick),
+                clock: None,
+                legend,
+                field_key: fk.as_ref(),
+                brush: frame.brush,
+                preview: None,
+                measuring: None,
+                selected: frame.selected,
+                inspected: None,
+                telemetry: None,
+            });
+            let swatches: Vec<[u8; 3]> = legend
+                .swatches
+                .iter()
+                .chain(fk.iter().flat_map(|k| &k.swatches))
+                .copied()
+                .collect();
+            studio
+                .set_overlay(&text, &swatches)
+                .expect("live v2 HUD overlay fits within caps");
+            records.extend(studio.take_recorded());
+            for status in studio.take_statuses() {
+                records.extend(TimelineRecord::status(&status));
+                statuses.push(status);
+            }
+            frame
+        };
+
+    // Initial frame + step 2 ticks so 34-plane Carrier-1 trails and vascular edges are live.
+    refresh_hud_and_frame(&mut studio, &mut records, &mut statuses);
+    for target in 1..=2 {
+        tap(&mut studio, KEY_PERIOD);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while statuses
+            .iter()
+            .filter(|s| matches!(s, Status::Stepped { .. }))
+            .count()
+            < target
+        {
+            assert!(Instant::now() < deadline, "timed out waiting for step");
+            refresh_hud_and_frame(&mut studio, &mut records, &mut statuses);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // Live 5-way C-key cycle across all field mappings + keys 8 & 9 on a 34-plane + vascular world.
+    assert!(studio.display_pair().1.field().trail_energy().is_some());
+    assert!(
+        studio
+            .display_pair()
+            .1
+            .field()
+            .vascular_conductance()
+            .is_some()
+    );
+    let expected_cycle = [
+        (Some(KEY_8), FieldMapping::Composition),
+        (None, FieldMapping::Component(Default::default())),
+        (Some(KEY_9), FieldMapping::TrailCarrier),
+        (None, FieldMapping::VascularConductance),
+        (None, FieldMapping::Energy),
+    ];
+    for (color_key, expected_field) in expected_cycle {
+        if let Some(k) = color_key {
+            tap(&mut studio, k);
+        }
+        tap(&mut studio, KEY_C);
+        let frame = refresh_hud_and_frame(&mut studio, &mut records, &mut statuses);
+        assert!(frame.drawn && frame.restyled);
+        assert_eq!(studio.view().style().field_mapping, expected_field);
+        // Render one more frame with the freshly set HUD overlay visible.
+        let hud_frame = refresh_hud_and_frame(&mut studio, &mut records, &mut statuses);
+        assert!(hud_frame.drawn);
+    }
+
+    let closed = studio.close().expect("closes studio");
+    records.push(TimelineRecord::end(&closed.session));
+    let text = timeline_text(&records);
+
+    let camera = CameraPath {
+        keys: vec![
+            CameraKey {
+                tick: 0,
+                center: [30.0, 16.0],
+                zoom: 1.0,
+            },
+            CameraKey {
+                tick: 2,
+                center: [2.0, 16.0],
+                zoom: 2.5,
+            },
+        ],
+    };
+
+    // 1. 60fps 4K Square (2160x2160) SimulationTime export every 1 tick -> ticks 0, 1, 2.
+    let out_sq60 = fresh("cinema-4k-square-60fps");
+    let mut opts_sq60 = CinemaOptions::cinema_4k_square(
+        NonZeroU32::new(60).expect("60fps"),
+        NonZeroU64::new(1).expect("every 1"),
+    );
+    opts_sq60.cpu_workers = NonZeroUsize::new(2);
+    opts_sq60.camera = Some(camera.clone());
+    let manifest_sq60 =
+        export_cinema(&config, &text, &opts_sq60, &out_sq60).expect("4K square 60fps export");
+    assert_eq!(manifest_sq60.mode, "simulation-time");
+    assert_eq!(manifest_sq60.frames.len(), 3);
+    assert_eq!(manifest_sq60.digest, closed.session.world.digest().to_hex());
+    let video_sq60 = manifest_sq60.video.as_ref().expect("4K square 60fps y4m");
+    assert_eq!(video_sq60.size, CINEMA_4K_SQUARE);
+    assert_eq!(video_sq60.frames_per_second, 60);
+    assert_eq!(
+        (video_sq60.slots, video_sq60.repeated, video_sq60.dropped),
+        (3, 0, 0)
+    );
+    let y4m_bytes = std::fs::read(out_sq60.join(VIDEO_FILE)).expect("y4m bytes");
+    let header_line = std::str::from_utf8(
+        y4m_bytes
+            .split(|&b| b == b'\n')
+            .next()
+            .expect("y4m header line"),
+    )
+    .expect("utf-8 y4m header");
+    assert!(
+        header_line.starts_with("YUV4MPEG2 W2160 H2160 F60:1 "),
+        "unexpected y4m header: {header_line}"
+    );
+    let decoded_y4m = decode_y4m(&y4m_bytes).expect("decodes 4K square 60fps y4m");
+    assert_eq!(
+        (
+            decoded_y4m.width,
+            decoded_y4m.height,
+            decoded_y4m.frames.len()
+        ),
+        (2160, 2160, 3)
+    );
+    for (idx, frame) in manifest_sq60.frames.iter().enumerate() {
+        assert_eq!(frame.tick, idx as u64);
+        assert!((frame.wall_seconds - idx as f64 / 60.0).abs() < 1e-12);
+        let png = std::fs::read(out_sq60.join(&frame.file)).expect("square 4K png");
+        assert_eq!(Sha256Digest::of(&png).to_hex(), frame.sha256);
+        let decoded = decode_png(&png, &PngLimits::default()).expect("decodes square 4K png");
+        assert_eq!([decoded.width, decoded.height], CINEMA_4K_SQUARE);
+    }
+
+    // 2. 60fps LiveCapture export with CameraPath override: exercises the
+    //    LiveCapture Draw re-placement path and verifies camera center/zoom
+    //    align on every exported frame without exhausting replay leases.
+    let out_live60 = fresh("cinema-live-60fps-cam");
+    let opts_live60 = CinemaOptions {
+        frames_per_second: NonZeroU32::new(60).expect("60fps"),
+        cpu_workers: NonZeroUsize::new(2),
+        mp4: false,
+        mode: ExportMode::LiveCapture,
+        resolution: Some([320, 320]),
+        pixels_per_point: Some(1.0),
+        camera: Some(camera.clone()),
+    };
+    let manifest_live60 =
+        export_cinema(&config, &text, &opts_live60, &out_live60).expect("live-capture 60fps cam");
+    assert_eq!(manifest_live60.mode, "live-capture");
+    assert!(!manifest_live60.frames.is_empty());
+    let live_video = manifest_live60.video.as_ref().expect("live 60fps y4m");
+    assert_eq!(live_video.frames_per_second, 60);
+    assert_eq!(live_video.size, [320, 320]);
+    for frame in &manifest_live60.frames {
+        let expected_cam = camera.at(frame.tick, [32.0, 32.0]);
+        assert_eq!(frame.camera_center, Some(expected_cam.center));
+        assert_eq!(frame.camera_zoom, Some(expected_cam.zoom));
+    }
+    // At tick 2 (zoom 2.5) the camera-moved live-capture frame must differ from
+    // an unmoved camera frame at the same tick.
+    let last_frame = manifest_live60.frames.last().expect("at least one frame");
+    assert_eq!(last_frame.tick, 2);
+    assert_eq!(last_frame.camera_zoom, Some(2.5));
+    let moved_png = std::fs::read(out_live60.join(&last_frame.file)).expect("moved png");
+    let out_live60_nocam = fresh("cinema-live-60fps-nocam");
+    let opts_live60_nocam = CinemaOptions {
+        camera: None,
+        ..opts_live60
+    };
+    let manifest_nocam =
+        export_cinema(&config, &text, &opts_live60_nocam, &out_live60_nocam).expect("nocam export");
+    let nocam_png =
+        std::fs::read(out_live60_nocam.join(&manifest_nocam.frames.last().expect("last").file))
+            .expect("nocam png");
+    assert_ne!(
+        moved_png, nocam_png,
+        "LiveCapture --export-camera must actually re-place the rendered view"
     );
 }

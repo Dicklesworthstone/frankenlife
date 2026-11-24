@@ -148,6 +148,18 @@ pub struct InspectedOrganism {
     /// is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secretory_readiness: Option<f64>,
+    /// Apical-basal unit polarity vector `p_i ∈ S^1` when `V2-08`
+    /// `pcp-polarity` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polarity: Option<[f64; 2]>,
+    /// Heritable lateral-belt polarity strength `α_pol ∈ [0, 1]` when `V2-08`
+    /// `pcp-polarity` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polarity_strength: Option<f64>,
+    /// Heritable spontaneous apical wedge curvature `β ∈ [-β_max, β_max]`
+    /// when `V2-08` `pcp-polarity` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wedge_curvature: Option<f64>,
 }
 
 /// An organism's held controller outputs.
@@ -355,6 +367,12 @@ fn of(
         .v2
         .as_ref()
         .is_some_and(|v2| v2.is_enabled(V2Feature::ExcitableRelay));
+    let polarity_active = world
+        .config()
+        .config()
+        .v2
+        .as_ref()
+        .is_some_and(|v2| v2.is_enabled(V2Feature::PcpPolarity));
     let population = world.population();
     let mut organisms = Vec::new();
     let mut organism_energy = 0.0;
@@ -393,6 +411,13 @@ fn of(
                     }
                 }),
             secretory_readiness: excitable_active.then(|| f64::from(organism.secretory_readiness)),
+            polarity: polarity_active.then_some(organism.polarity),
+            polarity_strength: polarity_active
+                .then(|| genome.traits().polarity_strength())
+                .flatten(),
+            wedge_curvature: polarity_active
+                .then(|| genome.traits().wedge_curvature())
+                .flatten(),
         });
     }
     let state = world.field();

@@ -70,9 +70,137 @@ use flife_core::model::{
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION, FIELD_ECOLOGY_V1_CONTACT_INHIBITION_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V1_CONTACT_INHIBITION_FRESH_OFFSPRING, MAXIMUM_CONTACT_SWEEPS, is_v2_model,
 };
+use flife_core::numerics::{normalize_turns, sin_cos_turns};
 use flife_core::{CoreError, ValidatedConfig};
 use flife_field::FieldGrid;
 use flife_genome::AFFINITY_TERMS;
+
+/// Maximum per-tick angular polarity rotation in radians (`V2-08`, `C003`).
+pub const MAX_POLARITY_DTHETA_RAD: f64 = 0.25;
+
+/// `V2-08` (`pcp-polarity`) Sweep-1 physics parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PcpSweepParams {
+    /// Timestep `Δt` in simulation seconds.
+    pub dt: f64,
+    /// Angular torque mobility `μ_θ >= 0` (`0.0` freezes polarity vectors).
+    pub torque_mobility: f64,
+    /// Basal-apical energy-gradient cue strength `k_cue >= 0`.
+    pub gradient_cue_strength: f64,
+}
+
+/// Optional `field-ecology-v2` Sweep-1 context (`V2-08` PCP polarity + EMT
+/// adhesion gate, clean extension seam for `V2-12` and `V2-13`).
+///
+/// When both `pcp` and `emt_factors` are `None`, Sweep 1 dispatches directly
+/// to the baseline isotropic [`relax`] kernel bit-for-bit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sweep1Context<'a> {
+    /// Active `V2-08` PCP polarity parameters, if `pcp-polarity` is enabled.
+    pub pcp: Option<PcpSweepParams>,
+    /// Committed unit apical-basal polarity vectors `p_i ∈ S^1` (length `N`).
+    pub polarities: Option<&'a [[f64; 2]]>,
+    /// Heritable lateral-belt polarity strengths `α_pol,i ∈ [0, 1]` (length `N`).
+    pub polarity_strengths: Option<&'a [f64]>,
+    /// Heritable spontaneous apical wedge curvatures `β_i ∈ [-β_max, β_max]` (length `N`).
+    pub wedge_curvatures: Option<&'a [f64]>,
+    /// Observed energy gradients `∇q_i` (`gradients[0]`, length `N`).
+    pub energy_gradients: Option<&'a [[f64; 2]]>,
+    /// Neural EMT adhesion multipliers `emt_eff_i = 2 σ(o_adh)` (length `N`),
+    /// if `emt-gate` is enabled.
+    pub emt_factors: Option<&'a [f64]>,
+}
+
+/// Mutable Sweep-1 outputs written by [`relax_sweep1_with_context`].
+#[derive(Debug)]
+pub struct Sweep1Output<'a> {
+    /// Clamped per-body contact displacements (length `N`).
+    pub displacements: &'a mut Vec<[f64; 2]>,
+    /// Updated unit polarity vectors `p'_i ∈ S^1` when `pcp-polarity` is active
+    /// (length `N`); `None` when disabled.
+    pub next_polarities: Option<&'a mut Vec<[f64; 2]>>,
+}
+
+/// Pure `V2-08` PCP lateral + wedge adhesion modulation factor
+/// `(1 - α_ij) + α_ij * G_apical * S_raw` (`∈ [0, 1]`), strictly symmetric
+/// under `(i, j, r_hat) <-> (j, i, -r_hat)` with exact `0.0` apical-collapse
+/// guard `G_apical = clamp(2 * (p_i · p_j), 0, 1)` when `p_i · p_j <= 0`.
+#[must_use]
+pub fn pcp_lateral_wedge_weight(
+    p_i: [f64; 2],
+    p_j: [f64; 2],
+    r_hat: [f64; 2],
+    alpha_ij: f64,
+    beta_bar: f64,
+) -> f64 {
+    let pi_dot_pj = p_i[0] * p_j[0] + p_i[1] * p_j[1];
+    let g_apical = (2.0 * pi_dot_pj).clamp(0.0, 1.0);
+    let pi_dot_r = p_i[0] * r_hat[0] + p_i[1] * r_hat[1];
+    let pj_dot_r = p_j[0] * r_hat[0] + p_j[1] * r_hat[1];
+    let s_raw = ((pi_dot_pj - pi_dot_r * pj_dot_r + beta_bar * (pi_dot_r - pj_dot_r))
+        / (1.0 + beta_bar * beta_bar))
+        .clamp(0.0, 1.0);
+    (1.0 - alpha_ij) + alpha_ij * g_apical * s_raw
+}
+
+/// Pure `V2-08` pair polarity torque kernel for body `i` from neighbor `j`
+/// along unit vector `r_hat = (x_j - x_i) / d`:
+/// `(p_i^⊥ · p_j) - (p_i^⊥ · r_hat)(p_j · r_hat) + β_bar (p_i^⊥ · r_hat)`.
+#[must_use]
+pub fn pcp_pair_torque_term(p_i: [f64; 2], p_j: [f64; 2], r_hat: [f64; 2], beta_bar: f64) -> f64 {
+    let p_i_perp = [-p_i[1], p_i[0]];
+    let perp_dot_pj = p_i_perp[0] * p_j[0] + p_i_perp[1] * p_j[1];
+    let perp_dot_r = p_i_perp[0] * r_hat[0] + p_i_perp[1] * r_hat[1];
+    let pj_dot_r = p_j[0] * r_hat[0] + p_j[1] * r_hat[1];
+    perp_dot_pj - perp_dot_r * pj_dot_r + beta_bar * perp_dot_r
+}
+
+/// Rotate unit polarity vector `p` by `dtheta` radians (clamped to
+/// `[-MAX_POLARITY_DTHETA_RAD, MAX_POLARITY_DTHETA_RAD]`) via host-independent
+/// [`sin_cos_turns`] + [`normalize_turns`], then renormalize to unit length.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] if `p` or `dtheta` is nonfinite or `p` has
+/// zero norm.
+pub fn rotate_unit_polarity(p: [f64; 2], dtheta: f64) -> Result<[f64; 2], CoreError> {
+    if !(p[0].is_finite() && p[1].is_finite() && dtheta.is_finite()) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "polarity rotation",
+            detail: format!("nonfinite polarity {p:?} or angle {dtheta:?}"),
+        });
+    }
+    let clamped = dtheta.clamp(-MAX_POLARITY_DTHETA_RAD, MAX_POLARITY_DTHETA_RAD);
+    if clamped == 0.0 {
+        let norm = p[0].hypot(p[1]);
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "polarity vector",
+                detail: format!("{p:?} has zero norm"),
+            });
+        }
+        return Ok(p);
+    }
+    let turns = normalize_turns(clamped / core::f64::consts::TAU).ok_or_else(|| {
+        CoreError::NumericalInvalid {
+            quantity: "polarity rotation turns",
+            detail: format!("angle {clamped:?} cannot normalize to turns"),
+        }
+    })?;
+    let (sin_d, cos_d) = sin_cos_turns(turns).ok_or_else(|| CoreError::NumericalInvalid {
+        quantity: "polarity rotation",
+        detail: format!("turns {turns:?} left [0, 1)"),
+    })?;
+    let rx = cos_d * p[0] - sin_d * p[1];
+    let ry = sin_d * p[0] + cos_d * p[1];
+    let norm = rx.hypot(ry);
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "rotated polarity",
+            detail: format!("rotated polarity [{rx:?}, {ry:?}] has nonpositive norm"),
+        });
+    }
+    Ok([rx / norm, ry / norm])
+}
 
 /// The most bins a side may have; a smaller reach uses coarser bins, which
 /// find the same neighbours.
@@ -216,8 +344,21 @@ pub struct ContactWork {
     pub ids: Vec<u64>,
     /// Whether each survives the tick.
     pub alive: Vec<bool>,
-    /// Each one's unit affinity direction, when bodies adhere.
+    /// Each one's unit affinity direction, when bodies adhere (or `pcp-polarity`
+    /// torque is enabled).
     pub affinities: Vec<[f32; AFFINITY_TERMS]>,
+    /// Committed unit polarity vectors `p_i` (`V2-08`; empty / `0 B` when off).
+    pub polarities: Vec<[f64; 2]>,
+    /// Updated unit polarity vectors `p'_i` from Sweep 1 (`V2-08`; empty / `0 B` when off).
+    pub next_polarities: Vec<[f64; 2]>,
+    /// Heritable lateral-belt polarity strengths `α_pol,i` (`V2-08`; empty / `0 B` when off).
+    pub polarity_strengths: Vec<f64>,
+    /// Heritable spontaneous apical wedge curvatures `β_i` (`V2-08`; empty / `0 B` when off).
+    pub wedge_curvatures: Vec<f64>,
+    /// Observed energy gradients `∇q_i` (`V2-08`; empty / `0 B` when off).
+    pub energy_gradients: Vec<[f64; 2]>,
+    /// Neural EMT adhesion multipliers `2 σ(o_adh)` (`V2-08`; empty / `0 B` when off).
+    pub emt_factors: Vec<f64>,
     /// Each one's displacement, zero for those that die: the sum of its
     /// sweeps'.
     pub displacements: Vec<[f64; 2]>,
@@ -255,9 +396,27 @@ impl ContactWork {
         rules: &ContactRules,
         rows: usize,
     ) -> Result<Self, CoreError> {
+        Self::with_capacity_v2(grid, rules, rows, false, false)
+    }
+
+    /// Buffers for `rows` organisms on `grid` under `rules`, additionally
+    /// reserving `V2-08` PCP polarity and/or EMT adhesion gate scratch ONLY
+    /// when enabled (`0 B` when disabled, `INV-15`).
+    ///
+    /// # Errors
+    /// [`CoreError::AllocationFailed`] when a reservation fails.
+    pub fn with_capacity_v2(
+        grid: &FieldGrid,
+        rules: &ContactRules,
+        rows: usize,
+        pcp_polarity: bool,
+        emt_gate: bool,
+    ) -> Result<Self, CoreError> {
         // Later sweeps push only, binned at the diameter: never fewer bins.
         let reach = if rules.sweeps > 1 {
             rules.diameter
+        } else if pcp_polarity {
+            rules.diameter * rules.range
         } else {
             rules.reach()
         };
@@ -266,8 +425,22 @@ impl ContactWork {
         reserve(&mut work.positions, rows, "contact positions")?;
         reserve(&mut work.ids, rows, "contact identities")?;
         reserve(&mut work.alive, rows, "contact fates")?;
-        if rules.adheres() {
+        if rules.adheres() || pcp_polarity {
             reserve(&mut work.affinities, rows, "contact affinities")?;
+        }
+        if pcp_polarity {
+            reserve(&mut work.polarities, rows, "contact polarities")?;
+            reserve(&mut work.next_polarities, rows, "contact next polarities")?;
+            reserve(
+                &mut work.polarity_strengths,
+                rows,
+                "contact polarity strengths",
+            )?;
+            reserve(&mut work.wedge_curvatures, rows, "contact wedge curvatures")?;
+            reserve(&mut work.energy_gradients, rows, "contact energy gradients")?;
+        }
+        if emt_gate {
+            reserve(&mut work.emt_factors, rows, "contact emt factors")?;
         }
         reserve(&mut work.displacements, rows, "contact displacements")?;
         if rules.sweeps > 1 {
@@ -292,6 +465,12 @@ impl ContactWork {
             bytes(&self.ids),
             bytes(&self.alive),
             bytes(&self.affinities),
+            bytes(&self.polarities),
+            bytes(&self.next_polarities),
+            bytes(&self.polarity_strengths),
+            bytes(&self.wedge_curvatures),
+            bytes(&self.energy_gradients),
+            bytes(&self.emt_factors),
             bytes(&self.displacements),
             bytes(&self.pressed),
             bytes(&self.settled),
@@ -319,32 +498,85 @@ impl ContactWork {
         rules: &ContactRules,
         workers: usize,
     ) -> Result<(), CoreError> {
+        self.relax_v2(grid, rules, None, false, workers)
+    }
+
+    /// [`Self::relax`] extended with optional `V2-08` PCP polarity (`pcp`) and
+    /// `emt-gate` (`emt_gate`) on Sweep 1. When both `pcp.is_none()` and
+    /// `!emt_gate`, runs the exact baseline isotropic [`relax`] path
+    /// bit-for-bit. Sweeps `2..S` remain strictly push-only (`d < D`).
+    ///
+    /// # Errors
+    /// As [`relax_sweep1_with_context`] and [`FieldGrid::wrap_position`].
+    pub fn relax_v2(
+        &mut self,
+        grid: &FieldGrid,
+        rules: &ContactRules,
+        pcp: Option<PcpSweepParams>,
+        emt_gate: bool,
+        workers: usize,
+    ) -> Result<(), CoreError> {
         let Self {
             positions,
             ids,
             alive,
             affinities,
+            polarities,
+            next_polarities,
+            polarity_strengths,
+            wedge_curvatures,
+            energy_gradients,
+            emt_factors,
             displacements,
             pressed,
             settled,
             sweep,
             scratch,
         } = self;
-        let affinities = rules.adheres().then_some(affinities.as_slice());
+        let has_v2 = pcp.is_some() || emt_gate;
+        let sweep1_affinities = (rules.adheres() || pcp.is_some()).then_some(affinities.as_slice());
+        let ctx = Sweep1Context {
+            pcp,
+            polarities: pcp.map(|_| polarities.as_slice()),
+            polarity_strengths: pcp.map(|_| polarity_strengths.as_slice()),
+            wedge_curvatures: pcp.map(|_| wedge_curvatures.as_slice()),
+            energy_gradients: pcp.map(|_| energy_gradients.as_slice()),
+            emt_factors: emt_gate.then_some(emt_factors.as_slice()),
+        };
         if rules.sweeps <= 1 {
-            relax(
-                grid,
-                rules,
-                Bodies {
-                    positions,
-                    ids,
-                    alive,
-                    affinities,
-                },
-                displacements,
-                scratch,
-                workers,
-            )?;
+            if has_v2 {
+                relax_sweep1_with_context(
+                    grid,
+                    rules,
+                    Bodies {
+                        positions,
+                        ids,
+                        alive,
+                        affinities: sweep1_affinities,
+                    },
+                    &ctx,
+                    Sweep1Output {
+                        displacements,
+                        next_polarities: pcp.map(|_| next_polarities),
+                    },
+                    scratch,
+                    workers,
+                )?;
+            } else {
+                relax(
+                    grid,
+                    rules,
+                    Bodies {
+                        positions,
+                        ids,
+                        alive,
+                        affinities: sweep1_affinities,
+                    },
+                    displacements,
+                    scratch,
+                    workers,
+                )?;
+            }
             pressed.clear();
             pressed.extend_from_slice(&scratch.pressed);
             return Ok(());
@@ -365,24 +597,44 @@ impl ContactWork {
             ..*rules
         };
         for index in 0..rules.sweeps {
-            let (rules, affinities) = if index == 0 {
-                (rules, affinities)
+            if index == 0 && has_v2 {
+                relax_sweep1_with_context(
+                    grid,
+                    rules,
+                    Bodies {
+                        positions,
+                        ids,
+                        alive,
+                        affinities: sweep1_affinities,
+                    },
+                    &ctx,
+                    Sweep1Output {
+                        displacements: sweep,
+                        next_polarities: pcp.map(|_| &mut *next_polarities),
+                    },
+                    scratch,
+                    workers,
+                )?;
             } else {
-                (&pushing, None)
-            };
-            relax(
-                grid,
-                rules,
-                Bodies {
-                    positions,
-                    ids,
-                    alive,
-                    affinities,
-                },
-                sweep,
-                scratch,
-                workers,
-            )?;
+                let (sweep_rules, sweep_affinities) = if index == 0 {
+                    (rules, sweep1_affinities)
+                } else {
+                    (&pushing, None)
+                };
+                relax(
+                    grid,
+                    sweep_rules,
+                    Bodies {
+                        positions,
+                        ids,
+                        alive,
+                        affinities: sweep_affinities,
+                    },
+                    sweep,
+                    scratch,
+                    workers,
+                )?;
+            }
             for (index, &[dx, dy]) in sweep.iter().enumerate() {
                 if dx != 0.0 || dy != 0.0 {
                     let total = &mut displacements[index];
@@ -732,6 +984,415 @@ pub fn relax(
                     operation: "contact",
                     detail: "a contact worker panicked".to_owned(),
                 });
+            }
+        }
+        result
+    })
+}
+
+/// Sweep 1 with optional `V2-08` PCP lateral/wedge adhesion, non-vanishing
+/// equilibrium polarity torque, and/or neural EMT adhesion gate (`emt-gate`).
+///
+/// When both `context.pcp` and `context.emt_factors` are `None`, delegates
+/// directly to [`relax`] bit-for-bit.
+///
+/// # Errors
+/// [`CoreError::StateConflict`] for misaligned inputs or missing required
+/// buffers; [`CoreError::NumericalInvalid`] for unwrapped positions or
+/// nonfinite polarity / EMT values.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Sweep 1 spatial bin pass combining soft-core overlap, PCP/EMT adhesion, and equilibrium torque in one deterministic traversal"
+)]
+pub fn relax_sweep1_with_context(
+    grid: &FieldGrid,
+    rules: &ContactRules,
+    bodies: Bodies<'_>,
+    context: &Sweep1Context<'_>,
+    output: Sweep1Output<'_>,
+    scratch: &mut ContactScratch,
+    workers: usize,
+) -> Result<(), CoreError> {
+    if context.pcp.is_none() && context.emt_factors.is_none() {
+        return relax(grid, rules, bodies, output.displacements, scratch, workers);
+    }
+    rules.check()?;
+    let Bodies {
+        positions,
+        ids,
+        alive,
+        affinities,
+    } = bodies;
+    let count = positions.len();
+    if ids.len() != count || alive.len() != count {
+        return Err(CoreError::StateConflict {
+            operation: "contact",
+            detail: format!(
+                "{count} positions, {} identities and {} fates",
+                ids.len(),
+                alive.len()
+            ),
+        });
+    }
+    let needs_affinities = rules.adheres() || context.pcp.is_some();
+    let affinities = match (needs_affinities, affinities) {
+        (true, Some(affinities)) if affinities.len() == count => Some(affinities),
+        (true, _) => {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!("adhesion/pcp needs one affinity per body, of {count}"),
+            });
+        }
+        (false, _) => None,
+    };
+    let pcp_inputs = if let Some(pcp) = context.pcp {
+        if !(pcp.dt.is_finite()
+            && pcp.dt >= 0.0
+            && pcp.torque_mobility.is_finite()
+            && pcp.torque_mobility >= 0.0
+            && pcp.gradient_cue_strength.is_finite()
+            && pcp.gradient_cue_strength >= 0.0)
+        {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.polarity",
+                detail: format!("invalid PCP sweep params {pcp:?}"),
+            });
+        }
+        let (Some(polarities), Some(strengths), Some(curvatures), Some(gradients)) = (
+            context.polarities,
+            context.polarity_strengths,
+            context.wedge_curvatures,
+            context.energy_gradients,
+        ) else {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: "pcp-polarity Sweep1Context is missing required polarity buffers"
+                    .to_owned(),
+            });
+        };
+        if polarities.len() != count
+            || strengths.len() != count
+            || curvatures.len() != count
+            || gradients.len() != count
+        {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!(
+                    "pcp-polarity buffers misaligned for {count} bodies: p={}, alpha={}, beta={}, grad={}",
+                    polarities.len(),
+                    strengths.len(),
+                    curvatures.len(),
+                    gradients.len()
+                ),
+            });
+        }
+        if output.next_polarities.is_none() {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: "pcp-polarity Sweep1Output requires next_polarities buffer".to_owned(),
+            });
+        }
+        Some((pcp, polarities, strengths, curvatures, gradients))
+    } else {
+        None
+    };
+    let emt_factors = match context.emt_factors {
+        Some(factors) if factors.len() == count => {
+            for (index, &value) in factors.iter().enumerate() {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "emt adhesion multiplier",
+                        detail: format!("body {index} has invalid emt_eff {value:?}"),
+                    });
+                }
+            }
+            Some(factors)
+        }
+        Some(factors) => {
+            return Err(CoreError::StateConflict {
+                operation: "contact",
+                detail: format!("{} emt factors for {count} bodies", factors.len()),
+            });
+        }
+        None => None,
+    };
+
+    let ContactRules {
+        diameter,
+        stiffness,
+        adhesion,
+        range,
+        inhibits,
+        repulsion,
+        ..
+    } = *rules;
+    let adheres = rules.adheres();
+    let reach = if adheres || pcp_inputs.is_some() {
+        diameter * range
+    } else {
+        diameter
+    };
+    let (width, height) = (grid.world_width(), grid.world_height());
+    let (bins_x, bins_y) = (bins_along(width, reach), bins_along(height, reach));
+    let limit = (0.5 * diameter).min(0.5 * grid.cell_width().min(grid.cell_height()));
+
+    // Counting sort of survivors by bin, stable in identity order.
+    let ContactScratch {
+        starts,
+        members,
+        bins,
+        pressed,
+    } = scratch;
+    starts.clear();
+    starts.resize(bins_x * bins_y + 1, 0);
+    bins.clear();
+    for (&[x, y], &live) in positions.iter().zip(alive) {
+        let bin = if live {
+            if !(0.0..width).contains(&x) || !(0.0..height).contains(&y) {
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "contact position",
+                    detail: format!("[{x:?}, {y:?}] is not wrapped"),
+                });
+            }
+            bin_of(y, height, bins_y) * bins_x + bin_of(x, width, bins_x)
+        } else {
+            usize::MAX
+        };
+        bins.push(bin);
+        if bin != usize::MAX {
+            starts[bin + 1] += 1;
+        }
+    }
+    for bin in 0..bins_x * bins_y {
+        starts[bin + 1] += starts[bin];
+    }
+    members.clear();
+    members.resize(starts[bins_x * bins_y], 0);
+    for (index, &bin) in bins.iter().enumerate().rev() {
+        if bin != usize::MAX {
+            starts[bin + 1] -= 1;
+            members[starts[bin + 1]] = index;
+        }
+    }
+    starts.remove(0);
+    starts.push(members.len());
+
+    let Sweep1Output {
+        displacements,
+        mut next_polarities,
+    } = output;
+    displacements.clear();
+    displacements.resize(count, [0.0, 0.0]);
+    pressed.clear();
+    if inhibits {
+        pressed.resize(count, [0.0, 0.0]);
+    }
+    if let Some(pol_out) = next_polarities.as_deref_mut() {
+        pol_out.clear();
+        if let Some((_, polarities, _, _, _)) = pcp_inputs {
+            pol_out.extend_from_slice(polarities);
+        } else {
+            pol_out.resize(count, [1.0, 0.0]);
+        }
+    }
+
+    let push_factor = 0.5 * stiffness;
+    let pull_factor = if adheres {
+        0.5 * adhesion / ((range - 1.0) * diameter)
+    } else {
+        0.0
+    };
+    let reach_distance = reach;
+    let beyond = reach_distance * reach_distance * (1.0 + 1e-9);
+    let (half_width, half_height) = (0.5 * width, 0.5 * height);
+    let (starts, members, bins) = (&*starts, &*members, &*bins);
+
+    type BodyEval = ([f64; 2], [f64; 2], [f64; 2]);
+    let eval_body = |index: usize| -> Result<BodyEval, CoreError> {
+        let current_pol =
+            pcp_inputs.map_or([1.0, 0.0], |(_, polarities, _, _, _)| polarities[index]);
+        let bin = bins[index];
+        if bin == usize::MAX {
+            return Ok(([0.0, 0.0], [0.0, 0.0], current_pol));
+        }
+        let here = positions[index];
+        let (bx, by) = (bin % bins_x, bin / bins_x);
+        let (rows, row_count) = neighbours(by, bins_y);
+        let (columns, column_count) = neighbours(bx, bins_x);
+        let mut sum = [0.0_f64, 0.0_f64];
+        let mut overlapping = [0.0_f64, 0.0_f64];
+        let mut tau_neighbors = 0.0_f64;
+        for &row in &rows[..row_count] {
+            for &column in &columns[..column_count] {
+                let neighbour = row * bins_x + column;
+                for &other in &members[starts[neighbour]..starts[neighbour + 1]] {
+                    if other == index {
+                        continue;
+                    }
+                    // From the other body to this one (`u_ij = (x_i - x_j) / d`).
+                    let there = positions[other];
+                    let dx = image(there[0], here[0], width, half_width);
+                    let dy = image(there[1], here[1], height, half_height);
+                    if dx * dx + dy * dy > beyond {
+                        continue;
+                    }
+                    let distance = dx.hypot(dy);
+                    let overlaps = distance < diameter;
+                    let in_reach = distance < reach_distance;
+                    if !overlaps && !in_reach {
+                        continue;
+                    }
+                    let (ux, uy) = if distance > 0.0 {
+                        (dx / distance, dy / distance)
+                    } else if ids[index] > ids[other] {
+                        (1.0, 0.0)
+                    } else {
+                        (-1.0, 0.0)
+                    };
+                    // `r_hat = (x_j - x_i) / d = -u_ij` for `d > 0`.
+                    let r_hat = [-ux, -uy];
+                    let kin_weight = affinities.map(|aff| {
+                        let alike = cosine(&aff[index], &aff[other]).max(0.0);
+                        if repulsion > 0.0 {
+                            (1.0 + repulsion) * (alike * alike) - repulsion
+                        } else {
+                            alike * alike
+                        }
+                    });
+                    if overlaps {
+                        let push = push_factor * (diameter - distance);
+                        sum[0] += push * ux;
+                        sum[1] += push * uy;
+                        overlapping[0] += push * ux;
+                        overlapping[1] += push * uy;
+                    } else if adheres && in_reach {
+                        let base_kin = kin_weight.unwrap_or(0.0);
+                        let eff_weight = if base_kin > 0.0 {
+                            let emt_pair = emt_factors
+                                .map_or(1.0, |factors| (factors[index] * factors[other]).sqrt());
+                            let pcp_factor = match pcp_inputs {
+                                Some((_, polarities, strengths, curvatures, _)) => {
+                                    let alpha_ij = (strengths[index] * strengths[other]).sqrt();
+                                    let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
+                                    pcp_lateral_wedge_weight(
+                                        polarities[index],
+                                        polarities[other],
+                                        r_hat,
+                                        alpha_ij,
+                                        beta_bar,
+                                    )
+                                }
+                                None => 1.0,
+                            };
+                            emt_pair * base_kin * pcp_factor
+                        } else {
+                            base_kin
+                        };
+                        let push = -pull_factor
+                            * eff_weight
+                            * (distance - diameter)
+                            * (reach_distance - distance);
+                        sum[0] += push * ux;
+                        sum[1] += push * uy;
+                    }
+                    if let Some((_, polarities, strengths, curvatures, _)) = pcp_inputs
+                        && distance > 0.0
+                        && in_reach
+                    {
+                        let kin_pos = kin_weight.unwrap_or(0.0).max(0.0);
+                        if kin_pos > 0.0 {
+                            let w_torque = kin_pos * (1.0 - distance / reach_distance);
+                            let alpha_ij = (strengths[index] * strengths[other]).sqrt();
+                            let beta_bar = 0.5 * (curvatures[index] + curvatures[other]);
+                            let pair_term = pcp_pair_torque_term(
+                                polarities[index],
+                                polarities[other],
+                                r_hat,
+                                beta_bar,
+                            );
+                            tau_neighbors += alpha_ij * w_torque * pair_term;
+                        }
+                    }
+                }
+            }
+        }
+        let length = sum[0].hypot(sum[1]);
+        if length > limit {
+            let scale = limit / length;
+            sum = [sum[0] * scale, sum[1] * scale];
+        }
+        let next_pol = if let Some((pcp, polarities, _, _, gradients)) = pcp_inputs {
+            let p_i = polarities[index];
+            let p_i_perp = [-p_i[1], p_i[0]];
+            let grad_q = gradients[index];
+            let tau_cue =
+                pcp.gradient_cue_strength * (p_i_perp[0] * grad_q[0] + p_i_perp[1] * grad_q[1]);
+            let tau_i = tau_cue + tau_neighbors;
+            let dtheta = pcp.dt * pcp.torque_mobility * tau_i;
+            rotate_unit_polarity(p_i, dtheta)?
+        } else {
+            current_pol
+        };
+        Ok((sum, overlapping, next_pol))
+    };
+
+    let fill = |first: usize,
+                out: &mut [[f64; 2]],
+                pushes: &mut [[f64; 2]],
+                pols: &mut [[f64; 2]]|
+     -> Result<(), CoreError> {
+        for (offset, slot) in out.iter_mut().enumerate() {
+            let (displacement, push, next_pol) = eval_body(first + offset)?;
+            *slot = displacement;
+            if let Some(push_slot) = pushes.get_mut(offset) {
+                *push_slot = push;
+            }
+            if let Some(pol_slot) = pols.get_mut(offset) {
+                *pol_slot = next_pol;
+            }
+        }
+        Ok(())
+    };
+
+    let used = workers
+        .max(1)
+        .min(count.div_ceil(MINIMUM_BODIES_PER_WORKER))
+        .max(1);
+    let pol_slice: &mut [[f64; 2]] = next_polarities.map_or(&mut [], Vec::as_mut_slice);
+    if used == 1 {
+        return fill(0, displacements, pressed, pol_slice);
+    }
+    let length = count.div_ceil(used);
+    let mut chunks = displacements.chunks_mut(length);
+    let mut push_chunks = pressed
+        .chunks_mut(length)
+        .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
+    let mut pol_chunks = pol_slice
+        .chunks_mut(length)
+        .chain(std::iter::repeat_with(|| -> &mut [[f64; 2]] { &mut [] }));
+    let head = chunks.next().unwrap_or_default();
+    let push_head = push_chunks.next().unwrap_or_default();
+    let pol_head = pol_chunks.next().unwrap_or_default();
+    let fill = &fill;
+    std::thread::scope(|scope| {
+        let others: Vec<_> = chunks
+            .zip(push_chunks)
+            .zip(pol_chunks)
+            .enumerate()
+            .map(|(index, ((chunk, pushes), pols))| {
+                scope.spawn(move || fill((index + 1) * length, chunk, pushes, pols))
+            })
+            .collect();
+        let mut result = fill(0, head, push_head, pol_head);
+        for other in others {
+            let joined = other.join().unwrap_or_else(|_| {
+                Err(CoreError::StateConflict {
+                    operation: "contact",
+                    detail: "a contact worker panicked".to_owned(),
+                })
+            });
+            if result.is_ok() {
+                result = joined;
             }
         }
         result

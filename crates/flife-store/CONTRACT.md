@@ -62,8 +62,11 @@ experiment knows what already ran and a report can list every run.
 - `checkpoints/<sequence>.manifest` is a checkpoint's sealed prefix (header, manifest and seal), with sixteen hex
   digits of sequence number. Numbers increase and are never reused, even after an invalid manifest.
 - `tmp/` holds writes in flight. `open` takes the writer's lock and then removes every file in it.
-- One writer at a time: `open` takes an exclusive lock on `lock`, and a second writer is refused (`state-conflict`).
-  The kernel releases the lock when the process dies.
+- One writer at a time: `open` takes an exclusive lock on `lock` held in an RAII `StoreLock` guard, and a second
+  writer is refused (`state-conflict`). `StoreLock::drop` explicitly calls `File::unlock()` (both on normal drop
+  and on early `open` failure) so concurrent `Command::spawn` / `__posix_spawn` descriptor duplication in the same
+  process cannot keep `LOCK_EX` held after `ChunkStore` closes. The kernel also releases the lock if the process
+  dies. `ChunkStore` uses checked 64-bit arithmetic for byte totals and propagates `read_dir` I/O failures.
 
 **Invariants — publication (§16.4).**
 - The whole checkpoint is verified (`CheckpointReader::parse`) before anything is written, so a damaged container
@@ -102,9 +105,11 @@ experiment knows what already ran and a report can list every run.
   a sealed prefix that does not verify or is followed by bytes, one naming other chunks, other lengths or offsets,
   or more or fewer chunks than the stream stored, and a stored chunk no longer in place at its length. It then
   links the manifest as `publish` does, the same commit point.
-- Chunks begin in manifest order; one begun out of order is refused. A stream's first refusal (a cancellation, a
-  refused write) sticks: every later call and the commit return it. A stream dropped, cancelled or failed removes
-  its temporary files; the chunks it already stored stay unreferenced until retention removes them.
+- Chunks begin in manifest order; one begun out of order is refused. `Stream::close_chunk` validates the streamed
+  chunk length against the declared length before `stored_as`, even when an identical chunk is already shared in
+  the store. A stream's first refusal (a cancellation, a refused write) sticks: every later call and the commit
+  return it. A stream dropped, cancelled or failed removes its temporary files; the chunks it already stored stay
+  unreferenced until retention removes them.
 - `verify(sequence)` checks what `load` checks, hashing each chunk a 1 MiB buffer at a time, and returns the
   container's SHA-256 without holding it. `retain_intact(n)` is `retain(n)` counting a checkpoint valid when it
   verifies; it never decodes one.
@@ -153,6 +158,8 @@ experiment knows what already ran and a report can list every run.
   chunk store (`latest_valid`), whose manifests stay the authority (§16.6).
 - The connection is `!Send`, so the journal is opened on the thread that uses it (the session's writer thread),
   and its async calls are driven by `flife_runtime::block_on_inline`, never on an Asupersync runtime thread.
+  `CommandJournal::drop` cleanly checkpoints the FrankenSQLite WAL (`close_in_place` with fallback) so closing a
+  run does not leave orphaned WAL state behind.
 - FL-039, branches:
   - `lineage` holds each branch session's forks, keyed by `(session, depth)`, root first. A fork row holds the
     parent session, the admissions it had made, the tick and the parent checkpoint's SHA-256.
@@ -174,6 +181,7 @@ experiment knows what already ran and a report can list every run.
   in ordinal order, whatever order they were recorded in. A `u64` is stored by its bits, so the full range of
   seeds round-trips.
 - The catalog never interprets the result or manifest JSON; `flife-cli` writes and reads them.
+  `ExperimentCatalog::drop` cleanly checkpoints the FrankenSQLite WAL (`close_in_place` with fallback) on close.
 
 **Refusal cases.**
 - `incompatible-checkpoint`: a container that does not verify, or a missing, oversized, mis-sealed or extended
@@ -196,8 +204,11 @@ chunk file is that chunk's bytes. Sequence numbers come from the manifests prese
 wall-clock time or directory-listing order: sequences are sorted, and retention's chunk set is computed from
 manifests.
 
-**Independent tests.** `tests/store.rs`, against real checkpoints of FL-013's 48-founder ecology and the
-4,096-organism preset, restored through `flife_runtime::restore`:
+**Independent tests.** `src/lib.rs` (1 unit test: `dropping_store_unlocks_even_with_duplicated_descriptor`, proving
+`StoreLock` releases `LOCK_EX` on drop even when a duplicated FD simulates `fork`/`posix_spawn`) and
+`tests/store.rs` (21 tests), against real checkpoints of FL-013's 48-founder ecology, the 4,096-organism preset,
+and `field-ecology-v2` worlds (`v2_model_checkpoint_and_stream_round_trip` and
+`stream_end_refuses_length_mismatch_even_when_chunk_is_already_shared`), restored through `flife_runtime::restore`:
 - Round trip, under both profiles: the store holds one file per distinct chunk, and each checkpoint loads back byte
   for byte and restores to its world's tick and digest. A damaged container is refused with nothing stored. A
   second writer, a foreign directory and another store format are refused. A reopened store continues the
@@ -260,8 +271,10 @@ manifests.
     caught on their first run. One (`commit` not refusing a chunk still open) survived until the open-chunk
     refusal case was added.
 
-- `tests/journal.rs` (FL-036, 12 tests; about 2 s), against FL-013's 48-founder ecology with Appendix A's
-  `write-ahead-before-apply` durability, sessions on Asupersync's native runtime with the journal's writer thread.
+- `tests/journal.rs` (FL-036 and later, 16 tests; about 3 s), against FL-013's 48-founder ecology with Appendix A's
+  `write-ahead-before-apply` durability, sessions on Asupersync's native runtime with the journal's writer thread
+  (including `held_step_wakes_when_control_consumes_final_journal_receipt` and
+  `dropping_command_journal_checkpoints_wal_cleanly`).
   Every committed world is compared with one stepped directly with the same interventions at the same ticks:
   - The catalog: WAL and `synchronous = FULL` read back; acceptances and outcomes numbered and idempotent; a
     conflicting reuse, a skipped or repeated number, a command addressed to another session, an unknown command's
@@ -340,7 +353,7 @@ manifests.
     - no fork, an inherited acceptance of the branch's session, and an outcome out of turn are each refused, with
       nothing recorded.
 
-`tests/experiment_catalog.rs` (2 tests, FL-041):
+`tests/experiment_catalog.rs` (3 tests, FL-041, including `dropping_experiment_catalog_checkpoints_wal_cleanly`):
 - `the_catalog_keeps_each_run_once_in_run_order_across_reopening`: four rows (reached, error, capacity-paused,
   failed; one with seed `u64::MAX`) recorded out of order read back in order, before and after reopening, with
   the design kept from creation. The same row again is a no-op; a changed row under its ordinal and a moved
@@ -368,8 +381,8 @@ file-backed engine), one writer thread per session, one session per database at 
   experiment catalog; a run directory keeps it as `manifest.json`, which `flife-cli` writes beside `catalog.db`
   (its contract).
 - The catalog records a branch's lineage and origin (FL-039), but not lineage of organisms: FL-040's lineage
-  summaries are `flife run` records, not catalog rows. `flife checkpoint`/`resume`, a CLI
-  that opens a journal (`flife run` refuses `write-ahead-before-apply`) and resuming from the store are FL-037.
+  summaries are `flife run` records, not catalog rows. CLI write-ahead runs, `flife checkpoint`, and `flife resume`
+  over this store and journal live in `flife-cli` (FL-037).
 - The journal's power-loss durability rests on FrankenSQLite's WAL and `synchronous = FULL` flush; only process
   crashes are tested. Two sessions writing one catalog at once, and two processes opening one session's journal,
   are not tested; FrankenSQLite's concurrent writers are not relied on.

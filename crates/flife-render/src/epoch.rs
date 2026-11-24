@@ -137,8 +137,10 @@ pub fn quantize_cell_state(h0: f32) -> i8 {
 /// onto `[−32767, +32767]`.
 #[must_use]
 pub fn quantize_polarity(polarity: [f32; 2]) -> i16 {
-    let x = f64::from(polarity[0]);
-    let y = f64::from(polarity[1]);
+    quantize_polarity_f64([f64::from(polarity[0]), f64::from(polarity[1])])
+}
+
+fn quantize_polarity_f64([x, y]: [f64; 2]) -> i16 {
     if !(x.is_finite() && y.is_finite()) || (x == 0.0 && y == 0.0) {
         return POLARITY_UNPOLARIZED;
     }
@@ -1730,10 +1732,7 @@ impl Epoch {
                 states.push(quantize_cell_state(h0));
             }
             if let Some(polarities) = &mut self.polarities {
-                // Until V2-08 lands organism polarity vectors on `Organism`,
-                // reserved polarity slots honestly report the unpolarized
-                // sentinel rather than fabricating directions.
-                polarities.push(POLARITY_UNPOLARIZED);
+                polarities.push(quantize_polarity_f64(organism.polarity));
             }
             organism_energy += organism.energy;
             max_generation = max_generation.max(organism.generation.get());

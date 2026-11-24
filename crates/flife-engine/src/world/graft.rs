@@ -346,6 +346,7 @@ impl World {
                         cooldown_deadline,
                         secretory_readiness: INITIAL_SECRETORY_READINESS,
                         emission_cooldown_deadline: Tick::new(0),
+                        polarity: organism.polarity,
                     },
                     genome,
                 });

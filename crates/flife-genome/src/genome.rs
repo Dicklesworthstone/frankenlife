@@ -33,6 +33,14 @@ pub const MOTION_RESPONSE_TERMS: usize = 1 + AFFINITY_TERMS;
 /// Components of a decoupled 4-D cadherin adhesion tag (`V2-13`, `C023`).
 pub const CADHERIN_TERMS: usize = 4;
 
+/// Additional checkpoint bytes per genome when `V2-08` `pcp-polarity` is
+/// enabled: `polarity_strength` (`f64`) and `wedge_curvature` (`f64`).
+pub const POLARITY_CHECKPOINT_BYTES: usize = 2 * 8;
+
+/// Hard physical upper bound on `maximum_wedge_curvature` in radians (`V2-08`,
+/// `C003`): prevents 3-cell pinwheel traps while allowing hollow cysts.
+pub const MAXIMUM_WEDGE_CURVATURE_CAP: f64 = 0.4;
+
 /// Additional checkpoint bytes per genome when `V2-13` `cadherin-4d` is
 /// enabled: four `f64` tag components and one `f64` cohesiveness scalar.
 pub const CADHERIN_CHECKPOINT_BYTES: usize = (CADHERIN_TERMS + 1) * 8;
@@ -43,6 +51,17 @@ pub const CADHERIN_CHECKPOINT_BYTES: usize = (CADHERIN_TERMS + 1) * 8;
 /// `sensing_scale` (8).
 pub const BASELINE_GENOME_HEADER_BYTES: usize =
     8 + 8 + 9 + 8 * (AFFINITY_TERMS + MOTION_RESPONSE_TERMS) + 8;
+
+/// Extra checkpoint bytes per genome for `V2-08` `pcp-polarity`: `0` when
+/// disabled, [`POLARITY_CHECKPOINT_BYTES`] (`16`) when enabled.
+#[must_use]
+pub const fn polarity_checkpoint_bytes(polarity_enabled: bool) -> usize {
+    if polarity_enabled {
+        POLARITY_CHECKPOINT_BYTES
+    } else {
+        0
+    }
+}
 
 /// Extra checkpoint bytes per genome for `V2-13` `cadherin-4d`: `0` when
 /// disabled, [`CADHERIN_CHECKPOINT_BYTES`] (`40`) when enabled.
@@ -56,19 +75,125 @@ pub const fn cadherin_checkpoint_bytes(cadherin_enabled: bool) -> usize {
 }
 
 /// Fixed-part bytes of one genome record before its parameter count in a
-/// checkpoint stream (`GENOME_HEADER_BYTES`), sized dynamically for active
-/// trait extensions (`0` extra bytes when `cadherin-4d` is disabled, `+40`
-/// bytes when enabled).
+/// checkpoint stream (`GENOME_HEADER_BYTES`) when only `cadherin-4d` varies
+/// (`0` extra bytes when disabled, `+40` bytes when enabled).
 #[must_use]
 pub const fn genome_header_bytes(cadherin_enabled: bool) -> usize {
-    BASELINE_GENOME_HEADER_BYTES + cadherin_checkpoint_bytes(cadherin_enabled)
+    genome_header_bytes_v2(false, cadherin_enabled)
 }
+
+/// Fixed-part bytes of one genome record before its parameter count in a
+/// checkpoint stream (`GENOME_HEADER_BYTES`), sized dynamically for active
+/// v2 trait extensions: `553` baseline, `+16` when `pcp-polarity` is enabled,
+/// `+40` when `cadherin-4d` is enabled (`0` extra bytes for any disabled
+/// feature).
+#[must_use]
+pub const fn genome_header_bytes_v2(polarity_enabled: bool, cadherin_enabled: bool) -> usize {
+    BASELINE_GENOME_HEADER_BYTES
+        + polarity_checkpoint_bytes(polarity_enabled)
+        + cadherin_checkpoint_bytes(cadherin_enabled)
+}
+
+/// Sentinel stored in [`Traits::polarity_strength`] when `V2-08` `pcp-polarity`
+/// is absent. Valid polarity strength always lies in `[0.0, 1.0]`, so `-1.0`
+/// is an unambiguous, reflexive (`PartialEq`-safe) absence marker with zero
+/// tag padding beyond the 16-byte polarity payload.
+const NO_POLARITY_STRENGTH: f64 = -1.0;
 
 /// Sentinel stored in [`Traits::cohesiveness`] when `V2-13` `cadherin-4d` is
 /// absent. Valid cohesiveness always lies in `[0.0, 1.0]`, so `-1.0` is an
 /// unambiguous, reflexive (`PartialEq`-safe) absence marker with zero tag
 /// padding beyond the 40-byte cadherin payload.
 const NO_CADHERIN_COHESIVENESS: f64 = -1.0;
+
+/// Heritable apical-basal PCP polarity traits (`V2-08`, `C003`).
+///
+/// - `polarity_strength`: finite scalar `α_pol ∈ [0.0, 1.0]` (`0.0` = isotropic
+///   adhesion, `1.0` = strictly lateral epithelial belt).
+/// - `wedge_curvature`: finite scalar `β ∈ [-β_max, β_max]` (spontaneous apical
+///   wedge angle in radians, with `β_max <= 0.4` rad).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PolarityTraits {
+    polarity_strength: f64,
+    wedge_curvature: f64,
+}
+
+impl PolarityTraits {
+    /// Validate and construct polarity traits with `polarity_strength ∈ [0, 1]`
+    /// and `wedge_curvature ∈ [-maximum_wedge_curvature, maximum_wedge_curvature]`
+    /// (`0 <= maximum_wedge_curvature <= 0.4`).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for any non-finite value, a
+    /// `maximum_wedge_curvature` outside `[0.0, 0.4]`, a `polarity_strength`
+    /// outside `[0.0, 1.0]`, or a `wedge_curvature` outside
+    /// `[-maximum_wedge_curvature, maximum_wedge_curvature]`.
+    pub fn new(
+        polarity_strength: f64,
+        wedge_curvature: f64,
+        maximum_wedge_curvature: f64,
+    ) -> Result<Self, CoreError> {
+        check_maximum_wedge_curvature(maximum_wedge_curvature)?;
+        check_polarity_strength(polarity_strength)?;
+        check_wedge_curvature(wedge_curvature, maximum_wedge_curvature)?;
+        Ok(Self {
+            polarity_strength,
+            wedge_curvature,
+        })
+    }
+
+    /// Heritable lateral-belt adhesion strength `α_pol ∈ [0.0, 1.0]`.
+    #[must_use]
+    pub const fn polarity_strength(&self) -> f64 {
+        self.polarity_strength
+    }
+
+    /// Heritable spontaneous apical wedge curvature `β ∈ [-β_max, β_max]`.
+    #[must_use]
+    pub const fn wedge_curvature(&self) -> f64 {
+        self.wedge_curvature
+    }
+
+    /// Feed canonical little-endian bit patterns of `polarity_strength` and
+    /// `wedge_curvature` into `hasher` for `Population::digest`.
+    pub fn hash_into(&self, hasher: &mut Sha256Stream) {
+        hasher.update(&self.polarity_strength.to_bits().to_le_bytes());
+        hasher.update(&self.wedge_curvature.to_bits().to_le_bytes());
+    }
+
+    /// Encode `polarity_strength` and `wedge_curvature` into a streaming
+    /// checkpoint chunk (`16` bytes).
+    pub fn write_checkpoint(&self, out: &mut ChunkWriter<'_>) {
+        out.f64(self.polarity_strength);
+        out.f64(self.wedge_curvature);
+    }
+
+    /// Encode `polarity_strength` and `wedge_curvature` into a [`ByteWriter`]
+    /// (`16` bytes).
+    pub fn write_bytes(&self, out: &mut ByteWriter) {
+        out.f64(self.polarity_strength);
+        out.f64(self.wedge_curvature);
+    }
+
+    /// Decode and validate `polarity_strength` and `wedge_curvature` from a
+    /// checkpoint stream (`16` bytes).
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] if truncated or if decoded values
+    /// violate polarity strength or wedge curvature bounds.
+    pub fn read_checkpoint(
+        input: &mut ByteReader<'_>,
+        maximum_wedge_curvature: f64,
+    ) -> Result<Self, CoreError> {
+        let polarity_strength = input.f64()?;
+        let wedge_curvature = input.f64()?;
+        Self::new(polarity_strength, wedge_curvature, maximum_wedge_curvature).map_err(|error| {
+            CoreError::IncompatibleCheckpoint {
+                reason: format!("polarity traits: {error}"),
+            }
+        })
+    }
+}
 
 /// Decoupled 4-D cadherin adhesion tag and cohesiveness (`V2-13`, `C023`).
 ///
@@ -189,6 +314,10 @@ pub struct TraitLimits {
     minimum_scale: f64,
     maximum_scale: f64,
     maximum_absolute_parameter: f64,
+    polarity_enabled: bool,
+    initial_polarity_strength_max: f64,
+    maximum_wedge_curvature: f64,
+    polarity_mutation_std: f64,
     cadherin_enabled: bool,
     cadherin_mutation_std: f64,
 }
@@ -237,9 +366,47 @@ impl TraitLimits {
             minimum_scale,
             maximum_scale,
             maximum_absolute_parameter,
+            polarity_enabled: false,
+            initial_polarity_strength_max: 0.0,
+            maximum_wedge_curvature: 0.0,
+            polarity_mutation_std: 0.0,
             cadherin_enabled: false,
             cadherin_mutation_std: 0.0,
         })
+    }
+
+    /// Enable `V2-08` `pcp-polarity` with founder strength ceiling
+    /// `initial_strength_max ∈ [0.0, 1.0]`, wedge curvature bound
+    /// `maximum_wedge_curvature ∈ [0.0, 0.4]`, and per-birth Gaussian
+    /// standard deviation `mutation_std >= 0.0`.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for any out-of-range or non-finite
+    /// parameter.
+    pub fn with_polarity(
+        mut self,
+        initial_strength_max: f64,
+        maximum_wedge_curvature: f64,
+        mutation_std: f64,
+    ) -> Result<Self, CoreError> {
+        if !initial_strength_max.is_finite() || !(0.0..=1.0).contains(&initial_strength_max) {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.polarity.initial_polarity_strength_max",
+                detail: format!("{initial_strength_max} is outside [0, 1]"),
+            });
+        }
+        check_maximum_wedge_curvature(maximum_wedge_curvature)?;
+        if !mutation_std.is_finite() || mutation_std < 0.0 {
+            return Err(CoreError::NumericalInvalid {
+                quantity: "v2.polarity.polarity_mutation_std",
+                detail: format!("{mutation_std} is not a non-negative finite standard deviation"),
+            });
+        }
+        self.polarity_enabled = true;
+        self.initial_polarity_strength_max = initial_strength_max;
+        self.maximum_wedge_curvature = maximum_wedge_curvature;
+        self.polarity_mutation_std = mutation_std;
+        Ok(self)
     }
 
     /// Enable `V2-13` `cadherin-4d` with per-birth Gaussian standard deviation
@@ -260,14 +427,16 @@ impl TraitLimits {
         Ok(self)
     }
 
-    /// The bounds of a validated configuration, including `V2-13` `cadherin-4d`
-    /// enablement and mutation standard deviation when active.
+    /// The bounds of a validated configuration, including `V2-08`
+    /// `pcp-polarity` and `V2-13` `cadherin-4d` enablement, bounds, and
+    /// mutation standard deviations when active.
     ///
     /// # Errors
-    /// As [`TraitLimits::new`] and [`TraitLimits::with_cadherin`].
+    /// As [`TraitLimits::new`], [`TraitLimits::with_polarity`], and
+    /// [`TraitLimits::with_cadherin`].
     pub fn from_config(config: &ValidatedConfig) -> Result<Self, CoreError> {
         let model = config.config();
-        let limits = Self::new(
+        let mut limits = Self::new(
             model.chemistry.affinity_norm_limit,
             model.chemistry.motion_response_norm_limit,
             [
@@ -276,12 +445,19 @@ impl TraitLimits {
             ],
             model.controller.maximum_absolute_parameter,
         )?;
-        match model.v2.as_ref() {
-            Some(v2) if v2.is_enabled(V2Feature::Cadherin4d) => {
-                limits.with_cadherin(v2.contact.cadherin.mutation_std)
+        if let Some(v2) = model.v2.as_ref() {
+            if v2.is_enabled(V2Feature::PcpPolarity) {
+                limits = limits.with_polarity(
+                    v2.polarity.initial_polarity_strength_max,
+                    v2.polarity.maximum_wedge_curvature,
+                    v2.polarity.polarity_mutation_std,
+                )?;
             }
-            _ => Ok(limits),
+            if v2.is_enabled(V2Feature::Cadherin4d) {
+                limits = limits.with_cadherin(v2.contact.cadherin.mutation_std)?;
+            }
         }
+        Ok(limits)
     }
 
     /// `maximum_absolute_parameter`.
@@ -308,6 +484,33 @@ impl TraitLimits {
         [self.minimum_scale, self.maximum_scale]
     }
 
+    /// Whether `V2-08` `pcp-polarity` is enabled for this run.
+    #[must_use]
+    pub const fn polarity_enabled(&self) -> bool {
+        self.polarity_enabled
+    }
+
+    /// The configured `v2.polarity.initial_polarity_strength_max` (`0.0` when
+    /// disabled).
+    #[must_use]
+    pub const fn initial_polarity_strength_max(&self) -> f64 {
+        self.initial_polarity_strength_max
+    }
+
+    /// The configured `v2.polarity.maximum_wedge_curvature` (`0.0` when
+    /// disabled).
+    #[must_use]
+    pub const fn maximum_wedge_curvature(&self) -> f64 {
+        self.maximum_wedge_curvature
+    }
+
+    /// The configured `v2.polarity.polarity_mutation_std` (`0.0` when
+    /// disabled).
+    #[must_use]
+    pub const fn polarity_mutation_std(&self) -> f64 {
+        self.polarity_mutation_std
+    }
+
     /// Whether `V2-13` `cadherin-4d` is enabled for this run.
     #[must_use]
     pub const fn cadherin_enabled(&self) -> bool {
@@ -321,10 +524,22 @@ impl TraitLimits {
     }
 
     /// Dynamic checkpoint fixed-header byte length for genomes under these
-    /// limits ([`genome_header_bytes`]).
+    /// limits ([`genome_header_bytes_v2`]).
     #[must_use]
     pub const fn genome_header_bytes(&self) -> usize {
-        genome_header_bytes(self.cadherin_enabled)
+        genome_header_bytes_v2(self.polarity_enabled, self.cadherin_enabled)
+    }
+
+    /// Wedge-curvature validation cap applied when checking/resealing a
+    /// [`PolarityTraits`]: the configured bound when `pcp-polarity` is
+    /// enabled, or the global physical cap [`MAXIMUM_WEDGE_CURVATURE_CAP`]
+    /// (`0.4`) when preserving carried polarity traits on a non-polarity host.
+    pub(crate) const fn effective_wedge_curvature_bound(&self) -> f64 {
+        if self.polarity_enabled {
+            self.maximum_wedge_curvature
+        } else {
+            MAXIMUM_WEDGE_CURVATURE_CAP
+        }
     }
 }
 
@@ -334,13 +549,15 @@ pub struct Traits {
     affinity: [f64; AFFINITY_TERMS],
     motion_response: [f64; MOTION_RESPONSE_TERMS],
     sensing_scale: f64,
+    polarity_strength: f64,
+    wedge_curvature: f64,
     cadherin_tag: [f64; CADHERIN_TERMS],
     cohesiveness: f64,
 }
 
 impl Traits {
-    /// Traits within `limits`, with norms checked in F64 and no `V2-13`
-    /// cadherin traits attached.
+    /// Traits within `limits`, with norms checked in F64 and no optional v2
+    /// polarity or cadherin traits attached.
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a nonfinite value, a norm above
@@ -351,11 +568,34 @@ impl Traits {
         sensing_scale: f64,
         limits: &TraitLimits,
     ) -> Result<Self, CoreError> {
-        Self::with_cadherin(affinity, motion_response, sensing_scale, None, limits)
+        Self::with_v2_traits(affinity, motion_response, sensing_scale, None, None, limits)
+    }
+
+    /// Traits within `limits`, optionally carrying validated `V2-08`
+    /// [`PolarityTraits`] (no cadherin traits attached).
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for a nonfinite value, a norm above
+    /// its bound, a sensing scale outside its range, or invalid polarity traits.
+    pub fn with_polarity(
+        affinity: [f64; AFFINITY_TERMS],
+        motion_response: [f64; MOTION_RESPONSE_TERMS],
+        sensing_scale: f64,
+        polarity: Option<PolarityTraits>,
+        limits: &TraitLimits,
+    ) -> Result<Self, CoreError> {
+        Self::with_v2_traits(
+            affinity,
+            motion_response,
+            sensing_scale,
+            polarity,
+            None,
+            limits,
+        )
     }
 
     /// Traits within `limits`, optionally carrying validated `V2-13`
-    /// [`CadherinTraits`].
+    /// [`CadherinTraits`] (no polarity traits attached).
     ///
     /// # Errors
     /// [`CoreError::NumericalInvalid`] for a nonfinite value, a norm above
@@ -364,6 +604,30 @@ impl Traits {
         affinity: [f64; AFFINITY_TERMS],
         motion_response: [f64; MOTION_RESPONSE_TERMS],
         sensing_scale: f64,
+        cadherin: Option<CadherinTraits>,
+        limits: &TraitLimits,
+    ) -> Result<Self, CoreError> {
+        Self::with_v2_traits(
+            affinity,
+            motion_response,
+            sensing_scale,
+            None,
+            cadherin,
+            limits,
+        )
+    }
+
+    /// Traits within `limits`, optionally carrying validated `V2-08`
+    /// [`PolarityTraits`] and/or `V2-13` [`CadherinTraits`].
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] for any nonfinite value, out-of-range
+    /// bound, or invalid polarity/cadherin traits.
+    pub fn with_v2_traits(
+        affinity: [f64; AFFINITY_TERMS],
+        motion_response: [f64; MOTION_RESPONSE_TERMS],
+        sensing_scale: f64,
+        polarity: Option<PolarityTraits>,
         cadherin: Option<CadherinTraits>,
         limits: &TraitLimits,
     ) -> Result<Self, CoreError> {
@@ -382,6 +646,17 @@ impl Traits {
                 ),
             });
         }
+        let (polarity_strength, wedge_curvature) = match polarity {
+            Some(pol) => {
+                let checked = PolarityTraits::new(
+                    pol.polarity_strength,
+                    pol.wedge_curvature,
+                    limits.effective_wedge_curvature_bound(),
+                )?;
+                (checked.polarity_strength, checked.wedge_curvature)
+            }
+            None => (NO_POLARITY_STRENGTH, 0.0),
+        };
         let (cadherin_tag, cohesiveness) = match cadherin {
             Some(cad) => {
                 let checked = CadherinTraits::new(cad.tag, cad.cohesiveness)?;
@@ -393,9 +668,39 @@ impl Traits {
             affinity,
             motion_response,
             sensing_scale,
+            polarity_strength,
+            wedge_curvature,
             cadherin_tag,
             cohesiveness,
         })
+    }
+
+    /// Return a copy of `self` with optional `V2-08` [`PolarityTraits`]
+    /// attached or cleared, re-validating `polarity` against `limits` when
+    /// present.
+    ///
+    /// # Errors
+    /// [`CoreError::NumericalInvalid`] if `polarity` violates polarity strength
+    /// or wedge curvature bounds.
+    pub fn with_polarity_traits(
+        mut self,
+        polarity: Option<PolarityTraits>,
+        limits: &TraitLimits,
+    ) -> Result<Self, CoreError> {
+        let (polarity_strength, wedge_curvature) = match polarity {
+            Some(pol) => {
+                let checked = PolarityTraits::new(
+                    pol.polarity_strength,
+                    pol.wedge_curvature,
+                    limits.effective_wedge_curvature_bound(),
+                )?;
+                (checked.polarity_strength, checked.wedge_curvature)
+            }
+            None => (NO_POLARITY_STRENGTH, 0.0),
+        };
+        self.polarity_strength = polarity_strength;
+        self.wedge_curvature = wedge_curvature;
+        Ok(self)
     }
 
     /// Return a copy of `self` with optional `V2-13` [`CadherinTraits`]
@@ -437,6 +742,47 @@ impl Traits {
         self.sensing_scale
     }
 
+    /// Whether `V2-08` `pcp-polarity` traits are present on this genome.
+    #[must_use]
+    pub const fn has_polarity(&self) -> bool {
+        self.polarity_strength >= 0.0
+    }
+
+    /// The optional heritable polarity strength `α_pol ∈ [0, 1]` (`None` when
+    /// disabled).
+    #[must_use]
+    pub const fn polarity_strength(&self) -> Option<f64> {
+        if self.has_polarity() {
+            Some(self.polarity_strength)
+        } else {
+            None
+        }
+    }
+
+    /// The optional heritable apical wedge curvature `β ∈ [-β_max, β_max]`
+    /// (`None` when disabled).
+    #[must_use]
+    pub const fn wedge_curvature(&self) -> Option<f64> {
+        if self.has_polarity() {
+            Some(self.wedge_curvature)
+        } else {
+            None
+        }
+    }
+
+    /// Both `V2-08` polarity fields together (`None` when disabled).
+    #[must_use]
+    pub const fn polarity_traits(&self) -> Option<PolarityTraits> {
+        if self.has_polarity() {
+            Some(PolarityTraits {
+                polarity_strength: self.polarity_strength,
+                wedge_curvature: self.wedge_curvature,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Whether `V2-13` `cadherin-4d` traits are present on this genome.
     #[must_use]
     pub const fn has_cadherin(&self) -> bool {
@@ -476,17 +822,19 @@ impl Traits {
         }
     }
 
-    /// Serialized trait bytes in a checkpoint record (`528` without cadherin,
-    /// `568` with cadherin).
+    /// Serialized trait bytes in a checkpoint record (`528` baseline, `+16`
+    /// with polarity, `+40` with cadherin, `584` with both).
     #[must_use]
     pub const fn checkpoint_bytes(&self) -> usize {
         8 * (AFFINITY_TERMS + MOTION_RESPONSE_TERMS)
             + 8
+            + polarity_checkpoint_bytes(self.has_polarity())
             + cadherin_checkpoint_bytes(self.has_cadherin())
     }
 
-    /// Encode all trait fields into a streaming checkpoint chunk (`0` extra
-    /// bytes when `include_cadherin == false`, `+40` bytes when `true`).
+    /// Encode baseline and optional cadherin trait fields into a streaming
+    /// checkpoint chunk (`0` extra bytes when `include_cadherin == false`,
+    /// `+40` bytes when `true`).
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] when `include_cadherin` is `true`
@@ -496,10 +844,36 @@ impl Traits {
         out: &mut ChunkWriter<'_>,
         include_cadherin: bool,
     ) -> Result<(), CoreError> {
+        self.write_checkpoint_fields_v2(out, false, include_cadherin)
+    }
+
+    /// Encode all active v2 trait fields into a streaming checkpoint chunk:
+    /// baseline (`528` B), then optional `V2-08` polarity (`+16` B when
+    /// `include_polarity`), then optional `V2-13` cadherin (`+40` B when
+    /// `include_cadherin`). Writes `0` extra bytes for any disabled feature.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] when a requested extension is
+    /// absent on `self`.
+    pub fn write_checkpoint_fields_v2(
+        &self,
+        out: &mut ChunkWriter<'_>,
+        include_polarity: bool,
+        include_cadherin: bool,
+    ) -> Result<(), CoreError> {
         for value in self.affinity.iter().chain(&self.motion_response) {
             out.f64(*value);
         }
         out.f64(self.sensing_scale);
+        if include_polarity {
+            let polarity =
+                self.polarity_traits()
+                    .ok_or_else(|| CoreError::IncompatibleCheckpoint {
+                        reason: "pcp-polarity checkpoint expects polarity traits on every genome"
+                            .into(),
+                    })?;
+            polarity.write_checkpoint(out);
+        }
         if include_cadherin {
             let cadherin =
                 self.cadherin_traits()
@@ -512,8 +886,9 @@ impl Traits {
         Ok(())
     }
 
-    /// Encode all trait fields into a [`ByteWriter`] (`0` extra bytes when
-    /// `include_cadherin == false`, `+40` bytes when `true`).
+    /// Encode baseline and optional cadherin trait fields into a [`ByteWriter`]
+    /// (`0` extra bytes when `include_cadherin == false`, `+40` bytes when
+    /// `true`).
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] when `include_cadherin` is `true`
@@ -523,10 +898,36 @@ impl Traits {
         out: &mut ByteWriter,
         include_cadherin: bool,
     ) -> Result<(), CoreError> {
+        self.write_bytes_v2(out, false, include_cadherin)
+    }
+
+    /// Encode all active v2 trait fields into a [`ByteWriter`]: baseline
+    /// (`528` B), then optional `V2-08` polarity (`+16` B), then optional
+    /// `V2-13` cadherin (`+40` B). Writes `0` extra bytes for any disabled
+    /// feature.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] when a requested extension is
+    /// absent on `self`.
+    pub fn write_bytes_v2(
+        &self,
+        out: &mut ByteWriter,
+        include_polarity: bool,
+        include_cadherin: bool,
+    ) -> Result<(), CoreError> {
         for value in self.affinity.iter().chain(&self.motion_response) {
             out.f64(*value);
         }
         out.f64(self.sensing_scale);
+        if include_polarity {
+            let polarity =
+                self.polarity_traits()
+                    .ok_or_else(|| CoreError::IncompatibleCheckpoint {
+                        reason: "pcp-polarity checkpoint expects polarity traits on every genome"
+                            .into(),
+                    })?;
+            polarity.write_bytes(out);
+        }
         if include_cadherin {
             let cadherin =
                 self.cadherin_traits()
@@ -539,15 +940,31 @@ impl Traits {
         Ok(())
     }
 
-    /// Decode and validate all trait fields from a checkpoint [`ByteReader`].
-    /// Reads `0` extra bytes when `include_cadherin == false`, `+40` bytes
-    /// when `true`.
+    /// Decode and validate baseline and optional cadherin trait fields from a
+    /// checkpoint [`ByteReader`]. Reads `0` extra bytes when
+    /// `include_cadherin == false`, `+40` bytes when `true`.
     ///
     /// # Errors
     /// [`CoreError::IncompatibleCheckpoint`] on truncation or invalid trait values.
     pub fn read_checkpoint_fields(
         input: &mut ByteReader<'_>,
         limits: &TraitLimits,
+        include_cadherin: bool,
+    ) -> Result<Self, CoreError> {
+        Self::read_checkpoint_fields_v2(input, limits, false, include_cadherin)
+    }
+
+    /// Decode and validate all active v2 trait fields from a checkpoint
+    /// [`ByteReader`]: baseline (`528` B), then optional `V2-08` polarity
+    /// (`+16` B), then optional `V2-13` cadherin (`+40` B). Reads `0` extra
+    /// bytes for any disabled feature.
+    ///
+    /// # Errors
+    /// [`CoreError::IncompatibleCheckpoint`] on truncation or invalid trait values.
+    pub fn read_checkpoint_fields_v2(
+        input: &mut ByteReader<'_>,
+        limits: &TraitLimits,
+        include_polarity: bool,
         include_cadherin: bool,
     ) -> Result<Self, CoreError> {
         let mut affinity = [0.0; AFFINITY_TERMS];
@@ -559,29 +976,45 @@ impl Traits {
             *value = input.f64()?;
         }
         let sensing_scale = input.f64()?;
+        let polarity = if include_polarity {
+            Some(PolarityTraits::read_checkpoint(
+                input,
+                limits.effective_wedge_curvature_bound(),
+            )?)
+        } else {
+            None
+        };
         let cadherin = if include_cadherin {
             Some(CadherinTraits::read_checkpoint(input)?)
         } else {
             None
         };
-        Self::with_cadherin(affinity, motion_response, sensing_scale, cadherin, limits).map_err(
-            |error| CoreError::IncompatibleCheckpoint {
-                reason: format!("genome traits: {error}"),
-            },
+        Self::with_v2_traits(
+            affinity,
+            motion_response,
+            sensing_scale,
+            polarity,
+            cadherin,
+            limits,
         )
+        .map_err(|error| CoreError::IncompatibleCheckpoint {
+            reason: format!("genome traits: {error}"),
+        })
     }
 
     /// Revalidate and copy every heritable trait against `limits`, preserving
-    /// all baseline and v2 traits (including `V2-13` cadherin tag and
-    /// cohesiveness) cleanly across crops and transplants (`V2-01`, `V2-13`).
+    /// all baseline and v2 traits (including `V2-08` polarity strength / wedge
+    /// curvature and `V2-13` cadherin tag / cohesiveness) cleanly across crops
+    /// and transplants (`V2-01`, `V2-08`, `V2-13`).
     ///
     /// # Errors
-    /// As [`Traits::with_cadherin`].
+    /// As [`Traits::with_v2_traits`].
     pub fn reseal(&self, limits: &TraitLimits) -> Result<Self, CoreError> {
-        Self::with_cadherin(
+        Self::with_v2_traits(
             self.affinity,
             self.motion_response,
             self.sensing_scale,
+            self.polarity_traits(),
             self.cadherin_traits(),
             limits,
         )
@@ -669,6 +1102,48 @@ fn check_cadherin_tag(tag: &[f64; CADHERIN_TERMS]) -> Result<(), CoreError> {
         return Err(CoreError::NumericalInvalid {
             quantity: "cadherin tag",
             detail: format!("the squared norm {squared} exceeds 1²"),
+        });
+    }
+    Ok(())
+}
+
+fn check_maximum_wedge_curvature(maximum_wedge_curvature: f64) -> Result<(), CoreError> {
+    if !maximum_wedge_curvature.is_finite()
+        || !(0.0..=MAXIMUM_WEDGE_CURVATURE_CAP).contains(&maximum_wedge_curvature)
+    {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.polarity.maximum_wedge_curvature",
+            detail: format!(
+                "{maximum_wedge_curvature} is outside [0, {MAXIMUM_WEDGE_CURVATURE_CAP}]"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn check_polarity_strength(polarity_strength: f64) -> Result<(), CoreError> {
+    if !polarity_strength.is_finite() || !(0.0..=1.0).contains(&polarity_strength) {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "polarity strength",
+            detail: format!("{polarity_strength} is outside [0, 1]"),
+        });
+    }
+    Ok(())
+}
+
+fn check_wedge_curvature(
+    wedge_curvature: f64,
+    maximum_wedge_curvature: f64,
+) -> Result<(), CoreError> {
+    if !wedge_curvature.is_finite()
+        || !(-maximum_wedge_curvature..=maximum_wedge_curvature).contains(&wedge_curvature)
+    {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "wedge curvature",
+            detail: format!(
+                "{wedge_curvature} is outside [{}, {}]",
+                -maximum_wedge_curvature, maximum_wedge_curvature
+            ),
         });
     }
     Ok(())

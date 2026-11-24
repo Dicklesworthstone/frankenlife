@@ -84,6 +84,7 @@ use flife_core::model::{
     FIELD_ECOLOGY_V1_UNGATED_MOTION, FIELD_ECOLOGY_V2, FIELD_ECOLOGY_V2_CHEMISTRY_ONLY,
     FIELD_ECOLOGY_V2_FIXED_CONTROLLER, FIELD_ECOLOGY_V2_FRESH_OFFSPRING,
 };
+use flife_core::numerics::sin_cos_turns;
 use flife_core::rng::{Address, Lane, LaneKind, SemanticRng, Stream, half_open_unit};
 use flife_core::{
     ConfigIssue, CoreError, EnergyBudget, EnergyLedger, Flow, Holdings, LedgerReport,
@@ -106,7 +107,7 @@ use flife_field::{
 use flife_genome::{
     CandidateRejection, Genome, GenomeQuota, MAXIMUM_CANDIDATES, MutationParameters,
     MutationRecord, Mutator, ParameterBuffer, TopologyCatalog, TopologyId, TraitLimits, Traits,
-    founder_topology, founder_traits, grow_founder, initial_scale,
+    founder_topology, founder_traits_v2, grow_founder, initial_scale,
 };
 use flife_neural::actions::EMISSION_SPEND;
 use flife_neural::{
@@ -121,7 +122,7 @@ use crate::chemistry::{
     Affinity, ChemicalPacket, Chemistry, UptakeSettlement, composition, corpse_affinity_direction,
     effective_affinity, symplectic_waste_direction,
 };
-use crate::contact::{ContactRules, ContactWork, CrowdingWork, unit_affinity};
+use crate::contact::{ContactRules, ContactWork, CrowdingWork, PcpSweepParams, unit_affinity};
 use crate::costs::{MaintenanceCosts, MaintenanceSettlement};
 use crate::emission::{
     EmissionContext, EmissionPolicy, EmissionSettlement, INITIAL_SECRETORY_READINESS,
@@ -134,7 +135,9 @@ use crate::intervention::{self, AppliedIntervention, Intervention};
 use crate::lifecycle::{BudgetStage, Death, Fate, Recycling, TinyEnergyPolicy, Vitality};
 use crate::measure::{RegionMeasurement, measure};
 use crate::motion::{Motion, MotionResponse, MotionSettlement, RESPONSE_TERMS, uptake_ratio};
-use crate::population::{Arrangement, CheckedTick, Entrant, HeldOutput, Organism, Population};
+use crate::population::{
+    Arrangement, CheckedTick, DEFAULT_POLARITY, Entrant, HeldOutput, Organism, Population,
+};
 use crate::reproduction::{
     Birth, BirthContext, BirthIntent, BirthRequest, BirthResolution, Births, CapacityPolicy,
     CapacityShortfall, Identities, Offspring, ParentState, PopulationQuota, RefusedBirth,
@@ -157,7 +160,7 @@ pub use graft::Graft;
 use settle::{Settle, settle_with};
 pub use v2::{
     BuddingRules, CarrierSpec, CorpseDirection, CrowdingMode, CrowdingRules, LysisRules,
-    SenescenceRules, V2Rules, WasteRules,
+    PolarityRules, SenescenceRules, V2Rules, WasteRules,
 };
 
 /// The backend this module implements: the scalar CPU reference.
@@ -726,7 +729,7 @@ impl Rules {
             position,
             velocity,
             energy_gradient: organism.gradients[0],
-            polarity: None,
+            polarity: self.v2.polarity().map(|_| organism.committed.polarity),
             raw_spend_logit,
             raw_pump_logit,
             tick: from,
@@ -1684,6 +1687,25 @@ impl World {
     #[must_use]
     pub const fn population(&self) -> &Population {
         &self.population
+    }
+
+    /// Whether `V2-08` (`pcp-polarity`) is active on this world.
+    #[must_use]
+    pub const fn tracks_polarity(&self) -> bool {
+        self.rules.v2.polarity().is_some()
+    }
+
+    /// Live unit apical-basal polarity vectors `p_i ∈ S^1` in ascending
+    /// identity order when `V2-08` (`pcp-polarity`) is active; `None` when
+    /// disabled (`INV-09` pure read-only seam for `V2-16` / `Epoch::polarities`).
+    #[must_use]
+    pub fn polarities(&self) -> Option<Vec<[f64; 2]>> {
+        self.rules.v2.polarity().map(|_| {
+            self.population
+                .iter()
+                .map(|organism| organism.polarity)
+                .collect()
+        })
     }
 
     /// How many controller topologies the run's catalog defines.
@@ -2853,6 +2875,11 @@ impl World {
         // Under contact inhibition, each survivor's push from the bodies it
         // overlapped; empty otherwise.
         let pressed = contact.pressed.as_slice();
+        let next_polarities = if rules.v2.polarity().is_some() && rules.contact.is_some() {
+            contact.next_polarities.as_slice()
+        } else {
+            &[]
+        };
         for (index, organism) in working.iter().enumerate() {
             emitted += usize::from(organism.emitted);
             match organism.vitality.fate()? {
@@ -2872,6 +2899,10 @@ impl World {
                         }
                         _ => organism.velocity,
                     };
+                    let polarity = next_polarities
+                        .get(index)
+                        .copied()
+                        .unwrap_or(organism.committed.polarity);
                     survivors.push(Organism {
                         position,
                         velocity,
@@ -2881,6 +2912,7 @@ impl World {
                         cooldown_deadline: organism.cooldown_deadline,
                         secretory_readiness: organism.secretory_readiness,
                         emission_cooldown_deadline: organism.emission_cooldown_deadline,
+                        polarity,
                         ..organism.committed
                     });
                 }
@@ -2963,6 +2995,7 @@ impl World {
                 interval: rules.interval,
                 cooldown: rules.reproduction.rules().cooldown,
                 maximum_population: rules.maximum_population,
+                pcp_polarity: rules.v2.polarity().is_some(),
             },
             survivors.len(),
             &mut next_identities,
@@ -3104,6 +3137,37 @@ pub fn founder_position(
 ) -> Result<[f64; 2], CoreError> {
     let [u, v] = founder_draws(rng, organism)?;
     grid.wrap_position([u * grid.world_width(), v * grid.world_height()])
+}
+
+/// A founder's initial unit apical-basal polarity vector (`V2-08`,
+/// `pcp-polarity`): uniform angle on `[0, 2π)` from word 0 of
+/// `(founders, organism, 0, lane (0, direction, 0x0802), 0)` via
+/// host-independent [`sin_cos_turns`].
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a degenerate draw; [`CoreError::Overflow`]
+/// for lane construction.
+pub fn founder_polarity(rng: &SemanticRng, organism: OrganismId) -> Result<[f64; 2], CoreError> {
+    let [word, ..] = rng.block(Address {
+        stream: Stream::Founders,
+        entity: organism.get(),
+        ordinal: 0,
+        lane: Lane::new(0, LaneKind::Direction, 0x0802)?,
+        draw: 0,
+    });
+    let (sin, cos) =
+        sin_cos_turns(half_open_unit(word)).ok_or_else(|| CoreError::NumericalInvalid {
+            quantity: "founder polarity angle",
+            detail: format!("word {word:#018x} left the unit interval"),
+        })?;
+    let norm = cos.hypot(sin);
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "founder polarity",
+            detail: format!("polarity [{cos:?}, {sin:?}] has nonpositive norm"),
+        });
+    }
+    Ok([cos / norm, sin / norm])
 }
 
 /// The two half-open uniforms behind a founder's position: words 0 and 1 of
@@ -3293,7 +3357,13 @@ impl Scratch {
             survivors: reserved(rows, "survivors")?,
             deaths: reserved(rows, "deaths")?,
             contact: match &rules.contact {
-                Some(bodies) => ContactWork::with_capacity(&rules.grid, bodies, rows)?,
+                Some(bodies) => ContactWork::with_capacity_v2(
+                    &rules.grid,
+                    bodies,
+                    rows,
+                    rules.v2.polarity().is_some(),
+                    rules.v2.emt_gate(),
+                )?,
                 None => ContactWork::default(),
             },
             crowding: match rules.v2.crowding() {
@@ -3462,11 +3532,11 @@ fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, Core
         } => (organism, genome, buffer),
         Seed::Unissued(error) => return Err(error),
         Seed::Unallocated { organism, error } => {
-            founder_traits(&rules.rng, organism, &rules.limits, founding.scale)?;
+            founder_traits_v2(&rules.rng, organism, &rules.limits, founding.scale)?;
             return Err(error);
         }
     };
-    let traits = founder_traits(&rules.rng, id, &rules.limits, founding.scale)?;
+    let traits = founder_traits_v2(&rules.rng, id, &rules.limits, founding.scale)?;
     let genome = grow_founder(
         &rules.rng,
         id,
@@ -3477,6 +3547,11 @@ fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, Core
         &rules.limits,
     )
     .map_err(|unsealed| unsealed.error)?;
+    let polarity = if rules.v2.polarity().is_some() {
+        founder_polarity(&rules.rng, id)?
+    } else {
+        DEFAULT_POLARITY
+    };
     let organism = Organism {
         id,
         genome: genome_id,
@@ -3493,6 +3568,7 @@ fn grown(rules: &Rules, founding: &Founding, seed: Seed) -> Result<Entrant, Core
         cooldown_deadline: founding.cooldown_deadline,
         secretory_readiness: INITIAL_SECRETORY_READINESS,
         emission_cooldown_deadline: Tick::new(0),
+        polarity,
     };
     Ok(Entrant { organism, genome })
 }
@@ -5972,19 +6048,49 @@ fn contact_displacements(
     work.ids.clear();
     work.alive.clear();
     work.affinities.clear();
-    let adheres = bodies.adheres();
+    work.polarities.clear();
+    work.next_polarities.clear();
+    work.polarity_strengths.clear();
+    work.wedge_curvatures.clear();
+    work.energy_gradients.clear();
+    work.emt_factors.clear();
+    let pcp = rules.v2.polarity();
+    let emt_gate = rules.v2.emt_gate();
+    let needs_affinities = bodies.adheres() || pcp.is_some();
     for organism in working {
         work.positions.push(organism.position);
         work.ids.push(organism.committed.id.get());
         work.alive
             .push(matches!(organism.vitality.fate()?, Fate::Survives));
-        if adheres {
-            let genome = genome_of(population, organism.committed.id)?;
+        let genome = if needs_affinities || pcp.is_some() {
+            Some(genome_of(population, organism.committed.id)?)
+        } else {
+            None
+        };
+        if needs_affinities && let Some(genome) = genome {
             work.affinities
                 .push(unit_affinity(genome.traits().affinity()));
         }
+        if pcp.is_some() {
+            let traits = genome.map(Genome::traits);
+            work.polarities.push(organism.committed.polarity);
+            work.polarity_strengths
+                .push(traits.and_then(Traits::polarity_strength).unwrap_or(0.0));
+            work.wedge_curvatures
+                .push(traits.and_then(Traits::wedge_curvature).unwrap_or(0.0));
+            work.energy_gradients.push(organism.gradients[0]);
+        }
+        if emt_gate {
+            let emt_eff = 2.0 * organism.actions.emt_gate.unwrap_or(0.5);
+            work.emt_factors.push(emt_eff);
+        }
     }
-    work.relax(&rules.grid, bodies, workers)
+    let pcp_params = pcp.map(|pol| PcpSweepParams {
+        dt: rules.step.seconds_per_tick(),
+        torque_mobility: pol.torque_mobility,
+        gradient_cue_strength: pol.gradient_cue_strength,
+    });
+    work.relax_v2(&rules.grid, bodies, pcp_params, emt_gate, workers)
 }
 
 /// Phases 6 and 7 for one organism: chemistry, maintenance, motion,
@@ -6138,18 +6244,58 @@ fn settle_stages(
         };
     }
     if let ReproductionProposal::Intent(mut intent) = proposal {
-        if let Some(budding) = rules.v2.budding() {
-            intent.budding_offset = Some(rules.reproduction.budding_child_offset(
+        if rules.v2.polarity().is_some() {
+            intent.newborn_polarity = Some(Reproduction::inherit_polarity(
                 &rules.rng,
                 intent.parent,
                 intent.tick,
-                Some(budding.local_offset_radius),
-                organism.actions.budding,
-                organism.gradients[0],
-                settled.velocity,
-                0.0,
-                [0.0, 0.0],
+                organism.committed.polarity,
             )?);
+        }
+        let lateral_diameter = rules
+            .v2
+            .polarity()
+            .filter(|pol| pol.oriented_lateral_mitosis)
+            .and_then(|_| rules.contact.map(|bodies| bodies.diameter));
+        let local_radius = rules.v2.budding().map(|b| b.local_offset_radius);
+        if local_radius.is_some() || lateral_diameter.is_some() {
+            let (lambda_epi, lateral_offset) = if let Some(diameter) = lateral_diameter {
+                let alpha_pol = traits.polarity_strength().unwrap_or(0.0);
+                let emt_eff = if rules.v2.emt_gate() {
+                    2.0 * organism.actions.emt_gate.unwrap_or(0.5)
+                } else {
+                    1.0
+                };
+                let lambda = (alpha_pol * emt_eff.min(1.0)).clamp(0.0, 1.0);
+                if lambda > 0.0 {
+                    let offset = Reproduction::lateral_mitosis_offset(
+                        &rules.rng,
+                        intent.parent,
+                        intent.tick,
+                        organism.committed.polarity,
+                        diameter,
+                        alpha_pol,
+                    )?;
+                    (lambda, offset)
+                } else {
+                    (0.0, [0.0, 0.0])
+                }
+            } else {
+                (0.0, [0.0, 0.0])
+            };
+            if local_radius.is_some() || lambda_epi > 0.0 {
+                intent.budding_offset = Some(rules.reproduction.budding_child_offset(
+                    &rules.rng,
+                    intent.parent,
+                    intent.tick,
+                    local_radius,
+                    organism.actions.budding,
+                    organism.gradients[0],
+                    settled.velocity,
+                    lambda_epi,
+                    lateral_offset,
+                )?);
+            }
         }
         settled.intent = Some(intent);
     }

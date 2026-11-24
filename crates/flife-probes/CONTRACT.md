@@ -12,7 +12,7 @@ as NDJSON lines (`flife.probe.v1`) and exits 0 (no failure), 1 (a probe failed) 
 
 | Probe | Checks | Oracle |
 |---|---|---|
-| `closure` | Each suite git source resolves at its `franken-stack.lock` commit; no repo at two commits; one git-sourced copy of asupersync, the franken-* runtime crates, fmn, fnp-*, ft-* and `block` | `franken-stack.lock` |
+| `closure` | Each suite git source resolves at its `franken-stack.lock` commit; no repo at two commits; one git-sourced copy of all 22 direct single-copy suite packages (`asupersync`, `franken-{decision,evidence,kernel}`, `fmn`, `fmn-{codec,core,frame,geom,render,text}`, `fnp-*`, `fsqlite`, `frankentorch-{api,core,kernel-cpu,runtime}`, `ft-kernel-metal`, `block`) | `franken-stack.lock` |
 | `runtime` | Asupersync current-thread runtime joins a spawned task; the lab replays a seeded schedule; FrankenTorch's `Budget` is this crate's `Budget` | Closed-form completion order `[0,5,4,3,2,1]`; the type check |
 | `rng` | PCG64DXSM words, `random()`, `advance(1000)`, `SeedSequence` and spawn keys | NumPy 2.5.4 values |
 | `array` | Reference-field `(128,128,33)` f32 C/F strides, bytes, broadcast | NumPy 2.5.4 values |
@@ -35,6 +35,9 @@ and Linux x86_64 (AMD EPYC Genoa); see `franken-stack.lock` `[probes]`.
 **Validity domain.** The commits in `franken-stack.lock` and the toolchain in `rust-toolchain.toml`. The Metal and
 window probes need macOS with a GPU and, for the window, a window server and the main thread.
 
-**Known gaps.** The window probe is not run in `cargo test`, because test threads are not the main thread. It
-observes the window's own geometry and focus events; delivery of posted pointer and key events is qualified by
-frankentorch's `native_input` test and FL-018's live Studio test, not by this probe.
+**Known gaps.** The window probe is not run in `cargo test`, because test threads are not the main thread. At the
+FL-043 repin (`franken_manim` `d1e1757b`, `frankentorch` `37e0d05e`), `native_window` is honestly recorded as
+`unverified` in `franken-stack.lock` (last qualified 2026-11-09 at `frankentorch` `71bbe52e`, `franken_manim`
+`2fe8d299`) because opening a real window takes operator focus. When run, it observes the window's own geometry and
+focus events; delivery of posted pointer and key events is qualified by frankentorch's `native_input` test and
+FL-018's live Studio test, not by this probe.

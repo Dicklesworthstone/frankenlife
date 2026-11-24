@@ -54,10 +54,12 @@ use flife_neural::{DenseTopology, ReferenceController, Weight, WeightDtype, Weig
 
 use crate::catalog::{TopologyCatalog, TopologyId};
 use crate::draws::normals;
-use crate::founder::{CADHERIN_COHESIVENESS_LANE, CADHERIN_TAG_LANE_BASE};
+use crate::founder::{
+    CADHERIN_COHESIVENESS_LANE, CADHERIN_TAG_LANE_BASE, POLARITY_STRENGTH_LANE, POLARITY_WEDGE_LANE,
+};
 use crate::genome::{
-    AFFINITY_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, TraitLimits, Traits,
-    normalize_cadherin_tag, rescale, squared_norm,
+    AFFINITY_TERMS, CadherinTraits, Genome, MOTION_RESPONSE_TERMS, PolarityTraits, TraitLimits,
+    Traits, normalize_cadherin_tag, rescale, squared_norm,
 };
 use crate::init::fan_in_draw;
 use crate::quota::{GenomeQuota, ParameterBuffer, ParameterValues, WeightsMut, allocate_values};
@@ -170,13 +172,16 @@ impl MutationParameters {
         self.validate_inner(false)
     }
 
-    /// Check the rates and limits, counting active `V2-13` cadherin mutation
-    /// configured on `limits` toward `reject_effective_noop`.
+    /// Check the rates and limits, counting active `V2-08` polarity and/or
+    /// `V2-13` cadherin mutation configured on `limits` toward
+    /// `reject_effective_noop`.
     ///
     /// # Errors
     /// As [`MutationParameters::validate`].
     pub fn validate_with_limits(&self, limits: &TraitLimits) -> Result<(), CoreError> {
-        self.validate_inner(limits.cadherin_enabled() && limits.cadherin_mutation_std() > 0.0)
+        let active_v2 = (limits.polarity_enabled() && limits.polarity_mutation_std() > 0.0)
+            || (limits.cadherin_enabled() && limits.cadherin_mutation_std() > 0.0);
+        self.validate_inner(active_v2)
     }
 
     fn validate_inner(&self, v2_trait_operator_active: bool) -> Result<(), CoreError> {
@@ -414,39 +419,123 @@ pub fn reflect_log_scale(scale: f64, delta: f64, range: [f64; 2]) -> Result<f64,
     )))
 }
 
+/// `value + delta`, reflected at `bounds[0]` and `bounds[1]` until inside
+/// `[bounds[0], bounds[1]]`, then clamped against last-bit rounding. A
+/// degenerate interval (`low == high`) stays at `low`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for non-finite inputs, `bounds[0] >
+/// bounds[1]`, `value` outside `[bounds[0], bounds[1]]`, or a step that does
+/// not reflect inside within 64 bounces.
+pub fn reflect_interval(value: f64, delta: f64, bounds: [f64; 2]) -> Result<f64, CoreError> {
+    let [low, high] = bounds;
+    let invalid = |detail: String| CoreError::NumericalInvalid {
+        quantity: "bounded trait",
+        detail,
+    };
+    if !low.is_finite() || !high.is_finite() || low > high {
+        return Err(invalid(format!("bounds [{low}, {high}] are invalid")));
+    }
+    if !value.is_finite() || !(low..=high).contains(&value) {
+        return Err(invalid(format!("{value} is outside [{low}, {high}]")));
+    }
+    if !delta.is_finite() {
+        return Err(invalid(format!("step {delta} is not finite")));
+    }
+    if low == high {
+        return Ok(low);
+    }
+    let mut current = value + delta;
+    if !current.is_finite() {
+        return Err(invalid(format!("value {current} is not finite")));
+    }
+    for _ in 0..REFLECTIONS {
+        if current > high {
+            current = 2.0 * high - current;
+        } else if current < low {
+            current = 2.0 * low - current;
+        } else {
+            return Ok(current.clamp(low, high));
+        }
+    }
+    Err(invalid(format!(
+        "{value} with step {delta} does not reflect into [{low}, {high}]"
+    )))
+}
+
 /// `value + delta`, reflected at `0.0` and `1.0` until inside `[0.0, 1.0]`,
-/// then clamped against last-bit rounding (`V2-13` cadherin cohesiveness).
+/// then clamped against last-bit rounding (`V2-13` cadherin cohesiveness and
+/// `V2-08` polarity strength).
 ///
 /// # Errors
 /// [`CoreError::NumericalInvalid`] for a non-finite input, `value` outside
 /// `[0.0, 1.0]`, or a step that does not reflect inside within 64 bounces.
 pub fn reflect_unit_interval(value: f64, delta: f64) -> Result<f64, CoreError> {
-    let invalid = |detail: String| CoreError::NumericalInvalid {
-        quantity: "cadherin cohesiveness",
-        detail,
+    reflect_interval(value, delta, [0.0, 1.0])
+}
+
+/// Semantically addressed `V2-08` polarity mutation for candidate `candidate`
+/// of `attempt` under Gaussian deviation `mutation_std` and wedge curvature
+/// bound `maximum_wedge_curvature ∈ [0.0, 0.4]`.
+///
+/// - When `mutation_std == 0.0`, validates and returns `parent` bit-for-bit
+///   with zero Philox draws.
+/// - Otherwise perturbs `polarity_strength` on `(Stream::Mutation, parent,
+///   tick, Direction, 0x0800)` with bounded reflection in `[0.0, 1.0]`, and
+///   perturbs `wedge_curvature` on `(Stream::Mutation, parent, tick,
+///   Direction, 0x0801)` with bounded reflection in
+///   `[-maximum_wedge_curvature, maximum_wedge_curvature]`.
+///
+/// # Errors
+/// [`CoreError::NumericalInvalid`] for a negative/non-finite `mutation_std`,
+/// an out-of-range `maximum_wedge_curvature` or `parent`, or an unreflectable
+/// step; [`CoreError::Overflow`] if a lane overflows.
+pub fn mutate_polarity_traits(
+    rng: &SemanticRng,
+    parent: PolarityTraits,
+    mutation_std: f64,
+    maximum_wedge_curvature: f64,
+    attempt: BirthAttempt,
+    candidate: u8,
+) -> Result<PolarityTraits, CoreError> {
+    if !mutation_std.is_finite() || mutation_std < 0.0 {
+        return Err(CoreError::NumericalInvalid {
+            quantity: "v2.polarity.polarity_mutation_std",
+            detail: format!("{mutation_std} is not a non-negative finite standard deviation"),
+        });
+    }
+    let validated_parent = PolarityTraits::new(
+        parent.polarity_strength(),
+        parent.wedge_curvature(),
+        maximum_wedge_curvature,
+    )?;
+    if mutation_std == 0.0 {
+        return Ok(validated_parent);
+    }
+    let address = |lane| Address {
+        stream: Stream::Mutation,
+        entity: attempt.parent.get(),
+        ordinal: attempt.tick.get(),
+        lane,
+        draw: 0,
     };
-    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-        return Err(invalid(format!("{value} is outside [0, 1]")));
-    }
-    if !delta.is_finite() {
-        return Err(invalid(format!("step {delta} is not finite")));
-    }
-    let mut current = value + delta;
-    if !current.is_finite() {
-        return Err(invalid(format!("cohesiveness {current} is not finite")));
-    }
-    for _ in 0..REFLECTIONS {
-        if current > 1.0 {
-            current = 2.0 - current;
-        } else if current < 0.0 {
-            current = -current;
-        } else {
-            return Ok(current.clamp(0.0, 1.0));
-        }
-    }
-    Err(invalid(format!(
-        "{value} with step {delta} does not reflect into [0, 1]"
-    )))
+    let strength_lane = Lane::new(candidate, LaneKind::Direction, POLARITY_STRENGTH_LANE)?;
+    let [s0, s1, ..] = rng.block(address(strength_lane));
+    let [n_strength, _] = box_muller(s0, s1)?;
+    let polarity_strength = reflect_unit_interval(
+        validated_parent.polarity_strength(),
+        mutation_std * n_strength,
+    )?;
+
+    let wedge_lane = Lane::new(candidate, LaneKind::Direction, POLARITY_WEDGE_LANE)?;
+    let [w0, w1, ..] = rng.block(address(wedge_lane));
+    let [n_wedge, _] = box_muller(w0, w1)?;
+    let wedge_curvature = reflect_interval(
+        validated_parent.wedge_curvature(),
+        mutation_std * n_wedge,
+        [-maximum_wedge_curvature, maximum_wedge_curvature],
+    )?;
+    PolarityTraits::new(polarity_strength, wedge_curvature, maximum_wedge_curvature)
 }
 
 /// Semantically addressed `V2-13` cadherin mutation for candidate `candidate`
@@ -1274,6 +1363,17 @@ impl<'a> Mutator<'a> {
             let [normal, _] = box_muller(first, second)?;
             scale = reflect_log_scale(scale, deviation * normal, self.limits.scale_range())?;
         }
+        let polarity = match traits.polarity_traits() {
+            Some(parent_pol) => Some(mutate_polarity_traits(
+                &self.rng,
+                parent_pol,
+                self.limits.polarity_mutation_std(),
+                self.limits.effective_wedge_curvature_bound(),
+                attempt,
+                candidate,
+            )?),
+            None => None,
+        };
         let cadherin = match traits.cadherin_traits() {
             Some(parent_cad) => Some(mutate_cadherin_traits(
                 &self.rng,
@@ -1284,7 +1384,14 @@ impl<'a> Mutator<'a> {
             )?),
             None => None,
         };
-        Traits::with_cadherin(affinity, motion_response, scale, cadherin, &self.limits)
+        Traits::with_v2_traits(
+            affinity,
+            motion_response,
+            scale,
+            polarity,
+            cadherin,
+            &self.limits,
+        )
     }
 
     fn member(&self, id: TopologyId) -> Result<&'a DenseTopology, CoreError> {
@@ -1326,6 +1433,14 @@ fn same_f64(a: &[f64], b: &[f64]) -> bool {
 }
 
 fn same_traits(a: &Traits, b: &Traits) -> bool {
+    let same_polarity = match (a.polarity_traits(), b.polarity_traits()) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.polarity_strength().to_bits() == y.polarity_strength().to_bits()
+                && x.wedge_curvature().to_bits() == y.wedge_curvature().to_bits()
+        }
+        _ => false,
+    };
     let same_cadherin = match (a.cadherin_traits(), b.cadherin_traits()) {
         (None, None) => true,
         (Some(x), Some(y)) => {
@@ -1336,5 +1451,6 @@ fn same_traits(a: &Traits, b: &Traits) -> bool {
     same_f64(a.affinity(), b.affinity())
         && same_f64(a.motion_response(), b.motion_response())
         && a.sensing_scale().to_bits() == b.sensing_scale().to_bits()
+        && same_polarity
         && same_cadherin
 }

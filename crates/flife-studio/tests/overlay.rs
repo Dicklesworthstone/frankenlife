@@ -1693,22 +1693,25 @@ fn a_measurement_says_what_its_disk_holds() {
     );
 }
 
-/// V2-16: `ColorMapping::CellState` and `ColorMapping::Polarity` paired with
-/// `FieldMapping::TrailCarrier` and `FieldMapping::VascularConductance` plus
-/// worst-case telemetry, clock, brush preview, and full inspector panel fit
-/// cleanly within FL-024's HUD vertex and triangle caps at both 2× and 3×
-/// scale, with zero refused or left-out glyphs.
+/// V2-16: EVERY colour mapping in `ColorMapping::ALL` (all 7 v1 mappings +
+/// `CellState` and `Polarity`) paired with `FieldMapping::TrailCarrier` and
+/// `FieldMapping::VascularConductance` plus worst-case telemetry, clock, brush
+/// preview, and full inspector panel fits cleanly within FL-024's HUD swatch,
+/// vertex, and triangle caps at both 2× and 3× scale, with zero refused or
+/// left-out glyphs.
 #[test]
 fn v2_legends_and_field_overlays_fit_within_hud_vertex_cap() {
     use flife_manim::Style;
 
     let all_keys = legends(&config()).expect("legends");
     assert_eq!(all_keys.len(), ColorMapping::ALL.len());
-    let v2_keys: Vec<_> = all_keys
-        .into_iter()
-        .filter(|(mapping, _)| mapping.is_v2())
-        .collect();
-    assert_eq!(v2_keys.len(), 2);
+    assert_eq!(
+        all_keys
+            .iter()
+            .filter(|(mapping, _)| mapping.is_v2())
+            .count(),
+        2
+    );
 
     // `field_key` respects `Style::field_drawn()` for the v2 field overlays.
     for field_mapping in [
@@ -1735,7 +1738,7 @@ fn v2_legends_and_field_overlays_fit_within_hud_vertex_cap() {
     let memory = admission(999 * GIB, 999 * GIB, GIB);
     let preview = widest_preview(Brush::Removal, BrushSettings::default());
 
-    for (mapping, legend) in &v2_keys {
+    for (mapping, legend) in &all_keys {
         for field_mapping in [
             FieldMapping::TrailCarrier,
             FieldMapping::VascularConductance,

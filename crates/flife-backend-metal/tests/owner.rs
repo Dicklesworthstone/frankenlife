@@ -435,3 +435,66 @@ fn retired_buffers_free_when_released_and_their_handles_stay_stale() {
     assert_eq!(epoch(&owner, w), 2);
     assert_eq!(values(&owner, w, 1), [2.0]);
 }
+
+/// Concurrent multi-thread `submit_batch` calls binding shared read-only
+/// buffers in opposite handle orders plus concurrent read leases never
+/// deadlock (verifies canonical `handle.index` lock ordering & clean
+/// `CommandGuard` release across threads).
+#[test]
+fn concurrent_reverse_order_submit_batch_never_deadlocks_and_leaves_owner_idle() {
+    let Some(owner) = owner(Limits::UNBOUNDED) else {
+        return;
+    };
+    let add_pair = Arc::new(pipeline(&owner, "add_pair"));
+    let a = owner.upload(&[1.0_f32, 2.0, 3.0, 4.0]).expect("a");
+    let b = owner.upload(&[10.0_f32, 20.0, 30.0, 40.0]).expect("b");
+    let outs: Vec<Buffer<f32>> = (0..4)
+        .map(|_| owner.zeroed::<f32>(4).expect("out"))
+        .collect();
+    let start = Arc::new(Barrier::new(4));
+
+    let threads: Vec<_> = outs
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(tid, out)| {
+            let owner = owner.clone();
+            let add_pair = Arc::clone(&add_pair);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..32 {
+                    let bindings = if tid % 2 == 0 {
+                        [a.reads(), b.reads(), out.writes()]
+                    } else {
+                        [b.reads(), a.reads(), out.writes()]
+                    };
+                    owner
+                        .submit(&add_pair, &bindings, Grid::linear(1, 4))
+                        .expect("concurrent submit");
+                    let lease = owner.read(out, Purpose::Readback).expect("readback");
+                    let mut got = [0.0_f32; 4];
+                    lease.read(&mut got).expect("read");
+                    assert_eq!(got, [11.0, 22.0, 33.0, 44.0]);
+                }
+            })
+        })
+        .collect();
+    for handle in threads {
+        handle.join().expect("worker joined cleanly");
+    }
+
+    let usage = owner.usage();
+    assert_eq!(
+        (
+            usage.buffers,
+            usage.retiring,
+            usage.read_leases,
+            usage.write_leases,
+            usage.running
+        ),
+        (6, 0, [0; 3], 0, 0),
+        "shared owner left non-idle state: {usage:?}"
+    );
+    assert_eq!(owner.device_time().commands, 128);
+}

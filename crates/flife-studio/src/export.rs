@@ -52,6 +52,10 @@ pub const CINEMA_1080P: [u32; 2] = [1920, 1080];
 /// Standard Cinema 4K UHD output resolution (`3840 × 2160`, FL-050).
 pub const CINEMA_4K: [u32; 2] = [3840, 2160];
 
+/// Square 4K Cinema output resolution (`2160 × 2160`, FL-050), ideal for
+/// square periodic torus worlds with zero letterboxing.
+pub const CINEMA_4K_SQUARE: [u32; 2] = [2160, 2160];
+
 /// The schema of an export's manifest.
 pub const EXPORT_SCHEMA: &str = "frankenlife.export.v1";
 
@@ -167,6 +171,21 @@ impl CinemaOptions {
         }
     }
 
+    /// Square 4K Cinema (`2160 × 2160`, `2.0` pixels/point) simulation-time
+    /// options sampling every `every_ticks` committed ticks.
+    #[must_use]
+    pub const fn cinema_4k_square(frames_per_second: NonZeroU32, every_ticks: NonZeroU64) -> Self {
+        Self {
+            frames_per_second,
+            cpu_workers: None,
+            mp4: false,
+            mode: ExportMode::SimulationTime { every_ticks },
+            resolution: Some(CINEMA_4K_SQUARE),
+            pixels_per_point: Some(2.0),
+            camera: None,
+        }
+    }
+
     /// Validate and resolve the optional Cinema `(drawable, pixels_per_point)`
     /// target before touching disk or allocating buffers.
     ///
@@ -202,7 +221,9 @@ impl CinemaOptions {
     }
 }
 
-/// Parse a Cinema resolution flag: `1080p`, `4k` / `2160p`, or `WxH`.
+/// Parse a Cinema resolution flag: `1080p`, `4k` / `2160p` (`3840×2160`),
+/// `4k-square` / `square-4k` (`2160×2160`), or `WxH` (e.g. `2160x2160`,
+/// `3840x2160`).
 ///
 /// # Errors
 /// Returns a human-readable explanation if the input is not a positive `WxH`
@@ -215,8 +236,13 @@ pub fn parse_cinema_resolution(text: &str) -> Result<[u32; 2], String> {
     if trimmed.eq_ignore_ascii_case("4k") || trimmed.eq_ignore_ascii_case("2160p") {
         return Ok(CINEMA_4K);
     }
+    if trimmed.eq_ignore_ascii_case("4k-square") || trimmed.eq_ignore_ascii_case("square-4k") {
+        return Ok(CINEMA_4K_SQUARE);
+    }
     let Some((w, h)) = trimmed.split_once(['x', 'X']) else {
-        return Err(format!("`{text}` is not `1080p`, `4k`, or `WIDTHxHEIGHT`"));
+        return Err(format!(
+            "`{text}` is not `1080p`, `4k`, `4k-square`, or `WIDTHxHEIGHT`"
+        ));
     };
     let width: u32 = w
         .trim()

@@ -306,7 +306,15 @@ impl MetalField {
                         .ok_or_else(overflow)?,
                 )?,
                 moment_params: owner.zeroed_owned(MOMENT_WORDS)?,
-                moments: owner.zeroed_owned(cells.checked_mul(CHANNELS).ok_or_else(overflow)?)?,
+                moments: owner.zeroed_owned(
+                    cells
+                        .checked_mul(if planes == DUAL_CARRIER_PLANES as usize {
+                            CARRIER0_MOMENT_CHANNELS as usize
+                        } else {
+                            CHANNELS
+                        })
+                        .ok_or_else(overflow)?,
+                )?,
                 fault: owner.zeroed_owned(1)?,
             });
         }

@@ -453,7 +453,7 @@ export function Film({ className, feather = false }: { className?: string; feath
         <button
           type="button"
           onClick={toggle}
-          className="absolute top-3 right-3 z-20 flex h-11 w-11 items-center justify-center rounded-xl border border-white/15 bg-black/60 text-white backdrop-blur-md transition-colors hover:border-green-400/60 hover:text-green-300 sm:top-4 sm:right-4"
+          className="absolute top-3 right-3 z-20 flex h-11 w-11 items-center justify-center rounded-xl border border-white/15 bg-black/60 text-white backdrop-blur-md transition-colors hover:border-green-400/60 hover:text-green-300 focus-visible:ring-2 focus-visible:ring-green-400 focus-visible:outline-none sm:top-4 sm:right-4"
           aria-label={playing ? "Pause the film" : "Play the film"}
         >
           {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}

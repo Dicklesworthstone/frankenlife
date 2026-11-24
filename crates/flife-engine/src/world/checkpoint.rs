@@ -50,7 +50,7 @@ use super::{
     initial_source_kernels, initial_sources, organism_total,
 };
 use crate::emission::INITIAL_SECRETORY_READINESS;
-use crate::population::{Arrangement, Entrant, HeldOutput, Organism, Population};
+use crate::population::{Arrangement, DEFAULT_POLARITY, Entrant, HeldOutput, Organism, Population};
 use crate::reproduction::Identities;
 
 /// Every baseline chunk version this module writes and reads.
@@ -114,8 +114,8 @@ fn counted(manifest: u64, family: ChunkFamily, held: usize) -> Result<(), CoreEr
 /// and sensing. A stream's window is filled to this before each record.
 /// Parameterized by `rules` so v2 trait extensions (polarity, cadherin, etc.)
 /// grow the refill window dynamically without under-filling `ByteReader`.
-fn genome_header_bytes(_rules: &Rules) -> usize {
-    8 + 8 + 9 + 8 * (flife_genome::AFFINITY_TERMS + flife_genome::MOTION_RESPONSE_TERMS) + 8
+fn genome_header_bytes(rules: &Rules) -> usize {
+    rules.limits.genome_header_bytes()
 }
 
 const fn arrangement_code(arrangement: Arrangement) -> u8 {
@@ -318,10 +318,11 @@ impl World {
                     out.u64(items(genome.topology().index()));
                     out.option_u64(genome.parent().map(GenomeId::get));
                     let traits = genome.traits();
-                    for value in traits.affinity().iter().chain(traits.motion_response()) {
-                        out.f64(*value);
-                    }
-                    out.f64(traits.sensing_scale());
+                    traits.write_checkpoint_fields_v2(
+                        out,
+                        self.rules.limits.polarity_enabled(),
+                        self.rules.limits.cadherin_enabled(),
+                    )?;
                     out.u64(items(genome.parameters().len()));
                     // Each value in the run's weight dtype: an F32's bits,
                     // or a binary16's.
@@ -356,6 +357,10 @@ impl World {
                         .chain([organism.energy])
                     {
                         out.f64(value);
+                    }
+                    if is_v2 && self.rules.v2.polarity().is_some() {
+                        out.f64(organism.polarity[0]);
+                        out.f64(organism.polarity[1]);
                     }
                 }
                 Ok(())
@@ -733,19 +738,15 @@ impl World {
                     refuse(format!("{id} has topology {index}, not a catalog member"))
                 })?;
             let parent = input.option_u64()?.map(GenomeId::new);
-            let mut affinity = [0.0; flife_genome::AFFINITY_TERMS];
-            for value in &mut affinity {
-                *value = input.f64()?;
-            }
-            let mut motion = [0.0; flife_genome::MOTION_RESPONSE_TERMS];
-            for value in &mut motion {
-                *value = input.f64()?;
-            }
-            let sensing = input.f64()?;
+            let traits = Traits::read_checkpoint_fields_v2(
+                &mut input,
+                &rules.limits,
+                rules.limits.polarity_enabled(),
+                rules.limits.cadherin_enabled(),
+            )
+            .map_err(|error| refuse(format!("{id}'s traits: {error}")))?;
             let used = stream.window().len() - input.remaining();
             stream.advance(used);
-            let traits = Traits::new(affinity, motion, sensing, &rules.limits)
-                .map_err(|error| refuse(format!("{id}'s traits: {error}")))?;
             let count = stream.count(parameters_max, width)?;
             let mut buffer = quota.allocate(catalog, topology)?;
             if buffer.values().len() != count {
@@ -826,6 +827,20 @@ impl World {
             let position = [particles.f64()?, particles.f64()?];
             let velocity = [particles.f64()?, particles.f64()?];
             let energy = particles.f64()?;
+            let polarity = if is_v2_chunk && rules.v2.polarity().is_some() {
+                let pol = [particles.f64()?, particles.f64()?];
+                let pol_sq = pol[0] * pol[0] + pol[1] * pol[1];
+                if !(pol[0].is_finite()
+                    && pol[1].is_finite()
+                    && pol_sq.is_finite()
+                    && (pol_sq - 1.0).abs() <= 1.0e-6)
+                {
+                    return Err(refuse(format!("{id} has non-unit polarity {pol:?}")));
+                }
+                pol
+            } else {
+                DEFAULT_POLARITY
+            };
 
             let held_id = OrganismId::new(held.u64()?);
             if held_id != id {
@@ -1007,6 +1022,7 @@ impl World {
                     cooldown_deadline,
                     secretory_readiness,
                     emission_cooldown_deadline,
+                    polarity,
                 },
                 genome,
             });

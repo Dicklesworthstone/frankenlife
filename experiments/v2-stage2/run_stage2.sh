@@ -207,8 +207,10 @@ seed = int(seed_s)
 smoke = smoke_s == "1"
 text = Path(base_path).read_text(encoding="utf-8")
 
-# Parse original area and source count so smoke scaling preserves power density.
-orig_w, orig_h, orig_count = 80.0, 80.0, 25
+# Parse original area, founder count, and source count so smoke scaling preserves
+# founder density, power density, Gaussian overlap ratio (M * pi * sigma^2 / area),
+# and dimensionless source-trail smearing (path_speed / (sigma * decay)).
+orig_w, orig_h, orig_count, orig_founders = 80.0, 80.0, 16, 10954
 scan_sec = ""
 for raw in text.splitlines():
     s = raw.strip()
@@ -221,6 +223,10 @@ for raw in text.splitlines():
         m = re.match(r"^height\s*=\s*([0-9.eE+-]+)", s)
         if m:
             orig_h = float(m.group(1))
+    elif scan_sec == "population":
+        m = re.match(r"^initial_count\s*=\s*([0-9]+)", s)
+        if m:
+            orig_founders = int(m.group(1))
     elif scan_sec == "sources":
         m = re.match(r"^count\s*=\s*([0-9]+)", s)
         if m:
@@ -229,6 +235,8 @@ for raw in text.splitlines():
 smoke_side = 16.0
 smoke_sources = 4
 area_ratio = (smoke_side * smoke_side) / max(orig_w * orig_h, 1.0e-9)
+sigma_scale = (area_ratio * (orig_count / smoke_sources)) ** 0.5
+smoke_founders = max(256, int(round(orig_founders * area_ratio)))
 
 # Replace top-level seed (and optionally model) before the first [section].
 lines = text.splitlines(keepends=True)
@@ -261,10 +269,10 @@ for line in lines:
                 continue
         elif section == "population":
             if re.match(r"^initial_count\s*=", stripped):
-                out.append("initial_count = 256\n")
+                out.append(f"initial_count = {smoke_founders}\n")
                 continue
             if re.match(r"^maximum_count\s*=", stripped):
-                out.append("maximum_count = 4096\n")
+                out.append("maximum_count = 8192\n")
                 continue
         elif section == "sources":
             if re.match(r"^count\s*=", stripped):
@@ -278,15 +286,32 @@ for line in lines:
                     out.append(f"power_per_source = {scaled:.4f}\n")
                     continue
             if re.match(r"^sigma_world_units\s*=", stripped):
-                out.append("sigma_world_units = 3.0\n")
-                continue
+                # Preserve exact Gaussian overlap fraction M * pi * sigma^2 / area.
+                m = re.search(r"=\s*([0-9.eE+-]+)", stripped)
+                if m:
+                    scaled_s = max(1.0, float(m.group(1)) * sigma_scale)
+                    out.append(f"sigma_world_units = {scaled_s:.4f}\n")
+                    continue
+            if re.match(r"^path_speed\s*=", stripped):
+                # Preserve dimensionless smearing ratio path_speed / (sigma * decay).
+                m = re.search(r"=\s*([0-9.eE+-]+)", stripped)
+                if m:
+                    scaled_v = float(m.group(1)) * sigma_scale
+                    out.append(f"path_speed = {scaled_v:.4f}\n")
+                    continue
         elif section == "v2.oases":
             if re.match(r"^sigma_min_world_units\s*=", stripped):
-                out.append("sigma_min_world_units = 1.5\n")
-                continue
+                m = re.search(r"=\s*([0-9.eE+-]+)", stripped)
+                if m:
+                    scaled_s = max(0.75, float(m.group(1)) * sigma_scale)
+                    out.append(f"sigma_min_world_units = {scaled_s:.4f}\n")
+                    continue
             if re.match(r"^sigma_max_world_units\s*=", stripped):
-                out.append("sigma_max_world_units = 3.0\n")
-                continue
+                m = re.search(r"=\s*([0-9.eE+-]+)", stripped)
+                if m:
+                    scaled_s = max(1.0, float(m.group(1)) * sigma_scale)
+                    out.append(f"sigma_max_world_units = {scaled_s:.4f}\n")
+                    continue
     out.append(line)
 
 Path(dest_path).write_text("".join(out), encoding="utf-8")
@@ -372,61 +397,109 @@ validate_stage2_matrix() {
   log "  OK Bundle B toggle matrix (${#b_toggles[@]} CLI override chains)"
 }
 
-render_treatment_views() {
+render_stage2_views() {
   local bundle_tag="$1"
-  local seed_val="$2"
-  local run_dir="$3"
-  local render_root="${OUT_DIR}/renders/bundle-${bundle_tag}/seed-${seed_val}"
+  local cond_name="$2"
+  local seed_val="$3"
+  local run_dir="$4"
+  local render_root="${OUT_DIR}/renders/bundle-${bundle_tag}/${cond_name}/seed-${seed_val}"
   local render_size=640
   if [[ "${MODE}" == "full" ]]; then
     render_size=1280
   fi
 
-  mkdir -p \
-    "${render_root}/raw-cell-state" \
-    "${render_root}/sphere-polarity" \
-    "${render_root}/glow-cell-state" \
-    "${render_root}/glow-trail-carrier" \
-    "${render_root}/glow-vascular-conductance"
+  log "  Rendering Gate G5 + bundle-${bundle_tag} views (${render_size}x${render_size}) for ${cond_name} seed=${seed_val}"
 
-  log "  Rendering V2-16 views (${render_size}x${render_size}) for bundle-${bundle_tag} seed=${seed_val}"
+  if [[ "${bundle_tag}" == "a" ]]; then
+    # Shared fair mapping (treatment & v1-compat side by side) + Gate G5 raw.
+    mkdir -p "${render_root}/sphere-lineage-energy" "${render_root}/raw-lineage-energy"
+    "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+      --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+      --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+      --look sphere --color lineage-energy --no-field \
+      --out "${render_root}/sphere-lineage-energy" \
+      > "${render_root}/render-sphere-lineage-energy.ndjson"
+    "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+      --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+      --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+      --look raw --color lineage-energy --field-mapping energy \
+      --out "${render_root}/raw-lineage-energy" \
+      > "${render_root}/render-raw-lineage-energy.ndjson"
 
-  # Gate G5 honest raw + sphere checks paired with V2-16 mappings.
-  "${FLIFE_BIN}" render --run-dir "${run_dir}" \
-    --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
-    --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
-    --look raw --color cell-state --field-mapping energy \
-    --out "${render_root}/raw-cell-state" \
-    > "${render_root}/render-raw-cell-state.ndjson"
+    if [[ "${cond_name}" == "treatment" ]]; then
+      # Bundle A mechanism overlays: V2-12 clonal cell-state + V2-08 polarity/apical ticks (--no-field dark backdrop).
+      mkdir -p \
+        "${render_root}/glow-cell-state" \
+        "${render_root}/raw-cell-state" \
+        "${render_root}/sphere-polarity"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look glow --color cell-state --field-mapping energy \
+        --out "${render_root}/glow-cell-state" \
+        > "${render_root}/render-glow-cell-state.ndjson"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look raw --color cell-state --field-mapping energy \
+        --out "${render_root}/raw-cell-state" \
+        > "${render_root}/render-raw-cell-state.ndjson"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look sphere --color polarity --no-field \
+        --out "${render_root}/sphere-polarity" \
+        > "${render_root}/render-sphere-polarity.ndjson"
+    fi
+  else
+    # Bundle B shared fair mapping (treatment & v1-compat) + Gate G5 raw.
+    mkdir -p "${render_root}/glow-lineage-energy" "${render_root}/raw-lineage-energy"
+    "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+      --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+      --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+      --look glow --color lineage-energy --field-mapping energy \
+      --out "${render_root}/glow-lineage-energy" \
+      > "${render_root}/render-glow-lineage-energy.ndjson"
+    "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+      --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+      --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+      --look raw --color lineage-energy --field-mapping energy \
+      --out "${render_root}/raw-lineage-energy" \
+      > "${render_root}/render-raw-lineage-energy.ndjson"
 
-  "${FLIFE_BIN}" render --run-dir "${run_dir}" \
-    --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
-    --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
-    --look sphere --color polarity --field-mapping energy \
-    --out "${render_root}/sphere-polarity" \
-    > "${render_root}/render-sphere-polarity.ndjson"
-
-  # All four V2-16 visual mappings on glow look.
-  "${FLIFE_BIN}" render --run-dir "${run_dir}" \
-    --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
-    --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
-    --look glow --color cell-state --field-mapping energy \
-    --out "${render_root}/glow-cell-state" \
-    > "${render_root}/render-glow-cell-state.ndjson"
-
-  "${FLIFE_BIN}" render --run-dir "${run_dir}" \
-    --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
-    --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
-    --look glow --color lineage --field-mapping trail-carrier \
-    --out "${render_root}/glow-trail-carrier" \
-    > "${render_root}/render-glow-trail-carrier.ndjson"
-
-  "${FLIFE_BIN}" render --run-dir "${run_dir}" \
-    --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
-    --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
-    --look glow --color lineage --field-mapping vascular-conductance \
-    --out "${render_root}/glow-vascular-conductance" \
-    > "${render_root}/render-glow-vascular-conductance.ndjson"
+    if [[ "${cond_name}" == "treatment" ]]; then
+      # Bundle B mechanism overlays: V2-14 Murray vascular conductance + V2-15 Carrier-1 trails (glow + G5 raw).
+      mkdir -p \
+        "${render_root}/glow-vascular-conductance" \
+        "${render_root}/glow-trail-carrier" \
+        "${render_root}/raw-vascular-conductance" \
+        "${render_root}/raw-trail-carrier"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look glow --color lineage-energy --field-mapping vascular-conductance \
+        --out "${render_root}/glow-vascular-conductance" \
+        > "${render_root}/render-glow-vascular-conductance.ndjson"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look glow --color lineage-energy --field-mapping trail-carrier \
+        --out "${render_root}/glow-trail-carrier" \
+        > "${render_root}/render-glow-trail-carrier.ndjson"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look raw --color lineage-energy --field-mapping vascular-conductance \
+        --out "${render_root}/raw-vascular-conductance" \
+        > "${render_root}/render-raw-vascular-conductance.ndjson"
+      "${FLIFE_BIN}" render --run-dir "${run_dir}" \
+        --ticks 0 --every 1 --width "${render_size}" --height "${render_size}" \
+        --controllers "${CONTROLLERS}" --cpu-workers "${CPU_WORKERS}" \
+        --look raw --color lineage-energy --field-mapping trail-carrier \
+        --out "${render_root}/raw-trail-carrier" \
+        > "${render_root}/render-raw-trail-carrier.ndjson"
+    fi
+  fi
 }
 
 run_one_condition() {
@@ -542,8 +615,8 @@ rec["run_exit_code"] = int(sys.argv[2])
 print(json.dumps(rec, separators=(",", ":")))
 PY
 
-  if [[ "${DO_RENDER}" -eq 1 && "${cond_name}" == "treatment" ]]; then
-    render_treatment_views "${bundle_tag}" "${seed_val}" "${run_dir}"
+  if [[ "${DO_RENDER}" -eq 1 && ( "${cond_name}" == "treatment" || "${cond_name}" == "v1-compat" ) ]]; then
+    render_stage2_views "${bundle_tag}" "${cond_name}" "${seed_val}" "${run_dir}"
   fi
 }
 

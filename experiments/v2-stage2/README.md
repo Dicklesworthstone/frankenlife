@@ -59,23 +59,21 @@ This directory implements the reproducible Stage-2 campaign for `V2-17`, exercis
 
 ## Stage-2 Diagnostics (`diagnostics.py`)
 
-1. **Clonal differentiation (`V2-12`):** Reads `held.recurrent_state[0]` (`h_0`) per live organism and computes local neighbor crowding `c_den` on the periodic torus within `r_c = 0.375` world units. Outputs member-weighted within-lineage variance, Bessel-corrected pooled within-lineage variance, between-lineage variance, global `corr(h_0, c_den)`, and within-clone centered `corr(h_0, c_den)`.
-2. **Murray vascular bimodality (`V2-14`):** Reads `field.vascular_conductance` from `flife inspect --field`. Outputs high-band (`>= P90`) to mid-band (`[P25, P75]`) conductance ratio, `P90/P50`, `P95/P50`, midpoint-exceedance fraction, and finite-sample Sarle's bimodality coefficient `b` (uniform = `5/9 ≈ 0.556`).
-3. **Trail-carrier SNR vs Carrier-0 (`V2-15`):** Reads `field.trail_energy` (`e_1`) alongside `field.energy` (`e_0`). Outputs `(P95 - median) / std`, `(max - median) / std`, `P95 / median`, top-decile energy share, Carrier-1-to-Carrier-0 SNR ratios, and spatial decoupling `1 - |corr(e_1, e_0)|`.
-4. **Trophallaxis flux (`V2-13`):** Sums `window.transfers["trophallaxis"]` and `window.flows["trophallaxis-loss"]` across `flife run --metrics-every` windows, reporting total credited/debited energy, mean flux per tick, and live-weighted flux per organism-tick.
-5. **Flock polarization (`V2-13`):** Computes global Vicsek polarization `P = ||(1/N) Σ (v_i / ||v_i||)||` over moving organisms (`||v_i|| > 1e-9`) alongside local neighborhood Vicsek polarization, local pairwise cosine alignment, and same-lineage kin local alignment on the periodic torus (`r_align = 0.375`).
+1. **Field spatial contrast (`field_spatial_contrast`):** Computes Carrier-0 `field_gini`, `mean`, `median`, `p95`, `max`, and `dark_fraction_below_10pct_mean` directly from `field.energy` to verify dark inter-oasis / inter-tissue medium (`field_gini >= 0.45` target).
+2. **Clonal differentiation (`V2-12`):** Reads `held.recurrent_state[0]` (`h_0`) per live organism and computes local neighbor crowding `c_den` on the periodic torus within `r_c = 0.375` world units. Outputs member-weighted within-lineage variance, Bessel-corrected pooled within-lineage variance, between-lineage variance, global `corr(h_0, c_den)`, and within-clone centered `corr(h_0, c_den)`.
+3. **Murray vascular bimodality (`V2-14`):** Reads `field.vascular_conductance` from `flife inspect --field`. Outputs high-band (`>= P90`) to mid-band (`[P25, P75]`) conductance ratio, `P90/P50`, `P95/P50`, midpoint-exceedance fraction, and finite-sample Sarle's bimodality coefficient `b` (uniform = `5/9 ≈ 0.556`).
+4. **Trail-carrier SNR vs Carrier-0 (`V2-15`):** Reads `field.trail_energy` (`e_1`) alongside `field.energy` (`e_0`). Outputs `(P95 - median) / std`, `(max - median) / std`, `P95 / median`, top-decile energy share, Carrier-1-to-Carrier-0 SNR ratios, and spatial decoupling `1 - |corr(e_1, e_0)|`.
+5. **Trophallaxis flux (`V2-13`):** Sums `window.transfers["trophallaxis"]` and `window.flows["trophallaxis-loss"]` across `flife run --metrics-every` windows, reporting total credited/debited energy, mean flux per tick, and live-weighted flux per organism-tick.
+6. **Flock polarization (`V2-13`):** Computes global Vicsek polarization `P = ||(1/N) Σ (v_i / ||v_i||)||` over moving organisms (`||v_i|| > 1e-9`) alongside local neighborhood Vicsek polarization, local pairwise cosine alignment, and same-lineage kin local alignment on the periodic torus (`r_align = 0.375`).
 
 ---
 
 ## Visual Review Hooks (`--render`, `V2-16` & Gate G5)
 
-When `--render` is passed, every `treatment` checkpoint is rendered through `flife render --run-dir` into `$OUT_DIR/renders/bundle-{a,b}/seed-<S>/` across five views so honest raw/sphere views always sit beside aesthetic glow overlays:
+When `--render` is passed, both `treatment` and `v1-compat` checkpoints are rendered through `flife render --run-dir` into `$OUT_DIR/renders/bundle-{a,b}/{treatment,v1-compat}/seed-<S>/` using bundle-appropriate mechanism overlays paired with shared fair-comparison (`lineage-energy`) and Gate G5 linear-grey (`raw`) views:
 
-- `raw-cell-state`: `--look raw --color cell-state --field-mapping energy`
-- `sphere-polarity`: `--look sphere --color polarity --field-mapping energy`
-- `glow-cell-state`: `--look glow --color cell-state --field-mapping energy`
-- `glow-trail-carrier`: `--look glow --color lineage --field-mapping trail-carrier`
-- `glow-vascular-conductance`: `--look glow --color lineage --field-mapping vascular-conductance`
+- **Bundle A (`treatment` + `v1-compat`):** shared `sphere-lineage-energy` (`--no-field`) + `raw-lineage-energy`, plus `treatment`-only `glow-cell-state`, `raw-cell-state`, and high-contrast dark-backdrop `sphere-polarity` (`--no-field`).
+- **Bundle B (`treatment` + `v1-compat`):** shared `glow-lineage-energy` + `raw-lineage-energy`, plus `treatment`-only `glow-vascular-conductance`, `glow-trail-carrier`, `raw-vascular-conductance`, and `raw-trail-carrier`.
 
 ---
 

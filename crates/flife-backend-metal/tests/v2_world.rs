@@ -50,6 +50,24 @@
 //!    `World::cell_states()`, `World::effective_affinity()`, `last_neighbor_h0`,
 //!    `World::polarities()`, `Transfer::MetabolicByproduct`, live state
 //!    differentiation, active 5/5 GPU service, and idle `DeviceOwner`.
+//! 6. **All 21/21 `V2Feature::ALL` enabled simultaneously, highlighting `V2-13`
+//!    (`trophallaxis` + `cadherin-4d` + `velocity-alignment`)** on ONE shared
+//!    Metal `DeviceOwner` vs pure CPU Reference in BOTH `f32` and `f16` over 64
+//!    ticks: asserts live exact-quantum `Transfer::Trophallaxis` /
+//!    `Flow::TrophallaxisLoss` conservation and bit-exact parity, bit-exact
+//!    `World::cadherin_traits()` (tag + cohesiveness), bit-exact velocities,
+//!    bit-exact `World::digest()`, 5/5 Metal backend service with 0 deferrals,
+//!    and idle `DeviceOwner`.
+//! 7. **Plan §11.5 Option B Phase 10 bounded cone-contraction parity on Metal
+//!    GPU vs CPU Reference** across BOTH (a) a 33-plane single-oasis no-emission
+//!    world under the unmodified `NumericalProfile::reference_f32()` (`INV-02 =
+//!    1.0e-5`, trigger `1.0e-6`) and (b) a 34-plane dual-carrier `supercolony`
+//!    world (fed on the 24-channel Carrier-0 cone boundary via `InjectMaterial`)
+//!    under a tight `(f32::MIN_POSITIVE, 1.0e-6)` / `1.0e-7` trigger:
+//!    asserts contraction fires live, `World::digest()`, unmasked `FieldSummary`,
+//!    and `ConeContractionSummary` match bit-for-bit, post-contraction fields
+//!    satisfy `trigger`, `INV-03` holds with zero hidden energy, `MetalField::check`
+//!    serves every tick with 0 reference fallbacks, and `DeviceOwner` stays idle.
 
 #![allow(
     clippy::expect_used,
@@ -65,8 +83,11 @@ use flife_backend_metal::{
     MetalUptake,
 };
 use flife_core::{CoreError, Flow, Transfer, V2Feature, ValidatedConfig};
-use flife_engine::{Arrangement, DeathCause, NumericalProfile, Stepped, World};
-use flife_field::{DUAL_CARRIER_PLANES, FieldSummary, VASCULAR_INITIAL_CONDUCTANCE};
+use flife_engine::{Arrangement, DeathCause, Intervention, NumericalProfile, Stepped, World};
+use flife_field::{
+    ConeContractionSummary, ConeTolerance, DUAL_CARRIER_PLANES, FieldSummary,
+    VASCULAR_INITIAL_CONDUCTANCE,
+};
 use flife_genome::Genome;
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
@@ -1530,5 +1551,685 @@ inhibition_gain = 0.25
             assert!(c_rep.batched > 0);
             assert_owner_idle(&owner, &format!("{} {dtype}", case.label));
         }
+    }
+}
+
+/// Full `V2-13` (`trophallaxis` + `cadherin-4d` + `velocity-alignment`) running
+/// alongside ALL other closed V2 mechanisms (all 21/21 [`V2Feature::ALL`]
+/// enabled simultaneously: 34-plane dual-carrier + vascular + PCP + EMT +
+/// V2-11 lysis/waste + V2-12 `S = 2` epigenetic/notch-delta + V2-13) on ONE
+/// shared Metal `DeviceOwner` (`MetalField` + `MetalSensors` + `MetalUptake` +
+/// `MetalBackend` + `MetalSettle`) vs pure CPU Reference in BOTH `f32` and
+/// `f16` over 64 ticks.
+#[test]
+fn v2_trophallaxis_cadherin_4d_and_velocity_alignment_on_metal_matches_reference_f32_and_f16() {
+    if open_owner().is_none() {
+        return;
+    }
+    let profile = NumericalProfile::reference_f32().expect("profile");
+
+    for dtype in ["f32", "f16"] {
+        let dtype_toml = format!("\"{dtype}\"");
+        let overrides = [
+            ("world", "width", "16.0"),
+            ("world", "height", "16.0"),
+            ("world", "grid_width", "32"),
+            ("world", "grid_height", "32"),
+            ("world", "tick_numerator", "1"),
+            ("world", "tick_denominator", "32"),
+            ("population", "initial_count", "64"),
+            ("population", "maximum_count", "384"),
+            ("population", "initial_energy", "4.0"),
+            ("sources", "count", "4"),
+            ("sources", "power_per_source", "220.0"),
+            ("sources", "sigma_world_units", "2.0"),
+            ("sources", "path_direction_interval_seconds", "2.0"),
+            ("chemistry", "uptake_capacity_per_second", "4.0"),
+            ("controller", "hidden_widths", "[64, 32]"),
+            ("controller", "canonical_weight_dtype", dtype_toml.as_str()),
+            ("reproduction", "cooldown_seconds", "0.10"),
+            (
+                "reproduction",
+                "minimum_parent_energy_before_attempt",
+                "1.8",
+            ),
+            ("reproduction", "maximum_attempt_rate_per_second", "6.0"),
+            ("architecture_mutation", "probability_per_birth", "0.20"),
+            ("execution", "command_durability", "\"volatile-in-memory\""),
+        ];
+        let tail = r#"
+[contact]
+diameter = 0.5
+stiffness = 0.75
+adhesion = 0.55
+adhesion_range = 2.0
+sweeps = 2
+
+[v2]
+profile = "supercolony"
+
+[v2.crowding]
+enabled = true
+mode = "local-neighbors-v1"
+arrest_threshold = 8.0
+expose_sensor = true
+
+[v2.polarity]
+enabled = true
+torque_mobility = 2.0
+gradient_cue_strength = 0.25
+initial_polarity_strength_max = 0.8
+maximum_wedge_curvature = 0.25
+polarity_mutation_std = 0.05
+oriented_lateral_mitosis = true
+emt_gate_enabled = true
+
+[v2.metabolism.waste]
+enabled = true
+byproduct_recycle_fraction = 0.45
+
+[v2.differentiation]
+enabled = true
+state_width = 2
+epigenetic_gate_bias = 2.5
+state_inheritance = "asymmetric-stem-v1"
+inheritance_retention = 0.8
+inheritance_jitter = 0.05
+stem_asymmetry = -0.8
+affinity_rotation_enabled = true
+emt_adhesion_enabled = true
+
+[v2.differentiation.notch_delta]
+enabled = true
+mode = "direct-lateral-inhibition-v1"
+inhibition_gain = 0.25
+
+[v2.trophallaxis]
+enabled = true
+conductance_per_second = 8.0
+transfer_efficiency = 0.95
+reserve_energy = 0.25
+maximum_export_fraction = 0.25
+kin_cosine_exponent = 4
+kin_threshold = 0.5
+
+[v2.contact.cadherin]
+enabled = true
+mutation_std = 0.05
+
+[v2.contact.velocity_alignment]
+enabled = true
+strength = 0.35
+
+[v2.visual]
+enabled = true
+"#;
+        let toml = ecology_toml("field-ecology-v2", &overrides, tail);
+        let config = ValidatedConfig::from_toml(&toml).expect("all-21 V2-13 config validates");
+
+        for feature in V2Feature::ALL {
+            assert!(
+                config.is_v2_feature_enabled(feature),
+                "V2-13 dtype={dtype}: expected {feature:?} enabled"
+            );
+        }
+        let abi = config.v2_abi();
+        assert_eq!(abi.field_planes, DUAL_CARRIER_PLANES);
+        assert_eq!(abi.input_width, 111);
+        assert_eq!(abi.action_width, 43);
+        assert_eq!(abi.raw_output_width, 47);
+
+        let mut reference = found_world(&config);
+        let mut gpu = found_world(&config);
+        let owner = install_all_metal_on_one_owner(&mut gpu).expect("metal owner");
+        assert!(reference.tracks_cadherin() && gpu.tracks_cadherin());
+
+        let watched_id = reference.population().ids().next().expect("watched");
+        reference.watch(Some(watched_id));
+        gpu.watch(Some(watched_id));
+
+        // Feed a clonal cluster around `watched_id` with chemically matched
+        // material (zeroed on Carrier-1 channels 24..32 so 34-plane Carrier 0
+        // gets full positive uptake efficiency) so sisters divide and exchange
+        // live exact-quantum trophallaxis transfers alongside cadherin adhesion
+        // and velocity alignment.
+        let mut food_dir = reference
+            .population()
+            .genome(watched_id)
+            .expect("watched genome")
+            .traits()
+            .affinity()
+            .map(|x| x * 0.99);
+        for slot in &mut food_dir[24..] {
+            *slot = 0.0;
+        }
+        let watched_pos = reference
+            .population()
+            .get(watched_id)
+            .expect("org")
+            .position;
+        let grid = *reference.field().grid();
+        let watched_cell = [
+            ((watched_pos[0] / grid.cell_width()).floor() as u32).min(grid.cells_x() - 1),
+            ((watched_pos[1] / grid.cell_height()).floor() as u32).min(grid.cells_y() - 1),
+        ];
+
+        let ticks = 64_u64;
+        let mut max_rel = 0.0_f64;
+        let mut total_tr_debited = 0.0_f64;
+        let mut total_tr_credited = 0.0_f64;
+        let mut total_tr_tax = 0.0_f64;
+        let mut total_births = 0_usize;
+        for step in 1..=ticks {
+            let interventions = if step % 2 == 1 {
+                vec![Intervention::InjectMaterial {
+                    cell: watched_cell,
+                    amount: 6.0,
+                    direction: food_dir,
+                }]
+            } else {
+                Vec::new()
+            };
+            let Stepped::Published(expected) =
+                reference.step_with(&interventions).expect("ref step")
+            else {
+                panic!("V2-13 dtype={dtype} tick={step}: ref paused");
+            };
+            let Stepped::Published(got) = gpu.step_with(&interventions).expect("metal step") else {
+                panic!("V2-13 dtype={dtype} tick={step}: gpu paused");
+            };
+            assert_eq!(
+                reference.digest(),
+                gpu.digest(),
+                "V2-13 dtype={dtype} tick={step}: World::digest diverged"
+            );
+            assert_eq!(
+                summary_bits(&expected.field),
+                summary_bits(&got.field),
+                "V2-13 dtype={dtype} tick={step}: FieldSummary diverged"
+            );
+            assert_eq!(
+                cell_state_bits(&reference),
+                cell_state_bits(&gpu),
+                "V2-13 dtype={dtype} tick={step}: World::cell_states diverged"
+            );
+            assert_eq!(
+                polarity_bits(&reference),
+                polarity_bits(&gpu),
+                "V2-13 dtype={dtype} tick={step}: World::polarities diverged"
+            );
+            let exp_deb = expected.closure.debited(Transfer::Trophallaxis);
+            let exp_cred = expected.closure.credited(Transfer::Trophallaxis);
+            let exp_tax = expected.closure.flow(Flow::TrophallaxisLoss);
+            let got_deb = got.closure.debited(Transfer::Trophallaxis);
+            let got_cred = got.closure.credited(Transfer::Trophallaxis);
+            let got_tax = got.closure.flow(Flow::TrophallaxisLoss);
+            assert_eq!(
+                (
+                    expected.closure.closing().field().to_bits(),
+                    expected.closure.closing().organisms().to_bits(),
+                    expected.closure.residual().to_bits(),
+                    exp_deb.to_bits(),
+                    exp_cred.to_bits(),
+                    exp_tax.to_bits(),
+                    expected
+                        .closure
+                        .credited(Transfer::MetabolicByproduct)
+                        .to_bits(),
+                ),
+                (
+                    got.closure.closing().field().to_bits(),
+                    got.closure.closing().organisms().to_bits(),
+                    got.closure.residual().to_bits(),
+                    got_deb.to_bits(),
+                    got_cred.to_bits(),
+                    got_tax.to_bits(),
+                    got.closure.credited(Transfer::MetabolicByproduct).to_bits(),
+                ),
+                "V2-13 dtype={dtype} tick={step}: INV-03 / Trophallaxis ledger diverged"
+            );
+            assert!(
+                ((got_deb - got_cred) - got_tax).abs() <= 1e-15,
+                "V2-13 dtype={dtype} tick={step}: exact-quantum trophallaxis balance error: deb={got_deb:e}, cred={got_cred:e}, tax={got_tax:e}"
+            );
+            assert_eq!(expected.births, got.births);
+            assert_eq!(expected.deaths, got.deaths);
+            for birth in &got.births {
+                let a = reference
+                    .population()
+                    .genome(birth.child)
+                    .expect("ref child");
+                let b = gpu.population().genome(birth.child).expect("gpu child");
+                assert!(
+                    same_genome(a, b),
+                    "V2-13 dtype={dtype} tick={step}: newborn genome {:?} diverged",
+                    birth.child
+                );
+            }
+            assert!(
+                reference
+                    .watched_transactions()
+                    .eq(gpu.watched_transactions()),
+                "V2-13 dtype={dtype} tick={step}: watched transactions diverged"
+            );
+
+            max_rel = max_rel.max(got.closure.residual().abs() / got.closure.scale().max(1.0));
+            total_tr_debited += got_deb;
+            total_tr_credited += got_cred;
+            total_tr_tax += got_tax;
+            total_births += got.births.len();
+        }
+
+        // Bit-exact `cadherin-4d` traits and post-`velocity-alignment` velocities across every live organism.
+        let mut any_moving = false;
+        for org in gpu.population().iter() {
+            let ref_org = reference
+                .population()
+                .get(org.id)
+                .expect("ref live organism");
+            assert_eq!(
+                org.velocity.map(f64::to_bits),
+                ref_org.velocity.map(f64::to_bits),
+                "V2-13 dtype={dtype}: velocity diverged for {:?}",
+                org.id
+            );
+            let ref_cad = reference
+                .cadherin_traits(org.id)
+                .expect("ref cadherin_traits");
+            let gpu_cad = gpu.cadherin_traits(org.id).expect("gpu cadherin_traits");
+            assert_eq!(
+                (
+                    ref_cad.tag().map(f64::to_bits),
+                    ref_cad.cohesiveness().to_bits()
+                ),
+                (
+                    gpu_cad.tag().map(f64::to_bits),
+                    gpu_cad.cohesiveness().to_bits()
+                ),
+                "V2-13 dtype={dtype}: cadherin_traits diverged for {:?}",
+                org.id
+            );
+            if org.velocity[0].hypot(org.velocity[1]) > 1e-4 {
+                any_moving = true;
+            }
+        }
+        assert!(
+            total_tr_debited > 0.0 && total_tr_credited > 0.0 && total_tr_tax > 0.0,
+            "V2-13 dtype={dtype}: expected active trophallaxis transfers (deb={total_tr_debited}, cred={total_tr_credited}, tax={total_tr_tax})"
+        );
+        assert!(
+            total_births > 0,
+            "V2-13 dtype={dtype}: expected live births carrying cadherin-4d mutations"
+        );
+        assert!(
+            any_moving,
+            "V2-13 dtype={dtype}: expected active moving organisms under velocity-alignment"
+        );
+
+        assert!(
+            max_rel <= 1e-6,
+            "V2-13 dtype={dtype}: per-tick INV-03 residual {max_rel:e} > 1e-6"
+        );
+        let cum_norm = gpu.ledger().report().normalized.unwrap_or(0.0);
+        assert!(
+            cum_norm <= profile.residual.cumulative(),
+            "V2-13 dtype={dtype}: cumulative INV-03 residual {cum_norm:e} > {}",
+            profile.residual.cumulative()
+        );
+
+        // ALL FIVE Metal backends served every tick with 0 failures and 0 controller deferrals.
+        let f_rep = gpu.field_report();
+        let s_rep = gpu.sensor_report();
+        let u_rep = gpu.uptake_report();
+        let c_rep = gpu.controller_report();
+        let t_rep = gpu.settle_report();
+        assert_eq!(f_rep.failure, None, "V2-13 {dtype} field: {f_rep:?}");
+        assert_eq!(s_rep.failure, None, "V2-13 {dtype} sensors: {s_rep:?}");
+        assert_eq!(u_rep.failure, None, "V2-13 {dtype} uptake: {u_rep:?}");
+        assert_eq!(c_rep.failure, None, "V2-13 {dtype} ctrl: {c_rep:?}");
+        assert_eq!(t_rep.failure, None, "V2-13 {dtype} settle: {t_rep:?}");
+        assert_eq!((f_rep.steps, f_rep.reference_steps), (ticks, 0));
+        assert_eq!((f_rep.reductions, f_rep.reference_reductions), (ticks, 0));
+        assert_eq!((f_rep.checks, f_rep.reference_checks), (ticks, 0));
+        assert_eq!((s_rep.ticks, s_rep.reference_ticks), (ticks, 0));
+        assert_eq!((u_rep.ticks, u_rep.reference_ticks), (ticks, 0));
+        assert_eq!((t_rep.ticks, t_rep.reference_ticks), (ticks, 0));
+        assert_eq!(c_rep.reference_ticks, 0);
+        assert_eq!(
+            c_rep.deferred, 0,
+            "V2-13 dtype={dtype}: expected 0 controller deferrals on Metal GPU"
+        );
+        assert!(c_rep.batched > 0);
+        assert_owner_idle(&owner, &format!("V2-13 all-21 {dtype}"));
+    }
+}
+
+fn contraction_bits(summary: &ConeContractionSummary) -> (u64, u64, u64) {
+    (
+        summary.cells,
+        summary.max_contraction.to_bits(),
+        summary.max_relative.to_bits(),
+    )
+}
+
+/// Deterministic 24-channel unit direction on Carrier 0 (`direction[24..32] == 0`)
+/// with distinct magnitudes across channels `0..24` so a 34-plane dual-carrier
+/// cell injected via `Intervention::InjectMaterial` sits right on the Carrier-0
+/// cone boundary (`||m^(0)||₂ == e_0`) rather than at the `~sqrt(24/32) = 0.866`
+/// interior projection of a 32-D seeded source vector.
+fn carrier0_unit_direction() -> [f64; 32] {
+    let mut dir = [0.0_f64; 32];
+    let mut sq = 0.0_f64;
+    for (k, slot) in dir.iter_mut().take(24).enumerate() {
+        let raw = ((k as f64) + 1.0) * if k % 2 == 0 { 1.0 } else { -0.73 };
+        *slot = raw;
+        sq += raw * raw;
+    }
+    let norm = sq.sqrt();
+    for slot in dir.iter_mut().take(24) {
+        *slot /= norm;
+    }
+    let shrink = 1.0 - f64::EPSILON / 2.0;
+    while dir.iter().fold(0.0_f64, |acc, &v| acc + v * v) > 1.0 {
+        for slot in dir.iter_mut().take(24) {
+            *slot *= shrink;
+        }
+    }
+    dir
+}
+
+/// Plan §11.5 Option B Phase 10 bounded moment-only cone-contraction parity on
+/// real Metal GPU (`MetalField::check` + all 4 other Metal phase backends on
+/// one shared `DeviceOwner`) vs pure CPU Reference:
+///
+/// - **Part A (33-plane single-carrier, unmodified `NumericalProfile::reference_f32()`):**
+///   `INV-02 = (f32::MIN_POSITIVE, 1.0e-5)`, contraction trigger `1.0e-6`, on a
+///   compact 16×16 Arm-1-style pulsing oasis world with `emission = 0.0` where
+///   F32 scalar-vs-32-vector phase-locking naturally drives cells past `1.0e-6`.
+/// - **Part B (34-plane dual-carrier `supercolony`, tight profile `1.0e-6` /
+///   trigger `1.0e-7`):** injects a 24-channel Carrier-0 unit direction on cell
+///   `(8, 8)` with `emission = 0.0` and `symplectic-waste` disabled so Carrier 0
+///   sits on `||m^(0)||₂ == e_0` while `dual-carrier-trails`, `tight-junctions`,
+///   and the updated `VascularField::update_edges` `/ dt` (`EnergyPerSecond`)
+///   Metal kernel run live on 34 planes.
+#[test]
+fn v2_phase10_cone_contraction_on_metal_matches_reference() {
+    if open_owner().is_none() {
+        return;
+    }
+
+    struct ContractionCase<'a> {
+        label: &'a str,
+        overrides: &'a [(&'a str, &'a str, &'a str)],
+        tail: &'a str,
+        profile: NumericalProfile,
+        inject_carrier0_unit: bool,
+        max_ticks: u64,
+        min_contraction_ticks: u64,
+        min_post_ticks: u64,
+    }
+
+    let ref_profile = NumericalProfile::reference_f32().expect("reference_f32");
+    let mut tight_profile = ref_profile;
+    tight_profile.cone =
+        ConeTolerance::new(f64::from(f32::MIN_POSITIVE), 1.0e-6).expect("tight cone");
+    let c0_dir = carrier0_unit_direction();
+
+    let part_a_overrides = [
+        ("world", "width", "16.0"),
+        ("world", "height", "16.0"),
+        ("world", "grid_width", "16"),
+        ("world", "grid_height", "16"),
+        ("world", "tick_numerator", "1"),
+        ("world", "tick_denominator", "128"),
+        ("world", "diffusion", "0.15"),
+        ("world", "decay_per_second", "0.005"),
+        ("population", "initial_count", "4"),
+        ("population", "maximum_count", "64"),
+        ("population", "initial_energy", "4.0"),
+        ("sources", "count", "1"),
+        ("sources", "power_per_source", "120.0"),
+        ("sources", "sigma_world_units", "2.0"),
+        ("sources", "path_speed", "0.4"),
+        ("sources", "path_direction_interval_seconds", "10.0"),
+        ("emission", "maximum_fractional_rate_per_second", "0.0"),
+        ("controller", "hidden_widths", "[8]"),
+        ("execution", "command_durability", "\"volatile-in-memory\""),
+    ];
+    let part_b_overrides = [
+        ("world", "width", "16.0"),
+        ("world", "height", "16.0"),
+        ("world", "grid_width", "16"),
+        ("world", "grid_height", "16"),
+        ("world", "tick_numerator", "1"),
+        ("world", "tick_denominator", "128"),
+        ("world", "diffusion", "0.15"),
+        ("world", "decay_per_second", "0.005"),
+        ("population", "initial_count", "4"),
+        ("population", "maximum_count", "64"),
+        ("population", "initial_energy", "4.0"),
+        ("sources", "count", "1"),
+        ("sources", "power_per_source", "1.0e-9"),
+        ("sources", "sigma_world_units", "2.0"),
+        ("sources", "path_speed", "0.4"),
+        ("sources", "path_direction_interval_seconds", "10.0"),
+        ("emission", "maximum_fractional_rate_per_second", "0.0"),
+        ("controller", "hidden_widths", "[32]"),
+        ("execution", "command_durability", "\"volatile-in-memory\""),
+    ];
+
+    let cases = [
+        ContractionCase {
+            label: "Part A (33-plane reference_f32 1e-5/1e-6 Arm-1-style oasis)",
+            overrides: &part_a_overrides,
+            tail: r#"
+[v2]
+profile = "minimal"
+
+[v2.oases]
+enabled = true
+bloom_period_seconds = 12.0
+minimum_power_fraction = 0.25
+sigma_min_world_units = 2.0
+sigma_max_world_units = 2.0
+
+[v2.senescence]
+enabled = true
+
+[v2.motor]
+enabled = true
+"#,
+            profile: ref_profile,
+            inject_carrier0_unit: false,
+            max_ticks: 512,
+            min_contraction_ticks: 3,
+            min_post_ticks: 24,
+        },
+        ContractionCase {
+            label: "Part B (34-plane dual-carrier supercolony tight 1e-6/1e-7 + vascular / dt)",
+            overrides: &part_b_overrides,
+            tail: r#"
+[v2]
+profile = "supercolony"
+
+[v2.oases]
+enabled = true
+bloom_period_seconds = 12.0
+minimum_power_fraction = 0.25
+sigma_min_world_units = 2.0
+sigma_max_world_units = 2.0
+
+[v2.metabolism.waste]
+enabled = false
+"#,
+            profile: tight_profile,
+            inject_carrier0_unit: true,
+            max_ticks: 192,
+            min_contraction_ticks: 3,
+            min_post_ticks: 16,
+        },
+    ];
+
+    for case in &cases {
+        let toml = ecology_toml("field-ecology-v2", case.overrides, case.tail);
+        let config =
+            ValidatedConfig::from_toml(&toml).expect("cone-contraction V2 config validates");
+        if case.inject_carrier0_unit {
+            assert!(config.is_v2_feature_enabled(V2Feature::DualCarrierTrails));
+            assert!(config.is_v2_feature_enabled(V2Feature::VascularField));
+            assert_eq!(config.v2_abi().field_planes, DUAL_CARRIER_PLANES);
+        }
+        let trigger = case.profile.cone_contraction_trigger();
+
+        let workers = std::thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(8);
+        let worker_count = NonZeroUsize::new(workers).expect("nonzero");
+        let mut reference =
+            World::found(&config, Arrangement::FreeList, case.profile).expect("ref world");
+        reference
+            .set_cpu_workers(worker_count)
+            .expect("ref workers");
+        let mut gpu =
+            World::found(&config, Arrangement::FreeList, case.profile).expect("gpu world");
+        gpu.set_cpu_workers(worker_count).expect("gpu workers");
+        let owner = install_all_metal_on_one_owner(&mut gpu).expect("metal owner");
+
+        let mut executed_ticks = 0_u64;
+        let mut contraction_ticks = 0_u64;
+        let mut total_contracted_cells = 0_u64;
+        let mut post_ticks = 0_u64;
+        let mut max_rel = 0.0_f64;
+
+        for step in 1..=case.max_ticks {
+            let interventions = if case.inject_carrier0_unit {
+                vec![Intervention::InjectMaterial {
+                    cell: [8, 8],
+                    amount: 2.0,
+                    direction: c0_dir,
+                }]
+            } else {
+                Vec::new()
+            };
+            let Stepped::Published(expected) =
+                reference.step_with(&interventions).expect("ref step")
+            else {
+                panic!("{} tick={step}: reference paused", case.label);
+            };
+            let Stepped::Published(got) = gpu.step_with(&interventions).expect("metal step") else {
+                panic!("{} tick={step}: metal paused", case.label);
+            };
+            executed_ticks = step;
+
+            assert_eq!(
+                reference.digest(),
+                gpu.digest(),
+                "{} tick={step}: World::digest diverged across Phase 10 cone contraction",
+                case.label
+            );
+            assert_eq!(
+                summary_bits(&expected.field),
+                summary_bits(&got.field),
+                "{} tick={step}: unmasked pre-contraction FieldSummary diverged",
+                case.label
+            );
+            assert_eq!(
+                contraction_bits(&expected.cone_contraction),
+                contraction_bits(&got.cone_contraction),
+                "{} tick={step}: ConeContractionSummary diverged between CPU and Metal",
+                case.label
+            );
+            assert_eq!(
+                (
+                    expected.closure.closing().field().to_bits(),
+                    expected.closure.closing().organisms().to_bits(),
+                    expected.closure.residual().to_bits(),
+                ),
+                (
+                    got.closure.closing().field().to_bits(),
+                    got.closure.closing().organisms().to_bits(),
+                    got.closure.residual().to_bits(),
+                ),
+                "{} tick={step}: INV-03 closure diverged (cone contraction must never touch energy)",
+                case.label
+            );
+
+            // Post-contraction committed field MUST satisfy the contraction trigger
+            // on every single tick (0 cells left above `trigger`).
+            gpu.field()
+                .check_invariants(trigger)
+                .expect("committed field after Phase 10 contraction must satisfy trigger");
+
+            if got.cone_contraction.cells > 0 {
+                assert!(
+                    got.field.max_cone_residual > 0.0,
+                    "{} tick={step}: contraction fired with zero unmasked pre-contraction residual",
+                    case.label
+                );
+                assert!(
+                    got.cone_contraction.max_contraction > 0.0
+                        && got.cone_contraction.max_relative > 0.0,
+                    "{} tick={step}: contraction summary must record positive contraction: {:?}",
+                    case.label,
+                    got.cone_contraction
+                );
+                contraction_ticks += 1;
+                total_contracted_cells += got.cone_contraction.cells;
+            }
+            if contraction_ticks >= case.min_contraction_ticks {
+                post_ticks += 1;
+            }
+
+            max_rel = max_rel.max(got.closure.residual().abs() / got.closure.scale().max(1.0));
+            if contraction_ticks >= case.min_contraction_ticks && post_ticks >= case.min_post_ticks
+            {
+                break;
+            }
+        }
+
+        assert!(
+            contraction_ticks >= case.min_contraction_ticks && total_contracted_cells > 0,
+            "{}: expected at least {} cone-contraction ticks over {} ticks, observed {} ticks ({} cells)",
+            case.label,
+            case.min_contraction_ticks,
+            executed_ticks,
+            contraction_ticks,
+            total_contracted_cells
+        );
+        assert!(
+            max_rel <= 1e-6,
+            "{}: per-tick INV-03 residual {max_rel:e} > 1e-6",
+            case.label
+        );
+        let cum_norm = gpu.ledger().report().normalized.unwrap_or(0.0);
+        assert!(
+            cum_norm <= case.profile.residual.cumulative(),
+            "{}: cumulative INV-03 residual {cum_norm:e} > {}",
+            case.label,
+            case.profile.residual.cumulative()
+        );
+
+        let f_rep = gpu.field_report();
+        let s_rep = gpu.sensor_report();
+        let u_rep = gpu.uptake_report();
+        let c_rep = gpu.controller_report();
+        let t_rep = gpu.settle_report();
+        assert_eq!(f_rep.failure, None, "{} field: {f_rep:?}", case.label);
+        assert_eq!(s_rep.failure, None, "{} sensors: {s_rep:?}", case.label);
+        assert_eq!(u_rep.failure, None, "{} uptake: {u_rep:?}", case.label);
+        assert_eq!(c_rep.failure, None, "{} ctrl: {c_rep:?}", case.label);
+        assert_eq!(t_rep.failure, None, "{} settle: {t_rep:?}", case.label);
+        assert_eq!((f_rep.steps, f_rep.reference_steps), (executed_ticks, 0));
+        assert_eq!(
+            (f_rep.reductions, f_rep.reference_reductions),
+            (executed_ticks, 0)
+        );
+        assert_eq!((f_rep.checks, f_rep.reference_checks), (executed_ticks, 0));
+        assert_eq!((s_rep.ticks, s_rep.reference_ticks), (executed_ticks, 0));
+        assert_eq!((u_rep.ticks, u_rep.reference_ticks), (executed_ticks, 0));
+        assert_eq!((t_rep.ticks, t_rep.reference_ticks), (executed_ticks, 0));
+        assert_eq!(c_rep.reference_ticks, 0);
+        assert_eq!(c_rep.deferred, 0);
+        assert_owner_idle(&owner, case.label);
     }
 }

@@ -3,10 +3,10 @@
 # inv08_pure_field = true).
 #
 # Category: modular field-ecology-v2 pure-field showcase preset (Stage-2
-# candidate, awaiting V2-10/V2-17 multi-seed verification and calibration).
-# Strictly preserves INV-08 (NO [contact] table: every organism interaction is
-# mediated solely through the 34-plane hybrid field and Murray vascular
-# conductances).
+# calibrated from V2-10 empirical quickies #37805 and dead-zone audit #37797;
+# awaiting V2-17 multi-seed Stage-2 verification). Strictly preserves INV-08
+# (NO [contact] table: every organism interaction is mediated solely through the
+# 34-plane hybrid field and Murray vascular conductances).
 #
 # Scale & Pinned ABI (all Metal F16 4-aligned — 0 alignment deferrals):
 # - World: 80.0 x 80.0 periodic torus on a 320 x 320 x 34 F32 hybrid field
@@ -73,16 +73,21 @@ energy_per_cell = 0.0
 composition = "zero"
 
 [sources]
-count = 32
-power_per_source = 16000.0
-sigma_world_units = 6.0
+# Calibrated from V2-10, dead-zone audit (#37797/#37805), and live smoke
+# verification: 16 slowly-drifting localized oases (power = 3200.0; P_tot =
+# 51,200 E/s; sigma = 4.2; path_speed = 0.6) remove the 576k-cap flood and
+# preserve dark inter-oasis corridors (field_gini >= 0.45) for Murray arteries
+# and Carrier-1 foraging highways.
+count = 16
+power_per_source = 3200.0
+sigma_world_units = 4.2
 spatial_normalization = "fixed-total-power"
 kernel = "normalized-truncated-minimum-image-gaussian-v1"
 kernel_cutoff_sigma = 4.0
 chemical_directions = "seeded-unit-vectors"
 chemical_direction_policy = "fixed-per-source"
 path = "seeded-smooth-torus-v1"
-path_speed = 3.2
+path_speed = 0.6
 path_direction_interval_seconds = 30.0
 
 [chemistry]
@@ -90,13 +95,17 @@ family = "bounded-affinity-v1"
 heritable_traits = ["affinity_direction", "motion_response", "sensing_scale"]
 maximum_efficiency = 0.777059
 affinity_norm_limit = 1.0
-affinity_gain = 14.5263
-discrimination_threshold = 0.265017
+# Tightened discrimination b/k = 1.16 / 8.0 = 0.145 (0.82 sigma in R^32) and
+# toxicity_sensitivity = 0.28 for real trophic specialization and corpse avoidance.
+affinity_gain = 8.0
+discrimination_threshold = 1.16
 uptake_capacity_per_second = 2.94923
 uptake_half_saturation_density = 0.805307
-toxicity_sensitivity = 0.0800432
+toxicity_sensitivity = 0.28
 chemistry_evaluation = "per-granted-cell-packet"
-motion_response_norm_limit = 6.27875
+# Attenuated passive chemotaxis (6.28 -> 1.6) so 4-output SO(2) neural motor
+# (V2-05) leads directional oasis foraging and trail-following (H2).
+motion_response_norm_limit = 1.6
 maximum_acceleration = 4.97403
 drag_per_second = 0.608376
 maximum_speed = 3.42612
@@ -236,8 +245,8 @@ profile = "supercolony"
 enabled = true
 bloom_period_seconds = 24.0
 minimum_power_fraction = 0.05
-sigma_min_world_units = 3.5
-sigma_max_world_units = 7.5
+sigma_min_world_units = 2.6
+sigma_max_world_units = 4.8
 
 [v2.senescence]
 enabled = true
@@ -346,13 +355,20 @@ minimum_conductance_ratio = 0.025
 maximum_diffusion = 0.30
 reinforcement_rate_per_second = 0.5
 pruning_rate_per_second = 0.1
-flux_half_saturation = 0.1
+# Calibrated for true EnergyPerSecond vascular flux (|J| / dt = (D_max/h^2)*g*|Delta e_cell|
+# = 4.8 * g * |Delta e_cell| under Wave-4's /dt fix): desert background edges
+# (~0.001..0.024 E/s) prune cleanly to g_min = 0.025 while active oasis-corridor
+# arteries (~0.26..1.68 E/s) reinforce to g ~ 0.70..0.83.
+flux_half_saturation = 0.25
 flux_exponent = 1.5
 
 [v2.carriers]
 enabled = true
 trail_diffusion = 0.0003
-trail_decay_per_second = 0.004
+# Raised from 0.004 (tau=250s, 10.4x oasis period -> stale haze) to 0.030
+# (tau=33.3s, 1.39x oasis bloom period, 2.7x slower than Carrier-0 decay) so
+# Carrier-1 pheromone highways stay sharp and locked to active oases (#37797).
+trail_decay_per_second = 0.030
 trail_emission_share = 0.20
 trail_energy_density_scale = 8.0
 

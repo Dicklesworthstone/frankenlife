@@ -980,6 +980,7 @@ impl FieldTexture {
         } else {
             planes.split_at(cells)
         };
+        validate_scalar_plane(energy, [cells_x, cells_y], "render field energy")?;
         let [width, height] = self.texels.map(|n| n as usize);
         let count = width * height;
         // The buffers' capacity is the texture's, so this never allocates.
@@ -1104,7 +1105,7 @@ impl Rows<'_> {
                 let sum = block_sum(self.energy, &rows, texel_x);
                 let area = (rows.len() * columns(texel_x).len()) as f64 * self.cell_area;
                 *total = sum;
-                *value = saturate(sum / area);
+                *value = saturate_nonnegative(sum / area);
             }
             if self.moments.is_empty() {
                 continue;
@@ -1537,15 +1538,11 @@ pub(crate) fn reserved<T>(count: usize, buffer: &'static str) -> Result<Vec<T>, 
     Ok(values)
 }
 
-/// `value` rounded to the nearest F32, saturating at the largest finite one.
-fn saturate(value: f64) -> f32 {
-    (value as f32).clamp(-f32::MAX, f32::MAX)
-}
-
-/// Nonnegative finite `value` rounded to the nearest F32 in `[0.0, f32::MAX]`,
-/// saturating finite overflow at `f32::MAX` and avoiding `-0.0`.
+/// Nonnegative `value` rounded to the nearest F32 in `[0.0, f32::MAX]`,
+/// saturating positive overflow (including `+∞`) at `f32::MAX` and mapping
+/// `NaN`, `-∞`, negative values, and `-0.0` to canonical `+0.0`.
 fn saturate_nonnegative(value: f64) -> f32 {
-    if !value.is_finite() || value <= 0.0 {
+    if value.is_nan() || value <= 0.0 {
         0.0
     } else {
         (value as f32).min(f32::MAX)
@@ -1716,7 +1713,7 @@ impl Epoch {
             // within the F32 limit.
             self.velocities
                 .push([organism.velocity[0] as f32, organism.velocity[1] as f32]);
-            self.energies.push(saturate(organism.energy));
+            self.energies.push(saturate_nonnegative(organism.energy));
             self.lineages.push(organism.lineage.get());
             self.generations.push(organism.generation.get());
             self.topologies.push(topology);
@@ -2504,5 +2501,82 @@ mod tests {
         assert!(tex_34.components()[1][24..].iter().all(|&c| c == 0));
         assert_eq!(tex_34.trail_energy(), Some(&[3.0, 0.0][..]));
         assert_eq!(tex_34.vascular_conductance(), Some(&[0.25, 0.75][..]));
+    }
+
+    #[test]
+    fn field_texture_energy_plane_validation_and_nonnegative_saturation() {
+        // 1. `saturate_nonnegative` maps positive overflow (including +Inf) to
+        //    f32::MAX and NaN / negative / -0.0 to canonical +0.0.
+        assert_eq!(saturate_nonnegative(f64::INFINITY), f32::MAX);
+        assert_eq!(saturate_nonnegative(1.0e100), f32::MAX);
+        assert_eq!(saturate_nonnegative(f64::NAN).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(
+            saturate_nonnegative(f64::NEG_INFINITY).to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(saturate_nonnegative(-0.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(saturate_nonnegative(-1.0).to_bits(), 0.0_f32.to_bits());
+        assert_eq!(saturate_nonnegative(3.5), 3.5_f32);
+
+        // 2. Positive overflow in density (`energy / cell_area` overflowing f64
+        //    to +Inf) saturates cleanly to `f32::MAX` rather than black `0.0`.
+        let saturated = FieldTexture::from_plane([1, 1], [1.0e-150, 1.0e-150], &[1.0e20])
+            .expect("positive overflow saturates");
+        assert_eq!(saturated.values(), &[f32::MAX]);
+
+        // 3. `from_plane`, `from_planes`, and `from_planes_with_overlays` refuse
+        //    non-finite and negative energy cells with `NumericalInvalid`.
+        let mut valid_planes = vec![0.0_f32; 2 * (1 + CHANNELS)];
+        valid_planes[0] = 2.0;
+        valid_planes[1] = 4.0;
+        valid_planes[2] = 1.0; // m_0 on cell 0
+        let mut live = FieldTexture::from_planes([2, 1], [1.0, 1.0], &valid_planes)
+            .expect("valid initial planes");
+        let before_values = live.values().to_vec();
+        let before_comp = live.composition().to_vec();
+        let before_ch = live.components().to_vec();
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.001] {
+            assert!(
+                matches!(
+                    FieldTexture::from_plane([2, 1], [1.0, 1.0], &[1.0, bad]),
+                    Err(CoreError::NumericalInvalid { .. })
+                ),
+                "from_plane must refuse {bad}"
+            );
+            let mut bad_planes = valid_planes.clone();
+            bad_planes[1] = bad;
+            assert!(
+                matches!(
+                    FieldTexture::from_planes([2, 1], [1.0, 1.0], &bad_planes),
+                    Err(CoreError::NumericalInvalid { .. })
+                ),
+                "from_planes must refuse {bad}"
+            );
+            assert!(
+                matches!(
+                    FieldTexture::from_planes_with_overlays(
+                        [2, 1],
+                        [1.0, 1.0],
+                        &bad_planes,
+                        Some(&[0.5, 0.5]),
+                        Some(&[0.5, 0.5]),
+                    ),
+                    Err(CoreError::NumericalInvalid { .. })
+                ),
+                "from_planes_with_overlays must refuse {bad}"
+            );
+            // Atomic refusal: `project_on` leaves previous texel buffers intact.
+            assert!(
+                matches!(
+                    live.project_on(&bad_planes, 1.0, 2),
+                    Err(CoreError::NumericalInvalid { .. })
+                ),
+                "project_on must refuse {bad}"
+            );
+            assert_eq!(live.values(), before_values.as_slice());
+            assert_eq!(live.composition(), before_comp.as_slice());
+            assert_eq!(live.components(), before_ch.as_slice());
+        }
     }
 }

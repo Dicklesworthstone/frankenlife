@@ -1,11 +1,11 @@
 # morphogenesis-tissue-v2: Bundle A showcase preset — Living Multi-Layered Animal
 # Tissues (V2-17, field-ecology-v2, inv08_pure_field = false).
 #
-# Category: modular field-ecology-v2 showcase preset (Stage-2 candidate,
-# awaiting V2-10/V2-17 multi-seed verification and calibration). It carries no
-# aesthetic fitness inside the world: organisms live, differentiate, exchange
-# energy, divide, and die strictly under explicit local physics and energy
-# conservation (INV-01..INV-15).
+# Category: modular field-ecology-v2 showcase preset (Stage-2 calibrated from
+# V2-10 empirical quickies #37805 and dead-zone audit #37797; awaiting V2-17
+# multi-seed Stage-2 verification). It carries no aesthetic fitness inside the
+# world: organisms live, differentiate, exchange energy, divide, and die
+# strictly under explicit local physics and energy conservation (INV-01..INV-15).
 #
 # Scale & Pinned ABI (all Metal F16 4-aligned — 0 alignment deferrals):
 # - World: 80.0 x 80.0 periodic torus on a 320 x 320 x 33 F32 field (h = 0.25),
@@ -19,10 +19,11 @@
 #     * INV-08 PURE FIELD = false ([contact] + contact-coupled tissue modules)
 #
 # Active Bundle A features (14):
-#   hippo-crowding (expose_sensor=true), pcp-polarity, tight-junctions,
-#   senescence, lysis-recycling, symplectic-waste, epigenetic-recurrence (S=2),
-#   notch-delta (sensor-neighbor-mean-v1), trophallaxis, cadherin-4d,
-#   so2-motor, surplus-emission, wake-offset (polarized-pump-v1/fixed-sign-v1),
+#   hippo-crowding (c_max=3.25, expose_sensor=true), pcp-polarity (init<=0.88),
+#   tight-junctions, senescence, lysis-recycling, symplectic-waste,
+#   epigenetic-recurrence (S=2, asymmetric-stem-v1), notch-delta
+#   (sensor-neighbor-mean-v1), trophallaxis, cadherin-4d, so2-motor,
+#   surplus-emission, wake-offset (polarized-pump-v1/fixed-sign-v1),
 #   v2-visual-mappings (cell-state-v1).
 #
 # Modular CLI / TOML overrides (founding-only, INV-14):
@@ -69,16 +70,22 @@ energy_per_cell = 0.0
 composition = "zero"
 
 [sources]
-count = 25
-power_per_source = 37970.7
-sigma_world_units = 14.9683
+# Calibrated from V2-10 Arm 2, dead-zone audit (#37797/#37805), and live smoke
+# verification: 16 slowly-drifting localized sources (power = 4000.0, 9.5x cut;
+# P_tot = 64,000 E/s; sigma = 4.2; path_speed = 0.5) keep each oasis chemically
+# pure (||z|| ~ 1) with dark inter-tissue space (M*pi*sigma^2/area = 0.14,
+# field_gini >= 0.45) so tissues form bounded cysts/sheets with open lumens and
+# genuine core-vs-rim gradients.
+count = 16
+power_per_source = 4000.0
+sigma_world_units = 4.2
 spatial_normalization = "fixed-total-power"
 kernel = "normalized-truncated-minimum-image-gaussian-v1"
 kernel_cutoff_sigma = 4.0
 chemical_directions = "seeded-unit-vectors"
 chemical_direction_policy = "fixed-per-source"
 path = "seeded-smooth-torus-v1"
-path_speed = 6.41031
+path_speed = 0.5
 path_direction_interval_seconds = 30.0
 
 [chemistry]
@@ -86,11 +93,14 @@ family = "bounded-affinity-v1"
 heritable_traits = ["affinity_direction", "motion_response", "sensing_scale"]
 maximum_efficiency = 0.777059
 affinity_norm_limit = 1.0
-affinity_gain = 14.5263
-discrimination_threshold = 0.265017
+# Tightened discrimination b/k = 1.16 / 8.0 = 0.145 (0.82 sigma in R^32) and
+# toxicity_sensitivity = 0.28 so symplectic waste, lysed corpses, and V2-12
+# affinity rotation impose real metabolic selection without founding wipeout.
+affinity_gain = 8.0
+discrimination_threshold = 1.16
 uptake_capacity_per_second = 2.94923
 uptake_half_saturation_density = 0.805307
-toxicity_sensitivity = 0.0800432
+toxicity_sensitivity = 0.28
 chemistry_evaluation = "per-granted-cell-packet"
 motion_response_norm_limit = 6.27875
 maximum_acceleration = 4.97403
@@ -240,8 +250,8 @@ profile = "tissue"
 enabled = false
 bloom_period_seconds = 24.0
 minimum_power_fraction = 0.05
-sigma_min_world_units = 10.0
-sigma_max_world_units = 16.0
+sigma_min_world_units = 3.0
+sigma_max_world_units = 5.2
 
 [v2.senescence]
 enabled = true
@@ -283,14 +293,18 @@ local_offset_radius = 0.125
 enabled = true
 mode = "local-neighbors-v1"
 radius_world_units = 0.375
-arrest_threshold = 4.5
+# Tightened from 4.5 -> 3.25 so 1-cell arches/cyst walls (z = 1..2) divide
+# laterally while dense 2D hexagonal pavements (z >= 4) arrest completely.
+arrest_threshold = 3.25
 expose_sensor = true
 
 [v2.polarity]
 enabled = true
 torque_mobility = 2.0
 gradient_cue_strength = 0.25
-initial_polarity_strength_max = 0.3
+# Raised from 0.3 -> 0.88 so founding lineages express strong lateral-belt
+# adhesion and oriented lateral mitosis from generation 0 (#37797).
+initial_polarity_strength_max = 0.88
 maximum_wedge_curvature = 0.35
 polarity_mutation_std = 0.05
 oriented_lateral_mitosis = true
@@ -315,7 +329,10 @@ byproduct_recycle_fraction = 0.45
 enabled = true
 state_width = 2
 epigenetic_gate_bias = 2.5
-state_inheritance = "symmetric-epigenetic-v1"
+# Asymmetric stem splitting produces rapid clonal h_0 divergence across mitosis
+# while keeping notch_delta = sensor-neighbor-mean-v1 so the 108/40/44/33 ABI
+# remains 4-aligned on Metal F16 (0 alignment deferrals).
+state_inheritance = "asymmetric-stem-v1"
 inheritance_retention = 0.8
 inheritance_jitter = 0.05
 stem_asymmetry = -0.8

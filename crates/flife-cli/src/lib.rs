@@ -47,6 +47,9 @@
 //!   §14.6, §20.5). [`capabilities()`] runs every controller route on a
 //!   world and compares it with the reference, and reports the host and
 //!   video encoding, with explicit refusals.
+//! - [`v2_diagnostics`]: read-only `field-ecology-v2` periodic tissue geometry
+//!   and `so2-motor` neural-agency diagnostics (`V2-10` / `V2-17`) over live
+//!   worlds, organism snapshots, and restored inspections.
 //! - [`mod@render`]: pre-rendered PNG frames and video through the
 //!   Studio's FrankenManim view. [`render()`] founds a configuration;
 //!   [`render_run`] continues a run directory (a run, branch or transplant)
@@ -85,6 +88,7 @@ pub mod persist;
 pub mod render;
 pub mod run;
 pub mod transplant;
+pub mod v2_diagnostics;
 pub mod validate;
 
 pub use analyze::{
@@ -145,6 +149,10 @@ pub use run::{
 pub use transplant::{
     GraftRecord, HeldEnergy, TRANSPLANT_FILE, TransplantHost, TransplantOptions, TransplantPackage,
     transplant, transplant_session,
+};
+pub use v2_diagnostics::{
+    COORDINATION_RADIUS_MULTIPLIER, GeometryDiagnostics, MotorAgencyDiagnostics, MotorSample,
+    PSI6_MIN_DENOMINATOR, SO2_MOTOR_ACTION_OFFSET, V2Diagnostics,
 };
 pub use validate::{VALIDATE_SCHEMA, Validation};
 

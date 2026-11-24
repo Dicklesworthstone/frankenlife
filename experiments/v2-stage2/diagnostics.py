@@ -844,6 +844,63 @@ def load_metrics(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def compute_field_spatial_contrast(
+    energy_plane: list[float] | None,
+) -> dict[str, Any]:
+    """Compute Carrier-0 spatial contrast (Gini, dark fraction, P95/P50) from field.energy."""
+    if not energy_plane:
+        return {
+            "available": False,
+            "reason": "no_energy_plane",
+            "cells": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "max": None,
+            "gini": None,
+            "dark_fraction_below_10pct_mean": None,
+        }
+    vals = [float(v) for v in energy_plane if isinstance(v, (int, float)) and math.isfinite(float(v))]
+    n = len(vals)
+    if n == 0:
+        return {
+            "available": False,
+            "reason": "no_finite_energy_values",
+            "cells": 0,
+            "mean": None,
+            "median": None,
+            "p95": None,
+            "max": None,
+            "gini": None,
+            "dark_fraction_below_10pct_mean": None,
+        }
+    vals.sort()
+    total = sum(vals)
+    mean = total / n
+    median = linear_quantile(vals, 0.5)
+    p95 = linear_quantile(vals, 0.95)
+    vmax = vals[-1]
+    if total > 0.0:
+        weighted = sum((idx + 1) * v for idx, v in enumerate(vals))
+        gini = (2.0 * weighted) / (n * total) - (n + 1.0) / n
+        gini = max(0.0, min(1.0, gini))
+        dark_thresh = 0.1 * mean
+        dark_frac = sum(1 for v in vals if v < dark_thresh) / n
+    else:
+        gini = 0.0
+        dark_frac = 1.0
+    return {
+        "available": True,
+        "cells": n,
+        "mean": mean,
+        "median": median,
+        "p95": p95,
+        "max": vmax,
+        "gini": gini,
+        "dark_fraction_below_10pct_mean": dark_frac,
+    }
+
+
 def evaluate_stage2(
     inspect_path: Path,
     metrics_path: Path | None = None,
@@ -889,6 +946,7 @@ def evaluate_stage2(
         "organism_energy": header.get("organism_energy"),
         "world": world,
         "diagnostics": {
+            "field_spatial_contrast": compute_field_spatial_contrast(energy_plane),
             "clonal_differentiation": compute_clonal_differentiation(
                 organisms, width, height, crowding_radius=crowding_radius
             ),

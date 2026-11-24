@@ -864,6 +864,26 @@ struct Inspection {
     /// (FL-054); omitted for stateless controller families.
     #[serde(skip_serializing_if = "Option::is_none")]
     recurrent_state: Option<Vec<f32>>,
+    /// Apical-basal unit polarity vector `p_i ∈ S^1` when `V2-08`
+    /// `pcp-polarity` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    polarity: Option<[f64; 2]>,
+    /// Heritable lateral-belt polarity strength `α_pol ∈ [0, 1]` when `V2-08`
+    /// `pcp-polarity` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    polarity_strength: Option<f64>,
+    /// Heritable spontaneous apical wedge curvature `β` when `V2-08`
+    /// `pcp-polarity` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wedge_curvature: Option<f64>,
+    /// Decoupled 4-D unit cadherin adhesion tag `c_i ∈ S^3` when `V2-13`
+    /// `cadherin-4d` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cadherin_tag: Option<[f64; flife_genome::CADHERIN_TERMS]>,
+    /// Heritable cadherin cohesiveness scalar `s_i ∈ [0, 1]` when `V2-13`
+    /// `cadherin-4d` is enabled; omitted when disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cohesiveness: Option<f64>,
     /// What it observed in the newest tick the world recorded for it.
     sensed: Option<SensedRecord>,
     /// The hidden activations its held output came from.
@@ -969,6 +989,14 @@ struct TransactionsRecord {
     emission: f64,
     births: usize,
     endowed: f64,
+    /// Energy staged as obligate symplectic metabolic waste (`V2-11`);
+    /// omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    byproduct_staged: Option<f64>,
+    /// Signed net energy moved by passive exact-quantum kin trophallaxis
+    /// (`V2-13`); omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trophallaxis: Option<f64>,
     net: f64,
     /// What the newest step's reproduction stage came to:
     /// `cooling-down`, `no-attempt`, `unviable`, `born` or `rejected`.
@@ -1031,10 +1059,7 @@ fn main() -> ExitCode {
     if let (Some(timeline), Some(out)) = (&cli.export, &cli.out) {
         return export_timeline(&config, &cli, timeline, out);
     }
-    let mapping = match cli
-        .color
-        .map_or_else(|| ColorMapping::configured(&config), Ok)
-    {
+    let mapping = match resolve_opening_color_mapping(&config, cli.color) {
         Ok(mapping) => mapping,
         Err(error) => return fail(error.kind(), error.to_string(), 2),
     };
@@ -1832,6 +1857,14 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
         }),
         recurrent_state: (!organism.held.recurrent_state().is_empty())
             .then(|| organism.held.recurrent_state().to_vec()),
+        polarity: snapshot
+            .traits
+            .polarity_strength()
+            .map(|_| organism.polarity),
+        polarity_strength: snapshot.traits.polarity_strength(),
+        wedge_curvature: snapshot.traits.wedge_curvature(),
+        cadherin_tag: snapshot.cadherin_tag(),
+        cohesiveness: snapshot.cohesiveness(),
         sensed: snapshot.sensed.as_ref().map(|sensed| SensedRecord {
             tick: sensed.tick.get(),
             scale: sensed.scale,
@@ -1861,6 +1894,9 @@ fn inspection(snapshot: &OrganismSnapshot) -> Inspection {
                 emission: recent.emission,
                 births: recent.births,
                 endowed: recent.endowed,
+                byproduct_staged: (recent.byproduct_staged > 0.0)
+                    .then_some(recent.byproduct_staged),
+                trophallaxis: (recent.trophallaxis != 0.0).then_some(recent.trophallaxis),
                 net: recent.net,
                 reproduction: recent.reproduction.map(|outcome| match outcome {
                     ReproductionOutcome::CoolingDown { .. } => "cooling-down",
@@ -1948,6 +1984,30 @@ fn load_toml(text: &str, overrides: &[FeatureOverride]) -> Result<ValidatedConfi
     let mut parsed = RunConfig::from_toml(text)?;
     apply_feature_overrides(&mut parsed, overrides)?;
     flife_core::validate(parsed)
+}
+
+/// Resolve the opening colour mapping for `flife-studio`: an explicit `--color`
+/// flag is preserved verbatim (and gated by [`validate_v2_visual_style`]),
+/// whereas a `field-ecology-v2*` preset's default v2 mapping (such as
+/// `morphogenesis-tissue-v2.toml`'s `cell-state-v1`) falls back cleanly to
+/// [`ColorMapping::Lineage`] when `v2-visual-mappings` is disabled via
+/// `--v1-compat` or `--disable v2-visual-mappings`.
+fn resolve_opening_color_mapping(
+    config: &ValidatedConfig,
+    explicit: Option<ColorMapping>,
+) -> Result<ColorMapping, CoreError> {
+    if let Some(mapping) = explicit {
+        return Ok(mapping);
+    }
+    let configured = ColorMapping::configured(config)?;
+    if configured.is_v2()
+        && flife_core::model::is_v2_model(&config.config().model)
+        && !config.is_v2_feature_enabled(V2Feature::V2VisualMappings)
+    {
+        Ok(ColorMapping::Lineage)
+    } else {
+        Ok(configured)
+    }
 }
 
 /// Refuse `V2-16` colour mappings (`cell-state`, `polarity`) and field
@@ -3171,5 +3231,203 @@ mod tests {
                 "{bad_cinema:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn opening_color_mapping_falls_back_on_v2_compat_and_still_refuses_explicit_v2_flags() {
+        use flife_core::FeatureOverride;
+
+        let bundle_a_toml = include_str!("../../../presets/morphogenesis-tissue-v2.toml");
+        let default_cfg = super::load_toml(bundle_a_toml, &[]).expect("Bundle A preset loads");
+        let default_mapping =
+            super::resolve_opening_color_mapping(&default_cfg, None).expect("default mapping");
+        assert_eq!(default_mapping, ColorMapping::CellState);
+        super::validate_v2_visual_style(&default_cfg, default_mapping, FieldMapping::Energy)
+            .expect("Bundle A default cell-state mapping is valid");
+
+        for overrides in [
+            vec![FeatureOverride::V1Compat],
+            vec![FeatureOverride::Disable("v2-visual-mappings".to_owned())],
+        ] {
+            let disabled_cfg =
+                super::load_toml(bundle_a_toml, &overrides).expect("v2 preset with override");
+            let fallback = super::resolve_opening_color_mapping(&disabled_cfg, None)
+                .expect("fallback resolves cleanly");
+            assert_eq!(
+                fallback,
+                ColorMapping::Lineage,
+                "v2 preset default cell-state-v1 falls back to lineage when v2-visual-mappings is disabled ({overrides:?})"
+            );
+            super::validate_v2_visual_style(&disabled_cfg, fallback, FieldMapping::Energy)
+                .expect("fallback lineage mapping passes v2 visual gate");
+
+            // Explicit `--color cell-state` is preserved and still refused.
+            let explicit =
+                super::resolve_opening_color_mapping(&disabled_cfg, Some(ColorMapping::CellState))
+                    .expect("explicit mapping preserved");
+            assert_eq!(explicit, ColorMapping::CellState);
+            assert!(matches!(
+                super::validate_v2_visual_style(&disabled_cfg, explicit, FieldMapping::Energy),
+                Err(flife_core::CoreError::InvalidConfig(_))
+            ));
+        }
+
+        // A v1 TOML file configured with a v2 mapping must NOT silently fall back.
+        let bad_v1_toml = include_str!("../../../presets/reference-small-world.toml").replacen(
+            "color_mapping = \"founder-lineage-v1\"",
+            "color_mapping = \"cell-state-v1\"",
+            1,
+        );
+        let bad_v1_cfg = ValidatedConfig::from_toml(&bad_v1_toml).expect("v1 config parses");
+        let configured =
+            super::resolve_opening_color_mapping(&bad_v1_cfg, None).expect("reads v1 mapping");
+        assert_eq!(configured, ColorMapping::CellState);
+        assert!(matches!(
+            super::validate_v2_visual_style(&bad_v1_cfg, configured, FieldMapping::Energy),
+            Err(flife_core::CoreError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn v2_inspected_records_emit_polarity_cadherin_and_v2_transactions() {
+        // Baseline v1 omits all optional V2 organism and transaction keys.
+        let v1_toml = include_str!("../../../presets/reference-small-world.toml").replacen(
+            "initial_count = 4096",
+            "initial_count = 16",
+            1,
+        );
+        let v1_cfg = ValidatedConfig::from_toml(&v1_toml).expect("v1 preset");
+        let mut v1_world = flife_engine::World::found(
+            &v1_cfg,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("v1 founds");
+        let v1_id = v1_world.population().ids().next().expect("v1 founder");
+        v1_world.watch(Some(v1_id));
+        v1_world.step().expect("v1 step");
+        let v1_snap = v1_world
+            .organism_snapshot(v1_id)
+            .expect("v1 inspect")
+            .expect("v1 lives");
+        let v1_record = serde_json::to_value(super::status_record(&Status::Inspected {
+            organism: v1_id,
+            seen: Tick::new(1),
+            snapshot: Some(Box::new(v1_snap)),
+        }))
+        .expect("v1 serializes");
+        let v1_obj = v1_record["snapshot"]
+            .as_object()
+            .expect("v1 snapshot object");
+        for omitted in [
+            "recurrent_state",
+            "polarity",
+            "polarity_strength",
+            "wedge_curvature",
+            "cadherin_tag",
+            "cohesiveness",
+        ] {
+            assert!(
+                !v1_obj.contains_key(omitted),
+                "v1 inspection must omit {omitted}"
+            );
+        }
+        let v1_tx = v1_record["snapshot"]["transactions"]
+            .as_object()
+            .expect("v1 transactions object");
+        assert!(!v1_tx.contains_key("byproduct_staged"));
+        assert!(!v1_tx.contains_key("trophallaxis"));
+
+        // Bundle A (`morphogenesis-tissue-v2.toml`) emits polarity, cadherin,
+        // recurrent state, and non-zero V2 transactions.
+        let v2_toml = include_str!("../../../presets/morphogenesis-tissue-v2.toml")
+            .replacen("initial_count = 10954", "initial_count = 16", 1)
+            .replacen("maximum_count = 262144", "maximum_count = 64", 1);
+        let v2_cfg = super::load_toml(&v2_toml, &[]).expect("Bundle A config loads");
+        let mut v2_world = flife_engine::World::found(
+            &v2_cfg,
+            flife_engine::Arrangement::FreeList,
+            flife_engine::NumericalProfile::reference_f32().expect("profile"),
+        )
+        .expect("v2 founds");
+        let v2_id = v2_world.population().ids().next().expect("v2 founder");
+        v2_world.watch(Some(v2_id));
+        for _ in 0..2 {
+            v2_world.step().expect("v2 step");
+        }
+        let mut v2_snap = v2_world
+            .organism_snapshot(v2_id)
+            .expect("v2 inspect")
+            .expect("v2 lives");
+        assert!(v2_snap.transactions.len() >= 2);
+        v2_snap.transactions[0].byproduct_staged = 0.045;
+        v2_snap.transactions[1].byproduct_staged = 0.015;
+        v2_snap.transactions[0].trophallaxis_delta = 0.025;
+        v2_snap.transactions[1].trophallaxis_delta = -0.150;
+
+        let expected_polarity = v2_snap.organism.polarity;
+        let expected_strength = v2_snap
+            .traits
+            .polarity_strength()
+            .expect("all-v2 has polarity_strength");
+        let expected_wedge = v2_snap
+            .traits
+            .wedge_curvature()
+            .expect("all-v2 has wedge_curvature");
+        let expected_cadherin = v2_snap.cadherin_tag().expect("all-v2 has cadherin_tag");
+        let expected_cohesiveness = v2_snap.cohesiveness().expect("all-v2 has cohesiveness");
+        assert!(
+            !v2_snap.organism.held.recurrent_state().is_empty(),
+            "all-v2 holds recurrent state"
+        );
+
+        let v2_record = serde_json::to_value(super::status_record(&Status::Inspected {
+            organism: v2_id,
+            seen: Tick::new(2),
+            snapshot: Some(Box::new(v2_snap)),
+        }))
+        .expect("v2 serializes");
+        let snap = &v2_record["snapshot"];
+        let pol: Vec<u64> = snap["polarity"]
+            .as_array()
+            .expect("polarity array")
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(f64::to_bits)
+            .collect();
+        assert_eq!(pol, expected_polarity.map(f64::to_bits).to_vec());
+        assert_eq!(
+            snap["polarity_strength"].as_f64().map(f64::to_bits),
+            Some(expected_strength.to_bits())
+        );
+        assert_eq!(
+            snap["wedge_curvature"].as_f64().map(f64::to_bits),
+            Some(expected_wedge.to_bits())
+        );
+        let cad: Vec<u64> = snap["cadherin_tag"]
+            .as_array()
+            .expect("cadherin_tag array")
+            .iter()
+            .filter_map(Value::as_f64)
+            .map(f64::to_bits)
+            .collect();
+        assert_eq!(cad, expected_cadherin.map(f64::to_bits).to_vec());
+        assert_eq!(
+            snap["cohesiveness"].as_f64().map(f64::to_bits),
+            Some(expected_cohesiveness.to_bits())
+        );
+        assert!(snap["recurrent_state"].is_array());
+        assert_eq!(
+            snap["transactions"]["byproduct_staged"]
+                .as_f64()
+                .map(f64::to_bits),
+            Some((0.045_f64 + 0.015_f64).to_bits())
+        );
+        assert_eq!(
+            snap["transactions"]["trophallaxis"]
+                .as_f64()
+                .map(f64::to_bits),
+            Some((0.025_f64 - 0.150_f64).to_bits())
+        );
     }
 }

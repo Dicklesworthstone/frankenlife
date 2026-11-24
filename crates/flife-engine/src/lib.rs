@@ -79,6 +79,7 @@ pub use emission::{
     EmissionV2Rules, ExcitableMode, INITIAL_SECRETORY_READINESS, NEXT_TICK_VISIBILITY, OffsetMode,
     POST_MOTION, PumpDirection, SurplusFloorRule,
 };
+pub use flife_field::ConeContractionSummary;
 pub use inspect::{
     Activations, ControllerWeights, ExchangeCell, LocalChemistry, OrganismSnapshot, RECENT_STEPS,
     ReproductionOutcome, Sensed, Transactions,

@@ -819,6 +819,12 @@ pub struct Recent {
     pub births: usize,
     /// `Σ` what their splits debited: the endowments and the birth costs.
     pub endowed: f64,
+    /// `Σ` energy staged as obligate symplectic metabolic waste (`V2-11`);
+    /// zero when `symplectic-waste` is disabled.
+    pub byproduct_staged: f64,
+    /// `Σ` signed net energy moved by passive exact-quantum kin trophallaxis
+    /// (`V2-13`); zero when `trophallaxis` is disabled.
+    pub trophallaxis: f64,
     /// The newest step's closing energy minus the first's opening energy.
     pub net: f64,
     /// What the newest step's reproduction stage came to.
@@ -838,16 +844,20 @@ pub fn recent(transactions: &[Transactions]) -> Option<Recent> {
         emission: 0.0,
         births: 0,
         endowed: 0.0,
+        byproduct_staged: 0.0,
+        trophallaxis: 0.0,
         net: newest.closing - first.opening,
         reproduction: newest.reproduction,
     };
     for step in transactions {
         recent.uptake += step.uptake.net();
+        recent.byproduct_staged += step.byproduct_staged;
         recent.maintenance += step
             .maintenance
             .map_or(0.0, |maintenance| maintenance.cost.paid);
         recent.motion += step.motion.map_or(0.0, |motion| motion.cost.paid);
         recent.emission += step.emission.map_or(0.0, |emission| emission.cost.paid);
+        recent.trophallaxis += step.trophallaxis_delta;
         if let Some(ReproductionOutcome::Born { split, .. }) = step.reproduction {
             recent.births += 1;
             recent.endowed += split.debited();
@@ -888,9 +898,14 @@ fn transaction_lines(recent: &Recent) -> String {
             grouped(u64::try_from(recent.steps).unwrap_or(u64::MAX))
         )
     };
+    let trophallaxis = if recent.trophallaxis != 0.0 {
+        format!(" · trophallaxis {}", signed(recent.trophallaxis, 3))
+    } else {
+        String::new()
+    };
     format!(
         "{steps}: uptake {} · maintenance {} · motion {}\n\
-         emission {} · {births} · net {} · {reproduction}",
+         emission {} · {births}{trophallaxis} · net {} · {reproduction}",
         signed(recent.uptake, 3),
         signed(-recent.maintenance, 3),
         signed(-recent.motion, 3),

@@ -21,13 +21,17 @@
 use std::num::NonZeroUsize;
 
 use flife_core::checkpoint::{CheckpointReader, CheckpointWriter};
-use flife_core::{FeatureOverride, ValidatedConfig};
+use flife_core::{CoreError, FeatureOverride, ValidatedConfig};
 use flife_engine::{
     Advance, Arrangement, Disposition, Intervention, NumericalProfile, Stepped, TickReport,
     WORLD_CHECKPOINT_CHUNKS, World,
 };
+use flife_field::ConeTolerance;
 
 const PLAN: &str = include_str!("../../../COMPREHENSIVE_PLAN_FOR_THE_DESIGN_OF_FRANKENLIFE.md");
+const ARM1_TOML: &str =
+    include_str!("../../../experiments/v2-quickies/arm1-neural-agency-128.toml");
+const PRESET_TOML: &str = include_str!("../../../presets/reference-small-world.toml");
 
 fn ecology_toml(model: &str, overrides: &[(&str, &str, &str)], tail: &str) -> String {
     let appendix = PLAN.find("## Appendix A").map_or("", |at| &PLAN[at..]);
@@ -331,5 +335,163 @@ occupancy_impedance = 1.5
             step_published(&mut restored);
         }
         assert_eq!(restored.digest(), w1.digest());
+    }
+}
+
+/// Plan §11.5 Option B bounded moment-only cone contraction in Phase 10:
+/// - `NumericalProfile::reference_f32()` keeps the hard `INV-02` gate at
+///   `(f32::MIN_POSITIVE, 1e-5)` and triggers contraction only above
+///   `(f32::MIN_POSITIVE, 1e-6)`.
+/// - `presets/reference-small-world.toml` (8 ticks = `PROBE_TICKS`) triggers
+///   0 contractions, keeping `PRESET_DIGEST` 100% bit-identical.
+/// - A genuine violation above the configured `INV-02` gate still faults
+///   immediately before contraction (never masked).
+/// - Arm 1 (`arm1-neural-agency-128.toml`, seed 101, 8 pulsing heterogeneous
+///   oases, `emission = 0.0`, `initial_count = 0` — which faulted on `INV-02`
+///   at tick 2,026 before this fix) now runs cleanly past tick 2,657 to tick
+///   2,700 with unchanged `INV-02 = 1e-5`, unmasked `FieldSummary`, logged
+///   `TickReport::cone_contraction`, intact `INV-03` energy closure, and
+///   1-vs-4 worker parity across contraction ticks.
+#[test]
+fn plan_11_5_phase10_cone_contraction_passes_arm1_seed101_past_tick_2657_and_preserves_short_digests()
+ {
+    let profile = NumericalProfile::reference_f32().expect("profile");
+    assert_eq!(profile.cone.relative(), 1.0e-5, "INV-02 gate stays 1e-5");
+    assert_eq!(
+        profile.cone_contraction_trigger().absolute(),
+        f64::from(f32::MIN_POSITIVE)
+    );
+    assert_eq!(
+        profile.cone_contraction_trigger().relative(),
+        1.0e-6,
+        "Option B contraction trigger is 1e-6"
+    );
+
+    // 1. Short reference preset (`PROBE_TICKS = 8`): 0 contractions -> PRESET_DIGEST bit-identical.
+    let preset_cfg = ValidatedConfig::from_toml(PRESET_TOML).expect("preset");
+    let mut preset_world = World::found_on(
+        &preset_cfg,
+        Arrangement::Compact,
+        profile,
+        NonZeroUsize::new(4).expect("4"),
+    )
+    .expect("preset world");
+    for tick in 0..8_u32 {
+        let report = step_published(&mut preset_world);
+        assert_eq!(
+            report.cone_contraction.cells, 0,
+            "preset tick {tick} must not trigger Option B contraction"
+        );
+    }
+
+    // 2. Hard INV-02 gate runs strictly before contraction and never masks a violation.
+    let strict_profile = NumericalProfile {
+        residual: profile.residual,
+        cone: ConeTolerance::EXACT,
+    };
+    let arm1_zero_toml = ARM1_TOML.replace("initial_count = 4096", "initial_count = 0");
+    let arm1_cfg = ValidatedConfig::from_toml(&arm1_zero_toml).expect("arm1 zero-pop cfg");
+    let mut strict_world = World::found_on(
+        &arm1_cfg,
+        Arrangement::Compact,
+        strict_profile,
+        NonZeroUsize::new(4).expect("4"),
+    )
+    .expect("strict world");
+    let mut strict_faulted = false;
+    for _ in 0..16 {
+        match strict_world.step() {
+            Ok(Stepped::Published(_)) => {}
+            Ok(Stepped::Paused(shortfall)) => panic!("unexpected pause: {shortfall:?}"),
+            Err(CoreError::NumericalInvalid {
+                quantity: "chemical moment cone",
+                ..
+            }) => {
+                strict_faulted = true;
+                break;
+            }
+            Err(other) => panic!("unexpected error under exact cone gate: {other:?}"),
+        }
+    }
+    assert!(
+        strict_faulted,
+        "INV-02 check must run read-only before contraction and reject violations beyond profile.cone"
+    );
+
+    // 3. Arm 1 seed 101 pulsing-oases world passes tick 2,026 and tick 2,657
+    //    cleanly all the way to tick 2,700 under unchanged `reference_f32()`.
+    let mut arm1_w4 = World::found_on(
+        &arm1_cfg,
+        Arrangement::Compact,
+        profile,
+        NonZeroUsize::new(4).expect("4"),
+    )
+    .expect("arm1 world");
+    let mut total_contracted_cells = 0_u64;
+    let mut contracted_ticks = 0_u64;
+    let mut max_contraction_rel = 0.0_f64;
+    let mut max_inv03_rel = 0.0_f64;
+    let mut first_contraction_checkpoint: Option<Vec<u8>> = None;
+    for tick in 0..2700_u32 {
+        // Capture a checkpoint right before a contraction tick to verify 1-vs-4
+        // worker bit-exactness across live contraction ticks without paying
+        // 2,700 serial ticks.
+        let report = step_published(&mut arm1_w4);
+        let inv03_rel = report.closure.residual().abs() / report.closure.scale().max(1.0);
+        max_inv03_rel = max_inv03_rel.max(inv03_rel);
+        if report.cone_contraction.cells > 0 {
+            contracted_ticks += 1;
+            total_contracted_cells += report.cone_contraction.cells;
+            max_contraction_rel = max_contraction_rel.max(report.cone_contraction.max_relative);
+            assert!(
+                report.field.max_cone_residual > 0.0,
+                "tick {tick}: FieldSummary must report unmasked pre-contraction residual"
+            );
+            assert!(
+                report.cone_contraction.max_relative < 2.0e-6,
+                "tick {tick}: bounded contraction exceeded 2e-6 ({:?})",
+                report.cone_contraction
+            );
+            if first_contraction_checkpoint.is_none() {
+                let mut writer = CheckpointWriter::new(&arm1_cfg.config().model);
+                arm1_w4
+                    .write_checkpoint(&mut writer)
+                    .expect("write checkpoint");
+                first_contraction_checkpoint = Some(writer.finish().expect("finish checkpoint"));
+            }
+        }
+    }
+    assert!(
+        contracted_ticks > 0 && total_contracted_cells > 0,
+        "Arm 1 seed 101 must trigger bounded plan §11.5 cone contraction across 2,700 ticks"
+    );
+    assert!(
+        max_inv03_rel < 1.0e-6,
+        "INV-03 residual must remain unaffected by moment-only contraction: {max_inv03_rel:e}"
+    );
+    let _ = max_contraction_rel;
+
+    // 4. Verify 1-vs-4 worker bit-exactness across contraction ticks starting
+    //    from the live Arm 1 contraction checkpoint.
+    let bytes = first_contraction_checkpoint.expect("captured contraction checkpoint");
+    let reader =
+        CheckpointReader::parse(&bytes, &WORLD_CHECKPOINT_CHUNKS).expect("open checkpoint");
+    let mut restored_w1 = World::read_checkpoint(&reader, profile).expect("restore w1");
+    let mut restored_w4 = World::read_checkpoint(&reader, profile).expect("restore w4");
+    restored_w4
+        .set_cpu_workers(NonZeroUsize::new(4).expect("4"))
+        .expect("set 4 workers");
+    for step_idx in 0..32_u32 {
+        let r1 = step_published(&mut restored_w1);
+        let r4 = step_published(&mut restored_w4);
+        assert_eq!(
+            r1.cone_contraction, r4.cone_contraction,
+            "step {step_idx}: 1 vs 4 worker ConeContractionSummary mismatch"
+        );
+        assert_eq!(
+            restored_w1.digest(),
+            restored_w4.digest(),
+            "step {step_idx}: 1 vs 4 worker digest mismatch across contraction"
+        );
     }
 }

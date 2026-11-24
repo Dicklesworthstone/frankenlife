@@ -473,6 +473,25 @@ class TestEndToEndCli(unittest.TestCase):
             self.assertAlmostEqual(
                 d["flock_polarization"]["global_polarization"], 1.0, places=12
             )
+            self.assertTrue(d["field_spatial_contrast"]["available"])
+
+    def test_field_spatial_contrast_oracles(self) -> None:
+        uniform = diag.compute_field_spatial_contrast([5.0, 5.0, 5.0, 5.0])
+        self.assertTrue(uniform["available"])
+        self.assertAlmostEqual(uniform["gini"], 0.0, places=12)
+        self.assertAlmostEqual(uniform["dark_fraction_below_10pct_mean"], 0.0, places=12)
+
+        spike = diag.compute_field_spatial_contrast([0.0, 0.0, 0.0, 10.0])
+        self.assertAlmostEqual(spike["gini"], 0.75, places=12)
+        self.assertAlmostEqual(spike["dark_fraction_below_10pct_mean"], 0.75, places=12)
+
+        half_dark = diag.compute_field_spatial_contrast([0.0, 0.0, 10.0, 10.0])
+        self.assertAlmostEqual(half_dark["gini"], 0.5, places=12)
+        self.assertAlmostEqual(half_dark["dark_fraction_below_10pct_mean"], 0.5, places=12)
+
+        absent = diag.compute_field_spatial_contrast(None)
+        self.assertFalse(absent["available"])
+        self.assertIsNone(absent["gini"])
 
 
 if __name__ == "__main__":

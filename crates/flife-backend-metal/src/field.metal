@@ -431,8 +431,9 @@ kernel void vascular_update(
     d64 en = d_from_f32_bits(en_bits);
     d64 diff_x = d_sub(ec, ee) & ~D_SIGN;
     d64 diff_y = d_sub(ec, en) & ~D_SIGN;
-    d64 flux_x = d_mul(d_mul(d_word(edge_x, 2u * cell), substeps), diff_x);
-    d64 flux_y = d_mul(d_mul(d_word(edge_y, 2u * cell), substeps), diff_y);
+    d64 rate_scale = d_div(substeps, dt);
+    d64 flux_x = d_mul(d_mul(d_word(edge_x, 2u * cell), rate_scale), diff_x);
+    d64 flux_y = d_mul(d_mul(d_word(edge_y, 2u * cell), rate_scale), diff_y);
     next_x[cell] = vascular_step(px_bits, flux_x, dt, g_min, alpha_v, gamma_v, j0, mu, fault);
     next_y[cell] = vascular_step(py_bits, flux_y, dt, g_min, alpha_v, gamma_v, j0, mu, fault);
 }

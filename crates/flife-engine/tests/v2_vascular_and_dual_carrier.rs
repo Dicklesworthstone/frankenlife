@@ -546,7 +546,7 @@ minimum_conductance_ratio = 0.025
 maximum_diffusion = 0.25
 reinforcement_rate_per_second = 1.5
 pruning_rate_per_second = 0.35
-flux_half_saturation = 0.02
+flux_half_saturation = 0.64
 flux_exponent = 1.5
 "#);
     let sublinear = run(r#"
@@ -562,7 +562,7 @@ minimum_conductance_ratio = 0.025
 maximum_diffusion = 0.25
 reinforcement_rate_per_second = 1.5
 pruning_rate_per_second = 0.35
-flux_half_saturation = 0.02
+flux_half_saturation = 0.64
 flux_exponent = 0.7
 "#);
     let disabled = run(r#"

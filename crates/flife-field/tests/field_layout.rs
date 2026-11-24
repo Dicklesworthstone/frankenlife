@@ -4,13 +4,18 @@
 //!
 //! Expected strides are NumPy's: `np.zeros(shape, np.float32).strides`.
 
-use flife_core::{CoreError, ValidatedConfig};
+use flife_core::ids::SourceId;
+use flife_core::{CoreError, TimeStep, ValidatedConfig};
 use flife_field::grid::{minimum_image, wrap_coordinate};
 use flife_field::layout::{FIELD_LAYOUT_SCHEMA, HOST_ALIGNMENT};
+use flife_field::sources::unit_direction;
+use flife_field::state::CHANNELS;
 use flife_field::{
-    Arrangement, BufferLimits, Cell, ConeTolerance, DeclaredLayout, FIELD_PLANES, FieldFootprint,
-    FieldGrid, FieldLayout, FieldPair, FieldState, FieldSummary, FieldView, InitialEnergy,
-    relayout,
+    Arrangement, BufferLimits, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE, Cell,
+    ConeContractionSummary, ConeTolerance, DUAL_CARRIER_PLANES, DeclaredLayout, FIELD_PLANES,
+    FieldFootprint, FieldGrid, FieldLayout, FieldPair, FieldState, FieldSummary, FieldView,
+    InitialEnergy, Source, SourceKernel, SourceSupport, TransportPlan, TransportScratch,
+    advance_field, relayout,
 };
 use fnp_dtype::{ArrayStorage, DType};
 use fnp_ndarray::{MemoryOrder, NdLayout};
@@ -1072,4 +1077,352 @@ fn ranged_failures(state: &FieldState) -> FieldState {
     negative.energy = -1.0;
     bad.set_cell(30, 70, &negative).expect("in range");
     bad
+}
+
+/// Plan §11.5 bounded moment-only cone contraction:
+/// - `check_invariants_with_trigger_on` matches `check_invariants_on` bit-for-bit
+///   and tracks `any_exceeds_trigger` accurately even when the largest absolute
+///   residual cell is below the relative trigger and a smaller-energy cell is above.
+/// - `contract_cone_on` never mutates `e_0` or `e_1` (0 bits touched), leaves
+///   cells at or below `trigger` bit-for-bit untouched, brings every contracted
+///   cell strictly inside `||m||₂ ≤ e` (`ConeTolerance::EXACT`), works on both
+///   33-plane single-carrier and 34-plane dual-carrier (`V2-15`) fields, handles
+///   `e == 0`, subnormals, `-0.0`, and near-`f32::MAX`, and is bit-identical
+///   across worker counts `[0, 1, 2, 4, 8]`.
+#[test]
+fn plan_11_5_cone_contraction_is_exact_energy_preserving_dual_carrier_and_worker_invariant() {
+    let g = grid(160, 128, 160.0, 128.0);
+    let limits = BufferLimits::host();
+    let mut base = FieldState::zeroed(g, &limits).expect("allocate");
+
+    let mut raw_dir = [0.0_f64; CHANNELS];
+    for (k, slot) in raw_dir.iter_mut().enumerate() {
+        *slot = (((k * 17 + 5) % 23) as f64 - 11.0) / 11.0;
+    }
+    let dir = unit_direction(&raw_dir).expect("unit dir");
+
+    // Cell (10, 3): tiny residual (~3e-8 <= 1e-6) — must remain bit-for-bit untouched.
+    let mut below_small = Cell::EMPTY;
+    below_small.energy = 1.0;
+    below_small.moments[0] = 1.0;
+    below_small.moments[1] = 2.0_f32.powi(-12);
+    base.set_cell(10, 3, &below_small).expect("set");
+
+    // Cell (12, 50): e = 10.0, residual ~3e-6 (rel ~3e-7 <= 1e-6) — larger ABSOLUTE
+    // residual than (5, 40), yet still below the relative trigger! Must stay untouched.
+    let mut below_large_abs = Cell::EMPTY;
+    below_large_abs.energy = 10.0;
+    below_large_abs.moments[0] = 10.0;
+    below_large_abs.moments[1] = (20.0_f64 * 3.0e-6).sqrt() as f32;
+    base.set_cell(12, 50, &below_large_abs).expect("set");
+
+    // Cells (5, 40) and (70, 100) in distinct worker ranges: e = 0.16908655,
+    // rel excess ~4e-6 (above 1e-6 trigger, below 1e-5 INV-02 gate).
+    let mut above = Cell::EMPTY;
+    above.energy = 0.169_086_55_f32;
+    let boost = f64::from(above.energy) * (1.0 + 4.0e-6);
+    for (slot, &c) in above.moments.iter_mut().zip(&dir) {
+        *slot = (boost * c) as f32;
+    }
+    base.set_cell(5, 40, &above).expect("set");
+    base.set_cell(70, 100, &above).expect("set");
+
+    // Cell (20, 60): e = 0.0 with tiny dust moment above trigger's absolute floor
+    // (checked under a looser tolerance floor so the `e == 0` zeroing branch runs).
+    let mut zero_e = Cell::EMPTY;
+    zero_e.energy = 0.0;
+    zero_e.moments[3] = 2.0 * f32::MIN_POSITIVE;
+    base.set_cell(20, 60, &zero_e).expect("set");
+
+    let tolerance = ConeTolerance::new(1.0e-36, 1.0e-5).expect("tol");
+    let trigger = ConeTolerance::new(f64::from(f32::MIN_POSITIVE), 1.0e-6).expect("trigger");
+
+    let plain = base.check_invariants_on(tolerance, 1).expect("passes gate");
+    assert_eq!(
+        plain.max_cone_residual_cell,
+        Some((12, 50)),
+        "max_abs cell is below relative trigger while (5, 40) is above"
+    );
+    for workers in [0, 1, 2, 4, 8] {
+        let (with_trig, needs) = base
+            .check_invariants_with_trigger_on(tolerance, trigger, workers)
+            .expect("passes gate with trigger");
+        assert_eq!(summary_bits(&with_trig), summary_bits(&plain));
+        assert!(
+            needs,
+            "workers={workers}: must flag cells above relative trigger despite larger max_abs cell below trigger"
+        );
+    }
+
+    let energy_before: Vec<u32> = base.energy().iter().map(|v| v.to_bits()).collect();
+    let below_small_before = base.cell(10, 3).expect("cell");
+    let below_large_before = base.cell(12, 50).expect("cell");
+
+    let mut serial = base.clone();
+    let s_serial = serial.contract_cone(trigger).expect("contract serial");
+    assert_eq!(s_serial.cells, 3, "(5, 40), (70, 100), and (20, 60)");
+    assert!(s_serial.max_contraction > 0.0);
+    assert!(
+        s_serial.max_relative > 3.5e-6 && s_serial.max_relative < 5.0e-6,
+        "relative contraction {:?}",
+        s_serial
+    );
+    let serial_bits: Vec<u32> = serial.as_slice().iter().map(|v| v.to_bits()).collect();
+    let energy_after: Vec<u32> = serial.energy().iter().map(|v| v.to_bits()).collect();
+    assert_eq!(
+        energy_after, energy_before,
+        "contract_cone must never touch a single energy bit"
+    );
+    assert_eq!(
+        serial.cell(10, 3).expect("c"),
+        below_small_before,
+        "below-trigger cell (10, 3) must stay bit-exact"
+    );
+    assert_eq!(
+        serial.cell(12, 50).expect("c"),
+        below_large_before,
+        "below-trigger cell (12, 50) must stay bit-exact"
+    );
+    assert_eq!(
+        serial.cell(20, 60).expect("c").moments[3].to_bits(),
+        0,
+        "zero-energy cell moments must be zeroed"
+    );
+    // Every contracted cell now satisfies ||m|| <= e with zero residual!
+    for (x, y) in [(5, 40), (70, 100), (20, 60)] {
+        let c = serial.cell(x, y).expect("cell");
+        let sq: f64 = c.moments.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        assert!(
+            sq.sqrt() <= f64::from(c.energy),
+            "contracted cell ({x}, {y}) must satisfy ||m|| <= e exactly: ||m||={}, e={}",
+            sq.sqrt(),
+            c.energy
+        );
+    }
+    let (_, still_needs) = serial
+        .check_invariants_with_trigger_on(tolerance, trigger, 4)
+        .expect("passes after contraction");
+    assert!(
+        !still_needs,
+        "no cell should exceed trigger after contraction"
+    );
+
+    // Bit-exact worker invariance across [0, 1, 2, 4, 8].
+    for workers in [0, 1, 2, 4, 8] {
+        let mut parallel = base.clone();
+        let s = parallel
+            .contract_cone_on(trigger, workers)
+            .expect("contract parallel");
+        assert_eq!(s, s_serial, "workers={workers}: summary mismatch");
+        let bits: Vec<u32> = parallel.as_slice().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(bits, serial_bits, "workers={workers}: field bits mismatch");
+    }
+
+    // Dual-carrier 34-plane (V2-15): Carrier 0 clean, Carrier 1 exceeds trigger.
+    let mut dual = FieldState::zeroed_with_planes(g, DUAL_CARRIER_PLANES, &limits).expect("dual");
+    let c1_idx = 70 * 160 + 15;
+    let e1_val = 0.05_f32;
+    dual.plane_mut(CARRIER1_ENERGY_PLANE).expect("e1")[c1_idx] = e1_val;
+    let c1_boost = f64::from(e1_val) * (1.0 + 5.0e-6);
+    let c1_norm = (8.0_f64).sqrt();
+    for ch in 0..8_u32 {
+        let sign = if ch % 2 == 0 { 1.0 } else { -1.0 };
+        dual.plane_mut(CARRIER1_FIRST_MOMENT_PLANE + ch)
+            .expect("m1")[c1_idx] = (sign * c1_boost / c1_norm) as f32;
+    }
+    let dual_ref_tol = ConeTolerance::new(f64::from(f32::MIN_POSITIVE), 1.0e-5).expect("tol");
+    let (dual_sum, dual_needs) = dual
+        .check_invariants_with_trigger_on(dual_ref_tol, trigger, 4)
+        .expect("dual passes gate");
+    assert!(
+        dual_needs,
+        "dual-carrier check must flag Carrier 1 exceeding trigger even when Carrier 0 is clean"
+    );
+    assert_eq!(dual_sum.max_cone_residual_cell, Some((15, 70)));
+    let e0_before: Vec<u32> = dual.energy().iter().map(|v| v.to_bits()).collect();
+    let e1_before: Vec<u32> = dual
+        .plane(CARRIER1_ENERGY_PLANE)
+        .expect("e1")
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    let mut dual_w4 = dual.clone();
+    let ds1 = dual.contract_cone_on(trigger, 1).expect("dual 1");
+    let ds4 = dual_w4.contract_cone_on(trigger, 4).expect("dual 4");
+    assert_eq!(ds1, ds4);
+    assert_eq!(ds1.cells, 1);
+    assert_eq!(
+        dual.as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        dual_w4
+            .as_slice()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        dual.energy()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        e0_before
+    );
+    assert_eq!(
+        dual.plane(CARRIER1_ENERGY_PLANE)
+            .expect("e1")
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        e1_before
+    );
+    dual.check_invariants(ConeTolerance::EXACT)
+        .expect("dual-carrier contracted exactly onto cone");
+
+    // Edge binades: subnormal, MIN_POSITIVE, negative zero, and near-f32::MAX.
+    let mut edge = FieldState::zeroed(grid(4, 4, 4.0, 4.0), &limits).expect("edge");
+    for (x, e_val, m0) in [
+        // Subnormal `bits(100)` has 1 ULP = 1%, so step explicitly to `-bits(101)`.
+        (0_u32, f32::from_bits(100), -f32::from_bits(101)),
+        (
+            1,
+            f32::MIN_POSITIVE,
+            -(f64::from(f32::MIN_POSITIVE) * (1.0 + 4.0e-6)) as f32,
+        ),
+        (2, 1.0_f32, -(1.0_f64 * (1.0 + 4.0e-6)) as f32),
+        (
+            3,
+            f32::MAX * 0.5,
+            -(f64::from(f32::MAX * 0.5) * (1.0 + 4.0e-6)) as f32,
+        ),
+    ] {
+        let mut cell = Cell::EMPTY;
+        cell.energy = e_val;
+        cell.moments[0] = m0;
+        cell.moments[1] = -0.0;
+        edge.set_cell(x, 0, &cell).expect("set");
+    }
+    let edge_summary = edge
+        .contract_cone(ConeTolerance::EXACT)
+        .expect("edge contract");
+    assert_eq!(edge_summary.cells, 4);
+    edge.check_invariants(ConeTolerance::EXACT)
+        .expect("all edge binades land strictly inside exact cone");
+    assert_eq!(
+        edge.cell(2, 0).expect("c").moments[1].to_bits(),
+        0,
+        "-0.0 canonicalized cleanly without underflow"
+    );
+}
+
+/// Phase-locked F32 decay + source rounding reproduces the Arm 1 seed 101
+/// `INV-02` cone-drift mechanism in ~211 ticks without contraction, and plan
+/// §11.5 Option B contraction (`trigger = (f32::MIN_POSITIVE, 1e-6)`) bounds
+/// it indefinitely with 0 energy bits altered and unchanged `1e-5` gate.
+#[test]
+fn plan_11_5_cone_contraction_stops_phase_locked_decay_stencil_source_drift() {
+    let g = grid(8, 8, 8.0, 8.0);
+    let limits = BufferLimits::host();
+    let step = TimeStep::new(1, 128).expect("dt");
+    let plan = TransportPlan::new(&g, step, 0.0, 0.01).expect("plan");
+    let kernel = SourceKernel::new(0.1, 4.0).expect("1-cell kernel");
+
+    let mut raw_dir = [0.0_f64; CHANNELS];
+    for (k, slot) in raw_dir.iter_mut().enumerate() {
+        *slot = (((k * 17 + 5) % 23) as f64 - 11.0) / 11.0;
+    }
+    let dir = unit_direction(&raw_dir).expect("unit dir");
+    // Exact Arm 1 (103, 87) post-stencil binade: decay drops 887 ULPs (-0.476 ULP err)
+    // and source adds +887 ULPs (-0.25 ULP err), locking e while ||m|| drifts outward.
+    let e0 = 0.169_097_63_f32;
+    let power = 887.25 * 2.0_f64.powi(-26) * 128.0;
+    let sources = [Source::new(SourceId::new(0), [4.5, 4.5], dir, power).expect("source")];
+
+    let seed_pair = || {
+        let mut pair = FieldPair::zeroed(g, &limits).expect("pair");
+        let mut cell = Cell::EMPTY;
+        cell.energy = e0;
+        for (slot, &c) in cell.moments.iter_mut().zip(&dir) {
+            *slot = (f64::from(e0) * c) as f32;
+        }
+        pair.current_mut().set_cell(4, 4, &cell).expect("set");
+        pair
+    };
+
+    let gate = ConeTolerance::new(f64::from(f32::MIN_POSITIVE), 1.0e-5).expect("gate");
+    let trigger = ConeTolerance::new(f64::from(f32::MIN_POSITIVE), 1.0e-6).expect("trigger");
+
+    // 1. Without contraction: breaches the 1e-5 INV-02 gate within 500 ticks.
+    let mut raw_pair = seed_pair();
+    let mut scratch = TransportScratch::new(&g, &limits).expect("scratch");
+    let mut support = SourceSupport::new();
+    let mut raw_failed_at = None;
+    for tick in 0..500_u32 {
+        advance_field(
+            &mut raw_pair,
+            &plan,
+            &kernel,
+            &sources,
+            step,
+            &mut scratch,
+            &mut support,
+        )
+        .expect("step");
+        if raw_pair.next().check_invariants(gate).is_err() {
+            raw_failed_at = Some(tick);
+            break;
+        }
+        raw_pair.commit();
+    }
+    assert!(
+        raw_failed_at.is_some(),
+        "phase-locked decay+source fixture must breach 1e-5 without contraction"
+    );
+
+    // 2. With plan §11.5 Option B contraction: passes all 500 ticks cleanly,
+    //    never alters a single energy bit, keeps INV-02 gate at 1e-5, and
+    //    logs every contraction honestly.
+    let mut fixed_pair = seed_pair();
+    let mut contracted_ticks = 0_u64;
+    let mut total_contracted = 0_u64;
+    let mut max_pre_rel = 0.0_f64;
+    let mut worst_contraction = ConeContractionSummary::default();
+    for _ in 0..500_u32 {
+        advance_field(
+            &mut fixed_pair,
+            &plan,
+            &kernel,
+            &sources,
+            step,
+            &mut scratch,
+            &mut support,
+        )
+        .expect("step");
+        let (_, next) = fixed_pair.stage();
+        let e_before: Vec<u32> = next.energy().iter().map(|v| v.to_bits()).collect();
+        let (summary, needs) = next
+            .check_invariants_with_trigger_on(gate, trigger, 1)
+            .expect("passes unchanged 1e-5 gate");
+        max_pre_rel = max_pre_rel.max(summary.max_cone_residual / f64::from(e0));
+        if needs {
+            let c = next.contract_cone(trigger).expect("contract");
+            contracted_ticks += 1;
+            total_contracted += c.cells;
+            worst_contraction.max_contraction =
+                worst_contraction.max_contraction.max(c.max_contraction);
+            worst_contraction.max_relative = worst_contraction.max_relative.max(c.max_relative);
+        }
+        let e_after: Vec<u32> = next.energy().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(e_after, e_before, "contraction must never modify energy");
+        fixed_pair.commit();
+    }
+    assert!(
+        contracted_ticks > 0 && total_contracted > 0,
+        "contraction must fire on phase-locked ticks"
+    );
+    assert!(
+        max_pre_rel < 2.0e-6 && worst_contraction.max_relative < 2.0e-6,
+        "pre-contraction residual ({max_pre_rel:e}) and contraction ({worst_contraction:?}) stay bounded well below 1e-5"
+    );
 }

@@ -1750,8 +1750,9 @@ impl VascularField {
     /// candidate buffers `(next_x, next_y)` from pre-transport Carrier-0
     /// `energy_before` and precomputed `edges` (`V2-14`, `C.8` cancel-safe).
     ///
-    /// Uses substep-invariant flux magnitude:
-    /// `|F_e| = (edge[c] * substeps as f64) * |f64::from(e[c]) - f64::from(e[nbr])|`.
+    /// Uses substep- and timestep-invariant flux rate (`EnergyPerSecond`,
+    /// matching `v2.vascular.flux_half_saturation`):
+    /// `|F_e| = (edge[c] * (substeps as f64 / dt)) * |f64::from(e[c]) - f64::from(e[nbr])|`.
     ///
     /// # Errors
     /// [`CoreError::LayoutMismatch`] if buffer lengths or grids disagree.
@@ -1788,6 +1789,7 @@ impl VascularField {
         let height = usize::try_from(plan.grid.cells_y()).map_err(|_| overflow())?;
         let substeps_f64 = f64::from(plan.substeps());
         let dt = f64::from(step.numerator()) / f64::from(step.denominator());
+        let rate_scale = substeps_f64 / dt;
         for y in 0..height {
             let row = y * width;
             let north_row = if y + 1 == height { 0 } else { (y + 1) * width };
@@ -1797,8 +1799,8 @@ impl VascularField {
                 let ec = f64::from(energy_before[c]);
                 let ee = f64::from(energy_before[row + east]);
                 let en = f64::from(energy_before[north_row + x]);
-                let flux_x = (edges.edge_x[c] * substeps_f64) * (ec - ee).abs();
-                let flux_y = (edges.edge_y[c] * substeps_f64) * (ec - en).abs();
+                let flux_x = (edges.edge_x[c] * rate_scale) * (ec - ee).abs();
+                let flux_y = (edges.edge_y[c] * rate_scale) * (ec - en).abs();
                 next_x[c] = self.update_conductance(prev_x[c], flux_x, dt);
                 next_y[c] = self.update_conductance(prev_y[c], flux_y, dt);
             }

@@ -1823,3 +1823,114 @@ fn v2_legends_and_field_overlays_fit_within_hud_vertex_cap() {
         }
     }
 }
+
+/// `V2-11` (`byproduct_staged`) and `V2-13` (`trophallaxis_delta`): `recent()`
+/// sums both across recorded steps, `inspector_lines` stays unchanged when
+/// trophallaxis is zero and surfaces signed trophallaxis when non-zero, and
+/// the worst-case V2 overlay with trophallaxis stays inside the HUD vertex and
+/// triangle caps at 2× (80% budget) and 3× (100% budget).
+#[test]
+fn v2_recent_transactions_sum_byproduct_and_trophallaxis_within_hud_cap() {
+    let mut snapshot = known();
+    assert!(snapshot.transactions.len() >= 3);
+
+    // Default (zero) V2 transaction fields omit the trophallaxis HUD clause.
+    let zero_recent = flife_studio::recent(&snapshot.transactions).expect("recent");
+    assert_eq!(zero_recent.byproduct_staged, 0.0);
+    assert_eq!(zero_recent.trophallaxis, 0.0);
+    let baseline = inspector_lines(Inspected::Read(&snapshot));
+    assert!(!baseline.contains("trophallaxis"));
+
+    // Positive net trophallaxis & non-zero symplectic byproduct staging.
+    snapshot.transactions[0].byproduct_staged = 0.025;
+    snapshot.transactions[1].byproduct_staged = 0.075;
+    snapshot.transactions[2].byproduct_staged = 0.050;
+    snapshot.transactions[0].trophallaxis_delta = 0.250;
+    snapshot.transactions[1].trophallaxis_delta = -0.070;
+    snapshot.transactions[2].trophallaxis_delta = 0.0;
+    let positive_recent = flife_studio::recent(&snapshot.transactions).expect("recent");
+    assert_eq!(
+        positive_recent.byproduct_staged.to_bits(),
+        (0.025_f64 + 0.075_f64 + 0.050_f64).to_bits()
+    );
+    assert_eq!(
+        positive_recent.trophallaxis.to_bits(),
+        (0.250_f64 - 0.070_f64).to_bits()
+    );
+    let positive_panel = inspector_lines(Inspected::Read(&snapshot));
+    assert!(
+        positive_panel.contains(" · trophallaxis +0.180 · net "),
+        "expected positive trophallaxis clause in:\n{positive_panel}"
+    );
+
+    // Negative net trophallaxis prints with minus sign.
+    snapshot.transactions[0].trophallaxis_delta = -0.250;
+    snapshot.transactions[1].trophallaxis_delta = 0.070;
+    let negative_panel = inspector_lines(Inspected::Read(&snapshot));
+    assert!(
+        negative_panel.contains(" · trophallaxis -0.180 · net "),
+        "expected negative trophallaxis clause in:\n{negative_panel}"
+    );
+
+    // Worst-case V2 HUD text with widest negative trophallaxis still fits.
+    snapshot.transactions[0].trophallaxis_delta = -99_999.999_4;
+    snapshot.transactions[1].trophallaxis_delta = 0.0;
+    let font = HudFont::bundled().expect("bundled HUD font");
+    let all_keys = legends(&config()).expect("legends");
+    let widest = metrics();
+    let memory = admission(999 * GIB, 999 * GIB, GIB);
+    let preview = widest_preview(Brush::Removal, BrushSettings::default());
+    for (mapping, legend) in all_keys.iter().filter(|(mapping, _)| mapping.is_v2()) {
+        for field_mapping in [
+            FieldMapping::TrailCarrier,
+            FieldMapping::VascularConductance,
+        ] {
+            let field = field_mapping.legend().expect("v2 overlay legend");
+            let text = overlay_text(&OverlayState {
+                paused: Some(true),
+                shown: Some(Tick::new(999_999_999_999)),
+                clock: Some(&READING),
+                legend,
+                field_key: Some(&field),
+                brush: Some(Brush::Removal),
+                preview: Some(preview),
+                measuring: None,
+                selected: Some(OrganismId::new(999_999_999_999)),
+                inspected: Some(Inspected::Read(&snapshot)),
+                telemetry: Some(Telemetry {
+                    metrics: &widest,
+                    model: "field-ecology-v2",
+                    seed: u64::MAX,
+                    evaluation_interval_ticks: u32::MAX,
+                    memory: &memory,
+                    capacity_pauses: 999_999_999_999,
+                    checkpoint: Some(Tick::new(999_999_999_999)),
+                }),
+            });
+            assert!(text.contains(" · trophallaxis -99999.999 · net "));
+            let colors: Vec<_> = legend
+                .swatches
+                .iter()
+                .chain(&field.swatches)
+                .map(|&rgb| linear(rgb))
+                .collect();
+            let glyphs = text.chars().filter(|c| !c.is_whitespace()).count();
+            for scale in [2.0_f64, 3.0_f64] {
+                let laid = font
+                    .text_with_swatches(&text, HUD_TEXT_POINTS * scale, &colors)
+                    .unwrap_or_else(|error| {
+                        panic!("{mapping:?} + {field_mapping:?} + trophallaxis @{scale}x: {error}")
+                    });
+                assert_eq!(laid.glyphs(), glyphs);
+                assert_eq!(laid.refused(), 0);
+                assert_eq!(laid.left_out(), 0);
+                assert!(laid.vertices().len() <= HUD_MAX_VERTICES);
+                assert!(laid.triangles().len() <= HUD_MAX_TRIANGLES);
+                if (scale - 2.0).abs() < f64::EPSILON {
+                    assert!(laid.vertices().len() * 5 <= HUD_MAX_VERTICES * 4);
+                    assert!(laid.triangles().len() * 5 <= HUD_MAX_TRIANGLES * 4);
+                }
+            }
+        }
+    }
+}

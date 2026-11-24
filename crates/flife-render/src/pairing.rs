@@ -157,7 +157,7 @@ pub fn pairs<'a>(prior: &'a Epoch, current: &'a Epoch) -> Pairs<'a> {
 /// of `length`, which a [`Gap`] decides.
 #[must_use]
 pub fn wrapped_between(from: f64, to: f64, length: f64, fraction: f64) -> f64 {
-    if fraction <= 0.0 {
+    if !fraction.is_finite() || fraction <= 0.0 || !(length.is_finite() && length > 0.0) {
         return from;
     }
     if fraction >= 1.0 {
@@ -265,4 +265,22 @@ pub fn interpolate(
         }
     }
     Ok(gap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrapped_between;
+
+    #[test]
+    fn wrapped_between_handles_non_finite_and_non_positive_inputs_without_nan() {
+        assert_eq!(wrapped_between(12.0, 20.0, 32.0, f64::NAN), 12.0);
+        assert_eq!(wrapped_between(12.0, 20.0, 32.0, f64::NEG_INFINITY), 12.0);
+        assert_eq!(wrapped_between(12.0, 20.0, 32.0, f64::INFINITY), 12.0);
+        assert_eq!(wrapped_between(12.0, 20.0, 0.0, 0.5), 12.0);
+        assert_eq!(wrapped_between(12.0, 20.0, -32.0, 0.5), 12.0);
+        assert_eq!(wrapped_between(12.0, 20.0, f64::NAN, 0.5), 12.0);
+        assert_eq!(wrapped_between(12.0, 20.0, f64::INFINITY, 0.5), 12.0);
+        // Valid seam crossing remains exact.
+        assert_eq!(wrapped_between(30.0, 2.0, 32.0, 0.5), 0.0);
+    }
 }

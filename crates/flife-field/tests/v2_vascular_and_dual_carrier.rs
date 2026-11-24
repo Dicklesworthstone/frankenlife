@@ -216,7 +216,8 @@ fn vascular_murray_branching_vs_sublinear_control() {
     let sinks = [10 * 32 + 24, 22 * 32 + 24];
 
     let run = |mu: f64| -> (f64, f64, f64) {
-        let vascular = VascularField::new(0.025, 0.32, 3.0, 0.6, 0.05, mu).expect("vascular");
+        // `flux_half_saturation` is `EnergyPerSecond` (`0.05 energy/tick * 32 ticks/s = 1.6`).
+        let vascular = VascularField::new(0.025, 0.32, 3.0, 0.6, 1.6, mu).expect("vascular");
         let plan = vascular.transport_plan(&g, step, 0.0).expect("plan");
         let mut pair = FieldPair::zeroed(g, &limits).expect("pair");
         pair.enable_vascular(vascular.initial_conductance(), &limits)
@@ -369,6 +370,133 @@ fn vascular_extreme_flux_overflow_guard_and_substep_invariance() {
     let b2y: Vec<u32> = ny2.iter().map(|v| v.to_bits()).collect();
     assert_eq!(b1x, b2x, "substep-invariant east update must be bit-exact");
     assert_eq!(b1y, b2y, "substep-invariant north update must be bit-exact");
+}
+
+/// `VascularField::update_edges` divides per-tick diffusive transfer by `dt` so
+/// `flux_x = (edges.edge_x[c] * (substeps / dt)) * |e_c - e_e|` has true
+/// `EnergyPerSecond` units matching `v2.vascular.flux_half_saturation`:
+/// instantaneous flux rate and ODE evolution are invariant under halving `dt`
+/// (including across substep-count transitions).
+#[test]
+fn vascular_flux_dt_invariance_energy_per_second() {
+    let g = grid(8, 8, 8.0, 8.0);
+    let limits = BufferLimits::host();
+    let cells = g.cell_count() as usize;
+    // D_max = 12.8 forces substeps=2 at dt=1/32 (r_total=0.40) and substeps=1 at
+    // dt=1/64 (0.20) and dt=1/128 (0.10), testing both dt and substep invariance!
+    let vascular = VascularField::new(0.025, 12.8, 2.0, 0.5, 1.5, 1.5).expect("vascular");
+    let energy: Vec<f32> = (0..cells).map(|c| ((c % 7) as f32) * 2.5).collect();
+    let prev_x = vec![0.25_f32; cells];
+    let prev_y = vec![0.25_f32; cells];
+
+    let steps = [
+        (TimeStep::new(1, 32).expect("1/32"), 16_usize, 2_u32),
+        (TimeStep::new(1, 64).expect("1/64"), 32_usize, 1_u32),
+        (TimeStep::new(1, 128).expect("1/128"), 64_usize, 1_u32),
+    ];
+
+    // 1. Instantaneous rate `(g_next - g_prev) / dt` matches across dt = 1/32, 1/64, 1/128.
+    let mut rates_x: Vec<Vec<f64>> = Vec::new();
+    let mut rates_y: Vec<Vec<f64>> = Vec::new();
+    for &(step, _, expected_substeps) in &steps {
+        let plan = vascular.transport_plan(&g, step, 0.0).expect("plan");
+        assert_eq!(plan.substeps(), expected_substeps);
+        let mut edges = FluxEdges::new(&g, &limits).expect("edges");
+        vascular
+            .fill_edges(&plan, &prev_x, &prev_y, None, &mut edges)
+            .expect("fill");
+        let dt = f64::from(step.numerator()) / f64::from(step.denominator());
+        let rate_scale = f64::from(plan.substeps()) / dt;
+        // `edges.edge_x[c] * (substeps / dt) == D_max * g / h^2 == 12.8 * 0.25 == 3.2` for all dt!
+        for &ex in edges.edge_x() {
+            assert!(
+                (ex * rate_scale - 3.2).abs() <= 1.0e-12,
+                "dt={dt}: flux rate coefficient {} != 3.2",
+                ex * rate_scale
+            );
+        }
+        let mut nx = vec![0.0_f32; cells];
+        let mut ny = vec![0.0_f32; cells];
+        vascular
+            .update_edges(
+                &plan,
+                step,
+                &edges,
+                &energy,
+                (&prev_x, &prev_y),
+                (&mut nx, &mut ny),
+            )
+            .expect("update");
+        rates_x.push(
+            nx.iter()
+                .zip(&prev_x)
+                .map(|(&n, &p)| (f64::from(n) - f64::from(p)) / dt)
+                .collect(),
+        );
+        rates_y.push(
+            ny.iter()
+                .zip(&prev_y)
+                .map(|(&n, &p)| (f64::from(n) - f64::from(p)) / dt)
+                .collect(),
+        );
+    }
+    for idx in 1..rates_x.len() {
+        for c in 0..cells {
+            assert!(
+                (rates_x[idx][c] - rates_x[0][c]).abs() <= 1.0e-4,
+                "cell {c} east dg/dt diverged across dt: {} vs {}",
+                rates_x[idx][c],
+                rates_x[0][c]
+            );
+            assert!(
+                (rates_y[idx][c] - rates_y[0][c]).abs() <= 1.0e-4,
+                "cell {c} north dg/dt diverged across dt: {} vs {}",
+                rates_y[idx][c],
+                rates_y[0][c]
+            );
+        }
+    }
+
+    // 2. Integrating T = 0.5 s at dt = 1/32, 1/64, 1/128 converges to the same
+    //    conductance profile (within explicit-Euler O(dt) error).
+    let mut finals = Vec::new();
+    for &(step, ticks, _) in &steps {
+        let plan = vascular.transport_plan(&g, step, 0.0).expect("plan");
+        let mut edges = FluxEdges::new(&g, &limits).expect("edges");
+        let mut gx = prev_x.clone();
+        let mut gy = prev_y.clone();
+        let mut nx = vec![0.0_f32; cells];
+        let mut ny = vec![0.0_f32; cells];
+        for _ in 0..ticks {
+            vascular
+                .fill_edges(&plan, &gx, &gy, None, &mut edges)
+                .expect("fill");
+            vascular
+                .update_edges(&plan, step, &edges, &energy, (&gx, &gy), (&mut nx, &mut ny))
+                .expect("update");
+            std::mem::swap(&mut gx, &mut nx);
+            std::mem::swap(&mut gy, &mut ny);
+        }
+        finals.push((gx, gy));
+    }
+    let max_diff_64_128 = finals[1]
+        .0
+        .iter()
+        .chain(&finals[1].1)
+        .zip(finals[2].0.iter().chain(&finals[2].1))
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .fold(0.0_f64, f64::max);
+    let max_diff_32_128 = finals[0]
+        .0
+        .iter()
+        .chain(&finals[0].1)
+        .zip(finals[2].0.iter().chain(&finals[2].1))
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_diff_64_128 < 0.01 && max_diff_64_128 < max_diff_32_128,
+        "O(dt) convergence failed: diff(1/64,1/128)={max_diff_64_128:.5}, diff(1/32,1/128)={max_diff_32_128:.5}"
+    );
 }
 
 #[test]

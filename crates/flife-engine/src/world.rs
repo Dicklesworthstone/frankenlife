@@ -93,15 +93,15 @@ use flife_core::{
 use flife_field::settle::MotorSteeringInputs;
 use flife_field::{
     Bins, BufferLimits, CARRIER0_MOMENT_CHANNELS, CARRIER1_FIRST_MOMENT_PLANE,
-    CARRIER1_MOMENT_CHANNELS, ConeTolerance, Demand, DepositSummary, Deposits, DualRawSample,
-    ExchangeKernel, ExchangeScratch, FieldBackend, FieldGrid, FieldPair, FieldState,
-    FieldStepOptions, FieldStepPhase2, FieldStepReport, FieldSummary, FieldWork, FluxEdges,
-    GrantPacket, Grants, MAX_PLANES, PyramidView, RawSample, RequestRule, SEEDED_SMOOTH_TORUS_V1,
-    SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid, SensorQuery, SettleBackend,
-    Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary, UptakeWork,
-    advance_field_on, advance_field_v2_on, advance_field_wave2_on, apply_deposits_to_carrier_on,
-    apply_grants_on, count_cell_occupancy, demand_with_scratch, demands_on, initial_source,
-    reduce_dual_carrier_field_on, reduce_field_on, resolve_uptake_on,
+    CARRIER1_MOMENT_CHANNELS, ConeContractionSummary, ConeTolerance, Demand, DepositSummary,
+    Deposits, DualRawSample, ExchangeKernel, ExchangeScratch, FieldBackend, FieldGrid, FieldPair,
+    FieldState, FieldStepOptions, FieldStepPhase2, FieldStepReport, FieldSummary, FieldWork,
+    FluxEdges, GrantPacket, Grants, MAX_PLANES, PyramidView, RawSample, RequestRule,
+    SEEDED_SMOOTH_TORUS_V1, SEEDED_UNIT_VECTORS, SeededPath, SensorBackend, SensorPyramid,
+    SensorQuery, SettleBackend, Source, SourceKernel, TransportPlan, UptakeBackend, UptakeSummary,
+    UptakeWork, advance_field_on, advance_field_v2_on, advance_field_wave2_on,
+    apply_deposits_to_carrier_on, apply_grants_on, count_cell_occupancy, demand_with_scratch,
+    demands_on, initial_source, reduce_dual_carrier_field_on, reduce_field_on, resolve_uptake_on,
     resolve_uptake_with_on_workers, state::CHANNELS,
 };
 use flife_genome::{
@@ -214,6 +214,24 @@ impl NumericalProfile {
             cone: ConeTolerance::new(floor, 1.0e-5)?,
         })
     }
+
+    /// Plan §11.5 bounded moment-only cone-contraction trigger for this
+    /// profile: the same absolute floor as `self.cone` and one-tenth its
+    /// relative bound (`(f32::MIN_POSITIVE, 10⁻⁶)` for
+    /// [`NumericalProfile::reference_f32`]).
+    ///
+    /// `self.cone` (`INV-02`, `10⁻⁵`) stays unchanged as the hard Phase 10
+    /// failure gate; contraction runs only after `INV-01` and `INV-02` have
+    /// already passed and only on cells strictly above this trigger.
+    #[must_use]
+    pub fn cone_contraction_trigger(&self) -> ConeTolerance {
+        let relative = if self.cone.relative() == 1.0e-5 {
+            1.0e-6
+        } else {
+            self.cone.relative() * 0.1
+        };
+        ConeTolerance::new(self.cone.absolute(), relative).unwrap_or(self.cone)
+    }
 }
 
 /// A numerical fault that stopped the run under `stop-and-preserve`.
@@ -289,8 +307,12 @@ pub struct TickReport {
     pub uptake: UptakeSummary,
     /// Phase 2's field terms.
     pub field_step: FieldStepReport,
-    /// The next field's invariant check.
+    /// The next field's invariant check (unmasked pre-contraction residual).
     pub field: FieldSummary,
+    /// Bounded non-energy-creating moment contraction applied after `INV-01`
+    /// and `INV-02` passed (plan §11.5); zero on ticks where no cell exceeded
+    /// the contraction trigger.
+    pub cone_contraction: ConeContractionSummary,
     /// The tick's closed ledger.
     pub closure: TickClosure,
     /// The run's ledger after the tick.
@@ -3226,8 +3248,15 @@ impl World {
 
         // Phase 10: invariants, accounting and the population's commit. The
         // field's check runs on the field backend if the world has one
-        // (FL-032).
-        let field_summary = check_field_with(next, rules.profile.cone, workers, fields)?;
+        // (FL-032), strictly read-only before any plan §11.5 moment-only
+        // contraction so genuine INV-02 violations (> 1e-5) always fail.
+        let (field_summary, cone_contraction) = check_field_with(
+            next,
+            rules.profile.cone,
+            rules.profile.cone_contraction_trigger(),
+            workers,
+            fields,
+        )?;
         let closing = Holdings::new(next.energy_total(), organisms.value())?;
         let closure = tick_ledger.close(closing)?;
         let mut next_ledger = ledger.clone();
@@ -3259,6 +3288,7 @@ impl World {
             uptake,
             field_step,
             field: field_summary,
+            cone_contraction,
             closure,
             ledger: cumulative,
             interventions: applied,
@@ -4097,18 +4127,22 @@ fn reduce_dual_carrier_with(
 
 /// Phase 10's check of the next field (INV-01, INV-02 at `tolerance`), on
 /// the world's field backend if it has one (FL-032), else on the field's
-/// workers. The backend scans the field; the host builds the summary from
-/// the scan, recomputing its largest residual's cell and summing the energy
-/// in cell order. A scan that names a failing cell leaves the error to the
-/// reference. If the backend errs, its scan is not this field's, or it names
-/// a failing cell the reference passes, the reference's check is the tick's,
-/// the backend is dropped and the failure recorded.
+/// workers, followed by plan §11.5 bounded moment-only cone contraction on
+/// any cell strictly exceeding `trigger`.
+///
+/// The INV-01/INV-02 check ALWAYS runs strictly read-only first so no
+/// operator bug beyond `tolerance` can ever be masked, and `FieldSummary`
+/// always reports the unmasked pre-contraction `max_cone_residual`. On CPU,
+/// `any_exceeds_trigger` is tracked in the same pass at zero extra memory
+/// reads so contraction is skipped completely on ticks where no cell exceeds
+/// `trigger`.
 fn check_field_with(
-    next: &FieldState,
+    next: &mut FieldState,
     tolerance: ConeTolerance,
+    trigger: ConeTolerance,
     workers: usize,
     fields: &mut Fields,
-) -> Result<FieldSummary, CoreError> {
+) -> Result<(FieldSummary, ConeContractionSummary), CoreError> {
     let Fields { backend, report } = fields;
     if let Some(device) = backend.as_deref_mut() {
         let failure = match device
@@ -4117,7 +4151,12 @@ fn check_field_with(
         {
             Ok(Some(summary)) => {
                 report.checks = report.checks.saturating_add(1);
-                return Ok(summary);
+                let contraction = if summary.max_cone_residual > 0.0 {
+                    next.contract_cone_on(trigger, workers)?
+                } else {
+                    ConeContractionSummary::default()
+                };
+                return Ok((summary, contraction));
             }
             Ok(None) => match next.check_invariants_on(tolerance, workers) {
                 Err(error) => {
@@ -4129,12 +4168,25 @@ fn check_field_with(
             Err(error) => error.to_string(),
         };
         report.reference_checks = report.reference_checks.saturating_add(1);
-        let summary = next.check_invariants_on(tolerance, workers)?;
+        let (summary, any_exceeds_trigger) =
+            next.check_invariants_with_trigger_on(tolerance, trigger, workers)?;
         report.failure = Some(failure);
         *backend = None;
-        return Ok(summary);
+        let contraction = if any_exceeds_trigger {
+            next.contract_cone_on(trigger, workers)?
+        } else {
+            ConeContractionSummary::default()
+        };
+        return Ok((summary, contraction));
     }
-    next.check_invariants_on(tolerance, workers)
+    let (summary, any_exceeds_trigger) =
+        next.check_invariants_with_trigger_on(tolerance, trigger, workers)?;
+    let contraction = if any_exceeds_trigger {
+        next.contract_cone_on(trigger, workers)?
+    } else {
+        ConeContractionSummary::default()
+    };
+    Ok((summary, contraction))
 }
 
 /// Phase 3 raw samples returned by a [`SensorBackend`], matching the field's

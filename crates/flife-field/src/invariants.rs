@@ -10,7 +10,11 @@ use std::ops::Range;
 
 use flife_core::CoreError;
 
-use crate::grid::{CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE};
+use crate::grid::{
+    CARRIER0_MOMENT_CHANNELS, CARRIER1_ENERGY_PLANE, CARRIER1_FIRST_MOMENT_PLANE,
+    CARRIER1_MOMENT_CHANNELS,
+};
+use crate::layout::BUFFER;
 use crate::state::FieldState;
 
 /// The cone residual a committed cell may carry:
@@ -82,17 +86,38 @@ pub struct FieldSummary {
     pub empty_cells: u64,
 }
 
+/// What a bounded, non-energy-creating moment contraction (plan §11.5)
+/// resolved after `INV-01` and `INV-02` passed.
+///
+/// Energy planes (`e_0` and optional `e_1`) are never mutated; only moment
+/// vectors whose cone residual exceeded the contraction trigger are scaled
+/// radially inward onto the closed F32 cone (`||m_c||₂ ≤ e_c`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ConeContractionSummary {
+    /// Carrier-cell pairs whose moment vector was contracted (in 34-plane
+    /// dual-carrier mode, Carrier 0 and Carrier 1 are counted independently).
+    pub cells: u64,
+    /// Largest norm contraction `||m_before||₂ − ||m_after||₂` across
+    /// contracted cells, in cell energy units.
+    pub max_contraction: f64,
+    /// Largest relative contraction `contraction / e_c` across contracted
+    /// cells with `e_c > 0` (`0.0` when none had positive energy).
+    pub max_relative: f64,
+}
+
 /// The fewest cells one thread of [`FieldState::check_invariants_on`]
 /// checks: a smaller range costs more to hand to a thread than it saves.
 const CELLS_PER_RANGE: usize = 4_096;
 
 /// What one range of cells measured: its largest residual and the first of
-/// its cells with that residual, when it is positive, and its empty cells.
+/// its cells with that residual, when it is positive, its empty cells, and
+/// whether any cell exceeded the contraction trigger.
 #[derive(Debug, Clone, Copy, Default)]
 struct RangeSummary {
     max_cone_residual: f64,
     max_cone_residual_cell: Option<(u32, u32)>,
     empty_cells: u64,
+    any_exceeds_trigger: bool,
 }
 
 /// Carrier-0 moment slices plus optional Carrier-1 `(energy, moments)` slices.
@@ -144,27 +169,52 @@ impl FieldState {
         tolerance: ConeTolerance,
         workers: usize,
     ) -> Result<FieldSummary, CoreError> {
+        self.check_invariants_with_trigger_on(tolerance, tolerance, workers)
+            .map(|(summary, _)| summary)
+    }
+
+    /// [`FieldState::check_invariants_on`] that also reports whether any cell
+    /// (on either carrier in dual-carrier mode) strictly exceeded `trigger`
+    /// while remaining within `tolerance`.
+    ///
+    /// Computed in the same single read-only pass as `check_invariants_on`
+    /// with zero extra memory reads, so Phase 10 can skip
+    /// [`FieldState::contract_cone_on`] on ticks where no cell exceeds
+    /// `trigger`.
+    ///
+    /// # Errors
+    /// As [`FieldState::check_invariants_on`].
+    pub fn check_invariants_with_trigger_on(
+        &self,
+        tolerance: ConeTolerance,
+        trigger: ConeTolerance,
+        workers: usize,
+    ) -> Result<(FieldSummary, bool), CoreError> {
         let grid = *self.grid();
         let planes = self.plane_slices();
         let Some((energy, moments)) = planes.split_first() else {
-            return Ok(FieldSummary {
-                energy_total: 0.0,
-                max_cone_residual: 0.0,
-                max_cone_residual_cell: None,
-                empty_cells: 0,
-            });
+            return Ok((
+                FieldSummary {
+                    energy_total: 0.0,
+                    max_cone_residual: 0.0,
+                    max_cone_residual_cell: None,
+                    empty_cells: 0,
+                },
+                false,
+            ));
         };
         let (c0_moments, c1) = split_carrier_moments(self.is_dual_carrier(), moments);
         let width = u64::from(grid.cells_x());
         let cells = energy.len();
         let ranges = workers.min(cells / CELLS_PER_RANGE).max(1);
+        let bounds = CheckBounds { tolerance, trigger };
         let check = |range: usize| {
             let start = cells / ranges * range + cells % ranges * range / ranges;
             let end = cells / ranges * (range + 1) + cells % ranges * (range + 1) / ranges;
             match c1 {
-                None => check_range(energy, c0_moments, start..end, tolerance, width),
+                None => check_range(energy, c0_moments, start..end, bounds, width),
                 Some((e1, m1)) => {
-                    check_range_dual(energy, c0_moments, e1, m1, start..end, tolerance, width)
+                    check_range_dual(energy, c0_moments, e1, m1, start..end, bounds, width)
                 }
             }
         };
@@ -189,6 +239,7 @@ impl FieldState {
             max_cone_residual_cell: None,
             empty_cells: 0,
         };
+        let mut any_exceeds_trigger = false;
         for range in checked {
             let range = range?;
             if range.max_cone_residual > summary.max_cone_residual {
@@ -196,9 +247,116 @@ impl FieldState {
                 summary.max_cone_residual_cell = range.max_cone_residual_cell;
             }
             summary.empty_cells += range.empty_cells;
+            any_exceeds_trigger |= range.any_exceeds_trigger;
         }
         summary.energy_total = self.energy_total();
-        Ok(summary)
+        Ok((summary, any_exceeds_trigger))
+    }
+
+    /// Plan §11.5 bounded, non-energy-creating moment contraction on one
+    /// thread: contracts every cell whose cone residual strictly exceeds
+    /// `trigger` radially inward onto the closed F32 cone (`||m_c||₂ ≤ e_c`)
+    /// without modifying any energy plane (`e_0` or `e_1`).
+    ///
+    /// # Errors
+    /// As [`FieldState::contract_cone_on`].
+    pub fn contract_cone(
+        &mut self,
+        trigger: ConeTolerance,
+    ) -> Result<ConeContractionSummary, CoreError> {
+        self.contract_cone_on(trigger, 1)
+    }
+
+    /// [`FieldState::contract_cone`] on up to `workers` threads (zero is taken
+    /// as one). Cells are partitioned into disjoint contiguous ranges; each
+    /// cell's contraction depends only on its own F32 energy and moments, so
+    /// the resulting field and [`ConeContractionSummary`] are bit-identical at
+    /// every worker count. Handles both 33-plane single-carrier and 34-plane
+    /// dual-carrier (`V2-15`) fields, contracting Carrier 0 and Carrier 1
+    /// cones independently while keeping energy slices strictly immutable.
+    ///
+    /// # Errors
+    /// [`CoreError::LayoutMismatch`] if the backing slice does not match the
+    /// field's grid and carrier plane layout, [`CoreError::NumericalInvalid`]
+    /// if a cell holds nonfinite/negative energy or a nonfinite moment, or
+    /// [`CoreError::StateConflict`] if a worker panicked.
+    pub fn contract_cone_on(
+        &mut self,
+        trigger: ConeTolerance,
+        workers: usize,
+    ) -> Result<ConeContractionSummary, CoreError> {
+        let cells = self.energy().len();
+        let total_planes = self.planes() as usize;
+        if cells == 0 || total_planes <= 1 {
+            return Ok(ConeContractionSummary::default());
+        }
+        let width = u64::from(self.grid().cells_x());
+        let dual = self.is_dual_carrier();
+        let values = self.as_mut_slice();
+        if dual {
+            let c0_count = CARRIER0_MOMENT_CHANNELS as usize;
+            let c1_count = CARRIER1_MOMENT_CHANNELS as usize;
+            let (e0, rest) = cut_mut(values, cells)?;
+            let (m0_all, c1_all) = cut_mut(rest, c0_count * cells)?;
+            let (e1, m1_all) = cut_mut(c1_all, cells)?;
+            if m1_all.len() != c1_count * cells {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: BUFFER,
+                    detail: format!(
+                        "dual-carrier trail moment slice holds {} values, expected {}",
+                        m1_all.len(),
+                        c1_count * cells
+                    ),
+                });
+            }
+            let s0 = contract_carrier_on(
+                e0,
+                m0_all,
+                CarrierShape {
+                    cells,
+                    moment_count: c0_count,
+                    width,
+                },
+                trigger,
+                workers,
+            )?;
+            let s1 = contract_carrier_on(
+                e1,
+                m1_all,
+                CarrierShape {
+                    cells,
+                    moment_count: c1_count,
+                    width,
+                },
+                trigger,
+                workers,
+            )?;
+            Ok(merge_contraction(s0, s1))
+        } else {
+            let c0_count = total_planes - 1;
+            let (e0, m0_all) = cut_mut(values, cells)?;
+            if m0_all.len() != c0_count * cells {
+                return Err(CoreError::LayoutMismatch {
+                    buffer: BUFFER,
+                    detail: format!(
+                        "field moment slice holds {} values, expected {}",
+                        m0_all.len(),
+                        c0_count * cells
+                    ),
+                });
+            }
+            contract_carrier_on(
+                e0,
+                m0_all,
+                CarrierShape {
+                    cells,
+                    moment_count: c0_count,
+                    width,
+                },
+                trigger,
+                workers,
+            )
+        }
     }
 }
 
@@ -402,6 +560,14 @@ fn check_cell(
     Ok(residual)
 }
 
+/// The hard INV-02 tolerance alongside the plan §11.5 contraction trigger
+/// checked in the same single pass.
+#[derive(Debug, Clone, Copy)]
+struct CheckBounds {
+    tolerance: ConeTolerance,
+    trigger: ConeTolerance,
+}
+
 /// Check cell `index` on a 34-plane dual-carrier field (`V2-15`): Carrier 0
 /// (`e_0`, `m^(0)`) then Carrier 1 (`e_1`, `m^(1)`), returning the larger
 /// cone residual.
@@ -420,25 +586,33 @@ fn check_cell_dual(
 }
 
 /// Check cells `range` on a 34-plane dual-carrier field in cell-index order,
-/// stopping at the first offending cell across either carrier.
+/// stopping at the first offending cell across either carrier and recording
+/// whether either carrier's residual strictly exceeded `bounds.trigger`.
 fn check_range_dual(
     e0: &[f32],
     m0: &[&[f32]],
     e1: &[f32],
     m1: &[&[f32]],
     range: Range<usize>,
-    tolerance: ConeTolerance,
+    bounds: CheckBounds,
     width: u64,
 ) -> Result<RangeSummary, CoreError> {
     let mut summary = RangeSummary::default();
     let end = range.end.min(e0.len());
     for index in range.start..end {
-        let residual = check_cell_dual(e0, m0, e1, m1, index, tolerance, width)?;
+        let r0 = check_cell(e0, m0, index, bounds.tolerance, width)?;
+        let r1 = check_cell(e1, m1, index, bounds.tolerance, width)?;
+        let e0_val = e0.get(index).copied().map_or(0.0, f64::from);
+        let e1_val = e1.get(index).copied().map_or(0.0, f64::from);
+        if !bounds.trigger.allows(r0, e0_val) || !bounds.trigger.allows(r1, e1_val) {
+            summary.any_exceeds_trigger = true;
+        }
+        let residual = r0.max(r1);
         if residual > summary.max_cone_residual {
             summary.max_cone_residual = residual;
             summary.max_cone_residual_cell = Some(locate(index, width));
         }
-        if e0.get(index).is_some_and(|&v| f64::from(v) == 0.0) {
+        if e0_val == 0.0 {
             summary.empty_cells += 1;
         }
     }
@@ -452,12 +626,13 @@ fn check_range_dual(
 const CHECK_BLOCK: usize = 64;
 
 /// Check cells `range` in cell-index order, stopping at the first offending
-/// cell, and measure them.
+/// cell, and measure them (including whether any cell strictly exceeded
+/// `bounds.trigger`, at zero extra memory reads).
 fn check_range(
     energy: &[f32],
     moments: &[&[f32]],
     range: Range<usize>,
-    tolerance: ConeTolerance,
+    bounds: CheckBounds,
     width: u64,
 ) -> Result<RangeSummary, CoreError> {
     let mut summary = RangeSummary::default();
@@ -479,12 +654,16 @@ fn check_range(
         if bad_energy {
             for offset in 0..len {
                 let index = base + offset;
-                let residual = check_cell(energy, moments, index, tolerance, width)?;
+                let residual = check_cell(energy, moments, index, bounds.tolerance, width)?;
+                let e = energy.get(index).copied().map_or(0.0, f64::from);
+                if !bounds.trigger.allows(residual, e) {
+                    summary.any_exceeds_trigger = true;
+                }
                 if residual > summary.max_cone_residual {
                     summary.max_cone_residual = residual;
                     summary.max_cone_residual_cell = Some(locate(index, width));
                 }
-                if energy.get(index).is_some_and(|&v| f64::from(v) == 0.0) {
+                if e == 0.0 {
                     summary.empty_cells += 1;
                 }
             }
@@ -510,7 +689,10 @@ fn check_range(
         if bad_moment {
             for (offset, &e) in energies.iter().enumerate().take(len) {
                 let index = base + offset;
-                let residual = check_cell(energy, moments, index, tolerance, width)?;
+                let residual = check_cell(energy, moments, index, bounds.tolerance, width)?;
+                if !bounds.trigger.allows(residual, e) {
+                    summary.any_exceeds_trigger = true;
+                }
                 if residual > summary.max_cone_residual {
                     summary.max_cone_residual = residual;
                     summary.max_cone_residual_cell = Some(locate(index, width));
@@ -529,10 +711,13 @@ fn check_range(
             } else {
                 (sq.sqrt() - e).max(0.0)
             };
-            if !tolerance.allows(residual, e) {
+            if !bounds.tolerance.allows(residual, e) {
                 // Fall back to `check_cell` from this exact cell to produce
                 // the identical error detail.
-                let _ = check_cell(energy, moments, base + offset, tolerance, width)?;
+                let _ = check_cell(energy, moments, base + offset, bounds.tolerance, width)?;
+            }
+            if !bounds.trigger.allows(residual, e) {
+                summary.any_exceeds_trigger = true;
             }
             if residual > summary.max_cone_residual {
                 summary.max_cone_residual = residual;
@@ -540,6 +725,239 @@ fn check_range(
             }
             if e == 0.0 {
                 summary.empty_cells += 1;
+            }
+        }
+        base += len;
+    }
+    Ok(summary)
+}
+
+/// Merge two disjoint [`ConeContractionSummary`] values.
+const fn merge_contraction(
+    a: ConeContractionSummary,
+    b: ConeContractionSummary,
+) -> ConeContractionSummary {
+    ConeContractionSummary {
+        cells: a.cells + b.cells,
+        max_contraction: if b.max_contraction > a.max_contraction {
+            b.max_contraction
+        } else {
+            a.max_contraction
+        },
+        max_relative: if b.max_relative > a.max_relative {
+            b.max_relative
+        } else {
+            a.max_relative
+        },
+    }
+}
+
+/// Split `slice` at `count`, refusing a short buffer cleanly without panicking.
+fn cut_mut(slice: &mut [f32], count: usize) -> Result<(&mut [f32], &mut [f32]), CoreError> {
+    slice
+        .split_at_mut_checked(count)
+        .ok_or_else(|| CoreError::LayoutMismatch {
+            buffer: BUFFER,
+            detail: format!("field buffer is shorter than {count} elements"),
+        })
+}
+
+/// Round a finite F64 toward zero to F32: the F32 value of largest magnitude
+/// at or below `|value|`, preserving sign (canonical `+0.0` for zero).
+/// Never underflows bit patterns and clamps F32 overflow to `±f32::MAX`.
+#[inline]
+fn round_toward_zero_f32(value: f64) -> f32 {
+    if value == 0.0 {
+        return 0.0;
+    }
+    let nearest = value as f32;
+    if !nearest.is_finite() {
+        return if value.is_sign_negative() {
+            -f32::MAX
+        } else {
+            f32::MAX
+        };
+    }
+    if f64::from(nearest).abs() > value.abs() {
+        // `|nearest| > |value| >= 0` guarantees `nearest != 0.0`, so its
+        // magnitude bits are at least `1` and subtracting `1` steps one ULP
+        // toward zero without altering the sign bit.
+        let stepped = f32::from_bits(nearest.to_bits() - 1);
+        if stepped == 0.0 { 0.0 } else { stepped }
+    } else if nearest == 0.0 {
+        0.0
+    } else {
+        nearest
+    }
+}
+
+/// One worker's disjoint cell range for [`contract_carrier_on`]: immutable
+/// energy slice plus mutable per-channel moment slices over the same range.
+struct ContractionLane<'a> {
+    start: usize,
+    energy: &'a [f32],
+    moments: Vec<&'a mut [f32]>,
+}
+
+/// Grid dimensions needed for error reporting and plane chunking inside
+/// [`contract_carrier_on`].
+#[derive(Clone, Copy)]
+struct CarrierShape {
+    cells: usize,
+    moment_count: usize,
+    width: u64,
+}
+
+/// Contract one carrier's moments across up to `workers` scoped threads while
+/// holding its energy plane strictly immutable.
+fn contract_carrier_on(
+    energy: &[f32],
+    moments_flat: &mut [f32],
+    shape: CarrierShape,
+    trigger: ConeTolerance,
+    workers: usize,
+) -> Result<ConeContractionSummary, CoreError> {
+    let cells = shape.cells;
+    if cells == 0 || shape.moment_count == 0 {
+        return Ok(ConeContractionSummary::default());
+    }
+    let ranges = workers.min(cells / CELLS_PER_RANGE).max(1);
+    let mut lanes = Vec::with_capacity(ranges);
+    for range in 0..ranges {
+        let start = cells / ranges * range + cells % ranges * range / ranges;
+        let end = cells / ranges * (range + 1) + cells % ranges * (range + 1) / ranges;
+        let e_slice = energy
+            .get(start..end)
+            .ok_or_else(|| CoreError::LayoutMismatch {
+                buffer: BUFFER,
+                detail: format!("energy slice out of bounds for range {start}..{end}"),
+            })?;
+        lanes.push(ContractionLane {
+            start,
+            energy: e_slice,
+            moments: Vec::with_capacity(shape.moment_count),
+        });
+    }
+    for mut plane in moments_flat.chunks_exact_mut(cells) {
+        for lane in &mut lanes {
+            let (head, tail) = cut_mut(plane, lane.energy.len())?;
+            plane = tail;
+            lane.moments.push(head);
+        }
+    }
+    let width = shape.width;
+    let run = |lane: &mut ContractionLane<'_>| contract_lane(lane, trigger, width);
+    let run = &run;
+    let results = std::thread::scope(|scope| {
+        let mut iter = lanes.iter_mut();
+        let first = iter.next();
+        let workers: Vec<_> = iter.map(|lane| scope.spawn(move || run(lane))).collect();
+        let mut results = Vec::with_capacity(ranges);
+        if let Some(head) = first {
+            results.push(run(head));
+        }
+        for worker in workers {
+            results.push(worker.join().map_err(|_| CoreError::StateConflict {
+                operation: "contract field cone",
+                detail: "a cone contraction worker panicked".to_owned(),
+            })?);
+        }
+        Ok::<_, CoreError>(results)
+    })?;
+    let mut total = ConeContractionSummary::default();
+    for part in results {
+        total = merge_contraction(total, part?);
+    }
+    Ok(total)
+}
+
+/// Contract every cell in `lane` whose cone residual strictly exceeds
+/// `trigger`, using the same cache-friendly 64-cell plane-major block scan as
+/// [`check_range`]. Leaves energy untouched.
+fn contract_lane(
+    lane: &mut ContractionLane<'_>,
+    trigger: ConeTolerance,
+    width: u64,
+) -> Result<ConeContractionSummary, CoreError> {
+    let mut summary = ConeContractionSummary::default();
+    let total_cells = lane.energy.len();
+    let mut base = 0_usize;
+    while base < total_cells {
+        let len = (total_cells - base).min(CHECK_BLOCK);
+        let energy_block = lane.energy.get(base..base + len).unwrap_or(&[]);
+        let mut energies = [0.0_f64; CHECK_BLOCK];
+        for (offset, (slot, &cell_energy)) in energies.iter_mut().zip(energy_block).enumerate() {
+            let e = f64::from(cell_energy);
+            if !e.is_finite() || e < 0.0 {
+                let (x, y) = locate(lane.start + base + offset, width);
+                return Err(CoreError::NumericalInvalid {
+                    quantity: "field energy",
+                    detail: format!("cell ({x}, {y}) holds {cell_energy:?} (INV-01)"),
+                });
+            }
+            *slot = e;
+        }
+        let mut squares = [0.0_f64; CHECK_BLOCK];
+        for (channel, plane) in lane.moments.iter().enumerate() {
+            let slice = plane.get(base..base + len).unwrap_or(&[]);
+            for (offset, (square, &m_raw)) in squares.iter_mut().zip(slice).enumerate() {
+                if !m_raw.is_finite() {
+                    let (x, y) = locate(lane.start + base + offset, width);
+                    return Err(CoreError::NumericalInvalid {
+                        quantity: "field moment",
+                        detail: format!(
+                            "cell ({x}, {y}) channel {channel} holds {m_raw:?} (INV-01)"
+                        ),
+                    });
+                }
+                let m = f64::from(m_raw);
+                *square += m * m;
+            }
+        }
+        for (offset, (&e, &sq)) in energies.iter().zip(&squares).enumerate().take(len) {
+            if sq == 0.0 {
+                continue;
+            }
+            let norm = sq.sqrt();
+            let residual = (norm - e).max(0.0);
+            if trigger.allows(residual, e) {
+                continue;
+            }
+            let local = base + offset;
+            if e == 0.0 {
+                for plane in &mut lane.moments {
+                    if let Some(slot) = plane.get_mut(local) {
+                        *slot = 0.0;
+                    }
+                }
+                summary.cells += 1;
+                if norm > summary.max_contraction {
+                    summary.max_contraction = norm;
+                }
+            } else {
+                // `scale` pulls the F64 vector strictly inside the sphere of
+                // radius `e` by `64 * f64::EPSILON`, and rounding every
+                // component toward zero to F32 guarantees `sqrt(Σ m'_k²) ≤ e`
+                // in exact channel-order F64 arithmetic across all binades.
+                let scale = (e / norm) * (1.0 - 64.0 * f64::EPSILON);
+                let mut after_sq = 0.0_f64;
+                for plane in &mut lane.moments {
+                    if let Some(slot) = plane.get_mut(local) {
+                        let scaled = round_toward_zero_f32(f64::from(*slot) * scale);
+                        *slot = scaled;
+                        let v = f64::from(scaled);
+                        after_sq += v * v;
+                    }
+                }
+                let contraction = (norm - after_sq.sqrt()).max(0.0);
+                let relative = contraction / e;
+                summary.cells += 1;
+                if contraction > summary.max_contraction {
+                    summary.max_contraction = contraction;
+                }
+                if relative > summary.max_relative {
+                    summary.max_relative = relative;
+                }
             }
         }
         base += len;

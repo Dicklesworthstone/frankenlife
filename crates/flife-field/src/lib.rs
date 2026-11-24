@@ -76,7 +76,7 @@ pub use grid::{
     CARRIER1_MOMENT_CHANNELS, CarrierLayout, DUAL_CARRIER_PLANES, ENERGY_PLANE, FIELD_PLANES,
     FieldGrid, field_planes_for_config,
 };
-pub use invariants::{ConeTolerance, FieldScan, FieldSummary};
+pub use invariants::{ConeContractionSummary, ConeTolerance, FieldScan, FieldSummary};
 pub use layout::{Arrangement, Axis, DeclaredLayout, FieldLayout, Ownership};
 pub use pyramid::{
     Corners, DualRawSample, LevelGrid, MAX_PLANES, PyramidView, RawSample, SensorBackend,

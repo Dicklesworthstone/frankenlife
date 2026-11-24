@@ -567,6 +567,9 @@ fn verify_single_chunk_with_buf(
     hasher.finish() == *digest
 }
 
+/// Content identity of a chunk entry inside a manifest: `(digest, length)`.
+type ChunkKey = (Sha256Digest, u64);
+
 struct ActiveChunk {
     work_index: usize,
     path: PathBuf,
@@ -1812,8 +1815,70 @@ impl ChunkStore {
     /// As [`ChunkStore::retain`].
     pub fn retain_intact(&mut self, keep: usize) -> Result<Retention, CoreError> {
         let sequences = self.prepare_retain(keep)?;
+        self.retain_intact_with(keep, &sequences, None)
+    }
+
+    /// Remove manifests and unreferenced chunks beyond the newest `keep`
+    /// intact checkpoints, returning the removed manifest sequence numbers
+    /// (oldest first).
+    ///
+    /// When the store holds at most `keep` manifests, no manifest can be
+    /// retired and this returns `Ok(Vec::new())` immediately without reading
+    /// any chunk data. When more than `keep` manifests exist and
+    /// `already_verified` names a sequence the caller just verified via
+    /// [`ChunkStore::verify`] whose manifest and chunk lengths still check out,
+    /// its chunks are treated as already verified so they are not re-read or
+    /// re-hashed during retention; otherwise behavior matches
+    /// [`ChunkStore::retain_intact`].
+    ///
+    /// # Errors
+    /// [`CoreError::StateConflict`] for `keep == 0`;
+    /// [`CoreError::StorageFailed`] if the host refuses an operation.
+    pub fn prune_excess_intact(
+        &mut self,
+        keep: usize,
+        already_verified: Option<u64>,
+    ) -> Result<Vec<u64>, CoreError> {
+        let sequences = self.prepare_retain(keep)?;
+        if sequences.len() <= keep {
+            return Ok(Vec::new());
+        }
+        let retention = self.retain_intact_with(keep, &sequences, already_verified)?;
+        Ok(retention.removed)
+    }
+
+    fn sealed_chunk_keys(&self, sequence: u64) -> Option<Vec<ChunkKey>> {
+        let prefix = self.sealed_prefix(sequence).ok()?;
+        let manifest = CheckpointManifest::parse(&prefix).ok()?;
+        Some(
+            manifest
+                .entries()
+                .iter()
+                .map(|entry| (entry.digest, entry.length))
+                .collect(),
+        )
+    }
+
+    fn retain_intact_with(
+        &mut self,
+        keep: usize,
+        sequences: &[u64],
+        already_verified: Option<u64>,
+    ) -> Result<Retention, CoreError> {
         let mut valid = Vec::new();
-        let mut chunk_status: BTreeMap<(Sha256Digest, u64), bool> = BTreeMap::new();
+        let mut chunk_status: BTreeMap<ChunkKey, bool> = BTreeMap::new();
+        let mut pre_parsed: Option<(u64, Vec<ChunkKey>)> = None;
+
+        if let Some(verified_seq) = already_verified
+            && sequences.binary_search(&verified_seq).is_ok()
+            && let Some(entries) = self.sealed_chunk_keys(verified_seq)
+        {
+            for &key in &entries {
+                chunk_status.insert(key, true);
+            }
+            pre_parsed = Some((verified_seq, entries));
+        }
+
         let mut cursor = sequences.len();
 
         while valid.len() < keep && cursor > 0 {
@@ -1822,23 +1887,17 @@ impl ChunkStore {
             let candidates = sequences.get(batch_start..cursor).unwrap_or_default();
             cursor = batch_start;
 
-            type ChunkKey = (Sha256Digest, u64);
             let mut parsed: Vec<(u64, Option<Vec<ChunkKey>>)> =
                 Vec::with_capacity(candidates.len());
             let mut seen = BTreeSet::new();
             let mut pending = Vec::new();
 
             for &sequence in candidates.iter().rev() {
-                let entries = self.sealed_prefix(sequence).ok().and_then(|prefix| {
-                    let manifest = CheckpointManifest::parse(&prefix).ok()?;
-                    Some(
-                        manifest
-                            .entries()
-                            .iter()
-                            .map(|entry| (entry.digest, entry.length))
-                            .collect::<Vec<_>>(),
-                    )
-                });
+                let entries = if pre_parsed.as_ref().is_some_and(|(seq, _)| *seq == sequence) {
+                    pre_parsed.take().map(|(_, keys)| keys)
+                } else {
+                    self.sealed_chunk_keys(sequence)
+                };
                 if let Some(entries_ref) = &entries {
                     for &key in entries_ref {
                         if !chunk_status.contains_key(&key) && seen.insert(key) {
@@ -1865,7 +1924,7 @@ impl ChunkStore {
             }
         }
 
-        self.finish_retention(keep, &sequences, valid)
+        self.finish_retention(keep, sequences, valid)
     }
 
     fn prepare_retain(&self, keep: usize) -> Result<Vec<u64>, CoreError> {
@@ -2458,5 +2517,263 @@ mod tests {
                 "case {case} kept sequences must match"
             );
         }
+    }
+
+    fn chunk_names(root: &Path) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for shard in fs::read_dir(root.join(CHUNKS)).expect("lists shards") {
+            let shard = shard.expect("shard").path();
+            if !shard.is_dir() {
+                continue;
+            }
+            for chunk in fs::read_dir(&shard).expect("lists chunks") {
+                let chunk = chunk.expect("chunk");
+                if let Some(name) = chunk.file_name().to_str()
+                    && is_digest_name(name)
+                {
+                    names.insert(name.to_owned());
+                }
+            }
+        }
+        names
+    }
+
+    /// `prune_excess_intact` must match `retain_intact(...).removed` and
+    /// on-disk store state identically across `<= keep`, `> keep`, shared
+    /// chunks, pins, corrupt older checkpoints, and corrupt newer checkpoints,
+    /// while skipping chunk reads on `<= keep` and on `already_verified`.
+    #[test]
+    fn prune_excess_intact_matches_retain_intact_and_skips_redundant_reads() {
+        let shared_config = pattern_bytes(31, 2048);
+        let shared_field = pattern_bytes(41, LANE_BUFFER_BYTES + 123);
+        let make_ckpt = |seed: u8, genome_len: usize| -> Vec<u8> {
+            let mut writer = flife_core::checkpoint::CheckpointWriter::new("field-ecology-v2");
+            writer
+                .chunk(
+                    ChunkFamily::Configuration,
+                    1,
+                    u64::try_from(shared_config.len()).expect("len"),
+                    shared_config.clone(),
+                    &[],
+                )
+                .expect("config");
+            writer
+                .chunk(
+                    ChunkFamily::Field,
+                    1,
+                    u64::try_from(shared_field.len()).expect("len"),
+                    shared_field.clone(),
+                    &[],
+                )
+                .expect("field");
+            let particles = pattern_bytes(seed.wrapping_add(10), 80_000);
+            writer
+                .chunk(
+                    ChunkFamily::Particles,
+                    1,
+                    u64::try_from(particles.len()).expect("len"),
+                    particles,
+                    &[],
+                )
+                .expect("particles");
+            let genomes = pattern_bytes(seed.wrapping_add(20), genome_len);
+            writer
+                .chunk(
+                    ChunkFamily::Genomes,
+                    1,
+                    u64::try_from(genomes.len()).expect("len"),
+                    genomes,
+                    &[],
+                )
+                .expect("genomes");
+            writer.finish().expect("seals")
+        };
+
+        let checkpoints = [
+            make_ckpt(1, 300_000),
+            make_ckpt(2, READ_BUFFER_BYTES + 511),
+            make_ckpt(3, READ_BUFFER_BYTES + 1023),
+            make_ckpt(4, READ_BUFFER_BYTES + 2047),
+            make_ckpt(5, READ_BUFFER_BYTES + 4093),
+        ];
+
+        // keep == 0 is refused even on an empty store.
+        let empty_dir = fresh_dir("prune-zero");
+        let mut empty = ChunkStore::open(&empty_dir.0, Durability::ProcessCrash).expect("opens");
+        assert!(matches!(
+            empty.prune_excess_intact(0, None),
+            Err(CoreError::StateConflict { .. })
+        ));
+
+        // Parity matrix against `retain_intact`: <= keep, == keep, > keep,
+        // pinned older checkpoint, missing already_verified sequence, corrupt
+        // older checkpoint, and corrupt newer checkpoint (manifest, truncated
+        // chunk, or bit-flipped chunk with older verified seq / None).
+        #[derive(Clone, Copy)]
+        enum Damage {
+            None,
+            FlipChunk(usize),
+            TruncateChunk(usize),
+            FlipManifest(u64),
+        }
+
+        let cases = [
+            ("below-keep", 3, 4, Damage::None, Some(3), false),
+            ("at-keep", 4, 4, Damage::None, Some(4), false),
+            ("above-keep-1", 5, 1, Damage::None, Some(5), false),
+            ("above-keep-2", 5, 2, Damage::None, Some(5), false),
+            ("above-keep-4", 5, 4, Damage::None, Some(5), false),
+            ("above-keep-pinned", 5, 2, Damage::None, Some(5), true),
+            ("unknown-verified", 5, 2, Damage::None, Some(999), false),
+            (
+                "corrupt-older-chunk",
+                5,
+                2,
+                Damage::FlipChunk(3),
+                Some(5),
+                false,
+            ),
+            (
+                "corrupt-middle-chunk",
+                5,
+                3,
+                Damage::FlipChunk(2),
+                Some(5),
+                false,
+            ),
+            (
+                "corrupt-newest-manifest-even-if-hinted",
+                5,
+                2,
+                Damage::FlipManifest(5),
+                Some(5),
+                false,
+            ),
+            (
+                "truncated-newest-chunk-even-if-hinted",
+                5,
+                2,
+                Damage::TruncateChunk(4),
+                Some(5),
+                false,
+            ),
+            (
+                "corrupt-newest-chunk-with-prior-verified",
+                5,
+                2,
+                Damage::FlipChunk(4),
+                Some(4),
+                false,
+            ),
+            (
+                "corrupt-newest-chunk-no-hint",
+                5,
+                2,
+                Damage::FlipChunk(4),
+                None,
+                false,
+            ),
+        ];
+
+        for (label, count, keep, damage, verified_hint, pin_first) in cases {
+            let prune_dir = fresh_dir(&format!("prune-{label}"));
+            let retain_dir = fresh_dir(&format!("retain-{label}"));
+            let mut by_prune =
+                ChunkStore::open(&prune_dir.0, Durability::ProcessCrash).expect("opens");
+            let mut by_retain =
+                ChunkStore::open(&retain_dir.0, Durability::ProcessCrash).expect("opens");
+            for bytes in &checkpoints[..count] {
+                by_prune.publish(bytes).expect("publishes");
+                by_retain.publish(bytes).expect("publishes");
+            }
+            if pin_first {
+                let holder = Sha256Digest::of(b"discovery-pin");
+                by_prune.pin(1, &holder).expect("pins");
+                by_retain.pin(1, &holder).expect("pins");
+            }
+            match damage {
+                Damage::None => {}
+                Damage::FlipChunk(idx) => {
+                    let digest = CheckpointManifest::parse(&checkpoints[idx])
+                        .expect("manifest")
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.family == ChunkFamily::Genomes)
+                        .expect("genomes")
+                        .digest;
+                    for store in [&by_prune, &by_retain] {
+                        let path = store.chunk_path(&digest);
+                        let mut raw = fs::read(&path).expect("reads");
+                        let mid = raw.len() / 2;
+                        raw[mid] ^= 0x01;
+                        fs::write(&path, raw).expect("corrupts");
+                    }
+                }
+                Damage::TruncateChunk(idx) => {
+                    let digest = CheckpointManifest::parse(&checkpoints[idx])
+                        .expect("manifest")
+                        .entries()
+                        .iter()
+                        .find(|entry| entry.family == ChunkFamily::Genomes)
+                        .expect("genomes")
+                        .digest;
+                    for store in [&by_prune, &by_retain] {
+                        let path = store.chunk_path(&digest);
+                        let raw = fs::read(&path).expect("reads");
+                        fs::write(&path, &raw[..raw.len() - 1]).expect("truncates");
+                    }
+                }
+                Damage::FlipManifest(seq) => {
+                    for store in [&by_prune, &by_retain] {
+                        let path = store.manifest_path(seq);
+                        let mut raw = fs::read(&path).expect("reads");
+                        raw[20] ^= 0x01;
+                        fs::write(&path, raw).expect("corrupts manifest");
+                    }
+                }
+            }
+
+            let pruned = by_prune
+                .prune_excess_intact(keep, verified_hint)
+                .expect("prune_excess_intact");
+            let retained = by_retain.retain_intact(keep).expect("retain_intact");
+            assert_eq!(pruned, retained.removed, "case {label}: removed mismatch");
+            assert_eq!(
+                by_prune.sequences().expect("seqs"),
+                by_retain.sequences().expect("seqs"),
+                "case {label}: sequences mismatch"
+            );
+            assert_eq!(
+                chunk_names(&prune_dir.0),
+                chunk_names(&retain_dir.0),
+                "case {label}: on-disk chunks mismatch"
+            );
+        }
+
+        // White-box skip proof: when `already_verified` names sequence 2 and
+        // its manifest + chunk lengths match, `prune_excess_intact(1, Some(2))`
+        // must not re-read/re-hash sequence 2's unique genome chunk (a caller
+        // only passes a sequence `verify` just succeeded on).
+        let skip_dir = fresh_dir("prune-skips-verified-read");
+        let mut skip_store =
+            ChunkStore::open(&skip_dir.0, Durability::ProcessCrash).expect("opens");
+        skip_store.publish(&checkpoints[0]).expect("publishes 1");
+        skip_store.publish(&checkpoints[1]).expect("publishes 2");
+        let g2 = CheckpointManifest::parse(&checkpoints[1])
+            .expect("manifest")
+            .entries()
+            .iter()
+            .find(|entry| entry.family == ChunkFamily::Genomes)
+            .expect("genomes")
+            .digest;
+        let g2_path = skip_store.chunk_path(&g2);
+        let mut raw = fs::read(&g2_path).expect("reads");
+        raw[0] ^= 0x01;
+        fs::write(&g2_path, raw).expect("flips byte preserving length");
+        let removed = skip_store
+            .prune_excess_intact(1, Some(2))
+            .expect("prunes trusting already_verified");
+        assert_eq!(removed, vec![1]);
+        assert_eq!(skip_store.sequences().expect("seqs"), vec![2]);
     }
 }

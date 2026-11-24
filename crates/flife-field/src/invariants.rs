@@ -219,20 +219,6 @@ impl FieldState {
             }
         };
         let check = &check;
-        let checked = std::thread::scope(|scope| {
-            let workers: Vec<_> = (1..ranges)
-                .map(|range| scope.spawn(move || check(range)))
-                .collect();
-            let mut checked = Vec::with_capacity(ranges);
-            checked.push(check(0));
-            for worker in workers {
-                checked.push(worker.join().map_err(|_| CoreError::StateConflict {
-                    operation: "check field invariants",
-                    detail: "an invariant worker panicked".to_owned(),
-                })?);
-            }
-            Ok::<_, CoreError>(checked)
-        })?;
         let mut summary = FieldSummary {
             energy_total: 0.0,
             max_cone_residual: 0.0,
@@ -240,14 +226,35 @@ impl FieldState {
             empty_cells: 0,
         };
         let mut any_exceeds_trigger = false;
-        for range in checked {
-            let range = range?;
-            if range.max_cone_residual > summary.max_cone_residual {
-                summary.max_cone_residual = range.max_cone_residual;
-                summary.max_cone_residual_cell = range.max_cone_residual_cell;
+        if ranges <= 1 {
+            let range = check(0)?;
+            summary.max_cone_residual = range.max_cone_residual;
+            summary.max_cone_residual_cell = range.max_cone_residual_cell;
+            summary.empty_cells = range.empty_cells;
+            any_exceeds_trigger = range.any_exceeds_trigger;
+        } else {
+            let mut checked: Vec<Option<Result<RangeSummary, CoreError>>> =
+                (0..ranges).map(|_| None).collect();
+            flife_core::pool::parallel_for_each_mut(
+                workers,
+                "check field invariants",
+                &mut checked,
+                |range, slot| {
+                    *slot = Some(check(range));
+                },
+            )?;
+            for part in checked {
+                let range = part.ok_or_else(|| CoreError::StateConflict {
+                    operation: "check field invariants",
+                    detail: "an invariant worker returned no result".to_owned(),
+                })??;
+                if range.max_cone_residual > summary.max_cone_residual {
+                    summary.max_cone_residual = range.max_cone_residual;
+                    summary.max_cone_residual_cell = range.max_cone_residual_cell;
+                }
+                summary.empty_cells += range.empty_cells;
+                any_exceeds_trigger |= range.any_exceeds_trigger;
             }
-            summary.empty_cells += range.empty_cells;
-            any_exceeds_trigger |= range.any_exceeds_trigger;
         }
         summary.energy_total = self.energy_total();
         Ok((summary, any_exceeds_trigger))
@@ -848,25 +855,30 @@ fn contract_carrier_on(
     let width = shape.width;
     let run = |lane: &mut ContractionLane<'_>| contract_lane(lane, trigger, width);
     let run = &run;
-    let results = std::thread::scope(|scope| {
-        let mut iter = lanes.iter_mut();
-        let first = iter.next();
-        let workers: Vec<_> = iter.map(|lane| scope.spawn(move || run(lane))).collect();
-        let mut results = Vec::with_capacity(ranges);
-        if let Some(head) = first {
-            results.push(run(head));
-        }
-        for worker in workers {
-            results.push(worker.join().map_err(|_| CoreError::StateConflict {
-                operation: "contract field cone",
-                detail: "a cone contraction worker panicked".to_owned(),
-            })?);
-        }
-        Ok::<_, CoreError>(results)
-    })?;
     let mut total = ConeContractionSummary::default();
-    for part in results {
-        total = merge_contraction(total, part?);
+    if ranges <= 1 {
+        if let Some(head) = lanes.first_mut() {
+            total = run(head)?;
+        }
+    } else {
+        let mut results: Vec<Result<ConeContractionSummary, CoreError>> = (0..lanes.len())
+            .map(|_| Ok(ConeContractionSummary::default()))
+            .collect();
+        flife_core::pool::scope_workers(workers, "contract field cone", |scope| {
+            let mut pairs = lanes.iter_mut().zip(results.iter_mut());
+            let head = pairs.next();
+            for (lane, slot) in pairs {
+                scope.spawn(move || {
+                    *slot = run(lane);
+                });
+            }
+            if let Some((lane, slot)) = head {
+                *slot = run(lane);
+            }
+        })?;
+        for part in results {
+            total = merge_contraction(total, part?);
+        }
     }
     Ok(total)
 }

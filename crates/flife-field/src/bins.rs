@@ -45,14 +45,19 @@ pub struct Bins {
     offsets: Vec<u32>,
     /// Item indices, bucket by bucket, each bucket in the order given.
     order: Vec<u32>,
+    /// Nonempty bucket indices in strictly ascending order, populated by
+    /// [`Bins::group`] so sparse reductions avoid scanning empty buckets.
+    occupied: Vec<u32>,
     largest: usize,
 }
 
 impl Bins {
-    /// Bytes its offsets and order hold (FL-043).
+    /// Bytes its offsets, order and occupied bucket list hold (FL-043).
     #[must_use]
     pub fn allocated_bytes(&self) -> u64 {
-        capacity_bytes(&self.offsets).saturating_add(capacity_bytes(&self.order))
+        capacity_bytes(&self.offsets)
+            .saturating_add(capacity_bytes(&self.order))
+            .saturating_add(capacity_bytes(&self.occupied))
     }
 
     /// Bins named `name` for at most `buckets` buckets and `items` items,
@@ -82,16 +87,23 @@ impl Bins {
             .and_then(|count| count.checked_mul(INDEX_BYTES))
             .ok_or_else(overflow)?;
         let order_bytes = items.checked_mul(INDEX_BYTES).ok_or_else(overflow)?;
+        let occupied_bytes = buckets
+            .min(items)
+            .checked_mul(INDEX_BYTES)
+            .ok_or_else(overflow)?;
         limits.admit(name, offset_bytes)?;
         limits.admit(name, order_bytes)?;
+        limits.admit(name, occupied_bytes)?;
         let buckets_limit = usize::try_from(buckets).map_err(|_| overflow())?;
         let items_limit = usize::try_from(items).map_err(|_| overflow())?;
+        let occupied_limit = buckets_limit.min(items_limit);
         Ok(Self {
             name,
             buckets_limit,
             items_limit,
             offsets: Vec::with_capacity(buckets_limit + 1),
             order: Vec::with_capacity(items_limit),
+            occupied: Vec::with_capacity(occupied_limit),
             largest: 0,
         })
     }
@@ -107,6 +119,7 @@ impl Bins {
             items_limit: range,
             offsets: Vec::new(),
             order: Vec::new(),
+            occupied: Vec::new(),
             largest: 0,
         }
     }
@@ -158,6 +171,10 @@ impl Bins {
         // 1. Count: bucket b's count goes in `offsets[b + 1]`. Both limits are
         //    within the u32 index range, so no count or sum overflows.
         self.offsets.resize(buckets + 1, 0);
+        if items == 0 {
+            self.largest = 0;
+            return Ok(());
+        }
         for item in 0..items {
             let bucket = bucket_of(item);
             if bucket >= buckets {
@@ -172,12 +189,22 @@ impl Bins {
             }
         }
         // 2. Exclusive prefix sum: `offsets[b]` becomes bucket b's start and
-        //    `offsets[buckets]` the total.
-        let mut largest = 0;
+        //    `offsets[buckets]` the total. Record nonempty buckets in ascending
+        //    order so downstream reductions skip empty buckets.
+        let mut running = 0_u32;
+        let mut largest = 0_u32;
         for bucket in 0..buckets {
             let count = self.offsets[bucket + 1];
-            largest = largest.max(count);
-            self.offsets[bucket + 1] = self.offsets[bucket] + count;
+            if count > 0 {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "buckets is bounded by u32::MAX"
+                )]
+                self.occupied.push(bucket as u32);
+                largest = largest.max(count);
+                running += count;
+            }
+            self.offsets[bucket + 1] = running;
         }
         // 3. Scatter in the given order, using `offsets[b]` as bucket b's
         //    cursor; afterwards it holds bucket b's end, the next one's start.
@@ -196,12 +223,16 @@ impl Bins {
                 None => return Err(outside(item, bucket)),
             }
         }
-        // Restore the starts: bucket b starts where bucket b − 1 ends.
-        for bucket in (1..buckets).rev() {
-            self.offsets[bucket] = self.offsets[bucket - 1];
-        }
-        if let Some(first) = self.offsets.first_mut() {
-            *first = 0;
+        // Restore the starts in O(occupied): empty buckets already hold their
+        // start, and walking nonempty buckets in descending order copies each
+        // predecessor's end (which equals this bucket's start).
+        for &bucket_u32 in self.occupied.iter().rev() {
+            let bucket = bucket_u32 as usize;
+            self.offsets[bucket] = if bucket == 0 {
+                0
+            } else {
+                self.offsets[bucket - 1]
+            };
         }
         self.largest = largest as usize;
         Ok(())
@@ -211,6 +242,7 @@ impl Bins {
     pub fn clear(&mut self) {
         self.offsets.clear();
         self.order.clear();
+        self.occupied.clear();
         self.largest = 0;
     }
 
@@ -255,14 +287,20 @@ impl Bins {
         self.order.get(self.range(bucket)).unwrap_or(&[])
     }
 
+    /// Nonempty bucket indices of the last grouping, in strictly ascending
+    /// bucket order.
+    #[must_use]
+    pub fn occupied_buckets(&self) -> &[u32] {
+        &self.occupied
+    }
+
     /// Each nonempty bucket with its positions in [`Bins::order`], in
     /// ascending bucket order.
     pub fn occupied(&self) -> impl Iterator<Item = (usize, Range<usize>)> + '_ {
-        self.offsets
-            .windows(2)
-            .enumerate()
-            .filter(|(_, pair)| pair[0] < pair[1])
-            .map(|(bucket, pair)| (bucket, pair[0] as usize..pair[1] as usize))
+        self.occupied.iter().map(|&bucket| {
+            let b = bucket as usize;
+            (b, self.offsets[b] as usize..self.offsets[b + 1] as usize)
+        })
     }
 
     /// The most items in one bucket of the last grouping: the hotspot.

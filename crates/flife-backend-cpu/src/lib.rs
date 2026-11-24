@@ -23,11 +23,13 @@
 //! layers, or a parameter count other than the layers'.
 //!
 //! **Executor** (plan §3.4, §12.5). The kernel runs on the thread that calls
-//! it and touches no rayon pool. [`CpuBackend`] splits a batch into at most
-//! `lanes` contiguous runs of at least [`MINIMUM_JOBS_PER_LANE`] jobs. The
-//! first run is on the calling thread, the rest on scoped threads it joins
-//! before returning. So the controllers of a tick use at most `lanes` threads,
-//! and the composition root gives it the world's `cpu_workers`.
+//! it and touches no global rayon pool. [`CpuBackend`] splits a batch into at
+//! most `lanes` contiguous runs of at least [`MINIMUM_JOBS_PER_LANE`] jobs. The
+//! first run is on the calling thread, the rest on the cached private
+//! [`flife_core::pool`] sized to `lanes` total threads (joined before
+//! returning). So the controllers of a tick use at most `lanes` threads with
+//! zero per-tick OS thread spawns, and the composition root gives it the
+//! world's `cpu_workers`.
 //!
 //! **Residency** (FL-026, plan §9.2). Each catalog member's genomes are
 //! packed into that topology's slabs, at their arena slots
@@ -48,11 +50,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::num::NonZeroUsize;
 
-use flife_core::CoreError;
 use flife_core::ids::GenomeId;
 use flife_core::memory::{bytes_for, capacity_bytes, total};
 use flife_core::model::MAXIMUM_HIDDEN_LAYERS;
 use flife_core::numerics::tanh_f32;
+use flife_core::{CoreError, pool};
 use flife_neural::{
     ArenaSlot, BackendBudget, ControllerBackend, ControllerJob, DenseTopology,
     MAX_CONTROLLER_OUTPUT_WIDTH, MAX_SENSOR_WIDTH, RawOutputs, ShardGeometry, Weight, Weights,
@@ -735,24 +737,49 @@ impl ControllerBackend for CpuBackend {
         outputs: &mut Vec<Option<RawOutputs>>,
     ) -> Result<(), CoreError> {
         self.used = 0;
-        outputs.clear();
-        reserve(outputs, jobs.len(), "cpu controller outputs")?;
-        outputs.resize(jobs.len(), None);
-        let widest = self.place(jobs)?;
         if jobs.is_empty() {
+            outputs.clear();
             return Ok(());
         }
+        if outputs.len() > jobs.len() {
+            outputs.truncate(jobs.len());
+        } else if outputs.len() < jobs.len() {
+            if outputs.capacity() < jobs.len()
+                && let Err(error) = reserve(
+                    outputs,
+                    jobs.len() - outputs.len(),
+                    "cpu controller outputs",
+                )
+            {
+                outputs.clear();
+                return Err(error);
+            }
+            outputs.resize(jobs.len(), None);
+        }
+        let widest = match self.place(jobs) {
+            Ok(widest) => widest,
+            Err(error) => {
+                outputs.clear();
+                return Err(error);
+            }
+        };
         let lanes = self
             .lanes
             .get()
             .min(jobs.len().div_ceil(MINIMUM_JOBS_PER_LANE))
             .max(1);
         if let Some(missing) = lanes.checked_sub(self.scratch.len()).filter(|&n| n > 0) {
-            reserve(&mut self.scratch, missing, "cpu controller lanes")?;
+            if let Err(error) = reserve(&mut self.scratch, missing, "cpu controller lanes") {
+                outputs.clear();
+                return Err(error);
+            }
             self.scratch.resize_with(lanes, Scratch::default);
         }
         for scratch in &mut self.scratch[..lanes] {
-            scratch.hold(widest)?;
+            if let Err(error) = scratch.hold(widest) {
+                outputs.clear();
+                return Err(error);
+            }
         }
         let buckets = &self.buckets;
         let length = jobs.len().div_ceil(lanes);
@@ -771,42 +798,33 @@ impl ControllerBackend for CpuBackend {
             }
             return result;
         }
-        let (result, used) = std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(lanes - 1);
-            let mut spawn_error = None;
-            for ((chunk_jobs, chunk_outputs), chunk_scratch) in runs {
-                match std::thread::Builder::new().spawn_scoped(scope, move || {
-                    run(buckets, chunk_jobs, chunk_outputs, chunk_scratch)
-                }) {
-                    Ok(handle) => workers.push(handle),
-                    Err(error) => {
-                        spawn_error = Some(CoreError::StateConflict {
-                            operation: "cpu controller lanes",
-                            detail: format!("failed to spawn controller lane: {error}"),
-                        });
-                        break;
-                    }
-                }
-            }
-            let used = 1 + workers.len();
-            let mut result = match spawn_error {
-                Some(error) => Err(error),
-                None => run(buckets, head_jobs, head_outputs, head_scratch),
-            };
-            for worker in workers {
-                let joined = worker.join().unwrap_or_else(|_| {
-                    Err(CoreError::StateConflict {
-                        operation: "cpu controller lanes",
-                        detail: "a controller lane panicked".to_owned(),
-                    })
+        let tail_count = runs.len();
+        let used = 1 + tail_count;
+        let mut tail_results: Vec<Result<(), CoreError>> =
+            (0..tail_count).map(|_| Ok(())).collect();
+        // Pass `self.lanes.get()` (the stable configured worker budget) so
+        // `CpuBackend` shares the exact same cached private pool (`flife-w{W}-*`)
+        // as every other phase without touching Rayon's global pool.
+        let scoped = pool::scope_workers(self.lanes.get(), "cpu controller lanes", |scope| {
+            for (((chunk_jobs, chunk_outputs), chunk_scratch), slot) in
+                runs.zip(tail_results.iter_mut())
+            {
+                scope.spawn(move || {
+                    *slot = run(buckets, chunk_jobs, chunk_outputs, chunk_scratch);
                 });
-                if result.is_ok() {
-                    result = joined;
-                }
             }
-            (result, used)
+            run(buckets, head_jobs, head_outputs, head_scratch)
         });
         self.used = used;
+        let mut result = match scoped {
+            Ok(head_result) => head_result,
+            Err(error) => Err(error),
+        };
+        for tail_result in tail_results {
+            if result.is_ok() {
+                result = tail_result;
+            }
+        }
         if result.is_err() {
             outputs.clear();
         }

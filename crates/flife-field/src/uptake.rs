@@ -599,8 +599,10 @@ fn resolve_into(
         }
     } else {
         // Partition cells into `runs` contiguous ranges of roughly equal
-        // packet count, count occupied cells per range, and pre-size `debits`
-        // (already reserved to capacity in `Grants::with_capacity`).
+        // packet count using `bins.occupied_buckets()` directly so empty cells
+        // are never scanned, and pre-size `debits` (already reserved in
+        // `Grants::with_capacity`).
+        let occupied_buckets = bins.occupied_buckets();
         let mut cell_bounds = Vec::with_capacity(runs + 1);
         for run in 0..=runs {
             if run == runs {
@@ -613,20 +615,8 @@ fn resolve_into(
                 cell_bounds.push(cell);
             }
         }
-        let mut occ_counts = Vec::with_capacity(runs);
-        let mut total_occupied = 0_usize;
-        for pair in cell_bounds.windows(2) {
-            let mut count = 0_usize;
-            for cell in pair[0]..pair[1] {
-                if offsets[cell] < offsets[cell + 1] {
-                    count += 1;
-                }
-            }
-            occ_counts.push(count);
-            total_occupied += count;
-        }
         debits.resize(
-            total_occupied,
+            occupied_buckets.len(),
             CellDebit {
                 cell: 0,
                 energy_before: 0.0,
@@ -636,9 +626,10 @@ fn resolve_into(
                 contended: false,
             },
         );
-        // Split `packets` and `debits` into disjoint per-worker slices.
+        // Split `packets`, `occupied_buckets`, and `debits` into disjoint
+        // per-worker slices.
         struct Slice<'a> {
-            cells: std::ops::Range<usize>,
+            occupied: &'a [u32],
             pkt_base: usize,
             packets: &'a mut [GrantPacket],
             debits: &'a mut [CellDebit],
@@ -646,16 +637,25 @@ fn resolve_into(
         let mut slices = Vec::with_capacity(runs);
         let mut rem_pkts = packets.as_mut_slice();
         let mut rem_debits = debits.as_mut_slice();
-        for (pair, &occ) in cell_bounds.windows(2).zip(&occ_counts) {
+        let mut occ_cursor = 0_usize;
+        for (run_idx, pair) in cell_bounds.windows(2).enumerate() {
             let pkt_base = offsets.get(pair[0]).map_or(items, |&v| v as usize);
             let pkt_end = offsets.get(pair[1]).map_or(items, |&v| v as usize);
             let pkt_len = pkt_end.saturating_sub(pkt_base);
             let (pkt_head, pkt_tail) = rem_pkts.split_at_mut(pkt_len);
             rem_pkts = pkt_tail;
-            let (deb_head, deb_tail) = rem_debits.split_at_mut(occ);
+            let occ_end = if run_idx + 1 == runs {
+                occupied_buckets.len()
+            } else {
+                occ_cursor
+                    + occupied_buckets[occ_cursor..].partition_point(|&c| (c as usize) < pair[1])
+            };
+            let lane_occupied = &occupied_buckets[occ_cursor..occ_end];
+            occ_cursor = occ_end;
+            let (deb_head, deb_tail) = rem_debits.split_at_mut(lane_occupied.len());
             rem_debits = deb_tail;
             slices.push(Slice {
-                cells: pair[0]..pair[1],
+                occupied: lane_occupied,
                 pkt_base,
                 packets: pkt_head,
                 debits: deb_head,
@@ -665,42 +665,25 @@ fn resolve_into(
         let work = |slice: &mut Slice<'_>| -> Result<(), CoreError> {
             let mut local_shares = Vec::new();
             let mut local_rank = Vec::new();
-            let mut out_idx = 0_usize;
-            for cell in slice.cells.clone() {
+            for (out_idx, &cell_u32) in slice.occupied.iter().enumerate() {
+                let cell = cell_u32 as usize;
                 let first = offsets[cell] as usize;
                 let end = offsets[cell + 1] as usize;
-                if first >= end {
-                    continue;
-                }
                 let value = cell_energy(energy, cell)?;
                 let local_start = first - slice.pkt_base;
                 let local_end = end - slice.pkt_base;
                 let group = &mut slice.packets[local_start..local_end];
                 let debit = resolve_cell(group, cell, value, &mut local_shares, &mut local_rank)?;
                 slice.debits[out_idx] = debit;
-                out_idx += 1;
             }
             Ok(())
         };
-        let work = &work;
-        let mut iter = slices.iter_mut();
-        let head = iter.next();
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = iter.map(|s| scope.spawn(move || work(s))).collect();
-            let mut first_err = head.map_or(Ok(()), work);
-            for handle in handles {
-                let joined = handle.join().unwrap_or_else(|_| {
-                    Err(CoreError::StateConflict {
-                        operation: "resolve uptake",
-                        detail: "an uptake worker panicked".to_owned(),
-                    })
-                });
-                if first_err.is_ok() {
-                    first_err = joined;
-                }
-            }
-            first_err
-        })?;
+        flife_core::pool::try_parallel_for_each_mut(
+            workers,
+            "resolve uptake",
+            &mut slices,
+            |_, slice| work(slice),
+        )?;
 
         for debit in debits.iter() {
             let len = (offsets[debit.cell + 1] - offsets[debit.cell]) as usize;
@@ -835,26 +818,14 @@ fn group_packets(grid: &FieldGrid, grants: &mut Grants, workers: usize) -> Resul
         let mut ord_iter = order.chunks(chunk);
         let mut dst_iter = packets.chunks_mut(chunk);
         let head = ord_iter.next().zip(dst_iter.next());
-        let panicked = std::thread::scope(|scope| {
-            let handles: Vec<_> = ord_iter
-                .zip(dst_iter)
-                .map(|(o, d)| scope.spawn(move || gather(o, d)))
-                .collect();
+        flife_core::pool::scope_workers(workers, "group uptake packets", |scope| {
+            for (o, d) in ord_iter.zip(dst_iter) {
+                scope.spawn(move || gather(o, d));
+            }
             if let Some((o, d)) = head {
                 gather(o, d);
             }
-            let mut panicked = false;
-            for h in handles {
-                panicked |= h.join().is_err();
-            }
-            panicked
-        });
-        if panicked {
-            return Err(CoreError::StateConflict {
-                operation: "group uptake packets",
-                detail: "a packet gather worker panicked".to_owned(),
-            });
-        }
+        })?;
     }
     Ok(())
 }
@@ -1154,10 +1125,6 @@ pub fn apply_grants_on(
     workers: usize,
 ) -> Result<f64, CoreError> {
     let cells = grants.check_debit(field)?;
-    let conflict = |detail: String| CoreError::StateConflict {
-        operation: "uptake grants",
-        detail,
-    };
     let energy = field.energy_mut();
     for debit in grants.debits.iter().filter(|debit| debit.granted > 0.0) {
         energy[debit.cell] = debit.energy_after;
@@ -1202,21 +1169,15 @@ pub fn apply_grants_on(
     let mut runs = field.moments_mut().chunks_mut(per * cells.max(1));
     let head = runs.next().unwrap_or_default();
     let scale = &scale;
-    let panicked = std::thread::scope(|scope| {
-        let workers: Vec<_> = runs
-            .map(|planes| scope.spawn(move || scale(planes)))
-            .collect();
+    if used <= 1 {
         scale(head);
-        // Join every worker, so that none is left for the scope to find
-        // panicked.
-        let mut panicked = false;
-        for worker in workers {
-            panicked |= worker.join().is_err();
-        }
-        panicked
-    });
-    if panicked {
-        return Err(conflict("a grant worker panicked".into()));
+    } else {
+        flife_core::pool::scope_workers(workers, "apply grants", |scope| {
+            for planes in runs {
+                scope.spawn(move || scale(planes));
+            }
+            scale(head);
+        })?;
     }
     grants.applied = true;
     Ok(grants.summary.granted)

@@ -88,9 +88,6 @@
 //! parent's lineage at the next generation. A birth sets both the child's
 //! and the parent's cooldown deadline to `n + 1 + ⌈cooldown/Δt⌉`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Barrier, mpsc};
-
 use flife_core::clock::{Tick, TickSpan, stable_phase};
 use flife_core::ids::{Generation, GenomeId, IdSequence, LineageId, OrganismId};
 use flife_core::ledger::{EnergyBudget, TickLedger, Transfer, sub_down};
@@ -1614,7 +1611,7 @@ fn resolve_births_inner(
             &mut working,
             quota,
             refusing,
-            parallel_workers,
+            workers,
             wave_size,
             &mut born,
             &mut rejected,
@@ -1681,30 +1678,6 @@ fn resolve_births_inner(
     }))
 }
 
-/// Ensures parallel proposal workers always wake from `start` and exit cleanly
-/// even if serial commit exits early on a shortfall or error.
-struct StopWorkers<'a> {
-    stop: &'a AtomicBool,
-    start: &'a Barrier,
-    stopped: bool,
-}
-
-impl StopWorkers<'_> {
-    fn finish(&mut self) {
-        if !self.stopped {
-            self.stopped = true;
-            self.stop.store(true, Ordering::Release);
-            self.start.wait();
-        }
-    }
-}
-
-impl Drop for StopWorkers<'_> {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
 fn propose_safely(
     propose_one: &(impl Fn(&BirthRequest<'_>) -> Result<DetachedProposal, CoreError> + Sync),
     request: &BirthRequest<'_>,
@@ -1731,7 +1704,7 @@ fn stage_parallel_waves(
     working: &mut Identities,
     quota: &mut GenomeQuota,
     refusing: bool,
-    used: usize,
+    workers: usize,
     wave_size: usize,
     born: &mut Vec<Birth>,
     rejected: &mut Vec<RejectedBirth>,
@@ -1747,7 +1720,7 @@ fn stage_parallel_waves(
         working,
         quota,
         refusing,
-        used,
+        workers,
         wave_size,
         born,
         rejected,
@@ -1777,168 +1750,99 @@ fn stage_parallel_waves_with(
     working: &mut Identities,
     quota: &mut GenomeQuota,
     refusing: bool,
-    used: usize,
+    workers: usize,
     wave_size: usize,
     born: &mut Vec<Birth>,
     rejected: &mut Vec<RejectedBirth>,
     refused: &mut Vec<RefusedBirth>,
     propose_one: &(impl Fn(&BirthRequest<'_>) -> Result<DetachedProposal, CoreError> + Sync),
 ) -> Result<Option<CapacityShortfall>, CoreError> {
-    let cursor = AtomicUsize::new(0);
-    let wave_end = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
-    let start_barrier = Barrier::new(used);
-    let done_barrier = Barrier::new(used);
-    let (tx, rx) = mpsc::channel::<(usize, Result<DetachedProposal, CoreError>)>();
-
     let mut wave_slots: Vec<Option<Result<DetachedProposal, CoreError>>> = Vec::new();
     reserve_births(&mut wave_slots, wave_size, "birth proposal wave")?;
-    let mut main_results: Vec<(usize, Result<DetachedProposal, CoreError>)> = Vec::new();
-    reserve_births(&mut main_results, wave_size, "birth proposal lane")?;
 
-    let outcome = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for _ in 1..used {
-            let worker_tx = tx.clone();
-            let cursor = &cursor;
-            let wave_end = &wave_end;
-            let stop = &stop;
-            let start_barrier = &start_barrier;
-            let done_barrier = &done_barrier;
-            handles.push(scope.spawn(move || {
-                loop {
-                    start_barrier.wait();
-                    if stop.load(Ordering::Acquire) {
-                        break;
+    let mut outcome: Result<Option<CapacityShortfall>, CoreError> = Ok(None);
+    let mut wave_start = 0;
+    'waves: while wave_start < order.len() {
+        let end = (wave_start + wave_size).min(order.len());
+        let wave_len = end - wave_start;
+        let wave_requests = &order[wave_start..end];
+        wave_slots.clear();
+        wave_slots.resize_with(wave_len, || None);
+
+        if let Err(error) = flife_core::pool::parallel_chunks_mut(
+            workers,
+            "propose births",
+            &mut wave_slots,
+            1,
+            |chunk_start, chunk| {
+                for (local, slot) in chunk.iter_mut().enumerate() {
+                    if let Some(request) = wave_requests.get(chunk_start + local) {
+                        *slot = Some(propose_safely(propose_one, request));
                     }
-                    let end = wave_end.load(Ordering::Acquire);
-                    loop {
-                        let index = cursor.fetch_add(1, Ordering::Relaxed);
-                        if index >= end {
-                            break;
-                        }
-                        let Some(request) = order.get(index) else {
-                            break;
-                        };
-                        let proposed = propose_safely(propose_one, request);
-                        if worker_tx.send((index, proposed)).is_err() {
-                            break;
-                        }
-                    }
-                    done_barrier.wait();
                 }
-            }));
-        }
-        drop(tx);
-
-        let mut guard = StopWorkers {
-            stop: &stop,
-            start: &start_barrier,
-            stopped: false,
-        };
-
-        let mut result: Result<Option<CapacityShortfall>, CoreError> = Ok(None);
-        let mut wave_start = 0;
-        'waves: while wave_start < order.len() {
-            let end = (wave_start + wave_size).min(order.len());
-            let wave_len = end - wave_start;
-            cursor.store(wave_start, Ordering::Release);
-            wave_end.store(end, Ordering::Release);
-            start_barrier.wait();
-
-            main_results.clear();
-            loop {
-                let index = cursor.fetch_add(1, Ordering::Relaxed);
-                if index >= end {
-                    break;
-                }
-                let Some(request) = order.get(index) else {
-                    break;
-                };
-                let proposed = propose_safely(propose_one, request);
-                main_results.push((index, proposed));
-            }
-            done_barrier.wait();
-
+            },
+        ) {
             wave_slots.clear();
-            wave_slots.resize_with(wave_len, || None);
-            for (index, proposed) in main_results.drain(..).chain(rx.try_iter()) {
-                if let Some(slot) = index
-                    .checked_sub(wave_start)
-                    .and_then(|offset| wave_slots.get_mut(offset))
-                {
-                    *slot = Some(proposed);
-                }
-            }
+            outcome = Err(error);
+            break 'waves;
+        }
 
-            for offset in 0..wave_len {
-                let Some(request) = order.get(wave_start + offset) else {
-                    break;
-                };
-                let Some(proposed) = wave_slots.get_mut(offset).and_then(Option::take) else {
-                    result = Err(CoreError::StateConflict {
-                        operation: "propose births",
-                        detail: "a birth proposal worker did not return a result".into(),
-                    });
-                    break 'waves;
-                };
-                match stage_detached(
-                    context,
-                    request,
-                    proposed,
-                    birth_tick,
-                    deadline,
-                    population,
-                    working,
-                    quota,
-                    born.len(),
-                ) {
-                    Ok(Staged::Born(birth)) => born.push(*birth),
-                    Ok(Staged::Rejected(birth)) => rejected.push(birth),
-                    Ok(Staged::Short { resource, .. }) if refusing => {
-                        refused.push(RefusedBirth {
-                            parent: request.intent.parent,
-                            resource,
-                        });
-                    }
-                    Ok(Staged::Short {
+        for offset in 0..wave_len {
+            let Some(request) = wave_requests.get(offset) else {
+                break;
+            };
+            let Some(proposed) = wave_slots.get_mut(offset).and_then(Option::take) else {
+                outcome = Err(CoreError::StateConflict {
+                    operation: "propose births",
+                    detail: "a birth proposal worker did not return a result".into(),
+                });
+                break 'waves;
+            };
+            match stage_detached(
+                context,
+                request,
+                proposed,
+                birth_tick,
+                deadline,
+                population,
+                working,
+                quota,
+                born.len(),
+            ) {
+                Ok(Staged::Born(birth)) => born.push(*birth),
+                Ok(Staged::Rejected(birth)) => rejected.push(birth),
+                Ok(Staged::Short { resource, .. }) if refusing => {
+                    refused.push(RefusedBirth {
+                        parent: request.intent.parent,
                         resource,
+                    });
+                }
+                Ok(Staged::Short {
+                    resource,
+                    required,
+                    available,
+                }) => {
+                    let covered = born.len();
+                    wave_slots.clear();
+                    outcome = Ok(Some(CapacityShortfall {
+                        resource,
+                        parent: request.intent.parent,
                         required,
                         available,
-                    }) => {
-                        let covered = born.len();
-                        wave_slots.clear();
-                        result = Ok(Some(CapacityShortfall {
-                            resource,
-                            parent: request.intent.parent,
-                            required,
-                            available,
-                            proposed: order.iter().map(|req| req.intent.parent).collect(),
-                            covered,
-                        }));
-                        break 'waves;
-                    }
-                    Err(error) => {
-                        wave_slots.clear();
-                        result = Err(error);
-                        break 'waves;
-                    }
+                        proposed: order.iter().map(|req| req.intent.parent).collect(),
+                        covered,
+                    }));
+                    break 'waves;
+                }
+                Err(error) => {
+                    wave_slots.clear();
+                    outcome = Err(error);
+                    break 'waves;
                 }
             }
-            wave_start = end;
         }
-
-        guard.finish();
-        for handle in handles {
-            if handle.join().is_err() && result.is_ok() {
-                result = Err(CoreError::StateConflict {
-                    operation: "propose births",
-                    detail: "a birth proposal worker panicked".into(),
-                });
-            }
-        }
-        result
-    });
+        wave_start = end;
+    }
 
     match outcome {
         Ok(None) => Ok(None),

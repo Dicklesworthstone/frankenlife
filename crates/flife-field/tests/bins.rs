@@ -1013,3 +1013,120 @@ fn apply_deposits_refuses_f64_overflow_without_mutating_field() {
         "refused apply_deposits must leave field state bit-for-bit unchanged"
     );
 }
+
+/// Regression: mixed chunks containing 31 level-0 queries + 1 mutated
+/// blended/coarse query (and arbitrary blends across levels 0..=3) must match
+/// scalar `PyramidView::sample` AND `PyramidView::sample_dual` bit-for-bit
+/// on unit, power-of-two, and non-power-of-two grids.
+#[test]
+fn pyramid_mixed_scale_chunks_match_scalar_bit_for_bit_single_and_dual() {
+    use flife_field::pyramid::{DualRawSample, MAX_PLANES};
+
+    let zero_single = RawSample {
+        values: [0.0; PLANES],
+        dx: [0.0; PLANES],
+        dy: [0.0; PLANES],
+    };
+    let zero_dual = DualRawSample {
+        values: [0.0; MAX_PLANES],
+        dx: [0.0; MAX_PLANES],
+        dy: [0.0; MAX_PLANES],
+    };
+
+    for (label, cell_w, cell_h) in [
+        ("unit", 1.0_f64, 1.0_f64),
+        ("pow2", 2.0_f64, 0.5_f64),
+        ("non_pow2", 1.3_f64, 0.7_f64),
+    ] {
+        let g = FieldGrid::new(32, 32, 32.0 * cell_w, 32.0 * cell_h).expect("grid");
+        let finest = cell_w.max(cell_h);
+        let mut rng = lcg(2026);
+        // 96 queries: block 0 has 31 level-0 + 1 level-0/1 blend; block 1 has
+        // 30 level-0 + 1 level-0/1 + 1 coarse level-2/3; block 2 has all mixed.
+        let mut queries = Vec::with_capacity(96);
+        for i in 0..96 {
+            let position = [rng() * 32.0 * cell_w, rng() * 32.0 * cell_h];
+            let scale = match i {
+                17 => finest * 1.37,
+                40 => finest * 1.75,
+                55 => finest * 4.9,
+                64.. => finest * (1.0 + rng() * 7.0),
+                _ => finest,
+            };
+            queries.push(SensorQuery { position, scale });
+        }
+
+        // Single-carrier 33-plane pyramid.
+        let snap = field(g, 303);
+        let mut pyr = SensorPyramid::new(g, 3, &BufferLimits::host()).expect("single pyramid");
+        let view = pyr.build_on(&snap, 4).expect("build single");
+        let want: Vec<RawSample> = queries
+            .iter()
+            .map(|q| view.sample(q.position, q.scale).expect("scalar single"))
+            .collect();
+        let mut got = vec![zero_single; queries.len()];
+        view.sample_batch(&queries, &mut got).expect("batch single");
+        for (i, (g_s, w_s)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                g_s.values.map(f64::to_bits),
+                w_s.values.map(f64::to_bits),
+                "{label} single v[{i}]"
+            );
+            assert_eq!(
+                g_s.dx.map(f64::to_bits),
+                w_s.dx.map(f64::to_bits),
+                "{label} single dx[{i}]"
+            );
+            assert_eq!(
+                g_s.dy.map(f64::to_bits),
+                w_s.dy.map(f64::to_bits),
+                "{label} single dy[{i}]"
+            );
+        }
+
+        // Dual-carrier 34-plane pyramid.
+        let mut dual_state =
+            FieldState::zeroed_dual_carrier(g, &BufferLimits::host()).expect("dual field");
+        let mut fill_rng = lcg(404);
+        for slot in dual_state.as_mut_slice() {
+            *slot = (fill_rng() * 3.0) as f32;
+        }
+        let mut dual_pyr = SensorPyramid::new_with_planes(
+            g,
+            3,
+            usize::from(dual_state.planes()),
+            &BufferLimits::host(),
+        )
+        .expect("dual pyramid");
+        let dual_view = dual_pyr.build_on(&dual_state, 4).expect("build dual");
+        let want_dual: Vec<DualRawSample> = queries
+            .iter()
+            .map(|q| {
+                dual_view
+                    .sample_dual(q.position, q.scale)
+                    .expect("scalar dual")
+            })
+            .collect();
+        let mut got_dual = vec![zero_dual; queries.len()];
+        dual_view
+            .sample_dual_batch(&queries, &mut got_dual)
+            .expect("batch dual");
+        for (i, (g_s, w_s)) in got_dual.iter().zip(&want_dual).enumerate() {
+            assert_eq!(
+                g_s.values.map(f64::to_bits),
+                w_s.values.map(f64::to_bits),
+                "{label} dual v[{i}]"
+            );
+            assert_eq!(
+                g_s.dx.map(f64::to_bits),
+                w_s.dx.map(f64::to_bits),
+                "{label} dual dx[{i}]"
+            );
+            assert_eq!(
+                g_s.dy.map(f64::to_bits),
+                w_s.dy.map(f64::to_bits),
+                "{label} dual dy[{i}]"
+            );
+        }
+    }
+}

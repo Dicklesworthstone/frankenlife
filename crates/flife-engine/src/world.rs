@@ -3241,8 +3241,11 @@ impl World {
             recycled_summary.record(&mut tick_ledger, Transfer::Recycling)?;
         }
         if let Some(byproducts) = byproducts.as_mut() {
-            let byproduct_summary =
-                apply_deposits_to_carrier_on(next, byproducts, next.carrier0(), workers)?;
+            let byproduct_summary = if byproducts.is_empty() {
+                DepositSummary::default()
+            } else {
+                apply_deposits_to_carrier_on(next, byproducts, next.carrier0(), workers)?
+            };
             byproduct_summary.record(&mut tick_ledger, Transfer::MetabolicByproduct)?;
         }
 
@@ -3698,22 +3701,27 @@ fn grow_founders(
     let grow = &grow;
     let mut runs = runs.into_iter();
     let head = runs.next().unwrap_or_default();
-    std::thread::scope(|scope| {
-        let others: Vec<_> = runs.map(|run| scope.spawn(move || grow(run))).collect();
-        let mut result = grow(head).map(|founders| entrants.extend(founders));
-        for other in others {
-            let joined = other.join().unwrap_or_else(|_| {
-                Err(CoreError::StateConflict {
-                    operation: "found",
-                    detail: "a founding worker panicked".to_owned(),
-                })
+    if used <= 1 {
+        entrants.extend(grow(head)?);
+        return Ok(());
+    }
+    let tail_count = runs.len();
+    let mut tail_results: Vec<Result<Vec<Entrant>, CoreError>> =
+        (0..tail_count).map(|_| Ok(Vec::new())).collect();
+    let mut head_result = Ok(Vec::new());
+    flife_core::pool::scope_workers(workers.get(), "found", |scope| {
+        for (run, slot) in runs.zip(tail_results.iter_mut()) {
+            scope.spawn(move || {
+                *slot = grow(run);
             });
-            if result.is_ok() {
-                result = joined.map(|founders| entrants.extend(founders));
-            }
         }
-        result
-    })
+        head_result = grow(head);
+    })?;
+    entrants.extend(head_result?);
+    for part in tail_results {
+        entrants.extend(part?);
+    }
+    Ok(())
 }
 
 /// `seed` grown into a founder: [`flife_genome::founder()`]'s traits and
@@ -4830,8 +4838,8 @@ fn in_runs<F>(rows: &[Organism], lanes: &mut [DecisionLane], work: &F) -> Result
 where
     F: Fn(usize, &[Organism], &mut DecisionLane) -> Result<(), CoreError> + Sync,
 {
-    let used = lanes
-        .len()
+    let worker_budget = lanes.len();
+    let used = worker_budget
         .min(rows.len().div_ceil(MINIMUM_ROWS_PER_LANE))
         .max(1);
     let Some((first, others)) = lanes.split_first_mut() else {
@@ -4846,26 +4854,26 @@ where
     let length = rows.len().div_ceil(used);
     let mut runs = rows.chunks(length);
     let head = runs.next().unwrap_or(&[]);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = runs
+    let tail_count = runs.len();
+    let mut tail_results: Vec<Result<(), CoreError>> = (0..tail_count).map(|_| Ok(())).collect();
+    let mut head_result = Ok(());
+    flife_core::pool::scope_workers(worker_budget, "decide", |scope| {
+        for (index, ((run, lane), slot)) in runs
             .zip(others.iter_mut())
+            .zip(tail_results.iter_mut())
             .enumerate()
-            .map(|(index, (run, lane))| scope.spawn(move || work((index + 1) * length, run, lane)))
-            .collect();
-        let mut result = work(0, head, first);
-        for worker in workers {
-            let joined = worker.join().unwrap_or_else(|_| {
-                Err(CoreError::StateConflict {
-                    operation: "decide",
-                    detail: "a decision worker panicked".to_owned(),
-                })
+        {
+            scope.spawn(move || {
+                *slot = work((index + 1) * length, run, lane);
             });
-            if result.is_ok() {
-                result = joined;
-            }
         }
-        result
-    })
+        head_result = work(0, head, first);
+    })?;
+    head_result?;
+    for result in tail_results {
+        result?;
+    }
+    Ok(())
 }
 
 /// [`in_runs`] over rows that `work` changes: the same split into
@@ -4882,8 +4890,8 @@ where
     T: Send,
     F: Fn(usize, &mut [T], &mut DecisionLane) -> Result<(), CoreError> + Sync,
 {
-    let used = lanes
-        .len()
+    let worker_budget = lanes.len();
+    let used = worker_budget
         .min(rows.len().div_ceil(MINIMUM_ROWS_PER_LANE))
         .max(1);
     let Some((first, others)) = lanes.split_first_mut() else {
@@ -4898,26 +4906,26 @@ where
     let length = rows.len().div_ceil(used);
     let mut runs = rows.chunks_mut(length);
     let head = runs.next().unwrap_or_default();
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = runs
+    let tail_count = runs.len();
+    let mut tail_results: Vec<Result<(), CoreError>> = (0..tail_count).map(|_| Ok(())).collect();
+    let mut head_result = Ok(());
+    flife_core::pool::scope_workers(worker_budget, operation, |scope| {
+        for (index, ((run, lane), slot)) in runs
             .zip(others.iter_mut())
+            .zip(tail_results.iter_mut())
             .enumerate()
-            .map(|(index, (run, lane))| scope.spawn(move || work((index + 1) * length, run, lane)))
-            .collect();
-        let mut result = work(0, head, first);
-        for worker in workers {
-            let joined = worker.join().unwrap_or_else(|_| {
-                Err(CoreError::StateConflict {
-                    operation,
-                    detail: "a lane's worker panicked".to_owned(),
-                })
+        {
+            scope.spawn(move || {
+                *slot = work((index + 1) * length, run, lane);
             });
-            if result.is_ok() {
-                result = joined;
-            }
         }
-        result
-    })
+        head_result = work(0, head, first);
+    })?;
+    head_result?;
+    for result in tail_results {
+        result?;
+    }
+    Ok(())
 }
 
 /// Phases 6 and 7 for every working organism, on the lanes: each lane
@@ -5125,24 +5133,22 @@ fn compositions_into(
         return Ok(());
     };
     let run = &run;
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = runs
-            .map(|(packets, slots)| scope.spawn(move || run(packets, slots)))
-            .collect();
-        let mut result = run(head, head_slots);
-        for worker in workers {
-            let joined = worker.join().unwrap_or_else(|_| {
-                Err(CoreError::StateConflict {
-                    operation: "compose packets",
-                    detail: "a composition worker panicked".to_owned(),
-                })
+    let tail_count = used.saturating_sub(1);
+    let mut tail_results: Vec<Result<(), CoreError>> = (0..tail_count).map(|_| Ok(())).collect();
+    let mut head_result = Ok(());
+    flife_core::pool::scope_workers(lanes, "compose packets", |scope| {
+        for ((packets, slots), result_slot) in runs.zip(tail_results.iter_mut()) {
+            scope.spawn(move || {
+                *result_slot = run(packets, slots);
             });
-            if result.is_ok() {
-                result = joined;
-            }
         }
-        result
-    })
+        head_result = run(head, head_slots);
+    })?;
+    head_result?;
+    for result in tail_results {
+        result?;
+    }
+    Ok(())
 }
 
 fn reserve_for<T>(

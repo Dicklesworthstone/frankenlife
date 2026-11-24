@@ -1013,7 +1013,8 @@ pub fn advance_field_wave2_on(
             "the candidate field has no moment planes".to_owned(),
         ));
     }
-    let used = scratches.len().clamp(1, channels.max(1));
+    let worker_budget = scratches.len();
+    let used = worker_budget.clamp(1, channels.max(1));
     let per = channels.div_ceil(used);
     if fused {
         if fused_accum.len() < used {
@@ -1031,30 +1032,30 @@ pub fn advance_field_wave2_on(
                 Ok(())
             };
         let run = &run;
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = runs
-                .enumerate()
-                .map(|(index, (planes, accum))| {
-                    scope.spawn(move || run((index + 1) * per, planes, accum))
-                })
-                .collect();
-            let mut result = match head {
-                Some((planes, accum)) => run(0, planes, accum),
-                None => Ok(()),
-            };
-            for worker in workers {
-                let joined = worker.join().unwrap_or_else(|_| {
-                    Err(CoreError::StateConflict {
-                        operation: "deposit",
-                        detail: "a deposit worker panicked".to_owned(),
-                    })
-                });
-                if result.is_ok() {
-                    result = joined;
-                }
+        if used <= 1 {
+            if let Some((planes, accum)) = head {
+                run(0, planes, accum)?;
             }
-            result
-        })?;
+        } else {
+            let mut tail_results: [Result<(), CoreError>; 32] = std::array::from_fn(|_| Ok(()));
+            let mut head_result = Ok(());
+            flife_core::pool::scope_workers(worker_budget, "deposit", |scope| {
+                for (index, ((planes, accum), slot)) in
+                    runs.zip(tail_results.iter_mut()).enumerate()
+                {
+                    scope.spawn(move || {
+                        *slot = run((index + 1) * per, planes, accum);
+                    });
+                }
+                if let Some((planes, accum)) = head {
+                    head_result = run(0, planes, accum);
+                }
+            })?;
+            head_result?;
+            for res in tail_results {
+                res?;
+            }
+        }
     } else {
         let run = |first: usize, planes: &mut [f32]| -> Result<(), CoreError> {
             for (offset, plane) in planes.chunks_exact_mut(cells).enumerate() {
@@ -1067,25 +1068,24 @@ pub fn advance_field_wave2_on(
         let mut runs = moments.chunks_mut(per * cells);
         let head = runs.next().unwrap_or(&mut []);
         let run = &run;
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = runs
-                .enumerate()
-                .map(|(index, planes)| scope.spawn(move || run((index + 1) * per, planes)))
-                .collect();
-            let mut result = run(0, head);
-            for worker in workers {
-                let joined = worker.join().unwrap_or_else(|_| {
-                    Err(CoreError::StateConflict {
-                        operation: "deposit",
-                        detail: "a deposit worker panicked".to_owned(),
-                    })
-                });
-                if result.is_ok() {
-                    result = joined;
+        if used <= 1 {
+            run(0, head)?;
+        } else {
+            let mut tail_results: [Result<(), CoreError>; 32] = std::array::from_fn(|_| Ok(()));
+            let mut head_result = Ok(());
+            flife_core::pool::scope_workers(worker_budget, "deposit", |scope| {
+                for (index, (planes, slot)) in runs.zip(tail_results.iter_mut()).enumerate() {
+                    scope.spawn(move || {
+                        *slot = run((index + 1) * per, planes);
+                    });
                 }
+                head_result = run(0, head);
+            })?;
+            head_result?;
+            for res in tail_results {
+                res?;
             }
-            result
-        })?;
+        }
     }
     Ok(step_report(transported, deposits, next))
 }
@@ -1133,24 +1133,22 @@ fn supports_on(
         return Ok(None);
     };
     let run = &run;
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = runs
-            .enumerate()
-            .map(|(index, (sources, supports))| {
-                scope.spawn(move || run((index + 1) * per, sources, supports))
-            })
-            .collect();
-        // Runs are in source order, so the first that is not clean decides.
-        let mut first = Ok(run(0, head_sources, head_supports));
-        for worker in workers {
-            let joined = worker.join().map_err(|_| CoreError::StateConflict {
-                operation: "source supports",
-                detail: "a source support worker panicked".to_owned(),
+    if used <= 1 {
+        return Ok(run(0, head_sources, head_supports));
+    }
+    let mut tail_results: Vec<Option<(usize, CoreError)>> =
+        (0..used.saturating_sub(1)).map(|_| None).collect();
+    let mut head_result = None;
+    flife_core::pool::scope_workers(workers, "source supports", |scope| {
+        for (index, ((sources, supports), slot)) in runs.zip(tail_results.iter_mut()).enumerate() {
+            scope.spawn(move || {
+                *slot = run((index + 1) * per, sources, supports);
             });
-            if matches!(first, Ok(None)) {
-                first = joined;
-            }
         }
-        first
-    })
+        head_result = run(0, head_sources, head_supports);
+    })?;
+    if head_result.is_some() {
+        return Ok(head_result);
+    }
+    Ok(tail_results.into_iter().flatten().next())
 }

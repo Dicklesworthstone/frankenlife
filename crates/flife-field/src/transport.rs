@@ -360,6 +360,7 @@ pub fn transport_on(
         }
         energy
     };
+    let worker_budget = scratches.len();
     let Some((head_scratch, others)) = scratches.split_first_mut() else {
         return Err(CoreError::StateConflict {
             operation: "transport",
@@ -372,29 +373,30 @@ pub fn transport_on(
         return Err(missing_plane());
     };
     let run = &run;
-    let energy = std::thread::scope(|scope| {
-        let workers: Vec<_> = sources
-            .zip(targets)
-            .zip(others.iter_mut())
-            .enumerate()
-            .map(|(index, ((source, target), scratch))| {
-                scope.spawn(move || run((index + 1) * per, source, target, scratch))
-            })
-            .collect();
-        let mut energy = run(0, head_source, head_target, head_scratch);
-        for worker in workers {
-            match worker.join() {
-                Ok(terms) => energy = energy.or(terms),
-                Err(_) => {
-                    return Err(CoreError::StateConflict {
-                        operation: "transport",
-                        detail: "a transport worker panicked".to_owned(),
-                    });
-                }
+    let energy = if used <= 1 {
+        run(0, head_source, head_target, head_scratch).ok_or_else(missing_plane)?
+    } else {
+        let mut tail_terms = [None; 64];
+        let mut head_energy = None;
+        flife_core::pool::scope_workers(worker_budget, "transport", |scope| {
+            for (index, (((source, target), scratch), slot)) in sources
+                .zip(targets)
+                .zip(others.iter_mut())
+                .zip(tail_terms.iter_mut())
+                .enumerate()
+            {
+                scope.spawn(move || {
+                    *slot = run((index + 1) * per, source, target, scratch);
+                });
             }
+            head_energy = run(0, head_source, head_target, head_scratch);
+        })?;
+        let mut energy = head_energy;
+        for terms in tail_terms {
+            energy = energy.or(terms);
         }
-        energy.ok_or_else(missing_plane)
-    })?;
+        energy.ok_or_else(missing_plane)?
+    };
     Ok(report(plan, energy_before, energy))
 }
 
@@ -494,6 +496,7 @@ pub fn transport_range_on(
         }
         energy
     };
+    let worker_budget = scratches.len();
     let Some((head_scratch, others)) = scratches.split_first_mut() else {
         return Err(CoreError::StateConflict {
             operation: "transport",
@@ -506,36 +509,35 @@ pub fn transport_range_on(
         return Err(missing_plane());
     };
     let run = &run;
-    let energy = std::thread::scope(|scope| {
-        let workers: Vec<_> = sources
-            .zip(targets)
-            .zip(others.iter_mut())
-            .enumerate()
-            .map(|(index, ((source, target), scratch))| {
+    let energy = if used <= 1 {
+        run(first_plane_index, head_source, head_target, head_scratch)
+    } else {
+        let mut tail_terms = [None; 64];
+        let mut head_energy = None;
+        flife_core::pool::scope_workers(worker_budget, "transport", |scope| {
+            for (index, (((source, target), scratch), slot)) in sources
+                .zip(targets)
+                .zip(others.iter_mut())
+                .zip(tail_terms.iter_mut())
+                .enumerate()
+            {
                 scope.spawn(move || {
-                    run(
+                    *slot = run(
                         first_plane_index + (index + 1) * per,
                         source,
                         target,
                         scratch,
-                    )
-                })
-            })
-            .collect();
-        let mut energy = run(first_plane_index, head_source, head_target, head_scratch);
-        for worker in workers {
-            match worker.join() {
-                Ok(terms) => energy = energy.or(terms),
-                Err(_) => {
-                    return Err(CoreError::StateConflict {
-                        operation: "transport",
-                        detail: "a transport worker panicked".to_owned(),
-                    });
-                }
+                    );
+                });
             }
+            head_energy = run(first_plane_index, head_source, head_target, head_scratch);
+        })?;
+        let mut energy = head_energy;
+        for terms in tail_terms {
+            energy = energy.or(terms);
         }
-        Ok(energy)
-    })?;
+        energy
+    };
     Ok(energy_before.and_then(|before| energy.map(|terms| report(plan, before, terms))))
 }
 
@@ -1255,6 +1257,7 @@ pub fn transport_flux_range_on(
         }
         energy
     };
+    let worker_budget = scratches.len();
     let Some((head_scratch, others)) = scratches.split_first_mut() else {
         return Err(CoreError::StateConflict {
             operation: "flux transport",
@@ -1267,36 +1270,35 @@ pub fn transport_flux_range_on(
         return Err(missing_plane());
     };
     let run = &run;
-    let energy = std::thread::scope(|scope| {
-        let workers: Vec<_> = sources
-            .zip(targets)
-            .zip(others.iter_mut())
-            .enumerate()
-            .map(|(index, ((source, target), scratch))| {
+    let energy = if used <= 1 {
+        run(first_plane_index, head_source, head_target, head_scratch)
+    } else {
+        let mut tail_terms = [None; 64];
+        let mut head_energy = None;
+        flife_core::pool::scope_workers(worker_budget, "flux transport", |scope| {
+            for (index, (((source, target), scratch), slot)) in sources
+                .zip(targets)
+                .zip(others.iter_mut())
+                .zip(tail_terms.iter_mut())
+                .enumerate()
+            {
                 scope.spawn(move || {
-                    run(
+                    *slot = run(
                         first_plane_index + (index + 1) * per,
                         source,
                         target,
                         scratch,
-                    )
-                })
-            })
-            .collect();
-        let mut energy = run(first_plane_index, head_source, head_target, head_scratch);
-        for worker in workers {
-            match worker.join() {
-                Ok(terms) => energy = energy.or(terms),
-                Err(_) => {
-                    return Err(CoreError::StateConflict {
-                        operation: "flux transport",
-                        detail: "a transport worker panicked".to_owned(),
-                    });
-                }
+                    );
+                });
             }
+            head_energy = run(first_plane_index, head_source, head_target, head_scratch);
+        })?;
+        let mut energy = head_energy;
+        for terms in tail_terms {
+            energy = energy.or(terms);
         }
-        Ok(energy)
-    })?;
+        energy
+    };
     Ok(energy_before.and_then(|before| energy.map(|terms| report(plan, before, terms))))
 }
 

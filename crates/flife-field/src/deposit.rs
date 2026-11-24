@@ -41,8 +41,6 @@
 //! and first absorbable, on the next tick, by every organism, its emitter
 //! included.
 
-use std::ops::Range;
-
 use flife_core::CoreError;
 use flife_core::ids::OrganismId;
 use flife_core::ledger::{CompensatedSum, TickLedger, Transfer, add_down, sub_down};
@@ -943,10 +941,6 @@ pub fn apply_deposits_to_carrier_on(
     carrier: CarrierLayout,
     workers: usize,
 ) -> Result<DepositSummary, CoreError> {
-    let conflict = |detail: String| CoreError::StateConflict {
-        operation: "apply deposits",
-        detail,
-    };
     let (mut summary, buckets) = deposits.prepare_for_carrier(field, carrier)?;
     let Deposits {
         entries,
@@ -956,27 +950,17 @@ pub fn apply_deposits_to_carrier_on(
         bins,
         ..
     } = deposits;
-    let values = field.as_mut_slice();
     let offsets = bins.offsets();
     let order = bins.order();
+    let occupied_buckets = bins.occupied_buckets();
     let items = order.len();
-    let start = |cell: usize| offsets.get(cell).map_or(items, |&at| at as usize);
-    let runs = workers.min(items / PACKETS_PER_RUN).max(1);
-    let bounds: Vec<usize> = (0..=runs)
-        .map(|run| {
-            if run == runs {
-                buckets
-            } else {
-                let target = items / runs * run + items % runs * run / runs;
-                offsets
-                    .partition_point(|&at| (at as usize) < target)
-                    .min(buckets)
-            }
-        })
-        .collect();
     received.clear();
-    received.resize(items, 0.0);
+    if items == 0 || occupied_buckets.is_empty() {
+        deposits.applied = true;
+        return Ok(summary);
+    }
 
+    let values = field.as_mut_slice();
     let energy_start = (carrier.energy_plane as usize) * buckets;
     let moments_start = (carrier.first_moment_plane as usize) * buckets;
     let moment_count = carrier.moment_count as usize;
@@ -997,19 +981,71 @@ pub fn apply_deposits_to_carrier_on(
         (e_slice, m_slice)
     };
 
+    let runs = workers.min(items / PACKETS_PER_RUN).max(1);
+    received.resize(occupied_buckets.len(), 0.0);
+    let (sequence, packets, entries) = (&**sequence, &**packets, &**entries);
+
+    if runs == 1 {
+        let mut run = Run {
+            cell_base: 0,
+            occupied_cells: occupied_buckets,
+            energy,
+            moment_count,
+            moments: std::array::from_fn(|_| <&mut [f32]>::default()),
+            received,
+        };
+        if moment_count > 0 {
+            for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
+                if let Some(slot) = run.moments.get_mut(channel) {
+                    *slot = plane;
+                }
+            }
+        }
+        let count = reduce_run(&mut run, offsets, order, sequence, packets, entries);
+        let mut applied = CompensatedSum::ZERO;
+        for &value in run.received.get(..count).unwrap_or(&[]) {
+            applied.add(value);
+        }
+        summary.cells = count;
+        summary.applied = applied.value();
+        deposits.applied = true;
+        return Ok(summary);
+    }
+
+    let bounds: Vec<usize> = (0..=runs)
+        .map(|run| {
+            if run == runs {
+                buckets
+            } else {
+                let target = items / runs * run + items % runs * run / runs;
+                offsets
+                    .partition_point(|&at| (at as usize) < target)
+                    .min(buckets)
+            }
+        })
+        .collect();
+
     let mut slots: &mut [f64] = received;
     let mut lanes = Vec::with_capacity(runs);
-    for pair in bounds.windows(2) {
-        let cells = pair[0]..pair[1];
-        let (head, tail) = cut(std::mem::take(&mut energy), cells.len())?;
+    let mut occ_cursor = 0_usize;
+    for (run_idx, pair) in bounds.windows(2).enumerate() {
+        let cell_start = pair[0];
+        let cell_end = pair[1];
+        let (head, tail) = cut(std::mem::take(&mut energy), cell_end - cell_start)?;
         energy = tail;
-        let (owned, rest) = cut(
-            std::mem::take(&mut slots),
-            start(cells.end).saturating_sub(start(cells.start)),
-        )?;
+        let occ_end = if run_idx + 1 == runs {
+            occupied_buckets.len()
+        } else {
+            occ_cursor
+                + occupied_buckets[occ_cursor..].partition_point(|&c| (c as usize) < cell_end)
+        };
+        let lane_occupied = &occupied_buckets[occ_cursor..occ_end];
+        occ_cursor = occ_end;
+        let (owned, rest) = cut(std::mem::take(&mut slots), lane_occupied.len())?;
         slots = rest;
         lanes.push(Run {
-            cells,
+            cell_base: cell_start,
+            occupied_cells: lane_occupied,
             energy: head,
             moment_count,
             moments: std::array::from_fn(|_| <&mut [f32]>::default()),
@@ -1020,7 +1056,7 @@ pub fn apply_deposits_to_carrier_on(
         for (channel, plane) in moments.chunks_exact_mut(buckets.max(1)).enumerate() {
             let mut plane = plane;
             for lane in &mut lanes {
-                let (head, tail) = cut(std::mem::take(&mut plane), lane.cells.len())?;
+                let (head, tail) = cut(std::mem::take(&mut plane), lane.energy.len())?;
                 plane = tail;
                 if let Some(slot) = lane.moments.get_mut(channel) {
                     *slot = head;
@@ -1029,23 +1065,20 @@ pub fn apply_deposits_to_carrier_on(
         }
     }
 
-    let (sequence, packets, entries) = (&**sequence, &**packets, &**entries);
     let reduce = |run: &mut Run<'_>| reduce_run(run, offsets, order, sequence, packets, entries);
     let reduce = &reduce;
-    let mut rest = lanes.iter_mut();
-    let first = rest.next();
-    let occupied = std::thread::scope(|scope| {
-        let workers: Vec<_> = rest.map(|run| scope.spawn(move || reduce(run))).collect();
-        let mut occupied = Vec::with_capacity(runs);
-        occupied.push(first.map_or(0, reduce));
-        for worker in workers {
-            occupied.push(
-                worker
-                    .join()
-                    .map_err(|_| conflict("a deposit worker panicked".into()))?,
-            );
+    let mut occupied = vec![0_usize; lanes.len()];
+    flife_core::pool::scope_workers(workers, "apply deposits", |scope| {
+        let mut pairs = lanes.iter_mut().zip(occupied.iter_mut());
+        let first = pairs.next();
+        for (run, slot) in pairs {
+            scope.spawn(move || {
+                *slot = reduce(run);
+            });
         }
-        Ok::<_, CoreError>(occupied)
+        if let Some((run, slot)) = first {
+            *slot = reduce(run);
+        }
     })?;
 
     let mut applied = CompensatedSum::ZERO;
@@ -1297,10 +1330,9 @@ impl DepositReduction<'_> {
         }
         let mut summary = self.summary;
         let mut applied = CompensatedSum::ZERO;
-        for (cell, pair) in self.offsets().windows(2).enumerate() {
-            if pair[0] < pair[1]
-                && let Some(&value) = received.get(cell)
-            {
+        for &cell_u32 in self.deposits.bins.occupied_buckets() {
+            let cell = cell_u32 as usize;
+            if let Some(&value) = received.get(cell) {
                 applied.add(value);
                 summary.cells += 1;
             }
@@ -1316,11 +1348,13 @@ impl DepositReduction<'_> {
     }
 }
 
-/// One thread's share of a reduction: a contiguous range of cells, their
-/// energy and their values in every moment plane, and a slot for what each
-/// of its occupied cells received.
+/// One thread's share of a reduction: a contiguous range of cells starting at
+/// `cell_base`, the compact ascending list of occupied cells in that range,
+/// their energy and their values in every moment plane, and a slot for what
+/// each of its occupied cells received.
 struct Run<'a> {
-    cells: Range<usize>,
+    cell_base: usize,
+    occupied_cells: &'a [u32],
     energy: &'a mut [f32],
     moment_count: usize,
     moments: [&'a mut [f32]; CHANNELS],
@@ -1334,14 +1368,14 @@ struct Run<'a> {
 const REDUCE_BATCH: usize = 32;
 
 /// Flush `count` buffered cell updates into `moments`, one plane at a time.
-fn flush_moment_batch(
+fn flush_moment_batch_const<const M: usize>(
     moments: &mut [&mut [f32]],
     count: usize,
     cell_at: &[usize; REDUCE_BATCH],
     factors: &[f64; REDUCE_BATCH],
-    accum: &[[f64; CHANNELS]; REDUCE_BATCH],
+    accum: &[[f64; M]; REDUCE_BATCH],
 ) {
-    for (channel, plane) in moments.iter_mut().enumerate() {
+    for (channel, plane) in moments.iter_mut().take(M).enumerate() {
         for b in 0..count {
             let added = accum[b][channel] * factors[b];
             if added != 0.0
@@ -1353,10 +1387,11 @@ fn flush_moment_batch(
     }
 }
 
-/// Reduce and write `run`'s occupied cells in cell order, each as
-/// [`apply_deposits`] reduces it, filling `run.received` in the same order.
-/// Returns how many cells received a packet.
-fn reduce_run(
+/// Fixed-channel specialization of [`reduce_run`] iterating only occupied cells
+/// with compile-time channel count `M` (`32` single-carrier, `24` Carrier 0,
+/// `8` Carrier 1) so LLVM auto-vectorizes the inner moment accumulation loop
+/// cleanly while preserving exact IEEE-754 order.
+fn reduce_run_const<const M: usize>(
     run: &mut Run<'_>,
     offsets: &[u32],
     order: &[u32],
@@ -1364,14 +1399,18 @@ fn reduce_run(
     packets: &[Packet],
     entries: &[Entry],
 ) -> usize {
-    let mut occupied = 0;
+    let mut occupied = 0_usize;
     let mut batch_len = 0_usize;
     let mut cell_at = [0_usize; REDUCE_BATCH];
     let mut factors = [0.0_f64; REDUCE_BATCH];
-    let mut accum = [[0.0_f64; CHANNELS]; REDUCE_BATCH];
-    let moment_count = run.moment_count.min(CHANNELS);
+    let mut accum = [[0.0_f64; M]; REDUCE_BATCH];
+    let cell_base = run.cell_base;
 
-    for (at, cell) in run.cells.clone().enumerate() {
+    for &cell_u32 in run.occupied_cells {
+        let cell = cell_u32 as usize;
+        let Some(at) = cell.checked_sub(cell_base) else {
+            continue;
+        };
         let (Some(&first), Some(&end)) = (offsets.get(cell), offsets.get(cell + 1)) else {
             continue;
         };
@@ -1383,8 +1422,8 @@ fn reduce_run(
         };
         let slice = order.get(first as usize..end as usize).unwrap_or(&[]);
         let before = *energy;
-        let mut total = 0.0;
-        let mut moment = [0.0; CHANNELS];
+        let mut total = 0.0_f64;
+        let mut moment = [0.0_f64; M];
         for &ord in slice {
             let Some(&seq) = sequence.get(ord as usize) else {
                 continue;
@@ -1393,10 +1432,11 @@ fn reduce_run(
                 continue;
             };
             total = add_down(total, packet.amount);
-            if let Some(entry) = entries.get(packet.entry) {
+            if let Some(entry) = entries.get(packet.entry)
+                && let Some(dir) = entry.direction.first_chunk::<M>()
+            {
                 let amount = packet.amount;
-                for (slot, &component) in moment.iter_mut().zip(&entry.direction).take(moment_count)
-                {
+                for (slot, &component) in moment.iter_mut().zip(dir) {
                     *slot += amount * component;
                 }
             }
@@ -1420,8 +1460,8 @@ fn reduce_run(
             accum[batch_len] = moment;
             batch_len += 1;
             if batch_len == REDUCE_BATCH {
-                flush_moment_batch(
-                    &mut run.moments[..moment_count],
+                flush_moment_batch_const::<M>(
+                    &mut run.moments[..M],
                     batch_len,
                     &cell_at,
                     &factors,
@@ -1432,15 +1472,112 @@ fn reduce_run(
         }
     }
     if batch_len > 0 {
-        flush_moment_batch(
-            &mut run.moments[..moment_count],
-            batch_len,
-            &cell_at,
-            &factors,
-            &accum,
-        );
+        flush_moment_batch_const::<M>(&mut run.moments[..M], batch_len, &cell_at, &factors, &accum);
     }
     occupied
+}
+
+/// Reduce and write `run`'s occupied cells in cell order, each as
+/// [`apply_deposits`] reduces it, filling `run.received` in the same order.
+/// Returns how many cells received a packet.
+fn reduce_run(
+    run: &mut Run<'_>,
+    offsets: &[u32],
+    order: &[u32],
+    sequence: &[u32],
+    packets: &[Packet],
+    entries: &[Entry],
+) -> usize {
+    let moment_count = run.moment_count.min(CHANNELS);
+    match moment_count {
+        CHANNELS => reduce_run_const::<CHANNELS>(run, offsets, order, sequence, packets, entries),
+        24 => reduce_run_const::<24>(run, offsets, order, sequence, packets, entries),
+        8 => reduce_run_const::<8>(run, offsets, order, sequence, packets, entries),
+        _ => {
+            let mut occupied = 0_usize;
+            let mut batch_len = 0_usize;
+            let mut cell_at = [0_usize; REDUCE_BATCH];
+            let mut factors = [0.0_f64; REDUCE_BATCH];
+            let mut accum = [[0.0_f64; CHANNELS]; REDUCE_BATCH];
+            let cell_base = run.cell_base;
+
+            for &cell_u32 in run.occupied_cells {
+                let cell = cell_u32 as usize;
+                let Some(at) = cell.checked_sub(cell_base) else {
+                    continue;
+                };
+                let (Some(&first), Some(&end)) = (offsets.get(cell), offsets.get(cell + 1)) else {
+                    continue;
+                };
+                if first >= end {
+                    continue;
+                }
+                let Some(energy) = run.energy.get_mut(at) else {
+                    continue;
+                };
+                let slice = order.get(first as usize..end as usize).unwrap_or(&[]);
+                let before = *energy;
+                let mut total = 0.0_f64;
+                let mut moment = [0.0_f64; CHANNELS];
+                for &ord in slice {
+                    let Some(&seq) = sequence.get(ord as usize) else {
+                        continue;
+                    };
+                    let Some(packet) = packets.get(seq as usize) else {
+                        continue;
+                    };
+                    total = add_down(total, packet.amount);
+                    if let Some(entry) = entries.get(packet.entry) {
+                        let amount = packet.amount;
+                        for (slot, &component) in
+                            moment.iter_mut().zip(&entry.direction).take(moment_count)
+                        {
+                            *slot += amount * component;
+                        }
+                    }
+                }
+                let after = round_down_f32(add_down(f64::from(before), total));
+                let received = f64::from(after) - f64::from(before);
+                let factor = if total > 0.0 && total.is_finite() {
+                    received / total
+                } else {
+                    0.0
+                };
+                *energy = after;
+                if let Some(slot) = run.received.get_mut(occupied) {
+                    *slot = received;
+                }
+                occupied += 1;
+
+                if factor != 0.0 {
+                    cell_at[batch_len] = at;
+                    factors[batch_len] = factor;
+                    accum[batch_len] = moment;
+                    batch_len += 1;
+                    if batch_len == REDUCE_BATCH {
+                        flush_moment_batch_const::<CHANNELS>(
+                            &mut run.moments[..moment_count],
+                            batch_len,
+                            &cell_at,
+                            &factors,
+                            &accum,
+                        );
+                        batch_len = 0;
+                    }
+                }
+            }
+            if batch_len > 0 {
+                flush_moment_batch_const::<CHANNELS>(
+                    &mut run.moments[..moment_count],
+                    batch_len,
+                    &cell_at,
+                    &factors,
+                    &accum,
+                );
+            }
+            occupied
+        }
+    }
 }
 
 /// `slice` cut after its first `count` values.

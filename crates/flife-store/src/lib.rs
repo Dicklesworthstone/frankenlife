@@ -1822,7 +1822,8 @@ impl ChunkStore {
             let candidates = sequences.get(batch_start..cursor).unwrap_or_default();
             cursor = batch_start;
 
-            let mut parsed: Vec<(u64, Option<Vec<(Sha256Digest, u64)>>)> =
+            type ChunkKey = (Sha256Digest, u64);
+            let mut parsed: Vec<(u64, Option<Vec<ChunkKey>>)> =
                 Vec::with_capacity(candidates.len());
             let mut seen = BTreeSet::new();
             let mut pending = Vec::new();
